@@ -28,6 +28,7 @@ use crate::money::MicroUsd;
 use crate::native::{agent_type, has_definition, kind_word, plugin_agent_type, HELLO_FRESH};
 use crate::orchestration::{
     parse_transcript, price, unpriced_reason, CacheWrites, PriceTable, Speed, UsageRecord,
+    UsageSource,
 };
 use crate::policy::EffortId;
 use crate::procs::Ended;
@@ -256,7 +257,9 @@ struct Booked {
 }
 
 /// Usage of the records given: tokens summed, cost estimated from the
-/// machine's price table, the model of the last one. No record, no table or
+/// machine's price table, the effective model that of the last executor
+/// record (an advisor call runs on its own model and never counts as the
+/// model the worker ran). No record, no table or
 /// a model without a price leaves the figure unknown, never zero.
 fn usage_of(records: &[UsageRecord], prices: Option<&PriceTable>) -> Booked {
     if records.is_empty() {
@@ -306,7 +309,10 @@ fn usage_of(records: &[UsageRecord], prices: Option<&PriceTable>) -> Booked {
             }),
             cost,
         },
-        effective_model: records.last().map(|record| record.model.clone()),
+        effective_model: records
+            .iter()
+            .rfind(|record| record.source == UsageSource::Executor)
+            .map(|record| record.model.clone()),
         unpriced,
     }
 }
@@ -329,6 +335,7 @@ fn usage_of_report(usage: Option<&AgentUsage>, prices: Option<&PriceTable>) -> B
     // tier it was written at: priced at the 5-minute rate, the default.
     let record = UsageRecord {
         message_id: String::new(),
+        source: UsageSource::Executor,
         model,
         speed: Speed::Standard,
         input_tokens: usage.input_tokens.unwrap_or(0),
@@ -474,6 +481,97 @@ pub fn book_turn_usage(
     )
 }
 
+/// Why advisor calls could not be booked at all, as opposed to booked with
+/// an unknown price.
+#[derive(Debug)]
+pub enum AdvisorBookingError {
+    NoSuchDispatch(String),
+    Ledger(crate::ledger::LedgerError),
+}
+
+impl From<crate::ledger::LedgerError> for AdvisorBookingError {
+    fn from(e: crate::ledger::LedgerError) -> Self {
+        Self::Ledger(e)
+    }
+}
+
+impl std::fmt::Display for AdvisorBookingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSuchDispatch(dispatch) => write!(f, "no such dispatch {dispatch}"),
+            Self::Ledger(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Books advisor calls (records of source [`UsageSource::Advisor`]) as
+/// usage of a dispatch, each at its own model's rate and under its own key,
+/// `advisor:<message id>#advisor<n>`: a call already booked, by an earlier
+/// report or an earlier dispatch of the same continued agent, books nothing.
+/// The rows carry no requested model, so no alias ever resolves to the
+/// advisor's model, and they are kept out of the dispatch's own rows. A call
+/// that cannot be priced is booked with an unknown cost and named in the
+/// returned pricing notes; a call that cannot be booked at all is the error.
+pub fn book_advisor_usage(
+    ledger: &crate::ledger::Ledger,
+    dispatch: &str,
+    advisors: &[UsageRecord],
+    prices: Option<&PriceTable>,
+) -> Result<Vec<String>, AdvisorBookingError> {
+    let Some(context) = ledger.dispatch_booking(dispatch)? else {
+        return Err(AdvisorBookingError::NoSuchDispatch(dispatch.to_string()));
+    };
+    let mut notes: Vec<String> = Vec::new();
+    for record in advisors
+        .iter()
+        .filter(|record| record.source == UsageSource::Advisor)
+    {
+        let priced = usage_of(std::slice::from_ref(record), prices);
+        let usage = &priced.usage;
+        let (cost, reasons) = if record.model.is_empty() {
+            (
+                Cost::Unknown,
+                vec!["an advisor call reported no model or malformed token counts".to_string()],
+            )
+        } else {
+            (usage.cost, priced.unpriced)
+        };
+        let event = crate::ledger::UsageEvent {
+            event_id: format!(
+                "{}{}",
+                crate::ledger::ADVISOR_EVENT_PREFIX,
+                record.message_id
+            ),
+            run_id: context.run_id.clone(),
+            attempt_id: context.attempt_id,
+            parent_event_id: None,
+            model: Some(record.model.clone()).filter(|model| !model.is_empty()),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+            cost: cost.micros(),
+            cost_kind: crate::money::CostKind::EstimatedApiEquivalent,
+            completeness: cost.completeness(),
+            inclusive: cost.inclusive(),
+            at: ledger.now(),
+            phase: context.phase,
+            duration_ms: None,
+            requested_model: None,
+            requested_effort: None,
+            harness: context.harness.clone(),
+        };
+        if ledger.record_advisor_usage(&event, dispatch)? {
+            for reason in reasons {
+                if !notes.contains(&reason) {
+                    notes.push(reason);
+                }
+            }
+        }
+    }
+    Ok(notes)
+}
+
 /// A launch that did not reach a result.
 fn ended_result(spec: &LaunchSpec, ended: Ended, detail: String) -> LaunchResult {
     LaunchResult {
@@ -501,6 +599,9 @@ pub struct NativeBackend<'a> {
     waits: Waits,
     prices: Option<PriceTable>,
     memory: Mutex<Memory>,
+    /// The ledger the advisor calls found in an agent's transcript are
+    /// booked into; `None` books none.
+    advisor_ledger: Option<PathBuf>,
 }
 
 impl<'a> NativeBackend<'a> {
@@ -518,7 +619,15 @@ impl<'a> NativeBackend<'a> {
             waits,
             prices,
             memory: Mutex::new(Memory::default()),
+            advisor_ledger: None,
         }
+    }
+
+    /// Books the advisor calls found in each stopped agent's transcript
+    /// into the ledger at `path`.
+    pub fn with_advisor_ledger(mut self, path: PathBuf) -> Self {
+        self.advisor_ledger = Some(path);
+        self
     }
 
     /// Write one request line, so the plugin sees it now.
@@ -731,31 +840,31 @@ impl<'a> NativeBackend<'a> {
         }
     }
 
-    /// The message ids of an agent's transcript, found at
-    /// `<projects>/*/<session>/subagents/agent-<agent>.jsonl`. They are
-    /// read for nothing else: an older relais's usage import skips what is
-    /// recorded here, so the agent's usage is not booked twice after a
-    /// revert. Empty when the file is missing or holds no message.
-    fn rollback_ids(&self, agent_id: &str) -> Vec<String> {
-        let Some(projects) = &self.link.projects_dir else {
-            return Vec::new();
-        };
-        // An unreadable directory is the same fact as a missing file: no
-        // ids, which the run says as `rollback_ids_missing`.
-        let Ok(slugs) = std::fs::read_dir(projects) else {
-            return Vec::new();
-        };
+    /// The content of an agent's transcript, found at
+    /// `<projects>/*/<session>/subagents/agent-<agent>.jsonl`. `None` when
+    /// the file is missing or unreadable: an unreadable directory is the
+    /// same fact as a missing file.
+    fn transcript_of(&self, agent_id: &str) -> Option<String> {
+        let projects = self.link.projects_dir.as_ref()?;
+        let slugs = std::fs::read_dir(projects).ok()?;
         let file = format!("agent-{agent_id}.jsonl");
-        slugs
-            .flatten()
-            .find_map(|slug| {
-                let path = slug
-                    .path()
-                    .join(&self.link.session_id)
-                    .join("subagents")
-                    .join(&file);
-                std::fs::read_to_string(path).ok()
-            })
+        slugs.flatten().find_map(|slug| {
+            let path = slug
+                .path()
+                .join(&self.link.session_id)
+                .join("subagents")
+                .join(&file);
+            std::fs::read_to_string(path).ok()
+        })
+    }
+
+    /// The message ids of an agent's transcript. They are read for nothing
+    /// else: an older relais's usage import skips what is recorded here, so
+    /// the agent's usage is not booked twice after a revert. Empty when the
+    /// file is missing or holds no message, which the run says as
+    /// `rollback_ids_missing`.
+    fn rollback_ids(&self, agent_id: &str) -> Vec<String> {
+        self.transcript_of(agent_id)
             .map(|content| {
                 parse_transcript(&content)
                     .into_iter()
@@ -763,6 +872,32 @@ impl<'a> NativeBackend<'a> {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Books the advisor calls of an agent's transcript for a dispatch,
+    /// each once however often the agent stops or is continued, and returns
+    /// the pricing notes of what was booked with an unknown cost. A missing
+    /// transcript has no advisor calls to book.
+    fn book_advisors(
+        &self,
+        dispatch: &str,
+        agent_id: &str,
+    ) -> Result<Vec<String>, AdvisorBookingError> {
+        let Some(path) = &self.advisor_ledger else {
+            return Ok(Vec::new());
+        };
+        let Some(content) = self.transcript_of(agent_id) else {
+            return Ok(Vec::new());
+        };
+        let advisors: Vec<UsageRecord> = parse_transcript(&content)
+            .into_iter()
+            .filter(|record| record.source == UsageSource::Advisor)
+            .collect();
+        if advisors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ledger = crate::ledger::Ledger::open(path)?;
+        book_advisor_usage(&ledger, dispatch, &advisors, self.prices.as_ref())
     }
 
     /// The result of a subagent that stopped: its answer and what it
@@ -779,7 +914,16 @@ impl<'a> NativeBackend<'a> {
             usage,
             answer,
         } = report;
-        let booked = usage_of_report(usage.as_ref(), self.prices.as_ref());
+        let mut booked = usage_of_report(usage.as_ref(), self.prices.as_ref());
+        let advisor_failure = match self.book_advisors(&spec.dispatch_id, &agent_id) {
+            Ok(unpriced) => {
+                booked.unpriced.extend(unpriced);
+                None
+            }
+            Err(e) => Some(format!(
+                "the advisor usage of agent {agent_id} could not be booked: {e}"
+            )),
+        };
         let failure = match status {
             AgentStatus::Completed => None,
             AgentStatus::Failed => Some("failed"),
@@ -810,6 +954,7 @@ impl<'a> NativeBackend<'a> {
         if failure.is_some() {
             notes.clear();
         }
+        notes.extend(advisor_failure);
         LaunchResult {
             dispatch_id: spec.dispatch_id.clone(),
             ended: Ended::Exited(i32::from(failure.is_some())),
@@ -964,9 +1109,17 @@ mod tests {
         }
     }
 
+    fn advisor_record(id: &str, model: &str, input: u64, output: u64) -> UsageRecord {
+        UsageRecord {
+            source: UsageSource::Advisor,
+            ..record(id, model, input, output)
+        }
+    }
+
     fn record(id: &str, model: &str, input: u64, output: u64) -> UsageRecord {
         UsageRecord {
             message_id: id.into(),
+            source: UsageSource::Executor,
             model: model.into(),
             speed: Speed::Standard,
             input_tokens: input,
@@ -994,6 +1147,41 @@ mod tests {
                 fast_output: None,
             }],
         }
+    }
+
+    #[test]
+    fn an_advisor_record_is_priced_at_its_rate_but_never_the_effective_model() {
+        let mut prices = table();
+        prices.models.push(ModelPrice {
+            ids: vec!["opus-x".into()],
+            input: 5_000_000,
+            output: 10_000_000,
+            cache_read: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            fast_input: None,
+            fast_output: None,
+        });
+        let worker = record("m1", "sonnet-x", 100, 10);
+        let advisor = advisor_record("m1#advisor0", "opus-x", 1000, 100);
+        let booked = usage_of(&[worker.clone(), advisor.clone()], Some(&prices));
+        assert_eq!(booked.effective_model.as_deref(), Some("sonnet-x"));
+        let alone = usage_of(&[worker], Some(&prices));
+        let advisor_alone = usage_of(&[advisor], Some(&prices));
+        let (
+            Cost::Estimated { micros: both },
+            Cost::Estimated { micros: w },
+            Cost::Estimated { micros: a },
+        ) = (
+            booked.usage.cost,
+            alone.usage.cost,
+            advisor_alone.usage.cost,
+        )
+        else {
+            panic!("costs should be estimated");
+        };
+        assert_eq!(both, w.saturating_add(a));
+        assert!(a > w);
     }
 
     fn backend_in<'a>(
@@ -1308,6 +1496,259 @@ mod tests {
         assert!(nowhere.rollback_ids("a1").is_empty());
         let unknown = backend_in(&harness, &gate, None);
         assert!(unknown.rollback_ids("a1").is_empty());
+    }
+
+    const WORKER_LINE: &str = r#"{"type":"assistant","timestamp":"2026-10-06T10:00:00Z","message":{"id":"m1","model":"sonnet-x","usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"iterations":[{"type":"advisor_message","model":"opus-x","input_tokens":1000,"output_tokens":100}]}}}"#;
+
+    /// A ledger holding dispatch `d1` of run `run-n`, a backend that books
+    /// advisor calls into it, and the projects directory it reads.
+    fn advisor_world(
+        tag: &str,
+        transcript: Option<&str>,
+    ) -> (
+        crate::test_support::TempDir,
+        crate::ledger::Ledger,
+        PathBuf,
+        Option<PathBuf>,
+    ) {
+        use crate::ids::{DispatchId, RunId, TaskId};
+        let dir = crate::test_support::short_temp_dir(tag);
+        let db = dir.join("ledger.sqlite");
+        let ledger = crate::ledger::Ledger::open(&db).expect("ledger");
+        let run = RunId::from_stored("run-n");
+        ledger
+            .insert_run(
+                &run,
+                "/repo",
+                Some("s1"),
+                &TaskId::from_stored("run-n"),
+                "rk",
+            )
+            .expect("run");
+        ledger
+            .record_dispatch_intent(
+                &DispatchId::from_stored("d1"),
+                &run,
+                None,
+                &serde_json::json!({ "kind": "initial", "model": "sonnet-x" }),
+                0,
+                crate::route::RoutedBy::RiskFloor,
+            )
+            .expect("dispatch");
+        let projects = dir.join("projects");
+        if let Some(text) = transcript {
+            let subagents = projects.join("-slug").join("s1").join("subagents");
+            std::fs::create_dir_all(&subagents).expect("dirs");
+            std::fs::write(subagents.join("agent-a1.jsonl"), text).expect("written");
+        }
+        (dir, ledger, db, Some(projects))
+    }
+
+    fn advisor_prices() -> PriceTable {
+        let mut prices = table();
+        prices.models.push(ModelPrice {
+            ids: vec!["opus-x".into()],
+            input: 5_000_000,
+            output: 10_000_000,
+            cache_read: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            fast_input: None,
+            fast_output: None,
+        });
+        prices
+    }
+
+    fn worker_usage() -> Option<AgentUsage> {
+        Some(AgentUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            model: Some("sonnet-x".into()),
+            ..AgentUsage::default()
+        })
+    }
+
+    fn advisor_rows(db: &std::path::Path) -> (i64, i64, i64) {
+        rusqlite::Connection::open(db)
+            .expect("conn")
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(cost_micros), 0), COALESCE(SUM(input_tokens), 0)
+                 FROM usage_events WHERE event_id LIKE 'advisor:%'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("rows")
+    }
+
+    #[test]
+    fn a_stopped_dispatch_books_its_advisor_calls_once_at_their_own_rate() {
+        let (_dir, ledger, db, projects) = advisor_world(
+            "native-adv",
+            Some(&format!("{WORKER_LINE}\n{WORKER_LINE}\n")),
+        );
+        let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
+        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let mut backend = backend_in(&harness, &gate, projects).with_advisor_ledger(db.clone());
+        backend.prices = Some(advisor_prices());
+        let worker = spec("sonnet-x", None);
+        for _ in 0..2 {
+            let result = backend.stopped_result(
+                &worker,
+                reported("a1", AgentStatus::Completed, worker_usage()),
+                Vec::new(),
+            );
+            // The plugin's figures are the worker's alone, at its own model.
+            assert_eq!(result.effective_model.as_deref(), Some("sonnet-x"));
+            assert_eq!(result.usage.input_tokens, Some(100));
+            assert!(result.unpriced.is_empty());
+        }
+        // 1000 in at 5 and 100 out at 10 USD per million tokens, once.
+        assert_eq!(advisor_rows(&db), (1, 6_000, 1000));
+        assert!(ledger
+            .model_observations()
+            .expect("observations")
+            .is_empty());
+        assert_eq!(
+            ledger
+                .models_used(&crate::ids::RunId::from_stored("run-n"))
+                .expect("models"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_planners_advisor_rows_take_the_phase_its_final_booking_repairs() {
+        use crate::ids::{DispatchId, RunId};
+        use crate::lifecycle::UsagePhase;
+        let (_dir, ledger, _db, _projects) = advisor_world("native-adv5", None);
+        let run = RunId::from_stored("run-n");
+        ledger
+            .record_dispatch_intent(
+                &DispatchId::from_stored("p1"),
+                &run,
+                None,
+                &serde_json::json!({ "kind": "plan", "model": "sonnet-x" }),
+                0,
+                crate::route::RoutedBy::RiskFloor,
+            )
+            .expect("planner dispatch");
+        let prices = advisor_prices();
+        let advisor = parse_transcript(WORKER_LINE)
+            .into_iter()
+            .filter(|record| record.source == UsageSource::Advisor)
+            .collect::<Vec<_>>();
+        book_advisor_usage(&ledger, "p1", &advisor, Some(&prices)).expect("advisor booked");
+        let booking = ledger
+            .dispatch_booking("p1")
+            .expect("booking")
+            .expect("some");
+        assert_eq!(booking.phase, None, "`plan` is no usage phase");
+        let final_row = crate::ledger::UsageEvent {
+            event_id: "p1".into(),
+            run_id: run.clone(),
+            attempt_id: booking.attempt_id,
+            parent_event_id: None,
+            model: Some("sonnet-x".into()),
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost: Some(crate::money::MicroUsd::from_micros(2_000)),
+            cost_kind: crate::money::CostKind::EstimatedApiEquivalent,
+            completeness: crate::money::CostCompleteness::Actual,
+            inclusive: false,
+            at: ledger.now(),
+            phase: Some(UsagePhase::Planning),
+            duration_ms: None,
+            requested_model: None,
+            requested_effort: None,
+            harness: None,
+        };
+        ledger
+            .record_usage_delta(&final_row, &[], crate::ledger::Booking::Final)
+            .expect("final booking");
+        let by_phase = ledger.run_cost_by_phase(&run).expect("by phase");
+        let cost_of = |phase: Option<UsagePhase>| {
+            by_phase
+                .iter()
+                .find(|entry| entry.phase == phase)
+                .map(|entry| entry.cost.to_micros())
+        };
+        // The advisor's 1000 in and 100 out: 6_000 on top of the 2_000.
+        assert_eq!(cost_of(Some(UsagePhase::Planning)), Some(8_000));
+        assert_eq!(cost_of(None), None, "nothing is left unattributed");
+    }
+
+    #[test]
+    fn a_continued_agent_books_an_advisor_call_once_across_dispatches() {
+        let (_dir, ledger, db, projects) = advisor_world("native-adv2", Some(WORKER_LINE));
+        ledger
+            .record_dispatch_intent(
+                &crate::ids::DispatchId::from_stored("d2"),
+                &crate::ids::RunId::from_stored("run-n"),
+                None,
+                &serde_json::json!({ "kind": "initial", "model": "sonnet-x" }),
+                0,
+                crate::route::RoutedBy::RiskFloor,
+            )
+            .expect("second dispatch");
+        let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
+        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let mut backend = backend_in(&harness, &gate, projects).with_advisor_ledger(db.clone());
+        backend.prices = Some(advisor_prices());
+        let notes = backend.book_advisors("d1", "a1").expect("booked");
+        assert!(notes.is_empty());
+        // A later dispatch of the same agent finds the same transcript line.
+        assert!(backend
+            .book_advisors("d2", "a1")
+            .expect("booked")
+            .is_empty());
+        assert_eq!(advisor_rows(&db).0, 1);
+    }
+
+    #[test]
+    fn an_unpriced_advisor_call_is_booked_unknown_and_noted() {
+        let (_dir, _ledger, db, projects) = advisor_world("native-adv3", Some(WORKER_LINE));
+        let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
+        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let mut backend = backend_in(&harness, &gate, projects).with_advisor_ledger(db.clone());
+        backend.prices = Some(table());
+        let notes = backend.book_advisors("d1", "a1").expect("booked");
+        assert_eq!(notes, ["opus-x has no [pricing.models] entry"]);
+        assert_eq!(advisor_rows(&db), (1, 0, 1000));
+    }
+
+    #[test]
+    fn an_advisor_call_that_cannot_be_booked_is_an_error_not_a_pricing_note() {
+        let (_dir, _ledger, db, projects) = advisor_world("native-adv4", Some(WORKER_LINE));
+        let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
+        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let mut backend = backend_in(&harness, &gate, projects).with_advisor_ledger(db.clone());
+        backend.prices = Some(advisor_prices());
+        let booked = backend.book_advisors("no-such-dispatch", "a1");
+        assert!(
+            matches!(booked, Err(AdvisorBookingError::NoSuchDispatch(ref d)) if d == "no-such-dispatch"),
+            "{booked:?}"
+        );
+        assert_eq!(advisor_rows(&db).0, 0);
+    }
+
+    #[test]
+    fn a_missing_transcript_books_executor_usage_as_before() {
+        let (_dir, _ledger, db, projects) = advisor_world("native-adv4", None);
+        let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
+        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let mut backend = backend_in(&harness, &gate, projects).with_advisor_ledger(db.clone());
+        backend.prices = Some(advisor_prices());
+        let result = backend.stopped_result(
+            &spec("sonnet-x", None),
+            reported("a1", AgentStatus::Completed, worker_usage()),
+            Vec::new(),
+        );
+        assert_eq!(result.usage.input_tokens, Some(100));
+        assert_eq!(result.effective_model.as_deref(), Some("sonnet-x"));
+        assert!(result.unpriced.is_empty());
+        assert_eq!(advisor_rows(&db).0, 0);
     }
 
     /// The reasons are said record by record, never inferred from the

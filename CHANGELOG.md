@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+Claude Code's advisor tool is now counted. When a worker or a session runs with an advisor (`claude --advisor opus`, `advisorModel`), the advisor's tokens appear only in `usage.iterations[]` as `advisor_message` entries, never in the top-level usage relais read, so they went unbooked. relais now books each advisor call at the advisor model's own rate: for a native dispatch from the agent's transcript when it stops, once per call across continuations, with the dispatch's phase; and through `relais usage import` for session transcripts. The worker's model stays the run's model, so an Opus advisor never reads as a model substitution or an alias drift.
+
 ## v0.21.0
 
 Typed recipes can now be promoted on replay evidence (#242, relais ADR-0006): a research-tier `change` recipe that names task types is promoted only on 14 of its first 15 qualifying replays, a seeded 10% of a promoted type's live runs still go to the implementation tier, and the learn cycle says (never writes) when a promoted type should be rolled back. `relais dataset judge-trial` records a ground-truth verdict on a review-rejected replay, which the gate reads (#243). Ledger step v32 adds the verdict columns. No recipe is promoted by this release.

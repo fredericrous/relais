@@ -275,6 +275,7 @@ mod tests {
     fn record(input: u64, output: u64, cache_read: u64, cache: CacheWrites) -> UsageRecord {
         UsageRecord {
             message_id: "msg_1".into(),
+            source: crate::orchestration::UsageSource::Executor,
             model: "claude-haiku-4-5".into(),
             speed: Speed::Standard,
             input_tokens: input,
