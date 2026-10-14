@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::policy::{CommandSpec, RepoPolicy};
 use crate::protocol::{Event, Events};
 use crate::verify::SetupGate;
+use crate::workspace::inplace;
 use crate::workspace::reuse::{
     self, decide_skip, step_key, RunReason, SkipDecision, StampStore, StepKey,
 };
@@ -36,9 +37,23 @@ fn decision(events: &Events, what: &str, reason: String) {
 /// busy source to settle, clone copy-on-write. Says what happened as
 /// decisions on the run; a filesystem that cannot clone costs nothing but
 /// the time today's setup already takes.
-pub fn seed_tree(policy: &RepoPolicy, source: &Path, dest: &Path, events: &Events) {
+///
+/// A source an in-place run holds is not cloned: its tree may be half
+/// written, and the run's marker exists for exactly as long as that is so.
+/// `own_run` is the run seeding, whose own marker does not count (an
+/// in-place run seeds its verification trees from its own worktree).
+pub fn seed_tree(
+    policy: &RepoPolicy,
+    source: &Path,
+    dest: &Path,
+    own_run: Option<&str>,
+    events: &Events,
+) {
     let deps = reuse::detect_deps(source, &policy.workspace.deps);
     if deps.is_empty() {
+        return;
+    }
+    if !source_is_free(source, own_run, events) {
         return;
     }
     for dep in &deps {
@@ -74,6 +89,28 @@ pub fn seed_tree(policy: &RepoPolicy, source: &Path, dest: &Path, events: &Event
         }
     }
     let report = reuse::seed(source, dest, &deps);
+    // A run may have started while the clone was under way: a marker found
+    // now means what was cloned may be half written, so it is thrown away.
+    if !report.seeded.is_empty() && !source_is_free(source, own_run, events) {
+        for (path, _) in &report.seeded {
+            if let Err(e) = std::fs::remove_dir_all(dest.join(path)) {
+                decision(
+                    events,
+                    "workspace_seed_discarded",
+                    format!("{} could not be removed: {e}", path.display()),
+                );
+            }
+        }
+        decision(
+            events,
+            "workspace_seed_discarded",
+            format!(
+                "{} was taken by an in-place run while it was cloned",
+                source.display()
+            ),
+        );
+        return;
+    }
     if let Some(reason) = &report.unavailable {
         decision(
             events,
@@ -96,6 +133,32 @@ pub fn seed_tree(policy: &RepoPolicy, source: &Path, dest: &Path, events: &Event
             "workspace_seed_skipped",
             format!("{}: {why}", path.display()),
         );
+    }
+}
+
+/// Is `source` free to clone from? Says why not as a decision.
+fn source_is_free(source: &Path, own_run: Option<&str>, events: &Events) -> bool {
+    match inplace::held_by(source, own_run) {
+        Ok(None) => true,
+        Ok(Some(run)) => {
+            decision(
+                events,
+                "workspace_seed_skipped",
+                format!("{} is held by in-place run {run}", source.display()),
+            );
+            false
+        }
+        Err(e) => {
+            decision(
+                events,
+                "workspace_seed_skipped",
+                format!(
+                    "{} could not be checked for a running in-place run: {e}",
+                    source.display()
+                ),
+            );
+            false
+        }
     }
 }
 

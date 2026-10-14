@@ -1187,6 +1187,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     // invalid states no effort fact, which is how the finding reads it.
     let mut effort_settings = EffortSettings::default();
     let mut max_effort = crate::policy::RoutingSettings::default().max_effort;
+    let mut machine_workspace = crate::policy::WorkspaceMode::default();
     match paths::machine_settings_path() {
         Err(e) => findings.push(Finding {
             component: "machine.toml",
@@ -1217,6 +1218,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                         ),
                     });
                     effort_settings = settings.efforts.clone();
+                    machine_workspace = settings.workspace.mode;
                     max_effort = settings.routing.max_effort.clone();
                     findings.extend(sandbox_finding(&settings));
                     findings.extend(permissions_finding(&settings));
@@ -1266,6 +1268,11 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     findings.extend(model_findings(&pricing));
     findings.push(registry_finding());
     findings.push(worktrees_finding_on_disk());
+    findings.push(workspace_finding_on_disk(
+        repo_dir,
+        machine_workspace,
+        policy.as_ref(),
+    ));
     findings.push(strays_finding_on_disk());
     findings.push(coordinator_finding());
     findings.push(plugin_finding(
@@ -1275,6 +1282,163 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     findings.extend(hook_wiring_finding(merged_roots(repo_dir, home.as_deref())));
 
     DoctorReport { findings }
+}
+
+/// What a copy-on-write probe found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CowProbe {
+    Ok,
+    Unavailable(String),
+    /// Nothing was tried, and why.
+    NotProbed(String),
+}
+
+/// Everything the workspace finding decides from, gathered by the caller so
+/// the finding itself reads no environment (ADR-0008).
+pub(crate) struct WorkspaceFacts {
+    pub machine: crate::policy::WorkspaceMode,
+    pub env_workspace: Option<String>,
+    pub ci: Option<String>,
+    pub repo_opts_out_of_in_place: bool,
+    pub linked_worktree: Option<bool>,
+}
+
+/// Where a run started from here would work, why, whether copy-on-write
+/// seeding is available, and any in-place run left unfinished. A left run
+/// or a seed that cannot clone is a warning that names its fix.
+pub(crate) fn workspace_finding(
+    facts: &WorkspaceFacts,
+    cow: &CowProbe,
+    leftovers: &[(String, PathBuf)],
+) -> Finding {
+    use crate::workspace::reuse::{resolve, ModeInputs, ModeRefusal, Workspace};
+    let inputs = ModeInputs {
+        flag: None,
+        env_workspace: facts.env_workspace.as_deref(),
+        ci: facts.ci.as_deref(),
+        machine: facts.machine,
+        repo_opts_out_of_in_place: facts.repo_opts_out_of_in_place,
+        linked_worktree: facts.linked_worktree,
+    };
+    let ci_on = facts
+        .ci
+        .as_deref()
+        .is_some_and(|v| !matches!(v.trim(), "" | "0" | "false"));
+    let mode = match resolve(inputs) {
+        Ok(mode) => mode,
+        Err(ModeRefusal::Unknown(value)) => {
+            return Finding {
+                component: "workspace",
+                level: Level::Warn,
+                detail: format!(
+                    "RELAIS_WORKSPACE={value} is none of auto, fork, in-place, isolated; `relais run` refuses it"
+                ),
+            };
+        }
+        Err(other) => {
+            return Finding {
+                component: "workspace",
+                level: Level::Warn,
+                detail: format!("{other:?}"),
+            };
+        }
+    };
+    let why = if ci_on {
+        "CI is set".to_string()
+    } else if let Some(value) = facts.env_workspace.as_deref() {
+        format!("RELAIS_WORKSPACE={value}")
+    } else if facts.machine == crate::policy::WorkspaceMode::Isolated {
+        "machine.toml [workspace] mode".to_string()
+    } else if mode == Workspace::InPlace {
+        "a linked worktree".to_string()
+    } else if facts.linked_worktree == Some(true) && facts.repo_opts_out_of_in_place {
+        "this repository sets [workspace] in_place = false".to_string()
+    } else {
+        "a primary checkout".to_string()
+    };
+    let mut level = Level::Ok;
+    let mut detail = format!("{} ({why})", mode.as_str());
+    if mode == Workspace::Isolated {
+        detail.push_str("; no dependencies are seeded");
+    } else {
+        match cow {
+            CowProbe::Ok => detail.push_str("; copy-on-write ok"),
+            CowProbe::Unavailable(reason) => {
+                level = Level::Warn;
+                detail.push_str(&format!(
+                    "; copy-on-write unavailable ({reason}), so setup runs in full; put RELAIS_STATE_DIR on the repository's volume"
+                ));
+            }
+            CowProbe::NotProbed(reason) => {
+                detail.push_str(&format!("; copy-on-write not probed ({reason})"));
+            }
+        }
+    }
+    for (run, path) in leftovers {
+        level = Level::Warn;
+        detail.push_str(&format!(
+            "\nrun {run} was interrupted in {}: relais resume --retire {run}",
+            path.display()
+        ));
+    }
+    Finding {
+        component: "workspace",
+        level,
+        detail,
+    }
+}
+
+/// The first regular file of the repository's top level: something to clone
+/// when probing, since a probe clones one existing file and writes nothing
+/// to the repository.
+fn probe_sample(repo_dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(repo_dir)
+        .ok()?
+        .flatten()
+        .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+}
+
+/// Gather the facts from the machine and the repository, then decide.
+fn workspace_finding_on_disk(
+    repo_dir: &Path,
+    machine: crate::policy::WorkspaceMode,
+    policy: Option<&RepoPolicy>,
+) -> Finding {
+    let cow = match paths::state_dir() {
+        Err(e) => CowProbe::NotProbed(e.to_string()),
+        Ok(state) if !state.is_dir() => {
+            CowProbe::NotProbed("the state directory does not exist yet".into())
+        }
+        Ok(state) => match probe_sample(repo_dir) {
+            None => CowProbe::NotProbed("the repository has no file at its top level".into()),
+            Some(sample) => match crate::fsclone::probe(&sample, &state) {
+                Ok(()) => CowProbe::Ok,
+                Err(e) => CowProbe::Unavailable(e.to_string()),
+            },
+        },
+    };
+    let facts = WorkspaceFacts {
+        machine,
+        env_workspace: std::env::var("RELAIS_WORKSPACE").ok(),
+        ci: std::env::var("CI").ok(),
+        repo_opts_out_of_in_place: policy.is_some_and(|p| p.workspace.in_place == Some(false)),
+        linked_worktree: crate::repo::is_linked_worktree(repo_dir),
+    };
+    let leftovers = crate::workspace::worktree_paths(repo_dir)
+        .map(|paths| {
+            paths
+                .into_iter()
+                .filter_map(|path| {
+                    let git_dir = crate::workspace::inplace::git_dir(&path).ok()?;
+                    let markers = crate::workspace::inplace::leftover_markers(&git_dir).ok()?;
+                    Some(markers.into_iter().map(move |m| (m.run, path.clone())))
+                })
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    workspace_finding(&facts, &cow, &leftovers)
 }
 
 /// `relais doctor --effort-template`: the machine.toml block for this
@@ -3406,6 +3570,150 @@ mod tests {
         let json = serde_json::to_value(&report).expect("serializes");
         assert_eq!(json["findings"][0]["component"], "sandbox");
         assert_eq!(json["findings"][0]["detail"], sentence);
+    }
+
+    fn workspace_facts() -> WorkspaceFacts {
+        WorkspaceFacts {
+            machine: crate::policy::WorkspaceMode::Auto,
+            env_workspace: None,
+            ci: None,
+            repo_opts_out_of_in_place: false,
+            linked_worktree: Some(false),
+        }
+    }
+
+    /// A primary checkout forks; a linked worktree is edited in place; and
+    /// each says why, so the line explains itself on a machine nobody set up.
+    #[test]
+    fn the_workspace_line_names_the_mode_and_why() {
+        let primary = workspace_finding(&workspace_facts(), &CowProbe::Ok, &[]);
+        assert_eq!(primary.level, Level::Ok);
+        assert_eq!(
+            primary.detail,
+            "fork (a primary checkout); copy-on-write ok"
+        );
+
+        let linked = WorkspaceFacts {
+            linked_worktree: Some(true),
+            ..workspace_facts()
+        };
+        assert_eq!(
+            workspace_finding(&linked, &CowProbe::Ok, &[]).detail,
+            "in_place (a linked worktree); copy-on-write ok"
+        );
+
+        let opted_out = WorkspaceFacts {
+            repo_opts_out_of_in_place: true,
+            ..linked
+        };
+        assert_eq!(
+            workspace_finding(&opted_out, &CowProbe::Ok, &[]).detail,
+            "fork (this repository sets [workspace] in_place = false); copy-on-write ok"
+        );
+    }
+
+    /// CI and the environment variable isolate, and the line says which did.
+    #[test]
+    fn ci_and_the_environment_are_named_as_the_reason_for_isolation() {
+        let ci = WorkspaceFacts {
+            ci: Some("true".into()),
+            ..workspace_facts()
+        };
+        let finding = workspace_finding(&ci, &CowProbe::Ok, &[]);
+        assert_eq!(finding.level, Level::Ok);
+        assert_eq!(
+            finding.detail,
+            "isolated (CI is set); no dependencies are seeded"
+        );
+
+        let env = WorkspaceFacts {
+            env_workspace: Some("isolated".into()),
+            ..workspace_facts()
+        };
+        assert_eq!(
+            workspace_finding(&env, &CowProbe::Ok, &[]).detail,
+            "isolated (RELAIS_WORKSPACE=isolated); no dependencies are seeded"
+        );
+
+        let machine = WorkspaceFacts {
+            machine: crate::policy::WorkspaceMode::Isolated,
+            ..workspace_facts()
+        };
+        assert_eq!(
+            workspace_finding(&machine, &CowProbe::Ok, &[]).detail,
+            "isolated (machine.toml [workspace] mode); no dependencies are seeded"
+        );
+
+        let bad = WorkspaceFacts {
+            env_workspace: Some("everywhere".into()),
+            ..workspace_facts()
+        };
+        let finding = workspace_finding(&bad, &CowProbe::Ok, &[]);
+        assert_eq!(finding.level, Level::Warn);
+        assert!(
+            finding.detail.contains("RELAIS_WORKSPACE=everywhere"),
+            "{}",
+            finding.detail
+        );
+    }
+
+    /// A seed that cannot clone is a warning that names its fix; one not
+    /// probed is information, not a warning; an isolated run never needs it.
+    #[test]
+    fn a_workspace_that_cannot_clone_warns_and_names_the_fix() {
+        let finding = workspace_finding(
+            &workspace_facts(),
+            &CowProbe::Unavailable("another volume".into()),
+            &[],
+        );
+        assert_eq!(finding.level, Level::Warn);
+        assert!(
+            finding.detail.contains("another volume"),
+            "{}",
+            finding.detail
+        );
+        assert!(
+            finding
+                .detail
+                .contains("RELAIS_STATE_DIR on the repository's volume"),
+            "{}",
+            finding.detail
+        );
+        let unprobed = workspace_finding(
+            &workspace_facts(),
+            &CowProbe::NotProbed("the state directory does not exist yet".into()),
+            &[],
+        );
+        assert_eq!(unprobed.level, Level::Ok);
+
+        let isolated = WorkspaceFacts {
+            ci: Some("1".into()),
+            ..workspace_facts()
+        };
+        assert_eq!(
+            workspace_finding(&isolated, &CowProbe::Unavailable("x".into()), &[]).level,
+            Level::Ok,
+            "isolation never clones, so an unavailable clone costs nothing"
+        );
+    }
+
+    /// An interrupted in-place run is a warning that names the exact command,
+    /// in the text report and in `--json`.
+    #[test]
+    fn an_interrupted_in_place_run_is_a_warning_with_the_retire_command() {
+        let leftovers = vec![("run-65dc-1".to_string(), PathBuf::from("/work/wt-a"))];
+        let finding = workspace_finding(&workspace_facts(), &CowProbe::Ok, &leftovers);
+        assert_eq!(finding.level, Level::Warn);
+        let sentence =
+            "run run-65dc-1 was interrupted in /work/wt-a: relais resume --retire run-65dc-1";
+        assert!(finding.detail.contains(sentence), "{}", finding.detail);
+        let report = DoctorReport {
+            findings: vec![finding],
+        };
+        assert!(report.render().contains(sentence), "{}", report.render());
+        let json = serde_json::to_value(&report).expect("serializes");
+        assert_eq!(json["findings"][0]["component"], "workspace");
+        assert_eq!(json["findings"][0]["level"], "warn");
     }
 
     #[test]

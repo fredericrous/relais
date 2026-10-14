@@ -3498,6 +3498,79 @@ fn a_leftover_worktree_is_retired_by_resume_with_its_tree_named() {
     assert!(one_out.contains("no worktree is retained"), "{one_out}");
 }
 
+// An in-place run that died leaves a marker in the git directory of the
+// worktree it edited, and that worktree is the person's own, so the state
+// directory never lists it. `resume --retire` with no run id finds the marker
+// in the worktrees of the repository it runs in, exports the edit no
+// candidate holds, puts the tree back and removes the marker (ADR-0008,
+// ADR-0009). The directory itself stays.
+#[test]
+fn resume_retire_with_no_id_finishes_an_interrupted_in_place_run() {
+    let world = World::new("retire-in-place");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(5), "{}", text(&run.stderr));
+    let run_id = world.only_run_id();
+
+    // What a run killed mid-way leaves: its marker and its edit in the tree.
+    let head = git(&world.repo, &["rev-parse", "HEAD"]).trim().to_string();
+    let listing = git(&world.repo, &["ls-files", "-s"]).trim().to_string();
+    let markers = world.repo.join(".git/relais-inplace");
+    std::fs::create_dir_all(&markers).expect("mkdir");
+    let marker = markers.join(format!("{run_id}.json"));
+    std::fs::write(
+        &marker,
+        serde_json::json!({
+            "run": run_id,
+            "stage": "running",
+            "head_symbolic": null,
+            "head_sha": head,
+            "start": head,
+            "index_listing": listing,
+            "target": null,
+            "exported": null,
+        })
+        .to_string(),
+    )
+    .expect("marker");
+    let edit = world.repo.join("src/in_place_edit.rs");
+    std::fs::write(&edit, "// the dead run's edit\n").expect("edit");
+
+    let out = world.relais(&["resume", "--retire"]);
+    let said = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{said}\n{}", text(&out.stderr));
+    assert!(said.contains(&format!("{run_id}: restored to")), "{said}");
+    assert!(said.contains("directory kept"), "{said}");
+    assert!(!edit.exists(), "the tree is back as it was found");
+    assert!(
+        world.repo.join("src/main.rs").exists(),
+        "and the directory stays"
+    );
+    assert_eq!(
+        git(
+            &world.repo,
+            &[
+                "show",
+                &format!("refs/relais/candidates/{run_id}/final:src/in_place_edit.rs")
+            ]
+        ),
+        "// the dead run's edit\n",
+        "the edit survives as the run's final candidate"
+    );
+    assert!(!marker.exists(), "the marker goes last");
+
+    // Nothing left: the sweep says so and exits 0.
+    let again = world.relais(&["resume", "--retire"]);
+    assert_eq!(again.status.code(), Some(0));
+    assert!(
+        text(&again.stdout).contains("no run worktree is retained"),
+        "{}",
+        text(&again.stdout)
+    );
+}
+
 // SPEC §12: a non-terminal run whose driver is gone (its events.jsonl silent
 // past the attempt wall time plus a margin) is interrupted as `driver_gone`
 // and its worktree retired; one silent for less is kept.
