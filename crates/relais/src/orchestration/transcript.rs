@@ -109,7 +109,8 @@ pub enum UsageSource {
 pub struct UsageRecord {
     pub message_id: String,
     pub source: UsageSource,
-    /// Empty when an advisor call reported no model: its cost is unknown.
+    /// Empty when an advisor call reported no model or malformed token
+    /// counts: its cost is unknown.
     pub model: String,
     pub speed: Speed,
     pub input_tokens: u64,
@@ -161,9 +162,9 @@ fn iteration_tokens(entry: &serde_json::Value, key: &str) -> Option<u64> {
 }
 
 /// The advisor calls of `usage.iterations`, one record each. An entry that
-/// is not an advisor call is left out; an advisor entry whose counts are
-/// malformed is left out too, and one without a model is kept with an empty
-/// model, which prices as unknown.
+/// is not an advisor call is left out. An advisor entry without a model, or
+/// whose counts are malformed, is kept with an empty model and no tokens,
+/// which prices as unknown: the call is booked and noted, never dropped.
 fn advisor_records(
     iterations: Option<&serde_json::Value>,
     message_id: &str,
@@ -176,28 +177,36 @@ fn advisor_records(
         .iter()
         .filter(|entry| entry.get("type").and_then(|t| t.as_str()) == Some("advisor_message"))
         .enumerate()
-        .filter_map(|(n, entry)| {
-            Some(UsageRecord {
+        .map(|(n, entry)| {
+            let tokens = (|| {
+                Some((
+                    iteration_tokens(entry, "input_tokens")?,
+                    iteration_tokens(entry, "output_tokens")?,
+                    iteration_tokens(entry, "cache_read_input_tokens")?,
+                    iteration_tokens(entry, "cache_creation_input_tokens")?,
+                ))
+            })();
+            let model = entry
+                .get("model")
+                .and_then(|m| m.as_str())
+                .filter(|_| tokens.is_some())
+                .unwrap_or_default()
+                .to_string();
+            let (input, output, cache_read, cache_write) = tokens.unwrap_or_default();
+            UsageRecord {
                 message_id: format!("{message_id}{ADVISOR_ID_MARKER}{n}"),
                 source: UsageSource::Advisor,
-                model: entry
-                    .get("model")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
+                model,
                 speed: Speed::Standard,
-                input_tokens: iteration_tokens(entry, "input_tokens")?,
-                output_tokens: iteration_tokens(entry, "output_tokens")?,
-                cache_read_input_tokens: iteration_tokens(entry, "cache_read_input_tokens")?,
+                input_tokens: input,
+                output_tokens: output,
+                cache_read_input_tokens: cache_read,
                 cache_writes: CacheWrites {
-                    ephemeral_5m_input_tokens: iteration_tokens(
-                        entry,
-                        "cache_creation_input_tokens",
-                    )?,
+                    ephemeral_5m_input_tokens: cache_write,
                     ephemeral_1h_input_tokens: 0,
                 },
                 timestamp: timestamp.to_string(),
-            })
+            }
         })
         .collect()
 }
@@ -428,13 +437,24 @@ mod tests {
     fn a_malformed_iteration_never_costs_the_lines_executor_record() {
         for its in [
             r#"[{"type":"message","input_tokens":1.5}]"#,
-            r#"[{"type":"advisor_message","model":"claude-opus-5-5","input_tokens":1.5}]"#,
             r#"[7,null,"x"]"#,
             r#"{"not":"an array"}"#,
         ] {
             let records = parse_transcript(&advisor_line("msg_1", 5, Some(its)));
             assert_eq!(records, vec![executor("msg_1", 5)], "{its}");
         }
+    }
+
+    #[test]
+    fn an_advisor_call_with_malformed_counts_is_kept_unpriced_not_dropped() {
+        let its = r#"[{"type":"advisor_message","model":"claude-opus-5-5","input_tokens":1.5,"output_tokens":4}]"#;
+        let records = parse_transcript(&advisor_line("msg_1", 5, Some(its)));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0], executor("msg_1", 5));
+        assert_eq!(records[1].source, UsageSource::Advisor);
+        assert_eq!(records[1].message_id, "msg_1#advisor0");
+        assert_eq!(records[1].model, "", "unknown cost, not a guessed one");
+        assert_eq!((records[1].input_tokens, records[1].output_tokens), (0, 0));
     }
 
     #[test]

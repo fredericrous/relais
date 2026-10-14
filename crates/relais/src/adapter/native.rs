@@ -481,6 +481,29 @@ pub fn book_turn_usage(
     )
 }
 
+/// Why advisor calls could not be booked at all, as opposed to booked with
+/// an unknown price.
+#[derive(Debug)]
+pub enum AdvisorBookingError {
+    NoSuchDispatch(String),
+    Ledger(crate::ledger::LedgerError),
+}
+
+impl From<crate::ledger::LedgerError> for AdvisorBookingError {
+    fn from(e: crate::ledger::LedgerError) -> Self {
+        Self::Ledger(e)
+    }
+}
+
+impl std::fmt::Display for AdvisorBookingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSuchDispatch(dispatch) => write!(f, "no such dispatch {dispatch}"),
+            Self::Ledger(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// Books advisor calls (records of source [`UsageSource::Advisor`]) as
 /// usage of a dispatch, each at its own model's rate and under its own key,
 /// `advisor:<message id>#advisor<n>`: a call already booked, by an earlier
@@ -488,17 +511,15 @@ pub fn book_turn_usage(
 /// The rows carry no requested model, so no alias ever resolves to the
 /// advisor's model, and they are kept out of the dispatch's own rows. A call
 /// that cannot be priced is booked with an unknown cost and named in the
-/// returned notes.
+/// returned pricing notes; a call that cannot be booked at all is the error.
 pub fn book_advisor_usage(
     ledger: &crate::ledger::Ledger,
     dispatch: &str,
     advisors: &[UsageRecord],
     prices: Option<&PriceTable>,
-) -> Result<Vec<String>, crate::ledger::LedgerError> {
+) -> Result<Vec<String>, AdvisorBookingError> {
     let Some(context) = ledger.dispatch_booking(dispatch)? else {
-        return Ok(vec![format!(
-            "the advisor usage of dispatch {dispatch} could not be booked: no such dispatch"
-        )]);
+        return Err(AdvisorBookingError::NoSuchDispatch(dispatch.to_string()));
     };
     let mut notes: Vec<String> = Vec::new();
     for record in advisors
@@ -510,7 +531,7 @@ pub fn book_advisor_usage(
         let (cost, reasons) = if record.model.is_empty() {
             (
                 Cost::Unknown,
-                vec!["an advisor call reported no model".to_string()],
+                vec!["an advisor call reported no model or malformed token counts".to_string()],
             )
         } else {
             (usage.cost, priced.unpriced)
@@ -854,32 +875,29 @@ impl<'a> NativeBackend<'a> {
     }
 
     /// Books the advisor calls of an agent's transcript for a dispatch,
-    /// each once however often the agent stops or is continued. What could
-    /// not be priced or booked is returned as notes; a missing transcript
-    /// has no advisor calls to book.
-    fn book_advisors(&self, dispatch: &str, agent_id: &str) -> Vec<String> {
+    /// each once however often the agent stops or is continued, and returns
+    /// the pricing notes of what was booked with an unknown cost. A missing
+    /// transcript has no advisor calls to book.
+    fn book_advisors(
+        &self,
+        dispatch: &str,
+        agent_id: &str,
+    ) -> Result<Vec<String>, AdvisorBookingError> {
         let Some(path) = &self.advisor_ledger else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Some(content) = self.transcript_of(agent_id) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let advisors: Vec<UsageRecord> = parse_transcript(&content)
             .into_iter()
             .filter(|record| record.source == UsageSource::Advisor)
             .collect();
         if advisors.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let booked = crate::ledger::Ledger::open(path).and_then(|ledger| {
-            book_advisor_usage(&ledger, dispatch, &advisors, self.prices.as_ref())
-        });
-        match booked {
-            Ok(notes) => notes,
-            Err(e) => vec![format!(
-                "the advisor usage of agent {agent_id} could not be booked: {e}"
-            )],
-        }
+        let ledger = crate::ledger::Ledger::open(path)?;
+        book_advisor_usage(&ledger, dispatch, &advisors, self.prices.as_ref())
     }
 
     /// The result of a subagent that stopped: its answer and what it
@@ -897,9 +915,15 @@ impl<'a> NativeBackend<'a> {
             answer,
         } = report;
         let mut booked = usage_of_report(usage.as_ref(), self.prices.as_ref());
-        booked
-            .unpriced
-            .extend(self.book_advisors(&spec.dispatch_id, &agent_id));
+        let advisor_failure = match self.book_advisors(&spec.dispatch_id, &agent_id) {
+            Ok(unpriced) => {
+                booked.unpriced.extend(unpriced);
+                None
+            }
+            Err(e) => Some(format!(
+                "the advisor usage of agent {agent_id} could not be booked: {e}"
+            )),
+        };
         let failure = match status {
             AgentStatus::Completed => None,
             AgentStatus::Failed => Some("failed"),
@@ -930,6 +954,7 @@ impl<'a> NativeBackend<'a> {
         if failure.is_some() {
             notes.clear();
         }
+        notes.extend(advisor_failure);
         LaunchResult {
             dispatch_id: spec.dispatch_id.clone(),
             ended: Ended::Exited(i32::from(failure.is_some())),
@@ -1084,14 +1109,17 @@ mod tests {
         }
     }
 
+    fn advisor_record(id: &str, model: &str, input: u64, output: u64) -> UsageRecord {
+        UsageRecord {
+            source: UsageSource::Advisor,
+            ..record(id, model, input, output)
+        }
+    }
+
     fn record(id: &str, model: &str, input: u64, output: u64) -> UsageRecord {
         UsageRecord {
             message_id: id.into(),
-            source: if id.contains("#advisor") {
-                UsageSource::Advisor
-            } else {
-                UsageSource::Executor
-            },
+            source: UsageSource::Executor,
             model: model.into(),
             speed: Speed::Standard,
             input_tokens: input,
@@ -1135,7 +1163,7 @@ mod tests {
             fast_output: None,
         });
         let worker = record("m1", "sonnet-x", 100, 10);
-        let advisor = record("m1#advisor0", "opus-x", 1000, 100);
+        let advisor = advisor_record("m1#advisor0", "opus-x", 1000, 100);
         let booked = usage_of(&[worker.clone(), advisor.clone()], Some(&prices));
         assert_eq!(booked.effective_model.as_deref(), Some("sonnet-x"));
         let alone = usage_of(&[worker], Some(&prices));
@@ -1668,10 +1696,13 @@ mod tests {
         let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
         let mut backend = backend_in(&harness, &gate, projects).with_advisor_ledger(db.clone());
         backend.prices = Some(advisor_prices());
-        let notes = backend.book_advisors("d1", "a1");
+        let notes = backend.book_advisors("d1", "a1").expect("booked");
         assert!(notes.is_empty());
         // A later dispatch of the same agent finds the same transcript line.
-        assert!(backend.book_advisors("d2", "a1").is_empty());
+        assert!(backend
+            .book_advisors("d2", "a1")
+            .expect("booked")
+            .is_empty());
         assert_eq!(advisor_rows(&db).0, 1);
     }
 
@@ -1682,9 +1713,24 @@ mod tests {
         let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
         let mut backend = backend_in(&harness, &gate, projects).with_advisor_ledger(db.clone());
         backend.prices = Some(table());
-        let notes = backend.book_advisors("d1", "a1");
+        let notes = backend.book_advisors("d1", "a1").expect("booked");
         assert_eq!(notes, ["opus-x has no [pricing.models] entry"]);
         assert_eq!(advisor_rows(&db), (1, 0, 1000));
+    }
+
+    #[test]
+    fn an_advisor_call_that_cannot_be_booked_is_an_error_not_a_pricing_note() {
+        let (_dir, _ledger, db, projects) = advisor_world("native-adv4", Some(WORKER_LINE));
+        let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
+        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let mut backend = backend_in(&harness, &gate, projects).with_advisor_ledger(db.clone());
+        backend.prices = Some(advisor_prices());
+        let booked = backend.book_advisors("no-such-dispatch", "a1");
+        assert!(
+            matches!(booked, Err(AdvisorBookingError::NoSuchDispatch(ref d)) if d == "no-such-dispatch"),
+            "{booked:?}"
+        );
+        assert_eq!(advisor_rows(&db).0, 0);
     }
 
     #[test]

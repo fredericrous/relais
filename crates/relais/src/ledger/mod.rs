@@ -4912,12 +4912,17 @@ impl Ledger {
                  WHERE event_id >= ?1 || '#' AND event_id < ?1 || '$'",
                 params![event.event_id, event.phase.map(UsagePhase::as_str)],
             )?;
-            // The advisor calls this dispatch booked are its rows too.
+            // The advisor calls this dispatch booked are its rows too. The
+            // keys come from the owner table, so `usage_events` is reached
+            // through its `event_id` index rather than scanned.
+            // holds-until: `native_usage_messages` has no index on
+            // `dispatch_id`, so this subquery scans that table (one row per
+            // booked message); add the index once a ledger holds enough
+            // messages for a Final booking to show it.
             tx.execute(
                 "UPDATE usage_events SET phase = ?2
-                 WHERE event_id LIKE ?3 || '%'
-                   AND substr(event_id, length(?3) + 1) IN
-                       (SELECT message_id FROM native_usage_messages WHERE dispatch_id = ?1)",
+                 WHERE event_id IN
+                       (SELECT ?3 || message_id FROM native_usage_messages WHERE dispatch_id = ?1)",
                 params![
                     event.event_id,
                     event.phase.map(UsagePhase::as_str),
