@@ -469,6 +469,14 @@ impl TaskWorktree {
         Ok(base == candidate)
     }
 
+    /// Replace the tree's content, index included, with `tree`: how a
+    /// verify run's task tree becomes the merge result (SPEC §8). The tree
+    /// is the merge-tree result, never a second merge.
+    pub fn check_out_tree(&self, tree: &str) -> Result<()> {
+        self.git_indexed(&["read-tree", "--reset", "-u", tree])?;
+        Ok(())
+    }
+
     /// Export the candidate as a patch artifact. Untrimmed: a patch whose
     /// last line lost its newline is one `git apply` calls corrupt.
     pub fn export_patch(&self, candidate_sha: &str, out_path: &Path) -> Result<()> {
@@ -981,29 +989,194 @@ pub fn name_candidate(repo_dir: &Path, run_id: &str, attempt: u32, sha: &str) ->
     Ok(name)
 }
 
-/// Drop every candidate ref of one run, releasing its commits to the
-/// next `git gc`. Nothing calls this yet: a candidate outlives its run on
-/// purpose (SPEC §8 — the patch and the base revision stay integrable
-/// afterwards), and deciding WHEN a run's evidence stops being wanted is
-/// a retention policy, not a runner step. It is the one operation a
-/// future `relais gc` needs, and it is here so the ref namespace has an
-/// owner rather than growing without one.
-pub fn forget_run_refs(repo_dir: &Path, run_id: &str) -> Result<Vec<String>> {
+/// The `(run, attempt)` candidates a run that has not ended still needs
+/// ([`crate::ledger::Ledger::pinned_candidates`]): their ref and patch
+/// file are not released.
+pub type Pins = std::collections::BTreeSet<(String, u32)>;
+
+/// What releasing a run's candidates did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Released {
+    pub refs_removed: Vec<String>,
+    pub patches_removed: Vec<PathBuf>,
+    /// Refs and patch files kept because a pin names them.
+    pub kept: Vec<String>,
+}
+
+/// The attempt number a `…/<run>/<n>` ref or a `candidate-<n>.patch` file
+/// names; `None` for `final`, `latest` and anything else.
+fn attempt_of(leaf: &str) -> Option<u32> {
+    leaf.parse().ok()
+}
+
+/// Drop the candidate refs of one run, releasing their commits to the
+/// next `git gc`, and the run's `candidate-*.patch` files in
+/// `artifacts_dir` — except what a pin names. Nothing calls this on its
+/// own yet: a candidate outlives its run on purpose (SPEC §8 — the patch
+/// and the base revision stay integrable afterwards), and deciding WHEN a
+/// run's evidence stops being wanted is a retention policy, not a runner
+/// step. It is the one operation a future `relais gc` needs, and it takes
+/// the pins so that a candidate a running `kind: verify` run applies
+/// cannot be swept from under it. `candidate-latest.patch` is kept while
+/// any attempt of the run is pinned, since a pin may have resolved
+/// "the latest".
+pub fn forget_run_candidates(
+    repo_dir: &Path,
+    run_id: &str,
+    artifacts_dir: &Path,
+    pinned: &Pins,
+) -> Result<Released> {
     let prefix = format!("refs/relais/candidates/{run_id}/");
     let listed = git(
         repo_dir,
         &["for-each-ref", "--format=%(refname)", &format!("{prefix}*")],
     )?;
-    let names: Vec<String> = listed
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect();
-    for name in &names {
+    let mut released = Released::default();
+    let run_is_pinned = pinned.iter().any(|(run, _)| run == run_id);
+    for name in listed.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let leaf = name.strip_prefix(&prefix).unwrap_or(name);
+        if attempt_of(leaf).is_some_and(|n| pinned.contains(&(run_id.to_string(), n))) {
+            released.kept.push(name.to_string());
+            continue;
+        }
         git(repo_dir, &["update-ref", "-d", name])?;
+        released.refs_removed.push(name.to_string());
     }
-    Ok(names)
+    let Ok(entries) = std::fs::read_dir(artifacts_dir) else {
+        return Ok(released);
+    };
+    let mut files: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    files.sort();
+    for path in files {
+        let Some(name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(leaf) = name
+            .strip_prefix("candidate-")
+            .and_then(|rest| rest.strip_suffix(".patch"))
+        else {
+            continue;
+        };
+        let held = match attempt_of(leaf) {
+            Some(n) => pinned.contains(&(run_id.to_string(), n)),
+            None => leaf == "latest" && run_is_pinned,
+        };
+        if held {
+            released.kept.push(path.to_string_lossy().into_owned());
+        } else {
+            std::fs::remove_file(&path)?;
+            released.patches_removed.push(path);
+        }
+    }
+    Ok(released)
+}
+
+/// The outcome of merging a candidate into a target base, in the object
+/// store: no worktree is touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Merged {
+    /// The merge is clean; this is its result tree.
+    Clean { tree: String },
+    /// The candidate conflicts with the target; these are the conflicted
+    /// paths, sorted.
+    Conflicted { files: Vec<String> },
+}
+
+/// The oldest git whose `merge-tree` has `--write-tree`.
+pub const MERGE_TREE_MIN_GIT: (u32, u32) = (2, 40);
+
+/// `(major, minor)` of a `git --version` line.
+pub fn parse_git_version(line: &str) -> Option<(u32, u32)> {
+    let version = line.trim().strip_prefix("git version ")?;
+    let mut parts = version.split(['.', ' ']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Does the installed git have `merge-tree --write-tree`? `Err` carries
+/// the sentence `relais doctor` and a refusal print.
+pub fn merge_tree_supported() -> std::result::Result<(), String> {
+    let output = Command::new("git")
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("git could not be launched: {e}"))?;
+    let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    match parse_git_version(&printed) {
+        Some(version) if version >= MERGE_TREE_MIN_GIT => Ok(()),
+        _ => Err(format!(
+            "`{printed}` is older than git {}.{}, whose `merge-tree --write-tree` relais needs \
+             to apply a candidate",
+            MERGE_TREE_MIN_GIT.0, MERGE_TREE_MIN_GIT.1
+        )),
+    }
+}
+
+/// Merge `candidate` (made against `source_base`) into `target_base`, in
+/// the object store: `git merge-tree --write-tree --merge-base=<source_base>
+/// <target_base> <candidate>` (exit 1 lists the conflicted paths). The
+/// result tree of a clean merge is what the task tree is checked out from,
+/// so detection and application cannot disagree.
+pub fn merge_candidate(
+    repo_dir: &Path,
+    source_base: &str,
+    target_base: &str,
+    candidate: &str,
+) -> Result<Merged> {
+    let output = git_command(repo_dir)
+        .args([
+            "merge-tree",
+            "--write-tree",
+            "-z",
+            "--no-messages",
+            &format!("--merge-base={source_base}"),
+            target_base,
+            candidate,
+        ])
+        .output()
+        .map_err(|e| WorkspaceError::Git(format!("git could not be launched: {e}")))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let mut fields = stdout.split('\0');
+    let tree = fields.next().unwrap_or("").trim().to_string();
+    match output.status.code() {
+        Some(0) if !tree.is_empty() => Ok(Merged::Clean { tree }),
+        Some(1) => {
+            // Conflicted file info: `<mode> <oid> <stage>\t<path>`, one
+            // NUL-terminated entry each.
+            let mut files: Vec<String> = fields
+                .take_while(|entry| !entry.is_empty())
+                .filter_map(|entry| entry.split_once('\t').map(|(_, path)| path.to_string()))
+                .collect();
+            files.sort();
+            files.dedup();
+            Ok(Merged::Conflicted { files })
+        }
+        _ => Err(WorkspaceError::Git(format!(
+            "git merge-tree failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+    }
+}
+
+/// Is this a commit the object store holds?
+pub fn commit_exists(repo_dir: &Path, sha: &str) -> bool {
+    git(repo_dir, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_ok()
+}
+
+/// The first parent of a commit: the base a candidate snapshot was made
+/// against (`commit-tree -p <base>`).
+pub fn first_parent(repo_dir: &Path, commit: &str) -> Result<String> {
+    git(repo_dir, &["rev-parse", &format!("{commit}^")])
+}
+
+/// The patch a candidate commit derives from its base, as the bytes
+/// `export_patch` writes.
+pub fn derive_patch(repo_dir: &Path, base: &str, candidate: &str) -> Result<String> {
+    git_raw(repo_dir, &["diff", base, candidate])
 }
 
 /// A fresh, single-commit checkout of `source_repo` at exactly
@@ -1472,7 +1645,7 @@ mod tests {
 
     #[test]
     fn a_named_candidate_survives_gc_and_forget_releases_it() {
-        let (_dir, repo) = temp_repo();
+        let (dir, repo) = temp_repo();
         let sha = resolve_base(&repo, "HEAD").expect("base");
         let wt_path = repo.parent().unwrap().join("wt-ref");
         let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
@@ -1495,19 +1668,67 @@ mod tests {
             git(&repo, &["rev-parse", &name]).expect("still there"),
             candidate
         );
-        assert_eq!(
-            forget_run_refs(&repo, "run-42").expect("forget"),
-            vec![name.clone()]
-        );
+        let released = forget_run_candidates(&repo, "run-42", &dir.join("none"), &Pins::new())
+            .expect("forget");
+        assert_eq!(released.refs_removed, vec![name.clone()]);
         assert!(
             git(&repo, &["rev-parse", "--verify", &name]).is_err(),
             "the ref is gone"
         );
         assert!(
-            forget_run_refs(&repo, "run-42")
+            forget_run_candidates(&repo, "run-42", &dir.join("none"), &Pins::new())
                 .expect("forget again")
+                .refs_removed
                 .is_empty(),
             "forgetting twice is not an error"
+        );
+    }
+
+    #[test]
+    fn git_versions_parse_and_compare_to_the_merge_tree_minimum() {
+        assert_eq!(parse_git_version("git version 2.50.1"), Some((2, 50)));
+        assert_eq!(
+            parse_git_version("git version 2.39.5 (Apple Git-154)"),
+            Some((2, 39))
+        );
+        assert!(parse_git_version("2.50.1").is_none());
+        assert!(parse_git_version("git version 2.39.5").unwrap() < MERGE_TREE_MIN_GIT);
+        assert!(parse_git_version("git version 2.40.0").unwrap() >= MERGE_TREE_MIN_GIT);
+    }
+
+    /// `merge-tree` is judged in the object store: a clean merge hands back
+    /// the tree to check out, a conflict names the files, and the
+    /// worktree is never touched.
+    #[test]
+    fn merge_candidate_reports_a_clean_tree_or_the_conflicted_files() {
+        let (_dir, repo) = temp_repo();
+        let base = resolve_base(&repo, "HEAD").expect("base");
+        let on = |path: &str, content: &str| {
+            std::fs::write(repo.join(path), content).expect("write");
+            git(&repo, &["add", "-A"]).expect("add");
+            git(&repo, &["commit", "-q", "-m", path]).expect("commit");
+            resolve_base(&repo, "HEAD").expect("sha")
+        };
+        let candidate = on("candidate.txt", "from the candidate\n");
+        git(&repo, &["reset", "-q", "--hard", &base]).expect("back to base");
+        let target = on("target.txt", "from the target\n");
+        match merge_candidate(&repo, &base, &target, &candidate).expect("merges") {
+            Merged::Clean { tree } => {
+                let listed = git(&repo, &["ls-tree", "--name-only", &tree]).expect("tree");
+                assert!(listed.contains("candidate.txt") && listed.contains("target.txt"));
+            }
+            other => panic!("expected a clean merge, got {other:?}"),
+        }
+        // Both sides write the same path differently.
+        git(&repo, &["reset", "-q", "--hard", &base]).expect("back to base");
+        let left = on("both.txt", "left\n");
+        git(&repo, &["reset", "-q", "--hard", &base]).expect("back to base");
+        let right = on("both.txt", "right\n");
+        assert_eq!(
+            merge_candidate(&repo, &base, &right, &left).expect("merges"),
+            Merged::Conflicted {
+                files: vec!["both.txt".to_string()]
+            }
         );
     }
 

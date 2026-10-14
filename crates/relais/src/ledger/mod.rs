@@ -37,7 +37,7 @@ pub use task_types::{
     ExportedTasks, ImportedTaskTypes, StoredTaskType, TaskExportRow, TaskTypeSource,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 32;
+pub const LEDGER_SCHEMA_VERSION: u64 = 33;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1920,6 +1920,29 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ALTER TABLE trials ADD COLUMN ground_truth_at TEXT;
     "#,
     ),
+    (
+        // The candidate a `kind: verify` run applies, resolved once at
+        // validation (docs/plans/2026-10-14-runs-survive-a-loaded-machine.md
+        // A1): one row per consuming run. The row is also the pin: while
+        // the consuming run is not terminal, the source run's candidate
+        // ref and patch file are kept. Expand-only: a new table, nothing
+        // read by an older binary, no existing value rewritten.
+        "v33",
+        r#"
+    CREATE TABLE candidate_inputs (
+        run_id TEXT PRIMARY KEY,
+        source_run TEXT NOT NULL,
+        candidate_index INTEGER NOT NULL,
+        candidate_commit TEXT NOT NULL,
+        patch_sha256 TEXT NOT NULL,
+        source_base_sha TEXT NOT NULL,
+        target_base_sha TEXT NOT NULL,
+        resolved_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_candidate_inputs_source
+        ON candidate_inputs(source_run, candidate_index);
+    "#,
+    ),
 ];
 
 /// `advice_p_approve, advice_model, advice_revision, advice_null_reason`.
@@ -3305,6 +3328,144 @@ impl Ledger {
         Ok(path.map(PathBuf::from))
     }
 
+    /// The repository identity a run was started under
+    /// ([`crate::policy::repo_key`], kept on its task); `None` when the
+    /// run or its task is not on record.
+    pub fn run_repo_key(&self, id: &RunId) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT tasks.repo_key FROM runs JOIN tasks ON tasks.task_id = runs.task_id
+                  WHERE runs.id = ?1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The attempts of a run that produced a candidate commit, by attempt
+    /// index: the commit object each one recorded (SPEC §8).
+    pub fn candidate_attempts(&self, id: &RunId) -> Result<Vec<(u32, String)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT attempt_index, candidate_sha FROM attempts
+              WHERE run_id = ?1 AND candidate_sha IS NOT NULL
+              ORDER BY attempt_index",
+        )?;
+        let rows = statement
+            .query_map([id.as_str()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|(index, sha)| (index as u32, sha))
+            .collect())
+    }
+
+    /// The base a run's contract resolved to (SPEC §4), from its newest
+    /// contract revision.
+    pub fn run_base_sha(&self, id: &RunId) -> Result<Option<String>> {
+        let sha: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT base_sha FROM contract_revisions WHERE run_id = ?1
+                  ORDER BY id DESC LIMIT 1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(sha.flatten())
+    }
+
+    /// Persist the candidate a verify run resolved. Once: a second call
+    /// for the same run keeps the first row, so what was resolved at
+    /// validation is what is applied.
+    pub fn record_candidate_input(
+        &self,
+        run: &RunId,
+        candidate: &crate::contract::ResolvedCandidate,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO candidate_inputs
+                (run_id, source_run, candidate_index, candidate_commit, patch_sha256,
+                 source_base_sha, target_base_sha, resolved_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                run.as_str(),
+                candidate.source_run,
+                candidate.index,
+                candidate.candidate_commit,
+                candidate.patch_sha256,
+                candidate.source_base_sha,
+                candidate.target_base_sha,
+                self.now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The candidate a run resolved, as persisted.
+    pub fn candidate_input(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<crate::contract::ResolvedCandidate>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT source_run, candidate_index, candidate_commit, patch_sha256,
+                        source_base_sha, target_base_sha
+                   FROM candidate_inputs WHERE run_id = ?1",
+                [run.as_str()],
+                |row| {
+                    Ok(crate::contract::ResolvedCandidate {
+                        source_run: row.get(0)?,
+                        index: row.get::<_, i64>(1)? as u32,
+                        candidate_commit: row.get(2)?,
+                        patch_sha256: row.get(3)?,
+                        source_base_sha: row.get(4)?,
+                        target_base_sha: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// The `(source run, attempt index)` pairs a run that has not ended
+    /// still needs: their candidate refs and patch files are pinned
+    /// against retirement and reaping. A consumer whose status this binary
+    /// cannot read keeps its pin: a pin is only ever released by a state
+    /// that is known to be terminal.
+    ///
+    // holds-until: successor intents and open decisions exist (plan A5): the
+    // plan also pins a candidate while an open decision or a pending intent
+    // references it, and neither is built yet, so only a run that has not
+    // ended pins today.
+    pub fn pinned_candidates(&self) -> Result<std::collections::BTreeSet<(String, u32)>> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT candidate_inputs.source_run, candidate_inputs.candidate_index,
+                    (SELECT {PROJECTED_STATUS} FROM runs WHERE runs.id = candidate_inputs.run_id)
+               FROM candidate_inputs"
+        ))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, _, status)| {
+                status
+                    .as_deref()
+                    .is_none_or(|status| !parse_state(status).is_ok_and(State::is_terminal))
+            })
+            .map(|(run, index, _)| (run, index as u32))
+            .collect())
+    }
+
     /// Close every dispatch of a run that never recorded a terminal state,
     /// as `state`, so none is judged live again. Returns how many.
     pub fn close_open_dispatches(&self, id: &RunId, state: &str) -> Result<usize> {
@@ -3736,6 +3897,24 @@ impl Ledger {
             Ok((contract, parse_tier(&tier)?))
         })
         .transpose()
+    }
+
+    /// Is this run a `kind: verify` run, by its newest recorded contract
+    /// revision? A run with no revision, or one this binary cannot read,
+    /// is not: the answer only ever says "verify" on evidence.
+    pub fn run_is_verify(&self, run_id: &RunId) -> Result<bool> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT contract_json FROM contract_revisions WHERE run_id = ?1
+                  ORDER BY id DESC LIMIT 1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(json
+            .and_then(|json| TaskContract::from_json_str(&json).ok())
+            .is_some_and(|contract| contract.is_verify()))
     }
 
     /// How many worker attempts a run consumed — the attempts table is

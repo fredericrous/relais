@@ -5791,6 +5791,10 @@ fn run_command(
             eprintln!("blocked ({code}): {detail}");
             Ok(CliOutcome::Blocked)
         }
+        Terminal::BlockedBy { reason, detail } => {
+            eprintln!("blocked ({reason}): {detail}");
+            Ok(CliOutcome::Blocked)
+        }
         Terminal::Failed { detail } => {
             eprintln!("failed: {detail}");
             eprintln!("the preserved candidate is under {}", run_dir.display());
@@ -10302,6 +10306,7 @@ mod tests {
                 baseline_cache_refused: None,
             },
             kind,
+            candidate: None,
             models_used: vec!["haiku".into()],
             attempts: 1,
             cost_completeness: relais::money::CostCompleteness::Actual,

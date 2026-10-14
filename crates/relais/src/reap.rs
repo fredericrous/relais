@@ -176,6 +176,55 @@ pub fn reap(
     }
 }
 
+/// Release a run's candidate refs and patch files, except the ones a
+/// run that has not ended still applies (`kind: verify`'s pin, the
+/// ledger's `candidate_inputs`). The single place that decides what may
+/// be swept, so a reap cannot remove a candidate a live verify needs.
+pub fn release_candidates(
+    ledger: &Ledger,
+    repo_dir: &Path,
+    run: &RunId,
+    artifacts_dir: &Path,
+) -> Result<crate::workspace::Released, ReleaseError> {
+    let pinned = ledger.pinned_candidates()?;
+    Ok(crate::workspace::forget_run_candidates(
+        repo_dir,
+        run.as_str(),
+        artifacts_dir,
+        &pinned,
+    )?)
+}
+
+/// Why candidates could not be released.
+#[derive(Debug)]
+pub enum ReleaseError {
+    Ledger(LedgerError),
+    Workspace(crate::workspace::WorkspaceError),
+}
+
+impl std::fmt::Display for ReleaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ledger(e) => write!(f, "{e}"),
+            Self::Workspace(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ReleaseError {}
+
+impl From<LedgerError> for ReleaseError {
+    fn from(e: LedgerError) -> Self {
+        Self::Ledger(e)
+    }
+}
+
+impl From<crate::workspace::WorkspaceError> for ReleaseError {
+    fn from(e: crate::workspace::WorkspaceError) -> Self {
+        Self::Workspace(e)
+    }
+}
+
 /// The full sentence a reaped run's outcome carries.
 fn sentence_of(run: &RunId, ending: Ending, driver_pid: Option<i64>) -> String {
     let driver = match driver_pid {

@@ -55,13 +55,36 @@ impl From<AttemptKind> for UsagePhase {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Terminal {
     Accepted(Box<crate::verify::Receipt>),
-    NeedsDecision { reason: Reason, detail: String },
-    NeedsReview { detail: String },
-    Blocked { code: BlockCode, detail: String },
-    Failed { detail: String },
-    BudgetExhausted { detail: String },
-    Interrupted { detail: String },
-    Cancelled { detail: String },
+    NeedsDecision {
+        reason: Reason,
+        detail: String,
+    },
+    NeedsReview {
+        detail: String,
+    },
+    Blocked {
+        code: BlockCode,
+        detail: String,
+    },
+    /// Blocked for a reason the lifecycle itself names (a candidate that
+    /// cannot be verified, SPEC §8). Same state and exit code as
+    /// `Blocked`; the name printed after `blocked` is the reason's.
+    BlockedBy {
+        reason: Reason,
+        detail: String,
+    },
+    Failed {
+        detail: String,
+    },
+    BudgetExhausted {
+        detail: String,
+    },
+    Interrupted {
+        detail: String,
+    },
+    Cancelled {
+        detail: String,
+    },
 }
 
 impl Terminal {
@@ -73,6 +96,7 @@ impl Terminal {
             Self::Accepted(_) => (None, None),
             Self::NeedsDecision { reason, detail } => (Some(reason.to_string()), Some(detail)),
             Self::Blocked { code, detail } => (Some(code.to_string()), Some(detail)),
+            Self::BlockedBy { reason, detail } => (Some(reason.to_string()), Some(detail)),
             Self::NeedsReview { detail }
             | Self::Failed { detail }
             | Self::BudgetExhausted { detail }
@@ -86,7 +110,7 @@ impl Terminal {
             Self::Accepted(_) => State::Accepted,
             Self::NeedsDecision { .. } => State::NeedsDecision,
             Self::NeedsReview { .. } => State::NeedsReview,
-            Self::Blocked { .. } => State::Blocked,
+            Self::Blocked { .. } | Self::BlockedBy { .. } => State::Blocked,
             Self::Failed { .. } => State::Failed,
             Self::BudgetExhausted { .. } => State::BudgetExhausted,
             Self::Interrupted { .. } => State::Interrupted,
@@ -106,6 +130,7 @@ impl Terminal {
             | Self::NeedsDecision { .. }
             | Self::NeedsReview { .. }
             | Self::Blocked { .. }
+            | Self::BlockedBy { .. }
             | Self::Failed { .. }
             | Self::BudgetExhausted { .. }
             | Self::Cancelled { .. } => WorktreeEnd::Retire,
@@ -119,6 +144,7 @@ impl Terminal {
             Self::NeedsDecision { detail, .. }
             | Self::NeedsReview { detail }
             | Self::Blocked { detail, .. }
+            | Self::BlockedBy { detail, .. }
             | Self::Failed { detail }
             | Self::BudgetExhausted { detail }
             | Self::Interrupted { detail }

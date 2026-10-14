@@ -651,6 +651,10 @@ pub struct RunLine {
     /// withdrawn the change. Always `false` for a run that never
     /// accepted.
     pub standing: bool,
+    /// A `kind: verify` run: it applied an existing candidate and no
+    /// worker wrote anything, so it is counted as its own kind.
+    #[serde(default)]
+    pub verify: bool,
 }
 
 /// One task's contribution to the window (SPEC §20's task spine): every
@@ -934,6 +938,7 @@ pub fn runs_report(
             models,
             final_detail,
             standing,
+            verify: ledger.run_is_verify(&run_id)?,
         });
     }
     let accepted = runs.iter().filter(|run| run.status.is_accepted()).count();
@@ -1271,6 +1276,14 @@ impl Report {
             self.accepted,
             self.accepted.saturating_sub(self.standing)
         ));
+        let verify_runs = self.runs.iter().filter(|run| run.verify).count();
+        if verify_runs > 0 {
+            out.push_str(&format!(
+                "verify runs: {} of {} (they apply an existing candidate; no worker wrote it)\n",
+                verify_runs,
+                self.runs.len()
+            ));
+        }
         if self.pending_decisions > 0 {
             out.push_str(&format!(
                 "awaiting a human: {} run(s) with an unanswered decision\n",
@@ -1873,6 +1886,7 @@ mod tests {
                 models: vec!["haiku".into()],
                 final_detail: Some(detail),
                 standing: true,
+                verify: false,
             }],
             accepted: 1,
             standing: 1,

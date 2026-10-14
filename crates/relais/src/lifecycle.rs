@@ -154,6 +154,20 @@ pub enum Reason {
     /// side by side, and `relais explain` would show a run that quietly
     /// ran on a model nobody asked it for.
     ModelSubstitutionApproved,
+    /// A `kind: verify` contract names a candidate whose run has not ended:
+    /// what it will leave is not known yet (SPEC §8). Blocked in preflight.
+    CandidateSourceRunning,
+    /// The named run has no candidate, or the commit object the ledger
+    /// recorded for it is gone.
+    CandidateMissing,
+    /// The named run belongs to another repository.
+    CandidateForeignRepo,
+    /// The candidate conflicts with the target base: detected in preflight,
+    /// before the baseline, so nothing was run.
+    CandidateDoesNotApply,
+    /// The candidate's patch file no longer matches the digest recorded
+    /// when the candidate was resolved.
+    CandidateDigestMismatch,
 }
 
 impl Reason {
@@ -162,7 +176,7 @@ impl Reason {
     ///
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it.
-    pub const ALL: [Self; 54] = [
+    pub const ALL: [Self; 59] = [
         Self::ChecksAndReviewPassed,
         Self::BehavioralFailure,
         Self::RepairExhausted,
@@ -217,6 +231,11 @@ impl Reason {
         Self::DecisionAbandoned,
         Self::DecisionSalvaged,
         Self::ModelSubstitutionApproved,
+        Self::CandidateSourceRunning,
+        Self::CandidateMissing,
+        Self::CandidateForeignRepo,
+        Self::CandidateDoesNotApply,
+        Self::CandidateDigestMismatch,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -275,6 +294,11 @@ impl Reason {
             Self::DecisionAbandoned => "decision_abandoned",
             Self::DecisionSalvaged => "decision_salvaged",
             Self::ModelSubstitutionApproved => "model_substitution_approved",
+            Self::CandidateSourceRunning => "candidate_source_running",
+            Self::CandidateMissing => "candidate_missing",
+            Self::CandidateForeignRepo => "candidate_foreign_repo",
+            Self::CandidateDoesNotApply => "candidate_does_not_apply",
+            Self::CandidateDigestMismatch => "candidate_digest_mismatch",
         }
     }
 

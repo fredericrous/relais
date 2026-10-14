@@ -830,6 +830,13 @@ fn mirror(
                 detail: with_prefix(detail),
             },
         ),
+        Terminal::BlockedBy { reason, detail } => (
+            reason,
+            Terminal::BlockedBy {
+                reason,
+                detail: with_prefix(detail),
+            },
+        ),
         Terminal::Failed { detail } => (
             Reason::PackageFinished,
             Terminal::Failed {
@@ -1062,6 +1069,7 @@ fn accept_integrated(
         outcome: State::Accepted.as_str().to_string(),
         verification: report,
         kind: engine.config.contract.kind(),
+        candidate: None,
         models_used: std::mem::take(&mut assembly.models_used),
         attempts: assembly.attempts_total,
         cost_completeness: spend.completeness,

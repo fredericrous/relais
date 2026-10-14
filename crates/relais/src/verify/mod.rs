@@ -2338,6 +2338,10 @@ pub struct Receipt {
     /// what every receipt written before it was.
     #[serde(default = "change_kind")]
     pub kind: Kind,
+    /// The candidate a `kind: verify` run applied, as it was resolved
+    /// once at validation (SPEC §8). Absent on every other receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<crate::contract::ResolvedCandidate>,
     pub models_used: Vec<String>,
     pub attempts: u32,
     pub cost_completeness: CostCompleteness,
@@ -5138,6 +5142,7 @@ mod tests {
                 baseline_cache_refused: None,
             },
             kind: Kind::Change,
+            candidate: None,
             models_used: vec!["sonnet".into()],
             attempts: 1,
             cost_completeness: CostCompleteness::Actual,
