@@ -1289,6 +1289,10 @@ pub fn default_disallowed_tools() -> Vec<String> {
         "Bash(git commit:*)".into(),
         "Bash(git merge:*)".into(),
         "Bash(git push:*)".into(),
+        // `amont land` runs `git push` itself, so it publishes as surely
+        // as the line above: the verified-push skill teaches it as THE
+        // way to push (amont 1.54).
+        "Bash(amont land:*)".into(),
         "Bash(git rebase:*)".into(),
         "Bash(git reset:*)".into(),
         "Bash(git tag:*)".into(),
@@ -2618,6 +2622,7 @@ keys = ["output.contract"]
             "Bash(git commit:*)",
             "Bash(git merge:*)",
             "Bash(git push:*)",
+            "Bash(amont land:*)",
             "Bash(git rebase:*)",
             "Bash(git reset:*)",
             "Bash(git tag:*)",
