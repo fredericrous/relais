@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/local-reuses-workspace
 repos: [relais]
 adrs:
@@ -170,5 +170,9 @@ One PR, reviewable commits: (1) SPEC + ADR-0008 + plan, (2) `fsclone` + deps + s
 
 Not run: a full `relais run` through the plugin on happier-wt-n1 (a run starts only from a Claude Code session with the plugin installed); the person's pilot after release.
 
+
+## Implementation review
+
+approve-with-changes (round 1, then a delta: no new blocker). Fixed: ceilings (`holds-until`) on the quiet check and the cache, swallowed cleanup errors, fingerprint errors read as changes, deviations recorded as D11-D16. Deliberate: no byte-golden for the isolated path (D14); `resume --retire` needs the run id (D12). 47k and 49k tokens.
 
 <!-- panel: repos=relais reviewers=backend,language,tui,unix body-sha=83fdb871c362 -->
