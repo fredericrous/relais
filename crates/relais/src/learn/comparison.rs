@@ -1251,6 +1251,7 @@ mod tests {
             created_at: created_at.into(),
             arm_run_id: None,
             design_sha256: None,
+            ground_truth: None,
         }
     }
 

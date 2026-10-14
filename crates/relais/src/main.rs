@@ -593,6 +593,33 @@ enum DatasetCommand {
         /// The file of labels
         file: PathBuf,
     },
+    /// Record a ground-truth verdict on a review-rejected replay trial:
+    /// `pass` when the source work has the same defect the review found
+    /// (the typed-research gate then counts the trial as accepted), `fail`
+    /// when it does not. Refused (exit 2, nothing written) for an unknown
+    /// trial, a trial that was not rejected, an empty note, or a trial
+    /// already judged the other way; the same verdict again is a no-op
+    #[command(name = "judge-trial")]
+    JudgeTrial {
+        /// The trial to judge
+        trial_id: String,
+        /// The verdict
+        #[arg(long, value_enum)]
+        verdict: JudgeVerdict,
+        /// The evidence, e.g. which source commit has the same defect
+        #[arg(long)]
+        note: String,
+        /// Print the verdict as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// The verdicts `relais dataset judge-trial` takes.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum JudgeVerdict {
+    Pass,
+    Fail,
 }
 
 #[derive(Subcommand)]
@@ -1407,6 +1434,12 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             DatasetCommand::Build => dataset_build_command(),
             DatasetCommand::ExportTasks { out } => export_tasks_command(&out),
             DatasetCommand::ImportTaskTypes { file } => import_task_types_command(&file),
+            DatasetCommand::JudgeTrial {
+                trial_id,
+                verdict,
+                note,
+                json,
+            } => judge_trial_command(&trial_id, verdict, &note, json),
             DatasetCommand::Replay {
                 task,
                 recipe,
@@ -2791,6 +2824,73 @@ fn import_task_types_command(file: &Path) -> Result<CliOutcome, CliError> {
         imported.unchanged,
         imported.kept_declared
     );
+    Ok(CliOutcome::Accepted)
+}
+
+/// `relais dataset judge-trial <TRIAL_ID> --verdict pass|fail --note <TEXT>`.
+fn judge_trial_command(
+    trial_id: &str,
+    verdict: JudgeVerdict,
+    note: &str,
+    json: bool,
+) -> Result<CliOutcome, CliError> {
+    use relais::ledger::{GroundTruthVerdict, JudgeRefusal, Judged};
+    let verdict = match verdict {
+        JudgeVerdict::Pass => GroundTruthVerdict::Pass,
+        JudgeVerdict::Fail => GroundTruthVerdict::Fail,
+    };
+    let ledger = open_ledger()?;
+    let id = relais::ids::TrialId::from_stored(trial_id);
+    let judged = operational(ledger.judge_trial(&id, verdict, note), "judge-trial")?;
+    let refuse = |detail: String| CliError::Usage {
+        detail: format!("relais dataset judge-trial: trial {trial_id}: {detail}"),
+    };
+    let (truth, already) = match judged {
+        Ok(Judged::Recorded(truth)) => (truth, false),
+        Ok(Judged::AlreadyRecorded(truth)) => (truth, true),
+        Err(JudgeRefusal::UnknownTrial) => return Err(refuse("no such trial".into())),
+        Err(JudgeRefusal::NotRejected(outcome)) => {
+            return Err(refuse(format!(
+                "its outcome is {}, and only a review-rejected trial is judged",
+                outcome.map_or("not settled", |outcome| outcome.as_str())
+            )))
+        }
+        Err(JudgeRefusal::EmptyNote) => {
+            return Err(refuse(
+                "the note is empty; it must carry the evidence for the verdict".into(),
+            ))
+        }
+        Err(JudgeRefusal::Conflict(existing)) => {
+            return Err(refuse(format!(
+                "already judged {} ({}); a verdict is final",
+                existing.verdict.as_str(),
+                existing.note
+            )))
+        }
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "trial_id": trial_id,
+                "verdict": truth.verdict.as_str(),
+                "note": truth.note,
+                "at": truth.at,
+                "already_recorded": already,
+            })
+        );
+    } else if already {
+        println!(
+            "relais dataset judge-trial: trial {trial_id} is already judged {}; nothing changed",
+            truth.verdict.as_str()
+        );
+    } else {
+        println!(
+            "relais dataset judge-trial: trial {trial_id} judged {} at {}",
+            truth.verdict.as_str(),
+            truth.at
+        );
+    }
     Ok(CliOutcome::Accepted)
 }
 

@@ -37,7 +37,7 @@ pub use task_types::{
     ExportedTasks, ImportedTaskTypes, StoredTaskType, TaskExportRow, TaskTypeSource,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 31;
+pub const LEDGER_SCHEMA_VERSION: u64 = 32;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -629,6 +629,65 @@ pub struct TrialRow {
     /// SHA-256 of the program design the arm was handed; `None` when it
     /// was handed none (and on every row written before ledger step v29).
     pub design_sha256: Option<String>,
+    /// The person's verdict on a review-rejected replay, once judged
+    /// (`relais dataset judge-trial`); `None` until then and on every row
+    /// written before ledger step v32.
+    pub ground_truth: Option<GroundTruth>,
+}
+
+/// What a person found when they checked a review-rejected replay against
+/// the source work: did the candidate hold up (`Pass`) or not (`Fail`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GroundTruthVerdict {
+    Pass,
+    Fail,
+}
+
+impl GroundTruthVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+        }
+    }
+
+    fn parse(stored: &str) -> Option<Self> {
+        match stored {
+            "pass" => Some(Self::Pass),
+            "fail" => Some(Self::Fail),
+            _ => None,
+        }
+    }
+}
+
+/// A verdict with the evidence the person gave and when it was recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroundTruth {
+    pub verdict: GroundTruthVerdict,
+    pub note: String,
+    /// RFC 3339, from the ledger clock.
+    pub at: String,
+}
+
+/// Why a trial cannot take the verdict it was offered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JudgeRefusal {
+    UnknownTrial,
+    /// Only a review-rejected trial is judged; this one's outcome is
+    /// recorded here (`None`: not settled).
+    NotRejected(Option<TrialOutcome>),
+    EmptyNote,
+    /// The trial already carries the other verdict, and a verdict is final.
+    Conflict(GroundTruth),
+}
+
+/// What offering a verdict did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Judged {
+    Recorded(GroundTruth),
+    /// The trial already carried this verdict; nothing was written.
+    AlreadyRecorded(GroundTruth),
 }
 
 /// What recording a fresh trial row needs — everything a comparison
@@ -747,6 +806,9 @@ type TrialColumns = (
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
 );
 
 /// A `trials` row as columns, parsed into a [`TrialRow`]: an
@@ -774,7 +836,27 @@ fn parse_trial_row(columns: TrialColumns) -> Result<TrialRow> {
         created_at,
         arm_run_id,
         design_sha256,
+        ground_truth,
+        ground_truth_note,
+        ground_truth_at,
     ) = columns;
+    let ground_truth = match (ground_truth, ground_truth_note, ground_truth_at) {
+        (None, None, None) => None,
+        (Some(stored), Some(note), Some(at)) => Some(GroundTruth {
+            verdict: GroundTruthVerdict::parse(&stored).ok_or_else(|| LedgerError::Corrupt {
+                what: "trials.ground_truth".into(),
+                detail: format!("`{stored}` is not a verdict this relais knows"),
+            })?,
+            note,
+            at,
+        }),
+        _ => {
+            return Err(LedgerError::Corrupt {
+                what: "trials.ground_truth".into(),
+                detail: "the verdict, its note and its time are not all present".into(),
+            })
+        }
+    };
     Ok(TrialRow {
         trial_id: TrialId::from_stored(trial_id),
         task_id: TaskId::from_stored(task_id),
@@ -805,6 +887,7 @@ fn parse_trial_row(columns: TrialColumns) -> Result<TrialRow> {
         created_at,
         arm_run_id: arm_run_id.map(RunId::from_stored),
         design_sha256,
+        ground_truth,
     })
 }
 
@@ -1821,6 +1904,20 @@ const MIGRATIONS: &[(&str, &str)] = &[
         promoted_at TEXT NOT NULL
     );
     CREATE INDEX idx_recipe_promotions_recipe ON recipe_promotions(recipe_id);
+    "#,
+    ),
+    (
+        // A person's verdict on a review-rejected replay trial (plan
+        // task-types D9): `ground_truth` is `pass` or `fail`, with the
+        // evidence in `ground_truth_note` and the ledger-clock time in
+        // `ground_truth_at`. Additive and nullable: a trial written before
+        // the step is unjudged, never guessed. Like v29 and v31 it takes no
+        // backup copy: no existing value is rewritten.
+        "v32",
+        r#"
+    ALTER TABLE trials ADD COLUMN ground_truth TEXT;
+    ALTER TABLE trials ADD COLUMN ground_truth_note TEXT;
+    ALTER TABLE trials ADD COLUMN ground_truth_at TEXT;
     "#,
     ),
 ];
@@ -5752,7 +5849,67 @@ impl Ledger {
          arm_recipe_id, arm_index, assignment_probability, seed, base_sha,
          contract_hash, verification_profile_hash, workspace_isolation,
          outcome, accepted_without_escalation, cost_micros, cost_completeness,
-         duration_ms, created_at, arm_run_id, design_sha256";
+         duration_ms, created_at, arm_run_id, design_sha256,
+         ground_truth, ground_truth_note, ground_truth_at";
+
+    /// One trial by id, or `None` when no such trial is recorded.
+    pub fn trial(&self, trial_id: &TrialId) -> Result<Option<TrialRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM trials WHERE trial_id = ?1",
+            Self::TRIAL_COLUMNS
+        ))?;
+        let rows = stmt.query_map([trial_id.as_str()], Self::trial_columns)?;
+        let rows: Vec<TrialColumns> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter().next().map(parse_trial_row).transpose()
+    }
+
+    /// Offer a ground-truth verdict for a review-rejected trial. Refused,
+    /// writing nothing, for an unknown trial, a trial whose outcome is not
+    /// `rejected`, an empty note, or a trial already judged the other way;
+    /// the same verdict again writes nothing and says so.
+    pub fn judge_trial(
+        &self,
+        trial_id: &TrialId,
+        verdict: GroundTruthVerdict,
+        note: &str,
+    ) -> Result<std::result::Result<Judged, JudgeRefusal>> {
+        let Some(trial) = self.trial(trial_id)? else {
+            return Ok(Err(JudgeRefusal::UnknownTrial));
+        };
+        if trial.outcome != Some(TrialOutcome::Rejected) {
+            return Ok(Err(JudgeRefusal::NotRejected(trial.outcome)));
+        }
+        if note.trim().is_empty() {
+            return Ok(Err(JudgeRefusal::EmptyNote));
+        }
+        if let Some(existing) = trial.ground_truth {
+            return Ok(if existing.verdict == verdict {
+                Ok(Judged::AlreadyRecorded(existing))
+            } else {
+                Err(JudgeRefusal::Conflict(existing))
+            });
+        }
+        let truth = GroundTruth {
+            verdict,
+            note: note.trim().to_string(),
+            at: self.now(),
+        };
+        let changed = self.conn.execute(
+            "UPDATE trials SET ground_truth = ?2, ground_truth_note = ?3, ground_truth_at = ?4
+              WHERE trial_id = ?1 AND ground_truth IS NULL AND outcome = 'rejected'",
+            params![trial_id.as_str(), verdict.as_str(), truth.note, truth.at],
+        )?;
+        if changed != 1 {
+            return Err(LedgerError::Corrupt {
+                what: "trials.ground_truth".into(),
+                detail: format!(
+                    "judging trial {} changed {changed} rows, not 1",
+                    trial_id.as_str()
+                ),
+            });
+        }
+        Ok(Ok(Judged::Recorded(truth)))
+    }
 
     /// Every trial recorded for one task, oldest first — a typed reader:
     /// a row with an unrecognised outcome or cost completeness is a
@@ -5826,7 +5983,7 @@ impl Ledger {
             Self::TRIAL_COLUMNS
         ))?;
         let rows = stmt.query_map([LIVE_WORKTREE], |row| {
-            Ok((Self::trial_columns(row)?, row.get::<_, String>(20)?))
+            Ok((Self::trial_columns(row)?, row.get::<_, String>(23)?))
         })?;
         let rows: Vec<(TrialColumns, String)> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         let mut kept = Vec::new();
@@ -5867,6 +6024,9 @@ impl Ledger {
             row.get(17)?,
             row.get(18)?,
             row.get(19)?,
+            row.get(20)?,
+            row.get(21)?,
+            row.get(22)?,
         ))
     }
 
@@ -9976,6 +10136,152 @@ mod tests {
             ledger
                 .task_type_of(&task("old"))
                 .expect("reads the new columns"),
+            None
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A ledger frozen at v31 upgrades to v32: a trial written before it
+    /// keeps every column and reads back unjudged, and, like the other
+    /// additive steps, the step leaves no backup copy.
+    #[test]
+    fn v32_adds_the_ground_truth_columns_and_keeps_every_trial() {
+        let dir = temp_dir("v31-to-v32");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            for (version, sql) in &MIGRATIONS[..31] {
+                conn.execute_batch(sql).expect("apply step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "then"],
+                )
+                .expect("record step");
+            }
+            conn.execute(
+                "INSERT INTO trials (trial_id, task_id, source_run_id, incumbent_recipe_id,
+                    arm_recipe_id, arm_index, assignment_probability, seed, base_sha,
+                    contract_hash, verification_profile_hash, workspace_isolation,
+                    outcome, accepted_without_escalation, created_at)
+                 VALUES ('trial-old', 'task-old', 'run-old', 'inc', 'arm', 0, 1.0, 1, 'b',
+                    'c', 'p', 'w', 'rejected', 0, 'then')",
+                [],
+            )
+            .expect("a trial written before v32");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade");
+        assert_eq!(
+            ledger.schema_version().expect("version"),
+            LEDGER_SCHEMA_VERSION
+        );
+        let old = ledger
+            .trial(&TrialId::from_stored("trial-old"))
+            .expect("reads")
+            .expect("the old trial survives");
+        assert_eq!(old.outcome, Some(TrialOutcome::Rejected));
+        assert_eq!(old.arm_recipe_id, "arm");
+        assert_eq!(old.ground_truth, None);
+        assert!(
+            !dir.join("ledger.sqlite.bak-v32").exists(),
+            "an additive step takes no backup, like v29 and v31"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn settled_trial_in(ledger: &Ledger, name: &str, outcome: Option<TrialOutcome>) -> TrialId {
+        let id = trial(name);
+        let source_task = task(name);
+        let source_run = run(&format!("run-{name}"));
+        ledger
+            .insert_run(&source_run, "/repo", None, &source_task, "rk")
+            .expect("run");
+        ledger
+            .insert_trial(&new_trial(&id, &source_task, &source_run))
+            .expect("trial");
+        if let Some(outcome) = outcome {
+            ledger
+                .settle_trial(&id, outcome, false, TrialCost::UNKNOWN, 1)
+                .expect("settle");
+        }
+        id
+    }
+
+    #[test]
+    fn judging_a_rejected_trial_records_verdict_note_and_time_once() {
+        let (ledger, dir) = temp_ledger();
+        let id = settled_trial_in(&ledger, "j1", Some(TrialOutcome::Rejected));
+        let Ok(Judged::Recorded(truth)) = ledger
+            .judge_trial(&id, GroundTruthVerdict::Pass, " same defect in abc123 ")
+            .expect("reads")
+        else {
+            panic!("recorded")
+        };
+        assert_eq!(truth.verdict, GroundTruthVerdict::Pass);
+        assert_eq!(truth.note, "same defect in abc123");
+        assert!(!truth.at.is_empty());
+        let stored = ledger.trial(&id).expect("reads").expect("row");
+        assert_eq!(stored.ground_truth, Some(truth.clone()));
+
+        // The same verdict again changes nothing.
+        let again = ledger
+            .judge_trial(&id, GroundTruthVerdict::Pass, "other words")
+            .expect("reads");
+        assert_eq!(again, Ok(Judged::AlreadyRecorded(truth.clone())));
+        // The other verdict is refused and the first stands.
+        let conflict = ledger
+            .judge_trial(&id, GroundTruthVerdict::Fail, "no")
+            .expect("reads");
+        assert_eq!(conflict, Err(JudgeRefusal::Conflict(truth.clone())));
+        assert_eq!(
+            ledger.trial(&id).expect("reads").expect("row").ground_truth,
+            Some(truth)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn judging_refuses_what_is_not_a_rejected_trial_with_a_note() {
+        let (ledger, dir) = temp_ledger();
+        assert_eq!(
+            ledger
+                .judge_trial(&trial("nope"), GroundTruthVerdict::Pass, "n")
+                .expect("reads"),
+            Err(JudgeRefusal::UnknownTrial)
+        );
+        for outcome in [
+            Some(TrialOutcome::Accepted),
+            Some(TrialOutcome::Errored),
+            Some(TrialOutcome::Invalid),
+            None,
+        ] {
+            let id = settled_trial_in(&ledger, &format!("o-{outcome:?}"), outcome);
+            assert_eq!(
+                ledger
+                    .judge_trial(&id, GroundTruthVerdict::Pass, "n")
+                    .expect("reads"),
+                Err(JudgeRefusal::NotRejected(outcome))
+            );
+            assert_eq!(
+                ledger.trial(&id).expect("reads").expect("row").ground_truth,
+                None
+            );
+        }
+        let id = settled_trial_in(&ledger, "empty", Some(TrialOutcome::Rejected));
+        assert_eq!(
+            ledger
+                .judge_trial(&id, GroundTruthVerdict::Fail, "  ")
+                .expect("reads"),
+            Err(JudgeRefusal::EmptyNote)
+        );
+        assert_eq!(
+            ledger.trial(&id).expect("reads").expect("row").ground_truth,
             None
         );
         std::fs::remove_dir_all(&dir).ok();
