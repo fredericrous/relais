@@ -184,15 +184,18 @@ pub enum TurnCeiling {
     /// the ceilings that actually bound the run.
     #[default]
     Unavailable,
+    /// The probe that would have said did not answer in time.
+    UnknownTimedOut,
 }
 
 impl TurnCeiling {
     /// The value recorded in the context manifest, which is where a
-    /// run says which of the two it was.
+    /// run says which of these it was.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Harness => "harness",
             Self::Unavailable => "unavailable",
+            Self::UnknownTimedOut => "unknown (timed out)",
         }
     }
 
@@ -201,6 +204,7 @@ impl TurnCeiling {
         match self {
             Self::Harness => "turn ceiling: enforced by the harness",
             Self::Unavailable => "turn ceiling: not available on this Claude Code — attempts and wall time are enforced by the runner, turns are not",
+            Self::UnknownTimedOut => "turn ceiling: unknown — the Claude Code probe did not answer in time",
         }
     }
 }
@@ -459,6 +463,11 @@ pub trait Harness {
     /// Probe the installed harness; capabilities are observed, not
     /// declared. `None` = harness not installed (blocked, not fallback).
     fn probe(&self) -> Option<Capabilities>;
+    /// Why `probe` has no answer when the harness did not answer in time:
+    /// its version is unchecked, not unsupported. `None` otherwise.
+    fn probe_timed_out(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The adapter contract (SPEC §20): a harness that can launch one dispatch.

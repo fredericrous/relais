@@ -704,6 +704,26 @@ fn unpriced_native_model(result: &LaunchResult) -> Option<Vec<String>> {
     (!result.unpriced.is_empty()).then(|| result.unpriced.clone())
 }
 
+/// What a run records about its harness from the probe: the turn ceiling
+/// for the manifest, and the warning to emit when the probe timed out
+/// (`timed_out`), leaving the version unchecked rather than unsupported.
+fn harness_reading(
+    capabilities: Option<&crate::backend::Capabilities>,
+    timed_out: Option<String>,
+) -> (crate::backend::TurnCeiling, Option<Event>) {
+    match (capabilities, timed_out) {
+        (Some(capabilities), _) => (capabilities.turn_ceiling(), None),
+        (None, Some(detail)) => (
+            crate::backend::TurnCeiling::UnknownTimedOut,
+            Some(Event::EnvironmentWarning {
+                what: "claude_code_version_unchecked".to_string(),
+                detail,
+            }),
+        ),
+        (None, None) => (crate::backend::TurnCeiling::default(), None),
+    }
+}
+
 impl<'a> RunEngine<'a> {
     /// The phase an attempt of THIS run records: a root run and an
     /// ordinary package say which attempt it is; every attempt of an
@@ -2154,6 +2174,16 @@ impl<'a> RunEngine<'a> {
                 }
             }
         };
+        let (turn_ceiling, warning) = harness_reading(
+            capabilities,
+            capabilities
+                .is_none()
+                .then(|| self.config.backend.probe_timed_out())
+                .flatten(),
+        );
+        if let Some(warning) = warning {
+            self.events.emit(warning);
+        }
         let assembled = context::assemble(context::ContextInputs {
             contract: self.config.contract,
             repo: self.config.repo_policy,
@@ -2169,9 +2199,7 @@ impl<'a> RunEngine<'a> {
             },
             // Recorded so a receipt says whether a turn ceiling was
             // enforceable at all on this harness (SPEC §11).
-            turn_ceiling: capabilities
-                .map(crate::backend::Capabilities::turn_ceiling)
-                .unwrap_or_default(),
+            turn_ceiling,
             resolver: self.config.aval_resolver,
             design,
         });
@@ -5502,6 +5530,32 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn a_probe_that_timed_out_is_recorded_as_unknown_with_one_warning() {
+        use crate::backend::TurnCeiling;
+        let late = "`claude --version` did not answer within 30s (machine busy?)";
+        let (ceiling, warning) = harness_reading(None, Some(late.to_string()));
+        assert_eq!(ceiling, TurnCeiling::UnknownTimedOut);
+        assert_eq!(ceiling.as_str(), "unknown (timed out)");
+        match warning {
+            Some(Event::EnvironmentWarning { what, detail }) => {
+                assert_eq!(what, "claude_code_version_unchecked");
+                assert_eq!(detail, late);
+            }
+            other => panic!("expected one environment_warning, got {other:?}"),
+        }
+        let (ceiling, warning) = harness_reading(None, None);
+        assert_eq!(ceiling, TurnCeiling::Unavailable);
+        assert!(warning.is_none(), "an unprobed harness is not a timeout");
+        let probed = crate::adapter::claude::capabilities_from_help(
+            "2.1.291 (Claude Code)".to_string(),
+            "--model --max-turns",
+        );
+        let (ceiling, warning) = harness_reading(Some(&probed), Some(late.to_string()));
+        assert_eq!(ceiling, probed.turn_ceiling());
+        assert!(warning.is_none(), "an answer outranks an earlier timeout");
+    }
 
     // -- fixtures ---------------------------------------------------------
 

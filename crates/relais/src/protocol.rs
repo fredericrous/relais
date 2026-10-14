@@ -148,6 +148,13 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// Something about the machine the run could not check and went on
+    /// without: `what` names it (`kind` is the event's own tag), `detail`
+    /// says what happened.
+    EnvironmentWarning {
+        what: String,
+        detail: String,
+    },
     /// A line the process wrote to stdout or stderr under `--protocol`.
     Stderr {
         text: String,
@@ -169,6 +176,7 @@ impl Event {
             | Self::Output { .. }
             | Self::CheckEnded { .. }
             | Self::Decision { .. }
+            | Self::EnvironmentWarning { .. }
             | Self::Outcome { .. } => true,
         }
     }
