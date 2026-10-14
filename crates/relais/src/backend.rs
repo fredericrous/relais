@@ -184,6 +184,8 @@ pub enum TurnCeiling {
     /// the ceilings that actually bound the run.
     #[default]
     Unavailable,
+    /// The probe that would have said did not answer in time.
+    UnknownTimedOut,
 }
 
 impl TurnCeiling {
@@ -193,6 +195,7 @@ impl TurnCeiling {
         match self {
             Self::Harness => "harness",
             Self::Unavailable => "unavailable",
+            Self::UnknownTimedOut => "unknown (timed out)",
         }
     }
 
@@ -201,6 +204,7 @@ impl TurnCeiling {
         match self {
             Self::Harness => "turn ceiling: enforced by the harness",
             Self::Unavailable => "turn ceiling: not available on this Claude Code — attempts and wall time are enforced by the runner, turns are not",
+            Self::UnknownTimedOut => "turn ceiling: unknown — `claude --help` did not answer in time",
         }
     }
 }

@@ -707,9 +707,8 @@ pub struct ContextInputs<'a> {
     pub fingerprints: Fingerprinted,
     pub tool_versions: ToolVersions,
     /// Whether the harness this run will dispatch on can take a turn
-    /// ceiling: `crate::backend::TurnCeiling::as_str`, or `unknown (timed
-    /// out)` when the probe that would have said timed out.
-    pub turn_ceiling: &'a str,
+    /// ceiling (`crate::backend::TurnCeiling`).
+    pub turn_ceiling: crate::backend::TurnCeiling,
     /// The decision corpus, as a port, so tests supply verdicts without
     /// invoking the real binary.
     pub resolver: &'a dyn DecisionResolver,
@@ -855,7 +854,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         constraints: constraints.clone(),
         budget_bytes: repo.context.budget_bytes,
         package_bytes,
-        turn_ceiling: turn_ceiling.to_string(),
+        turn_ceiling: turn_ceiling.as_str().to_string(),
         sandbox: SandboxRecord::default(),
         confinement: Confinement::session(),
         env_protection: "session".to_string(),
@@ -985,7 +984,7 @@ mod tests {
                 amont: Some("1.36.0".into()),
                 claude_code: None,
             },
-            turn_ceiling: crate::backend::TurnCeiling::Unavailable.as_str(),
+            turn_ceiling: crate::backend::TurnCeiling::Unavailable,
             resolver,
             design: None,
         }
