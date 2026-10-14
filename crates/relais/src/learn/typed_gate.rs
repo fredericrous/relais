@@ -23,16 +23,13 @@
 //! 15 qualifying trials and never earlier, so a run of successes cannot be
 //! stopped on while it is ahead; later trials do not move it.
 //!
-//! A trial's recorded outcome is taken as is ([`judge`]).
-//!
-//! holds-until: ground-truth verdicts of rejected replays (plan D9) are
-//! stored on the trial row; until then a review-rejected replay counts as a
-//! failure even when the source Sonnet code has the same defect, so a
-//! type's count can understate Haiku.
+//! A trial's recorded outcome is taken as is ([`judge`]), except that a
+//! review-rejected replay a person judged `pass` against the source work
+//! (`relais dataset judge-trial`, plan D9) counts as a success.
 
 use crate::contract::TaskType;
 use crate::ids::{TaskId, TrialId};
-use crate::ledger::{Ledger, LedgerError, TrialOutcome, TrialRow};
+use crate::ledger::{GroundTruthVerdict, Ledger, LedgerError, TrialOutcome, TrialRow};
 use crate::policy::{RecipeSpec, RepoPolicy};
 use crate::route::{
     is_typed_research_change, TypedGateCount, TypedGateEvidence, TYPED_GATE_TRIALS,
@@ -92,12 +89,14 @@ pub fn judge(
     if !in_arm || !research_first {
         return Judgement::NotCounted;
     }
-    // holds-until: ground-truth verdicts of rejected replays (plan D9) are
-    // stored on the trial row; until then a review-rejected replay counts
-    // as a failure even when the source Sonnet code has the same defect,
-    // so a type's count can understate Haiku.
+    // A rejected replay counts as a failure unless a person judged it pass.
+    let judged_pass = trial
+        .ground_truth
+        .as_ref()
+        .is_some_and(|truth| truth.verdict == GroundTruthVerdict::Pass);
     match (trial.outcome, trial.accepted_without_escalation) {
         (Some(TrialOutcome::Accepted), Some(true)) => Judgement::Success,
+        (Some(TrialOutcome::Rejected), _) if judged_pass => Judgement::Success,
         (Some(TrialOutcome::Accepted), Some(false)) | (Some(TrialOutcome::Rejected), _) => {
             Judgement::Failure
         }
@@ -601,6 +600,87 @@ tier = "research"
             }
         );
         assert!(w.promote().is_err());
+    }
+
+    /// Judge the rejected trial of task `n` with `verdict`.
+    fn judge_rejected(w: &World, n: usize, verdict: GroundTruthVerdict) {
+        w.ledger
+            .judge_trial(
+                &TrialId::from_stored(format!("trial-{n:03}")),
+                verdict,
+                "evidence",
+            )
+            .expect("reads")
+            .expect("recorded");
+    }
+
+    #[test]
+    fn a_rejected_replay_judged_pass_counts_and_judged_fail_or_unjudged_does_not() {
+        // 13 accepted + 1 rejected judged pass + 1 rejected unjudged.
+        let w = world();
+        w.qualifying(0, 15, 2);
+        judge_rejected(&w, 0, GroundTruthVerdict::Pass);
+        assert_eq!(
+            w.count(),
+            TypedGateCount {
+                qualifying: 15,
+                accepted: 14
+            }
+        );
+        w.promote().expect("14/15 authorises");
+        // The same with the rejected one judged fail.
+        let w = world();
+        w.qualifying(0, 15, 2);
+        judge_rejected(&w, 0, GroundTruthVerdict::Fail);
+        assert_eq!(w.count().accepted, 13);
+        assert!(w.promote().is_err());
+        // Neither judged pass: 13/15.
+        let w = world();
+        w.qualifying(0, 15, 2);
+        assert_eq!(w.count().accepted, 13);
+    }
+
+    #[test]
+    fn judge_ignores_a_ground_truth_on_any_other_outcome() {
+        let truth = crate::ledger::GroundTruth {
+            verdict: GroundTruthVerdict::Pass,
+            note: "n".into(),
+            at: "then".into(),
+        };
+        let cases = [
+            (TrialOutcome::Accepted, false, Judgement::Failure),
+            (TrialOutcome::Accepted, true, Judgement::Success),
+            (TrialOutcome::Errored, false, Judgement::NotCounted),
+            (TrialOutcome::Invalid, false, Judgement::NotCounted),
+        ];
+        for (outcome, without_escalation, expected) in cases {
+            let w = world();
+            w.trial(0, |s| {
+                s.outcome = outcome;
+                s.without_escalation = without_escalation;
+            });
+            let mut trial = w
+                .ledger
+                .trials_by_task(&TaskId::from_stored("task-0"))
+                .expect("trials")[0]
+                .clone();
+            trial.ground_truth = Some(truth.clone());
+            let facts = TrialFacts {
+                trial,
+                task_type: Some(TaskType::Feature),
+                first_model: Some("haiku".into()),
+            };
+            assert_eq!(
+                judge(
+                    &facts,
+                    &w.candidate.recipes[3],
+                    TaskType::Feature,
+                    Some("haiku")
+                ),
+                expected,
+                "{outcome:?}"
+            );
+        }
     }
 
     #[test]

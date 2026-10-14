@@ -325,3 +325,129 @@ fn an_import_labels_history_once_and_never_overwrites_a_declared_type() {
     );
     assert_eq!(world.ledger().typed_task_count().expect("count"), 2);
 }
+
+/// A settled replay trial `trial-<name>` on a fresh task, ended `outcome`.
+fn settled_replay(
+    world: &World,
+    name: &str,
+    outcome: relais::ledger::TrialOutcome,
+) -> relais::ids::TrialId {
+    use relais::ids::TrialId;
+    let ledger = world.ledger();
+    world.add_task(&ledger, name, "o", None);
+    let trial_id = TrialId::from_stored(format!("trial-{name}"));
+    let arm_run = RunId::from_stored(format!("arm-{name}"));
+    ledger
+        .insert_replay_trial(&relais::ledger::NewReplayTrial {
+            trial_id: &trial_id,
+            task_id: &TaskId::from_stored(format!("task-{name}")),
+            source_run_id: &RunId::from_stored(format!("run-{name}")),
+            incumbent_recipe_id: "incumbent",
+            arm_recipe_id: "arm",
+            base_sha: "base",
+            contract_hash: "contract",
+            verification_profile_hash: "profile",
+            workspace_isolation: "fresh_checkout_no_accepted_answer",
+            arm_run_id: &arm_run,
+            design_sha256: None,
+        })
+        .expect("trial");
+    ledger
+        .settle_trial(
+            &trial_id,
+            outcome,
+            false,
+            relais::ledger::TrialCost::UNKNOWN,
+            1,
+        )
+        .expect("settle");
+    trial_id
+}
+
+fn stored_truth(
+    world: &World,
+    trial: &relais::ids::TrialId,
+) -> Option<relais::ledger::GroundTruth> {
+    world
+        .ledger()
+        .trial(trial)
+        .expect("reads")
+        .expect("row")
+        .ground_truth
+}
+
+#[test]
+fn judge_trial_records_a_verdict_and_the_same_verdict_again_is_a_no_op() {
+    let world = World::new("judge");
+    let trial = settled_replay(&world, "r", relais::ledger::TrialOutcome::Rejected);
+    let out = world.run(&[
+        "judge-trial",
+        "trial-r",
+        "--verdict",
+        "pass",
+        "--note",
+        "commit abc has the same defect",
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(json["trial_id"], "trial-r");
+    assert_eq!(json["verdict"], "pass");
+    assert_eq!(json["note"], "commit abc has the same defect");
+    let at = json["at"].as_str().expect("timestamp").to_string();
+    assert!(!at.is_empty());
+    let stored = stored_truth(&world, &trial).expect("stored");
+    assert_eq!(stored.at, at);
+
+    let again = world.run(&["judge-trial", "trial-r", "--verdict", "pass", "--note", "x"]);
+    assert_eq!(again.status.code(), Some(0));
+    assert!(text(&again.stdout).contains("already judged pass"));
+    assert_eq!(stored_truth(&world, &trial), Some(stored));
+}
+
+#[test]
+fn judge_trial_refusals_exit_2_naming_the_trial_and_write_nothing() {
+    use relais::ledger::TrialOutcome;
+    let world = World::new("judge-no");
+    let rejected = settled_replay(&world, "r", TrialOutcome::Rejected);
+    let accepted = settled_replay(&world, "a", TrialOutcome::Accepted);
+    let errored = settled_replay(&world, "e", TrialOutcome::Errored);
+    let refuse = |args: &[&str]| {
+        let out = world.run(args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+        text(&out.stderr)
+    };
+    assert!(refuse(&[
+        "judge-trial",
+        "trial-ghost",
+        "--verdict",
+        "pass",
+        "--note",
+        "n"
+    ])
+    .contains("trial-ghost"));
+    assert!(
+        refuse(&["judge-trial", "trial-a", "--verdict", "pass", "--note", "n"]).contains("trial-a")
+    );
+    assert!(
+        refuse(&["judge-trial", "trial-e", "--verdict", "fail", "--note", "n"]).contains("trial-e")
+    );
+    assert!(
+        refuse(&["judge-trial", "trial-r", "--verdict", "pass", "--note", " "]).contains("trial-r")
+    );
+    for trial in [&rejected, &accepted, &errored] {
+        assert_eq!(stored_truth(&world, trial), None);
+    }
+    let ok = world.run(&["judge-trial", "trial-r", "--verdict", "fail", "--note", "n"]);
+    assert_eq!(ok.status.code(), Some(0));
+    let before = stored_truth(&world, &rejected);
+    assert!(
+        refuse(&["judge-trial", "trial-r", "--verdict", "pass", "--note", "m"]).contains("trial-r")
+    );
+    assert_eq!(stored_truth(&world, &rejected), before);
+}

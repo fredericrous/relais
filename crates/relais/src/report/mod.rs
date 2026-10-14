@@ -180,7 +180,11 @@ pub struct ReplayArm {
     pub with_design: bool,
     pub replays: usize,
     pub accepted_without_escalation: usize,
-    /// Rejected, or accepted only after a repair or an escalation.
+    /// Rejected by review but judged `pass` against the source work: the
+    /// typed-research gate counts these as accepted.
+    pub accepted_by_ground_truth: usize,
+    /// Rejected (and not judged pass), or accepted only after a repair or
+    /// an escalation.
     pub failed: usize,
     /// Ended on an infrastructure fault: no evidence either way.
     pub unknown: usize,
@@ -198,6 +202,7 @@ pub struct ReplayArm {
 struct ReplayTally {
     replays: usize,
     accepted_without_escalation: usize,
+    accepted_by_ground_truth: usize,
     failed: usize,
     unknown: usize,
     invalid: usize,
@@ -206,7 +211,7 @@ struct ReplayTally {
 /// The settled replay trials of a cohort, one entry per arm and design
 /// presence: the two arms of one type stay apart.
 fn replay_arms(rows: &[CohortTaskRow]) -> Vec<ReplayArm> {
-    use crate::ledger::TrialOutcome;
+    use crate::ledger::{GroundTruthVerdict, TrialOutcome};
     let mut by_arm: std::collections::BTreeMap<(&str, bool), ReplayArm> =
         std::collections::BTreeMap::new();
     for trial in rows.iter().flat_map(|row| &row.replays) {
@@ -225,6 +230,14 @@ fn replay_arms(rows: &[CohortTaskRow]) -> Vec<ReplayArm> {
         match outcome {
             TrialOutcome::Accepted if trial.accepted_without_escalation == Some(true) => {
                 arm.accepted_without_escalation += 1
+            }
+            TrialOutcome::Rejected
+                if trial
+                    .ground_truth
+                    .as_ref()
+                    .is_some_and(|truth| truth.verdict == GroundTruthVerdict::Pass) =>
+            {
+                arm.accepted_by_ground_truth += 1
             }
             TrialOutcome::Accepted | TrialOutcome::Rejected => arm.failed += 1,
             TrialOutcome::Errored => arm.unknown += 1,
@@ -245,6 +258,7 @@ fn replay_tally(arms: &[ReplayArm]) -> ReplayTally {
             replays: tally.replays + arm.replays,
             accepted_without_escalation: tally.accepted_without_escalation
                 + arm.accepted_without_escalation,
+            accepted_by_ground_truth: tally.accepted_by_ground_truth + arm.accepted_by_ground_truth,
             failed: tally.failed + arm.failed,
             unknown: tally.unknown + arm.unknown,
             invalid: tally.invalid + arm.invalid,
@@ -1405,6 +1419,12 @@ impl Report {
                         tally.unknown,
                         tally.invalid
                     ));
+                    if tally.accepted_by_ground_truth > 0 {
+                        out.push_str(&format!(
+                            "      + {} rejected but accepted by ground truth (judged pass)\n",
+                            tally.accepted_by_ground_truth
+                        ));
+                    }
                 }
             }
         }
@@ -3421,6 +3441,67 @@ mod tests {
         assert_eq!(
             line.trim(),
             "replays 4: 1 accepted unescalated, 1 failed, 1 unknown, 1 invalid"
+        );
+        assert!(line.chars().count() <= 80, "{line}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A rejected replay judged pass is shown as accepted by ground truth,
+    /// within 80 columns, and is no longer counted as failed.
+    #[test]
+    fn by_task_type_shows_rejected_replays_judged_pass() {
+        use crate::contract::TaskType;
+        use crate::ledger::{GroundTruthVerdict, NewReplayTrial, TrialCost, TrialOutcome};
+        let dir = temp_dir("task-type-ground-truth");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = crate::ids::RunId::from_stored("run-src");
+        let task = crate::ids::TaskId::from_stored("task-feature");
+        ledger
+            .insert_typed_run(&run, "/repo", None, &task, "rk", Some(TaskType::Feature))
+            .expect("run");
+        for id in ["t-1", "t-2"] {
+            let trial = crate::ids::TrialId::from_stored(id);
+            let arm_run = crate::ids::RunId::from_stored(format!("run-{id}"));
+            ledger
+                .insert_replay_trial(&NewReplayTrial {
+                    trial_id: &trial,
+                    task_id: &task,
+                    source_run_id: &run,
+                    incumbent_recipe_id: "incumbent",
+                    arm_recipe_id: "arm",
+                    base_sha: "base",
+                    contract_hash: "contract",
+                    verification_profile_hash: "profile",
+                    workspace_isolation: "fresh_checkout_no_accepted_answer",
+                    arm_run_id: &arm_run,
+                    design_sha256: None,
+                })
+                .expect("trial");
+            ledger
+                .settle_trial(&trial, TrialOutcome::Rejected, false, TrialCost::UNKNOWN, 1)
+                .expect("settle");
+        }
+        ledger
+            .judge_trial(
+                &crate::ids::TrialId::from_stored("t-1"),
+                GroundTruthVerdict::Pass,
+                "same defect in the source",
+            )
+            .expect("reads")
+            .expect("recorded");
+        let report = runs_report(&ledger, SINCE, Some(Dimension::TaskType)).expect("report");
+        let arm = &cohort(&report, "feature").replays[0];
+        assert_eq!((arm.accepted_by_ground_truth, arm.failed), (1, 1));
+        let json = serde_json::to_value(&report).expect("json");
+        assert!(json.to_string().contains("\"accepted_by_ground_truth\":1"));
+        let text = report.render();
+        let line = text
+            .lines()
+            .find(|line| line.contains("by ground truth"))
+            .unwrap_or_else(|| panic!("no ground-truth line: {text}"));
+        assert_eq!(
+            line.trim(),
+            "+ 1 rejected but accepted by ground truth (judged pass)"
         );
         assert!(line.chars().count() <= 80, "{line}");
         std::fs::remove_dir_all(&dir).ok();
