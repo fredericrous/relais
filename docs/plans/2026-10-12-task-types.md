@@ -129,6 +129,8 @@ Eight types, one per task, a closed enum `TaskType` in the library with a doc co
 - **D8** (person, 2026-10-14) No type has 15 replayable tasks (replay needs an accepted run with a receipt; salvaged runs have none): feature 13, review-fix 7, pattern 2, the rest 1. Screen now and grow each continuing arm to 15 as newly accepted, type-declared tasks accrue; promotion waits for 15 under the 14/15 bar.
 - **D9** (2026-10-14) A replay's review verdict is not compared with the source run's: reviewers differ run to run (a fresh Opus review of Sonnet's accepted #198 missed both defects the Haiku replay's reviewer raised, which are on main). A rejected replay is judged by ground truth instead: each finding is checked against the source Sonnet candidate's code at its commit, and the replay fails only on a defect that code does not have. Infrastructure stops (wall time, plugin-test timeouts under load) are retried once, then unknown; a stop on a contract that contradicts the code is unknown.
 - **D10** (2026-10-14) The Haiku + design arm is deferred: only 1 of the 5 screened feature tasks has a plan file at its base (Phase 2's drafting precondition), one replay measures no arm, and Haiku alone had no feature reasoning failure for a design to rescue.
+- **D11** (2026-10-14, implementation review) A due typed rollback is said, never written: the learn cycle names the reason and `relais recipe rollback <name>` once per recipe revision and does not edit relais.toml, since a background cycle writing a tracked file would leave the person's checkout dirty. ADR-0006 says the same.
+- **D12** (2026-10-14) PR 2 ships before the evidence: the gate, the draw and the rollback cannot act until a typed recipe is promoted, and no type has 15 qualifying trials yet (feature 7). The gate reads recorded trial outcomes, so a review-rejected replay counts as a failure even where D9's ground truth passed it (`holds-until` in `learn/typed_gate.rs`); with today's trials feature cannot reach 14/15 until ground-truth verdicts are stored on the trial row, which is the next relais change this plan needs.
 
 ## Record (PR 1)
 
@@ -180,10 +182,33 @@ Next: release, then the live phase (historical classification, pilot, replays), 
 
 Next: grow feature to 15 from new accepted tasks, then PR 2 (the typed-research promotion gate, the seeded Sonnet draw, rollback, ADR-0006). The design arm returns when feature shows reasoning failures or enough planned tasks exist (D10).
 
+## Record (PR 2)
+
+Commits 4af6f78 (gate), 450f357 (draw, rollback, ADR-0006), 29598de (review fixes); the first two salvaged from relais runs whose `make check` was green and whose reviewer ended without a verdict.
+
+| check | expected | actual |
+|---|---|---|
+| `make check` on the rebased tree | exit 0 | exit 0, plugin 286/286, on the rebased tree and again on 29598de (after the review fixes) |
+| 14/15 qualifying trials authorise; 13/15 and 14/14 do not | as stated | unit tests in `learn/typed_gate.rs` pass |
+| failed, escalated, other-model, other-type, other-arm, other-recipe trials cannot authorise, through `recipe promote` and the learn cycle | refused | unit tests pass |
+| one trial per task, the earliest decides | as stated | `a_task_counts_once_by_its_earliest_qualifying_trial`, shown to fail without the dedup |
+| seeded draw: ~10% to implementation, reproducible, propensity recorded, never a replay | as stated | unit tests in `route/mod.rs` pass |
+| rollback below a 0.50 bound or at the Sonnet cost median, at 20 runs then every 10, infra stops excluded, said once, never written | as stated | unit tests in `learn/typed_rollback.rs` and `learn/cycle.rs` pass |
+| `relais plan` routes a promoted typed contract to Haiku; a two-type rollback leaves the other type on Haiku | observed in the CLI | **not observed**: no type is promoted (feature 7 of 15, D12); covered by unit tests only |
+| ADR-0006 in the corpus | `aval check` clean | 39 records, no findings |
+
+Next: store D9 ground-truth verdicts on the trial row (D12), grow feature to 15, then the first promotion through `relais recipe promote --write`, observed with `relais plan`.
+
 ## Implementation review
 
 - **approve** after one Delta (round 1 approve-with-changes, 112k tokens, 143 s; Delta 119k, 17 s).
 - Fixed: unreadable contracts counted on export; a null taxonomy version is corrupt; the no-file-contents test can now fail; the `live_of` holds-until names its limit.
 - Carried to Measure: new contracts carry a declared type (target 100% in a week), which the holds-until relies on.
+
+## Implementation review (PR 2)
+
+- **approve** after one Delta (round 1 approve-with-changes, 81k tokens, 74 s; Delta 85k, 22 s).
+- Fixed: a dedup test that could not fail; the D9 limit carries a holds-until; the cycle says a rollback instead of writing relais.toml (D11); cost baseline on the implementation model only; stamps compared as times.
+- Carried: retention of learning-cycle notes, on which "said once" relies.
 
 <!-- panel: repos=relais reviewers=architect,backend,lang:rust,lang:typescript,po,tui,unix body-sha=25845c3bb661 -->
