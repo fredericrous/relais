@@ -126,6 +126,9 @@ Eight types, one per task, a closed enum `TaskType` in the library with a doc co
 - **D4** Rollback takes both the backend and product owner rules: a low acceptance bound, or a cost per accepted task no better than Sonnet's, since cost is why the plan exists.
 - **D6** (2026-10-13) The seeded `change-<type>` recipes use a field the installed relais (0.17.0) refuses, so from this branch on, relais cannot run against the relais repository until PR 1 is released and installed. The replay half was therefore implemented in the session; the release follows the merge, and the person re-grants trust for the changed `relais.toml`.
 - **D7** (2026-10-13) A replay candidate appends its new revision at the end of `[[recipes]]`: a candidate that inserts it beside rev 1 is refused ("a candidate may only append new revisions").
+- **D8** (person, 2026-10-14) No type has 15 replayable tasks (replay needs an accepted run with a receipt; salvaged runs have none): feature 13, review-fix 7, pattern 2, the rest 1. Screen now and grow each continuing arm to 15 as newly accepted, type-declared tasks accrue; promotion waits for 15 under the 14/15 bar.
+- **D9** (2026-10-14) A replay's review verdict is not compared with the source run's: reviewers differ run to run (a fresh Opus review of Sonnet's accepted #198 missed both defects the Haiku replay's reviewer raised, which are on main). A rejected replay is judged by ground truth instead: each finding is checked against the source Sonnet candidate's code at its commit, and the replay fails only on a defect that code does not have. Infrastructure stops (wall time, plugin-test timeouts under load) are retried once, then unknown; a stop on a contract that contradicts the code is unknown.
+- **D10** (2026-10-14) The Haiku + design arm is deferred: only 1 of the 5 screened feature tasks has a plan file at its base (Phase 2's drafting precondition), one replay measures no arm, and Haiku alone had no feature reasoning failure for a design to rescue.
 
 ## Record (PR 1)
 
@@ -144,6 +147,38 @@ Phase 1 and Phase 2's code are done (commits a4f9a3e, 63e894e, 6667125, 26ba68a,
 | `recipe evaluate` on that candidate | refused (`Admission::Promote`) | exit 3, "puts a `change` at the research tier; only a replay admits that today" |
 
 Next: release, then the live phase (historical classification, pilot, replays), then PR 2.
+
+## Record (live phase, 2026-10-13 → 2026-10-14)
+
+**Classification.** `export-tasks` on the live ledger: 233 tasks (218 change, 15 inspect). Three Haiku batches labelled all 233: feature 151, review-fix 26, report 15, mechanical 15, ui 14, refactor 6, pattern 3, infra 3, unclassified 0. Second pass on a 20% sample (47): 43/47 agree (91%); feature 29/31, the other types ≤ 4 sampled each; the four disagreements were feature vs refactor, pattern or ui. No type merged or split. Imported with `import-task-types` (233 labelled, re-import 233 unchanged).
+
+**Replayable** (accepted, receipt, change, relais repository, research tier at the task's own risk floor): feature 9 (one excluded: `task-0e615d0a4320e337`'s contract names a resume path the code does not have), review-fix 6.
+
+**Screening and extension, Haiku alone** (`change-<type>` rev 2, research tier; costs from the trial rows):
+
+| arm | task | outcome | cost |
+|---|---|---|---|
+| feature | `task-5c6125790865a77f` | rejected by review; both findings are in source #198 → pass (D9) | $0.78 |
+| feature | `task-08e9298a06f5b1ab` | wall time, then retry accepted → pass | $0.59 |
+| feature | `task-cf805e45cd03e1ee` | rejected by review (submodule listed as a file); source has the same `040000` check → pass | $0.57 |
+| feature | `task-ed37e275aa4e93ae` | accepted → pass | $0.60 |
+| feature | `task-2985a43086254f8d` | stopped: contract says "as today" for a behaviour the code lacks; source Sonnet's test passes for another reason → unknown | $0.14 |
+| feature | `task-fe69de8bb089e0f6` | accepted → pass | $0.55 |
+| feature | `task-d3b46f3fbe9369a6` | accepted → pass | $0.62 |
+| feature | `task-ca3014569b78ff61` | accepted → pass | $0.39 |
+| review-fix | `task-bf40c838df93fdbd` | wall time, then plugin-test timeout at load 41 and wall clock → unknown | $0.98 |
+| review-fix | `task-b97598e0b1991247` | rejected; a test that cannot fail and a ledger-only test, both absent from source f0fe5c8 → fail | $1.24 |
+| review-fix | `task-997854b3db7a841d` | accepted → pass | $0.45 |
+| review-fix | `task-dee0b0c31fe299ff` | rejected; a SPEC clause narrower than the code, worded correctly in the source → fail | $0.71 |
+| review-fix | `task-ad21810289a11171` | accepted → pass | $0.76 |
+
+- **feature:** 7 pass, 0 fail, 1 unknown of 8 replays; continues. Every replayable feature task is spent; reaching 15 needs newly accepted feature tasks.
+- **review-fix:** 2 pass, 2 fail, 1 unknown; two reasoning failures in the first five, so it stops and stays on Sonnet.
+- **Spend:** 18 trials (incl. the first pilot and infrastructure stops), $8.94 recorded, 2 with no reported cost, against the ~$35 screening cap. Per accepted Haiku feature replay: about $0.57, against about $1.24 a Sonnet initial attempt.
+- **Infrastructure:** 3 of 18 replays stopped on the 45-minute wall time (the worker runs the full suite itself) or on plugin-test 5 s timeouts under load; none counted against Haiku.
+- **Side finding fixed:** the first pilot's review found a leak that was on main (a decomposed run's verification checkouts never retired); fixed in #236.
+
+Next: grow feature to 15 from new accepted tasks, then PR 2 (the typed-research promotion gate, the seeded Sonnet draw, rollback, ADR-0006). The design arm returns when feature shows reasoning failures or enough planned tasks exist (D10).
 
 ## Implementation review
 
