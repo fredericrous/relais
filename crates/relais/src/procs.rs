@@ -1046,9 +1046,10 @@ mod imp {
     }
 
     /// `_IOW(0x94, 9, int)`: the same value on every architecture Linux
-    /// ships FICLONE for that relais targets.
+    /// ships FICLONE for that relais targets. `libc::Ioctl` is the request
+    /// type of the target's libc (`c_ulong` on glibc, `c_int` on musl).
     #[cfg(target_os = "linux")]
-    const FICLONE: libc::c_ulong = 0x4004_9409;
+    const FICLONE: libc::Ioctl = 0x4004_9409;
 
     #[cfg(target_os = "linux")]
     pub fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
