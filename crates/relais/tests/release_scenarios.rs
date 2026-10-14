@@ -5423,12 +5423,7 @@ fn golden_document(world: &World, run_id: &str, label: &str) -> serde_json::Valu
     let run_dir = world.run_dir(run_id);
     let events: Vec<serde_json::Value> = events_jsonl(&run_dir)
         .iter()
-        // `guidance` decisions say what the machine has (an `aval` on PATH or
-        // not), which is not a property of the isolated path.
-        .filter(|event| {
-            event["event"]["kind"] != "stderr"
-                && !(event["event"]["kind"] == "decision" && event["event"]["what"] == "guidance")
-        })
+        .filter(|event| event["event"]["kind"] != "stderr")
         .map(|event| {
             let body = &event["event"];
             let mut kept = serde_json::Map::new();
@@ -5438,9 +5433,20 @@ fn golden_document(world: &World, run_id: &str, label: &str) -> serde_json::Valu
                     kept.insert(field.into(), norm(value).into());
                 }
             }
+            // A guidance decision's reason says what the machine has (an
+            // `aval` on PATH or not, and how it failed), and how many of
+            // them there are follows from that: the decision and its place
+            // in the stream are pinned, its reason and repeats are not.
+            if body["kind"] == "decision" && body["what"] == "guidance" {
+                kept.insert("reason".into(), "<what the machine has>".into());
+            }
             serde_json::Value::Object(kept)
         })
         .collect();
+    let mut events = events;
+    events.dedup_by(|later, earlier| {
+        later == earlier && later["what"] == "guidance" && later["kind"] == "decision"
+    });
     let explain = text(&world.relais(&["explain", run_id]).stdout);
     let transitions: Vec<String> = explain
         .lines()

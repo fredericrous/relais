@@ -6,6 +6,11 @@
         "name": "preflight"
       },
       {
+        "kind": "decision",
+        "reason": "<what the machine has>",
+        "what": "guidance"
+      },
+      {
         "kind": "step",
         "name": "preflight"
       },
@@ -271,6 +276,11 @@
       {
         "kind": "step",
         "name": "preflight"
+      },
+      {
+        "kind": "decision",
+        "reason": "<what the machine has>",
+        "what": "guidance"
       },
       {
         "kind": "step",
