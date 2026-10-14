@@ -7474,41 +7474,17 @@ fn retire_all_command() -> Result<CliOutcome, CliError> {
     let ledger = open_ledger()?;
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
     let retained = retained_with_verification(&state_dir)?;
-    if retained.is_empty() {
+    let in_place = in_place_leftovers();
+    if retained.is_empty() && in_place.is_empty() {
         println!("no run worktree is retained under {}", state_dir.display());
         return Ok(CliOutcome::Accepted);
     }
     let mut failed = false;
+    let mut seen = std::collections::BTreeSet::new();
     for (worktree, kind) in retained {
         let run = RunId::from_stored(worktree.run_id.clone());
-        let Some(state) = operational(ledger.run_status(&run), "resume")? else {
-            println!(
-                "{}: kept, no such run on record ({})",
-                worktree.run_id,
-                worktree.path.display()
-            );
-            continue;
-        };
-        let state = if state.is_terminal() {
-            state
-        } else if let Some(orphan) = orphan_of_run(&ledger, &run)? {
-            match interrupt_orphan(&ledger, &run, state, &orphan)? {
-                OrphanOutcome::Ended(ended) => ended,
-                OrphanOutcome::KeptAlive(why) => {
-                    println!(
-                        "{}: kept, silent past its threshold but {why} ({})",
-                        worktree.run_id,
-                        worktree.path.display()
-                    );
-                    continue;
-                }
-            }
-        } else {
-            println!(
-                "{}: kept, the run is {state} ({})",
-                worktree.run_id,
-                worktree.path.display()
-            );
+        seen.insert(worktree.run_id.clone());
+        let Some(state) = settle_state(&ledger, &run, &worktree.path)? else {
             continue;
         };
         let reconciliation = reconcile_run(&ledger, &run)?;
@@ -7517,11 +7493,99 @@ fn retire_all_command() -> Result<CliOutcome, CliError> {
             Retired::Kept => failed = true,
         }
     }
+    // Interrupted in-place runs live in the person's own worktree, which the
+    // state directory never lists: their markers are found in the worktrees
+    // of the repository this is run from. A run found by both sources is
+    // handled once.
+    for (run, path) in in_place {
+        if !seen.insert(run.as_str().to_string()) {
+            continue;
+        }
+        let Some(state) = settle_state(&ledger, &run, &path)? else {
+            continue;
+        };
+        let reconciliation = reconcile_run(&ledger, &run)?;
+        match retire_in_place(&ledger, &run, state, &reconciliation)? {
+            Some(CliOutcome::Accepted) => {}
+            Some(_) => failed = true,
+            None => {
+                println!(
+                    "{run}: kept, {} has a marker the ledger does not match",
+                    path.display()
+                );
+                failed = true;
+            }
+        }
+    }
     Ok(if failed {
         CliOutcome::OperationalFailure
     } else {
         CliOutcome::Accepted
     })
+}
+
+/// The run's state, settled for a retirement: `None` (after saying why on
+/// one line) when the run is not on record, is still alive, or is silent but
+/// not provably dead. A non-terminal run that has gone silent is ended as
+/// interrupted first.
+fn settle_state(ledger: &Ledger, run: &RunId, path: &Path) -> Result<Option<State>, CliError> {
+    let Some(state) = operational(ledger.run_status(run), "resume")? else {
+        println!("{run}: kept, no such run on record ({})", path.display());
+        return Ok(None);
+    };
+    if state.is_terminal() {
+        return Ok(Some(state));
+    }
+    if let Some(orphan) = orphan_of_run(ledger, run)? {
+        return match interrupt_orphan(ledger, run, state, &orphan)? {
+            OrphanOutcome::Ended(ended) => Ok(Some(ended)),
+            OrphanOutcome::KeptAlive(why) => {
+                println!(
+                    "{run}: kept, silent past its threshold but {why} ({})",
+                    path.display()
+                );
+                Ok(None)
+            }
+        };
+    }
+    println!("{run}: kept, the run is {state} ({})", path.display());
+    Ok(None)
+}
+
+/// The interrupted in-place runs of the worktrees of the repository the
+/// command runs from, as `(run, worktree)`. Outside a repository, or where a
+/// worktree's git directory cannot be read, it says so in one line and
+/// carries on: this is a sweep, and one unreadable worktree (a pruned one,
+/// say) must not hide the others.
+fn in_place_leftovers() -> Vec<(RunId, PathBuf)> {
+    let here = match project_dir() {
+        Ok(here) => here,
+        Err(e) => {
+            println!("interrupted in-place runs are not looked for: {e}");
+            return Vec::new();
+        }
+    };
+    let worktrees = match workspace::worktree_paths(&here) {
+        Ok(worktrees) => worktrees,
+        Err(e) => {
+            println!("interrupted in-place runs are not looked for: {e}");
+            return Vec::new();
+        }
+    };
+    let mut found = Vec::new();
+    for path in worktrees {
+        match relais::workspace::inplace::git_dir(&path)
+            .and_then(|git_dir| relais::workspace::inplace::leftover_markers(&git_dir))
+        {
+            Ok(markers) => found.extend(
+                markers
+                    .into_iter()
+                    .map(|marker| (RunId::from_stored(marker.run), path.clone())),
+            ),
+            Err(e) => println!("kept, {}: {e}", path.display()),
+        }
+    }
+    found
 }
 
 /// What a retained checkout is: a task worktree (tracked work exported
@@ -7698,34 +7762,37 @@ fn retire_in_place(
             })
             .map_err(std::io::Error::other)
     };
-    Ok(Some(match inplace::finalize(lease, target, &mut export) {
-        Ok(Outcome::Applied { real_index_changed }) => {
-            println!(
-                "{run}: restored to {} in {} (directory kept)",
-                inplace::short(&marker.start),
-                root.display()
-            );
-            if real_index_changed {
+    let keep = inplace::IndexPolicy::Keep;
+    Ok(Some(
+        match inplace::finalize(lease, target, keep, &mut export) {
+            Ok(Outcome::Applied { index }) => {
                 println!(
+                    "{run}: restored to {} in {} (directory kept)",
+                    inplace::short(&marker.start),
+                    root.display()
+                );
+                if matches!(index, inplace::IndexOutcome::Changed(_)) {
+                    println!(
                     "{run}: your git index changed during the run; the original is kept at {}/relais-inplace/{run}.index.orig",
                     git_dir.display()
                 );
+                }
+                CliOutcome::Accepted
             }
-            CliOutcome::Accepted
-        }
-        Ok(Outcome::HeadMoved { was, now }) => {
-            println!(
+            Ok(Outcome::HeadMoved { was, now }) => {
+                println!(
                 "{run}: kept, HEAD moved from {} to {} during the run; the tree and the branch were not touched, review them yourself",
                 inplace::short(&was),
                 inplace::short(&now)
             );
-            CliOutcome::OperationalFailure
-        }
-        Err(e) => {
-            println!("{run}: kept, {e}");
-            CliOutcome::OperationalFailure
-        }
-    }))
+                CliOutcome::OperationalFailure
+            }
+            Err(e) => {
+                println!("{run}: kept, {e}");
+                CliOutcome::OperationalFailure
+            }
+        },
+    ))
 }
 
 /// Retire every worktree one terminal run still holds.

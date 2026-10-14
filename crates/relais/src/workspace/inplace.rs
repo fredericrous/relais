@@ -623,14 +623,78 @@ pub fn apply_tree(root: &Path, index: &Path, target_tree: &str) -> Result<(), Ap
 /// What the end of an in-place run decided to do with the tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// The tree now equals the target. `real_index_changed` is true when
-    /// the person's own index listing differs from the start's, which only
-    /// something outside relais's private index can have done; the copy of
-    /// the original is kept beside the markers.
-    Applied { real_index_changed: bool },
+    /// The tree now equals the target, and `index` says what became of the
+    /// person's own index.
+    Applied { index: IndexOutcome },
     /// `HEAD` moved during the run (a worker commit); tree and branch were
     /// left exactly as they are.
     HeadMoved { was: String, now: String },
+}
+
+/// What became of the person's own git index. Only something outside
+/// relais's private index can have changed it: a worker that ran `git add`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexOutcome {
+    /// Its listing at the end is the one at the start.
+    Untouched,
+    /// It had changed, and the byte copy taken at the start is back in place.
+    Restored,
+    /// It had changed and was left so; the copy of the original is kept
+    /// beside the markers.
+    Changed(Unrestored),
+}
+
+/// Why a changed index was left as it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unrestored {
+    /// The caller does not restore (`IndexPolicy::Keep`).
+    NotAsked,
+    /// The restore was tried and failed: the lock was held, the rename was
+    /// refused, the copy was missing, or the listing still differed.
+    Failed(String),
+}
+
+/// What `finalize` does about a changed index. The run that did the work
+/// restores it; a later `resume --retire` does not, because staging done
+/// after the run died is not the worker's to discard (ADR-0009).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexPolicy {
+    Restore,
+    Keep,
+}
+
+/// Put the byte copy of the index taken at the start back.
+///
+/// Takes git's own `index.lock` first (create-new): a git running at that
+/// moment then fails with "index.lock exists" instead of racing the rename,
+/// and a lock already there means one is running and the restore is left.
+/// The lock is removed on every error path. Success is only claimed when the
+/// listing afterwards equals the one at the start.
+fn restore_index(lease: &Lease, listing_at_start: &str) -> io::Result<()> {
+    let real = lease.dir.join("index");
+    let lock = lease.dir.join("index.lock");
+    let mut staged = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)?;
+    let put_back = (|| {
+        let mut original = std::fs::File::open(lease.orig_index())?;
+        io::copy(&mut original, &mut staged)?;
+        staged.sync_all()?;
+        drop(staged);
+        std::fs::rename(&lock, &real)
+    })();
+    if let Err(e) = put_back {
+        // The lock is ours and the rename did not consume it.
+        let _ = std::fs::remove_file(&lock);
+        return Err(e);
+    }
+    if real_index_changed(&lease.root, listing_at_start)? {
+        return Err(io_other(
+            "the restored index does not list what it did at the start",
+        ));
+    }
+    Ok(())
 }
 
 /// Decide, record, export, apply, and only then remove the marker.
@@ -641,6 +705,7 @@ pub enum Outcome {
 pub fn finalize(
     lease: Lease,
     target: Target,
+    index: IndexPolicy,
     export: &mut dyn FnMut() -> io::Result<String>,
 ) -> Result<Outcome, ApplyError> {
     let mut marker = lease.read_marker()?;
@@ -665,16 +730,48 @@ pub fn finalize(
         lease.write_marker(&marker)?;
     }
     apply_tree(lease.root(), &lease.relais_index(), &target.tree)?;
-    let changed = real_index_changed(lease.root(), &marker.index_listing)?;
-    lease.finish(changed)?;
-    Ok(Outcome::Applied {
-        real_index_changed: changed,
-    })
+    let outcome = if !real_index_changed(lease.root(), &marker.index_listing)? {
+        IndexOutcome::Untouched
+    } else if index == IndexPolicy::Restore {
+        match restore_index(&lease, &marker.index_listing) {
+            Ok(()) => IndexOutcome::Restored,
+            Err(error) => IndexOutcome::Changed(Unrestored::Failed(error.to_string())),
+        }
+    } else {
+        IndexOutcome::Changed(Unrestored::NotAsked)
+    };
+    lease.finish(matches!(outcome, IndexOutcome::Changed(_)))?;
+    Ok(Outcome::Applied { index: outcome })
 }
 
 /// Did the person's real index change since the run started?
 pub fn real_index_changed(root: &Path, listing_at_start: &str) -> io::Result<bool> {
     Ok(git_text(root, None, &["ls-files", "-s"])? != listing_at_start)
+}
+
+/// The run, other than `except`, that holds the worktree at `root`: any
+/// `*.json` under its `relais-inplace/` directory counts, parseable or not,
+/// because a marker relais cannot read is still a run it cannot vouch for.
+/// `Err` when the git directory cannot be read, which callers treat as "do
+/// not clone from here": a tree whose state is unknown is not a safe source.
+pub fn held_by(root: &Path, except: Option<&str>) -> io::Result<Option<String>> {
+    let dir = markers_dir(&git_dir(root)?);
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    let mut held = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            if let Some(run) = path.file_stem().and_then(|stem| stem.to_str()) {
+                if Some(run) != except {
+                    held.push(run.to_string());
+                }
+            }
+        }
+    }
+    held.sort();
+    Ok(held.into_iter().next())
 }
 
 /// A stable name for a marker's digest, for messages.
@@ -930,6 +1027,7 @@ mod tests {
                 kind: TargetKind::Start,
                 tree: tree_of(&wt, &start.sha),
             },
+            IndexPolicy::Restore,
             &mut || {
                 exports += 1;
                 Ok("refs/relais/candidates/run-1/final".to_string())
@@ -939,7 +1037,7 @@ mod tests {
         assert_eq!(
             outcome,
             Outcome::Applied {
-                real_index_changed: false
+                index: IndexOutcome::Untouched
             }
         );
         assert_eq!(exports, 1);
@@ -979,19 +1077,185 @@ mod tests {
                 kind: TargetKind::Start,
                 tree: tree_of(&wt, &start.sha),
             },
+            IndexPolicy::Restore,
             &mut || panic!("an export already on the marker is not repeated"),
         )
         .expect("finish");
         assert_eq!(
             outcome,
             Outcome::Applied {
-                real_index_changed: false
+                index: IndexOutcome::Untouched
             }
         );
         assert_eq!(
             std::fs::read_to_string(wt.join("a.txt")).expect("a"),
             "accepted change\n"
         );
+    }
+
+    /// A marker anywhere under `relais-inplace/` means a run holds the
+    /// worktree, readable or not; the run asking is not held against itself;
+    /// a directory git cannot read is "cannot tell", never "free".
+    #[test]
+    fn a_marker_means_the_worktree_is_held_unless_it_is_the_askers_own() {
+        let (keep, wt) = linked_worktree();
+        assert_eq!(held_by(&wt, None).expect("readable"), None);
+        let lease = Lease::acquire(&wt, "run-1").expect("lease");
+        let start = start_snapshot(&lease).expect("start");
+        lease
+            .write_marker(&marker_for(&lease, &start))
+            .expect("marker");
+        assert_eq!(
+            held_by(&wt, None).expect("readable"),
+            Some("run-1".to_string())
+        );
+        assert_eq!(
+            held_by(&wt, Some("run-1")).expect("readable"),
+            None,
+            "its own marker"
+        );
+        let corrupt = lease.git_dir().join("relais-inplace/run-2.json");
+        std::fs::write(&corrupt, "{ not json").expect("corrupt marker");
+        assert_eq!(
+            held_by(&wt, Some("run-1")).expect("readable"),
+            Some("run-2".to_string()),
+            "a marker relais cannot parse still holds the worktree"
+        );
+        let nowhere = keep.join("not-a-repo");
+        std::fs::create_dir_all(&nowhere).expect("mkdir");
+        assert!(held_by(&nowhere, None).is_err());
+    }
+
+    /// A worker's `git add` goes to the person's real index. A run that did
+    /// the work gives the index back byte for byte, and keeps no copy.
+    #[test]
+    fn a_staged_file_in_the_real_index_is_restored_byte_for_byte() {
+        let (_keep, wt) = linked_worktree();
+        let lease = Lease::acquire(&wt, "run-1").expect("lease");
+        let start = start_snapshot(&lease).expect("start");
+        lease
+            .write_marker(&marker_for(&lease, &start))
+            .expect("marker");
+        let gd = lease.git_dir().to_path_buf();
+        let index = gd.join("index");
+        let before = std::fs::read(&index).expect("index at start");
+
+        std::fs::write(wt.join("staged.txt"), "staged by the worker\n").expect("file");
+        git(&wt, &["add", "staged.txt"]);
+        assert_ne!(
+            std::fs::read(&index).expect("index"),
+            before,
+            "the worker changed it"
+        );
+
+        let outcome = finalize(
+            lease,
+            Target {
+                kind: TargetKind::Start,
+                tree: tree_of(&wt, &start.sha),
+            },
+            IndexPolicy::Restore,
+            &mut || Ok("refs/relais/candidates/run-1/final".to_string()),
+        )
+        .expect("finalize");
+        assert_eq!(
+            outcome,
+            Outcome::Applied {
+                index: IndexOutcome::Restored
+            }
+        );
+        assert_eq!(
+            std::fs::read(&index).expect("index"),
+            before,
+            "byte for byte"
+        );
+        assert!(
+            !gd.join("relais-inplace/run-1.index.orig").exists(),
+            "nothing left to offer"
+        );
+        assert!(!gd.join("index.lock").exists(), "git's lock is released");
+    }
+
+    /// A git running at the end holds `index.lock`; relais does not race it,
+    /// does not remove a lock it did not make, and keeps the copy.
+    #[test]
+    fn a_held_index_lock_leaves_the_index_alone_and_keeps_the_copy() {
+        let (_keep, wt) = linked_worktree();
+        let lease = Lease::acquire(&wt, "run-1").expect("lease");
+        let start = start_snapshot(&lease).expect("start");
+        lease
+            .write_marker(&marker_for(&lease, &start))
+            .expect("marker");
+        let gd = lease.git_dir().to_path_buf();
+        std::fs::write(wt.join("staged.txt"), "x\n").expect("file");
+        git(&wt, &["add", "staged.txt"]);
+        let staged = std::fs::read(gd.join("index")).expect("index");
+        std::fs::write(gd.join("index.lock"), "someone else's git").expect("their lock");
+
+        let outcome = finalize(
+            lease,
+            Target {
+                kind: TargetKind::Start,
+                tree: tree_of(&wt, &start.sha),
+            },
+            IndexPolicy::Restore,
+            &mut || Ok("refs/relais/candidates/run-1/final".to_string()),
+        )
+        .expect("finalize");
+        assert!(
+            matches!(
+                &outcome,
+                Outcome::Applied {
+                    index: IndexOutcome::Changed(Unrestored::Failed(why))
+                } if !why.is_empty()
+            ),
+            "a failed restore says why: {outcome:?}"
+        );
+        assert_eq!(std::fs::read(gd.join("index")).expect("index"), staged);
+        assert!(
+            gd.join("relais-inplace/run-1.index.orig").is_file(),
+            "the copy is kept"
+        );
+        assert_eq!(
+            std::fs::read_to_string(gd.join("index.lock")).expect("their lock"),
+            "someone else's git",
+            "a lock relais did not make is left as it is"
+        );
+    }
+
+    /// `resume --retire` of a run that died may come days later: the index is
+    /// reported and the copy kept, never written over (ADR-0009).
+    #[test]
+    fn the_keep_policy_reports_a_changed_index_and_does_not_touch_it() {
+        let (_keep, wt) = linked_worktree();
+        let lease = Lease::acquire(&wt, "run-1").expect("lease");
+        let start = start_snapshot(&lease).expect("start");
+        lease
+            .write_marker(&marker_for(&lease, &start))
+            .expect("marker");
+        let gd = lease.git_dir().to_path_buf();
+        std::fs::write(wt.join("staged.txt"), "x\n").expect("file");
+        git(&wt, &["add", "staged.txt"]);
+        let staged = std::fs::read(gd.join("index")).expect("index");
+
+        let outcome = finalize(
+            lease,
+            Target {
+                kind: TargetKind::Start,
+                tree: tree_of(&wt, &start.sha),
+            },
+            IndexPolicy::Keep,
+            &mut || Ok("refs/relais/candidates/run-1/final".to_string()),
+        )
+        .expect("finalize");
+        assert_eq!(
+            outcome,
+            Outcome::Applied {
+                index: IndexOutcome::Changed(Unrestored::NotAsked)
+            }
+        );
+        assert_eq!(std::fs::read(gd.join("index")).expect("index"), staged);
+        assert!(gd.join("relais-inplace/run-1.index.orig").is_file());
     }
 
     #[test]
@@ -1012,6 +1276,7 @@ mod tests {
                 kind: TargetKind::Start,
                 tree: tree_of(&wt, &start.sha),
             },
+            IndexPolicy::Restore,
             &mut || Ok("refs/relais/candidates/run-1/final".to_string()),
         )
         .expect("finalize");

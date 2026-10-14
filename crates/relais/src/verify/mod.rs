@@ -2037,12 +2037,69 @@ pub fn baseline_key(
 /// Bumped when what a cached baseline entry means changes, rather than
 /// what it was computed from. v2: a check that did not run to a verdict
 /// is `BaselineUnrunnable` and is never cached as a failure. v3: the key
-/// names the base's tree object instead of its commit (ADR-0008).
-const BASELINE_MEANING_VERSION: u32 = 3;
+/// names the base's tree object instead of its commit (ADR-0008). v4: an
+/// entry keeps the base's check outcomes and logs, not only its failed
+/// labels (ADR-0009).
+const BASELINE_MEANING_VERSION: u32 = 4;
 
-/// Cached baseline failures, one JSON file per key, opt-in per profile
-/// (SPEC §18: not cacheable by default). A miss reruns the checks; a
-/// corrupt entry is a miss.
+/// A cached base verdict: which checks failed at the base and, when the
+/// logs were small enough to keep, the base's check outcomes with their
+/// logs re-materialized for the run that read them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CachedBaseline {
+    pub failures: Vec<String>,
+    pub checks: Option<Vec<CheckOutcome>>,
+}
+
+/// What `put` kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stored {
+    /// The failures and the outcomes with their logs.
+    WithOutcomes,
+    /// The failures only: the logs came to `bytes`, over the limit.
+    OverLimit { bytes: u64 },
+    /// The failures only: a log could not be read back, or no longer
+    /// matches the hash recorded for it.
+    LogsUnreadable,
+    /// The cache could not be written: the next run of this base runs its
+    /// checks again.
+    NotWritten,
+}
+
+/// Why `collect` kept no outcomes.
+enum Skipped {
+    OverLimit(u64),
+    Unreadable,
+}
+
+/// The most log bytes an entry keeps outcomes for. The largest base-check log
+/// seen in 421 runs was 0.2 MiB (ADR-0009); above this an entry keeps its
+/// failures alone, which is how every entry behaved before.
+const OUTCOME_LOG_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// The cache directory is pruned, oldest file first, once it holds more than
+/// this: with logs in it the cache is no longer a few bytes per base tree.
+const CACHE_BUDGET: u64 = 256 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+struct Entry {
+    failures: Vec<String>,
+    outcomes: Option<Vec<StoredOutcome>>,
+}
+
+/// One check as stored: the outcome with its paths reduced to file names, and
+/// the hashes of the blobs holding its log and its JUnit copy.
+#[derive(Serialize, Deserialize)]
+struct StoredOutcome {
+    outcome: CheckOutcome,
+    log: String,
+    junit: Option<String>,
+}
+
+/// Cached baseline verdicts, one JSON file per key plus `<sha256>.blob`
+/// files for the logs they refer to, opt-in per profile (SPEC §18: not
+/// cacheable by default). A miss reruns the checks; a corrupt, truncated or
+/// tampered entry is a miss.
 pub struct BaselineCache {
     dir: PathBuf,
 }
@@ -2054,25 +2111,205 @@ impl BaselineCache {
         }
     }
 
-    /// A cached baseline, or `None`. This is a cache: a miss and an
-    /// unreadable entry have the same consequence — the baseline is
-    /// re-run — so neither is an error to report.
-    pub fn get(&self, key: &str) -> Option<Vec<String>> {
-        let text = std::fs::read_to_string(self.dir.join(format!("{key}.json"))).ok()?;
-        serde_json::from_str(&text).ok()
+    fn blob(&self, sha: &str) -> PathBuf {
+        self.dir.join(format!("{sha}.blob"))
     }
 
-    pub fn put(&self, key: &str, failures: &[String]) {
-        if std::fs::create_dir_all(&self.dir).is_err() {
-            return;
+    /// A cached baseline, or `None`. This is a cache: a miss and an
+    /// unreadable entry have the same consequence — the baseline is
+    /// re-run — so neither is an error to report. A hit with outcomes
+    /// writes each log (and JUnit copy) into `logs_dir` and names that copy
+    /// in the outcome; every piece must match the hash it was stored under,
+    /// or the whole entry is a miss.
+    pub fn get(&self, key: &str, logs_dir: &Path) -> Option<CachedBaseline> {
+        let entry_path = self.dir.join(format!("{key}.json"));
+        let entry: Entry =
+            serde_json::from_str(&std::fs::read_to_string(&entry_path).ok()?).ok()?;
+        let Some(stored) = entry.outcomes else {
+            return Some(CachedBaseline {
+                failures: entry.failures,
+                checks: None,
+            });
+        };
+        std::fs::create_dir_all(logs_dir).ok()?;
+        let mut checks = Vec::with_capacity(stored.len());
+        for piece in stored {
+            let mut outcome = piece.outcome;
+            // The hash the receipt will carry must be the hash of the bytes
+            // written: an entry edited by hand so that they differ is a miss.
+            if piece.log != outcome.log_sha256 {
+                return None;
+            }
+            outcome.log_path = self.restore(&piece.log, &outcome.log_path, logs_dir)?;
+            if let (
+                Some(sha),
+                Some(JunitReport::Reported {
+                    artifact: Some(artifact),
+                    ..
+                }),
+            ) = (&piece.junit, &mut outcome.junit)
+            {
+                if *sha != artifact.sha256 {
+                    return None;
+                }
+                artifact.path = self.restore(sha, &artifact.path, logs_dir)?;
+            }
+            checks.push(outcome);
         }
-        // Best effort: an entry that cannot be written is a cache miss
-        // next time, which costs one baseline run and nothing else.
-        let _ = std::fs::write(
-            self.dir.join(format!("{key}.json")),
-            serde_json::to_string(failures).expect("a list of owned strings serializes"),
-        );
+        // Reading an entry keeps it: the oldest are pruned first.
+        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&entry_path) {
+            // Best effort: an entry whose age is not refreshed is pruned a
+            // little sooner, which costs one baseline run and nothing else.
+            let _ = file.set_modified(std::time::SystemTime::now());
+        }
+        Some(CachedBaseline {
+            failures: entry.failures,
+            checks: Some(checks),
+        })
     }
+
+    /// Write blob `sha` into `logs_dir` under the file name of `stored_name`,
+    /// requiring its bytes to hash to `sha`; the new path, or `None`.
+    fn restore(&self, sha: &str, stored_name: &str, logs_dir: &Path) -> Option<String> {
+        let bytes = std::fs::read(self.blob(sha)).ok()?;
+        if sha256_hex(&bytes) != sha {
+            return None;
+        }
+        let dest = logs_dir.join(Path::new(stored_name).file_name()?);
+        std::fs::write(&dest, bytes).ok()?;
+        Some(dest.to_string_lossy().into_owned())
+    }
+
+    /// Keep the base verdict. With `checks`, the outcomes and their logs are
+    /// kept too, unless the logs are over [`OUTCOME_LOG_LIMIT`] or one no
+    /// longer matches its recorded hash.
+    pub fn put(&self, key: &str, failures: &[String], checks: &[CheckOutcome]) -> Stored {
+        if std::fs::create_dir_all(&self.dir).is_err() {
+            return Stored::NotWritten;
+        }
+        let kept = self.collect(checks);
+        let (outcomes, stored) = match kept {
+            Ok((outcomes, blobs)) => match blobs
+                .iter()
+                .try_for_each(|(sha, bytes)| self.write_blob(sha, bytes))
+            {
+                Ok(()) => (Some(outcomes), Stored::WithOutcomes),
+                Err(_) => (None, Stored::NotWritten),
+            },
+            Err(Skipped::OverLimit(bytes)) => (None, Stored::OverLimit { bytes }),
+            Err(Skipped::Unreadable) => (None, Stored::LogsUnreadable),
+        };
+        let entry = Entry {
+            failures: failures.to_vec(),
+            outcomes,
+        };
+        let text = serde_json::to_string(&entry).expect("an entry of owned values serializes");
+        // Best effort, as before: an entry that cannot be written is a cache
+        // miss next time, which costs one baseline run and nothing else.
+        if crate::fsutil::write_atomic(&self.dir.join(format!("{key}.json")), &text).is_err() {
+            return Stored::NotWritten;
+        }
+        self.prune();
+        stored
+    }
+
+    /// The outcomes with their paths reduced to file names, and the blobs
+    /// (hash, bytes) they refer to; or `Err(total bytes)` when they cannot
+    /// all be kept.
+    fn collect(&self, checks: &[CheckOutcome]) -> Result<Kept, Skipped> {
+        let mut total = 0u64;
+        let mut blobs = Vec::new();
+        let mut outcomes = Vec::with_capacity(checks.len());
+        for check in checks {
+            let mut outcome = check.clone();
+            let log = std::fs::read(&check.log_path).map_err(|_| Skipped::Unreadable)?;
+            if sha256_hex(&log) != check.log_sha256 {
+                return Err(Skipped::Unreadable);
+            }
+            total += log.len() as u64;
+            let mut junit = None;
+            if let Some(JunitReport::Reported {
+                artifact: Some(artifact),
+                ..
+            }) = &mut outcome.junit
+            {
+                let bytes = std::fs::read(&artifact.path).map_err(|_| Skipped::Unreadable)?;
+                if sha256_hex(&bytes) != artifact.sha256 {
+                    return Err(Skipped::Unreadable);
+                }
+                total += bytes.len() as u64;
+                junit = Some(artifact.sha256.clone());
+                artifact.path = file_name_of(&artifact.path);
+                blobs.push((artifact.sha256.clone(), bytes));
+            }
+            outcome.log_path = file_name_of(&check.log_path);
+            blobs.push((check.log_sha256.clone(), log));
+            outcomes.push(StoredOutcome {
+                outcome,
+                log: check.log_sha256.clone(),
+                junit,
+            });
+            if total > OUTCOME_LOG_LIMIT {
+                return Err(Skipped::OverLimit(total));
+            }
+        }
+        Ok((outcomes, blobs))
+    }
+
+    fn write_blob(&self, sha: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let path = self.blob(sha);
+        if path.exists() {
+            return Ok(());
+        }
+        let staging = self.dir.join(format!(".{sha}.blob.{}", std::process::id()));
+        std::fs::write(&staging, bytes)?;
+        std::fs::rename(&staging, &path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&staging);
+        })
+    }
+
+    /// Remove the oldest files once the directory is over [`CACHE_BUDGET`].
+    /// A blob an entry still needs may go; that entry is then a miss, never
+    /// a wrong answer.
+    fn prune(&self) {
+        self.prune_to(CACHE_BUDGET);
+    }
+
+    fn prune_to(&self, budget: u64) {
+        let Ok(listing) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = listing
+            .flatten()
+            .filter_map(|entry| {
+                let meta = entry.metadata().ok()?;
+                if !meta.is_file() {
+                    return None;
+                }
+                Some((meta.modified().ok()?, meta.len(), entry.path()))
+            })
+            .collect();
+        let mut total: u64 = files.iter().map(|(_, len, _)| len).sum();
+        files.sort();
+        for (_, len, path) in files {
+            if total <= budget {
+                break;
+            }
+            if std::fs::remove_file(path).is_ok() {
+                total -= len;
+            }
+        }
+    }
+}
+
+/// The stored outcomes and the blobs (hash, bytes) they refer to.
+type Kept = (Vec<StoredOutcome>, Vec<(String, Vec<u8>)>);
+
+fn file_name_of(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// A runner receipt (SPEC §12). Written by the runner into the ledger and
@@ -2656,6 +2893,123 @@ mod tests {
         assert!(touched.tests.is_empty());
     }
 
+    /// A base-check outcome whose log is a real file with its real hash.
+    fn outcome_with_log(dir: &Path, name: &str, bytes: &[u8]) -> CheckOutcome {
+        let path = dir.join(name);
+        std::fs::create_dir_all(dir).expect("mkdir");
+        std::fs::write(&path, bytes).expect("log");
+        CheckOutcome {
+            label: format!("check@{name}"),
+            argv: vec!["true".into()],
+            ended: CheckEnd::new(Ended::Exited(0)),
+            log_path: path.to_string_lossy().into_owned(),
+            log_sha256: sha256_hex(bytes),
+            junit: None,
+        }
+    }
+
+    /// A hit hands back the outcomes with their logs re-materialized as the
+    /// reader's own files, including a log that is not UTF-8.
+    #[test]
+    fn a_cached_baseline_returns_its_outcomes_and_writes_their_logs_for_the_reader() {
+        let dir = temp_dir("bcache-outcomes");
+        let cache = BaselineCache::new(&dir.join("cache"));
+        let log = [0u8, 159, 146, 150, b'\n'];
+        let checks = vec![outcome_with_log(
+            &dir.join("run-1/logs"),
+            "base-cmd0.log",
+            &log,
+        )];
+        assert_eq!(
+            cache.put("k", &["failed@x".to_string()], &checks),
+            Stored::WithOutcomes
+        );
+        let reader_logs = dir.join("run-2/logs");
+        let hit = cache.get("k", &reader_logs).expect("a hit");
+        assert_eq!(hit.failures, vec!["failed@x".to_string()]);
+        let got = hit.checks.expect("outcomes");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].label, checks[0].label);
+        assert_eq!(got[0].log_sha256, checks[0].log_sha256);
+        assert!(Path::new(&got[0].log_path).starts_with(&reader_logs));
+        assert_eq!(std::fs::read(&got[0].log_path).expect("copy"), log);
+    }
+
+    /// Any piece that is missing or no longer hashes to what was stored makes
+    /// the whole entry a miss; a truncated entry file is a miss too.
+    #[test]
+    fn a_tampered_or_incomplete_cache_entry_is_a_miss() {
+        let dir = temp_dir("bcache-tamper");
+        let cache = BaselineCache::new(&dir.join("cache"));
+        let checks = vec![outcome_with_log(
+            &dir.join("run-1/logs"),
+            "base-cmd0.log",
+            b"fine\n",
+        )];
+        cache.put("k", &[], &checks);
+        let blob = dir
+            .join("cache")
+            .join(format!("{}.blob", checks[0].log_sha256));
+        assert!(cache.get("k", &dir.join("a")).is_some());
+
+        std::fs::write(&blob, "tampered\n").expect("tamper");
+        assert_eq!(cache.get("k", &dir.join("b")), None, "a changed blob");
+        std::fs::remove_file(&blob).expect("remove");
+        assert_eq!(cache.get("k", &dir.join("c")), None, "a missing blob");
+
+        cache.put("k", &[], &checks);
+        let entry = dir.join("cache/k.json");
+        let text = std::fs::read_to_string(&entry).expect("entry");
+        std::fs::write(&entry, &text[..text.len() / 2]).expect("truncate");
+        assert_eq!(cache.get("k", &dir.join("d")), None, "a truncated entry");
+    }
+
+    /// Over the limit an entry keeps its failures alone, as every entry did
+    /// before, and says how much the logs came to.
+    #[test]
+    fn logs_over_the_limit_leave_a_failures_only_entry() {
+        let dir = temp_dir("bcache-big");
+        let cache = BaselineCache::new(&dir.join("cache"));
+        let big = vec![b'x'; (OUTCOME_LOG_LIMIT + 1) as usize];
+        let checks = vec![outcome_with_log(
+            &dir.join("run-1/logs"),
+            "base-cmd0.log",
+            &big,
+        )];
+        let stored = cache.put("k", &["failed@x".to_string()], &checks);
+        assert_eq!(
+            stored,
+            Stored::OverLimit {
+                bytes: OUTCOME_LOG_LIMIT + 1
+            }
+        );
+        let hit = cache
+            .get("k", &dir.join("reader"))
+            .expect("the failures are kept");
+        assert_eq!(hit.failures, vec!["failed@x".to_string()]);
+        assert_eq!(hit.checks, None);
+    }
+
+    /// The directory stays inside its budget by dropping the oldest files.
+    #[test]
+    fn the_cache_directory_is_pruned_oldest_first() {
+        let dir = temp_dir("bcache-prune");
+        let cache = BaselineCache::new(&dir);
+        let old = dir.join("old.blob");
+        let new = dir.join("new.blob");
+        std::fs::write(&old, vec![0u8; 100]).expect("old");
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .expect("open")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .expect("age it");
+        std::fs::write(&new, vec![0u8; 100]).expect("new");
+        cache.prune_to(150);
+        assert!(!old.exists(), "the oldest goes first");
+        assert!(new.exists());
+    }
+
     /// V2: the key must move when the TOOLCHAIN moves. `ToolVersions`
     /// names relais, aval, amont and Claude Code, none of which decides
     /// whether `cargo test` passes: after a `rustup update` the old key
@@ -2689,9 +3043,13 @@ mod tests {
             arch: "x86_64".into(),
         };
         let key = baseline_key("abc", &profile, &tools, &toolchain);
-        assert_eq!(cache.get(&key), None, "a miss reruns the checks");
-        cache.put(&key, &["cargo@deadbeef".to_string()]);
-        assert_eq!(cache.get(&key), Some(vec!["cargo@deadbeef".to_string()]));
+        let logs = dir.join("logs");
+        assert_eq!(cache.get(&key, &logs), None, "a miss reruns the checks");
+        cache.put(&key, &["cargo@deadbeef".to_string()], &[]);
+        assert_eq!(
+            cache.get(&key, &logs).map(|hit| hit.failures),
+            Some(vec!["cargo@deadbeef".to_string()])
+        );
 
         let updated = Toolchain {
             programs: vec![ProgramVersion {

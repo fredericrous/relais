@@ -1356,7 +1356,7 @@ impl<'a> RunEngine<'a> {
         self.events.emit(Event::Decision {
             what: "workspace_in_place".into(),
             reason: format!(
-                "in place in {}: do not edit it until the outcome arrives (lease held){}",
+                "in place in {}: do not edit it or stage anything in it until the outcome arrives (lease held){}",
                 self.config.repo_dir.display(),
                 if start.dirty.is_empty() {
                     String::new()
@@ -1417,7 +1417,10 @@ impl<'a> RunEngine<'a> {
         worktree: &TaskWorktree,
         outcome: &RunOutcome,
     ) -> Result<(), RunError> {
-        use crate::workspace::inplace::{finalize, ApplyError, Outcome, Target, TargetKind};
+        use crate::workspace::inplace::{
+            finalize, ApplyError, IndexOutcome, IndexPolicy, Outcome, Target, TargetKind,
+            Unrestored,
+        };
         let Some(lease) = self.inplace.as_mut().and_then(|state| state.lease.take()) else {
             return Ok(());
         };
@@ -1473,21 +1476,32 @@ impl<'a> RunEngine<'a> {
                 })
                 .map_err(std::io::Error::other)
         };
-        match finalize(lease, target, &mut export) {
-            Ok(Outcome::Applied { real_index_changed }) => self.transition(
-                self.state,
-                Reason::WorktreeRetired,
-                serde_json::json!({
-                    "worktree": worktree.path.to_string_lossy(),
-                    "in_place": true,
-                    "real_index_changed": real_index_changed,
-                    "left": match kind {
-                        TargetKind::Accepted => "the accepted change",
-                        TargetKind::Start => "the tree as it was found",
-                    },
-                    "detail": "the directory is kept",
-                }),
-            ),
+        match finalize(lease, target, IndexPolicy::Restore, &mut export) {
+            Ok(Outcome::Applied { index }) => {
+                self.say_index(&index, worktree);
+                self.transition(
+                    self.state,
+                    Reason::WorktreeRetired,
+                    serde_json::json!({
+                        "worktree": worktree.path.to_string_lossy(),
+                        "in_place": true,
+                        "index": match &index {
+                            IndexOutcome::Untouched => "untouched",
+                            IndexOutcome::Restored => "restored",
+                            IndexOutcome::Changed(_) => "changed",
+                        },
+                        "restore_error": match &index {
+                            IndexOutcome::Changed(Unrestored::Failed(why)) => Some(why.as_str()),
+                            _ => None,
+                        },
+                        "left": match kind {
+                            TargetKind::Accepted => "the accepted change",
+                            TargetKind::Start => "the tree as it was found",
+                        },
+                        "detail": "the directory is kept",
+                    }),
+                )
+            }
             Ok(Outcome::HeadMoved { was, now }) => {
                 self.events.emit(Event::Stderr {
                     text: format!(
@@ -1527,6 +1541,37 @@ impl<'a> RunEngine<'a> {
         }
     }
 
+    /// Say, as a decision on the run, what became of the person's git index.
+    fn say_index(&self, index: &crate::workspace::inplace::IndexOutcome, worktree: &TaskWorktree) {
+        use crate::workspace::inplace::{IndexOutcome, Unrestored};
+        let (what, reason) = match index {
+            IndexOutcome::Untouched => return,
+            IndexOutcome::Restored => (
+                "real_index_restored",
+                format!(
+                    "the worker changed your git index in {}; it is back as it was when the run began",
+                    worktree.path.display()
+                ),
+            ),
+            IndexOutcome::Changed(unrestored) => (
+                "real_index_changed",
+                format!(
+                    "the worker changed your git index in {} and it could not be restored{}; the original is kept in the git directory as {}.index.orig",
+                    worktree.path.display(),
+                    match unrestored {
+                        Unrestored::Failed(why) => format!(" ({why})"),
+                        Unrestored::NotAsked => String::new(),
+                    },
+                    self.run_id
+                ),
+            ),
+        };
+        self.events.emit(Event::Decision {
+            what: what.into(),
+            reason,
+        });
+    }
+
     /// The tree the worker edits, when it exists: the caller's own worktree
     /// for an in-place run, else this run's task worktree. Candidate
     /// verification trees are seeded from it.
@@ -1557,7 +1602,8 @@ impl<'a> RunEngine<'a> {
         }
         let source = seed_from.filter(|source| *source != dir);
         if let Some(source) = source {
-            setup_gate::seed_tree(self.config.repo_policy, source, dir, &self.events);
+            let own_run = self.inplace.is_some().then(|| self.run_id.as_str());
+            setup_gate::seed_tree(self.config.repo_policy, source, dir, own_run, &self.events);
         }
         let state = self
             .config
@@ -2313,19 +2359,21 @@ impl<'a> RunEngine<'a> {
         let cache_refused = toolchain.err();
         let cacheable = authority.verification_profile.cache_baseline;
         let cached = match (cacheable, &baseline_key) {
-            (true, Some(key)) => baseline_cache.get(key),
+            (true, Some(key)) => baseline_cache.get(key, &logs_dir),
             _ => None,
         };
         let was_cached = cached.is_some();
         // The baseline's check outcomes are kept: a candidate identical to
         // the base has exactly these results, without re-running them.
         let (failures, checks) = match cached {
-            // holds-until: the cache stores failed labels only, so a hit
-            // cannot reuse the base's check outcomes for a candidate that
-            // carries the base tree (the candidate's checks run again, which
-            // costs time and never a verdict). It ends when the cache keeps
-            // the outcomes, which needs them serializable (ADR-0008).
-            Some(failures) => (failures, None),
+            // A hit that kept the outcomes has written their logs into this
+            // run's `logs/`: they are this run's evidence like any check's.
+            Some(hit) => {
+                if let Some(checks) = &hit.checks {
+                    self.record_logs(None, EvidenceKind::CheckLog, checks)?;
+                }
+                (hit.failures, hit.checks)
+            }
             None => match verify::verification_worktree(
                 self.config.git,
                 self.config.repo_dir,
@@ -2424,7 +2472,27 @@ impl<'a> RunEngine<'a> {
                         .map(|outcome| outcome.label.clone())
                         .collect();
                     if let (true, Some(key)) = (cacheable, &baseline_key) {
-                        baseline_cache.put(key, &failures);
+                        let skipped = match baseline_cache.put(key, &failures, &checks) {
+                            verify::Stored::WithOutcomes => None,
+                            verify::Stored::OverLimit { bytes } => Some(format!(
+                                "the base's logs came to {} MiB; only its failed checks are cached",
+                                bytes / (1024 * 1024)
+                            )),
+                            verify::Stored::LogsUnreadable => Some(
+                                "a base log could not be read back to match its hash; only its failed checks are cached"
+                                    .to_string(),
+                            ),
+                            verify::Stored::NotWritten => Some(
+                                "the baseline cache could not be written; the next run of this base runs its checks again"
+                                    .to_string(),
+                            ),
+                        };
+                        if let Some(reason) = skipped {
+                            self.events.emit(Event::Decision {
+                                what: "baseline_cache_outcomes_skipped".into(),
+                                reason,
+                            });
+                        }
                     }
                     if let Err(e) = baseline.release() {
                         // Best effort: the verdict is already in hand and
@@ -8747,6 +8815,24 @@ mod tests {
             "a green base fills the cache: {first:?}"
         );
         std::fs::write(&flag, "red").expect("flag");
+        // A cache hit now keeps the base's outcomes, and an identical
+        // candidate reuses them instead of re-running (ADR-0009). The
+        // entry an over-limit base leaves keeps its failures alone, so the
+        // candidate is measured by running its checks, which is the path
+        // this test pins: strip the outcomes from the entry.
+        let cache = fixture
+            .artifacts
+            .parent()
+            .expect("state dir")
+            .join("baseline-cache");
+        let entries: Vec<_> = std::fs::read_dir(&cache)
+            .expect("cache")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .collect();
+        assert_eq!(entries.len(), 1, "one entry from the first run");
+        std::fs::write(&entries[0], r#"{"failures":[],"outcomes":null}"#).expect("strip");
         let launches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = std::sync::Arc::clone(&launches);
         let counting = MockBackend::new(move |_| {
@@ -9251,6 +9337,98 @@ mod tests {
                 .any(|row| row.kind == EvidenceKind::WorkerResult),
             "{evidence:?}"
         );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// The base's check outcomes survive in the cache (ADR-0009): a second
+    /// inspect run reads them, so its identical candidate needs no worktree
+    /// and no re-run, and the logs it cites are its own copies with the hash
+    /// the first run recorded.
+    #[test]
+    fn a_cache_hit_keeps_the_bases_outcomes_for_an_identical_candidate() {
+        let fixture = Fixture::new();
+        let shell = if cfg!(windows) { "sh" } else { "bash" };
+        let mut repo = fixture.repo_policy(
+            vec![CommandSpec {
+                name: None,
+                junit: None,
+                reuse: None,
+                argv: vec![shell.into(), "-c".into(), "true".into()],
+                timeout_seconds: 30,
+            }],
+            3,
+        );
+        repo.verification
+            .profiles
+            .get_mut("profile")
+            .expect("profile")
+            .cache_baseline = true;
+        let (backend, _) =
+            inspecting_backend("REPORT: nothing to change", "[1] met: read the code");
+        let contract = TaskContract::from_json_str(
+            &serde_json::json!({
+                "schema_version": 1,
+                "kind": "inspect",
+                "objective": "Say whether anything needs changing",
+                "base_ref": "HEAD",
+                "acceptance": ["evidence that nothing needs changing"],
+                "verification_profile": "profile",
+            })
+            .to_string(),
+        )
+        .expect("contract");
+
+        let RunOutcome {
+            run_id: first_id,
+            terminal: Terminal::Accepted(first),
+        } = fixture.execute(&contract, &repo, &backend)
+        else {
+            panic!("first run");
+        };
+        assert!(
+            !first.verification.baseline_cached,
+            "the first run fills the cache"
+        );
+
+        let RunOutcome {
+            run_id: second_id,
+            terminal: Terminal::Accepted(second),
+        } = fixture.execute(&contract, &repo, &backend)
+        else {
+            panic!("second run");
+        };
+        assert!(
+            second.verification.baseline_cached,
+            "the second run reads it"
+        );
+        assert!(
+            !fixture.verify_dir(&second_id).join("verify-1").exists(),
+            "an identical candidate re-ran nothing, also on a hit"
+        );
+        let check = &second.verification.checks[0];
+        let own_logs = fixture.artifacts.join(second_id.as_str()).join("logs");
+        assert!(
+            Path::new(&check.log_path).starts_with(&own_logs),
+            "{} is not under {}",
+            check.log_path,
+            own_logs.display()
+        );
+        assert_eq!(
+            check.log_sha256, first.verification.checks[0].log_sha256,
+            "the log is the one the first run recorded"
+        );
+        assert_eq!(
+            crate::ids::sha256_hex(&std::fs::read(&check.log_path).expect("the copy exists")),
+            check.log_sha256
+        );
+        let evidence = fixture.ledger.evidence(&second_id).expect("evidence");
+        assert!(
+            evidence
+                .iter()
+                .any(|row| row.kind == EvidenceKind::CheckLog),
+            "the second run records the base's logs as its own evidence: {evidence:?}"
+        );
+        assert_ne!(first_id, second_id);
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
@@ -10568,13 +10746,15 @@ mod tests {
     }
 
     /// A worker that stages a file with git's own index (it bypasses
-    /// relais's private one) leaves the person's index changed: the run is
-    /// still judged on its tree, and the original index is kept for them.
+    /// relais's private one) changes the person's index. The run is judged on
+    /// its tree, and the index is given back as it was (ADR-0009): the same
+    /// listing, no copy left behind, and a decision that says so.
     #[test]
-    fn a_worker_that_stages_into_the_real_index_leaves_the_original_for_the_person() {
+    fn a_worker_that_stages_into_the_real_index_finds_it_restored_when_the_run_ends() {
         use crate::workspace::reuse::Workspace;
         let fixture = fixture_in_a_linked_worktree();
         let (repo, machine) = in_place_policy(&fixture);
+        let listing_before = git(&fixture.repo, &["ls-files", "-s"]);
         let backend = MockBackend::new(move |spec| {
             if spec.prompt.contains("semantic reviewer") {
                 return MockOutcome {
@@ -10607,10 +10787,20 @@ mod tests {
             panic!("{outcome:?}");
         };
         let gd = crate::workspace::inplace::git_dir(&fixture.repo).expect("git dir");
+        assert_eq!(
+            git(&fixture.repo, &["ls-files", "-s"]),
+            listing_before,
+            "the index lists what it listed when the run began"
+        );
         assert!(
-            gd.join(format!("relais-inplace/{}.index.orig", run_id.as_str()))
-                .is_file(),
-            "the original index is kept when the real one changed"
+            !gd.join(format!("relais-inplace/{}.index.orig", run_id.as_str()))
+                .exists(),
+            "nothing is left to offer once it is back"
+        );
+        assert!(
+            decisions_of(&fixture, &run_id).contains(&"real_index_restored".to_string()),
+            "{:?}",
+            decisions_of(&fixture, &run_id)
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
@@ -10704,6 +10894,45 @@ mod tests {
                 "without copy-on-write the fork degrades to today's behaviour: {fork:?}"
             );
         }
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A source an in-place run holds is not cloned: its tree may be half
+    /// written. The fork says so and falls back to the full setup, which this
+    /// policy (a step that needs the caller's `node_modules`) cannot pass.
+    #[test]
+    fn a_fork_does_not_seed_from_a_source_an_in_place_run_holds() {
+        use crate::workspace::reuse::Workspace;
+        let fixture = fixture_with_installed_deps();
+        let markers = fixture.repo.join(".git/relais-inplace");
+        std::fs::create_dir_all(&markers).expect("mkdir");
+        std::fs::write(markers.join("run-other.json"), "{}").expect("marker");
+        let repo = fixture.repo_policy_with_setup(
+            vec![bash_step("test -f node_modules/dep/index.js")],
+            vec![versionable_main_gone_check()],
+            3,
+        );
+        let machine = fixture.machine_for(&repo);
+        let outcome = fixture.execute_in(
+            Workspace::Fork,
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            &conditional_worker("relais task"),
+        );
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Blocked { code, .. },
+        } = outcome
+        else {
+            panic!("nothing was seeded, so the step fails: {outcome:?}");
+        };
+        assert_eq!(code, BlockCode::VerificationSetupFailed);
+        assert!(
+            decisions_of(&fixture, &run_id).contains(&"workspace_seed_skipped".to_string()),
+            "{:?}",
+            decisions_of(&fixture, &run_id)
+        );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 

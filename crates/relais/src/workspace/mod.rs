@@ -169,6 +169,17 @@ fn git_raw(dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// Resolve `base_ref` once to a full commit SHA (SPEC §4).
+/// Every worktree of the repository `repo` belongs to, the primary checkout
+/// included: the `worktree <path>` lines of `git worktree list --porcelain`.
+pub fn worktree_paths(repo: &Path) -> Result<Vec<PathBuf>> {
+    let listing = git_raw(repo, &["worktree", "list", "--porcelain"])?;
+    Ok(listing
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect())
+}
+
 pub fn resolve_base(repo_dir: &Path, base_ref: &str) -> Result<String> {
     git(repo_dir, &["rev-parse", &format!("{base_ref}^{{commit}}")])
 }

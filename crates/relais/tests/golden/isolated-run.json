@@ -1,0 +1,325 @@
+[
+  {
+    "events": [
+      {
+        "kind": "step",
+        "name": "preflight"
+      },
+      {
+        "kind": "decision",
+        "reason": "<what the machine has>",
+        "what": "guidance"
+      },
+      {
+        "kind": "step",
+        "name": "preflight"
+      },
+      {
+        "kind": "step",
+        "name": "baseline"
+      },
+      {
+        "kind": "check_started",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "output",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "check_ended",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "check_started",
+        "label": "sh@c151f618"
+      },
+      {
+        "kind": "check_ended",
+        "label": "sh@c151f618"
+      },
+      {
+        "kind": "step",
+        "name": "baseline"
+      },
+      {
+        "kind": "step",
+        "name": "worktree · setup"
+      },
+      {
+        "kind": "check_started",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "output",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "check_ended",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "phase",
+        "reason": "worker_dispatched",
+        "state": "running"
+      },
+      {
+        "kind": "dispatch_started"
+      },
+      {
+        "kind": "dispatch_ended"
+      },
+      {
+        "kind": "cost"
+      },
+      {
+        "kind": "decision",
+        "reason": "disp-<id>-1",
+        "what": "rollback_ids_missing"
+      },
+      {
+        "kind": "phase",
+        "reason": "verification_started",
+        "state": "verifying"
+      },
+      {
+        "kind": "check_started",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "output",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "check_ended",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "check_started",
+        "label": "sh@c151f618"
+      },
+      {
+        "kind": "check_ended",
+        "label": "sh@c151f618"
+      },
+      {
+        "kind": "decision",
+        "reason": "behavioral_failure",
+        "what": "repair"
+      },
+      {
+        "kind": "phase",
+        "reason": "behavioral_failure",
+        "state": "repairing"
+      },
+      {
+        "kind": "phase",
+        "reason": "worker_dispatched",
+        "state": "running"
+      },
+      {
+        "kind": "dispatch_started"
+      },
+      {
+        "kind": "dispatch_ended"
+      },
+      {
+        "kind": "cost"
+      },
+      {
+        "kind": "decision",
+        "reason": "disp-<id>-2",
+        "what": "rollback_ids_missing"
+      },
+      {
+        "kind": "phase",
+        "reason": "verification_started",
+        "state": "verifying"
+      },
+      {
+        "kind": "check_started",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "output",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "check_ended",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "check_started",
+        "label": "sh@c151f618"
+      },
+      {
+        "kind": "check_ended",
+        "label": "sh@c151f618"
+      },
+      {
+        "kind": "decision",
+        "reason": "repair_exhausted",
+        "what": "escalation"
+      },
+      {
+        "kind": "phase",
+        "reason": "repair_exhausted",
+        "state": "escalating"
+      },
+      {
+        "kind": "phase",
+        "reason": "worker_dispatched",
+        "state": "running"
+      },
+      {
+        "kind": "dispatch_started"
+      },
+      {
+        "kind": "dispatch_ended"
+      },
+      {
+        "kind": "cost"
+      },
+      {
+        "kind": "decision",
+        "reason": "disp-<id>-3",
+        "what": "rollback_ids_missing"
+      },
+      {
+        "kind": "phase",
+        "reason": "verification_started",
+        "state": "verifying"
+      },
+      {
+        "kind": "check_started",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "output",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "check_ended",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "check_started",
+        "label": "sh@c151f618"
+      },
+      {
+        "kind": "check_ended",
+        "label": "sh@c151f618"
+      },
+      {
+        "kind": "decision",
+        "reason": "checks_and_review_passed",
+        "what": "accept"
+      },
+      {
+        "kind": "phase",
+        "reason": "checks_and_review_passed",
+        "state": "accepted"
+      },
+      {
+        "kind": "step",
+        "name": "receipt"
+      },
+      {
+        "kind": "phase",
+        "reason": "worktree_retired",
+        "state": "accepted"
+      },
+      {
+        "kind": "outcome",
+        "state": "accepted"
+      }
+    ],
+    "logs": [
+      "attempt1-cmd0.log",
+      "attempt1-setup0.log",
+      "attempt2-cmd0.log",
+      "attempt2-setup0.log",
+      "attempt3-cmd0.log",
+      "attempt3-setup0.log",
+      "base-cmd0.log",
+      "base-setup0.log",
+      "task-setup0.log"
+    ],
+    "receipt": {
+      "attempts": 3,
+      "baseline_cached": false,
+      "checks": [
+        {
+          "label": "sh@c151f618",
+          "log": "attempt3-cmd0.log"
+        }
+      ]
+    },
+    "scenario": "accepted-with-setup",
+    "transitions": [
+      "  prepared -> running (worker_dispatched)",
+      "  running -> verifying (verification_started)",
+      "  verifying -> repairing (behavioral_failure)",
+      "  repairing -> running (worker_dispatched)",
+      "  running -> verifying (verification_started)",
+      "  verifying -> escalating (repair_exhausted)",
+      "  escalating -> running (worker_dispatched)",
+      "  running -> verifying (verification_started)",
+      "  verifying -> accepted (checks_and_review_passed)",
+      "  accepted -> accepted (worktree_retired)"
+    ],
+    "verify": [],
+    "worktrees": []
+  },
+  {
+    "events": [
+      {
+        "kind": "step",
+        "name": "preflight"
+      },
+      {
+        "kind": "decision",
+        "reason": "<what the machine has>",
+        "what": "guidance"
+      },
+      {
+        "kind": "step",
+        "name": "preflight"
+      },
+      {
+        "kind": "step",
+        "name": "baseline"
+      },
+      {
+        "kind": "check_started",
+        "label": "setup:sh@b502577e"
+      },
+      {
+        "kind": "output",
+        "label": "setup:sh@b502577e"
+      },
+      {
+        "kind": "check_ended",
+        "label": "setup:sh@b502577e"
+      },
+      {
+        "kind": "phase",
+        "reason": "blocked_preflight",
+        "state": "blocked"
+      },
+      {
+        "kind": "outcome",
+        "state": "blocked"
+      }
+    ],
+    "logs": [
+      "base-setup0.log"
+    ],
+    "scenario": "blocked-by-failed-setup",
+    "transitions": [
+      "  prepared -> blocked (blocked_preflight)"
+    ],
+    "verify": [],
+    "worktrees": []
+  }
+]

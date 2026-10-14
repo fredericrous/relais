@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+An in-place run now gives your git index back. If a worker staged something (its Bash is not confined), relais restores the index byte for byte when the run ends, through git's own `index.lock`; if it cannot, it leaves the index, keeps `<git-dir>/relais-inplace/<run>.index.orig` and says so (`real_index_restored` / `real_index_changed`). The start message now asks you not to stage during a run. `relais resume --retire` with no run id finds interrupted in-place runs in the repository's worktrees (it reports a changed index and its copy, and never restores one after the run died). A fork no longer seeds from a worktree an in-place run holds. `relais doctor` has a workspace line: the mode, why, whether copy-on-write works between the repository and the state directory, and an interrupted in-place run. The baseline cache keeps the base's check outcomes and logs (cache version 4: old entries are misses), so an inspect run's identical candidate re-runs nothing on a hit; logs over 16 MiB leave a failures-only entry. A golden test pins what the isolated path leaves behind (ADR-0009).
+
 ## v0.22.0
 
 `/relais-verified-push` lands with `amont land --json` (#249), and a relais worker can no longer publish through `amont land` (the deny floor refuses it beside `git push`). A late Claude Code version probe warns instead of refusing the run (#247), and an advisor's tokens are booked at the advisor model's rate (#246). The skill reaches a session after the plugin reinstall.
