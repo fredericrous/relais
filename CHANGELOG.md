@@ -8,6 +8,10 @@ missing here.
 
 ## Unreleased
 
+## v0.20.1
+
+Fixes the release build of v0.20.0 (#239), which never published: the copy-on-write clone call was typed for glibc and did not compile for `x86_64-unknown-linux-musl`. v0.20.0 was tagged and its release workflow failed before publishing anything, so v0.20.1 is the first release with local workspace reuse; read the v0.20.0 notes below for what it brings. It also carries #240.
+
 Workers no longer spend the run's wall budget on the full verification: the worker prompt and every `relais-worker-*` agent now say that relais runs the verification profile's checks after the worker finishes, so the worker runs only focused tests for what it changed.
 
 `make check` no longer goes red when the plugin tests fail only with `timed out after 5000 ms` under machine load: `scripts/plugin-test.sh` reruns the suite once in that case, and exits non-zero at once on any other failure.
