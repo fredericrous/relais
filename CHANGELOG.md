@@ -13,6 +13,7 @@ missing here.
 The baseline cache is now safe to enable: a base is cached only when every one of its checks passed, so a base with any failed check is re-run every time, and the cache version is 5 (version 4 entries, which could hold failures, are never read). The docs now say the cache is keyed by the base tree, not the base SHA. `cache_baseline` stays off by default.
 
 A marker file left by a dead in-place run that relais cannot read is no longer ignored. `relais resume --retire` and `relais doctor` name the file and why it cannot be read (and `resume --retire` exits non-zero rather than saying nothing is retained), and a new in-place run refuses to start on top of it with `workspace_has_interrupted_run`. Delete the file once you have looked at the tree.
+- Successor intents are safer to recover: a launch a preflight refuses hands its claim back to pending with the refusal on the intent (ledger schema v35), a claim whose run never wrote a driver pid or whose pid is another process is abandoned once the grace passes, and the plugin relaunches an abandoned intent on every status poll and reports a status it cannot read instead of ignoring it.
 
 ## v0.23.0
 

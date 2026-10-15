@@ -7,7 +7,11 @@
 //! launches it. A second claim returns the run that holds the claim; a
 //! claimed intent is handed to a new run only when the claiming run left no
 //! row, or left a live-looking row whose driver process is gone, by
-//! compare-and-set on the old run id.
+//! compare-and-set on the old run id. A claim whose run never wrote a driver
+//! pid, or whose pid is now another process (its start time differs from the
+//! one recorded), is abandoned once the grace passes; a launch a preflight
+//! refuses hands the claim back (`release_claim`) with the refusal on the
+//! intent.
 
 use std::collections::BTreeSet;
 
@@ -23,6 +27,14 @@ use super::{parse_state, DecisionAnswer, Ledger, LedgerError, Result};
 /// ledger before the claim is called abandoned: a run inserts its row in
 /// preflight, seconds after the claim.
 pub const CLAIM_GRACE_SECONDS: i64 = 120;
+
+/// What the host knows of a driver pid: gone, or alive with the start time
+/// of the process that holds it now (`None` when it cannot be read).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuccessorProcess {
+    Gone,
+    Alive { started: Option<String> },
+}
 
 /// What a `revise` answer asks the plugin to launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +221,8 @@ impl Ledger {
         )?;
         let stored = read_intent(&tx, &intent_id)?;
         tx.commit()?;
+        #[cfg(test)]
+        super::failpoint::hit(super::failpoint::AFTER_DECIDE_COMMIT);
         Ok(stored)
     }
 
@@ -261,7 +275,7 @@ impl Ledger {
         &self,
         intent_id: &str,
         new_run: &RunId,
-        alive: &dyn Fn(u32) -> bool,
+        alive: &dyn Fn(u32) -> SuccessorProcess,
     ) -> Result<Claim> {
         let tx = self.write_tx()?;
         let Some(current) = read_intent(&tx, intent_id)? else {
@@ -284,6 +298,10 @@ impl Ledger {
         };
         let after = read_intent(&tx, intent_id)?;
         tx.commit()?;
+        #[cfg(test)]
+        if took == 1 {
+            super::failpoint::hit(super::failpoint::AFTER_CLAIM);
+        }
         match after {
             Some(intent) if took == 1 => Ok(Claim::Claimed(Box::new(intent))),
             Some(SuccessorIntent {
@@ -294,27 +312,31 @@ impl Ledger {
     }
 
     /// Has the run that holds a claim left nothing a live launch would
-    /// have: no row after the grace, or a row not yet terminal whose driver
+    /// have: no row after the grace, a row whose driver never wrote a pid
+    /// after the grace, a row whose pid is now another process (a different
+    /// start time) after the grace, or a row not yet terminal whose driver
     /// process is gone?
     fn abandoned(
         &self,
         conn: &rusqlite::Connection,
         intent_id: &str,
         run: &RunId,
-        alive: &dyn Fn(u32) -> bool,
+        process: &dyn Fn(u32) -> SuccessorProcess,
     ) -> Result<bool> {
-        let row: Option<(Option<i64>, Option<String>)> = conn
+        type Driver = (Option<i64>, Option<String>, Option<String>);
+        let row: Option<Driver> = conn
             .query_row(
                 &format!(
-                    "SELECT driver_pid, (SELECT {} FROM runs r2 WHERE r2.id = runs.id)
+                    "SELECT driver_pid, driver_started,
+                            (SELECT {} FROM runs r2 WHERE r2.id = runs.id)
                        FROM runs WHERE id = ?1",
                     super::PROJECTED_STATUS
                 ),
                 [run.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let Some((pid, status)) = row else {
+        let past_grace = || -> Result<bool> {
             let claimed_at: Option<String> = conn
                 .query_row(
                     "SELECT claimed_at FROM successor_intents WHERE intent_id = ?1",
@@ -323,22 +345,76 @@ impl Ledger {
                 )
                 .optional()?
                 .flatten();
-            return Ok(claimed_at
+            Ok(claimed_at
                 .and_then(|at| seconds_since(&at, &self.now()))
-                .is_some_and(|waited| waited >= CLAIM_GRACE_SECONDS));
+                .is_some_and(|waited| waited >= CLAIM_GRACE_SECONDS))
+        };
+        let Some((pid, started, status)) = row else {
+            return past_grace();
         };
         let terminal = status
             .as_deref()
             .is_some_and(|status| parse_state(status).is_ok_and(State::is_terminal));
-        Ok(!terminal
-            && pid
-                .and_then(|pid| u32::try_from(pid).ok())
-                .is_some_and(|pid| !alive(pid)))
+        if terminal {
+            return Ok(false);
+        }
+        let Some(pid) = pid.and_then(|pid| u32::try_from(pid).ok()) else {
+            return past_grace();
+        };
+        match process(pid) {
+            SuccessorProcess::Gone => Ok(true),
+            SuccessorProcess::Alive { started: now } => match (now, started) {
+                (Some(now), Some(recorded)) if now != recorded => past_grace(),
+                _ => Ok(false),
+            },
+        }
+    }
+
+    /// Hand a claim back after the launch it was for was refused before the
+    /// run existed: compare-and-set on the claiming run, back to pending,
+    /// with the refusal on the intent. `false` when the claim has moved.
+    pub fn release_claim(&self, intent_id: &str, run: &RunId, refusal: &str) -> Result<bool> {
+        let released = self.conn.execute(
+            "UPDATE successor_intents
+                SET state = 'pending', run_id = NULL, claimed_at = NULL,
+                    refusal = ?3, refused_at = ?4
+              WHERE intent_id = ?1 AND state = 'claimed' AND run_id = ?2",
+            params![intent_id, run.as_str(), refusal, self.now()],
+        )?;
+        Ok(released == 1)
+    }
+
+    /// Whether a run row exists (a launched run inserts its row in
+    /// preflight).
+    pub fn run_exists(&self, run: &RunId) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT 1 FROM runs WHERE id = ?1", [run.as_str()], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some())
+    }
+
+    /// The reason the last launch of an intent was refused, if one was.
+    pub fn intent_refusal(&self, intent_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT refusal FROM successor_intents WHERE intent_id = ?1",
+                [intent_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Intents the plugin should launch now: every pending one, and every
     /// claimed one whose claim was abandoned (what a claim would take).
-    pub fn launchable_intents(&self, alive: &dyn Fn(u32) -> bool) -> Result<Vec<SuccessorIntent>> {
+    pub fn launchable_intents(
+        &self,
+        alive: &dyn Fn(u32) -> SuccessorProcess,
+    ) -> Result<Vec<SuccessorIntent>> {
         let mut statement = self.conn.prepare(&format!(
             "SELECT {COLUMNS} FROM successor_intents ORDER BY created_at, intent_id"
         ))?;
@@ -409,6 +485,7 @@ fn read_intent(conn: &rusqlite::Connection, intent_id: &str) -> Result<Option<Su
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ledger::failpoint;
     use crate::ledger::{Actor, Clock, RecordedVia};
     use crate::lifecycle::Reason;
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -421,6 +498,22 @@ mod tests {
             chrono::DateTime::from_timestamp(1_800_000_000 + self.0.load(Ordering::SeqCst), 0)
                 .expect("a time")
                 .to_rfc3339()
+        }
+    }
+
+    fn up(_: u32) -> SuccessorProcess {
+        SuccessorProcess::Alive { started: None }
+    }
+
+    fn down(_: u32) -> SuccessorProcess {
+        SuccessorProcess::Gone
+    }
+
+    fn only_4242(pid: u32) -> SuccessorProcess {
+        if pid == 4242 {
+            up(pid)
+        } else {
+            down(pid)
         }
     }
 
@@ -557,7 +650,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let ledger = Ledger::open(&path).expect("own connection");
                     ledger
-                        .claim_intent(&id, &run(&format!("run-new-{n}")), &|_| true)
+                        .claim_intent(&id, &run(&format!("run-new-{n}")), &up)
                         .expect("claim")
                 })
             })
@@ -593,30 +686,24 @@ mod tests {
             .expect("open");
         let id = intent.intent_id;
         assert!(matches!(
-            ledger
-                .claim_intent(&id, &run("run-1"), &|_| true)
-                .expect("claim"),
+            ledger.claim_intent(&id, &run("run-1"), &up).expect("claim"),
             Claim::Claimed(_)
         ));
         // Inside the grace the first launch may still be starting.
         assert_eq!(
-            ledger
-                .claim_intent(&id, &run("run-2"), &|_| true)
-                .expect("claim"),
+            ledger.claim_intent(&id, &run("run-2"), &up).expect("claim"),
             Claim::AlreadyClaimed { run: run("run-1") }
         );
         seconds.store(CLAIM_GRACE_SECONDS + 1, Ordering::SeqCst);
-        assert_eq!(ledger.launchable_intents(&|_| true).expect("list").len(), 1);
+        assert_eq!(ledger.launchable_intents(&up).expect("list").len(), 1);
         assert!(matches!(
-            ledger.claim_intent(&id, &run("run-2"), &|_| true).expect("claim"),
+            ledger.claim_intent(&id, &run("run-2"), &up).expect("claim"),
             Claim::Claimed(intent) if intent.run_id == Some(run("run-2"))
         ));
         // Compare-and-set: the claim moved once; the next caller finds
         // run-2 and, run-2 having no row yet, waits out the grace again.
         assert_eq!(
-            ledger
-                .claim_intent(&id, &run("run-3"), &|_| true)
-                .expect("claim"),
+            ledger.claim_intent(&id, &run("run-3"), &up).expect("claim"),
             Claim::AlreadyClaimed { run: run("run-2") }
         );
     }
@@ -655,26 +742,24 @@ mod tests {
             .expect("open");
         let id = intent.intent_id;
         assert!(matches!(
-            ledger
-                .claim_intent(&id, &run("run-1"), &|_| true)
-                .expect("claim"),
+            ledger.claim_intent(&id, &run("run-1"), &up).expect("claim"),
             Claim::Claimed(_)
         ));
         seconds.store(CLAIM_GRACE_SECONDS * 10, Ordering::SeqCst);
         assert_eq!(
             ledger
-                .claim_intent(&id, &run("run-2"), &|pid| pid == 4242)
+                .claim_intent(&id, &run("run-2"), &only_4242)
                 .expect("claim"),
             Claim::AlreadyClaimed { run: run("run-1") },
             "a live driver keeps its claim, however old"
         );
         assert!(ledger
-            .launchable_intents(&|pid| pid == 4242)
+            .launchable_intents(&only_4242)
             .expect("list")
             .is_empty());
         assert!(matches!(
             ledger
-                .claim_intent(&id, &run("run-2"), &|_| false)
+                .claim_intent(&id, &run("run-2"), &down)
                 .expect("claim"),
             Claim::Claimed(_)
         ));
@@ -692,12 +777,203 @@ mod tests {
             .expect("pins")
             .contains(&("run-a".to_string(), 2)));
         ledger
-            .claim_intent(&intent.intent_id, &run("run-a"), &|_| true)
+            .claim_intent(&intent.intent_id, &run("run-a"), &up)
             .expect("claim");
         // The claiming run (here run-a itself, already terminal) has ended.
         assert!(!ledger
             .pinned_candidates()
             .expect("pins")
             .contains(&("run-a".to_string(), 2)));
+    }
+
+    /// A run `run-1` that holds the claim, running, with the given driver.
+    fn claimed_by_running(
+        label: &str,
+        pid: Option<i64>,
+        started: Option<&str>,
+    ) -> (Ledger, Arc<AtomicI64>, crate::test_support::TempDir, String) {
+        let (ledger, seconds, dir) = waiting(label);
+        ledger
+            .insert_run(
+                &run("run-1"),
+                "/r",
+                None,
+                &crate::ids::TaskId::from_stored("task-a"),
+                "rk",
+            )
+            .expect("run");
+        ledger
+            .record_transition_as_driver(&crate::ledger::Transition {
+                run_id: run("run-1"),
+                attempt_id: None,
+                from_state: None,
+                to_state: State::Running,
+                reason: "worker_dispatched".into(),
+                detail: None,
+                at: ledger.now(),
+            })
+            .expect("running");
+        ledger
+            .conn
+            .execute(
+                "UPDATE runs SET driver_pid = ?1, driver_started = ?2 WHERE id = 'run-1'",
+                params![pid, started],
+            )
+            .expect("bind a driver");
+        let intent = ledger
+            .resolve_decision_with_intent(&run("run-a"), &answer(), &intent_for("run-a"))
+            .expect("written")
+            .expect("open");
+        assert!(matches!(
+            ledger
+                .claim_intent(&intent.intent_id, &run("run-1"), &up)
+                .expect("claim"),
+            Claim::Claimed(_)
+        ));
+        (ledger, seconds, dir, intent.intent_id)
+    }
+
+    #[test]
+    fn a_claim_whose_run_has_no_driver_pid_is_abandoned_after_the_grace() {
+        let (ledger, seconds, _dir, id) = claimed_by_running("nullpid", None, None);
+        assert!(ledger.launchable_intents(&up).expect("list").is_empty());
+        seconds.store(CLAIM_GRACE_SECONDS + 1, Ordering::SeqCst);
+        assert_eq!(ledger.launchable_intents(&up).expect("list").len(), 1);
+        assert!(matches!(
+            ledger.claim_intent(&id, &run("run-2"), &up).expect("claim"),
+            Claim::Claimed(intent) if intent.run_id == Some(run("run-2"))
+        ));
+    }
+
+    #[test]
+    fn a_claim_whose_pid_is_another_process_is_abandoned_after_the_grace() {
+        let (ledger, seconds, _dir, id) = claimed_by_running("reused", Some(4242), Some("t0"));
+        let reused = |_: u32| SuccessorProcess::Alive {
+            started: Some("t1".into()),
+        };
+        let same = |_: u32| SuccessorProcess::Alive {
+            started: Some("t0".into()),
+        };
+        assert!(ledger.launchable_intents(&reused).expect("list").is_empty());
+        seconds.store(CLAIM_GRACE_SECONDS + 1, Ordering::SeqCst);
+        assert!(
+            ledger.launchable_intents(&same).expect("list").is_empty(),
+            "the very process that was recorded keeps its claim"
+        );
+        assert_eq!(ledger.launchable_intents(&reused).expect("list").len(), 1);
+        assert!(matches!(
+            ledger
+                .claim_intent(&id, &run("run-2"), &reused)
+                .expect("claim"),
+            Claim::Claimed(_)
+        ));
+    }
+
+    #[test]
+    fn a_refused_launch_hands_the_claim_back_with_the_refusal_recorded() {
+        let (ledger, _, _dir) = waiting("release");
+        let intent = ledger
+            .resolve_decision_with_intent(&run("run-a"), &answer(), &intent_for("run-a"))
+            .expect("written")
+            .expect("open");
+        let id = intent.intent_id;
+        ledger.claim_intent(&id, &run("run-1"), &up).expect("claim");
+        assert!(ledger
+            .release_claim(&id, &run("run-1"), "pricing: no price for model x")
+            .expect("release"));
+        let after = ledger.successor_intent(&id).expect("read").expect("row");
+        assert_eq!(after.state, IntentState::Pending);
+        assert_eq!(after.run_id, None);
+        assert_eq!(
+            ledger.intent_refusal(&id).expect("read").as_deref(),
+            Some("pricing: no price for model x")
+        );
+        assert_eq!(ledger.launchable_intents(&up).expect("list").len(), 1);
+        // A release by a run that no longer holds the claim changes nothing.
+        assert!(!ledger
+            .release_claim(&id, &run("run-9"), "stale")
+            .expect("release"));
+    }
+
+    /// The runs a recovering plugin has launched for an intent: each poll
+    /// lists what is launchable, claims it for a new run and, when the claim
+    /// is taken, inserts that run's row (a launch).
+    fn recover(ledger: &Ledger, label: &str, alive: &dyn Fn(u32) -> SuccessorProcess) {
+        for intent in ledger.launchable_intents(alive).expect("list") {
+            let new_run = run(&format!("succ-{label}"));
+            if matches!(
+                ledger
+                    .claim_intent(&intent.intent_id, &new_run, alive)
+                    .expect("claim"),
+                Claim::Claimed(_)
+            ) {
+                ledger
+                    .insert_run(
+                        &new_run,
+                        "/r",
+                        None,
+                        &crate::ids::TaskId::from_stored("task-a"),
+                        "rk",
+                    )
+                    .expect("launch");
+            }
+        }
+    }
+
+    fn successor_runs(ledger: &Ledger) -> i64 {
+        ledger
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE id LIKE 'succ-%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count")
+    }
+
+    #[test]
+    fn a_crash_after_the_decide_commit_still_yields_one_successor_run() {
+        let (ledger, _, _dir) = waiting("fp-decide");
+        failpoint::arm(failpoint::AFTER_DECIDE_COMMIT);
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ledger.resolve_decision_with_intent(&run("run-a"), &answer(), &intent_for("run-a"))
+        }));
+        failpoint::disarm();
+        assert!(crashed.is_err());
+        // A repeated decide finds the answered decision and writes no
+        // second intent; the committed one is launched once.
+        assert_eq!(
+            ledger
+                .resolve_decision_with_intent(&run("run-a"), &answer(), &intent_for("run-a"))
+                .expect("repeat"),
+            None
+        );
+        assert_eq!(ledger.count_successor_intents().expect("count"), 1);
+        recover(&ledger, "1", &up);
+        recover(&ledger, "2", &up);
+        assert_eq!(successor_runs(&ledger), 1);
+    }
+
+    #[test]
+    fn a_crash_after_the_claim_still_yields_one_successor_run() {
+        let (ledger, seconds, _dir) = waiting("fp-claim");
+        let intent = ledger
+            .resolve_decision_with_intent(&run("run-a"), &answer(), &intent_for("run-a"))
+            .expect("written")
+            .expect("open");
+        failpoint::arm(failpoint::AFTER_CLAIM);
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ledger.claim_intent(&intent.intent_id, &run("lost"), &up)
+        }));
+        failpoint::disarm();
+        assert!(crashed.is_err());
+        // Inside the grace the claim holds; once it passes with no run row
+        // the next poll takes the claim over, once.
+        recover(&ledger, "1", &up);
+        assert_eq!(successor_runs(&ledger), 0);
+        seconds.store(CLAIM_GRACE_SECONDS + 1, Ordering::SeqCst);
+        recover(&ledger, "2", &up);
+        recover(&ledger, "3", &up);
+        assert_eq!(successor_runs(&ledger), 1);
     }
 }

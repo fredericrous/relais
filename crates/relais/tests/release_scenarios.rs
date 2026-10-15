@@ -5684,4 +5684,79 @@ fn an_unreadable_marker_is_named_by_retire_and_warned_by_doctor() {
         report.contains("run-garbled.json") && report.contains("cannot be read"),
         "{report}"
     );
+
+// A successor intent whose launch a preflight refuses (here the pricing
+// one: the machine lost its price table) is handed back: the intent is
+// pending again with the refusal recorded on it, not claimed by a run that
+// has no row, so the next launch can take it at once.
+#[test]
+fn a_run_intent_refused_by_a_preflight_leaves_the_intent_pending_with_the_refusal() {
+    let world = World::new("intent-refused");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    let path = world.root.join("narrow.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "change",
+            "objective": "Remove the entry point",
+            "base_ref": "HEAD",
+            "write_scope": ["docs/**"],
+            "acceptance": ["src/main.rs no longer exists"],
+            "verification_profile": "default",
+            "review": "off",
+        })
+        .to_string(),
+    )
+    .expect("task");
+    let run = world.relais(&["run", "--task", path.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(8), "{}", text(&run.stderr));
+    let run_id = world.only_run_id();
+    let decided = world.relais(&[
+        "decide",
+        &run_id,
+        "--answer",
+        "revise",
+        "--widen-scope",
+        "--actor",
+        "orchestrator",
+        "--json",
+    ]);
+    assert_eq!(decided.status.code(), Some(0), "{}", text(&decided.stderr));
+    let decided: serde_json::Value = serde_json::from_str(&text(&decided.stdout)).expect("json");
+    let intent_id = decided["successor_intent"]["intent_id"]
+        .as_str()
+        .expect("an intent")
+        .to_string();
+
+    let machine = world.config.join("machine.toml");
+    let priced = std::fs::read_to_string(&machine).expect("machine.toml");
+    assert!(priced.contains(PRICING));
+    std::fs::write(&machine, priced.replace(PRICING, "")).expect("machine.toml");
+    let refused = world.relais(&["run", "--intent", &intent_id]);
+    assert_eq!(refused.status.code(), Some(3), "{}", text(&refused.stderr));
+
+    let ledger = relais::ledger::Ledger::open(&world.state.join("ledger.sqlite")).expect("ledger");
+    let intent = ledger
+        .successor_intent(&intent_id)
+        .expect("read")
+        .expect("the intent");
+    assert_eq!(intent.state, relais::ledger::IntentState::Pending);
+    assert_eq!(intent.run_id, None, "no claim names a run without a row");
+    let refusal = ledger
+        .intent_refusal(&intent_id)
+        .expect("read")
+        .expect("the refusal is recorded");
+    assert!(refusal.contains("unpriced"), "{refusal}");
+    assert_eq!(
+        world.only_run_id(),
+        run_id,
+        "the refused launch made no run"
+    );
+
+    // With prices back, the next launch takes the intent at once.
+    std::fs::write(&machine, priced).expect("machine.toml");
+    let ledger_intents = ledger.launchable_intents(&|_| relais::ledger::SuccessorProcess::Gone);
+    assert_eq!(ledger_intents.expect("list").len(), 1);
 }

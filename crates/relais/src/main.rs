@@ -5579,6 +5579,29 @@ fn intent_contract(ledger: &Ledger, intent_id: &str) -> Result<(TaskContract, St
     Ok((contract, task.to_string()))
 }
 
+/// What the host says of a driver pid, with the start time of the process
+/// that holds it now: the ledger compares it with the one recorded.
+fn successor_process(pid: u32) -> relais::ledger::SuccessorProcess {
+    if relais::coordinator::process_alive(pid) {
+        relais::ledger::SuccessorProcess::Alive {
+            started: relais::procs::start_time(pid),
+        }
+    } else {
+        relais::ledger::SuccessorProcess::Gone
+    }
+}
+
+/// A launch of a successor intent was refused before its run existed: hand
+/// the claim back to pending with the refusal on the intent, so a later
+/// launch can take it instead of finding a claim with no run row.
+fn release_intent(ledger: &Ledger, source: RunSource<'_>, run_id: &RunId, refusal: &str) {
+    if let RunSource::Intent(intent) = source {
+        if let Err(e) = ledger.release_claim(intent, run_id, refusal) {
+            eprintln!("relais run: intent {intent} could not be released: {e}");
+        }
+    }
+}
+
 fn run_command(
     source: RunSource<'_>,
     revise: Option<&str>,
@@ -5699,9 +5722,7 @@ fn run_command(
     // so a second launch of the same intent finds the first run instead of
     // making another (plan A5).
     if let RunSource::Intent(intent) = source {
-        match ledger.claim_intent(intent, &run_id, &|pid| {
-            relais::coordinator::process_alive(pid)
-        }) {
+        match ledger.claim_intent(intent, &run_id, &successor_process) {
             Ok(relais::ledger::Claim::Claimed(_)) => {}
             Ok(relais::ledger::Claim::AlreadyClaimed { run }) => {
                 return Ok(refuse_run(
@@ -5725,9 +5746,36 @@ fn run_command(
     }
     // The worker attempts go to the relais plugin of the parent session;
     // everything else stays on the Claude backend.
-    let prices = load_price_table()?;
-    if let Some(blocked) = pricing_preflight("relais run", &repo, &prices, &ledger)? {
-        return Ok(blocked);
+    let prices = match load_price_table() {
+        Ok(prices) => prices,
+        Err(e) => {
+            release_intent(
+                &ledger,
+                source,
+                &run_id,
+                &format!("prices unavailable: {e}"),
+            );
+            return Err(e);
+        }
+    };
+    let refusals = match pricing_refusals(&repo, &prices, &ledger) {
+        Ok(refusals) => refusals,
+        Err(e) => {
+            release_intent(
+                &ledger,
+                source,
+                &run_id,
+                &format!("pricing preflight failed: {e}"),
+            );
+            return Err(e);
+        }
+    };
+    if !refusals.is_empty() {
+        for refusal in &refusals {
+            eprintln!("relais run: {refusal}");
+        }
+        release_intent(&ledger, source, &run_id, &refusals.join("; "));
+        return Ok(CliOutcome::Blocked);
     }
     let native_backend = relais::adapter::native::NativeBackend::new(
         backend.as_ref(),
@@ -5771,7 +5819,7 @@ fn run_command(
     // always was.
     let repo_identity = relais::repo::identity(&root);
     let task_id = task_identity(task_override.clone(), &repo_identity, &contract);
-    let trial = operational(
+    let trial = match operational(
         live_trial::decide(&live_trial::Environment {
             root: &root,
             repo: &repo,
@@ -5782,7 +5830,18 @@ fn run_command(
             ledger: Some(&ledger),
         }),
         "trial assignment",
-    )?;
+    ) {
+        Ok(trial) => trial,
+        Err(e) => {
+            release_intent(
+                &ledger,
+                source,
+                &run_id,
+                &format!("trial assignment failed: {e}"),
+            );
+            return Err(e);
+        }
+    };
     for line in trial.lines() {
         eprintln!("{line}");
     }
@@ -5817,6 +5876,12 @@ fn run_command(
                 Ok(trial_id) => trial_id,
                 Err(e) => {
                     eprintln!("relais run: {e}");
+                    release_intent(
+                        &ledger,
+                        source,
+                        &run_id,
+                        &format!("trial record failed: {e}"),
+                    );
                     return Ok(CliOutcome::OperationalFailure);
                 }
             }
@@ -5962,6 +6027,23 @@ fn pricing_preflight(
     prices: &relais::orchestration::PriceTable,
     ledger: &relais::ledger::Ledger,
 ) -> Result<Option<CliOutcome>, CliError> {
+    let refusals = pricing_refusals(policy, prices, ledger)?;
+    if refusals.is_empty() {
+        return Ok(None);
+    }
+    for refusal in &refusals {
+        eprintln!("{who}: {refusal}");
+    }
+    Ok(Some(CliOutcome::Blocked))
+}
+
+/// The pricing preflight's refusals, warnings printed; empty when the run
+/// may proceed.
+fn pricing_refusals(
+    policy: &relais::policy::RepoPolicy,
+    prices: &relais::orchestration::PriceTable,
+    ledger: &relais::ledger::Ledger,
+) -> Result<Vec<String>, CliError> {
     let mut aliases: Vec<String> = policy.models.values().map(|m| m.id.clone()).collect();
     aliases.sort();
     aliases.dedup();
@@ -5971,13 +6053,7 @@ fn pricing_preflight(
     for warning in &decided.warnings {
         eprintln!("{warning}");
     }
-    if decided.refusals.is_empty() {
-        return Ok(None);
-    }
-    for refusal in &decided.refusals {
-        eprintln!("{who}: {refusal}");
-    }
-    Ok(Some(CliOutcome::Blocked))
+    Ok(decided.refusals.iter().map(|r| r.to_string()).collect())
 }
 
 /// The `done` line of a replay, sent once its trial is recorded (or could
@@ -7194,7 +7270,7 @@ fn recipe_rollback_command(name: &str, mode: AmendMode) -> Result<CliOutcome, Cl
 /// `resume` only list them; the plugin is the one launcher.
 fn launchable_intents(ledger: &Ledger) -> Vec<relais::ledger::SuccessorIntent> {
     ledger
-        .launchable_intents(&relais::coordinator::process_alive)
+        .launchable_intents(&successor_process)
         .unwrap_or_else(|e| {
             eprintln!("relais: successor intents cannot be listed: {e}");
             Vec::new()

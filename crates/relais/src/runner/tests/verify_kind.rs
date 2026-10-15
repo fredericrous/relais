@@ -718,7 +718,9 @@ fn a_widened_scope_verify_names_the_source_run_and_its_receipt_carries_the_delta
     assert!(matches!(
         fixture
             .ledger
-            .claim_intent(&stored.intent_id, &new_run, &|_| true)
+            .claim_intent(&stored.intent_id, &new_run, &|_| {
+                crate::ledger::SuccessorProcess::Alive { started: None }
+            })
             .expect("claim"),
         crate::ledger::Claim::Claimed(_)
     ));
@@ -934,5 +936,111 @@ fn a_verify_run_records_no_routing_prediction() {
         .predictions(&verify.run_id)
         .expect("predictions")
         .is_empty());
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+/// How many runs the ledger holds for an intent: the run its claim names
+/// that has a row.
+fn successor_runs_of(ledger: &Ledger, intent_id: &str) -> usize {
+    let intent = ledger
+        .successor_intent(intent_id)
+        .expect("read")
+        .expect("the intent");
+    intent
+        .run_id
+        .into_iter()
+        .filter(|run| ledger.run_exists(run).expect("read"))
+        .count()
+}
+
+#[test]
+fn a_launch_that_dies_before_its_id_is_returned_leaves_exactly_one_successor_run() {
+    use crate::ledger::{failpoint, Claim, DecisionAnswer, SuccessorProcess};
+    use crate::runner::successor;
+
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let backend = MockBackend::new(|spec| {
+        std::fs::create_dir_all(spec.work_dir.join("docs")).expect("mkdir");
+        std::fs::write(spec.work_dir.join("docs/extra.md"), "one\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let RunOutcome {
+        run_id: decided,
+        terminal: Terminal::NeedsDecision { .. },
+    } = fixture.execute(&fixture.contract(Review::Off), &repo, &backend)
+    else {
+        panic!("a write outside the scope waits on a person");
+    };
+    let paths = successor::out_of_scope_paths(&fixture.ledger, &decided).expect("paths");
+    let (original, _) = fixture
+        .ledger
+        .run_contract_and_tier(&decided)
+        .expect("read")
+        .expect("recorded");
+    let widened = successor::widened_contract(&original, &decided, &paths).expect("widened");
+    let intent = successor::plan(
+        &fixture.ledger,
+        &decided,
+        &widened,
+        paths,
+        &fixture.artifacts,
+    )
+    .expect("planned");
+    let stored = fixture
+        .ledger
+        .resolve_decision_with_intent(
+            &decided,
+            &DecisionAnswer {
+                resolution: Reason::DecisionRevised,
+                actor: crate::ledger::Actor::Orchestrator,
+                person_quote: None,
+                recorded_via: crate::ledger::RecordedVia::Cli,
+                note: None,
+                successor_run: None,
+                from_state: State::NeedsDecision,
+                to_state: State::Failed,
+            },
+            &intent,
+        )
+        .expect("written")
+        .expect("open decision");
+    let alive = |_: u32| SuccessorProcess::Alive { started: None };
+    let first = fixture.ids.run_id().expect("a run id");
+    assert!(matches!(
+        fixture
+            .ledger
+            .claim_intent(&stored.intent_id, &first, &alive)
+            .expect("claim"),
+        Claim::Claimed(_)
+    ));
+    let contract = TaskContract::from_json_str(&stored.contract_json).expect("the stored contract");
+
+    // The launch inserts the run row, then dies before the caller learns
+    // the run id.
+    failpoint::arm(failpoint::AFTER_LAUNCH);
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture.execute_as(Some(first.clone()), &contract, &repo, &backend)
+    }));
+    failpoint::disarm();
+    assert!(crashed.is_err(), "the failpoint fired");
+
+    // Recovery: the plugin polls again and claims again. The run that was
+    // launched holds the claim; no second run is made.
+    let retry = fixture.ids.run_id().expect("a run id");
+    assert_eq!(
+        fixture
+            .ledger
+            .claim_intent(&stored.intent_id, &retry, &alive)
+            .expect("claim"),
+        Claim::AlreadyClaimed { run: first.clone() }
+    );
+    assert_eq!(successor_runs_of(&fixture.ledger, &stored.intent_id), 1);
+    assert!(!fixture.ledger.run_exists(&retry).expect("read"));
     std::fs::remove_dir_all(&fixture.dir).ok();
 }

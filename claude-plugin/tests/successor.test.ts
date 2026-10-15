@@ -33,7 +33,7 @@ test('launchableIntents reads the intents a status lists and nothing else', () =
   expect(launchableIntents(JSON.stringify({ intents: [{ intent_id: 'intent-2' }, { repo: '/r' }] }))).toEqual([])
 })
 
-test('a decide that returns a successor_intent claims and launches it once; a repeat does not launch again', async ($: any, on: any) => {
+test('a decide that returns a successor_intent launches it; a repeat launches it again and the relais claim refuses the duplicate', async ($: any, on: any) => {
   const engine = scriptedEngine(on)
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   await settle(engine)
@@ -47,15 +47,15 @@ test('a decide that returns a successor_intent claims and launches it once; a re
   expect(launches(engine).map((e: any) => e.argv)).toEqual([['relais', 'run', '--intent', 'intent-1', '--protocol']])
   expect(launches(engine)[0].cwd).toBe('/repo')
 
-  // The same decide again: relais returns the same intent, the plugin has
-  // already launched it.
+  // The same decide again launches the same intent; relais's claim, not the
+  // plugin, refuses the duplicate.
   const again = await decide($)
   await settle(engine)
-  expect(again.result).toContain('already launched')
-  expect(launches(engine).length).toBe(1)
+  expect(again.result).toContain('Started relais successor intent intent-1')
+  expect(launches(engine).every((e: any) => e.argv[3] === 'intent-1')).toBe(true)
 })
 
-test('a pending intent found on start is launched once, and a later status poll does not launch it again', async ($: any, on: any) => {
+test('a pending intent found on start is launched, and a poll that still lists it launches it again', async ($: any, on: any) => {
   const engine = scriptedEngine(on)
   engine.script.runResult = (argv: string[]) =>
     argv[1] === 'native' && argv[2] === 'status' && argv.includes('--session')
@@ -69,8 +69,32 @@ test('a pending intent found on start is launched once, and a later status poll 
 
   await $.tool.call({ tool: 'mcp__relais__status' })
   await settle(engine)
-  expect(launches(engine).length).toBe(1)
+  // relais still lists it, so its successor is not running: relais's claim
+  // decides, not the plugin.
+  expect(launches(engine).length).toBe(2)
   expect(nativeCalls(engine.calls, 'status').some(c => c.argv.includes('--session'))).toBe(true)
+})
+
+test('an intent whose successor died is relaunched by a later poll in the same session, and not while it lives', async ($: any, on: any) => {
+  const engine = scriptedEngine(on)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await settle(engine)
+  let listed = [INTENT]
+  engine.script.runResult = (argv: string[]) =>
+    argv.includes('--session') ? result(JSON.stringify({ runs: [], intents: listed })) : result('')
+  await $.tool.call({ tool: 'mcp__relais__status' })
+  await settle(engine)
+  expect(launches(engine).length).toBe(1)
+  // The successor lives: relais lists nothing, so nothing is launched.
+  listed = []
+  await $.tool.call({ tool: 'mcp__relais__status' })
+  await settle(engine)
+  expect(launches(engine).length).toBe(1)
+  // It died: relais lists the intent again and the same session relaunches.
+  listed = [INTENT]
+  await $.tool.call({ tool: 'mcp__relais__status' })
+  await settle(engine)
+  expect(launches(engine).length).toBe(2)
 })
 
 test('a status poll launches an intent that appeared after start', async ($: any, on: any) => {
@@ -91,6 +115,37 @@ test('a status relais cannot give launches nothing', async ($: any, on: any) => 
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   await settle(engine)
   expect(launches(engine).length).toBe(0)
+})
+
+const failing = (script: (argv: string[]) => any) => async ($: any, on: any) => {
+  const engine = scriptedEngine(on)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await settle(engine)
+  engine.script.runResult = script
+  const out = await $.tool.call({ tool: 'mcp__relais__status' })
+  await settle(engine)
+  expect(launches(engine).length).toBe(0)
+  return String(out.result ?? out.deny)
+}
+
+test('a non-zero status exit is a typed failure and launches nothing', async ($: any, on: any) => {
+  const text = await failing((argv: string[]) =>
+    argv.includes('--session') ? { ...result('', 3), stderr: 'boom' } : result(''))($, on)
+  expect(text).toContain('status_exit 3')
+  expect(text).toContain('boom')
+})
+
+test('a thrown status error is a typed failure and launches nothing', async ($: any, on: any) => {
+  const text = await failing((argv: string[]) => {
+    if (argv.includes('--session')) throw new Error('spawn failed')
+    return result('')
+  })($, on)
+  expect(text).toContain('status_threw')
+})
+
+test('unparsable status JSON is a typed failure and launches nothing', async ($: any, on: any) => {
+  const text = await failing((argv: string[]) => (argv.includes('--session') ? result('not json') : result('')))($, on)
+  expect(text).toContain('status_unparsable')
 })
 
 test('widen_scope and successor_contract belong to revise and exclude each other', async ($: any, on: any) => {

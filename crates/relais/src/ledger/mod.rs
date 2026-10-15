@@ -24,10 +24,13 @@ use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
 use crate::policy::Tier;
 use crate::route::RoutedBy;
 
+pub(crate) mod failpoint;
 mod review;
 mod router;
 mod successor;
-pub use successor::{Claim, IntentState, NewIntent, SuccessorIntent, CLAIM_GRACE_SECONDS};
+pub use successor::{
+    Claim, IntentState, NewIntent, SuccessorIntent, SuccessorProcess, CLAIM_GRACE_SECONDS,
+};
 mod task_types;
 pub use review::{MergeTotals, ReviewClassTotals, ReviewOutcomeRow};
 pub use router::{
@@ -39,7 +42,7 @@ pub use task_types::{
     ExportedTasks, ImportedTaskTypes, StoredTaskType, TaskExportRow, TaskTypeSource,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 34;
+pub const LEDGER_SCHEMA_VERSION: u64 = 35;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1970,6 +1973,15 @@ const MIGRATIONS: &[(&str, &str)] = &[
         claimed_at TEXT
     );
     CREATE INDEX idx_successor_intents_run ON successor_intents(run_id);
+    "#,
+    ),
+    (
+        // Why the last launch of a successor intent was refused before it
+        // had a run (a preflight said no) and when. Additive and nullable.
+        "v35",
+        r#"
+    ALTER TABLE successor_intents ADD COLUMN refusal TEXT;
+    ALTER TABLE successor_intents ADD COLUMN refused_at TEXT;
     "#,
     ),
 ];

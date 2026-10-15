@@ -2047,7 +2047,11 @@ impl<'a> RunEngine<'a> {
                 if let Some(purpose) = self.config.purpose {
                     ledger.set_run_purpose(&self.run_id, purpose)?;
                 }
-                inserted?
+                inserted?;
+                // The run is launched (its row exists) and nothing has
+                // told the caller its id yet.
+                #[cfg(test)]
+                crate::ledger::failpoint::hit(crate::ledger::failpoint::AFTER_LAUNCH);
             }
             Some((parent_run, package_id, _role)) => {
                 // A work package is not a task of its own (SPEC §19): it
