@@ -9482,17 +9482,23 @@ fn salvage_command(
             format!("run {run} already carries a decision on record"),
         ));
     };
+    // The decision is saved: a landing that cannot be recorded is logged and
+    // never fails the command; detection finds the landing itself later.
     if contained == Some(true) {
-        if let Some(workspace) = operational(ledger.run_workspace(run), "decide")? {
-            operational(
-                relais::learn::salvage::record_salvage_landing(
-                    ledger,
-                    run,
-                    &workspace.repo_path,
-                    candidate_sha,
-                ),
-                "decide",
-            )?;
+        let recorded = ledger.run_workspace(run).and_then(|workspace| {
+            workspace
+                .map(|w| {
+                    relais::learn::salvage::record_salvage_landing(
+                        ledger,
+                        run,
+                        &w.repo_path,
+                        candidate_sha,
+                    )
+                })
+                .transpose()
+        });
+        if let Err(e) = recorded {
+            eprintln!("relais: could not record the landing of {run}: {e}");
         }
     }
     Ok(Ok(Decided {

@@ -298,28 +298,6 @@ fn inspect_from(
     (finding, walked.found)
 }
 
-/// The preferred tip among `for-each-ref`'s `<refname> <sha>` lines:
-/// origin's HEAD, then `main`, then `master`; `HEAD` when none exists.
-fn default_tip(refs: &str) -> String {
-    let named: Vec<(&str, &str)> = refs
-        .lines()
-        .filter_map(|line| line.trim().split_once(' '))
-        .collect();
-    [
-        "refs/remotes/origin/HEAD",
-        "refs/heads/main",
-        "refs/heads/master",
-    ]
-    .iter()
-    .find_map(|want| {
-        named
-            .iter()
-            .find(|(name, _)| name == want)
-            .map(|(_, sha)| sha.to_string())
-    })
-    .unwrap_or_else(|| "HEAD".to_string())
-}
-
 /// What a walk decided, and the landing it found on the way (even when it
 /// then stopped), for the caller to record.
 struct Walked {
@@ -375,7 +353,7 @@ fn scan(
             "refs/heads/master",
         ],
     )?;
-    let tip = default_tip(&refs);
+    let tip = salvage::default_tip(&refs);
     let range = match recorded {
         // The landing is known: only what came after it can undo it.
         Some(landing) => format!("{}..{tip}", landing.sha),
@@ -581,14 +559,22 @@ fn inspect_candidate(
         .with_timezone(&Utc);
     // Absolute, because git runs from the repository.
     let patch = std::path::absolute(&patch).unwrap_or(patch);
-    let recorded = ledger.landing_of(&candidate.run)?.and_then(|(sha, at)| {
-        let at = DateTime::parse_from_rfc3339(&at).ok()?.with_timezone(&Utc);
-        Some(Commit {
-            sha,
-            at,
-            message: String::new(),
-        })
-    });
+    let recorded = match ledger.landing_of(&candidate.run)? {
+        None => None,
+        Some((sha, at)) => {
+            let at = DateTime::parse_from_rfc3339(&at)
+                .map_err(|e| LedgerError::Corrupt {
+                    what: format!("the landing time of run {}", candidate.run),
+                    detail: format!("`{at}` is not an RFC3339 timestamp: {e}"),
+                })?
+                .with_timezone(&Utc);
+            Some(Commit {
+                sha,
+                at,
+                message: String::new(),
+            })
+        }
+    };
     Ok(inspect_from(
         &repo,
         &patch,
@@ -819,6 +805,30 @@ mod tests {
     }
 
     #[test]
+    fn a_salvage_candidate_off_the_default_tip_chain_records_no_landing() {
+        let w = world("revert-salvage-off-chain", &day(3));
+        let run = RunId::from_stored("run-a");
+        w.land(&day(5));
+        run_git_at(&w.root, &day(6), &["checkout", "-q", "-b", "other"]);
+        std::fs::write(w.root.join("b.txt"), "x\n").unwrap();
+        let off = w.commit(&day(6), "a commit off main");
+        run_git_at(&w.root, &day(6), &["checkout", "-q", "main"]);
+        assert!(!salvage::record_salvage_landing(&w.ledger, &run, &w.root, &off).unwrap());
+        assert_eq!(w.ledger.landing_of(&run).unwrap(), None);
+    }
+
+    #[test]
+    fn an_unparsable_recorded_landing_time_is_corrupt() {
+        let w = world("revert-bad-landed-at", &day(3));
+        let landing = w.land(&day(5));
+        w.ledger
+            .record_landing(&RunId::from_stored("run-a"), &landing, "not a time")
+            .unwrap();
+        let err = detect(&w.ledger, now()).unwrap_err();
+        assert!(matches!(err, LedgerError::Corrupt { .. }), "{err:?}");
+    }
+
+    #[test]
     fn an_undo_by_deleting_the_change_without_a_revert_message_is_detected() {
         let w = world("revert-by-hand", &day(3));
         w.land(&day(5));
@@ -962,13 +972,13 @@ mod tests {
     fn the_tip_prefers_origin_head_over_a_lagging_local_main() {
         // `for-each-ref` prints in refname order: heads before remotes.
         let refs = "refs/heads/main aaa\nrefs/heads/master bbb\nrefs/remotes/origin/HEAD ccc\n";
-        assert_eq!(default_tip(refs), "ccc");
+        assert_eq!(salvage::default_tip(refs), "ccc");
         assert_eq!(
-            default_tip("refs/heads/master bbb\nrefs/heads/main aaa\n"),
+            salvage::default_tip("refs/heads/master bbb\nrefs/heads/main aaa\n"),
             "aaa"
         );
-        assert_eq!(default_tip("refs/heads/master bbb\n"), "bbb");
-        assert_eq!(default_tip(""), "HEAD");
+        assert_eq!(salvage::default_tip("refs/heads/master bbb\n"), "bbb");
+        assert_eq!(salvage::default_tip(""), "HEAD");
     }
 
     fn record(w: &World, task: &TaskId, kind: OutcomeKind, at: &str) {

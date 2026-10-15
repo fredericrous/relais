@@ -287,10 +287,33 @@ pub fn containment_of_run(
     Ok(candidate_contained(&repo, &patch, sha))
 }
 
+/// The preferred tip among `for-each-ref`'s `<refname> <sha>` lines:
+/// origin's HEAD, then `main`, then `master`; `HEAD` when none exists.
+pub(crate) fn default_tip(refs: &str) -> String {
+    let named: Vec<(&str, &str)> = refs
+        .lines()
+        .filter_map(|line| line.trim().split_once(' '))
+        .collect();
+    [
+        "refs/remotes/origin/HEAD",
+        "refs/heads/main",
+        "refs/heads/master",
+    ]
+    .iter()
+    .find_map(|want| {
+        named
+            .iter()
+            .find(|(name, _)| name == want)
+            .map(|(_, sha)| sha.to_string())
+    })
+    .unwrap_or_else(|| "HEAD".to_string())
+}
+
 /// Record a contained salvage's candidate commit as the run's landing, with
-/// the commit's own time. `Ok(false)` when the repository or the commit
-/// cannot be read: nothing is recorded and detection finds the landing
-/// itself later.
+/// the commit's own time, only when the commit is on the default tip's
+/// first-parent chain (the chain revert detection walks). `Ok(false)` when
+/// the repository or the commit cannot be read or is off that chain:
+/// nothing is recorded and detection finds the landing itself later.
 pub fn record_salvage_landing(
     ledger: &Ledger,
     run: &RunId,
@@ -300,24 +323,49 @@ pub fn record_salvage_landing(
     let Some(repo) = reachable_repo(repo_path) else {
         return Ok(false);
     };
-    let output = Command::new("git")
-        .current_dir(&repo)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .args(["show", "-s", "--format=%cI", sha])
-        .stdin(Stdio::null())
-        .output();
-    let landed_at = match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        _ => return Ok(false),
+    let git = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git")
+            .current_dir(&repo)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).to_string())
     };
-    let Ok(landed_at) = chrono::DateTime::parse_from_rfc3339(&landed_at) else {
+    let Some(shown) = git(&["show", "-s", "--format=%H%n%cI", sha]) else {
+        return Ok(false);
+    };
+    let mut lines = shown.lines();
+    let (Some(full), Some(landed_at)) = (lines.next(), lines.next()) else {
+        return Ok(false);
+    };
+    let Some(refs) = git(&[
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+        "refs/remotes/origin/HEAD",
+        "refs/heads/main",
+        "refs/heads/master",
+    ]) else {
+        return Ok(false);
+    };
+    let tip = default_tip(&refs);
+    let Some(chain) = git(&["rev-list", "--first-parent", &tip]) else {
+        return Ok(false);
+    };
+    if !chain.lines().any(|l| l == full) {
+        return Ok(false);
+    }
+    let Ok(landed_at) = chrono::DateTime::parse_from_rfc3339(landed_at.trim()) else {
         return Ok(false);
     };
     ledger.record_landing(
         run,
-        sha,
+        full,
         &landed_at.with_timezone(&chrono::Utc).to_rfc3339(),
     )?;
     Ok(true)
