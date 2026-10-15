@@ -5684,6 +5684,7 @@ fn an_unreadable_marker_is_named_by_retire_and_warned_by_doctor() {
         report.contains("run-garbled.json") && report.contains("cannot be read"),
         "{report}"
     );
+}
 
 // A successor intent whose launch a preflight refuses (here the pricing
 // one: the machine lost its price table) is handed back: the intent is
