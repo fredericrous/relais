@@ -63,7 +63,6 @@ pub(crate) struct RootContext<'a> {
     /// Why the baseline could not be cached, when it could not (V2).
     pub baseline_cache_refused: &'a Option<crate::verify::CacheRefused>,
     pub logs_dir: &'a Path,
-    pub deadline: Instant,
 }
 
 pub(crate) enum Decomposed {
@@ -442,7 +441,7 @@ fn execute_waves(
             );
         }
         for path in &relevant {
-            if let Some(holder) = engine.wait_for_writers(path, root.deadline)? {
+            if let Some(holder) = engine.wait_for_writers(path)? {
                 return engine.stop_on_held_lease(path, &holder);
             }
         }
@@ -609,7 +608,7 @@ fn run_package(
     };
 
     // Aggregate limits, checked before every package (SPEC §19).
-    let remaining_wall = root.deadline.saturating_duration_since(Instant::now());
+    let remaining_wall = engine.budgets.remaining();
     if remaining_wall < Duration::from_secs(1) {
         return Ok(PackageEnd::Stop(
             engine.stop(&budget, Observation::LimitReached(Limit::WallClock))?,
@@ -687,6 +686,8 @@ fn run_package(
             // it inherits is what the root run has left.
             attempts: Some(plan.limits.attempts_per_package),
             wall_seconds: Some(remaining_wall.as_secs().max(1)),
+            // The root run's total is the run's, not a package's.
+            total_seconds: None,
         },
         // The root's review setting, as written: a package is reviewed
         // exactly as the contract asks the run to be.
@@ -1008,7 +1009,6 @@ fn accept_integrated(
                 // `candidate-latest.patch`, which a decomposed run never
                 // writes (R4).
                 patch_path: assembled.patch_path.clone(),
-                deadline: root.deadline,
                 routed_by: root.decision.routed_by,
                 covering: root.decision.covering.clone(),
             },
@@ -1195,10 +1195,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
             tools
         },
         work_dir: engine.config.repo_dir.to_path_buf(),
-        wall_timeout: root
-            .deadline
-            .saturating_duration_since(Instant::now())
-            .max(Duration::from_secs(1)),
+        wall_timeout: engine.budgets.remaining().max(Duration::from_secs(1)),
         cancel: None,
         agent: AgentKind::Planner,
     };
@@ -1219,7 +1216,6 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         depth: 0,
         parent: None,
         reserve_micros: remaining_budget.unwrap_or(0),
-        deadline: root.deadline,
         budget: &budget,
         // The planner reads; it writes no worktree and takes no lease.
         write_lease: None,

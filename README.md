@@ -59,7 +59,7 @@ split wherever a caller has to act differently.
 | 0 | the command did what was asked |
 | 1 | relais's own machinery failed (ledger, registry, a file it owns) — nothing is implied about the task |
 | 2 | the invocation, or a file it named, is invalid |
-| 3 | policy, trust, admission or the environment refuses; no model ran. This includes a `kind: verify` run that is blocked on its candidate (`candidate_source_running`, `candidate_missing`, `candidate_foreign_repo`, `candidate_does_not_apply`, `candidate_digest_mismatch`), and a `relais run --intent` for an intent already claimed (`intent_already_claimed`, naming the run that holds it) |
+| 3 | policy, trust, admission or the environment refuses; no model ran. This includes a `kind: verify` run that is blocked on its candidate (`candidate_source_running`, `candidate_missing`, `candidate_foreign_repo`, `candidate_does_not_apply`, `candidate_digest_mismatch`), and a `relais run --intent` for an intent already claimed (`intent_already_claimed`, naming the run that holds it). A run that waited out a budget on a loaded machine is blocked too: `admission_wait_exhausted` (queued for a lease past `[resources] admission_wait_seconds`) and `disk_low` (waited for free disk past `disk_wait_seconds`). `budget_exhausted (wall_clock)` and `budget_exhausted (total)` exit 5 |
 | 4 | the task executed and produced no acceptable candidate |
 | 5 | the spending ceiling was reached; patch and evidence preserved |
 | 6 | the run was interrupted; `relais resume` reconciles it |

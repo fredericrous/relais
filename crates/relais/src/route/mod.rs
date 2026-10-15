@@ -1219,6 +1219,7 @@ mod tests {
     fn machine_for(repo: &RepoPolicy) -> MachineSettings {
         let mut machine = MachineSettings {
             workspace: Default::default(),
+            resources: Default::default(),
             schema_version: 1,
             allowed_models: None,
             spending: Default::default(),
@@ -1581,6 +1582,7 @@ mod tests {
         let repo = repo_policy();
         let machine = MachineSettings {
             workspace: Default::default(),
+            resources: Default::default(),
             schema_version: 1,
             allowed_models: None,
             spending: Default::default(),
@@ -2094,6 +2096,7 @@ mod tests {
         let repo = repo_policy();
         let machine = MachineSettings {
             workspace: Default::default(),
+            resources: Default::default(),
             schema_version: 1,
             allowed_models: None,
             spending: Default::default(),

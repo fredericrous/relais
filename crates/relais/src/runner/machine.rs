@@ -207,10 +207,10 @@ pub enum Limit {
         code: String,
         detail: String,
     },
-    /// Queued for admission until the wall clock ran out.
-    AdmissionQueue {
-        position: usize,
-    },
+    /// The run's end-to-end `total_seconds` ran out (ADR-0010). The work
+    /// budget is [`Limit::WallClock`]; waiting for a lease or the disk
+    /// ends the run `blocked`, not here.
+    Total,
 }
 
 /// One row's worth of input: what the runner observed about the
@@ -545,7 +545,7 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
                     serde_json::json!({ "limit": "attempts", "max": max }),
                 ),
                 Limit::WallClock => (
-                    "wall clock for the run is exhausted".to_string(),
+                    "the work budget (wall clock after the baseline) is exhausted".to_string(),
                     serde_json::json!({ "limit": "wall_clock" }),
                 ),
                 // Both rendered amounts name themselves ("$0.02 per run",
@@ -560,11 +560,9 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
                     format!("{code}: {detail}"),
                     serde_json::json!({ "limit": "admission", "code": code }),
                 ),
-                Limit::AdmissionQueue { position } => (
-                    format!(
-                        "the wall clock ran out while queued for admission (position {position})"
-                    ),
-                    serde_json::json!({ "limit": "admission_queue", "position": position }),
+                Limit::Total => (
+                    "the total time for the run is exhausted".to_string(),
+                    serde_json::json!({ "limit": "total" }),
                 ),
             };
             Decision::stop(
@@ -794,7 +792,7 @@ mod tests {
                 code: "run_agent_cap".into(),
                 detail: "".into(),
             },
-            Limit::AdmissionQueue { position: 2 },
+            Limit::Total,
         ] {
             let d = decide(&b, Observation::LimitReached(limit));
             assert_eq!(d.state, State::BudgetExhausted);

@@ -168,6 +168,14 @@ pub enum Reason {
     /// The candidate's patch file no longer matches the digest recorded
     /// when the candidate was resolved.
     CandidateDigestMismatch,
+    /// The run's cumulative time queued for a lease reached
+    /// `admission_wait_seconds` (ADR-0010): the machine had no room for it
+    /// in the time it was given. A block (exit 3), not a verdict on the work.
+    AdmissionWaitExhausted,
+    /// The run's cumulative time waiting for the disk floor reached
+    /// `disk_wait_seconds` (ADR-0010). A block (exit 3), not a verdict on
+    /// the work.
+    DiskLow,
 }
 
 impl Reason {
@@ -176,7 +184,7 @@ impl Reason {
     ///
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it.
-    pub const ALL: [Self; 59] = [
+    pub const ALL: [Self; 61] = [
         Self::ChecksAndReviewPassed,
         Self::BehavioralFailure,
         Self::RepairExhausted,
@@ -236,6 +244,8 @@ impl Reason {
         Self::CandidateForeignRepo,
         Self::CandidateDoesNotApply,
         Self::CandidateDigestMismatch,
+        Self::AdmissionWaitExhausted,
+        Self::DiskLow,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -299,6 +309,8 @@ impl Reason {
             Self::CandidateForeignRepo => "candidate_foreign_repo",
             Self::CandidateDoesNotApply => "candidate_does_not_apply",
             Self::CandidateDigestMismatch => "candidate_digest_mismatch",
+            Self::AdmissionWaitExhausted => "admission_wait_exhausted",
+            Self::DiskLow => "disk_low",
         }
     }
 

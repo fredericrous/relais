@@ -15,6 +15,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+mod budgets;
+pub use budgets::{
+    BudgetClock, BudgetLimits, Budgets, Exhausted, Wait, WaitKind, WallClock,
+    DEFAULT_ADMISSION_WAIT_SECONDS, DEFAULT_DISK_WAIT_SECONDS,
+};
+
 use crate::contract::{Review, TaskContract};
 use crate::ids::canonical_json_hash;
 use crate::money::MicroUsd;
@@ -814,6 +820,36 @@ impl WorkspaceSettings {
     }
 }
 
+/// `[resources]`: how long a run may wait on the machine (ADR-0010). Every
+/// key is optional, so a file written before this table existed parses
+/// unchanged and is written back without it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct ResourceSettings {
+    /// Cumulative time a run may be queued for a lease, baseline
+    /// included. Default 1800.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_wait_seconds: Option<u64>,
+    /// Cumulative time a run may wait for the disk floor. Default 600.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_wait_seconds: Option<u64>,
+}
+
+impl ResourceSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn admission_wait_seconds(&self) -> u64 {
+        self.admission_wait_seconds
+            .unwrap_or(DEFAULT_ADMISSION_WAIT_SECONDS)
+    }
+
+    pub fn disk_wait_seconds(&self) -> u64 {
+        self.disk_wait_seconds.unwrap_or(DEFAULT_DISK_WAIT_SECONDS)
+    }
+}
+
 /// Machine-owned settings, `~/.config/relais/machine.toml`. Never written
 /// by a run; workers cannot update grants or policy during a run (SPEC §5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -845,6 +881,9 @@ pub struct MachineSettings {
     /// Where runs happen (ADR-0008). Absent = `auto`.
     #[serde(default, skip_serializing_if = "WorkspaceSettings::is_default")]
     pub workspace: WorkspaceSettings,
+    /// `[resources]`: the wait budgets (ADR-0010). Absent = the defaults.
+    #[serde(default, skip_serializing_if = "ResourceSettings::is_default")]
+    pub resources: ResourceSettings,
     #[serde(default)]
     pub routing: RoutingSettings,
     /// What a hook-admitted agent needs that the rest of this struct does
@@ -3312,5 +3351,61 @@ amont = { mode = "optional", bin = "/opt/amont/bin/amont" }
             a.max_attempts, 5,
             "and a written one past the ceiling does not broaden"
         );
+    }
+
+    /// ADR-0010 added `[resources]` to the machine settings and
+    /// `limits.total_seconds` to the contract. Both are optional, so a file
+    /// written before them parses to the same values and is written back
+    /// without them.
+    #[test]
+    fn files_written_before_the_budgets_parse_and_write_back_unchanged() {
+        let old = "schema_version = 1\n\n[spending]\nper_run_micros = 5000000\n";
+        let machine = MachineSettings::from_toml_str(old).expect("an old file parses");
+        assert!(machine.resources.is_default());
+        assert_eq!(machine.resources.admission_wait_seconds(), 1800);
+        assert_eq!(machine.resources.disk_wait_seconds(), 600);
+        let written = toml::to_string(&machine).expect("serializes");
+        assert!(!written.contains("resources"), "{written}");
+        assert!(!written.contains("wait_seconds"), "{written}");
+        assert_eq!(
+            MachineSettings::from_toml_str(&written).expect("round trip"),
+            machine
+        );
+
+        let new = format!("{old}\n[resources]\nadmission_wait_seconds = 60\n");
+        let tuned = MachineSettings::from_toml_str(&new).expect("a tuned file parses");
+        assert_eq!(tuned.resources.admission_wait_seconds(), 60);
+        assert_eq!(
+            tuned.resources.disk_wait_seconds(),
+            600,
+            "the other stays default"
+        );
+        let written = toml::to_string(&tuned).expect("serializes");
+        assert!(written.contains("admission_wait_seconds = 60"), "{written}");
+        assert!(!written.contains("disk_wait_seconds"), "{written}");
+
+        let contract = crate::contract::TaskContract::from_json_str(
+            r#"{"schema_version":1,"kind":"change","objective":"o","base_ref":"HEAD",
+                "write_scope":["src/**"],"acceptance":["a"],"verification_profile":"p",
+                "limits":{"attempts":2,"wall_seconds":600}}"#,
+        )
+        .expect("an old contract parses");
+        assert_eq!(contract.limits.total_seconds, None);
+        let written = serde_json::to_string(&contract.limits).expect("serializes");
+        assert!(!written.contains("total_seconds"), "{written}");
+        assert_eq!(written, r#"{"attempts":2,"wall_seconds":600}"#);
+        let capped = crate::contract::TaskContract::from_json_str(
+            r#"{"schema_version":1,"kind":"change","objective":"o","base_ref":"HEAD",
+                "write_scope":["src/**"],"acceptance":["a"],"verification_profile":"p",
+                "limits":{"total_seconds":900}}"#,
+        )
+        .expect("a total parses");
+        assert_eq!(capped.limits.total_seconds, Some(900));
+        let zero = crate::contract::TaskContract::from_json_str(
+            r#"{"schema_version":1,"kind":"change","objective":"o","base_ref":"HEAD",
+                "write_scope":["src/**"],"acceptance":["a"],"verification_profile":"p",
+                "limits":{"total_seconds":0}}"#,
+        );
+        assert!(zero.is_err(), "a zero total is not a limit");
     }
 }

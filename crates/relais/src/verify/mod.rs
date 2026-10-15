@@ -25,7 +25,7 @@ use crate::contract::Kind;
 use crate::ids::{canonical_json_hash, sha256_hex};
 use crate::money::{CostCompleteness, MicroUsd};
 use crate::policy::{
-    named_command, CommandSpec, DependencyMode, Integrations, VerificationProfile,
+    named_command, Budgets, CommandSpec, DependencyMode, Integrations, VerificationProfile,
 };
 use crate::procs::Ended;
 use crate::protocol::{Event, Events};
@@ -850,7 +850,33 @@ pub fn run_observed(
     events: &Events,
     cancel: Option<&AtomicBool>,
 ) -> Result<CheckOutcome, VerifyError> {
-    let timeout = command_timeout(spec)?;
+    run_observed_within(
+        dir,
+        spec,
+        logs_dir,
+        label,
+        log_stem,
+        events,
+        cancel,
+        &Budgets::unbounded(),
+    )
+}
+
+/// [`run_observed`] under a run's budgets (ADR-0010): the command starts
+/// with the smaller of its own timeout and what is left of each budget
+/// that applies to it.
+#[allow(clippy::too_many_arguments)]
+pub fn run_observed_within(
+    dir: &Path,
+    spec: &CommandSpec,
+    logs_dir: &Path,
+    label: &str,
+    log_stem: &str,
+    events: &Events,
+    cancel: Option<&AtomicBool>,
+    budgets: &Budgets,
+) -> Result<CheckOutcome, VerifyError> {
+    let timeout = budgets.clip(command_timeout(spec)?);
     std::fs::create_dir_all(logs_dir)?;
     // A report the candidate itself committed is not this command's
     // result: clear it, so what is read afterwards was written by the run.
@@ -1082,12 +1108,34 @@ pub fn run_profile(
     events: &Events,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<CheckOutcome>, VerifyError> {
+    run_profile_within(
+        dir,
+        profile,
+        logs_dir,
+        prefix,
+        events,
+        cancel,
+        &Budgets::unbounded(),
+    )
+}
+
+/// [`run_profile`] under a run's budgets: each command is clipped to what
+/// is left when it starts.
+pub fn run_profile_within(
+    dir: &Path,
+    profile: &VerificationProfile,
+    logs_dir: &Path,
+    prefix: &str,
+    events: &Events,
+    cancel: Option<&AtomicBool>,
+    budgets: &Budgets,
+) -> Result<Vec<CheckOutcome>, VerifyError> {
     let mut outcomes = Vec::new();
     for (index, command) in profile.commands.iter().enumerate() {
         let label = check_label(command);
         let log_stem = format!("{prefix}-cmd{index}");
-        outcomes.push(run_observed(
-            dir, command, logs_dir, &label, &log_stem, events, cancel,
+        outcomes.push(run_observed_within(
+            dir, command, logs_dir, &label, &log_stem, events, cancel, budgets,
         )?);
     }
     Ok(outcomes)
@@ -1159,6 +1207,31 @@ pub fn run_setup_gated(
     cancel: Option<&AtomicBool>,
     gate: &mut dyn SetupGate,
 ) -> Result<Vec<CheckOutcome>, VerifyError> {
+    run_setup_gated_within(
+        dir,
+        profile,
+        logs_dir,
+        prefix,
+        events,
+        cancel,
+        gate,
+        &Budgets::unbounded(),
+    )
+}
+
+/// [`run_setup_gated`] under a run's budgets: each step is clipped to
+/// what is left when it starts.
+#[allow(clippy::too_many_arguments)]
+pub fn run_setup_gated_within(
+    dir: &Path,
+    profile: &VerificationProfile,
+    logs_dir: &Path,
+    prefix: &str,
+    events: &Events,
+    cancel: Option<&AtomicBool>,
+    gate: &mut dyn SetupGate,
+    budgets: &Budgets,
+) -> Result<Vec<CheckOutcome>, VerifyError> {
     let mut outcomes = Vec::new();
     for (index, command) in profile.setup.iter().enumerate() {
         if gate.skip(index, command) {
@@ -1166,7 +1239,9 @@ pub fn run_setup_gated(
         }
         let label = setup_label(command);
         let log_stem = format!("{prefix}-setup{index}");
-        let outcome = run_observed(dir, command, logs_dir, &label, &log_stem, events, cancel)?;
+        let outcome = run_observed_within(
+            dir, command, logs_dir, &label, &log_stem, events, cancel, budgets,
+        )?;
         let failed = outcome.failed();
         gate.ran(index, command, !failed);
         outcomes.push(outcome);
@@ -2716,6 +2791,67 @@ mod tests {
         .expect("run");
         assert_eq!(hung.ended, Ended::TimedOut);
         assert!(hung.failed());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_candidate_command_is_clipped_to_the_remaining_work_budget() {
+        use crate::policy::{BudgetLimits, WallClock};
+        let dir = temp_dir("clipped");
+        let logs = dir.join("logs");
+        // Work has two seconds; the command asks for thirty and sleeps
+        // for twenty. The baseline draws on the total alone, and has
+        // finished: work begins.
+        let budgets = Budgets::start(
+            std::sync::Arc::new(WallClock),
+            BudgetLimits::resolve(2, 60, 60, Some(600), 0),
+        );
+        budgets.begin_work();
+        let started = std::time::Instant::now();
+        let clipped = run_observed_within(
+            &dir,
+            &command(&["sh", "-c", "sleep 20"], 30),
+            &logs,
+            "cmd0",
+            "x-cmd0",
+            &Events::silent(),
+            None,
+            &budgets,
+        )
+        .expect("run");
+        assert_eq!(clipped.ended, Ended::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "ended at the work budget, not at the command's own thirty seconds"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_baseline_command_draws_on_the_total_alone() {
+        use crate::policy::{BudgetLimits, WallClock};
+        let dir = temp_dir("baseline-clip");
+        let logs = dir.join("logs");
+        // Work would allow 600 s, the total two: work has not begun, so
+        // only the total clips the command.
+        let budgets = Budgets::start(
+            std::sync::Arc::new(WallClock),
+            BudgetLimits::resolve(600, 60, 60, Some(2), 0),
+        );
+        let started = std::time::Instant::now();
+        let clipped = run_observed_within(
+            &dir,
+            &command(&["sh", "-c", "sleep 20"], 30),
+            &logs,
+            "cmd0",
+            "x-cmd0",
+            &Events::silent(),
+            None,
+            &budgets,
+        )
+        .expect("run");
+        assert_eq!(clipped.ended, Ended::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(10));
         std::fs::remove_dir_all(&dir).ok();
     }
 

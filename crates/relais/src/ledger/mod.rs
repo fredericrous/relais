@@ -2304,7 +2304,7 @@ pub type RunDriver = (Option<i64>, Option<String>, Option<String>);
 pub struct Ledger {
     conn: Connection,
     path: std::path::PathBuf,
-    clock: Box<dyn Clock>,
+    clock: std::sync::Arc<dyn Clock>,
 }
 
 /// Every usage event that an inclusive ancestor already accounts for,
@@ -3105,7 +3105,7 @@ impl Ledger {
         Ok(Ledger {
             conn,
             path: path.to_path_buf(),
-            clock,
+            clock: std::sync::Arc::from(clock),
         })
     }
 
@@ -3142,7 +3142,7 @@ impl Ledger {
         Ok(Ledger {
             conn,
             path: path.to_path_buf(),
-            clock: Box::new(SystemClock),
+            clock: std::sync::Arc::new(SystemClock),
         })
     }
 
@@ -3165,6 +3165,12 @@ impl Ledger {
     /// is stamped by, and the one the runner stamps its events with.
     pub fn now(&self) -> String {
         self.clock.now_rfc3339()
+    }
+
+    /// The same clock, shared: what the run's budgets read, so a test
+    /// that scripts the ledger's clock scripts them too.
+    pub fn clock(&self) -> std::sync::Arc<dyn Clock> {
+        std::sync::Arc::clone(&self.clock)
     }
 
     /// Where this ledger lives, so a side thread can open its own

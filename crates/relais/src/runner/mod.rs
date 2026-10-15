@@ -40,8 +40,9 @@ use crate::ledger::{EvidenceKind, EvidenceOrigin, Ledger, LedgerError, Transitio
 use crate::lifecycle::UsagePhase;
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::{
-    effective_authority, repo_key, BlockCode, EffectiveAuthority, EffortId, MachineSettings,
-    RepoPolicy, Tier, VerificationProfile,
+    effective_authority, repo_key, BlockCode, BudgetClock, BudgetLimits, Budgets,
+    EffectiveAuthority, EffortId, Exhausted, MachineSettings, RepoPolicy, Tier,
+    VerificationProfile, WaitKind,
 };
 use crate::procs::Ended;
 use crate::protocol::{AgentKind, CostFigure, Event, Events, Request, Summary, TokenUsage, Wire};
@@ -407,8 +408,6 @@ pub(crate) struct ManagedDispatch<'d> {
     pub(crate) parent: Option<&'d str>,
     /// What the coordinator reserves for it.
     pub(crate) reserve_micros: i64,
-    /// The run's wall clock: a queue wait counts against it.
-    pub(crate) deadline: Instant,
     /// The budget an admission refusal is judged against.
     pub(crate) budget: &'d Budget,
     /// The worktree this dispatch writes, when it writes one. Readers
@@ -442,6 +441,9 @@ pub(crate) struct RunEngine<'a> {
     /// Set once the coordinator reports this run cancelled while no
     /// dispatch heartbeat was running (a check, or between phases).
     cancel_asked: Arc<AtomicBool>,
+    /// What this run may still spend of time (ADR-0010). Unbounded until
+    /// preflight has the authority that sizes it.
+    pub(crate) budgets: Budgets,
     /// Everything this run does, as events (SPEC §29).
     pub(crate) events: Events,
     /// The caller's worktree this run holds when it works in place
@@ -626,8 +628,6 @@ struct AttemptContext<'c> {
     /// The run's one owned worktree, at the base revision.
     worktree: &'c TaskWorktree,
     worktree_path: &'c Path,
-    /// The run's wall clock.
-    deadline: Instant,
 }
 
 /// The attempt row a candidate is snapshotted for.
@@ -858,6 +858,7 @@ impl<'a> RunEngine<'a> {
             inplace: None,
             reviewer_gap: None,
             cancel_asked: Arc::new(AtomicBool::new(false)),
+            budgets: Budgets::unbounded(),
             events,
         })
     }
@@ -1092,7 +1093,6 @@ impl<'a> RunEngine<'a> {
             depth,
             parent,
             reserve_micros,
-            deadline,
             budget,
             write_lease,
             ..
@@ -1128,6 +1128,9 @@ impl<'a> RunEngine<'a> {
             // dispatch id of its own to report.
             caller_agent_id: None,
         };
+        // Time spent queued is charged to `admission_wait_seconds` and to
+        // the total, never to the work budget (ADR-0010).
+        let mut queued = self.budgets.wait(WaitKind::Admission);
         loop {
             match gate.admit(&request) {
                 Err(e) => {
@@ -1154,15 +1157,16 @@ impl<'a> RunEngine<'a> {
                     )?));
                 }
                 Ok(Decision::Queued { position }) => {
-                    if Instant::now() >= deadline {
+                    if let Some(exhausted) = queued.tick() {
                         // Best effort: nothing was launched, and a
                         // request the coordinator still holds expires
                         // with the queue entry it never granted.
                         let _ = gate.withdraw(&spec.dispatch_id);
-                        return Ok(Err(self.stop(
-                            budget,
-                            Observation::LimitReached(Limit::AdmissionQueue { position }),
-                        )?));
+                        self.events.emit(Event::Decision {
+                            what: "admission_queue_ended".into(),
+                            reason: format!("still queued at position {position}"),
+                        });
+                        return Ok(Err(self.end_on_exhausted(exhausted, budget)?));
                     }
                     std::thread::sleep(ADMISSION_POLL);
                 }
@@ -1198,6 +1202,7 @@ impl<'a> RunEngine<'a> {
             }
         }
 
+        drop(queued);
         let lease_key = write_lease.map(|path| path.to_string_lossy().into_owned());
         if let Some(key) = lease_key.as_deref() {
             match gate.acquire_write(&spec.dispatch_id, key) {
@@ -1699,7 +1704,16 @@ impl<'a> RunEngine<'a> {
     ) -> Result<Vec<verify::CheckOutcome>, verify::VerifyError> {
         use crate::workspace::reuse::{StampStore, Workspace};
         if self.config.workspace == Workspace::Isolated {
-            return verify::run_setup(dir, profile, logs_dir, prefix, &self.events, cancel);
+            return verify::run_setup_gated_within(
+                dir,
+                profile,
+                logs_dir,
+                prefix,
+                &self.events,
+                cancel,
+                &mut verify::RunEveryStep,
+                &self.budgets,
+            );
         }
         let source = seed_from.filter(|source| *source != dir);
         if let Some(source) = source {
@@ -1713,7 +1727,7 @@ impl<'a> RunEngine<'a> {
             .unwrap_or(&self.config.artifacts_dir);
         let stamps = StampStore::new(state);
         let mut gate = setup_gate::ReuseGate::new(dir, source, &stamps, &self.events);
-        verify::run_setup_gated(
+        verify::run_setup_gated_within(
             dir,
             profile,
             logs_dir,
@@ -1721,6 +1735,7 @@ impl<'a> RunEngine<'a> {
             &self.events,
             cancel,
             &mut gate,
+            &self.budgets,
         )
     }
 
@@ -1872,11 +1887,24 @@ impl<'a> RunEngine<'a> {
     /// (SPEC §3, §9). Each phase either hands the next one what it
     /// established, or ends the run.
     fn run_inner(&mut self) -> Result<RunOutcome, RunError> {
+        // The run's clock starts here, on the ledger's own: preflight
+        // counts against `total_seconds`.
+        let clock: Arc<dyn BudgetClock> = Arc::new(LedgerBudgetClock(self.config.ledger.clock()));
+        let run_started = clock.now_millis();
         self.step("preflight", String::new());
         let preflight = match self.preflight()? {
             Phase::Ended(outcome) => return Ok(outcome),
             Phase::Ready(preflight) => preflight,
         };
+        self.budgets = Budgets::started_at(
+            clock,
+            budget_limits(
+                &preflight.authority,
+                &self.config.contract.limits,
+                &self.config.machine.resources,
+            ),
+            run_started,
+        );
         self.step("baseline", String::new());
         let baseline = match self.baseline(&preflight)? {
             Phase::Ended(outcome) => return Ok(outcome),
@@ -1884,7 +1912,12 @@ impl<'a> RunEngine<'a> {
         };
         self.step("baseline", baseline_summary(&baseline));
 
-        let deadline = Instant::now() + Duration::from_secs(preflight.authority.max_wall_seconds);
+        // The baseline is over: what follows draws on the work budget.
+        self.budgets.begin_work();
+        if let Some(exhausted) = self.budgets.exhausted() {
+            let nominal = fresh_progress(&preflight).budget;
+            return self.end_on_exhausted(exhausted, &nominal);
+        }
         // The harness identity every dispatch of this run records, probed
         // once (SPEC §16: model/effort/harness identity are features).
         self.harness = self.config.backend.probe().map(|capabilities| {
@@ -1911,7 +1944,6 @@ impl<'a> RunEngine<'a> {
                 baseline_cached: baseline.cached,
                 baseline_cache_refused: &baseline.cache_refused,
                 logs_dir: &baseline.logs_dir,
-                deadline,
             };
             match scheduler::run_decomposed(self, &root, decomposition)? {
                 scheduler::Decomposed::Outcome(outcome) => return Ok(outcome),
@@ -1991,7 +2023,6 @@ impl<'a> RunEngine<'a> {
                     baseline: &baseline,
                     worktree: &worktree,
                     worktree_path: &worktree_path,
-                    deadline,
                 };
                 if self.config.contract.is_verify() {
                     self.verify_applied(&ctx)?
@@ -2700,13 +2731,14 @@ impl<'a> RunEngine<'a> {
                         ));
                     }
                     let checks = self.while_watching_cancel(|cancel| {
-                        verify::run_profile(
+                        verify::run_profile_within(
                             baseline.path(),
                             &authority.verification_profile,
                             &logs_dir,
                             "base",
                             &self.events,
                             cancel,
+                            &self.budgets,
                         )
                     })?;
                     self.record_logs(None, EvidenceKind::CheckLog, &checks)?;
@@ -2826,7 +2858,7 @@ impl<'a> RunEngine<'a> {
             if let Some(outcome) = self.end_if_cancelled()? {
                 return Ok(outcome);
             }
-            if let Some(outcome) = self.ceiling_reached(&progress, ctx.deadline)? {
+            if let Some(outcome) = self.ceiling_reached(&progress)? {
                 return Ok(outcome);
             }
             let dispatched = match self.dispatch_attempt(ctx, &mut progress)? {
@@ -2909,13 +2941,54 @@ impl<'a> RunEngine<'a> {
         }
     }
 
+    /// End the run on the budget that ran out (ADR-0010, SPEC §11): the
+    /// work and total budgets are `budget_exhausted`; a wait budget is a
+    /// block, because the machine, not the work, was what ran short.
+    pub(crate) fn end_on_exhausted(
+        &mut self,
+        exhausted: Exhausted,
+        budget: &Budget,
+    ) -> Result<RunOutcome, RunError> {
+        let limits = self.budgets.limits();
+        match exhausted {
+            Exhausted::Work => self.stop(budget, Observation::LimitReached(Limit::WallClock)),
+            Exhausted::Total => self.stop(budget, Observation::LimitReached(Limit::Total)),
+            Exhausted::AdmissionWait => {
+                let detail = format!(
+                    "queued for a lease for {}s, the whole admission wait budget \
+                     (`[resources] admission_wait_seconds`); nothing was launched",
+                    limits.admission_wait.as_secs()
+                );
+                self.finish(
+                    Reason::AdmissionWaitExhausted,
+                    serde_json::json!({ "detail": detail }),
+                    Terminal::BlockedBy {
+                        reason: Reason::AdmissionWaitExhausted,
+                        detail,
+                    },
+                )
+            }
+            Exhausted::DiskWait => {
+                let detail = format!(
+                    "waited {}s for free disk space, the whole disk wait budget \
+                     (`[resources] disk_wait_seconds`)",
+                    limits.disk_wait.as_secs()
+                );
+                self.finish(
+                    Reason::DiskLow,
+                    serde_json::json!({ "detail": detail }),
+                    Terminal::BlockedBy {
+                        reason: Reason::DiskLow,
+                        detail,
+                    },
+                )
+            }
+        }
+    }
+
     /// Budget ceilings are checked BEFORE admitting more work (SPEC §9,
     /// §11). `Some(outcome)` means one was reached and the run ended.
-    fn ceiling_reached(
-        &mut self,
-        progress: &Progress,
-        deadline: Instant,
-    ) -> Result<Option<RunOutcome>, RunError> {
+    fn ceiling_reached(&mut self, progress: &Progress) -> Result<Option<RunOutcome>, RunError> {
         if progress.budget.attempts_used >= progress.budget.max_attempts {
             return Ok(Some(self.stop(
                 &progress.budget,
@@ -2925,11 +2998,8 @@ impl<'a> RunEngine<'a> {
                 }),
             )?));
         }
-        if Instant::now() >= deadline {
-            return Ok(Some(self.stop(
-                &progress.budget,
-                Observation::LimitReached(Limit::WallClock),
-            )?));
+        if let Some(exhausted) = self.budgets.exhausted() {
+            return Ok(Some(self.end_on_exhausted(exhausted, &progress.budget)?));
         }
         if let Some(ceiling) = self.config.machine.spending.per_run_micros {
             if progress.spend.total >= ceiling {
@@ -3073,10 +3143,7 @@ impl<'a> RunEngine<'a> {
         // function opened with cannot outlive that mutable call.
         let ledger = self.config.ledger;
 
-        let remaining_wall = ctx
-            .deadline
-            .saturating_duration_since(Instant::now())
-            .max(Duration::from_secs(1));
+        let remaining_wall = self.budgets.remaining().max(Duration::from_secs(1));
         // What this attempt may still spend, not the whole ceiling
         // again: the budget is the run's, not the attempt's.
         // Saturating: a wrapped remainder would read as a budget
@@ -3112,7 +3179,6 @@ impl<'a> RunEngine<'a> {
             depth: 0,
             parent: None,
             reserve_micros: remaining_budget.unwrap_or(0),
-            deadline: ctx.deadline,
             budget: &progress.budget,
             write_lease: Some(ctx.worktree_path),
         })? {
@@ -3331,7 +3397,7 @@ impl<'a> RunEngine<'a> {
         // worker's own lease went back when its process ended, so
         // any holder here is a straggler another tab or run owns
         // (SPEC §23).
-        if let Some(holder) = self.wait_for_writers(worktree_path, ctx.deadline)? {
+        if let Some(holder) = self.wait_for_writers(worktree_path)? {
             ledger.finish_attempt(attempt_id, State::Interrupted, Some(&held_worktree), None)?;
             return Ok(Snapshot::Ended(
                 self.stop_on_held_lease(worktree_path, &holder)?,
@@ -3624,6 +3690,19 @@ impl<'a> RunEngine<'a> {
         if let Some(outcome) = self.end_if_cancelled()? {
             return Ok(Step::Ended(outcome));
         }
+        // A check that timed out because a budget ran out under it says
+        // nothing about the code: the run ends on the budget (ADR-0010),
+        // with the candidate kept, rather than repairing a clock.
+        if checks
+            .iter()
+            .any(|check| matches!(check.ended.recorded(), Some(Ended::TimedOut)))
+        {
+            if let Some(exhausted) = self.budgets.exhausted() {
+                return Ok(Step::Ended(
+                    self.end_on_exhausted(exhausted, &progress.budget)?,
+                ));
+            }
+        }
         // An inspection judges its report: a gap about the profile's own
         // checks is recorded, not a stop. The acceptance-evidence gaps
         // keep their handling below.
@@ -3805,7 +3884,6 @@ impl<'a> RunEngine<'a> {
                     candidate_model: &candidate.model,
                     verification_inputs_changed: &verified.verification_inputs_changed,
                     patch_path: candidate.latest_patch.clone(),
-                    deadline: ctx.deadline,
                     routed_by: preflight.decision.routed_by,
                     covering: preflight.decision.covering.clone(),
                 },
@@ -3958,7 +4036,6 @@ impl<'a> RunEngine<'a> {
             candidate_model: &candidate.model,
             verification_inputs_changed: &[],
             patch_path: candidate.latest_patch.clone(),
-            deadline: ctx.deadline,
             routed_by: preflight.decision.routed_by,
             covering: preflight.decision.covering.clone(),
         };
@@ -4505,11 +4582,7 @@ impl<'a> RunEngine<'a> {
     /// that process has ended — the lease outlived it only because the
     /// coordinator refused the release (R3) — so the tree is still, and
     /// waiting would be the run waiting on itself to its own deadline.
-    pub(crate) fn wait_for_writers(
-        &mut self,
-        worktree: &Path,
-        deadline: Instant,
-    ) -> Result<Option<String>, RunError> {
+    pub(crate) fn wait_for_writers(&mut self, worktree: &Path) -> Result<Option<String>, RunError> {
         let Some(gate) = self.config.gate else {
             return Ok(None);
         };
@@ -4545,7 +4618,7 @@ impl<'a> RunEngine<'a> {
                     return Ok(None);
                 }
                 Ok(Some(holder)) => {
-                    if Instant::now() >= deadline {
+                    if self.budgets.remaining().is_zero() {
                         return Ok(Some(holder));
                     }
                     waited = true;
@@ -4671,13 +4744,14 @@ impl<'a> RunEngine<'a> {
                     }
                     None => self
                         .while_watching_cancel(|cancel| {
-                            verify::run_profile(
+                            verify::run_profile_within(
                                 holder.path(),
                                 &authority.verification_profile,
                                 logs_dir,
                                 &label.log_prefix(),
                                 &self.events,
                                 cancel,
+                                &self.budgets,
                             )
                         })
                         .map_err(|e| e.to_string())?,
@@ -5097,10 +5171,7 @@ impl<'a> RunEngine<'a> {
             // clock: a reviewer handed the one-second remainder is killed
             // before it can answer, and the run ends `needs_review` with
             // the whole attempt's spend already paid.
-            wall_timeout: request
-                .deadline
-                .saturating_duration_since(Instant::now())
-                .max(REVIEW_MIN_WALL),
+            wall_timeout: self.budgets.remaining().max(REVIEW_MIN_WALL),
             cancel: None,
             agent: AgentKind::Reviewer,
         };
@@ -5146,7 +5217,6 @@ impl<'a> RunEngine<'a> {
             depth: 0,
             parent: None,
             reserve_micros: remaining_budget.unwrap_or(0),
-            deadline: request.deadline,
             budget: &budget,
             // The reviewer reads; it writes no worktree and takes no
             // lease.
@@ -5276,7 +5346,6 @@ pub(crate) struct ReviewRequest<'r> {
     /// different files and the reviewer used to be sent to the one the
     /// decomposed path never writes (R4).
     pub(crate) patch_path: PathBuf,
-    pub(crate) deadline: Instant,
     /// How the candidate's own dispatch was routed (SPEC §6) — the
     /// review is accounted to the same run, so it carries the same
     /// routing fact rather than a value the reviewer's own dispatch
@@ -5448,6 +5517,45 @@ pub(crate) fn spend_limit(spent: MicroUsd, ceiling: MicroUsd, which: Ceiling) ->
 /// `None` for a model without effort control — omitted, never guessed.
 /// What the pane says of a baseline: how many checks ran and how many
 /// were already red on the base.
+/// The ledger's clock, read as the budgets' (ADR-0010).
+struct LedgerBudgetClock(Arc<dyn crate::ledger::Clock>);
+
+impl BudgetClock for LedgerBudgetClock {
+    fn now_millis(&self) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(&self.0.now_rfc3339()).map_or_else(
+            |_| chrono::Utc::now().timestamp_millis(),
+            |at| at.timestamp_millis(),
+        )
+    }
+}
+
+/// The size of each budget for one run: the work budget is the effective
+/// `max_wall_seconds` (the repository's, narrowed by `limits.wall_seconds`);
+/// the waits come from machine settings; the total is the contract's
+/// `limits.total_seconds` or the sum of everything the run may spend
+/// (ADR-0010).
+fn budget_limits(
+    authority: &EffectiveAuthority,
+    limits: &crate::contract::Limits,
+    resources: &crate::policy::ResourceSettings,
+) -> BudgetLimits {
+    let profile = &authority.verification_profile;
+    let baseline_seconds = profile
+        .setup
+        .iter()
+        .chain(&profile.commands)
+        .fold(0u64, |sum, command| {
+            sum.saturating_add(command.timeout_seconds)
+        });
+    BudgetLimits::resolve(
+        authority.max_wall_seconds,
+        resources.admission_wait_seconds(),
+        resources.disk_wait_seconds(),
+        limits.total_seconds,
+        baseline_seconds,
+    )
+}
+
 fn baseline_summary(baseline: &Baseline) -> String {
     let red = match baseline.failures.len() {
         0 => "green on base".to_string(),
@@ -6276,6 +6384,7 @@ mod tests {
             );
             MachineSettings {
                 workspace: Default::default(),
+                resources: Default::default(),
                 schema_version: 1,
                 allowed_models: None,
                 spending: Default::default(),
@@ -10331,10 +10440,11 @@ mod tests {
     }
 
     #[test]
-    fn queued_admission_counts_against_the_wall_clock() {
+    fn queued_admission_counts_against_the_admission_wait_budget() {
         let fixture = Fixture::new();
         let repo = fixture.repo_policy(vec![passing_check()], 3);
-        let machine = fixture.machine_for(&repo);
+        let mut machine = fixture.machine_for(&repo);
+        machine.resources.admission_wait_seconds = Some(1);
         let gate = crate::admission::LocalGate::new(ConcurrencyLimits {
             max_active_agents: Some(1),
             ..ConcurrencyLimits::default()
@@ -10363,14 +10473,17 @@ mod tests {
             .expect("admit"),
             Decision::Granted
         );
-        let mut contract = fixture.contract(Review::Off);
-        contract.limits.wall_seconds = Some(1);
+        let contract = fixture.contract(Review::Off);
         let backend = conditional_worker("");
         let outcome = fixture.execute_managed(&contract, &repo, &machine, &backend, &gate);
         assert!(
-            matches!(&outcome.terminal, Terminal::BudgetExhausted { detail, .. } if detail.contains("queued")),
+            matches!(
+                &outcome.terminal,
+                Terminal::BlockedBy { reason: Reason::AdmissionWaitExhausted, detail } if detail.contains("queued")
+            ),
             "{outcome:?}"
         );
+        assert_eq!(outcome.state(), State::Blocked);
         assert_eq!(
             gate.status().runs[outcome.run_id()].queued,
             0,
@@ -12808,7 +12921,6 @@ mod tests {
             candidate_model: "haiku",
             verification_inputs_changed: &[],
             patch_path: PathBuf::from("candidate.patch"),
-            deadline: Instant::now() + Duration::from_secs(60),
             routed_by: RoutedBy::ConservativeBaseline,
             covering: None,
         };
@@ -13906,6 +14018,7 @@ mod tests {
         );
     }
 
+    mod budgets;
     mod native;
     mod verify_kind;
 }
