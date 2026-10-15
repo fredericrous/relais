@@ -1335,6 +1335,13 @@ impl<'a> RunEngine<'a> {
                     "run {run} was interrupted here with edits applied; run: relais resume --retire {run}"
                 ),
             ),
+            LeaseRefusal::UnreadableMarker { path, why } => (
+                BlockCode::WorkspaceHasInterruptedRun,
+                format!(
+                    "a run died in this worktree and left {}, which cannot be read ({why}); look at the tree, and delete that file once you have",
+                    path.display()
+                ),
+            ),
             LeaseRefusal::Io(e) => (BlockCode::WorktreeUnavailable, e.to_string()),
         })?;
         let start = start_snapshot(&lease).map_err(|e| {
