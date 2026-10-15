@@ -261,8 +261,62 @@ impl WriteScope {
 /// there is no constructor that would take one (P11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Task {
-    Change { write_scope: WriteScope },
+    Change {
+        write_scope: WriteScope,
+        /// A candidate to continue from (SPEC §4): the task tree starts
+        /// with it applied. A conflict does not block the run; the worker
+        /// is handed the merge (SPEC §8).
+        from_candidate: Option<CandidateRef>,
+    },
     Inspect,
+    /// Verify an existing candidate (SPEC §4): no worker, no repair, no
+    /// escalation. The candidate is applied by relais and goes through the
+    /// run's post-attempt pipeline; the scope bounds what it may change.
+    Verify {
+        write_scope: WriteScope,
+        candidate: CandidateRef,
+    },
+}
+
+/// Which earlier candidate a `kind: verify` contract names: a run, and
+/// optionally one of its attempts (the latest when absent). It is the
+/// public syntax; relais resolves it once, at validation, to a
+/// [`ResolvedCandidate`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateRef {
+    pub run: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+}
+
+/// A candidate as it was resolved once at validation and persisted (ledger
+/// table `candidate_inputs`) and carried on the receipt: the identity a
+/// verify run applies, so later changes to a ref or a patch file cannot
+/// change what was verified (SPEC §8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedCandidate {
+    pub source_run: String,
+    pub index: u32,
+    /// The commit object the ledger recorded for that attempt.
+    pub candidate_commit: String,
+    /// SHA-256 of the patch derived from `source_base_sha..candidate_commit`.
+    pub patch_sha256: String,
+    /// The base the candidate was made against.
+    pub source_base_sha: String,
+    /// The base this run verifies against.
+    pub target_base_sha: String,
+}
+
+/// The run a successor was launched from, and what its contract changed
+/// about the scope: carried on the successor's receipt (SPEC §9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Predecessor {
+    pub run: String,
+    pub intent_id: String,
+    /// The paths the successor's write scope adds, exactly; empty when the
+    /// successor's contract was written whole.
+    pub scope_delta: Vec<String>,
 }
 
 impl Task {
@@ -274,21 +328,84 @@ impl Task {
         }
         Ok(Task::Change {
             write_scope: WriteScope::compile(patterns)?,
+            from_candidate: None,
         })
     }
 
+    /// A change that continues from an existing candidate.
+    pub fn change_from(
+        patterns: Vec<String>,
+        from_candidate: CandidateRef,
+    ) -> Result<Self, ContractError> {
+        if from_candidate.run.trim().is_empty() {
+            return Err(ContractError::EmptyCandidateRun);
+        }
+        match Self::change(patterns)? {
+            Task::Change { write_scope, .. } => Ok(Task::Change {
+                write_scope,
+                from_candidate: Some(from_candidate),
+            }),
+            other => Ok(other),
+        }
+    }
+
+    /// A verification of an existing candidate, bounded by these patterns.
+    pub fn verify(patterns: Vec<String>, candidate: CandidateRef) -> Result<Self, ContractError> {
+        if candidate.run.trim().is_empty() {
+            return Err(ContractError::EmptyCandidateRun);
+        }
+        if patterns.is_empty() {
+            return Err(ContractError::MissingWriteScope);
+        }
+        Ok(Task::Verify {
+            write_scope: WriteScope::compile(patterns)?,
+            candidate,
+        })
+    }
+
+    /// The kind of WORK this is. A verify judges a patch against a scope
+    /// and checks exactly as a change does, so it reports `Change` here;
+    /// [`Task::is_verify`] tells the two apart where that matters.
     pub fn kind(&self) -> Kind {
         match self {
-            Task::Change { .. } => Kind::Change,
+            Task::Change { .. } | Task::Verify { .. } => Kind::Change,
             Task::Inspect => Kind::Inspect,
         }
     }
 
     pub fn write_scope(&self) -> Option<&WriteScope> {
         match self {
-            Task::Change { write_scope } => Some(write_scope),
+            Task::Change { write_scope, .. } | Task::Verify { write_scope, .. } => {
+                Some(write_scope)
+            }
             Task::Inspect => None,
         }
+    }
+
+    /// The candidate a verify names; `None` for every other kind.
+    pub fn candidate(&self) -> Option<&CandidateRef> {
+        match self {
+            Task::Verify { candidate, .. } => Some(candidate),
+            Task::Change { .. } | Task::Inspect => None,
+        }
+    }
+
+    /// The candidate a `kind: change` continues from; `None` otherwise.
+    pub fn from_candidate(&self) -> Option<&CandidateRef> {
+        match self {
+            Task::Change { from_candidate, .. } => from_candidate.as_ref(),
+            Task::Verify { .. } | Task::Inspect => None,
+        }
+    }
+
+    /// The candidate this task applies to its tree: a verify's, or the
+    /// one a change continues from.
+    pub fn source_candidate(&self) -> Option<&CandidateRef> {
+        self.candidate().or_else(|| self.from_candidate())
+    }
+
+    pub fn is_verify(&self) -> bool {
+        matches!(self, Task::Verify { .. })
     }
 }
 
@@ -339,6 +456,17 @@ pub struct TaskContract {
 /// The largest design file a contract may name.
 pub const MAX_DESIGN_BYTES: usize = 16 * 1024;
 
+/// The `kind` spellings a contract may carry. `Kind` is the kind of work;
+/// `verify` is work of the `change` kind whose tree is an existing
+/// candidate, so it exists on the wire and in [`Task`] only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireKind {
+    Change,
+    Inspect,
+    Verify,
+}
+
 /// The contract exactly as it is written and stored: flat `kind` and
 /// `write_scope` fields, unknown fields refused (SPEC §4). It exists so
 /// the in-memory model can be an enum without changing one byte of the
@@ -348,11 +476,15 @@ pub const MAX_DESIGN_BYTES: usize = 16 * 1024;
 struct ContractWire {
     #[serde(alias = "version")]
     schema_version: u64,
-    kind: Kind,
+    kind: WireKind,
     objective: String,
     base_ref: String,
     #[serde(default)]
     write_scope: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate: Option<CandidateRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from_candidate: Option<CandidateRef>,
     #[serde(default)]
     read_hints: Vec<String>,
     acceptance: Vec<crate::acceptance::AcceptanceEntry>,
@@ -381,7 +513,13 @@ impl From<&TaskContract> for ContractWire {
     fn from(contract: &TaskContract) -> Self {
         Self {
             schema_version: contract.schema_version,
-            kind: contract.task.kind(),
+            kind: match contract.task {
+                Task::Change { .. } => WireKind::Change,
+                Task::Inspect => WireKind::Inspect,
+                Task::Verify { .. } => WireKind::Verify,
+            },
+            candidate: contract.task.candidate().cloned(),
+            from_candidate: contract.task.from_candidate().cloned(),
             objective: contract.objective.clone(),
             base_ref: contract.base_ref.clone(),
             // `null` for an inspect, exactly as it has always been
@@ -409,15 +547,30 @@ impl TryFrom<ContractWire> for TaskContract {
     type Error = ContractError;
 
     fn try_from(wire: ContractWire) -> Result<Self, ContractError> {
-        let task = match wire.kind {
-            Kind::Change => Task::change(wire.write_scope.unwrap_or_default())?,
-            Kind::Inspect => {
+        let from_candidate = wire.from_candidate;
+        if from_candidate.is_some() && wire.kind != WireKind::Change {
+            return Err(ContractError::FromCandidateOnNonChange);
+        }
+        let task = match (wire.kind, wire.candidate) {
+            (WireKind::Change, None) => match from_candidate {
+                Some(from) => Task::change_from(wire.write_scope.unwrap_or_default(), from)?,
+                None => Task::change(wire.write_scope.unwrap_or_default())?,
+            },
+            (WireKind::Inspect, None) => {
                 if wire.write_scope.is_some_and(|scope| !scope.is_empty()) {
                     return Err(ContractError::WriteScopeOnInspect);
                 }
                 Task::Inspect
             }
+            (WireKind::Verify, Some(candidate)) => {
+                Task::verify(wire.write_scope.unwrap_or_default(), candidate)?
+            }
+            (WireKind::Verify, None) => return Err(ContractError::VerifyWithoutCandidate),
+            (WireKind::Change | WireKind::Inspect, Some(_)) => {
+                return Err(ContractError::CandidateOnNonVerify)
+            }
         };
+
         let task_type = wire
             .task_type
             .map(|text| TaskType::parse_declared(&text).ok_or(ContractError::UnknownTaskType(text)))
@@ -716,6 +869,19 @@ pub enum ContractError {
     EmptyAcceptance,
     MissingWriteScope,
     WriteScopeOnInspect,
+    /// `kind: verify` names no `candidate`.
+    VerifyWithoutCandidate,
+    /// `candidate` is only meaningful for `kind: verify`.
+    CandidateOnNonVerify,
+    /// `candidate.run` is empty.
+    EmptyCandidateRun,
+    /// `from_candidate` is only meaningful for `kind: change`.
+    FromCandidateOnNonChange,
+    /// A change that continues from a candidate is one tree; there is
+    /// nothing to split.
+    DecompositionOnFromCandidate,
+    /// A verify applies an existing candidate; there is nothing to split.
+    DecompositionOnVerify,
     /// One declared write-scope pattern cannot be used as a bound.
     BadWriteScopePattern {
         pattern: String,
@@ -770,6 +936,22 @@ impl std::fmt::Display for ContractError {
             Self::EmptyAcceptance => write!(f, "acceptance needs at least one criterion"),
             Self::MissingWriteScope => write!(f, "kind=change requires a non-empty write_scope"),
             Self::WriteScopeOnInspect => write!(f, "kind=inspect cannot declare a write_scope"),
+            Self::VerifyWithoutCandidate => {
+                write!(f, "kind=verify requires `candidate: {{ run }}`")
+            }
+            Self::CandidateOnNonVerify => {
+                write!(f, "`candidate` is only meaningful with kind=verify")
+            }
+            Self::EmptyCandidateRun => write!(f, "candidate.run is empty"),
+            Self::FromCandidateOnNonChange => {
+                write!(f, "`from_candidate` is only meaningful with kind=change")
+            }
+            Self::DecompositionOnFromCandidate => {
+                write!(f, "a change with `from_candidate` cannot be decomposed")
+            }
+            Self::DecompositionOnVerify => {
+                write!(f, "kind=verify cannot be decomposed into work packages")
+            }
             Self::BadWriteScopePattern { pattern, problem } => {
                 write!(f, "write_scope pattern `{pattern}` {problem}")
             }
@@ -865,9 +1047,32 @@ impl TaskContract {
         TaskContract::try_from(wire)
     }
 
-    /// What this contract asks for: `change` or `inspect`.
+    /// What this contract asks for: `change` or `inspect`. A verify is
+    /// work of the `change` kind (see [`Task::kind`]).
     pub fn kind(&self) -> Kind {
         self.task.kind()
+    }
+
+    /// Does this contract verify an existing candidate rather than ask a
+    /// worker for one?
+    pub fn is_verify(&self) -> bool {
+        self.task.is_verify()
+    }
+
+    /// The candidate a `kind: verify` contract names.
+    pub fn candidate(&self) -> Option<&CandidateRef> {
+        self.task.candidate()
+    }
+
+    /// The candidate a `kind: change` contract continues from.
+    pub fn from_candidate(&self) -> Option<&CandidateRef> {
+        self.task.from_candidate()
+    }
+
+    /// The candidate this contract's task tree starts with: a verify's, or
+    /// a change's `from_candidate`.
+    pub fn source_candidate(&self) -> Option<&CandidateRef> {
+        self.task.source_candidate()
     }
 
     /// The declared write scope, or `None` for an inspect contract.
@@ -923,11 +1128,20 @@ impl TaskContract {
                 ));
             }
         }
-        match self.task {
-            Task::Change { .. } => {}
+        match &self.task {
+            Task::Change { from_candidate, .. } => {
+                if from_candidate.is_some() && self.decomposition.is_some() {
+                    return Err(ContractError::DecompositionOnFromCandidate);
+                }
+            }
             Task::Inspect => {
                 if self.decomposition.is_some() {
                     return Err(ContractError::DecompositionOnInspect);
+                }
+            }
+            Task::Verify { .. } => {
+                if self.decomposition.is_some() {
+                    return Err(ContractError::DecompositionOnVerify);
                 }
             }
         }
@@ -1104,6 +1318,68 @@ mod tests {
       "limits": {"attempts": 3, "wall_seconds": 1200},
       "review": "required"
     }"#;
+
+    const VERIFY: &str = r#"{
+      "schema_version": 1,
+      "kind": "verify",
+      "objective": "Verify the candidate of an earlier run",
+      "base_ref": "HEAD",
+      "write_scope": ["src/**"],
+      "candidate": {"run": "run-65dc62a01e3d1-bf16", "index": 2},
+      "acceptance": ["the checks pass"],
+      "verification_profile": "p"
+    }"#;
+
+    #[test]
+    fn a_verify_contract_names_its_candidate_and_round_trips() {
+        let contract = TaskContract::from_json_str(VERIFY).expect("parses");
+        assert!(contract.is_verify());
+        assert_eq!(contract.kind(), Kind::Change, "judged as a change");
+        assert_eq!(contract.scope_patterns(), ["src/**".to_string()]);
+        let candidate = contract.candidate().expect("names a candidate");
+        assert_eq!(candidate.run, "run-65dc62a01e3d1-bf16");
+        assert_eq!(candidate.index, Some(2));
+        let again = TaskContract::from_json_str(&serde_json::to_string(&contract).expect("json"))
+            .expect("round-trips");
+        assert_eq!(again, contract);
+        assert_eq!(again.canonical_value()["kind"], "verify");
+        // `index` is optional and absent from the canonical form when absent.
+        let latest = VERIFY.replace(r#", "index": 2"#, "");
+        let latest = TaskContract::from_json_str(&latest).expect("parses");
+        assert_eq!(latest.candidate().expect("named").index, None);
+        assert!(latest.canonical_value()["candidate"]
+            .as_object()
+            .expect("object")
+            .get("index")
+            .is_none());
+    }
+
+    #[test]
+    fn a_verify_without_a_candidate_or_a_candidate_on_another_kind_is_refused() {
+        let without = VERIFY.replace(
+            r#""candidate": {"run": "run-65dc62a01e3d1-bf16", "index": 2},"#,
+            "",
+        );
+        assert_eq!(
+            TaskContract::from_json_str(&without).expect_err("refused"),
+            ContractError::VerifyWithoutCandidate
+        );
+        let on_change = VERIFY.replace(r#""kind": "verify""#, r#""kind": "change""#);
+        assert_eq!(
+            TaskContract::from_json_str(&on_change).expect_err("refused"),
+            ContractError::CandidateOnNonVerify
+        );
+        let empty = VERIFY.replace("run-65dc62a01e3d1-bf16", " ");
+        assert_eq!(
+            TaskContract::from_json_str(&empty).expect_err("refused"),
+            ContractError::EmptyCandidateRun
+        );
+        let unscoped = VERIFY.replace(r#""write_scope": ["src/**"],"#, "");
+        assert_eq!(
+            TaskContract::from_json_str(&unscoped).expect_err("refused"),
+            ContractError::MissingWriteScope
+        );
+    }
 
     #[test]
     fn parses_the_spec_example() {

@@ -18,7 +18,7 @@ import {
   mintNonce,
 } from './decide.ts'
 import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses } from './guards.ts'
-import { cancelRun, childOf, contractPath, onChunk, pump, reloadTimeline, startReplay, startRun, statusOf, workspaceOf } from './runs.ts'
+import { cancelRun, childOf, contractPath, onChunk, pump, reconcileIntents, reloadTimeline, startReplay, startRun, statusOf, workspaceOf } from './runs.ts'
 import { onboardTool, onPersonPrompt, trustTool, withRoutingSection } from './consent.ts'
 import { decideGuard, learningEnvelopeGuard, machineSettingsGuard, routerEnvelopeGuard } from './guards.ts'
 import { ensureWatcher } from './quiet-watch.ts'
@@ -133,6 +133,9 @@ export function register(on: any) {
     )
     // Orphaned runs are reconciled in the background; nothing is announced.
     detach(startResumeSweep(fx, store))
+    // A successor intent a decide recorded and nobody launched (the session
+    // ended, or the launch failed): this plugin is the only launcher.
+    detach(reconcileIntents(fx, store))
     await $.tool.register({
       name: 'run',
       description:

@@ -1046,6 +1046,28 @@ fn merged_roots<'a>(
     }
 }
 
+/// Whether `git merge-tree --write-tree` is available: a `kind: verify`
+/// run detects conflicts and builds its tree with it. A warning, not a
+/// blocker: only a verify run needs it, and it says so when it is refused.
+fn merge_tree_finding(support: Result<(), String>) -> Finding {
+    match support {
+        Ok(()) => Finding {
+            component: "git merge-tree",
+            level: Level::Ok,
+            detail: format!(
+                "git {}.{} or newer: `kind: verify` can apply a candidate",
+                crate::workspace::MERGE_TREE_MIN_GIT.0,
+                crate::workspace::MERGE_TREE_MIN_GIT.1
+            ),
+        },
+        Err(detail) => Finding {
+            component: "git merge-tree",
+            level: Level::Warn,
+            detail: format!("{detail}; `kind: verify` runs will be refused"),
+        },
+    }
+}
+
 pub fn doctor(repo_dir: &Path) -> DoctorReport {
     // No home directory is a fact about the machine, not a doctor
     // failure: every finding that needs one reports its own absence, and
@@ -1058,6 +1080,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     }
 
     check_command("git", &["--version"], &mut findings, "git");
+    findings.push(merge_tree_finding(crate::workspace::merge_tree_supported()));
 
     // A probe that errored says so: "not found", "did not answer" and
     // "answered and refused" are different things to fix.

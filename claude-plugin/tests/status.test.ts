@@ -211,10 +211,13 @@ test('statusOf does not refresh a terminal model that awaits no person', async (
   engine.stream.push('stdout', doneLine('run-ok', 'accepted'))
   await settle(engine)
   engine.script.runResult = () => result('')
-  const before = nativeCalls(engine.calls, 'status').length
+  // The run itself is not asked about; the session-wide poll that looks for
+  // successor intents is a different call.
+  const aboutRuns = () => nativeCalls(engine.calls, 'status').filter(c => c.argv.includes('--run')).length
+  const before = aboutRuns()
   const [run] = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status' })).result)
   expect(run.outcome.state).toBe('accepted')
-  expect(nativeCalls(engine.calls, 'status').length).toBe(before)
+  expect(aboutRuns()).toBe(before)
 })
 
 test('an environment_warning event is rendered as a text line', () => {

@@ -158,8 +158,15 @@ enum Command {
     /// Validate the contract and start an execution (SPEC §3)
     Run {
         /// Path to the task contract
-        #[arg(long = "task")]
-        task: PathBuf,
+        #[arg(long = "task", required_unless_present = "intent")]
+        task: Option<PathBuf>,
+        /// Run a successor intent a `decide revise` recorded: claims it
+        /// atomically (`pending -> claimed`) and runs its contract as a
+        /// revision of the decided run's task. A second claim of an intent
+        /// that is already running is refused `intent_already_claimed`,
+        /// naming the run that holds it
+        #[arg(long = "intent", conflicts_with_all = ["task", "revise"])]
+        intent: Option<String>,
         /// Revise an existing task: this run's cost joins its total
         /// rather than starting a new one. Refused if the contract
         /// declares a different task, or if this id names no task on
@@ -402,6 +409,20 @@ enum Command {
         /// only meaningful with, `--answer salvaged`
         #[arg(long = "candidate")]
         candidate: Option<String>,
+        /// With `--answer revise` on a `scope_exceeded` decision: record a
+        /// successor intent for a `kind: verify` of this run's candidate
+        /// whose write scope adds exactly the out-of-scope paths. The
+        /// plugin launches it; `--json` returns `{successor_intent}`
+        #[arg(
+            long = "widen-scope",
+            conflicts_with = "successor_contract",
+            conflicts_with = "successor"
+        )]
+        widen_scope: bool,
+        /// With `--answer revise`: record a successor intent for the task
+        /// contract in this file. The plugin launches it
+        #[arg(long = "successor-contract", conflicts_with = "successor")]
+        successor_contract: Option<PathBuf>,
     },
     /// Evidence operations (SPEC §12, §18)
     Evidence {
@@ -1392,6 +1413,7 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
         }
         Command::Run {
             task,
+            intent,
             revise,
             protocol,
             workspace,
@@ -1401,7 +1423,16 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 protocol,
                 host: host.as_deref(),
             };
-            run_command(&task, revise.as_deref(), &origin, workspace.as_deref())
+            let source = match (&task, &intent) {
+                (Some(task), None) => RunSource::Task(task),
+                (None, Some(intent)) => RunSource::Intent(intent),
+                _ => {
+                    return Err(CliError::Usage {
+                        detail: "run: name exactly one of --task and --intent".into(),
+                    })
+                }
+            };
+            run_command(source, revise.as_deref(), &origin, workspace.as_deref())
         }
         Command::Native { cmd } => native_command(cmd),
         Command::Quiet { cmd } => quiet_command(cmd),
@@ -1542,7 +1573,11 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             successor,
             criterion,
             candidate,
+            widen_scope,
+            successor_contract,
         } => decide_command(DecideRequest {
+            widen_scope,
+            successor_contract: successor_contract.as_deref(),
             run_id: &run_id,
             answer,
             actor: &actor,
@@ -5214,8 +5249,13 @@ fn native_status_of_session(
     opened: Result<(Ledger, StatusAccess), CurrentUnknown>,
     session: &str,
 ) -> Result<CliOutcome, CliError> {
+    let mut intents = Vec::new();
     let entries = match opened {
         Ok((ledger, access)) => {
+            intents = listed_intents(&ledger)
+                .iter()
+                .map(|intent| intent_json(&ledger, intent))
+                .collect();
             let runs = operational(
                 ledger.runs_of_session(session, SESSION_RUNS_LIMIT),
                 "native status",
@@ -5253,7 +5293,13 @@ fn native_status_of_session(
             Vec::new()
         }
     };
-    println!("{}", serde_json::json!({ "runs": entries }));
+    // `intents` appears only when there is something to launch, so a
+    // session with none prints the shape it always has.
+    let mut printed = serde_json::json!({ "runs": entries });
+    if !intents.is_empty() {
+        printed["intents"] = serde_json::Value::Array(intents);
+    }
+    println!("{printed}");
     Ok(CliOutcome::Accepted)
 }
 
@@ -5503,8 +5549,76 @@ fn run_workspace(
     })
 }
 
+/// Where a run's contract comes from.
+#[derive(Clone, Copy)]
+enum RunSource<'a> {
+    /// A contract file.
+    Task(&'a Path),
+    /// A successor intent in the ledger (plan A5).
+    Intent(&'a str),
+}
+
+/// The contract of a successor intent and the task its run belongs to: the
+/// decided run's, so the successor's cost joins that task's total.
+fn intent_contract(ledger: &Ledger, intent_id: &str) -> Result<(TaskContract, String), String> {
+    let intent = ledger
+        .successor_intent(intent_id)
+        .map_err(|e| format!("ledger: {e}"))?
+        .ok_or_else(|| format!("unknown successor intent {intent_id}"))?;
+    let contract = TaskContract::from_json_str(&intent.contract_json)
+        .map_err(|e| format!("the contract of intent {intent_id} is invalid: {e}"))?;
+    if contract.hash() != intent.contract_digest {
+        return Err(format!(
+            "the contract of intent {intent_id} no longer has the digest recorded with it"
+        ));
+    }
+    let task = ledger
+        .task_of_run(&intent.predecessor)
+        .map_err(|e| format!("ledger: {e}"))?
+        .ok_or_else(|| format!("run {} has no task on record", intent.predecessor))?;
+    Ok((contract, task.to_string()))
+}
+
+/// What the host says of a driver pid, with the start time of the process
+/// that holds it now: the ledger compares it with the one recorded.
+fn successor_process(pid: u32) -> relais::ledger::SuccessorProcess {
+    if relais::coordinator::process_alive(pid) {
+        relais::ledger::SuccessorProcess::Alive {
+            started: relais::procs::start_time(pid),
+        }
+    } else {
+        relais::ledger::SuccessorProcess::Gone
+    }
+}
+
+/// A launch of a successor intent was refused before its run existed: hand
+/// the claim back to pending with the refusal on the intent, so a later
+/// launch can take it instead of finding a claim with no run row.
+fn release_intent(ledger: &Ledger, source: RunSource<'_>, run_id: &RunId, refusal: &str) {
+    if let RunSource::Intent(intent) = source {
+        if let Err(e) = ledger.release_claim(intent, run_id, refusal) {
+            eprintln!("relais run: intent {intent} could not be released: {e}");
+        }
+    }
+}
+
+/// A run that failed operationally hands its claim back only when it left
+/// no row: a run that exists holds the claim, and recovery reads its state.
+fn release_intent_without_run(
+    ledger: &Ledger,
+    source: RunSource<'_>,
+    run_id: &RunId,
+    refusal: &str,
+) {
+    match ledger.run_exists(run_id) {
+        Ok(false) => release_intent(ledger, source, run_id, refusal),
+        Ok(true) => {}
+        Err(e) => eprintln!("relais run: could not tell whether run {run_id} exists: {e}"),
+    }
+}
+
 fn run_command(
-    task: &Path,
+    source: RunSource<'_>,
     revise: Option<&str>,
     origin: &relais::native::RunOrigin<'_>,
     workspace_flag: Option<&str>,
@@ -5522,9 +5636,26 @@ fn run_command(
             return Ok(CliOutcome::Blocked);
         }
     };
-    let contract = load_contract(task)?;
+    let from_file = match source {
+        RunSource::Task(task) => Some(load_contract(task)?),
+        RunSource::Intent(_) => None,
+    };
     let ledger = open_ledger()?;
-    let task_override = match resolve_task_override(&ledger, &contract, revise) {
+    let (contract, revise) = match (source, from_file) {
+        (_, Some(contract)) => (contract, revise.map(str::to_string)),
+        (RunSource::Intent(intent), None) => match intent_contract(&ledger, intent) {
+            Ok((contract, task)) => (contract, Some(task)),
+            Err(detail) => {
+                return Ok(refuse_run(
+                    "intent_unavailable",
+                    detail,
+                    CliOutcome::Blocked,
+                ))
+            }
+        },
+        (RunSource::Task(_), None) => unreachable!("a task source loaded its contract above"),
+    };
+    let task_override = match resolve_task_override(&ledger, &contract, revise.as_deref()) {
         Ok(task_override) => task_override,
         Err(detail) => return Ok(refuse_run("task_refused", detail, CliOutcome::Blocked)),
     };
@@ -5602,11 +5733,64 @@ fn run_command(
             return Ok(CliOutcome::OperationalFailure);
         }
     };
+    // A successor intent is claimed by the run id minted for it: atomic,
+    // so a second launch of the same intent finds the first run instead of
+    // making another (plan A5).
+    if let RunSource::Intent(intent) = source {
+        match ledger.claim_intent(intent, &run_id, &successor_process) {
+            Ok(relais::ledger::Claim::Claimed(_)) => {}
+            Ok(relais::ledger::Claim::AlreadyClaimed { run }) => {
+                return Ok(refuse_run(
+                    "intent_already_claimed",
+                    format!("intent {intent} is already claimed by run {run}"),
+                    CliOutcome::Blocked,
+                ))
+            }
+            Ok(relais::ledger::Claim::Unknown) => {
+                return Ok(refuse_run(
+                    "intent_unavailable",
+                    format!("unknown successor intent {intent}"),
+                    CliOutcome::Blocked,
+                ))
+            }
+            Err(e) => {
+                eprintln!("relais run: {e}");
+                return Ok(CliOutcome::OperationalFailure);
+            }
+        }
+    }
     // The worker attempts go to the relais plugin of the parent session;
     // everything else stays on the Claude backend.
-    let prices = load_price_table()?;
-    if let Some(blocked) = pricing_preflight("relais run", &repo, &prices, &ledger)? {
-        return Ok(blocked);
+    let prices = match load_price_table() {
+        Ok(prices) => prices,
+        Err(e) => {
+            release_intent(
+                &ledger,
+                source,
+                &run_id,
+                &format!("prices unavailable: {e}"),
+            );
+            return Err(e);
+        }
+    };
+    let refusals = match pricing_refusals(&repo, &prices, &ledger) {
+        Ok(refusals) => refusals,
+        Err(e) => {
+            release_intent(
+                &ledger,
+                source,
+                &run_id,
+                &format!("pricing preflight failed: {e}"),
+            );
+            return Err(e);
+        }
+    };
+    if !refusals.is_empty() {
+        for refusal in &refusals {
+            eprintln!("relais run: {refusal}");
+        }
+        release_intent(&ledger, source, &run_id, &refusals.join("; "));
+        return Ok(CliOutcome::Blocked);
     }
     let native_backend = relais::adapter::native::NativeBackend::new(
         backend.as_ref(),
@@ -5650,7 +5834,7 @@ fn run_command(
     // always was.
     let repo_identity = relais::repo::identity(&root);
     let task_id = task_identity(task_override.clone(), &repo_identity, &contract);
-    let trial = operational(
+    let trial = match operational(
         live_trial::decide(&live_trial::Environment {
             root: &root,
             repo: &repo,
@@ -5661,7 +5845,18 @@ fn run_command(
             ledger: Some(&ledger),
         }),
         "trial assignment",
-    )?;
+    ) {
+        Ok(trial) => trial,
+        Err(e) => {
+            release_intent(
+                &ledger,
+                source,
+                &run_id,
+                &format!("trial assignment failed: {e}"),
+            );
+            return Err(e);
+        }
+    };
     for line in trial.lines() {
         eprintln!("{line}");
     }
@@ -5696,6 +5891,12 @@ fn run_command(
                 Ok(trial_id) => trial_id,
                 Err(e) => {
                     eprintln!("relais run: {e}");
+                    release_intent(
+                        &ledger,
+                        source,
+                        &run_id,
+                        &format!("trial record failed: {e}"),
+                    );
                     return Ok(CliOutcome::OperationalFailure);
                 }
             }
@@ -5746,6 +5947,7 @@ fn run_command(
                 }
             }
             eprintln!("relais run: {e}");
+            release_intent_without_run(&ledger, source, &run_id, &format!("run failed: {e}"));
             return Ok(CliOutcome::OperationalFailure);
         }
     };
@@ -5789,6 +5991,10 @@ fn run_command(
         }
         Terminal::Blocked { code, detail } => {
             eprintln!("blocked ({code}): {detail}");
+            Ok(CliOutcome::Blocked)
+        }
+        Terminal::BlockedBy { reason, detail } => {
+            eprintln!("blocked ({reason}): {detail}");
             Ok(CliOutcome::Blocked)
         }
         Terminal::Failed { detail } => {
@@ -5837,6 +6043,23 @@ fn pricing_preflight(
     prices: &relais::orchestration::PriceTable,
     ledger: &relais::ledger::Ledger,
 ) -> Result<Option<CliOutcome>, CliError> {
+    let refusals = pricing_refusals(policy, prices, ledger)?;
+    if refusals.is_empty() {
+        return Ok(None);
+    }
+    for refusal in &refusals {
+        eprintln!("{who}: {refusal}");
+    }
+    Ok(Some(CliOutcome::Blocked))
+}
+
+/// The pricing preflight's refusals, warnings printed; empty when the run
+/// may proceed.
+fn pricing_refusals(
+    policy: &relais::policy::RepoPolicy,
+    prices: &relais::orchestration::PriceTable,
+    ledger: &relais::ledger::Ledger,
+) -> Result<Vec<String>, CliError> {
     let mut aliases: Vec<String> = policy.models.values().map(|m| m.id.clone()).collect();
     aliases.sort();
     aliases.dedup();
@@ -5846,13 +6069,7 @@ fn pricing_preflight(
     for warning in &decided.warnings {
         eprintln!("{warning}");
     }
-    if decided.refusals.is_empty() {
-        return Ok(None);
-    }
-    for refusal in &decided.refusals {
-        eprintln!("{who}: {refusal}");
-    }
-    Ok(Some(CliOutcome::Blocked))
+    Ok(decided.refusals.iter().map(|r| r.to_string()).collect())
 }
 
 /// The `done` line of a replay, sent once its trial is recorded (or could
@@ -7064,6 +7281,35 @@ fn recipe_rollback_command(name: &str, mode: AmendMode) -> Result<CliOutcome, Cl
     present_amendment(&root, &incumbent, &amendment, mode)
 }
 
+/// The successor intents a status shows: every pending one (a refused one
+/// carries its refusal and retry time, and the plugin waits for that time),
+/// and every claimed one whose claim was abandoned (plan A5). `status` and
+/// `resume` only list them; the plugin is the one launcher.
+fn listed_intents(ledger: &Ledger) -> Vec<relais::ledger::SuccessorIntent> {
+    ledger
+        .listed_intents(&successor_process)
+        .unwrap_or_else(|e| {
+            eprintln!("relais: successor intents cannot be listed: {e}");
+            Vec::new()
+        })
+}
+
+/// One line per listed intent, for `status` and `resume`.
+fn print_pending_intents(ledger: &Ledger) {
+    for intent in listed_intents(ledger) {
+        println!(
+            "pending successor intent {} (decided run {}, {}): launch with `relais run --intent {}`",
+            intent.intent_id,
+            intent.predecessor,
+            intent.state.as_str(),
+            intent.intent_id
+        );
+        if let (Some(refusal), Some(retry)) = (&intent.refusal, intent.retry_after()) {
+            println!("  last launch refused: {refusal} (retry after {retry})");
+        }
+    }
+}
+
 fn status_command(run_id: Option<&str>) -> Result<CliOutcome, CliError> {
     let ledger = open_ledger()?;
     let run_id = run_id.map(RunId::from_stored);
@@ -7074,6 +7320,7 @@ fn status_command(run_id: Option<&str>) -> Result<CliOutcome, CliError> {
                 "status",
             )?;
             print!("{}", report.render());
+            print_pending_intents(&ledger);
             Ok(CliOutcome::Accepted)
         }
         Some(run_id) => {
@@ -7084,6 +7331,7 @@ fn status_command(run_id: Option<&str>) -> Result<CliOutcome, CliError> {
             let cost = operational(ledger.run_cost(&run_id), "status")?;
             let attempts = operational(ledger.attempt_count(&run_id), "status")?;
             println!("{run_id}: {state} (attempts: {attempts}, cost: {cost})");
+            print_pending_intents(&ledger);
             Ok(CliOutcome::Accepted)
         }
     }
@@ -7246,6 +7494,7 @@ impl Retire {
 
 fn resume_command(run_id: &str, retire: Retire) -> Result<CliOutcome, CliError> {
     let ledger = open_ledger()?;
+    print_pending_intents(&ledger);
     let run = RunId::from_stored(run_id);
     let Some(state) = operational(ledger.run_status(&run), "resume")? else {
         eprintln!("relais resume: unknown run {run_id}");
@@ -8631,6 +8880,8 @@ struct DecideRequest<'a> {
     successor: Option<&'a str>,
     criterion: Option<&'a str>,
     candidate: Option<&'a str>,
+    widen_scope: bool,
+    successor_contract: Option<&'a Path>,
     json: bool,
     proof_stdin: bool,
 }
@@ -8659,6 +8910,33 @@ struct Decided {
     to_state: State,
     advice: serde_json::Value,
     sentence: String,
+    /// The successor intent a `revise --widen-scope` or `--successor-
+    /// contract` answer wrote (or, repeated, found).
+    successor_intent: Option<serde_json::Value>,
+}
+
+/// An intent as `decide --json` and `native status` print it.
+fn intent_json(ledger: &Ledger, intent: &relais::ledger::SuccessorIntent) -> serde_json::Value {
+    // Where the plugin starts the run: the repository the decided run
+    // worked in.
+    let repo = ledger
+        .run_workspace(&intent.predecessor)
+        .ok()
+        .flatten()
+        .map(|workspace| workspace.repo_path.to_string_lossy().into_owned());
+    serde_json::json!({
+        "repo": repo,
+        "intent_id": intent.intent_id,
+        "decision_id": intent.decision_id,
+        "predecessor": intent.predecessor.as_str(),
+        "contract_digest": intent.contract_digest,
+        "state": intent.state.as_str(),
+        "run_id": intent.run_id.as_ref().map(RunId::as_str),
+        "scope_delta": intent.scope_delta,
+        "refusal": intent.refusal,
+        "refusal_count": intent.refusal_count,
+        "retry_after": intent.retry_after(),
+    })
 }
 
 type Decision = Result<Decided, Refusal>;
@@ -8668,17 +8946,18 @@ fn decide_command(request: DecideRequest<'_>) -> Result<CliOutcome, CliError> {
     match decide_inner(&request) {
         Ok(Ok(done)) => {
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "run": done.run,
-                        "resolution": done.resolution.as_str(),
-                        "actor": done.actor.as_str(),
-                        "from_state": done.from_state.as_str(),
-                        "to_state": done.to_state.as_str(),
-                        "advice": done.advice,
-                    })
-                );
+                let mut printed = serde_json::json!({
+                    "run": done.run,
+                    "resolution": done.resolution.as_str(),
+                    "actor": done.actor.as_str(),
+                    "from_state": done.from_state.as_str(),
+                    "to_state": done.to_state.as_str(),
+                    "advice": done.advice,
+                });
+                if let Some(intent) = &done.successor_intent {
+                    printed["successor_intent"] = intent.clone();
+                }
+                println!("{printed}");
             } else {
                 println!("{}", done.sentence);
             }
@@ -8868,6 +9147,31 @@ fn decide_inner(request: &DecideRequest<'_>) -> Result<Decision, CliError> {
             },
         );
     }
+    if request.widen_scope || request.successor_contract.is_some() {
+        if answer != DecideAnswer::Revise {
+            return Ok(refusal(
+                CliOutcome::InvalidInput,
+                "`--widen-scope` and `--successor-contract` only apply to `--answer revise`",
+            ));
+        }
+        if criterion.is_some() {
+            return Ok(refusal(
+                CliOutcome::InvalidInput,
+                "`--criterion` only applies to `--answer approve`",
+            ));
+        }
+        return successor_decide(
+            &ledger,
+            &run,
+            state,
+            request,
+            relais::ledger::Answerer {
+                actor,
+                person_quote,
+                recorded_via,
+            },
+        );
+    }
     if !state.awaits_a_person() {
         return Ok(refusal(
             CliOutcome::InvalidInput,
@@ -8981,7 +9285,117 @@ fn decide_inner(request: &DecideRequest<'_>) -> Result<Decision, CliError> {
         to_state,
         advice: operational(ledger.decision_advice(&run), "decide")?,
         sentence: format!("recorded {} for {run_id} by {actor}", resolution.as_str()),
+        successor_intent: None,
     }))
+}
+
+/// `relais decide --answer revise --widen-scope | --successor-contract
+/// <file>`: the answer and the successor intent that carries it out are one
+/// ledger transaction (plan A5). Repeated on an answered decision it returns
+/// the intent the first answer wrote.
+fn successor_decide(
+    ledger: &Ledger,
+    run: &RunId,
+    state: State,
+    request: &DecideRequest<'_>,
+    answerer: relais::ledger::Answerer<'_>,
+) -> Result<Decision, CliError> {
+    use relais::runner::successor;
+    let supplied = match request.successor_contract {
+        Some(path) => Some(load_contract(path)?),
+        None => None,
+    };
+    let decided =
+        |intent: relais::ledger::SuccessorIntent, sentence: String| -> Result<Decision, CliError> {
+            Ok(Ok(Decided {
+                run: run.to_string(),
+                resolution: Reason::DecisionRevised,
+                actor: answerer.actor,
+                from_state: state,
+                to_state: DecideAnswer::Revise.terminal_state(),
+                advice: operational(ledger.decision_advice(run), "decide")?,
+                sentence,
+                successor_intent: Some(intent_json(ledger, &intent)),
+            }))
+        };
+    // Repeated: the decision is answered and its intent exists.
+    if let Some(existing) = operational(ledger.intent_of_decision(run), "decide")? {
+        if let Some(contract) = &supplied {
+            if contract.hash() != existing.contract_digest {
+                return Ok(refusal(
+                    CliOutcome::InvalidInput,
+                    format!(
+                        "run {run} was already answered with successor intent {} for another \
+                         contract ({}); a decision has one successor",
+                        existing.intent_id, existing.contract_digest
+                    ),
+                ));
+            }
+        }
+        let sentence = format!(
+            "run {run} was already answered; successor intent {} is {}",
+            existing.intent_id,
+            existing.state.as_str()
+        );
+        return decided(existing, sentence);
+    }
+    if !state.awaits_a_person() {
+        return Ok(refusal(
+            CliOutcome::InvalidInput,
+            format!("run {run} is {state}, not waiting on a person — nothing to decide"),
+        ));
+    }
+    let planned = (|| -> Result<_, successor::PlanError> {
+        let (contract, scope_delta) = match supplied {
+            Some(contract) => (contract, Vec::new()),
+            None => {
+                let paths = successor::out_of_scope_paths(ledger, run)?;
+                let (original, _tier) = ledger.run_contract_and_tier(run)?.ok_or_else(|| {
+                    successor::PlanError::Missing(format!("run {run} carries no recorded contract"))
+                })?;
+                let widened = successor::widened_contract(&original, run, &paths)
+                    .map_err(successor::PlanError::Contract)?;
+                (widened, paths)
+            }
+        };
+        let runs_dir =
+            paths::runs_dir().map_err(|e| successor::PlanError::Missing(e.to_string()))?;
+        successor::plan(ledger, run, &contract, scope_delta, &runs_dir)
+    })();
+    let intent = match planned {
+        Ok(intent) => intent,
+        Err(e) => return Ok(refusal(CliOutcome::InvalidInput, e.to_string())),
+    };
+    let written = operational(
+        ledger.resolve_decision_with_intent(
+            run,
+            &relais::ledger::DecisionAnswer {
+                resolution: Reason::DecisionRevised,
+                actor: answerer.actor,
+                person_quote: answerer.person_quote,
+                recorded_via: answerer.recorded_via,
+                note: request.note,
+                successor_run: None,
+                from_state: state,
+                to_state: DecideAnswer::Revise.terminal_state(),
+            },
+            &intent,
+        ),
+        "decide",
+    )?;
+    let Some(stored) = written else {
+        return Ok(refusal(
+            CliOutcome::InvalidInput,
+            format!("run {run} has no open decision on record"),
+        ));
+    };
+    let sentence = format!(
+        "recorded {} for {run} by {}; successor intent {} is pending",
+        Reason::DecisionRevised.as_str(),
+        answerer.actor,
+        stored.intent_id
+    );
+    decided(stored, sentence)
 }
 
 /// The CLI flags `--answer salvaged` reads, grouped because they answer
@@ -9075,6 +9489,7 @@ fn salvage_command(
         from_state: state,
         to_state: State::AcceptedByPerson,
         advice: operational(ledger.decision_advice(run), "decide")?,
+        successor_intent: None,
         sentence: format!(
             "recorded {} for {run} by {} (originally ended: {}; candidate contained: {})",
             Reason::DecisionSalvaged.as_str(),
@@ -9312,6 +9727,88 @@ fn reseal_receipt_in(
 mod tests {
     use super::*;
     use relais::ledger::{Ledger, Transition};
+
+    /// A ledger holding one pending successor intent, and its id.
+    fn ledger_with_intent(tag: &str) -> (Ledger, String, relais::test_support::TempDir) {
+        use relais::ledger::{Actor, DecisionAnswer, NewIntent, RecordedVia};
+        use relais::lifecycle::{Reason, State};
+        let dir = relais::test_support::temp_dir(tag);
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let decided = RunId::from_stored("run-a");
+        ledger
+            .insert_run(&decided, "/r", None, &TaskId::from_stored("task-a"), "rk")
+            .expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: decided.clone(),
+                attempt_id: None,
+                from_state: None,
+                to_state: State::NeedsDecision,
+                reason: "scope_exceeded".into(),
+                detail: None,
+                at: ledger.now(),
+            })
+            .expect("waiting");
+        let intent = ledger
+            .resolve_decision_with_intent(
+                &decided,
+                &DecisionAnswer {
+                    resolution: Reason::DecisionRevised,
+                    actor: Actor::Orchestrator,
+                    person_quote: None,
+                    recorded_via: RecordedVia::Cli,
+                    note: None,
+                    successor_run: None,
+                    from_state: State::NeedsDecision,
+                    to_state: State::Failed,
+                },
+                &NewIntent {
+                    predecessor: decided.clone(),
+                    contract_digest: "digest".into(),
+                    contract_json: "{}".into(),
+                    scope_delta: Vec::new(),
+                    candidate: None,
+                },
+            )
+            .expect("written")
+            .expect("open decision");
+        (ledger, intent.intent_id, dir)
+    }
+
+    #[test]
+    fn a_failure_before_the_run_row_exists_leaves_the_intent_pending() {
+        use relais::ledger::{Claim, IntentState};
+        let (ledger, id, _dir) = ledger_with_intent("intent-release");
+        let run_id = RunId::from_stored("run-new");
+        assert!(matches!(
+            ledger
+                .claim_intent(&id, &run_id, &successor_process)
+                .expect("claim"),
+            Claim::Claimed(_)
+        ));
+        release_intent_without_run(&ledger, RunSource::Intent(&id), &run_id, "run failed");
+        let after = ledger.successor_intent(&id).expect("read").expect("row");
+        assert_eq!(after.state, IntentState::Pending);
+        assert_eq!(after.run_id, None);
+        assert_eq!(after.refusal.as_deref(), Some("run failed"));
+    }
+
+    #[test]
+    fn a_failure_after_the_run_row_exists_keeps_the_claim() {
+        use relais::ledger::IntentState;
+        let (ledger, id, _dir) = ledger_with_intent("intent-keep");
+        let run_id = RunId::from_stored("run-new");
+        ledger
+            .claim_intent(&id, &run_id, &successor_process)
+            .expect("claim");
+        ledger
+            .insert_run(&run_id, "/r", None, &TaskId::from_stored("task-a"), "rk")
+            .expect("the run row");
+        release_intent_without_run(&ledger, RunSource::Intent(&id), &run_id, "run failed");
+        let after = ledger.successor_intent(&id).expect("read").expect("row");
+        assert_eq!(after.state, IntentState::Claimed);
+        assert_eq!(after.run_id, Some(run_id));
+    }
 
     /// The start and end lines carry the type, the task, the outcome, the
     /// dispatched model, the cost, the wall time and the load at start.
@@ -10302,6 +10799,8 @@ mod tests {
                 baseline_cache_refused: None,
             },
             kind,
+            candidate: None,
+            predecessor: None,
             models_used: vec!["haiku".into()],
             attempts: 1,
             cost_completeness: relais::money::CostCompleteness::Actual,

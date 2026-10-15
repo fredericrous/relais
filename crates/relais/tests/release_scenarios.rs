@@ -5685,3 +5685,132 @@ fn an_unreadable_marker_is_named_by_retire_and_warned_by_doctor() {
         "{report}"
     );
 }
+
+// A successor intent whose launch a preflight refuses (here the pricing
+// one: the machine lost its price table) is handed back: the intent is
+// pending again with the refusal recorded on it, not claimed by a run that
+// has no row, so the next launch can take it at once.
+#[test]
+fn a_run_intent_refused_by_a_preflight_leaves_the_intent_pending_with_the_refusal() {
+    let world = World::new("intent-refused");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    let path = world.root.join("narrow.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "change",
+            "objective": "Remove the entry point",
+            "base_ref": "HEAD",
+            "write_scope": ["docs/**"],
+            "acceptance": ["src/main.rs no longer exists"],
+            "verification_profile": "default",
+            "review": "off",
+        })
+        .to_string(),
+    )
+    .expect("task");
+    let run = world.relais(&["run", "--task", path.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(8), "{}", text(&run.stderr));
+    let run_id = world.only_run_id();
+    let decided = world.relais(&[
+        "decide",
+        &run_id,
+        "--answer",
+        "revise",
+        "--widen-scope",
+        "--actor",
+        "orchestrator",
+        "--json",
+    ]);
+    assert_eq!(decided.status.code(), Some(0), "{}", text(&decided.stderr));
+    let decided: serde_json::Value = serde_json::from_str(&text(&decided.stdout)).expect("json");
+    let intent_id = decided["successor_intent"]["intent_id"]
+        .as_str()
+        .expect("an intent")
+        .to_string();
+
+    let machine = world.config.join("machine.toml");
+    let priced = std::fs::read_to_string(&machine).expect("machine.toml");
+    assert!(priced.contains(PRICING));
+    std::fs::write(&machine, priced.replace(PRICING, "")).expect("machine.toml");
+    let refused = world.relais(&["run", "--intent", &intent_id]);
+    assert_eq!(refused.status.code(), Some(3), "{}", text(&refused.stderr));
+
+    let ledger = relais::ledger::Ledger::open(&world.state.join("ledger.sqlite")).expect("ledger");
+    let intent = ledger
+        .successor_intent(&intent_id)
+        .expect("read")
+        .expect("the intent");
+    assert_eq!(intent.state, relais::ledger::IntentState::Pending);
+    assert_eq!(intent.run_id, None, "no claim names a run without a row");
+    let refusal = ledger
+        .intent_refusal(&intent_id)
+        .expect("read")
+        .expect("the refusal is recorded");
+    assert!(refusal.contains("unpriced"), "{refusal}");
+    assert_eq!(
+        world.only_run_id(),
+        run_id,
+        "the refused launch made no run"
+    );
+
+    // With prices back, the intent can be launched again, but not inside the
+    // backoff its refusal earned: it is listed with its refusal, not
+    // launchable.
+    std::fs::write(&machine, priced).expect("machine.toml");
+    let gone = |_: u32| relais::ledger::SuccessorProcess::Gone;
+    assert_eq!(ledger.listed_intents(&gone).expect("list").len(), 1);
+    assert!(ledger.launchable_intents(&gone).expect("list").is_empty());
+
+    // The real `native status` carries what the plugin reads to wait: the
+    // refusal, how many times, and an RFC 3339 `retry_after` in the future.
+    let status = world.relais(&["native", "status", "--session", "any-session"]);
+    assert_eq!(status.status.code(), Some(0), "{}", text(&status.stderr));
+    let status: serde_json::Value = serde_json::from_str(&text(&status.stdout)).expect("json");
+    let listed = status["intents"]
+        .as_array()
+        .and_then(|intents| {
+            intents
+                .iter()
+                .find(|i| i["intent_id"] == intent_id.as_str())
+        })
+        .unwrap_or_else(|| panic!("the refused intent is listed: {status}"));
+    assert!(
+        listed["refusal"]
+            .as_str()
+            .is_some_and(|r| r.contains("unpriced")),
+        "{listed}"
+    );
+    assert_eq!(listed["refusal_count"], 1, "{listed}");
+    let retry = chrono::DateTime::parse_from_rfc3339(
+        listed["retry_after"].as_str().expect("a retry_after"),
+    )
+    .expect("an RFC 3339 retry_after the plugin's Date.parse reads");
+    assert!(
+        retry > chrono::Utc::now(),
+        "the retry time is in the future: {listed}"
+    );
+
+    // Past the backoff the same intent is launchable again: a ledger whose
+    // clock stands 61 s on sees it.
+    struct Later;
+    impl relais::ledger::Clock for Later {
+        fn now_rfc3339(&self) -> String {
+            (chrono::Utc::now() + chrono::Duration::seconds(61)).to_rfc3339()
+        }
+    }
+    let later = relais::ledger::Ledger::open_with_clock(
+        &world.state.join("ledger.sqlite"),
+        Box::new(Later),
+    )
+    .expect("ledger");
+    let launchable = later.launchable_intents(&gone).expect("list");
+    assert_eq!(
+        launchable.len(),
+        1,
+        "a refused intent recovers after its backoff"
+    );
+    assert_eq!(launchable[0].intent_id, intent_id);
+}

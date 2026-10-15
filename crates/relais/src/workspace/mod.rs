@@ -36,6 +36,9 @@ pub enum WorkspaceError {
     Git(String),
     DirtyBase(Vec<String>),
     ScopeViolation(Vec<String>),
+    /// A path a candidate's merge conflicted in still has an unmerged index
+    /// entry or a conflict marker: it cannot be snapshotted (plan A4).
+    UnresolvedConflict(Vec<String>),
     Io(std::io::Error),
 }
 
@@ -51,6 +54,11 @@ impl std::fmt::Display for WorkspaceError {
             Self::ScopeViolation(paths) => write!(
                 f,
                 "diff leaves the declared write scope: {}",
+                paths.join(", ")
+            ),
+            Self::UnresolvedConflict(paths) => write!(
+                f,
+                "unresolved_conflict: {} still carries an unmerged entry or a conflict marker",
                 paths.join(", ")
             ),
             Self::Io(e) => write!(f, "{e}"),
@@ -469,16 +477,176 @@ impl TaskWorktree {
         Ok(base == candidate)
     }
 
+    /// Replace the tree's content, index included, with `tree`: how a
+    /// verify run's task tree becomes the merge result (SPEC §8). The tree
+    /// is the merge-tree result, never a second merge.
+    pub fn check_out_tree(&self, tree: &str) -> Result<()> {
+        self.git_indexed(&["read-tree", "--reset", "-u", tree])?;
+        Ok(())
+    }
+
+    /// [`Self::check_out_tree`] for a conflicted merge: the tree (with its
+    /// markers in the working files), then the unmerged stages in the index
+    /// (`index_info` from [`Merged::Conflicted`]).
+    pub fn check_out_conflicted(&self, tree: &str, index_info: &[u8]) -> Result<()> {
+        self.check_out_tree(tree)?;
+        let mut command = git_command(&self.path);
+        command.args(["update-index", "-z", "--index-info"]);
+        if let Some(index) = &self.index {
+            command.env("GIT_INDEX_FILE", index);
+        }
+        let mut child = command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| WorkspaceError::Git(format!("git could not be launched: {e}")))?;
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().expect("stdin was piped");
+            stdin.write_all(index_info)?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|e| WorkspaceError::Git(format!("git update-index: {e}")))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(WorkspaceError::Git(format!(
+                "git update-index --index-info failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
+    /// The paths among `conflicted` that still carry an unmerged index entry
+    /// or a conflict marker in their working file.
+    pub fn unresolved_conflicts(&self, conflicted: &[String]) -> Result<Vec<String>> {
+        if conflicted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let unmerged = self.git_indexed(&["ls-files", "-u", "-z"])?;
+        let unmerged: std::collections::BTreeSet<&str> = unmerged
+            .split('\0')
+            .filter_map(|entry| entry.split_once('\t').map(|(_, path)| path))
+            .collect();
+        let mut open = Vec::new();
+        for path in conflicted {
+            if unmerged.contains(path.as_str()) || has_conflict_marker(&self.path.join(path))? {
+                open.push(path.clone());
+            }
+        }
+        open.sort();
+        Ok(open)
+    }
+
+    /// [`Self::snapshot_candidate`], refused while a conflicted path is
+    /// unresolved: `git add -A` would otherwise stage markers as content.
+    pub fn snapshot_resolved(&self, label: &str, conflicted: &[String]) -> Result<String> {
+        let open = self.unresolved_conflicts(conflicted)?;
+        if !open.is_empty() {
+            return Err(WorkspaceError::UnresolvedConflict(open));
+        }
+        self.snapshot_candidate(label)
+    }
+
     /// Export the candidate as a patch artifact. Untrimmed: a patch whose
     /// last line lost its newline is one `git apply` calls corrupt.
     pub fn export_patch(&self, candidate_sha: &str, out_path: &Path) -> Result<()> {
-        let diff = git_raw(&self.path, &["diff", &self.base_sha, candidate_sha])?;
+        let diff = git_raw(
+            &self.path,
+            &candidate_diff_args(&self.base_sha, candidate_sha),
+        )?;
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(out_path, diff.as_bytes())?;
         Ok(())
     }
+}
+
+/// The paths of a scope violation with the lines each one adds and removes
+/// against `base`, for the decision text. A count git cannot give (a binary
+/// file, a failed call) is left out, never guessed.
+pub fn out_of_scope(
+    repo_dir: &Path,
+    base: &str,
+    candidate: &str,
+    paths: Vec<String>,
+) -> Vec<OutOfScope> {
+    let counts = git_raw(
+        repo_dir,
+        &["diff", "--numstat", "-z", "--no-renames", base, candidate],
+    )
+    .unwrap_or_default();
+    // `<added>\t<removed>\t<path>` NUL-terminated.
+    let counted: std::collections::BTreeMap<&str, (Option<u64>, Option<u64>)> = counts
+        .split('\0')
+        .filter_map(|entry| {
+            let mut parts = entry.splitn(3, '\t');
+            let added = parts.next()?.parse().ok();
+            let removed = parts.next()?.parse().ok();
+            Some((parts.next()?, (added, removed)))
+        })
+        .collect();
+    paths
+        .into_iter()
+        .map(|path| {
+            let (added, removed) = counted.get(path.as_str()).copied().unwrap_or((None, None));
+            OutOfScope {
+                path,
+                added,
+                removed,
+            }
+        })
+        .collect()
+}
+
+/// A path a diff changed outside the write scope, with how much.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct OutOfScope {
+    pub path: String,
+    /// Lines added and removed against the base; `None` for a binary file
+    /// or a count that could not be read.
+    pub added: Option<u64>,
+    pub removed: Option<u64>,
+}
+
+impl OutOfScope {
+    /// A path whose change size is not known.
+    pub fn bare(path: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            added: None,
+            removed: None,
+        }
+    }
+}
+
+impl std::fmt::Display for OutOfScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.added, self.removed) {
+            (Some(added), Some(removed)) => write!(f, "{} (+{added}/-{removed})", self.path),
+            _ => write!(f, "{}", self.path),
+        }
+    }
+}
+
+/// Does this file hold a git conflict marker line? An absent file (the path
+/// was resolved by deleting it) holds none; a file that cannot be read is an
+/// error, never a pass.
+fn has_conflict_marker(path: &Path) -> Result<bool> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(WorkspaceError::Io(e)),
+    };
+    Ok(String::from_utf8_lossy(&bytes).lines().any(|line| {
+        ["<<<<<<<", ">>>>>>>"].iter().any(|marker| {
+            line.strip_prefix(marker)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+        })
+    }))
 }
 
 /// Protected repository configuration (SPEC §8): changes here are rejected
@@ -981,29 +1149,267 @@ pub fn name_candidate(repo_dir: &Path, run_id: &str, attempt: u32, sha: &str) ->
     Ok(name)
 }
 
-/// Drop every candidate ref of one run, releasing its commits to the
-/// next `git gc`. Nothing calls this yet: a candidate outlives its run on
-/// purpose (SPEC §8 — the patch and the base revision stay integrable
-/// afterwards), and deciding WHEN a run's evidence stops being wanted is
-/// a retention policy, not a runner step. It is the one operation a
-/// future `relais gc` needs, and it is here so the ref namespace has an
-/// owner rather than growing without one.
-pub fn forget_run_refs(repo_dir: &Path, run_id: &str) -> Result<Vec<String>> {
+/// The `(run, attempt)` candidates a run that has not ended still needs
+/// ([`crate::ledger::Ledger::pinned_candidates`]): their ref and patch
+/// file are not released.
+pub type Pins = std::collections::BTreeSet<(String, u32)>;
+
+/// What releasing a run's candidates did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Released {
+    pub refs_removed: Vec<String>,
+    pub patches_removed: Vec<PathBuf>,
+    /// Refs and patch files kept because a pin names them.
+    pub kept: Vec<String>,
+}
+
+/// The attempt number a `…/<run>/<n>` ref or a `candidate-<n>.patch` file
+/// names; `None` for `final`, `latest` and anything else.
+fn attempt_of(leaf: &str) -> Option<u32> {
+    leaf.parse().ok()
+}
+
+/// Drop the candidate refs of one run, releasing their commits to the
+/// next `git gc`, and the run's `candidate-*.patch` files in
+/// `artifacts_dir` — except what a pin names. Nothing calls this on its
+/// own yet: a candidate outlives its run on purpose (SPEC §8 — the patch
+/// and the base revision stay integrable afterwards), and deciding WHEN a
+/// run's evidence stops being wanted is a retention policy, not a runner
+/// step. It is the one operation a future `relais gc` needs, and it takes
+/// the pins so that a candidate a running `kind: verify` run applies
+/// cannot be swept from under it. `candidate-latest.patch` is kept while
+/// any attempt of the run is pinned, since a pin may have resolved
+/// "the latest".
+///
+/// holds-until: a command that garbage-collects candidates (a future
+/// `relais gc`) calls `reap::release_candidates`; until then nothing does,
+/// and `retire` and reap never delete candidate refs.
+pub fn forget_run_candidates(
+    repo_dir: &Path,
+    run_id: &str,
+    artifacts_dir: &Path,
+    pinned: &Pins,
+) -> Result<Released> {
     let prefix = format!("refs/relais/candidates/{run_id}/");
     let listed = git(
         repo_dir,
         &["for-each-ref", "--format=%(refname)", &format!("{prefix}*")],
     )?;
-    let names: Vec<String> = listed
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect();
-    for name in &names {
+    let mut released = Released::default();
+    let run_is_pinned = pinned.iter().any(|(run, _)| run == run_id);
+    for name in listed.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let leaf = name.strip_prefix(&prefix).unwrap_or(name);
+        if attempt_of(leaf).is_some_and(|n| pinned.contains(&(run_id.to_string(), n))) {
+            released.kept.push(name.to_string());
+            continue;
+        }
         git(repo_dir, &["update-ref", "-d", name])?;
+        released.refs_removed.push(name.to_string());
     }
-    Ok(names)
+    let Ok(entries) = std::fs::read_dir(artifacts_dir) else {
+        return Ok(released);
+    };
+    let mut files: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    files.sort();
+    for path in files {
+        let Some(name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(leaf) = name
+            .strip_prefix("candidate-")
+            .and_then(|rest| rest.strip_suffix(".patch"))
+        else {
+            continue;
+        };
+        let held = match attempt_of(leaf) {
+            Some(n) => pinned.contains(&(run_id.to_string(), n)),
+            None => leaf == "latest" && run_is_pinned,
+        };
+        if held {
+            released.kept.push(path.to_string_lossy().into_owned());
+        } else {
+            std::fs::remove_file(&path)?;
+            released.patches_removed.push(path);
+        }
+    }
+    Ok(released)
+}
+
+/// The outcome of merging a candidate into a target base, in the object
+/// store: no worktree is touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Merged {
+    /// The merge is clean; this is its result tree.
+    Clean { tree: String },
+    /// The candidate conflicts with the target. `tree` is the result tree
+    /// git still writes (conflicted files carry markers); `files` are the
+    /// conflicted paths, sorted; `index_info` is the input
+    /// `git update-index -z --index-info` needs to turn those paths'
+    /// stage-0 entries into the unmerged stages merge-tree reported.
+    Conflicted {
+        tree: String,
+        files: Vec<String>,
+        index_info: Vec<u8>,
+    },
+}
+
+/// The oldest git whose `merge-tree` has `--write-tree`.
+pub const MERGE_TREE_MIN_GIT: (u32, u32) = (2, 40);
+
+/// `(major, minor)` of a `git --version` line.
+pub fn parse_git_version(line: &str) -> Option<(u32, u32)> {
+    let version = line.trim().strip_prefix("git version ")?;
+    let mut parts = version.split(['.', ' ']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Does the installed git have `merge-tree --write-tree`? `Err` carries
+/// the sentence `relais doctor` and a refusal print.
+pub fn merge_tree_supported() -> std::result::Result<(), String> {
+    let output = Command::new("git")
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("git could not be launched: {e}"))?;
+    let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    match parse_git_version(&printed) {
+        Some(version) if version >= MERGE_TREE_MIN_GIT => Ok(()),
+        _ => Err(format!(
+            "`{printed}` is older than git {}.{}, whose `merge-tree --write-tree` relais needs \
+             to apply a candidate",
+            MERGE_TREE_MIN_GIT.0, MERGE_TREE_MIN_GIT.1
+        )),
+    }
+}
+
+/// Merge `candidate` (made against `source_base`) into `target_base`, in
+/// the object store: `git merge-tree --write-tree --merge-base=<source_base>
+/// <target_base> <candidate>` (exit 1 lists the conflicted paths). The
+/// result tree of a clean merge is what the task tree is checked out from,
+/// so detection and application cannot disagree.
+pub fn merge_candidate(
+    repo_dir: &Path,
+    source_base: &str,
+    target_base: &str,
+    candidate: &str,
+) -> Result<Merged> {
+    let output = git_command(repo_dir)
+        .args([
+            "merge-tree",
+            "--write-tree",
+            "-z",
+            "--no-messages",
+            &format!("--merge-base={source_base}"),
+            target_base,
+            candidate,
+        ])
+        .output()
+        .map_err(|e| WorkspaceError::Git(format!("git could not be launched: {e}")))?;
+    let mut fields = output.stdout.split(|byte| *byte == 0);
+    let tree = String::from_utf8_lossy(fields.next().unwrap_or(&[]))
+        .trim()
+        .to_string();
+    match output.status.code() {
+        Some(0) if !tree.is_empty() => Ok(Merged::Clean { tree }),
+        Some(1) if !tree.is_empty() => {
+            // Only the conflicted-file-info section: `<mode> <oid>
+            // <stage>\t<path>`, one NUL-terminated entry each, ended by an
+            // empty field. What follows is informational messages.
+            let entries: Vec<&[u8]> = fields.take_while(|entry| !entry.is_empty()).collect();
+            let (files, index_info) = conflict_index_info(&entries);
+            Ok(Merged::Conflicted {
+                tree,
+                files,
+                index_info,
+            })
+        }
+        _ => Err(WorkspaceError::Git(format!(
+            "git merge-tree failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+    }
+}
+
+/// The conflicted paths (sorted) and the `git update-index -z --index-info`
+/// input for merge-tree's conflicted-file-info entries. The result tree
+/// already holds each conflicted path at stage 0 (with markers), and
+/// git-update-index(1) says an unmerged stage is only added beside nothing,
+/// so each path first gets a mode-0 removal, then its stage lines.
+fn conflict_index_info(entries: &[&[u8]]) -> (Vec<String>, Vec<u8>) {
+    let mut by_path: std::collections::BTreeMap<Vec<u8>, Vec<&[u8]>> =
+        std::collections::BTreeMap::new();
+    let mut zeros = 40;
+    for entry in entries {
+        let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+            continue;
+        };
+        let (meta, path) = (&entry[..tab], &entry[tab + 1..]);
+        if let Some(oid) = meta.split(|byte| *byte == b' ').nth(1) {
+            zeros = oid.len();
+        }
+        by_path.entry(path.to_vec()).or_default().push(entry);
+    }
+    let mut info = Vec::new();
+    for (path, lines) in &by_path {
+        info.extend_from_slice(b"0 ");
+        info.extend(std::iter::repeat_n(b'0', zeros));
+        info.push(b'\t');
+        info.extend_from_slice(path);
+        info.push(0);
+        for line in lines {
+            info.extend_from_slice(line);
+            info.push(0);
+        }
+    }
+    let files = by_path
+        .keys()
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect();
+    (files, info)
+}
+
+/// Is this a commit the object store holds?
+pub fn commit_exists(repo_dir: &Path, sha: &str) -> bool {
+    git(repo_dir, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_ok()
+}
+
+/// The first parent of a commit: the base a candidate snapshot was made
+/// against (`commit-tree -p <base>`).
+pub fn first_parent(repo_dir: &Path, commit: &str) -> Result<String> {
+    git(repo_dir, &["rev-parse", &format!("{commit}^")])
+}
+
+/// The patch a candidate commit derives from its base, as the bytes
+/// `export_patch` writes.
+pub fn derive_patch(repo_dir: &Path, base: &str, candidate: &str) -> Result<String> {
+    git_raw(repo_dir, &candidate_diff_args(base, candidate))
+}
+
+/// The `git diff` arguments that make a candidate patch, and so its
+/// digest, independent of the user's git config.
+fn candidate_diff_args<'a>(base: &'a str, candidate: &'a str) -> Vec<&'a str> {
+    vec![
+        "-c",
+        "diff.noprefix=false",
+        "-c",
+        "diff.mnemonicPrefix=false",
+        "-c",
+        "diff.algorithm=myers",
+        "-c",
+        "core.abbrev=40",
+        "-c",
+        "diff.renames=false",
+        "diff",
+        "--no-ext-diff",
+        "--no-color",
+        base,
+        candidate,
+    ]
 }
 
 /// A fresh, single-commit checkout of `source_repo` at exactly
@@ -1111,6 +1517,33 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_marker_check_on_an_absent_file_passes_and_on_an_unreadable_one_fails() {
+        let dir = crate::test_support::temp_dir("marker-read");
+        assert!(!has_conflict_marker(&dir.join("deleted.rs")).expect("absent is no marker"));
+        let marked = dir.join("marked.rs");
+        std::fs::write(&marked, "a\n<<<<<<< ours\nb\n").expect("write");
+        assert!(has_conflict_marker(&marked).expect("readable"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = dir.join("locked.rs");
+            std::fs::write(&locked, "<<<<<<< ours\n").expect("write");
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod");
+            // Root reads anything; the check is only meaningful when the read
+            // is really refused.
+            if std::fs::read(&locked).is_err() {
+                assert!(matches!(
+                    has_conflict_marker(&locked),
+                    Err(WorkspaceError::Io(_))
+                ));
+            }
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod back");
+        }
+    }
 
     fn temp_repo() -> (crate::test_support::TempDir, PathBuf) {
         let dir = crate::test_support::temp_dir("ws");
@@ -1472,7 +1905,7 @@ mod tests {
 
     #[test]
     fn a_named_candidate_survives_gc_and_forget_releases_it() {
-        let (_dir, repo) = temp_repo();
+        let (dir, repo) = temp_repo();
         let sha = resolve_base(&repo, "HEAD").expect("base");
         let wt_path = repo.parent().unwrap().join("wt-ref");
         let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
@@ -1495,20 +1928,153 @@ mod tests {
             git(&repo, &["rev-parse", &name]).expect("still there"),
             candidate
         );
-        assert_eq!(
-            forget_run_refs(&repo, "run-42").expect("forget"),
-            vec![name.clone()]
-        );
+        let released = forget_run_candidates(&repo, "run-42", &dir.join("none"), &Pins::new())
+            .expect("forget");
+        assert_eq!(released.refs_removed, vec![name.clone()]);
         assert!(
             git(&repo, &["rev-parse", "--verify", &name]).is_err(),
             "the ref is gone"
         );
         assert!(
-            forget_run_refs(&repo, "run-42")
+            forget_run_candidates(&repo, "run-42", &dir.join("none"), &Pins::new())
                 .expect("forget again")
+                .refs_removed
                 .is_empty(),
             "forgetting twice is not an error"
         );
+    }
+
+    #[test]
+    fn git_versions_parse_and_compare_to_the_merge_tree_minimum() {
+        assert_eq!(parse_git_version("git version 2.50.1"), Some((2, 50)));
+        assert_eq!(
+            parse_git_version("git version 2.39.5 (Apple Git-154)"),
+            Some((2, 39))
+        );
+        assert!(parse_git_version("2.50.1").is_none());
+        assert!(parse_git_version("git version 2.39.5").unwrap() < MERGE_TREE_MIN_GIT);
+        assert!(parse_git_version("git version 2.40.0").unwrap() >= MERGE_TREE_MIN_GIT);
+    }
+
+    /// `merge-tree` is judged in the object store: a clean merge hands back
+    /// the tree to check out, a conflict names the files, and the
+    /// worktree is never touched.
+    #[test]
+    fn merge_candidate_reports_a_clean_tree_or_the_conflicted_files() {
+        let (_dir, repo) = temp_repo();
+        let base = resolve_base(&repo, "HEAD").expect("base");
+        let on = |path: &str, content: &str| {
+            std::fs::write(repo.join(path), content).expect("write");
+            git(&repo, &["add", "-A"]).expect("add");
+            git(&repo, &["commit", "-q", "-m", path]).expect("commit");
+            resolve_base(&repo, "HEAD").expect("sha")
+        };
+        let candidate = on("candidate.txt", "from the candidate\n");
+        git(&repo, &["reset", "-q", "--hard", &base]).expect("back to base");
+        let target = on("target.txt", "from the target\n");
+        match merge_candidate(&repo, &base, &target, &candidate).expect("merges") {
+            Merged::Clean { tree } => {
+                let listed = git(&repo, &["ls-tree", "--name-only", &tree]).expect("tree");
+                assert!(listed.contains("candidate.txt") && listed.contains("target.txt"));
+            }
+            other => panic!("expected a clean merge, got {other:?}"),
+        }
+        // Both sides write the same path differently.
+        git(&repo, &["reset", "-q", "--hard", &base]).expect("back to base");
+        let left = on("both.txt", "left\n");
+        git(&repo, &["reset", "-q", "--hard", &base]).expect("back to base");
+        let right = on("both.txt", "right\n");
+        match merge_candidate(&repo, &base, &right, &left).expect("merges") {
+            Merged::Conflicted { files, tree, .. } => {
+                assert_eq!(files, vec!["both.txt".to_string()]);
+                assert!(!tree.is_empty(), "git still writes the tree with markers");
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+    }
+
+    /// A conflicted merge is built into the task tree as unmerged stages:
+    /// no stage-0 entry survives beside them, the working file carries the
+    /// markers, and the tree cannot be snapshotted until the path is
+    /// resolved (plan A2, A4).
+    #[test]
+    fn a_conflicted_tree_has_only_unmerged_stages_and_snapshots_only_once_resolved() {
+        let (dir, repo) = temp_repo();
+        let base = resolve_base(&repo, "HEAD").expect("base");
+        let on = |path: &str, content: &str| {
+            std::fs::write(repo.join(path), content).expect("write");
+            git(&repo, &["add", "-A"]).expect("add");
+            git(&repo, &["commit", "-q", "-m", path]).expect("commit");
+            resolve_base(&repo, "HEAD").expect("sha")
+        };
+        let left = on("both.txt", "left\n");
+        git(&repo, &["reset", "-q", "--hard", &base]).expect("back to base");
+        let right = on("both.txt", "right\n");
+        let Merged::Conflicted {
+            tree,
+            files,
+            index_info,
+        } = merge_candidate(&repo, &base, &right, &left).expect("merges")
+        else {
+            panic!("expected a conflict");
+        };
+        let worktree = create_worktree(&repo, &right, &dir.join("task-tree")).expect("worktree");
+        worktree
+            .check_out_conflicted(&tree, &index_info)
+            .expect("the index is built");
+
+        let staged = git(&worktree.path, &["ls-files", "-s", "--", "both.txt"]).expect("index");
+        let stages: Vec<&str> = staged
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(2))
+            .collect();
+        assert!(
+            !stages.contains(&"0"),
+            "a stage-0 entry survived beside the unmerged stages: {staged}"
+        );
+        assert!(
+            stages.contains(&"2") && stages.contains(&"3"),
+            "ours and theirs are staged: {staged}"
+        );
+        let text = std::fs::read_to_string(worktree.path.join("both.txt")).expect("file");
+        assert!(
+            text.contains("<<<<<<<") && text.contains(">>>>>>>"),
+            "{text}"
+        );
+
+        assert_eq!(worktree.unresolved_conflicts(&files).expect("check"), files);
+        assert!(matches!(
+            worktree.snapshot_resolved("attempt-1", &files),
+            Err(WorkspaceError::UnresolvedConflict(paths)) if paths == files
+        ));
+        // Markers gone from the file but the path still unmerged: refused.
+        std::fs::write(worktree.path.join("both.txt"), "resolved\n").expect("resolve");
+        assert!(matches!(
+            worktree.snapshot_resolved("attempt-1", &files),
+            Err(WorkspaceError::UnresolvedConflict(_))
+        ));
+        // Staged and clean: accepted.
+        git(&worktree.path, &["add", "both.txt"]).expect("stage the resolution");
+        assert!(worktree
+            .unresolved_conflicts(&files)
+            .expect("check")
+            .is_empty());
+        let candidate = worktree
+            .snapshot_resolved("attempt-1", &files)
+            .expect("snapshot");
+        let content =
+            git(&worktree.path, &["show", &format!("{candidate}:both.txt")]).expect("show");
+        assert_eq!(content, "resolved");
+        // Markers left in a staged file are refused as well.
+        std::fs::write(
+            worktree.path.join("both.txt"),
+            "<<<<<<< ours\nx\n>>>>>>> theirs\n",
+        )
+        .expect("markers");
+        assert!(matches!(
+            worktree.snapshot_resolved("attempt-2", &files),
+            Err(WorkspaceError::UnresolvedConflict(_))
+        ));
     }
 
     #[test]

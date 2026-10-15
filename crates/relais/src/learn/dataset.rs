@@ -507,6 +507,15 @@ pub fn build(
             exclusions.push(format!("{run_id}: no task identity recorded"));
             continue;
         };
+        // A verify run applies a candidate somebody else made: no worker
+        // produced it, so it is no example of a routing decision and must
+        // not stand in for the task's real attempt either.
+        if read_of(&run_id, "contract kind", ledger.run_is_verify(&run_id))? {
+            exclusions.push(format!(
+                "{run_id}: a verify run applies an existing candidate; no worker produced it"
+            ));
+            continue;
+        }
         // A replay is an arm observation of its task, never a later
         // attempt at it: read after every live run, below.
         let purpose = read_of(&run_id, "purpose", ledger.run_purpose(&run_id))?;
@@ -1641,6 +1650,77 @@ argv = ["true"]
             "the superseded attempt is still named, not silently dropped: {:?}",
             dataset.exclusions
         );
+    }
+
+    /// A `kind: verify` run applies a candidate nobody routed: it is no
+    /// example, and being the newest run of its task it must not displace
+    /// the task's real attempt either.
+    #[test]
+    fn a_verify_run_is_skipped_and_does_not_supersede_the_real_attempt() {
+        let times: Vec<String> = (0..80)
+            .map(|minute| format!("2026-01-01T00:{minute:02}:00+00:00"))
+            .collect();
+        let fixture = LedgerFixture::open_with_clock("dataset-verify", times);
+        fixture.dispatched_for_task("run-work", "task-shared", "implementation", "initial");
+        fixture.settle("run-work", State::Failed);
+
+        let verify = crate::contract::TaskContract::from_json_str(
+            r#"{"schema_version":1,"kind":"verify","objective":"Verify it",
+                "base_ref":"HEAD","write_scope":["crates/**"],
+                "candidate":{"run":"run-work"},"acceptance":["parses"],
+                "verification_profile":"p"}"#,
+        )
+        .expect("a verify contract");
+        fixture
+            .ledger
+            .insert_run(
+                &run_id("run-verify"),
+                "/r",
+                None,
+                &TaskId::from_stored("task-shared"),
+                "rk",
+            )
+            .expect("run");
+        let revision = fixture
+            .ledger
+            .insert_contract_revision(
+                &run_id("run-verify"),
+                &verify.hash(),
+                &serde_json::to_string(&verify.canonical_value()).expect("json"),
+                "HEAD",
+                None,
+            )
+            .expect("revision");
+        fixture
+            .ledger
+            .insert_attempt(
+                &run_id("run-verify"),
+                revision,
+                1,
+                "implementation",
+                UsagePhase::parse("initial").expect("known phase"),
+            )
+            .expect("attempt");
+        fixture.settle("run-verify", State::Accepted);
+
+        let dataset = fixture.build();
+        assert!(
+            dataset
+                .exclusions
+                .iter()
+                .any(|why| why.contains("run-verify") && why.contains("verify run")),
+            "the verify run is named: {:?}",
+            dataset.exclusions
+        );
+        assert!(
+            !dataset
+                .exclusions
+                .iter()
+                .any(|why| why.contains("run-work") && why.contains("superseded")),
+            "the real attempt still stands for its task: {:?}",
+            dataset.exclusions
+        );
+        assert_eq!(dataset.records.len(), 1, "{:?}", dataset.records);
     }
 
     /// Every dispatch native: a run's cost is every token priced from the

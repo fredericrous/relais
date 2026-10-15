@@ -427,6 +427,7 @@ pub fn trial_outcome_of(terminal: &Terminal) -> (TrialOutcome, bool) {
             (TrialOutcome::Rejected, false)
         }
         Terminal::Blocked { .. }
+        | Terminal::BlockedBy { .. }
         | Terminal::BudgetExhausted { .. }
         | Terminal::Interrupted { .. }
         | Terminal::Cancelled { .. } => (TrialOutcome::Errored, false),

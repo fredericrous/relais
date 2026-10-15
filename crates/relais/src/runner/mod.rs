@@ -51,11 +51,14 @@ use crate::route::{
 use crate::verify::{self, amont_gaps, Receipt, VerificationReport};
 use crate::workspace::{self, TaskWorktree, WorkspaceError};
 
+mod candidate;
 pub mod live_trial;
 pub mod machine;
 pub mod scheduler;
 mod setup_gate;
+pub mod successor;
 
+pub use crate::workspace::OutOfScope;
 pub use machine::{decide, AttemptKind, Budget, Limit, Next, Observation, Terminal, WorktreeEnd};
 
 /// The lifecycle vocabulary lives in `crate::lifecycle`, a leaf module
@@ -494,6 +497,17 @@ pub(crate) enum Phase<T> {
     Ended(RunOutcome),
 }
 
+/// What snapshotting an attempt's tree produced.
+enum Snapshot {
+    /// The candidate, recorded and scope-checked.
+    Ready(Candidate),
+    /// The run ended.
+    Ended(RunOutcome),
+    /// A path the candidate's merge conflicted in is still unresolved: the
+    /// attempt failed (plan A4), and the machine decides what follows.
+    Unresolved { attempt_id: i64, paths: Vec<String> },
+}
+
 /// What the attempt loop does next.
 enum Step {
     /// Dispatch another attempt.
@@ -515,6 +529,78 @@ struct Preflight {
     revision_id: i64,
     manifest: ContextManifest,
     decision: Route,
+    /// The candidate a `kind: verify` run applies, or a `kind: change` run
+    /// continues from, resolved and merge-checked in preflight; `None`
+    /// for every other run.
+    candidate: Option<PreparedCandidate>,
+    /// The intent this run was launched from (plan A5), when it was: what
+    /// the receipt names as its predecessor.
+    predecessor: Option<crate::contract::Predecessor>,
+}
+
+/// A resolved candidate and the tree its merge into the target base
+/// produced: the task tree is checked out from exactly this tree.
+struct PreparedCandidate {
+    resolved: crate::contract::ResolvedCandidate,
+    tree: String,
+    /// Set when the merge conflicted and the run continues from it (plan
+    /// A4): the tree holds the 3-way result for the worker to resolve.
+    conflicts: Option<CandidateConflicts>,
+}
+
+/// A `from_candidate` merge that conflicted.
+struct CandidateConflicts {
+    files: Vec<String>,
+    /// Input for `git update-index -z --index-info`.
+    index_info: Vec<u8>,
+}
+
+impl PreparedCandidate {
+    /// Make `worktree` this candidate's tree: the clean merge result, or
+    /// the 3-way result with its unmerged index entries.
+    fn check_out(&self, worktree: &TaskWorktree) -> Result<(), WorkspaceError> {
+        match &self.conflicts {
+            Some(conflicts) => worktree.check_out_conflicted(&self.tree, &conflicts.index_info),
+            None => worktree.check_out_tree(&self.tree),
+        }
+    }
+}
+
+impl Preflight {
+    /// The paths a `from_candidate` merge conflicted in; empty otherwise.
+    fn conflicted_paths(&self) -> &[String] {
+        self.candidate
+            .as_ref()
+            .and_then(|prepared| prepared.conflicts.as_ref())
+            .map_or(&[], |conflicts| conflicts.files.as_slice())
+    }
+}
+
+/// The state a run starts its attempts from.
+fn fresh_progress(preflight: &Preflight) -> Progress {
+    let authority = &preflight.authority;
+    let decision = &preflight.decision;
+    Progress {
+        budget: Budget {
+            attempts_used: 0,
+            max_attempts: authority.max_attempts,
+            repairs_used: 0,
+            max_repairs: authority.max_repairs_before_escalation,
+            tier: decision.tier,
+            rung: RungIndex::INITIAL,
+            // The route's kept tier: `None` when `allowed_models`
+            // removed its model. A budget that cannot reach the rung
+            // still decides an escalation, and the attempt ceiling
+            // ends the run before that rung is ever read.
+            escalation_tier: decision.escalation_tier,
+        },
+        kind: AttemptKind::Initial,
+        last_failures: None,
+        last_candidate: None,
+        spend: RunSpend::zero(),
+        models_used: Vec::new(),
+        unpriced_model: None,
+    }
 }
 
 /// What the base revision's own verification established (SPEC §10).
@@ -542,6 +628,14 @@ struct AttemptContext<'c> {
     worktree_path: &'c Path,
     /// The run's wall clock.
     deadline: Instant,
+}
+
+/// The attempt row a candidate is snapshotted for.
+struct Attempted {
+    attempt_id: i64,
+    index: u32,
+    tier: Tier,
+    model: String,
 }
 
 /// One attempt that reached a worker and came back.
@@ -1845,6 +1939,24 @@ impl<'a> RunEngine<'a> {
             },
         };
         let worktree_path = worktree.path.clone();
+        // A verify's tree is the merge result computed in preflight, not a
+        // second merge: what conflict detection judged is what is checked.
+        if let Some(prepared) = &preflight.candidate {
+            let ended = match self.recheck_candidate(prepared)? {
+                Some(outcome) => Some(outcome),
+                None => match prepared.check_out(&worktree) {
+                    Ok(()) => None,
+                    Err(e) => Some(self.fail_preflight(
+                        BlockCode::WorktreeUnavailable,
+                        format!("the candidate's tree could not be checked out: {e}"),
+                    )?),
+                },
+            };
+            if let Some(outcome) = ended {
+                self.retire_worktree(&worktree, &outcome)?;
+                return Ok(outcome);
+            }
+        }
         // The same setup in the worker's own tree, so the worker can run
         // the checks it is told to pass. This is also the one place the
         // setup is proven when the baseline came from the cache: a
@@ -1873,13 +1985,20 @@ impl<'a> RunEngine<'a> {
                 BlockCode::VerificationSetupFailed,
                 setup_failure_detail(failed, "the task worktree"),
             )?,
-            None => self.attempt_loop(&AttemptContext {
-                preflight: &preflight,
-                baseline: &baseline,
-                worktree: &worktree,
-                worktree_path: &worktree_path,
-                deadline,
-            })?,
+            None => {
+                let ctx = AttemptContext {
+                    preflight: &preflight,
+                    baseline: &baseline,
+                    worktree: &worktree,
+                    worktree_path: &worktree_path,
+                    deadline,
+                };
+                if self.config.contract.is_verify() {
+                    self.verify_applied(&ctx)?
+                } else {
+                    self.attempt_loop(&ctx)?
+                }
+            }
         };
         self.retire_worktree(&worktree, &outcome)?;
         Ok(outcome)
@@ -1928,7 +2047,11 @@ impl<'a> RunEngine<'a> {
                 if let Some(purpose) = self.config.purpose {
                     ledger.set_run_purpose(&self.run_id, purpose)?;
                 }
-                inserted?
+                inserted?;
+                // The run is launched (its row exists) and nothing has
+                // told the caller its id yet.
+                #[cfg(test)]
+                crate::ledger::failpoint::hit(crate::ledger::failpoint::AFTER_LAUNCH);
             }
             Some((parent_run, package_id, _role)) => {
                 // A work package is not a task of its own (SPEC §19): it
@@ -1962,8 +2085,11 @@ impl<'a> RunEngine<'a> {
         // gave.
         // An in-place run starts from the tree as it is: uncommitted work
         // is part of the start snapshot, not a refusal (ADR-0008).
+        // A verify applies a merge result into a tree of its own; it never
+        // rewrites the person's worktree.
         let in_place = self.config.workspace == crate::workspace::reuse::Workspace::InPlace
-            && self.parent.is_none();
+            && self.parent.is_none()
+            && !self.config.contract.is_verify();
         match workspace::dirty_paths(self.config.repo_dir).map(|dirty| {
             if in_place {
                 Vec::new()
@@ -2097,6 +2223,26 @@ impl<'a> RunEngine<'a> {
             Some(&base_sha),
         )?;
 
+        // A candidate is resolved once and checked for conflicts here, in
+        // the object store, before anything runs: a conflicting candidate
+        // costs no baseline (plan A1, A2).
+        let candidate = match self.config.contract.source_candidate() {
+            None => None,
+            Some(wanted) => match self.prepare_candidate(wanted, &this_repo_key, &base_sha)? {
+                Phase::Ended(outcome) => return Ok(Phase::Ended(outcome)),
+                Phase::Ready(prepared) => Some(prepared),
+            },
+        };
+
+        let predecessor =
+            ledger
+                .intent_of_run(&self.run_id)?
+                .map(|intent| crate::contract::Predecessor {
+                    run: intent.predecessor.as_str().to_string(),
+                    intent_id: intent.intent_id,
+                    scope_delta: intent.scope_delta,
+                });
+
         // One probe: the version, the turn-ceiling capability and the
         // efforts the CLI accepts are the same answer about the same
         // installed harness.
@@ -2153,7 +2299,12 @@ impl<'a> RunEngine<'a> {
                 return Ok(Phase::Ended(self.fail_preflight(code, detail)?));
             }
         };
-        if let Some(estimates) = &decision.estimates {
+        // A verify dispatches no worker: there is nothing to predict.
+        let estimates = decision
+            .estimates
+            .as_ref()
+            .filter(|_| !self.config.contract.is_verify());
+        if let Some(estimates) = estimates {
             ledger.record_prediction(
                 &self.run_id,
                 &estimates.artifact_id,
@@ -2180,7 +2331,136 @@ impl<'a> RunEngine<'a> {
             revision_id,
             manifest,
             decision,
+            candidate,
+            predecessor,
         }))
+    }
+
+    /// Resolve the candidate a verify names, persist it, and merge it into
+    /// the target base in the object store. A refusal or a conflict ends
+    /// the run `blocked` before the baseline.
+    fn prepare_candidate(
+        &mut self,
+        wanted: &crate::contract::CandidateRef,
+        repo_key: &str,
+        base_sha: &str,
+    ) -> Result<Phase<PreparedCandidate>, RunError> {
+        let ledger = self.config.ledger;
+        if let Err(detail) = workspace::merge_tree_supported() {
+            return Ok(Phase::Ended(
+                self.fail_preflight(BlockCode::VerificationUnavailable, detail)?,
+            ));
+        }
+        let source = candidate::Source {
+            repo_dir: self.config.repo_dir,
+            artifacts_dir: &self.config.artifacts_dir,
+        };
+        let resolved = match ledger.candidate_input(&self.run_id)? {
+            // Resolved once: a run that already has its row applies it.
+            Some(stored) => {
+                if stored.target_base_sha != base_sha {
+                    let detail = format!(
+                        "the candidate was resolved against base {} but this run's base is {base_sha}; \
+                         detection and application must use one base",
+                        stored.target_base_sha
+                    );
+                    return Ok(Phase::Ended(
+                        self.fail_preflight(BlockCode::BaseUnresolvable, detail)?,
+                    ));
+                }
+                stored
+            }
+            None => match candidate::resolve(ledger, &source, repo_key, base_sha, wanted)? {
+                candidate::Resolution::Refused(refusal) => {
+                    return Ok(Phase::Ended(self.refuse_candidate(refusal)?));
+                }
+                candidate::Resolution::Resolved(resolved) => {
+                    ledger.record_candidate_input(&self.run_id, &resolved)?;
+                    resolved
+                }
+            },
+        };
+        self.events.emit(Event::Decision {
+            what: "candidate_resolved".into(),
+            reason: format!(
+                "{}/{} at {}",
+                resolved.source_run, resolved.index, resolved.candidate_commit
+            ),
+        });
+        let merged = workspace::merge_candidate(
+            self.config.repo_dir,
+            &resolved.source_base_sha,
+            &resolved.target_base_sha,
+            &resolved.candidate_commit,
+        );
+        match merged {
+            Ok(workspace::Merged::Clean { tree }) => Ok(Phase::Ready(PreparedCandidate {
+                resolved,
+                tree,
+                conflicts: None,
+            })),
+            // A verify judges the candidate as it is: it cannot be asked to
+            // resolve a merge. A change that continues from one is handed
+            // the merge instead (plan A4).
+            Ok(workspace::Merged::Conflicted {
+                tree,
+                files,
+                index_info,
+            }) => {
+                if self.config.contract.is_verify() {
+                    let detail = candidate::conflict_detail(&resolved, &files);
+                    return Ok(Phase::Ended(self.refuse_candidate(candidate::Refusal {
+                        reason: Reason::CandidateDoesNotApply,
+                        detail,
+                    })?));
+                }
+                self.events.emit(Event::Decision {
+                    what: "candidate_conflicts".into(),
+                    reason: format!(
+                        "{}/{} conflicts with the base in {}; the worker resolves them first",
+                        resolved.source_run,
+                        resolved.index,
+                        files.join(", ")
+                    ),
+                });
+                Ok(Phase::Ready(PreparedCandidate {
+                    resolved,
+                    tree,
+                    conflicts: Some(CandidateConflicts { files, index_info }),
+                }))
+            }
+            Err(e) => Ok(Phase::Ended(
+                self.fail_preflight(BlockCode::SnapshotFailed, e.to_string())?,
+            )),
+        }
+    }
+
+    /// End the run `blocked` under the reason a candidate refusal names.
+    fn refuse_candidate(&mut self, refusal: candidate::Refusal) -> Result<RunOutcome, RunError> {
+        let candidate::Refusal { reason, detail } = refusal;
+        self.finish(
+            reason,
+            serde_json::json!({ "detail": detail }),
+            Terminal::BlockedBy { reason, detail },
+        )
+    }
+
+    /// Before a verify's tree is built: the identity resolved in preflight
+    /// still holds (the object, the derived digest, the patch files). A
+    /// file changed between validation and now ends the run
+    /// `candidate_digest_mismatch`.
+    fn recheck_candidate(
+        &mut self,
+        prepared: &PreparedCandidate,
+    ) -> Result<Option<RunOutcome>, RunError> {
+        let source = candidate::Source {
+            repo_dir: self.config.repo_dir,
+            artifacts_dir: &self.config.artifacts_dir,
+        };
+        match candidate::cross_check(self.config.ledger, &source, &prepared.resolved)? {
+            Some(refusal) => Ok(Some(self.refuse_candidate(refusal)?)),
+            None => Ok(None),
+        }
     }
 
     /// Context: verdicts and tool failures are distinct, contradictions
@@ -2540,29 +2820,7 @@ impl<'a> RunEngine<'a> {
     /// (SPEC §9): ceilings first, then one dispatch, its candidate, and
     /// the machine's verdict on it.
     fn attempt_loop(&mut self, ctx: &AttemptContext<'_>) -> Result<RunOutcome, RunError> {
-        let authority = &ctx.preflight.authority;
-        let decision = &ctx.preflight.decision;
-        let mut progress = Progress {
-            budget: Budget {
-                attempts_used: 0,
-                max_attempts: authority.max_attempts,
-                repairs_used: 0,
-                max_repairs: authority.max_repairs_before_escalation,
-                tier: decision.tier,
-                rung: RungIndex::INITIAL,
-                // The route's kept tier: `None` when `allowed_models`
-                // removed its model. A budget that cannot reach the rung
-                // still decides an escalation, and the attempt ceiling
-                // ends the run before that rung is ever read.
-                escalation_tier: decision.escalation_tier,
-            },
-            kind: AttemptKind::Initial,
-            last_failures: None,
-            last_candidate: None,
-            spend: RunSpend::zero(),
-            models_used: Vec::new(),
-            unpriced_model: None,
-        };
+        let mut progress = fresh_progress(ctx.preflight);
 
         loop {
             if let Some(outcome) = self.end_if_cancelled()? {
@@ -2575,11 +2833,16 @@ impl<'a> RunEngine<'a> {
                 Phase::Ended(outcome) => return Ok(outcome),
                 Phase::Ready(dispatched) => dispatched,
             };
-            let candidate = match self.snapshot_attempt(ctx, &progress, dispatched)? {
-                Phase::Ended(outcome) => return Ok(outcome),
-                Phase::Ready(candidate) => candidate,
+            let judged = match self.snapshot_attempt(ctx, &progress, dispatched)? {
+                Snapshot::Ended(outcome) => return Ok(outcome),
+                Snapshot::Ready(candidate) => {
+                    self.judge_candidate(ctx, &mut progress, candidate)?
+                }
+                Snapshot::Unresolved { attempt_id, paths } => {
+                    self.fail_unresolved(ctx, &mut progress, attempt_id, &paths)?
+                }
             };
-            match self.judge_candidate(ctx, &mut progress, candidate)? {
+            match judged {
                 Step::Ended(outcome) => return Ok(outcome),
                 // The attempt is booked and judged; only a further dispatch
                 // is replaced by the block.
@@ -2595,6 +2858,54 @@ impl<'a> RunEngine<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// A `kind: verify` run after its tree is built: no worker, no repair
+    /// and no escalation. The applied tree is snapshotted as the run's one
+    /// attempt and goes through the pipeline a worker's candidate goes
+    /// through: scope check, verification, review. A failed check ends the
+    /// run `failed`, with the evidence.
+    fn verify_applied(&mut self, ctx: &AttemptContext<'_>) -> Result<RunOutcome, RunError> {
+        if let Some(outcome) = self.end_if_cancelled()? {
+            return Ok(outcome);
+        }
+        let mut progress = fresh_progress(ctx.preflight);
+        progress.budget.attempts_used = 1;
+        let tier = ctx.preflight.decision.tier;
+        let attempt_id = self.config.ledger.insert_attempt(
+            &self.run_id,
+            ctx.preflight.revision_id,
+            1,
+            tier.as_str(),
+            self.attempt_phase(AttemptKind::Initial),
+        )?;
+        let candidate = match self.snapshot_tree(
+            ctx,
+            &progress,
+            Attempted {
+                attempt_id,
+                index: 1,
+                tier,
+                // No model wrote this candidate here: the reviewer, when
+                // one is required, is independent of every worker.
+                model: "relais-verify".to_string(),
+            },
+            None,
+        )? {
+            Snapshot::Ended(outcome) => return Ok(outcome),
+            Snapshot::Ready(candidate) => candidate,
+            // A verify is refused in preflight when the merge conflicts.
+            Snapshot::Unresolved { .. } => return Err(RunError::Other(
+                "a verify run has an unresolved conflict: it is refused before its tree is built"
+                    .into(),
+            )),
+        };
+        match self.judge_candidate(ctx, &mut progress, candidate)? {
+            Step::Ended(outcome) => Ok(outcome),
+            Step::Again => Err(RunError::Other(
+                "a verify run was offered another attempt: it has no worker to repair with".into(),
+            )),
         }
     }
 
@@ -2686,13 +2997,22 @@ impl<'a> RunEngine<'a> {
         // The ladder's rung at the index the machine named, exactly as
         // `route()` resolved and validated it: tier, model and effort.
         let model_profile = rung.profile();
-        let prompt = build_prompt(
+        let mut prompt = build_prompt(
             self.config.contract,
             &ctx.preflight.manifest,
             authority.verification_profile.commands.len(),
             progress.last_failures.as_deref(),
             kind,
         );
+        // A continued candidate that conflicted: what is still open is the
+        // worker's first job (plan A4). A path it already resolved is not
+        // listed again.
+        let conflicted = ctx.preflight.conflicted_paths();
+        let open = ctx
+            .worktree
+            .unresolved_conflicts(conflicted)
+            .unwrap_or_else(|_| conflicted.to_vec());
+        prompt.push_str(&conflict_block(&open));
 
         // Dispatch intent is persisted BEFORE the process exists
         // (SPEC §12), keyed so retries cannot duplicate agents.
@@ -2944,7 +3264,7 @@ impl<'a> RunEngine<'a> {
         ctx: &AttemptContext<'_>,
         progress: &Progress,
         dispatched: Dispatched,
-    ) -> Result<Phase<Candidate>, RunError> {
+    ) -> Result<Snapshot, RunError> {
         let ledger = self.config.ledger;
         let Dispatched {
             attempt_id,
@@ -2960,7 +3280,7 @@ impl<'a> RunEngine<'a> {
         // evidence stay; nothing else is dispatched (SPEC §23).
         if result.ended == Ended::Cancelled {
             ledger.finish_attempt(attempt_id, State::Cancelled, Some(&held_worktree), None)?;
-            return Ok(Phase::Ended(self.stop(
+            return Ok(Snapshot::Ended(self.stop(
                 &progress.budget,
                 Observation::Cancelled(
                     "the dispatch was cancelled through the coordinator; what the worker wrote \
@@ -2973,7 +3293,7 @@ impl<'a> RunEngine<'a> {
         // Missing terminal result = interrupted, not failed (SPEC §9).
         if result.terminal_result_missing() {
             ledger.finish_attempt(attempt_id, State::Interrupted, Some(&held_worktree), None)?;
-            return Ok(Phase::Ended(self.stop(
+            return Ok(Snapshot::Ended(self.stop(
                 &progress.budget,
                 Observation::TerminalResultMissing {
                     timed_out: result.ended == Ended::TimedOut,
@@ -3001,7 +3321,7 @@ impl<'a> RunEngine<'a> {
         let claimed_blockage = result.worker_claims_blockage;
         if claimed_blockage {
             ledger.finish_attempt(attempt_id, State::Blocked, None, None)?;
-            return Ok(Phase::Ended(self.stop(
+            return Ok(Snapshot::Ended(self.stop(
                 &progress.budget,
                 Observation::WorkerBlockage(result.result_text.unwrap_or_default()),
             )?));
@@ -3013,21 +3333,57 @@ impl<'a> RunEngine<'a> {
         // (SPEC §23).
         if let Some(holder) = self.wait_for_writers(worktree_path, ctx.deadline)? {
             ledger.finish_attempt(attempt_id, State::Interrupted, Some(&held_worktree), None)?;
-            return Ok(Phase::Ended(
+            return Ok(Snapshot::Ended(
                 self.stop_on_held_lease(worktree_path, &holder)?,
             ));
         }
 
+        self.snapshot_tree(
+            ctx,
+            progress,
+            Attempted {
+                attempt_id,
+                index,
+                tier,
+                model,
+            },
+            result.result_text,
+        )
+    }
+
+    /// Snapshot the worktree as attempt `index`'s candidate, name it,
+    /// export its patch and judge its scope. Shared by a worker's attempt
+    /// and a verify run's applied tree: both go through the same
+    /// pipeline.
+    fn snapshot_tree(
+        &mut self,
+        ctx: &AttemptContext<'_>,
+        progress: &Progress,
+        attempted: Attempted,
+        result_text: Option<String>,
+    ) -> Result<Snapshot, RunError> {
+        let ledger = self.config.ledger;
+        let Attempted {
+            attempt_id,
+            index,
+            tier,
+            model,
+        } = attempted;
+        let worktree_path = ctx.worktree_path;
+        let held_worktree = worktree_path.to_string_lossy().into_owned();
         // The candidate snapshot is recorded outside model control,
         // added files included (SPEC §8).
-        let sha = match ctx
-            .worktree
-            .snapshot_candidate(&format!("run {} attempt {index}", self.run_id))
-        {
+        let sha = match ctx.worktree.snapshot_resolved(
+            &format!("run {} attempt {index}", self.run_id),
+            ctx.preflight.conflicted_paths(),
+        ) {
             Ok(sha) => sha,
+            Err(WorkspaceError::UnresolvedConflict(paths)) => {
+                return Ok(Snapshot::Unresolved { attempt_id, paths });
+            }
             Err(e) => {
                 ledger.finish_attempt(attempt_id, State::Interrupted, None, None)?;
-                return Ok(Phase::Ended(
+                return Ok(Snapshot::Ended(
                     self.fail_preflight(BlockCode::SnapshotFailed, e.to_string())?,
                 ));
             }
@@ -3071,26 +3427,60 @@ impl<'a> RunEngine<'a> {
             Ok(_) => {}
             Err(WorkspaceError::ScopeViolation(paths)) => {
                 ledger.finish_attempt(attempt_id, State::NeedsDecision, None, Some(&sha))?;
-                return Ok(Phase::Ended(
-                    self.stop(&progress.budget, Observation::ScopeViolation(paths))?,
-                ));
+                return Ok(Snapshot::Ended(self.stop(
+                    &progress.budget,
+                    Observation::ScopeViolation(workspace::out_of_scope(
+                        self.config.repo_dir,
+                        &ctx.preflight.base_sha,
+                        &sha,
+                        paths,
+                    )),
+                )?));
             }
             Err(e) => {
-                return Ok(Phase::Ended(
+                return Ok(Snapshot::Ended(
                     self.fail_preflight(BlockCode::ScopeCheckFailed, e.to_string())?,
                 ));
             }
         }
 
-        Ok(Phase::Ready(Candidate {
+        Ok(Snapshot::Ready(Candidate {
             attempt_id,
             index,
             tier,
             model,
             sha,
             latest_patch,
-            result_text: result.result_text,
+            result_text,
         }))
+    }
+
+    /// The attempt left a conflicted path unresolved: it produced no
+    /// candidate, so it fails like a red check does (SPEC §9): a repair,
+    /// then an escalation, then the attempt ceiling.
+    fn fail_unresolved(
+        &mut self,
+        ctx: &AttemptContext<'_>,
+        progress: &mut Progress,
+        attempt_id: i64,
+        paths: &[String],
+    ) -> Result<Step, RunError> {
+        self.config
+            .ledger
+            .finish_attempt(attempt_id, State::Failed, None, None)?;
+        let failures = vec![format!("unresolved_conflict: {}", paths.join(", "))];
+        let same_failures = progress.last_failures.as_deref() == Some(failures.as_slice());
+        progress.last_failures = Some(failures.clone());
+        self.follow(
+            ctx,
+            progress,
+            Observation::VerificationFailed {
+                failures,
+                unchanged_candidate: false,
+                same_failures,
+                all_preexisting: false,
+            },
+        )
     }
 
     /// Judge one candidate (SPEC §9, §10): what it changes about
@@ -3298,10 +3688,27 @@ impl<'a> RunEngine<'a> {
         // A change task whose candidate changes nothing has not met
         // its objective, whatever the baseline says: a behavioural
         // failure the worker can repair, never an acceptance.
-        if identical && self.config.contract.kind() == crate::contract::Kind::Change {
+        if identical
+            && self.config.contract.kind() == crate::contract::Kind::Change
+            && !self.config.contract.is_verify()
+        {
             failures.push("empty_candidate".into());
         }
 
+        if !failures.is_empty() && self.config.contract.is_verify() {
+            // No repair and no escalation: the candidate was verified and
+            // it failed.
+            let detail = format!(
+                "the verified candidate fails: {}; no worker was dispatched and nothing was \
+                 repaired",
+                failures.join(", ")
+            );
+            return Ok(Step::Ended(self.finish(
+                Reason::BehavioralFailure,
+                serde_json::json!({ "failures": failures, "candidate": candidate.sha }),
+                Terminal::Failed { detail },
+            )?));
+        }
         if !failures.is_empty() {
             let same_failures = progress.last_failures.as_deref() == Some(failures.as_slice());
             progress.last_candidate = Some(candidate.sha.clone());
@@ -3453,6 +3860,11 @@ impl<'a> RunEngine<'a> {
             outcome: State::Accepted.as_str().to_string(),
             verification: report,
             kind: self.config.contract.kind(),
+            candidate: preflight
+                .candidate
+                .as_ref()
+                .map(|prepared| prepared.resolved.clone()),
+            predecessor: preflight.predecessor.clone(),
             models_used: std::mem::take(&mut progress.models_used),
             attempts: candidate.index,
             cost_completeness: progress.spend.completeness,
@@ -4051,6 +4463,11 @@ impl<'a> RunEngine<'a> {
             outcome: State::NeedsDecision.as_str().to_string(),
             verification: report,
             kind: self.config.contract.kind(),
+            candidate: preflight
+                .candidate
+                .as_ref()
+                .map(|prepared| prepared.resolved.clone()),
+            predecessor: preflight.predecessor.clone(),
             models_used: progress.models_used.clone(),
             attempts: candidate.index,
             cost_completeness: progress.spend.completeness,
@@ -5341,6 +5758,31 @@ fn reviewer_guidance(guidance: &Guidance, budget: usize) -> (String, Option<Guid
     let stated: Vec<&str> = shown.iter().map(|rule| rule.id.as_str()).collect();
     text.push_str(&relevant_block(guidance, &stated));
     (text, gap)
+}
+
+/// The conflicts a worker resolves first: `conflicts: [{path, ours:
+/// target_base, theirs: candidate}]` and the instruction. Empty when none
+/// is open.
+fn conflict_block(open: &[String]) -> String {
+    if open.is_empty() {
+        return String::new();
+    }
+    let conflicts: Vec<serde_json::Value> = open
+        .iter()
+        .map(|path| {
+            serde_json::json!({ "path": path, "ours": "target_base", "theirs": "candidate" })
+        })
+        .collect();
+    format!(
+        "\n[merge conflicts]\n\
+         the tree starts from an earlier candidate merged into the target base, and the merge \
+         conflicted. `ours` is the target base, `theirs` is the candidate.\n\
+         conflicts: {}\n\
+         resolve these first: edit each file to its final content with no conflict markers, then \
+         `git add` it. A candidate is not taken while any of these paths is unmerged or still \
+         has a marker.\n",
+        serde_json::Value::Array(conflicts)
+    )
 }
 
 fn build_prompt(
@@ -13465,4 +13907,5 @@ mod tests {
     }
 
     mod native;
+    mod verify_kind;
 }

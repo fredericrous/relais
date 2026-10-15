@@ -2,6 +2,7 @@
 // the run's child, so nothing here outlives the child it describes.
 
 import type { Fx } from './fx.ts'
+import type { ReconcileFailure } from './runs.ts'
 import type { Dispatch } from './dispatches.ts'
 import type { RunModel } from './timeline.ts'
 import { createRouterMemory, type RouterMemory } from './router.ts'
@@ -104,6 +105,9 @@ export type Store = {
   // The session's decide proof (decide.ts): minted at session start, sent
   // on stdin with every decide call, forgotten at session end.
   decideNonce: { session: string; nonce: string } | undefined
+  // Why the last intent reconcile could not read relais's status (runs.ts,
+  // `reconcileIntents`); cleared by the next one that could.
+  intentFailure: ReconcileFailure | undefined
   // When each run's outcome message reached the model, in the clock's ms:
   // a person's answer to it can only come after.
   outcomeDeliveredAt: Map<string, number>
@@ -179,6 +183,7 @@ export const createStore = (): Store => ({
   pendingOutcomes: new Map(),
   isCurrentMissingNoted: false,
   decideNonce: undefined,
+  intentFailure: undefined,
   outcomeDeliveredAt: new Map(),
   lastPersonPrompt: undefined,
   router: createRouterMemory(),

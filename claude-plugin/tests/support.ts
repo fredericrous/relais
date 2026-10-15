@@ -166,7 +166,9 @@ export function scriptedEngine(
       }
     }
     calls.spawn.push(e)
-    const queue = queueOf(e.argv[e.argv.indexOf('--task') + 1])
+    // A run is known by its task, or by its successor intent.
+    const keyAt = e.argv.indexOf('--task') >= 0 ? e.argv.indexOf('--task') : e.argv.indexOf('--intent')
+    const queue = queueOf(e.argv[keyAt + 1])
     for (;;) {
       while (queue.items.length === 0) await new Promise<void>(resolve => (queue.wake = resolve))
       const next = queue.items.shift()

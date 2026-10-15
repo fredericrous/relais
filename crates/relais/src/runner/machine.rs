@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::lifecycle::{Reason, State, UsagePhase};
 use crate::policy::{BlockCode, Tier};
 use crate::route::RungIndex;
+use crate::workspace::OutOfScope;
 
 /// What kind of attempt is being dispatched (SPEC §9: initial, one
 /// repair, one stronger attempt).
@@ -55,13 +56,36 @@ impl From<AttemptKind> for UsagePhase {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Terminal {
     Accepted(Box<crate::verify::Receipt>),
-    NeedsDecision { reason: Reason, detail: String },
-    NeedsReview { detail: String },
-    Blocked { code: BlockCode, detail: String },
-    Failed { detail: String },
-    BudgetExhausted { detail: String },
-    Interrupted { detail: String },
-    Cancelled { detail: String },
+    NeedsDecision {
+        reason: Reason,
+        detail: String,
+    },
+    NeedsReview {
+        detail: String,
+    },
+    Blocked {
+        code: BlockCode,
+        detail: String,
+    },
+    /// Blocked for a reason the lifecycle itself names (a candidate that
+    /// cannot be verified, SPEC §8). Same state and exit code as
+    /// `Blocked`; the name printed after `blocked` is the reason's.
+    BlockedBy {
+        reason: Reason,
+        detail: String,
+    },
+    Failed {
+        detail: String,
+    },
+    BudgetExhausted {
+        detail: String,
+    },
+    Interrupted {
+        detail: String,
+    },
+    Cancelled {
+        detail: String,
+    },
 }
 
 impl Terminal {
@@ -73,6 +97,7 @@ impl Terminal {
             Self::Accepted(_) => (None, None),
             Self::NeedsDecision { reason, detail } => (Some(reason.to_string()), Some(detail)),
             Self::Blocked { code, detail } => (Some(code.to_string()), Some(detail)),
+            Self::BlockedBy { reason, detail } => (Some(reason.to_string()), Some(detail)),
             Self::NeedsReview { detail }
             | Self::Failed { detail }
             | Self::BudgetExhausted { detail }
@@ -86,7 +111,7 @@ impl Terminal {
             Self::Accepted(_) => State::Accepted,
             Self::NeedsDecision { .. } => State::NeedsDecision,
             Self::NeedsReview { .. } => State::NeedsReview,
-            Self::Blocked { .. } => State::Blocked,
+            Self::Blocked { .. } | Self::BlockedBy { .. } => State::Blocked,
             Self::Failed { .. } => State::Failed,
             Self::BudgetExhausted { .. } => State::BudgetExhausted,
             Self::Interrupted { .. } => State::Interrupted,
@@ -106,6 +131,7 @@ impl Terminal {
             | Self::NeedsDecision { .. }
             | Self::NeedsReview { .. }
             | Self::Blocked { .. }
+            | Self::BlockedBy { .. }
             | Self::Failed { .. }
             | Self::BudgetExhausted { .. }
             | Self::Cancelled { .. } => WorktreeEnd::Retire,
@@ -119,6 +145,7 @@ impl Terminal {
             Self::NeedsDecision { detail, .. }
             | Self::NeedsReview { detail }
             | Self::Blocked { detail, .. }
+            | Self::BlockedBy { detail, .. }
             | Self::Failed { detail }
             | Self::BudgetExhausted { detail }
             | Self::Interrupted { detail }
@@ -212,7 +239,7 @@ pub enum Observation {
     /// check green, so no repair is bought.
     CheckCriteriaUnmet(Vec<String>),
     /// The diff leaves the contract's write scope.
-    ScopeViolation(Vec<String>),
+    ScopeViolation(Vec<OutOfScope>),
     /// The worker proposed that something outside the task blocks it.
     WorkerBlockage(String),
     /// The reviewer reported findings.
@@ -418,12 +445,21 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
             )
         }
 
-        Observation::ScopeViolation(paths) => {
-            let detail = format!("the diff leaves the contract scope: {}", paths.join(", "));
+        Observation::ScopeViolation(out) => {
+            // `paths` stay bare: `decide revise --widen-scope` reads them
+            // back as exactly the paths the successor's scope adds.
+            let paths: Vec<&str> = out.iter().map(|o| o.path.as_str()).collect();
+            let detail = format!(
+                "the diff leaves the contract scope: {}",
+                out.iter()
+                    .map(OutOfScope::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             Decision::stop(
                 State::NeedsDecision,
                 Reason::ScopeExceeded,
-                serde_json::json!({ "paths": paths }),
+                serde_json::json!({ "paths": paths, "changes": out }),
                 Terminal::NeedsDecision {
                     reason: Reason::ScopeExceeded,
                     detail,
@@ -703,7 +739,7 @@ mod tests {
     fn scope_gap_review_crash_cancel_and_limits_each_land_on_their_row() {
         let b = budget(0, Some(Tier::Escalation));
         assert_eq!(
-            decide(&b, Observation::ScopeViolation(vec!["x".into()])).state,
+            decide(&b, Observation::ScopeViolation(vec![OutOfScope::bare("x")])).state,
             State::NeedsDecision
         );
         assert_eq!(
