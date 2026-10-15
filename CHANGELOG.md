@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.24.0
+
 The baseline cache is now safe to enable: a base is cached only when every one of its checks passed, so a base with any failed check is re-run every time, and the cache version is 5 (version 4 entries, which could hold failures, are never read). The docs now say the cache is keyed by the base tree, not the base SHA. `cache_baseline` stays off by default.
 
 A marker file left by a dead in-place run that relais cannot read is no longer ignored. `relais resume --retire` and `relais doctor` name the file and why it cannot be read (and `resume --retire` exits non-zero rather than saying nothing is retained), and a new in-place run refuses to start on top of it with `workspace_has_interrupted_run`. Delete the file once you have looked at the tree.
