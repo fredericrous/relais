@@ -2671,19 +2671,22 @@ impl AdmissionState {
                 continue;
             }
             if !group_alive(group.pgid, group.leader_started.as_deref()) {
-                if !runner_lives || group.finished {
-                    if !runner_lives {
-                        report.warnings.push(format!(
-                            "lease {id}: runner {} is gone and process group {} is not the one \
-                             recorded or has no member left; its tokens are returned and nothing \
-                             is signalled",
-                            group.runner, group.pgid
-                        ));
-                    }
-                    self.settle(&id, None, now);
-                    self.release(&id, now);
-                    report.released.push(id);
+                // Nothing of the check is left to wait for: the tokens go
+                // back whether or not the runner is alive or released. A
+                // live runner whose own release failed, or was journalled
+                // to a coordinator that restarted, would otherwise hold
+                // them for its whole life; its later release is `Unknown`.
+                if !runner_lives {
+                    report.warnings.push(format!(
+                        "lease {id}: runner {} is gone and process group {} is not the one \
+                         recorded or has no member left; its tokens are returned and nothing \
+                         is signalled",
+                        group.runner, group.pgid
+                    ));
                 }
+                self.settle(&id, None, now);
+                self.release(&id, now);
+                report.released.push(id);
                 continue;
             }
             if runner_lives {

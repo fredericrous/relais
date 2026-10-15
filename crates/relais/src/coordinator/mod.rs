@@ -3002,6 +3002,55 @@ mod tests {
         bystander.wait().ok();
     }
 
+    /// A check whose group has exited while its runner lives on without
+    /// giving the lease back (its release failed, or reached a coordinator
+    /// that restarted) holds nothing the queue must wait for: the sweep
+    /// returns the tokens and the runner is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_gone_group_returns_its_tokens_while_its_runner_lives() {
+        use std::os::unix::process::CommandExt;
+        let state = one_token_state("run-g");
+        let store = GroupStore::new(None);
+        let ask =
+            |id: &str| lock_state(&state).request(&heavy_request(id, "run-g"), Instant::now());
+        assert_eq!(ask("first"), Decision::Granted);
+        assert_eq!(ask("second"), Decision::Queued { position: 1 });
+
+        let mut runner = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("runner");
+        let mut check = std::process::Command::new("true")
+            .process_group(0)
+            .spawn()
+            .expect("check");
+        let pgid = check.id();
+        let bound = lock_state(&state).bind_group(
+            "first",
+            runner.id(),
+            pgid,
+            Instant::now(),
+            &process_alive,
+            &crate::procs::start_time,
+        );
+        assert_eq!(bound, BindOutcome::Bound);
+        check.wait().expect("the check exits");
+
+        group_tick(&state, &store, Instant::now(), Duration::ZERO);
+        assert_eq!(
+            ask("second"),
+            Decision::Granted,
+            "the tokens came back although the runner never released"
+        );
+        assert!(
+            runner.try_wait().expect("try_wait").is_none(),
+            "the living runner was signalled"
+        );
+        runner.kill().ok();
+        runner.wait().ok();
+    }
+
     /// The hold is in the ledger from the moment the group is bound until
     /// it is given back; a coordinator that starts from it holds the same
     /// tokens and reconciles the orphan.
