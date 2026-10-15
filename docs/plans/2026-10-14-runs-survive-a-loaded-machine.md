@@ -201,7 +201,8 @@ Fixed: typed `TurnCeiling::UnknownTimedOut`; pure `harness_reading` with its own
 Deliberate: the live `relais run` check waits for the first install of v0.22.0 (`holds-until` in Verification 0); the `report` entry is deferred to PR 3.
 Next: PR 1 (candidate identity), on a new branch from `origin/main` after this merges.
 
-PR 1: approve, after two rounds and three deltas on one reviewer (round 1 on the pre-crash-fix tree, 72k/87 s; round 1 on the rebased tree, 68k/68 s; deltas 82k/40 s, 86k/11 s); final tree `c778ebd1`, nothing open.
+PR 1: approve, after two rounds and four deltas on one reviewer (round 1 on the pre-crash-fix tree, 72k/87 s; round 1 on the rebased tree, 68k/68 s; deltas 82k/40 s, 86k/11 s, Windows CI fix 87k/12 s); final tree `704398c8`, nothing open.
+CI: the first push failed on `windows-latest` in two tests (a CRLF checkout compared byte for byte, and a tamper step whose backslashed path `sh -c` misread); both fixed in the tests, no production code changed.
 Fixed: crash-injection failpoints (Verification 3); relaunch on every poll with a refusal backoff (60 s doubling to 10 min); typed reconciler failures; a claim handed back on refusal and on errors before the run row; abandoned claims by pid start time; a read error in the conflict-marker check is returned, not read as "no marker".
 Deliberate: pins protect the release path only (nothing calls it yet; `holds-until` a gc command). Next: PR 2 (resource admission), on a new branch after this merges; its ADR is ADR-0010, since #248 took 0009.
 
