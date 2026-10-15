@@ -2295,7 +2295,12 @@ impl<'a> RunEngine<'a> {
                 return Ok(Phase::Ended(self.fail_preflight(code, detail)?));
             }
         };
-        if let Some(estimates) = &decision.estimates {
+        // A verify dispatches no worker: there is nothing to predict.
+        let estimates = decision
+            .estimates
+            .as_ref()
+            .filter(|_| !self.config.contract.is_verify());
+        if let Some(estimates) = estimates {
             ledger.record_prediction(
                 &self.run_id,
                 &estimates.artifact_id,
@@ -2348,7 +2353,19 @@ impl<'a> RunEngine<'a> {
         };
         let resolved = match ledger.candidate_input(&self.run_id)? {
             // Resolved once: a run that already has its row applies it.
-            Some(stored) => stored,
+            Some(stored) => {
+                if stored.target_base_sha != base_sha {
+                    let detail = format!(
+                        "the candidate was resolved against base {} but this run's base is {base_sha}; \
+                         detection and application must use one base",
+                        stored.target_base_sha
+                    );
+                    return Ok(Phase::Ended(
+                        self.fail_preflight(BlockCode::BaseUnresolvable, detail)?,
+                    ));
+                }
+                stored
+            }
             None => match candidate::resolve(ledger, &source, repo_key, base_sha, wanted)? {
                 candidate::Resolution::Refused(refusal) => {
                     return Ok(Phase::Ended(self.refuse_candidate(refusal)?));

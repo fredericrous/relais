@@ -756,3 +756,183 @@ fn a_widened_scope_verify_names_the_source_run_and_its_receipt_carries_the_delta
     assert_eq!(written["predecessor"]["scope_delta"][0], "docs/extra.md");
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
+
+#[test]
+fn a_stored_row_resolved_against_another_base_is_refused_in_preflight() {
+    let fixture = Fixture::new();
+    let (source, _) = accepted_source(&fixture);
+    commit_file(&fixture, "README.md", "unrelated\n");
+    let base = git(&fixture.repo, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    let run = fixture.ids.run_id().expect("a run id");
+    let stale = "0".repeat(40);
+    fixture
+        .ledger
+        .record_candidate_input(
+            &run,
+            &crate::contract::ResolvedCandidate {
+                source_run: source.as_str().to_string(),
+                index: 1,
+                candidate_commit: "1".repeat(40),
+                patch_sha256: "2".repeat(64),
+                source_base_sha: "3".repeat(40),
+                target_base_sha: stale.clone(),
+            },
+        )
+        .expect("record");
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let seen = launches();
+    let backend = counting_worker(Arc::clone(&seen));
+    let outcome = fixture.execute_as(
+        Some(run.clone()),
+        &verify_contract(&source, None),
+        &repo,
+        &backend,
+    );
+    let detail = format!("{outcome:?}");
+    assert!(
+        detail.contains(&stale) && detail.contains(&base),
+        "{detail}"
+    );
+    assert_eq!(
+        fixture.ledger.run_status(&run).expect("status"),
+        Some(State::Blocked)
+    );
+    assert_eq!(seen.load(Ordering::SeqCst), 0);
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+#[test]
+fn a_user_diff_config_does_not_change_the_candidate_digest() {
+    let fixture = Fixture::new();
+    let (source, _) = accepted_source(&fixture);
+    commit_file(&fixture, "README.md", "unrelated\n");
+    git(&fixture.repo, &["config", "diff.noprefix", "true"]);
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let backend = counting_worker(launches());
+    let outcome = fixture.execute(&verify_contract(&source, None), &repo, &backend);
+    assert!(
+        matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+/// A predictor that always estimates, and counts how often it was asked:
+/// a route that consulted it carries estimates.
+struct CountingPredictor(AtomicUsize);
+
+impl crate::route::RoutePredictor for CountingPredictor {
+    fn estimate(
+        &self,
+        _contract: &TaskContract,
+        _authority: &crate::policy::EffectiveAuthority,
+        arms: &[crate::route::Arm],
+    ) -> Option<crate::route::Estimates> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Some(crate::route::Estimates {
+            artifact_id: "artifact-verify-test".into(),
+            input_hash: "in".into(),
+            acceptance: arms.iter().map(|arm| (arm.clone(), 0.9)).collect(),
+            cost: arms
+                .iter()
+                .map(|arm| (arm.clone(), crate::money::MicroUsd::from_micros(10)))
+                .collect(),
+            raw: serde_json::Value::Null,
+        })
+    }
+}
+
+/// `Fixture::execute` with a learned predictor in the route.
+fn execute_predicted(
+    fixture: &Fixture,
+    contract: &TaskContract,
+    repo: &RepoPolicy,
+    backend: &dyn Backend,
+    predictor: &dyn crate::route::RoutePredictor,
+) -> RunOutcome {
+    let mut machine = fixture.machine_for(repo);
+    machine.routing.learned_enabled = true;
+    let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
+        adr: "ADR-0001".into(),
+        choice: None,
+        reason: None,
+    };
+    execute(&RunConfig {
+        workspace: crate::workspace::reuse::Workspace::Isolated,
+        repo_dir: &fixture.repo,
+        contract,
+        repo_policy: repo,
+        machine: &machine,
+        ledger: &fixture.ledger,
+        ids: &fixture.ids,
+        backend,
+        git: &crate::workspace::SystemGit,
+        hooks: &crate::verify::FixedInventory(None),
+        attest: &crate::verify::FixedAttest::default(),
+        artifacts_dir: fixture.artifacts.clone(),
+        aval_resolver: &resolver,
+        predictor: Some(predictor),
+        gate: None,
+        session_id: "test-session".into(),
+        heartbeat_every: Duration::from_millis(50),
+        task_override: None,
+        purpose: None,
+        run_id: None,
+        wire: Wire::process(),
+        design: DesignSource::Contract,
+        declarations: &crate::trust::NoHistory,
+    })
+    .expect("the fixture's id source mints identifiers")
+}
+
+#[test]
+fn a_verify_run_records_no_routing_prediction() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let predictor = CountingPredictor(AtomicUsize::new(0));
+
+    // A change routed through the predictor records its prediction.
+    let change = execute_predicted(
+        &fixture,
+        &fixture.contract(Review::Off),
+        &repo,
+        &conditional_worker("relais task"),
+        &predictor,
+    );
+    assert!(
+        matches!(change.terminal, Terminal::Accepted(_)),
+        "{change:?}"
+    );
+    assert_eq!(
+        fixture
+            .ledger
+            .predictions(&change.run_id)
+            .expect("predictions")
+            .len(),
+        1
+    );
+
+    // A verify of that change's candidate dispatches no worker and
+    // records none, though the predictor is in its route as well.
+    let asked_before = predictor.0.load(Ordering::SeqCst);
+    let verify = execute_predicted(
+        &fixture,
+        &verify_contract(&change.run_id, None),
+        &repo,
+        &counting_worker(launches()),
+        &predictor,
+    );
+    assert!(
+        matches!(verify.terminal, Terminal::Accepted(_)),
+        "{verify:?}"
+    );
+    assert!(predictor.0.load(Ordering::SeqCst) > asked_before);
+    assert!(fixture
+        .ledger
+        .predictions(&verify.run_id)
+        .expect("predictions")
+        .is_empty());
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}

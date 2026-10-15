@@ -64,12 +64,10 @@ impl World {
         let candidate = git(&repo, &["rev-parse", "HEAD"]);
         git(&repo, &["reset", "-q", "--hard", &base]);
 
-        let patch = std::process::Command::new("git")
-            .args(["diff", &base, &candidate])
-            .current_dir(&repo)
-            .output()
-            .expect("diff")
-            .stdout;
+        // The bytes relais itself exports for a candidate, so the digest
+        // it derives at resolution matches the files.
+        let patch =
+            relais::workspace::derive_patch(&repo, &base, &candidate).expect("derive the patch");
         let run_dir = state.join("runs").join("run-1");
         std::fs::create_dir_all(&run_dir).expect("run dir");
         std::fs::write(run_dir.join("candidate-1.patch"), &patch).expect("patch");

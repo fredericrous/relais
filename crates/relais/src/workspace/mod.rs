@@ -554,7 +554,10 @@ impl TaskWorktree {
     /// Export the candidate as a patch artifact. Untrimmed: a patch whose
     /// last line lost its newline is one `git apply` calls corrupt.
     pub fn export_patch(&self, candidate_sha: &str, out_path: &Path) -> Result<()> {
-        let diff = git_raw(&self.path, &["diff", &self.base_sha, candidate_sha])?;
+        let diff = git_raw(
+            &self.path,
+            &candidate_diff_args(&self.base_sha, candidate_sha),
+        )?;
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1175,6 +1178,10 @@ fn attempt_of(leaf: &str) -> Option<u32> {
 /// cannot be swept from under it. `candidate-latest.patch` is kept while
 /// any attempt of the run is pinned, since a pin may have resolved
 /// "the latest".
+///
+/// holds-until: a command that garbage-collects candidates (a future
+/// `relais gc`) calls `reap::release_candidates`; until then nothing does,
+/// and `retire` and reap never delete candidate refs.
 pub fn forget_run_candidates(
     repo_dir: &Path,
     run_id: &str,
@@ -1378,7 +1385,29 @@ pub fn first_parent(repo_dir: &Path, commit: &str) -> Result<String> {
 /// The patch a candidate commit derives from its base, as the bytes
 /// `export_patch` writes.
 pub fn derive_patch(repo_dir: &Path, base: &str, candidate: &str) -> Result<String> {
-    git_raw(repo_dir, &["diff", base, candidate])
+    git_raw(repo_dir, &candidate_diff_args(base, candidate))
+}
+
+/// The `git diff` arguments that make a candidate patch, and so its
+/// digest, independent of the user's git config.
+fn candidate_diff_args<'a>(base: &'a str, candidate: &'a str) -> Vec<&'a str> {
+    vec![
+        "-c",
+        "diff.noprefix=false",
+        "-c",
+        "diff.mnemonicPrefix=false",
+        "-c",
+        "diff.algorithm=myers",
+        "-c",
+        "core.abbrev=40",
+        "-c",
+        "diff.renames=false",
+        "diff",
+        "--no-ext-diff",
+        "--no-color",
+        base,
+        candidate,
+    ]
 }
 
 /// A fresh, single-commit checkout of `source_repo` at exactly
