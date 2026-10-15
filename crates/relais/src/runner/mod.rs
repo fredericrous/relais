@@ -35,6 +35,7 @@ use crate::context::{
     self, ContextError, ContextManifest, Guidance, GuidanceGap, GuidanceSource, RuleRef,
 };
 use crate::contract::{Review, TaskContract};
+use crate::exhaustion;
 use crate::ids::{derive_task_id, DispatchId, PackageId, RunId};
 use crate::ledger::{EvidenceKind, EvidenceOrigin, Ledger, LedgerError, Transition, UsageEvent};
 use crate::lifecycle::UsagePhase;
@@ -95,6 +96,9 @@ impl RunOutcome {
 enum Finish {
     Own(RunOutcome),
     Superseded(RunOutcome),
+    /// The run cannot be recorded at all (relais's storage is full and
+    /// nothing could be persisted): `execute` returns this error.
+    Exit(RunError),
 }
 
 /// The runner's own failure, as distinct from anything a worker did.
@@ -111,6 +115,12 @@ pub enum RunError {
     /// Another process ended the run (reaped, cancelled) while this one
     /// drove it: the transition was not written and the driver stops.
     Superseded(RunId),
+    /// relais's own storage is full and nothing more could be persisted:
+    /// the run's last durable ledger state is what `relais resume`
+    /// reconciles from (SPEC §10). `relais run` exits with its own code.
+    StorageFull {
+        volume: String,
+    },
     Other(String),
 }
 
@@ -127,7 +137,25 @@ impl std::fmt::Display for RunError {
                 "run {} was ended by another process (reaped or cancelled)",
                 run.as_str()
             ),
+            Self::StorageFull { volume } => write!(
+                f,
+                "relais's own storage on {volume} is full and the run could not be recorded; \
+                 free space there, then `relais resume` the run to reconcile it"
+            ),
             Self::Other(detail) => f.write_str(detail),
+        }
+    }
+}
+
+impl RunError {
+    /// Does this error say relais's own write met a full disk?
+    pub fn is_storage_full(&self) -> bool {
+        match self {
+            Self::Io(e) => crate::storage_full::is_full(e),
+            Self::Ledger(e) => e.is_storage_full(),
+            Self::Workspace(e) => e.is_storage_full(),
+            Self::Verify(e) => e.is_storage_full(),
+            Self::Id(_) | Self::Superseded(_) | Self::StorageFull { .. } | Self::Other(_) => false,
         }
     }
 }
@@ -169,12 +197,16 @@ impl From<crate::ids::IdError> for RunError {
 pub(crate) enum VerifyFailure {
     Unavailable(String),
     Lease(verify::LeaseStop),
+    /// relais's own write met a full disk: the run's to end on (SPEC §10),
+    /// not a profile that could not be carried out.
+    Full(RunError),
 }
 
 impl From<verify::VerifyError> for VerifyFailure {
     fn from(e: verify::VerifyError) -> Self {
         match e {
             verify::VerifyError::Lease(stop) => Self::Lease(stop),
+            other if other.is_storage_full() => Self::Full(other.into()),
             other => Self::Unavailable(other.to_string()),
         }
     }
@@ -188,6 +220,9 @@ impl From<String> for VerifyFailure {
 
 impl From<WorkspaceError> for VerifyFailure {
     fn from(e: WorkspaceError) -> Self {
+        if e.is_storage_full() {
+            return Self::Full(e.into());
+        }
         Self::Unavailable(e.to_string())
     }
 }
@@ -367,7 +402,19 @@ fn retirement_detail(worktree: &Path, retirement: &workspace::Retirement) -> ser
 /// The supervised execution path (SPEC §3): preflight, route, then a
 /// bounded sequence of attempts the runner — not a model — owns.
 pub fn execute(config: &RunConfig<'_>) -> Result<RunOutcome, RunError> {
-    Ok(finished(config, RunEngine::new(config, None)?.run()))
+    let engine = RunEngine::new(config, None)?;
+    let run_id = engine.run_id.clone();
+    match engine.run() {
+        Ok(outcome) => Ok(finished(config, outcome)),
+        Err(error) => {
+            // A run that could not be recorded is over all the same: the
+            // coordinator must not keep its seat.
+            if let Some(gate) = config.gate {
+                let _ = gate.finish_run(run_id.as_str());
+            }
+            Err(error)
+        }
+    }
 }
 
 /// A work package's run (SPEC §19): the same lifecycle, attributed to
@@ -402,10 +449,9 @@ pub fn execute_child(
     package_id: &PackageId,
     role: PackageRole,
 ) -> Result<RunOutcome, RunError> {
-    Ok(finished(
-        config,
-        RunEngine::new(config, Some((parent_run.clone(), package_id.clone(), role)))?.run(),
-    ))
+    let outcome =
+        RunEngine::new(config, Some((parent_run.clone(), package_id.clone(), role)))?.run()?;
+    Ok(finished(config, outcome))
 }
 
 /// Tell the coordinator the run is over, whatever its end: a registered
@@ -483,6 +529,10 @@ pub(crate) struct RunEngine<'a> {
     /// The caller's worktree this run holds when it works in place
     /// (ADR-0008); `None` for every other workspace.
     inplace: Option<InPlaceRun>,
+    /// The newest candidate snapshot this run made, `(attempt, commit)`:
+    /// what the storage-full path names a ref for when the disk fills
+    /// after the snapshot exists (SPEC §10).
+    last_snapshot: Option<(u32, String)>,
 }
 
 /// An in-place run's hold on the caller's worktree.
@@ -893,6 +943,7 @@ impl<'a> RunEngine<'a> {
             harness: None,
             own_write_leases: std::collections::BTreeSet::new(),
             inplace: None,
+            last_snapshot: None,
             reviewer_gap: None,
             cancel_asked: Arc::new(AtomicBool::new(false)),
             budgets: Budgets::unbounded(),
@@ -1818,9 +1869,10 @@ impl<'a> RunEngine<'a> {
         }
     }
 
-    fn run(mut self) -> RunOutcome {
+    fn run(mut self) -> Result<RunOutcome, RunError> {
         let outcome = match self.run_to_outcome() {
             Finish::Own(outcome) => outcome,
+            Finish::Exit(error) => return Err(error),
             // Another process ended the run (a reap, a workerless cancel)
             // and wrote its one outcome event. This driver writes none: a
             // second would contradict it. The plugin reading this stream
@@ -1841,7 +1893,7 @@ impl<'a> RunEngine<'a> {
                         detail,
                     });
                 }
-                return outcome;
+                return Ok(outcome);
             }
         };
         // Whatever `persist_receipt` wrote, whichever way the run ended: an
@@ -1880,13 +1932,14 @@ impl<'a> RunEngine<'a> {
             // run's outcome is in the ledger and in `events.jsonl`.
             let _ = self.config.wire.send(&done);
         }
-        outcome
+        Ok(outcome)
     }
 
     fn run_to_outcome(&mut self) -> Finish {
         match self.run_inner() {
             Ok(outcome) => Finish::Own(outcome),
             Err(RunError::Superseded(_)) => Finish::Superseded(self.superseded_outcome()),
+            Err(error) if error.is_storage_full() => self.on_storage_full(&error),
             Err(error) => {
                 // The runner itself failed. Say so on the record if the
                 // record will still take it; the outcome says so either
@@ -1910,6 +1963,97 @@ impl<'a> RunEngine<'a> {
                 }
             }
         }
+    }
+
+    /// relais's own write met a full disk (SPEC §10). The error has
+    /// already unwound out of whatever was running, so no new launch
+    /// starts and the running check's process group is gone. What is left
+    /// is to persist, in order, the little that can still be saved: the
+    /// ballast is deleted first and must have raised the available space,
+    /// else nothing is written (a local snapshot can keep its blocks) and
+    /// the run exits on its own code; then the candidate's ref, the
+    /// `blocked (relais_storage_full)` transition and the follow-up note.
+    /// A step that fails ends the same way, and `relais resume` reconciles
+    /// from the last durable ledger state.
+    fn on_storage_full(&mut self, error: &RunError) -> Finish {
+        let probe = crate::storage_full::probe();
+        let volume = self.tightest_volume(probe.as_ref());
+        let exit = || {
+            Finish::Exit(RunError::StorageFull {
+                volume: volume.clone(),
+            })
+        };
+        let ballast = state_sibling(
+            &self.config.artifacts_dir,
+            crate::storage_full::BALLAST_FILE,
+        );
+        if crate::storage_full::free_ballast(&ballast, probe.as_ref())
+            != crate::storage_full::Freed::Rose
+        {
+            return exit();
+        }
+        // 1. The candidate's ref, when a snapshot exists. When the ref
+        // cannot be written the outcome says so; the tree stays for resume.
+        let mut notes = Vec::new();
+        if let Some((index, sha)) = self.last_snapshot.clone() {
+            if let Err(e) =
+                workspace::name_candidate(self.config.repo_dir, self.run_id.as_str(), index, &sha)
+            {
+                notes.push(format!(
+                    "the candidate {sha} could not be given its ref ({e}); its worktree is kept \
+                     for `relais resume`"
+                ));
+            }
+        }
+        // 2. The ledger transition.
+        let detail = format!(
+            "relais's own storage on {volume} is full ({error}); new launches stopped and \
+             running checks were killed. {}Free space on {volume}, then `relais resume {}` \
+             reconciles the run",
+            notes.iter().map(|n| format!("{n}. ")).collect::<String>(),
+            self.run_id
+        );
+        let recorded = self.transition(
+            State::Blocked,
+            Reason::RelaisStorageFull,
+            serde_json::json!({
+                "volume": volume,
+                "error": error.to_string(),
+                "candidate": self.last_snapshot.as_ref().map(|(_, sha)| sha),
+            }),
+        );
+        match recorded {
+            Ok(()) => {}
+            Err(RunError::Superseded(_)) => return Finish::Superseded(self.superseded_outcome()),
+            Err(_) => return exit(),
+        }
+        // 3. The follow-up intent.
+        let note = serde_json::json!({
+            "intent": "resume",
+            "run": self.run_id.as_str(),
+            "command": format!("relais resume {}", self.run_id),
+            "volume": volume,
+        });
+        let follow_up = self.artifacts.join("follow-up.json");
+        if crate::fsutil::write_atomic(&follow_up, &note.to_string()).is_err() {
+            return exit();
+        }
+        Finish::Own(RunOutcome {
+            run_id: self.run_id.clone(),
+            terminal: Terminal::BlockedBy {
+                reason: Reason::RelaisStorageFull,
+                detail,
+            },
+        })
+    }
+
+    /// The volume with the least space among those this run writes: the
+    /// likeliest one to be full.
+    fn tightest_volume(&self, probe: &dyn crate::disk::DiskProbe) -> String {
+        crate::disk::volumes(probe, &self.disk_paths())
+            .into_iter()
+            .min_by_key(|volume| volume.available)
+            .map_or_else(|| "unknown volume".to_string(), |volume| volume.mount)
     }
 
     /// The outcome of a run another process ended: what the ledger holds
@@ -2795,6 +2939,12 @@ impl<'a> RunEngine<'a> {
                         }
                         return Ok(Phase::Ended(outcome));
                     }
+                    if let Some(outcome) = self.end_on_baseline_exhaustion(&setup)? {
+                        if let Err(e) = baseline.release() {
+                            eprintln!("relais: {e}");
+                        }
+                        return Ok(Phase::Ended(outcome));
+                    }
                     if let Some(failed) = verify::setup_failure(&setup) {
                         let detail = setup_failure_detail(failed, "the base revision");
                         if let Err(e) = baseline.release() {
@@ -2828,6 +2978,15 @@ impl<'a> RunEngine<'a> {
                     };
                     self.record_logs(None, EvidenceKind::CheckLog, &checks)?;
                     if let Some(outcome) = self.end_if_cancelled()? {
+                        if let Err(e) = baseline.release() {
+                            eprintln!("relais: {e}");
+                        }
+                        return Ok(Phase::Ended(outcome));
+                    }
+                    // Exhaustion is evidence, never a red base: a failed
+                    // check that shows a full disk or no memory gave no
+                    // verdict (SPEC §10).
+                    if let Some(outcome) = self.end_on_baseline_exhaustion(&checks)? {
                         if let Err(e) = baseline.release() {
                             eprintln!("relais: {e}");
                         }
@@ -2931,6 +3090,72 @@ impl<'a> RunEngine<'a> {
             cache_refused,
             logs_dir,
         }))
+    }
+
+    /// A failed check among `checks` that shows exhaustion, with what the
+    /// machine had at failure time (SPEC §10). Read from the failed check's
+    /// output only.
+    fn exhaustion_in(
+        &self,
+        checks: &[verify::CheckOutcome],
+    ) -> Option<(String, exhaustion::Exhaustion, exhaustion::Measured)> {
+        let (label, found) = exhaustion::first_exhaustion(checks)?;
+        let probe = crate::storage_full::probe();
+        let measured = exhaustion::measure(
+            found.resource,
+            probe.as_ref(),
+            &self.disk_paths(),
+            self.config.machine.resources.min_free_bytes(),
+        );
+        Some((label, found, measured))
+    }
+
+    /// The base's failed check showed exhaustion: `blocked
+    /// (baseline_resource_exhausted)`, never a red base.
+    fn end_on_baseline_exhaustion(
+        &mut self,
+        checks: &[verify::CheckOutcome],
+    ) -> Result<Option<RunOutcome>, RunError> {
+        let Some((label, found, measured)) = self.exhaustion_in(checks) else {
+            return Ok(None);
+        };
+        let detail = exhaustion::baseline_text(&label, &found, &measured);
+        self.finish(
+            Reason::BaselineResourceExhausted,
+            exhaustion::detail_json(&label, &found, &measured, None),
+            Terminal::BlockedBy {
+                reason: Reason::BaselineResourceExhausted,
+                detail,
+            },
+        )
+        .map(Some)
+    }
+
+    /// The candidate's failed check showed exhaustion: `needs_decision
+    /// (resource_exhausted)` with the candidate preserved and no repair
+    /// (SPEC §10). Exhaustion is observed, not proof the code is innocent.
+    fn end_on_candidate_exhaustion(
+        &mut self,
+        ctx: &AttemptContext<'_>,
+        candidate: &Candidate,
+        exhausted: (String, exhaustion::Exhaustion, exhaustion::Measured),
+    ) -> Result<RunOutcome, RunError> {
+        let (label, found, measured) = exhausted;
+        self.config.ledger.finish_attempt(
+            candidate.attempt_id,
+            State::NeedsDecision,
+            Some(&ctx.worktree_path.to_string_lossy()),
+            Some(&candidate.sha),
+        )?;
+        let detail = exhaustion::candidate_text(&label, &found, &measured, self.run_id.as_str());
+        self.finish(
+            Reason::ResourceExhausted,
+            exhaustion::detail_json(&label, &found, &measured, Some(&candidate.sha)),
+            Terminal::NeedsDecision {
+                reason: Reason::ResourceExhausted,
+                detail,
+            },
+        )
     }
 
     /// The bounded sequence of attempts the runner — not a model — owns
@@ -3630,6 +3855,7 @@ impl<'a> RunEngine<'a> {
                 ));
             }
         };
+        self.last_snapshot = Some((index, sha.clone()));
         // `commit-tree` leaves a dangling object: the candidate the
         // receipt names, the patch's other side and the worktree's
         // history would all go in the next `git gc`. A ref under
@@ -3639,13 +3865,25 @@ impl<'a> RunEngine<'a> {
         // the object exists and this run verifies it from the object —
         // and the retirement at the run's end names the tree `…/final`
         // itself when no ref holds it, so nothing is lost either way.
-        let _ = workspace::name_candidate(self.config.repo_dir, self.run_id.as_str(), index, &sha);
+        // A full disk is the one failure of it that is not shrugged off:
+        // relais's own write failing stops the run (SPEC §10).
+        let named = crate::storage_full::at(crate::storage_full::Site::Ref)
+            .map_err(WorkspaceError::Io)
+            .and_then(|()| {
+                workspace::name_candidate(self.config.repo_dir, self.run_id.as_str(), index, &sha)
+            });
+        if let Err(e) = named {
+            if e.is_storage_full() {
+                return Err(e.into());
+            }
+        }
         ledger.finish_attempt(
             attempt_id,
             State::Verifying,
             Some(&held_worktree),
             Some(&sha),
         )?;
+        crate::storage_full::at(crate::storage_full::Site::Snapshot)?;
         std::fs::write(self.artifacts.join(format!("candidate-{index}.sha")), &sha)?;
         let patch_path = self.artifacts.join(format!("candidate-{index}.patch"));
         ctx.worktree.export_patch(&sha, &patch_path)?;
@@ -3865,6 +4103,7 @@ impl<'a> RunEngine<'a> {
                     self.fail_preflight(BlockCode::VerificationUnavailable, e)?,
                 ));
             }
+            Err(VerifyFailure::Full(e)) => return Err(e),
         };
         if let Some(outcome) = self.end_if_cancelled()? {
             return Ok(Step::Ended(outcome));
@@ -3881,6 +4120,13 @@ impl<'a> RunEngine<'a> {
                     self.end_on_exhausted(exhausted, &progress.budget)?,
                 ));
             }
+        }
+        // A failed check that shows a full disk or no memory is evidence
+        // for a person: no repair, no escalation, the candidate kept.
+        if let Some(exhausted) = self.exhaustion_in(&checks) {
+            return Ok(Step::Ended(
+                self.end_on_candidate_exhaustion(ctx, &candidate, exhausted)?,
+            ));
         }
         // An inspection judges its report: a gap about the profile's own
         // checks is recorded, not a stop. The acceptance-evidence gaps
@@ -14253,6 +14499,7 @@ mod tests {
     }
 
     mod budgets;
+    mod exhaustion;
     mod native;
     mod verify_kind;
 }

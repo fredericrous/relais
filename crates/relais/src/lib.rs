@@ -15,6 +15,7 @@ pub mod contract;
 pub mod coordinator;
 pub mod disk;
 pub mod doctor;
+pub mod exhaustion;
 pub mod fsclone;
 pub mod fsutil;
 pub mod hook;
@@ -43,6 +44,7 @@ pub mod rng;
 pub mod route;
 pub mod router;
 pub mod runner;
+pub mod storage_full;
 pub mod task_labels;
 /// Scratch-directory test helpers. `pub`, not `#[cfg(test)]`: the
 /// integration suites under `tests/` build this crate as an ordinary

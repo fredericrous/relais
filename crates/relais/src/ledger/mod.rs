@@ -72,6 +72,17 @@ pub enum LedgerError {
     },
 }
 
+impl LedgerError {
+    /// Does this error say the disk is full (SPEC §10)?
+    pub fn is_storage_full(&self) -> bool {
+        match self {
+            LedgerError::Io(e) => crate::storage_full::is_full(e),
+            LedgerError::Sqlite(e) => crate::storage_full::sqlite_full(e),
+            _ => false,
+        }
+    }
+}
+
 impl std::fmt::Display for LedgerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3229,6 +3240,9 @@ impl Ledger {
     /// leaf. Nothing does I/O inside one (SPEC §12: no transaction is
     /// ever held across a model call).
     fn write_tx(&self) -> Result<Transaction<'_>> {
+        // The failpoint a test arms to meet a full disk at a ledger write
+        // (SPEC §10); nothing in a release build.
+        crate::storage_full::at(crate::storage_full::Site::Ledger)?;
         Ok(Transaction::new_unchecked(
             &self.conn,
             TransactionBehavior::Immediate,

@@ -69,6 +69,13 @@ pub enum VerifyError {
     Io(std::io::Error),
 }
 
+impl VerifyError {
+    /// Does this error say the disk is full (SPEC §10)?
+    pub fn is_storage_full(&self) -> bool {
+        matches!(self, VerifyError::Io(e) if crate::storage_full::is_full(e))
+    }
+}
+
 impl std::fmt::Display for VerifyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -924,6 +931,7 @@ pub fn run_observed_within(
         }
     }
     let log_path = logs_dir.join(format!("{log_stem}.log"));
+    crate::storage_full::at(crate::storage_full::Site::Log)?;
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)

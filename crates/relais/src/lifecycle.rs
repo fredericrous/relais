@@ -176,6 +176,16 @@ pub enum Reason {
     /// `disk_wait_seconds` (ADR-0010). A block (exit 3), not a verdict on
     /// the work.
     DiskLow,
+    /// A candidate's failed check showed exhaustion of the machine (a full
+    /// disk, no memory): evidence for a person, never a repair and never a
+    /// verdict that the code is innocent (SPEC §10).
+    ResourceExhausted,
+    /// The base's failed check showed exhaustion: the baseline gave no
+    /// verdict, so the run is blocked and the base is never called red.
+    BaselineResourceExhausted,
+    /// relais's own write met a full disk: new launches stopped, running
+    /// checks were killed and what could be persisted was (SPEC §10).
+    RelaisStorageFull,
 }
 
 impl Reason {
@@ -184,7 +194,7 @@ impl Reason {
     ///
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it.
-    pub const ALL: [Self; 61] = [
+    pub const ALL: [Self; 64] = [
         Self::ChecksAndReviewPassed,
         Self::BehavioralFailure,
         Self::RepairExhausted,
@@ -246,6 +256,9 @@ impl Reason {
         Self::CandidateDigestMismatch,
         Self::AdmissionWaitExhausted,
         Self::DiskLow,
+        Self::ResourceExhausted,
+        Self::BaselineResourceExhausted,
+        Self::RelaisStorageFull,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -311,6 +324,9 @@ impl Reason {
             Self::CandidateDigestMismatch => "candidate_digest_mismatch",
             Self::AdmissionWaitExhausted => "admission_wait_exhausted",
             Self::DiskLow => "disk_low",
+            Self::ResourceExhausted => "resource_exhausted",
+            Self::BaselineResourceExhausted => "baseline_resource_exhausted",
+            Self::RelaisStorageFull => "relais_storage_full",
         }
     }
 

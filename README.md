@@ -59,12 +59,12 @@ split wherever a caller has to act differently.
 | 0 | the command did what was asked |
 | 1 | relais's own machinery failed (ledger, registry, a file it owns) — nothing is implied about the task |
 | 2 | the invocation, or a file it named, is invalid |
-| 3 | policy, trust, admission or the environment refuses; no model ran. This includes a `kind: verify` run that is blocked on its candidate (`candidate_source_running`, `candidate_missing`, `candidate_foreign_repo`, `candidate_does_not_apply`, `candidate_digest_mismatch`), and a `relais run --intent` for an intent already claimed (`intent_already_claimed`, naming the run that holds it). A run that waited out a budget on a loaded machine is blocked too: `admission_wait_exhausted` (queued for a lease past `[resources] admission_wait_seconds`) and `disk_low` (waited for free disk past `disk_wait_seconds`). `budget_exhausted (wall_clock)` and `budget_exhausted (total)` exit 5 |
+| 3 | policy, trust, admission or the environment refuses; no model ran. This includes a `kind: verify` run that is blocked on its candidate (`candidate_source_running`, `candidate_missing`, `candidate_foreign_repo`, `candidate_does_not_apply`, `candidate_digest_mismatch`), and a `relais run --intent` for an intent already claimed (`intent_already_claimed`, naming the run that holds it). A run that waited out a budget on a loaded machine is blocked too: `admission_wait_exhausted` (queued for a lease past `[resources] admission_wait_seconds`) and `disk_low` (waited for free disk past `disk_wait_seconds`). Exhaustion is a block, never a red base or a repair: `baseline_resource_exhausted` (the base's failed check showed a full disk or no memory) and `relais_storage_full` (relais's own write met a full disk; the candidate ref and the ledger record were persisted, `relais resume <run>` reconciles). `budget_exhausted (wall_clock)` and `budget_exhausted (total)` exit 5 |
 | 4 | the task executed and produced no acceptable candidate |
 | 5 | the spending ceiling was reached; patch and evidence preserved |
 | 6 | the run was interrupted; `relais resume` reconciles it |
 | 7 | cancelled by request |
-| 8 | needs a human decision |
+| 8 | needs a human decision; `resource_exhausted` is one (a candidate's failed check showed a full disk or no memory: observed, not proof the code is innocent; no repair was spent, the candidate is preserved, and `relais decide <run> --answer revise --rerun-verify` records a `kind: verify` rerun of it) |
 | 9 | needs a human review |
 | 10 | the run or artifact named is not on record |
 | 11 | `resume` refused: a worker may still be running |
@@ -77,6 +77,7 @@ split wherever a caller has to act differently.
 | 18 | `trust grant` refused: the key is not this policy's; `relais trust show` prints the current one |
 | 19 | `init --detect` found no verification command and none was typed; nothing was written |
 | 20 | `learn cycle`: another cycle holds the Training lease (its pid and start time are named); nothing was queued and no row was written |
+| 21 | relais's own storage is full and the run could not be recorded (one stderr line names the volume); `relais resume <run>` reconciles from the last durable ledger state |
 
 `relais native review-outcome [--ledger <path>] [--plan-root <dir>] [--dry-run]`
 ingests amont-agent's plan-review outcomes ledger (default

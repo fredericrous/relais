@@ -467,6 +467,7 @@ fn execute_waves(
             Err(VerifyFailure::Unavailable(e)) => {
                 return engine.fail_preflight(BlockCode::VerificationUnavailable, e)
             }
+            Err(VerifyFailure::Full(e)) => return Err(e),
         };
         if !gaps.is_empty() {
             return engine.stop(&budget, Observation::VerificationGap(gaps));
