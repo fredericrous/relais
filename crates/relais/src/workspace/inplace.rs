@@ -354,11 +354,7 @@ pub fn working_tree(root: &Path, index: &Path) -> io::Result<String> {
         }
     })?;
     git_text(root, Some(index), &["read-tree", "HEAD"])?;
-    git_text(
-        root,
-        Some(index),
-        &["add", "-A", "--", ".", ":(exclude).relais"],
-    )?;
+    git_text(root, Some(index), super::add_all_but_scratch(root))?;
     git_text(root, Some(index), &["write-tree"])
 }
 
@@ -861,6 +857,31 @@ mod tests {
 
     fn tree_of(dir: &Path, rev: &str) -> String {
         git(dir, &["rev-parse", &format!("{rev}^{{tree}}")])
+    }
+
+    /// A repository that ignores `.relais` itself (relais's own does): the
+    /// exclude pathspec made `git add` exit 1, so `resume --retire` could not
+    /// retire a salvaged run and every later run there was refused.
+    #[test]
+    fn a_worktree_that_ignores_the_scratch_still_snapshots_without_it() {
+        for ignore in ["*.log\ncache/\n.relais\n", "*.log\ncache/\n"] {
+            let (_keep, wt) = linked_worktree();
+            std::fs::write(wt.join(".gitignore"), ignore).expect("ignore");
+            std::fs::create_dir_all(wt.join(".relais")).expect("scratch");
+            std::fs::write(wt.join(".relais/task.json"), "{}\n").expect("task");
+            std::fs::write(wt.join("new.txt"), "new\n").expect("new");
+            let index = wt.join("private-index");
+            let tree = working_tree(&wt, &index).unwrap_or_else(|e| panic!("{ignore:?}: {e}"));
+            let listed = git(&wt, &["ls-tree", "-r", "--name-only", &tree]);
+            assert!(
+                listed.lines().any(|l| l == "new.txt"),
+                "{ignore:?}: {listed}"
+            );
+            assert!(
+                !listed.lines().any(|l| l.starts_with(".relais")),
+                "{ignore:?}: the scratch is never part of a tree: {listed}"
+            );
+        }
     }
 
     #[test]

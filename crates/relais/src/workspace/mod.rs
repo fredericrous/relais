@@ -98,6 +98,23 @@ pub fn git_command(dir: &Path) -> Command {
     command
 }
 
+/// The pathspec that stages a worktree without relais's own `.relais/`
+/// scratch directory. When `.relais` is already ignored, `add -A` never
+/// adds it, and naming it in an exclude makes git exit 1 ("The following
+/// paths are ignored", every pathspec form) after staging everything else:
+/// `resume --retire` then failed on every repository that ignores it.
+pub fn add_all_but_scratch(dir: &Path) -> &'static [&'static str] {
+    let ignored = git_command(dir)
+        .args(["check-ignore", "-q", ".relais"])
+        .status()
+        .is_ok_and(|status| status.success());
+    if ignored {
+        &["add", "-A", "--", "."]
+    } else {
+        &["add", "-A", "--", ".", ":(exclude).relais"]
+    }
+}
+
 /// Git, as this crate uses it: a subcommand run in a directory, its
 /// stdout captured, a non-zero status an error.
 ///
@@ -371,7 +388,7 @@ impl TaskWorktree {
         if self.index.is_some() {
             // The caller's own worktree holds relais's scratch directory
             // (the task contract); it is never part of a candidate.
-            self.git_indexed(&["add", "-A", "--", ".", ":(exclude).relais"])?;
+            self.git_indexed(add_all_but_scratch(&self.path))?;
         } else {
             self.git_indexed(&["add", "-A"])?;
         }
