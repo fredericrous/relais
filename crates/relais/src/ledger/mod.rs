@@ -42,7 +42,7 @@ pub use task_types::{
     ExportedTasks, ImportedTaskTypes, StoredTaskType, TaskExportRow, TaskTypeSource,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 35;
+pub const LEDGER_SCHEMA_VERSION: u64 = 36;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1982,6 +1982,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         r#"
     ALTER TABLE successor_intents ADD COLUMN refusal TEXT;
     ALTER TABLE successor_intents ADD COLUMN refused_at TEXT;
+    "#,
+    ),
+    (
+        // How many launches of an intent were refused, so the wait before
+        // the next offer can grow. Additive, defaulted.
+        "v36",
+        r#"
+    ALTER TABLE successor_intents ADD COLUMN refusal_count INTEGER NOT NULL DEFAULT 0;
     "#,
     ),
 ];

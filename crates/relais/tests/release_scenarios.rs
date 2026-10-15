@@ -5756,8 +5756,61 @@ fn a_run_intent_refused_by_a_preflight_leaves_the_intent_pending_with_the_refusa
         "the refused launch made no run"
     );
 
-    // With prices back, the next launch takes the intent at once.
+    // With prices back, the intent can be launched again, but not inside the
+    // backoff its refusal earned: it is listed with its refusal, not
+    // launchable.
     std::fs::write(&machine, priced).expect("machine.toml");
-    let ledger_intents = ledger.launchable_intents(&|_| relais::ledger::SuccessorProcess::Gone);
-    assert_eq!(ledger_intents.expect("list").len(), 1);
+    let gone = |_: u32| relais::ledger::SuccessorProcess::Gone;
+    assert_eq!(ledger.listed_intents(&gone).expect("list").len(), 1);
+    assert!(ledger.launchable_intents(&gone).expect("list").is_empty());
+
+    // The real `native status` carries what the plugin reads to wait: the
+    // refusal, how many times, and an RFC 3339 `retry_after` in the future.
+    let status = world.relais(&["native", "status", "--session", "any-session"]);
+    assert_eq!(status.status.code(), Some(0), "{}", text(&status.stderr));
+    let status: serde_json::Value = serde_json::from_str(&text(&status.stdout)).expect("json");
+    let listed = status["intents"]
+        .as_array()
+        .and_then(|intents| {
+            intents
+                .iter()
+                .find(|i| i["intent_id"] == intent_id.as_str())
+        })
+        .unwrap_or_else(|| panic!("the refused intent is listed: {status}"));
+    assert!(
+        listed["refusal"]
+            .as_str()
+            .is_some_and(|r| r.contains("unpriced")),
+        "{listed}"
+    );
+    assert_eq!(listed["refusal_count"], 1, "{listed}");
+    let retry = chrono::DateTime::parse_from_rfc3339(
+        listed["retry_after"].as_str().expect("a retry_after"),
+    )
+    .expect("an RFC 3339 retry_after the plugin's Date.parse reads");
+    assert!(
+        retry > chrono::Utc::now(),
+        "the retry time is in the future: {listed}"
+    );
+
+    // Past the backoff the same intent is launchable again: a ledger whose
+    // clock stands 61 s on sees it.
+    struct Later;
+    impl relais::ledger::Clock for Later {
+        fn now_rfc3339(&self) -> String {
+            (chrono::Utc::now() + chrono::Duration::seconds(61)).to_rfc3339()
+        }
+    }
+    let later = relais::ledger::Ledger::open_with_clock(
+        &world.state.join("ledger.sqlite"),
+        Box::new(Later),
+    )
+    .expect("ledger");
+    let launchable = later.launchable_intents(&gone).expect("list");
+    assert_eq!(
+        launchable.len(),
+        1,
+        "a refused intent recovers after its backoff"
+    );
+    assert_eq!(launchable[0].intent_id, intent_id);
 }

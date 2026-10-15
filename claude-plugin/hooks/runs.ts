@@ -235,9 +235,11 @@ export async function startIntent(fx: Fx, store: Store, input: { intent: string;
 export type PendingIntent = { intent_id: string; repo: string }
 
 // The intents `relais native status --session` lists as launchable: pending
-// ones, and claimed ones whose run is gone. Anything else it says is not
-// this function's.
-export function launchableIntents(text: string): PendingIntent[] {
+// ones, and claimed ones whose run is gone. A pending intent whose last
+// launch was refused carries a `retry_after`; inside it the intent is listed
+// for the pane but not launched. Anything else it says is not this
+// function's.
+export function launchableIntents(text: string, now: number = Date.now()): PendingIntent[] {
   let parsed: any
   try {
     parsed = JSON.parse(text)
@@ -245,8 +247,12 @@ export function launchableIntents(text: string): PendingIntent[] {
     return []
   }
   const listed: unknown[] = Array.isArray(parsed?.intents) ? parsed.intents : []
+  const backingOff = (intent: any) => {
+    const retry = typeof intent?.retry_after === 'string' ? Date.parse(intent.retry_after) : NaN
+    return !Number.isNaN(retry) && retry > now
+  }
   return listed.flatMap((intent: any) =>
-    typeof intent?.intent_id === 'string' && typeof intent?.repo === 'string' && intent.repo !== ''
+    typeof intent?.intent_id === 'string' && typeof intent?.repo === 'string' && intent.repo !== '' && !backingOff(intent)
       ? [{ intent_id: intent.intent_id, repo: intent.repo }]
       : [],
   )

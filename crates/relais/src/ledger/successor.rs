@@ -89,6 +89,43 @@ pub struct SuccessorIntent {
     pub candidate: Option<ResolvedCandidate>,
     pub state: IntentState,
     pub run_id: Option<RunId>,
+    /// Why the last launch was refused before it had a run, if one was.
+    pub refusal: Option<String>,
+    /// When that refusal was recorded.
+    pub refused_at: Option<String>,
+    /// How many launches have been refused; the backoff grows with it.
+    pub refusal_count: u32,
+}
+
+/// The seconds a pending intent waits after its first refusal.
+pub const REFUSAL_BACKOFF_SECONDS: i64 = 60;
+/// The longest a refused intent waits before it is offered again.
+pub const REFUSAL_BACKOFF_CEILING_SECONDS: i64 = 600;
+
+/// The wait after the `count`th refusal: 60 s, doubling, capped at 10 min.
+pub fn refusal_backoff_seconds(count: u32) -> i64 {
+    let doublings = count.saturating_sub(1).min(16);
+    (REFUSAL_BACKOFF_SECONDS << doublings).min(REFUSAL_BACKOFF_CEILING_SECONDS)
+}
+
+impl SuccessorIntent {
+    /// When a refused intent may be launched again: its refusal time plus
+    /// the backoff its refusal count earns. `None` for an intent never
+    /// refused.
+    pub fn retry_after(&self) -> Option<String> {
+        let at = chrono::DateTime::parse_from_rfc3339(self.refused_at.as_deref()?).ok()?;
+        let wait = chrono::Duration::seconds(refusal_backoff_seconds(self.refusal_count));
+        Some((at + wait).to_rfc3339())
+    }
+
+    /// Is the intent still inside its backoff at `now`?
+    pub fn backing_off(&self, now: &str) -> bool {
+        self.state == IntentState::Pending
+            && self
+                .retry_after()
+                .and_then(|retry| seconds_since(now, &retry))
+                .is_some_and(|left| left > 0)
+    }
 }
 
 /// What a claim ended in.
@@ -109,7 +146,8 @@ pub fn intent_id_of(decision_id: &str) -> String {
 }
 
 const COLUMNS: &str = "intent_id, decision_id, predecessor, contract_digest, contract_json, \
-                       scope_delta_json, candidate_json, state, run_id";
+                       scope_delta_json, candidate_json, state, run_id, \
+                       refusal, refused_at, refusal_count";
 
 type Row = (
     String,
@@ -121,6 +159,9 @@ type Row = (
     Option<String>,
     String,
     Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
 );
 
 fn row_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
@@ -134,6 +175,9 @@ fn row_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
     ))
 }
 
@@ -155,6 +199,9 @@ fn intent_of_row(row: Row) -> Result<SuccessorIntent> {
         candidate_json,
         state,
         run_id,
+        refusal,
+        refused_at,
+        refusal_count,
     ) = row;
     Ok(SuccessorIntent {
         intent_id,
@@ -170,6 +217,9 @@ fn intent_of_row(row: Row) -> Result<SuccessorIntent> {
             .map_err(|e| corrupt("a successor intent's candidate", e))?,
         state: IntentState::parse(&state)?,
         run_id: run_id.map(RunId::from_stored),
+        refusal,
+        refused_at,
+        refusal_count: u32::try_from(refusal_count).unwrap_or(u32::MAX),
     })
 }
 
@@ -377,7 +427,7 @@ impl Ledger {
         let released = self.conn.execute(
             "UPDATE successor_intents
                 SET state = 'pending', run_id = NULL, claimed_at = NULL,
-                    refusal = ?3, refused_at = ?4
+                    refusal = ?3, refused_at = ?4, refusal_count = refusal_count + 1
               WHERE intent_id = ?1 AND state = 'claimed' AND run_id = ?2",
             params![intent_id, run.as_str(), refusal, self.now()],
         )?;
@@ -409,9 +459,24 @@ impl Ledger {
             .flatten())
     }
 
-    /// Intents the plugin should launch now: every pending one, and every
-    /// claimed one whose claim was abandoned (what a claim would take).
+    /// Intents the plugin should launch now: those `listed_intents` names
+    /// that are not inside the backoff a refusal earned.
     pub fn launchable_intents(
+        &self,
+        alive: &dyn Fn(u32) -> SuccessorProcess,
+    ) -> Result<Vec<SuccessorIntent>> {
+        let now = self.now();
+        Ok(self
+            .listed_intents(alive)?
+            .into_iter()
+            .filter(|intent| !intent.backing_off(&now))
+            .collect())
+    }
+
+    /// Intents a status shows: every pending one (a refused one carries its
+    /// refusal and retry time), and every claimed one whose claim was
+    /// abandoned (what a claim would take).
+    pub fn listed_intents(
         &self,
         alive: &dyn Fn(u32) -> SuccessorProcess,
     ) -> Result<Vec<SuccessorIntent>> {
@@ -888,11 +953,54 @@ mod tests {
             ledger.intent_refusal(&id).expect("read").as_deref(),
             Some("pricing: no price for model x")
         );
-        assert_eq!(ledger.launchable_intents(&up).expect("list").len(), 1);
+        // Listed at once; launchable once the refusal's backoff has passed.
+        assert_eq!(ledger.listed_intents(&up).expect("list").len(), 1);
+        assert!(ledger.launchable_intents(&up).expect("list").is_empty());
         // A release by a run that no longer holds the claim changes nothing.
         assert!(!ledger
             .release_claim(&id, &run("run-9"), "stale")
             .expect("release"));
+    }
+
+    #[test]
+    fn a_refused_intent_is_not_launchable_inside_its_backoff_and_is_after_it() {
+        let (ledger, seconds, _dir) = waiting("backoff");
+        let intent = ledger
+            .resolve_decision_with_intent(&run("run-a"), &answer(), &intent_for("run-a"))
+            .expect("written")
+            .expect("open");
+        let id = intent.intent_id;
+        ledger.claim_intent(&id, &run("run-1"), &up).expect("claim");
+        ledger
+            .release_claim(&id, &run("run-1"), "pricing: no price")
+            .expect("release");
+        let refused = ledger.successor_intent(&id).expect("read").expect("row");
+        assert_eq!(refused.refusal_count, 1);
+        assert!(refused.retry_after().is_some());
+        // Inside the backoff it is listed (with its refusal) but not launchable.
+        seconds.store(REFUSAL_BACKOFF_SECONDS - 1, Ordering::SeqCst);
+        assert!(ledger.launchable_intents(&up).expect("list").is_empty());
+        assert_eq!(ledger.listed_intents(&up).expect("list").len(), 1);
+        seconds.store(REFUSAL_BACKOFF_SECONDS, Ordering::SeqCst);
+        assert_eq!(ledger.launchable_intents(&up).expect("list").len(), 1);
+        // A second refusal doubles the wait.
+        ledger.claim_intent(&id, &run("run-2"), &up).expect("claim");
+        ledger
+            .release_claim(&id, &run("run-2"), "pricing: no price")
+            .expect("release");
+        // Refused at 60 s, a second refusal waits 120 s: until 180 s.
+        seconds.store(179, Ordering::SeqCst);
+        assert!(ledger.launchable_intents(&up).expect("list").is_empty());
+        seconds.store(180, Ordering::SeqCst);
+        assert_eq!(ledger.launchable_intents(&up).expect("list").len(), 1);
+    }
+
+    #[test]
+    fn the_backoff_grows_to_ten_minutes_and_stays() {
+        assert_eq!(refusal_backoff_seconds(1), 60);
+        assert_eq!(refusal_backoff_seconds(2), 120);
+        assert_eq!(refusal_backoff_seconds(5), 600);
+        assert_eq!(refusal_backoff_seconds(500), 600);
     }
 
     /// The runs a recovering plugin has launched for an intent: each poll

@@ -109,6 +109,28 @@ test('a status poll launches an intent that appeared after start', async ($: any
   expect(launches(engine).length).toBe(1)
 })
 
+test('a poll launches no run for an intent refused inside its backoff, and does after it', async ($: any, on: any) => {
+  const engine = scriptedEngine(on)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await settle(engine)
+  const refused = (retryAfter: string) => ({
+    ...INTENT,
+    refusal: 'pricing: no price for model x',
+    refusal_count: 1,
+    retry_after: retryAfter,
+  })
+  let listed = [refused(new Date(Date.now() + 60 * 60_000).toISOString())]
+  engine.script.runResult = (argv: string[]) =>
+    argv.includes('--session') ? result(JSON.stringify({ runs: [], intents: listed })) : result('')
+  await $.tool.call({ tool: 'mcp__relais__status' })
+  await settle(engine)
+  expect(launches(engine).length).toBe(0)
+  listed = [refused(new Date(Date.now() - 1000).toISOString())]
+  await $.tool.call({ tool: 'mcp__relais__status' })
+  await settle(engine)
+  expect(launches(engine).length).toBe(1)
+})
+
 test('a status relais cannot give launches nothing', async ($: any, on: any) => {
   const engine = scriptedEngine(on)
   engine.script.runResult = () => result('', 1)

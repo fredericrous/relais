@@ -939,18 +939,15 @@ fn a_verify_run_records_no_routing_prediction() {
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
-/// How many runs the ledger holds for an intent: the run its claim names
-/// that has a row.
-fn successor_runs_of(ledger: &Ledger, intent_id: &str) -> usize {
-    let intent = ledger
-        .successor_intent(intent_id)
-        .expect("read")
-        .expect("the intent");
-    intent
-        .run_id
-        .into_iter()
+/// Which of the runs a test launched for an intent have a row, whatever the
+/// intent's claim names now: a duplicate shows here even when the claim
+/// points elsewhere.
+fn runs_with_a_row<'a>(ledger: &Ledger, launched: &[&'a RunId]) -> Vec<&'a RunId> {
+    launched
+        .iter()
+        .copied()
         .filter(|run| ledger.run_exists(run).expect("read"))
-        .count()
+        .collect()
 }
 
 #[test]
@@ -1040,7 +1037,53 @@ fn a_launch_that_dies_before_its_id_is_returned_leaves_exactly_one_successor_run
             .expect("claim"),
         Claim::AlreadyClaimed { run: first.clone() }
     );
-    assert_eq!(successor_runs_of(&fixture.ledger, &stored.intent_id), 1);
-    assert!(!fixture.ledger.run_exists(&retry).expect("read"));
+    assert_eq!(
+        runs_with_a_row(&fixture.ledger, &[&first, &retry]),
+        vec![&first],
+        "the crashed launch made one run; the retry made none"
+    );
+
+    // The launched run is presented as gone. A run that has a row and a
+    // recorded pid whose process is gone is abandoned at once: the grace
+    // period applies only to a claim whose run has no usable pid. The claim
+    // moves, once, to the retry.
+    let gone = |_: u32| SuccessorProcess::Gone;
+    assert!(matches!(
+        fixture
+            .ledger
+            .claim_intent(&stored.intent_id, &retry, &gone)
+            .expect("claim"),
+        Claim::Claimed(intent) if intent.run_id == Some(retry.clone())
+    ));
+    let third = fixture.ids.run_id().expect("a run id");
+    assert!(
+        matches!(
+            fixture
+                .ledger
+                .claim_intent(&stored.intent_id, &third, &alive)
+                .expect("claim"),
+            Claim::AlreadyClaimed { run } if run == retry
+        ),
+        "the claim moved once"
+    );
+    // The second run launches; the intent now names it alone.
+    fixture.execute_as(Some(retry.clone()), &contract, &repo, &backend);
+    // Total rows tied to this intent: the crashed first run and the retry,
+    // never a third.
+    assert_eq!(
+        runs_with_a_row(&fixture.ledger, &[&first, &retry, &third]),
+        vec![&first, &retry],
+        "two launches in total, one abandoned, and none for the refused third claim"
+    );
+    assert_eq!(
+        fixture
+            .ledger
+            .successor_intent(&stored.intent_id)
+            .expect("read")
+            .expect("the intent")
+            .run_id,
+        Some(retry.clone())
+    );
+    assert_eq!(fixture.ledger.count_successor_intents().expect("count"), 1);
     std::fs::remove_dir_all(&fixture.dir).ok();
 }

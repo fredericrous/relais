@@ -5252,7 +5252,7 @@ fn native_status_of_session(
     let mut intents = Vec::new();
     let entries = match opened {
         Ok((ledger, access)) => {
-            intents = launchable_intents(&ledger)
+            intents = listed_intents(&ledger)
                 .iter()
                 .map(|intent| intent_json(&ledger, intent))
                 .collect();
@@ -5602,6 +5602,21 @@ fn release_intent(ledger: &Ledger, source: RunSource<'_>, run_id: &RunId, refusa
     }
 }
 
+/// A run that failed operationally hands its claim back only when it left
+/// no row: a run that exists holds the claim, and recovery reads its state.
+fn release_intent_without_run(
+    ledger: &Ledger,
+    source: RunSource<'_>,
+    run_id: &RunId,
+    refusal: &str,
+) {
+    match ledger.run_exists(run_id) {
+        Ok(false) => release_intent(ledger, source, run_id, refusal),
+        Ok(true) => {}
+        Err(e) => eprintln!("relais run: could not tell whether run {run_id} exists: {e}"),
+    }
+}
+
 fn run_command(
     source: RunSource<'_>,
     revise: Option<&str>,
@@ -5932,6 +5947,7 @@ fn run_command(
                 }
             }
             eprintln!("relais run: {e}");
+            release_intent_without_run(&ledger, source, &run_id, &format!("run failed: {e}"));
             return Ok(CliOutcome::OperationalFailure);
         }
     };
@@ -7265,21 +7281,22 @@ fn recipe_rollback_command(name: &str, mode: AmendMode) -> Result<CliOutcome, Cl
     present_amendment(&root, &incumbent, &amendment, mode)
 }
 
-/// The successor intents a plugin should launch now: every pending one,
+/// The successor intents a status shows: every pending one (a refused one
+/// carries its refusal and retry time, and the plugin waits for that time),
 /// and every claimed one whose claim was abandoned (plan A5). `status` and
 /// `resume` only list them; the plugin is the one launcher.
-fn launchable_intents(ledger: &Ledger) -> Vec<relais::ledger::SuccessorIntent> {
+fn listed_intents(ledger: &Ledger) -> Vec<relais::ledger::SuccessorIntent> {
     ledger
-        .launchable_intents(&successor_process)
+        .listed_intents(&successor_process)
         .unwrap_or_else(|e| {
             eprintln!("relais: successor intents cannot be listed: {e}");
             Vec::new()
         })
 }
 
-/// One line per launchable intent, for `status` and `resume`.
+/// One line per listed intent, for `status` and `resume`.
 fn print_pending_intents(ledger: &Ledger) {
-    for intent in launchable_intents(ledger) {
+    for intent in listed_intents(ledger) {
         println!(
             "pending successor intent {} (decided run {}, {}): launch with `relais run --intent {}`",
             intent.intent_id,
@@ -7287,6 +7304,9 @@ fn print_pending_intents(ledger: &Ledger) {
             intent.state.as_str(),
             intent.intent_id
         );
+        if let (Some(refusal), Some(retry)) = (&intent.refusal, intent.retry_after()) {
+            println!("  last launch refused: {refusal} (retry after {retry})");
+        }
     }
 }
 
@@ -8913,6 +8933,9 @@ fn intent_json(ledger: &Ledger, intent: &relais::ledger::SuccessorIntent) -> ser
         "state": intent.state.as_str(),
         "run_id": intent.run_id.as_ref().map(RunId::as_str),
         "scope_delta": intent.scope_delta,
+        "refusal": intent.refusal,
+        "refusal_count": intent.refusal_count,
+        "retry_after": intent.retry_after(),
     })
 }
 
@@ -9704,6 +9727,88 @@ fn reseal_receipt_in(
 mod tests {
     use super::*;
     use relais::ledger::{Ledger, Transition};
+
+    /// A ledger holding one pending successor intent, and its id.
+    fn ledger_with_intent(tag: &str) -> (Ledger, String, relais::test_support::TempDir) {
+        use relais::ledger::{Actor, DecisionAnswer, NewIntent, RecordedVia};
+        use relais::lifecycle::{Reason, State};
+        let dir = relais::test_support::temp_dir(tag);
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let decided = RunId::from_stored("run-a");
+        ledger
+            .insert_run(&decided, "/r", None, &TaskId::from_stored("task-a"), "rk")
+            .expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: decided.clone(),
+                attempt_id: None,
+                from_state: None,
+                to_state: State::NeedsDecision,
+                reason: "scope_exceeded".into(),
+                detail: None,
+                at: ledger.now(),
+            })
+            .expect("waiting");
+        let intent = ledger
+            .resolve_decision_with_intent(
+                &decided,
+                &DecisionAnswer {
+                    resolution: Reason::DecisionRevised,
+                    actor: Actor::Orchestrator,
+                    person_quote: None,
+                    recorded_via: RecordedVia::Cli,
+                    note: None,
+                    successor_run: None,
+                    from_state: State::NeedsDecision,
+                    to_state: State::Failed,
+                },
+                &NewIntent {
+                    predecessor: decided.clone(),
+                    contract_digest: "digest".into(),
+                    contract_json: "{}".into(),
+                    scope_delta: Vec::new(),
+                    candidate: None,
+                },
+            )
+            .expect("written")
+            .expect("open decision");
+        (ledger, intent.intent_id, dir)
+    }
+
+    #[test]
+    fn a_failure_before_the_run_row_exists_leaves_the_intent_pending() {
+        use relais::ledger::{Claim, IntentState};
+        let (ledger, id, _dir) = ledger_with_intent("intent-release");
+        let run_id = RunId::from_stored("run-new");
+        assert!(matches!(
+            ledger
+                .claim_intent(&id, &run_id, &successor_process)
+                .expect("claim"),
+            Claim::Claimed(_)
+        ));
+        release_intent_without_run(&ledger, RunSource::Intent(&id), &run_id, "run failed");
+        let after = ledger.successor_intent(&id).expect("read").expect("row");
+        assert_eq!(after.state, IntentState::Pending);
+        assert_eq!(after.run_id, None);
+        assert_eq!(after.refusal.as_deref(), Some("run failed"));
+    }
+
+    #[test]
+    fn a_failure_after_the_run_row_exists_keeps_the_claim() {
+        use relais::ledger::IntentState;
+        let (ledger, id, _dir) = ledger_with_intent("intent-keep");
+        let run_id = RunId::from_stored("run-new");
+        ledger
+            .claim_intent(&id, &run_id, &successor_process)
+            .expect("claim");
+        ledger
+            .insert_run(&run_id, "/r", None, &TaskId::from_stored("task-a"), "rk")
+            .expect("the run row");
+        release_intent_without_run(&ledger, RunSource::Intent(&id), &run_id, "run failed");
+        let after = ledger.successor_intent(&id).expect("read").expect("row");
+        assert_eq!(after.state, IntentState::Claimed);
+        assert_eq!(after.run_id, Some(run_id));
+    }
 
     /// The start and end lines carry the type, the task, the outcome, the
     /// dispatched model, the cost, the wall time and the load at start.
