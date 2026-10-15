@@ -995,11 +995,42 @@ struct Dispatch {
 /// A heavy lease tied to a process group. The runner that owns the group
 /// is `runner`; when it dies the coordinator stops the group, and the
 /// tokens come back only once no member is left.
-#[derive(Debug, Clone, Copy)]
+///
+/// Both processes are identified by pid AND start time, recorded when the
+/// group was bound: a pid the OS has since given to another process is not
+/// the runner and not the group's leader, so it is never waited for and
+/// never signalled.
+#[derive(Debug, Clone)]
 struct GroupHold {
     runner: u32,
+    runner_started: Option<String>,
     pgid: u32,
+    leader_started: Option<String>,
     ladder: GroupLadder,
+    /// The runner gave the lease back while the group still ran: the
+    /// tokens stay until the sweep sees the group gone.
+    finished: bool,
+}
+
+/// A group binding as the coordinator persists it, so a restart does not
+/// lose the hold (SPEC §23).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupBinding {
+    pub dispatch_id: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub runner: u32,
+    pub runner_started: Option<String>,
+    pub pgid: u32,
+    pub leader_started: Option<String>,
+    pub tokens: u32,
+}
+
+/// A change to the persisted group bindings, in the order it happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupChange {
+    Bound(GroupBinding),
+    Removed(String),
 }
 
 /// How far the coordinator has got in stopping an orphaned group.
@@ -1018,6 +1049,9 @@ enum GroupLadder {
 pub struct GroupSignal {
     pub dispatch_id: String,
     pub pgid: u32,
+    /// The leader's start time recorded at the bind, checked again at the
+    /// moment of sending.
+    pub leader_started: Option<String>,
     pub signal: Signal,
 }
 
@@ -1027,9 +1061,11 @@ pub struct GroupReport {
     /// Groups to stop: SIGTERM first, SIGKILL once [`GROUP_KILL_AFTER`]
     /// has passed.
     pub to_signal: Vec<GroupSignal>,
-    /// Leases whose runner died and whose group is gone: the tokens are
-    /// back.
+    /// Leases whose group is gone: the tokens are back.
     pub released: Vec<String>,
+    /// What the sweep wants said: a hold released because its recorded
+    /// process is no longer the one that ran, for instance.
+    pub warnings: Vec<String>,
 }
 
 /// One worktree's exclusive write lease (SPEC §23: "concurrent writers
@@ -1111,6 +1147,12 @@ pub struct AdmissionState {
     /// keyed by dispatch. Read only to name a holder; entries whose
     /// dispatch is gone are dropped on the next lookup.
     training_started: BTreeMap<String, String>,
+    /// Changes to the persisted group bindings not yet written; the
+    /// coordinator takes them after each request and each sweep.
+    group_journal: Vec<GroupChange>,
+    /// Whether a group recorded with this leader start time still has a
+    /// member. Injectable so a test decides what the process table says.
+    group_probe: fn(u32, Option<&str>) -> bool,
 }
 
 /// Default duration a hook-admitted agent's lease is held before it
@@ -1148,7 +1190,19 @@ impl AdmissionState {
             admitted_by_source: BTreeMap::new(),
             native: native::NativeRegistry::default(),
             training_started: BTreeMap::new(),
+            group_journal: Vec::new(),
+            group_probe: crate::procs::group_alive,
         }
+    }
+
+    /// Replace the question "does this group still have a member".
+    pub fn set_group_probe(&mut self, probe: fn(u32, Option<&str>) -> bool) {
+        self.group_probe = probe;
+    }
+
+    /// The changes to the persisted group bindings since the last call.
+    pub fn take_group_journal(&mut self) -> Vec<GroupChange> {
+        std::mem::take(&mut self.group_journal)
     }
 
     pub fn limits(&self) -> &ConcurrencyLimits {
@@ -2092,9 +2146,19 @@ impl AdmissionState {
     /// before settlement cannot let a sibling spend the same money; the
     /// entry itself goes when both ends have arrived.
     pub fn release(&mut self, dispatch_id: &str, now: Instant) -> LifecycleOutcome {
+        let group_alive = self.group_probe;
         let Some(dispatch) = self.dispatches.get_mut(dispatch_id) else {
             return LifecycleOutcome::Unknown;
         };
+        // Capacity never returns while descendants run: a lease tied to a
+        // group that still has a member keeps its tokens, and the sweep
+        // returns them once the group is gone (SPEC §23).
+        if let Some(hold) = dispatch.group.as_mut() {
+            if group_alive(hold.pgid, hold.leader_started.as_deref()) {
+                hold.finished = true;
+                return LifecycleOutcome::Applied;
+            }
+        }
         // Usage already settled: this is the second end, so the entry is
         // over once the seat is back.
         let both_ends = dispatch.lifecycle.settled();
@@ -2176,7 +2240,14 @@ impl AdmissionState {
     /// Both ends have arrived: the entry goes, its worktree leases with
     /// it, and its ID is remembered as finished.
     fn forget_settled(&mut self, dispatch_id: &str) {
-        self.dispatches.remove(dispatch_id);
+        if self
+            .dispatches
+            .remove(dispatch_id)
+            .is_some_and(|dispatch| dispatch.group.is_some())
+        {
+            self.group_journal
+                .push(GroupChange::Removed(dispatch_id.to_string()));
+        }
         self.native.forget(dispatch_id);
         // A worker that is over does not still hold a worktree
         // (SPEC §23: verification waits for write leases to be
@@ -2489,6 +2560,10 @@ impl AdmissionState {
     /// (SPEC §23). From here the lease is no longer judged by heartbeats:
     /// it lasts while the runner lives, and after the runner dies, for as
     /// long as a member of the group runs ([`Self::reconcile_groups`]).
+    ///
+    /// The group is identified by its leader's pid and start time, and
+    /// the runner by its own pair, both read here through `started` and
+    /// recorded; every later signal and liveness question compares them.
     pub fn bind_group(
         &mut self,
         dispatch_id: &str,
@@ -2496,6 +2571,7 @@ impl AdmissionState {
         pgid: u32,
         now: Instant,
         alive: &dyn Fn(u32) -> bool,
+        started: &dyn Fn(u32) -> Option<String>,
     ) -> BindOutcome {
         let Some(dispatch) = self.dispatches.get_mut(dispatch_id) else {
             return BindOutcome::UnknownDispatch;
@@ -2503,42 +2579,116 @@ impl AdmissionState {
         if pgid <= 1 || !alive(runner) {
             return BindOutcome::PidNotAlive;
         }
-        dispatch.group = Some(GroupHold {
+        let hold = GroupHold {
             runner,
+            runner_started: started(runner),
             pgid,
+            leader_started: started(pgid),
             ladder: GroupLadder::Holding,
-        });
+            finished: false,
+        };
         dispatch.last_heartbeat = now;
+        let binding = GroupBinding {
+            dispatch_id: dispatch_id.to_string(),
+            run_id: dispatch.run_id.clone(),
+            session_id: dispatch.session_id.clone(),
+            runner: hold.runner,
+            runner_started: hold.runner_started.clone(),
+            pgid: hold.pgid,
+            leader_started: hold.leader_started.clone(),
+            tokens: dispatch.weight,
+        };
+        dispatch.group = Some(hold);
+        self.group_journal.push(GroupChange::Bound(binding));
         BindOutcome::Bound
+    }
+
+    /// Take back a group binding the previous coordinator persisted: the
+    /// hold is as it was, whatever has happened to the processes since;
+    /// the next sweep reconciles it.
+    pub fn adopt_group(&mut self, binding: &GroupBinding, now: Instant) {
+        if self.dispatches.contains_key(&binding.dispatch_id) {
+            return;
+        }
+        self.adopt(
+            &DispatchRequest {
+                dispatch_id: binding.dispatch_id.clone(),
+                run_id: binding.run_id.clone(),
+                session_id: binding.session_id.clone(),
+                parent_dispatch: None,
+                depth: 0,
+                resource: ResourceClass::HeavyLocal,
+                reserve_micros: 0,
+                source: DispatchSource::NativeRun,
+                caller_agent_id: None,
+                weight: binding.tokens,
+            },
+            None,
+            None,
+            Attribution::Recorded,
+            now,
+        );
+        if let Some(dispatch) = self.dispatches.get_mut(&binding.dispatch_id) {
+            dispatch.group = Some(GroupHold {
+                runner: binding.runner,
+                runner_started: binding.runner_started.clone(),
+                pgid: binding.pgid,
+                leader_started: binding.leader_started.clone(),
+                ladder: GroupLadder::Holding,
+                finished: false,
+            });
+        }
     }
 
     /// The sweep for leases tied to a process group. A lease whose runner
     /// lives is left alone; the runner gives it back when its check ends.
     /// One whose runner died has its group stopped: SIGTERM, then SIGKILL
     /// after `kill_after`, repeated while the group stays. The tokens are
-    /// returned only when `group_alive` says no member is left, never
-    /// while a descendant runs.
+    /// returned only when the group probe says no member is left, never
+    /// while a descendant runs. Both questions are asked of the recorded
+    /// identity (pid and start time): a process that is no longer the one
+    /// recorded is gone, the tokens return with a warning, and nothing is
+    /// signalled.
     pub fn reconcile_groups(
         &mut self,
         now: Instant,
         kill_after: Duration,
-        runner_alive: &dyn Fn(u32) -> bool,
-        group_alive: &dyn Fn(u32) -> bool,
+        runner_alive: &dyn Fn(u32, Option<&str>) -> bool,
     ) -> GroupReport {
+        let group_alive = self.group_probe;
         let mut report = GroupReport::default();
         let held: Vec<(String, GroupHold)> = self
             .dispatches
             .iter()
-            .filter_map(|(id, dispatch)| dispatch.group.map(|group| (id.clone(), group)))
+            .filter_map(|(id, dispatch)| dispatch.group.clone().map(|group| (id.clone(), group)))
             .collect();
         for (id, group) in held {
-            if runner_alive(group.runner) {
+            let runner_lives = runner_alive(group.runner, group.runner_started.as_deref());
+            if runner_lives
+                && !group.finished
+                && group_alive(group.pgid, group.leader_started.as_deref())
+            {
                 continue;
             }
-            if !group_alive(group.pgid) {
-                self.settle(&id, None, now);
-                self.release(&id, now);
-                report.released.push(id);
+            if !group_alive(group.pgid, group.leader_started.as_deref()) {
+                if !runner_lives || group.finished {
+                    if !runner_lives {
+                        report.warnings.push(format!(
+                            "lease {id}: runner {} is gone and process group {} is not the one \
+                             recorded or has no member left; its tokens are returned and nothing \
+                             is signalled",
+                            group.runner, group.pgid
+                        ));
+                    }
+                    self.settle(&id, None, now);
+                    self.release(&id, now);
+                    report.released.push(id);
+                }
+                continue;
+            }
+            if runner_lives {
+                // The check ended and gave the lease back, its runner is
+                // still there to kill what it left; the tokens wait.
                 continue;
             }
             let (signal, ladder) = match group.ladder {
@@ -2561,6 +2711,7 @@ impl AdmissionState {
             report.to_signal.push(GroupSignal {
                 dispatch_id: id,
                 pgid: group.pgid,
+                leader_started: group.leader_started,
                 signal,
             });
         }
@@ -3300,6 +3451,7 @@ impl Gate for LocalGate {
             pgid,
             Instant::now(),
             &crate::procs::alive,
+            &crate::procs::start_time,
         ))
     }
 

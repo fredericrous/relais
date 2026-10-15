@@ -366,26 +366,55 @@ pub fn kill_group(pgid: u32) -> GroupKill {
     imp::kill_group(pgid)
 }
 
-/// Whether any member of the process group `pgid` still runs: `kill(-pgid,
-/// 0)` is not `ESRCH`. A group outlives its leader while any member is in
-/// it, so this is the question "is a descendant still running", which the
-/// leader's own pid cannot answer. `EPERM` counts as running: the group
-/// exists and is not ours to signal. Windows has no process groups to ask
-/// about, so it asks after the root process alone.
-pub fn group_alive(pgid: u32) -> bool {
+/// Whether any member of the process group `pgid` still runs, and is the
+/// group that was recorded. A group is identified by its leader's pid AND
+/// the leader's start time (`leader_started`, from [`start_time`] at the
+/// moment the group was bound): when the leader is visible and started at
+/// another time, the pid was recycled and the group is not ours, whatever
+/// else runs under that number. `kill(-pgid, 0)` then asks whether a member
+/// is left; a group outlives its leader while any member is in it, so the
+/// leader's own pid cannot answer that. `EPERM` means the group exists and
+/// is not ours to signal, which is the same as gone. Windows has no process
+/// groups to ask about, so it asks after the root process alone.
+pub fn group_alive(pgid: u32, leader_started: Option<&str>) -> bool {
     if pgid <= 1 {
         return false;
+    }
+    if let (Some(recorded), Some(now)) = (leader_started, start_time(pgid)) {
+        if recorded != now {
+            return false;
+        }
     }
     imp::group_alive(pgid)
 }
 
-/// Ask a whole process group to stop (SIGTERM to `-pgid`). Windows has no
-/// gentler request than the tree kill, so it is the same as [`kill_group`].
-pub fn terminate_group(pgid: u32) -> GroupKill {
-    if pgid <= 1 {
+/// Whether `pid` is still the process that started at `started`: it is
+/// there, it is ours to signal, and its start time is the one recorded. A
+/// start time that was not recorded (`None`: the platform has no reader)
+/// leaves existence as the only evidence.
+pub fn same_process(pid: u32, started: Option<&str>) -> bool {
+    if pid == 0 || !imp::signalable(pid) {
+        return false;
+    }
+    match started {
+        Some(recorded) => start_time(pid).as_deref() == Some(recorded),
+        None => true,
+    }
+}
+
+/// Ask a whole process group to stop, or force it to. The group is
+/// identified first ([`group_alive`]): a group that is gone, or whose
+/// leader pid now belongs to another process, is never signalled.
+/// Windows has no gentler request than the tree kill, so there both are
+/// the same.
+pub fn stop_group(pgid: u32, leader_started: Option<&str>, kind: SignalKind) -> GroupKill {
+    if !group_alive(pgid, leader_started) {
         return GroupKill::NothingLeft;
     }
-    imp::terminate_group(pgid)
+    match kind {
+        SignalKind::Terminate => imp::terminate_group(pgid),
+        SignalKind::Kill => imp::kill_group(pgid),
+    }
 }
 
 /// What killing the worker's process group found. Recorded on the
@@ -1192,10 +1221,15 @@ mod imp {
 
     pub fn group_alive(pgid: u32) -> bool {
         // SAFETY: signal 0 performs error checking only; no signal is sent.
-        if unsafe { libc::kill(-(pgid as libc::pid_t), 0) } == 0 {
-            return true;
-        }
-        io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        // Only success counts: ESRCH is gone, and EPERM is a group that is
+        // not ours (a recycled number), which is not ours to wait for.
+        unsafe { libc::kill(-(pgid as libc::pid_t), 0) == 0 }
+    }
+
+    /// The process exists and this user may signal it (not `EPERM`).
+    pub fn signalable(pid: u32) -> bool {
+        // SAFETY: signal 0 performs error checking only; no signal is sent.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
 
     pub fn terminate_group(pgid: u32) -> GroupKill {
@@ -1399,6 +1433,10 @@ mod imp {
 
     pub fn group_alive(pgid: u32) -> bool {
         alive(pgid)
+    }
+
+    pub fn signalable(pid: u32) -> bool {
+        alive(pid)
     }
 
     pub fn terminate_group(pgid: u32) -> GroupKill {

@@ -3,9 +3,74 @@ use crate::admission::{
     Enforcement, HeartbeatStatus, LifecycleOutcome, LocalGate, ReleaseWriteOutcome, ResumeOutcome,
     RunRegistration, WaitOutcome, WithdrawOutcome, WriteLeaseOutcome,
 };
-use crate::policy::{BudgetLimits, CommandSpec, ConcurrencyLimits, WallClock};
+use crate::policy::{BudgetClock, BudgetLimits, CommandSpec, ConcurrencyLimits};
 use crate::verify::run_observed_within;
 use std::path::Path;
+use std::sync::atomic::AtomicI64;
+
+/// A clock a test moves by hand, and a sleeper that moves it: a queue that
+/// "waits" advances the clock by the poll and returns at once.
+struct ManualClock(AtomicI64);
+
+impl ManualClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(AtomicI64::new(1_000_000)))
+    }
+}
+
+impl BudgetClock for ManualClock {
+    fn now_millis(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Moves `clock` by what it is asked to sleep, remembers each sleep, and
+/// runs `on_sleep` (with the number of this sleep) so a test can change the
+/// world while a queue "waits".
+struct Advancing {
+    clock: Arc<ManualClock>,
+    slept: Mutex<Vec<Duration>>,
+    on_sleep: Box<dyn Fn(usize) + Send + Sync>,
+}
+
+impl Advancing {
+    fn new(clock: &Arc<ManualClock>) -> Arc<Self> {
+        Self::then(clock, |_| {})
+    }
+
+    fn then(
+        clock: &Arc<ManualClock>,
+        on_sleep: impl Fn(usize) + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            clock: Arc::clone(clock),
+            slept: Mutex::new(Vec::new()),
+            on_sleep: Box::new(on_sleep),
+        })
+    }
+}
+
+impl Sleeper for Advancing {
+    fn sleep(&self, duration: Duration) {
+        let number = {
+            let mut slept = self.slept.lock().expect("sleeps");
+            slept.push(duration);
+            slept.len()
+        };
+        self.clock.0.fetch_add(
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+            Ordering::SeqCst,
+        );
+        (self.on_sleep)(number);
+    }
+}
+
+fn budgets_on(clock: &Arc<ManualClock>, admission_wait: u64) -> Budgets {
+    Budgets::start(
+        Arc::clone(clock) as Arc<dyn BudgetClock>,
+        BudgetLimits::resolve(600, admission_wait, 60, Some(600), 0),
+    )
+}
 
 fn temp_dir(tag: &str) -> crate::test_support::TempDir {
     crate::test_support::temp_dir(&format!("heavy-{tag}"))
@@ -56,9 +121,48 @@ fn admission<'a>(
         cap,
         cores,
         slots: None,
+        ancestor_holds_slots: false,
         poll: Duration::from_millis(10),
         announce_every: ANNOUNCE_EVERY,
+        heartbeat_every: Duration::from_millis(10),
+        sleeper: Arc::new(ThreadSleeper),
+        registration: None,
         tries: Tries::default(),
+    }
+}
+
+fn registration(run: &str) -> RunRegistration {
+    RunRegistration {
+        run_id: run.into(),
+        session_id: "tab".into(),
+        budget_micros: None,
+        max_agents: None,
+        max_depth: None,
+    }
+}
+
+fn heavy_request(id: &str, run: &str, weight: u32) -> DispatchRequest {
+    DispatchRequest {
+        dispatch_id: id.into(),
+        run_id: run.into(),
+        session_id: "tab".into(),
+        parent_dispatch: None,
+        depth: 0,
+        resource: ResourceClass::HeavyLocal,
+        reserve_micros: 0,
+        source: DispatchSource::NativeRun,
+        caller_agent_id: None,
+        weight,
+    }
+}
+
+fn ask<'a>(env: &'a BTreeMap<String, String>, weight: u32) -> Ask<'a> {
+    Ask {
+        phase: "base-cmd0",
+        label: "cmd0",
+        weight,
+        env,
+        cancel: None,
     }
 }
 
@@ -66,6 +170,9 @@ fn admission<'a>(
 struct Recording {
     inner: LocalGate,
     events: Mutex<Vec<String>>,
+    /// Answer `bind_group` with `UnknownDispatch`, as a coordinator that
+    /// restarted would.
+    refuse_bind: bool,
 }
 
 impl Recording {
@@ -73,6 +180,14 @@ impl Recording {
         Self {
             inner,
             events: Mutex::new(Vec::new()),
+            refuse_bind: false,
+        }
+    }
+
+    fn refusing_bind(inner: LocalGate) -> Self {
+        Self {
+            refuse_bind: true,
+            ..Self::new(inner)
         }
     }
 
@@ -105,9 +220,13 @@ impl Gate for Recording {
         self.inner.bind(dispatch_id, agent_id, pid)
     }
     fn bind_group(&self, id: &str, runner: u32, pgid: u32) -> Result<BindOutcome, GateError> {
+        if self.refuse_bind {
+            return Ok(BindOutcome::UnknownDispatch);
+        }
         self.inner.bind_group(id, runner, pgid)
     }
     fn heartbeat(&self, dispatch_id: &str) -> Result<HeartbeatStatus, GateError> {
+        self.note(format!("heartbeat {dispatch_id}"));
         self.inner.heartbeat(dispatch_id)
     }
     fn mark_waiting(&self, dispatch_id: &str) -> Result<WaitOutcome, GateError> {
@@ -170,8 +289,10 @@ fn parallelism_is_the_weight_s_share_of_the_cores() {
         "a quarter of the cores, at least one"
     );
     assert_eq!(heavy_cap(Some(3), 16), 3);
-    let id = dispatch_id("run-1", "base-cmd0", "make@ab12:x", 2);
+    let id = dispatch_id("run-1", "base-cmd0", "make@ab12:x", 0, 2);
     assert_eq!(id, "run-1-heavy-base-cmd0-make@ab12_x-2");
+    let resumed = dispatch_id("run-1", "base-cmd0", "make@ab12:x", 1, 2);
+    assert_eq!(resumed, "run-1-heavy-base-cmd0-make@ab12_x-e1-2");
 }
 
 #[test]
@@ -187,7 +308,7 @@ fn with_one_heavy_slot_two_runs_checks_never_overlap() {
                 let admission = admission(gate, run, 1, 4);
                 run_observed_within(
                     dir,
-                    &sh("sleep 0.3"),
+                    &sh("sleep 0.02"),
                     &dir.join(format!("logs-{run}")),
                     "cmd0",
                     "x-cmd0",
@@ -310,27 +431,19 @@ fn queued_time_is_charged_to_the_admission_wait_and_the_total_not_to_work() {
     register(&gate, "run-q");
     register(&gate, "run-other");
     // Another run holds the only token.
-    let holder = DispatchRequest {
-        dispatch_id: "other-heavy".into(),
-        run_id: "run-other".into(),
-        session_id: "tab".into(),
-        parent_dispatch: None,
-        depth: 0,
-        resource: ResourceClass::HeavyLocal,
-        reserve_micros: 0,
-        source: DispatchSource::NativeRun,
-        caller_agent_id: None,
-        weight: 1,
-    };
-    assert_eq!(gate.admit(&holder).expect("admit"), Decision::Granted);
-
-    let budgets = Budgets::start(
-        Arc::new(WallClock),
-        BudgetLimits::resolve(600, 1, 60, Some(600), 0),
+    assert_eq!(
+        gate.admit(&heavy_request("other-heavy", "run-other", 1))
+            .expect("admit"),
+        Decision::Granted
     );
+
+    let clock = ManualClock::new();
+    let budgets = budgets_on(&clock, 1);
     budgets.begin_work();
     let mut queued = admission(&gate, "run-q", 1, 4);
     queued.budgets = budgets.clone();
+    queued.sleeper = Advancing::new(&clock);
+    queued.poll = Duration::from_millis(500);
     let stopped = run_observed_within(
         &dir,
         &sh("echo ran > ran"),
@@ -352,10 +465,10 @@ fn queued_time_is_charged_to_the_admission_wait_and_the_total_not_to_work() {
     );
     assert!(!dir.join("ran").exists(), "a queued command never ran");
     assert!(budgets.waited(WaitKind::Admission) >= Duration::from_secs(1));
-    assert!(
-        budgets.worked() < Duration::from_millis(500),
-        "the queue was taken out of work: {:?}",
-        budgets.worked()
+    assert_eq!(
+        budgets.worked(),
+        Duration::ZERO,
+        "the queue was taken out of work"
     );
     assert!(
         budgets.total_remaining() < Duration::from_secs(600),
@@ -369,34 +482,19 @@ fn a_queued_command_says_it_is_waiting_every_announce_period() {
     let gate = gate_with(1);
     register(&gate, "run-n");
     register(&gate, "run-other");
-    let holder = DispatchRequest {
-        dispatch_id: "other-heavy".into(),
-        run_id: "run-other".into(),
-        session_id: "tab".into(),
-        parent_dispatch: None,
-        depth: 0,
-        resource: ResourceClass::HeavyLocal,
-        reserve_micros: 0,
-        source: DispatchSource::NativeRun,
-        caller_agent_id: None,
-        weight: 1,
-    };
-    assert_eq!(gate.admit(&holder).expect("admit"), Decision::Granted);
-    let events = Events::for_run_on("run-n", &dir, crate::protocol::Wire::to(std::io::sink()));
-    let mut queued = admission(&gate, "run-n", 1, 4);
-    queued.events = events;
-    queued.announce_every = Duration::from_millis(100);
-    queued.budgets = Budgets::start(
-        Arc::new(WallClock),
-        BudgetLimits::resolve(600, 1, 60, Some(600), 0),
+    assert_eq!(
+        gate.admit(&heavy_request("other-heavy", "run-other", 1))
+            .expect("admit"),
+        Decision::Granted
     );
-    let _ = queued.admit(&Ask {
-        phase: "base-cmd0",
-        label: "cmd0",
-        weight: 1,
-        env: &BTreeMap::new(),
-        cancel: None,
-    });
+    let clock = ManualClock::new();
+    let mut queued = admission(&gate, "run-n", 1, 4);
+    queued.events = Events::for_run_on("run-n", &dir, crate::protocol::Wire::to(std::io::sink()));
+    queued.announce_every = Duration::from_millis(100);
+    queued.poll = Duration::from_millis(50);
+    queued.budgets = budgets_on(&clock, 1);
+    queued.sleeper = Advancing::new(&clock);
+    let _ = queued.admit(&ask(&BTreeMap::new(), 1));
     let written = std::fs::read_to_string(dir.join("events.jsonl")).expect("events");
     let announced = written
         .lines()
@@ -406,12 +504,303 @@ fn a_queued_command_says_it_is_waiting_every_announce_period() {
     assert!(written.contains("\"class\":\"heavy_local\""), "{written}");
 }
 
+#[test]
+fn a_restarted_coordinator_is_told_about_the_run_once_and_the_lease_goes_through() {
+    // The gate has never heard of the run: what a coordinator that
+    // restarted answers.
+    let gate = gate_with(1);
+    let mut forgotten = admission(&gate, "run-r", 1, 4);
+    let none = BTreeMap::new();
+    let refused = forgotten.admit(&ask(&none, 1));
+    assert!(
+        matches!(
+            refused,
+            Err(LeaseStop::Refused {
+                code: Refusal::UnknownRun,
+                ..
+            })
+        ),
+        "without a registration to repeat the refusal stands"
+    );
+    forgotten.registration = Some(registration("run-r"));
+    let lease = forgotten
+        .admit(&ask(&none, 1))
+        .expect("registered once, then admitted");
+    drop(lease);
+}
+
+#[test]
+fn a_run_the_coordinator_still_refuses_after_registering_again_is_refused() {
+    /// A coordinator that registers the run and still does not know it.
+    struct Amnesiac;
+    impl Gate for Amnesiac {
+        fn register_run(&self, _: &RunRegistration) -> Result<(), GateError> {
+            Ok(())
+        }
+        fn admit(&self, _: &DispatchRequest) -> Result<Decision, GateError> {
+            Ok(Decision::Refused {
+                code: Refusal::UnknownRun,
+                detail: "unknown run".into(),
+            })
+        }
+        fn bind(&self, _: &str, _: Option<&str>, _: Option<u32>) -> Result<BindOutcome, GateError> {
+            Ok(BindOutcome::UnknownDispatch)
+        }
+        fn heartbeat(&self, _: &str) -> Result<HeartbeatStatus, GateError> {
+            unreachable!()
+        }
+        fn mark_waiting(&self, _: &str) -> Result<WaitOutcome, GateError> {
+            unreachable!()
+        }
+        fn resume(&self, _: &str) -> Result<ResumeOutcome, GateError> {
+            unreachable!()
+        }
+        fn release(&self, _: &str) -> Result<LifecycleOutcome, GateError> {
+            unreachable!()
+        }
+        fn settle(&self, _: &str, _: Option<i64>) -> Result<LifecycleOutcome, GateError> {
+            unreachable!()
+        }
+        fn withdraw(&self, _: &str) -> Result<WithdrawOutcome, GateError> {
+            unreachable!()
+        }
+        fn acquire_write(&self, _: &str, _: &str) -> Result<WriteLeaseOutcome, GateError> {
+            unreachable!()
+        }
+        fn release_write(&self, _: &str, _: &str) -> Result<ReleaseWriteOutcome, GateError> {
+            unreachable!()
+        }
+        fn write_lease_holder(&self, _: &str) -> Result<Option<String>, GateError> {
+            unreachable!()
+        }
+        fn run_cancelled(&self, _: &str) -> Result<bool, GateError> {
+            unreachable!()
+        }
+        fn enforcement(&self) -> Enforcement {
+            unreachable!()
+        }
+    }
+    let mut once = admission(&Amnesiac, "run-r", 1, 4);
+    once.registration = Some(registration("run-r"));
+    let refused = once.admit(&ask(&BTreeMap::new(), 1));
+    assert!(
+        matches!(
+            refused,
+            Err(LeaseStop::Refused {
+                code: Refusal::UnknownRun,
+                ..
+            })
+        ),
+        "registered again once, not for ever"
+    );
+}
+
+#[test]
+fn a_coordinator_that_cannot_be_reached_is_a_gate_error_not_a_refusal() {
+    struct Unreachable;
+    impl Gate for Unreachable {
+        fn register_run(&self, _: &RunRegistration) -> Result<(), GateError> {
+            Err(GateError::Unavailable {
+                operation: "admit",
+                socket: "none".into(),
+                cause: "down".into(),
+            })
+        }
+        fn admit(&self, _: &DispatchRequest) -> Result<Decision, GateError> {
+            Err(GateError::Unavailable {
+                operation: "admit",
+                socket: "none".into(),
+                cause: "down".into(),
+            })
+        }
+        fn bind(&self, _: &str, _: Option<&str>, _: Option<u32>) -> Result<BindOutcome, GateError> {
+            unreachable!()
+        }
+        fn heartbeat(&self, _: &str) -> Result<HeartbeatStatus, GateError> {
+            unreachable!()
+        }
+        fn mark_waiting(&self, _: &str) -> Result<WaitOutcome, GateError> {
+            unreachable!()
+        }
+        fn resume(&self, _: &str) -> Result<ResumeOutcome, GateError> {
+            unreachable!()
+        }
+        fn release(&self, _: &str) -> Result<LifecycleOutcome, GateError> {
+            unreachable!()
+        }
+        fn settle(&self, _: &str, _: Option<i64>) -> Result<LifecycleOutcome, GateError> {
+            unreachable!()
+        }
+        fn withdraw(&self, _: &str) -> Result<WithdrawOutcome, GateError> {
+            unreachable!()
+        }
+        fn acquire_write(&self, _: &str, _: &str) -> Result<WriteLeaseOutcome, GateError> {
+            unreachable!()
+        }
+        fn release_write(&self, _: &str, _: &str) -> Result<ReleaseWriteOutcome, GateError> {
+            unreachable!()
+        }
+        fn write_lease_holder(&self, _: &str) -> Result<Option<String>, GateError> {
+            unreachable!()
+        }
+        fn run_cancelled(&self, _: &str) -> Result<bool, GateError> {
+            unreachable!()
+        }
+        fn enforcement(&self) -> Enforcement {
+            unreachable!()
+        }
+    }
+    let mut down = admission(&Unreachable, "run-d", 1, 4);
+    down.registration = Some(registration("run-d"));
+    assert!(matches!(
+        down.admit(&ask(&BTreeMap::new(), 1)),
+        Err(LeaseStop::Gate(_))
+    ));
+}
+
+#[test]
+fn a_resumed_runs_heavy_ids_do_not_collide_with_ids_settled_before_the_resume() {
+    let gate = gate_with(1);
+    register(&gate, "run-x");
+    let none = BTreeMap::new();
+    // The first start: a lease is taken, given back and settled, so the
+    // coordinator now remembers its id as finished (C8).
+    let first = admission(&gate, "run-x", 1, 4);
+    drop(first.admit(&ask(&none, 1)).expect("first start"));
+    // The same try, asked again by the same start, is a rerun and gets a
+    // new id; but a resume restarts the counter, which is what used to
+    // reuse the settled id.
+    let mut resumed = admission(&gate, "run-x", 1, 4);
+    resumed.tries = Tries::for_epoch(0);
+    assert!(
+        matches!(
+            resumed.admit(&ask(&none, 1)),
+            Err(LeaseStop::Refused {
+                code: Refusal::AlreadyFinished,
+                ..
+            })
+        ),
+        "a counter that starts over reuses a settled id"
+    );
+    resumed.tries = Tries::for_epoch(1);
+    drop(
+        resumed
+            .admit(&ask(&none, 1))
+            .expect("the resumed epoch has its own ids"),
+    );
+}
+
+#[test]
+fn with_no_gate_an_overweight_command_is_refused_and_the_bounds_still_apply() {
+    let unused = gate_with(1);
+    let mut ungated = admission(&unused, "run-n", 2, 8);
+    ungated.gate = None;
+    let none = BTreeMap::new();
+    assert!(matches!(
+        ungated.admit(&ask(&none, 3)),
+        Err(LeaseStop::Weight { weight: 3, cap: 2 })
+    ));
+    let lease = ungated.admit(&ask(&none, 1)).expect("unadmitted");
+    assert_eq!(
+        lease.env().get("MAKEFLAGS").map(String::as_str),
+        Some("-j4")
+    );
+    assert_eq!(lease.id(), "", "nothing was leased");
+
+    // The profile is refused when it is loaded, whatever the gate.
+    let heavy = {
+        let mut spec = sh("true");
+        spec.weight = Some(5);
+        spec
+    };
+    let light = sh("true");
+    assert!(overweight([&light], 2).is_none());
+    let refusal = overweight([&light, &heavy], 2).expect("refused");
+    assert!(refusal.contains("weight of 5"), "{refusal}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_lease_the_coordinator_could_not_tie_to_the_group_is_kept_alive_while_the_check_runs() {
+    let dir = temp_dir("untied");
+    let gate = Recording::refusing_bind(gate_with(1));
+    register(&gate.inner, "run-u");
+    let admission = admission(&gate, "run-u", 1, 4);
+    let mut with_events = admission;
+    with_events.events =
+        Events::for_run_on("run-u", &dir, crate::protocol::Wire::to(std::io::sink()));
+    run_observed_within(
+        &dir,
+        &sh("sleep 0.04"),
+        &dir.join("logs"),
+        "cmd0",
+        "x-cmd0",
+        &with_events.events.clone(),
+        None,
+        &with_events,
+    )
+    .expect("run");
+    let events = gate.events();
+    assert!(
+        events.iter().any(|e| e.starts_with("heartbeat ")),
+        "the untied lease was never heartbeated: {events:?}"
+    );
+    let written = std::fs::read_to_string(dir.join("events.jsonl")).expect("events");
+    assert!(
+        written.contains("heavy_lease_not_tied_to_group"),
+        "{written}"
+    );
+    assert!(written.contains("kept alive by heartbeats"), "{written}");
+}
+
+#[test]
+fn an_ancestor_that_holds_host_slots_is_not_queued_behind_and_the_fact_is_passed_on() {
+    assert!(ancestor_holds_slots(Some("held")));
+    assert!(!ancestor_holds_slots(Some("other")));
+    assert!(!ancestor_holds_slots(None));
+
+    let dir = temp_dir("ancestor");
+    let gate = gate_with(1);
+    register(&gate, "run-a");
+    let mut inside = admission(&gate, "run-a", 1, 4);
+    // Slots that could never be taken: a directory that does not exist.
+    inside.slots = Some(dir.join("no-such-slots"));
+    inside.ancestor_holds_slots = true;
+    let lease = inside.admit(&ask(&BTreeMap::new(), 1)).expect("admitted");
+    assert_eq!(
+        lease.env().get(HOST_SLOT_ENV).map(String::as_str),
+        Some("held")
+    );
+    #[cfg(unix)]
+    assert!(lease.slot_fds().is_empty(), "no host slot was queued for");
+    assert!(
+        !dir.join("no-such-slots").exists(),
+        "nothing was created either"
+    );
+    drop(lease);
+
+    let outcome = run_observed_within(
+        &dir,
+        &sh("echo slot=$AMONT_HOST_SLOT"),
+        &dir.join("logs"),
+        "cmd0",
+        "x-cmd0",
+        &Events::silent(),
+        None,
+        &inside,
+    )
+    .expect("run");
+    let log = std::fs::read_to_string(outcome.log_path).expect("log");
+    assert_eq!(log.trim(), "slot=held", "the check sees the variable");
+}
+
 #[cfg(unix)]
 mod host_slots {
     use super::*;
     use std::os::unix::fs::DirBuilderExt;
 
-    fn slot_dir(tag: &str) -> PathBuf {
+    /// A slot directory as amont leaves it: private, with `files` slot files.
+    fn slot_dir(tag: &str, files: u32) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("relais-heavy-slots-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -420,32 +809,56 @@ mod host_slots {
             .mode(0o700)
             .create(&dir)
             .expect("slot dir");
+        for index in 0..files {
+            std::fs::write(dir.join(format!("slot-{index}")), b"").expect("slot file");
+        }
         dir
     }
 
     fn lock(path: &Path) -> std::fs::File {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
-            .expect("slot file");
+        let file = std::fs::File::open(path).expect("slot file");
         let locked = crate::procs::try_flock(&file).expect("flock");
         assert!(locked, "the slot was free");
         file
     }
 
+    fn files(dir: &Path) -> Vec<PathBuf> {
+        slots::slot_files(dir).expect("slot files")
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
     fn a_partial_set_is_released_and_nothing_stays_held() {
-        let dir = slot_dir("partial");
+        let dir = slot_dir("partial", 2);
+        let all = files(&dir);
         let other = lock(&dir.join("slot-1"));
         assert!(
-            slots::try_take(&dir, 2, 2).expect("tried").is_none(),
+            matches!(
+                slots::try_take(&all, 2).expect("tried"),
+                slots::Taken::Short { missing: 1 }
+            ),
             "slot-1 is taken elsewhere, so a weight of two gets nothing"
         );
         // slot-0 was released on the back-off: a taker of one gets it.
-        let one = slots::try_take(&dir, 2, 1)
-            .expect("tried")
+        // (A process forked by another test in this binary can hold a copy
+        // of the descriptor for the instant before its exec, so a few
+        // short retries are allowed.)
+        let one = (0..200)
+            .find_map(|_| match slots::try_take(&all, 1).expect("tried") {
+                slots::Taken::All(held) => Some(held),
+                slots::Taken::Short { .. } => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    None
+                }
+            })
             .expect("slot-0 is free");
         assert_eq!(one.len(), 1);
         drop(other);
@@ -454,41 +867,132 @@ mod host_slots {
     }
 
     #[test]
+    fn a_missing_directory_or_one_with_no_slot_files_warns_once_and_creates_nothing() {
+        let scratch = temp_dir("slots-off");
+        let missing = scratch.join("never-made");
+        let empty = slot_dir("empty", 0);
+        std::fs::write(empty.join("not-a-slot"), b"").expect("other file");
+        let before = entries(&empty);
+        let gate = gate_with(1);
+        register(&gate, "run-o");
+        let mut off = admission(&gate, "run-o", 1, 4);
+        off.events = Events::for_run_on(
+            "run-o",
+            &scratch,
+            crate::protocol::Wire::to(std::io::sink()),
+        );
+        for dir in [&missing, &empty, &missing, &empty] {
+            off.slots = Some(dir.clone());
+            drop(
+                off.admit(&ask(&BTreeMap::new(), 1))
+                    .expect("falls back to the coordinator queue"),
+            );
+        }
+        assert!(!missing.exists(), "the directory is amont's to make");
+        assert_eq!(entries(&empty), before, "no slot file was created");
+        let written = std::fs::read_to_string(scratch.join("events.jsonl")).expect("events");
+        assert_eq!(
+            written.matches("host_slots_off").count(),
+            1,
+            "said once, however often it is asked: {written}"
+        );
+        std::fs::remove_dir_all(&empty).ok();
+    }
+
+    #[test]
+    fn a_weight_above_the_number_of_slot_files_is_refused_not_capped() {
+        // Four cores' worth of tokens, but amont made one slot file.
+        let dir = slot_dir("short", 1);
+        let gate = gate_with(2);
+        register(&gate, "run-w");
+        let mut shared = admission(&gate, "run-w", 2, 16);
+        shared.slots = Some(dir.clone());
+        let refused = shared.admit(&ask(&BTreeMap::new(), 2)).err();
+        assert!(
+            matches!(
+                refused,
+                Some(LeaseStop::HostSlots {
+                    weight: 2,
+                    slots: 1,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        // Nothing was queued for: the token is free for the next command.
+        shared.slots = None;
+        drop(
+            shared
+                .admit(&ask(&BTreeMap::new(), 2))
+                .expect("no token was kept"),
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_check_waits_for_a_held_host_slot_and_runs_holding_it() {
         let dir = temp_dir("slots");
-        let slots_dir = slot_dir("wait");
-        let held = lock(&slots_dir.join("slot-0"));
-        let gate = gate_with(1);
-        register(&gate, "run-s");
+        let slots_dir = slot_dir("wait", 1);
+        let held = Mutex::new(Some(lock(&slots_dir.join("slot-0"))));
+        let gate = Recording::new(gate_with(1));
+        register(&gate.inner, "run-s");
+        let clock = ManualClock::new();
         let mut with_slots = admission(&gate, "run-s", 1, 4);
         with_slots.slots = Some(slots_dir.clone());
-
-        let finished = AtomicBool::new(false);
-        let log = std::thread::scope(|scope| {
-            let runner = scope.spawn(|| {
-                let outcome = run_observed_within(
-                    &dir,
-                    &sh("echo slot=$AMONT_HOST_SLOT"),
-                    &dir.join("logs"),
-                    "cmd0",
-                    "x-cmd0",
-                    &Events::silent(),
-                    None,
-                    &with_slots,
-                )
-                .expect("run");
-                finished.store(true, Ordering::SeqCst);
-                std::fs::read_to_string(outcome.log_path).expect("log")
-            });
-            std::thread::sleep(Duration::from_millis(600));
-            assert!(
-                !finished.load(Ordering::SeqCst),
-                "the check ran while another process held the slot"
-            );
-            drop(held);
-            runner.join().expect("the runner thread")
+        with_slots.budgets = budgets_on(&clock, 60);
+        with_slots.events =
+            Events::for_run_on("run-s", &dir, crate::protocol::Wire::to(std::io::sink()));
+        with_slots.announce_every = Duration::from_millis(1);
+        with_slots.poll = Duration::from_millis(5);
+        // The other holder lets go during the third wait; the order of
+        // what the gate saw proves the check did not run before that.
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let noted = Arc::clone(&order);
+        let held = Arc::new(held);
+        let release = Arc::clone(&held);
+        with_slots.sleeper = Advancing::then(&clock, move |number| {
+            noted
+                .lock()
+                .expect("order")
+                .push(format!("waited {number}"));
+            if number == 3 {
+                noted
+                    .lock()
+                    .expect("order")
+                    .push("other holder let go".into());
+                release.lock().expect("held").take();
+            }
         });
+        let outcome = run_observed_within(
+            &dir,
+            &sh("echo slot=$AMONT_HOST_SLOT"),
+            &dir.join("logs"),
+            "cmd0",
+            "x-cmd0",
+            &with_slots.events.clone(),
+            None,
+            &with_slots,
+        )
+        .expect("run");
+        order.lock().expect("order").push("check finished".into());
+        let log = std::fs::read_to_string(outcome.log_path).expect("log");
         assert_eq!(log.trim(), "slot=held");
+        // A process forked elsewhere in this test binary can hold the
+        // descriptor for an instant, so the waits after the release are
+        // not counted: the order of events is what is asserted.
+        let order = order.lock().expect("order");
+        assert_eq!(
+            order[..4],
+            ["waited 1", "waited 2", "waited 3", "other holder let go"],
+            "{order:?}"
+        );
+        assert_eq!(order.last().map(String::as_str), Some("check finished"));
+        // While it waited for the slot it held its token and said so.
+        assert!(gate.events().iter().any(|e| e.starts_with("heartbeat ")));
+        // The queue position is the real shortfall: one slot to be freed.
+        let written = std::fs::read_to_string(dir.join("events.jsonl")).expect("events");
+        assert!(written.contains("\"class\":\"host_slot\""), "{written}");
+        assert!(written.contains("\"position\":1"), "{written}");
         std::fs::remove_dir_all(&slots_dir).ok();
     }
 }

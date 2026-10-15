@@ -39,8 +39,9 @@ mod junit;
 
 pub use end::CheckEnd;
 pub use heavy::{
-    child_environment, cores, default_heavy_commands, dispatch_id, heavy_cap, parallelism,
-    Admitted, Ask, HeavyAdmission, LeaseStop, Tries, ANNOUNCE_EVERY, HOST_SLOT_ENV,
+    ancestor_holds_slots, child_environment, cores, default_heavy_commands, dispatch_id, heavy_cap,
+    overweight, parallelism, Admitted, Ask, HeavyAdmission, LeaseStop, Sleeper, ThreadSleeper,
+    Tries, ANNOUNCE_EVERY, HOST_SLOT_ENV, LEASE_HEARTBEAT_EVERY,
 };
 pub use junit::{parse_junit, JunitArtifact, JunitError, JunitReport, TestOutcome};
 
@@ -958,14 +959,26 @@ pub fn run_observed_within(
         // Cancelled while queued: the check never started.
         None => Ended::Cancelled,
         Some(Ok(mut child)) => {
-            if let Some(admitted) = &admitted {
-                admitted.bound_to_group(child.id(), events);
-            }
+            let tied = admitted
+                .as_ref()
+                .is_none_or(|admitted| admitted.bound_to_group(child.id(), events));
+            // A lease the coordinator could not tie to the group is kept
+            // alive by heartbeats for as long as the check runs.
+            let finished = AtomicBool::new(false);
             // The whole process group goes when the check ends, however
             // it ends: a `cargo test` grandchild left running in a
             // worktree that is about to be removed corrupts the next
             // thing that reads it (audit V1).
-            match wait_following(&mut child, timeout, &log_path, label, events, cancel) {
+            let waited = std::thread::scope(|scope| {
+                if let (Some(admitted), false) = (&admitted, tied) {
+                    let finished = &finished;
+                    scope.spawn(move || admitted.keep_alive(finished, admission.heartbeat_every));
+                }
+                let waited = wait_following(&mut child, timeout, &log_path, label, events, cancel);
+                finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                waited
+            });
+            match waited {
                 Ok(ended) => ended,
                 Err(e) => {
                     ended_with(None);

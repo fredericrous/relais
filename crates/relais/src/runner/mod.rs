@@ -475,6 +475,9 @@ pub(crate) struct RunEngine<'a> {
     /// Which try of each command's heavy lease this is, so a rerun gets a
     /// lease id the coordinator has not seen (SPEC §23, C8).
     heavy_tries: verify::Tries,
+    /// What this run registered with the coordinator, kept to register
+    /// again when a restarted coordinator no longer knows the run.
+    registration: Option<RunRegistration>,
     /// Everything this run does, as events (SPEC §29).
     pub(crate) events: Events,
     /// The caller's worktree this run holds when it works in place
@@ -868,6 +871,9 @@ impl<'a> RunEngine<'a> {
             Some(run_id) if parent.is_none() => run_id.clone(),
             Some(_) | None => config.ids.run_id()?,
         };
+        // How often this run's runner has started: a resumed run counts on
+        // from there, so its heavy leases never reuse a settled id.
+        let epoch = config.ledger.next_run_epoch(run_id.as_str())?;
         let artifacts = config.artifacts_dir.join(run_id.as_str());
         let worktrees = worktree_root(&config.artifacts_dir).join(run_id.as_str());
         let verify_dir = verify_root(&config.artifacts_dir).join(run_id.as_str());
@@ -890,7 +896,8 @@ impl<'a> RunEngine<'a> {
             reviewer_gap: None,
             cancel_asked: Arc::new(AtomicBool::new(false)),
             budgets: Budgets::unbounded(),
-            heavy_tries: verify::Tries::default(),
+            heavy_tries: verify::Tries::for_epoch(epoch),
+            registration: None,
             events,
         })
     }
@@ -2230,6 +2237,21 @@ impl<'a> RunEngine<'a> {
             &crate::tooling::binary_available,
         );
 
+        // A weight no machine setting can grant is a profile that cannot
+        // run here: refused now, whether or not a coordinator is up.
+        let heavy_cap = verify::heavy_cap(
+            self.config.machine.concurrency.max_heavy_commands,
+            verify::cores(),
+        );
+        let profile = &authority.verification_profile;
+        if let Some(detail) =
+            verify::overweight(profile.setup.iter().chain(&profile.commands), heavy_cap)
+        {
+            return Ok(Phase::Ended(
+                self.fail_preflight(BlockCode::AdmissionRefused, detail)?,
+            ));
+        }
+
         // Managed runs register their root budget and agent-tree limits
         // before any dispatch; children can only narrow them (SPEC §23).
         if let Some(gate) = self.config.gate {
@@ -2253,6 +2275,7 @@ impl<'a> RunEngine<'a> {
                     format!("{e}; nothing was launched"),
                 )?));
             }
+            self.registration = Some(registration);
         }
 
         // The base resolves once (SPEC §4).
@@ -3017,8 +3040,14 @@ impl<'a> RunEngine<'a> {
                 .shared_host_slots
                 .as_ref()
                 .map(PathBuf::from),
+            ancestor_holds_slots: verify::ancestor_holds_slots(
+                std::env::var(verify::HOST_SLOT_ENV).ok().as_deref(),
+            ),
             poll: ADMISSION_POLL,
             announce_every: verify::ANNOUNCE_EVERY,
+            heartbeat_every: verify::LEASE_HEARTBEAT_EVERY,
+            sleeper: Arc::new(verify::ThreadSleeper),
+            registration: self.registration.clone(),
             tries: self.heavy_tries.clone(),
         }
     }
@@ -3053,7 +3082,7 @@ impl<'a> RunEngine<'a> {
                 BlockCode::AdmissionRefused,
                 detail,
             ),
-            LeaseStop::Weight { .. } => {
+            LeaseStop::Weight { .. } | LeaseStop::HostSlots { .. } => {
                 self.block(Reason::AdmissionRefused, BlockCode::AdmissionRefused, text)
             }
             LeaseStop::Duplicate(id) => self.finish(
@@ -13476,6 +13505,14 @@ mod tests {
             pid: Option<u32>,
         ) -> Result<crate::admission::BindOutcome, GateError> {
             self.inner.bind(dispatch_id, agent_id, pid)
+        }
+        fn bind_group(
+            &self,
+            dispatch_id: &str,
+            runner: u32,
+            pgid: u32,
+        ) -> Result<crate::admission::BindOutcome, GateError> {
+            self.inner.bind_group(dispatch_id, runner, pgid)
         }
         fn heartbeat(
             &self,
