@@ -338,10 +338,11 @@ pub struct VerificationProfile {
     /// candidate touching one requires review (SPEC §10).
     #[serde(default)]
     pub inputs: Vec<String>,
-    /// Cache baseline results by base SHA, profile and toolchain (SPEC
-    /// §18). Off by default: a profile with undeclared external
-    /// dependencies or nondeterministic checks is not cacheable, and only
-    /// the repository knows which it has.
+    /// Cache baseline results by base tree, profile and toolchain (SPEC
+    /// §18); only a base whose every check passed is cached. Off by
+    /// default: a profile with undeclared external dependencies or
+    /// nondeterministic checks is not cacheable, and only the repository
+    /// knows which it has.
     #[serde(default)]
     pub cache_baseline: bool,
 }
@@ -2043,7 +2044,9 @@ timeout_seconds = 300
 # verification GAP and the run ends needs_decision (SPEC §10). Listing an
 # ID here is a reviewed waiver in policy — the run can never grant one.
 # amont_waivers = ["pre-push-cargo-test"]
-# Cache baseline results by base SHA, profile and toolchain (SPEC §18).
+# Cache baseline results by base tree, profile and toolchain (SPEC §18).
+# Only a base whose every check passed is cached; a base with a failed
+# check is re-run each time.
 # Off by default: only a profile with no undeclared external dependency
 # and no nondeterministic check is safe to cache.
 # cache_baseline = true

@@ -2039,8 +2039,9 @@ pub fn baseline_key(
 /// is `BaselineUnrunnable` and is never cached as a failure. v3: the key
 /// names the base's tree object instead of its commit (ADR-0008). v4: an
 /// entry keeps the base's check outcomes and logs, not only its failed
-/// labels (ADR-0009).
-const BASELINE_MEANING_VERSION: u32 = 4;
+/// labels (ADR-0009). v5: only a base whose every check passed is cached,
+/// so a v4 entry, which may hold failures, is never read.
+const BASELINE_MEANING_VERSION: u32 = 5;
 
 /// A cached base verdict: which checks failed at the base and, when the
 /// logs were small enough to keep, the base's check outcomes with their
@@ -2054,6 +2055,9 @@ pub struct CachedBaseline {
 /// What `put` kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stored {
+    /// Nothing: a base with a failed check is not cached, so the next run
+    /// of it runs its checks again.
+    NotCached,
     /// The failures and the outcomes with their logs.
     WithOutcomes,
     /// The failures only: the logs came to `bytes`, over the limit.
@@ -2180,10 +2184,14 @@ impl BaselineCache {
         Some(dest.to_string_lossy().into_owned())
     }
 
-    /// Keep the base verdict. With `checks`, the outcomes and their logs are
-    /// kept too, unless the logs are over [`OUTCOME_LOG_LIMIT`] or one no
-    /// longer matches its recorded hash.
+    /// Keep the base verdict, but only an all-green one: a base with any
+    /// failed check is never stored. With `checks`, the outcomes and their
+    /// logs are kept too, unless the logs are over [`OUTCOME_LOG_LIMIT`] or
+    /// one no longer matches its recorded hash.
     pub fn put(&self, key: &str, failures: &[String], checks: &[CheckOutcome]) -> Stored {
+        if !failures.is_empty() || checks.iter().any(CheckOutcome::failed) {
+            return Stored::NotCached;
+        }
         if std::fs::create_dir_all(&self.dir).is_err() {
             return Stored::NotWritten;
         }
@@ -2920,13 +2928,10 @@ mod tests {
             "base-cmd0.log",
             &log,
         )];
-        assert_eq!(
-            cache.put("k", &["failed@x".to_string()], &checks),
-            Stored::WithOutcomes
-        );
+        assert_eq!(cache.put("k", &[], &checks), Stored::WithOutcomes);
         let reader_logs = dir.join("run-2/logs");
         let hit = cache.get("k", &reader_logs).expect("a hit");
-        assert_eq!(hit.failures, vec!["failed@x".to_string()]);
+        assert!(hit.failures.is_empty());
         let got = hit.checks.expect("outcomes");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].label, checks[0].label);
@@ -2976,7 +2981,7 @@ mod tests {
             "base-cmd0.log",
             &big,
         )];
-        let stored = cache.put("k", &["failed@x".to_string()], &checks);
+        let stored = cache.put("k", &[], &checks);
         assert_eq!(
             stored,
             Stored::OverLimit {
@@ -2986,8 +2991,67 @@ mod tests {
         let hit = cache
             .get("k", &dir.join("reader"))
             .expect("the failures are kept");
-        assert_eq!(hit.failures, vec!["failed@x".to_string()]);
+        assert!(hit.failures.is_empty());
         assert_eq!(hit.checks, None);
+    }
+
+    /// A base with one failing check is not stored: the same key misses, so
+    /// the checks run again.
+    #[test]
+    fn a_base_with_a_failed_check_is_not_cached() {
+        let dir = temp_dir("bcache-red");
+        let cache = BaselineCache::new(&dir.join("cache"));
+        let mut red = outcome_with_log(&dir.join("run-1/logs"), "base-cmd1.log", b"boom\n");
+        red.ended = CheckEnd::new(Ended::Exited(1));
+        let green = outcome_with_log(&dir.join("run-1/logs"), "base-cmd0.log", b"ok\n");
+        let checks = vec![green, red.clone()];
+        assert_eq!(
+            cache.put("k", &[red.label.clone()], &checks),
+            Stored::NotCached
+        );
+        assert_eq!(cache.put("k", &[], &checks), Stored::NotCached);
+        assert_eq!(cache.get("k", &dir.join("reader")), None);
+    }
+
+    /// An entry written under meaning version 4 is not read: the version is
+    /// part of the key.
+    #[test]
+    fn an_entry_written_under_meaning_version_four_is_not_read() {
+        assert_eq!(BASELINE_MEANING_VERSION, 5);
+        let profile = VerificationProfile::default();
+        let tools = crate::context::ToolVersions {
+            relais: "0.1.0".into(),
+            aval: None,
+            amont: None,
+            claude_code: None,
+        };
+        let toolchain = Toolchain {
+            programs: Vec::new(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        };
+        let current = baseline_key("t", &profile, &tools, &toolchain);
+        let v4 = sha256_hex(
+            serde_json::json!({
+                "meaning": 4,
+                "tree": "t",
+                "profile": &profile,
+                "tools": &tools,
+                "toolchain": &toolchain,
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        assert_ne!(current, v4);
+        let dir = temp_dir("bcache-v4");
+        let cache = BaselineCache::new(&dir.join("cache"));
+        std::fs::create_dir_all(dir.join("cache")).expect("mkdir");
+        std::fs::write(
+            dir.join("cache").join(format!("{v4}.json")),
+            r#"{"failures":["x@1"],"outcomes":null}"#,
+        )
+        .expect("v4 entry");
+        assert_eq!(cache.get(&current, &dir.join("reader")), None);
     }
 
     /// The directory stays inside its budget by dropping the oldest files.
@@ -3045,10 +3109,10 @@ mod tests {
         let key = baseline_key("abc", &profile, &tools, &toolchain);
         let logs = dir.join("logs");
         assert_eq!(cache.get(&key, &logs), None, "a miss reruns the checks");
-        cache.put(&key, &["cargo@deadbeef".to_string()], &[]);
+        cache.put(&key, &[], &[]);
         assert_eq!(
             cache.get(&key, &logs).map(|hit| hit.failures),
-            Some(vec!["cargo@deadbeef".to_string()])
+            Some(Vec::new())
         );
 
         let updated = Toolchain {
