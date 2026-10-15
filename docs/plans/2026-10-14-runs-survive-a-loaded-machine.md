@@ -11,7 +11,7 @@ adrs:
 
 ## Review panel
 
-👉 **Decide:** none — approve if PR 0 (probe timeout ≠ unsupported, your recommended fix) ahead of the three ordered PRs, all in one release (now v0.22.0), is right; D6 settled by ADR-0004.
+👉 **Decide:** none — approve if PR 0 (probe timeout ≠ unsupported, your recommended fix) ahead of the three ordered PRs, with PR 0 shipped in v0.22.0 and PRs 1–3 in the next release (v0.25.0 at this writing), is right; D6 settled by ADR-0004.
 📍 relais · plan reviewed after your eight findings, §0 added for the load-335 probe refusal, nothing built · next: PR 0. Panel: backend (opus-5-5), lang:rust (opus-5-5), tui (opus-5-5), unix (opus-5-5).
 **Changed by review:** conflict check and task tree share one `merge-tree -z` result (index built per git-update-index rules); usage re-sequenced by the driver, no new endpoint; flock slots all-or-nothing, inherited by the process group.
 **Verdicts:** round 1 4× approve-with-changes; your delta, then 3 backend confirmations (11 + 1 + 1 findings applied), final approve, no open blocker.
@@ -155,7 +155,7 @@ Waits never consume `work_seconds`; they consume their own budget and `total_sec
 8. **Pre-existing (PR 3).** Complete reports, subset, no targeted test → `needs_decision`, `repairs_used == 0`; same but a failing test named in acceptance → repair; truncated report / exit≠0 with zero failing cases → today's rule; v3 cache entry → today's rule.
 9. **Retry ownership.** Under relais (`RELAIS_CHECK=1`) the plugin check runs at most twice in total (count invocations); both logs exist and both attempts are on the receipt; CI path (`RELAIS_CHECK` unset) keeps the Makefile rerun.
 10. **Progress/cost.** A check printing nothing but burning CPU → `alive`, not stalled; a check sleeping without output or CPU past the threshold → `alive, no progress`; heartbeat seq monotonic. Plugin: out-of-order status responses → newer revision wins; replay twice → `¢69.20 est`; a seq-less usage line appears on stdout as one seq'd `cost`, exactly once across a resume.
-11. **Live (after release and install, this machine):** `relais --version` = 0.22.0; a `kind: verify` run of `run-65dc62a01e3d1-bf16`'s candidate (the advisor-token fix) reaches `accepted` or a named outcome with no worker; with `shared_host_slots` set to amont's slot directory and `max_heavy_commands = 1`, while a second relais run or an amont Heavy check holds the slot, the pane shows `waiting_for_slot` and lease events show no overlap; `df` before/after within the ADR-0008 bound; pane cost equals the ledger total.
+11. **Live (after release and install, this machine):** `relais --version` = the PR 3 release (v0.25.0 at this writing); a `kind: verify` run of `run-65dc62a01e3d1-bf16`'s candidate (the advisor-token fix) reaches `accepted` or a named outcome with no worker; with `shared_host_slots` set to amont's slot directory and `max_heavy_commands = 1`, while a second relais run or an amont Heavy check holds the slot, the pane shows `waiting_for_slot` and lease events show no overlap; `df` before/after within the ADR-0008 bound; pane cost equals the ledger total.
 
 ## Outcome (PR 0)
 
@@ -173,6 +173,26 @@ Branch `fix/probe-timeout-not-unsupported`, salvaged from relais run `run-65dd2b
 
 Deliberate: the live `relais run` check (35 s sleeper → one warning, one event, one `--version`) runs at the first install of v0.22.0 (v0.21.0 was cut from #242–#244 on 2026-10-14, so this plan's release is v0.22.0): `relais run` is refused outside the plugin and a branch binary would migrate the real ledger. The warning is not added to `report`: it is in `events.jsonl`, the pane and the manifest; a report entry is left to PR 3.
 
+## Outcome (PR 1)
+
+Branch `feat/candidate-identity`, built by five relais runs (three salvaged after `scope_exceeded` / `review_unavailable` / `interrupted`, one accepted, one salvaged after `needs_review`) and reviewed twice. Tests named below run in `cargo test`; the gate passed 30/30 at each commit.
+
+| Verification | Input | Expected | Actual (test) |
+|---|---|---|---|
+| 1 Identity | a clean verify of run X's candidate | the six identity fields persisted once in `candidate_inputs` and on the receipt | `a_clean_verify_dispatches_no_worker_and_persists_the_resolved_candidate` |
+| 1 | patch changed after validation | `candidate_digest_mismatch` | `a_patch_changed_after_validation_ends_candidate_digest_mismatch` |
+| 1 | source running / no candidate or commit gone / other repo | `candidate_source_running` / `candidate_missing` / `candidate_foreign_repo` | `a_source_that_has_not_ended_is_refused`, `a_source_without_a_candidate_or_without_its_commit_is_missing`, `a_source_from_another_repository_is_refused` |
+| 1 | a pinned candidate released | its ref and patch are kept while a non-terminal run or pending intent refers to it | `a_pinned_candidate_survives_release_while_its_consumer_is_running`, `a_pending_intent_pins_its_candidate_and_a_finished_run_releases_it` (release path only; nothing calls it yet, `holds-until` a gc command) |
+| 1 | stored row resolved against another base; user `diff.noprefix` | refused in preflight; digest unchanged | `a_stored_row_resolved_against_another_base_is_refused_in_preflight`, `a_user_diff_config_does_not_change_the_candidate_digest` |
+| 2 Conflicts | verify, conflicting candidate | `blocked (candidate_does_not_apply)`, no baseline event | `a_conflicting_candidate_is_blocked_before_the_baseline` |
+| 2 | `from_candidate`, conflicting | worker prompt lists paths; snapshot refused until resolved | `a_conflicting_from_candidate_hands_the_merge_to_the_worker_and_refuses_the_snapshot_until_resolved` |
+| 3 Successor intent | decide repeated; concurrent claims | one intent; one run | `the_answer_and_one_intent_are_written_together_and_repeat_to_the_same_intent`, `two_concurrent_claims_yield_one_run` |
+| 3 | crash after decide / after claim / after launch with the response dropped | exactly one successor run per intent | `a_crash_after_the_decide_commit_still_yields_one_successor_run`, `a_crash_after_the_claim_still_yields_one_successor_run`, `a_launch_that_dies_before_its_id_is_returned_leaves_exactly_one_successor_run` (counts run rows independently of the claim: two launched, one abandoned, none for the refused third) |
+| 3 | refused launch | claim handed back; not relaunched inside a 60 s, doubling to 10 min, backoff; `native status` lists refusal and `retry_after` (parsed by bun and node) | `a_refused_launch_hands_the_claim_back_with_the_refusal_recorded`, `a_refused_intent_is_not_launchable_inside_its_backoff_and_is_after_it`, `a_run_intent_refused_by_a_preflight_leaves_the_intent_pending_with_the_refusal` (real binary) |
+| A5 plugin | status poll relaunches a dead successor; errors typed | one launch per poll while it lives; typed failure on bad status | `claude-plugin/tests/successor.test.ts` |
+
+Deliberate: pins protect the release path only (no command calls it yet). The live step (`kind: verify` of a real candidate) is plan step 11, after the release.
+
 ## Implementation review
 
 PR 0: approve, four passes on one reviewer (round 1 50k/77 s; delta 56k/24 s; comment-only 58k/18 s; Windows CI fix 61k/17 s); final tree `87456d3f`, nothing open.
@@ -183,7 +203,7 @@ Next: PR 1 (candidate identity), on a new branch from `origin/main` after this m
 
 ## Delivery
 
-**PR 0** (§0, small, independent) merges first, so the remaining work is not itself blocked by a loaded machine. Then three PRs, merged in order PR 1 → PR 2 → PR 3 (B4 needs A5, C2 needs B4; later PRs say `merge-after:`), each mergeable on green CI and an approved implementation review: **PR 1** candidate identity and revision semantics (A); **PR 2** resource admission, budgets and exhaustion (B, ADR-0009); **PR 3** verification evidence and telemetry (C). The plan record landed as PR 0's first commit (ADR-0022). One minor release **v0.22.0** after PR 3 (v0.21.0 was cut from #242–#244 on 2026-10-14) (expand-only ledger steps). Install on this machine (`relais install --claude --user --write`, `relais coordinator stop`), which also brings v0.20.0's CoW seeding and #240; then live step 11. Rollback: v0.20.x against a ledger holding verify runs and intents — `status`/`report` name the unknown kind rather than fail; new tables are ignored. The pending `run-65dc815630ab3-117d3` decision is recorded `abandon` (superseded by step 11's verify run), and the advisor fix already landed as #246 (2026-10-14).
+**PR 0** (§0, small, independent) merges first, so the remaining work is not itself blocked by a loaded machine. Then three PRs, merged in order PR 1 → PR 2 → PR 3 (B4 needs A5, C2 needs B4; later PRs say `merge-after:`), each mergeable on green CI and an approved implementation review: **PR 1** candidate identity and revision semantics (A); **PR 2** resource admission, budgets and exhaustion (B, ADR-0009); **PR 3** verification evidence and telemetry (C). The plan record landed as PR 0's first commit (ADR-0022). PR 0 shipped in v0.22.0 (#250). One minor release after PR 3 carries the rest (expand-only ledger steps); its number is the next free one, v0.25.0 at this writing, since other work cut v0.21.0–v0.24.0 on 2026-10-14/15. Install on this machine (`relais install --claude --user --write`, `relais coordinator stop`), which also brings v0.20.0's CoW seeding and #240; then live step 11. Rollback: a relais from before schema 35 refuses an upgraded ledger (`SchemaAhead`, `ledger/mod.rs`), so a rollback restores the ledger from before the upgrade; it does not run old binaries against new tables. The pending `run-65dc815630ab3-117d3` decision is recorded `abandon` (superseded by step 11's verify run), and the advisor fix already landed as #246 (2026-10-14).
 
 ## Not in scope
 
@@ -203,7 +223,7 @@ Next: PR 1 (candidate identity), on a new branch from `origin/main` after this m
 - D7 One retry owner per execution context (`RELAIS_CHECK`); every attempt is visible.
 - D8 Pre-existing shortcut only on complete reports, subset failures and no targeted test.
 - D9 Defaults: disk floor 8 GiB, disk wait 600 s, admission wait 1800 s, `max_heavy_commands` cores/4 (min 1), ballast 64 MiB, disk estimate 2 GiB until measured.
-- D10 Delivery split into three PRs, one release (person's review); PR 0 added ahead of them, inside the same release, now v0.22.0.
+- D10 Delivery split into three PRs, one release (person's review); PR 0 added ahead of them and shipped on its own in v0.22.0; PRs 1–3 follow in one release.
 - D11 A probe that times out is "unchecked", not "unsupported": warn, record, continue; a version that answers outside the range, or no answer at all, still refuses. No cross-process version cache.
 - D12 (PR 0 implementation) A timed-out probe stands for `TIMEOUT_RETRY` (300 s) on the backend rather than being re-asked at every use, so a run start waits once, not once per caller; the timeout is read through `Harness::probe_timed_out`, never a process-wide static. `Support`/`claude_code_support` live in `adapter/claude.rs`, since `native` must not depend on `adapter` (module-cycle check).
 
