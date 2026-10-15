@@ -67,7 +67,9 @@ timeout_seconds = 1800
 # built-in list covers the common ones; add this repository's own here.
 # [verification.profiles.default]
 # inputs = ["scripts/check.sh", "ci/**"]
-# Cache baseline results by base SHA, profile and toolchain (SPEC §18).
+# Cache baseline results by base tree, profile and toolchain (SPEC §18).
+# Only a base whose every check passed is cached; a base with a failed
+# check is re-run each time.
 # Off by default: only a profile with no undeclared external dependency
 # and no nondeterministic check is safe to cache.
 # cache_baseline = true

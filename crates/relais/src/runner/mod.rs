@@ -2479,14 +2479,24 @@ impl<'a> RunEngine<'a> {
                         .map(|outcome| outcome.label.clone())
                         .collect();
                     if let (true, Some(key)) = (cacheable, &baseline_key) {
-                        let skipped = match baseline_cache.put(key, &failures, &checks) {
+                        let stored = baseline_cache.put(key, &failures, &checks);
+                        let what = if stored == verify::Stored::NotCached {
+                            "baseline_not_cached"
+                        } else {
+                            "baseline_cache_outcomes_skipped"
+                        };
+                        let skipped = match stored {
                             verify::Stored::WithOutcomes => None,
+                            verify::Stored::NotCached => Some(
+                                "the base has a failed check; a base is cached only when every check passed"
+                                    .to_string(),
+                            ),
                             verify::Stored::OverLimit { bytes } => Some(format!(
-                                "the base's logs came to {} MiB; only its failed checks are cached",
+                                "the base's logs came to {} MiB; only its green verdict is cached, without its logs",
                                 bytes / (1024 * 1024)
                             )),
                             verify::Stored::LogsUnreadable => Some(
-                                "a base log could not be read back to match its hash; only its failed checks are cached"
+                                "a base log could not be read back to match its hash; only its green verdict is cached, without its logs"
                                     .to_string(),
                             ),
                             verify::Stored::NotWritten => Some(
@@ -2496,7 +2506,7 @@ impl<'a> RunEngine<'a> {
                         };
                         if let Some(reason) = skipped {
                             self.events.emit(Event::Decision {
-                                what: "baseline_cache_outcomes_skipped".into(),
+                                what: what.into(),
                                 reason,
                             });
                         }
@@ -6152,6 +6162,19 @@ mod tests {
             reuse: None,
             argv: vec![shell.into(), "-c".into(), "test ! -f src/main.rs".into()],
             timeout_seconds: 30,
+        }
+    }
+
+    /// Green on every tree, and run by `bash`, whose version the baseline
+    /// key can name: a base it judges is cached.
+    fn versionable_passing_check() -> CommandSpec {
+        CommandSpec {
+            argv: vec![
+                versionable_main_gone_check().argv[0].clone(),
+                "-c".into(),
+                "true".into(),
+            ],
+            ..versionable_main_gone_check()
         }
     }
 
@@ -10133,7 +10156,7 @@ mod tests {
     #[test]
     fn baseline_results_are_cached_only_when_the_profile_opts_in() {
         let fixture = Fixture::new();
-        let mut repo = fixture.repo_policy(vec![versionable_main_gone_check()], 3);
+        let mut repo = fixture.repo_policy(vec![versionable_passing_check()], 3);
         let backend = conditional_worker("relais task");
         let first = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
         let RunOutcome {
@@ -10180,11 +10203,46 @@ mod tests {
             receipt.verification.baseline_cached,
             "the same base, profile and toolchain hit"
         );
-        assert_eq!(
-            receipt.verification.baseline_failures.len(),
-            1,
-            "the cached baseline still names the pre-existing failure"
+        assert!(
+            receipt.verification.baseline_failures.is_empty(),
+            "only an all-green base is cached"
         );
+    }
+
+    /// A base with a failed check is never cached: every run judges it
+    /// again, and still names the pre-existing failure.
+    #[test]
+    fn a_red_base_is_rerun_every_time_not_cached() {
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![versionable_main_gone_check()], 3);
+        repo.verification
+            .profiles
+            .get_mut("profile")
+            .expect("profile")
+            .cache_baseline = true;
+        let machine = fixture.machine_for(&repo);
+        let backend = conditional_worker("relais task");
+        for round in ["first", "second"] {
+            let outcome = fixture.execute_with_machine(
+                &fixture.contract(Review::Off),
+                &repo,
+                &machine,
+                &backend,
+            );
+            let RunOutcome {
+                terminal: Terminal::Accepted(receipt),
+                ..
+            } = outcome
+            else {
+                panic!("{round}: {outcome:?}");
+            };
+            assert!(!receipt.verification.baseline_cached, "{round} run");
+            assert_eq!(
+                receipt.verification.baseline_failures.len(),
+                1,
+                "{round} run"
+            );
+        }
     }
 
     /// The runner's own machinery failing — here, the run directory made
@@ -10486,7 +10544,7 @@ mod tests {
         let fixture = Fixture::new();
         let mut repo = fixture.repo_policy_with_setup(
             vec![bash_step("true")],
-            vec![versionable_main_gone_check()],
+            vec![versionable_passing_check()],
             3,
         );
         repo.verification
@@ -11056,7 +11114,7 @@ mod tests {
             timeout_seconds: 30,
         };
         let mut repo =
-            fixture.repo_policy_with_setup(vec![setup], vec![versionable_main_gone_check()], 3);
+            fixture.repo_policy_with_setup(vec![setup], vec![versionable_passing_check()], 3);
         repo.verification
             .profiles
             .get_mut("profile")
