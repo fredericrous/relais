@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+Revert detection records where a run's accepted change landed (ledger schema v37, table `landings`, decisions ADR-0036), so later passes start the log at the landing instead of searching for it again. The first landing found is kept, and a contained salvage records its candidate as the landing when it is decided. A relais from before schema 37 cannot read the upgraded ledger. Before upgrading, stop the coordinator and copy the ledger with `sqlite3 <state>/ledger.sqlite ".backup <file>"` (`<state>` is relais's state directory, `~/.local/state/relais` by default). To roll back, stop the coordinator again and restore that copy, only with the person's yes.
+
 ## v0.24.1
 
 `relais resume --retire` works in a repository that ignores `.relais` (relais's own does). Staging the worktree named `.relais` in an exclude pathspec, and git exits 1 when a pathspec names an ignored path, so retiring an interrupted in-place run failed and every later run in that worktree was refused with `workspace_has_interrupted_run`. The exclude is now left out when `.relais` is already ignored, since `add -A` never adds it then.

@@ -5814,3 +5814,53 @@ fn a_run_intent_refused_by_a_preflight_leaves_the_intent_pending_with_the_refusa
     );
     assert_eq!(launchable[0].intent_id, intent_id);
 }
+
+#[test]
+fn deciding_salvaged_with_a_contained_candidate_records_the_landing() {
+    let world = World::new("salvage-landing");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "[spending]\nper_run_micros = 20000\n");
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(5), "{}", text(&run.stderr));
+    let run_id = world.only_run_id();
+
+    // The person lands the worker's change (the deletion) as it is.
+    let ledger =
+        relais::ledger::Ledger::open(&world.state.join("ledger.sqlite")).expect("open ledger");
+    let patch = relais::learn::salvage::latest_candidate_patch(
+        &ledger,
+        &relais::ids::RunId::from_stored(&run_id),
+    )
+    .expect("read")
+    .expect("a candidate patch");
+    let patch = std::path::absolute(patch).expect("absolute");
+    git(&world.repo, &["apply", &patch.to_string_lossy()]);
+    git(&world.repo, &["add", "-A"]);
+    git(&world.repo, &["commit", "-q", "-m", "land the candidate"]);
+    let sha = git(&world.repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let salvage = world.relais(&[
+        "decide",
+        &run_id,
+        "--answer",
+        "salvaged",
+        "--actor",
+        "orchestrator",
+        "--candidate",
+        &sha,
+    ]);
+    assert_eq!(salvage.status.code(), Some(0), "{}", text(&salvage.stderr));
+    assert!(
+        text(&salvage.stdout).contains("candidate contained: yes"),
+        "{}",
+        text(&salvage.stdout)
+    );
+
+    let landing = ledger
+        .landing_of(&relais::ids::RunId::from_stored(&run_id))
+        .expect("read")
+        .expect("a landing row");
+    assert_eq!(landing.0, sha);
+    world.stop_coordinator();
+}

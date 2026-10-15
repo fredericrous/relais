@@ -42,7 +42,7 @@ pub use task_types::{
     ExportedTasks, ImportedTaskTypes, StoredTaskType, TaskExportRow, TaskTypeSource,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 36;
+pub const LEDGER_SCHEMA_VERSION: u64 = 37;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1990,6 +1990,19 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "v36",
         r#"
     ALTER TABLE successor_intents ADD COLUMN refusal_count INTEGER NOT NULL DEFAULT 0;
+    "#,
+    ),
+    (
+        // Where a run's accepted change landed, found once, so revert
+        // detection starts from it. Additive; nothing reads it but detection.
+        "v37",
+        r#"
+    CREATE TABLE landings (
+        run_id TEXT PRIMARY KEY REFERENCES runs(id),
+        landing_sha TEXT NOT NULL,
+        landed_at TEXT NOT NULL,
+        found_at TEXT NOT NULL
+    );
     "#,
     ),
 ];
@@ -4448,6 +4461,29 @@ impl Ledger {
             note,
             None,
         )
+    }
+
+    /// Record where a run's accepted change landed. The first landing found
+    /// is kept; a later one for the same run is ignored.
+    pub fn record_landing(&self, run_id: &RunId, sha: &str, landed_at: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO landings (run_id, landing_sha, landed_at, found_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![run_id.as_str(), sha, landed_at, self.now()],
+        )?;
+        Ok(())
+    }
+
+    /// The recorded landing of a run: its commit and when it landed.
+    pub fn landing_of(&self, run_id: &RunId) -> Result<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT landing_sha, landed_at FROM landings WHERE run_id = ?1",
+                [run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
     }
 
     /// [`Self::record_salvage`], also recording whether the run's verified
@@ -7345,6 +7381,30 @@ mod tests {
         );
         // Best effort: the fixture is a temp dir; a leftover costs
         // nothing but disk, and the next run pre-cleans it.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_first_recorded_landing_of_a_run_is_kept() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-l"), "/repo", None, &task("run-l"), "rk")
+            .expect("run");
+        assert_eq!(ledger.landing_of(&run("run-l")).expect("read"), None);
+        ledger
+            .record_landing(&run("run-l"), "aaa", "2026-09-05T12:00:00+00:00")
+            .expect("first");
+        ledger
+            .record_landing(&run("run-l"), "bbb", "2026-09-06T12:00:00+00:00")
+            .expect("second");
+        assert_eq!(
+            ledger.landing_of(&run("run-l")).expect("read"),
+            Some(("aaa".to_string(), "2026-09-05T12:00:00+00:00".to_string()))
+        );
+        assert_eq!(
+            ledger.schema_version().expect("version"),
+            LEDGER_SCHEMA_VERSION
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
