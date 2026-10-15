@@ -2479,18 +2479,24 @@ impl<'a> RunEngine<'a> {
                         .map(|outcome| outcome.label.clone())
                         .collect();
                     if let (true, Some(key)) = (cacheable, &baseline_key) {
-                        let skipped = match baseline_cache.put(key, &failures, &checks) {
+                        let stored = baseline_cache.put(key, &failures, &checks);
+                        let what = if stored == verify::Stored::NotCached {
+                            "baseline_not_cached"
+                        } else {
+                            "baseline_cache_outcomes_skipped"
+                        };
+                        let skipped = match stored {
                             verify::Stored::WithOutcomes => None,
                             verify::Stored::NotCached => Some(
                                 "the base has a failed check; a base is cached only when every check passed"
                                     .to_string(),
                             ),
                             verify::Stored::OverLimit { bytes } => Some(format!(
-                                "the base's logs came to {} MiB; only its failed checks are cached",
+                                "the base's logs came to {} MiB; only its green verdict is cached, without its logs",
                                 bytes / (1024 * 1024)
                             )),
                             verify::Stored::LogsUnreadable => Some(
-                                "a base log could not be read back to match its hash; only its failed checks are cached"
+                                "a base log could not be read back to match its hash; only its green verdict is cached, without its logs"
                                     .to_string(),
                             ),
                             verify::Stored::NotWritten => Some(
@@ -2500,7 +2506,7 @@ impl<'a> RunEngine<'a> {
                         };
                         if let Some(reason) = skipped {
                             self.events.emit(Event::Decision {
-                                what: "baseline_cache_outcomes_skipped".into(),
+                                what: what.into(),
                                 reason,
                             });
                         }

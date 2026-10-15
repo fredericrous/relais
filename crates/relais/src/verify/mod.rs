@@ -2060,10 +2060,11 @@ pub enum Stored {
     NotCached,
     /// The failures and the outcomes with their logs.
     WithOutcomes,
-    /// The failures only: the logs came to `bytes`, over the limit.
+    /// The green verdict without its logs: they came to `bytes`, over the
+    /// limit.
     OverLimit { bytes: u64 },
-    /// The failures only: a log could not be read back, or no longer
-    /// matches the hash recorded for it.
+    /// The green verdict without its logs: one could not be read back, or
+    /// no longer matches the hash recorded for it.
     LogsUnreadable,
     /// The cache could not be written: the next run of this base runs its
     /// checks again.
@@ -2972,7 +2973,7 @@ mod tests {
     /// Over the limit an entry keeps its failures alone, as every entry did
     /// before, and says how much the logs came to.
     #[test]
-    fn logs_over_the_limit_leave_a_failures_only_entry() {
+    fn logs_over_the_limit_leave_a_verdict_only_entry() {
         let dir = temp_dir("bcache-big");
         let cache = BaselineCache::new(&dir.join("cache"));
         let big = vec![b'x'; (OUTCOME_LOG_LIMIT + 1) as usize];
@@ -2990,7 +2991,7 @@ mod tests {
         );
         let hit = cache
             .get("k", &dir.join("reader"))
-            .expect("the failures are kept");
+            .expect("the green verdict is kept");
         assert!(hit.failures.is_empty());
         assert_eq!(hit.checks, None);
     }
