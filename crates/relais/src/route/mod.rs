@@ -1201,6 +1201,8 @@ mod tests {
                             argv: vec!["make".into(), "check".into()],
                             timeout_seconds: 300,
                             junit: None,
+                            weight: None,
+                            env: Default::default(),
                             reuse: None,
                         }],
                         amont_checks: Vec::new(),

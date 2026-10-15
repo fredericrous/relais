@@ -329,6 +329,29 @@ pub(crate) fn permissions_finding(settings: &MachineSettings) -> Option<Finding>
         })
 }
 
+/// The `heavy` finding: how many heavy-command tokens the machine hands
+/// out (`max_heavy_commands`, else a quarter of the cores, at least one),
+/// and the shared host-slot directory when `[resources] shared_host_slots`
+/// names one (SPEC §23). Information, never a warning.
+pub(crate) fn heavy_finding(settings: &MachineSettings, cores: u32) -> Finding {
+    let configured = settings.concurrency.max_heavy_commands;
+    let cap = crate::verify::heavy_cap(configured, cores);
+    let source = if configured.is_some() {
+        "machine.toml"
+    } else {
+        "a quarter of the cores"
+    };
+    let slots = match &settings.resources.shared_host_slots {
+        Some(dir) => format!("shared host slots in {dir}"),
+        None => "no shared host slots (the coordinator queue only)".to_string(),
+    };
+    Finding {
+        component: "heavy",
+        level: Level::Ok,
+        detail: format!("max_heavy_commands {cap} ({source}); {slots}"),
+    }
+}
+
 /// Words wrapped to `width` columns; continuation lines start with
 /// `indent`. A word longer than a line is broken across lines.
 fn wrap(text: &str, width: usize, indent: &str) -> Vec<String> {
@@ -1245,6 +1268,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                     max_effort = settings.routing.max_effort.clone();
                     findings.extend(sandbox_finding(&settings));
                     findings.extend(permissions_finding(&settings));
+                    findings.push(heavy_finding(&settings, crate::verify::cores()));
                     pricing = match &settings.pricing {
                         Some(table) => PricingConfig::Table(table.clone()),
                         None => PricingConfig::Unconfigured,
@@ -3578,6 +3602,34 @@ mod tests {
     fn machine_with(extra: &str) -> MachineSettings {
         MachineSettings::from_toml_str(&format!("schema_version = 1\n{extra}"))
             .expect("a valid machine.toml")
+    }
+
+    #[test]
+    fn doctor_shows_max_heavy_commands_and_the_shared_slot_directory() {
+        let default = heavy_finding(&machine_with(""), 16);
+        assert_eq!(default.level, Level::Ok);
+        assert!(
+            default.detail.contains("max_heavy_commands 4"),
+            "{}",
+            default.detail
+        );
+        assert!(
+            default.detail.contains("no shared host slots"),
+            "{}",
+            default.detail
+        );
+        let set = heavy_finding(
+            &machine_with(
+                "[concurrency]\nmax_heavy_commands = 3\n[resources]\nshared_host_slots = \"/run/slots\"\n",
+            ),
+            16,
+        );
+        assert!(
+            set.detail.contains("max_heavy_commands 3"),
+            "{}",
+            set.detail
+        );
+        assert!(set.detail.contains("/run/slots"), "{}", set.detail);
     }
 
     #[test]

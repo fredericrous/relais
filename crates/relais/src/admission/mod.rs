@@ -83,6 +83,10 @@ pub const UNBINDABLE_AFTER: u32 = 3;
 /// to the same PID every 15 s, for ever, with no escalation).
 pub const CANCEL_ESCALATE_AFTER: Duration = LEASE_GRACE;
 
+/// How long the coordinator lets a check's process group answer SIGTERM,
+/// after its runner died, before it sends SIGKILL (SPEC §23).
+pub const GROUP_KILL_AFTER: Duration = Duration::from_secs(10);
+
 /// How many settled dispatch IDs are remembered so a repeat is refused
 /// rather than admitted a second time (C8). Bounded and FIFO: a
 /// coordinator that runs for days cannot grow this without limit, and
@@ -109,6 +113,12 @@ impl ResourceClass {
             Self::Indexing => "indexing",
             Self::Training => "training",
         }
+    }
+
+    /// Whether a dispatch of this class is an agent of the run's tree: only
+    /// those count against `max_agents_per_run`. A check is not an agent.
+    fn is_agent(self) -> bool {
+        self == Self::ModelWork
     }
 
     /// The cap this class is scheduled against.
@@ -203,6 +213,20 @@ pub struct DispatchRequest {
     /// `a_mixed_version_pair_of_dispatch_requests_stays_wire_compatible`.
     #[serde(default)]
     pub caller_agent_id: Option<String>,
+    /// Tokens this dispatch takes from its cap group: a heavy command's
+    /// `weight` (SPEC §23). One for everything else. Additive and
+    /// defaulted like the fields above: an older request has no key and
+    /// reads as one, and a weight of one is not written.
+    #[serde(default = "one_token", skip_serializing_if = "takes_one_token")]
+    pub weight: u32,
+}
+
+fn one_token() -> u32 {
+    1
+}
+
+fn takes_one_token(weight: &u32) -> bool {
+    *weight == 1
 }
 
 /// Where a dispatch's admission was asked from. The hook labels its own
@@ -268,6 +292,9 @@ pub enum Refusal {
     /// This dispatch ID already ran and settled. Admitting it again
     /// would launch a second agent for work that is over (C8).
     AlreadyFinished,
+    /// A heavy command asked for more tokens than the machine has, or for
+    /// none: it could never be admitted.
+    WeightOutOfRange,
 }
 
 impl Refusal {
@@ -279,6 +306,7 @@ impl Refusal {
             Self::RunAgentCap => "run_agent_cap",
             Self::BudgetExceeded => "budget_exceeded",
             Self::AlreadyFinished => "already_finished",
+            Self::WeightOutOfRange => "weight_out_of_range",
         }
     }
 }
@@ -957,6 +985,51 @@ struct Dispatch {
     last_heartbeat: Instant,
     source: DispatchSource,
     attribution: Attribution,
+    /// Tokens held in the cap group (SPEC §23).
+    weight: u32,
+    /// The check's process group, once its runner reported it (SPEC §23):
+    /// the lease then lasts as long as a member of the group runs.
+    group: Option<GroupHold>,
+}
+
+/// A heavy lease tied to a process group. The runner that owns the group
+/// is `runner`; when it dies the coordinator stops the group, and the
+/// tokens come back only once no member is left.
+#[derive(Debug, Clone, Copy)]
+struct GroupHold {
+    runner: u32,
+    pgid: u32,
+    ladder: GroupLadder,
+}
+
+/// How far the coordinator has got in stopping an orphaned group.
+#[derive(Debug, Clone, Copy)]
+enum GroupLadder {
+    /// The runner is alive, or the group has not been asked to stop.
+    Holding,
+    Terminated {
+        since: Instant,
+    },
+    Killed,
+}
+
+/// A signal for a whole process group, handed to the caller to send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupSignal {
+    pub dispatch_id: String,
+    pub pgid: u32,
+    pub signal: Signal,
+}
+
+/// What a group sweep decided.
+#[derive(Debug, Default)]
+pub struct GroupReport {
+    /// Groups to stop: SIGTERM first, SIGKILL once [`GROUP_KILL_AFTER`]
+    /// has passed.
+    pub to_signal: Vec<GroupSignal>,
+    /// Leases whose runner died and whose group is gone: the tokens are
+    /// back.
+    pub released: Vec<String>,
 }
 
 /// One worktree's exclusive write lease (SPEC §23: "concurrent writers
@@ -1408,6 +1481,19 @@ impl AdmissionState {
                 detail: format!("run {} was cancelled", request.run_id),
             });
         }
+        if request.resource == ResourceClass::HeavyLocal {
+            let cap = self.limits.max_heavy_commands;
+            if request.weight == 0 || cap.is_some_and(|cap| request.weight > cap) {
+                return Some(Decision::Refused {
+                    code: Refusal::WeightOutOfRange,
+                    detail: format!(
+                        "a weight of {} is outside 1..={} (`max_heavy_commands`); it could never be admitted",
+                        request.weight,
+                        cap.unwrap_or(u32::MAX)
+                    ),
+                });
+            }
+        }
         let max_depth = min_opt(run.max_depth, self.limits.max_agent_depth);
         let depth = self.effective_depth(request);
         if max_depth.is_some_and(|max| depth > max) {
@@ -1423,10 +1509,14 @@ impl AdmissionState {
         let queued_for_run = self
             .queue
             .iter()
-            .filter(|queued| queued.request.run_id == request.run_id)
+            .filter(|queued| {
+                queued.request.run_id == request.run_id && queued.request.resource.is_agent()
+            })
             .count() as u32;
         let max_agents = min_opt(run.max_agents, self.limits.max_agents_per_run);
-        if max_agents.is_some_and(|max| run.admitted_total + queued_for_run >= max) {
+        if request.resource.is_agent()
+            && max_agents.is_some_and(|max| run.admitted_total + queued_for_run >= max)
+        {
             return Some(Decision::Refused {
                 code: Refusal::RunAgentCap,
                 detail: format!(
@@ -1544,7 +1634,9 @@ impl AdmissionState {
                     && dispatch.lifecycle.holds_seat()
                     && session.is_none_or(|session| dispatch.session_id == session)
             })
-            .count() as u32
+            .fold(0u32, |tokens, dispatch| {
+                tokens.saturating_add(dispatch.weight)
+            })
     }
 
     fn group_cap(&self, group: CapGroup) -> Option<u32> {
@@ -1558,10 +1650,11 @@ impl AdmissionState {
     /// Capacity caps only; hard limits were checked before queueing.
     fn admissible(&self, request: &DispatchRequest) -> bool {
         let group = request.resource.cap_group();
-        if self
-            .group_cap(group)
-            .is_some_and(|cap| self.active_count(group, None) >= cap)
-        {
+        if self.group_cap(group).is_some_and(|cap| {
+            self.active_count(group, None)
+                .saturating_add(request.weight.max(1))
+                > cap
+        }) {
             return false;
         }
         if group == CapGroup::Remote {
@@ -1590,7 +1683,9 @@ impl AdmissionState {
         // derives from what is recorded here.
         let depth = self.effective_depth(&request);
         if let Some(run) = self.runs.get_mut(&request.run_id) {
-            run.admitted_total += 1;
+            if request.resource.is_agent() {
+                run.admitted_total += 1;
+            }
             run.terminal = false;
             run.last_activity = now;
         }
@@ -1618,6 +1713,8 @@ impl AdmissionState {
                 last_heartbeat: now,
                 source: request.source,
                 attribution,
+                weight: request.weight.max(1),
+                group: None,
             },
         );
     }
@@ -1633,7 +1730,9 @@ impl AdmissionState {
         };
         self.native.forget(dispatch_id);
         if let Some(run) = self.runs.get_mut(&dispatch.run_id) {
-            run.admitted_total = run.admitted_total.saturating_sub(1);
+            if dispatch.class.is_agent() {
+                run.admitted_total = run.admitted_total.saturating_sub(1);
+            }
             run.last_activity = now;
         }
         self.write_leases
@@ -2300,6 +2399,11 @@ impl AdmissionState {
         self.reap_unclaimed(now, &mut report);
         let ids: Vec<String> = self.dispatches.keys().cloned().collect();
         for id in ids {
+            // A lease tied to a process group is judged by
+            // `reconcile_groups`, not by heartbeats.
+            if self.dispatches[&id].group.is_some() {
+                continue;
+            }
             let (heartbeat_age, binding, cancelled) = {
                 let dispatch = &self.dispatches[&id];
                 (
@@ -2378,6 +2482,88 @@ impl AdmissionState {
             }
         }
         self.reap_runs(now);
+        report
+    }
+
+    /// Tie a heavy lease to the process group its runner just spawned
+    /// (SPEC §23). From here the lease is no longer judged by heartbeats:
+    /// it lasts while the runner lives, and after the runner dies, for as
+    /// long as a member of the group runs ([`Self::reconcile_groups`]).
+    pub fn bind_group(
+        &mut self,
+        dispatch_id: &str,
+        runner: u32,
+        pgid: u32,
+        now: Instant,
+        alive: &dyn Fn(u32) -> bool,
+    ) -> BindOutcome {
+        let Some(dispatch) = self.dispatches.get_mut(dispatch_id) else {
+            return BindOutcome::UnknownDispatch;
+        };
+        if pgid <= 1 || !alive(runner) {
+            return BindOutcome::PidNotAlive;
+        }
+        dispatch.group = Some(GroupHold {
+            runner,
+            pgid,
+            ladder: GroupLadder::Holding,
+        });
+        dispatch.last_heartbeat = now;
+        BindOutcome::Bound
+    }
+
+    /// The sweep for leases tied to a process group. A lease whose runner
+    /// lives is left alone; the runner gives it back when its check ends.
+    /// One whose runner died has its group stopped: SIGTERM, then SIGKILL
+    /// after `kill_after`, repeated while the group stays. The tokens are
+    /// returned only when `group_alive` says no member is left, never
+    /// while a descendant runs.
+    pub fn reconcile_groups(
+        &mut self,
+        now: Instant,
+        kill_after: Duration,
+        runner_alive: &dyn Fn(u32) -> bool,
+        group_alive: &dyn Fn(u32) -> bool,
+    ) -> GroupReport {
+        let mut report = GroupReport::default();
+        let held: Vec<(String, GroupHold)> = self
+            .dispatches
+            .iter()
+            .filter_map(|(id, dispatch)| dispatch.group.map(|group| (id.clone(), group)))
+            .collect();
+        for (id, group) in held {
+            if runner_alive(group.runner) {
+                continue;
+            }
+            if !group_alive(group.pgid) {
+                self.settle(&id, None, now);
+                self.release(&id, now);
+                report.released.push(id);
+                continue;
+            }
+            let (signal, ladder) = match group.ladder {
+                GroupLadder::Holding => (Signal::Terminate, GroupLadder::Terminated { since: now }),
+                GroupLadder::Terminated { since } => {
+                    if now.saturating_duration_since(since) < kill_after {
+                        continue;
+                    }
+                    (Signal::Kill, GroupLadder::Killed)
+                }
+                GroupLadder::Killed => (Signal::Kill, GroupLadder::Killed),
+            };
+            if let Some(hold) = self
+                .dispatches
+                .get_mut(&id)
+                .and_then(|dispatch| dispatch.group.as_mut())
+            {
+                hold.ladder = ladder;
+            }
+            report.to_signal.push(GroupSignal {
+                dispatch_id: id,
+                pgid: group.pgid,
+                signal,
+            });
+        }
         report
     }
 
@@ -2773,6 +2959,16 @@ pub trait Gate {
         pid: Option<u32>,
     ) -> Result<BindOutcome, GateError>;
     fn heartbeat(&self, dispatch_id: &str) -> Result<HeartbeatStatus, GateError>;
+    /// Tie a heavy lease to the process group its runner spawned (see
+    /// `AdmissionState::bind_group`). The default has no such lease.
+    fn bind_group(
+        &self,
+        _dispatch_id: &str,
+        _runner: u32,
+        _pgid: u32,
+    ) -> Result<BindOutcome, GateError> {
+        Ok(BindOutcome::UnknownDispatch)
+    }
     /// The worker saw `cancelled` on a heartbeat and is stopping. The
     /// seat and the reservation go now, instead of waiting out the lease
     /// grace with a worker that is already leaving (C5). Idempotent, and
@@ -3092,6 +3288,21 @@ impl Gate for LocalGate {
         ))
     }
 
+    fn bind_group(
+        &self,
+        dispatch_id: &str,
+        runner: u32,
+        pgid: u32,
+    ) -> Result<BindOutcome, GateError> {
+        Ok(self.admission().bind_group(
+            dispatch_id,
+            runner,
+            pgid,
+            Instant::now(),
+            &crate::procs::alive,
+        ))
+    }
+
     fn heartbeat(&self, dispatch_id: &str) -> Result<HeartbeatStatus, GateError> {
         Ok(self.admission().heartbeat(dispatch_id, Instant::now()))
     }
@@ -3324,6 +3535,7 @@ mod tests {
             reserve_micros: 0,
             source: DispatchSource::ManagedRun,
             caller_agent_id: None,
+            weight: 1,
         }
     }
 

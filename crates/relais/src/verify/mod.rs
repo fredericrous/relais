@@ -25,7 +25,7 @@ use crate::contract::Kind;
 use crate::ids::{canonical_json_hash, sha256_hex};
 use crate::money::{CostCompleteness, MicroUsd};
 use crate::policy::{
-    named_command, Budgets, CommandSpec, DependencyMode, Integrations, VerificationProfile,
+    named_command, CommandSpec, DependencyMode, Integrations, VerificationProfile,
 };
 use crate::procs::Ended;
 use crate::protocol::{Event, Events};
@@ -34,9 +34,14 @@ use crate::workspace::{Git, WorkspaceError};
 
 mod end;
 mod follow;
+mod heavy;
 mod junit;
 
 pub use end::CheckEnd;
+pub use heavy::{
+    child_environment, cores, default_heavy_commands, dispatch_id, heavy_cap, parallelism,
+    Admitted, Ask, HeavyAdmission, LeaseStop, Tries, ANNOUNCE_EVERY, HOST_SLOT_ENV,
+};
 pub use junit::{parse_junit, JunitArtifact, JunitError, JunitReport, TestOutcome};
 
 /// Why verification could not be carried out as the policy declares it.
@@ -56,6 +61,10 @@ pub enum VerifyError {
     ZeroTimeout {
         argv: Vec<String>,
     },
+    /// The command was not admitted: a queue outlasted a budget, the
+    /// run was cancelled in it, or the coordinator refused or was
+    /// unreachable. Nothing was started.
+    Lease(LeaseStop),
     Io(std::io::Error),
 }
 
@@ -71,6 +80,7 @@ impl std::fmt::Display for VerifyError {
                 "the verification command `{}` declares timeout_seconds = 0; give it a time or remove it",
                 argv.join(" ")
             ),
+            Self::Lease(stop) => write!(f, "{stop}"),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -80,7 +90,7 @@ impl std::error::Error for VerifyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
-            Self::BadPattern { .. } | Self::ZeroTimeout { .. } => None,
+            Self::BadPattern { .. } | Self::ZeroTimeout { .. } | Self::Lease(_) => None,
         }
     }
 }
@@ -858,13 +868,15 @@ pub fn run_observed(
         log_stem,
         events,
         cancel,
-        &Budgets::unbounded(),
+        &HeavyAdmission::unmanaged(),
     )
 }
 
-/// [`run_observed`] under a run's budgets (ADR-0010): the command starts
-/// with the smaller of its own timeout and what is left of each budget
-/// that applies to it.
+/// [`run_observed`] under a run's budgets and heavy lease (ADR-0010,
+/// SPEC §23): the command first waits for its lease, then starts with the
+/// smaller of its own timeout and what is left of each budget that applies
+/// to it. Queue time is charged to `admission_wait_seconds` and the total,
+/// never to work, so the timeout is read after the wait.
 #[allow(clippy::too_many_arguments)]
 pub fn run_observed_within(
     dir: &Path,
@@ -874,10 +886,24 @@ pub fn run_observed_within(
     log_stem: &str,
     events: &Events,
     cancel: Option<&AtomicBool>,
-    budgets: &Budgets,
+    admission: &HeavyAdmission<'_>,
 ) -> Result<CheckOutcome, VerifyError> {
-    let timeout = budgets.clip(command_timeout(spec)?);
+    let own_timeout = command_timeout(spec)?;
     std::fs::create_dir_all(logs_dir)?;
+    // A cancelled queue wait runs nothing; every other refusal is the
+    // caller's to end the run on.
+    let admitted = match admission.admit(&Ask {
+        phase: log_stem,
+        label,
+        weight: spec.heavy_weight(),
+        env: &spec.env,
+        cancel,
+    }) {
+        Ok(admitted) => Some(admitted),
+        Err(LeaseStop::Cancelled) => None,
+        Err(stop) => return Err(VerifyError::Lease(stop)),
+    };
+    let timeout = admission.budgets.clip(own_timeout);
     // A report the candidate itself committed is not this command's
     // result: clear it, so what is read afterwards was written by the run.
     let junit_file = spec
@@ -904,6 +930,16 @@ pub fn run_observed_within(
         .stdout(log_file.try_clone()?)
         .stderr(log_file);
     crate::procs::own_process_group(&mut command);
+    if let Some(admitted) = &admitted {
+        command.envs(admitted.env());
+        #[cfg(unix)]
+        {
+            let fds = admitted.slot_fds();
+            if !fds.is_empty() {
+                crate::procs::inherit_fds(&mut command, fds);
+            }
+        }
+    }
     events.emit(Event::CheckStarted {
         label: label.to_string(),
         argv: spec.argv.clone(),
@@ -918,8 +954,13 @@ pub fn run_observed_within(
             duration_ms: started.elapsed().as_millis() as u64,
         });
     };
-    let ended = match command.spawn() {
-        Ok(mut child) => {
+    let ended = match admitted.as_ref().map(|_| command.spawn()) {
+        // Cancelled while queued: the check never started.
+        None => Ended::Cancelled,
+        Some(Ok(mut child)) => {
+            if let Some(admitted) = &admitted {
+                admitted.bound_to_group(child.id(), events);
+            }
             // The whole process group goes when the check ends, however
             // it ends: a `cargo test` grandchild left running in a
             // worktree that is about to be removed corrupts the next
@@ -940,7 +981,7 @@ pub fn run_observed_within(
         // baseline can say "unrunnable" instead of "interrupted" (see
         // `unrunnable`). Only NotFound: a program that exists and cannot
         // be executed is a different problem, not an install away.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             use std::io::Write as _;
             let mut log = std::fs::OpenOptions::new().append(true).open(&log_path)?;
             let message = format!("relais: {}: command not found", spec.argv[0]);
@@ -954,11 +995,14 @@ pub fn run_observed_within(
             });
             Ended::Exited(COMMAND_NOT_FOUND)
         }
-        Err(e) => {
+        Some(Err(e)) => {
             ended_with(None);
             return Err(VerifyError::Io(e));
         }
     };
+    // The group is gone (`wait_for_exit` kills it on every path): the
+    // tokens and host slots go back now.
+    drop(admitted);
     ended_with(match ended {
         Ended::Exited(code) => Some(code),
         Ended::TimedOut | Ended::Cancelled | Ended::Signalled => None,
@@ -1115,12 +1159,12 @@ pub fn run_profile(
         prefix,
         events,
         cancel,
-        &Budgets::unbounded(),
+        &HeavyAdmission::unmanaged(),
     )
 }
 
-/// [`run_profile`] under a run's budgets: each command is clipped to what
-/// is left when it starts.
+/// [`run_profile`] under a run's budgets and heavy leases: each command
+/// waits for its lease, then is clipped to what is left when it starts.
 pub fn run_profile_within(
     dir: &Path,
     profile: &VerificationProfile,
@@ -1128,14 +1172,14 @@ pub fn run_profile_within(
     prefix: &str,
     events: &Events,
     cancel: Option<&AtomicBool>,
-    budgets: &Budgets,
+    admission: &HeavyAdmission<'_>,
 ) -> Result<Vec<CheckOutcome>, VerifyError> {
     let mut outcomes = Vec::new();
     for (index, command) in profile.commands.iter().enumerate() {
         let label = check_label(command);
         let log_stem = format!("{prefix}-cmd{index}");
         outcomes.push(run_observed_within(
-            dir, command, logs_dir, &label, &log_stem, events, cancel, budgets,
+            dir, command, logs_dir, &label, &log_stem, events, cancel, admission,
         )?);
     }
     Ok(outcomes)
@@ -1215,12 +1259,12 @@ pub fn run_setup_gated(
         events,
         cancel,
         gate,
-        &Budgets::unbounded(),
+        &HeavyAdmission::unmanaged(),
     )
 }
 
-/// [`run_setup_gated`] under a run's budgets: each step is clipped to
-/// what is left when it starts.
+/// [`run_setup_gated`] under a run's budgets and heavy leases: each step
+/// waits for its lease, then is clipped to what is left when it starts.
 #[allow(clippy::too_many_arguments)]
 pub fn run_setup_gated_within(
     dir: &Path,
@@ -1230,7 +1274,7 @@ pub fn run_setup_gated_within(
     events: &Events,
     cancel: Option<&AtomicBool>,
     gate: &mut dyn SetupGate,
-    budgets: &Budgets,
+    admission: &HeavyAdmission<'_>,
 ) -> Result<Vec<CheckOutcome>, VerifyError> {
     let mut outcomes = Vec::new();
     for (index, command) in profile.setup.iter().enumerate() {
@@ -1240,7 +1284,7 @@ pub fn run_setup_gated_within(
         let label = setup_label(command);
         let log_stem = format!("{prefix}-setup{index}");
         let outcome = run_observed_within(
-            dir, command, logs_dir, &label, &log_stem, events, cancel, budgets,
+            dir, command, logs_dir, &label, &log_stem, events, cancel, admission,
         )?;
         let failed = outcome.failed();
         gate.ran(index, command, !failed);
@@ -2743,6 +2787,8 @@ mod tests {
             argv: argv.iter().map(|a| a.to_string()).collect(),
             timeout_seconds,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
         }
     }
@@ -2796,7 +2842,7 @@ mod tests {
 
     #[test]
     fn a_candidate_command_is_clipped_to_the_remaining_work_budget() {
-        use crate::policy::{BudgetLimits, WallClock};
+        use crate::policy::{BudgetLimits, Budgets, WallClock};
         let dir = temp_dir("clipped");
         let logs = dir.join("logs");
         // Work has two seconds; the command asks for thirty and sleeps
@@ -2816,7 +2862,10 @@ mod tests {
             "x-cmd0",
             &Events::silent(),
             None,
-            &budgets,
+            &HeavyAdmission {
+                budgets: budgets.clone(),
+                ..HeavyAdmission::unmanaged()
+            },
         )
         .expect("run");
         assert_eq!(clipped.ended, Ended::TimedOut);
@@ -2829,7 +2878,7 @@ mod tests {
 
     #[test]
     fn a_baseline_command_draws_on_the_total_alone() {
-        use crate::policy::{BudgetLimits, WallClock};
+        use crate::policy::{BudgetLimits, Budgets, WallClock};
         let dir = temp_dir("baseline-clip");
         let logs = dir.join("logs");
         // Work would allow 600 s, the total two: work has not begun, so
@@ -2847,7 +2896,10 @@ mod tests {
             "x-cmd0",
             &Events::silent(),
             None,
-            &budgets,
+            &HeavyAdmission {
+                budgets: budgets.clone(),
+                ..HeavyAdmission::unmanaged()
+            },
         )
         .expect("run");
         assert_eq!(clipped.ended, Ended::TimedOut);
@@ -3986,6 +4038,8 @@ mod tests {
             argv: argv.iter().map(|a| a.to_string()).collect(),
             timeout_seconds,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
         }
     }

@@ -246,6 +246,24 @@ pub struct CommandSpec {
     /// authority hash moves; meaningful only on a setup step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reuse: Option<ReuseSpec>,
+    /// How many heavy-command tokens this command holds while it runs
+    /// (SPEC §23, ADR-0010): absent means one. Refused above the machine's
+    /// `max_heavy_commands`. Omitted from the serialized form when absent,
+    /// so no existing authority hash moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
+    /// Environment this command sets itself, after relais's own parallelism
+    /// bounds (`MAKEFLAGS`, `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS`,
+    /// `NEXTEST_TEST_THREADS`): a key named here wins. Omitted when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
+
+impl CommandSpec {
+    /// The tokens this command takes: its `weight`, else one.
+    pub fn heavy_weight(&self) -> u32 {
+        self.weight.unwrap_or(1)
+    }
 }
 
 /// What lets a setup step be skipped (ADR-0008): the files its result
@@ -833,6 +851,12 @@ pub struct ResourceSettings {
     /// Cumulative time a run may wait for the disk floor. Default 600.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_wait_seconds: Option<u64>,
+    /// A directory of `flock` slot files shared with amont's heavy checks
+    /// (amont ADR-0009): when set, a heavy command takes as many slot
+    /// files as its weight after its coordinator tokens, so both tools
+    /// queue on one host. Unset: the coordinator's queue alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_host_slots: Option<String>,
 }
 
 impl ResourceSettings {
@@ -3357,6 +3381,55 @@ amont = { mode = "optional", bin = "/opt/amont/bin/amont" }
     /// `limits.total_seconds` to the contract. Both are optional, so a file
     /// written before them parses to the same values and is written back
     /// without them.
+    #[test]
+    fn the_heavy_lease_fields_are_additive_and_unwritten_when_unset() {
+        // A check that names neither field serializes exactly as before,
+        // so no authority hash moves.
+        let plain: CommandSpec =
+            serde_json::from_str(r#"{"argv":["make","test"]}"#).expect("parses");
+        assert_eq!(plain.heavy_weight(), 1);
+        let written = serde_json::to_string(&plain).expect("serializes");
+        assert!(
+            !written.contains("weight") && !written.contains("env"),
+            "{written}"
+        );
+        let heavy: CommandSpec = serde_json::from_str(
+            r#"{"argv":["make","test"],"weight":2,"env":{"CARGO_BUILD_JOBS":"1"}}"#,
+        )
+        .expect("parses");
+        assert_eq!(heavy.heavy_weight(), 2);
+        assert_eq!(
+            heavy.env.get("CARGO_BUILD_JOBS").map(String::as_str),
+            Some("1")
+        );
+        // The machine's shared slot directory is absent from a file that
+        // never named it, and written back when it did.
+        let machine = MachineSettings::from_toml_str("schema_version = 1\n").expect("parses");
+        assert_eq!(machine.resources.shared_host_slots, None);
+        assert!(!toml::to_string(&machine)
+            .expect("serializes")
+            .contains("shared_host_slots"));
+        let shared = MachineSettings::from_toml_str(
+            "schema_version = 1\n[resources]\nshared_host_slots = \"/run/slots\"\n",
+        )
+        .expect("parses");
+        assert!(toml::to_string(&shared)
+            .expect("serializes")
+            .contains("shared_host_slots = \"/run/slots\""));
+        // A request of weight one carries no key on the wire; an older
+        // request without the key reads as one.
+        let request = serde_json::json!({
+            "dispatch_id": "d", "run_id": "r", "session_id": "s", "parent_dispatch": null,
+            "depth": 0, "resource": "heavy_local", "reserve_micros": 0,
+        });
+        let parsed: crate::admission::DispatchRequest =
+            serde_json::from_value(request).expect("an older request parses");
+        assert_eq!(parsed.weight, 1);
+        assert!(!serde_json::to_string(&parsed)
+            .expect("serializes")
+            .contains("weight"));
+    }
+
     #[test]
     fn files_written_before_the_budgets_parse_and_write_back_unchanged() {
         let old = "schema_version = 1\n\n[spending]\nper_run_micros = 5000000\n";

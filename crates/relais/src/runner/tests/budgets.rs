@@ -32,6 +32,7 @@ fn gate_with_the_seat_taken() -> crate::admission::LocalGate {
             reserve_micros: 0,
             source: DispatchSource::ManagedRun,
             caller_agent_id: None,
+            weight: 1,
         })
         .expect("admit"),
         Decision::Granted
@@ -68,6 +69,67 @@ fn a_queue_that_outlasts_the_admission_wait_blocks_with_its_own_name() {
     let mut machine = fixture.machine_for(&repo);
     machine.resources.admission_wait_seconds = Some(1);
     let gate = gate_with_the_seat_taken();
+    let outcome = fixture.execute_managed(
+        &fixture.contract(Review::Off),
+        &repo,
+        &machine,
+        &conditional_worker(""),
+        &gate,
+    );
+    assert!(
+        matches!(
+            &outcome.terminal,
+            Terminal::BlockedBy {
+                reason: Reason::AdmissionWaitExhausted,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.state(), State::Blocked);
+}
+
+/// A gate whose only heavy-command token another run holds, so this run's
+/// first check queues.
+fn gate_with_the_heavy_token_taken() -> crate::admission::LocalGate {
+    let gate = crate::admission::LocalGate::new(ConcurrencyLimits {
+        max_heavy_commands: Some(1),
+        ..ConcurrencyLimits::default()
+    });
+    gate.register_run(&RunRegistration {
+        run_id: "other-run".into(),
+        session_id: "other-tab".into(),
+        budget_micros: None,
+        max_agents: None,
+        max_depth: None,
+    })
+    .expect("register");
+    assert_eq!(
+        gate.admit(&DispatchRequest {
+            dispatch_id: "other-heavy".into(),
+            run_id: "other-run".into(),
+            session_id: "other-tab".into(),
+            parent_dispatch: None,
+            depth: 0,
+            resource: ResourceClass::HeavyLocal,
+            reserve_micros: 0,
+            source: DispatchSource::NativeRun,
+            caller_agent_id: None,
+            weight: 1,
+        })
+        .expect("admit"),
+        Decision::Granted
+    );
+    gate
+}
+
+#[test]
+fn a_check_queued_for_a_heavy_token_blocks_with_the_admission_wait_name() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let mut machine = fixture.machine_for(&repo);
+    machine.resources.admission_wait_seconds = Some(1);
+    let gate = gate_with_the_heavy_token_taken();
     let outcome = fixture.execute_managed(
         &fixture.contract(Review::Off),
         &repo,

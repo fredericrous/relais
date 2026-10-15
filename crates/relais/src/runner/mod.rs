@@ -164,6 +164,34 @@ impl From<crate::ids::IdError> for RunError {
     }
 }
 
+/// Why a candidate could not be verified: the profile could not be carried
+/// out as declared (blocked), or a command was never admitted.
+pub(crate) enum VerifyFailure {
+    Unavailable(String),
+    Lease(verify::LeaseStop),
+}
+
+impl From<verify::VerifyError> for VerifyFailure {
+    fn from(e: verify::VerifyError) -> Self {
+        match e {
+            verify::VerifyError::Lease(stop) => Self::Lease(stop),
+            other => Self::Unavailable(other.to_string()),
+        }
+    }
+}
+
+impl From<String> for VerifyFailure {
+    fn from(detail: String) -> Self {
+        Self::Unavailable(detail)
+    }
+}
+
+impl From<WorkspaceError> for VerifyFailure {
+    fn from(e: WorkspaceError) -> Self {
+        Self::Unavailable(e.to_string())
+    }
+}
+
 pub struct RunConfig<'a> {
     pub repo_dir: &'a Path,
     /// Where this run works (ADR-0008). `Isolated` is today's behaviour.
@@ -444,6 +472,9 @@ pub(crate) struct RunEngine<'a> {
     /// What this run may still spend of time (ADR-0010). Unbounded until
     /// preflight has the authority that sizes it.
     pub(crate) budgets: Budgets,
+    /// Which try of each command's heavy lease this is, so a rerun gets a
+    /// lease id the coordinator has not seen (SPEC §23, C8).
+    heavy_tries: verify::Tries,
     /// Everything this run does, as events (SPEC §29).
     pub(crate) events: Events,
     /// The caller's worktree this run holds when it works in place
@@ -859,6 +890,7 @@ impl<'a> RunEngine<'a> {
             reviewer_gap: None,
             cancel_asked: Arc::new(AtomicBool::new(false)),
             budgets: Budgets::unbounded(),
+            heavy_tries: verify::Tries::default(),
             events,
         })
     }
@@ -1127,6 +1159,7 @@ impl<'a> RunEngine<'a> {
             // the hook path, which has a caller's agent id and no
             // dispatch id of its own to report.
             caller_agent_id: None,
+            weight: 1,
         };
         // Time spent queued is charged to `admission_wait_seconds` and to
         // the total, never to the work budget (ADR-0010).
@@ -1184,7 +1217,7 @@ impl<'a> RunEngine<'a> {
                                 }),
                             )?
                         }
-                        Refusal::UnknownRun => self.block(
+                        Refusal::UnknownRun | Refusal::WeightOutOfRange => self.block(
                             Reason::AdmissionRefused,
                             BlockCode::AdmissionRefused,
                             detail,
@@ -1712,7 +1745,7 @@ impl<'a> RunEngine<'a> {
                 &self.events,
                 cancel,
                 &mut verify::RunEveryStep,
-                &self.budgets,
+                &self.heavy(),
             );
         }
         let source = seed_from.filter(|source| *source != dir);
@@ -1735,7 +1768,7 @@ impl<'a> RunEngine<'a> {
             &self.events,
             cancel,
             &mut gate,
-            &self.budgets,
+            &self.heavy(),
         )
     }
 
@@ -2713,7 +2746,18 @@ impl<'a> RunEngine<'a> {
                             "base",
                             cancel,
                         )
-                    })?;
+                    });
+                    let setup = match setup {
+                        Ok(setup) => setup,
+                        Err(verify::VerifyError::Lease(stop)) => {
+                            if let Err(e) = baseline.release() {
+                                eprintln!("relais: {e}");
+                            }
+                            let nominal = fresh_progress(preflight).budget;
+                            return Ok(Phase::Ended(self.end_on_lease_stop(stop, &nominal)?));
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
                     self.record_logs(None, EvidenceKind::SetupLog, &setup)?;
                     if let Some(outcome) = self.end_if_cancelled()? {
                         if let Err(e) = baseline.release() {
@@ -2738,9 +2782,20 @@ impl<'a> RunEngine<'a> {
                             "base",
                             &self.events,
                             cancel,
-                            &self.budgets,
+                            &self.heavy(),
                         )
-                    })?;
+                    });
+                    let checks = match checks {
+                        Ok(checks) => checks,
+                        Err(verify::VerifyError::Lease(stop)) => {
+                            if let Err(e) = baseline.release() {
+                                eprintln!("relais: {e}");
+                            }
+                            let nominal = fresh_progress(preflight).budget;
+                            return Ok(Phase::Ended(self.end_on_lease_stop(stop, &nominal)?));
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
                     self.record_logs(None, EvidenceKind::CheckLog, &checks)?;
                     if let Some(outcome) = self.end_if_cancelled()? {
                         if let Err(e) = baseline.release() {
@@ -2944,6 +2999,73 @@ impl<'a> RunEngine<'a> {
     /// End the run on the budget that ran out (ADR-0010, SPEC §11): the
     /// work and total budgets are `budget_exhausted`; a wait budget is a
     /// block, because the machine, not the work, was what ran short.
+    /// The heavy-command admission of this run (SPEC §23, ADR-0010).
+    pub(crate) fn heavy(&self) -> verify::HeavyAdmission<'_> {
+        let cores = verify::cores();
+        verify::HeavyAdmission {
+            gate: self.config.gate,
+            run_id: self.run_id.as_str().to_string(),
+            session_id: self.config.session_id.clone(),
+            budgets: self.budgets.clone(),
+            events: self.events.clone(),
+            cap: verify::heavy_cap(self.config.machine.concurrency.max_heavy_commands, cores),
+            cores,
+            slots: self
+                .config
+                .machine
+                .resources
+                .shared_host_slots
+                .as_ref()
+                .map(PathBuf::from),
+            poll: ADMISSION_POLL,
+            announce_every: verify::ANNOUNCE_EVERY,
+            tries: self.heavy_tries.clone(),
+        }
+    }
+
+    /// End the run on a command that was never admitted: a budget that
+    /// ran out in the queue ends on its own name, a cancellation as a
+    /// cancellation, and a coordinator that is down or refuses as
+    /// admission does for model work.
+    pub(crate) fn end_on_lease_stop(
+        &mut self,
+        stop: verify::LeaseStop,
+        budget: &Budget,
+    ) -> Result<RunOutcome, RunError> {
+        use verify::LeaseStop;
+        let text = stop.to_string();
+        match stop {
+            LeaseStop::Exhausted(exhausted) => self.end_on_exhausted(exhausted, budget),
+            LeaseStop::Cancelled
+            | LeaseStop::Refused {
+                code: Refusal::RunCancelled,
+                ..
+            } => self.stop(
+                budget,
+                Observation::Cancelled("the run was cancelled while a command was queued".into()),
+            ),
+            LeaseStop::Gate(e) => {
+                let (reason, code) = admission_block(&e);
+                self.block(reason, code, format!("{e}; the command was not started"))
+            }
+            LeaseStop::Refused { detail, .. } => self.block(
+                Reason::AdmissionRefused,
+                BlockCode::AdmissionRefused,
+                detail,
+            ),
+            LeaseStop::Weight { .. } => {
+                self.block(Reason::AdmissionRefused, BlockCode::AdmissionRefused, text)
+            }
+            LeaseStop::Duplicate(id) => self.finish(
+                Reason::DuplicateDispatch,
+                serde_json::json!({ "dispatch_id": id }),
+                Terminal::Interrupted {
+                    detail: format!("lease {id} was already admitted elsewhere"),
+                },
+            ),
+        }
+    }
+
     pub(crate) fn end_on_exhausted(
         &mut self,
         exhausted: Exhausted,
@@ -3681,7 +3803,10 @@ impl<'a> RunEngine<'a> {
             reuse,
         ) {
             Ok(result) => result,
-            Err(e) => {
+            Err(VerifyFailure::Lease(stop)) => {
+                return Ok(Step::Ended(self.end_on_lease_stop(stop, &progress.budget)?));
+            }
+            Err(VerifyFailure::Unavailable(e)) => {
                 return Ok(Step::Ended(
                     self.fail_preflight(BlockCode::VerificationUnavailable, e)?,
                 ));
@@ -4664,7 +4789,7 @@ impl<'a> RunEngine<'a> {
         logs_dir: &Path,
         label: AttemptLabel,
         reuse: Option<&[verify::CheckOutcome]>,
-    ) -> Result<verify::Verified, String> {
+    ) -> Result<verify::Verified, VerifyFailure> {
         // amont's effective inventory (SPEC §10): consulted whenever the
         // integration is on, for the bypasses and downgrades it declares
         // and for the gaps among the checks this profile requires.
@@ -4701,7 +4826,7 @@ impl<'a> RunEngine<'a> {
                         candidate_sha,
                         &verify_path,
                     )
-                    .map_err(|e| e.to_string())?,
+                    .map_err(VerifyFailure::from)?,
                 )
             }
         };
@@ -4723,9 +4848,13 @@ impl<'a> RunEngine<'a> {
                             cancel,
                         )
                     })
-                    .map_err(|e| e.to_string())?;
+                    .map_err(VerifyFailure::from)?;
                 self.record_logs(None, EvidenceKind::SetupLog, &setup)
-                    .map_err(|e| format!("the ledger refused a setup-log evidence row: {e}"))?;
+                    .map_err(|e| {
+                        VerifyFailure::Unavailable(format!(
+                            "the ledger refused a setup-log evidence row: {e}"
+                        ))
+                    })?;
                 match verify::setup_failure(&setup) {
                     // A setup that did not complete at the candidate is a
                     // gap, not a failure: no check ran, so nothing was
@@ -4751,14 +4880,16 @@ impl<'a> RunEngine<'a> {
                                 &label.log_prefix(),
                                 &self.events,
                                 cancel,
-                                &self.budgets,
+                                &self.heavy(),
                             )
                         })
-                        .map_err(|e| e.to_string())?,
+                        .map_err(VerifyFailure::from)?,
                 }
             }
             (None, None) => {
-                return Err("a candidate to verify but no worktree to verify it in".to_string())
+                return Err(VerifyFailure::Unavailable(
+                    "a candidate to verify but no worktree to verify it in".to_string(),
+                ))
             }
         };
         if let Some(gap) = setup_gap {
@@ -6690,6 +6821,8 @@ mod tests {
         CommandSpec {
             name: None,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/main.rs".into()],
             timeout_seconds: 30,
@@ -6710,6 +6843,8 @@ mod tests {
         CommandSpec {
             name: None,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
             argv: vec![shell.into(), "-c".into(), "test ! -f src/main.rs".into()],
             timeout_seconds: 30,
@@ -6733,6 +6868,8 @@ mod tests {
         CommandSpec {
             name: None,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "true".into()],
             timeout_seconds: 30,
@@ -7142,6 +7279,8 @@ mod tests {
         let no_evil = CommandSpec {
             name: None,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/evil.txt".into()],
             timeout_seconds: 30,
@@ -8617,6 +8756,8 @@ mod tests {
         let no_tick0 = CommandSpec {
             name: None,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/tick-0.txt".into()],
             timeout_seconds: 30,
@@ -8675,6 +8816,8 @@ mod tests {
         let no_tick0 = CommandSpec {
             name: None,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
             argv: vec![
                 "sh".into(),
@@ -8736,6 +8879,8 @@ mod tests {
         let marker = CommandSpec {
             name: None,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test -f src/marker.txt".into()],
             timeout_seconds: 30,
@@ -9374,6 +9519,8 @@ mod tests {
         let check = CommandSpec {
             name: None,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
             argv: vec![
                 shell.into(),
@@ -9933,6 +10080,8 @@ mod tests {
             vec![CommandSpec {
                 name: None,
                 junit: None,
+                weight: None,
+                env: Default::default(),
                 reuse: None,
                 argv: vec![shell.into(), "-c".into(), "true".into()],
                 timeout_seconds: 30,
@@ -10298,6 +10447,8 @@ mod tests {
         let hanging = CommandSpec {
             name: None,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "sleep 60".into()],
             timeout_seconds: 120,
@@ -10469,6 +10620,7 @@ mod tests {
                 reserve_micros: 0,
                 source: DispatchSource::ManagedRun,
                 caller_agent_id: None,
+                weight: 1,
             })
             .expect("admit"),
             Decision::Granted
@@ -10861,6 +11013,8 @@ mod tests {
         CommandSpec {
             name: None,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), script.into()],
             timeout_seconds: 30,
@@ -10906,6 +11060,8 @@ mod tests {
                 CommandSpec {
                     name: None,
                     junit: None,
+                    weight: None,
+                    env: Default::default(),
                     reuse: None,
                     argv: vec!["relais-no-such-binary-4f3a".into()],
                     timeout_seconds: 30,
@@ -10980,6 +11136,8 @@ mod tests {
             vec![CommandSpec {
                 name: None,
                 junit: None,
+                weight: None,
+                env: Default::default(),
                 reuse: None,
                 argv: vec!["sh".into(), "-c".into(), "sleep 5".into()],
                 timeout_seconds: 1,
@@ -11445,6 +11603,8 @@ mod tests {
         CommandSpec {
             name: None,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
             argv: vec![shell.into(), "-c".into(), script.into()],
             timeout_seconds: 30,
@@ -11558,6 +11718,8 @@ mod tests {
 
     fn reusing_step(script: &str) -> CommandSpec {
         CommandSpec {
+            weight: None,
+            env: Default::default(),
             reuse: Some(crate::policy::ReuseSpec {
                 inputs: vec!["package.json".into()],
                 outputs: vec!["node_modules".into()],
@@ -11660,6 +11822,8 @@ mod tests {
         let setup = CommandSpec {
             name: None,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
             argv: vec![
                 shell.into(),
@@ -13040,6 +13204,8 @@ mod tests {
         let no_tick0 = CommandSpec {
             name: None,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/tick-0.txt".into()],
             timeout_seconds: 30,
@@ -13145,6 +13311,8 @@ mod tests {
         let green = CommandSpec {
             name: None,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/main.rs".into()],
             timeout_seconds: 30,

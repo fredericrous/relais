@@ -38,7 +38,7 @@ use crate::workspace::{self, WorkspaceError};
 use super::{
     data_block, data_list_block, effort_str, execute_child, AttemptLabel, Budget, Limit,
     ManagedDispatch, Next, Observation, Reason, ReviewOutcome, RunConfig, RunEngine, RunError,
-    RunOutcome, State, Terminal,
+    RunOutcome, State, Terminal, VerifyFailure,
 };
 
 /// The patch an accepted decomposed run exports its assembled revision
@@ -463,7 +463,10 @@ fn execute_waves(
             None,
         ) {
             Ok(result) => result,
-            Err(e) => return engine.fail_preflight(BlockCode::VerificationUnavailable, e),
+            Err(VerifyFailure::Lease(stop)) => return engine.end_on_lease_stop(stop, &budget),
+            Err(VerifyFailure::Unavailable(e)) => {
+                return engine.fail_preflight(BlockCode::VerificationUnavailable, e)
+            }
         };
         if !gaps.is_empty() {
             return engine.stop(&budget, Observation::VerificationGap(gaps));

@@ -343,6 +343,11 @@ fn refusal_for(code: AdmissionRefusal, detail: String) -> Refusal {
         AdmissionRefusal::AlreadyFinished => {
             "this dispatch already ran and settled, so nothing further is admitted under it"
         }
+        // A heavy command's weight; a hook-admitted spawn never carries
+        // one, so there is nothing for a person to change here.
+        AdmissionRefusal::WeightOutOfRange => {
+            "the request asked for more heavy-command tokens than the machine has"
+        }
     };
     Refusal {
         rule: RefusalRule::Admission(code),
@@ -379,6 +384,7 @@ impl RefusalRule {
                 | AdmissionRefusal::DepthExceeded
                 | AdmissionRefusal::RunAgentCap
                 | AdmissionRefusal::BudgetExceeded
+                | AdmissionRefusal::WeightOutOfRange
                 | AdmissionRefusal::AlreadyFinished => Availability::Decided,
             },
         }

@@ -288,6 +288,49 @@ pub fn own_process_group(command: &mut Command) {
     imp::own_process_group(command);
 }
 
+/// Take an exclusive, non-blocking `flock` on `file`: `Ok(true)` when
+/// taken, `Ok(false)` when another open file description holds it. The
+/// lock lasts as long as any descriptor of the open file does.
+#[cfg(unix)]
+pub fn try_flock(file: &std::fs::File) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a descriptor `file` keeps open; flock touches no memory.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+/// Let `command`, and only `command`, inherit these descriptors across
+/// its exec. Descriptors relais opens are close-on-exec; clearing the flag
+/// inside the child (between fork and exec) keeps every other process
+/// relais starts from inheriting them. A host slot held through such a
+/// descriptor lasts as long as any process of the command's group does.
+/// Unix only: Windows has no `flock` slots to pass.
+#[cfg(unix)]
+pub fn inherit_fds(command: &mut Command, fds: Vec<std::os::fd::RawFd>) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs between fork and exec and calls only
+    // `fcntl`, which is async-signal-safe, on descriptors the parent holds
+    // open until the child has been spawned.
+    unsafe {
+        command.pre_exec(move || {
+            for fd in &fds {
+                let flags = libc::fcntl(*fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Kill the child and everything it spawned: a harness that started its
 /// own children must not survive the kill (SPEC §23 cancellation).
 pub fn kill_tree(child: &mut Child) -> io::Result<()> {
@@ -321,6 +364,28 @@ pub fn kill_group(pgid: u32) -> GroupKill {
         return GroupKill::NothingLeft;
     }
     imp::kill_group(pgid)
+}
+
+/// Whether any member of the process group `pgid` still runs: `kill(-pgid,
+/// 0)` is not `ESRCH`. A group outlives its leader while any member is in
+/// it, so this is the question "is a descendant still running", which the
+/// leader's own pid cannot answer. `EPERM` counts as running: the group
+/// exists and is not ours to signal. Windows has no process groups to ask
+/// about, so it asks after the root process alone.
+pub fn group_alive(pgid: u32) -> bool {
+    if pgid <= 1 {
+        return false;
+    }
+    imp::group_alive(pgid)
+}
+
+/// Ask a whole process group to stop (SIGTERM to `-pgid`). Windows has no
+/// gentler request than the tree kill, so it is the same as [`kill_group`].
+pub fn terminate_group(pgid: u32) -> GroupKill {
+    if pgid <= 1 {
+        return GroupKill::NothingLeft;
+    }
+    imp::terminate_group(pgid)
 }
 
 /// What killing the worker's process group found. Recorded on the
@@ -1125,6 +1190,29 @@ mod imp {
         command.process_group(0);
     }
 
+    pub fn group_alive(pgid: u32) -> bool {
+        // SAFETY: signal 0 performs error checking only; no signal is sent.
+        if unsafe { libc::kill(-(pgid as libc::pid_t), 0) } == 0 {
+            return true;
+        }
+        io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    pub fn terminate_group(pgid: u32) -> GroupKill {
+        // SAFETY: SIGTERM to the process group named by the negative pid
+        // of a leader `own_process_group` made.
+        if unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGTERM) } == 0 {
+            return GroupKill::Killed;
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => GroupKill::NothingLeft,
+            _ => GroupKill::Refused {
+                detail: error.to_string(),
+            },
+        }
+    }
+
     pub fn kill_group(pgid: u32) -> GroupKill {
         // SAFETY: SIGKILL to a process group this process created, named
         // by the negative pid of the leader `own_process_group` made.
@@ -1307,6 +1395,14 @@ mod imp {
         // A new process group so a console break aimed at us does not
         // reach the child; the tree kill below does not depend on it.
         command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+
+    pub fn group_alive(pgid: u32) -> bool {
+        alive(pgid)
+    }
+
+    pub fn terminate_group(pgid: u32) -> GroupKill {
+        kill_group(pgid)
     }
 
     pub fn kill_group(pgid: u32) -> GroupKill {

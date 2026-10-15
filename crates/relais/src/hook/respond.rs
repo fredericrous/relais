@@ -216,6 +216,7 @@ fn ask_coordinator(
             .caller_agent_id
             .as_ref()
             .map(|id| id.as_str().to_string()),
+        weight: 1,
     };
     // Any failure to reach the coordinator — no daemon, a stale
     // socket, a protocol mismatch — is exactly `CoordinatorAnswer`'s
@@ -909,6 +910,7 @@ mod tests {
             reserve_micros: 0,
             source: DispatchSource::HookAdmitted,
             caller_agent_id: None,
+            weight: 1,
         };
 
         assert!(

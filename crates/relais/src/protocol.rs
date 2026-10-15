@@ -155,6 +155,15 @@ pub enum Event {
         what: String,
         detail: String,
     },
+    /// A command is queued for a lease: every 30 s while it waits.
+    /// `class` is `heavy_local` for the coordinator's tokens and
+    /// `host_slot` for the shared flock slots (whose position is not
+    /// observable, so it is 0).
+    WaitingForSlot {
+        class: String,
+        position: usize,
+        waited_s: u64,
+    },
     /// A line the process wrote to stdout or stderr under `--protocol`.
     Stderr {
         text: String,
@@ -177,6 +186,7 @@ impl Event {
             | Self::CheckEnded { .. }
             | Self::Decision { .. }
             | Self::EnvironmentWarning { .. }
+            | Self::WaitingForSlot { .. }
             | Self::Outcome { .. } => true,
         }
     }

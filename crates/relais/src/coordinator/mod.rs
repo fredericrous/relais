@@ -28,6 +28,7 @@ use crate::admission::{
     Provenance, RegisterOutcome, ReleaseWriteOutcome, ResourceClass, ResumeOutcome,
     RunRegistration, Signal, StatusSnapshot, StopNativeOutcome, StoppedOutcome, StoppedReport,
     TrainingDecision, WaitOutcome, WithdrawOutcome, WorktreeOutcome, WriteLeaseOutcome,
+    GROUP_KILL_AFTER,
 };
 use crate::ipc::{Listener, Stream};
 use crate::ledger::Ledger;
@@ -42,7 +43,9 @@ use crate::procs::{kill, terminate, LockFile};
 pub const DEFAULT_LIMITS: ConcurrencyLimits = ConcurrencyLimits {
     max_active_agents: Some(6),
     max_active_agents_per_session: Some(3),
-    max_heavy_commands: Some(2),
+    // Unused: heavy commands default to a quarter of the cores (at least
+    // one), which `effective_limits` computes on the machine it runs on.
+    max_heavy_commands: None,
     max_training_jobs: Some(1),
     max_agent_depth: Some(3),
     max_agents_per_run: Some(24),
@@ -226,6 +229,14 @@ pub enum Request {
     },
     Heartbeat {
         dispatch_id: String,
+    },
+    /// A heavy lease's runner spawned its check in process group `pgid`:
+    /// the lease now lasts as long as the runner lives, and after that as
+    /// long as a member of the group runs (SPEC §23).
+    BindGroup {
+        dispatch_id: String,
+        runner: u32,
+        pgid: u32,
     },
     /// The worker saw its cancellation on a heartbeat and is stopping:
     /// the seat and the reservation go now rather than at lease grace
@@ -699,6 +710,7 @@ impl Coordinator {
                         // caller's agent id, so there is nothing to carry
                         // here.
                         caller_agent_id: None,
+                        weight: 1,
                     },
                     pid,
                     live.agent_id.as_deref(),
@@ -737,6 +749,9 @@ impl Coordinator {
         let reconcile_state = Arc::clone(&self.state);
         let reconcile_shutdown = Arc::clone(&self.shutdown);
         let reconcile_ledger = self.ledger_path.clone();
+        let group_state = Arc::clone(&self.state);
+        let group_shutdown = Arc::clone(&self.shutdown);
+        let group_sweeper = std::thread::spawn(move || group_loop(&group_state, &group_shutdown));
         let reconciler = std::thread::spawn(move || {
             reconcile_loop(
                 &reconcile_state,
@@ -774,6 +789,7 @@ impl Coordinator {
         // Same: the reconciler is a background thread with no result
         // to return, and the daemon is going down either way.
         let _ = reconciler.join();
+        let _ = group_sweeper.join();
 
         // Only now that nothing is being served does the endpoint go.
         // Unlinking it while a connection was still in flight was the C1
@@ -900,6 +916,37 @@ fn reconcile_loop(
         // signalled at most twice in its life: once politely, once not
         // (C5).
         deliver_signals(state, report.to_signal);
+    }
+}
+
+/// How often leases tied to a process group are swept: a lease whose
+/// runner died is stopped on this clock, not on [`RECONCILE_EVERY`], so
+/// the SIGKILL that follows SIGTERM comes about [`GROUP_KILL_AFTER`] later.
+const GROUP_SWEEP_EVERY: Duration = Duration::from_secs(1);
+
+fn group_loop(state: &Mutex<AdmissionState>, shutdown: &std::sync::atomic::AtomicBool) {
+    while !shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(GROUP_SWEEP_EVERY);
+        group_tick(state, Instant::now(), GROUP_KILL_AFTER);
+    }
+}
+
+/// One sweep over the leases tied to a process group: the state machine
+/// decides, the signals are sent out from under the admission lock. A
+/// group is stopped only after its runner is gone, and its tokens return
+/// only when `kill(-pgid, 0)` says no member is left.
+pub(crate) fn group_tick(state: &Mutex<AdmissionState>, now: Instant, kill_after: Duration) {
+    let report = lock_state(state).reconcile_groups(
+        now,
+        kill_after,
+        &process_alive,
+        &crate::procs::group_alive,
+    );
+    for pending in report.to_signal {
+        match pending.signal {
+            Signal::Terminate => crate::procs::terminate_group(pending.pgid),
+            Signal::Kill => crate::procs::kill_group(pending.pgid),
+        };
     }
 }
 
@@ -1316,6 +1363,26 @@ pub fn handle(
                 },
             },
         },
+        Request::BindGroup {
+            dispatch_id,
+            runner,
+            pgid,
+        } => match state.bind_group(&dispatch_id, runner, pgid, now, &process_alive) {
+            BindOutcome::Bound => Response::Ack,
+            BindOutcome::UnknownDispatch => Response::Unknown {
+                entity: Entity::Dispatch,
+                id: dispatch_id,
+            },
+            BindOutcome::PidNotAlive | BindOutcome::AlreadyBoundToProcess => Response::Refused {
+                refusal: Refused::PidNotAlive {
+                    pid: Some(runner),
+                    detail: format!(
+                        "runner {runner} is not live, or group {pgid} is not one a runner can own; \
+                         dispatch {dispatch_id} keeps no group binding"
+                    ),
+                },
+            },
+        },
         Request::Heartbeat { dispatch_id } => Response::Heartbeat {
             status: state.heartbeat(&dispatch_id, now),
         },
@@ -1655,6 +1722,7 @@ impl Client {
                 reserve_micros: 0,
                 source: DispatchSource::ManagedRun,
                 caller_agent_id: None,
+                weight: 1,
             },
             pid,
             started_at: started_at.to_string(),
@@ -1842,6 +1910,34 @@ impl Gate for RemoteGate {
                 &refusal,
             )),
             other => Err(Self::unexpected("bind", &other)),
+        }
+    }
+
+    fn bind_group(
+        &self,
+        dispatch_id: &str,
+        runner: u32,
+        pgid: u32,
+    ) -> Result<BindOutcome, GateError> {
+        match self.call(
+            "bind_group",
+            Request::BindGroup {
+                dispatch_id: dispatch_id.into(),
+                runner,
+                pgid,
+            },
+        )? {
+            Response::Ack => Ok(BindOutcome::Bound),
+            Response::Unknown { .. } => Ok(BindOutcome::UnknownDispatch),
+            Response::Refused {
+                refusal: Refused::PidNotAlive { .. },
+            } => Ok(BindOutcome::PidNotAlive),
+            Response::Refused { refusal } => Err(Self::refused(
+                "bind_group",
+                &format!("dispatch {dispatch_id}"),
+                &refusal,
+            )),
+            other => Err(Self::unexpected("bind_group", &other)),
         }
     }
 
@@ -2536,9 +2632,9 @@ pub fn effective_limits(configured: &ConcurrencyLimits) -> ConcurrencyLimits {
         max_active_agents_per_session: configured
             .max_active_agents_per_session
             .or(DEFAULT_LIMITS.max_active_agents_per_session),
-        max_heavy_commands: configured
-            .max_heavy_commands
-            .or(DEFAULT_LIMITS.max_heavy_commands),
+        max_heavy_commands: configured.max_heavy_commands.or(Some(
+            crate::verify::default_heavy_commands(crate::verify::cores()),
+        )),
         max_training_jobs: configured
             .max_training_jobs
             .or(DEFAULT_LIMITS.max_training_jobs),
@@ -2614,7 +2710,103 @@ mod tests {
             reserve_micros: 0,
             source: DispatchSource::ManagedRun,
             caller_agent_id: None,
+            weight: 1,
         }
+    }
+
+    /// SPEC §23, survival: the runner dies mid-check. The coordinator
+    /// stops the check's process group (SIGTERM, then SIGKILL after the
+    /// grace) and returns the tokens only once `kill(-pgid, 0)` says no
+    /// member is left, so the next command never overlaps it.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_runners_group_is_stopped_and_its_tokens_return_only_when_it_is_gone() {
+        use std::os::unix::process::CommandExt;
+        let state = Mutex::new(AdmissionState::new(ConcurrencyLimits {
+            max_heavy_commands: Some(1),
+            ..ConcurrencyLimits::default()
+        }));
+        lock_state(&state).register_run(&registration("run-g", "tab"), Instant::now());
+        let heavy = |id: &str| DispatchRequest {
+            resource: ResourceClass::HeavyLocal,
+            ..request(id, "run-g", "tab")
+        };
+        let ask = |id: &str| lock_state(&state).request(&heavy(id), Instant::now());
+        assert_eq!(ask("first"), Decision::Granted);
+        assert_eq!(ask("second"), Decision::Queued { position: 1 });
+
+        // The runner is a process of its own; the check is a group of its
+        // own that ignores SIGTERM and ends only on SIGKILL.
+        let mut runner = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("a runner");
+        let dir = temp_dir("group-ready");
+        let ready = dir.join("ready");
+        let mut check = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "trap '' TERM; : > '{}'; while :; do sleep 1; done",
+                ready.display()
+            ))
+            .process_group(0)
+            .spawn()
+            .expect("a check");
+        let pgid = check.id();
+        // The trap is in place only once the shell has run it.
+        let patience = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(Instant::now() < patience, "the check never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let bound = lock_state(&state).bind_group(
+            "first",
+            runner.id(),
+            pgid,
+            Instant::now(),
+            &process_alive,
+        );
+        assert_eq!(bound, BindOutcome::Bound);
+        // Whoever spawned the check reaps it once it dies; here, a thread.
+        let reaper = std::thread::spawn(move || check.wait());
+
+        // While the runner lives nothing is signalled.
+        let grace = Duration::from_millis(800);
+        group_tick(&state, Instant::now(), grace);
+        assert!(crate::procs::group_alive(pgid));
+
+        runner.kill().expect("kill the runner");
+        runner.wait().expect("reap the runner");
+
+        // SIGTERM is ignored: the group, and the tokens, stay.
+        group_tick(&state, Instant::now(), grace);
+        std::thread::sleep(Duration::from_millis(300));
+        group_tick(&state, Instant::now(), grace);
+        assert!(crate::procs::group_alive(pgid), "SIGTERM is ignored");
+        assert_eq!(
+            ask("second"),
+            Decision::Queued { position: 1 },
+            "the tokens are not returned while a descendant runs"
+        );
+
+        // After the grace, SIGKILL; the next command is admitted only
+        // once the group is gone.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let granted = loop {
+            std::thread::sleep(Duration::from_millis(200));
+            group_tick(&state, Instant::now(), grace);
+            let answer = ask("second");
+            if answer == Decision::Granted {
+                break answer;
+            }
+            assert!(Instant::now() < deadline, "never released: {answer:?}");
+        };
+        assert_eq!(granted, Decision::Granted);
+        assert!(
+            !crate::procs::group_alive(pgid),
+            "the next command was admitted while the old group still ran"
+        );
+        reaper.join().expect("reaper").expect("waited");
     }
 
     #[test]
