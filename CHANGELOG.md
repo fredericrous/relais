@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+`relais resume --retire` works in a repository that ignores `.relais` (relais's own does). Staging the worktree named `.relais` in an exclude pathspec, and git exits 1 when a pathspec names an ignored path, so retiring an interrupted in-place run failed and every later run in that worktree was refused with `workspace_has_interrupted_run`. The exclude is now left out when `.relais` is already ignored, since `add -A` never adds it then.
+
 ## v0.24.0
 
 The baseline cache is now safe to enable: a base is cached only when every one of its checks passed, so a base with any failed check is re-run every time, and the cache version is 5 (version 4 entries, which could hold failures, are never read). The docs now say the cache is keyed by the base tree, not the base SHA. `cache_baseline` stays off by default.
