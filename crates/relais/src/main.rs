@@ -7474,12 +7474,20 @@ fn retire_all_command() -> Result<CliOutcome, CliError> {
     let ledger = open_ledger()?;
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
     let retained = retained_with_verification(&state_dir)?;
-    let in_place = in_place_leftovers();
+    let InPlaceScan {
+        runs: in_place,
+        unreadable,
+    } = in_place_leftovers();
     if retained.is_empty() && in_place.is_empty() {
+        if unreadable > 0 {
+            // Each was named on its own line: this is not an empty scan.
+            return Ok(CliOutcome::OperationalFailure);
+        }
         println!("no run worktree is retained under {}", state_dir.display());
         return Ok(CliOutcome::Accepted);
     }
-    let mut failed = false;
+    // A marker relais cannot read is kept for the person: not a success.
+    let mut failed = unreadable > 0;
     let mut seen = std::collections::BTreeSet::new();
     for (worktree, kind) in retained {
         let run = RunId::from_stored(worktree.run_id.clone());
@@ -7557,32 +7565,55 @@ fn settle_state(ledger: &Ledger, run: &RunId, path: &Path) -> Result<Option<Stat
 /// worktree's git directory cannot be read, it says so in one line and
 /// carries on: this is a sweep, and one unreadable worktree (a pruned one,
 /// say) must not hide the others.
-fn in_place_leftovers() -> Vec<(RunId, PathBuf)> {
+/// What the worktrees hold from interrupted in-place runs: the runs to
+/// retire, and how many marker files could not be read (each named on a line
+/// of its own already).
+#[derive(Default)]
+struct InPlaceScan {
+    runs: Vec<(RunId, PathBuf)>,
+    unreadable: usize,
+}
+
+fn in_place_leftovers() -> InPlaceScan {
     let here = match project_dir() {
         Ok(here) => here,
         Err(e) => {
             println!("interrupted in-place runs are not looked for: {e}");
-            return Vec::new();
+            return InPlaceScan::default();
         }
     };
     let worktrees = match workspace::worktree_paths(&here) {
         Ok(worktrees) => worktrees,
         Err(e) => {
             println!("interrupted in-place runs are not looked for: {e}");
-            return Vec::new();
+            return InPlaceScan::default();
         }
     };
-    let mut found = Vec::new();
+    let mut found = InPlaceScan::default();
     for path in worktrees {
         match relais::workspace::inplace::git_dir(&path)
             .and_then(|git_dir| relais::workspace::inplace::leftover_markers(&git_dir))
         {
-            Ok(markers) => found.extend(
-                markers
-                    .into_iter()
-                    .map(|marker| (RunId::from_stored(marker.run), path.clone())),
-            ),
-            Err(e) => println!("kept, {}: {e}", path.display()),
+            Ok(left) => {
+                found.runs.extend(
+                    left.markers
+                        .into_iter()
+                        .map(|marker| (RunId::from_stored(marker.run), path.clone())),
+                );
+                for bad in left.unreadable {
+                    found.unreadable += 1;
+                    println!(
+                        "kept, {}: {} cannot be read ({}); look at the tree, and delete the file once you have",
+                        path.display(),
+                        bad.path.display(),
+                        bad.why
+                    );
+                }
+            }
+            Err(e) => {
+                found.unreadable += 1;
+                println!("kept, {}: {e}", path.display());
+            }
         }
     }
     found
@@ -7713,7 +7744,9 @@ fn retire_in_place(
             );
             return Ok(Some(CliOutcome::OperationalFailure));
         }
-        Err(LeaseRefusal::Interrupted { .. }) => return Ok(None),
+        Err(LeaseRefusal::Interrupted { .. } | LeaseRefusal::UnreadableMarker { .. }) => {
+            return Ok(None)
+        }
         Err(LeaseRefusal::Io(e)) => {
             println!("{run}: kept, {} could not be taken: {e}", root.display());
             return Ok(Some(CliOutcome::OperationalFailure));

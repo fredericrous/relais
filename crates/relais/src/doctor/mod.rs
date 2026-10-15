@@ -1446,9 +1446,18 @@ fn workspace_finding_on_disk(
                 match crate::workspace::inplace::git_dir(&path)
                     .and_then(|git_dir| crate::workspace::inplace::leftover_markers(&git_dir))
                 {
-                    Ok(markers) => scan
-                        .runs
-                        .extend(markers.into_iter().map(|m| (m.run, path.clone()))),
+                    Ok(left) => {
+                        scan.runs
+                            .extend(left.markers.into_iter().map(|m| (m.run, path.clone())));
+                        scan.unreadable
+                            .extend(left.unreadable.into_iter().map(|bad| {
+                                format!(
+                                    "{}: marker cannot be read ({})",
+                                    bad.path.display(),
+                                    bad.why
+                                )
+                            }));
+                    }
                     Err(e) => scan.unreadable.push(format!("{}: {e}", path.display())),
                 }
             }

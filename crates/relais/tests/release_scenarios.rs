@@ -5643,3 +5643,45 @@ fn resume_retire_with_no_id_and_no_markers_says_nothing_is_retained() {
         text(&out.stderr)
     );
 }
+
+// A marker relais cannot read is a run it cannot vouch for: `resume --retire`
+// says which file and why, leaves it where it is, and `doctor` warns instead
+// of reading a clean scan.
+#[test]
+fn an_unreadable_marker_is_named_by_retire_and_warned_by_doctor() {
+    let world = World::new("retire-unreadable");
+    let markers = world.repo.join(".git/relais-inplace");
+    std::fs::create_dir_all(&markers).expect("mkdir");
+    let bad = markers.join("run-garbled.json");
+    std::fs::write(&bad, "{ not json").expect("garbage");
+
+    let out = world.relais(&["resume", "--retire"]);
+    let said = text(&out.stdout);
+    assert!(
+        said.contains("run-garbled.json cannot be read"),
+        "{said}\n{}",
+        text(&out.stderr)
+    );
+    assert!(
+        !said.contains("no run worktree is retained"),
+        "an unreadable marker is not an empty scan: {said}"
+    );
+    assert!(bad.is_file(), "relais does not delete what it cannot read");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "something is kept for the person, so it is not a success: {said}"
+    );
+
+    let doctor = world.relais(&["doctor"]);
+    let report = text(&doctor.stdout);
+    let line = report
+        .lines()
+        .find(|line| line.contains("workspace"))
+        .unwrap_or_else(|| panic!("a workspace line: {report}"));
+    assert!(line.contains('!'), "a warning: {report}");
+    assert!(
+        report.contains("run-garbled.json") && report.contains("cannot be read"),
+        "{report}"
+    );
+}

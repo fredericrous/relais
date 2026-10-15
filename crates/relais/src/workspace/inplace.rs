@@ -117,6 +117,13 @@ pub enum LeaseRefusal {
     Interrupted {
         run: String,
     },
+    /// A marker is in the git directory that relais cannot read, so what
+    /// run left it, and what it decided, is unknown. Nothing may start on
+    /// top of a tree whose last run cannot be named.
+    UnreadableMarker {
+        path: PathBuf,
+        why: String,
+    },
     Io(io::Error),
 }
 
@@ -147,24 +154,51 @@ fn marker_path(git_dir: &Path, run: &str) -> PathBuf {
     markers_dir(git_dir).join(format!("{run}.json"))
 }
 
-/// Markers left in `git_dir` by runs that are not running.
-pub fn leftover_markers(git_dir: &Path) -> io::Result<Vec<Marker>> {
-    let dir = markers_dir(git_dir);
-    if !dir.is_dir() {
-        return Ok(Vec::new());
+/// A marker file relais could not read or parse, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableMarker {
+    pub path: PathBuf,
+    pub why: String,
+}
+
+/// What `git_dir` holds from runs that are not running: the markers that
+/// parse, and the files that look like markers and do not. A file that
+/// cannot be read is still a run relais cannot vouch for, so it is listed,
+/// never dropped.
+#[derive(Debug, Default)]
+pub struct Leftovers {
+    pub markers: Vec<Marker>,
+    pub unreadable: Vec<UnreadableMarker>,
+}
+
+impl Leftovers {
+    pub fn is_empty(&self) -> bool {
+        self.markers.is_empty() && self.unreadable.is_empty()
     }
-    let mut found = Vec::new();
+}
+
+/// Markers left in `git_dir` by runs that are not running.
+pub fn leftover_markers(git_dir: &Path) -> io::Result<Leftovers> {
+    let dir = markers_dir(git_dir);
+    let mut found = Leftovers::default();
+    if !dir.is_dir() {
+        return Ok(found);
+    }
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
-        if path.extension().is_some_and(|ext| ext == "json") {
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                if let Ok(marker) = serde_json::from_str::<Marker>(&text) {
-                    found.push(marker);
-                }
-            }
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        match std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| serde_json::from_str::<Marker>(&text).map_err(|e| e.to_string()))
+        {
+            Ok(marker) => found.markers.push(marker),
+            Err(why) => found.unreadable.push(UnreadableMarker { path, why }),
         }
     }
-    found.sort_by(|a, b| a.run.cmp(&b.run));
+    found.markers.sort_by(|a, b| a.run.cmp(&b.run));
+    found.unreadable.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(found)
 }
 
@@ -183,8 +217,15 @@ impl Lease {
                 .filter(|text| !text.is_empty());
             return Err(LeaseRefusal::Busy { holder });
         };
-        if let Some(left) = leftover_markers(&git_dir)?.into_iter().next() {
-            return Err(LeaseRefusal::Interrupted { run: left.run });
+        let left = leftover_markers(&git_dir)?;
+        if let Some(marker) = left.markers.into_iter().next() {
+            return Err(LeaseRefusal::Interrupted { run: marker.run });
+        }
+        if let Some(bad) = left.unreadable.into_iter().next() {
+            return Err(LeaseRefusal::UnreadableMarker {
+                path: bad.path,
+                why: bad.why,
+            });
         }
         crate::fsutil::write_atomic(&git_dir.join(HOLDER_FILE), run)?;
         Ok(Self {
@@ -1124,6 +1165,56 @@ mod tests {
         let nowhere = keep.join("not-a-repo");
         std::fs::create_dir_all(&nowhere).expect("mkdir");
         assert!(held_by(&nowhere, None).is_err());
+    }
+
+    /// A marker file relais cannot read is listed with its path and the
+    /// reason, beside the markers that parse; a file that is not a marker at
+    /// all is ignored; and a run may not start on top of it.
+    #[test]
+    fn an_unreadable_marker_is_reported_not_dropped_and_blocks_a_new_run() {
+        let (_keep, wt) = linked_worktree();
+        let gd = git_dir(&wt).expect("git dir");
+        let markers = gd.join("relais-inplace");
+        std::fs::create_dir_all(&markers).expect("mkdir");
+        std::fs::write(markers.join("run-bad.json"), "{ not json").expect("garbage");
+        std::fs::write(markers.join("run-bytes.json"), [0xff, 0xfe, 0x00]).expect("bytes");
+        std::fs::write(markers.join("notes.txt"), "not a marker").expect("other file");
+
+        let left = leftover_markers(&gd).expect("scan");
+        assert!(left.markers.is_empty());
+        let names: Vec<_> = left
+            .unreadable
+            .iter()
+            .map(|bad| {
+                bad.path
+                    .file_name()
+                    .expect("name")
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(names, vec!["run-bad.json", "run-bytes.json"]);
+        assert!(
+            left.unreadable.iter().all(|bad| !bad.why.is_empty()),
+            "each says why: {:?}",
+            left.unreadable
+        );
+        assert!(!left.is_empty());
+
+        match Lease::acquire(&wt, "run-1") {
+            Err(LeaseRefusal::UnreadableMarker { path, why }) => {
+                assert!(path.ends_with("run-bad.json"), "{}", path.display());
+                assert!(!why.is_empty());
+            }
+            other => panic!(
+                "expected an unreadable-marker refusal, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        assert!(
+            !gd.join("relais-inplace/run-1.json").exists(),
+            "nothing was started"
+        );
     }
 
     /// A worker's `git add` goes to the person's real index. A run that did
