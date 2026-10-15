@@ -278,7 +278,12 @@ fn a_patch_changed_after_validation_ends_candidate_digest_mismatch() {
     // The baseline runs after validation and before the candidate is
     // applied: it is where the file changes.
     let repo = fixture.repo_policy(
-        vec![sh(&format!("echo tampered >> {}", latest.display()))],
+        // Forward slashes: `sh -c` reads a Windows path's backslashes as
+        // escapes and would append to another file.
+        vec![sh(&format!(
+            "echo tampered >> '{}'",
+            latest.display().to_string().replace('\\', "/")
+        ))],
         3,
     );
     let seen = launches();
@@ -615,7 +620,12 @@ fn a_clean_from_candidate_starts_with_the_candidate_applied_and_no_conflict_text
         "{outcome:?}"
     );
     let seen = seen.lock().expect("lock");
-    assert_eq!(seen[0].1, "fn main() { /* candidate */ }\n");
+    // Line endings normalised: a Windows git with `core.autocrlf` checks the
+    // candidate's `\n` out as `\r\n`, which is still the candidate's file.
+    assert_eq!(
+        seen[0].1.replace("\r\n", "\n"),
+        "fn main() { /* candidate */ }\n"
+    );
     assert!(!seen[0].0.contains("resolve these first"), "{}", seen[0].0);
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
