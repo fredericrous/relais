@@ -9482,6 +9482,19 @@ fn salvage_command(
             format!("run {run} already carries a decision on record"),
         ));
     };
+    if contained == Some(true) {
+        if let Some(workspace) = operational(ledger.run_workspace(run), "decide")? {
+            operational(
+                relais::learn::salvage::record_salvage_landing(
+                    ledger,
+                    run,
+                    &workspace.repo_path,
+                    candidate_sha,
+                ),
+                "decide",
+            )?;
+        }
+    }
     Ok(Ok(Decided {
         run: run.to_string(),
         resolution: Reason::DecisionSalvaged,

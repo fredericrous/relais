@@ -280,13 +280,22 @@ fn checked(
 }
 
 /// Walk one run's history and say whether its candidate landed and was
-/// undone in time.
-fn inspect(repo: &Path, patch: &Path, ended_at: DateTime<Utc>, meter: &mut Meter) -> Finding {
-    match walk(repo, patch, ended_at, meter) {
+/// undone in time, starting at a recorded landing if any; also returning the landing
+/// the walk itself found (never one it was given).
+fn inspect_from(
+    repo: &Path,
+    patch: &Path,
+    ended_at: DateTime<Utc>,
+    recorded: Option<&Commit>,
+    meter: &mut Meter,
+) -> (Finding, Option<Commit>) {
+    let walked = walk(repo, patch, ended_at, recorded, meter);
+    let finding = match walked.result {
         Ok(finding) => finding,
         Err(Stop::Unknown(reason)) => Finding::Unknown(reason),
         Err(Stop::Skipped) => Finding::Skipped,
-    }
+    };
+    (finding, walked.found)
 }
 
 /// The preferred tip among `for-each-ref`'s `<refname> <sha>` lines:
@@ -311,11 +320,32 @@ fn default_tip(refs: &str) -> String {
     .unwrap_or_else(|| "HEAD".to_string())
 }
 
+/// What a walk decided, and the landing it found on the way (even when it
+/// then stopped), for the caller to record.
+struct Walked {
+    result: Result<Finding, Stop>,
+    found: Option<Commit>,
+}
+
 fn walk(
     repo: &Path,
     patch: &Path,
     ended_at: DateTime<Utc>,
+    recorded: Option<&Commit>,
     meter: &mut Meter,
+) -> Walked {
+    let mut found = None;
+    let result = scan(repo, patch, ended_at, recorded, meter, &mut found);
+    Walked { result, found }
+}
+
+fn scan(
+    repo: &Path,
+    patch: &Path,
+    ended_at: DateTime<Utc>,
+    recorded: Option<&Commit>,
+    meter: &mut Meter,
+    found: &mut Option<Commit>,
 ) -> Result<Finding, Stop> {
     let patch_text = std::fs::read_to_string(patch)
         .map_err(|e| Stop::Unknown(format!("{}: {e}", patch.display())))?;
@@ -346,20 +376,26 @@ fn walk(
         ],
     )?;
     let tip = default_tip(&refs);
-    let end = metered_git(
-        meter,
-        repo,
-        &[
-            "rev-list",
-            "-1",
-            "--first-parent",
-            &format!("--before={}", ended_at.to_rfc3339()),
-            &tip,
-        ],
-    )?;
-    let range = match end.trim() {
-        "" => tip.clone(),
-        end => format!("{end}..{tip}"),
+    let range = match recorded {
+        // The landing is known: only what came after it can undo it.
+        Some(landing) => format!("{}..{tip}", landing.sha),
+        None => {
+            let end = metered_git(
+                meter,
+                repo,
+                &[
+                    "rev-list",
+                    "-1",
+                    "--first-parent",
+                    &format!("--before={}", ended_at.to_rfc3339()),
+                    &tip,
+                ],
+            )?;
+            match end.trim() {
+                "" => tip.clone(),
+                end => format!("{end}..{tip}"),
+            }
+        }
     };
     let mut log_args = vec![
         "log",
@@ -374,10 +410,11 @@ fn walk(
     let commits = parse_log(&log)
         .ok_or_else(|| Stop::Unknown("git log: output could not be read".to_string()))?;
 
-    let mut landing: Option<Commit> = None;
+    let mut landing: Option<Commit> = recorded.cloned();
     for commit in commits {
         let Some(landed) = &landing else {
             if checked(meter, repo, patch, &commit.sha, Direction::Reverse)? {
+                *found = Some(commit.clone());
                 landing = Some(commit);
             }
             continue;
@@ -484,7 +521,10 @@ pub fn detect(ledger: &Ledger, now: DateTime<Utc>) -> Result<RevertReport, Ledge
     for candidate in ledger.revert_candidates(&since)? {
         report.scanned += 1;
         let mut meter = Meter::new(CALLS_PER_RUN.min(build_left));
-        let finding = inspect_candidate(ledger, &candidate, &mut meter)?;
+        let (finding, found) = inspect_candidate(ledger, &candidate, &mut meter)?;
+        if let Some(landing) = &found {
+            ledger.record_landing(&candidate.run, &landing.sha, &landing.at.to_rfc3339())?;
+        }
         build_left -= meter.spent;
         report.git_calls += meter.spent;
         match finding {
@@ -522,17 +562,16 @@ fn inspect_candidate(
     ledger: &Ledger,
     candidate: &RevertCandidate,
     meter: &mut Meter,
-) -> Result<Finding, LedgerError> {
+) -> Result<(Finding, Option<Commit>), LedgerError> {
+    let unknown = |reason: String| Ok((Finding::Unknown(reason), None));
     let Some(repo) = salvage::reachable_repo(&candidate.repo_path) else {
-        return Ok(Finding::Unknown(format!(
+        return unknown(format!(
             "no repository at {}",
             candidate.repo_path.display()
-        )));
+        ));
     };
     let Some(patch) = salvage::latest_candidate_patch(ledger, &candidate.run)? else {
-        return Ok(Finding::Unknown(
-            "no candidate patch evidence recorded".to_string(),
-        ));
+        return unknown("no candidate patch evidence recorded".to_string());
     };
     let ended_at = DateTime::parse_from_rfc3339(&candidate.ended_at)
         .map_err(|e| LedgerError::Corrupt {
@@ -542,7 +581,21 @@ fn inspect_candidate(
         .with_timezone(&Utc);
     // Absolute, because git runs from the repository.
     let patch = std::path::absolute(&patch).unwrap_or(patch);
-    Ok(inspect(&repo, &patch, ended_at, meter))
+    let recorded = ledger.landing_of(&candidate.run)?.and_then(|(sha, at)| {
+        let at = DateTime::parse_from_rfc3339(&at).ok()?.with_timezone(&Utc);
+        Some(Commit {
+            sha,
+            at,
+            message: String::new(),
+        })
+    });
+    Ok(inspect_from(
+        &repo,
+        &patch,
+        ended_at,
+        recorded.as_ref(),
+        meter,
+    ))
 }
 
 #[cfg(test)]
@@ -552,6 +605,10 @@ mod tests {
     use crate::ledger::{EvidenceKind, Transition};
     use crate::lifecycle::{Reason, State, UsagePhase};
     use std::path::PathBuf;
+
+    fn inspect(repo: &Path, patch: &Path, ended_at: DateTime<Utc>, meter: &mut Meter) -> Finding {
+        inspect_from(repo, patch, ended_at, None, meter).0
+    }
 
     const BASE: &str = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
 
@@ -720,6 +777,45 @@ mod tests {
         let again = detect(&w.ledger, now()).unwrap();
         assert_eq!(again.recorded, 0);
         assert_eq!(w.reverted_rows().len(), 1);
+    }
+
+    #[test]
+    fn the_first_pass_records_the_landing_and_the_second_skips_the_search() {
+        let w = world("revert-landing-recorded", &day(3));
+        let run = RunId::from_stored("run-a");
+        assert_eq!(w.ledger.landing_of(&run).unwrap(), None);
+        let landing = w.land(&day(5));
+        let first = detect(&w.ledger, now()).unwrap();
+        let (sha, _at) = w.ledger.landing_of(&run).unwrap().expect("recorded");
+        assert_eq!(sha, landing);
+        let second = detect(&w.ledger, now()).unwrap();
+        assert!(first.git_calls > 2, "{first:?}");
+        // for-each-ref and log: no rev-list, no reverse-apply check.
+        assert_eq!(second.git_calls, 2, "{second:?}");
+        assert_eq!(w.ledger.landing_of(&run).unwrap().unwrap().0, landing);
+    }
+
+    #[test]
+    fn a_revert_after_a_recorded_landing_is_still_detected() {
+        let w = world("revert-after-recorded", &day(3));
+        w.land(&day(5));
+        let first = detect(&w.ledger, now()).unwrap();
+        assert_eq!(first.recorded, 0);
+        run_git_at(&w.root, &day(10), &["revert", "--no-edit", "HEAD"]);
+        let second = detect(&w.ledger, now()).unwrap();
+        assert_eq!(second.recorded, 1, "{second:?}");
+        assert_eq!(w.reverted_rows().len(), 1);
+    }
+
+    #[test]
+    fn a_contained_salvage_landing_is_recorded_with_the_commit_time() {
+        let w = world("revert-salvage-landing", &day(3));
+        let landing = w.land(&day(5));
+        let run = RunId::from_stored("run-a");
+        assert!(salvage::record_salvage_landing(&w.ledger, &run, &w.root, &landing).unwrap());
+        let (sha, at) = w.ledger.landing_of(&run).unwrap().expect("recorded");
+        assert_eq!(sha, landing);
+        assert!(at.starts_with("2026-09-05T12:00:00"), "{at}");
     }
 
     #[test]

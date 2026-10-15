@@ -287,6 +287,42 @@ pub fn containment_of_run(
     Ok(candidate_contained(&repo, &patch, sha))
 }
 
+/// Record a contained salvage's candidate commit as the run's landing, with
+/// the commit's own time. `Ok(false)` when the repository or the commit
+/// cannot be read: nothing is recorded and detection finds the landing
+/// itself later.
+pub fn record_salvage_landing(
+    ledger: &Ledger,
+    run: &RunId,
+    repo_path: &Path,
+    sha: &str,
+) -> Result<bool, LedgerError> {
+    let Some(repo) = reachable_repo(repo_path) else {
+        return Ok(false);
+    };
+    let output = Command::new("git")
+        .current_dir(&repo)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .args(["show", "-s", "--format=%cI", sha])
+        .stdin(Stdio::null())
+        .output();
+    let landed_at = match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => return Ok(false),
+    };
+    let Ok(landed_at) = chrono::DateTime::parse_from_rfc3339(&landed_at) else {
+        return Ok(false);
+    };
+    ledger.record_landing(
+        run,
+        sha,
+        &landed_at.with_timezone(&chrono::Utc).to_rfc3339(),
+    )?;
+    Ok(true)
+}
+
 /// What one backfill pass did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackfillReport {
