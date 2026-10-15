@@ -905,6 +905,11 @@ pub fn run_observed_within(
         Err(stop) => return Err(VerifyError::Lease(stop)),
     };
     let timeout = admission.budgets.clip(own_timeout);
+    let heartbeat_every = admission.heartbeat_every;
+    // The tree as it is before the check writes to it: what it grew by is
+    // the estimate its next lease reserves (SPEC §23).
+    let tree_before =
+        (admitted.is_some() && admission.tracks_growth()).then(|| crate::disk::tree_bytes(dir));
     // A report the candidate itself committed is not this command's
     // result: clear it, so what is read afterwards was written by the run.
     let junit_file = spec
@@ -972,7 +977,7 @@ pub fn run_observed_within(
             let waited = std::thread::scope(|scope| {
                 if let (Some(admitted), false) = (&admitted, tied) {
                     let finished = &finished;
-                    scope.spawn(move || admitted.keep_alive(finished, admission.heartbeat_every));
+                    scope.spawn(move || admitted.keep_alive(finished, heartbeat_every));
                 }
                 let waited = wait_following(&mut child, timeout, &log_path, label, events, cancel);
                 finished.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1013,6 +1018,12 @@ pub fn run_observed_within(
             return Err(VerifyError::Io(e));
         }
     };
+    if let (Some(before), false) = (tree_before, matches!(ended, Ended::Cancelled)) {
+        admission
+            .disk
+            .growth
+            .record(label, crate::disk::tree_bytes(dir).saturating_sub(before));
+    }
     // The group is gone (`wait_for_exit` kills it on every path): the
     // tokens and host slots go back now.
     drop(admitted);

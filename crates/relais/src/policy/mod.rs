@@ -851,6 +851,11 @@ pub struct ResourceSettings {
     /// Cumulative time a run may wait for the disk floor. Default 600.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_wait_seconds: Option<u64>,
+    /// Bytes that must stay available to this user on every volume a run
+    /// writes, after the leases already running have taken their
+    /// estimates. Default 8 GiB (SPEC §23).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_free_bytes: Option<u64>,
     /// A directory of `flock` slot files shared with amont's heavy checks
     /// (amont ADR-0009): when set, a heavy command takes as many slot
     /// files as its weight after its coordinator tokens, so both tools
@@ -871,6 +876,11 @@ impl ResourceSettings {
 
     pub fn disk_wait_seconds(&self) -> u64 {
         self.disk_wait_seconds.unwrap_or(DEFAULT_DISK_WAIT_SECONDS)
+    }
+
+    pub fn min_free_bytes(&self) -> u64 {
+        self.min_free_bytes
+            .unwrap_or(crate::disk::DEFAULT_MIN_FREE_BYTES)
     }
 }
 
@@ -3431,6 +3441,32 @@ amont = { mode = "optional", bin = "/opt/amont/bin/amont" }
     }
 
     #[test]
+    fn a_request_without_a_disk_ask_is_written_without_one_and_an_old_one_parses() {
+        let old = serde_json::json!({
+            "dispatch_id": "d", "run_id": "r", "session_id": "s",
+            "parent_dispatch": null, "depth": 0, "resource": "heavy_local",
+            "reserve_micros": 0
+        });
+        let parsed: crate::admission::DispatchRequest =
+            serde_json::from_value(old).expect("an older request parses");
+        assert_eq!(parsed.disk, None);
+        assert!(!serde_json::to_string(&parsed)
+            .expect("serializes")
+            .contains("disk"));
+        let asked = crate::admission::DispatchRequest {
+            disk: Some(crate::disk::DiskAsk {
+                estimate_bytes: 7,
+                paths: vec!["/p".into()],
+            }),
+            ..parsed
+        };
+        let wire = serde_json::to_string(&asked).expect("serializes");
+        let back: crate::admission::DispatchRequest =
+            serde_json::from_str(&wire).expect("round trip");
+        assert_eq!(back, asked);
+    }
+
+    #[test]
     fn files_written_before_the_budgets_parse_and_write_back_unchanged() {
         let old = "schema_version = 1\n\n[spending]\nper_run_micros = 5000000\n";
         let machine = MachineSettings::from_toml_str(old).expect("an old file parses");
@@ -3440,6 +3476,8 @@ amont = { mode = "optional", bin = "/opt/amont/bin/amont" }
         let written = toml::to_string(&machine).expect("serializes");
         assert!(!written.contains("resources"), "{written}");
         assert!(!written.contains("wait_seconds"), "{written}");
+        assert!(!written.contains("min_free_bytes"), "{written}");
+        assert_eq!(machine.resources.min_free_bytes(), 8 * 1024 * 1024 * 1024);
         assert_eq!(
             MachineSettings::from_toml_str(&written).expect("round trip"),
             machine
@@ -3456,6 +3494,13 @@ amont = { mode = "optional", bin = "/opt/amont/bin/amont" }
         let written = toml::to_string(&tuned).expect("serializes");
         assert!(written.contains("admission_wait_seconds = 60"), "{written}");
         assert!(!written.contains("disk_wait_seconds"), "{written}");
+        assert!(!written.contains("min_free_bytes"), "{written}");
+
+        let floor = format!("{old}\n[resources]\nmin_free_bytes = 1000\n");
+        let floored = MachineSettings::from_toml_str(&floor).expect("a floor parses");
+        assert_eq!(floored.resources.min_free_bytes(), 1000);
+        let written = toml::to_string(&floored).expect("serializes");
+        assert!(written.contains("min_free_bytes = 1000"), "{written}");
 
         let contract = crate::contract::TaskContract::from_json_str(
             r#"{"schema_version":1,"kind":"change","objective":"o","base_ref":"HEAD",

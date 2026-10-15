@@ -23,6 +23,7 @@ fn gate_with_the_seat_taken() -> crate::admission::LocalGate {
     .expect("register");
     assert_eq!(
         gate.admit(&DispatchRequest {
+            disk: None,
             dispatch_id: "other-dispatch".into(),
             run_id: "other-run".into(),
             session_id: "other-tab".into(),
@@ -106,6 +107,7 @@ fn gate_with_the_heavy_token_taken() -> crate::admission::LocalGate {
     .expect("register");
     assert_eq!(
         gate.admit(&DispatchRequest {
+            disk: None,
             dispatch_id: "other-heavy".into(),
             run_id: "other-run".into(),
             session_id: "other-tab".into(),

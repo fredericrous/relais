@@ -178,6 +178,7 @@ impl Daemon {
                     source: DispatchSource::ManagedRun,
                     caller_agent_id: None,
                     weight: 1,
+                    disk: None,
                 },
             })
             .expect("admission");

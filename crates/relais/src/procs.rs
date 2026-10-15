@@ -366,6 +366,32 @@ pub fn kill_group(pgid: u32) -> GroupKill {
     imp::kill_group(pgid)
 }
 
+/// Bytes available to this user (`statvfs`'s `f_bavail` times the
+/// fragment size) on the filesystem holding `path`, which must exist.
+/// `None` where it cannot be asked: Windows, or a path `statvfs` refuses.
+#[cfg(unix)]
+pub fn available_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c_path` is a valid NUL-terminated string and `stat` is a
+    // zeroed out-parameter that `statvfs` fills in.
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+            return None;
+        }
+        // The fields are 32 bits wide on some unixes and 64 on others.
+        #[allow(clippy::useless_conversion)]
+        Some(u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize)))
+    }
+}
+
+/// See the unix definition: nothing can be asked here.
+#[cfg(not(unix))]
+pub fn available_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
 /// Whether any member of the process group `pgid` still runs, and is the
 /// group that was recorded. A group is identified by its leader's pid AND
 /// the leader's start time (`leader_started`, from [`start_time`] at the

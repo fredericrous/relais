@@ -1153,6 +1153,7 @@ impl<'a> RunEngine<'a> {
             });
         };
         let request = DispatchRequest {
+            disk: None,
             dispatch_id: spec.dispatch_id.clone(),
             run_id: self.run_id.as_str().to_string(),
             session_id: self.config.session_id.clone(),
@@ -1196,7 +1197,13 @@ impl<'a> RunEngine<'a> {
                         },
                     )?));
                 }
-                Ok(Decision::Queued { position }) => {
+                Ok(decision @ (Decision::Queued { .. } | Decision::WaitingForDisk { .. })) => {
+                    // Model work asks nothing of the disk, so the second
+                    // form is not expected; it waits like a queue.
+                    let position = match decision {
+                        Decision::Queued { position } => position,
+                        _ => 0,
+                    };
                     if let Some(exhausted) = queued.tick() {
                         // Best effort: nothing was launched, and a
                         // request the coordinator still holds expires
@@ -3049,7 +3056,25 @@ impl<'a> RunEngine<'a> {
             sleeper: Arc::new(verify::ThreadSleeper),
             registration: self.registration.clone(),
             tries: self.heavy_tries.clone(),
+            disk: crate::disk::DiskCheck {
+                floor: self.config.machine.resources.min_free_bytes(),
+                probe: Arc::new(crate::disk::StatvfsProbe),
+                paths: self.disk_paths(),
+                growth: self.config.ledger,
+            },
         }
+    }
+
+    /// The places this run writes (SPEC §23): the state directory, the
+    /// repository, the worktrees and `TMPDIR`.
+    fn disk_paths(&self) -> Vec<PathBuf> {
+        vec![
+            self.config.artifacts_dir.clone(),
+            self.config.repo_dir.to_path_buf(),
+            worktree_root(&self.config.artifacts_dir),
+            verify_root(&self.config.artifacts_dir),
+            std::env::temp_dir(),
+        ]
     }
 
     /// End the run on a command that was never admitted: a budget that
@@ -6544,7 +6569,10 @@ mod tests {
             );
             MachineSettings {
                 workspace: Default::default(),
-                resources: Default::default(),
+                resources: crate::policy::ResourceSettings {
+                    min_free_bytes: Some(0),
+                    ..Default::default()
+                },
                 schema_version: 1,
                 allowed_models: None,
                 spending: Default::default(),
@@ -10640,6 +10668,7 @@ mod tests {
         .expect("register");
         assert_eq!(
             gate.admit(&DispatchRequest {
+                disk: None,
                 dispatch_id: "other-dispatch".into(),
                 run_id: "other-run".into(),
                 session_id: "other-tab".into(),

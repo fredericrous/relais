@@ -164,6 +164,16 @@ pub enum Event {
         position: usize,
         waited_s: u64,
     },
+    /// A command waits for the disk floor: every 30 s while it waits.
+    /// `volume` is a path on the volume that holds it, the byte counts are
+    /// what is available there, the floor, and what running leases have
+    /// set aside (SPEC §23).
+    WaitingForDisk {
+        volume: String,
+        available: u64,
+        floor: u64,
+        reserved: u64,
+    },
     /// A line the process wrote to stdout or stderr under `--protocol`.
     Stderr {
         text: String,
@@ -187,6 +197,7 @@ impl Event {
             | Self::Decision { .. }
             | Self::EnvironmentWarning { .. }
             | Self::WaitingForSlot { .. }
+            | Self::WaitingForDisk { .. }
             | Self::Outcome { .. } => true,
         }
     }

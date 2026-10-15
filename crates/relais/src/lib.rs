@@ -13,6 +13,7 @@ pub mod catalog;
 pub mod context;
 pub mod contract;
 pub mod coordinator;
+pub mod disk;
 pub mod doctor;
 pub mod fsclone;
 pub mod fsutil;

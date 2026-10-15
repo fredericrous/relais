@@ -128,6 +128,7 @@ fn admission<'a>(
         sleeper: Arc::new(ThreadSleeper),
         registration: None,
         tries: Tries::default(),
+        disk: crate::disk::DiskCheck::off(),
     }
 }
 
@@ -143,6 +144,7 @@ fn registration(run: &str) -> RunRegistration {
 
 fn heavy_request(id: &str, run: &str, weight: u32) -> DispatchRequest {
     DispatchRequest {
+        disk: None,
         dispatch_id: id.into(),
         run_id: run.into(),
         session_id: "tab".into(),
@@ -404,6 +406,7 @@ fn a_weight_above_max_heavy_commands_is_refused_and_nothing_runs() {
     assert!(!dir.join("ran").exists());
     // The coordinator refuses it too, whatever the runner thinks its cap is.
     let request = DispatchRequest {
+        disk: None,
         dispatch_id: "w-heavy".into(),
         run_id: "run-w".into(),
         session_id: "tab".into(),
@@ -995,4 +998,249 @@ mod host_slots {
         assert!(written.contains("\"position\":1"), "{written}");
         std::fs::remove_dir_all(&slots_dir).ok();
     }
+}
+
+// ---- the disk floor and its reservation (SPEC §23) ----
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// A disk whose free space a test sets by hand: one volume.
+#[derive(Debug)]
+struct StubDisk {
+    available: std::sync::atomic::AtomicU64,
+}
+
+impl StubDisk {
+    fn with(bytes: u64) -> Arc<Self> {
+        Arc::new(Self {
+            available: std::sync::atomic::AtomicU64::new(bytes),
+        })
+    }
+
+    fn set(&self, bytes: u64) {
+        self.available.store(bytes, Ordering::SeqCst);
+    }
+}
+
+impl crate::disk::DiskProbe for StubDisk {
+    fn volume_of(&self, _path: &Path) -> Option<crate::disk::Volume> {
+        Some(crate::disk::Volume {
+            id: 7,
+            mount: "/stub".into(),
+            available: self.available.load(Ordering::SeqCst),
+        })
+    }
+}
+
+fn disk_gate(heavy: u32, floor: u64, disk: &Arc<StubDisk>) -> LocalGate {
+    gate_with(heavy).with_disk(floor, Arc::clone(disk) as Arc<dyn crate::disk::DiskProbe>)
+}
+
+fn checking<'a>(
+    mut admission: HeavyAdmission<'a>,
+    floor: u64,
+    disk: &Arc<StubDisk>,
+) -> HeavyAdmission<'a> {
+    admission.disk = crate::disk::DiskCheck {
+        floor,
+        probe: Arc::clone(disk) as Arc<dyn crate::disk::DiskProbe>,
+        paths: vec![PathBuf::from("/stub/work")],
+        growth: &crate::disk::NoGrowth,
+    };
+    admission
+}
+
+fn disk_request(id: &str, run: &str, estimate: u64) -> DispatchRequest {
+    DispatchRequest {
+        disk: Some(crate::disk::DiskAsk {
+            estimate_bytes: estimate,
+            paths: vec!["/stub/work".into()],
+        }),
+        ..heavy_request(id, run, 1)
+    }
+}
+
+#[test]
+fn a_disk_below_the_floor_is_waited_out_under_the_disk_budget_and_ends_disk_low() {
+    let dir = temp_dir("disk-low");
+    let disk = StubDisk::with(5 * GIB);
+    let gate = disk_gate(2, 8 * GIB, &disk);
+    register(&gate, "run-d");
+    let clock = ManualClock::new();
+    // 60 s of disk wait, a large admission wait.
+    let budgets = budgets_on(&clock, 1800);
+    budgets.begin_work();
+    let mut held = checking(admission(&gate, "run-d", 2, 4), 8 * GIB, &disk);
+    held.budgets = budgets.clone();
+    held.sleeper = Advancing::new(&clock);
+    held.poll = Duration::from_secs(10);
+    held.events = Events::for_run_on("run-d", &dir, crate::protocol::Wire::to(std::io::sink()));
+    let stopped = held.admit(&ask(&BTreeMap::new(), 1));
+    assert!(
+        matches!(stopped, Err(LeaseStop::Exhausted(Exhausted::DiskWait))),
+        "{:?}",
+        stopped.as_ref().err()
+    );
+    let written = std::fs::read_to_string(dir.join("events.jsonl")).expect("events");
+    assert!(written.contains("\"waiting_for_disk\""), "{written}");
+    assert!(written.contains("\"volume\":\"/stub\""), "{written}");
+    assert!(written.contains("\"floor\":8589934592"), "{written}");
+    assert!(budgets.waited(WaitKind::Disk) >= Duration::from_secs(60));
+    assert_eq!(budgets.waited(WaitKind::Admission), Duration::ZERO);
+    assert_eq!(budgets.worked(), Duration::ZERO, "the wait was not work");
+    assert!(budgets.total_remaining() < Duration::from_secs(600));
+}
+
+#[test]
+fn a_second_run_that_does_not_fit_above_the_floor_queues_until_the_first_lease_is_released() {
+    let disk = StubDisk::with(11 * GIB);
+    let gate = disk_gate(2, 8 * GIB, &disk);
+    register(&gate, "run-1");
+    register(&gate, "run-2");
+    // 11 GiB available, floor 8, estimate 2: one fits (10), two do not.
+    assert_eq!(
+        gate.admit(&disk_request("first", "run-1", 2 * GIB))
+            .expect("admit"),
+        Decision::Granted
+    );
+    assert_eq!(
+        gate.admit(&disk_request("second", "run-2", 2 * GIB))
+            .expect("admit"),
+        Decision::WaitingForDisk {
+            volume: "/stub".into(),
+            available: 11 * GIB,
+            floor: 8 * GIB,
+            reserved: 2 * GIB,
+        },
+        "a token is free; the disk is what holds the second lease"
+    );
+    gate.release("first").expect("release");
+    gate.settle("first", Some(0)).expect("settle");
+    assert_eq!(
+        gate.admit(&disk_request("second", "run-2", 2 * GIB))
+            .expect("admit"),
+        Decision::Granted
+    );
+}
+
+#[test]
+fn the_floor_is_checked_again_after_the_grant_and_the_command_queues_instead_of_running() {
+    let dir = temp_dir("disk-window");
+    // The coordinator sees plenty; the runner, a moment later, sees little.
+    let coordinator_disk = StubDisk::with(50 * GIB);
+    let runner_disk = StubDisk::with(5 * GIB);
+    let gate = disk_gate(1, 8 * GIB, &coordinator_disk);
+    register(&gate, "run-w");
+    let clock = ManualClock::new();
+    let relief = Arc::clone(&runner_disk);
+    let mut racing = checking(admission(&gate, "run-w", 1, 4), 8 * GIB, &runner_disk);
+    racing.budgets = budgets_on(&clock, 1800);
+    let sleeper = Advancing::then(&clock, move |_| relief.set(50 * GIB));
+    racing.sleeper = sleeper.clone();
+    racing.poll = Duration::from_secs(10);
+    let lease = racing
+        .admit(&ask(&BTreeMap::new(), 1))
+        .expect("admitted once the space came back");
+    assert!(
+        lease.id().ends_with("-2"),
+        "the first lease was given back and a second one taken: {}",
+        lease.id()
+    );
+    assert_eq!(
+        sleeper.slept.lock().expect("sleeps").len(),
+        1,
+        "the command waited once instead of running"
+    );
+    drop(lease);
+    // A disk that stays low never lets the command run, and leaves no
+    // lease behind.
+    runner_disk.set(5 * GIB);
+    let mut stuck = checking(admission(&gate, "run-w", 1, 4), 8 * GIB, &runner_disk);
+    let clock = ManualClock::new();
+    stuck.budgets = budgets_on(&clock, 1800);
+    stuck.sleeper = Advancing::new(&clock);
+    stuck.poll = Duration::from_secs(10);
+    stuck.tries = Tries::for_epoch(1);
+    let stopped = run_observed_within(
+        &dir,
+        &sh("echo ran > ran"),
+        &dir.join("logs"),
+        "cmd0",
+        "x-cmd0",
+        &Events::silent(),
+        None,
+        &stuck,
+    );
+    assert!(
+        matches!(
+            stopped,
+            Err(crate::verify::VerifyError::Lease(LeaseStop::Exhausted(
+                Exhausted::DiskWait
+            )))
+        ),
+        "{stopped:?}"
+    );
+    assert!(!dir.join("ran").exists(), "the command never ran");
+    assert_eq!(
+        gate.admit(&heavy_request("after", "run-w", 1))
+            .expect("admit"),
+        Decision::Granted,
+        "the token came back"
+    );
+}
+
+/// A check's measured growth, kept in memory.
+#[derive(Default)]
+struct Remembered(Mutex<BTreeMap<String, u64>>);
+
+impl crate::disk::Growth for Remembered {
+    fn last(&self, label: &str) -> Option<u64> {
+        self.0.lock().expect("growth").get(label).copied()
+    }
+    fn record(&self, label: &str, bytes: u64) {
+        self.0.lock().expect("growth").insert(label.into(), bytes);
+    }
+}
+
+#[test]
+fn a_checks_growth_is_recorded_and_is_its_next_estimate_with_two_gib_before() {
+    let dir = temp_dir("disk-growth");
+    let gate = gate_with(1);
+    register(&gate, "run-g");
+    let growth = Remembered::default();
+    let mut measured = admission(&gate, "run-g", 1, 4);
+    measured.disk = crate::disk::DiskCheck {
+        floor: 0,
+        probe: Arc::new(crate::disk::StatvfsProbe),
+        paths: Vec::new(),
+        growth: &growth,
+    };
+    assert_eq!(
+        measured.disk.estimate("cmd0"),
+        2 * GIB,
+        "2 GiB before any measurement"
+    );
+    let outcome = run_observed_within(
+        &dir,
+        &sh("head -c 1048576 /dev/zero > big"),
+        &dir.join("logs"),
+        "cmd0",
+        "x-cmd0",
+        &Events::silent(),
+        None,
+        &measured,
+    )
+    .expect("run");
+    assert!(outcome.ended.succeeded());
+    assert_eq!(
+        crate::disk::Growth::last(&growth, "cmd0"),
+        Some(1_048_576),
+        "the tree grew by the file the check wrote"
+    );
+    assert_eq!(measured.disk.estimate("cmd0"), 1_048_576);
+    assert_eq!(
+        measured.disk.estimate("other"),
+        2 * GIB,
+        "another label is still unmeasured"
+    );
 }

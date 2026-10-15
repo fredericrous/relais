@@ -219,6 +219,12 @@ pub struct DispatchRequest {
     /// reads as one, and a weight of one is not written.
     #[serde(default = "one_token", skip_serializing_if = "takes_one_token")]
     pub weight: u32,
+    /// What a heavy command expects to write and where (SPEC §23): the
+    /// coordinator admits it only while those volumes stay above the disk
+    /// floor with every running lease's estimate set aside. Additive and
+    /// defaulted: an older request has none and is never held for disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<crate::disk::DiskAsk>,
 }
 
 fn one_token() -> u32 {
@@ -275,6 +281,15 @@ pub enum Decision {
     AlreadyAdmitted,
     /// Never admissible under current policy; not queued.
     Refused { code: Refusal, detail: String },
+    /// Tokens are free but a volume the command writes would drop below the
+    /// disk floor: the constraint that holds the lease is the disk, not the
+    /// queue. Poll again with the same dispatch ID.
+    WaitingForDisk {
+        volume: String,
+        available: u64,
+        floor: u64,
+        reserved: u64,
+    },
 }
 
 /// Why a request is refused outright rather than queued.
@@ -990,6 +1005,15 @@ struct Dispatch {
     /// The check's process group, once its runner reported it (SPEC §23):
     /// the lease then lasts as long as a member of the group runs.
     group: Option<GroupHold>,
+    /// The disk this lease set aside while it runs (SPEC §23).
+    disk: Option<DiskHold>,
+}
+
+/// The estimate a running lease reserves, and the devices it reserves it on.
+#[derive(Debug, Clone)]
+struct DiskHold {
+    estimate: u64,
+    volumes: Vec<u64>,
 }
 
 /// A heavy lease tied to a process group. The runner that owns the group
@@ -1153,6 +1177,9 @@ pub struct AdmissionState {
     /// Whether a group recorded with this leader start time still has a
     /// member. Injectable so a test decides what the process table says.
     group_probe: fn(u32, Option<&str>) -> bool,
+    /// The disk floor in bytes (zero: none) and how space is measured.
+    disk_floor: u64,
+    disk_probe: std::sync::Arc<dyn crate::disk::DiskProbe>,
 }
 
 /// Default duration a hook-admitted agent's lease is held before it
@@ -1192,6 +1219,65 @@ impl AdmissionState {
             training_started: BTreeMap::new(),
             group_journal: Vec::new(),
             group_probe: crate::procs::group_alive,
+            disk_floor: 0,
+            disk_probe: std::sync::Arc::new(crate::disk::StatvfsProbe),
+        }
+    }
+
+    /// Hold heavy leases that ask about the disk to `floor` bytes available
+    /// on every volume they write. Machine settings own the floor; `new`
+    /// has none, so a state built without it never holds a lease for disk.
+    pub fn set_disk(&mut self, floor: u64, probe: std::sync::Arc<dyn crate::disk::DiskProbe>) {
+        self.disk_floor = floor;
+        self.disk_probe = probe;
+    }
+
+    /// Why the disk holds this request, if it does: a volume it writes
+    /// where what is available, less the estimates of the leases running
+    /// there, would not stay above the floor plus its own estimate.
+    fn disk_hold(&self, request: &DispatchRequest) -> Option<crate::disk::Shortfall> {
+        let ask = request.disk.as_ref()?;
+        if self.disk_floor == 0 {
+            return None;
+        }
+        let volumes = crate::disk::volumes(self.disk_probe.as_ref(), &ask.paths);
+        crate::disk::shortfall(
+            &volumes,
+            |id| self.reserved_on(id),
+            self.disk_floor,
+            ask.estimate_bytes,
+        )
+    }
+
+    /// The sum of the estimates of the leases that hold a seat and write
+    /// to volume `id`.
+    fn reserved_on(&self, id: u64) -> u64 {
+        self.dispatches
+            .values()
+            .filter(|dispatch| dispatch.lifecycle.holds_seat())
+            .filter_map(|dispatch| dispatch.disk.as_ref())
+            .filter(|hold| hold.volumes.contains(&id))
+            .fold(0u64, |sum, hold| sum.saturating_add(hold.estimate))
+    }
+
+    /// What a queued or held request is told: the disk when tokens are
+    /// free and the disk is what holds it, else its place in the queue.
+    fn waiting(&self, request: &DispatchRequest, position: usize) -> Decision {
+        let tokens_free = self
+            .group_cap(request.resource.cap_group())
+            .is_none_or(|cap| {
+                self.active_count(request.resource.cap_group(), None)
+                    .saturating_add(request.weight.max(1))
+                    <= cap
+            });
+        match self.disk_hold(request) {
+            Some(short) if tokens_free => Decision::WaitingForDisk {
+                volume: short.volume,
+                available: short.available,
+                floor: short.floor,
+                reserved: short.reserved,
+            },
+            _ => Decision::Queued { position },
         }
     }
 
@@ -1347,14 +1433,13 @@ impl AdmissionState {
             if self.dispatches.contains_key(&request.dispatch_id) {
                 return self.request(request, now);
             }
-            return Decision::Queued {
-                position: self
-                    .queue
-                    .iter()
-                    .position(|queued| queued.request.dispatch_id == request.dispatch_id)
-                    .unwrap_or(position)
-                    + 1,
-            };
+            let position = self
+                .queue
+                .iter()
+                .position(|queued| queued.request.dispatch_id == request.dispatch_id)
+                .unwrap_or(position)
+                + 1;
+            return self.waiting(request, position);
         }
         if let Some(refusal) = self.check_hard_limits(request) {
             return refusal;
@@ -1374,9 +1459,7 @@ impl AdmissionState {
             request: request.clone(),
             enqueued_at: now,
         });
-        Decision::Queued {
-            position: self.queue.len(),
-        }
+        self.waiting(request, self.queue.len())
     }
 
     /// Ask for the Training lease WITHOUT queueing (SPEC §17): granted, or
@@ -1711,6 +1794,9 @@ impl AdmissionState {
         }) {
             return false;
         }
+        if self.disk_hold(request).is_some() {
+            return false;
+        }
         if group == CapGroup::Remote {
             if let Some(per_session) = self.limits.max_active_agents_per_session {
                 if self.active_count(group, Some(&request.session_id)) >= per_session {
@@ -1736,6 +1822,13 @@ impl AdmissionState {
         // Record the derived depth, not the self-report: a grandchild
         // derives from what is recorded here.
         let depth = self.effective_depth(&request);
+        let disk = request.disk.as_ref().map(|ask| DiskHold {
+            estimate: ask.estimate_bytes,
+            volumes: crate::disk::volumes(self.disk_probe.as_ref(), &ask.paths)
+                .iter()
+                .map(|volume| volume.id)
+                .collect(),
+        });
         if let Some(run) = self.runs.get_mut(&request.run_id) {
             if request.resource.is_agent() {
                 run.admitted_total += 1;
@@ -1769,6 +1862,7 @@ impl AdmissionState {
                 attribution,
                 weight: request.weight.max(1),
                 group: None,
+                disk,
             },
         );
     }
@@ -2612,6 +2706,7 @@ impl AdmissionState {
         }
         self.adopt(
             &DispatchRequest {
+                disk: None,
                 dispatch_id: binding.dispatch_id.clone(),
                 run_id: binding.run_id.clone(),
                 session_id: binding.session_id.clone(),
@@ -3393,6 +3488,13 @@ impl LocalGate {
         }
     }
 
+    /// Hold heavy leases that ask about the disk to `floor` bytes, measured
+    /// with `probe` (SPEC §23).
+    pub fn with_disk(self, floor: u64, probe: std::sync::Arc<dyn crate::disk::DiskProbe>) -> Self {
+        self.admission().set_disk(floor, probe);
+        self
+    }
+
     /// The admission state, recovering a lock a panicking caller
     /// poisoned instead of propagating it. One failed call must not
     /// wedge every later one: the state machine mutates one field at a
@@ -3681,6 +3783,7 @@ mod tests {
 
     fn req(dispatch: &str, run: &str, session: &str) -> DispatchRequest {
         DispatchRequest {
+            disk: None,
             dispatch_id: dispatch.into(),
             run_id: run.into(),
             session_id: session.into(),
@@ -3702,6 +3805,7 @@ mod tests {
         depth: u32,
     ) -> DispatchRequest {
         DispatchRequest {
+            disk: None,
             parent_dispatch: Some(parent.into()),
             depth,
             ..req(dispatch, run, session)
@@ -4078,6 +4182,7 @@ mod tests {
         let mut state = state();
         let t0 = Instant::now();
         let caller = DispatchRequest {
+            disk: None,
             source: DispatchSource::HookAdmitted,
             ..req("caller-dispatch", "run-a", "tab-a")
         };
@@ -4088,6 +4193,7 @@ mod tests {
         );
 
         let nested = DispatchRequest {
+            disk: None,
             source: DispatchSource::HookAdmitted,
             caller_agent_id: Some("caller-agent".into()),
             ..req("nested-dispatch", "run-a", "tab-a")
@@ -4112,6 +4218,7 @@ mod tests {
         let mut state = state();
         let t0 = Instant::now();
         let top_level = DispatchRequest {
+            disk: None,
             source: DispatchSource::HookAdmitted,
             ..req("top-level", "run-a", "tab-a")
         };
@@ -4131,6 +4238,7 @@ mod tests {
         let mut state = state();
         let t0 = Instant::now();
         let orphaned = DispatchRequest {
+            disk: None,
             source: DispatchSource::HookAdmitted,
             caller_agent_id: Some("agent-nobody-bound".into()),
             ..req("orphaned-caller", "run-a", "tab-a")
@@ -4166,6 +4274,7 @@ mod tests {
         for depth in 0..3 {
             let dispatch_id = chain.last().unwrap().clone();
             let request = DispatchRequest {
+                disk: None,
                 source: DispatchSource::HookAdmitted,
                 caller_agent_id: caller_agent.clone(),
                 ..req(&dispatch_id, "run-a", "tab-a")
@@ -4180,6 +4289,7 @@ mod tests {
         }
 
         let one_hop_too_deep = DispatchRequest {
+            disk: None,
             source: DispatchSource::HookAdmitted,
             caller_agent_id: caller_agent,
             ..req(chain.last().unwrap(), "run-a", "tab-a")
@@ -4711,6 +4821,7 @@ mod tests {
         let mut state = state();
         let t0 = Instant::now();
         let request = DispatchRequest {
+            disk: None,
             source: DispatchSource::HookAdmitted,
             ..req("hook-agent", "run-a", "tab-a")
         };
@@ -4748,6 +4859,7 @@ mod tests {
         let mut state = state();
         let t0 = Instant::now();
         let request = DispatchRequest {
+            disk: None,
             source: DispatchSource::HookAdmitted,
             ..req("hook-top-level", "run-a", "tab-a")
         };
@@ -4817,6 +4929,7 @@ mod tests {
         );
 
         let hooked = DispatchRequest {
+            disk: None,
             source: DispatchSource::HookAdmitted,
             ..req("hook-one", "run-a", "tab-a")
         };

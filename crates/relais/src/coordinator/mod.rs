@@ -696,6 +696,7 @@ impl Coordinator {
                 };
                 state.adopt(
                     &DispatchRequest {
+                        disk: None,
                         dispatch_id: live.dispatch.as_str().to_string(),
                         run_id: live.run.as_str().to_string(),
                         session_id: live.session_id.clone().unwrap_or_else(|| "unknown".into()),
@@ -1840,6 +1841,7 @@ impl Client {
                 source: DispatchSource::ManagedRun,
                 caller_agent_id: None,
                 weight: 1,
+                disk: None,
             },
             pid,
             started_at: started_at.to_string(),
@@ -2735,8 +2737,16 @@ pub fn run_daemon(
     limits: ConcurrencyLimits,
     ledger: Option<&Ledger>,
     agent_lease_ttl: Duration,
+    disk_floor: u64,
 ) -> Result<(), CoordinatorError> {
     let (coordinator, listener) = Coordinator::start(socket_path, limits, ledger, agent_lease_ttl)?;
+    // The machine's `min_free_bytes` (SPEC §23): a heavy lease that asks
+    // about the disk is held until its volumes stay above it.
+    coordinator
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .set_disk(disk_floor, Arc::new(crate::disk::StatvfsProbe));
     coordinator.serve(listener)
 }
 
@@ -2818,6 +2828,7 @@ mod tests {
 
     fn request(dispatch: &str, run: &str, session: &str) -> DispatchRequest {
         DispatchRequest {
+            disk: None,
             dispatch_id: dispatch.into(),
             run_id: run.into(),
             session_id: session.into(),
@@ -2939,6 +2950,7 @@ mod tests {
 
     fn heavy_request(id: &str, run: &str) -> DispatchRequest {
         DispatchRequest {
+            disk: None,
             resource: ResourceClass::HeavyLocal,
             ..request(id, run, "tab")
         }

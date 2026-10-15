@@ -25,6 +25,15 @@
 //! Time spent in 1 and 2 is queue time: it draws on `admission_wait_seconds`
 //! and `total_seconds`, never on work (`Budgets::wait`).
 //!
+//! The disk floor holds a lease apart from the queue (SPEC §23). The
+//! coordinator grants only while the volumes the run writes stay above the
+//! floor with the running leases' estimates set aside, and says
+//! `WaitingForDisk` when the disk is what holds the lease; the runner then
+//! checks the floor again once the lease is granted, because space can drop
+//! between the grant and the use, and gives the lease back and waits when
+//! it has. Waiting for the disk draws on `disk_wait_seconds` and the total,
+//! never on `admission_wait_seconds` or work.
+//!
 //! The parallelism bounds limit how many jobs a child starts. They are not
 //! a CPU or memory cap: a single job can still use every core and any
 //! amount of memory.
@@ -39,6 +48,7 @@ use crate::admission::{
     BindOutcome, Decision, DispatchRequest, DispatchSource, Gate, GateError, Refusal,
     ResourceClass, RunRegistration, ADMISSION_POLL,
 };
+use crate::disk::{DiskCheck, Shortfall};
 use crate::policy::{Budgets, Exhausted, WaitKind};
 use crate::protocol::{Event, Events};
 
@@ -275,6 +285,8 @@ pub struct HeavyAdmission<'a> {
     /// once if a restarted coordinator does not know it.
     pub registration: Option<RunRegistration>,
     pub tries: Tries,
+    /// The disk floor and the means to measure it.
+    pub disk: DiskCheck<'a>,
 }
 
 impl<'a> HeavyAdmission<'a> {
@@ -296,11 +308,16 @@ impl<'a> HeavyAdmission<'a> {
             sleeper: Arc::new(ThreadSleeper),
             registration: None,
             tries: Tries::default(),
+            disk: DiskCheck::off(),
         }
     }
 
     /// Whether this admission belongs to a run. A command outside any run
     /// has no run id: it is bounded by nothing and queued for nothing.
+    pub fn tracks_growth(&self) -> bool {
+        self.manages()
+    }
+
     fn manages(&self) -> bool {
         !self.run_id.is_empty()
     }
@@ -359,6 +376,9 @@ impl<'a> HeavyAdmission<'a> {
         }
         let environment = self.environment(ask.weight, ask.env);
         let Some(gate) = self.gate else {
+            if self.manages() {
+                self.wait_for_disk(self.disk.estimate(ask.label), ask.cancel)?;
+            }
             return Ok(Admitted::unadmitted(environment));
         };
         // The shared queue is amont's: its files are counted before any
@@ -368,60 +388,101 @@ impl<'a> HeavyAdmission<'a> {
             (Some(dir), false) => slots::inventory(dir, ask.weight, self)?,
             _ => None,
         };
-        let attempt = self.tries.next(&format!("{}\u{1}{}", ask.phase, ask.label));
-        let id = dispatch_id(
-            &self.run_id,
-            ask.phase,
-            ask.label,
-            self.tries.epoch,
-            attempt,
-        );
-        let request = DispatchRequest {
-            dispatch_id: id.clone(),
-            run_id: self.run_id.clone(),
-            session_id: self.session_id.clone(),
-            parent_dispatch: None,
-            depth: 0,
-            resource: ResourceClass::HeavyLocal,
-            reserve_micros: 0,
-            source: DispatchSource::NativeRun,
-            caller_agent_id: None,
-            weight: ask.weight,
-        };
+        let estimate = self.disk.estimate(ask.label);
         let mut queue = Queue::new(self);
         let mut registered_again = false;
         loop {
-            match self.ask(gate, &request, &mut registered_again)? {
-                Decision::Granted => break,
-                Decision::AlreadyAdmitted => return Err(LeaseStop::Duplicate(id)),
-                Decision::Refused { code, detail } => {
-                    return Err(LeaseStop::Refused { code, detail })
-                }
-                Decision::Queued { position } => {
-                    if let Err(stop) =
-                        queue.wait("heavy_local", position, ask.cancel, self.sleeper.as_ref())
-                    {
-                        // Best effort: nothing started, and a request the
-                        // coordinator still holds expires unclaimed.
-                        let _ = gate.withdraw(&id);
-                        return Err(stop);
+            // Each try has its own id: a lease given back settles, and a
+            // settled id is never admitted again.
+            let attempt = self.tries.next(&format!("{}\u{1}{}", ask.phase, ask.label));
+            let id = dispatch_id(
+                &self.run_id,
+                ask.phase,
+                ask.label,
+                self.tries.epoch,
+                attempt,
+            );
+            let request = DispatchRequest {
+                dispatch_id: id.clone(),
+                run_id: self.run_id.clone(),
+                session_id: self.session_id.clone(),
+                parent_dispatch: None,
+                depth: 0,
+                resource: ResourceClass::HeavyLocal,
+                reserve_micros: 0,
+                source: DispatchSource::NativeRun,
+                caller_agent_id: None,
+                weight: ask.weight,
+                disk: self.disk.ask(estimate),
+            };
+            loop {
+                match self.ask(gate, &request, &mut registered_again)? {
+                    Decision::Granted => break,
+                    Decision::AlreadyAdmitted => return Err(LeaseStop::Duplicate(id)),
+                    Decision::Refused { code, detail } => {
+                        return Err(LeaseStop::Refused { code, detail })
+                    }
+                    decision => {
+                        let holding = match &decision {
+                            Decision::WaitingForDisk {
+                                volume,
+                                available,
+                                floor,
+                                reserved,
+                            } => Holding::Disk(Shortfall {
+                                volume: volume.clone(),
+                                available: *available,
+                                floor: *floor,
+                                reserved: *reserved,
+                            }),
+                            Decision::Queued { position } => Holding::Slot {
+                                class: "heavy_local",
+                                position: *position,
+                            },
+                            _ => unreachable!("granted, duplicate and refused return above"),
+                        };
+                        if let Err(stop) = queue.wait(holding, ask.cancel, self.sleeper.as_ref()) {
+                            // Best effort: nothing started, and a request the
+                            // coordinator still holds expires unclaimed.
+                            let _ = gate.withdraw(&id);
+                            return Err(stop);
+                        }
                     }
                 }
             }
-        }
-        let mut lease = Admitted::leased(gate, id, environment);
-        if let Some(files) = shared {
-            // `lease` drops on an error and gives its tokens back.
-            if let Some(held) = slots::take(
-                &files, ask.weight, self, &mut queue, ask.cancel, gate, &lease.id,
-            )? {
-                lease.slots = held;
-                lease
-                    .env
-                    .insert(HOST_SLOT_ENV.to_string(), "held".to_string());
+            let mut lease = Admitted::leased(gate, id, environment.clone());
+            if let Some(files) = &shared {
+                // `lease` drops on an error and gives its tokens back.
+                if let Some(held) = slots::take(
+                    files, ask.weight, self, &mut queue, ask.cancel, gate, &lease.id,
+                )? {
+                    lease.slots = held;
+                    lease
+                        .env
+                        .insert(HOST_SLOT_ENV.to_string(), "held".to_string());
+                }
+            }
+            // The window between the grant and the use: space may have gone
+            // since the coordinator looked. The lease is given back and the
+            // command queues for the disk instead of running.
+            match self.disk.short(estimate) {
+                None => return Ok(lease),
+                Some(short) => {
+                    drop(lease);
+                    queue.wait(Holding::Disk(short), ask.cancel, self.sleeper.as_ref())?;
+                }
             }
         }
-        Ok(lease)
+    }
+
+    /// With no coordinator nothing reserves the disk, but a command still
+    /// does not start below the floor: wait for it.
+    fn wait_for_disk(&self, estimate: u64, cancel: Option<&AtomicBool>) -> Result<(), LeaseStop> {
+        let mut queue = Queue::new(self);
+        while let Some(short) = self.disk.short(estimate) {
+            queue.wait(Holding::Disk(short), cancel, self.sleeper.as_ref())?;
+        }
+        Ok(())
     }
 
     /// Say once, on stderr and as an event, that the shared host slots are
@@ -439,11 +500,28 @@ impl<'a> HeavyAdmission<'a> {
     }
 }
 
-/// Time spent queued, charged to `admission_wait_seconds` and the total,
-/// announced every [`HeavyAdmission::announce_every`].
+/// What holds a command: its place in a queue, or the disk floor.
+enum Holding<'h> {
+    Slot { class: &'h str, position: usize },
+    Disk(Shortfall),
+}
+
+impl Holding<'_> {
+    fn kind(&self) -> WaitKind {
+        match self {
+            Self::Slot { .. } => WaitKind::Admission,
+            Self::Disk(_) => WaitKind::Disk,
+        }
+    }
+}
+
+/// Time spent held, announced every [`HeavyAdmission::announce_every`] and
+/// charged to the budget of what holds the command: `admission_wait_seconds`
+/// for the queue, `disk_wait_seconds` for the disk floor, and the total for
+/// both.
 struct Queue<'q> {
     admission: &'q HeavyAdmission<'q>,
-    wait: crate::policy::Wait,
+    wait: Option<(WaitKind, crate::policy::Wait)>,
     started: i64,
     last_announced: i64,
 }
@@ -453,9 +531,25 @@ impl<'q> Queue<'q> {
         let started = admission.budgets.now();
         Self {
             admission,
-            wait: admission.budgets.wait(WaitKind::Admission),
+            wait: None,
             started,
             last_announced: started,
+        }
+    }
+
+    /// The wait that charges `kind`, started now if another was running
+    /// (dropping that one charges it up to now).
+    fn charging(&mut self, kind: WaitKind) -> &mut crate::policy::Wait {
+        if self.wait.as_ref().is_none_or(|(held, _)| *held != kind) {
+            self.wait = None;
+            let now = self.admission.budgets.now();
+            self.started = now;
+            self.last_announced = now;
+            self.wait = Some((kind, self.admission.budgets.wait(kind)));
+        }
+        match &mut self.wait {
+            Some((_, wait)) => wait,
+            None => unreachable!("the wait was set above"),
         }
     }
 
@@ -463,15 +557,25 @@ impl<'q> Queue<'q> {
     /// the run was cancelled, announce when it is time, then sleep.
     fn wait(
         &mut self,
-        class: &str,
-        position: usize,
+        holding: Holding<'_>,
         cancel: Option<&AtomicBool>,
         sleeper: &dyn Sleeper,
     ) -> Result<(), LeaseStop> {
-        if let Some(exhausted) = self.wait.tick() {
+        if let Some(exhausted) = self.charging(holding.kind()).tick() {
+            let reason = match &holding {
+                Holding::Slot { class, position } => {
+                    format!("still queued for {class} at position {position}")
+                }
+                Holding::Disk(short) => format!(
+                    "still waiting for {} to rise above the floor ({} available, floor {})",
+                    short.volume,
+                    crate::disk::gib(short.available),
+                    crate::disk::gib(short.floor)
+                ),
+            };
             self.admission.events.emit(Event::Decision {
                 what: "admission_queue_ended".into(),
-                reason: format!("still queued for {class} at position {position}"),
+                reason,
             });
             return Err(LeaseStop::Exhausted(exhausted));
         }
@@ -482,10 +586,19 @@ impl<'q> Queue<'q> {
         let every = i64::try_from(self.admission.announce_every.as_millis()).unwrap_or(i64::MAX);
         if now - self.last_announced >= every {
             self.last_announced = now;
-            self.admission.events.emit(Event::WaitingForSlot {
-                class: class.to_string(),
-                position,
-                waited_s: u64::try_from((now - self.started).max(0) / 1000).unwrap_or(0),
+            let waited_s = u64::try_from((now - self.started).max(0) / 1000).unwrap_or(0);
+            self.admission.events.emit(match holding {
+                Holding::Slot { class, position } => Event::WaitingForSlot {
+                    class: class.to_string(),
+                    position,
+                    waited_s,
+                },
+                Holding::Disk(short) => Event::WaitingForDisk {
+                    volume: short.volume,
+                    available: short.available,
+                    floor: short.floor,
+                    reserved: short.reserved,
+                },
             });
         }
         sleeper.sleep(self.admission.poll);
@@ -610,7 +723,7 @@ mod slots {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
 
-    use super::{Gate, HeavyAdmission, LeaseStop, Queue};
+    use super::{Gate, HeavyAdmission, Holding, LeaseStop, Queue};
 
     /// What a try at the slots found.
     pub(super) enum Taken {
@@ -734,8 +847,10 @@ mod slots {
             // the coordinator does not take the lease for abandoned.
             let _ = gate.heartbeat(lease);
             queue.wait(
-                "host_slot",
-                missing as usize,
+                Holding::Slot {
+                    class: "host_slot",
+                    position: missing as usize,
+                },
                 cancel,
                 admission.sleeper.as_ref(),
             )?;

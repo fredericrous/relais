@@ -42,7 +42,7 @@ pub use task_types::{
     ExportedTasks, ImportedTaskTypes, StoredTaskType, TaskExportRow, TaskTypeSource,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 39;
+pub const LEDGER_SCHEMA_VERSION: u64 = 40;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -2045,6 +2045,20 @@ const MIGRATIONS: &[(&str, &str)] = &[
     );
     "#,
     ),
+    (
+        // The disk each check label grew its tree by the last time it ran
+        // (plan B3, SPEC §23): the estimate the coordinator reserves for
+        // the next lease of the same label. Expand-only: one new table,
+        // nothing an older binary reads, no existing value rewritten.
+        "v40",
+        r#"
+    CREATE TABLE check_disk_growth (
+        label TEXT PRIMARY KEY,
+        bytes INTEGER NOT NULL,
+        recorded_at TEXT NOT NULL
+    );
+    "#,
+    ),
 ];
 
 /// `advice_p_approve, advice_model, advice_revision, advice_null_reason`.
@@ -3119,6 +3133,25 @@ pub struct GroupBindingRow {
     pub pgid: u32,
     pub leader_started: Option<String>,
     pub tokens: u32,
+}
+
+/// The ledger is where a check's measured growth is kept (SPEC §23).
+impl crate::disk::Growth for Ledger {
+    fn last(&self, label: &str) -> Option<u64> {
+        match self.check_disk_growth(label) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("relais: the disk estimate of `{label}` could not be read: {e}");
+                None
+            }
+        }
+    }
+
+    fn record(&self, label: &str, bytes: u64) {
+        if let Err(e) = self.record_check_disk_growth(label, bytes) {
+            eprintln!("relais: the disk growth of `{label}` could not be recorded: {e}");
+        }
+    }
 }
 
 impl Ledger {
@@ -5556,6 +5589,37 @@ impl Ledger {
             });
         }
         Ok(out)
+    }
+
+    /// The bytes the check `label` grew its tree by the last time it ran,
+    /// if it was ever measured.
+    pub fn check_disk_growth(&self, label: &str) -> Result<Option<u64>> {
+        let bytes: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT bytes FROM check_disk_growth WHERE label = ?1",
+                [label],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(bytes.map(|bytes| u64::try_from(bytes).unwrap_or(0)))
+    }
+
+    /// Remember how far the check `label` grew its tree this time; the
+    /// next lease of the label reserves this much.
+    pub fn record_check_disk_growth(&self, label: &str, bytes: u64) -> Result<()> {
+        let tx = self.write_tx()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO check_disk_growth (label, bytes, recorded_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                label,
+                i64::try_from(bytes).unwrap_or(i64::MAX),
+                self.clock.now_rfc3339()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Count one more start of this run's runner and say which one it is:
@@ -11708,6 +11772,33 @@ mod tests {
             .expect("count");
         assert_eq!(applied, 26, "the ledger stays at v26");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_checks_disk_growth_is_kept_per_label_and_replaced_by_the_latest() {
+        let (ledger, _dir) = temp_ledger();
+        assert_eq!(ledger.check_disk_growth("make test").expect("read"), None);
+        ledger
+            .record_check_disk_growth("make test", 10)
+            .expect("record");
+        ledger
+            .record_check_disk_growth("make lint", 3)
+            .expect("record");
+        assert_eq!(
+            ledger.check_disk_growth("make test").expect("read"),
+            Some(10)
+        );
+        ledger
+            .record_check_disk_growth("make test", 42)
+            .expect("record");
+        assert_eq!(
+            ledger.check_disk_growth("make test").expect("read"),
+            Some(42)
+        );
+        assert_eq!(
+            ledger.check_disk_growth("make lint").expect("read"),
+            Some(3)
+        );
     }
 
     #[test]

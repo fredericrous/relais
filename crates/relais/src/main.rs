@@ -3571,10 +3571,11 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
             // same file and the same parse as the concurrency limits
             // above it, rather than left at `AdmissionState`'s own
             // fallback regardless of what machine.toml states.
-            let (limits, agent_lease_ttl) = match std::fs::read_to_string(&path) {
+            let (limits, agent_lease_ttl, disk_floor) = match std::fs::read_to_string(&path) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
                     coordinator::effective_limits(&Default::default()),
                     Duration::from_secs(HookAdmissionSettings::default().binding_lease_secs),
+                    relais::disk::DEFAULT_MIN_FREE_BYTES,
                 ),
                 Err(cause) => {
                     return Err(CliError::Read {
@@ -3587,6 +3588,7 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
                     Ok(machine) => (
                         coordinator::effective_limits(&machine.concurrency),
                         Duration::from_secs(machine.admission.binding_lease_secs),
+                        machine.resources.min_free_bytes(),
                     ),
                     Err(e) => {
                         eprintln!(
@@ -3619,7 +3621,13 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
                     None
                 }
             };
-            match coordinator::run_daemon(&socket, limits, ledger.as_ref(), agent_lease_ttl) {
+            match coordinator::run_daemon(
+                &socket,
+                limits,
+                ledger.as_ref(),
+                agent_lease_ttl,
+                disk_floor,
+            ) {
                 Ok(()) => Ok(CliOutcome::Accepted),
                 Err(e) => {
                     eprintln!("relais coordinator: {e}");
