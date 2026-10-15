@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.24.1
+
 `relais resume --retire` works in a repository that ignores `.relais` (relais's own does). Staging the worktree named `.relais` in an exclude pathspec, and git exits 1 when a pathspec names an ignored path, so retiring an interrupted in-place run failed and every later run in that worktree was refused with `workspace_has_interrupted_run`. The exclude is now left out when `.relais` is already ignored, since `add -A` never adds it then.
 
 ## v0.24.0
