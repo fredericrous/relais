@@ -73,6 +73,11 @@ timeout_seconds = 1800
 # Off by default: only a profile with no undeclared external dependency
 # and no nondeterministic check is safe to cache.
 # cache_baseline = true
+#
+# On since relais 0.24.0, which caches only an all-green base, so a flaky
+# failure is never kept as pre-existing.
+[verification.profiles.default]
+cache_baseline = true
 
 # Risk floors: writes touching these patterns cannot route below the
 # minimum tier, and the review requirement here is a floor, not a hint.

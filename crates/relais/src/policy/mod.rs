@@ -3137,9 +3137,9 @@ timeout_seconds = 60
             .expect("this repository's own relais.toml parses");
         assert_eq!(
             own.authority_hash(),
-            "5e3a12d5df507c3783544df03b8434bd7e3dedf941accac28f3f56a805afd27e",
-            "the hash of this repository's own policy must not move (it moved once, deliberately, \
-when the per-type recipes were seeded)"
+            "200bcd5d6cb35a9243529c5b1e9621a72b1e70110cf53b866095b413eaa3332c",
+            "the hash of this repository's own policy must not move (it moved deliberately twice: \
+when the per-type recipes were seeded, and when `cache_baseline` was turned on)"
         );
         let tiered = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
         assert_eq!(
