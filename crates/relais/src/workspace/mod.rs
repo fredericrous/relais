@@ -530,13 +530,12 @@ impl TaskWorktree {
             .split('\0')
             .filter_map(|entry| entry.split_once('\t').map(|(_, path)| path))
             .collect();
-        let mut open: Vec<String> = conflicted
-            .iter()
-            .filter(|path| {
-                unmerged.contains(path.as_str()) || has_conflict_marker(&self.path.join(path))
-            })
-            .cloned()
-            .collect();
+        let mut open = Vec::new();
+        for path in conflicted {
+            if unmerged.contains(path.as_str()) || has_conflict_marker(&self.path.join(path))? {
+                open.push(path.clone());
+            }
+        }
         open.sort();
         Ok(open)
     }
@@ -633,18 +632,21 @@ impl std::fmt::Display for OutOfScope {
     }
 }
 
-/// Does this file hold a git conflict marker line? An unreadable or absent
-/// file (the path was resolved by deleting it) holds none.
-fn has_conflict_marker(path: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(path) else {
-        return false;
+/// Does this file hold a git conflict marker line? An absent file (the path
+/// was resolved by deleting it) holds none; a file that cannot be read is an
+/// error, never a pass.
+fn has_conflict_marker(path: &Path) -> Result<bool> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(WorkspaceError::Io(e)),
     };
-    String::from_utf8_lossy(&bytes).lines().any(|line| {
+    Ok(String::from_utf8_lossy(&bytes).lines().any(|line| {
         ["<<<<<<<", ">>>>>>>"].iter().any(|marker| {
             line.strip_prefix(marker)
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
         })
-    })
+    }))
 }
 
 /// Protected repository configuration (SPEC §8): changes here are rejected
@@ -1515,6 +1517,33 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_marker_check_on_an_absent_file_passes_and_on_an_unreadable_one_fails() {
+        let dir = crate::test_support::temp_dir("marker-read");
+        assert!(!has_conflict_marker(&dir.join("deleted.rs")).expect("absent is no marker"));
+        let marked = dir.join("marked.rs");
+        std::fs::write(&marked, "a\n<<<<<<< ours\nb\n").expect("write");
+        assert!(has_conflict_marker(&marked).expect("readable"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = dir.join("locked.rs");
+            std::fs::write(&locked, "<<<<<<< ours\n").expect("write");
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod");
+            // Root reads anything; the check is only meaningful when the read
+            // is really refused.
+            if std::fs::read(&locked).is_err() {
+                assert!(matches!(
+                    has_conflict_marker(&locked),
+                    Err(WorkspaceError::Io(_))
+                ));
+            }
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod back");
+        }
+    }
 
     fn temp_repo() -> (crate::test_support::TempDir, PathBuf) {
         let dir = crate::test_support::temp_dir("ws");
