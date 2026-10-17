@@ -42,7 +42,7 @@ pub use task_types::{
     ExportedTasks, ImportedTaskTypes, StoredTaskType, TaskExportRow, TaskTypeSource,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 37;
+pub const LEDGER_SCHEMA_VERSION: u64 = 38;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -2002,6 +2002,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         landing_sha TEXT NOT NULL,
         landed_at TEXT NOT NULL,
         found_at TEXT NOT NULL
+    );
+    "#,
+    ),
+    (
+        // How far a landing search got without finding the landing, so the
+        // next pass resumes there. Additive; nothing reads it but detection.
+        "v38",
+        r#"
+    CREATE TABLE landing_searches (
+        run_id TEXT PRIMARY KEY REFERENCES runs(id),
+        searched_to TEXT NOT NULL,
+        searched_at TEXT NOT NULL
     );
     "#,
     ),
@@ -4484,6 +4496,41 @@ impl Ledger {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?)
+    }
+
+    /// Keep where a run's landing search got to: the last commit checked
+    /// that did not reverse-apply. A later search replaces it.
+    pub fn record_landing_search(&self, run_id: &RunId, searched_to: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO landing_searches (run_id, searched_to, searched_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(run_id) DO UPDATE SET
+                 searched_to = excluded.searched_to,
+                 searched_at = excluded.searched_at",
+            params![run_id.as_str(), searched_to, self.now()],
+        )?;
+        Ok(())
+    }
+
+    /// The commit a run's landing search got to, if one is kept.
+    pub fn landing_search_of(&self, run_id: &RunId) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT searched_to FROM landing_searches WHERE run_id = ?1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Drop a run's kept search cursor.
+    pub fn clear_landing_search(&self, run_id: &RunId) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM landing_searches WHERE run_id = ?1",
+            [run_id.as_str()],
+        )?;
+        Ok(())
     }
 
     /// [`Self::record_salvage`], also recording whether the run's verified
@@ -7405,6 +7452,28 @@ mod tests {
             ledger.schema_version().expect("version"),
             LEDGER_SCHEMA_VERSION
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_landing_search_cursor_is_kept_replaced_and_deleted() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-s"), "/repo", None, &task("run-s"), "rk")
+            .expect("run");
+        assert_eq!(ledger.landing_search_of(&run("run-s")).expect("read"), None);
+        ledger
+            .record_landing_search(&run("run-s"), "aaa")
+            .expect("first");
+        ledger
+            .record_landing_search(&run("run-s"), "bbb")
+            .expect("second");
+        assert_eq!(
+            ledger.landing_search_of(&run("run-s")).expect("read"),
+            Some("bbb".to_string())
+        );
+        ledger.clear_landing_search(&run("run-s")).expect("delete");
+        assert_eq!(ledger.landing_search_of(&run("run-s")).expect("read"), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 

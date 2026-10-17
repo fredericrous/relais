@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+Revert detection no longer repeats a landing search (ledger schema v38, table `landing_searches`, decisions ADR-0036). A search that finds no landing keeps a cursor, the last first-parent commit on which the patch was checked and did not reverse-apply, and the next pass resumes from it when git confirms it is still an ancestor of the tip; the detection report line adds `N resumed` and `N cursor lost`. A relais from before schema 38 cannot read the upgraded ledger. Before upgrading, stop the coordinator and copy the ledger with `sqlite3 <state>/ledger.sqlite ".backup <file>"` (`<state>` is relais's state directory, `~/.local/state/relais` by default). To roll back, stop the coordinator again and restore that copy, only with the person's yes.
+
 ## v0.25.0
 
 Revert detection records where a run's accepted change landed (ledger schema v37, table `landings`, decisions ADR-0036), so later passes start the log at the landing instead of searching for it again. The first landing found is kept, and a contained salvage records its candidate as the landing when it is decided. A relais from before schema 37 cannot read the upgraded ledger. Before upgrading, stop the coordinator and copy the ledger with `sqlite3 <state>/ledger.sqlite ".backup <file>"` (`<state>` is relais's state directory, `~/.local/state/relais` by default). To roll back, stop the coordinator again and restore that copy, only with the person's yes.

@@ -15,6 +15,11 @@
 //! landing. Only `git log --first-parent <end>..<tip> -- <patch paths>`
 //! is walked.
 //!
+//! A search that finds no landing keeps a cursor, the last first-parent
+//! commit on which the patch was checked and did not reverse-apply, and
+//! the next pass resumes from it when git confirms it is still an
+//! ancestor of the tip.
+//!
 //! What is pure (patch paths, log parsing, the message and rename tests) is
 //! apart from what runs git ([`inspect`]) and from what writes the ledger
 //! ([`detect`]). Every git call is counted against a per-run and a
@@ -65,6 +70,10 @@ pub struct RevertReport {
     pub off: bool,
     /// `reverted` rows written.
     pub recorded: usize,
+    /// Runs whose search resumed from a kept cursor.
+    pub resumed: usize,
+    /// Runs whose kept cursor was no longer an ancestor of the tip.
+    pub cursor_lost: usize,
     pub elapsed: Duration,
 }
 
@@ -99,12 +108,15 @@ impl RevertReport {
         }
         format!(
             "revert detection: {} run(s) scanned, {} git call(s), {} skipped (call cap), \
-             {} unknown (repository or patch unreachable), {} recorded, {:.1} s",
+             {} unknown (repository or patch unreachable), {} recorded, \
+             {} resumed, {} cursor lost, {:.1} s",
             self.scanned,
             self.git_calls,
             self.skipped,
             self.unknown,
             self.recorded,
+            self.resumed,
+            self.cursor_lost,
             self.elapsed.as_secs_f64()
         )
     }
@@ -228,23 +240,45 @@ impl Meter {
     }
 }
 
-/// Run git in `repo` and return its stdout.
-fn git_text(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+/// The git invocation every call here shares.
+fn git_command(repo: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
         .current_dir(repo)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .args(["-c", "core.quotepath=off"])
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    command
+}
+
+/// Whether `ancestor` is an ancestor of `tip`: exit 0 yes, exit 1 no, any
+/// other failure is unknown.
+fn is_ancestor(repo: &Path, ancestor: &str, tip: &str) -> Result<bool, String> {
+    let args = ["merge-base", "--is-ancestor", ancestor, tip];
+    let output = git_command(repo, &args)
         .output()
-        .map_err(|e| {
-            format!(
-                "git {}: could not run git: {e}",
-                args.first().unwrap_or(&"")
-            )
-        })?;
+        .map_err(|e| format!("git merge-base: could not run git: {e}"))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git merge-base: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+/// Run git in `repo` and return its stdout.
+fn git_text(repo: &Path, args: &[&str]) -> Result<String, String> {
+    let output = git_command(repo, args).output().map_err(|e| {
+        format!(
+            "git {}: could not run git: {e}",
+            args.first().unwrap_or(&"")
+        )
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -279,42 +313,63 @@ fn checked(
     }
 }
 
+/// What a search left behind besides its finding: the landing it found, the
+/// cursor to keep, and how the kept cursor fared.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Trail {
+    /// The landing the walk itself found (never one it was given).
+    found: Option<Commit>,
+    /// The last commit checked that did not reverse-apply.
+    cursor: Option<String>,
+    /// The given cursor was confirmed and the walk started from it.
+    resumed: bool,
+    /// The given cursor was not an ancestor of the tip and was dropped.
+    lost: bool,
+}
+
+/// A finding with its trail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Inspected {
+    finding: Finding,
+    trail: Trail,
+}
+
+impl Inspected {
+    fn unknown(reason: String) -> Self {
+        Self {
+            finding: Finding::Unknown(reason),
+            trail: Trail::default(),
+        }
+    }
+}
+
 /// Walk one run's history and say whether its candidate landed and was
-/// undone in time, starting at a recorded landing if any; also returning the landing
-/// the walk itself found (never one it was given).
+/// undone in time, starting at a recorded landing if any, else at a kept
+/// cursor.
 fn inspect_from(
     repo: &Path,
     patch: &Path,
     ended_at: DateTime<Utc>,
     recorded: Option<&Commit>,
+    given_cursor: Option<&str>,
     meter: &mut Meter,
-) -> (Finding, Option<Commit>) {
-    let walked = walk(repo, patch, ended_at, recorded, meter);
-    let finding = match walked.result {
+) -> Inspected {
+    let mut trail = Trail::default();
+    let result = scan(
+        repo,
+        patch,
+        ended_at,
+        recorded,
+        given_cursor,
+        meter,
+        &mut trail,
+    );
+    let finding = match result {
         Ok(finding) => finding,
         Err(Stop::Unknown(reason)) => Finding::Unknown(reason),
         Err(Stop::Skipped) => Finding::Skipped,
     };
-    (finding, walked.found)
-}
-
-/// What a walk decided, and the landing it found on the way (even when it
-/// then stopped), for the caller to record.
-struct Walked {
-    result: Result<Finding, Stop>,
-    found: Option<Commit>,
-}
-
-fn walk(
-    repo: &Path,
-    patch: &Path,
-    ended_at: DateTime<Utc>,
-    recorded: Option<&Commit>,
-    meter: &mut Meter,
-) -> Walked {
-    let mut found = None;
-    let result = scan(repo, patch, ended_at, recorded, meter, &mut found);
-    Walked { result, found }
+    Inspected { finding, trail }
 }
 
 fn scan(
@@ -322,8 +377,9 @@ fn scan(
     patch: &Path,
     ended_at: DateTime<Utc>,
     recorded: Option<&Commit>,
+    given_cursor: Option<&str>,
     meter: &mut Meter,
-    found: &mut Option<Commit>,
+    trail: &mut Trail,
 ) -> Result<Finding, Stop> {
     let patch_text = std::fs::read_to_string(patch)
         .map_err(|e| Stop::Unknown(format!("{}: {e}", patch.display())))?;
@@ -354,10 +410,26 @@ fn scan(
         ],
     )?;
     let tip = salvage::default_tip(&refs);
-    let range = match recorded {
+    let confirmed = match (recorded, given_cursor) {
+        (None, Some(cursor)) => {
+            meter.spend(1)?;
+            if is_ancestor(repo, cursor, &tip).map_err(Stop::Unknown)? {
+                trail.cursor = Some(cursor.to_string());
+                trail.resumed = true;
+                Some(cursor)
+            } else {
+                trail.lost = true;
+                None
+            }
+        }
+        _ => None,
+    };
+    let range = match (recorded, confirmed) {
         // The landing is known: only what came after it can undo it.
-        Some(landing) => format!("{}..{tip}", landing.sha),
-        None => {
+        (Some(landing), _) => format!("{}..{tip}", landing.sha),
+        // Nothing before the cursor reverse-applied.
+        (None, Some(cursor)) => format!("{cursor}..{tip}"),
+        (None, None) => {
             let end = metered_git(
                 meter,
                 repo,
@@ -392,8 +464,10 @@ fn scan(
     for commit in commits {
         let Some(landed) = &landing else {
             if checked(meter, repo, patch, &commit.sha, Direction::Reverse)? {
-                *found = Some(commit.clone());
+                trail.found = Some(commit.clone());
                 landing = Some(commit);
+            } else {
+                trail.cursor = Some(commit.sha);
             }
             continue;
         };
@@ -492,17 +566,34 @@ pub fn detect_if(
 /// Look for detected reverts among the runs that ended in the last
 /// [`WINDOW_DAYS`] days as of `now`, and record each.
 pub fn detect(ledger: &Ledger, now: DateTime<Utc>) -> Result<RevertReport, LedgerError> {
+    detect_capped(ledger, now, CALLS_PER_RUN)
+}
+
+/// [`detect`] with `per_run` git calls to a run.
+fn detect_capped(
+    ledger: &Ledger,
+    now: DateTime<Utc>,
+    per_run: usize,
+) -> Result<RevertReport, LedgerError> {
     let started = Instant::now();
     let since = (now - TimeDelta::days(WINDOW_DAYS)).to_rfc3339();
     let mut report = RevertReport::default();
     let mut build_left = CALLS_PER_BUILD;
     for candidate in ledger.revert_candidates(&since)? {
         report.scanned += 1;
-        let mut meter = Meter::new(CALLS_PER_RUN.min(build_left));
-        let (finding, found) = inspect_candidate(ledger, &candidate, &mut meter)?;
-        if let Some(landing) = &found {
-            ledger.record_landing(&candidate.run, &landing.sha, &landing.at.to_rfc3339())?;
+        let mut meter = Meter::new(per_run.min(build_left));
+        let Inspected { finding, trail } = inspect_candidate(ledger, &candidate, &mut meter)?;
+        match (&trail.found, &trail.cursor) {
+            (Some(landing), _) => {
+                ledger.record_landing(&candidate.run, &landing.sha, &landing.at.to_rfc3339())?;
+                ledger.clear_landing_search(&candidate.run)?;
+            }
+            (None, Some(cursor)) => ledger.record_landing_search(&candidate.run, cursor)?,
+            (None, None) if trail.lost => ledger.clear_landing_search(&candidate.run)?,
+            (None, None) => {}
         }
+        report.resumed += usize::from(trail.resumed);
+        report.cursor_lost += usize::from(trail.lost);
         build_left -= meter.spent;
         report.git_calls += meter.spent;
         match finding {
@@ -540,8 +631,8 @@ fn inspect_candidate(
     ledger: &Ledger,
     candidate: &RevertCandidate,
     meter: &mut Meter,
-) -> Result<(Finding, Option<Commit>), LedgerError> {
-    let unknown = |reason: String| Ok((Finding::Unknown(reason), None));
+) -> Result<Inspected, LedgerError> {
+    let unknown = |reason: String| Ok(Inspected::unknown(reason));
     let Some(repo) = salvage::reachable_repo(&candidate.repo_path) else {
         return unknown(format!(
             "no repository at {}",
@@ -575,11 +666,16 @@ fn inspect_candidate(
             })
         }
     };
+    let cursor = match recorded {
+        Some(_) => None,
+        None => ledger.landing_search_of(&candidate.run)?,
+    };
     Ok(inspect_from(
         &repo,
         &patch,
         ended_at,
         recorded.as_ref(),
+        cursor.as_deref(),
         meter,
     ))
 }
@@ -593,7 +689,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn inspect(repo: &Path, patch: &Path, ended_at: DateTime<Utc>, meter: &mut Meter) -> Finding {
-        inspect_from(repo, patch, ended_at, None, meter).0
+        inspect_from(repo, patch, ended_at, None, None, meter).finding
     }
 
     const BASE: &str = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
@@ -1060,6 +1156,106 @@ mod tests {
             Finding::Skipped
         );
         assert_eq!(meter.spent, 0);
+    }
+
+    /// Edit a line of `a.txt` the candidate does not touch, and commit.
+    fn edit_elsewhere(w: &World, date: &str, from: &str, to: &str) -> String {
+        let current = std::fs::read_to_string(w.root.join("a.txt")).unwrap();
+        std::fs::write(w.root.join("a.txt"), current.replace(from, to)).unwrap();
+        w.commit(date, &format!("edit {from}"))
+    }
+
+    fn cursor_of(w: &World) -> Option<String> {
+        w.ledger
+            .landing_search_of(&RunId::from_stored("run-a"))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_second_pass_with_nothing_new_makes_three_calls_and_no_check() {
+        let w = world("revert-cursor-idle", &day(3));
+        let last = edit_elsewhere(&w, &day(6), "nine", "9");
+        let first = detect(&w.ledger, now()).unwrap();
+        assert!(first.git_calls > 3, "{first:?}");
+        assert_eq!(cursor_of(&w), Some(last));
+        // for-each-ref, merge-base --is-ancestor, log: no rev-list, no check.
+        let second = detect(&w.ledger, now()).unwrap();
+        assert_eq!(second.git_calls, 3, "{second:?}");
+        assert_eq!((second.resumed, second.cursor_lost), (1, 0));
+    }
+
+    #[test]
+    fn a_run_cut_off_by_the_cap_resumes_and_finds_the_landing_past_it() {
+        let w = world("revert-cursor-cap", &day(3));
+        let first_edit = edit_elsewhere(&w, &day(6), "nine", "9");
+        let second_edit = edit_elsewhere(&w, &day(7), "ten", "10");
+        let landing = w.land(&day(8));
+        // for-each-ref, rev-list, log, one check: the second check is cut.
+        let one = detect_capped(&w.ledger, now(), 5).unwrap();
+        assert_eq!((one.skipped, one.git_calls), (1, 5), "{one:?}");
+        assert_eq!(cursor_of(&w), Some(first_edit));
+        assert_eq!(
+            w.ledger.landing_of(&RunId::from_stored("run-a")).unwrap(),
+            None
+        );
+        // for-each-ref, merge-base, log, then two checks reach the landing.
+        let two = detect_capped(&w.ledger, now(), 5).unwrap();
+        assert_eq!((two.skipped, two.resumed), (1, 1), "{two:?}");
+        assert_eq!(cursor_of(&w), Some(second_edit));
+        let three = detect_capped(&w.ledger, now(), 7).unwrap();
+        assert_eq!((three.skipped, three.resumed), (0, 1), "{three:?}");
+        let run = RunId::from_stored("run-a");
+        assert_eq!(w.ledger.landing_of(&run).unwrap().unwrap().0, landing);
+        assert_eq!(cursor_of(&w), None);
+    }
+
+    #[test]
+    fn a_landing_after_the_cursor_is_recorded_and_leaves_no_cursor() {
+        let w = world("revert-cursor-landing", &day(3));
+        edit_elsewhere(&w, &day(6), "nine", "9");
+        detect(&w.ledger, now()).unwrap();
+        assert!(cursor_of(&w).is_some());
+        let landing = w.land(&day(8));
+        detect(&w.ledger, now()).unwrap();
+        let run = RunId::from_stored("run-a");
+        assert_eq!(w.ledger.landing_of(&run).unwrap().unwrap().0, landing);
+        assert_eq!(cursor_of(&w), None);
+    }
+
+    #[test]
+    fn an_unknown_after_progress_keeps_the_last_commit_that_failed_to_reverse_apply() {
+        let w = world("revert-cursor-unknown", &day(3));
+        let first = edit_elsewhere(&w, &day(6), "nine", "9");
+        std::fs::create_dir_all(w.root.join("other")).unwrap();
+        std::fs::write(w.root.join("other/x.txt"), "x\n").unwrap();
+        edit_elsewhere(&w, &day(7), "ten", "10");
+        // Lose a tree the log never opens (it filters on a.txt) but the
+        // check's read-tree must.
+        let tree = run_git_at(&w.root, &day(7), &["rev-parse", "HEAD:other"]);
+        let object = w
+            .root
+            .join(".git/objects")
+            .join(&tree[..2])
+            .join(&tree[2..]);
+        std::fs::remove_file(&object).unwrap();
+        let report = detect(&w.ledger, now()).unwrap();
+        assert_eq!(report.unknown, 1, "{report:?}");
+        assert_eq!(cursor_of(&w), Some(first));
+    }
+
+    #[test]
+    fn a_cursor_that_is_not_an_ancestor_of_the_tip_is_dropped_and_the_search_restarts() {
+        let w = world("revert-cursor-lost", &day(3));
+        run_git_at(&w.root, &day(5), &["checkout", "-q", "-b", "other"]);
+        let stray = edit_elsewhere(&w, &day(5), "nine", "9");
+        run_git_at(&w.root, &day(5), &["checkout", "-q", "main"]);
+        let run = RunId::from_stored("run-a");
+        w.ledger.record_landing_search(&run, &stray).unwrap();
+        let on_main = edit_elsewhere(&w, &day(6), "ten", "10");
+        let report = detect(&w.ledger, now()).unwrap();
+        assert_eq!((report.cursor_lost, report.resumed), (1, 0), "{report:?}");
+        // The search began again at the run's end and kept a fresh cursor.
+        assert_eq!(cursor_of(&w), Some(on_main));
     }
 
     #[test]
