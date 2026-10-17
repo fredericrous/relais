@@ -4335,6 +4335,13 @@ fn init_detect_command(
         return Ok(CliOutcome::OperationalFailure);
     }
     let mut proposal = relais::repo::detect_policy(&root);
+    // Diagnostics, on stderr: stdout stays the proposal alone.
+    for note in &proposal.notes {
+        eprintln!(
+            "relais init --detect: {}",
+            relais::repo::escape_control(note)
+        );
+    }
     if let Some(text) = command {
         match relais::repo::parse_command_text(text) {
             Ok(argv) => proposal = proposal.with_command(argv, "--command"),

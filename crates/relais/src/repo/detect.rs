@@ -4,11 +4,16 @@
 //! Only TEXT is read. Nothing here runs `make -n`, `npm`, or any other
 //! program of the repository's: GNU make evaluates `$(shell …)` while it
 //! parses a Makefile, so even asking make which targets exist would run
-//! repository code before a person agreed to anything. A proposal is a
+//! repository code before a person agreed to anything. The one program run
+//! is the person's own `amont`, from PATH, asked what it declares
+//! (`amont list --json`, which reads its configuration and runs no check):
+//! amont owns its configuration's grammar, so relais does not parse it
+//! (decisions ADR-0037). A proposal is a
 //! suggestion; what the person accepts is written to `relais.toml` and
 //! hashed into the trust grant like any hand-written policy (SPEC §5).
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -53,6 +58,11 @@ pub struct Proposal {
     /// The `relais.toml` this proposal writes. Kept in step with the
     /// fields above: every constructor renders it.
     pub toml: String,
+    /// What detection itself wants a person to know, one line each: a
+    /// degraded way of reading the repository, say. Diagnostics, not part
+    /// of the proposal; absent from JSON when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 impl Proposal {
@@ -77,10 +87,16 @@ impl Proposal {
 /// Read the repository at `root` and propose a policy. Pure text
 /// parsing: no file is written and no program is run.
 pub fn detect_policy(root: &Path) -> Proposal {
+    detect_policy_with(root, crate::tooling::which("amont").as_deref())
+}
+
+/// [`detect_policy`], with the `amont` it asks named (`None`: not on PATH).
+fn detect_policy_with(root: &Path, amont: Option<&Path>) -> Proposal {
     let mut skipped = Vec::new();
+    let mut notes = Vec::new();
     let commands = detect_commands(root, &mut skipped);
     let setup = detect_setup(root, &mut skipped);
-    skipped.extend(amont_gates(root));
+    skipped.extend(amont_gates(root, amont, &mut notes));
     let integrations = ProposedIntegrations {
         amont: required_if(root.join("amont.conf").is_file()),
         aval: required_if(root.join(".adr.yaml").is_file()),
@@ -94,6 +110,7 @@ pub fn detect_policy(root: &Path) -> Proposal {
         skipped,
         integrations,
         toml,
+        notes,
     }
 }
 
@@ -268,14 +285,80 @@ fn detect_setup(root: &Path, skipped: &mut Vec<Skipped>) -> Vec<ProposedCommand>
     setup
 }
 
-/// amont.conf `block` gates: seen, never proposed. Their command column
-/// is a shell line, and a policy names argv, never shell recipes
-/// (SPEC §6).
-fn amont_gates(root: &Path) -> Vec<Skipped> {
+/// How long `amont list --json` may take before relais reads the file
+/// itself.
+const AMONT_LIST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// amont's declared `block` checks: seen, never proposed. Their command
+/// column is a shell line, and a policy names argv, never shell recipes
+/// (SPEC §6). amont is asked: declared checks whose line says `block`
+/// (see [`declares_block`]), so neither a machine's `amont.severity.*`
+/// overrides nor whether this clone trusts its `amont.conf` changes the
+/// answer. Without a usable answer the file is read directly, and a note
+/// says so.
+fn amont_gates(root: &Path, amont: Option<&Path>, notes: &mut Vec<String>) -> Vec<Skipped> {
+    if !root.join("amont.conf").is_file() {
+        return Vec::new();
+    }
+    let why = match amont {
+        None => "amont not found".to_string(),
+        Some(bin) => match amont_list(bin, root) {
+            Ok(gates) => return gates,
+            Err(why) => why,
+        },
+    };
+    notes.push(format!("{why}; reading amont.conf directly (deprecated)"));
+    amont_conf_gates(root)
+}
+
+/// The declared block checks, as `amont list --json` reports them.
+fn amont_list(bin: &Path, root: &Path) -> Result<Vec<Skipped>, String> {
+    let mut command = std::process::Command::new(bin);
+    command.args(["list", "--json"]).current_dir(root);
+    let end = crate::procs::run_with_timeout(command, AMONT_LIST_TIMEOUT, None, None)
+        .map_err(|e| format!("amont list --json could not run: {e}"))?;
+    if !end.ended.succeeded() {
+        return Err(format!(
+            "amont list --json ended with {}",
+            end.ended.describe()
+        ));
+    }
+    let listing: serde_json::Value = serde_json::from_str(&end.stdout)
+        .map_err(|_| "amont list --json printed no JSON".to_string())?;
+    if listing["format"] != "amont-list-v1" {
+        return Err("amont list --json is not amont-list-v1".into());
+    }
+    let checks = listing["checks"]
+        .as_array()
+        .ok_or("amont list --json listed no checks")?;
+    let mut gates: Vec<Skipped> = checks
+        .iter()
+        .filter(|c| c["source"] == "declared" && declares_block(c))
+        .filter_map(|c| Some(gate(c["stage"].as_str()?, c["short_name"].as_str()?)))
+        .collect();
+    gates.sort_by(|a, b| a.what.cmp(&b.what));
+    Ok(gates)
+}
+
+/// Does this listing entry's `amont.conf` line say `block`? Its
+/// `manifest_severity` (amont 1.58) is the line's own word, trusted or not;
+/// `declared_severity` reads `warn` for a check that cannot run, an
+/// untrusted one included, and serves only an amont that predates it.
+fn declares_block(check: &serde_json::Value) -> bool {
+    match check.get("manifest_severity") {
+        Some(severity) => severity == "block",
+        None => check["declared_severity"] == "block",
+    }
+}
+
+/// The fallback: amont.conf's `block` lines, read as text. Deprecated —
+/// the grammar is amont's — and kept for a machine without amont.
+fn amont_conf_gates(root: &Path) -> Vec<Skipped> {
     let Ok(text) = std::fs::read_to_string(root.join("amont.conf")) else {
         return Vec::new();
     };
-    text.lines()
+    let mut gates: Vec<Skipped> = text
+        .lines()
         .filter_map(|line| {
             let line = line.trim();
             if line.starts_with('#') {
@@ -283,14 +366,21 @@ fn amont_gates(root: &Path) -> Vec<Skipped> {
             }
             let fields: Vec<&str> = line.split_whitespace().collect();
             match fields.as_slice() {
-                [stage, name, _scope, "block", _command, ..] => Some(Skipped {
-                    what: format!("amont.conf: {stage} {name}"),
-                    reason: "not a plain command".into(),
-                }),
+                [stage, name, _scope, "block", _command, ..] => Some(gate(stage, name)),
                 _ => None,
             }
         })
-        .collect()
+        .collect();
+    gates.sort_by(|a, b| a.what.cmp(&b.what));
+    gates
+}
+
+/// One skipped gate, labelled the same whichever way it was read.
+fn gate(stage: &str, name: &str) -> Skipped {
+    Skipped {
+        what: format!("amont.conf: {stage} {name}"),
+        reason: "not a plain command".into(),
+    }
 }
 
 /// A TOML basic string, quoted and escaped.
@@ -617,20 +707,129 @@ mod tests {
         assert_eq!(argvs(&proposal.setup), [["uv", "sync", "--frozen"]]);
     }
 
-    #[test]
-    fn amont_block_gates_are_seen_and_not_proposed() {
-        let dir = repo(
-            "detect-amont",
+    const AMONT_CONF: &str = "# a comment block cargo test\npre-commit  cargo-test  *.rs  block  cargo test\npre-push  lint  *  warn  make lint\n";
+
+    fn amont_repo(label: &str) -> crate::test_support::TempDir {
+        repo(
+            label,
             &[
-                (
-                    "amont.conf",
-                    "# a comment block cargo test\npre-commit  cargo-test  *.rs  block  cargo test\npre-push  lint  *  warn  make lint\n",
-                ),
+                ("amont.conf", AMONT_CONF),
                 (".adr.yaml", "areas: []\n"),
                 ("Cargo.toml", "[package]\nname = \"x\"\n"),
             ],
+        )
+    }
+
+    /// A stand-in `amont` that prints `stdout` and exits with `code`.
+    #[cfg(unix)]
+    fn fake_amont(dir: &Path, stdout: &str, code: i32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("fake-amont");
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\ncat <<'EOF'\n{stdout}\nEOF\nexit {code}\n"),
+        )
+        .expect("fake amont");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        bin
+    }
+
+    /// What `amont list --json` says of [`AMONT_CONF`], with a builtin and
+    /// a machine override that must change nothing.
+    const LISTING: &str = r#"{"format":"amont-list-v1","checks":[
+        {"id":"pre-commit-ban-terms","short_name":"ban-terms","stage":"pre-commit","source":"builtin","declared_severity":"block","effective_severity":"block"},
+        {"id":"pre-push-lint","short_name":"lint","stage":"pre-push","source":"declared","declared_severity":"warn","effective_severity":"block"},
+        {"id":"pre-commit-cargo-test","short_name":"cargo-test","stage":"pre-commit","source":"declared","declared_severity":"block","manifest_severity":"block","effective_severity":"warn"}]}"#;
+
+    /// The same repository in a clone that has not trusted its `amont.conf`:
+    /// every declared check reads `warn`, and only `manifest_severity` keeps
+    /// the line's word.
+    const UNTRUSTED_LISTING: &str = r#"{"format":"amont-list-v1","checks":[
+        {"id":"pre-push-lint","short_name":"lint","stage":"pre-push","source":"declared","declared_severity":"warn","manifest_severity":"warn","status":"unusable"},
+        {"id":"pre-commit-cargo-test","short_name":"cargo-test","stage":"pre-commit","source":"declared","declared_severity":"warn","manifest_severity":"block","status":"unusable"}]}"#;
+
+    /// An amont before 1.58, which has no `manifest_severity`.
+    const OLD_LISTING: &str = r#"{"format":"amont-list-v1","checks":[
+        {"id":"pre-push-lint","short_name":"lint","stage":"pre-push","source":"declared","declared_severity":"warn"},
+        {"id":"pre-commit-cargo-test","short_name":"cargo-test","stage":"pre-commit","source":"declared","declared_severity":"block"}]}"#;
+
+    fn the_cargo_test_gate() -> Vec<Skipped> {
+        vec![Skipped {
+            what: "amont.conf: pre-commit cargo-test".into(),
+            reason: "not a plain command".into(),
+        }]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn amont_is_asked_for_its_declared_block_checks() {
+        let dir = amont_repo("detect-amont-asked");
+        let bin = fake_amont(&dir, LISTING, 0);
+        let proposal = detect_policy_with(&dir, Some(&bin));
+        // Declared severity, not effective: a machine's override is not the
+        // repository's declaration. Builtins are not the repository's.
+        assert_eq!(proposal.skipped, the_cargo_test_gate());
+        assert_eq!(proposal.notes, Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_untrusted_clone_and_an_older_amont_give_the_same_answer() {
+        for (label, listing) in [
+            ("detect-amont-untrusted", UNTRUSTED_LISTING),
+            ("detect-amont-old", OLD_LISTING),
+        ] {
+            let dir = amont_repo(label);
+            let bin = fake_amont(&dir, listing, 0);
+            let proposal = detect_policy_with(&dir, Some(&bin));
+            assert_eq!(proposal.skipped, the_cargo_test_gate(), "{label}");
+            assert_eq!(proposal.notes, Vec::<String>::new(), "{label}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_amont_that_cannot_answer_falls_back_to_the_file_and_says_why() {
+        for (label, stdout, code, why) in [
+            (
+                "detect-amont-fails",
+                LISTING,
+                1,
+                "amont list --json ended with exit 1",
+            ),
+            (
+                "detect-amont-garbage",
+                "not json",
+                0,
+                "amont list --json printed no JSON",
+            ),
+            (
+                "detect-amont-format",
+                r#"{"format":"amont-list-v2","checks":[]}"#,
+                0,
+                "amont list --json is not amont-list-v1",
+            ),
+        ] {
+            let dir = amont_repo(label);
+            let bin = fake_amont(&dir, stdout, code);
+            let proposal = detect_policy_with(&dir, Some(&bin));
+            assert_eq!(proposal.skipped, the_cargo_test_gate(), "{label}");
+            assert_eq!(
+                proposal.notes,
+                [format!("{why}; reading amont.conf directly (deprecated)")],
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn amont_block_gates_are_seen_and_not_proposed() {
+        let dir = amont_repo("detect-amont");
+        let proposal = detect_policy_with(&dir, None);
+        assert_eq!(
+            proposal.notes,
+            ["amont not found; reading amont.conf directly (deprecated)"]
         );
-        let proposal = detect_policy(&dir);
         assert_eq!(
             proposal.skipped,
             [Skipped {
