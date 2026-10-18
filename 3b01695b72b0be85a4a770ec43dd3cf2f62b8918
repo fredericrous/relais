@@ -1,0 +1,16 @@
+amont-provenance-v1
+commit bba786991a4f741205924f2dfd062e7c4c24f94e
+tree 3b01695b72b0be85a4a770ec43dd3cf2f62b8918
+canon 858cada737194793e9521a5ad764016f096f5db2
+patch 9062d240c0aad3f22c226db46d64e850a0fa7c69
+plan docs/plans/2026-10-17-harness-one-owner-per-concept.md a6c9874d253b6c0ecdc7d29dd09f9b0484fc8a81803f4db61e5a1d67af3a52a2
+review reviewed 0799c99f2bd019e0ac8319d7274022c64e4d2b0ea2315c84f76acfea3db78f47
+preview not-required
+producer amont-agent 2.43.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAEDdXGV5K3V7Q919iHRvxKbjsThahTD0Cf0qHtOll4Smydb8oa
+KO/dWexBBaPRCEXysrLEPGGYN21XM0Pu80E84J
+-----END SSH SIGNATURE-----
