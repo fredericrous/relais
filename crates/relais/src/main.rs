@@ -127,8 +127,8 @@ enum Command {
         #[arg(long = "command", value_name = "TEXT", requires = "detect")]
         command: Option<String>,
     },
-    /// Watch the runs that amont and amont-agent keep quiet
-    /// (docs/quiet-runs.md)
+    /// Watch the runs that amont and amont-agent keep quiet (entry:
+    /// amont docs/quiet-runs.md)
     Quiet {
         #[command(subcommand)]
         cmd: QuietCommand,

@@ -2,7 +2,8 @@
 // file. `relais quiet watch --protocol` (quiet-watch.ts) tells this module
 // about them as JSON lines; this file is the pure part: folding a line into
 // the runs, and choosing which of them the pane and status line draw.
-// Contract: docs/quiet-runs.md.
+// Contract: docs/quiet-runs.md (the protocol); the entry is amont's,
+// amont docs/quiet-runs.md.
 
 import { cutLine, mmss } from './timeline.ts'
 import type { ProtocolLine } from './lines.ts'
