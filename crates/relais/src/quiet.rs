@@ -1,7 +1,8 @@
 //! The watcher behind `relais quiet watch --protocol`: it polls the
 //! active-run directory that amont and amont-agent write one JSON entry
 //! into per quiet run, tails each run's log, and prints the protocol
-//! lines the plugin folds into its pane (`docs/quiet-runs.md`).
+//! lines the plugin folds into its pane (`docs/quiet-runs.md`; the entry
+//! itself is amont's contract, amont `docs/quiet-runs.md`).
 //!
 //! The calculations (line cutting, line splitting, the tail window) are
 //! pure; reading the directory and the logs and writing stdout stay in
@@ -60,7 +61,7 @@ pub fn active_dir(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     Some(state.join("quiet").join("active"))
 }
 
-/// One active-run entry file (`docs/quiet-runs.md`). Unknown fields are
+/// One active-run entry file (amont `docs/quiet-runs.md`). Unknown fields are
 /// ignored so a newer writer does not blind an older watcher.
 #[derive(Debug, Deserialize)]
 struct Entry {

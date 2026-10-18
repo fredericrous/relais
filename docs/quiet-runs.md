@@ -1,62 +1,35 @@
-# Quiet runs: the active-run entry and the watcher protocol
+# Quiet runs: the watcher protocol
 
 amont (`amont run`, pre-commit checks) and `amont-agent quiet` keep a
-check's output out of the agent's context: the output goes to a
-`.log.tmp` file. So that a person can still see such a run live, each
-tool writes one small JSON file while the run is active, and
-`relais quiet watch --protocol` turns those files into JSON lines the
-plugin draws in its pane. The tools never depend on the watcher.
+check's output out of the agent's context, and write one small JSON file
+while each such run is active. `relais quiet watch --protocol` turns those
+files into JSON lines the plugin draws in its pane. The writers never
+depend on the watcher.
 
-## The directory
+The file itself (its directory, its name, its fields and the `v` version
+token, how and when a writer writes and sweeps it) is amont's contract:
+amont `docs/quiet-runs.md` (decisions ADR-0039, `harness.cross-tool-reads`).
+This page says only what relais does with it.
 
-`$QUIET_ACTIVE_DIR` when set (every test sets it), else
-`${XDG_STATE_HOME:-$HOME/.local/state}/quiet/active`, and
-`%LOCALAPPDATA%\quiet\active` on Windows. The directory is 0700.
+## What the watcher does with an entry
 
-## The entry file
-
-`<pid>-<n>.json`, 0600, written atomically (a temp file that does not end
-in `.json` or whose name starts with `.`, then a rename); the watcher
-ignores dotfiles. `<n>` tells apart the concurrent checks of one
-process. The file's name without `.json` is the run's `id`.
-
-| field     | type             | meaning                                                              |
-| --------- | ---------------- | -------------------------------------------------------------------- |
-| `v`       | number           | format version, `1`; the watcher ignores any other                   |
-| `tool`    | string           | `amont` or `amont-agent`                                             |
-| `session` | string or null   | `CLAUDE_CODE_SESSION_ID` of the starter; null outside Claude Code    |
-| `check`   | string           | the check name, or the program name for `amont-agent quiet`          |
-| `repo`    | string           | the git toplevel, else the working directory                         |
-| `log`     | string           | absolute path of the `.log.tmp` the output goes to                   |
-| `pid`     | number           | the writing process                                                  |
-| `started` | number           | unix milliseconds                                                    |
-| `exit`    | number or null   | only once ended: the exit code, null when the run was killed         |
-| `ended`   | number           | only once ended: unix milliseconds                                   |
-
-Unknown fields are ignored.
-
-## Lifetime
-
-1. The tool writes the entry when its capture opens.
-2. When the run ends, the tool rewrites the entry with `exit` and `ended`
-   and leaves it. A run that ends inside one 250 ms poll is still seen
-   with its exit.
-3. Each watcher emits `ended` for an entry carrying `ended` exactly once
+1. Each watcher emits `ended` for an entry carrying `ended` exactly once
    and then holds it as a closed run. Watchers share the directory, so
-   none deletes an ended entry younger than 60 s; any watcher or tool
+   none deletes an ended entry younger than 60 s; any watcher or writer
    sweep removes it after that. An ended entry older than 60 s that a
    watcher never announced is deleted without an event; a watcher that
    starts within 60 s of an end (a new or restarted session) announces it
    once, so a failure that recent is drawn there too. The 60 s compare
    `ended` with the watcher's clock; both are the same machine's. The check for
    `ended` comes before the pid check: the writer has usually exited by
-   then. A tool's own sweep also removes its dead-pid entries.
-4. An entry without `ended` whose pid is dead (`kill(pid, 0)` on unix,
+   then.
+2. An entry without `ended` whose pid is dead (`kill(pid, 0)` on unix,
    with EPERM counted as alive; `OpenProcess` on Windows) is ignored: it
    never yields `started`, and the watcher removes it only when the file
    is older than 1 h. A run the watcher already announced whose pid dies
    without `ended` (four polls in a row) ends with `exit` null.
-5. A run whose entry file disappears ends with `exit` null.
+3. A run whose entry file disappears ends with `exit` null.
+4. An entry whose `v` is not 1 is ignored.
 
 ## The protocol
 
