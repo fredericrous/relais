@@ -465,6 +465,44 @@ pub fn watch(dir: &Path, out: &mut impl Write) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// The rule relais had before it delegated, case by case: the reader
+    /// must name the directory the writers write to.
+    #[test]
+    fn active_dir_keeps_the_rule_it_had() {
+        let at = |pairs: &[(&str, &str)]| {
+            active_dir(|k| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| OsString::from(v))
+            })
+        };
+        assert_eq!(
+            at(&[("QUIET_ACTIVE_DIR", "/q"), ("HOME", "/h")]),
+            Some(PathBuf::from("/q"))
+        );
+        // An empty variable is unset, everywhere in the rule.
+        assert_eq!(at(&[("QUIET_ACTIVE_DIR", ""), ("HOME", "")]), None);
+        if cfg!(windows) {
+            assert_eq!(
+                at(&[("LOCALAPPDATA", "C:\\L")]),
+                Some(PathBuf::from("C:\\L").join("quiet").join("active"))
+            );
+            assert_eq!(at(&[("LOCALAPPDATA", ""), ("HOME", "/h")]), None);
+        } else {
+            assert_eq!(
+                at(&[("XDG_STATE_HOME", "/s"), ("HOME", "/h")]),
+                Some(PathBuf::from("/s/quiet/active"))
+            );
+            assert_eq!(
+                at(&[("XDG_STATE_HOME", ""), ("HOME", "/h")]),
+                Some(PathBuf::from("/h/.local/state/quiet/active"))
+            );
+            assert_eq!(at(&[("HOME", "")]), None);
+            assert_eq!(at(&[]), None);
+        }
+    }
+
     #[test]
     fn cut_line_strips_colour_and_controls_and_widens_tabs() {
         assert_eq!(cut_line("\u{1b}[31mred\u{1b}[0m\tx\u{7}y\u{0}"), "red  xy");
