@@ -1,0 +1,16 @@
+amont-provenance-v1
+commit 5d868725398e17bff343232ee076006aad221973
+tree 07cda5b18ed321af13c3167f2d4695875364f780
+canon f0ddefbc9a5f19a724144bf8203cc175d577e234
+patch bf70cccf58a187518dbbaba1877a21d5f6ec3054
+plan docs/plans/2026-10-14-runs-survive-a-loaded-machine.md ac25943cf8b382fa2d88e109fe078faf46c71dcfdebb1beb858ebd2a33a4d3c3
+review reviewed 1114d454d431645efed99178dc0bd3435ca860e41126dab716d4d7589c7eeaac
+preview not-required
+producer amont-agent 2.45.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAEBnNPcdhO4afByDVL+tssPOKuJiYPBUiErycKR6KD/z68BK/l
+fH2oHqlvqUxlCt6wjc5s6Cu0jXjDENG5rliUgH
+-----END SSH SIGNATURE-----
