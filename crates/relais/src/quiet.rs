@@ -43,22 +43,11 @@ const DEAD_GRACE_POLLS: u32 = 4;
 
 /// The active-run directory: `$QUIET_ACTIVE_DIR`, else the platform's
 /// state directory. `get` reads the environment, so the caller owns the
-/// ambient access.
+/// ambient access. The rule is amont's, and `amont-quiet` is its one
+/// implementation (decisions ADR-0039, `harness.shared-code`): the writers
+/// and this reader cannot name different directories.
 pub fn active_dir(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    if let Some(dir) = get("QUIET_ACTIVE_DIR").filter(|d| !d.is_empty()) {
-        return Some(PathBuf::from(dir));
-    }
-    if cfg!(windows) {
-        let base = get("LOCALAPPDATA").filter(|d| !d.is_empty())?;
-        return Some(PathBuf::from(base).join("quiet").join("active"));
-    }
-    let state = match get("XDG_STATE_HOME").filter(|d| !d.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(get("HOME").filter(|d| !d.is_empty())?)
-            .join(".local")
-            .join("state"),
-    };
-    Some(state.join("quiet").join("active"))
+    amont_quiet::dir(get)
 }
 
 /// One active-run entry file (amont `docs/quiet-runs.md`). Unknown fields are
@@ -475,6 +464,44 @@ pub fn watch(dir: &Path, out: &mut impl Write) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rule relais had before it delegated, case by case: the reader
+    /// must name the directory the writers write to.
+    #[test]
+    fn active_dir_keeps_the_rule_it_had() {
+        let at = |pairs: &[(&str, &str)]| {
+            active_dir(|k| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| OsString::from(v))
+            })
+        };
+        assert_eq!(
+            at(&[("QUIET_ACTIVE_DIR", "/q"), ("HOME", "/h")]),
+            Some(PathBuf::from("/q"))
+        );
+        // An empty variable is unset, everywhere in the rule.
+        assert_eq!(at(&[("QUIET_ACTIVE_DIR", ""), ("HOME", "")]), None);
+        if cfg!(windows) {
+            assert_eq!(
+                at(&[("LOCALAPPDATA", "C:\\L")]),
+                Some(PathBuf::from("C:\\L").join("quiet").join("active"))
+            );
+            assert_eq!(at(&[("LOCALAPPDATA", ""), ("HOME", "/h")]), None);
+        } else {
+            assert_eq!(
+                at(&[("XDG_STATE_HOME", "/s"), ("HOME", "/h")]),
+                Some(PathBuf::from("/s/quiet/active"))
+            );
+            assert_eq!(
+                at(&[("XDG_STATE_HOME", ""), ("HOME", "/h")]),
+                Some(PathBuf::from("/h/.local/state/quiet/active"))
+            );
+            assert_eq!(at(&[("HOME", "")]), None);
+            assert_eq!(at(&[]), None);
+        }
+    }
 
     #[test]
     fn cut_line_strips_colour_and_controls_and_widens_tabs() {

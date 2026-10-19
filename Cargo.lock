@@ -24,6 +24,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "amont-quiet"
+version = "1.60.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fcf90692b077eebd4afd0e44e3bf48a66a67c76ccbf7450b851642b5855834f"
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -645,6 +651,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "relais"
 version = "0.26.0"
 dependencies = [
+ "amont-quiet",
  "chrono",
  "clap",
  "globset",
