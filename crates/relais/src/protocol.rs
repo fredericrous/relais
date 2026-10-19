@@ -31,6 +31,9 @@ pub const OUTPUT_BUDGET_BYTES: u64 = 64 * 1024;
 /// How often a running check's new output is merged into events.
 pub const OUTPUT_MERGE: Duration = Duration::from_millis(100);
 
+/// How often a wait on a check or a worker says it is alive.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
 /// The most text one `stderr` event carries; a longer line is cut.
 const STDERR_TEXT_BYTES: usize = 4 * 1024;
 
@@ -180,6 +183,17 @@ pub enum Event {
         label: String,
         attempts: u32,
     },
+    /// The runner is alive while it waits on a check or a worker: every
+    /// [`HEARTBEAT_INTERVAL`]. `alive_at` is when the timer thread spoke;
+    /// `progress_at` is when the wait last moved, and `signal` says by what
+    /// (`log_bytes`, `worker_event` or `cpu`; `null` when nothing has moved
+    /// since the wait began). Alive with an old `progress_at` is a wait that
+    /// is not advancing, which a deadline still ends.
+    Heartbeat {
+        alive_at: String,
+        progress_at: String,
+        signal: Option<String>,
+    },
     /// A line the process wrote to stdout or stderr under `--protocol`.
     Stderr {
         text: String,
@@ -205,6 +219,7 @@ impl Event {
             | Self::WaitingForSlot { .. }
             | Self::WaitingForDisk { .. }
             | Self::Flaky { .. }
+            | Self::Heartbeat { .. }
             | Self::Outcome { .. } => true,
         }
     }
@@ -847,6 +862,51 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_heartbeat_round_trips_and_is_a_protocol_line() {
+        let event = Event::Heartbeat {
+            alive_at: "2026-10-20T10:00:00+00:00".into(),
+            progress_at: "2026-10-20T09:46:00+00:00".into(),
+            signal: Some("cpu".into()),
+        };
+        assert!(event.is_protocol_line());
+        let json = serde_json::to_value(&event).expect("serialises");
+        assert_eq!(json["kind"], "heartbeat");
+        assert_eq!(json["alive_at"], "2026-10-20T10:00:00+00:00");
+        assert_eq!(json["progress_at"], "2026-10-20T09:46:00+00:00");
+        assert_eq!(json["signal"], "cpu");
+        let none = Event::Heartbeat {
+            alive_at: "a".into(),
+            progress_at: "b".into(),
+            signal: None,
+        };
+        assert!(serde_json::to_value(&none).expect("serialises")["signal"].is_null());
+    }
+
+    #[test]
+    fn heartbeat_seq_numbers_are_monotonic_within_a_run() {
+        let dir = crate::test_support::short_temp_dir("pr-hb");
+        let events = Events::for_run("run-h", &dir.join("run-h"));
+        for n in 0..5 {
+            events.emit(Event::Heartbeat {
+                alive_at: format!("t{n}"),
+                progress_at: "t0".into(),
+                signal: None,
+            });
+            events.emit(Event::Decision {
+                what: "x".into(),
+                reason: "y".into(),
+            });
+        }
+        let seqs: Vec<u64> = lines(&dir.join("run-h").join("events.jsonl"))
+            .iter()
+            .filter(|line| line["event"]["kind"] == "heartbeat")
+            .map(|line| line["seq"].as_u64().expect("a seq"))
+            .collect();
+        assert_eq!(seqs.len(), 5);
+        assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
+    }
 
     fn lines(path: &Path) -> Vec<serde_json::Value> {
         std::fs::read_to_string(path)

@@ -81,6 +81,10 @@ export type RunModel = {
   // The hint for a live run that has been silent a while ("no events for
   // 12m"): plain text, a hint and not a verdict.
   stalled: string | undefined
+  // What the run waits on right now, as text: a heartbeat's "alive, no
+  // progress for 14m", a queue for a slot or the disk, a resource limit.
+  // Cleared when the wait ends.
+  wait: string | undefined
   // What the next worker attempt is, after a `repairing`/`escalating`
   // transition: its step is titled by it.
   retry: 'repair' | 'escalation' | undefined
@@ -103,6 +107,7 @@ export const emptyRun = (run: string, startedAt: number): RunModel => ({
   session: undefined,
   foreign: false,
   stalled: undefined,
+  wait: undefined,
   retry: undefined,
 })
 
@@ -139,6 +144,34 @@ export function appendOutput(check: Check, text: string): Check {
   const isOpen = pieces.length > 0 ? !endsLine : check.isOpen && !endsLine
   return { ...check, output: lines.slice(-MAX_OUTPUT_LINES), isOpen }
 }
+
+// A heartbeat whose progress is older than this reads as "no progress".
+export const NO_PROGRESS_AFTER_MS = 5 * 60_000
+
+const SIGNAL_NAMES: Record<string, string> = {
+  log_bytes: 'log output',
+  worker_event: 'worker activity',
+  cpu: 'cpu time',
+}
+
+// What one `heartbeat` event says, as text: the runner is alive (its timer
+// thread spoke at `alive_at`); whether the wait is moving is `progress_at`.
+export function heartbeatText(event: any): string {
+  const alive = Date.parse(event.alive_at)
+  const progress = Date.parse(event.progress_at)
+  const signal = typeof event.signal === 'string' ? (SIGNAL_NAMES[event.signal] ?? event.signal) : undefined
+  if (Number.isNaN(alive) || Number.isNaN(progress)) return 'alive'
+  const idle = Math.max(0, alive - progress)
+  if (idle >= NO_PROGRESS_AFTER_MS) {
+    const last = signal ? ` (last ${signal})` : ''
+    return `alive, no progress for ${Math.floor(idle / 60_000)}m${last}`
+  }
+  return signal ? `alive, progressing (${signal})` : 'alive, waiting'
+}
+
+const minutesOrSeconds = (s: number): string => (s >= 120 ? `${Math.floor(s / 60)}m` : `${s}s`)
+
+const gib = (bytes: number): string => `${(bytes / 2 ** 30).toFixed(1)} GiB`
 
 const pushEntry = (list: Entry[], entry: Entry): Entry[] => [...list, entry].slice(-MAX_EVENTS)
 
@@ -300,6 +333,7 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
         isOpen: false,
         elidedBytes: 0,
       }
+      m = { ...m, wait: undefined }
       m = mapLast(m, s => ({ ...s, checks: [...s.checks, check], detail: (event.argv ?? []).join(' ') }))
       return withEntry(m, at, 'check', `start · ${event.label}`)
     }
@@ -311,6 +345,7 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
       }))
     }
     case 'check_ended': {
+      m = { ...m, wait: undefined }
       m = mapCheck(m, event.label, c => ({
         ...c,
         running: false,
@@ -324,6 +359,31 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
       const entry = { at, kind: 'decision', text: `${event.what} · ${event.reason}` }
       return withEntry({ ...m, decisions: pushEntry(m.decisions, entry) }, at, 'decision', entry.text)
     }
+    case 'heartbeat': {
+      const text = heartbeatText(event)
+      m = { ...m, wait: text }
+      // Only a stale wait is worth a row of its own; a healthy minute is not news.
+      return text.includes('no progress') ? withEntry(m, at, 'heartbeat', text) : m
+    }
+    case 'waiting_for_slot': {
+      const where = event.class === 'host_slot' ? 'a host slot' : `a ${String(event.class ?? 'heavy').replace(/_/g, ' ')} slot`
+      const place = typeof event.position === 'number' && event.position > 0 ? `, position ${event.position}` : ''
+      const text = `waiting for ${where}${place} · ${minutesOrSeconds(Number(event.waited_s) || 0)}`
+      return withEntry({ ...m, wait: text }, at, 'waiting', text)
+    }
+    case 'waiting_for_disk': {
+      const text = `waiting for disk · ${gib(Number(event.available) || 0)} free of ${gib(Number(event.floor) || 0)} floor on ${event.volume ?? 'the volume'}`
+      return withEntry({ ...m, wait: text }, at, 'waiting', text)
+    }
+    case 'flaky': {
+      const text = `flaky · ${event.label} passed after ${event.attempts} attempts`
+      return withEntry(m, at, 'flaky', text)
+    }
+    case 'resource_exhausted': {
+      const detail = event.detail ?? event.reason
+      const text = `resource exhausted${event.label ? ` · ${event.label}` : ''}${detail ? ` · ${typeof detail === 'string' ? detail : JSON.stringify(detail)}` : ''}`
+      return withEntry({ ...m, wait: undefined }, at, 'resource_exhausted', text)
+    }
     case 'environment_warning':
       return withEntry(m, at, 'warning', `warning · ${event.what ?? 'environment'} · ${event.detail ?? ''}`)
     case 'outcome': {
@@ -334,6 +394,7 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
         phase: event.state,
         endedAt: at,
         stalled: undefined,
+        wait: undefined,
         outcome: {
           state: event.state,
           receipt: event.receipt ?? null,
@@ -491,6 +552,7 @@ export function timelineText(m: RunModel, now: number): string[] {
   }
   for (const d of m.decisions) lines.push(`decision · ${d.text}`)
   lines.push(`cost ${formatCost(m.cost)}`)
+  if (m.wait && isLive(m)) lines.push(m.wait)
   if (m.stalled && isLive(m)) lines.push(m.stalled)
   if (m.outcome) lines.push(`outcome ${outcomeText(m.outcome)}`)
   if (m.outcome?.reason) lines.push(m.outcome.reason)
@@ -518,6 +580,7 @@ export function statusReply(m: RunModel, now: number, opts: { output?: boolean }
     cost: formatCost(m.cost),
     outcome: m.outcome ?? null,
     ...(m.stalled && isLive(m) ? { stalled: m.stalled } : {}),
+    ...(m.wait && isLive(m) ? { waiting: m.wait } : {}),
     ...(m.foreign ? { session: m.session, foreign: true } : {}),
     ...(opts.output ? { output: latestOutput(m, MAX_OUTPUT_LINES) } : {}),
     // relais's own human lines and the plugin's failures, the latest few.

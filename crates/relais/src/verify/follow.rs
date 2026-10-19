@@ -12,6 +12,9 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
 
 use crate::protocol::{Event, Events, OUTPUT_BUDGET_BYTES, OUTPUT_CHUNK_BYTES, OUTPUT_MERGE};
 
@@ -42,6 +45,96 @@ pub(super) fn follow(log_path: &Path, label: &str, events: &Events, ended: &Rece
         }
     }
     follower.report_elided();
+}
+
+/// What moved in a wait, named in a heartbeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Signal {
+    /// Bytes were appended to the check's log.
+    LogBytes,
+    /// A worker turn or tool event arrived.
+    WorkerEvent,
+    /// The CPU time of the check's process group rose between samples.
+    Cpu,
+}
+
+impl Signal {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LogBytes => "log_bytes",
+            Self::WorkerEvent => "worker_event",
+            Self::Cpu => "cpu",
+        }
+    }
+}
+
+/// One reading of the things that count as progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct Sample {
+    pub log_bytes: u64,
+    pub worker_events: u64,
+    /// `None` when the CPU time could not be read.
+    pub cpu: Option<Duration>,
+}
+
+/// When a wait last moved, and by what: the state behind a heartbeat.
+pub(super) struct Progress {
+    last: Sample,
+    progress_at: DateTime<Utc>,
+    signal: Option<Signal>,
+}
+
+impl Progress {
+    pub(super) fn new(now: DateTime<Utc>, first: Sample) -> Self {
+        Self {
+            last: first,
+            progress_at: now,
+            signal: None,
+        }
+    }
+
+    /// Fold in a new sample taken at `now`; the heartbeat it makes. Alive is
+    /// `now`; progress is the last time any signal rose.
+    pub(super) fn observe(&mut self, now: DateTime<Utc>, sample: Sample) -> Event {
+        let moved = if sample.worker_events > self.last.worker_events {
+            Some(Signal::WorkerEvent)
+        } else if sample.log_bytes > self.last.log_bytes {
+            Some(Signal::LogBytes)
+        } else if matches!((self.last.cpu, sample.cpu), (Some(before), Some(after)) if after > before)
+        {
+            Some(Signal::Cpu)
+        } else {
+            None
+        };
+        if let Some(signal) = moved {
+            self.progress_at = now;
+            self.signal = Some(signal);
+        }
+        self.last = Sample {
+            cpu: sample.cpu.or(self.last.cpu),
+            ..sample
+        };
+        Event::Heartbeat {
+            alive_at: now.to_rfc3339(),
+            progress_at: self.progress_at.to_rfc3339(),
+            signal: self.signal.map(|signal| signal.as_str().to_string()),
+        }
+    }
+}
+
+/// Say the runner is alive every `interval` until `ended` fires or its
+/// sender is dropped. `probe` reads the progress signals; `clock` says when.
+pub(super) fn heartbeat(
+    events: &Events,
+    interval: Duration,
+    ended: &Receiver<()>,
+    clock: &dyn Fn() -> DateTime<Utc>,
+    probe: &mut dyn FnMut() -> Sample,
+) {
+    let mut progress = Progress::new(clock(), probe());
+    while let Err(RecvTimeoutError::Timeout) = ended.recv_timeout(interval) {
+        events.emit(progress.observe(clock(), probe()));
+    }
 }
 
 struct Follower<'a> {
@@ -158,6 +251,112 @@ fn pieces(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(seconds: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + seconds, 0).expect("a time")
+    }
+
+    fn cpu(seconds: u64) -> Sample {
+        Sample {
+            cpu: Some(Duration::from_secs(seconds)),
+            ..Sample::default()
+        }
+    }
+
+    fn parts(event: Event) -> (String, String, Option<String>) {
+        match event {
+            Event::Heartbeat {
+                alive_at,
+                progress_at,
+                signal,
+            } => (alive_at, progress_at, signal),
+            other => panic!("not a heartbeat: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_check_that_burns_cpu_silently_is_alive_with_progress() {
+        let mut progress = Progress::new(at(0), cpu(1));
+        let (alive, progressed, signal) = parts(progress.observe(at(60), cpu(40)));
+        assert_eq!(alive, at(60).to_rfc3339());
+        assert_eq!(progressed, at(60).to_rfc3339());
+        assert_eq!(signal.as_deref(), Some("cpu"));
+    }
+
+    #[test]
+    fn a_check_that_sleeps_past_the_threshold_is_alive_with_no_progress() {
+        let mut progress = Progress::new(at(0), cpu(1));
+        let mut last = None;
+        for minute in 1..=14 {
+            last = Some(parts(progress.observe(at(minute * 60), cpu(1))));
+        }
+        let (alive, progressed, signal) = last.expect("beats");
+        assert_eq!(alive, at(14 * 60).to_rfc3339());
+        assert_eq!(progressed, at(0).to_rfc3339());
+        assert_eq!(signal, None);
+    }
+
+    #[test]
+    fn log_bytes_and_worker_events_count_as_progress_and_the_last_signal_stays() {
+        let mut progress = Progress::new(at(0), Sample::default());
+        let logged = Sample {
+            log_bytes: 10,
+            ..Sample::default()
+        };
+        assert_eq!(
+            parts(progress.observe(at(60), logged)).2.as_deref(),
+            Some("log_bytes")
+        );
+        let (_, progressed, signal) = parts(progress.observe(at(120), logged));
+        assert_eq!(progressed, at(60).to_rfc3339());
+        assert_eq!(signal.as_deref(), Some("log_bytes"));
+        let turn = Sample {
+            worker_events: 1,
+            ..logged
+        };
+        assert_eq!(
+            parts(progress.observe(at(180), turn)).2.as_deref(),
+            Some("worker_event")
+        );
+    }
+
+    #[test]
+    fn the_heartbeat_thread_beats_until_the_wait_ends_and_is_joined() {
+        let dir = crate::test_support::short_temp_dir("hb-thread");
+        let artifacts = dir.join("run-t");
+        let events = Events::for_run("run-t", &artifacts);
+        let (ended_tx, ended_rx) = std::sync::mpsc::channel::<()>();
+        let mut ended_tx = Some(ended_tx);
+        let mut probes = 0;
+        let mut probe = move || {
+            probes += 1;
+            // The wait ends during the fourth sample.
+            if probes == 4 {
+                ended_tx.take();
+            }
+            cpu(probes)
+        };
+        std::thread::scope(|scope| {
+            let events = &events;
+            scope.spawn(move || {
+                heartbeat(
+                    events,
+                    Duration::from_millis(2),
+                    &ended_rx,
+                    &|| at(0),
+                    &mut probe,
+                )
+            });
+        });
+        let text = std::fs::read_to_string(artifacts.join("events.jsonl")).expect("events");
+        let beats: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("json"))
+            .collect();
+        assert_eq!(beats.len(), 3, "{text}");
+        assert!(beats.iter().all(|b| b["event"]["kind"] == "heartbeat"));
+        assert!(beats.iter().all(|b| b["event"]["signal"] == "cpu"));
+    }
 
     #[test]
     fn a_cut_character_is_left_for_the_next_poll() {

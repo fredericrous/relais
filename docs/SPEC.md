@@ -1041,9 +1041,12 @@ Nothing a run does is out of sight. Every step is an **event**, appended as one 
 | `output` | `label`, `text`, `elided_bytes` | while it runs |
 | `check_ended` | `label`, `exit` (`null` when it timed out or was killed), `duration_ms` | after it |
 | `flaky` | `label`, `attempts` | a check that failed and then passed on a retry (`retry = 1`); a pass marked flaky |
+| `heartbeat` | `alive_at`, `progress_at`, `signal` (`log_bytes`, `worker_event`, `cpu` or `null`) | every 60 s while the runner waits on a check, from a timer thread joined when the wait ends; seq'd like any event |
 | `decision` | `what` (`repair`, `escalate`, `accept`, `stop`, …), `reason` | where the machine picks the next step; the `phase` of the same decision follows |
 | `outcome` | `state`, `receipt` (the path, when accepted) | at the end of each run |
 | `stderr` | `text` | for each line the process wrote under `--protocol`; file only |
+
+**Alive is not progress.** A `heartbeat` carries two timestamps. `alive_at` is when the runner's timer thread spoke: the runner is running and its event channel works. `progress_at` is the last time the wait moved, by one of three signals, and `signal` names the last that did: bytes appended to the check's log (`log_bytes`), a worker turn or tool event (`worker_event`), or the CPU time of the check's process group rising between two samples (`cpu`; a silent check that computes reads as progressing, one that sleeps with no output does not). A heartbeat whose `progress_at` is old reads, in the plugin timeline and the pane, as text such as `alive, no progress for 14m`; that is a hint for a person, and it ends nothing: command deadlines and budgets apply whatever the heartbeats say. The plugin timeline also renders `waiting_for_slot`, `waiting_for_disk`, `flaky` and `resource_exhausted` as text, never by colour alone.
 
 **The requests.** Besides events, a run under `--protocol` writes requests to the relais plugin through the same writer, each one JSON line with a `relais` key:
 

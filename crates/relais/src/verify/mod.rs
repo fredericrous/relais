@@ -1151,7 +1151,15 @@ fn run_attempt(
                     let finished = &finished;
                     scope.spawn(move || admitted.keep_alive(finished, heartbeat_every));
                 }
-                let waited = wait_following(&mut child, timeout, &log_path, label, events, cancel);
+                let waited = wait_following(
+                    &mut child,
+                    timeout,
+                    &log_path,
+                    label,
+                    events,
+                    cancel,
+                    crate::protocol::HEARTBEAT_INTERVAL,
+                );
                 finished.store(true, std::sync::atomic::Ordering::SeqCst);
                 waited
             });
@@ -1243,7 +1251,10 @@ fn log_tail(path: &Path) -> String {
 
 /// Wait for the check to end, with a follower streaming its log into
 /// `events` meanwhile, and let the follower read once more before this
-/// returns. Silent events start no follower.
+/// returns. A heartbeat thread says every `heartbeat_every` that the
+/// runner is alive and whether the check moved; both threads are joined
+/// before this returns. Silent events start neither. The command's
+/// deadline is `timeout` whatever the heartbeats say.
 fn wait_following(
     child: &mut std::process::Child,
     timeout: Duration,
@@ -1251,16 +1262,34 @@ fn wait_following(
     label: &str,
     events: &Events,
     cancel: Option<&AtomicBool>,
+    heartbeat_every: Duration,
 ) -> Result<Ended, VerifyError> {
     if events.is_silent() {
         return Ok(crate::procs::wait_for_exit(child, timeout, cancel)?.ended);
     }
     let (ended_tx, ended_rx) = std::sync::mpsc::channel();
+    let (beat_tx, beat_rx) = std::sync::mpsc::channel::<()>();
+    let group = child.id();
     std::thread::scope(|scope| {
         scope.spawn(move || follow::follow(log_path, label, events, &ended_rx));
+        scope.spawn(move || {
+            follow::heartbeat(
+                events,
+                heartbeat_every,
+                &beat_rx,
+                &chrono::Utc::now,
+                &mut || follow::Sample {
+                    log_bytes: std::fs::metadata(log_path).map_or(0, |meta| meta.len()),
+                    worker_events: 0,
+                    cpu: crate::procs::group_cpu_time(group),
+                },
+            )
+        });
         let waited = crate::procs::wait_for_exit(child, timeout, cancel);
-        // Dropping the sender wakes the follower for its final read.
+        // Dropping the senders wakes the follower for its final read and
+        // the heartbeat thread, which the scope then joins.
         drop(ended_tx);
+        drop(beat_tx);
         Ok(waited?.ended)
     })
 }
@@ -2997,6 +3026,34 @@ mod tests {
         }
     }
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_waiting_check_is_followed_by_heartbeats_that_are_joined_at_its_end() {
+        let dir = crate::test_support::short_temp_dir("vf-hb");
+        let artifacts = dir.join("run-w");
+        let events = Events::for_run("run-w", &artifacts);
+        let log = dir.join("check.log");
+        std::fs::write(&log, "").expect("log");
+        let mut command = Command::new("sleep");
+        command.arg("0.4");
+        crate::procs::own_process_group(&mut command);
+        let mut child = command.spawn().expect("spawn");
+        let ended = wait_following(
+            &mut child,
+            Duration::from_secs(30),
+            &log,
+            "sleep@1",
+            &events,
+            None,
+            Duration::from_millis(30),
+        )
+        .expect("waited");
+        assert_eq!(ended, Ended::Exited(0));
+        let text = std::fs::read_to_string(artifacts.join("events.jsonl")).expect("events");
+        let beats = text.lines().filter(|l| l.contains("\"heartbeat\"")).count();
+        assert!(beats >= 2, "{text}");
+    }
 
     fn command(argv: &[&str], timeout_seconds: u64) -> CommandSpec {
         CommandSpec {

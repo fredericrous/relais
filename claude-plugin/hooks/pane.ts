@@ -149,6 +149,7 @@ function frame(m: RunModel, room: Room, isLast: boolean): { head: Row[]; steps: 
   }
   if (isLast && hasButton) tail.push({ text: HINT, dim: true })
   tail.push({ text: `cost    ${formatCost(m.cost)}` })
+  if (m.wait && isLive(m)) tail.push({ text: m.wait, dim: true })
   if (m.stalled && isLive(m)) tail.push({ text: m.stalled, dim: true })
   if (m.outcome) {
 
