@@ -43,22 +43,11 @@ const DEAD_GRACE_POLLS: u32 = 4;
 
 /// The active-run directory: `$QUIET_ACTIVE_DIR`, else the platform's
 /// state directory. `get` reads the environment, so the caller owns the
-/// ambient access.
+/// ambient access. The rule is amont's, and `amont-quiet` is its one
+/// implementation (decisions ADR-0039, `harness.shared-code`): the writers
+/// and this reader cannot name different directories.
 pub fn active_dir(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    if let Some(dir) = get("QUIET_ACTIVE_DIR").filter(|d| !d.is_empty()) {
-        return Some(PathBuf::from(dir));
-    }
-    if cfg!(windows) {
-        let base = get("LOCALAPPDATA").filter(|d| !d.is_empty())?;
-        return Some(PathBuf::from(base).join("quiet").join("active"));
-    }
-    let state = match get("XDG_STATE_HOME").filter(|d| !d.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(get("HOME").filter(|d| !d.is_empty())?)
-            .join(".local")
-            .join("state"),
-    };
-    Some(state.join("quiet").join("active"))
+    amont_quiet::dir(get)
 }
 
 /// One active-run entry file (amont `docs/quiet-runs.md`). Unknown fields are

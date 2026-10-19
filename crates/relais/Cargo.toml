@@ -45,6 +45,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # is the wrong trade. Default features only: no serde, no async, no
 # encoding support — the reader is pure over bytes.
 quick-xml = "0.42"
+# The quiet-run active directory (`quiet.rs` `active_dir`): amont owns the
+# contract and `amont-quiet` is its one implementation, which amont and
+# amont-agent write through (decisions ADR-0039). What it pulls: one std-only
+# crate, no dependencies and no build script, released with amont.
+amont-quiet = "1.60"
 
 # Process facts and signals live in `procs`; the endpoint in `ipc`. Each
 # platform gets the one binding crate it needs and nothing else.
