@@ -209,6 +209,7 @@ Deliberate: pins protect the release path only (nothing calls it yet; `holds-unt
 PR 2: approve, round 1 on the rebased tree `c118ac0e` (36k/45 s), nothing open.
 Rebase (2026-10-19, plan `2026-10-19-finish-admission-then-split.md`, Phase 1): main shipped its own v37 (`landings`) and v38 (`landing_searches`) in v0.25.0/v0.26.0, so this branch's steps became v39 (`group_bindings`, `run_epochs`) and v40 (`check_disk_growth`), schema 40; `a_v38_ledger_takes_the_admission_steps_on_top` pins a released v38 ledger taking both on top. This machine's real ledger holds main's v37/v38 only (scratch copy), so no branch binary ever migrated it.
 Deliberate: the test does not pin v39/v40 by index; it asserts all three tables exist after the upgrade, and an order swap between the two expand-only steps changes nothing a ledger can observe.
+CI: #267's first push failed on `windows-latest` in one test (`kill -9 $$`: Windows has no SIGKILL, so the run repaired and the mock worker found its file gone); that case now runs on unix only, `classify` keeps its 137 test everywhere. Delta: approve (38k/11 s), tree `1114d454`.
 Next: PR 3 (verification evidence), on a new branch after this merges.
 
 ## Outcome (PR 2)
