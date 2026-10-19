@@ -11,7 +11,7 @@
 //! An accepted receipt is bound to one candidate and does not authorize
 //! merge or survive edits.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
@@ -43,7 +43,7 @@ pub use heavy::{
     overweight, parallelism, Admitted, Ask, HeavyAdmission, LeaseStop, Sleeper, ThreadSleeper,
     Tries, ANNOUNCE_EVERY, HOST_SLOT_ENV, LEASE_HEARTBEAT_EVERY,
 };
-pub use junit::{parse_junit, JunitArtifact, JunitError, JunitReport, TestOutcome};
+pub use junit::{parse_junit, parse_report, JunitArtifact, JunitError, JunitReport, TestOutcome};
 
 /// Why verification could not be carried out as the policy declares it.
 /// Distinct from a check that RAN and failed: this is the plan itself
@@ -134,6 +134,74 @@ impl CheckOutcome {
     pub fn failed(&self) -> bool {
         !self.ended.succeeded()
     }
+
+    /// The failing tests of this check's COMPLETE JUnit report, else
+    /// `None` (see [`JunitReport::complete_failing_tests`]).
+    pub fn complete_failing_tests(&self) -> Option<BTreeSet<String>> {
+        let exited_nonzero =
+            matches!(self.ended.recorded(), Some(Ended::Exited(code)) if code != 0);
+        self.junit.as_ref()?.complete_failing_tests(exited_nonzero)
+    }
+}
+
+/// One failing check whose failing tests all fail at the base too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreexistingTests {
+    pub check: String,
+    /// The base's failing tests.
+    pub base: Vec<String>,
+    /// The candidate's failing tests, a subset of `base`.
+    pub candidate: Vec<String>,
+}
+
+/// The guarded pre-existing shortcut (plan C1): every failure is a failed
+/// check, each such check has complete JUnit at the base and on the
+/// candidate with the candidate's failing tests a subset of the base's,
+/// and no criterion names such a check or one of those tests. `None`
+/// means today's rule applies.
+pub fn guarded_preexisting(
+    failures: &[String],
+    base: &[CheckOutcome],
+    candidate: &[CheckOutcome],
+    profile: &VerificationProfile,
+    acceptance: &[AcceptanceEntry],
+) -> Option<Vec<PreexistingTests>> {
+    let failed: Vec<&CheckOutcome> = candidate.iter().filter(|check| check.failed()).collect();
+    let only_checks = !failed.is_empty()
+        && failures.len() == failed.len()
+        && failed.iter().all(|check| failures.contains(&check.label));
+    if !only_checks {
+        return None;
+    }
+    let mut found = Vec::new();
+    for check in failed {
+        let base_check = base.iter().find(|b| b.label == check.label)?;
+        let base_failing = base_check.complete_failing_tests()?;
+        let candidate_failing = check.complete_failing_tests()?;
+        if !candidate_failing.is_subset(&base_failing) {
+            return None;
+        }
+        found.push(PreexistingTests {
+            check: check.label.clone(),
+            base: base_failing.into_iter().collect(),
+            candidate: candidate_failing.into_iter().collect(),
+        });
+    }
+    let targeted = acceptance.iter().any(|entry| match entry.evidence() {
+        Some(Evidence::Check { name }) => named_command(profile, name)
+            .is_some_and(|spec| found.iter().any(|f| f.check == check_label(spec))),
+        Some(Evidence::Test {
+            name: Some(test), ..
+        }) => found
+            .iter()
+            .any(|f| f.base.contains(test) || f.candidate.contains(test)),
+        Some(Evidence::Test { name: None, .. })
+        | Some(Evidence::LlmReview)
+        | Some(Evidence::HumanSignOff)
+        | Some(Evidence::AmontGate { .. })
+        | None => false,
+    });
+    (!targeted).then_some(found)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -480,7 +548,9 @@ fn find_named_test(
     for check in checks {
         let Some(report) = &check.junit else { continue };
         match report {
-            JunitReport::Reported { tests, artifact } => {
+            JunitReport::Reported {
+                tests, artifact, ..
+            } => {
                 let Some(&outcome) = tests.get(test) else {
                     continue;
                 };
@@ -1103,19 +1173,20 @@ fn read_junit(file: Option<&Path>, kept: &Path) -> Result<JunitReport, VerifyErr
         });
     };
     Ok(match std::fs::read(file) {
-        Ok(bytes) => match parse_junit(&bytes) {
-            Ok(tests) => {
+        Ok(bytes) => match parse_report(&bytes) {
+            Ok(parsed) => {
                 // The hash is of the kept file as written and read back,
                 // not of the bytes in memory, so the evidence row names
                 // what is actually on disk (X5).
                 std::fs::write(kept, &bytes)?;
                 let written = std::fs::read(kept)?;
                 JunitReport::Reported {
-                    tests,
+                    tests: parsed.tests,
                     artifact: Some(JunitArtifact {
                         path: kept.to_string_lossy().into_owned(),
                         sha256: sha256_hex(&written),
                     }),
+                    totals_consistent: parsed.totals_consistent,
                 }
             }
             Err(e) => JunitReport::Unparseable {
@@ -4339,6 +4410,7 @@ mod tests {
                 .map(|(id, outcome)| (id.to_string(), *outcome))
                 .collect(),
             artifact: None,
+            totals_consistent: true,
         })
     }
 
@@ -4577,7 +4649,10 @@ mod tests {
         assert!(!outcome.failed());
         // The report is kept beside the log, with the hash of its bytes.
         let kept = logs.join("s.junit.xml");
-        let Some(JunitReport::Reported { tests, artifact }) = &outcome.junit else {
+        let Some(JunitReport::Reported {
+            tests, artifact, ..
+        }) = &outcome.junit
+        else {
             panic!("expected a read report: {:?}", outcome.junit);
         };
         assert_eq!(tests["a::b"], TestOutcome::Passed);

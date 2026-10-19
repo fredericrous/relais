@@ -4220,6 +4220,24 @@ impl<'a> RunEngine<'a> {
                 .iter()
                 .all(|label| ctx.baseline.failures.contains(label));
             progress.last_failures = Some(failures.clone());
+            // Plan C1: complete JUnit on both sides says every failing
+            // test already fails at the base and nothing targets it. A
+            // cached base keeps no failing checks, so it never applies.
+            if let Some(tests) = ctx.baseline.checks.as_deref().and_then(|base| {
+                verify::guarded_preexisting(
+                    &failures,
+                    base,
+                    &checks,
+                    &ctx.preflight.authority.verification_profile,
+                    &self.config.contract.acceptance,
+                )
+            }) {
+                return self.follow(
+                    ctx,
+                    progress,
+                    Observation::PreexistingTestFailures { failures, tests },
+                );
+            }
             return self.follow(
                 ctx,
                 progress,
@@ -9204,6 +9222,132 @@ mod tests {
         };
         assert_eq!(why, Reason::BaselineFailureNotWaived, "{detail}");
         assert!(detail.contains("not waived"), "{detail}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A check that fails exactly test `b` of `a` and `b`, writing `report`
+    /// first (a complete one by default), at the base and at every candidate.
+    fn failing_b_check(report: &str) -> CommandSpec {
+        CommandSpec {
+            junit: Some("junit.xml".into()),
+            ..sh(&format!("printf '%s' '{report}' > junit.xml; exit 1"))
+        }
+    }
+
+    const COMPLETE_B_FAILS: &str = "<testsuite tests=\"2\" failures=\"1\"><testcase name=\"a\"/>\
+        <testcase name=\"b\"><failure/></testcase></testsuite>";
+
+    fn contract_naming(evidence: serde_json::Value) -> TaskContract {
+        TaskContract::from_json_str(
+            &serde_json::json!({
+                "schema_version": 1,
+                "kind": "change",
+                "objective": "Fix the obsolete entry point",
+                "base_ref": "HEAD",
+                "write_scope": ["src/**"],
+                "acceptance": [{"statement": "b passes", "evidence": evidence}],
+                "verification_profile": "profile",
+            })
+            .to_string(),
+        )
+        .expect("contract")
+    }
+
+    fn repaired(fixture: &Fixture, run_id: &RunId) -> bool {
+        fixture
+            .ledger
+            .transitions(run_id)
+            .expect("history")
+            .iter()
+            .any(|t| t.to_state == State::Repairing)
+    }
+
+    #[test]
+    fn complete_reports_with_a_subset_of_base_failures_end_without_a_repair() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![failing_b_check(COMPLETE_B_FAILS)], 3);
+        let backend = churning_worker("");
+        let outcome = fixture.execute(&fixture.contract(Review::Optional), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::NeedsDecision { reason, detail },
+        } = outcome
+        else {
+            panic!("expected needs_decision, got {outcome:?}");
+        };
+        assert_eq!(reason, Reason::BaselineFailureNotWaived, "{detail}");
+        assert!(!repaired(&fixture, &run_id), "no repair is spent");
+        assert_eq!(
+            detail.matches("[b]").count(),
+            2,
+            "both test lists are in the detail: {detail}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_base_failing_test_named_by_a_criterion_is_still_repaired() {
+        let fixture = Fixture::new();
+        // The base fails `b` and `c`; once the worker has churned, only
+        // `c`: a subset of the base's, but `b` is a criterion's target.
+        let script = "if [ -f src/tick-0.txt ]; then \
+            printf '%s' '<testsuite tests=\"3\" failures=\"1\"><testcase name=\"a\"/>\
+            <testcase name=\"b\"/><testcase name=\"c\"><failure/></testcase></testsuite>' \
+            > junit.xml; else \
+            printf '%s' '<testsuite tests=\"3\" failures=\"2\"><testcase name=\"a\"/>\
+            <testcase name=\"b\"><failure/></testcase><testcase name=\"c\"><failure/>\
+            </testcase></testsuite>' > junit.xml; fi; exit 1";
+        let check = CommandSpec {
+            junit: Some("junit.xml".into()),
+            ..sh(script)
+        };
+        let repo = fixture.repo_policy(vec![check], 3);
+        let backend = churning_worker("");
+        let contract = contract_naming(serde_json::json!(
+            {"kind": "test", "authorship": "pre_existing", "name": "b"}
+        ));
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        assert!(repaired(&fixture, &outcome.run_id), "{outcome:?}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_check_named_by_a_criterion_is_still_repaired() {
+        let fixture = Fixture::new();
+        let check = CommandSpec {
+            name: Some("units".into()),
+            ..failing_b_check(COMPLETE_B_FAILS)
+        };
+        let repo = fixture.repo_policy(vec![check], 3);
+        let backend = churning_worker("");
+        let contract = contract_naming(serde_json::json!({"kind": "check", "name": "units"}));
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        assert!(repaired(&fixture, &outcome.run_id), "{outcome:?}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_truncated_report_keeps_todays_rule_and_repairs() {
+        let fixture = Fixture::new();
+        let truncated = "<testsuite tests=\"2\"><testcase name=\"b\"><failure/>";
+        let repo = fixture.repo_policy(vec![failing_b_check(truncated)], 3);
+        let backend = churning_worker("");
+        let outcome = fixture.execute(&fixture.contract(Review::Optional), &repo, &backend);
+        assert!(repaired(&fixture, &outcome.run_id), "{outcome:?}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_missing_report_keeps_todays_rule_and_repairs() {
+        let fixture = Fixture::new();
+        let check = CommandSpec {
+            junit: Some("junit.xml".into()),
+            ..sh("exit 1")
+        };
+        let repo = fixture.repo_policy(vec![check], 3);
+        let backend = churning_worker("");
+        let outcome = fixture.execute(&fixture.contract(Review::Optional), &repo, &backend);
+        assert!(repaired(&fixture, &outcome.run_id), "{outcome:?}");
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
