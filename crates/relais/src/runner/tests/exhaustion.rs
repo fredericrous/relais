@@ -159,11 +159,16 @@ fn each_disk_signature_in_a_failed_candidate_check_ends_resource_exhausted() {
 #[test]
 fn each_memory_signature_and_an_unsent_sigkill_end_resource_exhausted() {
     let _space = plenty();
-    for failure in [
+    let mut failures = vec![
         "echo 'Cannot allocate memory'; exit 1",
         "echo 'thread panicked: os error 12'; exit 101",
-        "kill -9 $$",
-    ] {
+    ];
+    // Windows has no SIGKILL: Git Bash's `kill -9 $$` ends the shell with
+    // neither a signal nor 137. `classify` is tested on 137 everywhere.
+    if cfg!(unix) {
+        failures.push("kill -9 $$");
+    }
+    for failure in failures {
         let ran = run_with(check_that_fails_with(failure), 3);
         assert_resource_exhausted(&ran, "memory");
     }
