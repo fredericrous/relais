@@ -9972,6 +9972,80 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// v0.26.0 ledgers stop at main's v38 (`landing_searches`). The
+    /// admission steps were written as v37/v38 on their branch and renamed
+    /// v39/v40 when it was rebased; a released ledger must take them on
+    /// top, keep what it had, and end at the current version.
+    #[test]
+    fn a_v38_ledger_takes_the_admission_steps_on_top() {
+        let dir = temp_dir("v38-to-v40");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            assert_eq!(MIGRATIONS[37].0, "v38", "pinned to main's v38");
+            for (version, sql) in &MIGRATIONS[..38] {
+                conn.execute_batch(sql).expect("apply step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "then"],
+                )
+                .expect("record step");
+            }
+            conn.execute(
+                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES ('run-old', '/repo', 'accepted', 'now', 'now')",
+                [],
+            )
+            .expect("a run written at v38");
+            conn.execute(
+                "INSERT INTO landing_searches (run_id, searched_to, searched_at)
+                 VALUES ('run-old', 'abc', 'now')",
+                [],
+            )
+            .expect("a v38 row");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade to current schema");
+        assert_eq!(ledger.schema_version().expect("version"), 40);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 40);
+        let tables: Vec<String> = ledger
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table'
+                 AND name IN ('group_bindings', 'run_epochs', 'check_disk_growth',
+                              'landing_searches')
+                 ORDER BY name",
+            )
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("names");
+        assert_eq!(
+            tables,
+            [
+                "check_disk_growth",
+                "group_bindings",
+                "landing_searches",
+                "run_epochs"
+            ]
+        );
+        let kept: i64 = ledger
+            .conn
+            .query_row("SELECT COUNT(*) FROM landing_searches", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(kept, 1, "the v38 row survives the upgrade");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn trial(id: &str) -> TrialId {
         TrialId::from_stored(id)
     }
