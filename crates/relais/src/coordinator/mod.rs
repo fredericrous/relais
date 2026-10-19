@@ -24,13 +24,14 @@ use serde::{Deserialize, Serialize};
 use crate::admission::{
     AdmissionState, AgentSettleOutcome, Attribution, BindNativeOutcome, BindOutcome, BoundOutcome,
     ClaimOutcome, Decision, DispatchRequest, DispatchSource, Enforcement, Gate, GateError,
-    HeartbeatStatus, LifecycleOutcome, NativeAnswer, NativeAsk, NativeProgress, PendingSignal,
-    Provenance, RegisterOutcome, ReleaseWriteOutcome, ResourceClass, ResumeOutcome,
-    RunRegistration, Signal, StatusSnapshot, StopNativeOutcome, StoppedOutcome, StoppedReport,
-    TrainingDecision, WaitOutcome, WithdrawOutcome, WorktreeOutcome, WriteLeaseOutcome,
+    GroupBinding, GroupChange, HeartbeatStatus, LifecycleOutcome, NativeAnswer, NativeAsk,
+    NativeProgress, PendingSignal, Provenance, RegisterOutcome, ReleaseWriteOutcome, ResourceClass,
+    ResumeOutcome, RunRegistration, Signal, StatusSnapshot, StopNativeOutcome, StoppedOutcome,
+    StoppedReport, TrainingDecision, WaitOutcome, WithdrawOutcome, WorktreeOutcome,
+    WriteLeaseOutcome, GROUP_KILL_AFTER,
 };
 use crate::ipc::{Listener, Stream};
-use crate::ledger::Ledger;
+use crate::ledger::{GroupBindingRow, Ledger};
 use crate::policy::ConcurrencyLimits;
 /// Liveness without a signal that could terminate anything (SPEC §23:
 /// lease expiry never proves a worker died). Re-exported for `resume`.
@@ -42,7 +43,9 @@ use crate::procs::{kill, terminate, LockFile};
 pub const DEFAULT_LIMITS: ConcurrencyLimits = ConcurrencyLimits {
     max_active_agents: Some(6),
     max_active_agents_per_session: Some(3),
-    max_heavy_commands: Some(2),
+    // Unused: heavy commands default to a quarter of the cores (at least
+    // one), which `effective_limits` computes on the machine it runs on.
+    max_heavy_commands: None,
     max_training_jobs: Some(1),
     max_agent_depth: Some(3),
     max_agents_per_run: Some(24),
@@ -226,6 +229,14 @@ pub enum Request {
     },
     Heartbeat {
         dispatch_id: String,
+    },
+    /// A heavy lease's runner spawned its check in process group `pgid`:
+    /// the lease now lasts as long as the runner lives, and after that as
+    /// long as a member of the group runs (SPEC §23).
+    BindGroup {
+        dispatch_id: String,
+        runner: u32,
+        pgid: u32,
     },
     /// The worker saw its cancellation on a heartbeat and is stopping:
     /// the seat and the reservation go now rather than at lease grace
@@ -630,6 +641,14 @@ impl Coordinator {
                 .map_err(|cause| CoordinatorError::LiveSetUnreadable { cause })?,
             None => Vec::new(),
         };
+        // The holds the last coordinator had on process groups (SPEC §23):
+        // read for the same reason, and adopted below.
+        let bound_groups = match ledger {
+            Some(ledger) => ledger
+                .group_bindings()
+                .map_err(|cause| CoordinatorError::LiveSetUnreadable { cause })?,
+            None => Vec::new(),
+        };
         let (listener, lock) = elect(socket_path)?;
         // `elect` above refused a socket path with no parent, so this
         // one has one; asked again rather than threaded through.
@@ -677,6 +696,7 @@ impl Coordinator {
                 };
                 state.adopt(
                     &DispatchRequest {
+                        disk: None,
                         dispatch_id: live.dispatch.as_str().to_string(),
                         run_id: live.run.as_str().to_string(),
                         session_id: live.session_id.clone().unwrap_or_else(|| "unknown".into()),
@@ -699,10 +719,32 @@ impl Coordinator {
                         // caller's agent id, so there is nothing to carry
                         // here.
                         caller_agent_id: None,
+                        weight: 1,
                     },
                     pid,
                     live.agent_id.as_deref(),
                     attribution,
+                    now,
+                );
+            }
+        }
+        // A hold survives the coordinator that took it: the sweep judges
+        // each one against the process table, so an orphan whose group is
+        // gone is released and one whose group still runs is stopped.
+        {
+            let now = Instant::now();
+            for row in bound_groups {
+                state.adopt_group(
+                    &GroupBinding {
+                        dispatch_id: row.dispatch_id,
+                        run_id: row.run_id,
+                        session_id: row.session_id,
+                        runner: row.runner,
+                        runner_started: row.runner_started,
+                        pgid: row.pgid,
+                        leader_started: row.leader_started,
+                        tokens: row.tokens,
+                    },
                     now,
                 );
             }
@@ -737,6 +779,13 @@ impl Coordinator {
         let reconcile_state = Arc::clone(&self.state);
         let reconcile_shutdown = Arc::clone(&self.shutdown);
         let reconcile_ledger = self.ledger_path.clone();
+        let group_state = Arc::clone(&self.state);
+        let group_shutdown = Arc::clone(&self.shutdown);
+        let store = Arc::new(GroupStore::new(self.ledger_path.clone()));
+        let group_store = Arc::clone(&store);
+        let group_sweeper = std::thread::spawn(move || {
+            group_loop(&group_state, &group_store, &group_shutdown);
+        });
         let reconciler = std::thread::spawn(move || {
             reconcile_loop(
                 &reconcile_state,
@@ -752,8 +801,9 @@ impl Coordinator {
             let queue = Arc::clone(&queue);
             let state = Arc::clone(&self.state);
             let shutdown = Arc::clone(&self.shutdown);
+            let store = Arc::clone(&store);
             handlers.push(std::thread::spawn(move || {
-                handler_loop(&queue, &state, &shutdown);
+                handler_loop(&queue, &state, &store, &shutdown);
             }));
         }
 
@@ -774,6 +824,7 @@ impl Coordinator {
         // Same: the reconciler is a background thread with no result
         // to return, and the daemon is going down either way.
         let _ = reconciler.join();
+        let _ = group_sweeper.join();
 
         // Only now that nothing is being served does the endpoint go.
         // Unlinking it while a connection was still in flight was the C1
@@ -900,6 +951,108 @@ fn reconcile_loop(
         // signalled at most twice in its life: once politely, once not
         // (C5).
         deliver_signals(state, report.to_signal);
+    }
+}
+
+/// How often leases tied to a process group are swept: a lease whose
+/// runner died is stopped on this clock, not on [`RECONCILE_EVERY`], so
+/// the SIGKILL that follows SIGTERM comes about [`GROUP_KILL_AFTER`] later.
+const GROUP_SWEEP_EVERY: Duration = Duration::from_secs(1);
+
+fn group_loop(
+    state: &Mutex<AdmissionState>,
+    store: &GroupStore,
+    shutdown: &std::sync::atomic::AtomicBool,
+) {
+    while !shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(GROUP_SWEEP_EVERY);
+        group_tick(state, store, Instant::now(), GROUP_KILL_AFTER);
+    }
+}
+
+/// Where group bindings are made durable: the ledger, when there is one.
+/// The state machine journals each change; `flush` takes the journal and
+/// writes it, under one lock so two threads cannot write the changes of one
+/// lease out of order.
+pub(crate) struct GroupStore {
+    ledger_path: Option<PathBuf>,
+    writing: Mutex<()>,
+}
+
+impl GroupStore {
+    pub(crate) fn new(ledger_path: Option<PathBuf>) -> Self {
+        Self {
+            ledger_path,
+            writing: Mutex::new(()),
+        }
+    }
+
+    /// Write what the state has journalled. A change that cannot be written
+    /// is said on stderr, not dropped silently: the hold works in memory,
+    /// and only a restart would lose it.
+    pub(crate) fn flush(&self, state: &Mutex<AdmissionState>) {
+        let _writing = self
+            .writing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let changes = lock_state(state).take_group_journal();
+        let Some(path) = &self.ledger_path else {
+            return;
+        };
+        if changes.is_empty() {
+            return;
+        }
+        let ledger = match Ledger::open(path) {
+            Ok(ledger) => ledger,
+            Err(e) => {
+                eprintln!("relais coordinator: group bindings were not persisted: {e}");
+                return;
+            }
+        };
+        for change in changes {
+            let written = match &change {
+                GroupChange::Bound(binding) => ledger.put_group_binding(&GroupBindingRow {
+                    dispatch_id: binding.dispatch_id.clone(),
+                    run_id: binding.run_id.clone(),
+                    session_id: binding.session_id.clone(),
+                    runner: binding.runner,
+                    runner_started: binding.runner_started.clone(),
+                    pgid: binding.pgid,
+                    leader_started: binding.leader_started.clone(),
+                    tokens: binding.tokens,
+                }),
+                GroupChange::Removed(id) => ledger.remove_group_binding(id),
+            };
+            if let Err(e) = written {
+                eprintln!("relais coordinator: a group binding was not persisted: {e}");
+            }
+        }
+    }
+}
+
+/// One sweep over the leases tied to a process group: the state machine
+/// decides, the signals are sent out from under the admission lock. A
+/// group is stopped only after its runner is gone, and its tokens return
+/// only when `kill(-pgid, 0)` says no member is left.
+pub(crate) fn group_tick(
+    state: &Mutex<AdmissionState>,
+    store: &GroupStore,
+    now: Instant,
+    kill_after: Duration,
+) {
+    let report = lock_state(state).reconcile_groups(now, kill_after, &crate::procs::same_process);
+    store.flush(state);
+    for warning in &report.warnings {
+        eprintln!("relais coordinator: {warning}");
+    }
+    for pending in report.to_signal {
+        // The group is identified again at the moment of sending: a leader
+        // pid that now belongs to another process is not signalled.
+        let kind = match pending.signal {
+            Signal::Terminate => crate::procs::SignalKind::Terminate,
+            Signal::Kill => crate::procs::SignalKind::Kill,
+        };
+        crate::procs::stop_group(pending.pgid, pending.leader_started.as_deref(), kind);
     }
 }
 
@@ -1075,6 +1228,7 @@ fn deliver_signals(state: &Mutex<AdmissionState>, signals: Vec<PendingSignal>) {
 fn handler_loop(
     queue: &Mutex<std::sync::mpsc::Receiver<Stream>>,
     state: &Mutex<AdmissionState>,
+    store: &GroupStore,
     shutdown: &std::sync::atomic::AtomicBool,
 ) {
     loop {
@@ -1087,7 +1241,7 @@ fn handler_loop(
             queue.recv()
         };
         let Ok(stream) = next else { return };
-        if let Err(e) = handle_connection(stream, state, shutdown) {
+        if let Err(e) = handle_connection(stream, state, store, shutdown) {
             // The connection is gone and there is nobody left to tell;
             // the daemon keeps serving every other one.
             eprintln!("relais coordinator: connection: {e}");
@@ -1109,6 +1263,7 @@ fn lock_state(state: &Mutex<AdmissionState>) -> std::sync::MutexGuard<'_, Admiss
 fn handle_connection(
     stream: Stream,
     state: &Mutex<AdmissionState>,
+    store: &GroupStore,
     shutdown: &std::sync::atomic::AtomicBool,
 ) -> Result<(), CoordinatorError> {
     let io = |operation: &'static str| {
@@ -1163,6 +1318,9 @@ fn handle_connection(
     // would otherwise wait on a signal being delivered to a process that
     // may be stopped.
     deliver_signals(state, signals);
+    // A group binding or its removal is durable before the caller hears of
+    // it (SPEC §23).
+    store.flush(state);
     let payload = serde_json::to_string(&response).map_err(|e| CoordinatorError::Protocol {
         operation: "serializing the response",
         detail: e.to_string(),
@@ -1312,6 +1470,33 @@ pub fn handle(
                         "pid {} is not a live process; dispatch {dispatch_id} keeps no process \
                          binding",
                         pid.unwrap_or(0)
+                    ),
+                },
+            },
+        },
+        Request::BindGroup {
+            dispatch_id,
+            runner,
+            pgid,
+        } => match state.bind_group(
+            &dispatch_id,
+            runner,
+            pgid,
+            now,
+            &process_alive,
+            &crate::procs::start_time,
+        ) {
+            BindOutcome::Bound => Response::Ack,
+            BindOutcome::UnknownDispatch => Response::Unknown {
+                entity: Entity::Dispatch,
+                id: dispatch_id,
+            },
+            BindOutcome::PidNotAlive | BindOutcome::AlreadyBoundToProcess => Response::Refused {
+                refusal: Refused::PidNotAlive {
+                    pid: Some(runner),
+                    detail: format!(
+                        "runner {runner} is not live, or group {pgid} is not one a runner can own; \
+                         dispatch {dispatch_id} keeps no group binding"
                     ),
                 },
             },
@@ -1655,6 +1840,8 @@ impl Client {
                 reserve_micros: 0,
                 source: DispatchSource::ManagedRun,
                 caller_agent_id: None,
+                weight: 1,
+                disk: None,
             },
             pid,
             started_at: started_at.to_string(),
@@ -1842,6 +2029,34 @@ impl Gate for RemoteGate {
                 &refusal,
             )),
             other => Err(Self::unexpected("bind", &other)),
+        }
+    }
+
+    fn bind_group(
+        &self,
+        dispatch_id: &str,
+        runner: u32,
+        pgid: u32,
+    ) -> Result<BindOutcome, GateError> {
+        match self.call(
+            "bind_group",
+            Request::BindGroup {
+                dispatch_id: dispatch_id.into(),
+                runner,
+                pgid,
+            },
+        )? {
+            Response::Ack => Ok(BindOutcome::Bound),
+            Response::Unknown { .. } => Ok(BindOutcome::UnknownDispatch),
+            Response::Refused {
+                refusal: Refused::PidNotAlive { .. },
+            } => Ok(BindOutcome::PidNotAlive),
+            Response::Refused { refusal } => Err(Self::refused(
+                "bind_group",
+                &format!("dispatch {dispatch_id}"),
+                &refusal,
+            )),
+            other => Err(Self::unexpected("bind_group", &other)),
         }
     }
 
@@ -2522,8 +2737,16 @@ pub fn run_daemon(
     limits: ConcurrencyLimits,
     ledger: Option<&Ledger>,
     agent_lease_ttl: Duration,
+    disk_floor: u64,
 ) -> Result<(), CoordinatorError> {
     let (coordinator, listener) = Coordinator::start(socket_path, limits, ledger, agent_lease_ttl)?;
+    // The machine's `min_free_bytes` (SPEC §23): a heavy lease that asks
+    // about the disk is held until its volumes stay above it.
+    coordinator
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .set_disk(disk_floor, Arc::new(crate::disk::StatvfsProbe));
     coordinator.serve(listener)
 }
 
@@ -2536,9 +2759,9 @@ pub fn effective_limits(configured: &ConcurrencyLimits) -> ConcurrencyLimits {
         max_active_agents_per_session: configured
             .max_active_agents_per_session
             .or(DEFAULT_LIMITS.max_active_agents_per_session),
-        max_heavy_commands: configured
-            .max_heavy_commands
-            .or(DEFAULT_LIMITS.max_heavy_commands),
+        max_heavy_commands: configured.max_heavy_commands.or(Some(
+            crate::verify::default_heavy_commands(crate::verify::cores()),
+        )),
         max_training_jobs: configured
             .max_training_jobs
             .or(DEFAULT_LIMITS.max_training_jobs),
@@ -2605,6 +2828,7 @@ mod tests {
 
     fn request(dispatch: &str, run: &str, session: &str) -> DispatchRequest {
         DispatchRequest {
+            disk: None,
             dispatch_id: dispatch.into(),
             run_id: run.into(),
             session_id: session.into(),
@@ -2614,6 +2838,398 @@ mod tests {
             reserve_micros: 0,
             source: DispatchSource::ManagedRun,
             caller_agent_id: None,
+            weight: 1,
+        }
+    }
+
+    /// SPEC §23, survival: the runner dies mid-check. The coordinator
+    /// stops the check's process group (SIGTERM, then SIGKILL after the
+    /// grace) and returns the tokens only once `kill(-pgid, 0)` says no
+    /// member is left, so the next command never overlaps it.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_runners_group_is_stopped_and_its_tokens_return_only_when_it_is_gone() {
+        use std::os::unix::process::CommandExt;
+        let state = Mutex::new(AdmissionState::new(ConcurrencyLimits {
+            max_heavy_commands: Some(1),
+            ..ConcurrencyLimits::default()
+        }));
+        let no_store = GroupStore::new(None);
+        lock_state(&state).register_run(&registration("run-g", "tab"), Instant::now());
+        let heavy = |id: &str| DispatchRequest {
+            resource: ResourceClass::HeavyLocal,
+            ..request(id, "run-g", "tab")
+        };
+        let ask = |id: &str| lock_state(&state).request(&heavy(id), Instant::now());
+        assert_eq!(ask("first"), Decision::Granted);
+        assert_eq!(ask("second"), Decision::Queued { position: 1 });
+
+        // The runner is a process of its own; the check is a group of its
+        // own that ignores SIGTERM and ends only on SIGKILL.
+        let mut runner = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("a runner");
+        let dir = temp_dir("group-ready");
+        let ready = dir.join("ready");
+        let mut check = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "trap '' TERM; : > '{}'; while :; do sleep 1; done",
+                ready.display()
+            ))
+            .process_group(0)
+            .spawn()
+            .expect("a check");
+        let pgid = check.id();
+        // The trap is in place only once the shell has run it.
+        let patience = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(Instant::now() < patience, "the check never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let bound = lock_state(&state).bind_group(
+            "first",
+            runner.id(),
+            pgid,
+            Instant::now(),
+            &process_alive,
+            &crate::procs::start_time,
+        );
+        assert_eq!(bound, BindOutcome::Bound);
+        // Whoever spawned the check reaps it once it dies; here, a thread.
+        let reaper = std::thread::spawn(move || check.wait());
+
+        // While the runner lives nothing is signalled.
+        let grace = Duration::from_millis(800);
+        group_tick(&state, &no_store, Instant::now(), grace);
+        assert!(crate::procs::group_alive(pgid, None));
+
+        runner.kill().expect("kill the runner");
+        runner.wait().expect("reap the runner");
+
+        // SIGTERM is ignored: the group, and the tokens, stay.
+        group_tick(&state, &no_store, Instant::now(), grace);
+        std::thread::sleep(Duration::from_millis(300));
+        group_tick(&state, &no_store, Instant::now(), grace);
+        assert!(crate::procs::group_alive(pgid, None), "SIGTERM is ignored");
+        assert_eq!(
+            ask("second"),
+            Decision::Queued { position: 1 },
+            "the tokens are not returned while a descendant runs"
+        );
+
+        // After the grace, SIGKILL; the next command is admitted only
+        // once the group is gone.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let granted = loop {
+            std::thread::sleep(Duration::from_millis(200));
+            group_tick(&state, &no_store, Instant::now(), grace);
+            let answer = ask("second");
+            if answer == Decision::Granted {
+                break answer;
+            }
+            assert!(Instant::now() < deadline, "never released: {answer:?}");
+        };
+        assert_eq!(granted, Decision::Granted);
+        assert!(
+            !crate::procs::group_alive(pgid, None),
+            "the next command was admitted while the old group still ran"
+        );
+        reaper.join().expect("reaper").expect("waited");
+    }
+
+    fn one_token_state(run: &str) -> Mutex<AdmissionState> {
+        let state = Mutex::new(AdmissionState::new(ConcurrencyLimits {
+            max_heavy_commands: Some(1),
+            ..ConcurrencyLimits::default()
+        }));
+        lock_state(&state).register_run(&registration(run, "tab"), Instant::now());
+        state
+    }
+
+    fn heavy_request(id: &str, run: &str) -> DispatchRequest {
+        DispatchRequest {
+            disk: None,
+            resource: ResourceClass::HeavyLocal,
+            ..request(id, run, "tab")
+        }
+    }
+
+    /// A group is its leader's pid AND start time. When the pid belongs to
+    /// another process now (here: the recorded start time is not the real
+    /// one), the group is not ours: the tokens return with a warning and
+    /// nothing is signalled.
+    #[cfg(unix)]
+    #[test]
+    fn a_recycled_leader_pid_releases_the_tokens_without_signalling_anything() {
+        use std::os::unix::process::CommandExt;
+        let state = one_token_state("run-r");
+        let store = GroupStore::new(None);
+        let ask =
+            |id: &str| lock_state(&state).request(&heavy_request(id, "run-r"), Instant::now());
+        assert_eq!(ask("first"), Decision::Granted);
+        assert_eq!(ask("second"), Decision::Queued { position: 1 });
+
+        let mut runner = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("runner");
+        // The unrelated process that now owns the number: a group of its
+        // own that must survive the sweep.
+        let mut bystander = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("bystander");
+        let pgid = bystander.id();
+        // The recorded start time is another one: the pid was recycled.
+        let bound = lock_state(&state).bind_group(
+            "first",
+            runner.id(),
+            pgid,
+            Instant::now(),
+            &process_alive,
+            &|pid| {
+                (pid == pgid)
+                    .then(|| "a start time this process never had".to_string())
+                    .or_else(|| crate::procs::start_time(pid))
+            },
+        );
+        assert_eq!(bound, BindOutcome::Bound);
+        runner.kill().expect("kill the runner");
+        runner.wait().expect("reap the runner");
+
+        group_tick(&state, &store, Instant::now(), Duration::ZERO);
+        assert_eq!(
+            ask("second"),
+            Decision::Granted,
+            "the tokens came back although the pid is alive"
+        );
+        assert!(
+            bystander.try_wait().expect("try_wait").is_none(),
+            "the process that now owns the pid was signalled"
+        );
+        bystander.kill().ok();
+        bystander.wait().ok();
+    }
+
+    /// A check whose group has exited while its runner lives on without
+    /// giving the lease back (its release failed, or reached a coordinator
+    /// that restarted) holds nothing the queue must wait for: the sweep
+    /// returns the tokens and the runner is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_gone_group_returns_its_tokens_while_its_runner_lives() {
+        use std::os::unix::process::CommandExt;
+        let state = one_token_state("run-g");
+        let store = GroupStore::new(None);
+        let ask =
+            |id: &str| lock_state(&state).request(&heavy_request(id, "run-g"), Instant::now());
+        assert_eq!(ask("first"), Decision::Granted);
+        assert_eq!(ask("second"), Decision::Queued { position: 1 });
+
+        let mut runner = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("runner");
+        let mut check = std::process::Command::new("true")
+            .process_group(0)
+            .spawn()
+            .expect("check");
+        let pgid = check.id();
+        let bound = lock_state(&state).bind_group(
+            "first",
+            runner.id(),
+            pgid,
+            Instant::now(),
+            &process_alive,
+            &crate::procs::start_time,
+        );
+        assert_eq!(bound, BindOutcome::Bound);
+        check.wait().expect("the check exits");
+
+        group_tick(&state, &store, Instant::now(), Duration::ZERO);
+        assert_eq!(
+            ask("second"),
+            Decision::Granted,
+            "the tokens came back although the runner never released"
+        );
+        assert!(
+            runner.try_wait().expect("try_wait").is_none(),
+            "the living runner was signalled"
+        );
+        runner.kill().ok();
+        runner.wait().ok();
+    }
+
+    /// The hold is in the ledger from the moment the group is bound until
+    /// it is given back; a coordinator that starts from it holds the same
+    /// tokens and reconciles the orphan.
+    #[cfg(unix)]
+    #[test]
+    fn a_hold_bound_before_a_restart_is_still_held_and_reconciled_after_it() {
+        use std::os::unix::process::CommandExt;
+        let dir = crate::test_support::short_temp_dir("restart-hold");
+        let ledger = Ledger::open(&dir.join("ledger.db")).expect("ledger");
+        let store = GroupStore::new(Some(ledger.path().to_path_buf()));
+        let before = one_token_state("run-p");
+        assert_eq!(
+            lock_state(&before).request(&heavy_request("held", "run-p"), Instant::now()),
+            Decision::Granted
+        );
+        let mut runner = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("runner");
+        let ready = dir.join("ready");
+        let mut check = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "trap '' TERM; : > '{}'; while :; do sleep 1; done",
+                ready.display()
+            ))
+            .process_group(0)
+            .spawn()
+            .expect("a check");
+        let pgid = check.id();
+        let patience = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(Instant::now() < patience, "the check never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (response, _) = handle(
+            Request::BindGroup {
+                dispatch_id: "held".into(),
+                runner: runner.id(),
+                pgid,
+            },
+            &mut lock_state(&before),
+            Instant::now(),
+        );
+        assert!(matches!(response, Response::Ack), "{response:?}");
+        store.flush(&before);
+        let persisted = ledger.group_bindings().expect("rows");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].pgid, pgid);
+        assert_eq!(persisted[0].tokens, 1);
+        assert!(persisted[0].leader_started.is_some());
+
+        // The coordinator is gone. A new one starts from the ledger.
+        drop(before);
+        let socket = dir.join("c.sock");
+        let (coordinator, listener) = Coordinator::start(
+            &socket,
+            ConcurrencyLimits {
+                max_heavy_commands: Some(1),
+                ..ConcurrencyLimits::default()
+            },
+            Some(&ledger),
+            Duration::from_secs(120),
+        )
+        .expect("a coordinator that adopts the holds");
+        drop(listener);
+        let after = Arc::clone(&coordinator.state);
+        let ask =
+            |id: &str| lock_state(&after).request(&heavy_request(id, "run-p"), Instant::now());
+        assert_eq!(
+            ask("next"),
+            Decision::Queued { position: 1 },
+            "the token bound before the restart is still held"
+        );
+
+        // The runner dies: the sweep of the new coordinator stops the
+        // group, and the tokens return only when it is gone.
+        runner.kill().expect("kill the runner");
+        runner.wait().expect("reap the runner");
+        let reaper = std::thread::spawn(move || check.wait());
+        let store = GroupStore::new(Some(ledger.path().to_path_buf()));
+        let grace = Duration::from_millis(300);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            group_tick(&after, &store, Instant::now(), grace);
+            if ask("next") == Decision::Granted {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the orphan was never reconciled");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!crate::procs::group_alive(pgid, None), "the group is gone");
+        assert!(
+            ledger.group_bindings().expect("rows").is_empty(),
+            "the binding was removed once the tokens returned"
+        );
+        reaper.join().expect("reaper").expect("waited");
+    }
+
+    /// The runner gives the lease back while a descendant still runs: the
+    /// tokens stay, and the sweep returns them once the group has exited.
+    #[cfg(unix)]
+    #[test]
+    fn release_keeps_the_tokens_while_a_descendant_runs_and_the_sweep_returns_them_after() {
+        use std::os::unix::process::CommandExt;
+        let state = one_token_state("run-k");
+        let store = GroupStore::new(None);
+        let ask =
+            |id: &str| lock_state(&state).request(&heavy_request(id, "run-k"), Instant::now());
+        assert_eq!(ask("first"), Decision::Granted);
+        assert_eq!(ask("second"), Decision::Queued { position: 1 });
+
+        // The check's leader exits at once; a descendant in the group
+        // keeps it alive.
+        let dir = temp_dir("descendant");
+        let ready = dir.join("ready");
+        let mut leader = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 60 & : > '{}'; wait", ready.display()))
+            .process_group(0)
+            .spawn()
+            .expect("a check");
+        let pgid = leader.id();
+        let patience = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(Instant::now() < patience, "the check never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let bound = lock_state(&state).bind_group(
+            "first",
+            std::process::id(),
+            pgid,
+            Instant::now(),
+            &process_alive,
+            &crate::procs::start_time,
+        );
+        assert_eq!(bound, BindOutcome::Bound);
+
+        {
+            let mut state = lock_state(&state);
+            assert!(state.release("first", Instant::now()).applied());
+            assert!(state.settle("first", Some(0), Instant::now()).applied());
+        }
+        assert_eq!(
+            ask("second"),
+            Decision::Queued { position: 1 },
+            "released, but a descendant runs: the tokens stay"
+        );
+        group_tick(&state, &store, Instant::now(), Duration::from_secs(60));
+        assert_eq!(
+            ask("second"),
+            Decision::Queued { position: 1 },
+            "the sweep does not return them either while the group lives"
+        );
+
+        // The descendants end (the runner is this process, still alive, so
+        // nothing was signalled for them).
+        crate::procs::stop_group(pgid, None, crate::procs::SignalKind::Kill);
+        leader.wait().expect("reaped");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            group_tick(&state, &store, Instant::now(), Duration::from_secs(60));
+            if ask("second") == Decision::Granted {
+                break;
+            }
+            assert!(Instant::now() < deadline, "never returned");
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -3372,7 +3988,8 @@ mod tests {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 let stream = listener.accept().expect("accept").expect("a connection");
-                handle_connection(stream, &state, &shutdown).expect("answered");
+                handle_connection(stream, &state, &GroupStore::new(None), &shutdown)
+                    .expect("answered");
             });
             let err = Client::new(socket.clone())
                 .request(&Request::RegisterRun {

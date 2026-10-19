@@ -782,6 +782,8 @@ mod tests {
             argv: vec!["install".into()],
             timeout_seconds: 60,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: Some(ReuseSpec {
                 inputs: vec!["lock".into(), "**/package.json".into(), "patches/**".into()],
                 outputs: vec!["node_modules".into()],
@@ -873,6 +875,8 @@ mod tests {
             )
         };
         let plain = CommandSpec {
+            weight: None,
+            env: Default::default(),
             reuse: None,
             ..step.clone()
         };

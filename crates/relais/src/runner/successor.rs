@@ -56,19 +56,41 @@ impl From<LedgerError> for PlanError {
     }
 }
 
+/// The transition that raised `run`'s open decision. Retiring the worktree
+/// records a same-state row after it; the raising row is the last one that
+/// is not that.
+fn raising_transition(
+    ledger: &Ledger,
+    run: &RunId,
+) -> Result<crate::ledger::Transition, PlanError> {
+    ledger
+        .transitions(run)?
+        .into_iter()
+        .rev()
+        .find(|t| {
+            t.to_state == State::NeedsDecision && t.reason != Reason::WorktreeRetired.as_str()
+        })
+        .ok_or_else(|| PlanError::NotWidenable(format!("run {run} is not waiting on a decision")))
+}
+
+/// `--rerun-verify` answers a `resource_exhausted` decision only: a rerun of
+/// the same candidate is the answer to a machine that was out of room, not
+/// to a code failure or a scope question (plan B4).
+pub fn require_resource_exhausted(ledger: &Ledger, run: &RunId) -> Result<(), PlanError> {
+    let waiting = raising_transition(ledger, run)?;
+    if waiting.reason != Reason::ResourceExhausted.as_str() {
+        return Err(PlanError::NotWidenable(format!(
+            "`--rerun-verify` answers a resource_exhausted decision, and run {run} waits on {}",
+            waiting.reason
+        )));
+    }
+    Ok(())
+}
+
 /// The out-of-scope paths a `scope_exceeded` decision of `run` lists,
 /// exactly as its transition recorded them.
 pub fn out_of_scope_paths(ledger: &Ledger, run: &RunId) -> Result<Vec<String>, PlanError> {
-    let transitions = ledger.transitions(run)?;
-    // Retiring the worktree records a same-state row after the one that
-    // raised the decision; the raising row is the last one that is not it.
-    let Some(waiting) = transitions.iter().rev().find(|t| {
-        t.to_state == State::NeedsDecision && t.reason != Reason::WorktreeRetired.as_str()
-    }) else {
-        return Err(PlanError::NotWidenable(format!(
-            "run {run} is not waiting on a decision"
-        )));
-    };
+    let waiting = raising_transition(ledger, run)?;
     if waiting.reason != Reason::ScopeExceeded.as_str() {
         return Err(PlanError::NotWidenable(format!(
             "`--widen-scope` answers a scope_exceeded decision, and run {run} waits on {}",

@@ -168,6 +168,24 @@ pub enum Reason {
     /// The candidate's patch file no longer matches the digest recorded
     /// when the candidate was resolved.
     CandidateDigestMismatch,
+    /// The run's cumulative time queued for a lease reached
+    /// `admission_wait_seconds` (ADR-0010): the machine had no room for it
+    /// in the time it was given. A block (exit 3), not a verdict on the work.
+    AdmissionWaitExhausted,
+    /// The run's cumulative time waiting for the disk floor reached
+    /// `disk_wait_seconds` (ADR-0010). A block (exit 3), not a verdict on
+    /// the work.
+    DiskLow,
+    /// A candidate's failed check showed exhaustion of the machine (a full
+    /// disk, no memory): evidence for a person, never a repair and never a
+    /// verdict that the code is innocent (SPEC §10).
+    ResourceExhausted,
+    /// The base's failed check showed exhaustion: the baseline gave no
+    /// verdict, so the run is blocked and the base is never called red.
+    BaselineResourceExhausted,
+    /// relais's own write met a full disk: new launches stopped, running
+    /// checks were killed and what could be persisted was (SPEC §10).
+    RelaisStorageFull,
 }
 
 impl Reason {
@@ -176,7 +194,7 @@ impl Reason {
     ///
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it.
-    pub const ALL: [Self; 59] = [
+    pub const ALL: [Self; 64] = [
         Self::ChecksAndReviewPassed,
         Self::BehavioralFailure,
         Self::RepairExhausted,
@@ -236,6 +254,11 @@ impl Reason {
         Self::CandidateForeignRepo,
         Self::CandidateDoesNotApply,
         Self::CandidateDigestMismatch,
+        Self::AdmissionWaitExhausted,
+        Self::DiskLow,
+        Self::ResourceExhausted,
+        Self::BaselineResourceExhausted,
+        Self::RelaisStorageFull,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -299,6 +322,11 @@ impl Reason {
             Self::CandidateForeignRepo => "candidate_foreign_repo",
             Self::CandidateDoesNotApply => "candidate_does_not_apply",
             Self::CandidateDigestMismatch => "candidate_digest_mismatch",
+            Self::AdmissionWaitExhausted => "admission_wait_exhausted",
+            Self::DiskLow => "disk_low",
+            Self::ResourceExhausted => "resource_exhausted",
+            Self::BaselineResourceExhausted => "baseline_resource_exhausted",
+            Self::RelaisStorageFull => "relais_storage_full",
         }
     }
 

@@ -27,6 +27,11 @@ const BIN: &str = env!("CARGO_BIN_EXE_relais");
 /// What the fake agents cost: a native worker is priced from the usage the
 /// plugin reports, so the world prices its models so that the fake's 100
 /// input and 10 output tokens are the $0.01 its headless result reported.
+/// No disk floor: these scenarios run real checks on whatever machine runs
+/// the suite, and a full disk there must not hold every one of them in the
+/// disk queue. The floor itself is tested with a stubbed probe.
+const NO_DISK_FLOOR: &str = "[resources]\nmin_free_bytes = 0\n";
+
 const PRICING: &str = "[pricing]\nversion = \"suite\"\n\n[[pricing.models]]\n\
 ids = [\"haiku\", \"sonnet\", \"fable\"]\ninput = 90000000\noutput = 100000000\n\
 cache_read = 0\ncache_write_5m = 0\ncache_write_1h = 0\n";
@@ -215,7 +220,7 @@ amont_agent = "off"
         std::fs::write(
             self.config.join("machine.toml"),
             format!(
-                "schema_version = 1\n{extra}\n{PRICING}\n[trust.\"{key}\"]\n                 granted_at = \"2026-09-18\"\nreviewed_by = \"the release suite\"\n"
+                "schema_version = 1\n{extra}\n{PRICING}\n{NO_DISK_FLOOR}\n[trust.\"{key}\"]\n                 granted_at = \"2026-09-18\"\nreviewed_by = \"the release suite\"\n"
             ),
         )
         .expect("machine");
@@ -1647,7 +1652,7 @@ fn blocked_outcomes_are_explicit_and_launch_nothing() {
     // No trust grant: blocked before any dispatch.
     std::fs::write(
         world.config.join("machine.toml"),
-        format!("schema_version = 1\n{PRICING}\n"),
+        format!("schema_version = 1\n{PRICING}\n{NO_DISK_FLOOR}"),
     )
     .expect("machine");
     let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
@@ -4273,7 +4278,7 @@ impl TrialWorld {
             )
         };
         let mut text = format!(
-            "schema_version = 1\n{trials}\n{PRICING}\n{}",
+            "schema_version = 1\n{trials}\n{PRICING}\n{NO_DISK_FLOOR}\n{}",
             grant(&self.incumbent_hash)
         );
         if grant_candidate == GrantCandidate::Yes {

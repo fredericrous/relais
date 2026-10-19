@@ -192,6 +192,7 @@ fn ask_coordinator(
     let dispatch_id = ids::derive_dispatch_id(&call.session_id, &call.tool_use_id);
     let run_id = ids::derive_run_id(&call.session_id);
     let request = DispatchRequest {
+        disk: None,
         dispatch_id: dispatch_id.as_str().to_string(),
         run_id: run_id.as_str().to_string(),
         session_id: call.session_id.as_str().to_string(),
@@ -216,6 +217,7 @@ fn ask_coordinator(
             .caller_agent_id
             .as_ref()
             .map(|id| id.as_str().to_string()),
+        weight: 1,
     };
     // Any failure to reach the coordinator — no daemon, a stale
     // socket, a protocol mismatch — is exactly `CoordinatorAnswer`'s
@@ -909,6 +911,8 @@ mod tests {
             reserve_micros: 0,
             source: DispatchSource::HookAdmitted,
             caller_agent_id: None,
+            weight: 1,
+            disk: None,
         };
 
         assert!(

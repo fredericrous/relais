@@ -288,6 +288,49 @@ pub fn own_process_group(command: &mut Command) {
     imp::own_process_group(command);
 }
 
+/// Take an exclusive, non-blocking `flock` on `file`: `Ok(true)` when
+/// taken, `Ok(false)` when another open file description holds it. The
+/// lock lasts as long as any descriptor of the open file does.
+#[cfg(unix)]
+pub fn try_flock(file: &std::fs::File) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a descriptor `file` keeps open; flock touches no memory.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+/// Let `command`, and only `command`, inherit these descriptors across
+/// its exec. Descriptors relais opens are close-on-exec; clearing the flag
+/// inside the child (between fork and exec) keeps every other process
+/// relais starts from inheriting them. A host slot held through such a
+/// descriptor lasts as long as any process of the command's group does.
+/// Unix only: Windows has no `flock` slots to pass.
+#[cfg(unix)]
+pub fn inherit_fds(command: &mut Command, fds: Vec<std::os::fd::RawFd>) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs between fork and exec and calls only
+    // `fcntl`, which is async-signal-safe, on descriptors the parent holds
+    // open until the child has been spawned.
+    unsafe {
+        command.pre_exec(move || {
+            for fd in &fds {
+                let flags = libc::fcntl(*fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Kill the child and everything it spawned: a harness that started its
 /// own children must not survive the kill (SPEC §23 cancellation).
 pub fn kill_tree(child: &mut Child) -> io::Result<()> {
@@ -321,6 +364,83 @@ pub fn kill_group(pgid: u32) -> GroupKill {
         return GroupKill::NothingLeft;
     }
     imp::kill_group(pgid)
+}
+
+/// Bytes available to this user (`statvfs`'s `f_bavail` times the
+/// fragment size) on the filesystem holding `path`, which must exist.
+/// `None` where it cannot be asked: Windows, or a path `statvfs` refuses.
+#[cfg(unix)]
+pub fn available_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c_path` is a valid NUL-terminated string and `stat` is a
+    // zeroed out-parameter that `statvfs` fills in.
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+            return None;
+        }
+        // The fields are 32 bits wide on some unixes and 64 on others.
+        #[allow(clippy::useless_conversion)]
+        Some(u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize)))
+    }
+}
+
+/// See the unix definition: nothing can be asked here.
+#[cfg(not(unix))]
+pub fn available_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// Whether any member of the process group `pgid` still runs, and is the
+/// group that was recorded. A group is identified by its leader's pid AND
+/// the leader's start time (`leader_started`, from [`start_time`] at the
+/// moment the group was bound): when the leader is visible and started at
+/// another time, the pid was recycled and the group is not ours, whatever
+/// else runs under that number. `kill(-pgid, 0)` then asks whether a member
+/// is left; a group outlives its leader while any member is in it, so the
+/// leader's own pid cannot answer that. `EPERM` means the group exists and
+/// is not ours to signal, which is the same as gone. Windows has no process
+/// groups to ask about, so it asks after the root process alone.
+pub fn group_alive(pgid: u32, leader_started: Option<&str>) -> bool {
+    if pgid <= 1 {
+        return false;
+    }
+    if let (Some(recorded), Some(now)) = (leader_started, start_time(pgid)) {
+        if recorded != now {
+            return false;
+        }
+    }
+    imp::group_alive(pgid)
+}
+
+/// Whether `pid` is still the process that started at `started`: it is
+/// there, it is ours to signal, and its start time is the one recorded. A
+/// start time that was not recorded (`None`: the platform has no reader)
+/// leaves existence as the only evidence.
+pub fn same_process(pid: u32, started: Option<&str>) -> bool {
+    if pid == 0 || !imp::signalable(pid) {
+        return false;
+    }
+    match started {
+        Some(recorded) => start_time(pid).as_deref() == Some(recorded),
+        None => true,
+    }
+}
+
+/// Ask a whole process group to stop, or force it to. The group is
+/// identified first ([`group_alive`]): a group that is gone, or whose
+/// leader pid now belongs to another process, is never signalled.
+/// Windows has no gentler request than the tree kill, so there both are
+/// the same.
+pub fn stop_group(pgid: u32, leader_started: Option<&str>, kind: SignalKind) -> GroupKill {
+    if !group_alive(pgid, leader_started) {
+        return GroupKill::NothingLeft;
+    }
+    match kind {
+        SignalKind::Terminate => imp::terminate_group(pgid),
+        SignalKind::Kill => imp::kill_group(pgid),
+    }
 }
 
 /// What killing the worker's process group found. Recorded on the
@@ -1125,6 +1245,34 @@ mod imp {
         command.process_group(0);
     }
 
+    pub fn group_alive(pgid: u32) -> bool {
+        // SAFETY: signal 0 performs error checking only; no signal is sent.
+        // Only success counts: ESRCH is gone, and EPERM is a group that is
+        // not ours (a recycled number), which is not ours to wait for.
+        unsafe { libc::kill(-(pgid as libc::pid_t), 0) == 0 }
+    }
+
+    /// The process exists and this user may signal it (not `EPERM`).
+    pub fn signalable(pid: u32) -> bool {
+        // SAFETY: signal 0 performs error checking only; no signal is sent.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    pub fn terminate_group(pgid: u32) -> GroupKill {
+        // SAFETY: SIGTERM to the process group named by the negative pid
+        // of a leader `own_process_group` made.
+        if unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGTERM) } == 0 {
+            return GroupKill::Killed;
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => GroupKill::NothingLeft,
+            _ => GroupKill::Refused {
+                detail: error.to_string(),
+            },
+        }
+    }
+
     pub fn kill_group(pgid: u32) -> GroupKill {
         // SAFETY: SIGKILL to a process group this process created, named
         // by the negative pid of the leader `own_process_group` made.
@@ -1307,6 +1455,18 @@ mod imp {
         // A new process group so a console break aimed at us does not
         // reach the child; the tree kill below does not depend on it.
         command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+
+    pub fn group_alive(pgid: u32) -> bool {
+        alive(pgid)
+    }
+
+    pub fn signalable(pid: u32) -> bool {
+        alive(pid)
+    }
+
+    pub fn terminate_group(pgid: u32) -> GroupKill {
+        kill_group(pgid)
     }
 
     pub fn kill_group(pgid: u32) -> GroupKill {

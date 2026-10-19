@@ -256,6 +256,19 @@ fn decide_spawn(
                 // decision, not an unknown.
             },
         },
+        // A hook-admitted spawn never asks about the disk, so the
+        // coordinator never answers it this way; if one did, the spawn is
+        // refused like a queue that never opened.
+        Some(Decision::WaitingForDisk { volume, .. }) => HookAnswer::Refuse {
+            refusal: Refusal {
+                rule: RefusalRule::QueueTimeout,
+                reason: format!(
+                    "the disk on {volume} is below the floor. relais waited {} before giving up",
+                    format_waited(waited),
+                ),
+                remedy: "Free disk space and retry.".to_string(),
+            },
+        },
         Some(Decision::Refused { code, detail }) => HookAnswer::Refuse {
             refusal: refusal_for(code, detail),
         },
@@ -343,6 +356,11 @@ fn refusal_for(code: AdmissionRefusal, detail: String) -> Refusal {
         AdmissionRefusal::AlreadyFinished => {
             "this dispatch already ran and settled, so nothing further is admitted under it"
         }
+        // A heavy command's weight; a hook-admitted spawn never carries
+        // one, so there is nothing for a person to change here.
+        AdmissionRefusal::WeightOutOfRange => {
+            "the request asked for more heavy-command tokens than the machine has"
+        }
     };
     Refusal {
         rule: RefusalRule::Admission(code),
@@ -379,6 +397,7 @@ impl RefusalRule {
                 | AdmissionRefusal::DepthExceeded
                 | AdmissionRefusal::RunAgentCap
                 | AdmissionRefusal::BudgetExceeded
+                | AdmissionRefusal::WeightOutOfRange
                 | AdmissionRefusal::AlreadyFinished => Availability::Decided,
             },
         }

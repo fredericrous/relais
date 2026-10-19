@@ -855,8 +855,15 @@ pub struct Limits {
     /// contract's unwritten default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempts: Option<u32>,
+    /// Caps the WORK budget only (attempts, verification and review after
+    /// the baseline), as the repository's `max_wall_seconds` does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wall_seconds: Option<u64>,
+    /// Caps the run end to end, from its start: baseline, work and every
+    /// wait. Absent, the total is the sum of the baseline's command
+    /// timeouts, the work budget and both wait budgets (ADR-0010).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_seconds: Option<u64>,
 }
 
 /// Why a contract is rejected. Errors are hard validation failures at
@@ -890,6 +897,7 @@ pub enum ContractError {
     DuplicateAcceptanceCriterion(String),
     BadAttempts(u32),
     BadWallSeconds(u64),
+    BadTotalSeconds(u64),
     EmptyBaseRef,
     EmptyVerificationProfile,
     MalformedJson(String),
@@ -960,6 +968,7 @@ impl std::fmt::Display for ContractError {
             }
             Self::BadAttempts(n) => write!(f, "limits.attempts must be >= 1, got {n}"),
             Self::BadWallSeconds(n) => write!(f, "limits.wall_seconds must be >= 1, got {n}"),
+            Self::BadTotalSeconds(n) => write!(f, "limits.total_seconds must be >= 1, got {n}"),
             Self::EmptyBaseRef => write!(f, "base_ref is empty"),
             Self::EmptyVerificationProfile => write!(f, "verification_profile is empty"),
             Self::MalformedJson(detail) => write!(f, "contract is not valid JSON: {detail}"),
@@ -1118,6 +1127,11 @@ impl TaskContract {
         if let Some(wall_seconds) = self.limits.wall_seconds {
             if wall_seconds < 1 {
                 return Err(ContractError::BadWallSeconds(wall_seconds));
+            }
+        }
+        if let Some(total_seconds) = self.limits.total_seconds {
+            if total_seconds < 1 {
+                return Err(ContractError::BadTotalSeconds(total_seconds));
             }
         }
         let mut seen = std::collections::BTreeSet::new();

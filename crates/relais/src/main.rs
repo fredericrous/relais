@@ -423,6 +423,17 @@ enum Command {
         /// contract in this file. The plugin launches it
         #[arg(long = "successor-contract", conflicts_with = "successor")]
         successor_contract: Option<PathBuf>,
+        /// With `--answer revise` on a `resource_exhausted` decision: record
+        /// a successor intent for a `kind: verify` rerun of this same
+        /// candidate, once the machine has room. The plugin launches it;
+        /// `--json` returns `{successor_intent}`
+        #[arg(
+            long = "rerun-verify",
+            conflicts_with = "successor_contract",
+            conflicts_with = "widen_scope",
+            conflicts_with = "successor"
+        )]
+        rerun_verify: bool,
     },
     /// Evidence operations (SPEC §12, §18)
     Evidence {
@@ -1068,6 +1079,9 @@ enum CliOutcome {
     NothingDetected,
     /// `learn cycle`: another cycle holds the Training lease.
     TrainingLeaseHeld,
+    /// relais's own storage is full and the run could not be recorded;
+    /// `relais resume <run>` reconciles from the last durable ledger state.
+    StorageFull,
 }
 
 /// The one exit-code table. Pure, total, and exhaustive over
@@ -1097,6 +1111,7 @@ const fn exit_code(outcome: &CliOutcome) -> i32 {
         CliOutcome::StaleGrantKey => 18,
         CliOutcome::NothingDetected => 19,
         CliOutcome::TrainingLeaseHeld => 20,
+        CliOutcome::StorageFull => 21,
     }
 }
 
@@ -1575,8 +1590,10 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             candidate,
             widen_scope,
             successor_contract,
+            rerun_verify,
         } => decide_command(DecideRequest {
             widen_scope,
+            rerun_verify,
             successor_contract: successor_contract.as_deref(),
             run_id: &run_id,
             answer,
@@ -3571,10 +3588,11 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
             // same file and the same parse as the concurrency limits
             // above it, rather than left at `AdmissionState`'s own
             // fallback regardless of what machine.toml states.
-            let (limits, agent_lease_ttl) = match std::fs::read_to_string(&path) {
+            let (limits, agent_lease_ttl, disk_floor) = match std::fs::read_to_string(&path) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
                     coordinator::effective_limits(&Default::default()),
                     Duration::from_secs(HookAdmissionSettings::default().binding_lease_secs),
+                    relais::disk::DEFAULT_MIN_FREE_BYTES,
                 ),
                 Err(cause) => {
                     return Err(CliError::Read {
@@ -3587,6 +3605,7 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
                     Ok(machine) => (
                         coordinator::effective_limits(&machine.concurrency),
                         Duration::from_secs(machine.admission.binding_lease_secs),
+                        machine.resources.min_free_bytes(),
                     ),
                     Err(e) => {
                         eprintln!(
@@ -3619,7 +3638,13 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
                     None
                 }
             };
-            match coordinator::run_daemon(&socket, limits, ledger.as_ref(), agent_lease_ttl) {
+            match coordinator::run_daemon(
+                &socket,
+                limits,
+                ledger.as_ref(),
+                agent_lease_ttl,
+                disk_floor,
+            ) {
                 Ok(()) => Ok(CliOutcome::Accepted),
                 Err(e) => {
                     eprintln!("relais coordinator: {e}");
@@ -5914,6 +5939,9 @@ fn run_command(
         Some(_) => trial.candidate_policy().unwrap_or(&repo),
         None => &repo,
     };
+    // The ballast is made at start when space allows, and made again on
+    // the next start after a full disk freed it (SPEC §10).
+    keep_ballast(&artifacts_dir);
     let outcome = match execute(&RunConfig {
         workspace,
         repo_dir: &root,
@@ -5952,6 +5980,15 @@ fn run_command(
                 if let Err(settle_error) = live_trial::settle_errored(&ledger, trial_id) {
                     eprintln!("relais run: could not settle trial {trial_id}: {settle_error}");
                 }
+            }
+            if let relais::runner::RunError::StorageFull { volume } = &e {
+                // One line, naming the volume; the run's last durable
+                // ledger state is what `resume` reconciles from.
+                eprintln!(
+                    "relais run: storage full on {volume}; `relais resume {run_id}` reconciles the run"
+                );
+                release_intent_without_run(&ledger, source, &run_id, &format!("run failed: {e}"));
+                return Ok(CliOutcome::StorageFull);
             }
             eprintln!("relais run: {e}");
             release_intent_without_run(&ledger, source, &run_id, &format!("run failed: {e}"));
@@ -6032,6 +6069,22 @@ fn run_command(
         }
     };
     result
+}
+
+/// Make the state directory's ballast file when it is missing and the
+/// volume has room for it. A ballast that cannot be made is said once and
+/// never stops the run: it is a cushion, not a requirement.
+fn keep_ballast(artifacts_dir: &Path) {
+    use relais::storage_full::{ballast_path, ensure_ballast, BallastState, BALLAST_BYTES};
+    let Some(state_dir) = artifacts_dir.parent() else {
+        return;
+    };
+    let probe = relais::disk::StatvfsProbe;
+    if let BallastState::Failed(why) =
+        ensure_ballast(&ballast_path(state_dir), BALLAST_BYTES, &probe)
+    {
+        eprintln!("relais run: the 64 MiB ballast file could not be made: {why}");
+    }
 }
 
 /// `relais dataset replay` (SPEC §24): re-run a task's already-accepted
@@ -8888,6 +8941,7 @@ struct DecideRequest<'a> {
     criterion: Option<&'a str>,
     candidate: Option<&'a str>,
     widen_scope: bool,
+    rerun_verify: bool,
     successor_contract: Option<&'a Path>,
     json: bool,
     proof_stdin: bool,
@@ -9154,11 +9208,12 @@ fn decide_inner(request: &DecideRequest<'_>) -> Result<Decision, CliError> {
             },
         );
     }
-    if request.widen_scope || request.successor_contract.is_some() {
+    if request.widen_scope || request.rerun_verify || request.successor_contract.is_some() {
         if answer != DecideAnswer::Revise {
             return Ok(refusal(
                 CliOutcome::InvalidInput,
-                "`--widen-scope` and `--successor-contract` only apply to `--answer revise`",
+                "`--widen-scope`, `--rerun-verify` and `--successor-contract` only apply to \
+                 `--answer revise`",
             ));
         }
         if criterion.is_some() {
@@ -9355,6 +9410,15 @@ fn successor_decide(
     let planned = (|| -> Result<_, successor::PlanError> {
         let (contract, scope_delta) = match supplied {
             Some(contract) => (contract, Vec::new()),
+            None if request.rerun_verify => {
+                successor::require_resource_exhausted(ledger, run)?;
+                let (original, _tier) = ledger.run_contract_and_tier(run)?.ok_or_else(|| {
+                    successor::PlanError::Missing(format!("run {run} carries no recorded contract"))
+                })?;
+                let rerun = successor::widened_contract(&original, run, &[])
+                    .map_err(successor::PlanError::Contract)?;
+                (rerun, Vec::new())
+            }
             None => {
                 let paths = successor::out_of_scope_paths(ledger, run)?;
                 let (original, _tier) = ledger.run_contract_and_tier(run)?.ok_or_else(|| {

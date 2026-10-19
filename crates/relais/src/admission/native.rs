@@ -806,6 +806,7 @@ mod tests {
         );
         let decision = state.request(
             &DispatchRequest {
+                disk: None,
                 dispatch_id: dispatch.into(),
                 run_id: "run".into(),
                 session_id: session.into(),
@@ -815,6 +816,7 @@ mod tests {
                 reserve_micros: 0,
                 source: DispatchSource::ManagedRun,
                 caller_agent_id: None,
+                weight: 1,
             },
             now,
         );

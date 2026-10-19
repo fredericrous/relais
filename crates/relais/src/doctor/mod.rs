@@ -329,6 +329,68 @@ pub(crate) fn permissions_finding(settings: &MachineSettings) -> Option<Finding>
         })
 }
 
+/// The `heavy` finding: how many heavy-command tokens the machine hands
+/// out (`max_heavy_commands`, else a quarter of the cores, at least one),
+/// and the shared host-slot directory when `[resources] shared_host_slots`
+/// names one (SPEC §23). Information, never a warning.
+pub(crate) fn heavy_finding(settings: &MachineSettings, cores: u32) -> Finding {
+    let configured = settings.concurrency.max_heavy_commands;
+    let cap = crate::verify::heavy_cap(configured, cores);
+    let source = if configured.is_some() {
+        "machine.toml"
+    } else {
+        "a quarter of the cores"
+    };
+    let slots = match &settings.resources.shared_host_slots {
+        Some(dir) => format!("shared host slots in {dir}"),
+        None => "no shared host slots (the coordinator queue only)".to_string(),
+    };
+    Finding {
+        component: "heavy",
+        level: Level::Ok,
+        detail: format!("max_heavy_commands {cap} ({source}); {slots}"),
+    }
+}
+
+/// The `disk` findings: one line per volume the run writes, with what is
+/// available to this user, the floor and what running leases hold
+/// (SPEC §23). A volume below the floor is a warning. Where the platform
+/// cannot measure, one line says so and nothing ever blocks.
+pub(crate) fn disk_findings(
+    settings: &MachineSettings,
+    probe: &dyn crate::disk::DiskProbe,
+    paths: &[PathBuf],
+    reserved: impl Fn(u64) -> u64,
+) -> Vec<Finding> {
+    let floor = settings.resources.min_free_bytes();
+    let volumes = crate::disk::volumes(probe, paths);
+    if volumes.is_empty() {
+        return vec![Finding {
+            component: "disk",
+            level: Level::Ok,
+            detail: format!(
+                "unknown (no free-space measurement here); floor {}, never blocks",
+                crate::disk::gib(floor)
+            ),
+        }];
+    }
+    volumes
+        .iter()
+        .map(|volume| {
+            let held = reserved(volume.id);
+            Finding {
+                component: "disk",
+                level: if volume.available.saturating_sub(held) < floor {
+                    Level::Warn
+                } else {
+                    Level::Ok
+                },
+                detail: crate::disk::doctor_line(volume, floor, held),
+            }
+        })
+        .collect()
+}
+
 /// Words wrapped to `width` columns; continuation lines start with
 /// `indent`. A word longer than a line is broken across lines.
 fn wrap(text: &str, width: usize, indent: &str) -> Vec<String> {
@@ -1245,6 +1307,15 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                     max_effort = settings.routing.max_effort.clone();
                     findings.extend(sandbox_finding(&settings));
                     findings.extend(permissions_finding(&settings));
+                    findings.push(heavy_finding(&settings, crate::verify::cores()));
+                    let mut written = vec![repo_dir.to_path_buf(), std::env::temp_dir()];
+                    written.extend(paths::state_dir().ok());
+                    findings.extend(disk_findings(
+                        &settings,
+                        &crate::disk::StatvfsProbe,
+                        &written,
+                        |_| 0,
+                    ));
                     pricing = match &settings.pricing {
                         Some(table) => PricingConfig::Table(table.clone()),
                         None => PricingConfig::Unconfigured,
@@ -3578,6 +3649,98 @@ mod tests {
     fn machine_with(extra: &str) -> MachineSettings {
         MachineSettings::from_toml_str(&format!("schema_version = 1\n{extra}"))
             .expect("a valid machine.toml")
+    }
+
+    #[test]
+    fn doctor_shows_max_heavy_commands_and_the_shared_slot_directory() {
+        let default = heavy_finding(&machine_with(""), 16);
+        assert_eq!(default.level, Level::Ok);
+        assert!(
+            default.detail.contains("max_heavy_commands 4"),
+            "{}",
+            default.detail
+        );
+        assert!(
+            default.detail.contains("no shared host slots"),
+            "{}",
+            default.detail
+        );
+        let set = heavy_finding(
+            &machine_with(
+                "[concurrency]\nmax_heavy_commands = 3\n[resources]\nshared_host_slots = \"/run/slots\"\n",
+            ),
+            16,
+        );
+        assert!(
+            set.detail.contains("max_heavy_commands 3"),
+            "{}",
+            set.detail
+        );
+        assert!(set.detail.contains("/run/slots"), "{}", set.detail);
+    }
+
+    /// One volume with the space a test gives it.
+    #[derive(Debug)]
+    struct OneVolume(u64);
+
+    impl crate::disk::DiskProbe for OneVolume {
+        fn volume_of(&self, _path: &Path) -> Option<crate::disk::Volume> {
+            Some(crate::disk::Volume {
+                id: 1,
+                mount: "/data".into(),
+                available: self.0,
+            })
+        }
+    }
+
+    #[test]
+    fn doctor_prints_a_disk_line_per_volume_and_marks_one_below_the_floor() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let paths = [PathBuf::from("/data/a"), PathBuf::from("/data/b")];
+        let low = disk_findings(
+            &machine_with(""),
+            &OneVolume(5 * GIB + GIB / 5),
+            &paths,
+            |_| 2 * GIB,
+        );
+        assert_eq!(low.len(), 1, "two paths on one device are one volume");
+        assert_eq!(low[0].component, "disk");
+        assert_eq!(low[0].level, Level::Warn);
+        assert_eq!(
+            low[0].detail,
+            "5.2 GiB available on /data, floor 8.0 GiB, reserved 2.0 GiB (below floor)"
+        );
+        let ok = disk_findings(&machine_with(""), &OneVolume(50 * GIB), &paths, |_| 0);
+        assert_eq!(ok[0].level, Level::Ok);
+        assert!(!ok[0].detail.contains("below floor"), "{}", ok[0].detail);
+        let tuned = disk_findings(
+            &machine_with("[resources]\nmin_free_bytes = 1073741824\n"),
+            &OneVolume(5 * GIB),
+            &paths,
+            |_| 0,
+        );
+        assert!(
+            tuned[0].detail.contains("floor 1.0 GiB"),
+            "{}",
+            tuned[0].detail
+        );
+        let rendered = DoctorReport { findings: low }.render();
+        assert!(rendered.contains("disk"), "{rendered}");
+    }
+
+    #[test]
+    fn where_nothing_can_be_measured_the_disk_is_unknown_and_never_blocks() {
+        #[derive(Debug)]
+        struct Blind;
+        impl crate::disk::DiskProbe for Blind {
+            fn volume_of(&self, _path: &Path) -> Option<crate::disk::Volume> {
+                None
+            }
+        }
+        let found = disk_findings(&machine_with(""), &Blind, &[PathBuf::from("/x")], |_| 0);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].level, Level::Ok);
+        assert!(found[0].detail.contains("unknown"), "{}", found[0].detail);
     }
 
     #[test]

@@ -15,6 +15,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+mod budgets;
+pub use budgets::{
+    BudgetClock, BudgetLimits, Budgets, Exhausted, Wait, WaitKind, WallClock,
+    DEFAULT_ADMISSION_WAIT_SECONDS, DEFAULT_DISK_WAIT_SECONDS,
+};
+
 use crate::contract::{Review, TaskContract};
 use crate::ids::canonical_json_hash;
 use crate::money::MicroUsd;
@@ -240,6 +246,24 @@ pub struct CommandSpec {
     /// authority hash moves; meaningful only on a setup step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reuse: Option<ReuseSpec>,
+    /// How many heavy-command tokens this command holds while it runs
+    /// (SPEC §23, ADR-0010): absent means one. Refused above the machine's
+    /// `max_heavy_commands`. Omitted from the serialized form when absent,
+    /// so no existing authority hash moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
+    /// Environment this command sets itself, after relais's own parallelism
+    /// bounds (`MAKEFLAGS`, `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS`,
+    /// `NEXTEST_TEST_THREADS`): a key named here wins. Omitted when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
+
+impl CommandSpec {
+    /// The tokens this command takes: its `weight`, else one.
+    pub fn heavy_weight(&self) -> u32 {
+        self.weight.unwrap_or(1)
+    }
 }
 
 /// What lets a setup step be skipped (ADR-0008): the files its result
@@ -814,6 +838,52 @@ impl WorkspaceSettings {
     }
 }
 
+/// `[resources]`: how long a run may wait on the machine (ADR-0010). Every
+/// key is optional, so a file written before this table existed parses
+/// unchanged and is written back without it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct ResourceSettings {
+    /// Cumulative time a run may be queued for a lease, baseline
+    /// included. Default 1800.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_wait_seconds: Option<u64>,
+    /// Cumulative time a run may wait for the disk floor. Default 600.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_wait_seconds: Option<u64>,
+    /// Bytes that must stay available to this user on every volume a run
+    /// writes, after the leases already running have taken their
+    /// estimates. Default 8 GiB (SPEC §23).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_free_bytes: Option<u64>,
+    /// A directory of `flock` slot files shared with amont's heavy checks
+    /// (amont ADR-0009): when set, a heavy command takes as many slot
+    /// files as its weight after its coordinator tokens, so both tools
+    /// queue on one host. Unset: the coordinator's queue alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_host_slots: Option<String>,
+}
+
+impl ResourceSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn admission_wait_seconds(&self) -> u64 {
+        self.admission_wait_seconds
+            .unwrap_or(DEFAULT_ADMISSION_WAIT_SECONDS)
+    }
+
+    pub fn disk_wait_seconds(&self) -> u64 {
+        self.disk_wait_seconds.unwrap_or(DEFAULT_DISK_WAIT_SECONDS)
+    }
+
+    pub fn min_free_bytes(&self) -> u64 {
+        self.min_free_bytes
+            .unwrap_or(crate::disk::DEFAULT_MIN_FREE_BYTES)
+    }
+}
+
 /// Machine-owned settings, `~/.config/relais/machine.toml`. Never written
 /// by a run; workers cannot update grants or policy during a run (SPEC §5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -845,6 +915,9 @@ pub struct MachineSettings {
     /// Where runs happen (ADR-0008). Absent = `auto`.
     #[serde(default, skip_serializing_if = "WorkspaceSettings::is_default")]
     pub workspace: WorkspaceSettings,
+    /// `[resources]`: the wait budgets (ADR-0010). Absent = the defaults.
+    #[serde(default, skip_serializing_if = "ResourceSettings::is_default")]
+    pub resources: ResourceSettings,
     #[serde(default)]
     pub routing: RoutingSettings,
     /// What a hook-admitted agent needs that the rest of this struct does
@@ -3312,5 +3385,145 @@ amont = { mode = "optional", bin = "/opt/amont/bin/amont" }
             a.max_attempts, 5,
             "and a written one past the ceiling does not broaden"
         );
+    }
+
+    /// ADR-0010 added `[resources]` to the machine settings and
+    /// `limits.total_seconds` to the contract. Both are optional, so a file
+    /// written before them parses to the same values and is written back
+    /// without them.
+    #[test]
+    fn the_heavy_lease_fields_are_additive_and_unwritten_when_unset() {
+        // A check that names neither field serializes exactly as before,
+        // so no authority hash moves.
+        let plain: CommandSpec =
+            serde_json::from_str(r#"{"argv":["make","test"]}"#).expect("parses");
+        assert_eq!(plain.heavy_weight(), 1);
+        let written = serde_json::to_string(&plain).expect("serializes");
+        assert!(
+            !written.contains("weight") && !written.contains("env"),
+            "{written}"
+        );
+        let heavy: CommandSpec = serde_json::from_str(
+            r#"{"argv":["make","test"],"weight":2,"env":{"CARGO_BUILD_JOBS":"1"}}"#,
+        )
+        .expect("parses");
+        assert_eq!(heavy.heavy_weight(), 2);
+        assert_eq!(
+            heavy.env.get("CARGO_BUILD_JOBS").map(String::as_str),
+            Some("1")
+        );
+        // The machine's shared slot directory is absent from a file that
+        // never named it, and written back when it did.
+        let machine = MachineSettings::from_toml_str("schema_version = 1\n").expect("parses");
+        assert_eq!(machine.resources.shared_host_slots, None);
+        assert!(!toml::to_string(&machine)
+            .expect("serializes")
+            .contains("shared_host_slots"));
+        let shared = MachineSettings::from_toml_str(
+            "schema_version = 1\n[resources]\nshared_host_slots = \"/run/slots\"\n",
+        )
+        .expect("parses");
+        assert!(toml::to_string(&shared)
+            .expect("serializes")
+            .contains("shared_host_slots = \"/run/slots\""));
+        // A request of weight one carries no key on the wire; an older
+        // request without the key reads as one.
+        let request = serde_json::json!({
+            "dispatch_id": "d", "run_id": "r", "session_id": "s", "parent_dispatch": null,
+            "depth": 0, "resource": "heavy_local", "reserve_micros": 0,
+        });
+        let parsed: crate::admission::DispatchRequest =
+            serde_json::from_value(request).expect("an older request parses");
+        assert_eq!(parsed.weight, 1);
+        assert!(!serde_json::to_string(&parsed)
+            .expect("serializes")
+            .contains("weight"));
+    }
+
+    #[test]
+    fn a_request_without_a_disk_ask_is_written_without_one_and_an_old_one_parses() {
+        let old = serde_json::json!({
+            "dispatch_id": "d", "run_id": "r", "session_id": "s",
+            "parent_dispatch": null, "depth": 0, "resource": "heavy_local",
+            "reserve_micros": 0
+        });
+        let parsed: crate::admission::DispatchRequest =
+            serde_json::from_value(old).expect("an older request parses");
+        assert_eq!(parsed.disk, None);
+        assert!(!serde_json::to_string(&parsed)
+            .expect("serializes")
+            .contains("disk"));
+        let asked = crate::admission::DispatchRequest {
+            disk: Some(crate::disk::DiskAsk {
+                estimate_bytes: 7,
+                paths: vec!["/p".into()],
+            }),
+            ..parsed
+        };
+        let wire = serde_json::to_string(&asked).expect("serializes");
+        let back: crate::admission::DispatchRequest =
+            serde_json::from_str(&wire).expect("round trip");
+        assert_eq!(back, asked);
+    }
+
+    #[test]
+    fn files_written_before_the_budgets_parse_and_write_back_unchanged() {
+        let old = "schema_version = 1\n\n[spending]\nper_run_micros = 5000000\n";
+        let machine = MachineSettings::from_toml_str(old).expect("an old file parses");
+        assert!(machine.resources.is_default());
+        assert_eq!(machine.resources.admission_wait_seconds(), 1800);
+        assert_eq!(machine.resources.disk_wait_seconds(), 600);
+        let written = toml::to_string(&machine).expect("serializes");
+        assert!(!written.contains("resources"), "{written}");
+        assert!(!written.contains("wait_seconds"), "{written}");
+        assert!(!written.contains("min_free_bytes"), "{written}");
+        assert_eq!(machine.resources.min_free_bytes(), 8 * 1024 * 1024 * 1024);
+        assert_eq!(
+            MachineSettings::from_toml_str(&written).expect("round trip"),
+            machine
+        );
+
+        let new = format!("{old}\n[resources]\nadmission_wait_seconds = 60\n");
+        let tuned = MachineSettings::from_toml_str(&new).expect("a tuned file parses");
+        assert_eq!(tuned.resources.admission_wait_seconds(), 60);
+        assert_eq!(
+            tuned.resources.disk_wait_seconds(),
+            600,
+            "the other stays default"
+        );
+        let written = toml::to_string(&tuned).expect("serializes");
+        assert!(written.contains("admission_wait_seconds = 60"), "{written}");
+        assert!(!written.contains("disk_wait_seconds"), "{written}");
+        assert!(!written.contains("min_free_bytes"), "{written}");
+
+        let floor = format!("{old}\n[resources]\nmin_free_bytes = 1000\n");
+        let floored = MachineSettings::from_toml_str(&floor).expect("a floor parses");
+        assert_eq!(floored.resources.min_free_bytes(), 1000);
+        let written = toml::to_string(&floored).expect("serializes");
+        assert!(written.contains("min_free_bytes = 1000"), "{written}");
+
+        let contract = crate::contract::TaskContract::from_json_str(
+            r#"{"schema_version":1,"kind":"change","objective":"o","base_ref":"HEAD",
+                "write_scope":["src/**"],"acceptance":["a"],"verification_profile":"p",
+                "limits":{"attempts":2,"wall_seconds":600}}"#,
+        )
+        .expect("an old contract parses");
+        assert_eq!(contract.limits.total_seconds, None);
+        let written = serde_json::to_string(&contract.limits).expect("serializes");
+        assert!(!written.contains("total_seconds"), "{written}");
+        assert_eq!(written, r#"{"attempts":2,"wall_seconds":600}"#);
+        let capped = crate::contract::TaskContract::from_json_str(
+            r#"{"schema_version":1,"kind":"change","objective":"o","base_ref":"HEAD",
+                "write_scope":["src/**"],"acceptance":["a"],"verification_profile":"p",
+                "limits":{"total_seconds":900}}"#,
+        )
+        .expect("a total parses");
+        assert_eq!(capped.limits.total_seconds, Some(900));
+        let zero = crate::contract::TaskContract::from_json_str(
+            r#"{"schema_version":1,"kind":"change","objective":"o","base_ref":"HEAD",
+                "write_scope":["src/**"],"acceptance":["a"],"verification_profile":"p",
+                "limits":{"total_seconds":0}}"#,
+        );
+        assert!(zero.is_err(), "a zero total is not a limit");
     }
 }

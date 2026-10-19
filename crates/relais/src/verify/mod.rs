@@ -34,9 +34,15 @@ use crate::workspace::{Git, WorkspaceError};
 
 mod end;
 mod follow;
+mod heavy;
 mod junit;
 
 pub use end::CheckEnd;
+pub use heavy::{
+    ancestor_holds_slots, child_environment, cores, default_heavy_commands, dispatch_id, heavy_cap,
+    overweight, parallelism, Admitted, Ask, HeavyAdmission, LeaseStop, Sleeper, ThreadSleeper,
+    Tries, ANNOUNCE_EVERY, HOST_SLOT_ENV, LEASE_HEARTBEAT_EVERY,
+};
 pub use junit::{parse_junit, JunitArtifact, JunitError, JunitReport, TestOutcome};
 
 /// Why verification could not be carried out as the policy declares it.
@@ -56,7 +62,18 @@ pub enum VerifyError {
     ZeroTimeout {
         argv: Vec<String>,
     },
+    /// The command was not admitted: a queue outlasted a budget, the
+    /// run was cancelled in it, or the coordinator refused or was
+    /// unreachable. Nothing was started.
+    Lease(LeaseStop),
     Io(std::io::Error),
+}
+
+impl VerifyError {
+    /// Does this error say the disk is full (SPEC §10)?
+    pub fn is_storage_full(&self) -> bool {
+        matches!(self, VerifyError::Io(e) if crate::storage_full::is_full(e))
+    }
 }
 
 impl std::fmt::Display for VerifyError {
@@ -71,6 +88,7 @@ impl std::fmt::Display for VerifyError {
                 "the verification command `{}` declares timeout_seconds = 0; give it a time or remove it",
                 argv.join(" ")
             ),
+            Self::Lease(stop) => write!(f, "{stop}"),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -80,7 +98,7 @@ impl std::error::Error for VerifyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
-            Self::BadPattern { .. } | Self::ZeroTimeout { .. } => None,
+            Self::BadPattern { .. } | Self::ZeroTimeout { .. } | Self::Lease(_) => None,
         }
     }
 }
@@ -850,8 +868,55 @@ pub fn run_observed(
     events: &Events,
     cancel: Option<&AtomicBool>,
 ) -> Result<CheckOutcome, VerifyError> {
-    let timeout = command_timeout(spec)?;
+    run_observed_within(
+        dir,
+        spec,
+        logs_dir,
+        label,
+        log_stem,
+        events,
+        cancel,
+        &HeavyAdmission::unmanaged(),
+    )
+}
+
+/// [`run_observed`] under a run's budgets and heavy lease (ADR-0010,
+/// SPEC §23): the command first waits for its lease, then starts with the
+/// smaller of its own timeout and what is left of each budget that applies
+/// to it. Queue time is charged to `admission_wait_seconds` and the total,
+/// never to work, so the timeout is read after the wait.
+#[allow(clippy::too_many_arguments)]
+pub fn run_observed_within(
+    dir: &Path,
+    spec: &CommandSpec,
+    logs_dir: &Path,
+    label: &str,
+    log_stem: &str,
+    events: &Events,
+    cancel: Option<&AtomicBool>,
+    admission: &HeavyAdmission<'_>,
+) -> Result<CheckOutcome, VerifyError> {
+    let own_timeout = command_timeout(spec)?;
     std::fs::create_dir_all(logs_dir)?;
+    // A cancelled queue wait runs nothing; every other refusal is the
+    // caller's to end the run on.
+    let admitted = match admission.admit(&Ask {
+        phase: log_stem,
+        label,
+        weight: spec.heavy_weight(),
+        env: &spec.env,
+        cancel,
+    }) {
+        Ok(admitted) => Some(admitted),
+        Err(LeaseStop::Cancelled) => None,
+        Err(stop) => return Err(VerifyError::Lease(stop)),
+    };
+    let timeout = admission.budgets.clip(own_timeout);
+    let heartbeat_every = admission.heartbeat_every;
+    // The tree as it is before the check writes to it: what it grew by is
+    // the estimate its next lease reserves (SPEC §23).
+    let tree_before =
+        (admitted.is_some() && admission.tracks_growth()).then(|| crate::disk::tree_bytes(dir));
     // A report the candidate itself committed is not this command's
     // result: clear it, so what is read afterwards was written by the run.
     let junit_file = spec
@@ -866,6 +931,7 @@ pub fn run_observed(
         }
     }
     let log_path = logs_dir.join(format!("{log_stem}.log"));
+    crate::storage_full::at(crate::storage_full::Site::Log)?;
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -878,6 +944,16 @@ pub fn run_observed(
         .stdout(log_file.try_clone()?)
         .stderr(log_file);
     crate::procs::own_process_group(&mut command);
+    if let Some(admitted) = &admitted {
+        command.envs(admitted.env());
+        #[cfg(unix)]
+        {
+            let fds = admitted.slot_fds();
+            if !fds.is_empty() {
+                crate::procs::inherit_fds(&mut command, fds);
+            }
+        }
+    }
     events.emit(Event::CheckStarted {
         label: label.to_string(),
         argv: spec.argv.clone(),
@@ -892,13 +968,30 @@ pub fn run_observed(
             duration_ms: started.elapsed().as_millis() as u64,
         });
     };
-    let ended = match command.spawn() {
-        Ok(mut child) => {
+    let ended = match admitted.as_ref().map(|_| command.spawn()) {
+        // Cancelled while queued: the check never started.
+        None => Ended::Cancelled,
+        Some(Ok(mut child)) => {
+            let tied = admitted
+                .as_ref()
+                .is_none_or(|admitted| admitted.bound_to_group(child.id(), events));
+            // A lease the coordinator could not tie to the group is kept
+            // alive by heartbeats for as long as the check runs.
+            let finished = AtomicBool::new(false);
             // The whole process group goes when the check ends, however
             // it ends: a `cargo test` grandchild left running in a
             // worktree that is about to be removed corrupts the next
             // thing that reads it (audit V1).
-            match wait_following(&mut child, timeout, &log_path, label, events, cancel) {
+            let waited = std::thread::scope(|scope| {
+                if let (Some(admitted), false) = (&admitted, tied) {
+                    let finished = &finished;
+                    scope.spawn(move || admitted.keep_alive(finished, heartbeat_every));
+                }
+                let waited = wait_following(&mut child, timeout, &log_path, label, events, cancel);
+                finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                waited
+            });
+            match waited {
                 Ok(ended) => ended,
                 Err(e) => {
                     ended_with(None);
@@ -914,7 +1007,7 @@ pub fn run_observed(
         // baseline can say "unrunnable" instead of "interrupted" (see
         // `unrunnable`). Only NotFound: a program that exists and cannot
         // be executed is a different problem, not an install away.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             use std::io::Write as _;
             let mut log = std::fs::OpenOptions::new().append(true).open(&log_path)?;
             let message = format!("relais: {}: command not found", spec.argv[0]);
@@ -928,11 +1021,20 @@ pub fn run_observed(
             });
             Ended::Exited(COMMAND_NOT_FOUND)
         }
-        Err(e) => {
+        Some(Err(e)) => {
             ended_with(None);
             return Err(VerifyError::Io(e));
         }
     };
+    if let (Some(before), false) = (tree_before, matches!(ended, Ended::Cancelled)) {
+        admission
+            .disk
+            .growth
+            .record(label, crate::disk::tree_bytes(dir).saturating_sub(before));
+    }
+    // The group is gone (`wait_for_exit` kills it on every path): the
+    // tokens and host slots go back now.
+    drop(admitted);
     ended_with(match ended {
         Ended::Exited(code) => Some(code),
         Ended::TimedOut | Ended::Cancelled | Ended::Signalled => None,
@@ -1082,12 +1184,34 @@ pub fn run_profile(
     events: &Events,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<CheckOutcome>, VerifyError> {
+    run_profile_within(
+        dir,
+        profile,
+        logs_dir,
+        prefix,
+        events,
+        cancel,
+        &HeavyAdmission::unmanaged(),
+    )
+}
+
+/// [`run_profile`] under a run's budgets and heavy leases: each command
+/// waits for its lease, then is clipped to what is left when it starts.
+pub fn run_profile_within(
+    dir: &Path,
+    profile: &VerificationProfile,
+    logs_dir: &Path,
+    prefix: &str,
+    events: &Events,
+    cancel: Option<&AtomicBool>,
+    admission: &HeavyAdmission<'_>,
+) -> Result<Vec<CheckOutcome>, VerifyError> {
     let mut outcomes = Vec::new();
     for (index, command) in profile.commands.iter().enumerate() {
         let label = check_label(command);
         let log_stem = format!("{prefix}-cmd{index}");
-        outcomes.push(run_observed(
-            dir, command, logs_dir, &label, &log_stem, events, cancel,
+        outcomes.push(run_observed_within(
+            dir, command, logs_dir, &label, &log_stem, events, cancel, admission,
         )?);
     }
     Ok(outcomes)
@@ -1159,6 +1283,31 @@ pub fn run_setup_gated(
     cancel: Option<&AtomicBool>,
     gate: &mut dyn SetupGate,
 ) -> Result<Vec<CheckOutcome>, VerifyError> {
+    run_setup_gated_within(
+        dir,
+        profile,
+        logs_dir,
+        prefix,
+        events,
+        cancel,
+        gate,
+        &HeavyAdmission::unmanaged(),
+    )
+}
+
+/// [`run_setup_gated`] under a run's budgets and heavy leases: each step
+/// waits for its lease, then is clipped to what is left when it starts.
+#[allow(clippy::too_many_arguments)]
+pub fn run_setup_gated_within(
+    dir: &Path,
+    profile: &VerificationProfile,
+    logs_dir: &Path,
+    prefix: &str,
+    events: &Events,
+    cancel: Option<&AtomicBool>,
+    gate: &mut dyn SetupGate,
+    admission: &HeavyAdmission<'_>,
+) -> Result<Vec<CheckOutcome>, VerifyError> {
     let mut outcomes = Vec::new();
     for (index, command) in profile.setup.iter().enumerate() {
         if gate.skip(index, command) {
@@ -1166,7 +1315,9 @@ pub fn run_setup_gated(
         }
         let label = setup_label(command);
         let log_stem = format!("{prefix}-setup{index}");
-        let outcome = run_observed(dir, command, logs_dir, &label, &log_stem, events, cancel)?;
+        let outcome = run_observed_within(
+            dir, command, logs_dir, &label, &log_stem, events, cancel, admission,
+        )?;
         let failed = outcome.failed();
         gate.ran(index, command, !failed);
         outcomes.push(outcome);
@@ -2668,6 +2819,8 @@ mod tests {
             argv: argv.iter().map(|a| a.to_string()).collect(),
             timeout_seconds,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
         }
     }
@@ -2716,6 +2869,73 @@ mod tests {
         .expect("run");
         assert_eq!(hung.ended, Ended::TimedOut);
         assert!(hung.failed());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_candidate_command_is_clipped_to_the_remaining_work_budget() {
+        use crate::policy::{BudgetLimits, Budgets, WallClock};
+        let dir = temp_dir("clipped");
+        let logs = dir.join("logs");
+        // Work has two seconds; the command asks for thirty and sleeps
+        // for twenty. The baseline draws on the total alone, and has
+        // finished: work begins.
+        let budgets = Budgets::start(
+            std::sync::Arc::new(WallClock),
+            BudgetLimits::resolve(2, 60, 60, Some(600), 0),
+        );
+        budgets.begin_work();
+        let started = std::time::Instant::now();
+        let clipped = run_observed_within(
+            &dir,
+            &command(&["sh", "-c", "sleep 20"], 30),
+            &logs,
+            "cmd0",
+            "x-cmd0",
+            &Events::silent(),
+            None,
+            &HeavyAdmission {
+                budgets: budgets.clone(),
+                ..HeavyAdmission::unmanaged()
+            },
+        )
+        .expect("run");
+        assert_eq!(clipped.ended, Ended::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "ended at the work budget, not at the command's own thirty seconds"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_baseline_command_draws_on_the_total_alone() {
+        use crate::policy::{BudgetLimits, Budgets, WallClock};
+        let dir = temp_dir("baseline-clip");
+        let logs = dir.join("logs");
+        // Work would allow 600 s, the total two: work has not begun, so
+        // only the total clips the command.
+        let budgets = Budgets::start(
+            std::sync::Arc::new(WallClock),
+            BudgetLimits::resolve(600, 60, 60, Some(2), 0),
+        );
+        let started = std::time::Instant::now();
+        let clipped = run_observed_within(
+            &dir,
+            &command(&["sh", "-c", "sleep 20"], 30),
+            &logs,
+            "cmd0",
+            "x-cmd0",
+            &Events::silent(),
+            None,
+            &HeavyAdmission {
+                budgets: budgets.clone(),
+                ..HeavyAdmission::unmanaged()
+            },
+        )
+        .expect("run");
+        assert_eq!(clipped.ended, Ended::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(10));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3850,6 +4070,8 @@ mod tests {
             argv: argv.iter().map(|a| a.to_string()).collect(),
             timeout_seconds,
             junit: None,
+            weight: None,
+            env: Default::default(),
             reuse: None,
         }
     }

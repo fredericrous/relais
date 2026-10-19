@@ -42,6 +42,17 @@ pub enum WorkspaceError {
     Io(std::io::Error),
 }
 
+impl WorkspaceError {
+    /// Does this error say the disk is full? git reports it as text.
+    pub fn is_storage_full(&self) -> bool {
+        match self {
+            WorkspaceError::Io(e) => crate::storage_full::is_full(e),
+            WorkspaceError::Git(text) => text.contains("No space left on device"),
+            _ => false,
+        }
+    }
+}
+
 impl std::fmt::Display for WorkspaceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -577,6 +588,7 @@ impl TaskWorktree {
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        crate::storage_full::at(crate::storage_full::Site::Patch)?;
         std::fs::write(out_path, diff.as_bytes())?;
         Ok(())
     }
