@@ -206,6 +206,11 @@ CI: the first push failed on `windows-latest` in two tests (a CRLF checkout comp
 Fixed: crash-injection failpoints (Verification 3); relaunch on every poll with a refusal backoff (60 s doubling to 10 min); typed reconciler failures; a claim handed back on refusal and on errors before the run row; abandoned claims by pid start time; a read error in the conflict-marker check is returned, not read as "no marker".
 Deliberate: pins protect the release path only (nothing calls it yet; `holds-until` a gc command). Next: PR 2 (resource admission), on a new branch after this merges; its ADR is ADR-0010, since #248 took 0009.
 
+PR 2: approve, round 1 on the rebased tree `c118ac0e` (36k/45 s), nothing open.
+Rebase (2026-10-19, plan `2026-10-19-finish-admission-then-split.md`, Phase 1): main shipped its own v37 (`landings`) and v38 (`landing_searches`) in v0.25.0/v0.26.0, so this branch's steps became v39 (`group_bindings`, `run_epochs`) and v40 (`check_disk_growth`), schema 40; `a_v38_ledger_takes_the_admission_steps_on_top` pins a released v38 ledger taking both on top. This machine's real ledger holds main's v37/v38 only (scratch copy), so no branch binary ever migrated it.
+Deliberate: the test does not pin v39/v40 by index; it asserts all three tables exist after the upgrade, and an order swap between the two expand-only steps changes nothing a ledger can observe.
+Next: PR 3 (verification evidence), on a new branch after this merges.
+
 ## Outcome (PR 2)
 
 Branch `feat/resource-admission`, built by five relais runs (B1 salvaged after `scope_exceeded` on compile-forced fixtures; B2 salvaged after the coordinator restarted mid-run under a 0.24.1 upgrade; the B2 fixes salvaged after `review_unavailable`; B3 salvaged after `budget_exhausted`; B4 salvaged after `interrupted`) and two early reviews of B2. The gate passed 30/30 at each commit.
@@ -244,5 +249,6 @@ Deliberate: a weight above the number of host slot files is refused when the fir
 - D10 Delivery split into three PRs, one release (person's review); PR 0 added ahead of them and shipped on its own in v0.22.0; PRs 1–3 follow in one release.
 - D11 A probe that times out is "unchecked", not "unsupported": warn, record, continue; a version that answers outside the range, or no answer at all, still refuses. No cross-process version cache.
 - D12 (PR 0 implementation) A timed-out probe stands for `TIMEOUT_RETRY` (300 s) on the backend rather than being re-asked at every use, so a run start waits once, not once per caller; the timeout is read through `Harness::probe_timed_out`, never a process-wide static. `Support`/`claude_code_support` live in `adapter/claude.rs`, since `native` must not depend on `adapter` (module-cycle check).
+- D13 (PR 2 rebase) Schema steps are matched by name, so a branch's steps that collide with names main already shipped are renamed on rebase, never merged into them: PR 2's v37/v38 became v39/v40.
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix body-sha=29618604254a -->
