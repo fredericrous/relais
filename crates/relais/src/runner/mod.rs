@@ -3281,6 +3281,7 @@ impl<'a> RunEngine<'a> {
             sleeper: Arc::new(verify::ThreadSleeper),
             registration: self.registration.clone(),
             tries: self.heavy_tries.clone(),
+            exhausted: |ended, tail| crate::exhaustion::classify(ended, tail).is_some(),
             disk: crate::disk::DiskCheck {
                 floor: self.config.machine.resources.min_free_bytes(),
                 probe: Arc::new(crate::disk::StatvfsProbe),
@@ -7143,6 +7144,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/main.rs".into()],
@@ -7165,6 +7167,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec![shell.into(), "-c".into(), "test ! -f src/main.rs".into()],
@@ -7190,6 +7193,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "true".into()],
@@ -7601,6 +7605,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/evil.txt".into()],
@@ -9078,6 +9083,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/tick-0.txt".into()],
@@ -9138,6 +9144,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec![
@@ -9201,6 +9208,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test -f src/marker.txt".into()],
@@ -9967,6 +9975,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec![
@@ -10528,6 +10537,7 @@ mod tests {
                 name: None,
                 junit: None,
                 weight: None,
+                retry: None,
                 env: Default::default(),
                 reuse: None,
                 argv: vec![shell.into(), "-c".into(), "true".into()],
@@ -10895,6 +10905,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "sleep 60".into()],
@@ -11462,6 +11473,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), script.into()],
@@ -11509,6 +11521,7 @@ mod tests {
                     name: None,
                     junit: None,
                     weight: None,
+                    retry: None,
                     env: Default::default(),
                     reuse: None,
                     argv: vec!["relais-no-such-binary-4f3a".into()],
@@ -11585,6 +11598,7 @@ mod tests {
                 name: None,
                 junit: None,
                 weight: None,
+                retry: None,
                 env: Default::default(),
                 reuse: None,
                 argv: vec!["sh".into(), "-c".into(), "sleep 5".into()],
@@ -12052,6 +12066,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec![shell.into(), "-c".into(), script.into()],
@@ -12167,6 +12182,7 @@ mod tests {
     fn reusing_step(script: &str) -> CommandSpec {
         CommandSpec {
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: Some(crate::policy::ReuseSpec {
                 inputs: vec!["package.json".into()],
@@ -12271,6 +12287,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec![
@@ -13653,6 +13670,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/tick-0.txt".into()],
@@ -13760,6 +13778,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/main.rs".into()],
@@ -14645,5 +14664,6 @@ mod tests {
     mod budgets;
     mod exhaustion;
     mod native;
+    mod plugin_test_script;
     mod verify_kind;
 }

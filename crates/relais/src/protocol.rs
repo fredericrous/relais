@@ -174,6 +174,12 @@ pub enum Event {
         floor: u64,
         reserved: u64,
     },
+    /// A check failed and then passed on a retry: a pass, marked flaky.
+    /// `attempts` is how many times it ran.
+    Flaky {
+        label: String,
+        attempts: u32,
+    },
     /// A line the process wrote to stdout or stderr under `--protocol`.
     Stderr {
         text: String,
@@ -198,6 +204,7 @@ impl Event {
             | Self::EnvironmentWarning { .. }
             | Self::WaitingForSlot { .. }
             | Self::WaitingForDisk { .. }
+            | Self::Flaky { .. }
             | Self::Outcome { .. } => true,
         }
     }

@@ -1202,6 +1202,7 @@ mod tests {
                             timeout_seconds: 300,
                             junit: None,
                             weight: None,
+                            retry: None,
                             env: Default::default(),
                             reuse: None,
                         }],

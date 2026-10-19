@@ -783,6 +783,7 @@ mod tests {
             timeout_seconds: 60,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: Some(ReuseSpec {
                 inputs: vec!["lock".into(), "**/package.json".into(), "patches/**".into()],
@@ -876,6 +877,7 @@ mod tests {
         };
         let plain = CommandSpec {
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             ..step.clone()

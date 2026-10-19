@@ -83,6 +83,7 @@ fn sh(script: &str) -> CommandSpec {
         timeout_seconds: 30,
         junit: None,
         weight: None,
+        retry: None,
         env: BTreeMap::new(),
         reuse: None,
     }
@@ -128,6 +129,7 @@ fn admission<'a>(
         sleeper: Arc::new(ThreadSleeper),
         registration: None,
         tries: Tries::default(),
+        exhausted: |_, _| false,
         disk: crate::disk::DiskCheck::off(),
     }
 }

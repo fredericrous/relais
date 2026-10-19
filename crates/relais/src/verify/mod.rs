@@ -128,9 +128,38 @@ pub struct CheckOutcome {
     /// `ended`, which stays the command's own exit status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub junit: Option<JunitReport>,
+    /// Every attempt of a check that was run again (`retry`), in order,
+    /// the last one being what the fields above describe. Empty for a check
+    /// that ran once, so older receipts read and write unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<Attempt>,
+    /// A check that failed and then passed on a retry: a pass, marked.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub flaky: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// One run of a check that was run more than once: how it ended and the
+/// hash of its own log.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attempt {
+    pub ended: CheckEnd,
+    pub log_path: String,
+    pub log_sha256: String,
 }
 
 impl CheckOutcome {
+    fn attempt(&self) -> Attempt {
+        Attempt {
+            ended: self.ended,
+            log_path: self.log_path.clone(),
+            log_sha256: self.log_sha256.clone(),
+        }
+    }
+
     pub fn failed(&self) -> bool {
         !self.ended.succeeded()
     }
@@ -955,8 +984,72 @@ pub fn run_observed(
 /// smaller of its own timeout and what is left of each budget that applies
 /// to it. Queue time is charged to `admission_wait_seconds` and the total,
 /// never to work, so the timeout is read after the wait.
+///
+/// A check that declares `retry` and fails runs again, each attempt in its
+/// own log (`<stem>.log`, `<stem>-retry1.log`); a failure that shows
+/// resource exhaustion, and a cancellation, are never retried. A
+/// fail-then-pass is a pass marked `flaky`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_observed_within(
+    dir: &Path,
+    spec: &CommandSpec,
+    logs_dir: &Path,
+    label: &str,
+    log_stem: &str,
+    events: &Events,
+    cancel: Option<&AtomicBool>,
+    admission: &HeavyAdmission<'_>,
+) -> Result<CheckOutcome, VerifyError> {
+    let mut outcome = run_attempt(
+        dir, spec, logs_dir, label, log_stem, events, cancel, admission,
+    )?;
+    let mut attempts = Vec::new();
+    for number in 1..=spec.retry.unwrap_or(0) {
+        if !retryable(&outcome, admission) {
+            break;
+        }
+        attempts.push(outcome.attempt());
+        outcome = run_attempt(
+            dir,
+            spec,
+            logs_dir,
+            label,
+            &format!("{log_stem}-retry{number}"),
+            events,
+            cancel,
+            admission,
+        )?;
+    }
+    if !attempts.is_empty() {
+        attempts.push(outcome.attempt());
+        outcome.flaky = !outcome.failed();
+        if outcome.flaky {
+            events.emit(Event::Flaky {
+                label: label.to_string(),
+                attempts: attempts.len() as u32,
+            });
+        }
+        outcome.attempts = attempts;
+    }
+    Ok(outcome)
+}
+
+/// Does a failed check earn another run? Not a pass, not a cancellation,
+/// and not a failure that shows the machine ran out of a resource.
+fn retryable(outcome: &CheckOutcome, admission: &HeavyAdmission<'_>) -> bool {
+    match outcome.ended.recorded() {
+        None | Some(Ended::Cancelled) => false,
+        Some(ended) if ended.succeeded() => false,
+        Some(ended) => {
+            let tail = log_tail(Path::new(&outcome.log_path));
+            !(admission.exhausted)(ended, &tail)
+        }
+    }
+}
+
+/// One run of one command: the body of [`run_observed_within`].
+#[allow(clippy::too_many_arguments)]
+fn run_attempt(
     dir: &Path,
     spec: &CommandSpec,
     logs_dir: &Path,
@@ -1012,7 +1105,8 @@ pub fn run_observed_within(
         .args(&spec.argv[1..])
         .current_dir(dir)
         .stdout(log_file.try_clone()?)
-        .stderr(log_file);
+        .stderr(log_file)
+        .env("RELAIS_CHECK", "1");
     crate::procs::own_process_group(&mut command);
     if let Some(admitted) = &admitted {
         command.envs(admitted.env());
@@ -1124,7 +1218,27 @@ pub fn run_observed_within(
         log_path: log_path.to_string_lossy().into_owned(),
         log_sha256: sha256_hex(&log_bytes),
         junit,
+        attempts: Vec::new(),
+        flaky: false,
     })
+}
+
+/// The end of a log, at most 64 KiB, lossily decoded: what a failure is
+/// classified from. A log that cannot be read has no tail.
+fn log_tail(path: &Path) -> String {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    const TAIL_BYTES: u64 = 64 * 1024;
+    let read = || -> std::io::Result<Vec<u8>> {
+        let mut file = std::fs::File::open(path)?;
+        let length = file.metadata()?.len();
+        file.seek(SeekFrom::Start(length.saturating_sub(TAIL_BYTES)))?;
+        let mut bytes = Vec::new();
+        file.take(TAIL_BYTES).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    read()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
 }
 
 /// Wait for the check to end, with a follower streaming its log into
@@ -2891,9 +3005,119 @@ mod tests {
             timeout_seconds,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
         }
+    }
+
+    fn retrying(script: &str) -> CommandSpec {
+        CommandSpec {
+            retry: Some(1),
+            ..command(&["sh", "-c", script], 10)
+        }
+    }
+
+    /// Appends a line to `runs` each time the check runs.
+    const COUNTED: &str = "echo run >> runs; ";
+
+    fn runs_of(dir: &Path) -> usize {
+        std::fs::read_to_string(dir.join("runs"))
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_retried_check_that_fails_then_passes_is_a_flaky_pass() {
+        let dir = temp_dir("flaky");
+        let logs = dir.join("logs");
+        let script = format!(
+            "{COUNTED}if [ -f seen ]; then echo second; else touch seen; echo first; exit 1; fi"
+        );
+        let outcome = run_command(&dir, &retrying(&script), &logs, "c", "s").expect("runs");
+        assert!(!outcome.failed());
+        assert!(outcome.flaky);
+        assert_eq!(runs_of(&dir), 2);
+        assert_eq!(outcome.attempts.len(), 2);
+        assert_eq!(outcome.attempts[0].ended.recorded(), Some(Ended::Exited(1)));
+        assert_eq!(outcome.attempts[1].ended.recorded(), Some(Ended::Exited(0)));
+        assert_ne!(
+            outcome.attempts[0].log_sha256,
+            outcome.attempts[1].log_sha256
+        );
+        assert_eq!(outcome.attempts[1].log_sha256, outcome.log_sha256);
+        assert!(logs.join("s.log").exists());
+        assert!(logs.join("s-retry1.log").exists());
+        assert_eq!(
+            std::fs::read_to_string(logs.join("s.log")).unwrap(),
+            "first\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(logs.join("s-retry1.log")).unwrap(),
+            "second\n"
+        );
+    }
+
+    #[test]
+    fn a_retried_check_that_fails_twice_is_a_failure_with_both_attempts() {
+        let dir = temp_dir("twice");
+        let script = format!("{COUNTED}exit 3");
+        let outcome =
+            run_command(&dir, &retrying(&script), &dir.join("logs"), "c", "s").expect("runs");
+        assert!(outcome.failed());
+        assert!(!outcome.flaky);
+        assert_eq!(runs_of(&dir), 2);
+        assert_eq!(outcome.attempts.len(), 2);
+        assert!(outcome
+            .attempts
+            .iter()
+            .all(|a| a.ended.recorded() == Some(Ended::Exited(3))));
+    }
+
+    #[test]
+    fn a_check_without_retry_runs_once() {
+        let dir = temp_dir("once");
+        let script = format!("{COUNTED}exit 1");
+        let spec = command(&["sh", "-c", &script], 10);
+        let outcome = run_command(&dir, &spec, &dir.join("logs"), "c", "s").expect("runs");
+        assert!(outcome.failed());
+        assert_eq!(runs_of(&dir), 1);
+        assert!(outcome.attempts.is_empty());
+        assert!(!dir.join("logs/s-retry1.log").exists());
+        let written = serde_json::to_string(&outcome).unwrap();
+        assert!(!written.contains("attempts") && !written.contains("flaky"));
+    }
+
+    #[test]
+    fn a_failure_that_shows_exhaustion_is_not_retried() {
+        let dir = temp_dir("exhausted");
+        let script = format!("{COUNTED}echo 'No space left on device'; exit 1");
+        let admission = HeavyAdmission {
+            exhausted: |ended, tail| crate::exhaustion::classify(ended, tail).is_some(),
+            ..HeavyAdmission::unmanaged()
+        };
+        let outcome = run_observed_within(
+            &dir,
+            &retrying(&script),
+            &dir.join("logs"),
+            "c",
+            "s",
+            &Events::silent(),
+            None,
+            &admission,
+        )
+        .expect("runs");
+        assert!(outcome.failed());
+        assert_eq!(runs_of(&dir), 1);
+        assert!(outcome.attempts.is_empty());
+    }
+
+    #[test]
+    fn a_check_sees_relais_check_in_its_environment() {
+        let dir = temp_dir("env");
+        let spec = command(&["sh", "-c", "echo \"[$RELAIS_CHECK]\""], 10);
+        let outcome = run_command(&dir, &spec, &dir.join("logs"), "c", "s").expect("runs");
+        assert_eq!(std::fs::read_to_string(&outcome.log_path).unwrap(), "[1]\n");
     }
 
     #[test]
@@ -3213,6 +3437,8 @@ mod tests {
             log_path: path.to_string_lossy().into_owned(),
             log_sha256: sha256_hex(bytes),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         }
     }
 
@@ -4113,6 +4339,8 @@ mod tests {
                 log_path: "x.log".into(),
                 log_sha256: "h".into(),
                 junit: None,
+                attempts: Vec::new(),
+                flaky: false,
             }],
             gaps: vec![],
             baseline_failures: vec![],
@@ -4142,6 +4370,7 @@ mod tests {
             timeout_seconds,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
         }
@@ -4201,6 +4430,8 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         }];
         let gaps = acceptance_gaps(
             &entries,
@@ -4263,6 +4494,8 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         }];
         let report = VerificationReport {
             candidate_sha: "abc".into(),
@@ -4400,6 +4633,8 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
             junit,
+            attempts: Vec::new(),
+            flaky: false,
         }
     }
 
@@ -4732,6 +4967,8 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         }];
         let entries = vec![declared(
             "a person signed off on the migration",
@@ -4813,6 +5050,8 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         }];
         let entries = vec![declared(
             "a person signed off on the migration",
@@ -4912,6 +5151,8 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         }];
         let entries = vec![declared(
             "the pre-push cargo test gate covers this candidate",
@@ -4995,6 +5236,8 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         }];
         let entries = vec![declared(
             "the pre-push cargo test gate covers this candidate",
@@ -5182,6 +5425,8 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         };
         let entries = vec![
             AcceptanceEntry::Bare("the layout is listed".into()),
@@ -5372,6 +5617,8 @@ mod tests {
             log_path: "f.log".into(),
             log_sha256: "h".into(),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         };
         let report = VerificationReport {
             candidate_sha: "abc".into(),
