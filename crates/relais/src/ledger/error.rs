@@ -1,5 +1,6 @@
 //! The ledger's error type and the parsers that turn stored text into typed values.
 
+use super::transitions::{seconds_between, DecisionRow};
 use super::*;
 
 #[derive(Debug)]

@@ -3,6 +3,7 @@
 
 use super::schema::migrations::MIGRATIONS;
 use super::*;
+use crate::ids::PackageId;
 use crate::money::CostKind;
 use crate::orchestration::{Speed, TranscriptSource};
 use crate::outcome::{Outcome, OutcomeDetail};
@@ -169,4 +170,18 @@ pub(super) fn event(event_id: &str, run_id: &str, micros: i64) -> UsageEvent {
         requested_effort: None,
         harness: None,
     }
+}
+
+pub(super) fn driver_of(
+    ledger: &Ledger,
+    id: &str,
+) -> (Option<i64>, Option<String>, Option<String>) {
+    ledger
+        .conn
+        .query_row(
+            "SELECT driver_pid, driver_started, driver_since FROM runs WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("driver columns")
 }
