@@ -1,7 +1,31 @@
 //! `relais dataset replay`.
 
-use super::*;
-
+use super::ctx::id_source;
+use super::ctx::load_machine;
+use super::ctx::load_price_table;
+use super::ctx::load_repo_policy;
+use super::ctx::open_ledger;
+use super::ctx::pricing_preflight;
+use super::ctx::tuning_bounds;
+use super::outcome::operational;
+use super::outcome::CliError;
+use super::outcome::CliOutcome;
+use super::run::run_refusal;
+use relais::contract::TaskContract;
+use relais::ids::TaskId;
+use relais::learn::typed_gate;
+use relais::lifecycle::RunPurpose;
+use relais::paths;
+use relais::policy::RecipeSpec;
+use relais::policy::RepoPolicy;
+use relais::route;
+use relais::runner::execute;
+use relais::runner::live_trial;
+use relais::runner::worktree_root;
+use relais::runner::RunConfig;
+use relais::runner::State;
+use relais::workspace;
+use std::path::Path;
 /// The `done` line of a replay, sent once its trial is recorded (or could
 /// not be): the plugin's verdict names the trial, and never precedes it.
 pub(crate) fn announce_replay_done(

@@ -11,7 +11,7 @@ use relais::orchestration::PriceTable;
 use relais::policy::{MachineSettings, RepoPolicy};
 use relais::{paths, route};
 
-use super::outcome::{operational, CliError};
+use super::outcome::{operational, CliError, CliOutcome};
 
 /// The process's working directory. An error, never a panic: tearing down
 /// a task worktree deletes the directory a long-running relais is sitting
@@ -236,4 +236,90 @@ pub(crate) fn print_document<T: serde::Serialize>(document: &T) -> Result<(), Cl
     let text = operational(serde_json::to_string_pretty(document), "rendering JSON")?;
     println!("{text}");
     Ok(())
+}
+
+/// The repository policy a cycle reads when there is no `relais.toml`.
+pub(crate) fn default_repo_policy() -> Result<RepoPolicy, CliError> {
+    RepoPolicy::from_toml_str(&format!(
+        "schema_version = {}\n",
+        relais::policy::POLICY_SCHEMA_VERSION
+    ))
+    .map_err(|cause| CliError::Operational {
+        operation: "learn cycle",
+        cause: Box::new(cause),
+    })
+}
+
+/// The machine's hook-admission settings, or the stated defaults when
+/// machine.toml is missing or will not parse. A hook cannot refuse to
+/// answer over a settings problem any more than over anything else it
+/// might hit — that failure belongs to `relais doctor`, not to a hook
+/// answer holding a tool call open.
+pub(crate) fn hook_admission_settings() -> relais::policy::HookAdmissionSettings {
+    paths::machine_settings_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| MachineSettings::from_toml_str(&text).ok())
+        .map(|machine| machine.admission)
+        .unwrap_or_default()
+}
+
+/// `relais dataset replay` (SPEC §24): re-run a task's already-accepted
+/// run under a candidate recipe, in a workspace where the accepted answer
+/// is genuinely absent, and record that arm as one settled trial. This is
+/// NOT a promotion mechanism and does not compare, score, rank or promote
+/// anything — it produces exactly one arm's result for one task, and it
+/// spends real money, subject to the ordinary ceilings ordinary work goes
+/// through (the same `execute` path `relais run` takes).
+/// Refuses, before anything is dispatched, a policy naming a model the
+/// price table cannot price and no observation resolves (N5); the warnings
+/// go to stderr either way.
+pub(crate) fn pricing_preflight(
+    who: &str,
+    policy: &relais::policy::RepoPolicy,
+    prices: &relais::orchestration::PriceTable,
+    ledger: &relais::ledger::Ledger,
+) -> Result<Option<CliOutcome>, CliError> {
+    let refusals = pricing_refusals(policy, prices, ledger)?;
+    if refusals.is_empty() {
+        return Ok(None);
+    }
+    for refusal in &refusals {
+        eprintln!("{who}: {refusal}");
+    }
+    Ok(Some(CliOutcome::Blocked))
+}
+
+/// The pricing preflight's refusals, warnings printed; empty when the run
+/// may proceed.
+pub(crate) fn pricing_refusals(
+    policy: &relais::policy::RepoPolicy,
+    prices: &relais::orchestration::PriceTable,
+    ledger: &relais::ledger::Ledger,
+) -> Result<Vec<String>, CliError> {
+    let mut aliases: Vec<String> = policy.models.values().map(|m| m.id.clone()).collect();
+    aliases.sort();
+    aliases.dedup();
+    let observations = operational(ledger.model_observations(), "model observations")?;
+    let machine_toml = paths::machine_settings_path().map_err(CliError::Home)?;
+    let decided = relais::native_pricing::preflight(&aliases, prices, &observations, &machine_toml);
+    for warning in &decided.warnings {
+        eprintln!("{warning}");
+    }
+    Ok(decided.refusals.iter().map(|r| r.to_string()).collect())
+}
+
+/// A refusal of a decision: the exit outcome and the sentence that says
+/// why. Printed to stderr, or as `{error, exit}` under `--json`.
+#[derive(Debug)]
+pub(crate) struct Refusal {
+    pub(crate) outcome: CliOutcome,
+    pub(crate) message: String,
+}
+
+pub(crate) fn refusal<T>(outcome: CliOutcome, message: impl Into<String>) -> Result<T, Refusal> {
+    Err(Refusal {
+        outcome,
+        message: message.into(),
+    })
 }

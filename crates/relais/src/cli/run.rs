@@ -1,8 +1,38 @@
 //! `relais run`.
 
+use super::ctx::id_source;
+use super::ctx::load_contract;
+use super::ctx::load_machine;
+use super::ctx::load_price_table;
+use super::ctx::load_repo_policy;
+use super::ctx::open_ledger;
+use super::ctx::pricing_refusals;
+use super::ctx::resolve_task_override;
+use super::learn::learned_registry;
+use super::outcome::operational;
+use super::outcome::CliError;
+use super::outcome::CliOutcome;
 use super::plan::task_identity;
-use super::*;
+use super::protocol::refuse_run;
+use relais::admission::Gate;
+use relais::admission::GateError;
+use relais::backend::Harness;
+use relais::contract::TaskContract;
+use relais::ids::RunId;
+use relais::learn::predict::RegistryPredictor;
+use relais::ledger::Ledger;
+use relais::lifecycle::RunPurpose;
+use relais::paths;
+use relais::policy::MachineSettings;
+use relais::policy::RepoPolicy;
 use relais::report;
+use relais::route;
+use relais::runner::execute;
+use relais::runner::live_trial;
+use relais::runner::RunConfig;
+use relais::runner::Terminal;
+use relais::workspace;
+use std::path::Path;
 
 /// Why this `relais run` must not start, if it must not: it comes from the
 /// relais plugin, whose session said hello recently, on a Claude Code the
@@ -610,6 +640,7 @@ pub(crate) fn keep_ballast(artifacts_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use relais::ids::TaskId;
     use relais::ledger::{Ledger, Transition};
 
     /// A ledger holding one pending successor intent, and its id.

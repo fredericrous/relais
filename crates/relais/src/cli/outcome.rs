@@ -275,3 +275,100 @@ where
         cause: Box::new(cause),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every outcome the table has. Listed here rather than derived,
+    /// because the point of the test below is that two of them never
+    /// share a code; `exit_code` itself is exhaustive, so a new variant
+    /// stops the build until it is given one.
+    const ALL: &[CliOutcome] = &[
+        CliOutcome::Accepted,
+        CliOutcome::OperationalFailure,
+        CliOutcome::InvalidInput,
+        CliOutcome::Blocked,
+        CliOutcome::Failed,
+        CliOutcome::BudgetExhausted,
+        CliOutcome::Interrupted,
+        CliOutcome::Cancelled,
+        CliOutcome::NeedsDecision,
+        CliOutcome::NeedsReview,
+        CliOutcome::UnknownRun,
+        CliOutcome::ResumeRefusedLive,
+        CliOutcome::ResumeReconciled,
+        CliOutcome::NotFullyApplied,
+        CliOutcome::NoTrainingRecords,
+        CliOutcome::NoTierCoverage,
+        CliOutcome::SolverDiverged,
+        CliOutcome::PromotionRefused,
+        CliOutcome::StaleGrantKey,
+        CliOutcome::NothingDetected,
+    ];
+
+    #[test]
+    fn the_exit_code_table_is_total_and_injective() {
+        let mut seen: Vec<i32> = ALL.iter().map(exit_code).collect();
+        assert_eq!(seen.len(), 20, "every documented outcome is listed");
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            ALL.len(),
+            "two outcomes share a code, so a caller cannot tell them apart"
+        );
+        // A shell can only see 0..=255, so the table has to live there.
+        assert!(seen.iter().all(|code| (0..=255).contains(code)), "{seen:?}");
+    }
+
+    /// The distinctions the review asked for, spelled out as assertions
+    /// so collapsing any of them again fails a test (C10).
+    #[test]
+    fn the_codes_callers_must_tell_apart_are_different() {
+        let distinct = |a: CliOutcome, b: CliOutcome| {
+            assert_ne!(exit_code(&a), exit_code(&b), "{a:?} vs {b:?}");
+        };
+        // Needs a human, versus the contract was wrong, versus no such run.
+        distinct(CliOutcome::NeedsDecision, CliOutcome::InvalidInput);
+        distinct(CliOutcome::NeedsReview, CliOutcome::InvalidInput);
+        distinct(CliOutcome::NeedsDecision, CliOutcome::NeedsReview);
+        distinct(CliOutcome::UnknownRun, CliOutcome::InvalidInput);
+        // Resume refused because something may still be running, versus
+        // resume having reconciled the run.
+        distinct(CliOutcome::ResumeRefusedLive, CliOutcome::ResumeReconciled);
+        // `1` is relais's own machinery, not the task.
+        assert_eq!(exit_code(&CliOutcome::OperationalFailure), 1);
+        assert_eq!(exit_code(&CliOutcome::Accepted), 0);
+    }
+
+    #[test]
+    fn a_cli_error_carries_its_cause_and_picks_one_code() {
+        let unreadable = CliError::Read {
+            what: "the task contract",
+            path: PathBuf::from("/tmp/task.json"),
+            cause: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+        };
+        let rendered = unreadable.to_string();
+        assert!(rendered.contains("/tmp/task.json"), "{rendered}");
+        assert!(rendered.contains("no such file"), "{rendered}");
+        assert_eq!(unreadable.outcome(), CliOutcome::InvalidInput);
+
+        // A deleted working directory is an environment problem, not a
+        // malformed invocation, and never a panic (C14).
+        let gone = CliError::Cwd(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file or directory",
+        ));
+        assert_eq!(gone.outcome(), CliOutcome::Blocked);
+        assert!(gone.to_string().contains("removed under this process"));
+
+        // The ledger failing is code 1 and says nothing about the task.
+        let ledger = CliError::Operational {
+            operation: "status",
+            cause: Box::new(std::io::Error::other("database is locked")),
+        };
+        assert_eq!(exit_code(&ledger.outcome()), 1);
+        assert!(ledger.to_string().contains("database is locked"));
+    }
+}

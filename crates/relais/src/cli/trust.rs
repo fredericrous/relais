@@ -1,7 +1,20 @@
 //! `relais trust`: showing and recording the repository grant in machine.toml.
 
-use super::*;
-
+use super::ctx::load_machine;
+use super::ctx::load_repo_policy;
+use super::ctx::open_ledger;
+use super::ctx::print_document;
+use super::outcome::operational;
+use super::outcome::CliError;
+use super::outcome::CliOutcome;
+use super::plan::pending_command_change;
+use super::GrantScope;
+use super::GrantSource;
+use super::TrustCommand;
+use relais::ledger::Ledger;
+use relais::paths;
+use relais::policy::RepoIdentity;
+use relais::policy::RepoPolicy;
 pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
     let (root, policy) = load_repo_policy()?;
     let machine = load_machine()?;

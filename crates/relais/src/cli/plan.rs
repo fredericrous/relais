@@ -1,7 +1,30 @@
 //! `relais plan`.
 
-use super::*;
-
+use super::ctx::load_contract;
+use super::ctx::load_machine;
+use super::ctx::load_repo_policy;
+use super::ctx::open_ledger;
+use super::ctx::resolve_task_override;
+use super::learn::harness_identity;
+use super::learn::learned_registry;
+use super::outcome::operational;
+use super::outcome::CliError;
+use super::outcome::CliOutcome;
+use super::recipe::missing_grant_text;
+use relais::contract::TaskContract;
+use relais::ids::TaskId;
+use relais::learn::predict::RegistryPredictor;
+use relais::ledger::Ledger;
+use relais::paths;
+use relais::policy::effective_authority;
+use relais::policy::EffectiveAuthority;
+use relais::policy::MachineSettings;
+use relais::policy::RepoIdentity;
+use relais::policy::RepoPolicy;
+use relais::route;
+use relais::runner::live_trial;
+use relais::workspace;
+use std::path::Path;
 /// A change to the repository's commands that no `relais run` has said
 /// yet, read without consuming it (`plan`, `trust show`): from the ledger
 /// when there is one, nothing otherwise. Best effort — a ledger that

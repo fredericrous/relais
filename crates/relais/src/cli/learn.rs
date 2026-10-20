@@ -1,8 +1,24 @@
 //! The learning commands: the registry, datasets, training, promotion,
 //! rollback, export and import, and the learning envelope.
 
-use super::*;
-
+use super::ctx::datasets_dir;
+use super::ctx::default_repo_policy;
+use super::ctx::load_machine;
+use super::ctx::load_repo_policy;
+use super::ctx::open_ledger;
+use super::ctx::print_document;
+use super::ctx::registry;
+use super::outcome::operational;
+use super::outcome::CliError;
+use super::outcome::CliOutcome;
+use super::JudgeVerdict;
+use relais::backend::Harness;
+use relais::contract::TaskContract;
+use relais::ids::RunId;
+use relais::ledger::Ledger;
+use relais::paths;
+use relais::policy::MachineSettings;
+use std::path::Path;
 /// The registry, when learned routing is on and the registry opens; a
 /// missing or unreadable registry is the conservative baseline, not an
 /// error (SPEC §21: missing trained evidence produces conservative

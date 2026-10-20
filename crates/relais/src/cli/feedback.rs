@@ -1,8 +1,18 @@
 //! `relais feedback`.
 
-use super::decide::*;
-use super::*;
-
+use super::ctx::open_ledger;
+use super::ctx::refusal;
+use super::ctx::Refusal;
+use super::decide::read_decide_proof;
+use super::outcome::exit_code;
+use super::outcome::operational;
+use super::outcome::CliError;
+use super::outcome::CliOutcome;
+use super::FeedbackOutcome;
+use relais::ids::RunId;
+use relais::ids::TaskId;
+use relais::ledger::Ledger;
+use relais::runner::State;
 /// The run a `relais feedback` invocation is about: the one named
 /// directly, or the task's accepted run when `--task` is given instead.
 /// Exactly one of `run_id`/`task` is `Some` — clap's `conflicts_with` and
@@ -346,6 +356,7 @@ mod tests {
     use super::*;
     use crate::cli::tests::temp_ledger;
     use relais::ledger::Transition;
+    use relais::runner::Reason;
 
     /// `decide --answer approve` reads the gaps a `VerificationGap`
     /// transition recorded, not a fresh verification run: the run is

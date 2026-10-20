@@ -1,7 +1,21 @@
 //! `relais report` and `relais usage import`.
 
-use super::*;
+use super::ctx::load_price_table;
+use super::ctx::open_ledger;
+use super::ctx::print_document;
+use super::outcome::operational;
+use super::outcome::CliError;
+use super::outcome::CliOutcome;
+use relais::ledger::Ledger;
+use relais::ledger::OrchestrationUsageRow;
+use relais::money::CostCompleteness;
+use relais::money::MicroUsd;
+use relais::orchestration;
+use relais::orchestration::PriceTable;
+use relais::orchestration::TranscriptSource;
+use relais::paths;
 use relais::report;
+use std::path::Path;
 
 pub(crate) fn report_command(
     since: Option<&str>,
@@ -294,6 +308,7 @@ mod tests {
     use super::*;
     use crate::cli::tests::temp_ledger;
     use relais::ledger::Ledger;
+    use std::path::PathBuf;
 
     /// A session transcript: one assistant message with this id.
     fn assistant_line(message_id: &str) -> String {

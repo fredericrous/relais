@@ -1,7 +1,25 @@
 //! `relais recipe`: list, show, diff, evaluate, promote, rollback.
 
-use super::*;
-
+use super::ctx::load_repo_policy;
+use super::ctx::open_ledger;
+use super::ctx::tuning_bounds;
+use super::outcome::operational;
+use super::outcome::CliError;
+use super::outcome::CliOutcome;
+use relais::learn::comparison::evaluate_candidate;
+use relais::learn::comparison::DEFAULT_BOOTSTRAP_RESAMPLES;
+use relais::learn::comparison::MIN_PAIRED_TASKS;
+use relais::learn::promote::admit;
+use relais::learn::promote::Amendment;
+use relais::learn::typed_gate;
+use relais::paths;
+use relais::policy::grant_key;
+use relais::policy::RecipeSpec;
+use relais::policy::RepoIdentity;
+use relais::policy::RepoPolicy;
+use relais::route;
+use serde::Serialize;
+use std::path::Path;
 /// `kind` as `list`/`show` print it — never `Debug`'s capitalised
 /// spelling, and named `unset` rather than empty when the recipe leaves
 /// it unspecified.

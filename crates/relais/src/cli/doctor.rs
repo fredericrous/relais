@@ -1,7 +1,17 @@
 //! `relais doctor`, `relais hook` and `relais init`.
 
-use super::*;
+use super::ctx::hook_admission_settings;
+use super::ctx::load_machine;
+use super::ctx::load_repo_policy;
+use super::ctx::print_document;
+use super::ctx::project_dir;
+use super::outcome::CliError;
+use super::outcome::CliOutcome;
+use relais::backend::Harness;
 use relais::doctor;
+use relais::paths;
+use relais::route;
+use std::path::Path;
 
 /// Say on doctor's `effort` finding which models a `raise` repair WOULD hold
 /// because their effort order is unknown. Doctor has no task or budget, so

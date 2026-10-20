@@ -1,7 +1,13 @@
 //! `relais status` and `relais explain`.
 
+use super::ctx::open_ledger;
+use super::outcome::operational;
+use super::outcome::CliError;
+use super::outcome::CliOutcome;
 use super::run::successor_process;
-use super::*;
+use relais::ids::RunId;
+use relais::ledger::Ledger;
+use relais::paths;
 use relais::report;
 
 /// The successor intents a status shows: every pending one (a refused one

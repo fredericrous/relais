@@ -21,18 +21,11 @@ pub(crate) mod salvage;
 pub(crate) mod status;
 pub(crate) mod trust;
 
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::Serialize;
 
 use self::coordinator::{coordinator_command, quiet_command};
-use self::ctx::{
-    cwd, datasets_dir, id_source, load_contract, load_machine, load_machine_pricing,
-    load_price_table, load_repo_policy, open_ledger, print_document, project_dir, read_stdin,
-    registry, resolve_task_override, tuning_bounds,
-};
 use self::decide::{decide_command, DecideRequest};
 use self::doctor::{
     doctor_command, doctor_effort_template_command, hook_command, hook_respond_command,
@@ -43,51 +36,25 @@ use self::feedback::{feedback_command, FeedbackRequest};
 use self::install::{install_command, uninstall_command, Targets};
 use self::learn::{
     dataset_build_command, evaluate_command, export_classifier_command, export_tasks_command,
-    harness_identity, import_task_types_command, judge_trial_command, learn_cycle_command,
-    learn_last_command, learned_registry, learning_envelope_command, learning_off_command,
+    import_task_types_command, judge_trial_command, learn_cycle_command, learn_last_command,
     promote_command, rollback_command, train_command,
 };
-use self::native::{await_cancel, cancel_standing, native_command, CancelStanding};
-use self::outcome::{exit_code, operational, CliError, CliOutcome};
-use self::plan::{pending_command_change, plan_command, PlanFormat};
-use self::protocol::{announce_unstarted, open_protocol, refuse_run};
+use self::native::native_command;
+use self::outcome::{exit_code, CliError, CliOutcome};
+use self::plan::{plan_command, PlanFormat};
+use self::protocol::{announce_unstarted, open_protocol};
 use self::recipe::{
-    missing_grant_text, recipe_diff_command, recipe_evaluate_command, recipe_list_command,
-    recipe_promote_command, recipe_rollback_command, recipe_show_command, AmendMode,
+    recipe_diff_command, recipe_evaluate_command, recipe_list_command, recipe_promote_command,
+    recipe_rollback_command, recipe_show_command, AmendMode,
 };
 use self::replay::replay_command;
 use self::report::{report_command, usage_import_command};
 use self::resume::{resume_command, resume_logged, retire_all_command, Retire};
-use self::run::{run_command, run_refusal, RunSource};
-use self::status::{explain_command, intent_json, status_command};
+use self::run::{run_command, RunSource};
+use self::status::{explain_command, status_command};
 use self::trust::trust_command;
 
-use relais::acceptance::Evidence;
-use relais::admission::{BoundOutcome, Gate, GateError, StoppedOutcome, StoppedReport};
-use relais::backend::Harness;
-use relais::contract::TaskContract;
-use relais::ids::{RunId, TaskId};
-use relais::install::{InstallReport, InstallRequest, Mode, Scope};
-use relais::learn::comparison::{
-    evaluate_candidate, DEFAULT_BOOTSTRAP_RESAMPLES, MIN_PAIRED_TASKS,
-};
-use relais::learn::predict::RegistryPredictor;
-use relais::learn::promote::{admit, Amendment};
-use relais::learn::typed_gate;
-use relais::ledger::OrchestrationUsageRow;
-use relais::lifecycle::RunPurpose;
-use relais::money::{CostCompleteness, MicroUsd};
-use relais::orchestration::{self, PriceTable, TranscriptSource};
-use relais::policy::{
-    effective_authority, grant_key, EffectiveAuthority, HookAdmissionSettings, MachineSettings,
-    RecipeSpec, RepoIdentity, RepoPolicy,
-};
-use relais::runner::{execute, live_trial, worktree_root, Reason, RunConfig, State, Terminal};
-use relais::verify::{independence_summary, Receipt, SettledVia};
-use relais::{
-    ledger::{EvidenceKind, EvidenceOrigin, Ledger},
-    paths, route, workspace,
-};
+use relais::runner::{Reason, State};
 
 #[derive(Parser)]
 #[command(
@@ -1327,92 +1294,6 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
     }
 }
 
-/// The repository policy a cycle reads when there is no `relais.toml`.
-pub(crate) fn default_repo_policy() -> Result<RepoPolicy, CliError> {
-    RepoPolicy::from_toml_str(&format!(
-        "schema_version = {}\n",
-        relais::policy::POLICY_SCHEMA_VERSION
-    ))
-    .map_err(|cause| CliError::Operational {
-        operation: "learn cycle",
-        cause: Box::new(cause),
-    })
-}
-
-/// The machine's hook-admission settings, or the stated defaults when
-/// machine.toml is missing or will not parse. A hook cannot refuse to
-/// answer over a settings problem any more than over anything else it
-/// might hit — that failure belongs to `relais doctor`, not to a hook
-/// answer holding a tool call open.
-pub(crate) fn hook_admission_settings() -> relais::policy::HookAdmissionSettings {
-    paths::machine_settings_path()
-        .ok()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| MachineSettings::from_toml_str(&text).ok())
-        .map(|machine| machine.admission)
-        .unwrap_or_default()
-}
-
-/// `relais dataset replay` (SPEC §24): re-run a task's already-accepted
-/// run under a candidate recipe, in a workspace where the accepted answer
-/// is genuinely absent, and record that arm as one settled trial. This is
-/// NOT a promotion mechanism and does not compare, score, rank or promote
-/// anything — it produces exactly one arm's result for one task, and it
-/// spends real money, subject to the ordinary ceilings ordinary work goes
-/// through (the same `execute` path `relais run` takes).
-/// Refuses, before anything is dispatched, a policy naming a model the
-/// price table cannot price and no observation resolves (N5); the warnings
-/// go to stderr either way.
-pub(crate) fn pricing_preflight(
-    who: &str,
-    policy: &relais::policy::RepoPolicy,
-    prices: &relais::orchestration::PriceTable,
-    ledger: &relais::ledger::Ledger,
-) -> Result<Option<CliOutcome>, CliError> {
-    let refusals = pricing_refusals(policy, prices, ledger)?;
-    if refusals.is_empty() {
-        return Ok(None);
-    }
-    for refusal in &refusals {
-        eprintln!("{who}: {refusal}");
-    }
-    Ok(Some(CliOutcome::Blocked))
-}
-
-/// The pricing preflight's refusals, warnings printed; empty when the run
-/// may proceed.
-pub(crate) fn pricing_refusals(
-    policy: &relais::policy::RepoPolicy,
-    prices: &relais::orchestration::PriceTable,
-    ledger: &relais::ledger::Ledger,
-) -> Result<Vec<String>, CliError> {
-    let mut aliases: Vec<String> = policy.models.values().map(|m| m.id.clone()).collect();
-    aliases.sort();
-    aliases.dedup();
-    let observations = operational(ledger.model_observations(), "model observations")?;
-    let machine_toml = paths::machine_settings_path().map_err(CliError::Home)?;
-    let decided = relais::native_pricing::preflight(&aliases, prices, &observations, &machine_toml);
-    for warning in &decided.warnings {
-        eprintln!("{warning}");
-    }
-    Ok(decided.refusals.iter().map(|r| r.to_string()).collect())
-}
-
-/// A refusal of a decision: the exit outcome and the sentence that says
-/// why. Printed to stderr, or as `{error, exit}` under `--json`.
-#[derive(Debug)]
-pub(crate) struct Refusal {
-    pub(crate) outcome: CliOutcome,
-    pub(crate) message: String,
-}
-
-pub(crate) fn refusal<T>(outcome: CliOutcome, message: impl Into<String>) -> Result<T, Refusal> {
-    Err(Refusal {
-        outcome,
-        message: message.into(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1483,97 +1364,5 @@ mod tests {
             };
             assert_eq!(answer.terminal_state(), expected, "{answer:?}");
         }
-    }
-
-    /// Every outcome the table has. Listed here rather than derived,
-    /// because the point of the test below is that two of them never
-    /// share a code; `exit_code` itself is exhaustive, so a new variant
-    /// stops the build until it is given one.
-    const ALL: &[CliOutcome] = &[
-        CliOutcome::Accepted,
-        CliOutcome::OperationalFailure,
-        CliOutcome::InvalidInput,
-        CliOutcome::Blocked,
-        CliOutcome::Failed,
-        CliOutcome::BudgetExhausted,
-        CliOutcome::Interrupted,
-        CliOutcome::Cancelled,
-        CliOutcome::NeedsDecision,
-        CliOutcome::NeedsReview,
-        CliOutcome::UnknownRun,
-        CliOutcome::ResumeRefusedLive,
-        CliOutcome::ResumeReconciled,
-        CliOutcome::NotFullyApplied,
-        CliOutcome::NoTrainingRecords,
-        CliOutcome::NoTierCoverage,
-        CliOutcome::SolverDiverged,
-        CliOutcome::PromotionRefused,
-        CliOutcome::StaleGrantKey,
-        CliOutcome::NothingDetected,
-    ];
-
-    #[test]
-    fn the_exit_code_table_is_total_and_injective() {
-        let mut seen: Vec<i32> = ALL.iter().map(exit_code).collect();
-        assert_eq!(seen.len(), 20, "every documented outcome is listed");
-        seen.sort_unstable();
-        seen.dedup();
-        assert_eq!(
-            seen.len(),
-            ALL.len(),
-            "two outcomes share a code, so a caller cannot tell them apart"
-        );
-        // A shell can only see 0..=255, so the table has to live there.
-        assert!(seen.iter().all(|code| (0..=255).contains(code)), "{seen:?}");
-    }
-
-    /// The distinctions the review asked for, spelled out as assertions
-    /// so collapsing any of them again fails a test (C10).
-    #[test]
-    fn the_codes_callers_must_tell_apart_are_different() {
-        let distinct = |a: CliOutcome, b: CliOutcome| {
-            assert_ne!(exit_code(&a), exit_code(&b), "{a:?} vs {b:?}");
-        };
-        // Needs a human, versus the contract was wrong, versus no such run.
-        distinct(CliOutcome::NeedsDecision, CliOutcome::InvalidInput);
-        distinct(CliOutcome::NeedsReview, CliOutcome::InvalidInput);
-        distinct(CliOutcome::NeedsDecision, CliOutcome::NeedsReview);
-        distinct(CliOutcome::UnknownRun, CliOutcome::InvalidInput);
-        // Resume refused because something may still be running, versus
-        // resume having reconciled the run.
-        distinct(CliOutcome::ResumeRefusedLive, CliOutcome::ResumeReconciled);
-        // `1` is relais's own machinery, not the task.
-        assert_eq!(exit_code(&CliOutcome::OperationalFailure), 1);
-        assert_eq!(exit_code(&CliOutcome::Accepted), 0);
-    }
-
-    #[test]
-    fn a_cli_error_carries_its_cause_and_picks_one_code() {
-        let unreadable = CliError::Read {
-            what: "the task contract",
-            path: PathBuf::from("/tmp/task.json"),
-            cause: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
-        };
-        let rendered = unreadable.to_string();
-        assert!(rendered.contains("/tmp/task.json"), "{rendered}");
-        assert!(rendered.contains("no such file"), "{rendered}");
-        assert_eq!(unreadable.outcome(), CliOutcome::InvalidInput);
-
-        // A deleted working directory is an environment problem, not a
-        // malformed invocation, and never a panic (C14).
-        let gone = CliError::Cwd(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "No such file or directory",
-        ));
-        assert_eq!(gone.outcome(), CliOutcome::Blocked);
-        assert!(gone.to_string().contains("removed under this process"));
-
-        // The ledger failing is code 1 and says nothing about the task.
-        let ledger = CliError::Operational {
-            operation: "status",
-            cause: Box::new(std::io::Error::other("database is locked")),
-        };
-        assert_eq!(exit_code(&ledger.outcome()), 1);
-        assert!(ledger.to_string().contains("database is locked"));
     }
 }

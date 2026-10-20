@@ -1,7 +1,18 @@
 //! `relais install` and `relais uninstall`: what they plan, apply and print.
 
-use super::*;
-
+use super::ctx::hook_admission_settings;
+use super::ctx::open_ledger;
+use super::ctx::project_dir;
+use super::outcome::operational;
+use super::outcome::CliError;
+use super::outcome::CliOutcome;
+use relais::install::InstallReport;
+use relais::install::InstallRequest;
+use relais::install::Mode;
+use relais::install::Scope;
+use relais::paths;
+use std::path::Path;
+use std::path::PathBuf;
 /// The request the two `--claude` commands share. `--write` is the only
 /// thing that applies anything; `--user` is the only thing that leaves
 /// the project.

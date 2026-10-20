@@ -1,7 +1,21 @@
 //! `relais evidence attach`.
 
-use super::*;
-
+use super::ctx::open_ledger;
+use super::outcome::operational;
+use super::outcome::CliError;
+use super::outcome::CliOutcome;
+use relais::acceptance::Evidence;
+use relais::ids::RunId;
+use relais::ledger::EvidenceKind;
+use relais::ledger::EvidenceOrigin;
+use relais::ledger::Ledger;
+use relais::paths;
+use relais::runner::State;
+use relais::verify::independence_summary;
+use relais::verify::Receipt;
+use relais::verify::SettledVia;
+use relais::workspace;
+use std::path::Path;
 /// Record one piece of evidence produced by another tool, against a run
 /// and, optionally, the acceptance criterion it answers. This decides
 /// nothing: it never marks a criterion met, changes a run's state, or
@@ -194,6 +208,7 @@ pub(crate) fn reseal_receipt_in(
 mod tests {
     use super::*;
     use crate::cli::tests::temp_ledger;
+    use relais::money::MicroUsd;
 
     const SIGN_OFF_GAP: &str =
         "acceptance criterion `read` names a human sign-off, which nothing has recorded";

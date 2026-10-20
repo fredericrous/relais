@@ -1,8 +1,21 @@
 //! `relais resume` and the retirement of runs.
 
+use super::ctx::open_ledger;
+use super::ctx::project_dir;
+use super::outcome::operational;
+use super::outcome::CliError;
+use super::outcome::CliOutcome;
 use super::status::print_pending_intents;
-use super::*;
+use relais::admission::Gate;
+use relais::ids::RunId;
+use relais::ledger::Ledger;
+use relais::paths;
 use relais::resume;
+use relais::runner::Reason;
+use relais::runner::State;
+use relais::workspace;
+use std::path::Path;
+use std::path::PathBuf;
 
 /// Run this same `relais resume` again with its output appended to `log`
 /// (a timestamp line first), and report whether it succeeded. A detached

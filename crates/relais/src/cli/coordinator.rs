@@ -1,7 +1,21 @@
 //! `relais coordinator` and `relais quiet`.
 
-use super::*;
-
+use super::ctx::open_ledger;
+use super::ctx::print_document;
+use super::native::await_cancel;
+use super::native::cancel_standing;
+use super::native::CancelStanding;
+use super::outcome::CliError;
+use super::outcome::CliOutcome;
+use super::CoordinatorCommand;
+use super::QuietCommand;
+use relais::ids::RunId;
+use relais::ledger::Ledger;
+use relais::paths;
+use relais::policy::HookAdmissionSettings;
+use relais::policy::MachineSettings;
+use std::path::Path;
+use std::time::Duration;
 /// `coordinator status --json`, in every state. A typed document, never a
 /// human sentence on stdout: a caller parsing this had to tell "no daemon"
 /// from a parse failure, and the client's error was thrown away
