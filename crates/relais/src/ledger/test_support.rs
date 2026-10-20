@@ -3,6 +3,7 @@
 
 use super::schema::migrations::MIGRATIONS;
 use super::*;
+use crate::orchestration::{Speed, TranscriptSource};
 use crate::outcome::{Outcome, OutcomeDetail};
 
 pub(super) fn run(id: &str) -> RunId {
