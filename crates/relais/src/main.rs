@@ -10,13 +10,19 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
+use cli::ctx::{
+    cwd, datasets_dir, id_source, load_contract, load_machine, load_machine_pricing,
+    load_price_table, load_repo_policy, open_ledger, print_document, project_dir, read_stdin,
+    registry, resolve_task_override, tuning_bounds,
+};
 use cli::outcome::{exit_code, operational, CliError, CliOutcome};
+use cli::protocol::{announce_unstarted, open_protocol, refuse_run};
 
 use relais::acceptance::Evidence;
 use relais::admission::{BoundOutcome, Gate, GateError, StoppedOutcome, StoppedReport};
 use relais::backend::Harness;
 use relais::contract::TaskContract;
-use relais::ids::{IdSource, RunId, TaskId};
+use relais::ids::{RunId, TaskId};
 use relais::install::{InstallReport, InstallRequest, Mode, Scope};
 use relais::learn::comparison::{
     evaluate_candidate, DEFAULT_BOOTSTRAP_RESAMPLES, MIN_PAIRED_TASKS,
@@ -991,28 +997,6 @@ impl DecideAnswer {
     }
 }
 
-impl CliError {
-    /// The name a `done` line gives this failure when it ends a
-    /// `relais run --protocol` before any run exists (SPEC §29).
-    fn wire_code(&self) -> &'static str {
-        match self {
-            CliError::Locate(relais::repo::LocateError::RepoWithoutPolicy(_)) => "no_policy",
-            CliError::Locate(relais::repo::LocateError::NotInRepository(_)) => "not_in_repository",
-            CliError::Read { what, .. } | CliError::Invalid { what, .. } => match *what {
-                "the repository policy" => "invalid_policy",
-                "the machine settings" => "invalid_machine_settings",
-                _ => "invalid_input",
-            },
-            CliError::Home(_) | CliError::Cwd(_) => "environment",
-            CliError::Usage { .. } => "refused",
-            CliError::NoDataset { .. }
-            | CliError::Amend(_)
-            | CliError::AppendPolicy { .. }
-            | CliError::Operational { .. } => "operational_failure",
-        }
-    }
-}
-
 fn main() {
     let cli = Cli::parse();
     // Before anything runs, or prints: `--protocol` takes stdout over.
@@ -1054,71 +1038,6 @@ fn main() {
         channel.close();
     }
     std::process::exit(exit_code(&outcome));
-}
-
-thread_local! {
-    /// The refusal a `relais run --protocol` printed before any run
-    /// existed, for the `done` line `main` sends in its place.
-    static REFUSAL: std::cell::RefCell<Option<(&'static str, String)>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Print a refusal that ends `relais run` before a run exists, and keep
-/// it for the `done` line (see [`announce_unstarted`]).
-fn refuse_run(code: &'static str, detail: String, outcome: CliOutcome) -> CliOutcome {
-    eprintln!("relais run: blocked ({code}): {detail}");
-    REFUSAL.with(|refusal| *refusal.borrow_mut() = Some((code, detail)));
-    outcome
-}
-
-/// Every `relais run --protocol` (and `dataset replay --protocol`) that
-/// exits sends one `done` line: the runner sends it for a run that
-/// started; this sends it, with `run: null`, for one refused before it
-/// could — no policy, unreadable settings, a bad contract, admission.
-/// Without it the plugin had only an exit code to tell the model.
-fn announce_unstarted(outcome: CliOutcome, error: Option<&CliError>) {
-    if relais::protocol::done_sent() || outcome == CliOutcome::Accepted {
-        return;
-    }
-    let kept = REFUSAL.with(|refusal| refusal.borrow_mut().take());
-    let (code, detail) = match (error, kept) {
-        (Some(e), _) => (e.wire_code(), e.to_string()),
-        (None, Some((code, detail))) => (code, detail),
-        (None, None) => (
-            "refused",
-            format!("relais exited with code {}", exit_code(&outcome)),
-        ),
-    };
-    let _ = relais::protocol::Wire::process().send(&relais::protocol::Request::Done {
-        run: None,
-        outcome: "blocked",
-        receipt: None,
-        summary: None,
-        trial: None,
-        code: Some(code),
-        detail: Some(&detail),
-    });
-}
-
-/// The protocol channel of `relais run --protocol` (SPEC §29): installed
-/// before the run starts, or refused on a platform that cannot.
-fn open_protocol(command: &Command) -> Result<Option<relais::protocol::Channel>, CliError> {
-    let run = matches!(command, Command::Run { protocol: true, .. });
-    let replay = matches!(
-        command,
-        Command::Dataset {
-            cmd: DatasetCommand::Replay { protocol: true, .. },
-        }
-    );
-    if !run && !replay {
-        return Ok(None);
-    }
-    let name = if replay { "dataset replay" } else { "run" };
-    relais::protocol::install()
-        .map(Some)
-        .map_err(|e| CliError::Usage {
-            detail: format!("{name} --protocol: {e}"),
-        })
 }
 
 /// Route one parsed invocation to its handler. Every handler returns the
@@ -1838,26 +1757,6 @@ fn harness_identity() -> HarnessProbe {
 struct HarnessProbe {
     identity: Option<String>,
     efforts: Option<relais::catalog::EffortSet>,
-}
-
-/// The identifier source this process mints with: the wall clock and
-/// this process's id, read once, here, at the boundary. `ids` itself
-/// takes both as parameters (`effects.no-ambient-access`), which is
-/// what lets a test assert on a minted identifier.
-fn id_source() -> IdSource {
-    IdSource::new(std::time::SystemTime::now, std::process::id())
-}
-
-fn registry() -> Result<relais::learn::registry::Registry, CliError> {
-    let dir = paths::registry_dir().map_err(CliError::Home)?;
-    operational(
-        relais::learn::registry::Registry::open(&dir),
-        "the artifact registry is unavailable",
-    )
-}
-
-fn datasets_dir() -> Result<PathBuf, CliError> {
-    Ok(paths::state_dir().map_err(CliError::Home)?.join("datasets"))
 }
 
 fn latest_dataset() -> Result<relais::learn::dataset::Dataset, CliError> {
@@ -2952,15 +2851,6 @@ fn coordinator_status_command(socket: &Path, json: bool) -> Result<CliOutcome, C
     Ok(CliOutcome::Accepted)
 }
 
-/// Print one JSON document on stdout. Serialization of a document this
-/// file built is an invariant, not a runtime condition, but it is still
-/// reported rather than unwrapped.
-fn print_document<T: serde::Serialize>(document: &T) -> Result<(), CliError> {
-    let text = operational(serde_json::to_string_pretty(document), "rendering JSON")?;
-    println!("{text}");
-    Ok(())
-}
-
 /// `relais quiet watch --protocol`: the watcher ends when its reader goes
 /// away, which is how it is meant to stop, so that is success.
 fn quiet_command(cmd: QuietCommand) -> Result<CliOutcome, CliError> {
@@ -3683,47 +3573,6 @@ fn opt(value: Option<u32>) -> String {
     value.map_or_else(|| "unlimited".into(), |value| value.to_string())
 }
 
-/// The process's working directory. An error, never a panic: tearing down
-/// a task worktree deletes the directory a long-running relais is sitting
-/// in, and a backtrace is the wrong way to say so (C14).
-fn cwd() -> Result<PathBuf, CliError> {
-    std::env::current_dir().map_err(CliError::Cwd)
-}
-
-/// The directory a repository-level command acts on: the root whose
-/// `relais.toml` governs the cwd; failing that, the repository root
-/// (where `init` belongs); failing that, the cwd itself. Never a
-/// locate error: `doctor`, `init` and `install` report what they find
-/// there.
-fn project_dir() -> Result<PathBuf, CliError> {
-    let cwd = cwd()?;
-    Ok(match relais::repo::locate_repo_root(&cwd) {
-        Ok(root) | Err(relais::repo::LocateError::RepoWithoutPolicy(root)) => root,
-        Err(relais::repo::LocateError::NotInRepository(start)) => start,
-    })
-}
-
-/// The repository root and its policy. `relais.toml` is looked up from
-/// the cwd upward to the nearest `.git`, so a Claude Code session whose
-/// cwd is a subdirectory, or the shell's `cd repo && relais …`, both land
-/// on the repository's policy; a directory outside any repository is
-/// refused by name rather than guessed at.
-fn load_repo_policy() -> Result<(PathBuf, RepoPolicy), CliError> {
-    let root = relais::repo::locate_repo_root(&cwd()?).map_err(CliError::Locate)?;
-    let path = root.join("relais.toml");
-    let text = std::fs::read_to_string(&path).map_err(|cause| CliError::Read {
-        what: "the repository policy",
-        path: path.clone(),
-        cause,
-    })?;
-    let policy = RepoPolicy::from_toml_str(&text).map_err(|cause| CliError::Invalid {
-        what: "the repository policy",
-        path,
-        cause: Box::new(cause),
-    })?;
-    Ok((root, policy))
-}
-
 /// The repository policy a cycle reads when there is no `relais.toml`.
 fn default_repo_policy() -> Result<RepoPolicy, CliError> {
     RepoPolicy::from_toml_str(&format!(
@@ -3734,77 +3583,6 @@ fn default_repo_policy() -> Result<RepoPolicy, CliError> {
         operation: "learn cycle",
         cause: Box::new(cause),
     })
-}
-
-fn load_machine() -> Result<MachineSettings, CliError> {
-    let path = paths::machine_settings_path().map_err(CliError::Home)?;
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        // Absent is empty: no ceilings, no grants. A fresh machine then
-        // reaches the trust check and is told `missing_trust_grant`,
-        // which names the way out, instead of failing on a read before
-        // any run exists (SPEC §5).
-        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
-            format!(
-                "schema_version = {}\n",
-                relais::policy::MACHINE_SCHEMA_VERSION
-            )
-        }
-        // Unreadable is not absent: ceilings and grants the file states
-        // would silently not apply.
-        Err(cause) => {
-            return Err(CliError::Read {
-                what: "the machine settings",
-                path,
-                cause,
-            })
-        }
-    };
-    MachineSettings::from_toml_str(&text).map_err(|cause| CliError::Invalid {
-        what: "the machine settings",
-        path,
-        cause: Box::new(cause),
-    })
-}
-
-/// The bounds a candidate recipe is admitted under: the incumbent's own,
-/// with effort catalogs resolved as routing resolves them — from the
-/// harness probe and machine.toml. A machine.toml that is absent or invalid
-/// states no effort fact, and a harness that does not answer accepts none:
-/// both leave the catalogs unknown, which admits only the incumbent's
-/// configured efforts, never more.
-fn tuning_bounds(incumbent: &RepoPolicy) -> route::TuningBounds {
-    let settings = paths::machine_settings_path()
-        .ok()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| MachineSettings::from_toml_str(&text).ok())
-        .map(|machine| {
-            (
-                machine.efforts,
-                machine.routing.max_effort,
-                machine.allowed_models,
-            )
-        });
-    let (efforts, max_effort, allowed_models) = settings.unwrap_or_else(|| {
-        (
-            relais::policy::EffortSettings::default(),
-            relais::policy::RoutingSettings::default().max_effort,
-            None,
-        )
-    });
-    let cli = relais::adapter::claude::ClaudeBackend::discover()
-        .ok()
-        .and_then(|backend| backend.probe())
-        .map_or(relais::catalog::Fact::Unknown, |capabilities| {
-            capabilities.accepted_efforts
-        });
-    let catalogs = relais::catalog::EffortCatalogs::resolve_all(
-        &cli,
-        &efforts,
-        &max_effort,
-        incumbent.models.values().map(|profile| profile.id.as_str()),
-    );
-    route::default_tuning_bounds(incumbent, allowed_models.as_deref(), &catalogs)
 }
 
 /// `relais native contract`: the model writes a task as JSON, the plugin
@@ -3855,53 +3633,6 @@ fn native_contract_command() -> Result<CliOutcome, CliError> {
                 tasks.display()
             );
             Ok(CliOutcome::OperationalFailure)
-        }
-    }
-}
-
-fn load_contract(task: &Path) -> Result<TaskContract, CliError> {
-    let text = std::fs::read_to_string(task).map_err(|cause| CliError::Read {
-        what: "the task contract",
-        path: task.to_path_buf(),
-        cause,
-    })?;
-    TaskContract::from_json_str(&text).map_err(|cause| CliError::Invalid {
-        what: "the task contract",
-        path: task.to_path_buf(),
-        cause: Box::new(cause),
-    })
-}
-
-fn open_ledger() -> Result<Ledger, CliError> {
-    let path = paths::ledger_path().map_err(CliError::Home)?;
-    operational(Ledger::open(&path), "the ledger is unavailable")
-}
-
-/// What this run's task identity will be, decided before any dispatch
-/// (SPEC's task spine): `None` for a fresh task, derived once preflight
-/// runs; `Some(id)` for a task the contract declares or `--revise`
-/// names, already confirmed on record. A disagreement between the two,
-/// or an id naming no task at all, is refused here by name rather than
-/// silently picked or created.
-fn resolve_task_override(
-    ledger: &Ledger,
-    contract: &TaskContract,
-    revise: Option<&str>,
-) -> Result<Option<TaskId>, String> {
-    let revise = revise.map(TaskId::from_stored);
-    let link = relais::contract::resolve_task_link(contract.task_id.as_ref(), revise.as_ref())
-        .map_err(|e| e.to_string())?;
-    match link {
-        relais::contract::TaskLink::Fresh => Ok(None),
-        relais::contract::TaskLink::Declared(id) | relais::contract::TaskLink::Revises(id) => {
-            let known = ledger
-                .runs_of_task(&id)
-                .map_err(|e| format!("ledger: {e}"))?;
-            if known.is_empty() {
-                Err(format!("unknown task {id}: no run is on record for it"))
-            } else {
-                Ok(Some(id))
-            }
         }
     }
 }
@@ -4934,13 +4665,6 @@ fn acknowledged(what: &str, answer: Result<(), GateError>) -> Result<CliOutcome,
             Ok(CliOutcome::OperationalFailure)
         }
     }
-}
-
-fn read_stdin() -> Result<String, CliError> {
-    std::io::read_to_string(std::io::stdin()).map_err(|cause| CliError::Operational {
-        operation: "reading stdin",
-        cause: Box::new(cause),
-    })
 }
 
 fn read_stopped_report(payload: &str) -> Result<StoppedReport, serde_json::Error> {
@@ -8084,36 +7808,6 @@ fn report_command(
         print!("{}", report.render());
     }
     Ok(CliOutcome::Accepted)
-}
-
-/// `~/.config/relais/machine.toml`'s `[pricing]` table, or an empty one
-/// when the file is absent — the same "absent settings means the
-/// defaults" posture `coordinator daemon` already takes reading this
-/// file, not an error just because nobody has priced anything yet.
-fn load_price_table() -> Result<PriceTable, CliError> {
-    Ok(load_machine_pricing()?.unwrap_or_else(PriceTable::empty))
-}
-
-/// The machine's `[pricing]` table; `None` when it has none, so a cost can
-/// say that no table is the reason it is unknown.
-fn load_machine_pricing() -> Result<Option<PriceTable>, CliError> {
-    let path = paths::machine_settings_path().map_err(CliError::Home)?;
-    match std::fs::read_to_string(&path) {
-        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(cause) => Err(CliError::Read {
-            what: "the machine settings",
-            path,
-            cause,
-        }),
-        Ok(text) => match MachineSettings::from_toml_str(&text) {
-            Ok(machine) => Ok(machine.pricing),
-            Err(e) => Err(CliError::Invalid {
-                what: "the machine settings",
-                path,
-                cause: Box::new(e),
-            }),
-        },
-    }
 }
 
 /// Every run recorded before the session-identity fix (#119) keyed a run
