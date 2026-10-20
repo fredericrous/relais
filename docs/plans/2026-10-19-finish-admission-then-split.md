@@ -149,11 +149,31 @@ Branch `test/layout-independent-source-scan`, built by relais run-65e417ee0e4c5-
 
 Review: approve-with-changes, then the Delta (28k/56 s, 31k/28 s). Fixed: the real test and the controls share `check_arm_boundary`; two more controls; the optional `cli/` root carries a `holds-until:` (required from PR A on). Evidence after PRs A and B is recorded in their Outcomes.
 
+## Outcome (Phase 4, PR A)
+
+Branch `refactor/split-main-into-cli`. `main.rs` went from 10,941 lines to 10: its doc, `mod cli;` and `fn main`. The binary's module tree `src/cli/` holds `mod.rs` (`Cli`, `Command`, the shared clap value enums, `main`, `dispatch`), `outcome.rs` (the exit model and its table, with its tests), `ctx.rs` (shared plumbing), `protocol.rs`, and one file per command group: evidence, salvage, decide, feedback, report, trust, install, doctor, coordinator, learn, recipe, replay, native, resume, status, plan and run. The library is untouched: `git diff --stat origin/main -- crates/relais/src/lib.rs` and every library module are empty, so its public API cannot have changed (this stands in for the rustdoc-JSON diff).
+
+| Check | Expected | Actual |
+|---|---|---|
+| `scripts/check-move-only.py` on each move commit | code only moved | `9f2d55e1`, `d340e027`, `ebd1be16`, `aeb77e1b`, `1bd333fc`, `a3ac9ea3`, `811c8f14`: yes. `8de9bf5c`: differs by the `fn main() { cli::main() }` shim and one equivalent path (`report::Dimension` → `relais::report::Dimension`), read by hand; the script cannot see path prefixes, which it strips |
+| visibility (the script's report) | nothing new is `pub` | 246 items private → `pub(crate)`, none `pub`; in a binary crate `pub(crate)` reaches only `main.rs` and `cli/` |
+| comments added | module docs only | one-line `//!` headers per module; `main.rs`'s doc now says it only wires `cli/` |
+| `--help` of the binary and all 64 subcommands, recursively (scratch `RELAIS_STATE_DIR`) | byte-identical | identical (`diff -r` over 65 files) |
+| sorted test names, all targets, at `e2496dd3` (after the tidy) | origin/main's set | its 2,053 plus `a_missing_cli_tree_is_an_error`; none lost |
+| `scripts/check-module-cycles.py` | no cycle | 47 modules, no cycles |
+| arm-boundary scan | `src/cli/` now required | `cli_roots` requires it; `a_missing_cli_tree_is_an_error` |
+| implementation review | approve | approve-with-changes, then Delta approve-with-changes (26k/36 s, 34k/24 s); every finding fixed or recorded |
+| each group's relais run (`make lint/test/msrv/audit/plugin`, `tests/golden` included) | accepted | 8 runs, all accepted at the first attempt, no retry; about 20 min each (checks 2 × 9.4 min, worker 1–3 min), $0.13–0.40 each |
+
 ## Decision log
 
 - 2026-10-19, Phase 1: PR 2's steps renamed v39/v40 on rebase (main's v37/v38 shipped first); merged as #267. Its first Windows run failed on a `kill -9 $$` case (no SIGKILL on Windows), now unix-only.
 - 2026-10-20, Phase 2: running the branch's relais (`cargo run -- doctor`) migrated this machine's real ledger from 38 to 40 (PR 2's three tables, empty). Brew's relais 0.26.0 then refused the ledger. The person chose to install main's relais (`c49141de`) in `~/.local/bin` until v0.27.0; it is to be removed after the brew upgrade. A branch relais runs only with `RELAIS_STATE_DIR` pointed at a scratch directory.
 - 2026-10-20, Phase 2: the semantic reviewer's dispatch exits 1 at once in this relais (C2, C4, C5: `review_unavailable`). The orchestrator read each patch and approved on `make check`; the PR's implementation review was the first independent read. Follow-up: diagnose the reviewer launch.
 - 2026-10-20, Phase 2: until v0.27.0 is installed, relais cannot run in this repository (its `relais.toml` uses `weight` and `retry`), so C3 and the review fixes were made by hand.
+- 2026-10-20, Phase 4: the first relais refactor run took 20 min, 19 of them the five checks on the base and on the candidate, so one cluster per run would cost about 7 h for PR A and 17 h for the split. The ceiling set from it: one cohesive group of clusters per run, at most 6 runs per PR, each commit checked move-only. PR A overran it with 8: the last group split in two because the clap definitions and dispatch were too entangled for one worker, and a tidy moved leftover plumbing to `ctx.rs` and replaced glob imports. PRs B and C keep to 6 by planning the leftovers into their groups (each group's contract names its helpers and imports), and an overrun there is a stop and a report, not a seventh run. Commits are per group, not per cluster.
+- 2026-10-20, Phase 4: the move-only check is `scripts/check-move-only.py` (token multiset; impl splits, rustfmt's end-of-line commas, moved test modules and `use` statements are structure; visibility changes are reported). It strips path prefixes, so a changed path is read by hand.
+- 2026-10-20, Phase 4: in the binary (PR A) visibility widens to `pub(crate)`, not `pub(super)`/`pub(in crate::cli)`: a binary crate's `pub(crate)` reaches only `main.rs` and `cli/`, so the two are the same set. PRs B and C are in the library, where `pub(crate)` reaches every module, so they keep the written rule.
+- 2026-10-20, Phase 4: deliberate for PR A: the move check keys visibility on kind and name, so two same-named items moved in one commit with different visibility could hide a widening. Fixed first on PR B's branch (key on the enclosing type too).
 
 <!-- panel: repos=relais reviewers=backend,codex body-sha=4b2cbf579c05 -->
