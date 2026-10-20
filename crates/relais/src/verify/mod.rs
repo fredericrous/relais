@@ -3054,9 +3054,20 @@ mod tests {
         )
         .expect("waited");
         assert_eq!(ended, Ended::Exited(0));
-        let text = std::fs::read_to_string(artifacts.join("events.jsonl")).expect("events");
-        let beats = text.lines().filter(|l| l.contains("\"heartbeat\"")).count();
-        assert!(beats >= 2, "{text}");
+        let beats = || {
+            std::fs::read_to_string(artifacts.join("events.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains("\"heartbeat\""))
+                .count()
+        };
+        // At least one beat: how many fit in the wait depends on the load
+        // (each samples `ps`), so the count is not the property.
+        let at_end = beats();
+        assert!(at_end >= 1, "no heartbeat during the wait");
+        // Joined: nothing beats once the wait has returned.
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(beats(), at_end, "a heartbeat after the wait ended");
     }
 
     fn command(argv: &[&str], timeout_seconds: u64) -> CommandSpec {

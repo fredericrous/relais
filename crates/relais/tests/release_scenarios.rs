@@ -5196,7 +5196,11 @@ fn a_repository_is_trusted_once_and_a_command_change_warns_once() {
     let world = World::new("trust-once");
     world.write_policy(3);
     let machine = world.config.join("machine.toml");
-    std::fs::write(&machine, format!("schema_version = 1\n{PRICING}\n")).expect("machine");
+    std::fs::write(
+        &machine,
+        format!("schema_version = 1\n{PRICING}\n{NO_DISK_FLOOR}"),
+    )
+    .expect("machine");
     let task = world.write_task("task.json", "off");
 
     let blocked = world.relais(&["run", "--task", task.to_str().unwrap()]);
