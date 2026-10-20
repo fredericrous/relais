@@ -34,6 +34,8 @@ impl_types = set()
 COMMENT = re.compile(r'^\s*//')
 in_use = {'+': False, '-': False}
 CFG_TEST = re.compile(r'^\s*#\[cfg\(test\)\]\s*$')
+# `#![cfg(test)]` at the top of a file makes the file a test module.
+CFG_TEST_FILE = re.compile(r'^\s*#!\[cfg\(test\)\]\s*$')
 MOD_BLOCK = re.compile(r'^\s*(pub(\([^)]*\))?\s+)?mod\s+\w+\s*\{\s*$')
 mod_blocks = Counter()
 cfg_tests = Counter()
@@ -63,6 +65,9 @@ for l in diff.splitlines():
         continue
     if side in in_use:
         body = l[1:]
+        if CFG_TEST_FILE.match(body):
+            prev[side] = body
+            continue
         if CFG_TEST.match(body):
             cfg_tests[side] += 1
             prev[side] = body
