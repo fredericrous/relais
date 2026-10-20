@@ -537,3 +537,45 @@ fn a_ledger_on_another_schema_is_not_reaped() {
     assert_eq!(events_before, events_after);
     assert!(!events_after.lines().any(|l| l.contains("interrupted")));
 }
+
+/// The plugin applies a status only if its revision is newer, and puts
+/// the ledger's cost in place of the cost it summed.
+#[test]
+fn status_carries_the_last_seq_read_and_the_ledger_cost_total() {
+    let world = World::new("revision");
+    let ledger = world.ledger();
+    ended(
+        &ledger,
+        "run-v",
+        State::NeedsDecision,
+        Reason::VerificationInputsChanged,
+    );
+    drop(ledger);
+    let dir = world.state.join("runs").join("run-v");
+    std::fs::create_dir_all(&dir).expect("run dir");
+    let line = |seq: Option<u64>, kind: &str| {
+        let mut entry = serde_json::json!({
+            "at": "2026-10-09T11:32:24Z",
+            "run": "run-v",
+            "event": { "kind": kind, "booked": 5, "completeness": "actual" },
+        });
+        if let Some(seq) = seq {
+            entry["seq"] = seq.into();
+        }
+        format!("{entry}\n")
+    };
+    let text = [
+        line(Some(0), "cost"),
+        line(Some(1), "cost"),
+        line(None, "cost"),
+    ]
+    .concat();
+    std::fs::write(dir.join("events.jsonl"), text).expect("events");
+    let (json, _) = world.status_json("run-v");
+    assert_eq!(json["revision"], 1, "{json}");
+    assert_eq!(json["current"]["cost_total"]["micros"], 0, "{json}");
+    assert!(
+        json["current"]["cost_total"]["completeness"].is_string(),
+        "{json}"
+    );
+}

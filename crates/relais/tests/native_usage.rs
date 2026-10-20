@@ -225,3 +225,24 @@ fn an_unpriced_model_is_named_in_the_cost_event_with_a_clean_short_name() {
     assert!(name.starts_with("evil"), "{name}");
     assert!(name.chars().count() <= 40, "{name}");
 }
+
+#[test]
+fn a_model_reported_without_token_fields_books_an_unknown_cost_not_zero() {
+    let world = World::new("tokenless");
+    let tokenless = serde_json::json!({
+        "agent": "a-1",
+        "turns": 1,
+        "usage": { "model": "m" },
+        "message_ids": ["msg-t"],
+    })
+    .to_string();
+    assert_eq!(world.usage(Some(&tokenless)).status.code(), Some(0));
+    let events = world.events();
+    let cost: serde_json::Value = events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|line| line["event"]["kind"] == "cost")
+        .expect("a cost event");
+    assert!(cost["event"]["booked"].is_null(), "{cost}");
+    assert_eq!(cost["event"]["completeness"], "unknown", "{cost}");
+}

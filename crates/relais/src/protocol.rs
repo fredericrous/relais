@@ -441,11 +441,40 @@ struct LogState {
     next_seq: u64,
     next_stderr_seq: u64,
     file: Option<File>,
+    /// How far into `events.jsonl` seq-less lines have been taken up:
+    /// rebuilt from the end of the last seq'd line when the log is opened,
+    /// so a resumed driver does not re-emit what an earlier one did.
+    tail_offset: u64,
 }
 
 impl EventLog {
     fn emit(&self, event: &Event) {
         let mut state = locked(&self.state);
+        self.emit_locked(&mut state, event);
+    }
+
+    /// Take up the seq-less `cost` lines that `relais native usage`
+    /// appended past the tail offset, and emit each once, seq'd, on the
+    /// wire. Only whole lines are read: a torn last line waits.
+    fn relay_usage(&self) {
+        let mut state = locked(&self.state);
+        let Ok(mut file) = File::open(&self.path) else {
+            return;
+        };
+        let mut rest = Vec::new();
+        if io::Seek::seek(&mut file, io::SeekFrom::Start(state.tail_offset)).is_err()
+            || file.read_to_end(&mut rest).is_err()
+        {
+            return;
+        }
+        let (costs, taken) = pending_usage(&rest);
+        state.tail_offset += taken;
+        for cost in costs {
+            self.emit_locked(&mut state, &cost);
+        }
+    }
+
+    fn emit_locked(&self, state: &mut LogState, event: &Event) {
         let (seq, stderr_seq) = if event.is_protocol_line() {
             state.next_seq += 1;
             (Some(state.next_seq - 1), None)
@@ -488,6 +517,49 @@ impl EventLog {
             .open(&self.path)
             .ok()
     }
+}
+
+/// The `cost` events among the whole lines of `bytes` that carry no `seq`
+/// (what `relais native usage` appends), and how many bytes those whole
+/// lines took. Lines that are not such events are passed over.
+fn pending_usage(bytes: &[u8]) -> (Vec<Event>, u64) {
+    let whole = bytes
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |end| end + 1);
+    let costs = bytes[..whole]
+        .split(|b| *b == b'\n')
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .filter(|entry| entry["seq"].is_null() && entry["event"]["kind"] == "cost")
+        .filter_map(|entry| {
+            let event = &entry["event"];
+            Some(Event::Cost {
+                booked: event["booked"].as_i64(),
+                completeness: serde_json::from_value(event["completeness"].clone()).ok()?,
+                unpriced_reason: event["unpriced_reason"].as_str().map(str::to_string),
+            })
+        })
+        .collect();
+    (costs, whole as u64)
+}
+
+/// Where the last seq'd line of `path` ends, or 0 when there is none.
+fn seqd_end(path: &Path) -> u64 {
+    let Ok(bytes) = std::fs::read(path) else {
+        return 0;
+    };
+    let mut end = 0;
+    let mut at = 0;
+    for line in bytes.split_inclusive(|b| *b == b'\n') {
+        at += line.len();
+        if line.ends_with(b"\n")
+            && serde_json::from_slice::<serde_json::Value>(line)
+                .is_ok_and(|entry| entry["seq"].is_u64())
+        {
+            end = at;
+        }
+    }
+    end as u64
 }
 
 /// Append one event to `artifacts/events.jsonl` from a process that is not
@@ -542,6 +614,7 @@ impl Events {
                 next_seq: 0,
                 next_stderr_seq: 0,
                 file: None,
+                tail_offset: seqd_end(&artifacts.join("events.jsonl")),
             }),
         })))
     }
@@ -555,6 +628,15 @@ impl Events {
     pub fn emit(&self, event: Event) {
         if let Some(log) = &self.0 {
             log.emit(&event);
+        }
+    }
+
+    /// Re-emit, once each and seq'd, the usage lines `relais native usage`
+    /// appended to this run's events since the last call (or since the
+    /// last seq'd line, for a log reopened by a resume).
+    pub fn relay_usage(&self) {
+        if let Some(log) = &self.0 {
+            log.relay_usage();
         }
     }
 
@@ -608,6 +690,9 @@ pub const STATUS_EVENTS: usize = 1000;
 /// decisions, cost and outcome, and the last [`STATUS_OUTPUT_LINES`] lines
 /// of check output, read from the run's `events.jsonl`. Never the whole file.
 ///
+/// `revision` is the last `seq` read (null before any), and `current.cost_total`
+/// (added by `main`) the ledger's cost: the reconciliation rule is in SPEC.
+///
 /// `events` is what the plugin rebuilds its pane from after `/clear` or
 /// `/resume`: the event lines themselves, every one but `output`, plus
 /// only the newest `output` lines up to [`STATUS_OUTPUT_LINES`] — so the
@@ -618,6 +703,7 @@ pub fn timeline(run: &str, events_jsonl: &str) -> serde_json::Value {
     let mut decisions = Vec::new();
     let mut cost = Vec::new();
     let mut outcome = serde_json::Value::Null;
+    let mut revision: Option<u64> = None;
     let mut output: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     for line in events_jsonl.lines() {
         // A line that is not an event (a torn last line of a killed run)
@@ -626,6 +712,9 @@ pub fn timeline(run: &str, events_jsonl: &str) -> serde_json::Value {
             continue;
         };
         let event = &entry["event"];
+        if let Some(seq) = entry["seq"].as_u64() {
+            revision = Some(revision.map_or(seq, |last| last.max(seq)));
+        }
         if event["kind"].is_string() {
             events.push(entry.clone());
         }
@@ -666,6 +755,9 @@ pub fn timeline(run: &str, events_jsonl: &str) -> serde_json::Value {
     }
     serde_json::json!({
         "run": run,
+        // The last `seq` this read saw: a reader applies a status only if
+        // its revision is newer than what it has already folded in.
+        "revision": revision,
         "phases": phases,
         "decisions": decisions,
         "cost": cost,
@@ -906,6 +998,82 @@ mod tests {
             .collect();
         assert_eq!(seqs.len(), 5);
         assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
+    }
+
+    fn append_usage(path: &Path, booked: i64) {
+        let line = serde_json::json!({
+            "relais": "event", "run": "run-u", "at": "t",
+            "event": { "kind": "cost", "booked": booked, "completeness": "actual" },
+        });
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open");
+        writeln!(file, "{line}").expect("append");
+    }
+
+    fn cost_seqs(path: &Path) -> Vec<(u64, i64)> {
+        lines(path)
+            .iter()
+            .filter(|l| l["event"]["kind"] == "cost" && l["seq"].is_u64())
+            .map(|l| {
+                (
+                    l["seq"].as_u64().unwrap(),
+                    l["event"]["booked"].as_i64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_seqless_usage_line_is_re_emitted_once_and_survives_a_resume() {
+        let dir = crate::test_support::short_temp_dir("pr-usage");
+        let artifacts = dir.join("run-u");
+        let path = artifacts.join("events.jsonl");
+        let sink = SharedSink::default();
+        let events = Events::for_run_on("run-u", &artifacts, Wire::to(sink.clone()));
+        events.emit(Event::Decision {
+            what: "x".into(),
+            reason: "y".into(),
+        });
+        append_usage(&path, 7);
+        events.relay_usage();
+        events.relay_usage();
+        assert_eq!(cost_seqs(&path), [(1, 7)]);
+        let on_wire = sink.text();
+        assert_eq!(on_wire.matches("\"kind\":\"cost\"").count(), 1, "{on_wire}");
+        // A resumed driver rebuilds its offset from the last seq'd line.
+        let resumed = Events::for_run_on("run-u", &artifacts, Wire::to(SharedSink::default()));
+        resumed.relay_usage();
+        assert_eq!(
+            cost_seqs(&path).len(),
+            1,
+            "nothing re-emitted by the resume"
+        );
+        append_usage(&path, 9);
+        resumed.relay_usage();
+        let booked: Vec<i64> = cost_seqs(&path).iter().map(|c| c.1).collect();
+        assert_eq!(booked, [7, 9]);
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedSink(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedSink {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&locked(&self.0)).into_owned()
+        }
+    }
+
+    impl Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            locked(&self.0).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     fn lines(path: &Path) -> Vec<serde_json::Value> {

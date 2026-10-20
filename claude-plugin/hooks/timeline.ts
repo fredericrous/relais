@@ -88,6 +88,9 @@ export type RunModel = {
   // What the next worker attempt is, after a `repairing`/`escalating`
   // transition: its step is titled by it.
   retry: 'repair' | 'escalation' | undefined
+  // The revision of the last `relais native status` applied: the last
+  // `seq` that status had read. A status no newer than this is stale.
+  revision: number | undefined
 }
 
 export const emptyRun = (run: string, startedAt: number): RunModel => ({
@@ -109,6 +112,7 @@ export const emptyRun = (run: string, startedAt: number): RunModel => ({
   stalled: undefined,
   wait: undefined,
   retry: undefined,
+  revision: undefined,
 })
 
 const FAILED_STATES = ['failed', 'blocked', 'cancelled', 'interrupted', 'budget_exhausted']
@@ -451,12 +455,22 @@ export const isoMs = (at: unknown, fallback: number): number => {
 // Folds one protocol line into the models, creating the run's on first sight.
 export function applyLine(
   models: Record<string, RunModel>,
-  line: { run?: string; at?: string; event?: unknown },
+  line: { run?: string; at?: string; seq?: number; event?: unknown },
   now: number,
 ): Record<string, RunModel> {
   if (typeof line.run !== 'string' || typeof line.event !== 'object' || line.event === null) return models
   const at = isoMs(line.at, now)
   const model = models[line.run] ?? emptyRun(line.run, at)
+  // A cost the applied status had already read is in the ledger total it
+  // put in place: adding it again would count it twice.
+  if (
+    (line.event as any).kind === 'cost' &&
+    typeof line.seq === 'number' &&
+    model.revision !== undefined &&
+    line.seq <= model.revision
+  ) {
+    return models
+  }
   return { ...models, [line.run]: applyEvent(model, line.event, at) }
 }
 
@@ -605,9 +619,10 @@ function rebuildOne(models: Record<string, RunModel>, timeline: any, now: number
   let out = models
   for (const line of lines) {
     const run = line.run ?? timeline.run
-    out = applyLine(out, { run, at: line.at, event: line.event ?? line }, now)
+    out = applyLine(out, { run, at: line.at, seq: line.seq, event: line.event ?? line }, now)
   }
   const run = typeof timeline?.run === 'string' ? timeline.run : undefined
+  if (run && out[run]) out = { ...out, [run]: reconcileStatus(out[run], timeline) }
   const current = timeline?.current
   if (!run || !current || typeof current !== 'object') return out
   let model = out[run] ?? emptyRun(run, now)
@@ -630,6 +645,21 @@ function answeredModel(model: RunModel, current: any): RunModel {
   const actor = typeof decision.actor === 'string' ? decision.actor : null
   const answer: Answer = { resolution: decision.resolution, actor }
   return { ...model, phase: current.state, outcome: { ...model.outcome, state: current.state, answer } }
+}
+
+// What a `relais native status` reply says about the cost, applied to the
+// model: the ledger's total REPLACES the cost, never adds to it, so events
+// replayed or a reconnect converge to the ledger. Only a reply whose
+// revision (the last `seq` it read) is newer than the model's is applied;
+// an older one, or one with no revision or total, leaves the model as it is.
+export function reconcileStatus(model: RunModel, timeline: any): RunModel {
+  const revision = timeline?.revision
+  const total = timeline?.current?.cost_total
+  if (typeof revision !== 'number' || typeof total?.completeness !== 'string') return model
+  if (model.revision !== undefined && revision <= model.revision) return model
+  const booked = total.completeness === 'unknown' || typeof total.micros !== 'number' ? null : total.micros
+  const cost: Cost = { booked, completeness: total.completeness, ...(model.cost?.unpriced ? { unpriced: model.cost.unpriced } : {}) }
+  return { ...model, cost, revision }
 }
 
 // Runs rebuilt from `relais native status`: one timeline object (`--run`),

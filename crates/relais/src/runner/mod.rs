@@ -1349,8 +1349,10 @@ impl<'a> RunEngine<'a> {
             let cancel = Arc::clone(&cancel);
             let stop = &stop;
             let heartbeat_lost = &heartbeat_lost;
+            let events = &self.events;
             scope.spawn(move || {
                 let mut last: Option<Instant> = None;
+                let mut last_relay = Instant::now();
                 let mut heartbeat_errors: u32 = 0;
                 while !stop.load(Ordering::SeqCst) {
                     if last.is_none_or(|last| last.elapsed() >= heartbeat_every) {
@@ -1384,6 +1386,12 @@ impl<'a> RunEngine<'a> {
                             }
                         }
                     }
+                    // Usage the worker reports through `relais native
+                    // usage` reaches the sequenced stream while it runs.
+                    if last_relay.elapsed() >= Duration::from_millis(200) {
+                        last_relay = Instant::now();
+                        events.relay_usage();
+                    }
                     std::thread::sleep(Duration::from_millis(20));
                 }
             });
@@ -1391,6 +1399,8 @@ impl<'a> RunEngine<'a> {
             stop.store(true, Ordering::SeqCst);
             result
         });
+        // The last report may have landed after the final tick.
+        self.events.relay_usage();
 
         // The process has ended: whatever it wrote is written. The lease
         // goes back before the seat, so verification never waits on a
