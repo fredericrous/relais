@@ -1,6 +1,6 @@
 //! `relais recipe`: list, show, diff, evaluate, promote, rollback.
 
-use crate::*;
+use super::*;
 
 /// `kind` as `list`/`show` print it — never `Debug`'s capitalised
 /// spelling, and named `unset` rather than empty when the recipe leaves

@@ -1,6 +1,7 @@
 //! `relais report` and `relais usage import`.
 
-use crate::*;
+use super::*;
+use relais::report;
 
 pub(crate) fn report_command(
     since: Option<&str>,
@@ -291,7 +292,7 @@ pub(crate) fn usage_import_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::temp_ledger;
+    use crate::cli::tests::temp_ledger;
     use relais::ledger::Ledger;
 
     /// A session transcript: one assistant message with this id.

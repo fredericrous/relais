@@ -1,7 +1,7 @@
 //! `relais feedback`.
 
 use super::decide::*;
-use crate::*;
+use super::*;
 
 /// The run a `relais feedback` invocation is about: the one named
 /// directly, or the task's accepted run when `--task` is given instead.
@@ -344,7 +344,7 @@ pub(crate) fn open_verification_gaps(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::temp_ledger;
+    use crate::cli::tests::temp_ledger;
     use relais::ledger::Transition;
 
     /// `decide --answer approve` reads the gaps a `VerificationGap`

@@ -1,6 +1,6 @@
 //! `relais dataset replay`.
 
-use crate::*;
+use super::*;
 
 /// The `done` line of a replay, sent once its trial is recorded (or could
 /// not be): the plugin's verdict names the trial, and never precedes it.

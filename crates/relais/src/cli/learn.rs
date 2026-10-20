@@ -1,7 +1,7 @@
 //! The learning commands: the registry, datasets, training, promotion,
 //! rollback, export and import, and the learning envelope.
 
-use crate::*;
+use super::*;
 
 /// The registry, when learned routing is on and the registry opens; a
 /// missing or unreadable registry is the conservative baseline, not an

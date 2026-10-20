@@ -2,7 +2,7 @@
 //! the `done` line, and the wire name of a failure.
 
 use super::outcome::{exit_code, CliError, CliOutcome};
-use crate::{Command, DatasetCommand};
+use super::{Command, DatasetCommand};
 
 thread_local! {
     /// The refusal a `relais run --protocol` printed before any run

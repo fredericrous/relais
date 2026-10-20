@@ -1,7 +1,8 @@
 //! `relais resume` and the retirement of runs.
 
 use super::status::print_pending_intents;
-use crate::*;
+use super::*;
+use relais::resume;
 
 /// Run this same `relais resume` again with its output appended to `log`
 /// (a timestamp line first), and report whether it succeeded. A detached
@@ -806,7 +807,7 @@ pub(crate) fn retire_worktree(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::temp_ledger;
+    use crate::cli::tests::temp_ledger;
 
     #[test]
     fn resume_records_the_resuming_process_as_the_driver() {

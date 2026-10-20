@@ -1,7 +1,8 @@
 //! `relais status` and `relais explain`.
 
 use super::run::successor_process;
-use crate::*;
+use super::*;
+use relais::report;
 
 /// The successor intents a status shows: every pending one (a refused one
 /// carries its refusal and retry time, and the plugin waits for that time),

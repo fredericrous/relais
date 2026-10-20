@@ -1,6 +1,6 @@
 //! `relais install` and `relais uninstall`: what they plan, apply and print.
 
-use crate::*;
+use super::*;
 
 /// The request the two `--claude` commands share. `--write` is the only
 /// thing that applies anything; `--user` is the only thing that leaves

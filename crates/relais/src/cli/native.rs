@@ -1,7 +1,8 @@
 //! The native subcommands.
 
 use super::status::{intent_json, listed_intents};
-use crate::*;
+use super::*;
+use relais::resume;
 
 /// Where a run stands when a cancel arrives.
 pub(crate) enum CancelStanding {

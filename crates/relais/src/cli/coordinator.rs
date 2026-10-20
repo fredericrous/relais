@@ -1,6 +1,6 @@
 //! `relais coordinator` and `relais quiet`.
 
-use crate::*;
+use super::*;
 
 /// `coordinator status --json`, in every state. A typed document, never a
 /// human sentence on stdout: a caller parsing this had to tell "no daemon"

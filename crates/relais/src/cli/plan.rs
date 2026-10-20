@@ -1,6 +1,6 @@
 //! `relais plan`.
 
-use crate::*;
+use super::*;
 
 /// A change to the repository's commands that no `relais run` has said
 /// yet, read without consuming it (`plan`, `trust show`): from the ledger

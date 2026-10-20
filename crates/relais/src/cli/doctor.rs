@@ -1,6 +1,7 @@
 //! `relais doctor`, `relais hook` and `relais init`.
 
-use crate::*;
+use super::*;
+use relais::doctor;
 
 /// Say on doctor's `effort` finding which models a `raise` repair WOULD hold
 /// because their effort order is unknown. Doctor has no task or budget, so

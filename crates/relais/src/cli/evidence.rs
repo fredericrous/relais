@@ -1,6 +1,6 @@
 //! `relais evidence attach`.
 
-use crate::*;
+use super::*;
 
 /// Record one piece of evidence produced by another tool, against a run
 /// and, optionally, the acceptance criterion it answers. This decides
@@ -193,7 +193,7 @@ pub(crate) fn reseal_receipt_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::temp_ledger;
+    use crate::cli::tests::temp_ledger;
 
     const SIGN_OFF_GAP: &str =
         "acceptance criterion `read` names a human sign-off, which nothing has recorded";

@@ -1,6 +1,6 @@
 //! `relais trust`: showing and recording the repository grant in machine.toml.
 
-use crate::*;
+use super::*;
 
 pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
     let (root, policy) = load_repo_policy()?;
