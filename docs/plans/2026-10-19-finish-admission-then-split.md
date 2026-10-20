@@ -165,6 +165,23 @@ Branch `refactor/split-main-into-cli`. `main.rs` went from 10,941 lines to 10: i
 | implementation review | approve | approve-with-changes, then Delta approve-with-changes (26k/36 s, 34k/24 s); every finding fixed or recorded |
 | each group's relais run (`make lint/test/msrv/audit/plugin`, `tests/golden` included) | accepted | 8 runs, all accepted at the first attempt, no retry; about 20 min each (checks 2 × 9.4 min, worker 1–3 min), $0.13–0.40 each |
 
+## Outcome (Phase 4, PR B)
+
+Branch `refactor/split-ledger`. `ledger/mod.rs` went from 11,575 lines to 2,478: a 272-line facade (`Ledger`, opening, the write transaction, busy handling, `now`/`path`/`schema_version`, the `pub use` re-exports) and the tests that span clusters or test the facade's own opening and busy handling (the open/busy tests, the stored-value corruption checks, the cost and dispatch tests that cross runs and usage, the arm-boundary source scan over several trees). New children, each with its own `impl Ledger` where it has methods: `error.rs`, `clock.rs`, `schema/mod.rs` and `schema/migrations.rs`, `trust.rs`, `evidence.rs`, `outcomes.rs`, `trials.rs`, `learning.rs`, `sessions.rs`, `usage.rs`, `runs.rs`, `transitions.rs` (with decisions), `admission.rs` (PR 2's group bindings, run epochs and disk growth) and `test_support.rs`. Six relais runs, inside the ceiling; the semantic reviewer was unavailable on all six (the open relais fault), so each candidate was approved after `make check` and the move check.
+
+| Check | Expected | Actual |
+|---|---|---|
+| `scripts/check-move-only.py` on each move commit | code only moved | `50bbff77`, `33daaf4f`, `9eff56d0`, `386abfd4`, `c912ece2`, `8ee117bf`: yes (structure only: impl splits, rustfmt commas, a `#![cfg(test)]` file marker) |
+| visibility (the script's report) | `pub(super)`/`pub(in crate::ledger)` only | 45 private → `pub(super)`, 1 → `pub(in crate::ledger)`; nothing `pub(crate)` or `pub`; the existing public methods stay `pub` |
+| the library's public names (every top-level `pub` item of `ledger` reachable as `crate::ledger::<name>`, on main and here; no nightly toolchain here for a rustdoc-JSON diff) | identical | 90 and 90; none lost, none gained |
+| a fresh ledger's `sqlite3 .schema` dump and its `schema_migrations`, branch binary with a scratch `RELAIS_STATE_DIR` | byte-identical | identical (443 lines; v1 to v40 in order) |
+| sorted test names, all targets, at `8ee117bf` and again at `1ffc0237` (after 22 tests moved to `schema/`) | origin/main's set | identical, 2,054, both times |
+| `scripts/check-module-cycles.py` | no cycle | 47 modules, no cycles; it stops at the top-level module, so it says nothing about the children |
+| `scripts/check-child-cycles.py crates/relais/src/ledger` (added in review: the graph between children, facade re-exports resolved to their defining child) | no cycle | none, at `1ffc0237`; each child's production dependencies: `admission`: error; `clock`: -; `error`: -; `evidence`: error, transitions; `failpoint`: -; `learning`: error, transitions; `migrations`: -; `outcomes`: error; `review`: error, router; `router`: error; `runs`: error, task_types, transitions; `schema`: clock, error, transitions; `sessions`: error, transitions; `successor`: error, transitions; `task_types`: error; `transitions`: error; `trials`: error; `trust`: error; `usage`: error, transitions |
+| the arm-boundary scan, with `NewReplayTrial` now in `trials.rs` | finds it | passes (in `make check` on every commit) |
+| each run's `make lint/test/msrv/audit/plugin`, time and attempts | green | green on all six: run 1 44 min, 2 attempts (one repair after a failed check); run 2 38 min, 2 attempts; runs 3–6 26, 24, 26 and 32 min, 1 attempt each |
+| implementation review | approve | approve-with-changes (60k/153 s). Fixed by hand in `d46cd204` (move check: yes): the row parsers moved to `error.rs` had made sibling cycles (error ↔ transitions, trials, evidence, runs), so each went to its only caller; `LEGACY_ACTORS` moved next to `Actor` (it closed transitions ↔ schema); the 22 migration tests moved from `mod.rs` into `schema/`. `scripts/check-child-cycles.py` added. Delta: approve (69k/30 s) |
+
 ## Decision log
 
 - 2026-10-19, Phase 1: PR 2's steps renamed v39/v40 on rebase (main's v37/v38 shipped first); merged as #267. Its first Windows run failed on a `kill -9 $$` case (no SIGKILL on Windows), now unix-only.
@@ -175,5 +192,8 @@ Branch `refactor/split-main-into-cli`. `main.rs` went from 10,941 lines to 10: i
 - 2026-10-20, Phase 4: the move-only check is `scripts/check-move-only.py` (token multiset; impl splits, rustfmt's end-of-line commas, moved test modules and `use` statements are structure; visibility changes are reported). It strips path prefixes, so a changed path is read by hand.
 - 2026-10-20, Phase 4: in the binary (PR A) visibility widens to `pub(crate)`, not `pub(super)`/`pub(in crate::cli)`: a binary crate's `pub(crate)` reaches only `main.rs` and `cli/`, so the two are the same set. PRs B and C are in the library, where `pub(crate)` reaches every module, so they keep the written rule.
 - 2026-10-20, Phase 4: deliberate for PR A: the move check keys visibility on kind and name, so two same-named items moved in one commit with different visibility could hide a widening. Fixed first on PR B's branch (key on the enclosing type too).
+- 2026-10-20, Phase 4: PR B adds a child the plan did not name, `ledger/admission.rs`, for PR 2's admission records (group bindings, run epochs, disk growth). They arrived after the plan was written and belong to neither runs nor usage.
+- 2026-10-20, Phase 4: the plan's per-PR "dependencies listed before each extraction" is met after the fact by `scripts/check-child-cycles.py` on the final tree, not before each run: the review found cycles the top-level script could not see, and the graph is the check worth keeping for PR C.
+- 2026-10-20, Phase 4: `scripts/check-child-cycles.py` runs by hand for now: PR C runs it on `runner/` before each extraction and adds it to `make lint` and CI once `runner/` is split, so both directories are checked on every change from then on. Its cut at the first `#[cfg(test)]` assumes the test module comes last; PR C's branch first makes it refuse any other layout, as `check-module-cycles.py` does.
 
 <!-- panel: repos=relais reviewers=backend,codex body-sha=4b2cbf579c05 -->

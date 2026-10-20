@@ -34,12 +34,18 @@ impl_types = set()
 COMMENT = re.compile(r'^\s*//')
 in_use = {'+': False, '-': False}
 CFG_TEST = re.compile(r'^\s*#\[cfg\(test\)\]\s*$')
+# `#![cfg(test)]` at the top of a file makes the file a test module.
+CFG_TEST_FILE = re.compile(r'^\s*#!\[cfg\(test\)\]\s*$')
 MOD_BLOCK = re.compile(r'^\s*(pub(\([^)]*\))?\s+)?mod\s+\w+\s*\{\s*$')
 mod_blocks = Counter()
 cfg_tests = Counter()
 trailing_commas = Counter()
 VIS_ITEM = re.compile(r'^\s*(pub(?:\([^)]*\))?\s+)?(?:(?:async|const|unsafe|extern "C")\s+)*(fn|struct|enum|trait|type|const|static|mod)\s+(\w+)')
-visibility = {'+': {}, '-': {}}
+# (enclosing impl type, kind, name) -> visibilities seen, counted per side:
+# two same-named items (two `fn new`) cannot overwrite each other.
+visibility = {'+': Counter(), '-': Counter()}
+IMPL_OPEN = re.compile(r'^impl(?:<[^>]*>)?\s+(?:[\w:<>, ]+\s+for\s+)?(\w+)')
+current_impl = {'+': '', '-': ''}
 prev = {'+': '', '-': ''}
 new_comment_lines, old_comment_lines = Counter(), Counter()
 for l in diff.splitlines():
@@ -59,6 +65,9 @@ for l in diff.splitlines():
         continue
     if side in in_use:
         body = l[1:]
+        if CFG_TEST_FILE.match(body):
+            prev[side] = body
+            continue
         if CFG_TEST.match(body):
             cfg_tests[side] += 1
             prev[side] = body
@@ -76,9 +85,18 @@ for l in diff.splitlines():
         if in_use[side] or SKIP.match(body):
             in_use[side] = not body.rstrip().endswith(';')
             continue
+        o = IMPL_OPEN.match(body)
+        if o:
+            current_impl[side] = o.group(1)
+        elif body.startswith('}'):
+            current_impl[side] = ''
         m = VIS_ITEM.match(body)
         if m:
-            visibility[side][(m.group(2), m.group(3))] = (m.group(1) or 'private').strip()
+            # An indented item whose `impl` header lies outside the diff's
+            # context has an unknown owner ('?'), matched by kind and name.
+            owner = (current_impl[side] or '?') if body.startswith((' ', '\t')) else ''
+            key = (owner, m.group(2), m.group(3))
+            visibility[side][key + ((m.group(1) or 'private').strip(),)] += 1
         # rustfmt's wrapping puts one item per line, each ending in `,`.
         # Counted per side: only that many added commas are free, and none
         # in the middle of a line.
@@ -113,14 +131,19 @@ if not cfg_ok: print(f"#[cfg(test)]: {cfg_tests['-']} removed, {cfg_tests['+']} 
 # Visibility is stripped before the comparison; report every item whose
 # visibility a move changed, so a person reads each widening.
 changes = Counter()
-for key, after in sorted(visibility['+'].items()):
-    before = visibility['-'].get(key)
+gained, lost = visibility['+'] - visibility['-'], visibility['-'] - visibility['+']
+for (owner, kind, name, after), n in sorted(gained.items()):
+    befores = [v for (o, k, nm, v), c in lost.items()
+               if (k, nm) == (kind, name) and (o == owner or '?' in (o, owner)) for _ in range(c)]
+    before = befores[0] if befores else None
+    where = f"{owner}::" if owner else ""
     if before is not None and before != after:
-        changes[(before, after)] += 1
-        if after == 'pub':
-            print(f"  visibility: {key[0]} {key[1]}: {before} -> pub")
-    elif before is None and after == 'pub':
-        print(f"  visibility: {key[0]} {key[1]}: new item is `pub`")
+        changes[(before, after)] += n
+        match = next(key for key in lost if key[1:] == (kind, name, before) and (key[0] == owner or '?' in (key[0], owner)))
+        lost[match] -= 1
+        lost = +lost
+    if after == 'pub' and before != 'pub':
+        print(f"  visibility: {kind} {where}{name}: {before or 'new item'} -> pub")
 if changes:
     print("visibility: " + ", ".join(f"{n} {b} -> {a}" for (b, a), n in sorted(changes.items())))
 new_doc = sum((doc_add - doc_rem).values()); lost_doc = sum((doc_rem - doc_add).values())

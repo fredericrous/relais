@@ -380,7 +380,7 @@ impl Ledger {
                     "SELECT driver_pid, driver_started,
                             (SELECT {} FROM runs r2 WHERE r2.id = runs.id)
                        FROM runs WHERE id = ?1",
-                    super::PROJECTED_STATUS
+                    super::transitions::PROJECTED_STATUS
                 ),
                 [run.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -511,7 +511,7 @@ impl Ledger {
             "SELECT pin_run, pin_index, state,
                     (SELECT {} FROM runs WHERE runs.id = successor_intents.run_id)
                FROM successor_intents WHERE pin_run IS NOT NULL AND pin_index IS NOT NULL",
-            super::PROJECTED_STATUS
+            super::transitions::PROJECTED_STATUS
         ))?;
         let rows = statement
             .query_map([], |row| {
