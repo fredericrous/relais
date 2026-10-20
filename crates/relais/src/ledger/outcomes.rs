@@ -291,10 +291,47 @@ impl Ledger {
     }
 }
 
+/// One `reverted` outcome row, as the report's agreement reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevertedReport {
+    pub task: TaskId,
+    /// `detected` (git), `orchestrator` (the plugin's proved call), `cli`
+    /// or none (a row stored before the field existed).
+    pub source: Option<String>,
+    /// When the row was written.
+    pub reported_at: String,
+    /// When the undo commit was made, for a detected row.
+    pub undone_at: Option<String>,
+}
+
+impl Ledger {
+    /// Every `reverted` outcome row with the source that recorded it, for
+    /// the report's agreement between the orchestrator and git. A row with
+    /// no task identity is left out: agreement is counted over tasks.
+    pub fn reverted_reports(&self) -> Result<Vec<RevertedReport>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, json_extract(detail_json, '$.source'), at,
+                    json_extract(detail_json, '$.undo_at')
+               FROM outcomes WHERE kind = ?1 AND task_id IS NOT NULL ORDER BY id",
+        )?;
+        let rows = stmt.query_map([OutcomeKind::Reverted.as_str()], |row| {
+            Ok(RevertedReport {
+                task: TaskId::from_stored(row.get::<_, String>(0)?),
+                source: row.get(1)?,
+                reported_at: row.get(2)?,
+                undone_at: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{run, sample_outcome, task, temp_ledger};
     use super::super::*;
+    use crate::outcome::OutcomeKind;
+    use rusqlite::params;
 
     #[test]
     fn recorded_outcomes_are_read_back_typed_by_task_and_since() {

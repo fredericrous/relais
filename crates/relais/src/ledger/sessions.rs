@@ -7,7 +7,8 @@ use crate::ids::{DispatchId, RunId};
 use crate::money::{CostCompleteness, MicroUsd};
 use crate::orchestration::{Speed, TranscriptSource};
 
-use super::{Ledger, Result, PROJECTED_STATUS};
+use super::transitions::PROJECTED_STATUS;
+use super::{Ledger, LedgerError, Result};
 
 /// One orchestrating-session API message, ready to persist: the pure
 /// [`crate::orchestration::UsageRecord`] plus its price and the identity
@@ -187,9 +188,54 @@ impl Ledger {
     }
 }
 
+impl Ledger {
+    pub fn predictions(&self, run_id: &RunId) -> Result<Vec<(String, String, serde_json::Value)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT artifact_id, input_hash, result_json FROM predictions WHERE run_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([run_id.as_str()], |row| {
+            let text: String = row.get(2)?;
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Orchestration spend attributed to the window by each message's OWN
+    /// timestamp (SPEC §11), not by any run's `created_at` — a session
+    /// that spans several days splits across windows correctly this way.
+    pub fn orchestration_spend_since(&self, since: &str) -> Result<(MicroUsd, CostCompleteness)> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT cost_micros, completeness FROM orchestration_usage WHERE at >= ?1")?;
+        let rows = stmt.query_map([since], |row| {
+            Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut total = MicroUsd::ZERO;
+        let mut parts = Vec::new();
+        for row in rows {
+            let (cost_micros, completeness) = row?;
+            let completeness: CostCompleteness =
+                serde_json::from_str(&completeness).map_err(|e| LedgerError::Corrupt {
+                    what: "an orchestration usage row's completeness".into(),
+                    detail: e.to_string(),
+                })?;
+            parts.push(completeness);
+            if let Some(micros) = cost_micros {
+                total = total.saturating_add(MicroUsd::from_micros(micros));
+            }
+        }
+        Ok((total, CostCompleteness::worst(parts)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{run, task, temp_ledger};
+    use super::super::test_support::{run, task, temp_ledger, usage_row};
+    use crate::money::MicroUsd;
 
     #[test]
     fn runs_of_session_returns_only_that_session_newest_first_capped() {
@@ -284,6 +330,33 @@ mod tests {
             .distinct_root_sessions_since("2025-01-01T00:00:00+00:00")
             .expect("sessions");
         assert_eq!(sessions, vec!["sess-new".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Orchestration spend is attributed to the report window by each
+    /// message's OWN timestamp, not by the run's `created_at` (SPEC
+    /// §11): a session that spans several days splits across windows.
+    #[test]
+    fn orchestration_spend_is_windowed_by_message_timestamp() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .record_orchestration_usage(&usage_row("msg-early", "sess-1", "2026-09-01T00:00:00Z"))
+            .expect("early insert");
+        ledger
+            .record_orchestration_usage(&usage_row("msg-late", "sess-1", "2026-09-20T00:00:00Z"))
+            .expect("late insert");
+        let (window_one, _) = ledger
+            .orchestration_spend_since("2026-09-01T00:00:00Z")
+            .expect("window one");
+        let (window_two, _) = ledger
+            .orchestration_spend_since("2026-09-10T00:00:00Z")
+            .expect("window two");
+        assert_eq!(window_one, MicroUsd::from_micros(2_000), "both messages");
+        assert_eq!(
+            window_two,
+            MicroUsd::from_micros(1_000),
+            "only the later one"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

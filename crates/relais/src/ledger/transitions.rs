@@ -1,6 +1,8 @@
 //! Transitions and decisions: the transition chain, the decision spine and
 //! the answers recorded on it. Together because they share transactions.
 
+use std::path::PathBuf;
+
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
@@ -8,7 +10,7 @@ use crate::ids::{RunId, TaskId};
 use crate::lifecycle::{Reason, State};
 
 use super::error::{parse_decision_row, parse_state};
-use super::{Ledger, LedgerError, Result};
+use super::{Ledger, LedgerError, Result, LEGACY_ACTORS};
 
 /// Who decided (orchestrator-decides plan, Phase 1). Exactly three
 /// values; there is no free-text name because the machine has one person.
@@ -825,6 +827,183 @@ impl Ledger {
             Some(hash) if hash == crate::ids::sha256_hex(nonce.as_bytes()) => RecordedVia::Plugin,
             _ => RecordedVia::Cli,
         })
+    }
+}
+
+/// `advice_p_approve, advice_model, advice_revision, advice_null_reason`.
+type StoredAdvice = (Option<f64>, Option<String>, Option<String>, Option<String>);
+
+impl Actor {
+    pub const ALL: [Actor; 3] = [
+        Actor::Orchestrator,
+        Actor::Person,
+        Actor::PersonViaOrchestrator,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Actor::Orchestrator => "orchestrator",
+            Actor::Person => "person",
+            Actor::PersonViaOrchestrator => "person-via-orchestrator",
+        }
+    }
+
+    /// Parse what the command line names. An old spelling is refused with
+    /// the actor that replaces it; any other string with the three values.
+    pub fn parse(text: &str) -> std::result::Result<Actor, String> {
+        if let Some(actor) = Actor::ALL.into_iter().find(|a| a.as_str() == text) {
+            return Ok(actor);
+        }
+        if let Some((_, actor)) = LEGACY_ACTORS.iter().find(|(old, _)| *old == text) {
+            return Err(format!("`{text}` is now `{}`", actor.as_str()));
+        }
+        Err(format!(
+            "unknown actor `{text}` — one of: {}",
+            Actor::ALL.map(Actor::as_str).join(", ")
+        ))
+    }
+
+    /// Read a stored actor leniently: a canonical value, or a legacy
+    /// spelling mapped to its replacement.
+    pub fn from_stored(text: &str) -> Option<Actor> {
+        Actor::ALL
+            .into_iter()
+            .find(|a| a.as_str() == text)
+            .or_else(|| {
+                LEGACY_ACTORS
+                    .iter()
+                    .find(|(old, _)| *old == text)
+                    .map(|(_, actor)| *actor)
+            })
+    }
+}
+
+impl std::fmt::Display for Actor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl RecordedVia {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RecordedVia::Plugin => "plugin",
+            RecordedVia::Cli => "cli",
+        }
+    }
+}
+
+/// The `event_id` prefix of the usage row of a Claude Code advisor call:
+/// `advisor:<message id>#advisor<n>`. Such a row carries the advisor's own
+/// model, never a requested one, and is no model a run or task used.
+pub const ADVISOR_EVENT_PREFIX: &str = "advisor:";
+
+impl Ledger {
+    /// Salvaged runs whose `candidate_contained` was never computed, with
+    /// the repository each ran in: what `dataset build` backfills once.
+    pub fn salvages_without_containment(&self) -> Result<Vec<(RunId, PathBuf)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT decisions.run, runs.repo_path
+               FROM decisions JOIN runs ON runs.id = decisions.run
+              WHERE decisions.resolution = ?1 AND decisions.candidate_contained IS NULL
+              ORDER BY decisions.run",
+        )?;
+        let rows = stmt.query_map([Reason::DecisionSalvaged.as_str()], |row| {
+            Ok((
+                RunId::from_stored(row.get::<_, String>(0)?),
+                PathBuf::from(row.get::<_, String>(1)?),
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Record the containment of a salvage whose answer is still NULL.
+    /// Never overwrites a recorded answer: `Ok(false)` when there was
+    /// nothing to fill.
+    pub fn set_candidate_contained(&self, run_id: &RunId, contained: bool) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE decisions SET candidate_contained = ?2
+              WHERE run = ?1 AND resolution = ?3 AND candidate_contained IS NULL",
+            params![
+                run_id.as_str(),
+                contained,
+                Reason::DecisionSalvaged.as_str()
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// The candidate a person recorded merging when they salvaged a
+    /// terminal run (SPEC's decision spine): the `candidate_sha`
+    /// [`Self::record_salvage`] wrote into the [`State::AcceptedByPerson`]
+    /// transition's detail. `None` for a run that was never salvaged —
+    /// including one accepted the ordinary way, whose candidate `receipt`
+    /// names instead.
+    pub fn salvaged_candidate(&self, run_id: &RunId) -> Result<Option<String>> {
+        let detail: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT detail_json FROM transitions
+                 WHERE run_id = ?1 AND to_state = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![run_id.as_str(), State::AcceptedByPerson.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(detail) = detail else {
+            return Ok(None);
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&detail).map_err(|e| LedgerError::Corrupt {
+                what: format!("the salvage detail of run {run_id}"),
+                detail: e.to_string(),
+            })?;
+        Ok(value
+            .get("candidate_sha")
+            .and_then(|v| v.as_str())
+            .map(str::to_string))
+    }
+
+    /// The advisor's stored advice for one run's decision, as JSON, or
+    /// `null` when none was stored (no advisor yet: the columns exist, and
+    /// nothing writes them).
+    pub fn decision_advice(&self, run_id: &RunId) -> Result<serde_json::Value> {
+        let row: Option<StoredAdvice> = self
+            .conn
+            .query_row(
+                "SELECT advice_p_approve, advice_model, advice_revision, advice_null_reason
+                   FROM decisions WHERE run = ?1",
+                [run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((p_approve, model, revision, null_reason))
+                if p_approve.is_some() || null_reason.is_some() =>
+            {
+                serde_json::json!({
+                    "p_approve": p_approve,
+                    "model": model,
+                    "revision": revision,
+                    "null_reason": null_reason,
+                })
+            }
+            _ => serde_json::Value::Null,
+        })
+    }
+
+    /// Every criterion a person has signed off for one run, with who
+    /// signed each — what `verify::acceptance_gaps`/`settle_acceptance`
+    /// read back to stop treating an answered human-sign-off criterion
+    /// as unmet.
+    pub fn human_signoffs(&self, run_id: &RunId) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT criterion_id, actor FROM human_signoffs WHERE run_id = ?1 ORDER BY criterion_id",
+        )?;
+        let rows = stmt.query_map([run_id.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 }
 

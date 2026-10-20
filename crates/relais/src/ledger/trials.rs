@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{RunId, TaskId, TrialId};
 use crate::money::{CostCompleteness, MicroUsd};
 
-use super::{parse_trial_row, Ledger, LedgerError, Result, TrialOutcome};
+use super::{parse_trial_row, Ledger, LedgerError, Result};
 
 /// One arm of one controlled comparison (SPEC §17), as the ledger holds
 /// it: which task and source run it derives from, the incumbent and arm
@@ -774,6 +774,55 @@ impl Ledger {
             row.get(21)?,
             row.get(22)?,
         ))
+    }
+}
+
+/// What became of one trial arm's run, once settled (SPEC §17). `NULL`
+/// on the row means "not settled yet" — a trial in flight — never an
+/// unnamed outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrialOutcome {
+    /// The arm's candidate was accepted.
+    Accepted,
+    /// Verification (or a person) concluded the candidate should not be
+    /// accepted.
+    Rejected,
+    /// The arm's run ended on an infrastructure fault — a crash, a
+    /// cancellation — rather than a verification verdict, so it is not
+    /// comparable evidence for or against the arm.
+    Errored,
+    /// The replay did not run the arm it was recorded under: its first
+    /// attempt dispatched another model than the arm's, or the design it
+    /// was handed disagrees with the arm's `requires_design`
+    /// (docs/plans/2026-10-12-task-types.md). Never evidence for or
+    /// against any arm, and never counted as the arm's failure.
+    Invalid,
+}
+
+impl TrialOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Errored => "errored",
+            Self::Invalid => "invalid",
+        }
+    }
+
+    pub(super) fn parse(stored: &str) -> Option<Self> {
+        match stored {
+            "accepted" => Some(Self::Accepted),
+            "rejected" => Some(Self::Rejected),
+            "errored" => Some(Self::Errored),
+            "invalid" => Some(Self::Invalid),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TrialOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }
 

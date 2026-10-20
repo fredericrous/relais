@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::ids::RunId;
 use crate::lifecycle::{RunPurpose, State};
 
-use super::{Ledger, LedgerError, Result, PROJECTED_STATUS};
+use super::transitions::PROJECTED_STATUS;
+use super::{Ledger, LedgerError, Result};
 
 /// A live root run with its first dispatch intent.
 #[derive(Debug, Clone, PartialEq)]

@@ -1,5 +1,11 @@
 //! The ledger's error type and the parsers that turn stored text into typed values.
 
+use crate::ids::{RunId, TaskId, TrialId};
+use crate::lifecycle::{Reason, RunPurpose, State};
+use crate::money::{CostCompleteness, MicroUsd};
+use crate::policy::Tier;
+use crate::route::RoutedBy;
+
 use super::transitions::{seconds_between, DecisionRow};
 use super::*;
 
@@ -131,8 +137,8 @@ pub(super) fn parse_cost_completeness(stored: &str) -> Result<CostCompleteness> 
 }
 
 /// A trial outcome string as a trial row stored it.
-pub(super) fn parse_trial_outcome(stored: &str) -> Result<TrialOutcome> {
-    TrialOutcome::parse(stored).ok_or_else(|| LedgerError::Corrupt {
+pub(super) fn parse_trial_outcome(stored: &str) -> Result<super::TrialOutcome> {
+    super::TrialOutcome::parse(stored).ok_or_else(|| LedgerError::Corrupt {
         what: "trial outcome".into(),
         detail: format!("`{stored}` is not a trial outcome this relais knows"),
     })

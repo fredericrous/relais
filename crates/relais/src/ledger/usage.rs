@@ -9,7 +9,8 @@ use crate::lifecycle::{RunPurpose, UsagePhase};
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::route::RoutedBy;
 
-use super::{Ledger, LedgerError, Result, ADVISOR_EVENT_PREFIX};
+use super::transitions::ADVISOR_EVENT_PREFIX;
+use super::{Ledger, LedgerError, Result};
 
 /// The one `usage_events` insert: a duplicate event id is ignored.
 fn insert_usage_event(conn: &Connection, event: &UsageEvent) -> Result<bool> {
@@ -847,10 +848,147 @@ impl Ledger {
     }
 }
 
+impl Ledger {
+    /// Every dispatch ever recorded for a run: the aggregate agent count
+    /// no work package resets (SPEC §19).
+    pub fn dispatch_count(&self, run_id: &RunId) -> Result<u32> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM dispatches WHERE run_id = ?1",
+            [run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(count as u32)
+    }
+
+    /// Close every dispatch of a run that never recorded a terminal state,
+    /// as `state`, so none is judged live again. Returns how many.
+    pub fn close_open_dispatches(&self, id: &RunId, state: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE dispatches SET state = ?2, updated_at = ?3
+             WHERE run_id = ?1 AND state IN ('intent', 'launched')",
+            params![id.as_str(), state, self.now()],
+        )?)
+    }
+
+    /// Every distinct model an orchestration usage record names at or
+    /// after `since` (RFC3339), sorted. Only orchestration usage is priced
+    /// from machine.toml's `[pricing]`; a worker's usage event carries the
+    /// cost its provider reported, so a worker model with no price entry
+    /// is not a gap.
+    pub fn models_seen_since(&self, since: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT model FROM orchestration_usage WHERE at >= ?1
+             ORDER BY 1",
+        )?;
+        let rows = stmt.query_map([since], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Whether a reviewer was DISPATCHED for this run: a review dispatch
+    /// intent is written before the launch, so a review whose model
+    /// reported no usage, or whose launch failed, still counts. This is
+    /// the fact a receipt's review record rests on; `review_attempted`
+    /// counts billed review usage, for the review-correction rate.
+    pub fn review_dispatched(&self, run_id: &RunId) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM dispatches
+             WHERE run_id = ?1 AND json_extract(intent_json, '$.kind') = 'review'",
+            [run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Whether a run's reviewer actually ran, from usage events tagged
+    /// with the review phase. The review-correction rate's denominator
+    /// counts only tasks a reviewer looked at (SPEC §11): a rate over
+    /// never-reviewed tasks says nothing about review quality.
+    pub fn review_attempted(&self, run_id: &RunId) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM usage_events WHERE run_id = ?1 AND phase = 'review'",
+            [run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Was this transcript message booked to a native run's attempt?
+    pub fn is_native_booked(&self, message_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM native_usage_messages WHERE message_id = ?1)",
+            params![message_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Is this agent the one a relais dispatch recorded
+    /// (`dispatches.agent_id`)? Its whole transcript is the run's, so
+    /// `usage import` leaves it alone even when no message id of it was
+    /// booked.
+    pub fn is_relais_agent(&self, agent_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM dispatches WHERE agent_id = ?1)",
+            params![agent_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn attach_dispatch_process(
+        &self,
+        dispatch_id: &DispatchId,
+        pid: Option<Pid>,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE dispatches SET pid = ?2, session_id = ?3, state = ?4, updated_at = ?5
+             WHERE dispatch_id = ?1",
+            params![
+                dispatch_id.as_str(),
+                pid.map(|pid| i64::from(pid.get())),
+                session_id,
+                "launched",
+                self.now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The dispatch's worker is a native subagent of the parent session:
+    /// its row says so, from before the launch (`agent_id` NULL), and
+    /// names the agent once the launch returns one. A NULL never
+    /// overwrites an agent already named.
+    pub fn record_native_dispatch(
+        &self,
+        dispatch_id: &DispatchId,
+        agent_id: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE dispatches SET source = ?2, agent_id = COALESCE(?3, agent_id),
+                 updated_at = ?4
+             WHERE dispatch_id = ?1",
+            params![
+                dispatch_id.as_str(),
+                crate::admission::DispatchSource::NativeRun.as_str(),
+                agent_id,
+                self.now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_dispatch(&self, dispatch_id: &DispatchId, state: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE dispatches SET state = ?2, updated_at = ?3 WHERE dispatch_id = ?1",
+            params![dispatch_id.as_str(), state, self.now()],
+        )?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{event, package, run, task, temp_ledger};
-    use super::super::ChildOf;
+    use super::super::test_support::{dispatch, event, package, run, task, temp_ledger, usage_row};
+    use super::super::{ChildOf, OrchestrationUsageRow};
     use super::*;
 
     #[test]
@@ -1169,6 +1307,238 @@ mod tests {
             1110,
             "run_cost's own tree walk agrees"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A dispatch killed after its per-turn bookings never booked its
+    /// final row, so it does not count as reported: the run's cost is a
+    /// lower bound, not complete.
+    #[test]
+    fn per_turn_rows_alone_do_not_make_a_dispatch_reported() {
+        let (ledger, _dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-k"), "/repo", None, &task("run-k"), "rk")
+            .expect("run");
+        for id in ["disp-done", "disp-killed"] {
+            ledger
+                .record_dispatch_intent(
+                    &dispatch(id),
+                    &run("run-k"),
+                    None,
+                    &serde_json::json!({}),
+                    0,
+                    RoutedBy::ConservativeBaseline,
+                )
+                .expect("intent");
+        }
+        ledger
+            .record_usage_delta(&event("disp-done", "run-k", 5), &[], Booking::Final)
+            .expect("final");
+        let turn = ledger
+            .record_usage_delta(&event("disp-killed", "run-k", 3), &[], Booking::Turn)
+            .expect("turn")
+            .expect("booked");
+        assert_eq!(
+            turn.event_id, "disp-killed#0",
+            "a turn never takes the bare id"
+        );
+        assert_eq!(
+            ledger
+                .run_cost_completeness(&run("run-k"))
+                .expect("completeness"),
+            CostCompleteness::IncompleteLowerBound
+        );
+    }
+
+    /// A final booking with nothing new still writes the bare-id row: it
+    /// is the dispatch's "reported" marker, at zero.
+    #[test]
+    fn a_final_booking_with_nothing_new_still_marks_the_dispatch_reported() {
+        let (ledger, _dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-z"), "/repo", None, &task("run-z"), "rk")
+            .expect("run");
+        ledger
+            .record_usage_delta(&event("disp-z", "run-z", 7), &[], Booking::Turn)
+            .expect("turn");
+        let last = ledger
+            .record_usage_delta(&event("disp-z", "run-z", 7), &[], Booking::Final)
+            .expect("final")
+            .expect("the marker is written");
+        assert_eq!(last.event_id, "disp-z");
+        assert_eq!(last.input_tokens, Some(0));
+        assert_eq!(
+            ledger.run_cost(&run("run-z")).expect("cost"),
+            MicroUsd::from_micros(7)
+        );
+    }
+
+    /// An intent that does not parse is a corrupt row, reported, never a
+    /// booking with every field silently empty.
+    #[test]
+    fn a_corrupt_intent_is_reported_not_booked_blank() {
+        let (ledger, _dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-c"), "/repo", None, &task("run-c"), "rk")
+            .expect("run");
+        ledger
+            .record_dispatch_intent(
+                &dispatch("disp-c"),
+                &run("run-c"),
+                None,
+                &serde_json::json!({}),
+                0,
+                RoutedBy::ConservativeBaseline,
+            )
+            .expect("intent");
+        ledger
+            .conn
+            .execute(
+                "UPDATE dispatches SET intent_json = '{not json' WHERE dispatch_id = 'disp-c'",
+                [],
+            )
+            .expect("corrupt");
+        assert!(matches!(
+            ledger.dispatch_booking("disp-c"),
+            Err(LedgerError::Corrupt { .. })
+        ));
+    }
+
+    /// Import first: it booked the worker's message as the session's own.
+    /// The native booking moves exactly that row to the run and keeps the
+    /// session's, so summed over both tables each message is counted once.
+    #[test]
+    fn a_native_booking_takes_over_the_row_an_import_made_first() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-n"), "/r", Some("sess-1"), &task("run-n"), "rk")
+            .expect("run");
+        let at = "2026-10-06T00:00:00Z";
+        for id in ["msg-session", "msg-worker"] {
+            ledger
+                .record_orchestration_usage(&usage_row(id, "sess-1", at))
+                .expect("imported");
+        }
+        let booked = event("d1", "run-n", 1_000);
+        ledger
+            .record_native_usage(&booked, &["msg-worker".to_string()])
+            .expect("native booking");
+        let (session_cost, _) = ledger
+            .orchestration_spend_since("2026-01-01T00:00:00Z")
+            .expect("spend");
+        assert_eq!(
+            session_cost,
+            MicroUsd::from_micros(1_000),
+            "only the session's"
+        );
+        assert_eq!(
+            ledger.run_cost(&run("run-n")).expect("run cost"),
+            MicroUsd::from_micros(1_000)
+        );
+        assert!(ledger.is_native_booked("msg-worker").expect("lookup"));
+        assert!(!ledger.is_native_booked("msg-session").expect("lookup"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The race: an import reads the worker's message as unbooked, the
+    /// run books it (deleting no row, since none exists yet), and only
+    /// then does the import insert. The insert's own guard refuses it.
+    #[test]
+    fn an_import_racing_a_native_booking_still_counts_the_message_once() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-n"), "/r", Some("sess-1"), &task("run-n"), "rk")
+            .expect("run");
+        let at = "2026-10-06T00:00:00Z";
+        assert!(!ledger.is_native_booked("msg-worker").expect("lookup"));
+        ledger
+            .record_native_usage(&event("d1", "run-n", 1_000), &["msg-worker".to_string()])
+            .expect("native booking");
+        assert!(!ledger
+            .record_orchestration_usage(&usage_row("msg-worker", "sess-1", at))
+            .expect("the late insert runs"));
+        let rows: i64 = ledger
+            .conn
+            .query_row("SELECT COUNT(*) FROM orchestration_usage", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(rows, 0, "the run's message is not the session's too");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An attempt without message ids books no transcript message to a run.
+    #[test]
+    fn a_plain_usage_event_books_no_native_message() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-h"), "/r", None, &task("run-h"), "rk")
+            .expect("run");
+        ledger
+            .record_usage(&event("d1", "run-h", 10))
+            .expect("usage");
+        let booked: i64 = ledger
+            .conn
+            .query_row("SELECT COUNT(*) FROM native_usage_messages", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(booked, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A message imported mid-stream carries a partial `output_tokens`.
+    /// Re-importing the finished message must raise it and its cost, and
+    /// an older, smaller snapshot must never lower it back. FALSIFIED:
+    /// with `INSERT OR IGNORE` the row stayed at 50 tokens / $0.001;
+    /// restored.
+    #[test]
+    fn a_message_imported_mid_stream_grows_to_its_final_snapshot() {
+        let (ledger, dir) = temp_ledger();
+        let partial = usage_row("msg-1", "sess-1", "2026-09-28T00:00:00Z");
+        assert!(ledger
+            .record_orchestration_usage(&partial)
+            .expect("partial"));
+        let finished = OrchestrationUsageRow {
+            output_tokens: 400,
+            cost: Some(MicroUsd::from_micros(3_000)),
+            ..usage_row("msg-1", "sess-1", "2026-09-28T00:00:00Z")
+        };
+        assert!(ledger
+            .record_orchestration_usage(&finished)
+            .expect("finished snapshot raises the row"));
+        assert!(!ledger
+            .record_orchestration_usage(&partial)
+            .expect("an older snapshot is a no-op"));
+        let (spend, _) = ledger
+            .orchestration_spend_since("2000-01-01T00:00:00Z")
+            .expect("spend");
+        assert_eq!(spend, MicroUsd::from_micros(3_000));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Importing the same session twice inserts nothing the second time
+    /// (SPEC §11): `message_id` is the transcript's own dedup key and is
+    /// the table's primary key.
+    #[test]
+    fn recording_the_same_message_id_twice_is_a_no_op() {
+        let (ledger, dir) = temp_ledger();
+        let row = usage_row("msg-1", "sess-1", "2026-09-28T00:00:00Z");
+        assert!(ledger
+            .record_orchestration_usage(&row)
+            .expect("first insert"));
+        assert!(!ledger
+            .record_orchestration_usage(&row)
+            .expect("second insert is a no-op"));
+        let (spend, completeness) = ledger
+            .orchestration_spend_since("2000-01-01T00:00:00Z")
+            .expect("spend");
+        assert_eq!(
+            spend,
+            MicroUsd::from_micros(1_000),
+            "counted once, not twice"
+        );
+        assert_eq!(completeness, CostCompleteness::Actual);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
