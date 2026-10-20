@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/runs-survive-the-machine (four PRs: fix/probe-timeout-not-unsupported, feat/candidate-identity, feat/resource-admission, feat/verification-evidence)
 repos: [relais]
 adrs:
@@ -212,6 +212,8 @@ Deliberate: the test does not pin v39/v40 by index; it asserts all three tables 
 CI: #267's first push failed on `windows-latest` in one test (`kill -9 $$`: Windows has no SIGKILL, so the run repaired and the mock worker found its file gone); that case now runs on unix only, `classify` keeps its 137 test everywhere. Delta: approve (38k/11 s), tree `1114d454`.
 Next: PR 3 (verification evidence), on a new branch after this merges.
 
+PR 3: rework, then approve on the Delta (round 1 79k/118 s on tree `ab1fa53d`; delta 85k/19 s on `9d9f74d4`). Fixed: the plugin-script test module is unix-only (it would not compile on Windows); a resumed driver keeps its relay offset in `events.relay-offset` instead of rebuilding it from the last seq'd line (an unrelayed line before a later event was skipped); seq resumes one past the highest written (the plugin dropped post-resume costs); the heartbeat's zero worker signal has a `holds-until:`. Deliberate: a relay is at most once (offset before emit), converging through status; the offset write's error is dropped by design, with the reason beside it.
+
 ## Outcome (PR 2)
 
 Branch `feat/resource-admission`, built by five relais runs (B1 salvaged after `scope_exceeded` on compile-forced fixtures; B2 salvaged after the coordinator restarted mid-run under a 0.24.1 upgrade; the B2 fixes salvaged after `review_unavailable`; B3 salvaged after `budget_exhausted`; B4 salvaged after `interrupted`) and two early reviews of B2. The gate passed 30/30 at each commit.
@@ -224,6 +226,19 @@ Branch `feat/resource-admission`, built by five relais runs (B1 salvaged after `
 | 7 Exhaustion | each signature on a failing check → `resource_exhausted`, no repair; on base → `baseline_resource_exhausted`; relais's own timeout kill is not memory; a passing check with the text passes | `each_disk_signature_in_a_failed_candidate_check_ends_resource_exhausted`, `each_memory_signature_and_an_unsent_sigkill_end_resource_exhausted`, `a_classified_failure_on_the_base_blocks_the_run_and_never_reddens_the_base`, `a_timeout_relais_sent_is_not_memory`, `a_passing_check_that_prints_a_signature_is_still_a_pass` |
 
 Deliberate: a weight above the number of host slot files is refused when the first heavy lease is taken, not at preflight, so a base setup can run first; an untied lease (its bind failed) is not persisted across a coordinator restart (SPEC §23 says so); the stress variant of item 5 (20× in CI) is not added; the live check with amont's real slot directory is plan step 11, after the release. Found on the way: this machine's disk stood at 4.1 GiB free, under the new 8 GiB floor; the release scenarios now run with no floor (`NO_DISK_FLOOR`), the floor itself tested with a stubbed probe.
+
+## Outcome (PR 3)
+
+Branch `feat/verification-evidence`, under `2026-10-19-finish-admission-then-split.md` Phase 2. C1, C2, C4 and C5 were built by relais runs (sonnet workers); C2's out-of-scope lines (compile-forced `retry: None` in test literals) were verified with a widened scope. The semantic reviewer was unavailable on C2, C4 and C5 (its dispatch exits 1 at once in the installed relais, a separate fault), so the orchestrator read each patch before approving. C3 and the review fixes were made by hand: relais cannot run in this branch until a relais that knows `weight` and `retry` is installed.
+
+| Verification | Expected | Actual (test) |
+|---|---|---|
+| 8 Pre-existing | complete reports, subset, no targeted test → `needs_decision`, no repair; a targeted test → repair; truncated or missing report, exit≠0 with no failing case → today's rule | `complete_reports_with_a_subset_of_base_failures_end_without_a_repair`, `a_base_failing_test_named_by_a_criterion_is_still_repaired`, `a_check_named_by_a_criterion_is_still_repaired`, `a_truncated_report_keeps_todays_rule_and_repairs`, `a_missing_report_keeps_todays_rule_and_repairs`; `junit`: `totals_that_disagree_with_the_testcases_are_not_complete`, `a_non_zero_exit_with_no_failing_case_is_not_complete`, `a_receipt_without_the_totals_field_reads_as_incomplete_and_round_trips` |
+| 9 Retry | fail-then-pass is a flaky pass with both attempts; twice failing lists both; no retry runs once; exhaustion never retried; `RELAIS_CHECK` set, and the plugin script reruns only outside relais | `a_retried_check_that_fails_then_passes_is_a_flaky_pass`, `a_retried_check_that_fails_twice_is_a_failure_with_both_attempts`, `a_check_without_retry_runs_once`, `a_failure_that_shows_exhaustion_is_not_retried`, `a_check_sees_relais_check_in_its_environment`, `under_relais_the_plugin_suite_runs_at_most_once`, `outside_relais_an_all_timeout_failure_is_rerun_once` |
+| 10 Heartbeat and cost | a silent CPU-bound check is alive with progress, a sleeper alive with none; heartbeat seq monotonic, its thread joined; a seq-less usage line relayed once, across a resume; out-of-order status → newer revision wins; replay twice → the ledger total; tokenless → unknown | `a_check_that_burns_cpu_silently_is_alive_with_progress`, `a_check_that_sleeps_past_the_threshold_is_alive_with_no_progress`, `heartbeat_seq_numbers_are_monotonic_within_a_run`, `the_heartbeat_thread_beats_until_the_wait_ends_and_is_joined`, `a_seqless_usage_line_is_re_emitted_once_and_survives_a_resume`, `an_unrelayed_usage_line_before_a_later_event_survives_a_resume`, `status_carries_the_last_seq_read_and_the_ledger_cost_total`, `a_model_reported_without_token_fields_books_an_unknown_cost_not_zero`; plugin: `out-of-order status responses: the newer revision wins`, `replaying the same events twice leaves the cost equal to the ledger total`, `status requests are coalesced to one in flight per run, with a 5 s timeout` and the five timeline text tests |
+| 11 Live | after the release, on this machine | not run: `holds-until:` the v0.27.0 install (delivery plan Phase 3) |
+
+Drift, recorded: C1's cache needs no change (main's cache is v5 and stores only all-green bases, so the failing sets come from the live base run). C3's timeouts are three times one measured run each (toolchain 0 s, lint 10, test 339, msrv 152, audit 3, plugin 62; load 14–74), floor 300 s; `make test` writes no JUnit, so none is declared, and the pinned authority hash of this repository's policy moved deliberately a third time. A relay is at most once: the offset is written before the lines go out, so a crash between the two loses a relay, and status reconciliation restores the total.
 
 ## Delivery
 
