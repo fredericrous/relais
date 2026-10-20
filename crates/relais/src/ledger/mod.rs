@@ -10276,17 +10276,9 @@ mod tests {
     /// written.
     #[test]
     fn nothing_a_model_can_reach_names_a_trials_arm() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let cli = read_rs_tree(&src, &cli_roots(&src), "the binary CLI tree")
-            .unwrap_or_else(|e| panic!("{e}"));
-        let contract = read_rs_tree(&src, &[src.join("contract")], "the contract tree")
-            .unwrap_or_else(|e| panic!("{e}"));
-        let ledger = read_rs_tree(&src, &[src.join("ledger")], "the ledger tree")
-            .unwrap_or_else(|e| panic!("{e}"));
-        if let Err(e) = check_unreachable_identifiers(&cli, &contract) {
-            panic!("{e}");
-        }
-        if let Err(e) = check_replay_trial_declaration(&ledger) {
+        // The same function the negative controls below run on fixture
+        // trees, so what they prove holds for this check too.
+        if let Err(e) = check_arm_boundary(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))) {
             panic!("{e}");
         }
     }
@@ -10296,6 +10288,9 @@ mod tests {
     const REPLAY_TRIAL_DECL: &str = concat!("pub struct NewReplayTrial", "<'a> {");
 
     /// The CLI roots under `src`: `main.rs`, plus `cli/` when it exists.
+    /// holds-until: the split moves the CLI into `src/cli/` (plan
+    /// 2026-10-19-finish-admission-then-split, PR A); from then on `cli/`
+    /// is a required root, so a renamed tree cannot pass unscanned.
     fn cli_roots(src: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut roots = vec![src.join("main.rs")];
         let cli = src.join("cli");
@@ -10442,7 +10437,8 @@ mod tests {
         dir
     }
 
-    fn run_fixture_checks(dir: &std::path::Path) -> std::result::Result<(), String> {
+    /// Both checks over the crate (or fixture) rooted at `dir`.
+    fn check_arm_boundary(dir: &std::path::Path) -> std::result::Result<(), String> {
         let src = dir.join("src");
         let cli = read_rs_tree(&src, &cli_roots(&src), "the binary CLI tree")?;
         let contract = read_rs_tree(&src, &[src.join("contract")], "the contract tree")?;
@@ -10477,7 +10473,7 @@ mod tests {
     #[test]
     fn a_clean_extracted_layout_passes_the_arm_boundary_checks() {
         let dir = fixture_src("arm-clean", &clean_layout());
-        assert_eq!(run_fixture_checks(&dir), Ok(()));
+        assert_eq!(check_arm_boundary(&dir), Ok(()));
     }
 
     #[test]
@@ -10488,8 +10484,38 @@ mod tests {
             "let arm_index = 1;\n".to_string(),
         );
         let dir = fixture_src("arm-cli-child", &layout);
-        let err = run_fixture_checks(&dir).expect_err("reported");
+        let err = check_arm_boundary(&dir).expect_err("reported");
         assert!(err.contains("arm_index") && err.contains("run.rs"), "{err}");
+    }
+
+    #[test]
+    fn a_forbidden_identifier_in_a_nested_cli_file_is_reported() {
+        let layout = with_file(
+            clean_layout(),
+            "cli/learn/train.rs",
+            "let arm_index = 1;\n".to_string(),
+        );
+        let dir = fixture_src("arm-cli-nested", &layout);
+        let err = check_arm_boundary(&dir).expect_err("reported");
+        assert!(
+            err.contains("arm_index") && err.contains("train.rs"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_forbidden_identifier_in_a_contract_child_is_reported() {
+        let layout = with_file(
+            clean_layout(),
+            "contract/child.rs",
+            "pub assignment_probability: f64,\n".to_string(),
+        );
+        let dir = fixture_src("arm-contract-child", &layout);
+        let err = check_arm_boundary(&dir).expect_err("reported");
+        assert!(
+            err.contains("assignment_probability") && err.contains("child.rs"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -10500,7 +10526,7 @@ mod tests {
             format!("{REPLAY_TRIAL_DECL}\n    pub seed: u64,\n}}\n"),
         );
         let dir = fixture_src("arm-seed", &layout);
-        let err = run_fixture_checks(&dir).expect_err("reported");
+        let err = check_arm_boundary(&dir).expect_err("reported");
         assert!(err.contains("`seed`") && err.contains("trials.rs"), "{err}");
     }
 
@@ -10512,7 +10538,7 @@ mod tests {
             "pub struct Other;\n".to_string(),
         );
         let dir = fixture_src("arm-missing-decl", &layout);
-        let err = run_fixture_checks(&dir).expect_err("an error");
+        let err = check_arm_boundary(&dir).expect_err("an error");
         assert!(err.contains("NewReplayTrial"), "{err}");
     }
 
@@ -10523,7 +10549,7 @@ mod tests {
             .filter(|(r, _)| !r.starts_with("contract/"))
             .collect();
         let dir = fixture_src("arm-no-contract", &layout);
-        let err = run_fixture_checks(&dir).expect_err("an error");
+        let err = check_arm_boundary(&dir).expect_err("an error");
         assert!(err.contains("contract tree"), "{err}");
     }
 
