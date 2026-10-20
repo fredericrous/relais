@@ -6,7 +6,7 @@ use rusqlite::{params, OptionalExtension};
 
 use crate::ids::RunId;
 
-use super::{parse_evidence_kind, parse_state, Ledger, LedgerError, Result, Transition};
+use super::{parse_state, Ledger, LedgerError, Result, Transition};
 
 /// What an evidence row is: every kind this ledger has ever stored, plus
 /// the two this package introduces. A stored name this binary does not
@@ -324,6 +324,14 @@ impl Ledger {
         })
         .transpose()
     }
+}
+
+/// An evidence kind string as an evidence row stored it.
+pub(super) fn parse_evidence_kind(stored: &str) -> Result<EvidenceKind> {
+    EvidenceKind::parse(stored).ok_or_else(|| LedgerError::Corrupt {
+        what: "evidence kind".into(),
+        detail: format!("`{stored}` is not an evidence kind this relais knows"),
+    })
 }
 
 #[cfg(test)]

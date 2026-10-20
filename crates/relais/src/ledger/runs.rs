@@ -11,9 +11,7 @@ use crate::lifecycle::{RunPurpose, State, UsagePhase};
 use crate::policy::Tier;
 use crate::route::RoutedBy;
 
-use super::error::{
-    parse_routed_by, parse_run_purpose, parse_state, parse_task_origin, parse_tier,
-};
+use super::error::{parse_routed_by, parse_run_purpose, parse_state, parse_tier};
 use super::task_types;
 use super::transitions::{stamp_driver, PROJECTED_STATUS};
 use super::{Ledger, LedgerError, Result};
@@ -1216,6 +1214,14 @@ impl Ledger {
             .optional()?
             .flatten())
     }
+}
+
+/// A task origin string as the ledger stored it.
+pub(super) fn parse_task_origin(stored: &str) -> Result<TaskOrigin> {
+    TaskOrigin::parse(stored).ok_or_else(|| LedgerError::Corrupt {
+        what: "task origin".into(),
+        detail: format!("`{stored}` is not a task origin this relais knows"),
+    })
 }
 
 #[cfg(test)]

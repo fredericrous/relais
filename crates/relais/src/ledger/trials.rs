@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{RunId, TaskId, TrialId};
 use crate::money::{CostCompleteness, MicroUsd};
 
-use super::{parse_trial_row, Ledger, LedgerError, Result};
+use super::error::parse_cost_completeness;
+use super::{Ledger, LedgerError, Result};
 
 /// One arm of one controlled comparison (SPEC §17), as the ledger holds
 /// it: which task and source run it derives from, the incumbent and arm
@@ -824,6 +825,119 @@ impl std::fmt::Display for TrialOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
     }
+}
+
+/// A `trials` row as columns, parsed into a [`TrialRow`]: an
+/// unrecognised outcome or cost completeness is a `Corrupt` row the
+/// caller reports, never silently normalised into a settled-looking one.
+pub(super) fn parse_trial_row(columns: TrialColumns) -> Result<TrialRow> {
+    let (
+        trial_id,
+        task_id,
+        source_run_id,
+        incumbent_recipe_id,
+        arm_recipe_id,
+        arm_index,
+        assignment_probability,
+        seed,
+        base_sha,
+        contract_hash,
+        verification_profile_hash,
+        workspace_isolation,
+        outcome,
+        accepted_without_escalation,
+        cost_micros,
+        cost_completeness,
+        duration_ms,
+        created_at,
+        arm_run_id,
+        design_sha256,
+        ground_truth,
+        ground_truth_note,
+        ground_truth_at,
+    ) = columns;
+    let ground_truth = match (ground_truth, ground_truth_note, ground_truth_at) {
+        (None, None, None) => None,
+        (Some(stored), Some(note), Some(at)) => Some(GroundTruth {
+            verdict: GroundTruthVerdict::parse(&stored).ok_or_else(|| LedgerError::Corrupt {
+                what: "trials.ground_truth".into(),
+                detail: format!("`{stored}` is not a verdict this relais knows"),
+            })?,
+            note,
+            at,
+        }),
+        _ => {
+            return Err(LedgerError::Corrupt {
+                what: "trials.ground_truth".into(),
+                detail: "the verdict, its note and its time are not all present".into(),
+            })
+        }
+    };
+    Ok(TrialRow {
+        trial_id: TrialId::from_stored(trial_id),
+        task_id: TaskId::from_stored(task_id),
+        source_run_id: RunId::from_stored(source_run_id),
+        incumbent_recipe_id,
+        arm_recipe_id,
+        // `as u32` turned a stored -1 into 4294967295 and 4294967296
+        // into 0 — a corrupt row read back as a plausible arm. `seed`
+        // needs no such care: u64 <-> i64 round-trips every bit.
+        arm_index: u32::try_from(arm_index).map_err(|_| LedgerError::Corrupt {
+            what: "trials.arm_index".into(),
+            detail: format!("{arm_index} is not an arm index"),
+        })?,
+        assignment_probability,
+        seed: seed as u64,
+        base_sha,
+        contract_hash,
+        verification_profile_hash,
+        workspace_isolation,
+        outcome: outcome.as_deref().map(parse_trial_outcome).transpose()?,
+        accepted_without_escalation: accepted_without_escalation.map(|v| v != 0),
+        // The figure and its completeness are paired HERE, through the
+        // one constructor that refuses an impossible pair, so a row
+        // written by an older binary — or by hand — that says "0, but
+        // unknown" is Corrupt rather than a trial that reads as free.
+        cost: parse_trial_cost(cost_micros, cost_completeness.as_deref())?,
+        duration_ms,
+        created_at,
+        arm_run_id: arm_run_id.map(RunId::from_stored),
+        design_sha256,
+        ground_truth,
+    })
+}
+
+/// Pair a stored cost with its stored completeness, refusing the two
+/// combinations that say contradictory things. An unsettled trial has
+/// neither and reads `None`; a settled one must have a coherent pair.
+pub(super) fn parse_trial_cost(
+    cost_micros: Option<i64>,
+    completeness: Option<&str>,
+) -> Result<Option<TrialCost>> {
+    match (cost_micros, completeness) {
+        (None, None) => Ok(None),
+        (cost, Some(stored)) => {
+            let completeness = parse_cost_completeness(stored)?;
+            TrialCost::new(cost.map(MicroUsd::from_micros), completeness)
+                .map(Some)
+                .map_err(|e| LedgerError::Corrupt {
+                    what: "trials.cost_micros/cost_completeness".into(),
+                    detail: e.to_string(),
+                })
+        }
+        (Some(cost), None) => Err(LedgerError::Corrupt {
+            what: "trials.cost_completeness".into(),
+            detail: format!("a cost of {cost} micros with no completeness beside it"),
+        }),
+    }
+}
+
+/// A trial outcome string as a trial row stored it.
+pub(super) fn parse_trial_outcome(stored: &str) -> Result<super::TrialOutcome> {
+    super::TrialOutcome::parse(stored).ok_or_else(|| LedgerError::Corrupt {
+        what: "trial outcome".into(),
+        detail: format!("`{stored}` is not a trial outcome this relais knows"),
+    })
 }
 
 #[cfg(test)]

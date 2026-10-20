@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{RunId, TaskId};
 use crate::lifecycle::{Reason, State};
 
-use super::error::{parse_decision_row, parse_state};
-use super::{Ledger, LedgerError, Result, LEGACY_ACTORS};
+use super::error::parse_state;
+use super::{Ledger, LedgerError, Result};
 
 /// Who decided (orchestrator-decides plan, Phase 1). Exactly three
 /// values; there is no free-text name because the machine has one person.
@@ -1006,6 +1006,66 @@ impl Ledger {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 }
+
+/// A `decisions` row as columns, parsed into a [`DecisionRecord`] (P6): an
+/// unknown state or resolution is a `Corrupt` row the caller reports,
+/// never a silently dropped or mismatched decision. `now` is the wait
+/// clock for a row still open; a resolved row uses its own `resolved_at`
+/// instead, so re-reading it later never changes what it says.
+pub(super) fn parse_decision_row(row: DecisionRow, now: &str) -> Result<DecisionRecord> {
+    let (
+        run,
+        task,
+        raised_at,
+        raised_state,
+        raised_reason,
+        resolved_at,
+        resolution,
+        actor,
+        note,
+        successor_run,
+        candidate_contained,
+    ) = row;
+    let resolution = resolution
+        .map(|stored| {
+            Reason::parse(&stored).map_err(|unknown| LedgerError::Corrupt {
+                what: unknown.what.into(),
+                detail: unknown.to_string(),
+            })
+        })
+        .transpose()?;
+    let waited_seconds = seconds_between(&raised_at, resolved_at.as_deref().unwrap_or(now))?;
+    Ok(DecisionRecord {
+        run: RunId::from_stored(run),
+        task: TaskId::from_stored(task),
+        raised_at,
+        raised_state: parse_state(&raised_state)?,
+        raised_reason,
+        resolved_at,
+        resolution,
+        actor,
+        note,
+        successor_run: successor_run.map(RunId::from_stored),
+        candidate_contained,
+        waited_seconds,
+    })
+}
+
+/// Every actor spelling a ledger written before the typed [`Actor`] may
+/// hold, and the actor it becomes. The v27 SQL `CASE` repeats this table;
+/// a test runs each row through the migration so the two cannot drift.
+pub const LEGACY_ACTORS: &[(&str, Actor)] = &[
+    ("claude", Actor::Orchestrator),
+    ("claude-orchestrator", Actor::Orchestrator),
+    ("claude-session", Actor::Orchestrator),
+    ("claude (for the person)", Actor::PersonViaOrchestrator),
+    (
+        "Frédéric Rousseau (via Claude Code)",
+        Actor::PersonViaOrchestrator,
+    ),
+    ("fredericrous", Actor::Person),
+    ("person", Actor::Person),
+];
 
 #[cfg(test)]
 mod tests {
