@@ -3,6 +3,7 @@
 
 use super::schema::migrations::MIGRATIONS;
 use super::*;
+use crate::money::CostKind;
 use crate::orchestration::{Speed, TranscriptSource};
 use crate::outcome::{Outcome, OutcomeDetail};
 
@@ -144,4 +145,28 @@ pub(super) fn v26_ledger_with(path: &std::path::Path, spellings: &[&str]) {
         [],
     )
     .expect("open decision");
+}
+
+pub(super) fn event(event_id: &str, run_id: &str, micros: i64) -> UsageEvent {
+    UsageEvent {
+        event_id: event_id.into(),
+        run_id: run(run_id),
+        attempt_id: None,
+        parent_event_id: None,
+        model: Some("sonnet".into()),
+        input_tokens: Some(100),
+        output_tokens: Some(10),
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        cost: Some(MicroUsd::from_micros(micros)),
+        cost_kind: CostKind::ApiSpend,
+        completeness: CostCompleteness::Actual,
+        inclusive: false,
+        at: now_rfc3339(),
+        phase: None,
+        duration_ms: None,
+        requested_model: None,
+        requested_effort: None,
+        harness: None,
+    }
 }
