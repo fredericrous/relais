@@ -111,6 +111,14 @@ for l in diff.splitlines():
             trailing_commas[side] += 1
         if COMMENT.match(body):
             (new_comment_lines if side == '+' else old_comment_lines)[body.strip()] += 1
+    # An impl header (`impl<'a> RunEngine<'a> {`) is structure as a whole:
+    # its generics are no more code than the `impl` keyword itself.
+    IMPL_HEADER = re.match(r'\s*impl\b[^;{]*\{\s*$', l[1:]) if l[:1] in '+-' else None
+    if IMPL_HEADER:
+        m = re.match(r'\s*impl(?:<[^>]*>)?\s+(\w+)', l[1:])
+        if m and l.startswith('+'): impl_types.add(m.group(1))
+        (add if l.startswith('+') else rem).update(['impl', m.group(1) if m else 'impl', '{'])
+        continue
     if l.startswith('+'):
         m = re.match(r'\s*impl(?:<[^>]*>)?\s+(\w+)', l[1:])
         if m: impl_types.add(m.group(1))
