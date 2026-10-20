@@ -92,7 +92,10 @@ for l in diff.splitlines():
             current_impl[side] = ''
         m = VIS_ITEM.match(body)
         if m:
-            key = (current_impl[side] if body.startswith((' ', '\t')) else '', m.group(2), m.group(3))
+            # An indented item whose `impl` header lies outside the diff's
+            # context has an unknown owner ('?'), matched by kind and name.
+            owner = (current_impl[side] or '?') if body.startswith((' ', '\t')) else ''
+            key = (owner, m.group(2), m.group(3))
             visibility[side][key + ((m.group(1) or 'private').strip(),)] += 1
         # rustfmt's wrapping puts one item per line, each ending in `,`.
         # Counted per side: only that many added commas are free, and none
@@ -130,14 +133,16 @@ if not cfg_ok: print(f"#[cfg(test)]: {cfg_tests['-']} removed, {cfg_tests['+']} 
 changes = Counter()
 gained, lost = visibility['+'] - visibility['-'], visibility['-'] - visibility['+']
 for (owner, kind, name, after), n in sorted(gained.items()):
-    befores = [v for (o, k, nm, v), c in lost.items() if (o, k, nm) == (owner, kind, name) for _ in range(c)]
+    befores = [v for (o, k, nm, v), c in lost.items()
+               if (k, nm) == (kind, name) and (o == owner or '?' in (o, owner)) for _ in range(c)]
     before = befores[0] if befores else None
     where = f"{owner}::" if owner else ""
-    if before is not None:
+    if before is not None and before != after:
         changes[(before, after)] += n
-        lost[(owner, kind, name, before)] -= 1
+        match = next(key for key in lost if key[1:] == (kind, name, before) and (key[0] == owner or '?' in (key[0], owner)))
+        lost[match] -= 1
         lost = +lost
-    if after == 'pub':
+    if after == 'pub' and before != 'pub':
         print(f"  visibility: {kind} {where}{name}: {before or 'new item'} -> pub")
 if changes:
     print("visibility: " + ", ".join(f"{n} {b} -> {a}" for (b, a), n in sorted(changes.items())))
