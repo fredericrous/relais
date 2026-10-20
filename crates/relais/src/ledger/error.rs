@@ -145,42 +145,6 @@ pub(super) fn parse_evidence_kind(stored: &str) -> Result<EvidenceKind> {
     })
 }
 
-/// An `outcomes` row as columns, parsed into a [`StoredOutcome`] (P6): an
-/// unknown kind, a missing task id or a detail that will not parse as
-/// [`OutcomeDetail`] is a `Corrupt` row the caller reports, never a
-/// silently dropped or defaulted outcome.
-pub(super) fn parse_outcome_row(
-    run_id: String,
-    task_id: Option<String>,
-    kind: String,
-    detail_json: Option<String>,
-    at: String,
-) -> Result<StoredOutcome> {
-    let kind = OutcomeKind::parse(&kind).ok_or_else(|| LedgerError::Corrupt {
-        what: format!("the outcome kind of run {run_id}"),
-        detail: format!("`{kind}` is not an outcome kind this relais knows"),
-    })?;
-    let task_id = task_id.ok_or_else(|| LedgerError::Corrupt {
-        what: format!("the outcome of run {run_id}"),
-        detail: "no task_id was recorded".into(),
-    })?;
-    let detail_json = detail_json.ok_or_else(|| LedgerError::Corrupt {
-        what: format!("the outcome of run {run_id}"),
-        detail: "no detail was recorded".into(),
-    })?;
-    let detail: OutcomeDetail =
-        serde_json::from_str(&detail_json).map_err(|e| LedgerError::Corrupt {
-            what: format!("the outcome detail of run {run_id}"),
-            detail: e.to_string(),
-        })?;
-    Ok(StoredOutcome {
-        run_id: RunId::from_stored(run_id),
-        task_id: TaskId::from_stored(task_id),
-        outcome: Outcome { kind, detail },
-        at,
-    })
-}
-
 /// A task origin string as the ledger stored it.
 pub(super) fn parse_task_origin(stored: &str) -> Result<TaskOrigin> {
     TaskOrigin::parse(stored).ok_or_else(|| LedgerError::Corrupt {

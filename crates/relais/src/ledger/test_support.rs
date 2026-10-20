@@ -3,6 +3,7 @@
 
 use super::schema::migrations::MIGRATIONS;
 use super::*;
+use crate::outcome::{Outcome, OutcomeDetail};
 
 pub(super) fn run(id: &str) -> RunId {
     RunId::from_stored(id)

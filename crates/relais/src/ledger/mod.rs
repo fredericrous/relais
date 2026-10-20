@@ -20,29 +20,35 @@ use crate::ids::{DispatchId, PackageId, Pid, RunId, TaskId, TrialId};
 use crate::lifecycle::{Reason, RunPurpose, State, UsagePhase};
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::orchestration::{Speed, TranscriptSource};
-use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
+use crate::outcome::OutcomeKind;
 use crate::policy::Tier;
 use crate::route::RoutedBy;
 
 mod clock;
 mod error;
+mod evidence;
 pub(crate) mod failpoint;
+mod outcomes;
 mod review;
 mod router;
 mod schema;
 mod successor;
 mod test_support;
+mod trust;
 pub use clock::{now_rfc3339, Clock, FixedClock, SystemClock};
 pub use error::LedgerError;
 use error::{
-    parse_decision_row, parse_evidence_kind, parse_outcome_row, parse_routed_by, parse_run_purpose,
-    parse_state, parse_task_origin, parse_tier, parse_trial_row, Result,
+    parse_decision_row, parse_evidence_kind, parse_routed_by, parse_run_purpose, parse_state,
+    parse_task_origin, parse_tier, parse_trial_row, Result,
 };
+pub use evidence::{EvidenceKind, EvidenceOrigin, EvidenceRow};
+pub use outcomes::{RevertCandidate, StoredOutcome};
 use schema::{applied_count, migrate};
 pub use schema::{LEDGER_SCHEMA_VERSION, LEGACY_ACTORS};
 pub use successor::{
     Claim, IntentState, NewIntent, SuccessorIntent, SuccessorProcess, CLAIM_GRACE_SECONDS,
 };
+pub use trust::{StoredDeclaration, TrustGrantRecord};
 mod task_types;
 pub use review::{MergeTotals, ReviewClassTotals, ReviewOutcomeRow};
 pub use router::{
@@ -103,126 +109,6 @@ impl std::fmt::Display for TrialOutcome {
     }
 }
 
-/// What an evidence row is: every kind this ledger has ever stored, plus
-/// the two this package introduces. A stored name this binary does not
-/// know is a corrupt row (`parse_evidence_kind`), never silently dropped
-/// or coerced into one of these.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EvidenceKind {
-    /// A named check's log, from the verification profile.
-    CheckLog,
-    /// The context manifest assembled for a dispatch.
-    ContextManifest,
-    /// A worker's own result text.
-    WorkerResult,
-    /// A candidate's exported patch.
-    CandidatePatch,
-    /// A reviewer's result text.
-    ReviewResult,
-    /// A stored receipt.
-    Receipt,
-    /// A declared setup's log.
-    SetupLog,
-    /// Evidence another tool produced, recorded by `relais evidence
-    /// attach` and decided about by nothing here.
-    ExternalAttestation,
-    /// A person's sign-off, recorded as evidence like any other kind.
-    HumanSignOff,
-    /// The JUnit report a command wrote, kept as its check log is.
-    JunitReport,
-    /// Nothing produces this any more (the OS sandbox's denial report); the
-    /// ledger may still hold it.
-    SandboxDenials,
-    /// What relais did differently for a native worker than it asked
-    /// (SPEC §23): a continuation keeps its agent's own effort.
-    NativeNote,
-}
-
-impl EvidenceKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::CheckLog => "check_log",
-            Self::ContextManifest => "context_manifest",
-            Self::WorkerResult => "worker_result",
-            Self::CandidatePatch => "candidate_patch",
-            Self::ReviewResult => "review_result",
-            Self::Receipt => "receipt",
-            Self::SetupLog => "setup_log",
-            Self::ExternalAttestation => "external_attestation",
-            Self::HumanSignOff => "human_sign_off",
-            Self::JunitReport => "junit_report",
-            Self::SandboxDenials => "sandbox_denials",
-            Self::NativeNote => "native_note",
-        }
-    }
-
-    fn parse(stored: &str) -> Option<Self> {
-        match stored {
-            "check_log" => Some(Self::CheckLog),
-            "context_manifest" => Some(Self::ContextManifest),
-            "worker_result" => Some(Self::WorkerResult),
-            "candidate_patch" => Some(Self::CandidatePatch),
-            "review_result" => Some(Self::ReviewResult),
-            "receipt" => Some(Self::Receipt),
-            "setup_log" => Some(Self::SetupLog),
-            "external_attestation" => Some(Self::ExternalAttestation),
-            "human_sign_off" => Some(Self::HumanSignOff),
-            "junit_report" => Some(Self::JunitReport),
-            "sandbox_denials" => Some(Self::SandboxDenials),
-            "native_note" => Some(Self::NativeNote),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for EvidenceKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-/// Where a piece of evidence came from and what it is about — every
-/// field optional, so a row `record_evidence` writes (nothing here) and
-/// a row `attach_evidence` writes (whatever the caller names) share one
-/// column set without one implying the other.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct EvidenceOrigin<'a> {
-    /// The tool that produced this evidence.
-    pub tool: Option<&'a str>,
-    /// That tool's own identifier for this evidence.
-    pub external_id: Option<&'a str>,
-    /// The subject this evidence attests to.
-    pub subject: Option<&'a str>,
-    /// The acceptance criterion this evidence answers, when it answers
-    /// one.
-    pub criterion_id: Option<&'a str>,
-}
-
-/// One piece of evidence bound to a run, read back typed: what kind it
-/// is, where it is, and — when recorded — what it is about. Typed so a
-/// caller cannot read the kind where it meant to read the path, the way
-/// the positional tuple this replaced allowed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EvidenceRow {
-    pub kind: EvidenceKind,
-    pub path: String,
-    pub sha256: Option<String>,
-    pub tool: Option<String>,
-    pub external_id: Option<String>,
-    pub subject: Option<String>,
-    pub criterion_id: Option<String>,
-}
-
-/// A typed outcome as `latest_outcome`/`outcomes_since` hand it back:
-/// the row's identity plus the [`Outcome`] it parses to.
-#[derive(Debug, Clone, PartialEq)]
-pub struct StoredOutcome {
-    pub run_id: RunId,
-    pub task_id: TaskId,
-    pub outcome: Outcome,
-    pub at: String,
-}
-
 /// One `reverted` outcome row, as the report's agreement reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevertedReport {
@@ -235,20 +121,6 @@ pub struct RevertedReport {
     /// When the undo commit was made, for a detected row.
     pub undone_at: Option<String>,
 }
-
-/// A run whose accepted change may have landed and been undone since.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RevertCandidate {
-    pub run: RunId,
-    pub task: TaskId,
-    /// Where the run ran; may be a removed worktree.
-    pub repo_path: PathBuf,
-    /// When the run reached its accepted state (RFC3339).
-    pub ended_at: String,
-}
-
-/// Raw columns of one `outcomes` row: run_id, task_id, kind, detail_json, at.
-type OutcomeRow = (String, Option<String>, String, Option<String>, String);
 
 /// How a task's row came to exist: minted for a fresh task, or
 /// reconstructed for a run that predates the task spine.
@@ -769,28 +641,6 @@ pub struct PersonAnswerCounts {
 /// How long a minted decide nonce is honoured when its session never said
 /// it ended (a crash, a kill): past this, minting any nonce sweeps it.
 const DECIDE_NONCE_TTL_DAYS: i64 = 7;
-
-/// One row of `repo_declarations`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredDeclaration {
-    pub declaration_hash: String,
-    pub declaration_json: String,
-    pub seen_at: String,
-}
-
-/// One row of `trust_grants`: what [`Ledger::record_trust_grant`] writes.
-#[derive(Debug, Clone, Copy)]
-pub struct TrustGrantRecord<'a> {
-    pub grant_key: &'a str,
-    /// [`crate::policy::repo_key`] of the repository identity.
-    pub repo_key: &'a str,
-    /// The identity as a person reads it.
-    pub repo: &'a str,
-    pub reviewed_by: &'a str,
-    /// `cli` or `plugin`: who asked the person.
-    pub source: &'a str,
-    pub steps_json: &'a str,
-}
 
 /// The `event_id` prefix of the usage row of a Claude Code advisor call:
 /// `advisor:<message id>#advisor<n>`. Such a row carries the advisor's own
@@ -3219,105 +3069,6 @@ impl Ledger {
         })
     }
 
-    /// Record a trust grant `relais trust grant` just wrote to
-    /// machine.toml (SPEC §5). `steps_json` is the JSON list of the steps
-    /// the grant authorized, as `trust show --json` printed them.
-    pub fn record_trust_grant(&self, grant: &TrustGrantRecord<'_>) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO trust_grants
-                (grant_key, repo_key, repo, reviewed_by, source, steps_json, granted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                grant.grant_key,
-                grant.repo_key,
-                grant.repo,
-                grant.reviewed_by,
-                grant.source,
-                grant.steps_json,
-                self.now()
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// The steps the latest grant for this repository authorized, as
-    /// recorded — `None` when this repository was never granted from a
-    /// command (a hand-pasted grant leaves no row).
-    pub fn latest_trust_grant_steps(&self, repo_key: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT steps_json FROM trust_grants WHERE repo_key = ?1 ORDER BY id DESC LIMIT 1",
-                [repo_key],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?)
-    }
-
-    /// The command declaration `repo_key` last ran under (ADR-0007):
-    /// `None` when none was ever recorded.
-    pub fn repo_declaration(&self, repo_key: &str) -> Result<Option<StoredDeclaration>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT declaration_hash, declaration_json, seen_at
-                 FROM repo_declarations WHERE repo_key = ?1",
-                [repo_key],
-                |row| {
-                    Ok(StoredDeclaration {
-                        declaration_hash: row.get(0)?,
-                        declaration_json: row.get(1)?,
-                        seen_at: row.get(2)?,
-                    })
-                },
-            )
-            .optional()?)
-    }
-
-    /// Record the declaration `repo_key` runs under now, replacing the
-    /// last one. An upsert: two runs recording at once both land, the
-    /// later one stands, and neither fails.
-    pub fn upsert_repo_declaration(
-        &self,
-        repo_key: &str,
-        declaration_hash: &str,
-        declaration_json: &str,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO repo_declarations
-                (repo_key, declaration_hash, declaration_json, seen_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(repo_key) DO UPDATE SET
-                declaration_hash = excluded.declaration_hash,
-                declaration_json = excluded.declaration_json,
-                seen_at = excluded.seen_at",
-            params![repo_key, declaration_hash, declaration_json, self.now()],
-        )?;
-        Ok(())
-    }
-
-    /// Which grant admitted a run (`repository` or `legacy_exact`).
-    pub fn set_run_trust_status(&self, id: &RunId, status: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE runs SET trust_status = ?2 WHERE id = ?1",
-            params![id.as_str(), status],
-        )?;
-        Ok(())
-    }
-
-    /// How many runs created at or after `since` (RFC3339) a legacy
-    /// `[trust]` grant admitted: what `relais doctor` reports before the
-    /// legacy grants can be retired.
-    pub fn legacy_grant_runs_since(&self, since: &str) -> Result<u64> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM runs
-             WHERE trust_status = 'legacy_exact' AND created_at >= ?1",
-            [since],
-            |row| row.get(0),
-        )?;
-        Ok(count as u64)
-    }
-
     /// The advisor's stored advice for one run's decision, as JSON, or
     /// `null` when none was stored (no advisor yet: the columns exist, and
     /// nothing writes them).
@@ -3358,171 +3109,6 @@ impl Ledger {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-    }
-
-    /// One piece of evidence bound to a run: the context manifest, a
-    /// candidate patch, a check log, the receipt — by path and content
-    /// hash (SPEC §12: "every transition has … evidence references").
-    pub fn record_evidence(
-        &self,
-        run_id: &RunId,
-        attempt_id: Option<i64>,
-        kind: EvidenceKind,
-        path: &Path,
-        sha256: Option<&str>,
-    ) -> Result<()> {
-        self.insert_evidence_row(
-            run_id,
-            attempt_id,
-            kind,
-            path,
-            sha256,
-            EvidenceOrigin::default(),
-        )
-    }
-
-    /// Evidence produced by another tool: `relais evidence attach`
-    /// records one row and decides nothing about it — no criterion is
-    /// marked met, no run's state changes, no gap clears.
-    pub fn attach_evidence(
-        &self,
-        run_id: &RunId,
-        path: &Path,
-        sha256: Option<&str>,
-        origin: EvidenceOrigin,
-    ) -> Result<()> {
-        self.insert_evidence_row(
-            run_id,
-            None,
-            EvidenceKind::ExternalAttestation,
-            path,
-            sha256,
-            origin,
-        )
-    }
-
-    fn insert_evidence_row(
-        &self,
-        run_id: &RunId,
-        attempt_id: Option<i64>,
-        kind: EvidenceKind,
-        path: &Path,
-        sha256: Option<&str>,
-        origin: EvidenceOrigin,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO evidence
-                (run_id, attempt_id, kind, path, sha256, at,
-                 tool, external_id, subject, criterion_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                run_id.as_str(),
-                attempt_id,
-                kind.as_str(),
-                path.to_string_lossy(),
-                sha256,
-                self.now(),
-                origin.tool,
-                origin.external_id,
-                origin.subject,
-                origin.criterion_id,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn evidence(&self, run_id: &RunId) -> Result<Vec<EvidenceRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT kind, path, sha256, tool, external_id, subject, criterion_id
-               FROM evidence WHERE run_id = ?1 ORDER BY id",
-        )?;
-        type Row = (
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        );
-        let rows = stmt.query_map([run_id.as_str()], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-            ))
-        })?;
-        let rows: Vec<Row> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(
-                |(kind, path, sha256, tool, external_id, subject, criterion_id)| {
-                    Ok(EvidenceRow {
-                        kind: parse_evidence_kind(&kind)?,
-                        path,
-                        sha256,
-                        tool,
-                        external_id,
-                        subject,
-                        criterion_id,
-                    })
-                },
-            )
-            .collect()
-    }
-
-    pub fn transitions(&self, run_id: &RunId) -> Result<Vec<Transition>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT run_id, attempt_id, from_state, to_state, reason, detail_json, at
-             FROM transitions WHERE run_id = ?1 ORDER BY id",
-        )?;
-        // The rows come back raw and are interpreted here: a state this
-        // binary does not know is a LedgerError, not a panic in the
-        // middle of `explain`.
-        type Row = (
-            String,
-            Option<i64>,
-            Option<String>,
-            String,
-            String,
-            Option<String>,
-            String,
-        );
-        let rows = stmt.query_map([run_id.as_str()], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-            ))
-        })?;
-        let rows: Vec<Row> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(
-                |(run_id, attempt_id, from_state, to_state, reason, detail, at)| {
-                    Ok(Transition {
-                        run_id: RunId::from_stored(run_id),
-                        attempt_id,
-                        from_state: from_state.as_deref().map(parse_state).transpose()?,
-                        to_state: parse_state(&to_state)?,
-                        reason,
-                        // Free-form diagnostic JSON a transition carried.
-                        // Nothing reads it back as a value — it is
-                        // printed — so a row that will not parse is
-                        // reported as "no detail", not as a read failure
-                        // that would hide the transition itself.
-                        detail: detail.and_then(|d| serde_json::from_str(&d).ok()),
-                        at,
-                    })
-                },
-            )
-            .collect()
     }
 
     pub fn record_usage(&self, event: &UsageEvent) -> Result<bool> {
@@ -4201,266 +3787,6 @@ impl Ledger {
                 completeness: CostCompleteness::worst(completenesses),
             })
             .collect())
-    }
-
-    pub fn store_receipt(
-        &self,
-        run_id: &RunId,
-        receipt_json: &serde_json::Value,
-        hash: &str,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO receipts (run_id, receipt_json, hash, at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                run_id.as_str(),
-                serde_json::to_string(receipt_json).expect("receipt serializes"),
-                hash,
-                self.now()
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn receipt(&self, run_id: &RunId) -> Result<Option<(serde_json::Value, String)>> {
-        let row: Option<(String, String)> = self
-            .conn
-            .query_row(
-                "SELECT receipt_json, hash FROM receipts WHERE run_id = ?1",
-                [run_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        // A receipt is the run's evidence; a stored one that will not
-        // parse is reported, so `explain` prints the rest of what it
-        // knows instead of aborting.
-        row.map(|(json, hash)| {
-            let value = serde_json::from_str(&json).map_err(|e| LedgerError::Corrupt {
-                what: format!("the receipt of run {run_id}"),
-                detail: e.to_string(),
-            })?;
-            Ok((value, hash))
-        })
-        .transpose()
-    }
-
-    /// Record a typed final-outcome (SPEC §20), attributed to the task
-    /// and the exact candidate the detail names.
-    pub fn record_outcome(
-        &self,
-        run_id: &RunId,
-        task_id: &TaskId,
-        outcome: &Outcome,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO outcomes (run_id, task_id, candidate_sha, kind, detail_json, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                run_id.as_str(),
-                task_id.as_str(),
-                outcome.detail.candidate_sha.as_deref(),
-                outcome.kind.as_str(),
-                serde_json::to_string(&outcome.detail).expect("outcome detail serializes"),
-                self.now()
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// The most recently recorded outcome for a task, if any.
-    pub fn latest_outcome(&self, task_id: &TaskId) -> Result<Option<StoredOutcome>> {
-        let row: Option<OutcomeRow> = self
-            .conn
-            .query_row(
-                "SELECT run_id, task_id, kind, detail_json, at FROM outcomes
-                 WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
-                [task_id.as_str()],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .optional()?;
-        row.map(|(run_id, task_id, kind, detail_json, at)| {
-            parse_outcome_row(run_id, task_id, kind, detail_json, at)
-        })
-        .transpose()
-    }
-
-    /// The most recently recorded outcome for a run, if any — `relais
-    /// explain <run>`'s source: a per-run query (`WHERE run_id = ?`), not
-    /// [`Ledger::latest_outcome`]'s task-scoped one. A later run of the
-    /// same task recording its own feedback must not shadow an earlier
-    /// run's outcome when THAT run is explained.
-    pub fn outcome_of_run(&self, run_id: &RunId) -> Result<Option<StoredOutcome>> {
-        let row: Option<OutcomeRow> = self
-            .conn
-            .query_row(
-                "SELECT run_id, task_id, kind, detail_json, at FROM outcomes
-                 WHERE run_id = ?1 ORDER BY id DESC LIMIT 1",
-                [run_id.as_str()],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .optional()?;
-        row.map(|(run_id, task_id, kind, detail_json, at)| {
-            parse_outcome_row(run_id, task_id, kind, detail_json, at)
-        })
-        .transpose()
-    }
-
-    /// Every outcome recorded at or after `since`, oldest first.
-    pub fn outcomes_since(&self, since: &str) -> Result<Vec<StoredOutcome>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT run_id, task_id, kind, detail_json, at FROM outcomes
-             WHERE at >= ?1 ORDER BY id",
-        )?;
-        let rows = stmt.query_map([since], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (run_id, task_id, kind, detail_json, at) = row?;
-            parse_outcome_row(run_id, task_id, kind, detail_json, at)
-        })
-        .collect()
-    }
-
-    /// Runs whose accepted change a git revert could undo, ended at or
-    /// after `since`: runs the runner accepted (verified, or approved by a
-    /// person), and salvaged runs whose verified candidate was contained in
-    /// the landed commit. `ended_at` is when the run reached that state.
-    /// Replays are not changes anyone landed.
-    pub fn revert_candidates(&self, since: &str) -> Result<Vec<RevertCandidate>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT runs.id, runs.task_id, runs.repo_path, t.at
-               FROM runs
-               JOIN transitions t ON t.id = (
-                    SELECT MAX(id) FROM transitions
-                     WHERE run_id = runs.id AND to_state IN (?1, ?2))
-               LEFT JOIN decisions ON decisions.run = runs.id
-              WHERE runs.task_id IS NOT NULL
-                AND COALESCE(runs.purpose, '') <> ?3
-                AND t.at >= ?4
-                AND (runs.status = ?1
-                     OR (runs.status = ?2
-                         AND decisions.resolution = ?5
-                         AND decisions.candidate_contained = 1
-                         AND decisions.raised_state = ?6
-                         AND decisions.raised_reason = ?7))
-              ORDER BY runs.id",
-        )?;
-        let rows = stmt.query_map(
-            params![
-                State::Accepted.as_str(),
-                State::AcceptedByPerson.as_str(),
-                RunPurpose::Replay.as_str(),
-                since,
-                Reason::DecisionSalvaged.as_str(),
-                State::NeedsReview.as_str(),
-                Reason::ReviewFindings.as_str(),
-            ],
-            |row| {
-                Ok(RevertCandidate {
-                    run: RunId::from_stored(row.get::<_, String>(0)?),
-                    task: TaskId::from_stored(row.get::<_, String>(1)?),
-                    repo_path: PathBuf::from(row.get::<_, String>(2)?),
-                    ended_at: row.get(3)?,
-                })
-            },
-        )?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-    }
-
-    /// Record a revert relais found in git (`learn::revert`), unless the
-    /// task already has it or has since been vouched for. Checked and
-    /// inserted in one `BEGIN IMMEDIATE` transaction, so `dataset build`
-    /// and a learn cycle running together insert one row between them.
-    ///
-    /// Not recorded (`Ok(false)`): a `source = detected` row of this task
-    /// already names `undo_sha`; or the task's latest outcome was recorded
-    /// after the undo commit (`undo_at`) and says the change stands
-    /// (`accepted_unchanged`, `corrected`). An earlier outcome, or a
-    /// `reverted` or `confirmed_regression` row from another source, does
-    /// not block it. The two shas ride in the row's detail as
-    /// `landing_sha` and `undo_sha`.
-    pub fn record_detected_revert(
-        &self,
-        run_id: &RunId,
-        task_id: &TaskId,
-        outcome: &Outcome,
-        landing_sha: &str,
-        undo_sha: &str,
-        undo_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<bool> {
-        let tx = self.write_tx()?;
-        let already: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM outcomes
-                             WHERE task_id = ?1
-                               AND json_extract(detail_json, '$.source') = 'detected'
-                               AND json_extract(detail_json, '$.undo_sha') = ?2)",
-            params![task_id.as_str(), undo_sha],
-            |row| row.get(0),
-        )?;
-        if already {
-            return Ok(false);
-        }
-        let latest: Option<(String, String)> = tx
-            .query_row(
-                "SELECT kind, at FROM outcomes WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
-                [task_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        if let Some((kind, at)) = latest {
-            let stands = kind == OutcomeKind::AcceptedUnchanged.as_str()
-                || kind == OutcomeKind::Corrected.as_str();
-            let recorded =
-                chrono::DateTime::parse_from_rfc3339(&at).map_err(|e| LedgerError::Corrupt {
-                    what: format!("the time of an outcome of task {task_id}"),
-                    detail: format!("`{at}` is not an RFC3339 timestamp: {e}"),
-                })?;
-            if stands && recorded > undo_at {
-                return Ok(false);
-            }
-        }
-        let mut detail = serde_json::to_value(&outcome.detail).expect("outcome detail serializes");
-        if let Some(object) = detail.as_object_mut() {
-            object.insert("landing_sha".into(), landing_sha.into());
-            object.insert("undo_sha".into(), undo_sha.into());
-            object.insert("undo_at".into(), undo_at.to_rfc3339().into());
-        }
-        tx.execute(
-            "INSERT INTO outcomes (run_id, task_id, candidate_sha, kind, detail_json, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                run_id.as_str(),
-                task_id.as_str(),
-                outcome.detail.candidate_sha.as_deref(),
-                outcome.kind.as_str(),
-                detail.to_string(),
-                self.now()
-            ],
-        )?;
-        tx.commit()?;
-        Ok(true)
     }
 
     /// The intent recorded for a run's first dispatch: model, effort and
@@ -5726,10 +5052,11 @@ impl Ledger {
 mod tests {
     use super::schema::{apply_step, migrations::MIGRATIONS};
     use super::test_support::{
-        dispatch, new_trial, package, run, sample_outcome, task, temp_dir, temp_ledger, trial,
-        usage_row, v26_ledger_with,
+        dispatch, new_trial, package, run, task, temp_dir, temp_ledger, trial, usage_row,
+        v26_ledger_with,
     };
     use super::*;
+    use crate::outcome::{Outcome, OutcomeDetail};
 
     /// A read-only open shut out by an exclusive lock gives up after
     /// `READ_ONLY_BUSY_TIMEOUT`, not the writers' five seconds: it sits
@@ -7011,51 +6338,6 @@ mod tests {
             ),
             "reading the history of that run is an error too"
         );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn an_unparseable_receipt_is_an_error_not_a_panic() {
-        let (ledger, dir) = temp_ledger();
-        ledger
-            .insert_run(&run("run-bad"), "/repo", None, &task("run-bad"), "rk")
-            .expect("run");
-        ledger
-            .conn
-            .execute(
-                "INSERT INTO receipts (run_id, receipt_json, hash, at)
-                 VALUES ('run-bad', '{truncated', 'h', 'then')",
-                [],
-            )
-            .expect("truncated receipt");
-        assert!(matches!(
-            ledger.receipt(&run("run-bad")),
-            Err(LedgerError::Corrupt { .. })
-        ));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn an_unknown_evidence_kind_is_an_error_not_a_panic() {
-        let (ledger, dir) = temp_ledger();
-        ledger
-            .insert_run(&run("run-bad"), "/repo", None, &task("run-bad"), "rk")
-            .expect("run");
-        ledger
-            .conn
-            .execute(
-                "INSERT INTO evidence (run_id, attempt_id, kind, path, sha256, at)
-                 VALUES ('run-bad', NULL, 'a_kind_nobody_wrote', '/tmp/x', NULL, 'then')",
-                [],
-            )
-            .expect("a row this binary does not know how to read");
-        match ledger.evidence(&run("run-bad")) {
-            Err(LedgerError::Corrupt { what, detail }) => {
-                assert_eq!(what, "evidence kind");
-                assert!(detail.contains("a_kind_nobody_wrote"), "{detail}");
-            }
-            other => panic!("an unknown evidence kind must be an error, got {other:?}"),
-        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -9787,90 +9069,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn recorded_outcomes_are_read_back_typed_by_task_and_since() {
-        let (ledger, dir) = temp_ledger();
-        ledger
-            .insert_run(&run("run-a"), "/repo", None, &task("a"), "rk")
-            .expect("run");
-        let outcome = sample_outcome(OutcomeKind::AcceptedUnchanged);
-        ledger
-            .record_outcome(&run("run-a"), &task("a"), &outcome)
-            .expect("record");
-
-        let latest = ledger
-            .latest_outcome(&task("a"))
-            .expect("latest")
-            .expect("one outcome recorded");
-        assert_eq!(latest.run_id, run("run-a"));
-        assert_eq!(latest.task_id, task("a"));
-        assert_eq!(latest.outcome, outcome);
-
-        assert!(ledger
-            .latest_outcome(&task("nothing-recorded"))
-            .expect("latest")
-            .is_none());
-
-        let since = ledger
-            .outcomes_since("2000-01-01T00:00:00+00:00")
-            .expect("since");
-        assert_eq!(since.len(), 1);
-        assert_eq!(since[0].outcome, outcome);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// The most recently recorded outcome wins, so a later `reverted`
-    /// eclipses an earlier `accepted_unchanged` for the same task.
-    #[test]
-    fn latest_outcome_is_the_most_recent_one_recorded() {
-        let (ledger, dir) = temp_ledger();
-        ledger
-            .insert_run(&run("run-a"), "/repo", None, &task("a"), "rk")
-            .expect("run");
-        ledger
-            .record_outcome(
-                &run("run-a"),
-                &task("a"),
-                &sample_outcome(OutcomeKind::AcceptedUnchanged),
-            )
-            .expect("record accepted");
-        ledger
-            .record_outcome(
-                &run("run-a"),
-                &task("a"),
-                &sample_outcome(OutcomeKind::Reverted),
-            )
-            .expect("record reverted");
-        let latest = ledger
-            .latest_outcome(&task("a"))
-            .expect("latest")
-            .expect("recorded");
-        assert_eq!(latest.outcome.kind, OutcomeKind::Reverted);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// P6: a stored outcome row this binary cannot read is reported, not
-    /// silently dropped or defaulted.
-    #[test]
-    fn a_stored_outcome_this_relais_cannot_read_is_corrupt() {
-        let (ledger, dir) = temp_ledger();
-        ledger
-            .insert_run(&run("run-a"), "/repo", None, &task("a"), "rk")
-            .expect("run");
-        ledger
-            .conn
-            .execute(
-                "INSERT INTO outcomes (run_id, task_id, candidate_sha, kind, detail_json, at)
-                 VALUES ('run-a', 'task-a', 'sha', 'not-a-kind-this-relais-knows', '{}', ?1)",
-                params![now_rfc3339()],
-            )
-            .expect("hand-inserted row");
-        let err = ledger
-            .latest_outcome(&task("a"))
-            .expect_err("an unknown kind is corrupt, not silently absent");
-        assert!(matches!(err, LedgerError::Corrupt { .. }), "{err}");
-        std::fs::remove_dir_all(&dir).ok();
-    }
     /// A run whose second attempt is still open has no duration yet.
     /// `MAX(ended_at)` skips NULLs, so asking for it alone answers with
     /// the span of the attempts that finished — which would put a run
