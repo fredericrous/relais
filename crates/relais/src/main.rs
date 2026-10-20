@@ -5435,9 +5435,17 @@ fn current_of_run(
     let session = ledger.run_root_session(&run).map_err(ledgered)?;
     let stalled =
         !state.is_terminal() && silent.is_some_and(|s| resume::is_stalled(s, stalled_after));
+    let cost_micros = ledger.run_cost(&run).map_err(ledgered)?;
+    let cost_completeness = ledger.run_cost_completeness(&run).map_err(ledgered)?;
     let mut current = serde_json::json!({
         "state": state,
         "session": session,
+        // The ledger's total, which the plugin puts in place of whatever
+        // it summed from events: replaying events cannot drift from it.
+        "cost_total": {
+            "micros": cost_micros.to_micros(),
+            "completeness": cost_completeness,
+        },
         "silent_seconds": silent.map(|s| s.as_secs()),
         "decision": decision.map(|d| serde_json::json!({
             "raised_state": d.raised_state,

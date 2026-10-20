@@ -9,7 +9,7 @@
 //! turned out to be is a [`JunitReport`], recorded on the check outcome
 //! whether or not it could be read.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
@@ -55,6 +55,11 @@ pub enum JunitReport {
         /// Absent in a receipt written before the copy was kept.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact: Option<JunitArtifact>,
+        /// Every `testsuite`/`testsuites` total the report declares
+        /// agrees with the testcases it holds. Absent (false) in a
+        /// receipt written before this was recorded: never complete.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        totals_consistent: bool,
     },
 }
 
@@ -74,6 +79,29 @@ impl JunitReport {
             Self::Unparseable { reason } => Some(format!("junit: unparseable ({reason})")),
             Self::Reported { .. } => None,
         }
+    }
+
+    /// The failing tests of a COMPLETE report, else `None`. Complete
+    /// means: read (the file is deleted before its command runs, so a
+    /// report that exists was written by it), declared totals consistent
+    /// with its testcases, and a non-zero exit explained by at least one
+    /// failing testcase. `exited_nonzero` is whether the command ended
+    /// with a non-zero exit status.
+    pub fn complete_failing_tests(&self, exited_nonzero: bool) -> Option<BTreeSet<String>> {
+        let Self::Reported {
+            tests,
+            totals_consistent: true,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let failing: BTreeSet<String> = tests
+            .iter()
+            .filter(|(_, outcome)| **outcome == TestOutcome::Failed)
+            .map(|(id, _)| id.clone())
+            .collect();
+        (exited_nonzero && !failing.is_empty()).then_some(failing)
     }
 }
 
@@ -139,6 +167,69 @@ fn classify(name: &str) -> Element {
 /// Passed — nextest's `flakyFailure` and `rerunFailure` children describe
 /// attempts before a pass and do not change it.
 pub fn parse_junit(bytes: &[u8]) -> Result<BTreeMap<String, TestOutcome>, JunitError> {
+    parse_report(bytes).map(|parsed| parsed.tests)
+}
+
+/// A parsed report: each test's outcome, and whether the totals the
+/// report declares agree with the testcases it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedJunit {
+    pub tests: BTreeMap<String, TestOutcome>,
+    pub totals_consistent: bool,
+}
+
+/// The testcases seen inside one suite element (nested suites included)
+/// and the totals its start tag declared.
+#[derive(Default)]
+struct SuiteTally {
+    declared_tests: Option<u64>,
+    declared_failing: Option<u64>,
+    cases: u64,
+    failing: u64,
+}
+
+impl SuiteTally {
+    fn declared(element: &BytesStart<'_>, position: u64) -> Result<(Self, bool), JunitError> {
+        let mut readable = true;
+        let mut count = |key: &str| -> Result<Option<u64>, JunitError> {
+            Ok(match attribute(element, key, position)? {
+                None => None,
+                Some(text) => {
+                    let parsed = text.trim().parse::<u64>().ok();
+                    readable &= parsed.is_some();
+                    parsed
+                }
+            })
+        };
+        let declared_tests = count("tests")?;
+        let failures = count("failures")?;
+        let errors = count("errors")?;
+        let declared_failing = match (failures, errors) {
+            (None, None) => None,
+            (f, e) => Some(f.unwrap_or(0) + e.unwrap_or(0)),
+        };
+        Ok((
+            Self {
+                declared_tests,
+                declared_failing,
+                cases: 0,
+                failing: 0,
+            },
+            readable,
+        ))
+    }
+
+    fn agrees(&self) -> bool {
+        self.declared_tests.is_none_or(|n| n == self.cases)
+            && self.declared_failing.is_none_or(|n| n == self.failing)
+    }
+}
+
+/// Like [`parse_junit`], also saying whether every declared suite total
+/// matches the testcases counted.
+pub fn parse_report(bytes: &[u8]) -> Result<ParsedJunit, JunitError> {
+    let mut suites: Vec<SuiteTally> = Vec::new();
+    let mut consistent = true;
     let mut reader = Reader::from_reader(bytes);
     let mut tests: BTreeMap<String, TestOutcome> = BTreeMap::new();
     let mut open_elements = 0usize;
@@ -154,6 +245,12 @@ pub fn parse_junit(bytes: &[u8]) -> Result<BTreeMap<String, TestOutcome>, JunitE
                 check_root(&element, &mut root_seen, open_elements)?;
                 open_elements += 1;
                 match classify(element.local_name().as_ref()) {
+                    Element::Suite => {
+                        let (tally, readable) =
+                            SuiteTally::declared(&element, reader.buffer_position())?;
+                        consistent &= readable;
+                        suites.push(tally);
+                    }
                     Element::Case if open_case.is_none() => {
                         open_case = Some((
                             test_id(&element, reader.buffer_position())?,
@@ -162,27 +259,47 @@ pub fn parse_junit(bytes: &[u8]) -> Result<BTreeMap<String, TestOutcome>, JunitE
                     }
                     Element::Failing => worsen(&mut open_case, TestOutcome::Failed),
                     Element::Skipped => worsen(&mut open_case, TestOutcome::Skipped),
-                    Element::Case | Element::Suite | Element::Other => {}
+                    Element::Case | Element::Other => {}
                 }
             }
             Event::Empty(element) => {
                 check_root(&element, &mut root_seen, open_elements)?;
                 match classify(element.local_name().as_ref()) {
+                    Element::Suite => {
+                        let (tally, readable) =
+                            SuiteTally::declared(&element, reader.buffer_position())?;
+                        consistent &= readable && tally.agrees();
+                        // An empty suite holds nothing to add to its parent.
+                    }
                     Element::Case if open_case.is_none() => {
                         let id = test_id(&element, reader.buffer_position())?;
                         record(&mut tests, id, TestOutcome::Passed);
+                        count_case(&mut suites, TestOutcome::Passed);
                     }
                     Element::Failing => worsen(&mut open_case, TestOutcome::Failed),
                     Element::Skipped => worsen(&mut open_case, TestOutcome::Skipped),
-                    Element::Case | Element::Suite | Element::Other => {}
+                    Element::Case | Element::Other => {}
                 }
             }
             Event::End(element) => {
                 open_elements = open_elements.saturating_sub(1);
-                if let Element::Case = classify(element.local_name().as_ref()) {
-                    if let Some((id, outcome)) = open_case.take() {
-                        record(&mut tests, id, outcome);
+                match classify(element.local_name().as_ref()) {
+                    Element::Case => {
+                        if let Some((id, outcome)) = open_case.take() {
+                            count_case(&mut suites, outcome);
+                            record(&mut tests, id, outcome);
+                        }
                     }
+                    Element::Suite => {
+                        if let Some(done) = suites.pop() {
+                            consistent &= done.agrees();
+                            if let Some(parent) = suites.last_mut() {
+                                parent.cases += done.cases;
+                                parent.failing += done.failing;
+                            }
+                        }
+                    }
+                    Element::Failing | Element::Skipped | Element::Other => {}
                 }
             }
             Event::Eof => break,
@@ -197,7 +314,19 @@ pub fn parse_junit(bytes: &[u8]) -> Result<BTreeMap<String, TestOutcome>, JunitE
     if open_elements != 0 {
         return Err(JunitError::Truncated);
     }
-    Ok(tests)
+    Ok(ParsedJunit {
+        tests,
+        totals_consistent: consistent,
+    })
+}
+
+fn count_case(suites: &mut [SuiteTally], outcome: TestOutcome) {
+    if let Some(suite) = suites.last_mut() {
+        suite.cases += 1;
+        if outcome == TestOutcome::Failed {
+            suite.failing += 1;
+        }
+    }
 }
 
 /// The first element of the document must be a suite (or suites).
@@ -409,9 +538,65 @@ mod tests {
             JunitReport::Reported {
                 tests: BTreeMap::new(),
                 artifact: None,
+                totals_consistent: false,
             }
             .fact(),
             None
         );
+    }
+
+    fn reported_from(xml: &[u8]) -> JunitReport {
+        let parsed = parse_report(xml).expect("parses");
+        JunitReport::Reported {
+            tests: parsed.tests,
+            artifact: None,
+            totals_consistent: parsed.totals_consistent,
+        }
+    }
+
+    const ONE_FAILURE: &[u8] = br#"<testsuites tests="2" failures="1" errors="0">
+        <testsuite tests="2" failures="1" errors="0">
+            <testcase name="a"/>
+            <testcase name="b"><failure/></testcase>
+        </testsuite></testsuites>"#;
+
+    #[test]
+    fn a_consistent_report_with_a_failing_case_is_complete_on_a_non_zero_exit() {
+        let failing = reported_from(ONE_FAILURE).complete_failing_tests(true);
+        assert_eq!(failing, Some(BTreeSet::from(["b".to_string()])));
+    }
+
+    #[test]
+    fn totals_that_disagree_with_the_testcases_are_not_complete() {
+        let report = reported_from(
+            br#"<testsuite tests="3" failures="1"><testcase name="a"/>
+            <testcase name="b"><failure/></testcase></testsuite>"#,
+        );
+        assert_eq!(report.complete_failing_tests(true), None);
+        let failures_off = reported_from(
+            br#"<testsuite tests="2" failures="0"><testcase name="a"/>
+            <testcase name="b"><failure/></testcase></testsuite>"#,
+        );
+        assert_eq!(failures_off.complete_failing_tests(true), None);
+    }
+
+    #[test]
+    fn a_non_zero_exit_with_no_failing_case_is_not_complete() {
+        let green = reported_from(br#"<testsuite tests="1"><testcase name="a"/></testsuite>"#);
+        assert_eq!(green.complete_failing_tests(true), None);
+        // A zero exit does not make failing cases a baseline failure either.
+        assert_eq!(
+            reported_from(ONE_FAILURE).complete_failing_tests(false),
+            None
+        );
+        assert_eq!(JunitReport::Missing.complete_failing_tests(true), None);
+    }
+
+    #[test]
+    fn a_receipt_without_the_totals_field_reads_as_incomplete_and_round_trips() {
+        let old = r#"{"reported":{"tests":{"b":"failed"}}}"#;
+        let report: JunitReport = serde_json::from_str(old).expect("old receipt parses");
+        assert_eq!(report.complete_failing_tests(true), None);
+        assert_eq!(serde_json::to_string(&report).expect("serializes"), old);
     }
 }

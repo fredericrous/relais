@@ -288,6 +288,69 @@ pub fn own_process_group(command: &mut Command) {
     imp::own_process_group(command);
 }
 
+/// The CPU time the live processes of group `pgid` have used so far, from
+/// one `ps` sample: what tells a silent check that computes from one that
+/// sleeps (SPEC §29, heartbeat). `None` when the platform has no `ps`, the
+/// sample failed, or no process of the group is left. The figure is the sum
+/// over the group's present members, so it can drop when a member exits; a
+/// reader compares it with the previous sample and calls only a rise
+/// progress.
+pub fn group_cpu_time(pgid: u32) -> Option<Duration> {
+    #[cfg(unix)]
+    {
+        let out = Command::new("ps")
+            .args(["-A", "-o", "pgid=,time="])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        sum_group_cpu(&String::from_utf8_lossy(&out.stdout), pgid)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pgid;
+        None
+    }
+}
+
+/// The CPU time of group `pgid` in the text of `ps -A -o pgid=,time=`:
+/// the sum of its rows, `None` when it has none.
+pub fn sum_group_cpu(table: &str, pgid: u32) -> Option<Duration> {
+    let mut total = None;
+    for line in table.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(group), Some(time)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if group.parse::<u32>().ok() != Some(pgid) {
+            continue;
+        }
+        if let Some(used) = parse_cpu_time(time) {
+            total = Some(total.unwrap_or(Duration::ZERO) + used);
+        }
+    }
+    total
+}
+
+/// A `ps` CPU time: `[[DD-]HH:]MM:SS` on Linux, `[H:]MM:SS.cc` on macOS.
+pub fn parse_cpu_time(text: &str) -> Option<Duration> {
+    let (days, clock) = match text.split_once('-') {
+        Some((days, clock)) => (days.parse::<u64>().ok()?, clock),
+        None => (0, text),
+    };
+    let mut seconds = 0.0_f64;
+    for part in clock.split(':') {
+        seconds = seconds * 60.0 + part.parse::<f64>().ok()?;
+    }
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs(days * 86_400) + Duration::from_secs_f64(seconds))
+}
+
 /// Take an exclusive, non-blocking `flock` on `file`: `Ok(true)` when
 /// taken, `Ok(false)` when another open file description holds it. The
 /// lock lasts as long as any descriptor of the open file does.
@@ -1536,6 +1599,70 @@ pub fn os_random(bytes: &mut [u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_ps_cpu_time_reads_in_both_the_linux_and_the_macos_form() {
+        use std::time::Duration;
+        assert_eq!(
+            super::parse_cpu_time("00:00:07"),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            super::parse_cpu_time("1:02:03"),
+            Some(Duration::from_secs(3723))
+        );
+        assert_eq!(
+            super::parse_cpu_time("0:01.50"),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(
+            super::parse_cpu_time("2-00:00:01"),
+            Some(Duration::from_secs(172_801))
+        );
+        assert_eq!(super::parse_cpu_time("junk"), None);
+    }
+
+    #[test]
+    fn a_groups_cpu_time_is_the_sum_of_its_rows() {
+        use std::time::Duration;
+        let table = " 10 0:01.00\n 10 0:00.50\n 11 5:00.00\nbad line\n";
+        assert_eq!(
+            super::sum_group_cpu(table, 10),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(super::sum_group_cpu(table, 12), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_cpu_time_of_a_busy_process_group_rises_and_a_sleeper_does_not() {
+        use std::time::{Duration, Instant};
+        let mut busy = std::process::Command::new("sh");
+        busy.args(["-c", "while :; do :; done"]);
+        super::own_process_group(&mut busy);
+        let mut busy = busy.spawn().expect("spawn");
+        let mut idle = std::process::Command::new("sleep");
+        idle.arg("30");
+        super::own_process_group(&mut idle);
+        let mut idle = idle.spawn().expect("spawn");
+        // `ps` reports whole seconds on some systems: sample until it shows.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut rose = false;
+        while Instant::now() < deadline {
+            if super::group_cpu_time(busy.id()).is_some_and(|used| used >= Duration::from_secs(1)) {
+                rose = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let sleeper = super::group_cpu_time(idle.id());
+        let _ = super::kill_tree(&mut busy);
+        let _ = super::kill_tree(&mut idle);
+        let _ = busy.wait();
+        let _ = idle.wait();
+        assert!(rose, "a busy loop used at least a second of CPU");
+        assert!(sleeper.is_some_and(|used| used < Duration::from_secs(1)));
+    }
+
     // A9: a persistent accept failure the loop cannot make progress on
     // has to be told from one the next accept is unaffected by, or the
     // coordinator's accept loop spins at full speed on `EMFILE` and

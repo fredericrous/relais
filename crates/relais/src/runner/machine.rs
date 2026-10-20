@@ -229,6 +229,13 @@ pub enum Observation {
         /// Every failure also fails at the base revision.
         all_preexisting: bool,
     },
+    /// Every failing check fails only tests that also fail at the base,
+    /// both sides' JUnit complete, and no criterion targets them: no
+    /// repair is bought (plan C1).
+    PreexistingTestFailures {
+        failures: Vec<String>,
+        tests: Vec<crate::verify::PreexistingTests>,
+    },
     /// A required check is a gap: skipped, inert, unavailable, untrusted.
     VerificationGap(Vec<String>),
     /// An inspection's report review did not meet these criteria. A
@@ -392,6 +399,44 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
                 Reason::RepairExhausted,
                 serde_json::json!({ "failures": failures }),
                 Terminal::Failed { detail },
+            )
+        }
+
+        Observation::PreexistingTestFailures { failures, tests } => {
+            let lists: Vec<serde_json::Value> = tests
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "check": t.check,
+                        "base_failing_tests": t.base,
+                        "candidate_failing_tests": t.candidate,
+                    })
+                })
+                .collect();
+            let described: Vec<String> = tests
+                .iter()
+                .map(|t| {
+                    format!(
+                        "{}: candidate fails [{}], base fails [{}]",
+                        t.check,
+                        t.candidate.join(", "),
+                        t.base.join(", ")
+                    )
+                })
+                .collect();
+            let detail = format!(
+                "every failing test also fails at the base and no criterion targets it, so no \
+                 repair was spent: {}",
+                described.join("; ")
+            );
+            Decision::stop(
+                State::NeedsDecision,
+                Reason::BaselineFailureNotWaived,
+                serde_json::json!({ "failures": failures, "tests": lists }),
+                Terminal::NeedsDecision {
+                    reason: Reason::BaselineFailureNotWaived,
+                    detail,
+                },
             )
         }
 
@@ -607,6 +652,32 @@ mod tests {
     }
 
     // SPEC §9 rows, one assertion each.
+
+    #[test]
+    fn guarded_preexisting_test_failures_end_without_a_repair() {
+        let d = decide(
+            &budget(0, Some(Tier::Escalation)),
+            Observation::PreexistingTestFailures {
+                failures: vec!["make@1".into()],
+                tests: vec![crate::verify::PreexistingTests {
+                    check: "make@1".into(),
+                    base: vec!["a".into(), "b".into()],
+                    candidate: vec!["a".into()],
+                }],
+            },
+        );
+        assert_eq!(d.state, State::NeedsDecision);
+        assert_eq!(d.reason, Reason::BaselineFailureNotWaived);
+        assert!(matches!(d.next, Next::Stop(Terminal::NeedsDecision { .. })));
+        assert_eq!(
+            d.detail["tests"][0]["base_failing_tests"],
+            serde_json::json!(["a", "b"])
+        );
+        assert_eq!(
+            d.detail["tests"][0]["candidate_failing_tests"],
+            serde_json::json!(["a"])
+        );
+    }
 
     #[test]
     fn a_behavioural_failure_with_allowance_repairs_at_the_next_rung() {

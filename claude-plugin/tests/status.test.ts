@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { formatCost, rebuildRuns, applyEvent, emptyRun, outcomeText, statusReply } from '../hooks/timeline.ts'
+import { formatCost, rebuildRuns, applyEvent, applyLine, reconcileStatus, emptyRun, outcomeText, statusReply } from '../hooks/timeline.ts'
 import { wrapWords } from '../hooks/pane.ts'
 import { nativeCalls, scriptedEngine, settle, spawnLine, startedRun, turn } from './support.ts'
 
@@ -228,4 +228,53 @@ test('an environment_warning event is rendered as a text line', () => {
   )
   expect(model.events.map(e => e.text).join('\n')).toContain('warning · claude_code_version_unchecked')
   expect(model.events.map(e => e.text).join('\n')).toContain('did not answer within 30s')
+})
+
+const withCost = (run: string, revision: number, micros: number, state = 'running') => ({
+  ...timelineOf(run, { state, cost_total: { micros, completeness: 'actual' } }),
+  revision,
+})
+
+test('out-of-order status responses: the newer revision wins', () => {
+  const base = rebuildRuns(withCost('run-a', 4, 400), NOW)['run-a']
+  expect(base.cost?.booked).toBe(400)
+  const stale = withCost('run-a', 2, 200)
+  const model = reconcileStatus(base, stale)
+  expect(model.cost?.booked).toBe(400)
+  expect(model.revision).toBe(4)
+  expect(reconcileStatus(base, withCost('run-a', 7, 700)).cost?.booked).toBe(700)
+  expect(reconcileStatus(base, withCost('run-a', 4, 999)).cost?.booked).toBe(400)
+})
+
+test('replaying the same events twice leaves the cost equal to the ledger total', () => {
+  const cost = (seq: number) => ev('run-a', seq, { kind: 'cost', booked: 100, completeness: 'actual' })
+  const events = [cost(0), cost(1)]
+  let models = rebuildRuns({ ...timelineOf('run-a', undefined, events) }, NOW)
+  models = { ...models, ...rebuildRuns({ ...timelineOf('run-a', undefined, events) }, NOW) }
+  let model = models['run-a']
+  for (const line of [...events, ...events]) {
+    model = applyLine({ 'run-a': model }, line, NOW)['run-a']
+  }
+  expect(model.cost?.booked).toBeGreaterThan(200)
+  model = reconcileStatus(model, withCost('run-a', 1, 200))
+  expect(model.cost?.booked).toBe(200)
+  // Lines the status had read add nothing; a newer one adds on top.
+  for (const line of [...events, cost(2)]) model = applyLine({ 'run-a': model }, line, NOW)['run-a']
+  expect(model.cost?.booked).toBe(300)
+})
+
+test('status requests are coalesced to one in flight per run, with a 5 s timeout', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stdout', JSON.stringify(ev('run-live', 0, { kind: 'phase', state: 'running', reason: 'x', detail: {} })) + '\n')
+  await settle(engine)
+  engine.script.runResult = (argv: string[]) =>
+    argv[2] === 'status' ? result(JSON.stringify(withCost('run-live', 3, 300))) : result('')
+  await Promise.all([
+    $.tool.call({ tool: 'mcp__relais__status' }),
+    $.tool.call({ tool: 'mcp__relais__status' }),
+    $.tool.call({ tool: 'mcp__relais__status' }),
+  ])
+  const calls = nativeCalls(engine.calls, 'status').filter((c: any) => c.argv.includes('run-live'))
+  expect(calls.length).toBe(1)
+  expect(calls[0].init?.timeoutMs).toBe(5000)
 })

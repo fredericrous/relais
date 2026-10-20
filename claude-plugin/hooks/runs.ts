@@ -16,6 +16,7 @@ import {
   shortId,
   statusReply,
   type RunModel,
+  reconcileStatus,
 } from './timeline.ts'
 import { sendHello } from './callbacks.ts'
 import { onRunDone } from './routing.ts'
@@ -31,6 +32,11 @@ import {
 } from './ui.ts'
 
 const STATUS_TIMEOUT_MS = 10_000
+// A reconciling status of one live run: short, because the next poll asks again.
+const RECONCILE_TIMEOUT_MS = 5_000
+// The status request in flight for each run, per store: a second caller
+// shares it instead of starting another.
+const reconciling = new WeakMap<object, Map<string, Promise<void>>>()
 // `native cancel` waits up to 10 s for the driver's outcome itself.
 const CANCEL_TIMEOUT_MS = 20_000
 // The freshness check sits on the path to the session's next turn: a
@@ -569,17 +575,33 @@ function foreignMarked(models: Record<string, RunModel>, session: string): Recor
 // holds (a reap or a cancel by another process wrote none to the stream),
 // and whether it has gone quiet. A run the status cannot be read for stays
 // as it was.
-async function refreshRun(fx: Fx, store: Store, run: string) {
+export function refreshRun(fx: Fx, store: Store, run: string): Promise<void> {
+  const inFlight = reconciling.get(store) ?? new Map<string, Promise<void>>()
+  reconciling.set(store, inFlight)
+  const running = inFlight.get(run)
+  if (running) return running
+  const request = readRun(fx, store, run).finally(() => inFlight.delete(run))
+  inFlight.set(run, request)
+  return request
+}
+
+async function readRun(fx: Fx, store: Store, run: string) {
   try {
-    const result = await fx.process.run(['relais', 'native', 'status', '--run', run], { timeoutMs: STATUS_TIMEOUT_MS })
+    const result = await fx.process.run(['relais', 'native', 'status', '--run', run], { timeoutMs: RECONCILE_TIMEOUT_MS })
     if (result.exitCode !== 0) {
       store.statusFailure = `relais native status --run ${run} exited ${result.exitCode}: ${String(result.stderr ?? '').trim().slice(0, 400)}`
       return
     }
     const now = await fx.clock.now()
-    const fresh = rebuildRuns(JSON.parse(String(result.stdout ?? '')), now)[run]
-    const held = store.models[run]
-    if (!fresh || !held) return
+    const reply = JSON.parse(String(result.stdout ?? ''))
+    const fresh = rebuildRuns(reply, now)[run]
+    const known = store.models[run]
+    if (!fresh || !known) return
+    const held = reconcileStatus(known, reply)
+    if (held !== known) {
+      store.models = { ...store.models, [run]: held }
+      markDirty(store)
+    }
     if (!isLive(held)) {
       // A run that stopped awaiting a person may have been answered since.
       if (held.outcome && AWAITS_A_PERSON.has(held.outcome.state) && fresh.outcome && fresh.outcome.state !== held.outcome.state) {

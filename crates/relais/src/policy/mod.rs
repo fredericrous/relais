@@ -252,6 +252,14 @@ pub struct CommandSpec {
     /// so no existing authority hash moves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
+    /// How many times a FAILED check is run again (SPEC §10): `retry = 1`
+    /// runs it a second time, and a fail-then-pass is a pass marked
+    /// `flaky`. Every attempt keeps its own log and is listed on the
+    /// outcome. A failure that shows resource exhaustion is never retried.
+    /// Omitted from the serialized form when absent, so no existing
+    /// authority hash moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<u32>,
     /// Environment this command sets itself, after relais's own parallelism
     /// bounds (`MAKEFLAGS`, `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS`,
     /// `NEXTEST_TEST_THREADS`): a key named here wins. Omitted when empty.
@@ -3210,9 +3218,10 @@ timeout_seconds = 60
             .expect("this repository's own relais.toml parses");
         assert_eq!(
             own.authority_hash(),
-            "200bcd5d6cb35a9243529c5b1e9621a72b1e70110cf53b866095b413eaa3332c",
-            "the hash of this repository's own policy must not move (it moved deliberately twice: \
-when the per-type recipes were seeded, and when `cache_baseline` was turned on)"
+            "862c14ebf055486e51e05f704e2d309041e34e015ed0e2307d2547c4aa5e732d",
+            "the hash of this repository's own policy must not move (it moved deliberately three \
+times: when the per-type recipes were seeded, when `cache_baseline` was turned on, and when \
+`make check` was split into one check per gate)"
         );
         let tiered = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
         assert_eq!(
@@ -3385,6 +3394,27 @@ amont = { mode = "optional", bin = "/opt/amont/bin/amont" }
             a.max_attempts, 5,
             "and a written one past the ceiling does not broaden"
         );
+    }
+
+    /// `retry` is optional: a check without it writes back without the key,
+    /// so the serialized form (what the authority hash reads) is unchanged;
+    /// one that names it keeps it.
+    #[test]
+    fn retry_is_additive_and_unwritten_when_unset() {
+        let text = r#"{"argv":["make","plugin"]}"#;
+        let plain: CommandSpec = serde_json::from_str(text).expect("parses");
+        assert_eq!(plain.retry, None);
+        let written = serde_json::to_string(&plain).expect("serializes");
+        let again: CommandSpec = serde_json::from_str(&written).expect("parses");
+        assert_eq!(again, plain);
+        assert_eq!(serde_json::to_string(&again).unwrap(), written);
+        assert!(!serde_json::to_string(&plain).unwrap().contains("retry"));
+        let retried: CommandSpec =
+            serde_json::from_str(r#"{"argv":["make","plugin"],"retry":1}"#).expect("parses");
+        assert_eq!(retried.retry, Some(1));
+        assert!(serde_json::to_string(&retried)
+            .unwrap()
+            .contains(r#""retry":1"#));
     }
 
     /// ADR-0010 added `[resources]` to the machine settings and

@@ -4,6 +4,10 @@
 # EVERY failure is that timeout, rerun the whole suite once and exit with the
 # rerun's status. Any other failure exits non-zero at once, with no rerun.
 #
+# One retry owner per execution context: under relais (RELAIS_CHECK is set in
+# every check's environment) the check's own `retry` owns the rerun, so this
+# script never reruns; CI, without it, keeps the rerun.
+#
 # CLAUDE_BIN overrides the command (used by the script's test).
 set -u
 
@@ -27,7 +31,7 @@ failed=$(grep -c '^(fail) ' "$out")
 timed=$(grep -c 'timed out after 5000 ms' "$out")
 other=$(grep -i -E '^[[:space:]]*([a-z]*error|fatal)[:[:space:]]' "$out" | grep -v -c 'timed out after 5000 ms')
 
-if [ "$failed" -gt 0 ] && [ "$timed" -ge "$failed" ] && [ "$other" -eq 0 ]; then
+if [ -z "${RELAIS_CHECK:-}" ] && [ "$failed" -gt 0 ] && [ "$timed" -ge "$failed" ] && [ "$other" -eq 0 ]; then
 	echo "plugin-test: every failure was 'timed out after 5000 ms' (machine load); rerunning the suite once" >&2
 	"$claude_bin" plugin test
 	exit $?

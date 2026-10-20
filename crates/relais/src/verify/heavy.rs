@@ -50,6 +50,7 @@ use crate::admission::{
 };
 use crate::disk::{DiskCheck, Shortfall};
 use crate::policy::{Budgets, Exhausted, WaitKind};
+use crate::procs::Ended;
 use crate::protocol::{Event, Events};
 
 /// How often a queued command says it is still queued.
@@ -287,6 +288,15 @@ pub struct HeavyAdmission<'a> {
     pub tries: Tries,
     /// The disk floor and the means to measure it.
     pub disk: DiskCheck<'a>,
+    /// Does a failed check's end and output show resource exhaustion? Such
+    /// a failure is evidence for a decision and is never retried. Passed in
+    /// because the classifier reads `verify`'s outcomes.
+    pub exhausted: fn(Ended, &str) -> bool,
+}
+
+/// The default `exhausted`: nothing shows exhaustion.
+fn never_exhausted(_: Ended, _: &str) -> bool {
+    false
 }
 
 impl<'a> HeavyAdmission<'a> {
@@ -309,6 +319,7 @@ impl<'a> HeavyAdmission<'a> {
             registration: None,
             tries: Tries::default(),
             disk: DiskCheck::off(),
+            exhausted: never_exhausted,
         }
     }
 

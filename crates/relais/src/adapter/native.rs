@@ -331,6 +331,23 @@ fn usage_of_report(usage: Option<&AgentUsage>, prices: Option<&PriceTable>) -> B
             unpriced: vec!["the agent reported no model".to_string()],
         };
     };
+    // A model with no token field at all reported nothing to price: the
+    // figure is unknown, not the zero the defaults below would make it.
+    if [
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read_input_tokens,
+        usage.cache_creation_input_tokens,
+    ]
+    .iter()
+    .all(Option::is_none)
+    {
+        return Booked {
+            usage: UsageReport::unknown(),
+            effective_model: Some(model),
+            unpriced: vec!["the agent reported no token counts".to_string()],
+        };
+    }
     // The plugin sums one cache-write figure over the turns, without the
     // tier it was written at: priced at the 5-minute rate, the default.
     let record = UsageRecord {
@@ -1386,6 +1403,15 @@ mod tests {
         assert_eq!(modelless.usage.cost, Cost::Unknown);
         assert_eq!(modelless.effective_model, None);
         assert_eq!(modelless.unpriced.len(), 1);
+        let tokenless = usage_of_report(
+            Some(&AgentUsage {
+                model: Some("sonnet-x".into()),
+                ..AgentUsage::default()
+            }),
+            Some(&table()),
+        );
+        assert_eq!(tokenless.usage.cost, Cost::Unknown);
+        assert_eq!(tokenless.effective_model.as_deref(), Some("sonnet-x"));
     }
 
     /// Repairs raise effort on the same model by default, and a

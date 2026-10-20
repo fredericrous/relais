@@ -1349,8 +1349,10 @@ impl<'a> RunEngine<'a> {
             let cancel = Arc::clone(&cancel);
             let stop = &stop;
             let heartbeat_lost = &heartbeat_lost;
+            let events = &self.events;
             scope.spawn(move || {
                 let mut last: Option<Instant> = None;
+                let mut last_relay = Instant::now();
                 let mut heartbeat_errors: u32 = 0;
                 while !stop.load(Ordering::SeqCst) {
                     if last.is_none_or(|last| last.elapsed() >= heartbeat_every) {
@@ -1384,6 +1386,12 @@ impl<'a> RunEngine<'a> {
                             }
                         }
                     }
+                    // Usage the worker reports through `relais native
+                    // usage` reaches the sequenced stream while it runs.
+                    if last_relay.elapsed() >= Duration::from_millis(200) {
+                        last_relay = Instant::now();
+                        events.relay_usage();
+                    }
                     std::thread::sleep(Duration::from_millis(20));
                 }
             });
@@ -1391,6 +1399,8 @@ impl<'a> RunEngine<'a> {
             stop.store(true, Ordering::SeqCst);
             result
         });
+        // The last report may have landed after the final tick.
+        self.events.relay_usage();
 
         // The process has ended: whatever it wrote is written. The lease
         // goes back before the seat, so verification never waits on a
@@ -3281,6 +3291,7 @@ impl<'a> RunEngine<'a> {
             sleeper: Arc::new(verify::ThreadSleeper),
             registration: self.registration.clone(),
             tries: self.heavy_tries.clone(),
+            exhausted: |ended, tail| crate::exhaustion::classify(ended, tail).is_some(),
             disk: crate::disk::DiskCheck {
                 floor: self.config.machine.resources.min_free_bytes(),
                 probe: Arc::new(crate::disk::StatvfsProbe),
@@ -4220,6 +4231,24 @@ impl<'a> RunEngine<'a> {
                 .iter()
                 .all(|label| ctx.baseline.failures.contains(label));
             progress.last_failures = Some(failures.clone());
+            // Plan C1: complete JUnit on both sides says every failing
+            // test already fails at the base and nothing targets it. A
+            // cached base keeps no failing checks, so it never applies.
+            if let Some(tests) = ctx.baseline.checks.as_deref().and_then(|base| {
+                verify::guarded_preexisting(
+                    &failures,
+                    base,
+                    &checks,
+                    &ctx.preflight.authority.verification_profile,
+                    &self.config.contract.acceptance,
+                )
+            }) {
+                return self.follow(
+                    ctx,
+                    progress,
+                    Observation::PreexistingTestFailures { failures, tests },
+                );
+            }
             return self.follow(
                 ctx,
                 progress,
@@ -7125,6 +7154,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/main.rs".into()],
@@ -7147,6 +7177,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec![shell.into(), "-c".into(), "test ! -f src/main.rs".into()],
@@ -7172,6 +7203,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "true".into()],
@@ -7583,6 +7615,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/evil.txt".into()],
@@ -9060,6 +9093,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/tick-0.txt".into()],
@@ -9120,6 +9154,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec![
@@ -9183,6 +9218,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test -f src/marker.txt".into()],
@@ -9204,6 +9240,132 @@ mod tests {
         };
         assert_eq!(why, Reason::BaselineFailureNotWaived, "{detail}");
         assert!(detail.contains("not waived"), "{detail}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A check that fails exactly test `b` of `a` and `b`, writing `report`
+    /// first (a complete one by default), at the base and at every candidate.
+    fn failing_b_check(report: &str) -> CommandSpec {
+        CommandSpec {
+            junit: Some("junit.xml".into()),
+            ..sh(&format!("printf '%s' '{report}' > junit.xml; exit 1"))
+        }
+    }
+
+    const COMPLETE_B_FAILS: &str = "<testsuite tests=\"2\" failures=\"1\"><testcase name=\"a\"/>\
+        <testcase name=\"b\"><failure/></testcase></testsuite>";
+
+    fn contract_naming(evidence: serde_json::Value) -> TaskContract {
+        TaskContract::from_json_str(
+            &serde_json::json!({
+                "schema_version": 1,
+                "kind": "change",
+                "objective": "Fix the obsolete entry point",
+                "base_ref": "HEAD",
+                "write_scope": ["src/**"],
+                "acceptance": [{"statement": "b passes", "evidence": evidence}],
+                "verification_profile": "profile",
+            })
+            .to_string(),
+        )
+        .expect("contract")
+    }
+
+    fn repaired(fixture: &Fixture, run_id: &RunId) -> bool {
+        fixture
+            .ledger
+            .transitions(run_id)
+            .expect("history")
+            .iter()
+            .any(|t| t.to_state == State::Repairing)
+    }
+
+    #[test]
+    fn complete_reports_with_a_subset_of_base_failures_end_without_a_repair() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![failing_b_check(COMPLETE_B_FAILS)], 3);
+        let backend = churning_worker("");
+        let outcome = fixture.execute(&fixture.contract(Review::Optional), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::NeedsDecision { reason, detail },
+        } = outcome
+        else {
+            panic!("expected needs_decision, got {outcome:?}");
+        };
+        assert_eq!(reason, Reason::BaselineFailureNotWaived, "{detail}");
+        assert!(!repaired(&fixture, &run_id), "no repair is spent");
+        assert_eq!(
+            detail.matches("[b]").count(),
+            2,
+            "both test lists are in the detail: {detail}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_base_failing_test_named_by_a_criterion_is_still_repaired() {
+        let fixture = Fixture::new();
+        // The base fails `b` and `c`; once the worker has churned, only
+        // `c`: a subset of the base's, but `b` is a criterion's target.
+        let script = "if [ -f src/tick-0.txt ]; then \
+            printf '%s' '<testsuite tests=\"3\" failures=\"1\"><testcase name=\"a\"/>\
+            <testcase name=\"b\"/><testcase name=\"c\"><failure/></testcase></testsuite>' \
+            > junit.xml; else \
+            printf '%s' '<testsuite tests=\"3\" failures=\"2\"><testcase name=\"a\"/>\
+            <testcase name=\"b\"><failure/></testcase><testcase name=\"c\"><failure/>\
+            </testcase></testsuite>' > junit.xml; fi; exit 1";
+        let check = CommandSpec {
+            junit: Some("junit.xml".into()),
+            ..sh(script)
+        };
+        let repo = fixture.repo_policy(vec![check], 3);
+        let backend = churning_worker("");
+        let contract = contract_naming(serde_json::json!(
+            {"kind": "test", "authorship": "pre_existing", "name": "b"}
+        ));
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        assert!(repaired(&fixture, &outcome.run_id), "{outcome:?}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_check_named_by_a_criterion_is_still_repaired() {
+        let fixture = Fixture::new();
+        let check = CommandSpec {
+            name: Some("units".into()),
+            ..failing_b_check(COMPLETE_B_FAILS)
+        };
+        let repo = fixture.repo_policy(vec![check], 3);
+        let backend = churning_worker("");
+        let contract = contract_naming(serde_json::json!({"kind": "check", "name": "units"}));
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        assert!(repaired(&fixture, &outcome.run_id), "{outcome:?}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_truncated_report_keeps_todays_rule_and_repairs() {
+        let fixture = Fixture::new();
+        let truncated = "<testsuite tests=\"2\"><testcase name=\"b\"><failure/>";
+        let repo = fixture.repo_policy(vec![failing_b_check(truncated)], 3);
+        let backend = churning_worker("");
+        let outcome = fixture.execute(&fixture.contract(Review::Optional), &repo, &backend);
+        assert!(repaired(&fixture, &outcome.run_id), "{outcome:?}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_missing_report_keeps_todays_rule_and_repairs() {
+        let fixture = Fixture::new();
+        let check = CommandSpec {
+            junit: Some("junit.xml".into()),
+            ..sh("exit 1")
+        };
+        let repo = fixture.repo_policy(vec![check], 3);
+        let backend = churning_worker("");
+        let outcome = fixture.execute(&fixture.contract(Review::Optional), &repo, &backend);
+        assert!(repaired(&fixture, &outcome.run_id), "{outcome:?}");
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
@@ -9823,6 +9985,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec![
@@ -10384,6 +10547,7 @@ mod tests {
                 name: None,
                 junit: None,
                 weight: None,
+                retry: None,
                 env: Default::default(),
                 reuse: None,
                 argv: vec![shell.into(), "-c".into(), "true".into()],
@@ -10751,6 +10915,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "sleep 60".into()],
@@ -11318,6 +11483,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), script.into()],
@@ -11365,6 +11531,7 @@ mod tests {
                     name: None,
                     junit: None,
                     weight: None,
+                    retry: None,
                     env: Default::default(),
                     reuse: None,
                     argv: vec!["relais-no-such-binary-4f3a".into()],
@@ -11441,6 +11608,7 @@ mod tests {
                 name: None,
                 junit: None,
                 weight: None,
+                retry: None,
                 env: Default::default(),
                 reuse: None,
                 argv: vec!["sh".into(), "-c".into(), "sleep 5".into()],
@@ -11908,6 +12076,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec![shell.into(), "-c".into(), script.into()],
@@ -12023,6 +12192,7 @@ mod tests {
     fn reusing_step(script: &str) -> CommandSpec {
         CommandSpec {
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: Some(crate::policy::ReuseSpec {
                 inputs: vec!["package.json".into()],
@@ -12127,6 +12297,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec![
@@ -13509,6 +13680,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/tick-0.txt".into()],
@@ -13616,6 +13788,7 @@ mod tests {
             name: None,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/main.rs".into()],
@@ -14501,5 +14674,9 @@ mod tests {
     mod budgets;
     mod exhaustion;
     mod native;
+    // Shells out to `sh` and a fake `claude` script made executable with
+    // unix permissions: unix only, like the script it tests.
+    #[cfg(unix)]
+    mod plugin_test_script;
     mod verify_kind;
 }

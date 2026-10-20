@@ -81,9 +81,16 @@ export type RunModel = {
   // The hint for a live run that has been silent a while ("no events for
   // 12m"): plain text, a hint and not a verdict.
   stalled: string | undefined
+  // What the run waits on right now, as text: a heartbeat's "alive, no
+  // progress for 14m", a queue for a slot or the disk, a resource limit.
+  // Cleared when the wait ends.
+  wait: string | undefined
   // What the next worker attempt is, after a `repairing`/`escalating`
   // transition: its step is titled by it.
   retry: 'repair' | 'escalation' | undefined
+  // The revision of the last `relais native status` applied: the last
+  // `seq` that status had read. A status no newer than this is stale.
+  revision: number | undefined
 }
 
 export const emptyRun = (run: string, startedAt: number): RunModel => ({
@@ -103,7 +110,9 @@ export const emptyRun = (run: string, startedAt: number): RunModel => ({
   session: undefined,
   foreign: false,
   stalled: undefined,
+  wait: undefined,
   retry: undefined,
+  revision: undefined,
 })
 
 const FAILED_STATES = ['failed', 'blocked', 'cancelled', 'interrupted', 'budget_exhausted']
@@ -139,6 +148,34 @@ export function appendOutput(check: Check, text: string): Check {
   const isOpen = pieces.length > 0 ? !endsLine : check.isOpen && !endsLine
   return { ...check, output: lines.slice(-MAX_OUTPUT_LINES), isOpen }
 }
+
+// A heartbeat whose progress is older than this reads as "no progress".
+export const NO_PROGRESS_AFTER_MS = 5 * 60_000
+
+const SIGNAL_NAMES: Record<string, string> = {
+  log_bytes: 'log output',
+  worker_event: 'worker activity',
+  cpu: 'cpu time',
+}
+
+// What one `heartbeat` event says, as text: the runner is alive (its timer
+// thread spoke at `alive_at`); whether the wait is moving is `progress_at`.
+export function heartbeatText(event: any): string {
+  const alive = Date.parse(event.alive_at)
+  const progress = Date.parse(event.progress_at)
+  const signal = typeof event.signal === 'string' ? (SIGNAL_NAMES[event.signal] ?? event.signal) : undefined
+  if (Number.isNaN(alive) || Number.isNaN(progress)) return 'alive'
+  const idle = Math.max(0, alive - progress)
+  if (idle >= NO_PROGRESS_AFTER_MS) {
+    const last = signal ? ` (last ${signal})` : ''
+    return `alive, no progress for ${Math.floor(idle / 60_000)}m${last}`
+  }
+  return signal ? `alive, progressing (${signal})` : 'alive, waiting'
+}
+
+const minutesOrSeconds = (s: number): string => (s >= 120 ? `${Math.floor(s / 60)}m` : `${s}s`)
+
+const gib = (bytes: number): string => `${(bytes / 2 ** 30).toFixed(1)} GiB`
 
 const pushEntry = (list: Entry[], entry: Entry): Entry[] => [...list, entry].slice(-MAX_EVENTS)
 
@@ -300,6 +337,7 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
         isOpen: false,
         elidedBytes: 0,
       }
+      m = { ...m, wait: undefined }
       m = mapLast(m, s => ({ ...s, checks: [...s.checks, check], detail: (event.argv ?? []).join(' ') }))
       return withEntry(m, at, 'check', `start · ${event.label}`)
     }
@@ -311,6 +349,7 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
       }))
     }
     case 'check_ended': {
+      m = { ...m, wait: undefined }
       m = mapCheck(m, event.label, c => ({
         ...c,
         running: false,
@@ -324,6 +363,31 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
       const entry = { at, kind: 'decision', text: `${event.what} · ${event.reason}` }
       return withEntry({ ...m, decisions: pushEntry(m.decisions, entry) }, at, 'decision', entry.text)
     }
+    case 'heartbeat': {
+      const text = heartbeatText(event)
+      m = { ...m, wait: text }
+      // Only a stale wait is worth a row of its own; a healthy minute is not news.
+      return text.includes('no progress') ? withEntry(m, at, 'heartbeat', text) : m
+    }
+    case 'waiting_for_slot': {
+      const where = event.class === 'host_slot' ? 'a host slot' : `a ${String(event.class ?? 'heavy').replace(/_/g, ' ')} slot`
+      const place = typeof event.position === 'number' && event.position > 0 ? `, position ${event.position}` : ''
+      const text = `waiting for ${where}${place} · ${minutesOrSeconds(Number(event.waited_s) || 0)}`
+      return withEntry({ ...m, wait: text }, at, 'waiting', text)
+    }
+    case 'waiting_for_disk': {
+      const text = `waiting for disk · ${gib(Number(event.available) || 0)} free of ${gib(Number(event.floor) || 0)} floor on ${event.volume ?? 'the volume'}`
+      return withEntry({ ...m, wait: text }, at, 'waiting', text)
+    }
+    case 'flaky': {
+      const text = `flaky · ${event.label} passed after ${event.attempts} attempts`
+      return withEntry(m, at, 'flaky', text)
+    }
+    case 'resource_exhausted': {
+      const detail = event.detail ?? event.reason
+      const text = `resource exhausted${event.label ? ` · ${event.label}` : ''}${detail ? ` · ${typeof detail === 'string' ? detail : JSON.stringify(detail)}` : ''}`
+      return withEntry({ ...m, wait: undefined }, at, 'resource_exhausted', text)
+    }
     case 'environment_warning':
       return withEntry(m, at, 'warning', `warning · ${event.what ?? 'environment'} · ${event.detail ?? ''}`)
     case 'outcome': {
@@ -334,6 +398,7 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
         phase: event.state,
         endedAt: at,
         stalled: undefined,
+        wait: undefined,
         outcome: {
           state: event.state,
           receipt: event.receipt ?? null,
@@ -390,12 +455,22 @@ export const isoMs = (at: unknown, fallback: number): number => {
 // Folds one protocol line into the models, creating the run's on first sight.
 export function applyLine(
   models: Record<string, RunModel>,
-  line: { run?: string; at?: string; event?: unknown },
+  line: { run?: string; at?: string; seq?: number; event?: unknown },
   now: number,
 ): Record<string, RunModel> {
   if (typeof line.run !== 'string' || typeof line.event !== 'object' || line.event === null) return models
   const at = isoMs(line.at, now)
   const model = models[line.run] ?? emptyRun(line.run, at)
+  // A cost the applied status had already read is in the ledger total it
+  // put in place: adding it again would count it twice.
+  if (
+    (line.event as any).kind === 'cost' &&
+    typeof line.seq === 'number' &&
+    model.revision !== undefined &&
+    line.seq <= model.revision
+  ) {
+    return models
+  }
   return { ...models, [line.run]: applyEvent(model, line.event, at) }
 }
 
@@ -491,6 +566,7 @@ export function timelineText(m: RunModel, now: number): string[] {
   }
   for (const d of m.decisions) lines.push(`decision · ${d.text}`)
   lines.push(`cost ${formatCost(m.cost)}`)
+  if (m.wait && isLive(m)) lines.push(m.wait)
   if (m.stalled && isLive(m)) lines.push(m.stalled)
   if (m.outcome) lines.push(`outcome ${outcomeText(m.outcome)}`)
   if (m.outcome?.reason) lines.push(m.outcome.reason)
@@ -518,6 +594,7 @@ export function statusReply(m: RunModel, now: number, opts: { output?: boolean }
     cost: formatCost(m.cost),
     outcome: m.outcome ?? null,
     ...(m.stalled && isLive(m) ? { stalled: m.stalled } : {}),
+    ...(m.wait && isLive(m) ? { waiting: m.wait } : {}),
     ...(m.foreign ? { session: m.session, foreign: true } : {}),
     ...(opts.output ? { output: latestOutput(m, MAX_OUTPUT_LINES) } : {}),
     // relais's own human lines and the plugin's failures, the latest few.
@@ -542,9 +619,10 @@ function rebuildOne(models: Record<string, RunModel>, timeline: any, now: number
   let out = models
   for (const line of lines) {
     const run = line.run ?? timeline.run
-    out = applyLine(out, { run, at: line.at, event: line.event ?? line }, now)
+    out = applyLine(out, { run, at: line.at, seq: line.seq, event: line.event ?? line }, now)
   }
   const run = typeof timeline?.run === 'string' ? timeline.run : undefined
+  if (run && out[run]) out = { ...out, [run]: reconcileStatus(out[run], timeline) }
   const current = timeline?.current
   if (!run || !current || typeof current !== 'object') return out
   let model = out[run] ?? emptyRun(run, now)
@@ -567,6 +645,21 @@ function answeredModel(model: RunModel, current: any): RunModel {
   const actor = typeof decision.actor === 'string' ? decision.actor : null
   const answer: Answer = { resolution: decision.resolution, actor }
   return { ...model, phase: current.state, outcome: { ...model.outcome, state: current.state, answer } }
+}
+
+// What a `relais native status` reply says about the cost, applied to the
+// model: the ledger's total REPLACES the cost, never adds to it, so events
+// replayed or a reconnect converge to the ledger. Only a reply whose
+// revision (the last `seq` it read) is newer than the model's is applied;
+// an older one, or one with no revision or total, leaves the model as it is.
+export function reconcileStatus(model: RunModel, timeline: any): RunModel {
+  const revision = timeline?.revision
+  const total = timeline?.current?.cost_total
+  if (typeof revision !== 'number' || typeof total?.completeness !== 'string') return model
+  if (model.revision !== undefined && revision <= model.revision) return model
+  const booked = total.completeness === 'unknown' || typeof total.micros !== 'number' ? null : total.micros
+  const cost: Cost = { booked, completeness: total.completeness, ...(model.cost?.unpriced ? { unpriced: model.cost.unpriced } : {}) }
+  return { ...model, cost, revision }
 }
 
 // Runs rebuilt from `relais native status`: one timeline object (`--run`),

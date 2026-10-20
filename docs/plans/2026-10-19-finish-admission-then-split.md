@@ -131,4 +131,11 @@ Principles, one for all three files:
   - Afterwards, each of the three files is a facade. The size of every new module is recorded in the Outcome.
 - After the patch release: `relais --version` shows it, and a relais run started from the plugin reaches a terminal state with its events in the pane.
 
+## Decision log
+
+- 2026-10-19, Phase 1: PR 2's steps renamed v39/v40 on rebase (main's v37/v38 shipped first); merged as #267. Its first Windows run failed on a `kill -9 $$` case (no SIGKILL on Windows), now unix-only.
+- 2026-10-20, Phase 2: running the branch's relais (`cargo run -- doctor`) migrated this machine's real ledger from 38 to 40 (PR 2's three tables, empty). Brew's relais 0.26.0 then refused the ledger. The person chose to install main's relais (`c49141de`) in `~/.local/bin` until v0.27.0; it is to be removed after the brew upgrade. A branch relais runs only with `RELAIS_STATE_DIR` pointed at a scratch directory.
+- 2026-10-20, Phase 2: the semantic reviewer's dispatch exits 1 at once in this relais (C2, C4, C5: `review_unavailable`). The orchestrator read each patch and approved on `make check`; the PR's implementation review was the first independent read. Follow-up: diagnose the reviewer launch.
+- 2026-10-20, Phase 2: until v0.27.0 is installed, relais cannot run in this repository (its `relais.toml` uses `weight` and `retry`), so C3 and the review fixes were made by hand.
+
 <!-- panel: repos=relais reviewers=backend,codex body-sha=4b2cbf579c05 -->

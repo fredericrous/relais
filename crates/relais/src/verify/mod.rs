@@ -11,7 +11,7 @@
 //! An accepted receipt is bound to one candidate and does not authorize
 //! merge or survive edits.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
@@ -43,7 +43,7 @@ pub use heavy::{
     overweight, parallelism, Admitted, Ask, HeavyAdmission, LeaseStop, Sleeper, ThreadSleeper,
     Tries, ANNOUNCE_EVERY, HOST_SLOT_ENV, LEASE_HEARTBEAT_EVERY,
 };
-pub use junit::{parse_junit, JunitArtifact, JunitError, JunitReport, TestOutcome};
+pub use junit::{parse_junit, parse_report, JunitArtifact, JunitError, JunitReport, TestOutcome};
 
 /// Why verification could not be carried out as the policy declares it.
 /// Distinct from a check that RAN and failed: this is the plan itself
@@ -128,12 +128,109 @@ pub struct CheckOutcome {
     /// `ended`, which stays the command's own exit status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub junit: Option<JunitReport>,
+    /// Every attempt of a check that was run again (`retry`), in order,
+    /// the last one being what the fields above describe. Empty for a check
+    /// that ran once, so older receipts read and write unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<Attempt>,
+    /// A check that failed and then passed on a retry: a pass, marked.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub flaky: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// One run of a check that was run more than once: how it ended and the
+/// hash of its own log.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attempt {
+    pub ended: CheckEnd,
+    pub log_path: String,
+    pub log_sha256: String,
 }
 
 impl CheckOutcome {
+    fn attempt(&self) -> Attempt {
+        Attempt {
+            ended: self.ended,
+            log_path: self.log_path.clone(),
+            log_sha256: self.log_sha256.clone(),
+        }
+    }
+
     pub fn failed(&self) -> bool {
         !self.ended.succeeded()
     }
+
+    /// The failing tests of this check's COMPLETE JUnit report, else
+    /// `None` (see [`JunitReport::complete_failing_tests`]).
+    pub fn complete_failing_tests(&self) -> Option<BTreeSet<String>> {
+        let exited_nonzero =
+            matches!(self.ended.recorded(), Some(Ended::Exited(code)) if code != 0);
+        self.junit.as_ref()?.complete_failing_tests(exited_nonzero)
+    }
+}
+
+/// One failing check whose failing tests all fail at the base too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreexistingTests {
+    pub check: String,
+    /// The base's failing tests.
+    pub base: Vec<String>,
+    /// The candidate's failing tests, a subset of `base`.
+    pub candidate: Vec<String>,
+}
+
+/// The guarded pre-existing shortcut (plan C1): every failure is a failed
+/// check, each such check has complete JUnit at the base and on the
+/// candidate with the candidate's failing tests a subset of the base's,
+/// and no criterion names such a check or one of those tests. `None`
+/// means today's rule applies.
+pub fn guarded_preexisting(
+    failures: &[String],
+    base: &[CheckOutcome],
+    candidate: &[CheckOutcome],
+    profile: &VerificationProfile,
+    acceptance: &[AcceptanceEntry],
+) -> Option<Vec<PreexistingTests>> {
+    let failed: Vec<&CheckOutcome> = candidate.iter().filter(|check| check.failed()).collect();
+    let only_checks = !failed.is_empty()
+        && failures.len() == failed.len()
+        && failed.iter().all(|check| failures.contains(&check.label));
+    if !only_checks {
+        return None;
+    }
+    let mut found = Vec::new();
+    for check in failed {
+        let base_check = base.iter().find(|b| b.label == check.label)?;
+        let base_failing = base_check.complete_failing_tests()?;
+        let candidate_failing = check.complete_failing_tests()?;
+        if !candidate_failing.is_subset(&base_failing) {
+            return None;
+        }
+        found.push(PreexistingTests {
+            check: check.label.clone(),
+            base: base_failing.into_iter().collect(),
+            candidate: candidate_failing.into_iter().collect(),
+        });
+    }
+    let targeted = acceptance.iter().any(|entry| match entry.evidence() {
+        Some(Evidence::Check { name }) => named_command(profile, name)
+            .is_some_and(|spec| found.iter().any(|f| f.check == check_label(spec))),
+        Some(Evidence::Test {
+            name: Some(test), ..
+        }) => found
+            .iter()
+            .any(|f| f.base.contains(test) || f.candidate.contains(test)),
+        Some(Evidence::Test { name: None, .. })
+        | Some(Evidence::LlmReview)
+        | Some(Evidence::HumanSignOff)
+        | Some(Evidence::AmontGate { .. })
+        | None => false,
+    });
+    (!targeted).then_some(found)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -480,7 +577,9 @@ fn find_named_test(
     for check in checks {
         let Some(report) = &check.junit else { continue };
         match report {
-            JunitReport::Reported { tests, artifact } => {
+            JunitReport::Reported {
+                tests, artifact, ..
+            } => {
                 let Some(&outcome) = tests.get(test) else {
                     continue;
                 };
@@ -885,8 +984,72 @@ pub fn run_observed(
 /// smaller of its own timeout and what is left of each budget that applies
 /// to it. Queue time is charged to `admission_wait_seconds` and the total,
 /// never to work, so the timeout is read after the wait.
+///
+/// A check that declares `retry` and fails runs again, each attempt in its
+/// own log (`<stem>.log`, `<stem>-retry1.log`); a failure that shows
+/// resource exhaustion, and a cancellation, are never retried. A
+/// fail-then-pass is a pass marked `flaky`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_observed_within(
+    dir: &Path,
+    spec: &CommandSpec,
+    logs_dir: &Path,
+    label: &str,
+    log_stem: &str,
+    events: &Events,
+    cancel: Option<&AtomicBool>,
+    admission: &HeavyAdmission<'_>,
+) -> Result<CheckOutcome, VerifyError> {
+    let mut outcome = run_attempt(
+        dir, spec, logs_dir, label, log_stem, events, cancel, admission,
+    )?;
+    let mut attempts = Vec::new();
+    for number in 1..=spec.retry.unwrap_or(0) {
+        if !retryable(&outcome, admission) {
+            break;
+        }
+        attempts.push(outcome.attempt());
+        outcome = run_attempt(
+            dir,
+            spec,
+            logs_dir,
+            label,
+            &format!("{log_stem}-retry{number}"),
+            events,
+            cancel,
+            admission,
+        )?;
+    }
+    if !attempts.is_empty() {
+        attempts.push(outcome.attempt());
+        outcome.flaky = !outcome.failed();
+        if outcome.flaky {
+            events.emit(Event::Flaky {
+                label: label.to_string(),
+                attempts: attempts.len() as u32,
+            });
+        }
+        outcome.attempts = attempts;
+    }
+    Ok(outcome)
+}
+
+/// Does a failed check earn another run? Not a pass, not a cancellation,
+/// and not a failure that shows the machine ran out of a resource.
+fn retryable(outcome: &CheckOutcome, admission: &HeavyAdmission<'_>) -> bool {
+    match outcome.ended.recorded() {
+        None | Some(Ended::Cancelled) => false,
+        Some(ended) if ended.succeeded() => false,
+        Some(ended) => {
+            let tail = log_tail(Path::new(&outcome.log_path));
+            !(admission.exhausted)(ended, &tail)
+        }
+    }
+}
+
+/// One run of one command: the body of [`run_observed_within`].
+#[allow(clippy::too_many_arguments)]
+fn run_attempt(
     dir: &Path,
     spec: &CommandSpec,
     logs_dir: &Path,
@@ -942,7 +1105,8 @@ pub fn run_observed_within(
         .args(&spec.argv[1..])
         .current_dir(dir)
         .stdout(log_file.try_clone()?)
-        .stderr(log_file);
+        .stderr(log_file)
+        .env("RELAIS_CHECK", "1");
     crate::procs::own_process_group(&mut command);
     if let Some(admitted) = &admitted {
         command.envs(admitted.env());
@@ -987,7 +1151,15 @@ pub fn run_observed_within(
                     let finished = &finished;
                     scope.spawn(move || admitted.keep_alive(finished, heartbeat_every));
                 }
-                let waited = wait_following(&mut child, timeout, &log_path, label, events, cancel);
+                let waited = wait_following(
+                    &mut child,
+                    timeout,
+                    &log_path,
+                    label,
+                    events,
+                    cancel,
+                    crate::protocol::HEARTBEAT_INTERVAL,
+                );
                 finished.store(true, std::sync::atomic::Ordering::SeqCst);
                 waited
             });
@@ -1054,12 +1226,35 @@ pub fn run_observed_within(
         log_path: log_path.to_string_lossy().into_owned(),
         log_sha256: sha256_hex(&log_bytes),
         junit,
+        attempts: Vec::new(),
+        flaky: false,
     })
+}
+
+/// The end of a log, at most 64 KiB, lossily decoded: what a failure is
+/// classified from. A log that cannot be read has no tail.
+fn log_tail(path: &Path) -> String {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    const TAIL_BYTES: u64 = 64 * 1024;
+    let read = || -> std::io::Result<Vec<u8>> {
+        let mut file = std::fs::File::open(path)?;
+        let length = file.metadata()?.len();
+        file.seek(SeekFrom::Start(length.saturating_sub(TAIL_BYTES)))?;
+        let mut bytes = Vec::new();
+        file.take(TAIL_BYTES).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    read()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
 }
 
 /// Wait for the check to end, with a follower streaming its log into
 /// `events` meanwhile, and let the follower read once more before this
-/// returns. Silent events start no follower.
+/// returns. A heartbeat thread says every `heartbeat_every` that the
+/// runner is alive and whether the check moved; both threads are joined
+/// before this returns. Silent events start neither. The command's
+/// deadline is `timeout` whatever the heartbeats say.
 fn wait_following(
     child: &mut std::process::Child,
     timeout: Duration,
@@ -1067,16 +1262,38 @@ fn wait_following(
     label: &str,
     events: &Events,
     cancel: Option<&AtomicBool>,
+    heartbeat_every: Duration,
 ) -> Result<Ended, VerifyError> {
     if events.is_silent() {
         return Ok(crate::procs::wait_for_exit(child, timeout, cancel)?.ended);
     }
     let (ended_tx, ended_rx) = std::sync::mpsc::channel();
+    let (beat_tx, beat_rx) = std::sync::mpsc::channel::<()>();
+    let group = child.id();
     std::thread::scope(|scope| {
         scope.spawn(move || follow::follow(log_path, label, events, &ended_rx));
+        scope.spawn(move || {
+            follow::heartbeat(
+                events,
+                heartbeat_every,
+                &beat_rx,
+                &chrono::Utc::now,
+                &mut || follow::Sample {
+                    log_bytes: std::fs::metadata(log_path).map_or(0, |meta| meta.len()),
+                    // A check wait has no worker, so no worker events.
+                    // holds-until: the heartbeat also covers worker waits
+                    // (plan C4 names worker turns as a signal); it covers
+                    // check waits only today.
+                    worker_events: 0,
+                    cpu: crate::procs::group_cpu_time(group),
+                },
+            )
+        });
         let waited = crate::procs::wait_for_exit(child, timeout, cancel);
-        // Dropping the sender wakes the follower for its final read.
+        // Dropping the senders wakes the follower for its final read and
+        // the heartbeat thread, which the scope then joins.
         drop(ended_tx);
+        drop(beat_tx);
         Ok(waited?.ended)
     })
 }
@@ -1103,19 +1320,20 @@ fn read_junit(file: Option<&Path>, kept: &Path) -> Result<JunitReport, VerifyErr
         });
     };
     Ok(match std::fs::read(file) {
-        Ok(bytes) => match parse_junit(&bytes) {
-            Ok(tests) => {
+        Ok(bytes) => match parse_report(&bytes) {
+            Ok(parsed) => {
                 // The hash is of the kept file as written and read back,
                 // not of the bytes in memory, so the evidence row names
                 // what is actually on disk (X5).
                 std::fs::write(kept, &bytes)?;
                 let written = std::fs::read(kept)?;
                 JunitReport::Reported {
-                    tests,
+                    tests: parsed.tests,
                     artifact: Some(JunitArtifact {
                         path: kept.to_string_lossy().into_owned(),
                         sha256: sha256_hex(&written),
                     }),
+                    totals_consistent: parsed.totals_consistent,
                 }
             }
             Err(e) => JunitReport::Unparseable {
@@ -2813,6 +3031,34 @@ mod tests {
     }
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn a_waiting_check_is_followed_by_heartbeats_that_are_joined_at_its_end() {
+        let dir = crate::test_support::short_temp_dir("vf-hb");
+        let artifacts = dir.join("run-w");
+        let events = Events::for_run("run-w", &artifacts);
+        let log = dir.join("check.log");
+        std::fs::write(&log, "").expect("log");
+        let mut command = Command::new("sleep");
+        command.arg("0.4");
+        crate::procs::own_process_group(&mut command);
+        let mut child = command.spawn().expect("spawn");
+        let ended = wait_following(
+            &mut child,
+            Duration::from_secs(30),
+            &log,
+            "sleep@1",
+            &events,
+            None,
+            Duration::from_millis(30),
+        )
+        .expect("waited");
+        assert_eq!(ended, Ended::Exited(0));
+        let text = std::fs::read_to_string(artifacts.join("events.jsonl")).expect("events");
+        let beats = text.lines().filter(|l| l.contains("\"heartbeat\"")).count();
+        assert!(beats >= 2, "{text}");
+    }
+
     fn command(argv: &[&str], timeout_seconds: u64) -> CommandSpec {
         CommandSpec {
             name: None,
@@ -2820,9 +3066,119 @@ mod tests {
             timeout_seconds,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
         }
+    }
+
+    fn retrying(script: &str) -> CommandSpec {
+        CommandSpec {
+            retry: Some(1),
+            ..command(&["sh", "-c", script], 10)
+        }
+    }
+
+    /// Appends a line to `runs` each time the check runs.
+    const COUNTED: &str = "echo run >> runs; ";
+
+    fn runs_of(dir: &Path) -> usize {
+        std::fs::read_to_string(dir.join("runs"))
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_retried_check_that_fails_then_passes_is_a_flaky_pass() {
+        let dir = temp_dir("flaky");
+        let logs = dir.join("logs");
+        let script = format!(
+            "{COUNTED}if [ -f seen ]; then echo second; else touch seen; echo first; exit 1; fi"
+        );
+        let outcome = run_command(&dir, &retrying(&script), &logs, "c", "s").expect("runs");
+        assert!(!outcome.failed());
+        assert!(outcome.flaky);
+        assert_eq!(runs_of(&dir), 2);
+        assert_eq!(outcome.attempts.len(), 2);
+        assert_eq!(outcome.attempts[0].ended.recorded(), Some(Ended::Exited(1)));
+        assert_eq!(outcome.attempts[1].ended.recorded(), Some(Ended::Exited(0)));
+        assert_ne!(
+            outcome.attempts[0].log_sha256,
+            outcome.attempts[1].log_sha256
+        );
+        assert_eq!(outcome.attempts[1].log_sha256, outcome.log_sha256);
+        assert!(logs.join("s.log").exists());
+        assert!(logs.join("s-retry1.log").exists());
+        assert_eq!(
+            std::fs::read_to_string(logs.join("s.log")).unwrap(),
+            "first\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(logs.join("s-retry1.log")).unwrap(),
+            "second\n"
+        );
+    }
+
+    #[test]
+    fn a_retried_check_that_fails_twice_is_a_failure_with_both_attempts() {
+        let dir = temp_dir("twice");
+        let script = format!("{COUNTED}exit 3");
+        let outcome =
+            run_command(&dir, &retrying(&script), &dir.join("logs"), "c", "s").expect("runs");
+        assert!(outcome.failed());
+        assert!(!outcome.flaky);
+        assert_eq!(runs_of(&dir), 2);
+        assert_eq!(outcome.attempts.len(), 2);
+        assert!(outcome
+            .attempts
+            .iter()
+            .all(|a| a.ended.recorded() == Some(Ended::Exited(3))));
+    }
+
+    #[test]
+    fn a_check_without_retry_runs_once() {
+        let dir = temp_dir("once");
+        let script = format!("{COUNTED}exit 1");
+        let spec = command(&["sh", "-c", &script], 10);
+        let outcome = run_command(&dir, &spec, &dir.join("logs"), "c", "s").expect("runs");
+        assert!(outcome.failed());
+        assert_eq!(runs_of(&dir), 1);
+        assert!(outcome.attempts.is_empty());
+        assert!(!dir.join("logs/s-retry1.log").exists());
+        let written = serde_json::to_string(&outcome).unwrap();
+        assert!(!written.contains("attempts") && !written.contains("flaky"));
+    }
+
+    #[test]
+    fn a_failure_that_shows_exhaustion_is_not_retried() {
+        let dir = temp_dir("exhausted");
+        let script = format!("{COUNTED}echo 'No space left on device'; exit 1");
+        let admission = HeavyAdmission {
+            exhausted: |ended, tail| crate::exhaustion::classify(ended, tail).is_some(),
+            ..HeavyAdmission::unmanaged()
+        };
+        let outcome = run_observed_within(
+            &dir,
+            &retrying(&script),
+            &dir.join("logs"),
+            "c",
+            "s",
+            &Events::silent(),
+            None,
+            &admission,
+        )
+        .expect("runs");
+        assert!(outcome.failed());
+        assert_eq!(runs_of(&dir), 1);
+        assert!(outcome.attempts.is_empty());
+    }
+
+    #[test]
+    fn a_check_sees_relais_check_in_its_environment() {
+        let dir = temp_dir("env");
+        let spec = command(&["sh", "-c", "echo \"[$RELAIS_CHECK]\""], 10);
+        let outcome = run_command(&dir, &spec, &dir.join("logs"), "c", "s").expect("runs");
+        assert_eq!(std::fs::read_to_string(&outcome.log_path).unwrap(), "[1]\n");
     }
 
     #[test]
@@ -3142,6 +3498,8 @@ mod tests {
             log_path: path.to_string_lossy().into_owned(),
             log_sha256: sha256_hex(bytes),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         }
     }
 
@@ -4042,6 +4400,8 @@ mod tests {
                 log_path: "x.log".into(),
                 log_sha256: "h".into(),
                 junit: None,
+                attempts: Vec::new(),
+                flaky: false,
             }],
             gaps: vec![],
             baseline_failures: vec![],
@@ -4071,6 +4431,7 @@ mod tests {
             timeout_seconds,
             junit: None,
             weight: None,
+            retry: None,
             env: Default::default(),
             reuse: None,
         }
@@ -4130,6 +4491,8 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         }];
         let gaps = acceptance_gaps(
             &entries,
@@ -4192,6 +4555,8 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         }];
         let report = VerificationReport {
             candidate_sha: "abc".into(),
@@ -4329,6 +4694,8 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
             junit,
+            attempts: Vec::new(),
+            flaky: false,
         }
     }
 
@@ -4339,6 +4706,7 @@ mod tests {
                 .map(|(id, outcome)| (id.to_string(), *outcome))
                 .collect(),
             artifact: None,
+            totals_consistent: true,
         })
     }
 
@@ -4577,7 +4945,10 @@ mod tests {
         assert!(!outcome.failed());
         // The report is kept beside the log, with the hash of its bytes.
         let kept = logs.join("s.junit.xml");
-        let Some(JunitReport::Reported { tests, artifact }) = &outcome.junit else {
+        let Some(JunitReport::Reported {
+            tests, artifact, ..
+        }) = &outcome.junit
+        else {
             panic!("expected a read report: {:?}", outcome.junit);
         };
         assert_eq!(tests["a::b"], TestOutcome::Passed);
@@ -4657,6 +5028,8 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         }];
         let entries = vec![declared(
             "a person signed off on the migration",
@@ -4738,6 +5111,8 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         }];
         let entries = vec![declared(
             "a person signed off on the migration",
@@ -4837,6 +5212,8 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         }];
         let entries = vec![declared(
             "the pre-push cargo test gate covers this candidate",
@@ -4920,6 +5297,8 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         }];
         let entries = vec![declared(
             "the pre-push cargo test gate covers this candidate",
@@ -5107,6 +5486,8 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         };
         let entries = vec![
             AcceptanceEntry::Bare("the layout is listed".into()),
@@ -5297,6 +5678,8 @@ mod tests {
             log_path: "f.log".into(),
             log_sha256: "h".into(),
             junit: None,
+            attempts: Vec::new(),
+            flaky: false,
         };
         let report = VerificationReport {
             candidate_sha: "abc".into(),
