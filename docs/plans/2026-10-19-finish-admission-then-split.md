@@ -131,6 +131,24 @@ Principles, one for all three files:
   - Afterwards, each of the three files is a facade. The size of every new module is recorded in the Outcome.
 - After the patch release: `relais --version` shows it, and a relais run started from the plugin reaches a terminal state with its events in the pane.
 
+## Outcome (Phase 4, step 0)
+
+Branch `test/layout-independent-source-scan`, built by relais run-65e417ee0e4c5-de6c (v0.27.0: the five gates ran as separate checks and passed, the first live use of C3's profile). `nothing_a_model_can_reach_names_a_trials_arm` now calls `check_arm_boundary`, which walks the CLI tree (`main.rs` and `src/cli/`), the contract tree and the ledger tree at run time; the fixture controls run the same function. The controls are kept as permanent tests, not temporary ones: they cost milliseconds and guard the check itself.
+
+| Test | Input | Expected | Actual |
+|---|---|---|---|
+| `nothing_a_model_can_reach_names_a_trials_arm` | this repository's own layout | passes | passes |
+| the same, with a planted `crates/relais/src/contract/zz_plant.rs` holding `arm_index` (then removed) | a real contract child | fails | `the task contract must not name `arm_index` (found in …/crates/relais/src/contract/zz_plant.rs)` |
+| `a_clean_extracted_layout_passes_the_arm_boundary_checks` | fixture: `main.rs`, `cli/run.rs`, `contract/mod.rs`, `ledger/trials.rs` with `NewReplayTrial` | passes | passes |
+| `a_forbidden_identifier_in_an_extracted_cli_child_is_reported` | `arm_index` in `cli/run.rs` | error naming it and the file | passes |
+| `a_forbidden_identifier_in_a_nested_cli_file_is_reported` | `arm_index` in `cli/learn/train.rs` | error naming it and the file | passes |
+| `a_forbidden_identifier_in_a_contract_child_is_reported` | `assignment_probability` in `contract/child.rs` | error naming it and the file | passes |
+| `a_seed_field_in_a_ledger_child_new_replay_trial_is_reported` | `pub seed` in `ledger/trials.rs`'s `NewReplayTrial` | error naming `seed` and the file | passes |
+| `a_ledger_tree_without_the_declaration_is_an_error` | no `NewReplayTrial` in the ledger tree | error | passes |
+| `a_missing_contract_tree_is_an_error` | no `contract/` | error | passes |
+
+Review: approve-with-changes, then the Delta (28k/56 s, 31k/28 s). Fixed: the real test and the controls share `check_arm_boundary`; two more controls; the optional `cli/` root carries a `holds-until:` (required from PR A on). Evidence after PRs A and B is recorded in their Outcomes.
+
 ## Decision log
 
 - 2026-10-19, Phase 1: PR 2's steps renamed v39/v40 on rebase (main's v37/v38 shipped first); merged as #267. Its first Windows run failed on a `kill -9 $$` case (no SIGKILL on Windows), now unix-only.
