@@ -22,11 +22,22 @@ defined = {}
 for m, p in mods.items():
     if m == '__facade__': continue
     for n in DEF.findall(p.read_text()): defined.setdefault(n, m)
-def prod(text): return text.split('#[cfg(test)]')[0]
+def prod(text, path=None):
+    """The production part: everything before the file's test module. A
+    top-level `#[cfg(test)]` that is not a single trailing `mod` would hide
+    code after it, so that layout is refused, as check-module-cycles.py
+    refuses it."""
+    marks = [m.start() for m in re.finditer(r'^#\[cfg\(test\)\]\s*$', text, re.M)]
+    if not marks:
+        return text
+    rest = text[marks[0]:].split('\n', 1)[1] if len(marks) == 1 else ''
+    if len(marks) > 1 or not re.match(r'(pub(\([^)]*\))?\s+)?mod\s+\w+\s*(;|\{)', rest):
+        sys.exit(f"{path}: a top-level #[cfg(test)] that is not one trailing test module; cannot tell production from tests")
+    return text[:marks[0]]
 edges = {}
 for m, p in mods.items():
     if m in ('__facade__', 'test_support'): continue
-    t = prod(p.read_text())
+    t = prod(p.read_text(), p)
     deps = set(re.findall(r'\bsuper::(\w+)::', t))
     for group in re.findall(r'use super::\{([^}]*)\}', t, re.S):
         for n in re.findall(r'\b(\w+)\b', group):

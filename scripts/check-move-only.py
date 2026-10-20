@@ -39,6 +39,7 @@ CFG_TEST_FILE = re.compile(r'^\s*#!\[cfg\(test\)\]\s*$')
 MOD_BLOCK = re.compile(r'^\s*(pub(\([^)]*\))?\s+)?mod\s+\w+\s*\{\s*$')
 mod_blocks = Counter()
 cfg_tests = Counter()
+cfg_counted = {'+': False, '-': False}  # the attribute above was a changed line on that side
 trailing_commas = Counter()
 VIS_ITEM = re.compile(r'^\s*(pub(?:\([^)]*\))?\s+)?(?:(?:async|const|unsafe|extern "C")\s+)*(fn|struct|enum|trait|type|const|static|mod)\s+(\w+)')
 # (enclosing impl type, kind, name) -> visibilities seen, counted per side:
@@ -62,25 +63,31 @@ for l in diff.splitlines():
             if in_use[sd] or SKIP.match(body):
                 in_use[sd] = not body.rstrip().endswith(';')
             prev[sd] = body
+            cfg_counted[sd] = False
         continue
     if side in in_use:
         body = l[1:]
+        if not CFG_TEST.match(body) and not MOD_BLOCK.match(body) and not re.match(r'^\s*(pub(\([^)]*\))?\s+)?mod\s+\w+\s*;', body):
+            cfg_counted[side] = False
         if CFG_TEST_FILE.match(body):
             prev[side] = body
             continue
         if CFG_TEST.match(body):
             cfg_tests[side] += 1
+            cfg_counted[side] = True
             prev[side] = body
             continue
         if MOD_BLOCK.match(body):
             mod_blocks[side] += 1
             # `#[cfg(test)] mod tests {`: a test module's header, not an
             # attribute on a moved item.
-            if CFG_TEST.match(prev[side]):
+            if CFG_TEST.match(prev[side]) and cfg_counted[side]:
                 cfg_tests[side] -= 1
             prev[side] = body
             continue
         prev[side] = body
+        if re.match(r'^\s*(pub(\([^)]*\))?\s+)?mod\s+\w+\s*;', body) and CFG_TEST.match(prev[side]) and cfg_counted[side]:
+            cfg_tests[side] -= 1
         # A `use` statement spans lines until its `;`: skip all of it.
         if in_use[side] or SKIP.match(body):
             in_use[side] = not body.rstrip().endswith(';')
@@ -113,8 +120,11 @@ for l in diff.splitlines():
 only_rem, only_add = rem - add, add - rem
 structural = {'impl', '{', '}', ','} | impl_types
 # A module block opened on one side closes with a `}` there too.
-only_add['}'] -= mod_blocks['+'] - mod_blocks['-']
-only_add = +only_add
+only_add['}'] -= max(0, mod_blocks['+'] - mod_blocks['-'])
+only_rem['}'] -= max(0, mod_blocks['-'] - mod_blocks['+'])
+# rustfmt joining a wrapped list drops its end-of-line commas.
+only_rem[','] -= max(0, trailing_commas['-'] - trailing_commas['+'])
+only_add, only_rem = +only_add, +only_rem
 struct_add = Counter({k: v for k, v in only_add.items() if k in structural})
 real_add = only_add - struct_add
 print(f"tokens: removed-only {sum(only_rem.values())}, added-only {sum(real_add.values())}, structure {dict(struct_add)}")
