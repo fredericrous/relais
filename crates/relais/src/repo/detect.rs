@@ -731,6 +731,13 @@ mod tests {
         )
         .expect("fake amont");
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        // Exec it once, untimed: macOS assesses a freshly written script on
+        // its first direct exec (seconds under load), which would otherwise
+        // be charged to AMONT_LIST_TIMEOUT. The exit code is irrelevant here.
+        let _ = std::process::Command::new(&bin)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
         bin
     }
 
