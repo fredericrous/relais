@@ -1,6 +1,7 @@
-//! CLI entry point (SPEC §3, §17, §23). Handlers live in the library
-//! modules; this file is argument parsing, wiring and exit codes. The
-//! exit-code table lives in [`cli::outcome`].
+//! CLI entry point (SPEC §3, §17, §23), and nothing else: argument
+//! parsing, dispatch and one module per command group live in [`cli`], the
+//! exit-code table in [`cli::outcome`], and the handlers' substance in the
+//! library modules.
 
 mod cli;
 

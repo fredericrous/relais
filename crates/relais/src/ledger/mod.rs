@@ -10287,17 +10287,11 @@ mod tests {
     /// not hold it: the ledger tree is scanned for exactly one match.
     const REPLAY_TRIAL_DECL: &str = concat!("pub struct NewReplayTrial", "<'a> {");
 
-    /// The CLI roots under `src`: `main.rs`, plus `cli/` when it exists.
-    /// holds-until: the split moves the CLI into `src/cli/` (plan
-    /// 2026-10-19-finish-admission-then-split, PR A); from then on `cli/`
-    /// is a required root, so a renamed tree cannot pass unscanned.
+    /// The CLI roots under `src`: `main.rs` and `cli/`. Both are required
+    /// (`read_rs_tree` fails on a missing root), so a renamed CLI tree
+    /// cannot pass unscanned.
     fn cli_roots(src: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut roots = vec![src.join("main.rs")];
-        let cli = src.join("cli");
-        if cli.is_dir() {
-            roots.push(cli);
-        }
-        roots
+        vec![src.join("main.rs"), src.join("cli")]
     }
 
     /// Every `.rs` file at or under each root, as (path, text) pairs in
@@ -10540,6 +10534,17 @@ mod tests {
         let dir = fixture_src("arm-missing-decl", &layout);
         let err = check_arm_boundary(&dir).expect_err("an error");
         assert!(err.contains("NewReplayTrial"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_cli_tree_is_an_error() {
+        let layout: Vec<_> = clean_layout()
+            .into_iter()
+            .filter(|(r, _)| !r.starts_with("cli/"))
+            .collect();
+        let dir = fixture_src("arm-no-cli", &layout);
+        let err = check_arm_boundary(&dir).expect_err("an error");
+        assert!(err.contains("CLI tree"), "{err}");
     }
 
     #[test]
