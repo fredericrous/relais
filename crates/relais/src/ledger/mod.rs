@@ -10276,9 +10276,83 @@ mod tests {
     /// written.
     #[test]
     fn nothing_a_model_can_reach_names_a_trials_arm() {
-        const CLI: &str = include_str!("../main.rs");
-        const CONTRACT: &str = include_str!("../contract/mod.rs");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let cli = read_rs_tree(&src, &cli_roots(&src), "the binary CLI tree")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let contract = read_rs_tree(&src, &[src.join("contract")], "the contract tree")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let ledger = read_rs_tree(&src, &[src.join("ledger")], "the ledger tree")
+            .unwrap_or_else(|e| panic!("{e}"));
+        if let Err(e) = check_unreachable_identifiers(&cli, &contract) {
+            panic!("{e}");
+        }
+        if let Err(e) = check_replay_trial_declaration(&ledger) {
+            panic!("{e}");
+        }
+    }
 
+    /// The needle for the declaration, split so this file's own text does
+    /// not hold it: the ledger tree is scanned for exactly one match.
+    const REPLAY_TRIAL_DECL: &str = concat!("pub struct NewReplayTrial", "<'a> {");
+
+    /// The CLI roots under `src`: `main.rs`, plus `cli/` when it exists.
+    fn cli_roots(src: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut roots = vec![src.join("main.rs")];
+        let cli = src.join("cli");
+        if cli.is_dir() {
+            roots.push(cli);
+        }
+        roots
+    }
+
+    /// Every `.rs` file at or under each root, as (path, text) pairs in
+    /// path order. A missing root or a tree with no `.rs` file is an
+    /// error naming `what`.
+    fn read_rs_tree(
+        src: &std::path::Path,
+        roots: &[std::path::PathBuf],
+        what: &str,
+    ) -> std::result::Result<Vec<(String, String)>, String> {
+        fn walk(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+            if p.is_dir() {
+                for entry in std::fs::read_dir(p)? {
+                    walk(&entry?.path(), out)?;
+                }
+            } else if p.extension().is_some_and(|e| e == "rs") {
+                out.push(p.to_path_buf());
+            }
+            Ok(())
+        }
+        let mut files = Vec::new();
+        for root in roots {
+            if !root.exists() {
+                return Err(format!(
+                    "{what} is missing: {} does not exist",
+                    root.display()
+                ));
+            }
+            walk(root, &mut files).map_err(|e| format!("{what}: {}: {e}", root.display()))?;
+        }
+        if files.is_empty() {
+            return Err(format!("{what} has no .rs file under {}", src.display()));
+        }
+        files.sort();
+        files
+            .into_iter()
+            .map(|f| {
+                let text = std::fs::read_to_string(&f)
+                    .map_err(|e| format!("{what}: cannot read {}: {e}", f.display()))?;
+                Ok((f.display().to_string(), text))
+            })
+            .collect()
+    }
+
+    /// No CLI file and no contract file names an identifier a caller must
+    /// never choose.
+    fn check_unreachable_identifiers(
+        cli: &[(String, String)],
+        contract: &[(String, String)],
+    ) -> std::result::Result<(), String> {
         // The three a caller must never choose. An arm index and a draw
         // probability describe a SAMPLED comparison; a seed reproduces
         // one. A caller able to name any of them could describe a
@@ -10294,7 +10368,7 @@ mod tests {
         // identifiers would have forced the legitimate path to obscure
         // itself. What replaces them is stricter, not looser: the
         // structural check below.
-        for (what, source) in [("the CLI", CLI), ("the task contract", CONTRACT)] {
+        for (what, files) in [("the CLI", cli), ("the task contract", contract)] {
             // `seed` is NOT scanned for: `main.rs` names the solver's
             // training seed (`settings.solver.seed`), which has nothing
             // to do with a trial, and a substring scan cannot tell the
@@ -10302,38 +10376,155 @@ mod tests {
             // keeps a caller from naming a trial's seed; these two
             // identifiers are scanned because they have no innocent
             // meaning anywhere in this crate.
-            for forbidden in ["arm_index", "assignment_probability"] {
-                assert!(
-                    !source.contains(forbidden),
-                    "{what} must not name `{forbidden}`: a trial's arm and the probability \
-                     it was drawn with come from relais's own assignment, never from a flag a \
-                     person types or a field a model writes"
-                );
+            for (path, source) in files {
+                for forbidden in ["arm_index", "assignment_probability"] {
+                    if source.contains(forbidden) {
+                        return Err(format!(
+                            "{what} must not name `{forbidden}` (found in {path}): a trial's \
+                             arm and the probability it was drawn with come from relais's own \
+                             assignment, never from a flag a person types or a field a model \
+                             writes"
+                        ));
+                    }
+                }
             }
         }
+        Ok(())
+    }
 
-        // Structural, and the part the identifier scan could not make:
-        // the only shape a caller outside this module can hand to
-        // `insert_replay_trial` has no field for any of the three, so a
-        // replay cannot describe a draw even by accident. `insert_trial`
-        // takes `NewTrial`, which does carry them — and is reachable only
-        // from inside this module until assignment is written.
-        const LEDGER: &str = include_str!("mod.rs");
-        let decl_start = LEDGER
-            .find("pub struct NewReplayTrial<'a> {")
-            .expect("NewReplayTrial is declared here");
+    /// Structural, and the part the identifier scan could not make:
+    /// the only shape a caller outside this module can hand to
+    /// `insert_replay_trial` has no field for any of the three, so a
+    /// replay cannot describe a draw even by accident. `insert_trial`
+    /// takes `NewTrial`, which does carry them — and is reachable only
+    /// from inside this module until assignment is written.
+    fn check_replay_trial_declaration(
+        ledger: &[(String, String)],
+    ) -> std::result::Result<(), String> {
+        let holders: Vec<&(String, String)> = ledger
+            .iter()
+            .filter(|(_, text)| text.contains(REPLAY_TRIAL_DECL))
+            .collect();
+        let [(path, text)] = holders.as_slice() else {
+            return Err(format!(
+                "NewReplayTrial must be declared in exactly one file under src/ledger/, found {}",
+                holders.len()
+            ));
+        };
+        let decl_start = text
+            .find(REPLAY_TRIAL_DECL)
+            .expect("it holds the declaration");
         let decl_end = decl_start
-            + LEDGER[decl_start..]
+            + text[decl_start..]
                 .find("\n}")
-                .expect("its declaration ends");
-        let decl = &LEDGER[decl_start..decl_end];
+                .ok_or_else(|| format!("its declaration in {path} does not end"))?;
+        let decl = &text[decl_start..decl_end];
         for absent in ["arm_index", "assignment_probability", "seed"] {
-            assert!(
-                !decl.contains(absent),
-                "NewReplayTrial must have no `{absent}` field, so no replay caller can name \
-                 one. Declaration: {decl}"
-            );
+            if decl.contains(absent) {
+                return Err(format!(
+                    "NewReplayTrial must have no `{absent}` field, so no replay caller can name \
+                     one. Declaration in {path}: {decl}"
+                ));
+            }
         }
+        Ok(())
+    }
+
+    /// Writes `files` (relative path, text) under a fresh `src/` in a
+    /// temp directory and returns it.
+    fn fixture_src(label: &str, files: &[(&str, String)]) -> crate::test_support::TempDir {
+        let dir = temp_dir(label);
+        for (rel, text) in files {
+            let p = dir.join("src").join(rel);
+            std::fs::create_dir_all(p.parent().expect("a parent")).expect("mkdir");
+            std::fs::write(&p, text).expect("write");
+        }
+        dir
+    }
+
+    fn run_fixture_checks(dir: &std::path::Path) -> std::result::Result<(), String> {
+        let src = dir.join("src");
+        let cli = read_rs_tree(&src, &cli_roots(&src), "the binary CLI tree")?;
+        let contract = read_rs_tree(&src, &[src.join("contract")], "the contract tree")?;
+        let ledger = read_rs_tree(&src, &[src.join("ledger")], "the ledger tree")?;
+        check_unreachable_identifiers(&cli, &contract)?;
+        check_replay_trial_declaration(&ledger)
+    }
+
+    fn clean_layout() -> Vec<(&'static str, String)> {
+        vec![
+            ("main.rs", "mod cli;\nfn main() {}\n".to_string()),
+            ("cli/run.rs", "pub fn run() {}\n".to_string()),
+            ("contract/mod.rs", "pub struct C;\n".to_string()),
+            ("ledger/mod.rs", "mod trials;\n".to_string()),
+            (
+                "ledger/trials.rs",
+                format!("{REPLAY_TRIAL_DECL}\n    pub id: u32,\n}}\n"),
+            ),
+        ]
+    }
+
+    fn with_file(
+        mut layout: Vec<(&'static str, String)>,
+        rel: &'static str,
+        text: String,
+    ) -> Vec<(&'static str, String)> {
+        layout.retain(|(r, _)| *r != rel);
+        layout.push((rel, text));
+        layout
+    }
+
+    #[test]
+    fn a_clean_extracted_layout_passes_the_arm_boundary_checks() {
+        let dir = fixture_src("arm-clean", &clean_layout());
+        assert_eq!(run_fixture_checks(&dir), Ok(()));
+    }
+
+    #[test]
+    fn a_forbidden_identifier_in_an_extracted_cli_child_is_reported() {
+        let layout = with_file(
+            clean_layout(),
+            "cli/run.rs",
+            "let arm_index = 1;\n".to_string(),
+        );
+        let dir = fixture_src("arm-cli-child", &layout);
+        let err = run_fixture_checks(&dir).expect_err("reported");
+        assert!(err.contains("arm_index") && err.contains("run.rs"), "{err}");
+    }
+
+    #[test]
+    fn a_seed_field_in_a_ledger_child_new_replay_trial_is_reported() {
+        let layout = with_file(
+            clean_layout(),
+            "ledger/trials.rs",
+            format!("{REPLAY_TRIAL_DECL}\n    pub seed: u64,\n}}\n"),
+        );
+        let dir = fixture_src("arm-seed", &layout);
+        let err = run_fixture_checks(&dir).expect_err("reported");
+        assert!(err.contains("`seed`") && err.contains("trials.rs"), "{err}");
+    }
+
+    #[test]
+    fn a_ledger_tree_without_the_declaration_is_an_error() {
+        let layout = with_file(
+            clean_layout(),
+            "ledger/trials.rs",
+            "pub struct Other;\n".to_string(),
+        );
+        let dir = fixture_src("arm-missing-decl", &layout);
+        let err = run_fixture_checks(&dir).expect_err("an error");
+        assert!(err.contains("NewReplayTrial"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_contract_tree_is_an_error() {
+        let layout: Vec<_> = clean_layout()
+            .into_iter()
+            .filter(|(r, _)| !r.starts_with("contract/"))
+            .collect();
+        let dir = fixture_src("arm-no-contract", &layout);
+        let err = run_fixture_checks(&dir).expect_err("an error");
+        assert!(err.contains("contract tree"), "{err}");
     }
 
     /// The two combinations a cost and its completeness must never form.
