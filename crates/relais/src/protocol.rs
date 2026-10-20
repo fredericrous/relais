@@ -441,9 +441,10 @@ struct LogState {
     next_seq: u64,
     next_stderr_seq: u64,
     file: Option<File>,
-    /// How far into `events.jsonl` seq-less lines have been taken up:
-    /// rebuilt from the end of the last seq'd line when the log is opened,
-    /// so a resumed driver does not re-emit what an earlier one did.
+    /// How far into `events.jsonl` seq-less lines have been taken up. Kept
+    /// in `events.relay-offset` beside the log, so a resumed driver neither
+    /// re-emits what an earlier one relayed nor skips a line it had not
+    /// reached yet; see [`resume_point`].
     tail_offset: u64,
 }
 
@@ -468,7 +469,15 @@ impl EventLog {
             return;
         }
         let (costs, taken) = pending_usage(&rest);
+        if taken == 0 {
+            return;
+        }
         state.tail_offset += taken;
+        // Written before the lines go out: a crash between the two loses a
+        // relay (the ledger still has the cost, and status reconciles it)
+        // rather than repeating one. A write that fails leaves the old
+        // offset, and a resume then relays these lines again.
+        let _ = std::fs::write(relay_offset_path(&self.path), state.tail_offset.to_string());
         for cost in costs {
             self.emit_locked(&mut state, &cost);
         }
@@ -543,23 +552,42 @@ fn pending_usage(bytes: &[u8]) -> (Vec<Event>, u64) {
     (costs, whole as u64)
 }
 
-/// Where the last seq'd line of `path` ends, or 0 when there is none.
-fn seqd_end(path: &Path) -> u64 {
+/// Where the relay offset of the log at `log` is kept.
+fn relay_offset_path(log: &Path) -> PathBuf {
+    log.with_extension("relay-offset")
+}
+
+/// Where a driver opening the log at `path` resumes: the next `seq` (one
+/// past the highest written, so numbering never restarts and a reader that
+/// drops lines at or below a revision it has seen keeps the new ones) and
+/// the relay offset. The offset is the one the last relay recorded; a log
+/// with no record (written before relaying, or never relayed) starts after
+/// its last seq'd line, which is what the driver had seen.
+fn resume_point(path: &Path) -> (u64, u64) {
     let Ok(bytes) = std::fs::read(path) else {
-        return 0;
+        return (0, 0);
     };
-    let mut end = 0;
+    let mut next_seq = 0;
+    let mut seqd_end = 0;
     let mut at = 0;
     for line in bytes.split_inclusive(|b| *b == b'\n') {
         at += line.len();
-        if line.ends_with(b"\n")
-            && serde_json::from_slice::<serde_json::Value>(line)
-                .is_ok_and(|entry| entry["seq"].is_u64())
+        if !line.ends_with(b"\n") {
+            continue;
+        }
+        if let Some(seq) = serde_json::from_slice::<serde_json::Value>(line)
+            .ok()
+            .and_then(|entry| entry["seq"].as_u64())
         {
-            end = at;
+            next_seq = next_seq.max(seq + 1);
+            seqd_end = at;
         }
     }
-    end as u64
+    let recorded = std::fs::read_to_string(relay_offset_path(path))
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .filter(|offset| *offset <= bytes.len() as u64);
+    (next_seq, recorded.unwrap_or(seqd_end as u64))
 }
 
 /// Append one event to `artifacts/events.jsonl` from a process that is not
@@ -606,15 +634,17 @@ impl Events {
 
     /// The events of `run`, sent to `wire`.
     pub fn for_run_on(run: &str, artifacts: &Path, wire: Wire) -> Self {
+        let path = artifacts.join("events.jsonl");
+        let (next_seq, tail_offset) = resume_point(&path);
         Self(Some(Arc::new(EventLog {
             run: run.to_string(),
-            path: artifacts.join("events.jsonl"),
+            path,
             wire,
             state: Mutex::new(LogState {
-                next_seq: 0,
+                next_seq,
                 next_stderr_seq: 0,
                 file: None,
-                tail_offset: seqd_end(&artifacts.join("events.jsonl")),
+                tail_offset,
             }),
         })))
     }
@@ -1055,6 +1085,42 @@ mod tests {
         resumed.relay_usage();
         let booked: Vec<i64> = cost_seqs(&path).iter().map(|c| c.1).collect();
         assert_eq!(booked, [7, 9]);
+        let seqs: Vec<u64> = lines(&path)
+            .iter()
+            .filter_map(|line| line["seq"].as_u64())
+            .collect();
+        assert!(
+            seqs.windows(2).all(|pair| pair[0] < pair[1]),
+            "seq keeps rising across the resume: {seqs:?}"
+        );
+    }
+
+    /// A usage line appended but not yet relayed when another seq'd event
+    /// was written is still relayed, once, by the driver that resumes.
+    #[test]
+    fn an_unrelayed_usage_line_before_a_later_event_survives_a_resume() {
+        let dir = crate::test_support::short_temp_dir("pr-usage-gap");
+        let artifacts = dir.join("run-u");
+        let path = artifacts.join("events.jsonl");
+        let events = Events::for_run_on("run-u", &artifacts, Wire::to(SharedSink::default()));
+        events.emit(Event::Decision {
+            what: "x".into(),
+            reason: "y".into(),
+        });
+        append_usage(&path, 5);
+        events.relay_usage();
+        append_usage(&path, 11);
+        // The driver writes another event before its next relay, then dies.
+        events.emit(Event::Decision {
+            what: "x".into(),
+            reason: "z".into(),
+        });
+        drop(events);
+        let resumed = Events::for_run_on("run-u", &artifacts, Wire::to(SharedSink::default()));
+        resumed.relay_usage();
+        resumed.relay_usage();
+        let booked: Vec<i64> = cost_seqs(&path).iter().map(|c| c.1).collect();
+        assert_eq!(booked, [5, 11], "each usage line relayed exactly once");
     }
 
     #[derive(Clone, Default)]

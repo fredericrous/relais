@@ -1280,6 +1280,10 @@ fn wait_following(
                 &chrono::Utc::now,
                 &mut || follow::Sample {
                     log_bytes: std::fs::metadata(log_path).map_or(0, |meta| meta.len()),
+                    // A check wait has no worker, so no worker events.
+                    // holds-until: the heartbeat also covers worker waits
+                    // (plan C4 names worker turns as a signal); it covers
+                    // check waits only today.
                     worker_events: 0,
                     cpu: crate::procs::group_cpu_time(group),
                 },

@@ -14674,6 +14674,9 @@ mod tests {
     mod budgets;
     mod exhaustion;
     mod native;
+    // Shells out to `sh` and a fake `claude` script made executable with
+    // unix permissions: unix only, like the script it tests.
+    #[cfg(unix)]
     mod plugin_test_script;
     mod verify_kind;
 }
