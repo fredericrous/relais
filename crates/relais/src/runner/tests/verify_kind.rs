@@ -6,6 +6,8 @@
 
 use std::sync::atomic::AtomicUsize;
 
+use crate::verify::Receipt;
+
 use super::*;
 
 /// The number of worker launches a backend saw.
