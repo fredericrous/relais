@@ -2824,7 +2824,8 @@ pub struct ReviewPartRecord {
     pub of: u32,
     /// SHA-256 of the part's patch artifact (`review-parts/<index>.patch`).
     pub patch_sha256: String,
-    /// SHA-256 of the reviewer's answer (`review-parts/<index>.txt`); absent
+    /// SHA-256 of the reviewer's answer (`review-parts/<index>.<dispatch id>.txt`, the
+    /// attempt the manifest names); absent
     /// when the part has none.
     pub result_sha256: Option<String>,
     /// `passed`, `findings`, `unavailable`, `dispatched` or `not_run`.

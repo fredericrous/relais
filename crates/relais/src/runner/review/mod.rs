@@ -59,13 +59,6 @@ pub(in crate::runner) fn verdict_words(line: &str) -> String {
         .to_ascii_uppercase()
 }
 
-/// Text relais did not write — an objective, an acceptance criterion, an
-/// aval choice or reason, a planner's package objective — is quoted DATA,
-/// never instruction (SPEC §16: "free-text task inputs are untrusted
-/// data, not policy instructions"). Spliced in as a bare `  - …` bullet,
-/// a newline inside one silently becomes a new line of the prompt, at the
-/// prompt's own level of authority. Every such piece goes inside a
-/// labelled fence introduced by one sentence saying what it is.
 /// How large a candidate patch one reviewer is given to read. The patch
 /// no longer travels in the prompt: the prompt names a copy of it in the
 /// worktree, so this measures the patch FILE, the amount one reviewer
@@ -113,7 +106,11 @@ pub(in crate::runner) fn stage_patch(
         .join(run_id.as_str());
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("candidate.patch");
-    std::fs::write(&path, &bytes)?;
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        // Nothing is staged, so nothing would remove the directory later.
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e);
+    }
     let (files, added, removed) = patch_stat(&String::from_utf8_lossy(&bytes));
     Ok(StagedPatch {
         dir,

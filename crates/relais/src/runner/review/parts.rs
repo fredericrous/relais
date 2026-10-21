@@ -78,7 +78,7 @@ impl<'a> RunEngine<'a> {
                 PartStatus::Findings => return findings_on_record(row, label),
                 PartStatus::NotRun | PartStatus::Unavailable | PartStatus::Dispatched => {}
             }
-            let result_path = dir.join(format!("{}.txt", row.index));
+            let result_stem = dir.join(format!("{}.txt", row.index));
             let part_request = request.for_patch(Path::new(&row.patch_path).to_path_buf());
             // The dispatch id is on the manifest as soon as the dispatch
             // exists, so a part cut off mid-review still names it.
@@ -94,7 +94,7 @@ impl<'a> RunEngine<'a> {
                     label,
                     on_dispatch: &on_dispatch,
                 }),
-                &result_path,
+                &result_stem,
             );
             let (status, detail) = match &reviewed.outcome {
                 ReviewOutcome::NoFindings => (PartStatus::Passed, None),
@@ -103,7 +103,6 @@ impl<'a> RunEngine<'a> {
                     (PartStatus::Unavailable, Some(detail.clone()))
                 }
             };
-            let kept = reviewed.result_sha256.is_some();
             let settled = ledger.finish_review_part(
                 &run_id,
                 sha,
@@ -111,7 +110,10 @@ impl<'a> RunEngine<'a> {
                 &PartResult {
                     status,
                     dispatch_id: reviewed.dispatch_id.clone(),
-                    result_path: kept.then(|| result_path.to_string_lossy().into_owned()),
+                    result_path: reviewed
+                        .result_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned()),
                     result_sha256: reviewed.result_sha256.clone(),
                     detail,
                 },

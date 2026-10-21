@@ -551,11 +551,86 @@ fn seed_interrupted_review(fixture: &Fixture, run: &RunId, new_run: &RunId) {
     ledger
         .mark_review_part_dispatched(new_run, &sha, 2, "old-dispatch-2")
         .expect("mark 2");
+    // The reviewer answered and the run stopped before it settled the part:
+    // the answer file and its evidence row exist, the part is `dispatched`.
+    let old_answer = dir.join("2.old-dispatch-2.txt");
+    crate::runner::review::write_immutable(&old_answer, b"an earlier attempt's answer")
+        .expect("old answer");
+    ledger
+        .record_evidence(
+            new_run,
+            None,
+            EvidenceKind::ReviewResult,
+            &old_answer,
+            Some(&crate::ids::sha256_hex(b"an earlier attempt's answer")),
+        )
+        .expect("old evidence row");
     let raw = rusqlite::Connection::open(fixture.dir.join("ledger.sqlite")).expect("open");
     raw.execute_batch("PRAGMA foreign_keys = OFF;")
         .expect("pragma");
     raw.execute("DELETE FROM runs WHERE id = ?1", [new_run.as_str()])
         .expect("the run row goes");
+}
+
+/// A retried part keeps the answer an earlier attempt left: the new answer
+/// goes to a path of its own, so every evidence row still names the bytes on
+/// disk, and the manifest names the attempt that counts.
+#[test]
+fn a_retried_part_keeps_the_answer_an_earlier_attempt_left() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let run = stopped_run(&fixture, 3, 2300, false);
+    let (contract, new_run) = answer_review_parts(&fixture, &run, State::NeedsDecision);
+    seed_interrupted_review(&fixture, &run, &new_run);
+    let (backend, _seen) = parts_backend(3, 2300, None, None);
+
+    let outcome = fixture.execute_as(Some(new_run.clone()), &contract, &repo, &backend);
+    assert!(
+        matches!(outcome.terminal, Terminal::Accepted(_)),
+        "the retry is not blocked by the earlier answer: {outcome:?}"
+    );
+    let results: Vec<_> = fixture
+        .ledger
+        .evidence(&new_run)
+        .expect("evidence")
+        .into_iter()
+        .filter(|row| row.kind == EvidenceKind::ReviewResult)
+        .collect();
+    assert!(
+        results
+            .iter()
+            .any(|row| row.path.ends_with("2.old-dispatch-2.txt")),
+        "the earlier attempt's row stays: {results:?}"
+    );
+    for row in &results {
+        let on_disk = crate::ids::sha256_hex(&std::fs::read(&row.path).expect("answer on disk"));
+        assert_eq!(
+            row.sha256.as_deref(),
+            Some(on_disk.as_str()),
+            "{}",
+            row.path
+        );
+    }
+    let sha = fixture
+        .ledger
+        .verification_snapshot(&run)
+        .expect("snapshot")
+        .expect("a snapshot")
+        .candidate_sha;
+    let part_two = fixture
+        .ledger
+        .review_parts_of(&new_run, &sha)
+        .expect("manifest")
+        .into_iter()
+        .find(|row| row.index == 2)
+        .expect("part 2");
+    let counted = part_two.result_path.expect("a result path");
+    assert!(!counted.ends_with("old-dispatch-2.txt"), "{counted}");
+    assert!(
+        results.iter().any(|row| row.path == counted),
+        "the manifest's path has an evidence row: {counted}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
 #[test]

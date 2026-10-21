@@ -300,6 +300,43 @@ impl Fixture {
         .expect("the fixture's id source mints identifiers")
     }
 
+    /// `execute` with a resolver the test supplies, for guidance.
+    fn execute_resolving(
+        &self,
+        resolver: &dyn crate::context::DecisionResolver,
+        contract: &TaskContract,
+        repo: &RepoPolicy,
+        backend: &dyn Backend,
+    ) -> RunOutcome {
+        let machine = self.machine_for(repo);
+        execute(&RunConfig {
+            workspace: crate::workspace::reuse::Workspace::Isolated,
+            repo_dir: &self.repo,
+            contract,
+            repo_policy: repo,
+            machine: &machine,
+            ledger: &self.ledger,
+            ids: &self.ids,
+            backend,
+            git: &crate::workspace::SystemGit,
+            hooks: &crate::verify::FixedInventory(None),
+            attest: &crate::verify::FixedAttest::default(),
+            artifacts_dir: self.artifacts.clone(),
+            aval_resolver: resolver,
+            predictor: None,
+            gate: None,
+            session_id: "test-session".into(),
+            heartbeat_every: Duration::from_millis(50),
+            task_override: None,
+            purpose: None,
+            run_id: None,
+            wire: Wire::process(),
+            design: DesignSource::Contract,
+            declarations: &crate::trust::NoHistory,
+        })
+        .expect("the fixture's id source mints identifiers")
+    }
+
     fn execute_with_machine(
         &self,
         contract: &TaskContract,
@@ -7890,6 +7927,26 @@ fn a_blockage_claim_is_blocked() {
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
+/// A resolver whose constraint rules are the ones given.
+struct StatedRules(Vec<crate::context::RuleRef>);
+
+impl crate::context::DecisionResolver for StatedRules {
+    fn resolve(&self, _key: &str, _scope: Option<&str>) -> AvalVerdict {
+        AvalVerdict::Active {
+            adr: "ADR-0001".into(),
+            choice: None,
+            reason: None,
+        }
+    }
+
+    fn constraint_rules(&self) -> Result<crate::context::Rules, crate::context::GuidanceGap> {
+        Ok(crate::context::Rules {
+            rules: self.0.clone(),
+            omitted: Default::default(),
+        })
+    }
+}
+
 /// The patch is not in the reviewer's prompt: the prompt names a copy in
 /// the worktree's ignored relais area, with its size, the changed files
 /// and the stat. The copy exists while the review runs and is gone after.
@@ -7947,10 +8004,32 @@ fn the_reviewer_prompt_names_the_patch_it_does_not_carry_it() {
         kept.lock().unwrap().push(spec.prompt.clone());
         (backend.behavior)(spec)
     });
-    let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &spy);
+    let rules = StatedRules(
+        (0..40)
+            .map(|n| crate::context::RuleRef {
+                id: format!("r.{n:04}"),
+                level: "constraint".into(),
+                statement: format!("the statement of r.{n:04}"),
+            })
+            .collect(),
+    );
+    let outcome =
+        fixture.execute_resolving(&rules, &fixture.contract(Review::Required), &repo, &spy);
     assert!(
         matches!(outcome.terminal, Terminal::Accepted(_)),
         "{outcome:?}"
+    );
+    let events = std::fs::read_to_string(
+        fixture
+            .artifacts
+            .join(outcome.run_id.as_str())
+            .join("events.jsonl"),
+    )
+    .expect("events.jsonl");
+    assert!(!events.contains("reviewer constraints partial"), "{events}");
+    assert!(
+        !events.contains("constraint statements fit the reviewer prompt"),
+        "{events}"
     );
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
@@ -7976,6 +8055,10 @@ fn the_reviewer_prompt_names_the_patch_it_does_not_carry_it() {
     );
     assert!(!review.contains("begin candidate patch"), "{review}");
     assert!(review.contains("Read tool"), "{review}");
+    for n in 0..40 {
+        let statement = format!("the statement of r.{n:04}");
+        assert!(review.contains(&statement), "{statement} missing: {review}");
+    }
     assert!(review.len() < 20_000, "{} bytes", review.len());
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
@@ -8057,6 +8140,104 @@ fn a_reviewer_that_could_not_be_launched_says_why() {
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
+/// A reviewer launch that reports no reason ends with the generic
+/// sentence, not an invented cause.
+#[test]
+fn a_reviewer_that_ended_with_nothing_to_report_gets_the_generic_sentence() {
+    use crate::backend::{BackendError, Harness};
+    struct Silent(MockBackend);
+    impl Harness for Silent {
+        fn name(&self) -> &'static str {
+            self.0.name()
+        }
+        fn probe(&self) -> Option<crate::backend::Capabilities> {
+            self.0.probe()
+        }
+    }
+    impl Backend for Silent {
+        fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
+            let mut result = self.0.launch(spec)?;
+            if spec.agent == AgentKind::Reviewer {
+                result.ended = Ended::Exited(1);
+                result.result_text = None;
+                result.failure_detail = None;
+            }
+            Ok(result)
+        }
+    }
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let inner = MockBackend::new(move |spec| {
+        if spec.prompt.contains("semantic reviewer") {
+            return MockOutcome::default();
+        }
+        std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &Silent(inner));
+    let Terminal::NeedsReview { detail } = &outcome.terminal else {
+        panic!("an unanswering reviewer is needs_review, got {outcome:?}");
+    };
+    assert!(
+        detail.contains("the reviewer ended without a terminal result"),
+        "{detail}"
+    );
+    assert!(!detail.contains("could not be launched"), "{detail}");
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+/// A patch copy that cannot be written leaves nothing to review: the run
+/// is needs_review with the error, and no reviewer was dispatched.
+#[test]
+fn a_patch_copy_that_cannot_be_written_dispatches_no_reviewer() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let reviewers = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&reviewers);
+    let repo_dir = fixture.repo.clone();
+    let backend = MockBackend::new(move |spec| {
+        if spec.prompt.contains("semantic reviewer") {
+            counted.fetch_add(1, Ordering::SeqCst);
+            return MockOutcome {
+                result_text: Some("FINDINGS: none".into()),
+                exit_code: Some(0),
+                ..Default::default()
+            };
+        }
+        // `.relais/review` is a file, so the copy's directory cannot exist;
+        // the area is ignored, as it is in a real worktree.
+        let exclude = repo_dir.join(".git/info/exclude");
+        std::fs::create_dir_all(exclude.parent().expect("info")).expect("info");
+        std::fs::write(&exclude, ".relais/\n").expect("exclude");
+        let area = spec.work_dir.join(".relais");
+        std::fs::create_dir_all(&area).expect("area");
+        std::fs::write(area.join("review"), "in the way").expect("blocker");
+        std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+    let Terminal::NeedsReview { detail } = &outcome.terminal else {
+        panic!("an unstageable patch is needs_review, got {outcome:?}");
+    };
+    assert!(detail.contains("could not be staged"), "{detail}");
+    assert_eq!(
+        reviewers.load(Ordering::SeqCst),
+        0,
+        "no reviewer dispatched"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
 /// An integration repair's spend is integration spend. It runs as a
 /// child package, so considered alone its attempts are `initial` —
 /// which would hide the money inside the packages' own first
@@ -8103,3 +8284,20 @@ mod review_stop;
 #[cfg(unix)]
 mod plugin_test_script;
 mod verify_kind;
+
+/// A copy that cannot be written leaves no `.relais/review/<run>` behind:
+/// nothing would remove it, since no review ends for it.
+#[test]
+fn a_patch_copy_that_cannot_be_written_leaves_no_directory() {
+    let dir = crate::test_support::temp_dir("stage-patch-write");
+    let patch = dir.join("candidate.patch");
+    std::fs::write(&patch, "diff --git a/x b/x\n").expect("write the patch");
+    let worktree = dir.join("worktree");
+    let run = RunId::from_stored("run-stage");
+    let run_dir = worktree.join(".relais").join("review").join(run.as_str());
+    // `candidate.patch` as a directory: the run's directory is created,
+    // then the write into it fails.
+    std::fs::create_dir_all(run_dir.join("candidate.patch")).expect("seed the obstacle");
+    assert!(super::review::stage_patch(&worktree, &run, &patch).is_err());
+    assert!(!run_dir.exists(), "the run's review directory is removed");
+}

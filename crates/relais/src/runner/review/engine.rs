@@ -7,7 +7,7 @@ use crate::backend::{LaunchResult, LaunchSpec};
 use crate::context::GuidanceGap;
 use crate::ledger::{EvidenceKind, Ledger, UsageEvent};
 use crate::money::MicroUsd;
-use crate::protocol::AgentKind;
+use crate::protocol::{AgentKind, Event};
 use crate::route::RungIndex;
 use crate::verify;
 use crate::workspace;
@@ -228,10 +228,18 @@ impl<'a> RunEngine<'a> {
         }
         let review_dir = self.review_dir();
         // The reviewer reads the patch from a copy in its worktree's
-        // ignored relais area; the copy goes when the review ends.
-        let staged = stage_patch(&review_dir, &self.run_id, &request.patch_path);
-        let (prompt, reviewer_gap) =
-            self.review_prompt(request, &review_dir, staged.as_ref(), part);
+        // ignored relais area; the copy goes when the review ends. A copy
+        // that cannot be written leaves nothing to review: no reviewer is
+        // dispatched for it.
+        let staged = match stage_patch(&review_dir, &self.run_id, &request.patch_path) {
+            Ok(staged) => staged,
+            Err(e) => {
+                return Reviewed::unavailable(format!(
+                    "the candidate patch could not be staged for the reviewer: {e}"
+                ))
+            }
+        };
+        let (prompt, reviewer_gap) = self.review_prompt(request, &review_dir, &staged, part);
         if let Some(gap) = &reviewer_gap {
             self.emit_guidance_gap(gap);
         }
@@ -245,13 +253,16 @@ impl<'a> RunEngine<'a> {
             on_dispatch,
         };
         let dispatched = self.dispatch_reviewer(request, seat, prompt, spend);
-        if let Ok(staged) = &staged {
-            if let Err(e) = std::fs::remove_dir_all(&staged.dir) {
-                return Reviewed::unavailable(format!(
+        // The copy's removal is reported, never allowed to replace the
+        // reviewer's answer or the launch failure that came first.
+        if let Err(e) = std::fs::remove_dir_all(&staged.dir) {
+            self.events.emit(Event::EnvironmentWarning {
+                what: "review_patch_copy_not_removed".to_string(),
+                detail: format!(
                     "the patch copy {} could not be removed: {e}",
                     staged.dir.display()
-                ));
-            }
+                ),
+            });
         }
         let (result, dispatch_id) = match dispatched {
             Ok(dispatched) => dispatched,
@@ -261,10 +272,17 @@ impl<'a> RunEngine<'a> {
         // The artifact and its evidence row are one operation: a review
         // the run cannot record is a review it cannot show, and a run
         // that cannot show its review does not accept (X5).
-        let recorded = if part.is_some() {
-            self.record_immutable_artifact(EvidenceKind::ReviewResult, artifact, &text)
+        // A part's answer lives at a path of its own attempt, so an
+        // earlier attempt's answer and its evidence row stay as they were.
+        let (recorded, kept_at) = if part.is_some() {
+            let own = artifact.with_extension(format!("{dispatch_id}.txt"));
+            let recorded = self.record_immutable_artifact(EvidenceKind::ReviewResult, &own, &text);
+            (recorded, Some(own))
         } else {
-            self.record_artifact(None, EvidenceKind::ReviewResult, artifact, &text)
+            (
+                self.record_artifact(None, EvidenceKind::ReviewResult, artifact, &text),
+                None,
+            )
         };
         if let Err(e) = recorded {
             return Reviewed {
@@ -278,6 +296,7 @@ impl<'a> RunEngine<'a> {
             outcome: review_verdict(&text),
             dispatch_id: Some(dispatch_id),
             result_sha256: Some(crate::ids::sha256_hex(text.as_bytes())),
+            result_path: kept_at,
         }
     }
 
@@ -288,7 +307,7 @@ impl<'a> RunEngine<'a> {
         &self,
         request: &ReviewRequest<'_>,
         review_dir: &Path,
-        staged: Result<&StagedPatch, &std::io::Error>,
+        staged: &StagedPatch,
         part: Option<PartLabel>,
     ) -> (String, Option<GuidanceGap>) {
         let mut prompt = String::from(
@@ -350,20 +369,7 @@ impl<'a> RunEngine<'a> {
                  and report findings about them.\n"
             ));
         }
-        match staged {
-            Ok(staged) => prompt.push_str(&patch_section(staged)),
-            Err(e) => {
-                // Say so in the prompt rather than pretending there is no
-                // diff: a reviewer that cannot see the change must report
-                // that, and the runner reads the missing verdict as
-                // `Unavailable` rather than as approval.
-                prompt.push_str(&format!(
-                    "\nthe candidate patch could not be staged for you ({e}); review what the \
-                     objective and the criteria demand, and report that the diff was \
-                     unavailable to you\n"
-                ));
-            }
-        }
+        prompt.push_str(&patch_section(staged));
         prompt.push_str(&format!("source to inspect: {}\n", review_dir.display()));
         prompt.push_str(
             "\nFinish your answer with exactly one of these, and nothing after it: the line \
@@ -574,6 +580,8 @@ pub(in crate::runner) struct Reviewed {
     pub(in crate::runner) outcome: ReviewOutcome,
     pub(in crate::runner) dispatch_id: Option<String>,
     pub(in crate::runner) result_sha256: Option<String>,
+    /// Where a part's answer is kept: a path naming the attempt.
+    pub(in crate::runner) result_path: Option<PathBuf>,
 }
 
 impl Reviewed {
@@ -582,6 +590,7 @@ impl Reviewed {
             outcome,
             dispatch_id: None,
             result_sha256: None,
+            result_path: None,
         }
     }
 
