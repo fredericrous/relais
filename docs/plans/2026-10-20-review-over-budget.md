@@ -105,6 +105,7 @@ Observed on a913ea09 before the first push; fda52a99 fixed the Windows-only fail
 - **Patch copy.** `.relais/review` unwritable → `review_unavailable`, no reviewer dispatched, no directory left, and a cleanup that fails too is added to the returned error → as expected (two tests).
 - **Observability.** A run over budget and recorded reviewer failures → `review_over_budget` counted, "reviews not had" by cause → as expected (`report_counts_runs_over_budget`, `the_report_names_the_reviews_not_had_by_cause`, `every_recorded_review_failure_maps_to_its_cause`).
 - **Windows.** PR #274's first CI run → green on three platforms → windows-latest failed 10 tests with `Access is denied`: `write_immutable` fsynced the parent directory, which Windows cannot open as a file (`fsutil.rs` already gates the same sync), and one test matched a `/` in an OS path. Fixed in fda52a99 (Unix-only directory sync, component-wise path match).
+- **Ubuntu.** The next run and its re-run → green → ubuntu-latest failed both times on the untouched `adapter::claude` probe-retry test with `Text file busy`: a fake script exec'd while another test's fork held its write handle, a window this branch's spawning tests widened. Fixed in b5eba234 and fccf27c2: `test_support::prime_script` retries only that error for up to 10 s, and `fake_claude`, `fake_amont` and the plugin-test fake prime through it.
 - **Gates.** The pre-commit gate (fmt, clippy `-D warnings`, cargo test, plugin test, check-child-cycles) passed on each commit.
 - **Live checks** (a ~100 KB patch reviewed; an over-budget run answered `review-parts`; the 14 runs) belong to v0.28.0's install and are recorded in plan `2026-10-19-finish-admission-then-split.md` step 11.
 
@@ -115,6 +116,7 @@ Observed on a913ea09 before the first push; fda52a99 fixed the Windows-only fail
 - 2026-10-21, carried item "version mismatch": not applicable. The protocol's shape did not change (the coordinator keeps the prompt), only the size limit for native registration. An older coordinator still refuses a line over 64 KiB, but the reviewer prompt no longer carries the patch and is asserted under 20,000 bytes, so it fits either coordinator.
 - 2026-10-21, a part's answer is written per attempt (`review-parts/<index>.<dispatch id>.txt`), not to `<index>.txt`: evidence rows are append-only, so a retry that rewrote one path would leave an earlier row's hash false.
 - 2026-10-21, the review-fix runs' own reviews were unavailable (the installed 0.27 has the cap this branch removes); an independent read-only reviewer read the candidate patch, and the orchestrator answered on its verdict.
+- 2026-10-21, `tests/learning_cycle.rs` writes a fake `claude` that a separate relais process execs, unprimed; it keeps the `Text file busy` window open in principle but has not failed. Left as is; prime it through `tests/fake_bin` if it ever does.
 - 2026-10-21, deliberate: no test for a cleanup that fails (the `review_patch_copy_not_removed` warning, and `stage_patch`'s combined error). A directory that refuses removal needs a different permission trick on each of the three CI platforms, and none under root. Revisit if either path is changed or a cleanup failure is seen in `events.jsonl`.
 
 ## Implementation review
@@ -123,5 +125,6 @@ Observed on a913ea09 before the first push; fda52a99 fixed the Windows-only fail
 - Delta: approve-with-changes (85k, 29 s); every round-1 finding resolved; low 1 (a swallowed cleanup error) fixed in a913ea09; low 2 deliberate: no test for a cleanup that fails (see Decision log).
 - Round 1 on the final tree 2d5a55bf: approve-with-changes, 2 lows in the plan (23k, 50 s); both fixed in the closing commit.
 - Round 1 on tree 4d2f36d5 (the Windows fix fda52a99): approve (18k, 16 s); no other directory fsync or separator-bound path assertion found.
+- Round 1 on tree 7f1556eb (b5eba234): approve-with-changes (26k, 59 s), 2 more helpers with the same race and the prime's output; fixed in fccf27c2. Delta on tree fcd48370: approve (29k, 12 s).
 
 <!-- panel: repos=relais reviewers=backend,codex body-sha=a19380c861ef -->
