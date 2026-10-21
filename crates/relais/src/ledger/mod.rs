@@ -44,8 +44,8 @@ pub use learning::{
 };
 pub use outcomes::{RevertCandidate, RevertedReport, StoredOutcome};
 pub use runs::{
-    ChildOf, ChildRun, ModelObservation, ModelPair, RunWorkspace, TaskOrigin, TaskRow,
-    WorkerAttempt, EFFORT_NOT_REQUESTED, EFFORT_NO_CONTROL, EFFORT_UNKNOWN,
+    ChildOf, ChildRun, ModelObservation, ModelPair, ReviewDispatch, RunWorkspace, TaskOrigin,
+    TaskRow, WorkerAttempt, EFFORT_NOT_REQUESTED, EFFORT_NO_CONTROL, EFFORT_UNKNOWN,
 };
 pub use schema::LEDGER_SCHEMA_VERSION;
 use schema::{applied_count, migrate};

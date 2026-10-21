@@ -11,6 +11,7 @@
 //! here converts token savings into subscription fee savings.
 
 mod decision_data;
+mod harness;
 mod repairs;
 mod reviewers;
 
@@ -20,6 +21,7 @@ pub use decision_data::{
     count_by_source, decision_labels, project_floor, revert_agreement, DecisionLabels,
     FloorProjection, Fraction, SourceCount,
 };
+pub use harness::{harness_report, HarnessReport, HarnessStep, StepModel};
 pub use repairs::{EffortRepairs, RepairCost};
 pub use reviewers::{reviewer_report, ReviewerClass, ReviewerReport};
 
@@ -70,8 +72,8 @@ fn accepted_by_person(
 /// status` prints, so its JSON agrees with the sentence a person sees),
 /// so a downstream parser can tell an old shape from a new one instead of
 /// guessing from key presence. 9: `never_shipped_tasks`. 10:
-/// `repair_outcomes`. 11: `advisor_data`. 12: `advisor_data` becomes `decision_labels`.
-pub const REPORT_SCHEMA_VERSION: u32 = 12;
+/// `repair_outcomes`. 11: `advisor_data`. 12: `advisor_data` becomes `decision_labels`. 13: `harness`.
+pub const REPORT_SCHEMA_VERSION: u32 = 13;
 
 /// A dimension `relais report --by` groups the window's tasks over (SPEC
 /// §11: "compare like task classes and policy versions"). Total over the
@@ -780,6 +782,9 @@ pub struct Report {
     /// — apart from that — how its run eventually ended. Empty when the
     /// window has no repair; present in every report, `--by` or not.
     pub repair_outcomes: Vec<EffortRepairs>,
+    /// Per pipeline step and model, how often it ran and how often it caught
+    /// what it guards against (decisions ADR-0042); ledger facts only.
+    pub harness: HarnessReport,
     /// The same enforcement summary `relais coordinator status` prints,
     /// carried as structured data (SPEC §23) so a later tool reading this
     /// report's JSON is never told something the coordinator disagrees
@@ -1200,6 +1205,7 @@ pub fn runs_report(
     };
     let observational = recipe_view.then(|| RECIPE_OBSERVATIONAL_NOTE.to_string());
     let repair_outcomes = repairs::repair_outcomes(ledger, &window_runs)?;
+    let harness = harness::harness_report(ledger, &window_runs)?;
     let accepted_tasks = tasks.iter().filter(|task| task.accepted).count();
     let accepted_tasks_by_person = tasks
         .iter()
@@ -1278,6 +1284,7 @@ pub fn runs_report(
         decision_labels,
         cohorts,
         repair_outcomes,
+        harness,
         enforcement: EnforcementReport::observed(),
         orchestration,
         cost_per_accepted_task_with_orchestration,
@@ -1300,6 +1307,8 @@ impl Report {
         if self.runs.is_empty() {
             out.push_str("no runs recorded in this window\n");
             self.push_repair_lines(&mut out);
+            out.push('\n');
+            out.push_str(&self.harness.render());
             self.push_recipe_lines(&mut out);
             self.push_orchestration_lines(&mut out);
             return out;
@@ -1530,6 +1539,8 @@ impl Report {
             }
         }
         self.push_repair_lines(&mut out);
+        out.push('\n');
+        out.push_str(&self.harness.render());
         self.push_recipe_lines(&mut out);
         out.push('\n');
         self.push_orchestration_lines(&mut out);
@@ -2061,6 +2072,7 @@ mod tests {
             ),
             cohorts: None,
             repair_outcomes: Vec::new(),
+            harness: HarnessReport { steps: Vec::new() },
             trial_spend: None,
             observational: None,
             enforcement: EnforcementReport::observed(),
@@ -2278,6 +2290,7 @@ mod tests {
                 "cost_per_standing_change",
                 "decision_labels",
                 "enforcement",
+                "harness",
                 "learning",
                 "never_shipped_tasks",
                 "observational",
@@ -4176,6 +4189,164 @@ mod tests {
             .contains("repairs by requested effort: none in this window"));
         let json = serde_json::to_value(&report).expect("serializes");
         assert_eq!(json["repair_outcomes"], serde_json::json!([]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A review run: one review dispatch run by `model`; when `revised`,
+    /// its findings were answered with `revise`.
+    fn review_run(ledger: &Ledger, name: &str, model: &str, revised: bool) {
+        let run = new_run(ledger, name);
+        let dispatch = format!("d-review-{name}");
+        ledger
+            .record_dispatch_intent(
+                &crate::ids::DispatchId::from_stored(dispatch.clone()),
+                &run,
+                None,
+                &serde_json::json!({ "kind": "review" }),
+                0,
+                RoutedBy::ConservativeBaseline,
+            )
+            .expect("dispatch");
+        record_model_usage(ledger, &run, None, &dispatch, model, UsagePhase::Review);
+        go(ledger, &run, State::Running, "worker_dispatched");
+        go(ledger, &run, State::Verifying, "verification_started");
+        if !revised {
+            go(ledger, &run, State::Accepted, "checks_and_review_passed");
+            return;
+        }
+        go(ledger, &run, State::NeedsReview, "review_findings");
+        assert!(ledger
+            .resolve_decision(
+                &run,
+                &crate::ledger::DecisionAnswer {
+                    resolution: Reason::DecisionRevised,
+                    actor: crate::ledger::Actor::Person,
+                    person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
+                    note: None,
+                    successor_run: None,
+                    from_state: State::NeedsReview,
+                    to_state: State::Cancelled,
+                },
+            )
+            .expect("resolve"));
+    }
+
+    fn record_model_usage(
+        ledger: &Ledger,
+        run: &crate::ids::RunId,
+        attempt_id: Option<i64>,
+        event_id: &str,
+        model: &str,
+        phase: UsagePhase,
+    ) {
+        ledger
+            .record_usage(&crate::ledger::UsageEvent {
+                event_id: event_id.into(),
+                run_id: run.clone(),
+                attempt_id,
+                parent_event_id: None,
+                model: Some(model.into()),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cost: None,
+                cost_kind: crate::money::CostKind::ApiSpend,
+                completeness: CostCompleteness::Unknown,
+                inclusive: false,
+                at: now_rfc3339(),
+                phase: Some(phase),
+                duration_ms: None,
+                requested_model: None,
+                requested_effort: None,
+                harness: None,
+            })
+            .expect("usage");
+    }
+
+    /// A run with one repair run by `model`, whose checks turned `green`
+    /// or stayed failed.
+    fn repair_run(ledger: &Ledger, name: &str, model: &str, green: bool) {
+        let run = new_run(ledger, name);
+        let first = ledger
+            .insert_attempt(&run, 1, 1, "implementation", UsagePhase::Initial)
+            .expect("attempt");
+        record_model_usage(
+            ledger,
+            &run,
+            Some(first),
+            &format!("e1-{name}"),
+            "initial",
+            UsagePhase::Initial,
+        );
+        let repair = ledger
+            .insert_attempt(&run, 1, 2, "implementation", UsagePhase::Repair)
+            .expect("attempt");
+        record_model_usage(
+            ledger,
+            &run,
+            Some(repair),
+            &format!("e2-{name}"),
+            model,
+            UsagePhase::Repair,
+        );
+        for (state, reason) in [
+            (State::Running, "worker_dispatched"),
+            (State::Verifying, "verification_started"),
+            (State::Repairing, "behavioral_failure"),
+            (State::Running, "worker_dispatched"),
+            (State::Verifying, "verification_started"),
+        ] {
+            go(ledger, &run, state, reason);
+        }
+        if green {
+            go(ledger, &run, State::Accepted, "checks_and_review_passed");
+        } else {
+            go(ledger, &run, State::Failed, "checks_failed");
+        }
+    }
+
+    /// 3 of 5 reviews led to revise and 2 of 4 repairs turned green, across
+    /// two models: the harness section prints those counts per step and
+    /// model, in text and in JSON.
+    #[test]
+    fn the_harness_section_counts_catches_per_step_and_model() {
+        let dir = temp_dir("harness-section");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        review_run(&ledger, "rv1", "opus", true);
+        review_run(&ledger, "rv2", "opus", true);
+        review_run(&ledger, "rv3", "opus", false);
+        review_run(&ledger, "rv4", "sonnet", true);
+        review_run(&ledger, "rv5", "sonnet", false);
+        repair_run(&ledger, "rp1", "opus", true);
+        repair_run(&ledger, "rp2", "opus", false);
+        repair_run(&ledger, "rp3", "sonnet", true);
+        repair_run(&ledger, "rp4", "sonnet", false);
+        let report = runs_report(&ledger, SINCE, None).expect("report");
+        let json = serde_json::to_value(&report).expect("json");
+        assert_eq!(
+            json["harness"],
+            serde_json::json!({ "steps": [
+                { "step": "review", "models": [
+                    { "model": "opus", "ran": 3, "caught": 2 },
+                    { "model": "sonnet", "ran": 2, "caught": 1 },
+                ]},
+                { "step": "repair", "models": [
+                    { "model": "opus", "ran": 2, "caught": 1 },
+                    { "model": "sonnet", "ran": 2, "caught": 1 },
+                ]},
+            ]})
+        );
+        let text = report.render();
+        for line in [
+            "review [opus]: 2 of 3 reviews led to revise",
+            "review [sonnet]: 1 of 2 reviews led to revise",
+            "repair [opus]: 1 of 2 repairs turned a failed check green",
+            "repair [sonnet]: 1 of 2 repairs turned a failed check green",
+        ] {
+            assert!(text.contains(line), "{line} missing from {text}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

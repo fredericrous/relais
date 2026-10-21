@@ -93,10 +93,19 @@ fn closing_verdict(from: State, to_state: State, reason: &str) -> Option<Verdict
 
 /// One repair attempt of a run: its requested effort, how its own
 /// verification ended, and what it cost when any usage was reported.
-struct Repair {
+pub(super) struct Repair {
     effort: String,
+    /// The model that ran the repair; `None` when no usage row named one.
+    pub(super) model: Option<String>,
     verdict: Verdict,
     cost: Option<MicroUsd>,
+}
+
+impl Repair {
+    /// The repair's own checks went from failed to green.
+    pub(super) fn turned_green(&self) -> bool {
+        self.verdict == Verdict::Passed
+    }
 }
 
 /// A run's repairs, paired with the transitions that opened and closed
@@ -123,6 +132,7 @@ fn repairs_of_run(ledger: &Ledger, run_id: &RunId) -> Result<Vec<Repair>, Ledger
             None => Verdict::NoVerdict(NoVerdict::Unrecorded),
         };
         repairs.push(Repair {
+            model: ledger.attempt_model(attempt.id)?,
             effort: ledger.requested_effort(attempt.id)?,
             verdict,
             cost: ledger.attempt_cost(attempt.id)?,
@@ -249,22 +259,35 @@ pub fn repair_outcomes(
     window: &[(RunId, State)],
 ) -> Result<Vec<EffortRepairs>, LedgerError> {
     let mut tallies: BTreeMap<String, Tally> = BTreeMap::new();
-    let mut pending: Vec<(RunId, State)> = window.to_vec();
-    while let Some((run_id, status)) = pending.pop() {
-        for repair in repairs_of_run(ledger, &run_id)? {
-            tallies
-                .entry(repair.effort.clone())
-                .or_default()
-                .add(&repair, &run_id, status);
-        }
-        for child in ledger.child_runs(&run_id)? {
-            pending.push((child.run, child.status));
-        }
+    for (repair, run_id, status) in window_repairs(ledger, window)? {
+        tallies
+            .entry(repair.effort.clone())
+            .or_default()
+            .add(&repair, &run_id, status);
     }
     Ok(tallies
         .into_iter()
         .map(|(effort, tally)| tally.finish(effort))
         .collect())
+}
+
+/// Every repair of the window's runs and of the package runs beneath
+/// them, each with the run it happened in and that run's status.
+pub(super) fn window_repairs(
+    ledger: &Ledger,
+    window: &[(RunId, State)],
+) -> Result<Vec<(Repair, RunId, State)>, LedgerError> {
+    let mut all = Vec::new();
+    let mut pending: Vec<(RunId, State)> = window.to_vec();
+    while let Some((run_id, status)) = pending.pop() {
+        for repair in repairs_of_run(ledger, &run_id)? {
+            all.push((repair, run_id.clone(), status));
+        }
+        for child in ledger.child_runs(&run_id)? {
+            pending.push((child.run, child.status));
+        }
+    }
+    Ok(all)
 }
 
 /// A state as a person reads it in a count: `needs review`, `accepted by a

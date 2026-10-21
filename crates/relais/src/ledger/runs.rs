@@ -571,6 +571,13 @@ impl TaskOrigin {
     }
 }
 
+/// A patch-review dispatch and the model that ran it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewDispatch {
+    pub dispatch_id: String,
+    pub model: Option<String>,
+}
+
 /// A worker attempt as the `attempts` table holds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerAttempt {
@@ -946,6 +953,46 @@ impl Ledger {
              ORDER BY model",
         )?;
         let rows = stmt.query_map([run_id.as_str()], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The model that ran a worker attempt, from its own non-review usage
+    /// rows; `None` when no row named one.
+    pub fn attempt_model(&self, attempt_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT model FROM usage_events
+                  WHERE attempt_id = ?1 AND model IS NOT NULL AND phase IS NOT 'review'
+                  ORDER BY id LIMIT 1",
+                [attempt_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
+    /// A run's patch-review dispatches, first dispatched first, each with
+    /// the model its usage rows name (`None` when none does). The reviewer
+    /// has no attempt row, so the dispatch is the review.
+    pub fn review_dispatches(&self, run_id: &RunId) -> Result<Vec<ReviewDispatch>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT dispatch_id,
+                    (SELECT model FROM usage_events
+                      WHERE model IS NOT NULL
+                        AND (event_id = dispatches.dispatch_id
+                             OR (event_id >= dispatches.dispatch_id || '#'
+                                 AND event_id < dispatches.dispatch_id || '$'))
+                      ORDER BY id LIMIT 1)
+               FROM dispatches
+              WHERE run_id = ?1 AND json_extract(intent_json, '$.kind') = 'review'
+              ORDER BY created_at, dispatch_id",
+        )?;
+        let rows = stmt.query_map([run_id.as_str()], |row| {
+            Ok(ReviewDispatch {
+                dispatch_id: row.get(0)?,
+                model: row.get(1)?,
+            })
+        })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
