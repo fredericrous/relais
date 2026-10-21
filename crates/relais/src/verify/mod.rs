@@ -3039,10 +3039,32 @@ mod tests {
         let events = Events::for_run("run-w", &artifacts);
         let log = dir.join("check.log");
         std::fs::write(&log, "").expect("log");
-        let mut command = Command::new("sleep");
-        command.arg("0.4");
+        // The check waits until the test has seen a heartbeat (or 20 s have
+        // passed, inside the wait's 30 s), so a loaded machine whose `ps` sample outlasts a fixed
+        // sleep cannot end the wait before the first beat.
+        let release = dir.join("release");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "while [ ! -e \"$1\" ]; do sleep 0.05; done", "sh"])
+            .arg(&release);
         crate::procs::own_process_group(&mut command);
         let mut child = command.spawn().expect("spawn");
+        let watched = artifacts.join("events.jsonl");
+        let releaser = std::thread::spawn({
+            let release = release.clone();
+            move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while std::time::Instant::now() < deadline {
+                    if std::fs::read_to_string(&watched)
+                        .is_ok_and(|text| text.contains("\"heartbeat\""))
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                std::fs::write(&release, "").expect("release");
+            }
+        });
         let ended = wait_following(
             &mut child,
             Duration::from_secs(30),
@@ -3053,6 +3075,7 @@ mod tests {
             Duration::from_millis(30),
         )
         .expect("waited");
+        releaser.join().expect("releaser");
         assert_eq!(ended, Ended::Exited(0));
         let beats = || {
             std::fs::read_to_string(artifacts.join("events.jsonl"))
