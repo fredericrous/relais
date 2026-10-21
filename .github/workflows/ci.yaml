@@ -55,6 +55,11 @@ jobs:
       # `policy` is pure. Python 3 is on the runner image and on the
       # workstation; nothing else is installed for this.
       - run: python3 scripts/check-module-cycles.py
+      # The fourth and fifth: no cycle between the children of the two
+      # split modules, which check-module-cycles.py cannot see (it stops at
+      # the top-level module).
+      - run: python3 scripts/check-child-cycles.py crates/relais/src/ledger
+      - run: python3 scripts/check-child-cycles.py crates/relais/src/runner
 
   # `make test`: the library suite plus the release scenarios, which drive
   # the real binary against a fake `claude`, a temporary repository and a
