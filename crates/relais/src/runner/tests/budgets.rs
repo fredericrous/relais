@@ -5,6 +5,7 @@
 // `Budgets` itself with a clock the test moves (`policy::budgets`); these
 // tests drive whole runs.
 
+use super::engine::budget_limits;
 use super::*;
 
 /// A gate whose only agent seat another tab holds, so this run queues.
