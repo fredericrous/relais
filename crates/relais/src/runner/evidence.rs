@@ -110,6 +110,25 @@ impl<'a> RunEngine<'a> {
         Ok(())
     }
 
+    /// `record_artifact` for an artifact that is never overwritten: created
+    /// new and synced, or already there with the same bytes.
+    pub(crate) fn record_immutable_artifact(
+        &self,
+        kind: EvidenceKind,
+        path: &Path,
+        body: &str,
+    ) -> Result<(), RunError> {
+        super::review::write_immutable(path, body.as_bytes())?;
+        self.config.ledger.record_evidence(
+            &self.run_id,
+            None,
+            kind,
+            path,
+            Some(&workspace::sha256_file(path)?),
+        )?;
+        Ok(())
+    }
+
     /// Store a receipt in the ledger and next to the run, with its
     /// evidence row; close the accepting attempt.
     pub(crate) fn seal(

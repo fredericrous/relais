@@ -10,7 +10,7 @@ use super::{
 };
 use crate::acceptance::Evidence;
 use crate::contract::Review;
-use crate::ledger::{EvidenceKind, EvidenceOrigin, VerificationSnapshot};
+use crate::ledger::{EvidenceKind, EvidenceOrigin, IntentReview, VerificationSnapshot};
 use crate::policy::EffectiveAuthority;
 use crate::route::Recipe;
 use crate::verify::{self, amont_gaps, Receipt, VerificationReport};
@@ -29,10 +29,20 @@ impl<'a> RunEngine<'a> {
         let preflight = ctx.preflight;
         // An inspection has no patch to review: its report review has
         // already run (`judge_inspection`).
-        if verified.review_required && verdict.is_none() {
+        // A `review-parts` answer asked for this review: the successor
+        // reviews in parts whatever the contract's own review says.
+        let in_parts = self
+            .config
+            .ledger
+            .intent_of_run(&self.run_id)?
+            .is_some_and(|intent| intent.review == Some(IntentReview::Parts));
+        if (verified.review_required || in_parts) && verdict.is_none() {
             // A patch one reviewer cannot be given to read dispatches no
-            // reviewer: the run asks a person (SPEC §10).
-            if let Some(over) = super::review::over_budget(&candidate.latest_patch) {
+            // reviewer: the run asks a person (SPEC §10). A review in parts
+            // is the answer to that question.
+            if let Some(over) =
+                super::review::over_budget(&candidate.latest_patch).filter(|_| !in_parts)
+            {
                 let review = verify::ReviewRecord::NotRun(verify::ReviewNotRun::OverBudget {
                     patch_bytes: over.patch_bytes,
                     budget_bytes: over.budget_bytes,
@@ -54,20 +64,22 @@ impl<'a> RunEngine<'a> {
                     Observation::ReviewOverBudget(over),
                 );
             }
-            let review = self.review_candidate(
-                &ReviewRequest {
-                    manifest: &preflight.manifest,
-                    authority: &preflight.authority,
-                    candidate_sha: &candidate.sha,
-                    candidate_tier: candidate.tier,
-                    candidate_model: &candidate.model,
-                    verification_inputs_changed: &verified.verification_inputs_changed,
-                    patch_path: candidate.latest_patch.clone(),
-                    routed_by: preflight.decision.routed_by,
-                    covering: preflight.decision.covering.clone(),
-                },
-                &mut progress.spend,
-            );
+            let request = ReviewRequest {
+                manifest: &preflight.manifest,
+                authority: &preflight.authority,
+                candidate_sha: &candidate.sha,
+                candidate_tier: candidate.tier,
+                candidate_model: &candidate.model,
+                verification_inputs_changed: &verified.verification_inputs_changed,
+                patch_path: candidate.latest_patch.clone(),
+                routed_by: preflight.decision.routed_by,
+                covering: preflight.decision.covering.clone(),
+            };
+            let review = if in_parts {
+                self.review_candidate_in_parts(&request, &mut progress.spend)
+            } else {
+                self.review_candidate(&request, &mut progress.spend)
+            };
             match review {
                 ReviewOutcome::NoFindings => {}
                 ReviewOutcome::Findings(detail) => {
@@ -84,9 +96,7 @@ impl<'a> RunEngine<'a> {
                                 &verified,
                                 verdict,
                                 State::NeedsDecision,
-                                verify::ReviewRecord::Unavailable {
-                                    detail: detail.clone(),
-                                },
+                                engine.unavailable_review_record(&detail)?,
                             )
                         },
                         Reason::ReviewUnavailable,
@@ -123,6 +133,20 @@ impl<'a> RunEngine<'a> {
         Ok(RunOutcome {
             run_id: self.run_id.clone(),
             terminal: Terminal::Accepted(Box::new(receipt)),
+        })
+    }
+
+    /// What the snapshot saved at a review that could not be had says of the
+    /// review. A run that reviewed in parts lists every part with its
+    /// verdict, the failing one included, so approving it seals a receipt
+    /// that shows what was and was not reviewed; any other review is just
+    /// unavailable, with its detail.
+    fn unavailable_review_record(&self, detail: &str) -> Result<verify::ReviewRecord, RunError> {
+        Ok(match review_record_of(self.config.ledger, &self.run_id)? {
+            parts @ verify::ReviewRecord::Parts { .. } => parts,
+            _ => verify::ReviewRecord::Unavailable {
+                detail: detail.to_string(),
+            },
         })
     }
 

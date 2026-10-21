@@ -287,8 +287,10 @@ pub(crate) fn decide_in(
             },
         );
     }
-    if request.widen_scope || request.rerun_verify || request.successor_contract.is_some() {
-        if answer != DecideAnswer::Revise {
+    let revision_flags =
+        request.widen_scope || request.rerun_verify || request.successor_contract.is_some();
+    if revision_flags || answer == DecideAnswer::ReviewParts {
+        if revision_flags && answer != DecideAnswer::Revise {
             return Ok(refusal(
                 CliOutcome::InvalidInput,
                 "`--widen-scope`, `--rerun-verify` and `--successor-contract` only apply to \
@@ -306,6 +308,7 @@ pub(crate) fn decide_in(
             &run,
             state,
             request,
+            &locations.runs,
             relais::ledger::Answerer {
                 actor,
                 person_quote,
@@ -552,9 +555,11 @@ pub(crate) fn successor_decide(
     run: &RunId,
     state: State,
     request: &DecideRequest<'_>,
+    runs_dir: &Path,
     answerer: relais::ledger::Answerer<'_>,
 ) -> Result<Decision, CliError> {
     use relais::runner::successor;
+    let in_parts = request.answer == DecideAnswer::ReviewParts;
     let supplied = match request.successor_contract {
         Some(path) => Some(load_contract(path)?),
         None => None,
@@ -586,6 +591,19 @@ pub(crate) fn successor_decide(
                 ));
             }
         }
+        if in_parts != (existing.review == Some(relais::ledger::IntentReview::Parts)) {
+            return Ok(refusal(
+                CliOutcome::InvalidInput,
+                format!(
+                    "run {run} was already answered with successor intent {} ({}); a decision \
+                     has one successor",
+                    existing.intent_id,
+                    existing
+                        .review
+                        .map_or("a revision", |_| "a review in parts")
+                ),
+            ));
+        }
         let sentence = format!(
             "run {run} was already answered; successor intent {} is {}",
             existing.intent_id,
@@ -600,6 +618,9 @@ pub(crate) fn successor_decide(
         ));
     }
     let planned = (|| -> Result<_, successor::PlanError> {
+        if in_parts {
+            return successor::plan_review_parts(ledger, run, runs_dir);
+        }
         let (contract, scope_delta) = match supplied {
             Some(contract) => (contract, Vec::new()),
             None if request.rerun_verify => {
@@ -621,9 +642,7 @@ pub(crate) fn successor_decide(
                 (widened, paths)
             }
         };
-        let runs_dir =
-            paths::runs_dir().map_err(|e| successor::PlanError::Missing(e.to_string()))?;
-        successor::plan(ledger, run, &contract, scope_delta, &runs_dir)
+        successor::plan(ledger, run, &contract, scope_delta, runs_dir)
     })();
     let intent = match planned {
         Ok(intent) => intent,

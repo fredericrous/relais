@@ -270,6 +270,11 @@ pub enum Observation {
     LimitReached(Limit),
 }
 
+/// The most parts a review in parts may take: with the per-part timeout
+/// (`REVIEW_PART_TIMEOUT`), the most wall clock a review can spend is this
+/// many times it.
+pub(in crate::runner) const REVIEW_MAX_PARTS: usize = 8;
+
 /// A candidate patch too large for one reviewer: its measure, and how a
 /// review in parts would cut it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,14 +283,20 @@ pub struct OverBudget {
     pub budget_bytes: u64,
     pub files: usize,
     /// How many parts, cut at file boundaries, each within the budget; `None`
-    /// when a single file's patch exceeds the budget on its own.
+    /// when a single file's patch exceeds the budget on its own. More than the
+    /// most parts a review may take is counted, and not offered.
     pub parts: Option<usize>,
 }
 
 impl OverBudget {
     /// The sentence a decision shows: size, budget, files and parts.
     pub fn describe(&self) -> String {
+        let max = REVIEW_MAX_PARTS;
         let parts = match self.parts {
+            Some(parts) if parts > max => format!(
+                "a review in parts would take {parts}, more than the {max} a review may take, \
+                 so it cannot be reviewed in parts"
+            ),
             Some(parts) => format!("a review in parts would take {parts}"),
             None => "a single file exceeds the budget, so it cannot be reviewed in parts".into(),
         };

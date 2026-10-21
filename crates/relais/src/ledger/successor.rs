@@ -49,6 +49,39 @@ pub struct NewIntent {
     /// The candidate the successor applies, resolved and pinned with the
     /// answer.
     pub candidate: Option<ResolvedCandidate>,
+    /// How the successor reviews its candidate, when the answer asked for
+    /// more than the contract's own review (`review-parts`).
+    pub review: Option<IntentReview>,
+}
+
+/// How a successor intent asks its run to review. An intent whose mode this
+/// binary does not know is refused by name ([`IntentReview::parse`]), never
+/// launched as a plain verify that would skip what the answer asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntentReview {
+    /// Review the patch in parts, each part its own reviewer dispatch.
+    Parts,
+}
+
+impl IntentReview {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Parts => "parts",
+        }
+    }
+
+    fn parse(stored: &str) -> Result<Self> {
+        match stored {
+            "parts" => Ok(Self::Parts),
+            other => Err(LedgerError::Corrupt {
+                what: "a successor intent's review mode".into(),
+                detail: format!(
+                    "`{other}` is a review mode this relais does not know (it knows `parts`); \
+                     upgrade relais before launching this intent"
+                ),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +120,7 @@ pub struct SuccessorIntent {
     pub contract_json: String,
     pub scope_delta: Vec<String>,
     pub candidate: Option<ResolvedCandidate>,
+    pub review: Option<IntentReview>,
     pub state: IntentState,
     pub run_id: Option<RunId>,
     /// Why the last launch was refused before it had a run, if one was.
@@ -147,7 +181,7 @@ pub fn intent_id_of(decision_id: &str) -> String {
 
 const COLUMNS: &str = "intent_id, decision_id, predecessor, contract_digest, contract_json, \
                        scope_delta_json, candidate_json, state, run_id, \
-                       refusal, refused_at, refusal_count";
+                       refusal, refused_at, refusal_count, review";
 
 type Row = (
     String,
@@ -162,6 +196,7 @@ type Row = (
     Option<String>,
     Option<String>,
     i64,
+    Option<String>,
 );
 
 fn row_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
@@ -178,6 +213,7 @@ fn row_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         row.get(9)?,
         row.get(10)?,
         row.get(11)?,
+        row.get(12)?,
     ))
 }
 
@@ -202,6 +238,7 @@ fn intent_of_row(row: Row) -> Result<SuccessorIntent> {
         refusal,
         refused_at,
         refusal_count,
+        review,
     ) = row;
     Ok(SuccessorIntent {
         intent_id,
@@ -215,6 +252,10 @@ fn intent_of_row(row: Row) -> Result<SuccessorIntent> {
             .map(|json| serde_json::from_str(&json))
             .transpose()
             .map_err(|e| corrupt("a successor intent's candidate", e))?,
+        // An unknown mode fails every read of the intent, not only its launch:
+        // a binary that writes a newer mode also bumps the schema, so an older
+        // binary is refused at open before it could read the row.
+        review: review.as_deref().map(IntentReview::parse).transpose()?,
         state: IntentState::parse(&state)?,
         run_id: run_id.map(RunId::from_stored),
         refusal,
@@ -253,8 +294,9 @@ impl Ledger {
         tx.execute(
             "INSERT INTO successor_intents
                 (intent_id, decision_id, predecessor, contract_digest, contract_json,
-                 scope_delta_json, candidate_json, pin_run, pin_index, state, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10)",
+                 scope_delta_json, candidate_json, pin_run, pin_index, state, created_at,
+                 review)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10, ?11)",
             params![
                 intent_id,
                 decision_id,
@@ -267,6 +309,7 @@ impl Ledger {
                 intent.candidate.as_ref().map(|c| c.source_run.clone()),
                 intent.candidate.as_ref().map(|c| i64::from(c.index)),
                 self.now(),
+                intent.review.map(IntentReview::as_str),
             ],
         )?;
         let stored = read_intent(&tx, &intent_id)?;
@@ -600,6 +643,7 @@ mod tests {
                 source_base_sha: "b".repeat(40),
                 target_base_sha: "b".repeat(40),
             }),
+            review: None,
         }
     }
 

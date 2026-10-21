@@ -15,7 +15,7 @@ use crate::workspace;
 use super::{
     patch_section, report_review_prompt, review_verdict, reviewer_tier, stage_patch, ReviewOutcome,
     ReviewPurpose, ReviewRequest, ReviewSeat, StagedPatch, REVIEW_CONSTRAINTS_BUDGET_BYTES,
-    REVIEW_MIN_WALL,
+    REVIEW_MIN_WALL, REVIEW_PART_TIMEOUT,
 };
 use crate::runner::{
     data_block, data_list_block, effort_str, reviewer_guidance, utc_day_start, Budget, Candidate,
@@ -58,9 +58,11 @@ impl<'a> RunEngine<'a> {
             tier: request.candidate_tier,
             dir: worktree.to_path_buf(),
             purpose: ReviewPurpose::Report,
+            wall: None,
+            on_dispatch: None,
         };
         let result = match self.dispatch_reviewer(request, seat, prompt, spend) {
-            Ok(result) => result,
+            Ok((result, _)) => result,
             Err(ReviewOutcome::Unavailable(detail)) => return Err(detail),
             Err(ReviewOutcome::NoFindings | ReviewOutcome::Findings(_)) => {
                 return Err("the report review dispatch answered with a verdict".into());
@@ -158,6 +160,22 @@ impl<'a> RunEngine<'a> {
         request: &ReviewRequest<'_>,
         spend: &mut RunSpend,
     ) -> ReviewOutcome {
+        let artifact = self.artifacts.join("review.txt");
+        self.review_unit(request, spend, None, &artifact).outcome
+    }
+
+    /// One reviewer dispatch about the patch `request` names: the whole
+    /// candidate (`part` is `None`) or one part of it. The answer is kept at
+    /// `artifact`.
+    pub(super) fn review_unit(
+        &mut self,
+        request: &ReviewRequest<'_>,
+        spend: &mut RunSpend,
+        part: Option<PartRun<'_>>,
+        artifact: &Path,
+    ) -> Reviewed {
+        let on_dispatch = part.as_ref().map(|part| part.on_dispatch);
+        let part = part.map(|part| part.label);
         // A reviewer gap belongs to the review that made it: a later
         // review that ends before it builds its prompt carries none.
         self.reviewer_gap = None;
@@ -166,9 +184,7 @@ impl<'a> RunEngine<'a> {
             request.candidate_tier,
             request.candidate_model,
         ) else {
-            return ReviewOutcome::Unavailable(
-                "no reviewer model is configured at any tier".into(),
-            );
+            return Reviewed::unavailable("no reviewer model is configured at any tier".into());
         };
         // The review is a dispatch and costs money like any other. It is
         // reached after the loop-top check, with the attempt that
@@ -178,11 +194,11 @@ impl<'a> RunEngine<'a> {
         // zero and the run was accepted on a review nobody paid for
         // (SPEC §11: stop admitting work once the ceiling is reached).
         if let Some(exhausted) = self.review_spend_blocked(spend.total) {
-            return ReviewOutcome::Unavailable(exhausted);
+            return Reviewed::unavailable(exhausted);
         }
         self.step("review", format!("{} tier", reviewer_tier.as_str()));
         let Some(profile) = request.authority.models.get(&reviewer_tier).cloned() else {
-            return ReviewOutcome::Unavailable(format!(
+            return Reviewed::unavailable(format!(
                 "no reviewer model configured at the {} tier",
                 reviewer_tier.as_str()
             ));
@@ -205,7 +221,7 @@ impl<'a> RunEngine<'a> {
                     "candidate": request.candidate_sha,
                 }),
             ) {
-                return ReviewOutcome::Unavailable(format!(
+                return Reviewed::unavailable(format!(
                     "the ledger refused the reviewer-tier record: {e}"
                 ));
             }
@@ -214,7 +230,8 @@ impl<'a> RunEngine<'a> {
         // The reviewer reads the patch from a copy in its worktree's
         // ignored relais area; the copy goes when the review ends.
         let staged = stage_patch(&review_dir, &self.run_id, &request.patch_path);
-        let (prompt, reviewer_gap) = self.review_prompt(request, &review_dir, staged.as_ref());
+        let (prompt, reviewer_gap) =
+            self.review_prompt(request, &review_dir, staged.as_ref(), part);
         if let Some(gap) = &reviewer_gap {
             self.emit_guidance_gap(gap);
         }
@@ -224,35 +241,44 @@ impl<'a> RunEngine<'a> {
             tier: reviewer_tier,
             dir: review_dir,
             purpose: ReviewPurpose::Patch,
+            wall: part.map(|_| REVIEW_PART_TIMEOUT),
+            on_dispatch,
         };
         let dispatched = self.dispatch_reviewer(request, seat, prompt, spend);
         if let Ok(staged) = &staged {
             if let Err(e) = std::fs::remove_dir_all(&staged.dir) {
-                return ReviewOutcome::Unavailable(format!(
+                return Reviewed::unavailable(format!(
                     "the patch copy {} could not be removed: {e}",
                     staged.dir.display()
                 ));
             }
         }
-        let result = match dispatched {
-            Ok(result) => result,
-            Err(unavailable) => return unavailable,
+        let (result, dispatch_id) = match dispatched {
+            Ok(dispatched) => dispatched,
+            Err(unavailable) => return Reviewed::of(unavailable),
         };
         let text = result.result_text.unwrap_or_default();
         // The artifact and its evidence row are one operation: a review
         // the run cannot record is a review it cannot show, and a run
         // that cannot show its review does not accept (X5).
-        if let Err(e) = self.record_artifact(
-            None,
-            EvidenceKind::ReviewResult,
-            &self.artifacts.join("review.txt"),
-            &text,
-        ) {
-            return ReviewOutcome::Unavailable(format!(
-                "the review could not be recorded as evidence: {e}"
-            ));
+        let recorded = if part.is_some() {
+            self.record_immutable_artifact(EvidenceKind::ReviewResult, artifact, &text)
+        } else {
+            self.record_artifact(None, EvidenceKind::ReviewResult, artifact, &text)
+        };
+        if let Err(e) = recorded {
+            return Reviewed {
+                dispatch_id: Some(dispatch_id),
+                ..Reviewed::unavailable(format!(
+                    "the review could not be recorded as evidence: {e}"
+                ))
+            };
         }
-        review_verdict(&text)
+        Reviewed {
+            outcome: review_verdict(&text),
+            dispatch_id: Some(dispatch_id),
+            result_sha256: Some(crate::ids::sha256_hex(text.as_bytes())),
+        }
     }
 
     /// What the reviewer is asked. Every piece of project text — the
@@ -263,6 +289,7 @@ impl<'a> RunEngine<'a> {
         request: &ReviewRequest<'_>,
         review_dir: &Path,
         staged: Result<&StagedPatch, &std::io::Error>,
+        part: Option<PartLabel>,
     ) -> (String, Option<GuidanceGap>) {
         let mut prompt = String::from(
             "You are a semantic reviewer. You cannot edit or waive checks; you report findings only.\n\
@@ -316,6 +343,13 @@ impl<'a> RunEngine<'a> {
             ));
         }
         prompt.push_str(&format!("\ncandidate commit: {}\n", request.candidate_sha));
+        if let Some(part) = part {
+            prompt.push_str(&format!(
+                "this is {part}: the candidate patch was too large for one review and was cut \
+                 at file boundaries; the patch below is that part only. Review the files in it, \
+                 and report findings about them.\n"
+            ));
+        }
         match staged {
             Ok(staged) => prompt.push_str(&patch_section(staged)),
             Err(e) => {
@@ -349,12 +383,14 @@ impl<'a> RunEngine<'a> {
         seat: ReviewSeat<'_>,
         prompt: String,
         spend: &mut RunSpend,
-    ) -> Result<LaunchResult, ReviewOutcome> {
+    ) -> Result<(LaunchResult, String), ReviewOutcome> {
         let ReviewSeat {
             profile,
             tier: reviewer_tier,
             dir: review_dir,
             purpose,
+            wall,
+            on_dispatch,
         } = seat;
         // A reviewer the runner cannot even name is a reviewer it
         // cannot dispatch: `Unavailable`, never a silent acceptance.
@@ -382,7 +418,7 @@ impl<'a> RunEngine<'a> {
             // clock: a reviewer handed the one-second remainder is killed
             // before it can answer, and the run ends `needs_review` with
             // the whole attempt's spend already paid.
-            wall_timeout: self.budgets.remaining().max(REVIEW_MIN_WALL),
+            wall_timeout: wall.unwrap_or_else(|| self.budgets.remaining().max(REVIEW_MIN_WALL)),
             cancel: None,
             agent: AgentKind::Reviewer,
         };
@@ -408,6 +444,11 @@ impl<'a> RunEngine<'a> {
             return Err(ReviewOutcome::Unavailable(format!(
                 "the ledger refused the review intent: {e}"
             )));
+        }
+        if let Some(on_dispatch) = on_dispatch {
+            if let Err(e) = on_dispatch(dispatch_id.as_str()) {
+                return Err(ReviewOutcome::Unavailable(e));
+            }
         }
         // A review dispatch ends the run only through `Unavailable`, so
         // the budget it observes with is nominal.
@@ -502,6 +543,49 @@ impl<'a> RunEngine<'a> {
                 _ => "the reviewer ended without a terminal result".into(),
             }));
         }
-        Ok(result)
+        Ok((result, dispatch_id.as_str().to_string()))
+    }
+}
+
+/// Which part of a patch a reviewer is asked about: `part 2 of 5`, counted
+/// from one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runner) struct PartLabel {
+    pub(in crate::runner) index: u32,
+    pub(in crate::runner) of: u32,
+}
+
+impl std::fmt::Display for PartLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "part {} of {}", self.index, self.of)
+    }
+}
+
+/// A part about to be reviewed: which one, and what to tell the parts
+/// manifest when its dispatch exists.
+pub(in crate::runner) struct PartRun<'a> {
+    pub(in crate::runner) label: PartLabel,
+    pub(in crate::runner) on_dispatch: &'a super::types::OnDispatch<'a>,
+}
+
+/// One reviewer dispatch's result: the verdict, the dispatch that gave it
+/// and the hash of the answer kept as evidence.
+pub(in crate::runner) struct Reviewed {
+    pub(in crate::runner) outcome: ReviewOutcome,
+    pub(in crate::runner) dispatch_id: Option<String>,
+    pub(in crate::runner) result_sha256: Option<String>,
+}
+
+impl Reviewed {
+    pub(in crate::runner) fn of(outcome: ReviewOutcome) -> Self {
+        Self {
+            outcome,
+            dispatch_id: None,
+            result_sha256: None,
+        }
+    }
+
+    pub(in crate::runner) fn unavailable(detail: String) -> Self {
+        Self::of(ReviewOutcome::Unavailable(detail))
     }
 }

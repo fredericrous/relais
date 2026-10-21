@@ -683,6 +683,7 @@ mod tests {
                     contract_json: "{}".into(),
                     scope_delta: Vec::new(),
                     candidate: None,
+                    review: None,
                 },
             )
             .expect("written")

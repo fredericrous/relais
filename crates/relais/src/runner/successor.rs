@@ -10,7 +10,7 @@ use std::path::Path;
 
 use crate::contract::{ContractError, TaskContract};
 use crate::ids::RunId;
-use crate::ledger::{Ledger, LedgerError, NewIntent};
+use crate::ledger::{IntentReview, Ledger, LedgerError, NewIntent};
 use crate::lifecycle::{Reason, State};
 
 use super::candidate::{self, Refusal, Resolution, Source};
@@ -24,6 +24,9 @@ pub enum PlanError {
     Contract(ContractError),
     /// The decided run is not one `--widen-scope` answers.
     NotWidenable(String),
+    /// `review-parts` does not answer this run, or its patch cannot be
+    /// reviewed in parts.
+    NotReviewable(String),
     /// The successor's candidate cannot be resolved now.
     Candidate {
         reason: Reason,
@@ -39,7 +42,9 @@ impl std::fmt::Display for PlanError {
             Self::Ledger(e) => write!(f, "ledger: {e}"),
             Self::Run(e) => write!(f, "{e}"),
             Self::Contract(e) => write!(f, "the successor contract is invalid: {e}"),
-            Self::NotWidenable(detail) | Self::Missing(detail) => write!(f, "{detail}"),
+            Self::NotWidenable(detail) | Self::NotReviewable(detail) | Self::Missing(detail) => {
+                write!(f, "{detail}")
+            }
             Self::Candidate { reason, detail } => write!(
                 f,
                 "the successor's candidate cannot be pinned ({reason}): {detail}"
@@ -201,5 +206,54 @@ pub fn plan(
             .expect("a validated contract serializes"),
         scope_delta,
         candidate,
+        review: None,
     })
+}
+
+/// The outbox row for a `review-parts` answer to `run`'s decision: a
+/// `kind: verify` of the run's own candidate, `review: parts`. Refused, with
+/// nothing planned, when the run did not stop for a review it could not have
+/// or when its patch cannot be cut into parts that each fit the budget (a
+/// single file over it, or more than the most parts a review may take).
+pub fn plan_review_parts(
+    ledger: &Ledger,
+    run: &RunId,
+    runs_dir: &Path,
+) -> Result<NewIntent, PlanError> {
+    let raised = ledger
+        .decision_of_run(run)?
+        .map(|decision| decision.raised_reason)
+        .unwrap_or_default();
+    if !super::approval::seals_from_snapshot(&raised) {
+        return Err(PlanError::NotReviewable(format!(
+            "`review-parts` answers a review_over_budget or review_unavailable stop, and run \
+             {run} waits on {}",
+            if raised.is_empty() {
+                "nothing"
+            } else {
+                &raised
+            }
+        )));
+    }
+    let (original, _tier) = ledger
+        .run_contract_and_tier(run)?
+        .ok_or_else(|| PlanError::Missing(format!("run {run} carries no recorded contract")))?;
+    let contract = widened_contract(&original, run, &[]).map_err(PlanError::Contract)?;
+    let mut intent = plan(ledger, run, &contract, Vec::new(), runs_dir)?;
+    let resolved = intent.candidate.as_ref().ok_or_else(|| {
+        PlanError::Missing(format!("run {run}'s candidate could not be resolved"))
+    })?;
+    let patch_path = runs_dir
+        .join(&resolved.source_run)
+        .join(format!("candidate-{}.patch", resolved.index));
+    let patch = std::fs::read(&patch_path).map_err(|e| {
+        PlanError::Missing(format!(
+            "the candidate patch {} could not be read: {e}",
+            patch_path.display()
+        ))
+    })?;
+    super::review::split_into_parts(&patch, super::review::REVIEW_PATCH_BUDGET_BYTES)
+        .map_err(|refusal| PlanError::NotReviewable(refusal.to_string()))?;
+    intent.review = Some(IntentReview::Parts);
+    Ok(intent)
 }

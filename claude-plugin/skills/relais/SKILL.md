@@ -124,8 +124,10 @@ up, and the person answers there.
 
 5. Answer a run that waits on a decision (needs_decision, needs_review,
    interrupted) and record it with `mcp__relais__decide`: approve,
-   revise (`successor` names the run that carries the revision), reject,
-   salvaged (`candidate` is the commit that landed it), abandon or
+   revise (`successor` names the run that carries the revision),
+   review-parts (a `review_over_budget` or `review_unavailable` stop:
+   relais re-verifies the same candidate and reviews its patch in parts;
+   the tool launches the successor), reject, salvaged (`candidate` is the commit that landed it), abandon or
    decided, with a `note` naming the evidence.
    - Answer it yourself when the request or the approved plan already
      answers it. Otherwise ask the person, then record their answer with

@@ -6,7 +6,11 @@ use super::{
     Guidance, GuidanceGap, GuidanceSource, Path, PathBuf, Reason, RuleRef, RunId, Tier,
 };
 
+pub(in crate::runner) use super::machine::REVIEW_MAX_PARTS;
+
 mod engine;
+mod parts;
+pub(in crate::runner) use parts::write_immutable;
 mod types;
 pub(crate) use types::{ReviewOutcome, ReviewRequest};
 pub(in crate::runner) use types::{ReviewPurpose, ReviewSeat};
@@ -164,33 +168,107 @@ pub(in crate::runner) fn over_budget_by(
     })
 }
 
-/// How many consecutive parts, cut at file boundaries and each within
-/// `budget` bytes, review the patch; `None` when a single file's patch
-/// exceeds the budget on its own (no part may break a file in two).
-pub(in crate::runner) fn review_part_count(patch: &str, budget: usize) -> Option<usize> {
-    let mut sizes: Vec<usize> = Vec::new();
+/// How long ONE part's reviewer may run. A review in parts is sequential,
+/// so its worst case is [`REVIEW_MAX_PARTS`] times this (SPEC §10).
+pub(in crate::runner) const REVIEW_PART_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// Why a patch cannot be reviewed in parts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PartsRefusal {
+    /// One file's patch alone exceeds the budget; no part may break a file
+    /// in two.
+    FileOverBudget {
+        file: String,
+        bytes: usize,
+        budget: usize,
+    },
+    /// Cutting at file boundaries takes more than [`REVIEW_MAX_PARTS`].
+    TooManyParts { needed: usize },
+}
+
+impl std::fmt::Display for PartsRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FileOverBudget {
+                file,
+                bytes,
+                budget,
+            } => write!(
+                f,
+                "the patch of `{file}` alone is {bytes} bytes, over the {budget}-byte review budget, \
+                 and a part never breaks a file in two, so the candidate cannot be reviewed in parts"
+            ),
+            Self::TooManyParts { needed } => write!(
+                f,
+                "a review in parts would take {needed} parts, more than the {REVIEW_MAX_PARTS} \
+                 a review may take, so the candidate cannot be reviewed in parts"
+            ),
+        }
+    }
+}
+
+/// The patch cut at file boundaries into consecutive parts that each fit
+/// `budget` bytes, in order and whole: concatenated they are the patch. A
+/// patch within the budget is one part.
+pub(crate) fn split_into_parts(patch: &[u8], budget: usize) -> Result<Vec<Vec<u8>>, PartsRefusal> {
+    let parts = cut_into_parts(patch, budget)?;
+    if parts.len() > REVIEW_MAX_PARTS {
+        return Err(PartsRefusal::TooManyParts {
+            needed: parts.len(),
+        });
+    }
+    Ok(parts)
+}
+
+/// [`split_into_parts`] without the limit on how many parts a review may
+/// take: the cut itself, which only a file over the budget prevents.
+fn cut_into_parts(patch: &[u8], budget: usize) -> Result<Vec<Vec<u8>>, PartsRefusal> {
+    // One section per file; the bytes before the first `diff --git` line
+    // belong to the first section.
+    let mut sections: Vec<&[u8]> = Vec::new();
+    let mut start = 0usize;
     let mut at = 0usize;
-    for line in patch.split_inclusive('\n') {
-        if line.starts_with("diff --git ") || sizes.is_empty() {
-            sizes.push(0);
+    for line in patch.split_inclusive(|byte| *byte == b'\n') {
+        if line.starts_with(b"diff --git ") && at > start {
+            sections.push(&patch[start..at]);
+            start = at;
         }
         at += line.len();
-        *sizes.last_mut().expect("a file section was just pushed") += line.len();
     }
-    debug_assert_eq!(at, patch.len());
-    if sizes.iter().any(|size| *size > budget) {
-        return None;
+    if at > start || sections.is_empty() {
+        sections.push(&patch[start..at]);
     }
-    let mut parts = 0usize;
-    let mut used = 0usize;
-    for size in sizes {
-        if parts == 0 || used + size > budget {
-            parts += 1;
-            used = 0;
+    if let Some(section) = sections.iter().find(|section| section.len() > budget) {
+        let head = String::from_utf8_lossy(section);
+        let file = head
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("diff --git a/"))
+            .map(|rest| rest.split(" b/").next().unwrap_or(rest).to_string())
+            .unwrap_or_else(|| "the patch".to_string());
+        return Err(PartsRefusal::FileOverBudget {
+            file,
+            bytes: section.len(),
+            budget,
+        });
+    }
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    for section in sections {
+        match parts.last_mut() {
+            Some(last) if last.len() + section.len() <= budget => last.extend_from_slice(section),
+            _ => parts.push(section.to_vec()),
         }
-        used += size;
     }
-    Some(parts)
+    Ok(parts)
+}
+
+/// How many parts a cut at file boundaries takes, however many; `None` when
+/// a file over the budget prevents the cut. A review may take at most
+/// [`REVIEW_MAX_PARTS`], which [`split_into_parts`] enforces.
+pub(in crate::runner) fn review_part_count(patch: &str, budget: usize) -> Option<usize> {
+    cut_into_parts(patch.as_bytes(), budget)
+        .ok()
+        .map(|parts| parts.len())
 }
 
 /// What the prompt says about the patch: its path and size, the changed
@@ -287,7 +365,8 @@ pub(crate) fn review_record_of(
     ledger: &crate::ledger::Ledger,
     run_id: &RunId,
 ) -> Result<verify::ReviewRecord, crate::ledger::LedgerError> {
-    if !ledger.review_dispatched(run_id)? {
+    let parts = ledger.review_parts(run_id)?;
+    if parts.is_empty() && !ledger.review_dispatched(run_id)? {
         return Ok(verify::ReviewRecord::NoReview);
     }
     // Through `Reason::parse`, so a row an older ledger spelled
@@ -296,6 +375,21 @@ pub(crate) fn review_record_of(
         .transitions(run_id)?
         .iter()
         .any(|transition| Reason::parse(&transition.reason) == Ok(Reason::ReviewerSameModel));
+    if !parts.is_empty() {
+        return Ok(verify::ReviewRecord::Parts {
+            same_model,
+            parts: parts
+                .into_iter()
+                .map(|part| verify::ReviewPartRecord {
+                    index: part.index,
+                    of: part.count,
+                    patch_sha256: part.patch_sha256,
+                    result_sha256: part.result_sha256,
+                    verdict: part.status.as_str().to_string(),
+                })
+                .collect(),
+        });
+    }
     Ok(if same_model {
         verify::ReviewRecord::SameModel
     } else {

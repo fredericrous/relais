@@ -1103,4 +1103,33 @@ pub(in crate::ledger) const MIGRATIONS: &[(&str, &str)] = &[
     );
     "#,
     ),
+    (
+        // A review in parts (plan review-over-budget, Changes step 5): the
+        // successor intent a `review-parts` answer writes names how the
+        // successor reviews (`review`, NULL for every earlier intent), and
+        // the parts manifest records each part of that review, keyed by
+        // run, candidate hash and part index, with the hashes of its
+        // immutable patch and result artifacts and its status. Expand-only:
+        // one nullable column and one new table; no existing value is
+        // rewritten, and an older binary reads neither.
+        "v42",
+        r#"
+    ALTER TABLE successor_intents ADD COLUMN review TEXT;
+    CREATE TABLE review_parts (
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        candidate_sha TEXT NOT NULL,
+        part_index INTEGER NOT NULL,
+        part_count INTEGER NOT NULL,
+        patch_path TEXT NOT NULL,
+        patch_sha256 TEXT NOT NULL,
+        dispatch_id TEXT,
+        result_path TEXT,
+        result_sha256 TEXT,
+        status TEXT NOT NULL,
+        detail TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, candidate_sha, part_index)
+    );
+    "#,
+    ),
 ];

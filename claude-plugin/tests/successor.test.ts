@@ -204,3 +204,25 @@ test('a successor_contract object is saved first and its path passed to decide',
   expect(call.argv.slice(call.argv.indexOf('--successor-contract'))[1]).toBe('/repo/.relais/tasks/next.json')
   expect(launches(engine).length).toBe(1)
 })
+
+test('a review-parts answer is passed to relais as the answer and launches the successor it records', async ($: any, on: any) => {
+  const engine = scriptedEngine(on)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await settle(engine)
+  engine.script.runResult = (argv: string[]) => (argv[1] === 'decide' ? result(decided()) : result(''))
+
+  const reply = await $.tool.call({ tool: 'mcp__relais__decide', run: 'run-1', answer: 'review-parts' })
+  await settle(engine)
+  expect(reply.result).toContain('Started relais successor intent intent-1')
+  const decideCall = engine.calls.run.find(c => c.argv[1] === 'decide')!
+  expect(decideCall.argv.slice(0, 6)).toEqual(['relais', 'decide', 'run-1', '--answer', 'review-parts', '--actor'])
+  expect(launches(engine).map((e: any) => e.argv)).toEqual([['relais', 'run', '--intent', 'intent-1', '--protocol']])
+})
+
+test('widen_scope does not go with review-parts', async ($: any, on: any) => {
+  const engine = scriptedEngine(on)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await settle(engine)
+  const wrong = await decide($, { answer: 'review-parts' })
+  expect(wrong.deny ?? wrong.result).toContain('belong to answer revise')
+})

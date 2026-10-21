@@ -714,6 +714,10 @@ pub struct Report {
     /// larger than one reviewer reads (`review_over_budget`), answered or
     /// not: the count of how often the review budget is the limit.
     pub review_over_budget: usize,
+    /// Reviews that could not be had (`review_unavailable`) in the window,
+    /// counted by cause (see [`reviewer_failure_cause`]): a launch refusal
+    /// no longer hides behind one generic sentence.
+    pub reviewer_launch_failures: std::collections::BTreeMap<String, usize>,
     pub cost_completeness: CostCompleteness,
     /// One line per task whose first run falls in the window (SPEC §20):
     /// the unit the primary metric is actually denominated in, a run is
@@ -877,6 +881,50 @@ impl EnforcementReport {
     }
 }
 
+/// Why a review could not be had, from the detail the run recorded:
+/// `launch_refused` (the reviewer could not be registered or started, with
+/// the cause the harness gave), `dispatch_ended` (the dispatch ended in a
+/// state that is not an answer), `ended_without_result`, `no_verdict` (it
+/// answered without a verdict line), `spend_ceiling`, `no_reviewer_model`,
+/// `ledger` and `other`. A part of a review in parts is classed by its own
+/// cause.
+pub fn reviewer_failure_cause(detail: &str) -> &'static str {
+    let detail = detail.strip_prefix("review part ").map_or(detail, |rest| {
+        rest.split_once(" could not be had: ")
+            .map_or(detail, |(_, d)| d)
+    });
+    let causes: [(&str, &str); 8] = [
+        ("the reviewer could not be launched", "launch_refused"),
+        ("reviewer dispatch ended", "dispatch_ended"),
+        ("reviewer dispatch failed", "dispatch_ended"),
+        (
+            "the reviewer ended without a terminal result",
+            "ended_without_result",
+        ),
+        ("the reviewer's answer has no verdict line", "no_verdict"),
+        ("the spend ceiling was reached", "spend_ceiling"),
+        ("no reviewer model", "no_reviewer_model"),
+        ("the ledger refused", "ledger"),
+    ];
+    causes
+        .iter()
+        .find(|(prefix, _)| detail.starts_with(prefix))
+        .map_or("other", |(_, cause)| cause)
+}
+
+/// The report's line for reviews that could not be had, by cause, or
+/// nothing when every review was had.
+fn reviews_not_had_line(failures: &std::collections::BTreeMap<String, usize>) -> Option<String> {
+    if failures.is_empty() {
+        return None;
+    }
+    let causes: Vec<String> = failures
+        .iter()
+        .map(|(cause, count)| format!("{cause} {count}"))
+        .collect();
+    Some(format!("reviews not had: {}\n", causes.join(", ")))
+}
+
 pub fn runs_report(
     ledger: &Ledger,
     since: &str,
@@ -960,13 +1008,28 @@ pub fn runs_report(
         .filter(|decision| runs.iter().any(|run| run.run_id == decision.run.as_str()))
         .count();
     let mut review_over_budget = 0;
+    let mut reviewer_launch_failures = std::collections::BTreeMap::new();
     for run in &runs {
-        let ended_over_budget = ledger
-            .transitions(&crate::ids::RunId::from_stored(&run.run_id))?
+        let transitions = ledger.transitions(&crate::ids::RunId::from_stored(&run.run_id))?;
+        if transitions
             .iter()
-            .any(|transition| transition.reason == Reason::ReviewOverBudget.as_str());
-        if ended_over_budget {
+            .any(|transition| transition.reason == Reason::ReviewOverBudget.as_str())
+        {
             review_over_budget += 1;
+        }
+        for transition in transitions
+            .iter()
+            .filter(|transition| transition.reason == Reason::ReviewUnavailable.as_str())
+        {
+            let detail = transition
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("detail"))
+                .and_then(|detail| detail.as_str())
+                .unwrap_or_default();
+            *reviewer_launch_failures
+                .entry(reviewer_failure_cause(detail).to_string())
+                .or_insert(0) += 1;
         }
     }
     let cost_completeness = CostCompleteness::worst(runs.iter().map(|run| run.cost_completeness));
@@ -1196,6 +1259,7 @@ pub fn runs_report(
         acceptance_rate,
         pending_decisions,
         review_over_budget,
+        reviewer_launch_failures,
         cost_completeness,
         task_cost_completeness: CostCompleteness::worst(
             tasks.iter().map(|task| task.cost_completeness),
@@ -1310,6 +1374,9 @@ impl Report {
                 "review over budget: {} run(s) whose patch was larger than one reviewer reads\n",
                 self.review_over_budget
             ));
+        }
+        if let Some(line) = reviews_not_had_line(&self.reviewer_launch_failures) {
+            out.push_str(&line);
         }
         out.push('\n');
         out.push_str(&format!(
@@ -1887,6 +1954,52 @@ mod tests {
         crate::test_support::temp_dir(&format!("report-{name}"))
     }
 
+    /// Each detail a run records when its review could not be had, as the
+    /// runner writes it, maps to its cause; a part of a review in parts is
+    /// classed by its own cause. A reworded detail falls into `other`,
+    /// which this table is here to catch.
+    #[test]
+    fn every_recorded_review_failure_maps_to_its_cause() {
+        for (detail, cause) in [
+            (
+                "the reviewer could not be launched: the native dispatch could not be registered: request exceeds 65536 bytes",
+                "launch_refused",
+            ),
+            ("reviewer dispatch ended cancelled: by the person", "dispatch_ended"),
+            ("reviewer dispatch failed: io error", "dispatch_ended"),
+            ("the reviewer ended without a terminal result", "ended_without_result"),
+            ("the reviewer's answer has no verdict line", "no_verdict"),
+            ("the spend ceiling was reached before the review", "spend_ceiling"),
+            ("no reviewer model configured at the implementation tier", "no_reviewer_model"),
+            ("no reviewer model is configured at any tier", "no_reviewer_model"),
+            ("the ledger refused the review record: busy", "ledger"),
+            (
+                "review part 2 of 3 could not be had: the reviewer could not be launched: refused",
+                "launch_refused",
+            ),
+            (
+                "review part 1 of 4 could not be had: the reviewer ended without a terminal result",
+                "ended_without_result",
+            ),
+            ("something new", "other"),
+        ] {
+            assert_eq!(reviewer_failure_cause(detail), cause, "{detail}");
+        }
+    }
+
+    #[test]
+    fn the_report_names_the_reviews_not_had_by_cause() {
+        assert_eq!(reviews_not_had_line(&Default::default()), None);
+        let failures = std::collections::BTreeMap::from([
+            ("launch_refused".to_string(), 3),
+            ("no_verdict".to_string(), 1),
+        ]);
+        assert_eq!(
+            reviews_not_had_line(&failures).as_deref(),
+            Some("reviews not had: launch_refused 3, no_verdict 1\n")
+        );
+    }
+
     /// The detail line is reviewer prose: a fixed BYTE slice at 120 in a
     /// sentence whose 121st byte lands inside an em dash panics.
     #[test]
@@ -1916,6 +2029,7 @@ mod tests {
             acceptance_rate: Some(1.0),
             pending_decisions: 0,
             review_over_budget: 0,
+            reviewer_launch_failures: Default::default(),
             cost_completeness: CostCompleteness::Actual,
             tasks: vec![TaskLine {
                 task_id: "task-a".into(),
@@ -2174,6 +2288,7 @@ mod tests {
                 "repair_outcomes",
                 "review_outcomes",
                 "review_over_budget",
+                "reviewer_launch_failures",
                 "runs",
                 "schema_version",
                 "session_routing",
