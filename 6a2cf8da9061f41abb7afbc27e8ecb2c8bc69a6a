@@ -1,0 +1,16 @@
+amont-provenance-v1
+commit 6a2cf8da9061f41abb7afbc27e8ecb2c8bc69a6a
+tree 75945f371fc4f10008f5cbbb40b765e0e9e56396
+canon 2a2d2515f5e24d53b423bd2941e229f67a0712de
+patch 9672c47f46eef73ded8a2ddef586cb6024fa59ff
+plan docs/plans/2026-10-20-review-over-budget.md c9c19f6a9364e2ea2dc583bf2d52e2891049b21333ddb07f6259c46d4e4178a6
+review reviewed fcd48370beb825ff57c4e6c6d01aa0d4e5b42f8589e381cf210f734e24848c1f
+preview not-required
+producer amont-agent 2.45.1
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAEAHJ2CXWn2q022KN01U+GfzWdTTfVa1pWwlGlbn6jyMdTCzVg
+IhOwSnPg21TPoy1Z94hkp4UXprZ1d/8esPVOsN
+-----END SSH SIGNATURE-----
