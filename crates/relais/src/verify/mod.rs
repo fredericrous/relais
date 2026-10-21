@@ -3039,8 +3039,8 @@ mod tests {
         let events = Events::for_run("run-w", &artifacts);
         let log = dir.join("check.log");
         std::fs::write(&log, "").expect("log");
-        // The check waits until the test has seen a heartbeat (or 30 s have
-        // passed), so a loaded machine whose `ps` sample outlasts a fixed
+        // The check waits until the test has seen a heartbeat (or 20 s have
+        // passed, inside the wait's 30 s), so a loaded machine whose `ps` sample outlasts a fixed
         // sleep cannot end the wait before the first beat.
         let release = dir.join("release");
         let mut command = Command::new("sh");
@@ -3053,7 +3053,7 @@ mod tests {
         let releaser = std::thread::spawn({
             let release = release.clone();
             move || {
-                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
                 while std::time::Instant::now() < deadline {
                     if std::fs::read_to_string(&watched)
                         .is_ok_and(|text| text.contains("\"heartbeat\""))
