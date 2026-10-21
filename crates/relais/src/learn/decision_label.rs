@@ -9,7 +9,7 @@
 //! [`label_decisions`] is the thin reader that feeds it from the ledger.
 
 use crate::ids::{RunId, TaskId};
-use crate::ledger::{Ledger, LedgerError};
+use crate::ledger::{IntentReview, Ledger, LedgerError};
 use crate::lifecycle::{Reason, State};
 use crate::outcome::{OutcomeKind, SOURCE_ORCHESTRATOR};
 
@@ -140,6 +140,9 @@ pub struct DecisionFacts {
     pub answerer: Answerer,
     pub salvage: SalvageEvidence,
     pub outcome: Option<TaskOutcome>,
+    /// The answer asked for a review in parts (`review-parts`): it is
+    /// recorded as a revision, but nobody judged the candidate.
+    pub asked_for_review_in_parts: bool,
 }
 
 /// What a task's outcome says about the change an answer let through.
@@ -176,6 +179,8 @@ const NOT_AN_ANSWER: &str = "the decision is open, or was not answered with a de
 ///   intact is yes, the landed commit rewriting it is no (`rewritten`), a
 ///   withdrawn outcome beats containment; unknown containment and any
 ///   other raising reason are excluded;
+/// - a revision that asked for a review in parts: excluded, the candidate
+///   was not judged;
 /// - revise, reject and abandon: no from the answer, unless the advisor
 ///   gave it;
 /// - `decided`/`recorded`, a run raised from any other state, and a
@@ -193,6 +198,9 @@ pub fn decision_label_of(facts: &DecisionFacts) -> DecisionLabel {
     match resolution {
         Reason::DecisionApproved => approval_label(facts),
         Reason::DecisionSalvaged => salvage_label(facts),
+        Reason::DecisionRevised if facts.asked_for_review_in_parts => {
+            DecisionLabel::Excluded("a review in parts was asked for: the candidate was not judged")
+        }
         Reason::DecisionRevised | Reason::DecisionRejected | Reason::DecisionAbandoned => {
             match facts.answerer {
                 Answerer::Advisor => DecisionLabel::Excluded("the advisor's own unlabelled answer"),
@@ -266,12 +274,16 @@ pub fn label_decisions(ledger: &Ledger) -> Result<Vec<LabelledDecision>, LedgerE
                     kind: stored.outcome.kind,
                     reporter: Reporter::of_stored(stored.outcome.detail.source.as_deref()),
                 });
+            let asked_for_review_in_parts = ledger
+                .intent_of_decision(&decision.run)?
+                .is_some_and(|intent| intent.review == Some(IntentReview::Parts));
             let facts = DecisionFacts {
                 raised_state: decision.raised_state,
                 resolution: decision.resolution,
                 answerer: Answerer::of_stored(decision.actor.as_deref()),
                 salvage: salvage_evidence_of(Some(&decision)),
                 outcome,
+                asked_for_review_in_parts,
             };
             Ok(LabelledDecision {
                 run: decision.run,
@@ -296,6 +308,7 @@ mod tests {
             answerer: Answerer::Anyone,
             salvage: SalvageEvidence::NotSalvaged,
             outcome: None,
+            asked_for_review_in_parts: false,
         }
     }
 
@@ -308,6 +321,21 @@ mod tests {
 
     fn outcome(kind: OutcomeKind, reporter: Reporter) -> Option<TaskOutcome> {
         Some(TaskOutcome { kind, reporter })
+    }
+
+    /// `review-parts` is recorded as a revision, but it judges nothing:
+    /// only that answer is left out, a plain revise stays a no.
+    #[test]
+    fn a_revision_that_asked_for_a_review_in_parts_is_excluded() {
+        let in_parts = DecisionFacts {
+            asked_for_review_in_parts: true,
+            ..facts(Reason::DecisionRevised)
+        };
+        assert!(matches!(decision_label_of(&in_parts), Excluded(_)));
+        assert_eq!(
+            decision_label_of(&facts(Reason::DecisionRevised)),
+            No(S::Answer)
+        );
     }
 
     #[test]
@@ -414,6 +442,22 @@ mod tests {
                 "{reason:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_revision_asking_for_a_review_in_parts_is_excluded_and_a_plain_revise_is_a_no() {
+        let parts = DecisionFacts {
+            asked_for_review_in_parts: true,
+            ..facts(Reason::DecisionRevised)
+        };
+        assert_eq!(
+            decision_label_of(&parts),
+            Excluded("a review in parts was asked for: the candidate was not judged")
+        );
+        assert_eq!(
+            decision_label_of(&facts(Reason::DecisionRevised)),
+            No(S::Answer)
+        );
     }
 
     #[test]
