@@ -60,6 +60,19 @@ const RECONCILE_EVERY: Duration = Duration::from_secs(15);
 /// object; anything larger is a malformed or hostile client, and is
 /// answered with an error rather than buffered.
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+/// The most prompt text a native dispatch may register. The coordinator
+/// keeps the registered prompt and answers `ClaimOutcome::Spawn` with it,
+/// whatever the call asked for, so the prompt itself travels in the
+/// registration (`register_native`, `NativeAsk::Spawn` and `Continue`).
+const NATIVE_PROMPT_BUDGET_BYTES: u64 = 192 * 1024;
+/// The cap for a native registration only: the prompt budget plus a margin
+/// for the JSON around it and for escaping. Every other request keeps
+/// `MAX_REQUEST_BYTES`.
+const MAX_NATIVE_REQUEST_BYTES: u64 = NATIVE_PROMPT_BUDGET_BYTES + 64 * 1024;
+/// How a serialized `Request::RegisterNative` begins: the method tag is
+/// the first field, which is how the size cap tells the request kind
+/// before the whole line has been read.
+const NATIVE_REGISTRATION_PREFIX: &str = r#"{"method":"register_native""#;
 /// `pub(crate)`: the hook's own admission wait derives its handler
 /// timeout from this (`install::settings::derived_pretooluse_timeout`),
 /// so the number in force lives here once rather than being copied.
@@ -1281,17 +1294,30 @@ fn handle_connection(
         .take(MAX_REQUEST_BYTES);
     let mut writer = stream;
     let mut line = String::new();
-    let read = reader
+    let mut read = reader
         .read_line(&mut line)
         .map_err(io("reading the request"))?;
     if read == 0 {
         return Ok(());
     }
-    let oversized = read as u64 == MAX_REQUEST_BYTES && !line.ends_with('\n');
+    let mut cap = MAX_REQUEST_BYTES;
+    // Only a native registration may exceed the ordinary cap: read on
+    // for it, to its own bound.
+    if read as u64 == MAX_REQUEST_BYTES
+        && !line.ends_with('\n')
+        && line.starts_with(NATIVE_REGISTRATION_PREFIX)
+    {
+        cap = MAX_NATIVE_REQUEST_BYTES;
+        reader.set_limit(MAX_NATIVE_REQUEST_BYTES - MAX_REQUEST_BYTES);
+        read += reader
+            .read_line(&mut line)
+            .map_err(io("reading the request"))?;
+    }
+    let oversized = read as u64 == cap && !line.ends_with('\n');
     let mut signals = Vec::new();
     let response = if oversized {
         Response::Error {
-            detail: format!("request exceeds {MAX_REQUEST_BYTES} bytes"),
+            detail: format!("request exceeds {cap} bytes"),
         }
     } else {
         match serde_json::from_str::<Request>(line.trim()) {
@@ -3420,6 +3446,87 @@ mod tests {
             state.lock().expect("lock").status(Instant::now()).runs["run-1"].admitted_total,
             2
         );
+    }
+
+    // A native registration may carry a prompt past the ordinary cap, up to
+    // its own bound, and the claim answers with the whole prompt. Any other
+    // request over 64 KiB, and a registration over the native bound, is
+    // refused with an error naming the cap.
+    #[test]
+    fn only_a_native_registration_may_exceed_the_ordinary_cap() {
+        let dir = temp_dir("native-cap");
+        let socket = dir.join("relais.sock");
+        let (coordinator, listener) = Coordinator::start(
+            &socket,
+            limits(),
+            None,
+            crate::admission::DEFAULT_AGENT_LEASE_TTL,
+        )
+        .expect("start");
+        let server = std::thread::spawn(move || coordinator.serve(listener));
+        let gate = RemoteGate::new(socket.clone());
+        gate.register_run(&registration("run-n", "sess-n"))
+            .expect("register");
+        assert_eq!(
+            gate.admit(&request("d-n", "run-n", "sess-n"))
+                .expect("admit"),
+            Decision::Granted
+        );
+        gate.native_hello("sess-n").expect("hello");
+        let prompt = "p".repeat(100 * 1024);
+        let ask = NativeAsk::Spawn {
+            subagent_type: "relais-reviewer".into(),
+            model: "sonnet".into(),
+            prompt: prompt.clone(),
+            worktree: PathBuf::from("/trees/n"),
+        };
+        assert_eq!(
+            gate.register_native("sess-n", "d-n", &ask).expect("native"),
+            RegisterOutcome::Registered
+        );
+        match gate.claim_native("sess-n", "d-n", None).expect("claim") {
+            ClaimOutcome::Spawn { prompt: kept, .. } => assert_eq!(kept, prompt),
+            other => panic!("expected the spawn, got {other:?}"),
+        }
+
+        let send = |text: String| {
+            let stream = Stream::connect(&socket).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let mut writer = stream.try_clone().expect("clone");
+            let sender = std::thread::spawn(move || {
+                let _ = writer.write_all(text.as_bytes());
+            });
+            let mut line = String::new();
+            let _ = BufReader::new(stream).read_line(&mut line);
+            let _ = sender.join();
+            line
+        };
+        let padded = format!(r#"{{"method":"ping","pad":"{}"}}"#, "a".repeat(70 * 1024));
+        let refused = send(format!("{padded}\n"));
+        assert!(
+            refused.contains(&format!("request exceeds {MAX_REQUEST_BYTES} bytes")),
+            "{refused}"
+        );
+        let flood = format!(
+            r#"{{"method":"register_native","pad":"{}"#,
+            "a".repeat(MAX_NATIVE_REQUEST_BYTES as usize)
+        );
+        let refused = send(flood);
+        assert!(
+            refused.contains(&format!("request exceeds {MAX_NATIVE_REQUEST_BYTES} bytes")),
+            "{refused}"
+        );
+
+        assert!(matches!(
+            Client::new(socket.clone())
+                .request(&Request::Shutdown)
+                .expect("shutdown"),
+            Response::Ack
+        ));
+        let _ = Client::new(socket.clone()).ping();
+        server.join().expect("server thread").expect("serve");
     }
 
     // The native-dispatch calls over a real socket: each request reaches

@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+A reviewer no longer fails to launch on a large diff. The reviewer prompt names the candidate patch (a copy in the worktree's `.relais/review/<run>/candidate.patch`, removed when the review ends) with its size, changed files and diff stat, and the reviewer reads it with `Read` in windows; the constraint statements get their own 32 KiB budget instead of what the patch left. The coordinator raises its per-request cap above 64 KiB for native registration only (to 256 KiB); every other request keeps 64 KiB. A reviewer launch failure now puts its cause in the `review_unavailable` detail and in `events.jsonl`.
+
 ## v0.27.0
 
 Runs survive a loaded machine (relais ADR-0010): budgets, heavy leases, a disk floor, exhaustion as evidence, pre-existing failures without a wasted repair, visible retries, a heartbeat apart from progress, and cost on the sequenced path; the paragraphs below say each. The ledger moves to schema v40 (tables `group_bindings`, `run_epochs`, `check_disk_growth`). A relais from before schema 40 cannot read the upgraded ledger. Before upgrading, stop the coordinator and copy the ledger with `sqlite3 <state>/ledger.sqlite ".backup <file>"` (`<state>` is relais's state directory, `~/.local/state/relais` by default). To roll back, stop the coordinator again and restore that copy, only with the person's yes.

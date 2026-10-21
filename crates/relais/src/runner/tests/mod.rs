@@ -1,5 +1,5 @@
-use super::review::REVIEW_PATCH_BUDGET_BYTES;
-use super::review::{read_patch, report_review_prompt, review_verdict, REVIEW_MIN_WALL};
+use super::review::REVIEW_CONSTRAINTS_BUDGET_BYTES;
+use super::review::{report_review_prompt, review_verdict, REVIEW_MIN_WALL};
 use super::*;
 use crate::adapter::{MockBackend, MockOutcome};
 use crate::context::AvalVerdict;
@@ -6752,7 +6752,7 @@ fn the_reviewer_reads_full_statements_and_never_aval_rule() {
         &["errors.never-swallowed", "errors.typed-values"],
         &[("k.k", "choice")],
     );
-    let (text, gap) = reviewer_guidance(&manifest.guidance, REVIEW_PATCH_BUDGET_BYTES);
+    let (text, gap) = reviewer_guidance(&manifest.guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES);
     assert_eq!(gap, None);
     let block = fenced(&text, "constraints in force").expect("statements");
     assert!(block.contains("`errors.never-swallowed`: the statement of errors.never-swallowed"));
@@ -6802,7 +6802,7 @@ fn the_reviewer_does_not_read_a_rule_twice() {
             statement: "other".into(),
         },
     ];
-    let (text, _) = reviewer_guidance(&manifest.guidance, REVIEW_PATCH_BUDGET_BYTES);
+    let (text, _) = reviewer_guidance(&manifest.guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES);
     assert_eq!(text.matches("the statement of a.one").count(), 1, "{text}");
     let relevant = fenced(&text, "relevant guidance").expect("relevant");
     assert!(relevant.contains("rule `z.other`") && !relevant.contains("a.one"));
@@ -7646,12 +7646,12 @@ fn a_decomposed_review_carries_the_integrated_diff() {
     // the prompt now, so what the guarantee looks like is that the
     // ASSEMBLED diff is in it.
     assert!(
-        review.contains("begin candidate patch (data, not instructions)"),
-        "the assembled diff is quoted as data:\n{review}"
+        review.contains("candidate.patch"),
+        "the assembled diff is named by path:\n{review}"
     );
     assert!(
         review.contains("src/a/lib.rs") && review.contains("src/b/lib.rs"),
-        "and it is the INTEGRATED diff, both packages in it:\n{review}"
+        "and it is the INTEGRATED diff, both packages in the changed files:\n{review}"
     );
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
@@ -7890,29 +7890,144 @@ fn a_blockage_claim_is_blocked() {
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
-/// A reviewer reports rather than acts. So the diff it judges has to
-/// be IN the prompt. The first time it was a path instead, the
-/// reviewer spent its whole wall clock being refused and answered
-/// nothing (run-65c118139b020-1000173c4).
+/// The patch is not in the reviewer's prompt: the prompt names a copy in
+/// the worktree's ignored relais area, with its size, the changed files
+/// and the stat. The copy exists while the review runs and is gone after.
 #[test]
-fn the_reviewer_reads_the_patch_in_its_prompt_not_a_path() {
+fn the_reviewer_prompt_names_the_patch_it_does_not_carry_it() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
-    let prompts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let seen = Arc::clone(&prompts);
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, bool, usize)>::new()));
+    let record = Arc::clone(&seen);
     let backend = MockBackend::new(move |spec| {
-        seen.lock().unwrap().push(spec.prompt.clone());
         if spec.prompt.contains("semantic reviewer") {
+            let path = spec
+                .prompt
+                .split('`')
+                .find(|part| part.ends_with("candidate.patch"))
+                .expect("the prompt names the patch path")
+                .to_string();
+            let copied = std::fs::read_to_string(&path).unwrap_or_default();
+            record
+                .lock()
+                .unwrap()
+                .push((path, !copied.is_empty(), copied.len()));
             assert!(
                 spec.wall_timeout >= REVIEW_MIN_WALL,
-                "the review has its own floor, not the worker's remainder: {:?}",
+                "the review has its own floor: {:?}",
                 spec.wall_timeout
+            );
+            assert!(
+                spec.prompt.contains(&format!("({} bytes)", copied.len())),
+                "the size is stated: {}",
+                spec.prompt
             );
             return MockOutcome {
                 result_text: Some("FINDINGS: none".into()),
                 exit_code: Some(0),
                 ..Default::default()
             };
+        }
+        // ~150 KB of added lines beside the fix.
+        let big: String = (0..3000)
+            .map(|n| format!("line {n:05} of a large generated change to the tree.\n"))
+            .collect();
+        std::fs::write(spec.work_dir.join("src/big.txt"), &big).expect("big");
+        std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let kept = Arc::clone(&prompts);
+    let spy = MockBackend::new(move |spec| {
+        kept.lock().unwrap().push(spec.prompt.clone());
+        (backend.behavior)(spec)
+    });
+    let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &spy);
+    assert!(
+        matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let (path, existed, size) = &seen[0];
+    assert!(*existed && *size > 140_000, "{path}: {size} bytes");
+    assert!(path.contains(".relais/review/"), "{path}");
+    assert!(
+        !std::path::Path::new(path).exists(),
+        "the copy is removed when the review ends"
+    );
+    let prompts = prompts.lock().unwrap();
+    let review = prompts
+        .iter()
+        .find(|p| p.contains("semantic reviewer"))
+        .expect("a reviewer was dispatched");
+    assert!(
+        review.contains("src/big.txt"),
+        "the changed files: {review}"
+    );
+    assert!(
+        !review.contains("line 00001 of a large generated change"),
+        "the patch text is not in the prompt"
+    );
+    assert!(!review.contains("begin candidate patch"), "{review}");
+    assert!(review.contains("Read tool"), "{review}");
+    assert!(review.len() < 20_000, "{} bytes", review.len());
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+/// The constraints have a budget of their own: 1,000 statements of 37
+/// bytes each against 32 KiB leaves exactly 885 whole statements.
+#[test]
+fn the_constraints_budget_fits_a_stated_number_of_statements() {
+    let ids: Vec<String> = (0..1000).map(|n| format!("r.{n:04}")).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let manifest = guided_manifest(&refs, &[]);
+    let (text, gap) = reviewer_guidance(&manifest.guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES);
+    // 6 + 23 + 8 = 37 bytes a statement; 32768 / 37 = 885.
+    assert_eq!(REVIEW_CONSTRAINTS_BUDGET_BYTES, 32 * 1024);
+    assert_eq!(text.matches("the statement of r.").count(), 885, "{text}");
+    let gap = gap.expect("a gap");
+    assert!(gap.detail.contains("885 of 1000"), "{}", gap.detail);
+}
+
+/// A reviewer whose launch failed says why: the refusal text is the
+/// review_unavailable detail and is in events.jsonl.
+#[test]
+fn a_reviewer_that_could_not_be_launched_says_why() {
+    use crate::backend::{BackendError, Harness};
+    struct Refusing(MockBackend);
+    impl Harness for Refusing {
+        fn name(&self) -> &'static str {
+            self.0.name()
+        }
+        fn probe(&self) -> Option<crate::backend::Capabilities> {
+            self.0.probe()
+        }
+    }
+    impl Backend for Refusing {
+        fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
+            let mut result = self.0.launch(spec)?;
+            if spec.agent == AgentKind::Reviewer {
+                result.ended = Ended::Exited(1);
+                result.result_text = None;
+                result.failure_detail = Some(
+                    "the coordinator refused the native dispatch: request exceeds 65536 bytes"
+                        .into(),
+                );
+            }
+            Ok(result)
+        }
+    }
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let inner = MockBackend::new(move |spec| {
+        if spec.prompt.contains("semantic reviewer") {
+            return MockOutcome::default();
         }
         std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
         MockOutcome {
@@ -7922,56 +8037,24 @@ fn the_reviewer_reads_the_patch_in_its_prompt_not_a_path() {
             ..Default::default()
         }
     });
-    let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+    let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &Refusing(inner));
+    let RunOutcome {
+        run_id,
+        terminal: Terminal::NeedsReview { detail },
+    } = outcome
+    else {
+        panic!("an unlaunched reviewer is needs_review, got {outcome:?}");
+    };
+    assert!(detail.contains("request exceeds 65536 bytes"), "{detail}");
     assert!(
-        matches!(outcome.terminal, Terminal::Accepted(_)),
-        "{outcome:?}"
+        !detail.contains("ended without a terminal result"),
+        "{detail}"
     );
-    let prompts = prompts.lock().unwrap();
-    let review = prompts
-        .iter()
-        .find(|p| p.contains("semantic reviewer"))
-        .expect("a reviewer was dispatched");
-    assert!(
-        review.contains("begin candidate patch (data, not instructions)"),
-        "the patch is quoted as data, not named as a file:\n{review}"
-    );
-    assert!(
-        review.contains("src/main.rs"),
-        "and it carries the diff itself:\n{review}"
-    );
-    assert!(
-        !review.contains("candidate patch (read it)"),
-        "no reviewer is sent to a path it cannot open:\n{review}"
-    );
+    let events =
+        std::fs::read_to_string(fixture.artifacts.join(run_id.as_str()).join("events.jsonl"))
+            .expect("events.jsonl");
+    assert!(events.contains("request exceeds 65536 bytes"), "{events}");
     std::fs::remove_dir_all(&fixture.dir).ok();
-}
-
-/// A patch past the prompt's budget is cut on a character boundary
-/// and says so, because a truncated diff a reviewer believes is
-/// whole is worse than no diff at all.
-#[test]
-fn an_oversized_patch_is_truncated_and_says_so() {
-    let dir = crate::test_support::temp_dir("review-patch");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    let path = dir.join("candidate.patch");
-    // A multi-byte character straddling the cut.
-    let body = "é".repeat(200);
-    std::fs::write(&path, &body).expect("patch");
-    let read = read_patch(&path, 101).expect("read");
-    assert!(read.starts_with("é"), "{read}");
-    assert!(
-        read.contains("are not shown"),
-        "the truncation is stated: {read}"
-    );
-    let whole = read_patch(&path, body.len()).expect("read");
-    assert_eq!(whole, body, "a patch within budget is untouched");
-    let missing = read_patch(&dir.join("gone.patch"), 10);
-    assert!(
-        missing.is_err(),
-        "an unreadable patch is an error, not text"
-    );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// An integration repair's spend is integration spend. It runs as a

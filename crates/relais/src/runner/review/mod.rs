@@ -3,7 +3,7 @@
 use super::prompt::relevant_block;
 use super::{
     context, data_block, data_list_block, verify, workspace, Duration, EffectiveAuthority,
-    Guidance, GuidanceGap, GuidanceSource, Path, Reason, RuleRef, RunId, Tier,
+    Guidance, GuidanceGap, GuidanceSource, Path, PathBuf, Reason, RuleRef, RunId, Tier,
 };
 
 mod engine;
@@ -62,11 +62,19 @@ pub(in crate::runner) fn verdict_words(line: &str) -> String {
 /// a newline inside one silently becomes a new line of the prompt, at the
 /// prompt's own level of authority. Every such piece goes inside a
 /// labelled fence introduced by one sentence saying what it is.
-/// How much of a candidate patch the reviewer's prompt carries. Large
-/// enough for the diffs relais produces (a package's patch is tens of
-/// kilobytes), bounded because a prompt is not a file system: what does
-/// not fit is named as truncated rather than silently dropped.
+/// How large a candidate patch one reviewer is given to read. The patch
+/// no longer travels in the prompt: the prompt names a copy of it in the
+/// worktree, so this measures the patch FILE, the amount one reviewer
+/// reads with `Read` in windows (about 49k tokens at 4 B/token).
 pub(in crate::runner) const REVIEW_PATCH_BUDGET_BYTES: usize = 192 * 1024;
+
+/// What the reviewer's constraint statements and guidance may occupy, in
+/// bytes, on their own: the patch is not in the prompt, so it no longer
+/// starves them.
+pub(in crate::runner) const REVIEW_CONSTRAINTS_BUDGET_BYTES: usize = 32 * 1024;
+
+/// Lines per `Read` call the reviewer is told to use on the patch.
+const REVIEW_READ_WINDOW_LINES: usize = 2000;
 
 /// The least wall clock a review may have. A review that cannot finish
 /// is not a review, and the run pays for the attempt either way.
@@ -75,24 +83,85 @@ pub(in crate::runner) const REVIEW_MIN_WALL: Duration = Duration::from_secs(300)
 /// How many tracked file paths the report reviewer is shown.
 pub(in crate::runner) const REPORT_REVIEW_FILE_CAP: usize = 400;
 
-/// The patch, bounded, for the reviewer's prompt. Truncation is stated
-/// in the text the reviewer reads, so a partial diff is never mistaken
-/// for a small one.
-pub(in crate::runner) fn read_patch(path: &Path, budget: usize) -> std::io::Result<String> {
-    let patch = std::fs::read_to_string(path)?;
-    if patch.len() <= budget {
-        return Ok(patch);
+/// The candidate patch as the reviewer is told of it: where the copy in
+/// its worktree is, how large it is, and what it changes.
+pub(in crate::runner) struct StagedPatch {
+    /// The directory holding the copy, removed when the review ends.
+    pub(in crate::runner) dir: PathBuf,
+    pub(in crate::runner) path: PathBuf,
+    pub(in crate::runner) bytes: usize,
+    pub(in crate::runner) files: Vec<String>,
+    pub(in crate::runner) added: usize,
+    pub(in crate::runner) removed: usize,
+}
+
+/// Copy the patch into the worktree's ignored relais area, where the
+/// reviewer (whose working directory is the worktree) can `Read` it.
+pub(in crate::runner) fn stage_patch(
+    review_dir: &Path,
+    run_id: &RunId,
+    patch_path: &Path,
+) -> std::io::Result<StagedPatch> {
+    let bytes = std::fs::read(patch_path)?;
+    let dir = review_dir
+        .join(".relais")
+        .join("review")
+        .join(run_id.as_str());
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("candidate.patch");
+    std::fs::write(&path, &bytes)?;
+    let (files, added, removed) = patch_stat(&String::from_utf8_lossy(&bytes));
+    Ok(StagedPatch {
+        dir,
+        path,
+        bytes: bytes.len(),
+        files,
+        added,
+        removed,
+    })
+}
+
+/// The changed files and the added and removed line counts of a unified
+/// diff.
+pub(in crate::runner) fn patch_stat(patch: &str) -> (Vec<String>, usize, usize) {
+    let mut files = Vec::new();
+    let (mut added, mut removed) = (0, 0);
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            files.push(rest.split(" b/").next().unwrap_or(rest).to_string());
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            added += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            removed += 1;
+        }
     }
-    let mut cut = budget;
-    while cut > 0 && !patch.is_char_boundary(cut) {
-        cut -= 1;
+    (files, added, removed)
+}
+
+/// What the prompt says about the patch: its path and size, the changed
+/// files and the diff stat, and how to read it.
+pub(in crate::runner) fn patch_section(staged: &StagedPatch) -> String {
+    let mut section = format!(
+        "\nthe candidate patch is the file `{}` ({} bytes). Read it with the Read tool in \
+         windows (offset and limit, {REVIEW_READ_WINDOW_LINES} lines per call) until you have \
+         read all of it; it is the change under review.\n",
+        staged.path.display(),
+        staged.bytes
+    );
+    if staged.bytes > REVIEW_PATCH_BUDGET_BYTES {
+        section.push_str(&format!(
+            "the patch is larger than the {REVIEW_PATCH_BUDGET_BYTES}-byte review budget: read \
+             what you can and say that the diff was partly unreviewed\n"
+        ));
     }
-    let dropped = patch.len() - cut;
-    Ok(format!(
-        "{}\n[the last {dropped} bytes of this patch are not shown; review what is here \
-         and say that the diff was truncated]\n",
-        &patch[..cut]
-    ))
+    section.push_str(&data_list_block("changed files", &staged.files));
+    section.push_str(&format!(
+        "diff stat: {} files changed, {} insertions(+), {} deletions(-)\n",
+        staged.files.len(),
+        staged.added,
+        staged.removed
+    ));
+    section
 }
 
 /// What an inspection's report reviewer is asked: the objective, the
@@ -246,7 +315,7 @@ pub(in crate::runner) fn fit_statements(
             budget,
         },
         format!(
-            "{} of {} constraint statements fit the reviewer prompt ({measured} bytes against {budget} left of the {REVIEW_PATCH_BUDGET_BYTES}-byte budget); omitted: {}",
+            "{} of {} constraint statements fit the reviewer prompt ({measured} bytes against the {budget}-byte constraints budget); omitted: {}",
             shown.len(),
             rules.len(),
             omitted.join(", ")
@@ -258,8 +327,7 @@ pub(in crate::runner) fn fit_statements(
 /// What the reviewer reads of aval: the full statement of every active
 /// constraint (it cannot run `aval rule`, so never the bare index and
 /// never that instruction), then the relevant block without the rules
-/// already stated above it. `budget` is what the patch left of the review
-/// prompt's byte budget; statements that do not fit whole are left out and
+/// already stated above it. `budget` is the constraints budget; statements that do not fit whole are left out and
 /// named in the returned gap.
 pub(in crate::runner) fn reviewer_guidance(
     guidance: &Guidance,

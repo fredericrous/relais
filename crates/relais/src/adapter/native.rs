@@ -1307,6 +1307,18 @@ mod tests {
     }
 
     #[test]
+    fn a_spawn_line_carries_a_prompt_past_the_ordinary_request_cap() {
+        let spec = LaunchSpec {
+            prompt: "x".repeat(100 * 1024),
+            ..spec("sonnet", None)
+        };
+        let ask = ask_for(&Route::Spawn, &spec);
+        let line = serde_json::to_string(&request_for("run-1", &spec, &ask)).expect("json");
+        let input: serde_json::Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(input["prompt"].as_str().map(str::len), Some(100 * 1024));
+    }
+
+    #[test]
     fn a_reviewer_and_a_planner_spawn_as_their_own_kind_and_are_never_continued() {
         let known = agent("sonnet", Some("medium"));
         for (kind, word) in [

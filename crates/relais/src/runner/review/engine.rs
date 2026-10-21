@@ -13,8 +13,9 @@ use crate::verify;
 use crate::workspace;
 
 use super::{
-    read_patch, report_review_prompt, review_verdict, reviewer_tier, ReviewOutcome, ReviewPurpose,
-    ReviewRequest, ReviewSeat, REVIEW_MIN_WALL, REVIEW_PATCH_BUDGET_BYTES,
+    patch_section, report_review_prompt, review_verdict, reviewer_tier, stage_patch, ReviewOutcome,
+    ReviewPurpose, ReviewRequest, ReviewSeat, StagedPatch, REVIEW_CONSTRAINTS_BUDGET_BYTES,
+    REVIEW_MIN_WALL,
 };
 use crate::runner::{
     data_block, data_list_block, effort_str, reviewer_guidance, utc_day_start, Budget, Candidate,
@@ -210,7 +211,10 @@ impl<'a> RunEngine<'a> {
             }
         }
         let review_dir = self.review_dir();
-        let (prompt, reviewer_gap) = self.review_prompt(request, &review_dir);
+        // The reviewer reads the patch from a copy in its worktree's
+        // ignored relais area; the copy goes when the review ends.
+        let staged = stage_patch(&review_dir, &self.run_id, &request.patch_path);
+        let (prompt, reviewer_gap) = self.review_prompt(request, &review_dir, staged.as_ref());
         if let Some(gap) = &reviewer_gap {
             self.emit_guidance_gap(gap);
         }
@@ -221,7 +225,16 @@ impl<'a> RunEngine<'a> {
             dir: review_dir,
             purpose: ReviewPurpose::Patch,
         };
-        let result = match self.dispatch_reviewer(request, seat, prompt, spend) {
+        let dispatched = self.dispatch_reviewer(request, seat, prompt, spend);
+        if let Ok(staged) = &staged {
+            if let Err(e) = std::fs::remove_dir_all(&staged.dir) {
+                return ReviewOutcome::Unavailable(format!(
+                    "the patch copy {} could not be removed: {e}",
+                    staged.dir.display()
+                ));
+            }
+        }
+        let result = match dispatched {
             Ok(result) => result,
             Err(unavailable) => return unavailable,
         };
@@ -249,6 +262,7 @@ impl<'a> RunEngine<'a> {
         &self,
         request: &ReviewRequest<'_>,
         review_dir: &Path,
+        staged: Result<&StagedPatch, &std::io::Error>,
     ) -> (String, Option<GuidanceGap>) {
         let mut prompt = String::from(
             "You are a semantic reviewer. You cannot edit or waive checks; you report findings only.\n\
@@ -282,14 +296,10 @@ impl<'a> RunEngine<'a> {
         if let Some(design) = &request.manifest.design {
             prompt.push_str(&data_block("program design", design));
         }
-        // The patch is read first: the constraint statements share its
-        // budget, and the patch is what the reviewer cannot do without.
-        let patch = read_patch(&request.patch_path, REVIEW_PATCH_BUDGET_BYTES);
-        let patch_bytes = patch.as_ref().map_or(0, String::len);
-        let (guidance_text, reviewer_gap) = reviewer_guidance(
-            &request.manifest.guidance,
-            REVIEW_PATCH_BUDGET_BYTES.saturating_sub(patch_bytes),
-        );
+        // The patch is not in the prompt, so the constraints have a
+        // budget of their own.
+        let (guidance_text, reviewer_gap) =
+            reviewer_guidance(&request.manifest.guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES);
         prompt.push_str(&guidance_text);
         if !request.verification_inputs_changed.is_empty() {
             prompt.push_str(
@@ -306,20 +316,15 @@ impl<'a> RunEngine<'a> {
             ));
         }
         prompt.push_str(&format!("\ncandidate commit: {}\n", request.candidate_sha));
-        // The patch travels IN the prompt. A reviewer's agent definition
-        // gives it Read, Grep and Glob only — it reports, it does not act —
-        // and a path it cannot open is a review that cannot happen: the first time this
-        // prompt told a reviewer to read a file, it spent its whole wall
-        // clock being refused and answered nothing at all.
-        match patch {
-            Ok(patch) => prompt.push_str(&data_block("candidate patch", &patch)),
+        match staged {
+            Ok(staged) => prompt.push_str(&patch_section(staged)),
             Err(e) => {
                 // Say so in the prompt rather than pretending there is no
                 // diff: a reviewer that cannot see the change must report
                 // that, and the runner reads the missing verdict as
                 // `Unavailable` rather than as approval.
                 prompt.push_str(&format!(
-                    "\nthe candidate patch could not be read ({e}); review what the \
+                    "\nthe candidate patch could not be staged for you ({e}); review what the \
                      objective and the criteria demand, and report that the diff was \
                      unavailable to you\n"
                 ));
@@ -488,9 +493,14 @@ impl<'a> RunEngine<'a> {
         }
         spend.fold(event.cost, result.usage.cost.completeness());
         if result.terminal_result_missing() {
-            return Err(ReviewOutcome::Unavailable(
-                "the reviewer ended without a terminal result".into(),
-            ));
+            // A launch that failed says why; the generic sentence is for
+            // an end with nothing to report.
+            return Err(ReviewOutcome::Unavailable(match &result.failure_detail {
+                Some(detail) if !detail.is_empty() => {
+                    format!("the reviewer could not be launched: {detail}")
+                }
+                _ => "the reviewer ended without a terminal result".into(),
+            }));
         }
         Ok(result)
     }
