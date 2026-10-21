@@ -2786,11 +2786,12 @@ impl LadderRecord {
     }
 }
 
-/// What a receipt records about the review of its candidate. Four states:
-/// a receipt from before this field recorded nothing either way, a run
-/// with review off had none, and a review either came from another model
-/// or from the same model that wrote the candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// What a receipt records about the review of its candidate. A receipt from
+/// before this field recorded nothing either way, a run with review off had
+/// none, a review either came from another model or from the same model
+/// that wrote the candidate, and a person's approval can stand where the
+/// review did not run or was unavailable.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewRecord {
     #[default]
@@ -2798,6 +2799,45 @@ pub enum ReviewRecord {
     NoReview,
     Independent,
     SameModel,
+    /// No reviewer ran, and a person accepted the candidate on its checks
+    /// alone (`relais decide <run> approve`).
+    NotRun(ReviewNotRun),
+    /// A review was owed and could not be had; a person accepted the
+    /// candidate anyway. `detail` is the failure the run recorded.
+    Unavailable {
+        detail: String,
+    },
+    /// The patch was reviewed in parts (`review-parts`, SPEC §10): every
+    /// part, in order, with its hashes and verdict. `same_model` is true when
+    /// the reviewer's model is the one that wrote the candidate.
+    Parts {
+        same_model: bool,
+        parts: Vec<ReviewPartRecord>,
+    },
+}
+
+/// One part of a review in parts as a receipt lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewPartRecord {
+    /// The part, counted from one, and how many there are.
+    pub index: u32,
+    pub of: u32,
+    /// SHA-256 of the part's patch artifact (`review-parts/<index>.patch`).
+    pub patch_sha256: String,
+    /// SHA-256 of the reviewer's answer (`review-parts/<index>.<dispatch id>.txt`, the
+    /// attempt the manifest names); absent
+    /// when the part has none.
+    pub result_sha256: Option<String>,
+    /// `passed`, `findings`, `unavailable`, `dispatched` or `not_run`.
+    pub verdict: String,
+}
+
+/// Why no reviewer ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewNotRun {
+    /// The candidate patch was larger than one reviewer is given to read.
+    OverBudget { patch_bytes: u64, budget_bytes: u64 },
 }
 
 impl Receipt {

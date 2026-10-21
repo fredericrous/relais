@@ -4,13 +4,13 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::{
-    review_record_of, AttemptContext, AttemptLabel, Candidate, Next, Observation, PendingEvidence,
-    Progress, ReviewOutcome, ReviewRequest, RunEngine, RunError, RunOutcome, State, Step, Terminal,
-    Verified, VerifyFailure,
+    review_record_of, AttemptContext, AttemptLabel, Budget, Candidate, Next, Observation,
+    PendingEvidence, Progress, Reason, ReviewOutcome, ReviewRequest, RunEngine, RunError,
+    RunOutcome, State, Step, Terminal, Verified, VerifyFailure,
 };
 use crate::acceptance::Evidence;
 use crate::contract::Review;
-use crate::ledger::{EvidenceKind, EvidenceOrigin};
+use crate::ledger::{EvidenceKind, EvidenceOrigin, IntentReview, VerificationSnapshot};
 use crate::policy::EffectiveAuthority;
 use crate::route::Recipe;
 use crate::verify::{self, amont_gaps, Receipt, VerificationReport};
@@ -29,28 +29,79 @@ impl<'a> RunEngine<'a> {
         let preflight = ctx.preflight;
         // An inspection has no patch to review: its report review has
         // already run (`judge_inspection`).
-        if verified.review_required && verdict.is_none() {
-            let review = self.review_candidate(
-                &ReviewRequest {
-                    manifest: &preflight.manifest,
-                    authority: &preflight.authority,
-                    candidate_sha: &candidate.sha,
-                    candidate_tier: candidate.tier,
-                    candidate_model: &candidate.model,
-                    verification_inputs_changed: &verified.verification_inputs_changed,
-                    patch_path: candidate.latest_patch.clone(),
-                    routed_by: preflight.decision.routed_by,
-                    covering: preflight.decision.covering.clone(),
-                },
-                &mut progress.spend,
-            );
+        // A `review-parts` answer asked for this review: the successor
+        // reviews in parts whatever the contract's own review says.
+        let in_parts = self
+            .config
+            .ledger
+            .intent_of_run(&self.run_id)?
+            .is_some_and(|intent| intent.review == Some(IntentReview::Parts));
+        if (verified.review_required || in_parts) && verdict.is_none() {
+            // A patch one reviewer cannot be given to read dispatches no
+            // reviewer: the run asks a person (SPEC §10). A review in parts
+            // is the answer to that question.
+            if let Some(over) =
+                super::review::over_budget(&candidate.latest_patch).filter(|_| !in_parts)
+            {
+                let review = verify::ReviewRecord::NotRun(verify::ReviewNotRun::OverBudget {
+                    patch_bytes: over.patch_bytes,
+                    budget_bytes: over.budget_bytes,
+                });
+                return self.stop_for_review(
+                    &progress.budget,
+                    &|engine| {
+                        engine.candidate_receipt(
+                            ctx,
+                            progress,
+                            candidate,
+                            &verified,
+                            verdict,
+                            State::NeedsDecision,
+                            review.clone(),
+                        )
+                    },
+                    Reason::ReviewOverBudget,
+                    Observation::ReviewOverBudget(over),
+                );
+            }
+            let request = ReviewRequest {
+                manifest: &preflight.manifest,
+                authority: &preflight.authority,
+                candidate_sha: &candidate.sha,
+                candidate_tier: candidate.tier,
+                candidate_model: &candidate.model,
+                verification_inputs_changed: &verified.verification_inputs_changed,
+                patch_path: candidate.latest_patch.clone(),
+                routed_by: preflight.decision.routed_by,
+                covering: preflight.decision.covering.clone(),
+            };
+            let review = if in_parts {
+                self.review_candidate_in_parts(&request, &mut progress.spend)
+            } else {
+                self.review_candidate(&request, &mut progress.spend)
+            };
             match review {
                 ReviewOutcome::NoFindings => {}
                 ReviewOutcome::Findings(detail) => {
                     return self.stop(&progress.budget, Observation::ReviewFindings(detail));
                 }
                 ReviewOutcome::Unavailable(detail) => {
-                    return self.stop(&progress.budget, Observation::ReviewUnavailable(detail));
+                    return self.stop_for_review(
+                        &progress.budget,
+                        &|engine| {
+                            engine.candidate_receipt(
+                                ctx,
+                                progress,
+                                candidate,
+                                &verified,
+                                verdict,
+                                State::NeedsDecision,
+                                engine.unavailable_review_record(&detail)?,
+                            )
+                        },
+                        Reason::ReviewUnavailable,
+                        Observation::ReviewUnavailable(detail.clone()),
+                    );
                 }
             }
         }
@@ -63,34 +114,73 @@ impl<'a> RunEngine<'a> {
                 )))
             }
         }
-        let mut notes = verified.notes;
+        let review = review_record_of(self.config.ledger, &self.run_id)?;
+        let receipt = self.candidate_receipt(
+            ctx,
+            progress,
+            candidate,
+            &verified,
+            verdict,
+            State::Accepted,
+            review,
+        )?;
+        self.seal(
+            &receipt,
+            Some(candidate.attempt_id),
+            Some(ctx.worktree_path),
+            &candidate.sha,
+        )?;
+        Ok(RunOutcome {
+            run_id: self.run_id.clone(),
+            terminal: Terminal::Accepted(Box::new(receipt)),
+        })
+    }
+
+    /// What the snapshot saved at a review that could not be had says of the
+    /// review. A run that reviewed in parts lists every part with its
+    /// verdict, the failing one included, so approving it seals a receipt
+    /// that shows what was and was not reviewed; any other review is just
+    /// unavailable, with its detail.
+    fn unavailable_review_record(&self, detail: &str) -> Result<verify::ReviewRecord, RunError> {
+        Ok(match review_record_of(self.config.ledger, &self.run_id)? {
+            parts @ verify::ReviewRecord::Parts { .. } => parts,
+            _ => verify::ReviewRecord::Unavailable {
+                detail: detail.to_string(),
+            },
+        })
+    }
+
+    /// The receipt a candidate that passed its checks earns, `outcome` named
+    /// by the caller: `accepted` for the run's own acceptance,
+    /// `needs_decision` for the snapshot a run keeps when it stops for a
+    /// review it could not have.
+    #[allow(clippy::too_many_arguments)]
+    fn candidate_receipt(
+        &self,
+        ctx: &AttemptContext<'_>,
+        progress: &Progress,
+        candidate: &Candidate,
+        verified: &Verified,
+        verdict: Option<&verify::ReportVerdict>,
+        outcome: State,
+        review: verify::ReviewRecord,
+    ) -> Result<Receipt, RunError> {
+        let preflight = ctx.preflight;
+        let mut notes = verified.notes.clone();
         notes.extend(self.guidance_note(&preflight.manifest));
         let report = VerificationReport {
-            candidate_sha: candidate.sha.clone(),
-            base_sha: preflight.base_sha.clone(),
-            contract_hash: preflight.contract_hash.clone(),
-            policy_hash: preflight.authority.authority_hash.clone(),
-            checks: verified.checks,
-            gaps: verified.gaps,
-            gaps_not_judged: verified.gaps_not_judged,
             notes,
-            baseline_failures: ctx.baseline.failures.clone(),
-            amont_bypasses: verified.amont_bypasses,
-            amont_downgrades: verified.amont_downgrades,
-            verification_inputs_changed: verified.verification_inputs_changed,
-            integration_gaps: preflight.integration_gaps.clone(),
-            baseline_cached: ctx.baseline.cached,
-            baseline_cache_refused: ctx.baseline.cache_refused.clone(),
+            ..verification_report(ctx, candidate, verified)
         };
         let (criteria, mandatory_evidence_independence) =
             self.settle(ctx, &report, &verified.gate_coverage, verdict)?;
-        let receipt = Receipt {
+        Ok(Receipt {
             run_id: self.run_id.as_str().to_string(),
             candidate_sha: candidate.sha.clone(),
             base_sha: preflight.base_sha.clone(),
             contract_hash: preflight.contract_hash.clone(),
             policy_hash: preflight.authority.authority_hash.clone(),
-            outcome: State::Accepted.as_str().to_string(),
+            outcome: outcome.as_str().to_string(),
             verification: report,
             kind: self.config.contract.kind(),
             candidate: preflight
@@ -98,7 +188,7 @@ impl<'a> RunEngine<'a> {
                 .as_ref()
                 .map(|prepared| prepared.resolved.clone()),
             predecessor: preflight.predecessor.clone(),
-            models_used: std::mem::take(&mut progress.models_used),
+            models_used: progress.models_used.clone(),
             attempts: candidate.index,
             cost_completeness: progress.spend.completeness,
             cost: progress.spend.total,
@@ -112,20 +202,50 @@ impl<'a> RunEngine<'a> {
                     .map(Recipe::covering_identity),
             ),
             verification_profile_hash: preflight.authority.verification_profile.hash(),
-            review: review_record_of(self.config.ledger, &self.run_id)?,
+            review,
             ladder: verify::LadderRecord::Single(preflight.decision.ladder.rungs().to_vec()),
             efforts_used: self.config.ledger.efforts_used(&self.run_id)?,
-        };
-        self.seal(
-            &receipt,
-            Some(candidate.attempt_id),
-            Some(ctx.worktree_path),
-            &candidate.sha,
-        )?;
-        Ok(RunOutcome {
-            run_id: self.run_id.clone(),
-            terminal: Terminal::Accepted(Box::new(receipt)),
         })
+    }
+
+    /// Save the snapshot a receipt would be sealed from, then stop the run
+    /// on `observation`: the snapshot is durable before the run waits on a
+    /// person, so an approval never has to recompute verification.
+    pub(super) fn stop_for_review(
+        &mut self,
+        budget: &Budget,
+        build: &dyn Fn(&Self) -> Result<Receipt, RunError>,
+        reason: Reason,
+        observation: Observation,
+    ) -> Result<RunOutcome, RunError> {
+        // Best effort: the stop is the run's outcome, the snapshot only
+        // lets an approval seal a receipt. Building the receipt is inside the
+        // same block, so a failure there is a step, never the run's end.
+        // Without a snapshot, approve is refused by name (a change) or
+        // resolves only (an older run), never invented.
+        let saved = build(self).map_err(|e| e.to_string()).and_then(|receipt| {
+            self.config
+                .ledger
+                .save_verification_snapshot(
+                    &self.run_id,
+                    &VerificationSnapshot {
+                        candidate_sha: receipt.candidate_sha.clone(),
+                        base_sha: receipt.base_sha.clone(),
+                        contract_hash: receipt.contract_hash.clone(),
+                        policy_hash: receipt.policy_hash.clone(),
+                        stop_reason: reason.as_str().to_string(),
+                        receipt: serde_json::to_value(&receipt).expect("a receipt serializes"),
+                    },
+                )
+                .map_err(|e| e.to_string())
+        });
+        if let Err(e) = saved {
+            self.step(
+                "verification_snapshot_failed",
+                format!("the verification snapshot could not be saved: {e}"),
+            );
+        }
+        self.stop(budget, observation)
     }
 
     /// Settle the contract's criteria against a report, reading the
@@ -206,9 +326,24 @@ impl<'a> RunEngine<'a> {
         ) {
             Ok(verdict) => verdict,
             Err(detail) => {
-                return Ok(Step::Ended(
-                    self.stop(&progress.budget, Observation::ReviewUnavailable(detail))?,
-                ));
+                return Ok(Step::Ended(self.stop_for_review(
+                    &progress.budget,
+                    &|engine| {
+                        engine.candidate_receipt(
+                            ctx,
+                            progress,
+                            candidate,
+                            &verified,
+                            None,
+                            State::NeedsDecision,
+                            verify::ReviewRecord::Unavailable {
+                                detail: detail.clone(),
+                            },
+                        )
+                    },
+                    Reason::ReviewUnavailable,
+                    Observation::ReviewUnavailable(detail.clone()),
+                )?));
             }
         };
         let report = verification_report(ctx, candidate, &verified);

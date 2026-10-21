@@ -212,7 +212,7 @@ pub(super) fn apply_step(conn: &Connection, version: &str, sql: &str, now: &str)
     Ok(())
 }
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 40;
+pub const LEDGER_SCHEMA_VERSION: u64 = 42;
 
 #[cfg(test)]
 mod tests {
@@ -956,8 +956,8 @@ mod tests {
             .expect("a v38 row");
         }
         let ledger = Ledger::open(&path).expect("upgrade to current schema");
-        assert_eq!(ledger.schema_version().expect("version"), 40);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 40);
+        assert_eq!(ledger.schema_version().expect("version"), 42);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 42);
         let tables: Vec<String> = ledger
             .conn
             .prepare(
@@ -987,6 +987,120 @@ mod tests {
             })
             .expect("count");
         assert_eq!(kept, 1, "the v38 row survives the upgrade");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v41 adds the verification snapshot table beside what a v40 ledger
+    /// holds: every v40 row survives and the version is 41.
+    #[test]
+    fn a_v40_ledger_takes_the_snapshot_table_and_keeps_its_rows() {
+        let dir = temp_dir("v40-to-v41");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            assert_eq!(MIGRATIONS[39].0, "v40", "pinned to v40");
+            for (version, sql) in &MIGRATIONS[..40] {
+                conn.execute_batch(sql).expect("apply step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "then"],
+                )
+                .expect("record step");
+            }
+            conn.execute(
+                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES ('run-old', '/repo', 'accepted', 'now', 'now')",
+                [],
+            )
+            .expect("a run written at v40");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade to v41");
+        assert_eq!(ledger.schema_version().expect("version"), 42);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 42);
+        let runs: i64 = ledger
+            .conn
+            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(runs, 1, "the v40 row survives the upgrade");
+        let snapshots: i64 = ledger
+            .conn
+            .query_row("SELECT COUNT(*) FROM verification_snapshots", [], |row| {
+                row.get(0)
+            })
+            .expect("the table exists");
+        assert_eq!(snapshots, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v42 adds the successor intent's review column and the parts manifest
+    /// beside what a v41 ledger holds: every v41 row survives, an intent
+    /// written before reads back with no review mode, and the version is 42.
+    #[test]
+    fn a_v41_ledger_takes_the_review_parts_columns_and_keeps_its_rows() {
+        let dir = temp_dir("v41-to-v42");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            assert_eq!(MIGRATIONS[40].0, "v41", "pinned to v41");
+            for (version, sql) in &MIGRATIONS[..41] {
+                conn.execute_batch(sql).expect("apply step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "then"],
+                )
+                .expect("record step");
+            }
+            conn.execute(
+                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES ('run-old', '/repo', 'accepted', 'now', 'now')",
+                [],
+            )
+            .expect("a run written at v41");
+            conn.execute(
+                "INSERT INTO successor_intents
+                    (intent_id, decision_id, predecessor, contract_digest, contract_json,
+                     scope_delta_json, state, created_at)
+                 VALUES ('intent-old', 'run-old', 'run-old', 'd', '{}', '[]', 'pending', 'now')",
+                [],
+            )
+            .expect("an intent written at v41");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade to v42");
+        assert_eq!(ledger.schema_version().expect("version"), 42);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 42);
+        let runs: i64 = ledger
+            .conn
+            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(runs, 1, "the v41 row survives the upgrade");
+        let review: Option<String> = ledger
+            .conn
+            .query_row(
+                "SELECT review FROM successor_intents WHERE intent_id = 'intent-old'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the intent survives");
+        assert_eq!(review, None, "an earlier intent has no review mode");
+        let parts: i64 = ledger
+            .conn
+            .query_row("SELECT COUNT(*) FROM review_parts", [], |row| row.get(0))
+            .expect("the table exists");
+        assert_eq!(parts, 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

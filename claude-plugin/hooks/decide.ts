@@ -13,7 +13,7 @@ const NONCE_TIMEOUT_MS = 10_000
 // A quote the person's prompt must contain, in whole words: long enough
 // that "y" or "ok" cannot pass for one.
 const MIN_QUOTE_CHARS = 12
-export const ANSWERS = ['approve', 'revise', 'reject', 'salvaged', 'abandon', 'decided'] as const
+export const ANSWERS = ['approve', 'revise', 'review-parts', 'reject', 'salvaged', 'abandon', 'decided'] as const
 
 // The eight task types a contract may declare (relais TaskType, taxonomy
 // version 1), in the order the Rust list has them. A plugin test pins this
@@ -26,7 +26,7 @@ export const TASK_TYPES = ['report', 'mechanical', 'pattern', 'review-fix', 'fea
 export const RUN_CONTRACT_DESCRIPTION = `The task contract: {schema_version: 1, kind: "change" | "inspect" | "verify", task_type: ${TASK_TYPES.map(type => `"${type}"`).join(' | ')} (declare the one that fits the work), objective, base_ref: "HEAD", write_scope: [globs], read_hints: [paths], acceptance: [criteria a command can verify], verification_profile: "default", review: "optional"}. To verify an existing candidate use kind "verify" with candidate: {run, index?} (no worker runs); to continue one use kind "change" with from_candidate: {run, index?}. Never write "apply this patch" into an objective. A path to a contract .json file is also accepted.`
 
 export const DECIDE_TOOL_DESCRIPTION =
-  "Record the answer to a relais run waiting on a decision (needs_decision, needs_review, interrupted): approve, revise, reject, salvaged, abandon or decided. A decision is not made until it is recorded here. Answer it yourself when the request or the approved plan already answers it; otherwise ask the person, and record their answer with on_behalf_of_person and their own words as person_quote. relais refuses what may not be answered (an approval with open verification gaps) and says why."
+  "Record the answer to a relais run waiting on a decision (needs_decision, needs_review, interrupted): approve, revise, review-parts (a run that stopped because its patch was too large for one review, or its reviewer was unavailable: review the same candidate in parts, one reviewer per part; relais refuses it when a single file is over the review budget or more than 8 parts would be needed), reject, salvaged, abandon or decided. A decision is not made until it is recorded here. Answer it yourself when the request or the approved plan already answers it; otherwise ask the person, and record their answer with on_behalf_of_person and their own words as person_quote. relais refuses what may not be answered (an approval with open verification gaps) and says why."
 
 export const DECIDE_INPUT_SCHEMA = {
   type: 'object',

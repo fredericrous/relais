@@ -35,6 +35,7 @@ pub(crate) fn intent_json(
         "state": intent.state.as_str(),
         "run_id": intent.run_id.as_ref().map(RunId::as_str),
         "scope_delta": intent.scope_delta,
+        "review": intent.review.map(relais::ledger::IntentReview::as_str),
         "refusal": intent.refusal,
         "refusal_count": intent.refusal_count,
         "retry_after": intent.retry_after(),

@@ -1,7 +1,7 @@
 //! The reviewer dispatch's value types.
 
 use super::super::{
-    ContextManifest, EffectiveAuthority, PathBuf, Recipe, RoutedBy, Tier, UsagePhase,
+    ContextManifest, Duration, EffectiveAuthority, PathBuf, Recipe, RoutedBy, Tier, UsagePhase,
 };
 
 /// What a reviewer dispatch is for. A report review reads the worktree and
@@ -15,6 +15,9 @@ pub(in crate::runner) enum ReviewPurpose {
     Report,
 }
 
+/// What is told a dispatch id: `Err` is the reason it could not be kept.
+pub(in crate::runner) type OnDispatch<'a> = dyn Fn(&str) -> Result<(), String> + 'a;
+
 /// Who a reviewer dispatch is seated as: the model, its tier, where it
 /// reads, and what it is for.
 pub(in crate::runner) struct ReviewSeat<'p> {
@@ -22,6 +25,13 @@ pub(in crate::runner) struct ReviewSeat<'p> {
     pub(in crate::runner) tier: Tier,
     pub(in crate::runner) dir: PathBuf,
     pub(in crate::runner) purpose: ReviewPurpose,
+    /// The wall clock this dispatch gets; `None` is what the run has left,
+    /// at least [`super::REVIEW_MIN_WALL`]. A part of a review in parts has
+    /// its own, [`super::REVIEW_PART_TIMEOUT`].
+    pub(in crate::runner) wall: Option<Duration>,
+    /// Told the dispatch id once the dispatch is on record and before the
+    /// reviewer runs; an `Err` ends the review `Unavailable`.
+    pub(in crate::runner) on_dispatch: Option<&'p OnDispatch<'p>>,
 }
 
 impl ReviewPurpose {
@@ -68,6 +78,23 @@ pub(crate) struct ReviewRequest<'r> {
     /// The recipe that covered the candidate's own dispatch, if any —
     /// carried the same way as `routed_by`, for the same reason.
     pub(crate) covering: Option<Recipe>,
+}
+
+impl ReviewRequest<'_> {
+    /// The same request about another patch file: one part of the patch.
+    pub(in crate::runner) fn for_patch(&self, patch_path: PathBuf) -> ReviewRequest<'_> {
+        ReviewRequest {
+            manifest: self.manifest,
+            authority: self.authority,
+            candidate_sha: self.candidate_sha,
+            candidate_tier: self.candidate_tier,
+            candidate_model: self.candidate_model,
+            verification_inputs_changed: self.verification_inputs_changed,
+            patch_path,
+            routed_by: self.routed_by,
+            covering: self.covering.clone(),
+        }
+    }
 }
 
 pub(crate) enum ReviewOutcome {

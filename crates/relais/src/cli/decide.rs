@@ -1,7 +1,6 @@
 //! `relais decide`.
 
 use super::ctx::load_contract;
-use super::ctx::open_ledger;
 use super::ctx::refusal;
 use super::ctx::Refusal;
 use super::evidence::authorship_label;
@@ -19,9 +18,11 @@ use relais::acceptance::Evidence;
 use relais::ids::RunId;
 use relais::ledger::Ledger;
 use relais::paths;
+use relais::runner::approval;
+use relais::runner::approval::seals_from_snapshot;
 use relais::runner::Reason;
 use relais::runner::State;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 /// One `relais decide` invocation's arguments, bundled because they
 /// answer one decision together.
 pub(crate) struct DecideRequest<'a> {
@@ -197,7 +198,29 @@ pub(crate) fn check_decide_arguments(
     Ok(actor)
 }
 
+/// Where a decision reads and writes: the ledger file and the runs directory.
+pub(crate) struct StateLocations {
+    pub(crate) ledger: PathBuf,
+    pub(crate) runs: PathBuf,
+}
+
+fn locations_from_environment() -> Result<StateLocations, CliError> {
+    Ok(StateLocations {
+        ledger: paths::ledger_path().map_err(CliError::Home)?,
+        runs: paths::runs_dir().map_err(CliError::Home)?,
+    })
+}
+
 pub(crate) fn decide_inner(request: &DecideRequest<'_>) -> Result<Decision, CliError> {
+    decide_in(request, &locations_from_environment)
+}
+
+/// [`decide_inner`] with the state locations passed in, so a test names its
+/// own directory instead of setting process-wide environment.
+pub(crate) fn decide_in(
+    request: &DecideRequest<'_>,
+    locate: &dyn Fn() -> Result<StateLocations, CliError>,
+) -> Result<Decision, CliError> {
     use std::io::IsTerminal;
     let actor = match check_decide_arguments(request, std::io::stdin().is_terminal()) {
         Ok(actor) => actor,
@@ -220,7 +243,8 @@ pub(crate) fn decide_inner(request: &DecideRequest<'_>) -> Result<Decision, CliE
     } else {
         None
     };
-    let ledger = open_ledger()?;
+    let locations = locate()?;
+    let ledger = operational(Ledger::open(&locations.ledger), "the ledger is unavailable")?;
     let recorded_via = match &proof {
         Some(proof) => operational(
             ledger.verify_decide_nonce(&proof.session, &proof.nonce),
@@ -263,8 +287,10 @@ pub(crate) fn decide_inner(request: &DecideRequest<'_>) -> Result<Decision, CliE
             },
         );
     }
-    if request.widen_scope || request.rerun_verify || request.successor_contract.is_some() {
-        if answer != DecideAnswer::Revise {
+    let revision_flags =
+        request.widen_scope || request.rerun_verify || request.successor_contract.is_some();
+    if revision_flags || answer == DecideAnswer::ReviewParts {
+        if revision_flags && answer != DecideAnswer::Revise {
             return Ok(refusal(
                 CliOutcome::InvalidInput,
                 "`--widen-scope`, `--rerun-verify` and `--successor-contract` only apply to \
@@ -282,12 +308,54 @@ pub(crate) fn decide_inner(request: &DecideRequest<'_>) -> Result<Decision, CliE
             &run,
             state,
             request,
+            &locations.runs,
             relais::ledger::Answerer {
                 actor,
                 person_quote,
                 recorded_via,
             },
         );
+    }
+    if answer == DecideAnswer::Approve && criterion.is_none() {
+        // An answered decision falls through to the refusal below, before any
+        // artifact is written. A stop with no snapshot that is not a change's
+        // over-budget stop (one from before schema 41, or whose snapshot could
+        // not be saved) is resolved as it always was.
+        let open_review_stop = match operational(ledger.decision_of_run(&run), "decide")? {
+            Some(decision)
+                if decision.resolved_at.is_none()
+                    && seals_from_snapshot(&decision.raised_reason) =>
+            {
+                let has_snapshot =
+                    operational(ledger.verification_snapshot(&run), "decide")?.is_some();
+                has_snapshot || decision.raised_reason == Reason::ReviewOverBudget.as_str()
+            }
+            // Resolved with a receipt row: a repeat. `approve_from_snapshot`
+            // finds it matches the snapshot's receipt (exit 0, heals a missing
+            // `receipt.json`) or refuses it by name.
+            Some(decision)
+                if decision.resolved_at.is_some()
+                    && seals_from_snapshot(&decision.raised_reason) =>
+            {
+                operational(ledger.receipt(&run), "decide")?.is_some()
+                    && operational(ledger.verification_snapshot(&run), "decide")?.is_some()
+            }
+            _ => false,
+        };
+        if open_review_stop {
+            return approve_stopped_review(
+                &ledger,
+                &locations.runs,
+                &run,
+                state,
+                relais::ledger::Answerer {
+                    actor,
+                    person_quote,
+                    recorded_via,
+                },
+                note,
+            );
+        }
     }
     if !state.awaits_a_person() {
         return Ok(refusal(
@@ -406,6 +474,78 @@ pub(crate) fn decide_inner(request: &DecideRequest<'_>) -> Result<Decision, CliE
     }))
 }
 
+/// `relais decide --answer approve` on a run that stopped for a review it
+/// could not have (`review_over_budget`, `review_unavailable`): the existing
+/// verification-gap guards, then a receipt sealed from the run's saved
+/// snapshot, published with the resolution (see [`approval`]). Repeated on
+/// the answered run it finds the same receipt and writes nothing.
+fn approve_stopped_review(
+    ledger: &Ledger,
+    runs_dir: &Path,
+    run: &RunId,
+    state: State,
+    answerer: relais::ledger::Answerer<'_>,
+    note: Option<&str>,
+) -> Result<Decision, CliError> {
+    if state.awaits_a_person() {
+        let gaps = open_verification_gaps(ledger, run)?;
+        if !gaps.is_empty() {
+            return Ok(refusal(
+                CliOutcome::InvalidInput,
+                format!(
+                    "run {run} still carries verification gaps ({}) — a waiver is \
+                     a policy or contract change, never a CLI flag",
+                    gaps.join("; ")
+                ),
+            ));
+        }
+    }
+    let answer = relais::ledger::DecisionAnswer {
+        resolution: Reason::DecisionApproved,
+        actor: answerer.actor,
+        person_quote: answerer.person_quote,
+        recorded_via: answerer.recorded_via,
+        note,
+        successor_run: None,
+        from_state: state,
+        to_state: DecideAnswer::Approve.terminal_state(),
+    };
+    let sealed = match approval::approve_from_snapshot(ledger, runs_dir, run, &answer, &|| Ok(())) {
+        Ok(sealed) => sealed,
+        Err(e @ (approval::ApprovalError::Io(_) | approval::ApprovalError::Ledger(_))) => {
+            return Err(CliError::Operational {
+                operation: "decide",
+                cause: Box::new(e),
+            })
+        }
+        Err(refused) => return Ok(refusal(CliOutcome::InvalidInput, refused.to_string())),
+    };
+    let sentence = if sealed.written {
+        format!(
+            "recorded {} for {run} by {}; receipt {} sealed at {}",
+            Reason::DecisionApproved.as_str(),
+            answerer.actor,
+            sealed.receipt_hash,
+            sealed.artifact.display()
+        )
+    } else {
+        format!(
+            "run {run} was already approved; receipt {} is sealed, nothing written",
+            sealed.receipt_hash
+        )
+    };
+    Ok(Ok(Decided {
+        run: run.to_string(),
+        resolution: Reason::DecisionApproved,
+        actor: answerer.actor,
+        from_state: state,
+        to_state: DecideAnswer::Approve.terminal_state(),
+        advice: operational(ledger.decision_advice(run), "decide")?,
+        sentence,
+        successor_intent: None,
+    }))
+}
+
 /// `relais decide --answer revise --widen-scope | --successor-contract
 /// <file>`: the answer and the successor intent that carries it out are one
 /// ledger transaction (plan A5). Repeated on an answered decision it returns
@@ -415,9 +555,11 @@ pub(crate) fn successor_decide(
     run: &RunId,
     state: State,
     request: &DecideRequest<'_>,
+    runs_dir: &Path,
     answerer: relais::ledger::Answerer<'_>,
 ) -> Result<Decision, CliError> {
     use relais::runner::successor;
+    let in_parts = request.answer == DecideAnswer::ReviewParts;
     let supplied = match request.successor_contract {
         Some(path) => Some(load_contract(path)?),
         None => None,
@@ -449,6 +591,19 @@ pub(crate) fn successor_decide(
                 ));
             }
         }
+        if in_parts != (existing.review == Some(relais::ledger::IntentReview::Parts)) {
+            return Ok(refusal(
+                CliOutcome::InvalidInput,
+                format!(
+                    "run {run} was already answered with successor intent {} ({}); a decision \
+                     has one successor",
+                    existing.intent_id,
+                    existing
+                        .review
+                        .map_or("a revision", |_| "a review in parts")
+                ),
+            ));
+        }
         let sentence = format!(
             "run {run} was already answered; successor intent {} is {}",
             existing.intent_id,
@@ -463,6 +618,9 @@ pub(crate) fn successor_decide(
         ));
     }
     let planned = (|| -> Result<_, successor::PlanError> {
+        if in_parts {
+            return successor::plan_review_parts(ledger, run, runs_dir);
+        }
         let (contract, scope_delta) = match supplied {
             Some(contract) => (contract, Vec::new()),
             None if request.rerun_verify => {
@@ -484,9 +642,7 @@ pub(crate) fn successor_decide(
                 (widened, paths)
             }
         };
-        let runs_dir =
-            paths::runs_dir().map_err(|e| successor::PlanError::Missing(e.to_string()))?;
-        successor::plan(ledger, run, &contract, scope_delta, &runs_dir)
+        successor::plan(ledger, run, &contract, scope_delta, runs_dir)
     })();
     let intent = match planned {
         Ok(intent) => intent,
@@ -522,4 +678,275 @@ pub(crate) fn successor_decide(
         stored.intent_id
     );
     decided(stored, sentence)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use relais::ids::TaskId;
+    use relais::ledger::{Transition, VerificationSnapshot};
+    use relais::money::{CostCompleteness, MicroUsd};
+    use relais::verify::{LadderRecord, Receipt, ReviewNotRun, ReviewRecord, VerificationReport};
+
+    fn receipt(run: &str) -> Receipt {
+        Receipt {
+            run_id: run.into(),
+            candidate_sha: "cand".into(),
+            base_sha: "base".into(),
+            contract_hash: "ch".into(),
+            policy_hash: "ph".into(),
+            outcome: State::NeedsDecision.as_str().into(),
+            verification: VerificationReport {
+                candidate_sha: "cand".into(),
+                base_sha: "base".into(),
+                contract_hash: "ch".into(),
+                policy_hash: "ph".into(),
+                checks: Vec::new(),
+                gaps: Vec::new(),
+                gaps_not_judged: Vec::new(),
+                notes: Vec::new(),
+                baseline_failures: Vec::new(),
+                amont_bypasses: Vec::new(),
+                amont_downgrades: Vec::new(),
+                verification_inputs_changed: Vec::new(),
+                integration_gaps: Vec::new(),
+                baseline_cached: false,
+                baseline_cache_refused: None,
+            },
+            kind: relais::contract::Kind::Change,
+            candidate: None,
+            predecessor: None,
+            models_used: Vec::new(),
+            attempts: 1,
+            cost_completeness: CostCompleteness::Actual,
+            cost: MicroUsd::from_micros(1),
+            criteria: Vec::new(),
+            mandatory_evidence_independence: None,
+            recipe: relais::policy::RecipeRecord::NotRecorded,
+            verification_profile_hash: "vph".into(),
+            review: ReviewRecord::NotRun(ReviewNotRun::OverBudget {
+                patch_bytes: 300_000,
+                budget_bytes: 196_608,
+            }),
+            ladder: LadderRecord::NotRecorded,
+            efforts_used: Vec::new(),
+        }
+    }
+
+    /// A run waiting on a person since `reason`, with a snapshot for
+    /// `snapshot_candidate` when given.
+    fn waiting_run(
+        ledger: &Ledger,
+        name: &str,
+        state: State,
+        reason: Reason,
+        detail: Option<serde_json::Value>,
+        snapshot_candidate: Option<&str>,
+    ) {
+        let run = RunId::from_stored(name);
+        ledger
+            .insert_run(&run, "/repo", None, &TaskId::from_stored(name), "rk")
+            .expect("run");
+        let revision = ledger
+            .insert_contract_revision(&run, "h", "{}", "HEAD", None)
+            .expect("revision");
+        let attempt = ledger
+            .insert_attempt(
+                &run,
+                revision,
+                1,
+                "implementation",
+                relais::lifecycle::UsagePhase::Initial,
+            )
+            .expect("attempt");
+        ledger
+            .finish_attempt(attempt, State::Running, None, Some("cand"))
+            .expect("candidate");
+        for (from, to, why, detail) in [
+            (
+                State::Prepared,
+                State::Running,
+                Reason::WorkerDispatched,
+                None,
+            ),
+            (State::Running, state, reason, detail),
+        ] {
+            ledger
+                .record_transition(&Transition {
+                    run_id: run.clone(),
+                    attempt_id: None,
+                    from_state: Some(from),
+                    to_state: to,
+                    reason: why.as_str().into(),
+                    detail,
+                    at: ledger.now(),
+                })
+                .expect("transition");
+        }
+        if let Some(candidate) = snapshot_candidate {
+            let mut saved = receipt(name);
+            saved.candidate_sha = candidate.into();
+            saved.verification.candidate_sha = candidate.into();
+            ledger
+                .save_verification_snapshot(
+                    &run,
+                    &VerificationSnapshot {
+                        candidate_sha: candidate.into(),
+                        base_sha: "base".into(),
+                        contract_hash: "ch".into(),
+                        policy_hash: "ph".into(),
+                        stop_reason: reason.as_str().into(),
+                        receipt: serde_json::to_value(&saved).expect("receipt"),
+                    },
+                )
+                .expect("snapshot");
+        }
+    }
+
+    fn approve(dir: &Path, run_id: &str) -> Decision {
+        let locations = || {
+            Ok(StateLocations {
+                ledger: dir.join("ledger.sqlite"),
+                runs: dir.join("runs"),
+            })
+        };
+        decide_in(
+            &DecideRequest {
+                run_id,
+                answer: DecideAnswer::Approve,
+                actor: "orchestrator",
+                person_quote: None,
+                note: None,
+                successor: None,
+                criterion: None,
+                candidate: None,
+                widen_scope: false,
+                rerun_verify: false,
+                successor_contract: None,
+                json: false,
+                proof_stdin: false,
+            },
+            &locations,
+        )
+        .expect("decide runs")
+    }
+
+    fn exit_of(decision: &Decision) -> i32 {
+        match decision {
+            Ok(_) => exit_code(&CliOutcome::Accepted),
+            Err(refused) => exit_code(&refused.outcome),
+        }
+    }
+
+    #[test]
+    fn approving_a_review_stop_seals_once_and_refuses_what_it_must() {
+        let dir = relais::test_support::short_temp_dir("decide-review");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let gaps = serde_json::json!({"gaps": ["declared-check: status `inert`"]});
+        waiting_run(
+            &ledger,
+            "run-ok",
+            State::NeedsDecision,
+            Reason::ReviewOverBudget,
+            None,
+            Some("cand"),
+        );
+        waiting_run(
+            &ledger,
+            "run-gaps",
+            State::NeedsDecision,
+            Reason::ReviewOverBudget,
+            Some(gaps),
+            Some("cand"),
+        );
+        waiting_run(
+            &ledger,
+            "run-old",
+            State::NeedsReview,
+            Reason::ReviewUnavailable,
+            None,
+            None,
+        );
+        waiting_run(
+            &ledger,
+            "run-stale",
+            State::NeedsDecision,
+            Reason::ReviewOverBudget,
+            None,
+            Some("other"),
+        );
+
+        // First approve: sealed, exit 0.
+        let first = approve(&dir, "run-ok");
+        assert_eq!(exit_of(&first), 0);
+        let decided = first.expect("approved");
+        assert!(
+            decided.sentence.contains("sealed at"),
+            "{}",
+            decided.sentence
+        );
+        let runs = dir.join("runs");
+        let mut expected = receipt("run-ok");
+        expected.outcome = State::Accepted.as_str().into();
+        let (_, row_hash) = ledger
+            .receipt(&RunId::from_stored("run-ok"))
+            .expect("read")
+            .expect("a receipt row");
+        assert_eq!(row_hash, expected.hash());
+        let receipts = std::fs::read_dir(runs.join("run-ok").join("receipts"))
+            .expect("receipts dir")
+            .count();
+        assert_eq!(receipts, 1);
+        assert_eq!(
+            std::fs::read_to_string(runs.join("run-ok").join("receipt.json"))
+                .expect("receipt.json"),
+            serde_json::to_string_pretty(&expected).expect("serializes"),
+        );
+
+        // Repeat approve: the receipt row matches, so it exits 0 and writes
+        // nothing; with `receipt.json` deleted it rewrites the same bytes.
+        let before = std::fs::read(runs.join("run-ok").join("receipt.json")).expect("bytes");
+        let again = approve(&dir, "run-ok");
+        assert_eq!(exit_of(&again), 0);
+        assert!(again.expect("repeat").sentence.contains("nothing written"));
+        std::fs::remove_file(runs.join("run-ok").join("receipt.json")).expect("delete");
+        assert_eq!(exit_of(&approve(&dir, "run-ok")), 0);
+        assert_eq!(
+            std::fs::read(runs.join("run-ok").join("receipt.json")).expect("healed"),
+            before
+        );
+        assert_eq!(
+            std::fs::read_dir(runs.join("run-ok").join("receipts"))
+                .expect("receipts dir")
+                .count(),
+            1
+        );
+
+        // The verification-gap guard refuses, and seals nothing.
+        let gapped = approve(&dir, "run-gaps");
+        assert_eq!(exit_of(&gapped), 2);
+        assert!(gapped
+            .err()
+            .expect("refused")
+            .message
+            .contains("verification gaps"));
+        assert!(!runs.join("run-gaps").exists());
+
+        // A snapshot of another candidate is refused.
+        let stale = approve(&dir, "run-stale");
+        assert_eq!(exit_of(&stale), 2);
+        assert!(stale.err().expect("refused").message.contains("stale"));
+        assert!(!runs.join("run-stale").exists());
+
+        // A stop with no snapshot that is not over budget resolves as before.
+        let old = approve(&dir, "run-old");
+        assert_eq!(exit_of(&old), 0);
+        assert_eq!(
+            ledger
+                .receipt(&RunId::from_stored("run-old"))
+                .expect("read"),
+            None
+        );
+        assert!(!runs.join("run-old").exists());
+    }
 }

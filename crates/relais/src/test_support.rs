@@ -144,6 +144,35 @@ pub fn wait_until(patience: std::time::Duration, mut ready: impl FnMut() -> bool
     }
 }
 
+/// Run a script this test just wrote, once, with `prime`, its output
+/// discarded and its exit code ignored. This takes macOS's assessment of
+/// a fresh script's first exec off the clock of what is timed next. On Linux the
+/// exec fails with "Text file busy" while another test's forked child
+/// still holds the script's write handle, until that child execs; that
+/// clears within milliseconds, so the exec is retried for up to 10 s.
+#[cfg(unix)]
+pub fn prime_script(script: &Path) {
+    let busy = |e: &std::io::Error| e.kind() == std::io::ErrorKind::ExecutableFileBusy;
+    let mut last = None;
+    let primed = wait_until(
+        std::time::Duration::from_secs(10),
+        || match std::process::Command::new(script)
+            .arg("prime")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(_) => true,
+            Err(e) if busy(&e) => {
+                last = Some(e);
+                false
+            }
+            Err(e) => panic!("prime {}: {e}", script.display()),
+        },
+    );
+    assert!(primed, "prime {}: still busy: {last:?}", script.display());
+}
+
 /// `true` if `holds` was still true at the end of `window`, sampled
 /// throughout. For a property whose point is that nothing happens — a
 /// process that must NOT die of the signal it was sent.

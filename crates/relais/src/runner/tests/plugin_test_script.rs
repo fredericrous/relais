@@ -18,12 +18,15 @@ fn timing_out_claude(dir: &Path) -> std::path::PathBuf {
     std::fs::write(
         &bin,
         format!(
-            "#!/bin/sh\necho run >> '{}'\necho '(fail) slow test'\necho 'error: test timed out after 5000 ms'\nexit 1\n",
+            "#!/bin/sh\n[ \"$1\" = prime ] && exit 0\necho run >> '{}'\necho '(fail) slow test'\necho 'error: test timed out after 5000 ms'\nexit 1\n",
             dir.join("runs").display()
         ),
     )
     .expect("writes the fake");
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    // The script runs it by exec; a fork elsewhere still holding the write
+    // handle would make that exec fail as a 126, not as the retry under test.
+    crate::test_support::prime_script(&bin);
     bin
 }
 

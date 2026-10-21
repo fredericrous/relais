@@ -1081,4 +1081,55 @@ pub(in crate::ledger) const MIGRATIONS: &[(&str, &str)] = &[
     );
     "#,
     ),
+    (
+        // What a receipt needs, saved before a run stops for a review that
+        // did not fit or could not be had (plan review-over-budget, SPEC
+        // §10): the receipt the candidate would have earned, bound to the
+        // candidate, base, contract and policy hashes it was verified under.
+        // `relais decide <run> approve` seals the person's receipt from it.
+        // Expand-only: one new table, nothing an older binary reads, no
+        // existing value rewritten.
+        "v41",
+        r#"
+    CREATE TABLE verification_snapshots (
+        run_id TEXT PRIMARY KEY REFERENCES runs(id),
+        candidate_sha TEXT NOT NULL,
+        base_sha TEXT NOT NULL,
+        contract_hash TEXT NOT NULL,
+        policy_hash TEXT NOT NULL,
+        stop_reason TEXT NOT NULL,
+        receipt_json TEXT NOT NULL,
+        saved_at TEXT NOT NULL
+    );
+    "#,
+    ),
+    (
+        // A review in parts (plan review-over-budget, Changes step 5): the
+        // successor intent a `review-parts` answer writes names how the
+        // successor reviews (`review`, NULL for every earlier intent), and
+        // the parts manifest records each part of that review, keyed by
+        // run, candidate hash and part index, with the hashes of its
+        // immutable patch and result artifacts and its status. Expand-only:
+        // one nullable column and one new table; no existing value is
+        // rewritten, and an older binary reads neither.
+        "v42",
+        r#"
+    ALTER TABLE successor_intents ADD COLUMN review TEXT;
+    CREATE TABLE review_parts (
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        candidate_sha TEXT NOT NULL,
+        part_index INTEGER NOT NULL,
+        part_count INTEGER NOT NULL,
+        patch_path TEXT NOT NULL,
+        patch_sha256 TEXT NOT NULL,
+        dispatch_id TEXT,
+        result_path TEXT,
+        result_sha256 TEXT,
+        status TEXT NOT NULL,
+        detail TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, candidate_sha, part_index)
+    );
+    "#,
+    ),
 ];

@@ -978,6 +978,14 @@ pub(crate) enum DecideAnswer {
     /// acceptance of that specific candidate. `--candidate` is required,
     /// and the run's own reason for stopping is kept, not replaced.
     Salvaged,
+    /// The run stopped for a review it could not have (`review_over_budget`,
+    /// `review_unavailable`): review the same candidate in parts, one
+    /// reviewer dispatch per part. Records a successor intent, a `kind:
+    /// verify` of this run's candidate with `review: parts`; refused, before
+    /// any intent, when a single file exceeds the review budget or more than
+    /// 8 parts would be needed. On a patch within the budget it is one part,
+    /// a retry of the review.
+    ReviewParts,
 }
 
 impl DecideAnswer {
@@ -989,6 +997,8 @@ impl DecideAnswer {
             Self::Decided => Reason::DecisionRecorded,
             Self::Abandon => Reason::DecisionAbandoned,
             Self::Salvaged => Reason::DecisionSalvaged,
+            // The answer is a revision of the run: its successor reviews.
+            Self::ReviewParts => Reason::DecisionRevised,
         }
     }
 
@@ -1001,7 +1011,9 @@ impl DecideAnswer {
     fn terminal_state(self) -> State {
         match self {
             Self::Approve => State::Accepted,
-            Self::Reject | Self::Revise | Self::Decided | Self::Abandon => State::Cancelled,
+            Self::Reject | Self::Revise | Self::Decided | Self::Abandon | Self::ReviewParts => {
+                State::Cancelled
+            }
             Self::Salvaged => State::AcceptedByPerson,
         }
     }
@@ -1353,6 +1365,7 @@ mod tests {
             DecideAnswer::Decided,
             DecideAnswer::Abandon,
             DecideAnswer::Salvaged,
+            DecideAnswer::ReviewParts,
         ] {
             let expected = match answer {
                 DecideAnswer::Approve => State::Accepted,
@@ -1360,7 +1373,8 @@ mod tests {
                 DecideAnswer::Reject
                 | DecideAnswer::Revise
                 | DecideAnswer::Decided
-                | DecideAnswer::Abandon => State::Cancelled,
+                | DecideAnswer::Abandon
+                | DecideAnswer::ReviewParts => State::Cancelled,
             };
             assert_eq!(answer.terminal_state(), expected, "{answer:?}");
         }

@@ -22,10 +22,12 @@ pub(crate) mod failpoint;
 mod learning;
 mod outcomes;
 mod review;
+mod review_parts;
 mod router;
 mod runs;
 mod schema;
 mod sessions;
+mod snapshot;
 mod successor;
 mod test_support;
 mod transitions;
@@ -48,8 +50,10 @@ pub use runs::{
 pub use schema::LEDGER_SCHEMA_VERSION;
 use schema::{applied_count, migrate};
 pub use sessions::OrchestrationUsageRow;
+pub use snapshot::{ReceiptResolution, VerificationSnapshot};
 pub use successor::{
-    Claim, IntentState, NewIntent, SuccessorIntent, SuccessorProcess, CLAIM_GRACE_SECONDS,
+    Claim, IntentReview, IntentState, NewIntent, SuccessorIntent, SuccessorProcess,
+    CLAIM_GRACE_SECONDS,
 };
 pub use transitions::{
     Actor, Answerer, DecisionAnswer, DecisionRecord, PersonAnswerCounts, RecordedVia, RunDriver,
@@ -64,6 +68,7 @@ pub use trust::{StoredDeclaration, TrustGrantRecord};
 pub use usage::{Booking, DispatchBooking, LiveDispatch, PhaseCost, UsageEvent};
 mod task_types;
 pub use review::{MergeTotals, ReviewClassTotals, ReviewOutcomeRow};
+pub use review_parts::{PartResult, PartStatus, PlannedPart, ReviewPartRow};
 pub use router::{
     ExplorationTask, RouterCheck, RouterClass, RouterClassificationRow, RouterDecisionRow,
     RouterExplorationStop, RouterProvenance, RouterReassessRow, RouterRecord, RouterTaskOutcomeRow,

@@ -49,7 +49,7 @@ const AWAITS_A_PERSON = new Set(['needs_decision', 'needs_review', 'interrupted'
 // The closing line of an outcome that waits on a person: the step that
 // settles it (ADR-0004).
 export const DECIDE_STEP =
-  'Decide it, then record the answer with mcp__relais__decide (approve, revise, reject, salvaged, abandon or decided). When the request or the approved plan does not answer it, ask the person and record their answer with on_behalf_of_person and their own words as person_quote.'
+  'Decide it, then record the answer with mcp__relais__decide (approve, revise, review-parts, reject, salvaged, abandon or decided). When the request or the approved plan does not answer it, ask the person and record their answer with on_behalf_of_person and their own words as person_quote.'
 // The closing line of an accepted outcome: a later undo is recorded by the
 // feedback tool (D23).
 export const FEEDBACK_STEP =
