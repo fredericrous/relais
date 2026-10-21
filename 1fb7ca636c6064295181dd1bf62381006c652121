@@ -1,0 +1,16 @@
+amont-provenance-v1
+commit d493f2304f80867c76582cb407bb91e2aee028d7
+tree 1fb7ca636c6064295181dd1bf62381006c652121
+canon aab52938d0fb487000e550a3514c101b9c15cfaa
+patch deb66486e4fb8791eb06253f6a1e6ffbe7adff97
+plan docs/plans/2026-10-19-finish-admission-then-split.md ca009e878e4335de50346b1260ac151c897a13d467c393471ddd5108ae7cc44c
+review reviewed 5e07d652d98fe3e513c185b007d1efa43af80756dc6fa154e0fef9ae9848ad37
+preview not-required
+producer amont-agent 2.45.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAEBUvingJY83zG2Jo7dJDVCmM2gBD30yCl/vJfRFArxZ+SDiFf
+wwZDRo2l2q4AlShlAFi+uK5JjNjO6Mx6lVnXYL
+-----END SSH SIGNATURE-----
