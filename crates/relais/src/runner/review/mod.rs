@@ -138,6 +138,61 @@ pub(in crate::runner) fn patch_stat(patch: &str) -> (Vec<String>, usize, usize) 
     (files, added, removed)
 }
 
+/// Is the candidate patch larger than one reviewer is given to read? `None`
+/// when it fits, and when its size cannot be read: the review then reports
+/// the unreadable patch itself, never a budget it did not measure.
+pub(in crate::runner) fn over_budget(patch_path: &Path) -> Option<crate::runner::OverBudget> {
+    over_budget_by(patch_path, REVIEW_PATCH_BUDGET_BYTES)
+}
+
+/// [`over_budget`] against an explicit budget.
+pub(in crate::runner) fn over_budget_by(
+    patch_path: &Path,
+    budget: usize,
+) -> Option<crate::runner::OverBudget> {
+    let patch_bytes = std::fs::metadata(patch_path).ok()?.len();
+    if patch_bytes <= budget as u64 {
+        return None;
+    }
+    let bytes = std::fs::read(patch_path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    Some(crate::runner::OverBudget {
+        patch_bytes,
+        budget_bytes: budget as u64,
+        files: patch_stat(&text).0.len(),
+        parts: review_part_count(&text, budget),
+    })
+}
+
+/// How many consecutive parts, cut at file boundaries and each within
+/// `budget` bytes, review the patch; `None` when a single file's patch
+/// exceeds the budget on its own (no part may break a file in two).
+pub(in crate::runner) fn review_part_count(patch: &str, budget: usize) -> Option<usize> {
+    let mut sizes: Vec<usize> = Vec::new();
+    let mut at = 0usize;
+    for line in patch.split_inclusive('\n') {
+        if line.starts_with("diff --git ") || sizes.is_empty() {
+            sizes.push(0);
+        }
+        at += line.len();
+        *sizes.last_mut().expect("a file section was just pushed") += line.len();
+    }
+    debug_assert_eq!(at, patch.len());
+    if sizes.iter().any(|size| *size > budget) {
+        return None;
+    }
+    let mut parts = 0usize;
+    let mut used = 0usize;
+    for size in sizes {
+        if parts == 0 || used + size > budget {
+            parts += 1;
+            used = 0;
+        }
+        used += size;
+    }
+    Some(parts)
+}
+
 /// What the prompt says about the patch: its path and size, the changed
 /// files and the diff stat, and how to read it.
 pub(in crate::runner) fn patch_section(staged: &StagedPatch) -> String {

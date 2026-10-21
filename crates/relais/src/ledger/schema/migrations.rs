@@ -1081,4 +1081,26 @@ pub(in crate::ledger) const MIGRATIONS: &[(&str, &str)] = &[
     );
     "#,
     ),
+    (
+        // What a receipt needs, saved before a run stops for a review that
+        // did not fit or could not be had (plan review-over-budget, SPEC
+        // §10): the receipt the candidate would have earned, bound to the
+        // candidate, base, contract and policy hashes it was verified under.
+        // `relais decide <run> approve` seals the person's receipt from it.
+        // Expand-only: one new table, nothing an older binary reads, no
+        // existing value rewritten.
+        "v41",
+        r#"
+    CREATE TABLE verification_snapshots (
+        run_id TEXT PRIMARY KEY REFERENCES runs(id),
+        candidate_sha TEXT NOT NULL,
+        base_sha TEXT NOT NULL,
+        contract_hash TEXT NOT NULL,
+        policy_hash TEXT NOT NULL,
+        stop_reason TEXT NOT NULL,
+        receipt_json TEXT NOT NULL,
+        saved_at TEXT NOT NULL
+    );
+    "#,
+    ),
 ];

@@ -186,6 +186,10 @@ pub enum Reason {
     /// relais's own write met a full disk: new launches stopped, running
     /// checks were killed and what could be persisted was (SPEC §10).
     RelaisStorageFull,
+    /// The candidate patch is larger than one reviewer is given to read
+    /// (`REVIEW_PATCH_BUDGET_BYTES`): no reviewer was dispatched and the run
+    /// waits on a person (SPEC §10).
+    ReviewOverBudget,
 }
 
 impl Reason {
@@ -194,7 +198,7 @@ impl Reason {
     ///
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it.
-    pub const ALL: [Self; 64] = [
+    pub const ALL: [Self; 65] = [
         Self::ChecksAndReviewPassed,
         Self::BehavioralFailure,
         Self::RepairExhausted,
@@ -259,6 +263,7 @@ impl Reason {
         Self::ResourceExhausted,
         Self::BaselineResourceExhausted,
         Self::RelaisStorageFull,
+        Self::ReviewOverBudget,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -327,6 +332,7 @@ impl Reason {
             Self::ResourceExhausted => "resource_exhausted",
             Self::BaselineResourceExhausted => "baseline_resource_exhausted",
             Self::RelaisStorageFull => "relais_storage_full",
+            Self::ReviewOverBudget => "review_over_budget",
         }
     }
 

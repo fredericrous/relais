@@ -303,6 +303,8 @@ impl Ledger {
         tier: &str,
         phase: UsagePhase,
     ) -> Result<i64> {
+        // A new attempt makes a saved verification snapshot stale.
+        self.delete_verification_snapshot(run_id)?;
         self.conn.execute(
             "INSERT INTO attempts
                 (run_id, revision_id, attempt_index, tier, phase, state, started_at)

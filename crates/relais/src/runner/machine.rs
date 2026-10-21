@@ -253,6 +253,9 @@ pub enum Observation {
     ReviewFindings(String),
     /// Required review could not be obtained.
     ReviewUnavailable(String),
+    /// The candidate patch is larger than one reviewer is given to read, so
+    /// no reviewer was dispatched.
+    ReviewOverBudget(OverBudget),
     /// The worker process ended without a terminal result: killed,
     /// non-zero exit, or output the adapter could not read.
     TerminalResultMissing { timed_out: bool, detail: String },
@@ -265,6 +268,33 @@ pub enum Observation {
     },
     /// A ceiling was reached before or during dispatch.
     LimitReached(Limit),
+}
+
+/// A candidate patch too large for one reviewer: its measure, and how a
+/// review in parts would cut it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverBudget {
+    pub patch_bytes: u64,
+    pub budget_bytes: u64,
+    pub files: usize,
+    /// How many parts, cut at file boundaries, each within the budget; `None`
+    /// when a single file's patch exceeds the budget on its own.
+    pub parts: Option<usize>,
+}
+
+impl OverBudget {
+    /// The sentence a decision shows: size, budget, files and parts.
+    pub fn describe(&self) -> String {
+        let parts = match self.parts {
+            Some(parts) => format!("a review in parts would take {parts}"),
+            None => "a single file exceeds the budget, so it cannot be reviewed in parts".into(),
+        };
+        format!(
+            "the candidate patch is {} bytes against the {}-byte review budget, across {} \
+             files; {parts}; no reviewer was dispatched",
+            self.patch_bytes, self.budget_bytes, self.files
+        )
+    }
 }
 
 /// What to do after recording the transition.
@@ -542,6 +572,25 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
             serde_json::json!({ "detail": detail }),
             Terminal::NeedsReview { detail },
         ),
+
+        Observation::ReviewOverBudget(over) => {
+            let detail = over.describe();
+            Decision::stop(
+                State::NeedsDecision,
+                Reason::ReviewOverBudget,
+                serde_json::json!({
+                    "detail": detail,
+                    "patch_bytes": over.patch_bytes,
+                    "budget_bytes": over.budget_bytes,
+                    "files": over.files,
+                    "parts": over.parts,
+                }),
+                Terminal::NeedsDecision {
+                    reason: Reason::ReviewOverBudget,
+                    detail,
+                },
+            )
+        }
 
         Observation::TerminalResultMissing { timed_out, detail } => Decision::stop(
             State::Interrupted,

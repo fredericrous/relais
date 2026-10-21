@@ -26,6 +26,7 @@ mod router;
 mod runs;
 mod schema;
 mod sessions;
+mod snapshot;
 mod successor;
 mod test_support;
 mod transitions;
@@ -48,6 +49,7 @@ pub use runs::{
 pub use schema::LEDGER_SCHEMA_VERSION;
 use schema::{applied_count, migrate};
 pub use sessions::OrchestrationUsageRow;
+pub use snapshot::{ReceiptResolution, VerificationSnapshot};
 pub use successor::{
     Claim, IntentState, NewIntent, SuccessorIntent, SuccessorProcess, CLAIM_GRACE_SECONDS,
 };

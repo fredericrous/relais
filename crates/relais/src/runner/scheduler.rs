@@ -995,10 +995,36 @@ fn accept_integrated(
         total: ledger.run_cost(&engine.run_id)?,
         completeness: ledger.run_cost_completeness(&engine.run_id)?,
     };
-    let verification_inputs_changed = assembled.touched_inputs.tests;
+    let verification_inputs_changed = assembled.touched_inputs.tests.clone();
     let review_required =
         root.decision.review >= Review::Required || !verification_inputs_changed.is_empty();
     if review_required {
+        // A patch one reviewer cannot be given to read dispatches no
+        // reviewer: the run asks a person (SPEC §10).
+        if let Some(over) = super::review::over_budget(&assembled.patch_path) {
+            let review = verify::ReviewRecord::NotRun(verify::ReviewNotRun::OverBudget {
+                patch_bytes: over.patch_bytes,
+                budget_bytes: over.budget_bytes,
+            });
+            let assembly = &*assembly;
+            return engine.stop_for_review(
+                &budget,
+                &|engine| {
+                    integrated_receipt(
+                        engine,
+                        root,
+                        &assembled,
+                        assembly,
+                        &spend,
+                        &verification_inputs_changed,
+                        State::NeedsDecision,
+                        review.clone(),
+                    )
+                },
+                Reason::ReviewOverBudget,
+                Observation::ReviewOverBudget(over),
+            );
+        }
         let review = engine.review_candidate(
             &crate::runner::ReviewRequest {
                 manifest: root.manifest,
@@ -1024,7 +1050,26 @@ fn accept_integrated(
                 return engine.stop(&budget, Observation::ReviewFindings(detail));
             }
             ReviewOutcome::Unavailable(detail) => {
-                return engine.stop(&budget, Observation::ReviewUnavailable(detail));
+                let assembly = &*assembly;
+                return engine.stop_for_review(
+                    &budget,
+                    &|engine| {
+                        integrated_receipt(
+                            engine,
+                            root,
+                            &assembled,
+                            assembly,
+                            &spend,
+                            &verification_inputs_changed,
+                            State::NeedsDecision,
+                            verify::ReviewRecord::Unavailable {
+                                detail: detail.clone(),
+                            },
+                        )
+                    },
+                    Reason::ReviewUnavailable,
+                    Observation::ReviewUnavailable(detail.clone()),
+                );
             }
         }
     }
@@ -1036,19 +1081,63 @@ fn accept_integrated(
             )))
         }
     }
+    let review = super::review_record_of(ledger, &engine.run_id)?;
+    let receipt = integrated_receipt(
+        engine,
+        root,
+        &assembled,
+        assembly,
+        &spend,
+        &verification_inputs_changed,
+        State::Accepted,
+        review,
+    )?;
+    engine.seal(&receipt, None, None, &head)?;
+    // The assembled revision is named under this run so the retirement
+    // that follows finds its tree already kept. Best effort: a ref that
+    // could not be written costs nothing, because the retirement then
+    // finds the tree unnamed and names it `…/final` itself.
+    let _ = workspace::name_candidate(
+        engine.config.repo_dir,
+        engine.run_id.as_str(),
+        INTEGRATION_ATTEMPT,
+        &head,
+    );
+    Ok(RunOutcome {
+        run_id: engine.run_id.clone(),
+        terminal: Terminal::Accepted(Box::new(receipt)),
+    })
+}
+
+/// The root's receipt for an assembled candidate that passed its checks,
+/// `outcome` named by the caller (`accepted`, or `needs_decision` for the
+/// snapshot a run keeps when it stops for a review it could not have).
+#[allow(clippy::too_many_arguments)]
+fn integrated_receipt(
+    engine: &RunEngine<'_>,
+    root: &RootContext<'_>,
+    assembled: &Assembled,
+    assembly: &Assembly,
+    spend: &crate::runner::RunSpend,
+    verification_inputs_changed: &[String],
+    outcome: State,
+    review: verify::ReviewRecord,
+) -> Result<Receipt, RunError> {
+    let ledger = engine.config.ledger;
+    let head = assembly.head.clone();
     let report = VerificationReport {
         candidate_sha: head.clone(),
         base_sha: root.base_sha.to_string(),
         contract_hash: root.contract_hash.to_string(),
         policy_hash: root.authority.authority_hash.clone(),
-        checks: assembled.checks,
+        checks: assembled.checks.clone(),
         gaps: Vec::new(),
         gaps_not_judged: Vec::new(),
         notes: engine.guidance_note(root.manifest).into_iter().collect(),
         baseline_failures: root.baseline_failures.to_vec(),
-        amont_bypasses: assembled.amont_bypasses,
-        amont_downgrades: assembled.amont_downgrades,
-        verification_inputs_changed,
+        amont_bypasses: assembled.amont_bypasses.clone(),
+        amont_downgrades: assembled.amont_downgrades.clone(),
+        verification_inputs_changed: verification_inputs_changed.to_vec(),
         integration_gaps: root.integration_gaps.to_vec(),
         baseline_cached: root.baseline_cached,
         baseline_cache_refused: root.baseline_cache_refused.clone(),
@@ -1072,18 +1161,18 @@ fn accept_integrated(
         engine.config.contract.kind(),
         None,
     );
-    let receipt = Receipt {
+    Ok(Receipt {
         run_id: engine.run_id.as_str().to_string(),
-        candidate_sha: head.clone(),
+        candidate_sha: head,
         base_sha: root.base_sha.to_string(),
         contract_hash: root.contract_hash.to_string(),
         policy_hash: root.authority.authority_hash.clone(),
-        outcome: State::Accepted.as_str().to_string(),
+        outcome: outcome.as_str().to_string(),
         verification: report,
         kind: engine.config.contract.kind(),
         candidate: None,
         predecessor: None,
-        models_used: std::mem::take(&mut assembly.models_used),
+        models_used: assembly.models_used.clone(),
         attempts: assembly.attempts_total,
         cost_completeness: spend.completeness,
         cost: spend.total,
@@ -1096,24 +1185,9 @@ fn accept_integrated(
                 .map(Recipe::covering_identity),
         ),
         verification_profile_hash: root.authority.verification_profile.hash(),
-        review: super::review_record_of(ledger, &engine.run_id)?,
-        ladder: verify::LadderRecord::PerPackage(std::mem::take(&mut assembly.ladders)),
-        efforts_used: std::mem::take(&mut assembly.efforts_used),
-    };
-    engine.seal(&receipt, None, None, &head)?;
-    // The assembled revision is named under this run so the retirement
-    // that follows finds its tree already kept. Best effort: a ref that
-    // could not be written costs nothing, because the retirement then
-    // finds the tree unnamed and names it `…/final` itself.
-    let _ = workspace::name_candidate(
-        engine.config.repo_dir,
-        engine.run_id.as_str(),
-        INTEGRATION_ATTEMPT,
-        &head,
-    );
-    Ok(RunOutcome {
-        run_id: engine.run_id.clone(),
-        terminal: Terminal::Accepted(Box::new(receipt)),
+        review,
+        ladder: verify::LadderRecord::PerPackage(assembly.ladders.clone()),
+        efforts_used: assembly.efforts_used.clone(),
     })
 }
 

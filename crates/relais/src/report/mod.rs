@@ -710,6 +710,10 @@ pub struct Report {
     /// answered runs as waiting and contradict the open-decision list
     /// this report prints.
     pub pending_decisions: usize,
+    /// Runs of the window that stopped because their candidate patch was
+    /// larger than one reviewer reads (`review_over_budget`), answered or
+    /// not: the count of how often the review budget is the limit.
+    pub review_over_budget: usize,
     pub cost_completeness: CostCompleteness,
     /// One line per task whose first run falls in the window (SPEC §20):
     /// the unit the primary metric is actually denominated in, a run is
@@ -955,6 +959,16 @@ pub fn runs_report(
         .iter()
         .filter(|decision| runs.iter().any(|run| run.run_id == decision.run.as_str()))
         .count();
+    let mut review_over_budget = 0;
+    for run in &runs {
+        let ended_over_budget = ledger
+            .transitions(&crate::ids::RunId::from_stored(&run.run_id))?
+            .iter()
+            .any(|transition| transition.reason == Reason::ReviewOverBudget.as_str());
+        if ended_over_budget {
+            review_over_budget += 1;
+        }
+    }
     let cost_completeness = CostCompleteness::worst(runs.iter().map(|run| run.cost_completeness));
     let cost_per_accepted = if accepted > 0 {
         Some(MicroUsd::from_micros(
@@ -1181,6 +1195,7 @@ pub fn runs_report(
         cost_per_accepted,
         acceptance_rate,
         pending_decisions,
+        review_over_budget,
         cost_completeness,
         task_cost_completeness: CostCompleteness::worst(
             tasks.iter().map(|task| task.cost_completeness),
@@ -1288,6 +1303,12 @@ impl Report {
             out.push_str(&format!(
                 "awaiting a human: {} run(s) with an unanswered decision\n",
                 self.pending_decisions
+            ));
+        }
+        if self.review_over_budget > 0 {
+            out.push_str(&format!(
+                "review over budget: {} run(s) whose patch was larger than one reviewer reads\n",
+                self.review_over_budget
             ));
         }
         out.push('\n');
@@ -1894,6 +1915,7 @@ mod tests {
             cost_per_accepted: Some(MicroUsd::from_micros(10)),
             acceptance_rate: Some(1.0),
             pending_decisions: 0,
+            review_over_budget: 0,
             cost_completeness: CostCompleteness::Actual,
             tasks: vec![TaskLine {
                 task_id: "task-a".into(),
@@ -2151,6 +2173,7 @@ mod tests {
                 "pending_feedback",
                 "repair_outcomes",
                 "review_outcomes",
+                "review_over_budget",
                 "runs",
                 "schema_version",
                 "session_routing",

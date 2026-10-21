@@ -2786,11 +2786,12 @@ impl LadderRecord {
     }
 }
 
-/// What a receipt records about the review of its candidate. Four states:
-/// a receipt from before this field recorded nothing either way, a run
-/// with review off had none, and a review either came from another model
-/// or from the same model that wrote the candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// What a receipt records about the review of its candidate. A receipt from
+/// before this field recorded nothing either way, a run with review off had
+/// none, a review either came from another model or from the same model
+/// that wrote the candidate, and a person's approval can stand where the
+/// review did not run or was unavailable.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewRecord {
     #[default]
@@ -2798,6 +2799,22 @@ pub enum ReviewRecord {
     NoReview,
     Independent,
     SameModel,
+    /// No reviewer ran, and a person accepted the candidate on its checks
+    /// alone (`relais decide <run> approve`).
+    NotRun(ReviewNotRun),
+    /// A review was owed and could not be had; a person accepted the
+    /// candidate anyway. `detail` is the failure the run recorded.
+    Unavailable {
+        detail: String,
+    },
+}
+
+/// Why no reviewer ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewNotRun {
+    /// The candidate patch was larger than one reviewer is given to read.
+    OverBudget { patch_bytes: u64, budget_bytes: u64 },
 }
 
 impl Receipt {

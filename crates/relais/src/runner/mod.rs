@@ -46,6 +46,7 @@ use crate::route::{Recipe, RoutePredictor, RoutedBy, RungIndex};
 use crate::verify::{self};
 use crate::workspace::{self, TaskWorktree, WorkspaceError};
 
+pub mod approval;
 mod attempt;
 mod baseline;
 mod candidate;
@@ -74,7 +75,9 @@ pub use config::{verify_root, worktree_root, DesignSource, RunConfig};
 use error::Finish;
 pub use error::RunError;
 use launch::admission_block;
-pub use machine::{decide, AttemptKind, Budget, Limit, Next, Observation, Terminal, WorktreeEnd};
+pub use machine::{
+    decide, AttemptKind, Budget, Limit, Next, Observation, OverBudget, Terminal, WorktreeEnd,
+};
 use prompt::{build_prompt, conflict_block};
 pub(crate) use prompt::{data_block, data_list_block, relevant_block};
 use review::reviewer_guidance;
