@@ -108,8 +108,16 @@ pub(in crate::runner) fn stage_patch(
     let path = dir.join("candidate.patch");
     if let Err(e) = std::fs::write(&path, &bytes) {
         // Nothing is staged, so nothing would remove the directory later.
-        let _ = std::fs::remove_dir_all(&dir);
-        return Err(e);
+        return Err(match std::fs::remove_dir_all(&dir) {
+            Ok(()) => e,
+            Err(cleanup) => std::io::Error::new(
+                e.kind(),
+                format!(
+                    "{e}; the directory {} could not be removed either: {cleanup}",
+                    dir.display()
+                ),
+            ),
+        });
     }
     let (files, added, removed) = patch_stat(&String::from_utf8_lossy(&bytes));
     Ok(StagedPatch {
