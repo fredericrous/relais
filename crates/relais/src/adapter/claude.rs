@@ -466,7 +466,7 @@ mod tests {
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         // The first exec of a fresh script can take longer than the
         // probe timeout (Gatekeeper); run it once before the probe.
-        Command::new(&binary).arg("prime").status().expect("prime");
+        crate::test_support::prime_script(&binary);
         ClaudeBackend::with_binary(binary)
             .expect("backend")
             .with_probe_timeout(Duration::from_millis(200))
