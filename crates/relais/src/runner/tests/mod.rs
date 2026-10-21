@@ -8035,7 +8035,15 @@ fn the_reviewer_prompt_names_the_patch_it_does_not_carry_it() {
     assert_eq!(seen.len(), 1);
     let (path, existed, size) = &seen[0];
     assert!(*existed && *size > 140_000, "{path}: {size} bytes");
-    assert!(path.contains(".relais/review/"), "{path}");
+    assert!(
+        std::path::Path::new(path).ends_with(
+            std::path::Path::new(".relais")
+                .join("review")
+                .join(outcome.run_id.as_str())
+                .join("candidate.patch")
+        ),
+        "{path}"
+    );
     assert!(
         !std::path::Path::new(path).exists(),
         "the copy is removed when the review ends"

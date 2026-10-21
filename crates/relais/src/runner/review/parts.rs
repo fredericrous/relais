@@ -188,11 +188,13 @@ pub(in crate::runner) fn write_immutable(path: &Path, bytes: &[u8]) -> std::io::
         Ok(mut file) => {
             file.write_all(bytes)?;
             file.sync_all()?;
-            // The new name is durable too.
-            match path.parent() {
-                Some(dir) => std::fs::File::open(dir)?.sync_all(),
-                None => Ok(()),
+            // The new name is durable too. Windows refuses to open a
+            // directory as a file, and NTFS journals the creation itself.
+            #[cfg(unix)]
+            if let Some(dir) = path.parent() {
+                std::fs::File::open(dir)?.sync_all()?;
             }
+            Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             if std::fs::read(path)? == bytes {
