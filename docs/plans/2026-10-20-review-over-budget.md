@@ -92,4 +92,9 @@ Intended outcome:
 - **Observability:** `relais report` counts `review_over_budget` runs and reviewer launch failures by cause. Input: a run that is over budget. Expected: the count goes up by 1.
 - **Gates:** `make check` exits 0, and CI is green on all three platforms.
 
+## Decision log
+
+- 2026-10-21, Changes step 2: the reviewer reads the patch from a copy in the worktree's ignored relais area (`.relais/review/<run>/candidate.patch`), Design 1's alternative, removed when the review ends. The reviewer's working directory is that worktree, so the copy is readable whatever Claude Code allows a plugin-spawned subagent outside it; the artifacts directory was not relied on.
+- 2026-10-21, Changes step 2: the coordinator does use the prompt text. When the plugin spawns the subagent, the hook claims the marked call and the coordinator answers `ClaimOutcome::Spawn` with the registered fields, "whatever the call asked for" (`admission/native.rs:144-153`, `:430-453`): the registered prompt is authoritative, a guard against an altered spawn. So Design 2's alternative applies: the coordinator keeps the text, and the request cap is raised for native registration only (`register_native`, `Continue`), to a bound derived from the prompt budget plus a margin. Every other request keeps 64 KiB.
+
 <!-- panel: repos=relais reviewers=backend,codex body-sha=a19380c861ef -->
