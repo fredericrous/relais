@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: fix/review-over-budget
 repos: [relais]
 adrs: [ADR-0010 (relais), ADR-0040, ADR-0041]
@@ -92,9 +92,34 @@ Intended outcome:
 - **Observability:** `relais report` counts `review_over_budget` runs and reviewer launch failures by cause. Input: a run that is over budget. Expected: the count goes up by 1.
 - **Gates:** `make check` exits 0, and CI is green on all three platforms.
 
+## Outcome
+
+Observed on a913ea09 before the push. Each row: input → expected → actual.
+
+- **Cap.** A `register_native` line over 64 KiB, and an ordinary request over 64 KiB → the first accepted, the second refused naming the cap → as expected (`only_a_native_registration_may_exceed_the_ordinary_cap`).
+- **Failure text.** A refused registration, and a reviewer ending with no detail → the refusal text in the detail and `events.jsonl`; the generic sentence only for the second → as expected (`a_reviewer_that_could_not_be_launched_says_why`, `a_reviewer_that_ended_with_nothing_to_report_gets_the_generic_sentence`).
+- **Constraints fit.** A ~150 KB patch with 40 constraint statements → all 40 in the prompt, no partial gap; the prompt names the patch and stays under 20,000 bytes; the byte budget fits exactly 885 statements → as expected (`the_reviewer_prompt_names_the_patch_it_does_not_carry_it`, `the_constraints_budget_fits_a_stated_number_of_statements`).
+- **Over budget asks.** A patch over 192 KiB → no reviewer dispatched, `needs_decision (review_over_budget)` naming size, budget and parts → as expected (`a_patch_over_the_budget_dispatches_no_reviewer_and_asks`, `a_single_file_over_the_budget_says_so`).
+- **approve.** Both stops; reopened ledger and receipt; publication failure then retry; gaps and a foreign snapshot → receipt sealed from the snapshot and matching; retry recovers without a duplicate; gaps refused by name → as expected (`runner/tests/review_stop.rs`, 15 tests).
+- **review-parts.** Cut, order, all-pass; a failing part; a later dispatch failure; an oversized single file and more than 8 parts refused before any intent; resume skipping passed parts; a retried part keeping the earlier answer and its row → as expected (`runner/tests/review_parts.rs`, 11 tests; `tests/review_parts_cli.rs`, 4 tests).
+- **Patch copy.** `.relais/review` unwritable → `review_unavailable`, no reviewer dispatched, no directory left, and a cleanup that fails too is added to the returned error → as expected (two tests).
+- **Observability.** A run over budget and recorded reviewer failures → `review_over_budget` counted, "reviews not had" by cause → as expected (`report_counts_runs_over_budget`, `the_report_names_the_reviews_not_had_by_cause`, `every_recorded_review_failure_maps_to_its_cause`).
+- **Gates.** The pre-commit gate (fmt, clippy `-D warnings`, cargo test, plugin test, check-child-cycles) passed on each commit.
+- **Live checks** (a ~100 KB patch reviewed; an over-budget run answered `review-parts`; the 14 runs) belong to v0.28.0's install and are recorded in plan `2026-10-19-finish-admission-then-split.md` step 11.
+
 ## Decision log
 
 - 2026-10-21, Changes step 2: the reviewer reads the patch from a copy in the worktree's ignored relais area (`.relais/review/<run>/candidate.patch`), Design 1's alternative, removed when the review ends. The reviewer's working directory is that worktree, so the copy is readable whatever Claude Code allows a plugin-spawned subagent outside it; the artifacts directory was not relied on.
 - 2026-10-21, Changes step 2: the coordinator does use the prompt text. When the plugin spawns the subagent, the hook claims the marked call and the coordinator answers `ClaimOutcome::Spawn` with the registered fields, "whatever the call asked for" (`admission/native.rs:144-153`, `:430-453`): the registered prompt is authoritative, a guard against an altered spawn. So Design 2's alternative applies: the coordinator keeps the text, and the request cap is raised for native registration only (`register_native`, `Continue`), to a bound derived from the prompt budget plus a margin. Every other request keeps 64 KiB.
+- 2026-10-21, carried item "version mismatch": not applicable. The protocol's shape did not change (the coordinator keeps the prompt), only the size limit for native registration. An older coordinator still refuses a line over 64 KiB, but the reviewer prompt no longer carries the patch and is asserted under 20,000 bytes, so it fits either coordinator.
+- 2026-10-21, a part's answer is written per attempt (`review-parts/<index>.<dispatch id>.txt`), not to `<index>.txt`: evidence rows are append-only, so a retry that rewrote one path would leave an earlier row's hash false.
+- 2026-10-21, the review-fix runs' own reviews were unavailable (the installed 0.27 has the cap this branch removes); an independent read-only reviewer read the candidate patch, and the orchestrator answered on its verdict.
+- 2026-10-21, deliberate: no test for a cleanup that fails (the `review_patch_copy_not_removed` warning, and `stage_patch`'s combined error). A directory that refuses removal needs a different permission trick on each of the three CI platforms, and none under root. Revisit if either path is changed or a cleanup failure is seen in `events.jsonl`.
+
+## Implementation review
+
+- Round 1: approve-with-changes, 5 findings (74k, 104 s); all fixed through two relais review-fix runs and by hand.
+- Delta: approve-with-changes (85k, 29 s); every round-1 finding resolved; low 1 (a swallowed cleanup error) fixed in a913ea09; low 2 deliberate: no test for a cleanup that fails (see Decision log).
+- Round 1 on the final tree 2d5a55bf: approve-with-changes, 2 lows in the plan (23k, 50 s); both fixed in this commit.
 
 <!-- panel: repos=relais reviewers=backend,codex body-sha=a19380c861ef -->
