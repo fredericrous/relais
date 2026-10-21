@@ -1,6 +1,6 @@
 //! The runner's own failure type and how a run ends for its driver.
 
-use super::*;
+use super::{verify, LedgerError, RunId, RunOutcome, WorkspaceError};
 
 /// How a run ended for its driver: by its own last transition, or by
 /// another process that ended it first (whose outcome event stands).

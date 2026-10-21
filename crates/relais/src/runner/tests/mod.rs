@@ -1,3 +1,4 @@
+use super::review::REVIEW_PATCH_BUDGET_BYTES;
 use super::review::{read_patch, report_review_prompt, review_verdict, REVIEW_MIN_WALL};
 use super::*;
 use crate::adapter::{MockBackend, MockOutcome};

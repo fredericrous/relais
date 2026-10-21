@@ -1,6 +1,8 @@
 //! The reviewer dispatch's value types.
 
-use super::super::*;
+use super::super::{
+    ContextManifest, EffectiveAuthority, PathBuf, Recipe, RoutedBy, Tier, UsagePhase,
+};
 
 /// What a reviewer dispatch is for. A report review reads the worktree and
 /// nothing else; it is not the patch review, and the ledger does not count

@@ -1,6 +1,10 @@
 //! Reading a reviewer's answer and building its prompts.
 
-use super::*;
+use super::prompt::relevant_block;
+use super::{
+    context, data_block, data_list_block, verify, workspace, Duration, EffectiveAuthority,
+    Guidance, GuidanceGap, GuidanceSource, Path, Reason, RuleRef, RunId, Tier,
+};
 
 mod engine;
 mod types;
@@ -208,4 +212,78 @@ pub(crate) fn reviewer_tier(
         .get(&tier)
         .is_some_and(|profile| profile.id == candidate_model);
     Some((tier, same_model))
+}
+
+/// The statement lines of the rules that fit `budget` bytes, whole and in
+/// order, and the gap naming the ones that did not. Never cuts a statement.
+pub(in crate::runner) fn fit_statements(
+    rules: &[RuleRef],
+    budget: usize,
+) -> (Vec<&RuleRef>, Option<GuidanceGap>) {
+    let line_bytes = |rule: &RuleRef| rule.id.len() + rule.statement.len() + 8;
+    let mut used = 0usize;
+    let mut shown = Vec::new();
+    for rule in rules {
+        let next = used + line_bytes(rule);
+        if next > budget {
+            break;
+        }
+        used = next;
+        shown.push(rule);
+    }
+    if shown.len() == rules.len() {
+        return (shown, None);
+    }
+    let omitted: Vec<&str> = rules[shown.len()..]
+        .iter()
+        .map(|rule| rule.id.as_str())
+        .collect();
+    let measured: usize = rules.iter().map(line_bytes).sum();
+    let gap = GuidanceGap::new(
+        GuidanceSource::Reviewer,
+        context::guidance::GapCause::OverBudget {
+            measured,
+            budget,
+        },
+        format!(
+            "{} of {} constraint statements fit the reviewer prompt ({measured} bytes against {budget} left of the {REVIEW_PATCH_BUDGET_BYTES}-byte budget); omitted: {}",
+            shown.len(),
+            rules.len(),
+            omitted.join(", ")
+        ),
+    );
+    (shown, Some(gap))
+}
+
+/// What the reviewer reads of aval: the full statement of every active
+/// constraint (it cannot run `aval rule`, so never the bare index and
+/// never that instruction), then the relevant block without the rules
+/// already stated above it. `budget` is what the patch left of the review
+/// prompt's byte budget; statements that do not fit whole are left out and
+/// named in the returned gap.
+pub(in crate::runner) fn reviewer_guidance(
+    guidance: &Guidance,
+    budget: usize,
+) -> (String, Option<GuidanceGap>) {
+    let (shown, gap) = fit_statements(&guidance.rules, budget);
+    let mut text = String::new();
+    if !shown.is_empty() {
+        let statements: Vec<String> = shown
+            .iter()
+            .map(|rule| format!("`{}`: {}", rule.id, rule.statement))
+            .collect();
+        text.push_str("the constraint rules below are in force; review blocks on them.\n");
+        if let Some(gap) = &gap {
+            text.push_str(&format!(
+                "only {} of {} could be shown; the rest are not available to you ({}).\n",
+                shown.len(),
+                guidance.rules.len(),
+                gap.detail
+            ));
+        }
+        text.push_str(&data_list_block("constraints in force", &statements));
+    }
+    let stated: Vec<&str> = shown.iter().map(|rule| rule.id.as_str()).collect();
+    text.push_str(&relevant_block(guidance, &stated));
+    (text, gap)
 }

@@ -1,6 +1,8 @@
 //! What a run has spent and its per-attempt progress.
 
-use super::*;
+use super::{
+    AttemptKind, Budget, CostCompleteness, EffortId, Limit, MicroUsd, Preflight, RungIndex,
+};
 
 /// What a run has spent so far, and how well that figure is known.
 ///

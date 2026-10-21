@@ -5,60 +5,10 @@ use super::{
     setup_failure_detail, state_sibling, verify, verify_root, workspace, worktree_root, Arc,
     AtomicBool, AttemptContext, AttemptKind, BlockCode, Budget, BudgetClock, BudgetLimits, Budgets,
     Candidate, CostKind, Duration, EffectiveAuthority, Event, Events, EvidenceKind, Exhausted,
-    Finish, GuidanceGap, InPlaceRun, Instant, LaunchResult, Limit, Next, Observation, Ordering,
-    PackageId, PackageRole, PathBuf, Phase, Reason, Refusal, Request, RunConfig, RunError, RunId,
-    RunOutcome, RunRegistration, State, Summary, Terminal, Transition, UsagePhase, ADMISSION_POLL,
+    Finish, Instant, Limit, Next, Observation, Ordering, PackageId, PackageRole, PathBuf, Phase,
+    Reason, Refusal, Request, RunConfig, RunEngine, RunError, RunId, RunOutcome, State, Summary,
+    Terminal, Transition, UsagePhase, ADMISSION_POLL,
 };
-
-/// What a managed launch produced: the worker's result, or the run's
-/// end when admission or the launch itself decided it.
-pub(crate) type Launched = Result<LaunchResult, RunOutcome>;
-
-pub(crate) struct RunEngine<'a> {
-    pub(crate) config: &'a RunConfig<'a>,
-    pub(crate) run_id: RunId,
-    pub(crate) artifacts: PathBuf,
-    /// This run's worktrees, outside the artifact directory (B6): the
-    /// task worktree the worker gets, or the scheduler's integration
-    /// worktree — never both, since a decomposed run has no task
-    /// worktree of its own.
-    pub(crate) worktrees: PathBuf,
-    /// This run's throwaway verification worktrees.
-    pub(crate) verify_dir: PathBuf,
-    pub(crate) state: State,
-    pub(in crate::runner) parent: Option<(RunId, PackageId, PackageRole)>,
-    /// `<backend> <version>` as probed at run start; unknown = `None`.
-    pub(crate) harness: Option<String>,
-    /// Write leases this run's own dispatches took and could not give
-    /// back (R3). Verification never waits on one of these: the process
-    /// that held it has ended, so the tree is still, and waiting would
-    /// be the run waiting on itself until its own deadline.
-    pub(in crate::runner) own_write_leases: std::collections::BTreeSet<String>,
-    /// The reviewer's constraint statements that did not fit its prompt:
-    /// known only once the review prompt is built, shown in the receipt.
-    pub(in crate::runner) reviewer_gap: Option<GuidanceGap>,
-    /// Set once the coordinator reports this run cancelled while no
-    /// dispatch heartbeat was running (a check, or between phases).
-    pub(in crate::runner) cancel_asked: Arc<AtomicBool>,
-    /// What this run may still spend of time (ADR-0010). Unbounded until
-    /// preflight has the authority that sizes it.
-    pub(crate) budgets: Budgets,
-    /// Which try of each command's heavy lease this is, so a rerun gets a
-    /// lease id the coordinator has not seen (SPEC §23, C8).
-    pub(in crate::runner) heavy_tries: verify::Tries,
-    /// What this run registered with the coordinator, kept to register
-    /// again when a restarted coordinator no longer knows the run.
-    pub(in crate::runner) registration: Option<RunRegistration>,
-    /// Everything this run does, as events (SPEC §29).
-    pub(crate) events: Events,
-    /// The caller's worktree this run holds when it works in place
-    /// (ADR-0008); `None` for every other workspace.
-    pub(in crate::runner) inplace: Option<InPlaceRun>,
-    /// The newest candidate snapshot this run made, `(attempt, commit)`:
-    /// what the storage-full path names a ref for when the disk fills
-    /// after the snapshot exists (SPEC §10).
-    pub(in crate::runner) last_snapshot: Option<(u32, String)>,
-}
 
 impl<'a> RunEngine<'a> {
     /// The phase an attempt of THIS run records: a root run and an
