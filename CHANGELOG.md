@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.28.1
+
 A `review-parts` answer no longer labels its candidate No in the learning data: it is recorded as a revision, but nobody judged the candidate, so the decision label leaves it out (`Excluded`); every other revision is labelled as before.
 
 ## v0.28.0
