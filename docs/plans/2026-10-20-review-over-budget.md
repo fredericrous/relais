@@ -94,7 +94,7 @@ Intended outcome:
 
 ## Outcome
 
-Observed on a913ea09 before the push. Each row: input → expected → actual.
+Observed on a913ea09 before the first push; fda52a99 fixed the Windows-only failure CI found (below). Each row: input → expected → actual.
 
 - **Cap.** A `register_native` line over 64 KiB, and an ordinary request over 64 KiB → the first accepted, the second refused naming the cap → as expected (`only_a_native_registration_may_exceed_the_ordinary_cap`).
 - **Failure text.** A refused registration, and a reviewer ending with no detail → the refusal text in the detail and `events.jsonl`; the generic sentence only for the second → as expected (`a_reviewer_that_could_not_be_launched_says_why`, `a_reviewer_that_ended_with_nothing_to_report_gets_the_generic_sentence`).
@@ -104,6 +104,7 @@ Observed on a913ea09 before the push. Each row: input → expected → actual.
 - **review-parts.** Cut, order, all-pass; a failing part; a later dispatch failure; an oversized single file and more than 8 parts refused before any intent; resume skipping passed parts; a retried part keeping the earlier answer and its row → as expected (`runner/tests/review_parts.rs`, 11 tests; `tests/review_parts_cli.rs`, 4 tests).
 - **Patch copy.** `.relais/review` unwritable → `review_unavailable`, no reviewer dispatched, no directory left, and a cleanup that fails too is added to the returned error → as expected (two tests).
 - **Observability.** A run over budget and recorded reviewer failures → `review_over_budget` counted, "reviews not had" by cause → as expected (`report_counts_runs_over_budget`, `the_report_names_the_reviews_not_had_by_cause`, `every_recorded_review_failure_maps_to_its_cause`).
+- **Windows.** PR #274's first CI run → green on three platforms → windows-latest failed 10 tests with `Access is denied`: `write_immutable` fsynced the parent directory, which Windows cannot open as a file (`fsutil.rs` already gates the same sync), and one test matched a `/` in an OS path. Fixed in fda52a99 (Unix-only directory sync, component-wise path match).
 - **Gates.** The pre-commit gate (fmt, clippy `-D warnings`, cargo test, plugin test, check-child-cycles) passed on each commit.
 - **Live checks** (a ~100 KB patch reviewed; an over-budget run answered `review-parts`; the 14 runs) belong to v0.28.0's install and are recorded in plan `2026-10-19-finish-admission-then-split.md` step 11.
 
@@ -120,6 +121,7 @@ Observed on a913ea09 before the push. Each row: input → expected → actual.
 
 - Round 1: approve-with-changes, 5 findings (74k, 104 s); all fixed through two relais review-fix runs and by hand.
 - Delta: approve-with-changes (85k, 29 s); every round-1 finding resolved; low 1 (a swallowed cleanup error) fixed in a913ea09; low 2 deliberate: no test for a cleanup that fails (see Decision log).
-- Round 1 on the final tree 2d5a55bf: approve-with-changes, 2 lows in the plan (23k, 50 s); both fixed in this commit.
+- Round 1 on the final tree 2d5a55bf: approve-with-changes, 2 lows in the plan (23k, 50 s); both fixed in the closing commit.
+- Round 1 on tree 4d2f36d5 (the Windows fix fda52a99): approve (18k, 16 s); no other directory fsync or separator-bound path assertion found.
 
 <!-- panel: repos=relais reviewers=backend,codex body-sha=a19380c861ef -->
