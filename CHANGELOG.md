@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+A `review-parts` answer no longer labels its candidate No in the learning data: it is recorded as a revision, but nobody judged the candidate, so the decision label leaves it out (`Excluded`); every other revision is labelled as before.
+
 ## v0.28.0
 
 A review that does not fit asks the orchestrator (plan `2026-10-20-review-over-budget`): a large diff is reviewed again, a launch failure says why, a patch over the review budget stops `needs_decision (review_over_budget)`, and the new answer `review-parts` reviews it in parts; the paragraphs below say each. `runner/mod.rs`, `ledger/mod.rs` and the review module are split into phase modules with no change in behaviour (#270-#273). The ledger moves to schema v42 (tables `verification_snapshots` and `review_parts`, and the successor intent's `review` column). A relais from before schema 42 cannot read the upgraded ledger. Before upgrading, stop the coordinator and copy the ledger with `sqlite3 <state>/ledger.sqlite ".backup <file>"` (`<state>` is relais's state directory, `~/.local/state/relais` by default). To roll back, stop the coordinator again and restore that copy, only with the person's yes.

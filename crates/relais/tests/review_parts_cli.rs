@@ -215,6 +215,21 @@ fn a_patch_that_cuts_into_parts_records_one_intent_with_review_parts() {
     assert_eq!(contract["candidate"]["run"], "run-1");
     assert!(stored.scope_delta.is_empty());
 
+    // The answer judged nothing, so the learning labels leave it out.
+    let labelled = relais::learn::decision_label::label_decisions(&world.ledger()).expect("labels");
+    let label = &labelled
+        .iter()
+        .find(|decision| decision.run.as_str() == "run-1")
+        .expect("the decision is labelled")
+        .label;
+    assert!(
+        matches!(
+            label,
+            relais::learn::decision_label::DecisionLabel::Excluded(_)
+        ),
+        "{label:?}"
+    );
+
     // A repeat returns the same intent and writes no second.
     let again = world.decide("review-parts");
     assert_eq!(again.status.code(), Some(0), "{again:?}");
