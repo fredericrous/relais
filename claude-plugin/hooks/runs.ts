@@ -655,7 +655,8 @@ export async function statusOf(fx: Fx, store: Store, run?: string, opts: { outpu
   // ones first, then the most recent; `offset` pages through the rest.
   const needsLook = (m: RunModel) => isLive(m) || (m.outcome !== undefined && AWAITS_A_PERSON.has(m.outcome.state))
   const ordered = [...models].sort((a, b) => Number(needsLook(b)) - Number(needsLook(a)) || b.startedAt - a.startedAt)
-  const offset = Number.isInteger(opts.offset) && (opts.offset as number) > 0 ? (opts.offset as number) : 0
+  // The tool handler refuses an offset that is not a whole number >= 0.
+  const offset = opts.offset ?? 0
   const page = ordered.slice(offset, offset + STATUS_PAGE)
   const end = offset + page.length
   const more = Math.max(0, ordered.length - end)

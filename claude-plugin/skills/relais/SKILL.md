@@ -114,9 +114,8 @@ up, and the person answers there.
    - Progress: call `mcp__relais__status` with `run` (phases, decisions,
      cost and outcome; add `output: true` only when the last lines of a
      check's output are what you need). Without `run` it lists a short
-     page of this session's runs (10 at most, `offset` for the next page),
-     or tell the person to open
-     `/relais-status`.
+     page of this session's runs (10 at most, `offset` for the next page).
+     The person can follow the same runs in `/relais-status`.
    - The outcome arrives as a message when the run ends. Do not end your
      turn before it arrives: a run whose session ends goes with it.
    - Read the outcome: accepted (receipt + patch), needs_decision,

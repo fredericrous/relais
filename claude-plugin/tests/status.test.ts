@@ -75,9 +75,20 @@ test('statusOf refreshes a live model from the ledger before it replies', async 
   await settle(engine)
   engine.script.runResult = (argv: string[]) =>
     argv[2] === 'status' ? result(JSON.stringify(timelineOf('run-live', { state: 'interrupted', reason: 'its driver is gone' }))) : result('')
+  // The list reply refreshes it first, then the reply by id shows the reason.
+  const list = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status' })).result)
+  expect(list.runs[0].outcome).toBe('interrupted')
   const [run] = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status', run: 'run-live' })).result)
   expect(run.outcome.state).toBe('interrupted')
   expect(run.outcome.reason).toBe('its driver is gone')
+})
+
+test('status refuses an offset that is not a whole number of at least 0', async ($: any, on: any) => {
+  await startedRun($, on)
+  for (const offset of [-1, 1.5, '10']) {
+    const reply = await $.tool.call({ tool: 'mcp__relais__status', offset })
+    expect(reply.deny).toContain('offset')
+  }
 })
 
 test('the cancel tool runs native cancel with --run and --session and returns its line', async ($: any, on: any) => {
