@@ -77,9 +77,21 @@ const NATIVE_REGISTRATION_PREFIX: &str = r#"{"method":"register_native""#;
 /// timeout from this (`install::settings::derived_pretooluse_timeout`),
 /// so the number in force lives here once rather than being copied.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a client waits for the answer to a request that can change a
+/// group binding (`bind_group`, and `release`, `settle`,
+/// `acknowledge_cancel` and `end_training`, which can give a bound lease
+/// back). It is answered only
+/// once the change is durable, and on a busy ledger that waits for the
+/// batch ahead of it and then its own, each statement up to the ledger's
+/// 5 s busy timeout: past `REQUEST_TIMEOUT`, the caller gave up on a write
+/// that then succeeded (2026-10-22).
+// holds-until: a batch of more than about five changes meets a ledger
+// busy for each; then the write moves off the reply path.
+const WRITE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many connections are served at once. Every request is short and
-/// capped by `REQUEST_TIMEOUT`, so a small pool is enough; what it
+/// capped by `REQUEST_TIMEOUT`, or by `WRITE_RESPONSE_TIMEOUT` for one
+/// that writes a group binding, so a small pool is enough; what it
 /// prevents is one thread per connection, unjoined, for as many
 /// connections as anybody cares to open (A9).
 const HANDLER_THREADS: usize = 8;
@@ -989,26 +1001,50 @@ fn group_loop(
 /// lease out of order.
 pub(crate) struct GroupStore {
     ledger_path: Option<PathBuf>,
-    writing: Mutex<()>,
+    /// Held while a batch is written, so batches land in journal order.
+    /// The value is the journal position the writes have reached: every
+    /// change before it is durable, or was reported as not persisted.
+    written: Mutex<u64>,
 }
 
 impl GroupStore {
     pub(crate) fn new(ledger_path: Option<PathBuf>) -> Self {
         Self {
             ledger_path,
-            writing: Mutex::new(()),
+            written: Mutex::new(0),
         }
+    }
+
+    /// Make the changes before journal position `end` durable, waiting
+    /// only on the writes that carry them: a request that journalled
+    /// nothing does not call this, so it never waits on another
+    /// request's write to a busy ledger.
+    pub(crate) fn flush_through(&self, state: &Mutex<AdmissionState>, end: u64) {
+        let mut written = self
+            .written
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *written >= end {
+            return;
+        }
+        self.write_journal(state, &mut written);
     }
 
     /// Write what the state has journalled. A change that cannot be written
     /// is said on stderr, not dropped silently: the hold works in memory,
     /// and only a restart would lose it.
     pub(crate) fn flush(&self, state: &Mutex<AdmissionState>) {
-        let _writing = self
-            .writing
+        let mut written = self
+            .written
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let changes = lock_state(state).take_group_journal();
+        self.write_journal(state, &mut written);
+    }
+
+    /// Take the journal and write it, under the `written` guard.
+    fn write_journal(&self, state: &Mutex<AdmissionState>, written: &mut u64) {
+        let (changes, end) = lock_state(state).take_group_journal();
+        *written = end;
         let Some(path) = &self.ledger_path else {
             return;
         };
@@ -1315,6 +1351,7 @@ fn handle_connection(
     }
     let oversized = read as u64 == cap && !line.ends_with('\n');
     let mut signals = Vec::new();
+    let mut journaled = None;
     let response = if oversized {
         Response::Error {
             detail: format!("request exceeds {cap} bytes"),
@@ -1331,7 +1368,12 @@ fn handle_connection(
             // whatever the call was about (A11).
             Ok(_) if shutdown.load(std::sync::atomic::Ordering::SeqCst) => Response::ShuttingDown,
             Ok(request) => {
-                let (response, pending) = handle(request, &mut lock_state(state), Instant::now());
+                let mut guard = lock_state(state);
+                let before = guard.group_journal_end();
+                let (response, pending) = handle(request, &mut guard, Instant::now());
+                let after = guard.group_journal_end();
+                drop(guard);
+                journaled = (after > before).then_some(after);
                 signals = pending;
                 response
             }
@@ -1345,8 +1387,10 @@ fn handle_connection(
     // may be stopped.
     deliver_signals(state, signals);
     // A group binding or its removal is durable before the caller hears of
-    // it (SPEC §23).
-    store.flush(state);
+    // it (SPEC §23). A request that changed none waits on no write.
+    if let Some(end) = journaled {
+        store.flush_through(state, end);
+    }
     let payload = serde_json::to_string(&response).map_err(|e| CoordinatorError::Protocol {
         operation: "serializing the response",
         detail: e.to_string(),
@@ -1776,8 +1820,16 @@ impl Client {
             move |cause: std::io::Error| CoordinatorError::Io { operation, cause }
         };
         let mut stream = Stream::connect(&self.socket).map_err(connect)?;
+        let response_timeout = match request {
+            Request::BindGroup { .. }
+            | Request::Release { .. }
+            | Request::Settle { .. }
+            | Request::AcknowledgeCancel { .. }
+            | Request::EndTraining { .. } => WRITE_RESPONSE_TIMEOUT,
+            _ => REQUEST_TIMEOUT,
+        };
         stream
-            .set_read_timeout(Some(REQUEST_TIMEOUT))
+            .set_read_timeout(Some(response_timeout))
             .map_err(io("setting the read timeout"))?;
         stream
             .set_write_timeout(Some(REQUEST_TIMEOUT))
@@ -3087,6 +3139,89 @@ mod tests {
         );
         runner.kill().ok();
         runner.wait().ok();
+    }
+
+    /// A group binding whose write waits on a busy ledger must not hold up
+    /// every other reply: a run waiting for its turn asks again at that
+    /// very moment, and a reply later than `REQUEST_TIMEOUT` ended it
+    /// `admission_unavailable` (2026-10-22, run-65e669900fbb3-9a8a).
+    #[cfg(unix)]
+    #[test]
+    fn a_binding_waiting_on_a_busy_ledger_does_not_delay_other_replies() {
+        use std::os::unix::process::CommandExt;
+        let dir = crate::test_support::short_temp_dir("busy-flush");
+        let ledger = Ledger::open(&dir.join("ledger.db")).expect("ledger");
+        let socket = dir.join("c.sock");
+        let (coordinator, listener) = Coordinator::start(
+            &socket,
+            ConcurrencyLimits {
+                max_heavy_commands: Some(1),
+                ..ConcurrencyLimits::default()
+            },
+            Some(&ledger),
+            Duration::from_secs(120),
+        )
+        .expect("start");
+        let server = std::thread::spawn(move || coordinator.serve(listener));
+        let gate = RemoteGate::new(socket.clone());
+        gate.register_run(&registration("run-p", "tab"))
+            .expect("register");
+        assert_eq!(
+            gate.admit(&heavy_request("held", "run-p")).expect("admit"),
+            Decision::Granted
+        );
+        let mut check = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("a check");
+
+        // Another process holds the ledger's write lock for longer than a
+        // request may take.
+        // Shorter than the ledger's 5 s busy timeout, so the binding's
+        // write waits it out and lands.
+        let held = Duration::from_secs(3);
+        let path = ledger.path().to_path_buf();
+        let (locked, is_locked) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&path).expect("open");
+            conn.execute_batch("BEGIN IMMEDIATE").expect("lock");
+            locked.send(()).expect("signal");
+            std::thread::sleep(held);
+            conn.execute_batch("ROLLBACK").expect("unlock");
+        });
+        is_locked.recv().expect("locked");
+        let binding = {
+            let gate = RemoteGate::new(socket.clone());
+            let pgid = check.id();
+            std::thread::spawn(move || gate.bind_group("held", std::process::id(), pgid))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        let pinged = Client::new(socket.clone()).ping();
+        let took = started.elapsed();
+        // A request that changed nothing writes nothing, and waits on
+        // nobody's write.
+        assert!(
+            pinged.is_ok() && took < Duration::from_secs(1),
+            "a ping behind a binding waiting on the ledger: {pinged:?} after {took:?}"
+        );
+
+        holder.join().expect("holder");
+        // The binding's own caller waits for its durable write.
+        assert!(
+            matches!(binding.join().expect("bind thread"), Ok(BindOutcome::Bound)),
+            "the binding's caller gave up before its write was answered"
+        );
+        let persisted = ledger.group_bindings().expect("rows");
+        assert!(
+            persisted.iter().any(|row| row.dispatch_id == "held"),
+            "the binding is in the ledger once its caller hears of it: {persisted:?}"
+        );
+        check.kill().ok();
+        check.wait().ok();
+        Client::new(socket).request(&Request::Shutdown).ok();
+        server.join().expect("server").expect("served");
     }
 
     /// The hold is in the ledger from the moment the group is bound until

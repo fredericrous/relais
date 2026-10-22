@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+A run waiting for its turn on the heavy lease no longer ends `blocked (admission_unavailable)` with "reading the response: Resource temporarily unavailable" when another lease is bound. The coordinator wrote a group binding to the ledger before answering, under a lock every reply took, so while another process held the ledger for its 5 s busy timeout, every request waited behind that write and missed the client's 5 s deadline. Now a request that changed no binding waits on no write, and `bind_group`, and `release`, `settle`, `acknowledge_cancel` and `end_training` (which can give a bound lease back), are answered only once their change is durable and wait up to 30 s for that answer.
+
 ## v0.29.0
 
 `relais report` gains a `harness` section (report schema 13): per pipeline step and model, how many reviews reached a verdict and how many of those led to a `revise`, and how many repair attempts turned a failed check green. A review counts once per run, credited to its last dispatch's model; reviews and repairs with no verdict are counted apart. SPEC now states the failure each step prevents (ADR-0042). It is measurement only: a trial still cannot lower review.
