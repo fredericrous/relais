@@ -8,6 +8,10 @@ missing here.
 
 ## Unreleased
 
+## v0.29.2
+
+`relais report`'s harness section no longer counts a run as reviewed because it was accepted. A review now reaches a verdict only with a `review_findings` decision or a `checks_and_review_passed` transition, whatever the run ended as. Runs whose reviewer was unavailable and that were then approved by hand used to read as clean reviews (25 on this machine); they now count as reviews with no verdict.
+
 ## v0.29.1
 
 A run waiting for its turn on the heavy lease no longer ends `blocked (admission_unavailable)` with "reading the response: Resource temporarily unavailable" when another lease is bound. The coordinator wrote a group binding to the ledger before answering, under a lock every reply took, so while another process held the ledger for its 5 s busy timeout, every request waited behind that write and missed the client's 5 s deadline. Now a request that changed no binding waits on no write, and `bind_group`, and `release`, `settle`, `acknowledge_cancel` and `end_training` (which can give a bound lease back), are answered only once their change is durable and wait up to 30 s for that answer.
