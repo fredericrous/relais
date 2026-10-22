@@ -655,7 +655,9 @@ fn a_coordinator_that_cannot_be_reached_is_a_gate_error_not_a_refusal() {
             unreachable!()
         }
     }
+    let clock = ManualClock::new();
     let mut down = admission(&Unreachable, "run-d", 1, 4);
+    down.sleeper = Advancing::new(&clock);
     down.registration = Some(registration("run-d"));
     assert!(matches!(
         down.admit(&ask(&BTreeMap::new(), 1)),
@@ -1245,4 +1247,161 @@ fn a_checks_growth_is_recorded_and_is_its_next_estimate_with_two_gib_before() {
         2 * GIB,
         "another label is still unmeasured"
     );
+}
+
+/// A gate whose `admit` is unreachable `down` times, then answers `then`.
+struct Flaky {
+    down: usize,
+    calls: std::sync::atomic::AtomicUsize,
+    after: Box<dyn Fn() + Send + Sync>,
+    then: Decision,
+}
+
+impl Flaky {
+    fn new(down: usize) -> Self {
+        Self {
+            down,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            after: Box::new(|| {}),
+            then: Decision::Granted,
+        }
+    }
+}
+
+impl Gate for Flaky {
+    fn register_run(&self, _: &RunRegistration) -> Result<(), GateError> {
+        Ok(())
+    }
+    fn admit(&self, _: &DispatchRequest) -> Result<Decision, GateError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        (self.after)();
+        if n < self.down {
+            Err(GateError::Unavailable {
+                operation: "admit",
+                socket: "none".into(),
+                cause: "Resource temporarily unavailable".into(),
+            })
+        } else {
+            Ok(self.then.clone())
+        }
+    }
+    fn bind(&self, _: &str, _: Option<&str>, _: Option<u32>) -> Result<BindOutcome, GateError> {
+        unreachable!()
+    }
+    fn heartbeat(&self, _: &str) -> Result<HeartbeatStatus, GateError> {
+        unreachable!()
+    }
+    fn mark_waiting(&self, _: &str) -> Result<WaitOutcome, GateError> {
+        unreachable!()
+    }
+    fn resume(&self, _: &str) -> Result<ResumeOutcome, GateError> {
+        unreachable!()
+    }
+    fn release(&self, _: &str) -> Result<LifecycleOutcome, GateError> {
+        unreachable!()
+    }
+    fn settle(&self, _: &str, _: Option<i64>) -> Result<LifecycleOutcome, GateError> {
+        unreachable!()
+    }
+    fn withdraw(&self, _: &str) -> Result<WithdrawOutcome, GateError> {
+        unreachable!()
+    }
+    fn acquire_write(&self, _: &str, _: &str) -> Result<WriteLeaseOutcome, GateError> {
+        unreachable!()
+    }
+    fn release_write(&self, _: &str, _: &str) -> Result<ReleaseWriteOutcome, GateError> {
+        unreachable!()
+    }
+    fn write_lease_holder(&self, _: &str) -> Result<Option<String>, GateError> {
+        unreachable!()
+    }
+    fn run_cancelled(&self, _: &str) -> Result<bool, GateError> {
+        unreachable!()
+    }
+    fn enforcement(&self) -> Enforcement {
+        unreachable!()
+    }
+}
+
+/// The grant reached the coordinator but its answer did not: asked again
+/// with the same id, it answers `AlreadyAdmitted`, and the lease is ours.
+#[test]
+fn a_grant_whose_answer_was_lost_is_the_lease_on_retry() {
+    let clock = ManualClock::new();
+    let gate = Flaky {
+        then: Decision::AlreadyAdmitted,
+        ..Flaky::new(1)
+    };
+    let mut heavy = admission(&gate, "run-l", 1, 4);
+    heavy.sleeper = Advancing::new(&clock);
+    let env = BTreeMap::new();
+    let lease = heavy.admit(&ask(&env, 1)).map_err(|e| e.to_string());
+    let lease = lease.expect("the lost grant is this request's lease");
+    std::mem::forget(lease);
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn an_unreachable_coordinator_is_retried_with_backoff_and_the_lease_is_granted() {
+    let clock = ManualClock::new();
+    let sleeper = Advancing::new(&clock);
+    let gate = Flaky::new(6);
+    let mut heavy = admission(&gate, "run-r", 1, 4);
+    heavy.sleeper = sleeper.clone();
+    let env = BTreeMap::new();
+    let lease = heavy.admit(&ask(&env, 1)).map_err(|e| e.to_string());
+    let lease = lease.expect("granted after the coordinator came back");
+    // `release` and `settle` are not wired in the fake gate.
+    std::mem::forget(lease);
+    let slept: Vec<u64> = sleeper
+        .slept
+        .lock()
+        .expect("sleeps")
+        .iter()
+        .map(Duration::as_secs)
+        .collect();
+    assert_eq!(slept, vec![1, 2, 4, 8, 16, 30]);
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 7);
+}
+
+#[test]
+fn an_unreachable_coordinator_is_given_up_on_after_the_bound() {
+    let clock = ManualClock::new();
+    let sleeper = Advancing::new(&clock);
+    let gate = Flaky::new(usize::MAX);
+    let mut heavy = admission(&gate, "run-g", 1, 4);
+    heavy.sleeper = sleeper.clone();
+    let env = BTreeMap::new();
+    let Err(LeaseStop::Gate(error)) = heavy.admit(&ask(&env, 1)) else {
+        panic!("expected a gate stop");
+    };
+    assert!(error.unavailable());
+    assert!(error.to_string().contains("retried for 600 s"), "{error}");
+    let total: Duration = sleeper.slept.lock().expect("sleeps").iter().sum();
+    assert_eq!(total, UNREACHABLE_BOUND);
+    assert_eq!(clock.now_millis(), 1_000_000 + 600_000);
+    // 1+2+4+8+16 then 30s steps: 31 + 30*k, the last clamped to the bound.
+    assert!(gate.calls.load(Ordering::SeqCst) > 10);
+}
+
+#[test]
+fn a_cancel_set_while_the_coordinator_is_unreachable_stops_the_retries() {
+    let clock = ManualClock::new();
+    let flag = Arc::new(AtomicBool::new(false));
+    let sleeper = {
+        let flag = Arc::clone(&flag);
+        Advancing::then(&clock, move |n| {
+            if n == 3 {
+                flag.store(true, Ordering::SeqCst);
+            }
+        })
+    };
+    let gate = Flaky::new(usize::MAX);
+    let mut heavy = admission(&gate, "run-c", 1, 4);
+    heavy.sleeper = sleeper.clone();
+    let env = BTreeMap::new();
+    let mut request = ask(&env, 1);
+    request.cancel = Some(&flag);
+    assert!(matches!(heavy.admit(&request), Err(LeaseStop::Cancelled)));
+    assert_eq!(sleeper.slept.lock().expect("sleeps").len(), 3);
 }

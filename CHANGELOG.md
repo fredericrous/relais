@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+A heavy-lease admission whose coordinator is unreachable (a read timeout, or a refused connection while it restarts) no longer stops the run on the first failure. It retries with backoff (1 s doubling to 30 s) for up to 10 minutes, emitting a `waiting_for_slot` event of class `coordinator_unreachable` on each retry, honouring cancel, and then stops with the admission error naming how long it retried. A grant whose answer was lost, so that the retry hears `AlreadyAdmitted` for the same id, is taken as the lease rather than stopping the run as a duplicate.
+
 ## v0.29.2
 
 `relais report`'s harness section no longer counts a run as reviewed because it was accepted. A review now reaches a verdict only with a `review_findings` decision or a `checks_and_review_passed` transition, whatever the run ended as. Runs whose reviewer was unavailable and that were then approved by hand used to read as clean reviews (25 on this machine); they now count as reviews with no verdict.
