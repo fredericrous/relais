@@ -8,6 +8,10 @@ missing here.
 
 ## Unreleased
 
+## v0.29.0
+
+`relais report` gains a `harness` section (report schema 13): per pipeline step and model, how many reviews reached a verdict and how many of those led to a `revise`, and how many repair attempts turned a failed check green. A review counts once per run, credited to its last dispatch's model; reviews and repairs with no verdict are counted apart. SPEC now states the failure each step prevents (ADR-0042). It is measurement only: a trial still cannot lower review.
+
 ## v0.28.1
 
 A `review-parts` answer no longer labels its candidate No in the learning data: it is recorded as a revision, but nobody judged the candidate, so the decision label leaves it out (`Excluded`); every other revision is labelled as before.
