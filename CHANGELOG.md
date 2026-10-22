@@ -12,6 +12,8 @@ missing here.
 
 A heavy-lease admission whose coordinator is unreachable (a read timeout, or a refused connection while it restarts) no longer stops the run on the first failure. It retries with backoff (1 s doubling to 30 s) for up to 10 minutes of wall time from the first failure, on the registration made again after `unknown_run` as well, emitting a `waiting_for_slot` event of class `coordinator_unreachable` (position 0, `waited_s` since the first failure) on each retry. A cancel is seen within one poll and withdraws the request. An `AlreadyAdmitted` answer after a retry is taken as the lease; without a retry it is still a duplicate. When the bound is spent the run stops `blocked (admission_unavailable)` with an error naming how long it retried.
 
+The plugin's `mcp__relais__status` without `run` now returns a page, `{runs, more, waiting, next_offset}`, instead of every run in full: at most 10 short entries (run, phase, attempt, cost, outcome state), live or awaiting runs first, `offset` for the next page, and a bad offset refused. One session's call had grown to 54 KB. With `run` the reply is unchanged. The shape without `run` changed from an array to an object, so reinstall the plugin after upgrading (#288).
+
 ## v0.29.2
 
 `relais report`'s harness section no longer counts a run as reviewed because it was accepted. A review now reaches a verdict only with a `review_findings` decision or a `checks_and_review_passed` transition, whatever the run ended as. Runs whose reviewer was unavailable and that were then approved by hand used to read as clean reviews (25 on this machine); they now count as reviews with no verdict.
