@@ -606,6 +606,24 @@ export function statusReply(m: RunModel, now: number, opts: { output?: boolean }
   }
 }
 
+const SUMMARY_TEXT_MAX = 120
+const short = (text: string) => (text.length > SUMMARY_TEXT_MAX ? `${text.slice(0, SUMMARY_TEXT_MAX - 1)}…` : text)
+
+// One run as the bounded list shows it: identity, progress, cost, the
+// outcome's state alone, and the hints that say it needs a look.
+export function statusSummaryEntry(m: RunModel) {
+  return {
+    run: m.run,
+    phase: m.phase,
+    attempt: m.attempt,
+    cost: formatCost(m.cost),
+    outcome: m.outcome?.state ?? null,
+    ...(m.stalled && isLive(m) ? { stalled: short(m.stalled) } : {}),
+    ...(m.wait && isLive(m) ? { waiting: short(m.wait) } : {}),
+    ...(m.foreign ? { foreign: true } : {}),
+  }
+}
+
 // The hint a live run's `current` gives when it has been silent a while.
 export function stalledHint(current: any): string | undefined {
   if (current?.stalled !== true) return undefined

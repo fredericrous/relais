@@ -216,7 +216,7 @@ test('a child that exits with its run unfinished ends that run as interrupted', 
   engine.stream.end(137)
   await settle(engine)
   await tick(engine)
-  const reply = await $.tool.call({ tool: 'mcp__relais__status' })
+  const reply = await $.tool.call({ tool: 'mcp__relais__status', run: RUN })
   const [run] = JSON.parse(reply.result)
   expect(run.outcome.state).toBe('interrupted')
 })

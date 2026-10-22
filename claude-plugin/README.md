@@ -24,7 +24,8 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
 
 - **Tools and command.** At `session.start` it registers `mcp__relais__run`
   (`{task, cwd}`), `mcp__relais__replay` (`{task, recipe, cwd}`) and
-  `mcp__relais__status` (`{run?}`) and the command `/relais-status`. `run`
+  `mcp__relais__status` (`{run?, output?, offset?}`: one run in full, or a
+  page of at most 10 short entries for this session's runs) and the command `/relais-status`. `run`
   starts `relais run --task <task> --protocol` in `cwd` with
   `RELAIS_HOST=claude-code-mod` and `RELAIS_SESSION_ID=<session>` and returns
   at once; `replay` starts `relais dataset replay --task <task> --recipe

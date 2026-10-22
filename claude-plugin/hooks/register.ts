@@ -200,11 +200,15 @@ export function register(on: any) {
     await $.tool.register({
       name: 'status',
       description:
-        "The phases, decisions, cost and outcome of relais runs: one run by id, or all of this session's runs (started from this Claude Code session id). A run of another session is returned only when asked for by id, marked foreign: true. A run's latest output lines only with output: true.",
+        "The phases, decisions, cost and outcome of a relais run by id (with run). Without run, a bounded summary {runs, more, waiting, next_offset} of this session's runs (started from this Claude Code session id): at most 10 short entries (run, phase, attempt, cost, outcome state, waiting, stalled, foreign), live or awaiting-a-person runs first, then the most recent. more counts the runs not shown, waiting counts all live or awaiting runs including those cut, and next_offset (present while more > 0) is the offset to pass for the next page. A run of another session is returned only when asked for by id, marked foreign: true. A run's latest output lines only with output: true.",
       inputSchema: {
         type: 'object',
         properties: {
-          run: { type: 'string', description: 'A run id; all runs when left out.' },
+          run: { type: 'string', description: "A run id; the bounded summary of this session's runs when left out." },
+          offset: {
+            type: 'number',
+            description: 'With no run: how many runs to skip, to page through the summary (use next_offset from the previous reply). Default 0.',
+          },
           output: {
             type: 'boolean',
             description: "Also return each run's last 40 output lines (a check's own log, often long). Off by default.",
@@ -355,7 +359,10 @@ export function register(on: any) {
   }))
 
   on('tool.call', { tool: STATUS_TOOL }, async ($: any, e: any) => ({
-    result: await statusOf(effects($), store, typeof e.run === 'string' ? e.run : undefined, { output: e.output === true }),
+    result: await statusOf(effects($), store, typeof e.run === 'string' ? e.run : undefined, {
+      output: e.output === true,
+      offset: typeof e.offset === 'number' ? e.offset : 0,
+    }),
   }))
 
   on('tool.call', { tool: CANCEL_TOOL }, async ($: any, e: any) => {
