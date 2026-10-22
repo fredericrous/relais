@@ -90,4 +90,21 @@ Live trials cannot run this candidate: `runner/live_trial.rs:112` admits with `C
   - `relais recipe evaluate` prints both gates; promotion happens only when both pass.
 - **All:** the merged PRs and the release are verified as `tag-release` steps 4–6.
 
+## Verification record
+
+- **A** (dotfiles #45, merged f144787): probe `claude -p --model sonnet --advisor opus` through the local proxy → `server_tool_use` `advisor` at line 29 of the probe transcript; Opus 26,185 input tokens, $0.116 per consult, uncached. Haiku main → Opus $0.115. 13 agents pinned (`grep -L '^model:'` empty). After apply, a fresh `claude -p --model sonnet` with no flag consulted Opus ($0.115) from settings. 7-day comparison: due 2026-10-29.
+- **B:** `make plugin`, PLUGIN_SKIP_OK unset, load 5 → 313 pass, 0 fail. The 20-run fixture (12 live or waiting): 10 entries, `more` 10, `waiting` 12, reply asserted ≤ 6144 bytes; paging returns all 20 ids once; a bad offset is denied. Before: this session's live call on the old plugin returned 54.4 KB (Claude Code persisted it as too large). The live call on the new plugin is checked after the release and plugin reinstall (tag-release steps 4–6), see the Decision log. Pre-commit gate: 30 checks passed.
+- **C:** the rebuilt candidate counts the 7 existing trials (`relais recipe evaluate`: "change-feature@2 has 7 qualifying trials"). The replay pool is smaller than planned: only relais declares `change-feature` (amont-agent, duro-design-system, happier and dotfiles do not), and only 2 errored tasks never settled. At most 5 + 2 = 7 replays → 14 qualifying, one short of 15; 20 paired is out of reach until relais accepts more feature tasks. Replay 1 (task-28d18dfd7e5d13b3) was blocked `disk_low` (8.4 GB free, 99% full): errored, $0.33. Replays held until disk is freed.
+
+## Decision log
+
+- 2026-10-22: Part A applies only the 13 agent targets and edits the live settings.json by hand: the live file has drifted from the source (proxy key helper, hooks, relais paths).
+- 2026-10-22: the `status` reply without `run` changes from an array to `{runs, more, waiting, next_offset}` in one step, with no compatibility period: the only reader is the model in the same session, through the plugin it ships with. The release note says so.
+- 2026-10-22: the live `status` size check moves to the release steps: it needs the released plugin installed.
+- 2026-10-22: Part C stops at evidence for now (see the record): promotion needs one more relais-accepted feature task for the typed gate and three for the paired comparison.
+
+## Implementation review
+
+approve-with-changes (round 1: 60k, 94 s; delta: 67k, 22 s). Fixed: list-path refresh test, offset denied at the boundary, `waiting` wording, SKILL.md sentence, comment placement. Recorded here: verification actuals, the reply-shape break. deliberate: the offset-refusal test checks the deny text only (low; a further code change would need a third pass).
+
 <!-- panel: repos=dotfiles,relais reviewers=backend body-sha=385fca95a47f -->
