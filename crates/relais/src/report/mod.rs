@@ -21,7 +21,7 @@ pub use decision_data::{
     count_by_source, decision_labels, project_floor, revert_agreement, DecisionLabels,
     FloorProjection, Fraction, SourceCount,
 };
-pub use harness::{harness_report, HarnessReport, HarnessStep, StepModel};
+pub use harness::{harness_report, HarnessReport, HarnessStep, Step, StepModel};
 pub use repairs::{EffortRepairs, RepairCost};
 pub use reviewers::{reviewer_report, ReviewerClass, ReviewerReport};
 
@@ -4307,6 +4307,190 @@ mod tests {
         }
     }
 
+    fn harness_step(report: &Report, step: &str) -> serde_json::Value {
+        let json = serde_json::to_value(report).expect("json");
+        json["harness"]["steps"]
+            .as_array()
+            .expect("steps")
+            .iter()
+            .find(|s| s["step"] == step)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// A revise that answers a decision raised for another reason than review
+    /// findings is not a review catch.
+    #[test]
+    fn a_revise_for_another_reason_is_not_a_review_catch() {
+        let dir = temp_dir("harness-other-revise");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = new_run(&ledger, "other");
+        let dispatch = "d-review-other".to_string();
+        ledger
+            .record_dispatch_intent(
+                &crate::ids::DispatchId::from_stored(dispatch.clone()),
+                &run,
+                None,
+                &serde_json::json!({ "kind": "review" }),
+                0,
+                RoutedBy::ConservativeBaseline,
+            )
+            .expect("dispatch");
+        record_model_usage(&ledger, &run, None, &dispatch, "opus", UsagePhase::Review);
+        go(&ledger, &run, State::Running, "worker_dispatched");
+        go(&ledger, &run, State::NeedsDecision, "scope_exceeded");
+        assert!(ledger
+            .resolve_decision(
+                &run,
+                &crate::ledger::DecisionAnswer {
+                    resolution: Reason::DecisionRevised,
+                    actor: crate::ledger::Actor::Person,
+                    person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
+                    note: None,
+                    successor_run: None,
+                    from_state: State::NeedsDecision,
+                    to_state: State::Cancelled,
+                },
+            )
+            .expect("resolve"));
+        let report = runs_report(&ledger, SINCE, None).expect("report");
+        assert_eq!(
+            harness_step(&report, "review")["models"],
+            serde_json::json!([{ "model": "opus", "ran": 1, "caught": 0, "no_verdict": 0 }])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two review dispatches in one run: each is a review that ran, and the
+    /// revise is credited to the last one's model only (SPEC: the answer is
+    /// credited to the run's last review).
+    #[test]
+    fn two_review_dispatches_credit_the_last() {
+        let dir = temp_dir("harness-two-reviews");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = new_run(&ledger, "two");
+        for (n, model) in [(1, "sonnet"), (2, "opus")] {
+            let dispatch = format!("d-review-two-{n}");
+            ledger
+                .record_dispatch_intent(
+                    &crate::ids::DispatchId::from_stored(dispatch.clone()),
+                    &run,
+                    None,
+                    &serde_json::json!({ "kind": "review" }),
+                    0,
+                    RoutedBy::ConservativeBaseline,
+                )
+                .expect("dispatch");
+            record_model_usage(&ledger, &run, None, &dispatch, model, UsagePhase::Review);
+        }
+        go(&ledger, &run, State::Running, "worker_dispatched");
+        go(&ledger, &run, State::Verifying, "verification_started");
+        go(&ledger, &run, State::NeedsReview, "review_findings");
+        assert!(ledger
+            .resolve_decision(
+                &run,
+                &crate::ledger::DecisionAnswer {
+                    resolution: Reason::DecisionRevised,
+                    actor: crate::ledger::Actor::Person,
+                    person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
+                    note: None,
+                    successor_run: None,
+                    from_state: State::NeedsReview,
+                    to_state: State::Cancelled,
+                },
+            )
+            .expect("resolve"));
+        let report = runs_report(&ledger, SINCE, None).expect("report");
+        assert_eq!(
+            harness_step(&report, "review")["models"],
+            serde_json::json!([
+                { "model": "opus", "ran": 1, "caught": 1, "no_verdict": 0 },
+                { "model": "sonnet", "ran": 1, "caught": 0, "no_verdict": 0 },
+            ])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A review dispatch no usage row names a model for shows as `unknown`.
+    #[test]
+    fn a_review_with_no_model_usage_is_unknown() {
+        let dir = temp_dir("harness-unknown");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = new_run(&ledger, "nomodel");
+        ledger
+            .record_dispatch_intent(
+                &crate::ids::DispatchId::from_stored("d-review-nomodel".to_string()),
+                &run,
+                None,
+                &serde_json::json!({ "kind": "review" }),
+                0,
+                RoutedBy::ConservativeBaseline,
+            )
+            .expect("dispatch");
+        go(&ledger, &run, State::Running, "worker_dispatched");
+        go(&ledger, &run, State::Verifying, "verification_started");
+        go(&ledger, &run, State::Accepted, "checks_and_review_passed");
+        let report = runs_report(&ledger, SINCE, None).expect("report");
+        assert_eq!(
+            harness_step(&report, "review")["models"],
+            serde_json::json!([{ "model": "unknown", "ran": 1, "caught": 0, "no_verdict": 0 }])
+        );
+        assert!(
+            report.render().contains("review [unknown]"),
+            "{}",
+            report.render()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A repair that crashed reached no verdict: it is in `no_verdict`, not in
+    /// `ran`, so it cannot lower the repair's catch rate.
+    #[test]
+    fn a_crashed_repair_counts_as_no_verdict_not_ran() {
+        let dir = temp_dir("harness-crashed-repair");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = new_run(&ledger, "crash");
+        let first = ledger
+            .insert_attempt(&run, 1, 1, "implementation", UsagePhase::Initial)
+            .expect("attempt");
+        record_model_usage(
+            &ledger,
+            &run,
+            Some(first),
+            "e1-crash",
+            "initial",
+            UsagePhase::Initial,
+        );
+        let repair = ledger
+            .insert_attempt(&run, 1, 2, "implementation", UsagePhase::Repair)
+            .expect("attempt");
+        record_model_usage(
+            &ledger,
+            &run,
+            Some(repair),
+            "e2-crash",
+            "sonnet",
+            UsagePhase::Repair,
+        );
+        for (state, reason) in [
+            (State::Running, "worker_dispatched"),
+            (State::Verifying, "verification_started"),
+            (State::Repairing, "behavioral_failure"),
+            (State::Running, "worker_dispatched"),
+            (State::Interrupted, "process_crash"),
+        ] {
+            go(&ledger, &run, state, reason);
+        }
+        let report = runs_report(&ledger, SINCE, None).expect("report");
+        assert_eq!(
+            harness_step(&report, "repair")["models"],
+            serde_json::json!([{ "model": "sonnet", "ran": 0, "caught": 0, "no_verdict": 1 }])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 3 of 5 reviews led to revise and 2 of 4 repairs turned green, across
     /// two models: the harness section prints those counts per step and
     /// model, in text and in JSON.
@@ -4329,12 +4513,12 @@ mod tests {
             json["harness"],
             serde_json::json!({ "steps": [
                 { "step": "review", "models": [
-                    { "model": "opus", "ran": 3, "caught": 2 },
-                    { "model": "sonnet", "ran": 2, "caught": 1 },
+                    { "model": "opus", "ran": 3, "caught": 2, "no_verdict": 0 },
+                    { "model": "sonnet", "ran": 2, "caught": 1, "no_verdict": 0 },
                 ]},
                 { "step": "repair", "models": [
-                    { "model": "opus", "ran": 2, "caught": 1 },
-                    { "model": "sonnet", "ran": 2, "caught": 1 },
+                    { "model": "opus", "ran": 2, "caught": 1, "no_verdict": 0 },
+                    { "model": "sonnet", "ran": 2, "caught": 1, "no_verdict": 0 },
                 ]},
             ]})
         );

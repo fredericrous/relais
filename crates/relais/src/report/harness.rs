@@ -6,8 +6,11 @@
 //! * review: the patch-review dispatches that ran, and those whose findings
 //!   led to a `revise` answer (the share is the review's catch rate). The
 //!   decision is per run, so it is credited to the run's last review.
-//! * repair: the repair attempts that ran, and those that turned a failed
-//!   check green (the repair's own verification passed).
+//! * repair: the repair attempts that ran to a verdict, and those that turned
+//!   a failed check green (the repair's own verification passed). An attempt
+//!   with no verdict (crashed, cancelled) is counted apart as `no_verdict`.
+//!
+//! `unknown` is the model of a step no usage row named a model for.
 
 use std::collections::BTreeMap;
 
@@ -25,17 +28,28 @@ const UNKNOWN_MODEL: &str = "unknown";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StepModel {
     pub model: String,
-    /// Times the step ran.
+    /// Times the step ran to a verdict.
     pub ran: usize,
     /// Times it caught what it guards against: a review whose findings led
     /// to `revise`, a repair that turned a failed check green.
     pub caught: usize,
+    /// Repair attempts that ended with no verdict (crashed, cancelled, cut
+    /// off before the checks ran); they are in neither `ran` nor `caught`.
+    pub no_verdict: usize,
+}
+
+/// A pipeline step the section reports on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Step {
+    Review,
+    Repair,
 }
 
 /// One pipeline step's rows, ordered by model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HarnessStep {
-    pub step: String,
+    pub step: Step,
     pub models: Vec<StepModel>,
 }
 
@@ -49,12 +63,20 @@ fn model_label(model: Option<String>) -> String {
     model.unwrap_or_else(|| UNKNOWN_MODEL.to_string())
 }
 
-fn step(name: &str, tally: BTreeMap<String, (usize, usize)>) -> HarnessStep {
+/// Per model: (ran, caught, no_verdict).
+type Tally = BTreeMap<String, (usize, usize, usize)>;
+
+fn step(step: Step, tally: Tally) -> HarnessStep {
     HarnessStep {
-        step: name.to_string(),
+        step,
         models: tally
             .into_iter()
-            .map(|(model, (ran, caught))| StepModel { model, ran, caught })
+            .map(|(model, (ran, caught, no_verdict))| StepModel {
+                model,
+                ran,
+                caught,
+                no_verdict,
+            })
             .collect(),
     }
 }
@@ -72,7 +94,7 @@ pub fn harness_report(
     ledger: &Ledger,
     window: &[(RunId, State)],
 ) -> Result<HarnessReport, LedgerError> {
-    let mut reviews: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut reviews: Tally = BTreeMap::new();
     let mut pending: Vec<RunId> = window.iter().map(|(run, _)| run.clone()).collect();
     while let Some(run) = pending.pop() {
         let dispatches = ledger.review_dispatches(&run)?;
@@ -87,18 +109,22 @@ pub fn harness_report(
         }
         pending.extend(ledger.child_runs(&run)?.into_iter().map(|child| child.run));
     }
-    let mut repairs: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut repairs: Tally = BTreeMap::new();
     for (repair, _, _) in window_repairs(ledger, window)? {
         let entry = repairs
             .entry(model_label(repair.model.clone()))
             .or_default();
+        if repair.ended_without_verdict() {
+            entry.2 += 1;
+            continue;
+        }
         entry.0 += 1;
         if repair.turned_green() {
             entry.1 += 1;
         }
     }
     Ok(HarnessReport {
-        steps: vec![step("review", reviews), step("repair", repairs)],
+        steps: vec![step(Step::Review, reviews), step(Step::Repair, repairs)],
     })
 }
 
@@ -107,18 +133,22 @@ impl HarnessReport {
     pub fn render(&self) -> String {
         let mut out = String::from("harness (per step and model):\n");
         for step in &self.steps {
-            let (noun, caught) = match step.step.as_str() {
-                "review" => ("reviews", "led to revise"),
-                _ => ("repairs", "turned a failed check green"),
+            let (name, noun, caught) = match step.step {
+                Step::Review => ("review", "reviews", "led to revise"),
+                Step::Repair => ("repair", "repairs", "turned a failed check green"),
             };
             if step.models.is_empty() {
-                out.push_str(&format!("  {}: none in this window\n", step.step));
+                out.push_str(&format!("  {name}: none in this window\n"));
             }
             for row in &step.models {
                 out.push_str(&format!(
-                    "  {} [{}]: {} of {} {noun} {caught}\n",
-                    step.step, row.model, row.caught, row.ran
+                    "  {name} [{}]: {} of {} {noun} {caught}",
+                    row.model, row.caught, row.ran
                 ));
+                if row.no_verdict > 0 {
+                    out.push_str(&format!(", {} with no verdict", row.no_verdict));
+                }
+                out.push('\n');
             }
         }
         out

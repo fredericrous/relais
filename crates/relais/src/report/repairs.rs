@@ -106,6 +106,12 @@ impl Repair {
     pub(super) fn turned_green(&self) -> bool {
         self.verdict == Verdict::Passed
     }
+
+    /// The repair ended with no verdict on its own checks (crashed,
+    /// cancelled, blocked, stopped before the checks, still in flight).
+    pub(super) fn ended_without_verdict(&self) -> bool {
+        matches!(self.verdict, Verdict::NoVerdict(_))
+    }
 }
 
 /// A run's repairs, paired with the transitions that opened and closed
