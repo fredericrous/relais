@@ -4442,6 +4442,13 @@ mod tests {
             "{}",
             report.render()
         );
+        assert!(
+            report
+                .render()
+                .contains("unknown: no usage row named the model that ran the step"),
+            "{}",
+            report.render()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

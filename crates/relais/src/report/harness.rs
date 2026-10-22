@@ -157,7 +157,7 @@ impl HarnessReport {
             .flat_map(|s| &s.models)
             .any(|row| row.model == UNKNOWN_MODEL);
         if any_unknown {
-            out.push_str("  unknown: no usage row named the dispatch's model\n");
+            out.push_str("  unknown: no usage row named the model that ran the step\n");
         }
         out
     }
