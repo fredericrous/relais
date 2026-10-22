@@ -33,6 +33,9 @@ test('waiting_for_slot reads as text with its class, position and wait', () => {
   expect(fold({ kind: 'waiting_for_slot', class: 'host_slot', position: 0, waited_s: 300 }).wait).toBe(
     'waiting for a host slot · 5m',
   )
+  expect(fold({ kind: 'waiting_for_slot', class: 'coordinator_unreachable', position: 0, waited_s: 90 }).wait).toBe(
+    'coordinator unreachable, retrying · 90s',
+  )
 })
 
 test('waiting_for_disk reads as text with the volume and the floor', () => {

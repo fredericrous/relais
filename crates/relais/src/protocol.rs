@@ -161,7 +161,9 @@ pub enum Event {
     /// A command is queued for a lease: every 30 s while it waits.
     /// `class` is `heavy_local` for the coordinator's tokens and
     /// `host_slot` for the shared flock slots (whose position is not
-    /// observable, so it is 0).
+    /// observable, so it is 0), and `coordinator_unreachable` while the
+    /// coordinator cannot be reached and the runner retries (position 0,
+    /// `waited_s` the time since the first failure).
     WaitingForSlot {
         class: String,
         position: usize,
