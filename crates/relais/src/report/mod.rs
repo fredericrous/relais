@@ -4439,6 +4439,74 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A review dispatch for a run, up to verification.
+    fn review_dispatch(ledger: &Ledger, run: &crate::ids::RunId, name: &str) {
+        let dispatch = format!("d-review-{name}");
+        ledger
+            .record_dispatch_intent(
+                &crate::ids::DispatchId::from_stored(dispatch.clone()),
+                run,
+                None,
+                &serde_json::json!({ "kind": "review" }),
+                0,
+                RoutedBy::ConservativeBaseline,
+            )
+            .expect("dispatch");
+        record_model_usage(ledger, run, None, &dispatch, "opus", UsagePhase::Review);
+        go(ledger, run, State::Running, "worker_dispatched");
+        go(ledger, run, State::Verifying, "verification_started");
+    }
+
+    /// A decision raised for `review_unavailable` and then approved leaves the
+    /// run Accepted without any review verdict.
+    #[test]
+    fn an_unavailable_review_later_approved_is_no_verdict() {
+        let dir = temp_dir("harness-unavailable-approved");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = new_run(&ledger, "approved");
+        review_dispatch(&ledger, &run, "approved");
+        go(&ledger, &run, State::NeedsReview, "review_unavailable");
+        assert!(ledger
+            .resolve_decision(
+                &run,
+                &crate::ledger::DecisionAnswer {
+                    resolution: Reason::DecisionApproved,
+                    actor: crate::ledger::Actor::Person,
+                    person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
+                    note: None,
+                    successor_run: None,
+                    from_state: State::NeedsReview,
+                    to_state: State::Accepted,
+                },
+            )
+            .expect("resolve"));
+        let report = runs_report(&ledger, SINCE, None).expect("report");
+        assert_eq!(
+            harness_step(&report, "review")["models"],
+            serde_json::json!([{ "model": "opus", "ran": 0, "caught": 0, "no_verdict": 1 }])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A clean pass is a verdict, not a revise, even when the run later ended
+    /// Cancelled.
+    #[test]
+    fn a_clean_pass_later_cancelled_is_a_verdict_not_revised() {
+        let dir = temp_dir("harness-pass-cancelled");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = new_run(&ledger, "cancelled");
+        review_dispatch(&ledger, &run, "cancelled");
+        go(&ledger, &run, State::Accepted, "checks_and_review_passed");
+        go(&ledger, &run, State::Cancelled, "cancelled_by_user");
+        let report = runs_report(&ledger, SINCE, None).expect("report");
+        assert_eq!(
+            harness_step(&report, "review")["models"],
+            serde_json::json!([{ "model": "opus", "ran": 1, "caught": 0, "no_verdict": 0 }])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A review dispatch no usage row names a model for shows as `unknown`.
     #[test]
     fn a_review_with_no_model_usage_is_unknown() {
