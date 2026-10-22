@@ -1174,6 +1174,10 @@ pub struct AdmissionState {
     /// Changes to the persisted group bindings not yet written; the
     /// coordinator takes them after each request and each sweep.
     group_journal: Vec<GroupChange>,
+    /// How many changes were ever journalled: the position just past the
+    /// last one, which a request compares before and after to know
+    /// whether it has a write to wait for.
+    group_journal_end: u64,
     /// Whether a group recorded with this leader start time still has a
     /// member. Injectable so a test decides what the process table says.
     group_probe: fn(u32, Option<&str>) -> bool,
@@ -1218,6 +1222,7 @@ impl AdmissionState {
             native: native::NativeRegistry::default(),
             training_started: BTreeMap::new(),
             group_journal: Vec::new(),
+            group_journal_end: 0,
             group_probe: crate::procs::group_alive,
             disk_floor: 0,
             disk_probe: std::sync::Arc::new(crate::disk::StatvfsProbe),
@@ -1286,9 +1291,23 @@ impl AdmissionState {
         self.group_probe = probe;
     }
 
-    /// The changes to the persisted group bindings since the last call.
-    pub fn take_group_journal(&mut self) -> Vec<GroupChange> {
-        std::mem::take(&mut self.group_journal)
+    /// The changes to the persisted group bindings since the last call,
+    /// and the journal position just past the last of them.
+    pub fn take_group_journal(&mut self) -> (Vec<GroupChange>, u64) {
+        (
+            std::mem::take(&mut self.group_journal),
+            self.group_journal_end,
+        )
+    }
+
+    /// The journal position just past the last change ever journalled.
+    pub fn group_journal_end(&self) -> u64 {
+        self.group_journal_end
+    }
+
+    fn journal_group(&mut self, change: GroupChange) {
+        self.group_journal.push(change);
+        self.group_journal_end += 1;
     }
 
     pub fn limits(&self) -> &ConcurrencyLimits {
@@ -2339,8 +2358,7 @@ impl AdmissionState {
             .remove(dispatch_id)
             .is_some_and(|dispatch| dispatch.group.is_some())
         {
-            self.group_journal
-                .push(GroupChange::Removed(dispatch_id.to_string()));
+            self.journal_group(GroupChange::Removed(dispatch_id.to_string()));
         }
         self.native.forget(dispatch_id);
         // A worker that is over does not still hold a worktree
@@ -2693,7 +2711,7 @@ impl AdmissionState {
             tokens: dispatch.weight,
         };
         dispatch.group = Some(hold);
-        self.group_journal.push(GroupChange::Bound(binding));
+        self.journal_group(GroupChange::Bound(binding));
         BindOutcome::Bound
     }
 
