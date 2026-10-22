@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/resource-admission (PR 2), feat/verification-evidence (PR 3), then one branch per split PR
 repos: [relais]
 adrs: [relais ADR-0010, ADR-0011, ADR-0030, ADR-0040]
@@ -201,6 +201,16 @@ Found on the way and fixed in this branch (each its own commit): the move check 
 
 Module sizes (lines): `scheduler.rs` 1408, `live_trial.rs` 1042, `attempt.rs` 1028, `machine.rs` 901, `engine.rs` 848, `preflight.rs` 630, `verification.rs` 613, `review/engine.rs` 497, `workspace_ops.rs` 448, `launch.rs` 440, `baseline.rs` 423, `types.rs` 355, `evidence.rs` 339, `setup_gate.rs` 295, `review/mod.rs` 289, `mod.rs` 261, `prompt.rs` 240, `candidate.rs` 231, `successor.rs` 205, `config.rs` 140, `spend.rs` 120, `error.rs` 104, `review/types.rs` 77.
 
+## Outcome (Phase 3 and the patch release, live)
+
+Observed on this machine 2026-10-21/22. Each row: input → expected → actual.
+
+- **Releases.** The split shipped in v0.28.0 (#275), with the review-over-budget fix (#274). v0.28.1 (#277) fixed the learning label of a `review-parts` answer (#276), and v0.29.1 (#281) fixed the coordinator bug below (#280). Each was installed by brew. `relais --version` → the release → as expected each time. The ledger went to v42 with a backup taken first.
+- **Verify run with no worker.** A `kind: verify` of an earlier candidate at its own base → a terminal state, no worker → as expected (`run-65e57ae9c624d-15096`, `run-65e669925f548-9c2e` accepted).
+- **Reviews.** A 143 KB patch → reviewed, with a verdict → as expected. A 215 KB patch → `needs_decision (review_over_budget)` naming 2 parts, then `review-parts` reviewed both in order → as expected (`run-65e5a6666c874-16078`).
+- **Shared host slots** (item 11), with `[resources] shared_host_slots` pointing at amont's directory and `max_heavy_commands = 2`. Two verify runs started together → the second queues (`waiting_for_slot`), and no two heavy checks overlap → as expected. One run held both of amont's `slot-*` files through `flock` (seen with `lsof`, inherited by its `make` → `cargo` → `rustc` children). `max_heavy_commands = 1` was refused at preflight (`make test` has weight 2), as SPEC §22 says. Disk: 15.6 → 14.6 GB free across both runs, above the 8 GiB floor. Cost: 0, `actual`, as a run with no worker should be.
+- **The waiting run did not survive its turn, twice.** First, at its grant (`run-65e669900fbb3-9a8a`): the coordinator wrote a group binding before replying, under a lock every reply took, so with the ledger busy for its 5 s timeout every reply missed the client's 5 s deadline (`os error 35`). Reproduced by a regression test and fixed in #280. Second, on 0.29.1 (`run-65e6844b7381e-1537f`, `run-65e684496aa76-15198`): every relais process, across two sessions, went silent from 07:03:45 to 07:08:30 UTC, the Happier run's heartbeat timer included. Both waiting runs then died on their next read. That stall is an open finding below, and the bounded admission retry (`fix/admit-retries-unreachable`) keeps a waiting run alive through one.
+
 ## Decision log
 
 - 2026-10-19, Phase 1: PR 2's steps renamed v39/v40 on rebase (main's v37/v38 shipped first); merged as #267. Its first Windows run failed on a `kill -9 $$` case (no SIGKILL on Windows), now unix-only.
@@ -217,5 +227,8 @@ Module sizes (lines): `scheduler.rs` 1408, `live_trial.rs` 1042, `attempt.rs` 10
 - 2026-10-21, Phase 4: three of PR C's five runs ended `review_unavailable`; the cause is now confirmed (the coordinator's 64 KiB request cap against a reviewer prompt that embeds a 105–167 KB patch). Each was approved after `make check` and the move check, as in PR B. The fix has its own approved plan (`~/.claude/plans/relais-review-budget-2026-10-20.md`), one PR after this one, released with the split as v0.28.0.
 - 2026-10-21, Phase 4: the review found `scripts/check-child-cycles.py` keyed modules by file stem, so `review/engine.rs` shadowed `runner/engine.rs` and real cycles went unseen (engine ↔ baseline, launch, scheduler, types; prompt ↔ review). Fixed by keying by path, and by moving `RunEngine`'s definition into `runner/mod.rs`, the pattern `Ledger` already follows: the facade owns the struct, the phase modules extend it. The rewritten script also passes on `ledger`, so PR B's recorded "no cycles" holds.
 - 2026-10-21, Phase 4: the child-cycle check treats each split module's `mod.rs` as the facade and leaves it out of the graph, as `Ledger`'s is: the facade owns the struct and the re-exports, children extend it, and a dependency through the facade is not an edge. Accepted for `runner` as for `ledger`. Deliberate, known limit: a name defined `pub` in two children resolves to the first, so two same-named public items could hide an edge; none exists today.
+
+- 2026-10-22, Phase 3: the person had me add `shared_host_slots` and `max_heavy_commands` to `machine.toml`, but the relais plugin refuses any agent read or write of that file (it holds the trust grants), so the person edited it. `max_heavy_commands = 1`, my first suggestion, refuses this repository's weight-2 `make test`; it is 2.
+- 2026-10-22, Phase 3, open finding: a 5-minute stall of every relais process across two sessions (07:03:45–07:08:30 UTC). There was no sleep (`pmset`), and the coordinator answered in 0.1 s afterwards. Hypotheses, ranked: (1) each run's stdout pipe to its Claude Code session stopped being read, and a blocked event write stops heartbeats; (2) the SQLite ledger was write-locked for about 5 minutes by some process; (3) extreme load (it reached 300 that day). The person chose to close this plan and investigate when it recurs: sample the relais stacks and the ledger lock holders while it happens.
 
 <!-- panel: repos=relais reviewers=backend,codex body-sha=4b2cbf579c05 -->

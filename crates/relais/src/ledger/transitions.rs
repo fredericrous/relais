@@ -160,13 +160,6 @@ pub(super) const PROJECTED_STATUS: &str = "COALESCE(\
     (SELECT t.to_state FROM transitions t WHERE t.run_id = runs.id ORDER BY t.id DESC LIMIT 1), \
     runs.status) AS status";
 
-/// One run's decision row (SPEC's decision spine): when a person was
-/// first owed a look, what state and reason raised it, and — once
-/// answered — who decided what, when, and any successor run their
-/// decision names. `resolved_at.is_none()` is the open half `report`
-/// lists and `relais decide` closes; `waited_seconds` is derived from the
-/// recorded timestamps, never stored, so it is always current for an open
-/// row and exact for a resolved one.
 /// A person's answer to an open decision: what they decided, who they
 /// are, any note and successor run they named, and the two states their
 /// answer moves the run between. One argument rather than six, because
@@ -187,6 +180,13 @@ pub struct DecisionAnswer<'a> {
     pub to_state: State,
 }
 
+/// One run's decision row (SPEC's decision spine): when a person was
+/// first owed a look, what state and reason raised it, and — once
+/// answered — who decided what, when, and any successor run their
+/// decision names. `resolved_at.is_none()` is the open half `report`
+/// lists and `relais decide` closes; `waited_seconds` is derived from the
+/// recorded timestamps, never stored, so it is always current for an open
+/// row and exact for a resolved one.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DecisionRecord {
     pub run: RunId,
@@ -353,9 +353,6 @@ impl Ledger {
         Ok(())
     }
 
-    /// Every run still waiting for a person to answer it, oldest raised
-    /// first — the queue `relais report` lists and `relais decide`
-    /// closes one row at a time from.
     /// How many answers count as the person's judgment (ADR-0004), for the
     /// decision advisor's data gate: a `person` answer, or a
     /// `person-via-orchestrator` one the plugin proved, on a
@@ -400,6 +397,9 @@ impl Ledger {
         })
     }
 
+    /// Every run still waiting for a person to answer it, oldest raised
+    /// first — the queue `relais report` lists and `relais decide`
+    /// closes one row at a time from.
     pub fn open_decisions(&self) -> Result<Vec<DecisionRecord>> {
         let now = self.now();
         let mut stmt = self.conn.prepare(&format!(
