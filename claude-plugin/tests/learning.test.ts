@@ -88,7 +88,7 @@ test('a cycle that cannot be spawned leaves one pane note', async ($: any, on: a
   engine.script.learnSpawnFails = true
   await start($)
   await settle(engine)
-  const status = await $.tool.call({ tool: 'mcp__relais__status' })
+  const status = await $.tool.call({ tool: 'mcp__relais__status', run: JSON.parse((await $.tool.call({ tool: 'mcp__relais__status' })).result).runs[0].run })
   expect(JSON.stringify(status)).toContain('learning cycle could not be started')
 })
 
@@ -97,7 +97,7 @@ test('the line goes to the pane when a run is there', async ($: any, on: any) =>
   lastOf(engine, { id: 3, action: 'promoted' })
   await start($)
   await settle(engine)
-  const status = await $.tool.call({ tool: 'mcp__relais__status' })
+  const status = await $.tool.call({ tool: 'mcp__relais__status', run: JSON.parse((await $.tool.call({ tool: 'mcp__relais__status' })).result).runs[0].run })
   expect(JSON.stringify(status)).toContain('relais rollback')
 })
 

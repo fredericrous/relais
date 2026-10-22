@@ -59,14 +59,14 @@ test('statusOf never returns another session’s run unless asked by id, and the
     return result(JSON.stringify(timelineOf('run-other', { state: 'accepted', session: 'session-2' })))
   }
   const list = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status' })).result)
-  expect(list.map((r: any) => r.run)).toEqual(['run-mine'])
+  expect(list.runs.map((r: any) => r.run)).toEqual(['run-mine'])
   const asked = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status', run: 'run-other' })).result)
   expect(asked[0].run).toBe('run-other')
   expect(asked[0].foreign).toBe(true)
   expect(asked[0].session).toBe('session-2')
   const again = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status' })).result)
-  expect(again.map((r: any) => r.run)).toEqual(['run-mine'])
-  expect(list[0].foreign).toBeUndefined()
+  expect(again.runs.map((r: any) => r.run)).toEqual(['run-mine'])
+  expect(list.runs[0].foreign).toBeUndefined()
 })
 
 test('statusOf refreshes a live model from the ledger before it replies', async ($: any, on: any) => {
@@ -75,9 +75,20 @@ test('statusOf refreshes a live model from the ledger before it replies', async 
   await settle(engine)
   engine.script.runResult = (argv: string[]) =>
     argv[2] === 'status' ? result(JSON.stringify(timelineOf('run-live', { state: 'interrupted', reason: 'its driver is gone' }))) : result('')
-  const [run] = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status' })).result)
+  // The list reply refreshes it first, then the reply by id shows the reason.
+  const list = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status' })).result)
+  expect(list.runs[0].outcome).toBe('interrupted')
+  const [run] = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status', run: 'run-live' })).result)
   expect(run.outcome.state).toBe('interrupted')
   expect(run.outcome.reason).toBe('its driver is gone')
+})
+
+test('status refuses an offset that is not a whole number of at least 0', async ($: any, on: any) => {
+  await startedRun($, on)
+  for (const offset of [-1, 1.5, '10']) {
+    const reply = await $.tool.call({ tool: 'mcp__relais__status', offset })
+    expect(reply.deny).toContain('offset')
+  }
 })
 
 test('the cancel tool runs native cancel with --run and --session and returns its line', async ($: any, on: any) => {
@@ -197,7 +208,7 @@ test('statusOf refreshes a model that awaits a person and replies with the answe
       ? result(JSON.stringify(timelineOf('run-nr', { state: 'accepted_by_person', decision: salvaged }, reviewEvents('run-nr'))))
       : result('')
   const before = nativeCalls(engine.calls, 'status').length
-  const [run] = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status' })).result)
+  const [run] = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status', run: 'run-nr' })).result)
   const calls = nativeCalls(engine.calls, 'status').slice(before)
   expect(calls.some((c: any) => c.argv.join(' ') === 'relais native status --run run-nr')).toBe(true)
   expect(run.phase).toBe('accepted_by_person')
@@ -215,7 +226,7 @@ test('statusOf does not refresh a terminal model that awaits no person', async (
   // successor intents is a different call.
   const aboutRuns = () => nativeCalls(engine.calls, 'status').filter(c => c.argv.includes('--run')).length
   const before = aboutRuns()
-  const [run] = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status' })).result)
+  const [run] = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status', run: 'run-ok' })).result)
   expect(run.outcome.state).toBe('accepted')
   expect(aboutRuns()).toBe(before)
 })
@@ -277,4 +288,68 @@ test('status requests are coalesced to one in flight per run, with a 5 s timeout
   const calls = nativeCalls(engine.calls, 'status').filter((c: any) => c.argv.includes('run-live'))
   expect(calls.length).toBe(1)
   expect(calls[0].init?.timeoutMs).toBe(5000)
+})
+
+// Twenty runs of this session: the first twelve are live, the rest accepted.
+const twentyRuns = () =>
+  Array.from({ length: 20 }, (_, i) => {
+    const run = `run-${String(i).padStart(2, '0')}`
+    const at = `2026-10-06T11:${String(i).padStart(2, '0')}:00Z`
+    const events = [{ relais: 'event', run, seq: 0, at, event: { kind: 'phase', state: 'running', reason: 'worker_dispatched', detail: {} } }]
+    return timelineOf(run, { state: i < 12 ? 'running' : 'accepted', session: 'session-1' }, events)
+  })
+
+const listTwenty = async ($: any, on: any) => {
+  const engine = scriptedEngine(on)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await settle(engine)
+  engine.script.runResult = (argv: string[]) =>
+    argv[2] !== 'status'
+      ? result('')
+      : argv[3] === '--session'
+        ? result(JSON.stringify({ runs: twentyRuns() }))
+        : result(JSON.stringify(twentyRuns().find(t => t.run === argv[4]) ?? {}))
+}
+
+test('status without run is a bounded summary: 10 entries, live first, more and waiting counted', async ($: any, on: any) => {
+  await listTwenty($, on)
+  const text = (await $.tool.call({ tool: 'mcp__relais__status' })).result
+  expect(new TextEncoder().encode(text).length).toBeLessThanOrEqual(6144)
+  const reply = JSON.parse(text)
+  expect(reply.runs.length).toBe(10)
+  expect(reply.more).toBe(10)
+  expect(reply.waiting).toBe(12)
+  expect(reply.next_offset).toBe(10)
+  expect(reply.runs.every((r: any) => r.outcome === null)).toBe(true)
+  expect(Object.keys(reply.runs[0]).sort()).toEqual(['attempt', 'cost', 'outcome', 'phase', 'run'])
+})
+
+test('status pages with offset: every run once, each page bounded, next_offset absent on the last', async ($: any, on: any) => {
+  await listTwenty($, on)
+  const seen: string[] = []
+  let offset: number | undefined = 0
+  let pages = 0
+  while (offset !== undefined) {
+    const text = (await $.tool.call({ tool: 'mcp__relais__status', offset })).result
+    expect(new TextEncoder().encode(text).length).toBeLessThanOrEqual(6144)
+    const reply = JSON.parse(text)
+    seen.push(...reply.runs.map((r: any) => r.run))
+    offset = reply.next_offset
+    pages += 1
+    expect(pages).toBeLessThanOrEqual(2)
+    if (offset === undefined) expect(reply.more).toBe(0)
+  }
+  expect(pages).toBe(2)
+  expect(seen.length).toBe(20)
+  expect(new Set(seen).size).toBe(20)
+})
+
+test('status with run still carries phases, decisions, stderr and outcome', async ($: any, on: any) => {
+  await listTwenty($, on)
+  const [reply] = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status', run: 'run-15' })).result)
+  expect(reply.run).toBe('run-15')
+  expect(Array.isArray(reply.phases)).toBe(true)
+  expect(Array.isArray(reply.decisions)).toBe(true)
+  expect(Array.isArray(reply.stderr)).toBe(true)
+  expect(reply.outcome.state).toBe('accepted')
 })

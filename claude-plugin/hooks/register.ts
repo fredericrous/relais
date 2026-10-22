@@ -200,11 +200,15 @@ export function register(on: any) {
     await $.tool.register({
       name: 'status',
       description:
-        "The phases, decisions, cost and outcome of relais runs: one run by id, or all of this session's runs (started from this Claude Code session id). A run of another session is returned only when asked for by id, marked foreign: true. A run's latest output lines only with output: true.",
+        "The phases, decisions, cost and outcome of a relais run by id (with run). Without run, a bounded summary {runs, more, waiting, next_offset} of this session's runs (started from this Claude Code session id): at most 10 short entries (run, phase, attempt, cost, outcome state, waiting, stalled, foreign), live or awaiting-a-person runs first, then the most recent. more counts the runs not shown, the top-level waiting counts all live or awaiting runs including those cut (an entry's own waiting is the reason text it waits on), and next_offset (present while more > 0) is the offset to pass for the next page. A run of another session is returned only when asked for by id, marked foreign: true. A run's latest output lines only with output: true.",
       inputSchema: {
         type: 'object',
         properties: {
-          run: { type: 'string', description: 'A run id; all runs when left out.' },
+          run: { type: 'string', description: "A run id; the bounded summary of this session's runs when left out." },
+          offset: {
+            type: 'number',
+            description: 'With no run: how many runs to skip, to page through the summary (use next_offset from the previous reply). Default 0.',
+          },
           output: {
             type: 'boolean',
             description: "Also return each run's last 40 output lines (a check's own log, often long). Off by default.",
@@ -354,9 +358,19 @@ export function register(on: any) {
     result: 'relais feedback failed inside the plugin (internal error); whether the outcome was recorded is unknown.',
   }))
 
-  on('tool.call', { tool: STATUS_TOOL }, async ($: any, e: any) => ({
-    result: await statusOf(effects($), store, typeof e.run === 'string' ? e.run : undefined, { output: e.output === true }),
-  }))
+  on('tool.call', { tool: STATUS_TOOL }, async ($: any, e: any) => {
+    // A bad offset is refused, never read as 0: a caller paging with it
+    // would get the first page back forever.
+    if (e.offset !== undefined && !(Number.isInteger(e.offset) && e.offset >= 0)) {
+      return { deny: `relais status needs \`offset\` to be a whole number of at least 0, not ${JSON.stringify(e.offset)}.` }
+    }
+    return {
+      result: await statusOf(effects($), store, typeof e.run === 'string' ? e.run : undefined, {
+        output: e.output === true,
+        offset: e.offset ?? 0,
+      }),
+    }
+  })
 
   on('tool.call', { tool: CANCEL_TOOL }, async ($: any, e: any) => {
     if (typeof e.run !== 'string' || e.run.length === 0) return { deny: 'relais cancel needs a run id.' }

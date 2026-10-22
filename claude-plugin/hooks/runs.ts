@@ -15,6 +15,7 @@ import {
   rebuildRuns,
   shortId,
   statusReply,
+  statusSummaryEntry,
   type RunModel,
   reconcileStatus,
 } from './timeline.ts'
@@ -43,6 +44,8 @@ const CANCEL_TIMEOUT_MS = 20_000
 // second is long enough for a read-only ledger lookup, short enough not
 // to be felt.
 const FRESHEN_TIMEOUT_MS = 1_000
+// Runs a status reply without `run` lists at most this many.
+const STATUS_PAGE = 10
 // The states whose outcome message asks a person for something, as the
 // `done` line spells them (`State::awaits_a_person` in relais).
 const AWAITS_A_PERSON = new Set(['needs_decision', 'needs_review', 'interrupted'])
@@ -623,10 +626,13 @@ async function readRun(fx: Fx, store: Store, run: string) {
   }
 }
 
-// The reply of the `status` tool: this session's models, or the one asked
-// for by id (marked `foreign` when another session started it). Every live
+// The reply of the `status` tool: without `run`, a page of at most
+// STATUS_PAGE short entries for this session's runs (live or awaiting a
+// person first, then the most recent; `offset` pages on), with `more` and
+// `waiting`; with `run`, that run in full (marked `foreign` when another
+// session started it). Every live
 // model, and every one awaiting a person, is checked against the ledger first.
-export async function statusOf(fx: Fx, store: Store, run?: string, opts: { output?: boolean } = {}): Promise<string> {
+export async function statusOf(fx: Fx, store: Store, run?: string, opts: { output?: boolean; offset?: number } = {}): Promise<string> {
   const { failure } = await reconcileIntents(fx, store)
   const now = await fx.clock.now()
   const known = () => Object.values(store.models).filter(m => (run ? m.run === run : !m.foreign))
@@ -641,8 +647,27 @@ export async function statusOf(fx: Fx, store: Store, run?: string, opts: { outpu
       ? `No relais run is known in this session, and relais's own timeline could not be read: ${store.statusFailure}${failure ? ` ${describeFailure(failure)}` : ''}`
       : `No relais run is known in this session.${failure ? ` ${describeFailure(failure)}` : ''}`
   }
-  const replies = models.map(m => statusReply(m, now, opts))
-  return JSON.stringify(failure ? { runs: replies, intent_reconcile_failure: failure } : replies)
+  if (run) {
+    const replies = models.map(m => statusReply(m, now, opts))
+    return JSON.stringify(failure ? { runs: replies, intent_reconcile_failure: failure } : replies)
+  }
+  // Without a run: at most STATUS_PAGE runs, the live or waiting-for-a-person
+  // ones first, then the most recent; `offset` pages through the rest.
+  const needsLook = (m: RunModel) => isLive(m) || (m.outcome !== undefined && AWAITS_A_PERSON.has(m.outcome.state))
+  const ordered = [...models].sort((a, b) => Number(needsLook(b)) - Number(needsLook(a)) || b.startedAt - a.startedAt)
+  // The tool handler refuses an offset that is not a whole number >= 0.
+  const offset = opts.offset ?? 0
+  const page = ordered.slice(offset, offset + STATUS_PAGE)
+  const end = offset + page.length
+  const more = Math.max(0, ordered.length - end)
+  const summary = {
+    runs: page.map(statusSummaryEntry),
+    more,
+    waiting: ordered.filter(needsLook).length,
+    ...(more > 0 ? { next_offset: end } : {}),
+    ...(failure ? { intent_reconcile_failure: failure } : {}),
+  }
+  return JSON.stringify(summary)
 }
 
 // The `cancel` tool: `relais native cancel --run <run> --session <session>`.
