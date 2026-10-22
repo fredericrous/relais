@@ -4357,14 +4357,13 @@ mod tests {
         let report = runs_report(&ledger, SINCE, None).expect("report");
         assert_eq!(
             harness_step(&report, "review")["models"],
-            serde_json::json!([{ "model": "opus", "ran": 1, "caught": 0, "no_verdict": 0 }])
+            serde_json::json!([{ "model": "opus", "ran": 0, "caught": 0, "no_verdict": 1 }])
         );
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Two review dispatches in one run: each is a review that ran, and the
-    /// revise is credited to the last one's model only (SPEC: the answer is
-    /// credited to the run's last review).
+    /// Two review dispatches in one run are one review, credited to the
+    /// model of the last dispatch.
     #[test]
     fn two_review_dispatches_credit_the_last() {
         let dir = temp_dir("harness-two-reviews");
@@ -4405,10 +4404,37 @@ mod tests {
         let report = runs_report(&ledger, SINCE, None).expect("report");
         assert_eq!(
             harness_step(&report, "review")["models"],
-            serde_json::json!([
-                { "model": "opus", "ran": 1, "caught": 1, "no_verdict": 0 },
-                { "model": "sonnet", "ran": 1, "caught": 0, "no_verdict": 0 },
-            ])
+            serde_json::json!([{ "model": "opus", "ran": 1, "caught": 1, "no_verdict": 0 }])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A review whose run failed without a review verdict (the reviewer was
+    /// unavailable) is in `no_verdict`, not in `ran`.
+    #[test]
+    fn a_review_with_no_verdict_is_not_counted_as_ran() {
+        let dir = temp_dir("harness-review-no-verdict");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = new_run(&ledger, "unavailable");
+        let dispatch = "d-review-unavailable".to_string();
+        ledger
+            .record_dispatch_intent(
+                &crate::ids::DispatchId::from_stored(dispatch.clone()),
+                &run,
+                None,
+                &serde_json::json!({ "kind": "review" }),
+                0,
+                RoutedBy::ConservativeBaseline,
+            )
+            .expect("dispatch");
+        record_model_usage(&ledger, &run, None, &dispatch, "opus", UsagePhase::Review);
+        go(&ledger, &run, State::Running, "worker_dispatched");
+        go(&ledger, &run, State::Verifying, "verification_started");
+        go(&ledger, &run, State::Failed, "review_unavailable");
+        let report = runs_report(&ledger, SINCE, None).expect("report");
+        assert_eq!(
+            harness_step(&report, "review")["models"],
+            serde_json::json!([{ "model": "opus", "ran": 0, "caught": 0, "no_verdict": 1 }])
         );
         std::fs::remove_dir_all(&dir).ok();
     }

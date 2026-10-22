@@ -28,13 +28,15 @@ const UNKNOWN_MODEL: &str = "unknown";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StepModel {
     pub model: String,
-    /// Times the step ran to a verdict.
+    /// Times the step ran to a verdict: one review per run, one repair per
+    /// attempt.
     pub ran: usize,
     /// Times it caught what it guards against: a review whose findings led
     /// to `revise`, a repair that turned a failed check green.
     pub caught: usize,
-    /// Repair attempts that ended with no verdict (crashed, cancelled, cut
-    /// off before the checks ran); they are in neither `ran` nor `caught`.
+    /// Reviews and repairs that ended with no verdict (a reviewer
+    /// unavailable or not launched, a repair crashed or cancelled, a run
+    /// still in flight); they are in neither `ran` nor `caught`.
     pub no_verdict: usize,
 }
 
@@ -81,12 +83,28 @@ fn step(step: Step, tally: Tally) -> HarnessStep {
     }
 }
 
-/// Whether the run's review findings were answered with `revise`.
-fn revised_after_review(ledger: &Ledger, run: &RunId) -> Result<bool, LedgerError> {
-    Ok(ledger.decision_of_run(run)?.is_some_and(|decision| {
-        decision.raised_reason == Reason::ReviewFindings.as_str()
-            && decision.resolution == Some(Reason::DecisionRevised)
-    }))
+/// How a run's review ended: with a verdict (its findings raised a decision,
+/// or the run was accepted past it), and whether those findings were
+/// answered with `revise`; or with no verdict (the reviewer was unavailable,
+/// failed to launch, or the run is still in flight).
+enum ReviewEnd {
+    Verdict { revised: bool },
+    NoVerdict,
+}
+
+fn review_end(ledger: &Ledger, run: &RunId) -> Result<ReviewEnd, LedgerError> {
+    let decision = ledger.decision_of_run(run)?;
+    let raised_by_findings = decision
+        .as_ref()
+        .is_some_and(|d| d.raised_reason == Reason::ReviewFindings.as_str());
+    if raised_by_findings {
+        let revised = decision.is_some_and(|d| d.resolution == Some(Reason::DecisionRevised));
+        return Ok(ReviewEnd::Verdict { revised });
+    }
+    Ok(match ledger.run_status(run)? {
+        Some(State::Accepted) => ReviewEnd::Verdict { revised: false },
+        _ => ReviewEnd::NoVerdict,
+    })
 }
 
 /// The section for the window's runs and the package runs beneath them.
@@ -97,14 +115,18 @@ pub fn harness_report(
     let mut reviews: Tally = BTreeMap::new();
     let mut pending: Vec<RunId> = window.iter().map(|(run, _)| run.clone()).collect();
     while let Some(run) = pending.pop() {
-        let dispatches = ledger.review_dispatches(&run)?;
-        let revised = !dispatches.is_empty() && revised_after_review(ledger, &run)?;
-        let last = dispatches.len().saturating_sub(1);
-        for (position, dispatch) in dispatches.into_iter().enumerate() {
-            let entry = reviews.entry(model_label(dispatch.model)).or_default();
-            entry.0 += 1;
-            if revised && position == last {
-                entry.1 += 1;
+        // One review per run, however many parts it was dispatched in,
+        // credited to the model of its last dispatch.
+        if let Some(last) = ledger.review_dispatches(&run)?.pop() {
+            let entry = reviews.entry(model_label(last.model)).or_default();
+            match review_end(ledger, &run)? {
+                ReviewEnd::Verdict { revised } => {
+                    entry.0 += 1;
+                    if revised {
+                        entry.1 += 1;
+                    }
+                }
+                ReviewEnd::NoVerdict => entry.2 += 1,
             }
         }
         pending.extend(ledger.child_runs(&run)?.into_iter().map(|child| child.run));
