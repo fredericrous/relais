@@ -78,7 +78,9 @@ const NATIVE_REGISTRATION_PREFIX: &str = r#"{"method":"register_native""#;
 /// so the number in force lives here once rather than being copied.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a client waits for the answer to a request that can change a
-/// group binding (`bind_group`, `release`, `settle`). It is answered only
+/// group binding (`bind_group`, and `release`, `settle`,
+/// `acknowledge_cancel` and `end_training`, which can give a bound lease
+/// back). It is answered only
 /// once the change is durable, and on a busy ledger that waits for the
 /// batch ahead of it and then its own, each statement up to the ledger's
 /// 5 s busy timeout: past `REQUEST_TIMEOUT`, the caller gave up on a write
@@ -88,7 +90,8 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many connections are served at once. Every request is short and
-/// capped by `REQUEST_TIMEOUT`, so a small pool is enough; what it
+/// capped by `REQUEST_TIMEOUT`, or by `WRITE_RESPONSE_TIMEOUT` for one
+/// that writes a group binding, so a small pool is enough; what it
 /// prevents is one thread per connection, unjoined, for as many
 /// connections as anybody cares to open (A9).
 const HANDLER_THREADS: usize = 8;
@@ -1818,9 +1821,11 @@ impl Client {
         };
         let mut stream = Stream::connect(&self.socket).map_err(connect)?;
         let response_timeout = match request {
-            Request::BindGroup { .. } | Request::Release { .. } | Request::Settle { .. } => {
-                WRITE_RESPONSE_TIMEOUT
-            }
+            Request::BindGroup { .. }
+            | Request::Release { .. }
+            | Request::Settle { .. }
+            | Request::AcknowledgeCancel { .. }
+            | Request::EndTraining { .. } => WRITE_RESPONSE_TIMEOUT,
             _ => REQUEST_TIMEOUT,
         };
         stream
@@ -3136,9 +3141,6 @@ mod tests {
         runner.wait().ok();
     }
 
-    /// The hold is in the ledger from the moment the group is bound until
-    /// it is given back; a coordinator that starts from it holds the same
-    /// tokens and reconciles the orphan.
     /// A group binding whose write waits on a busy ledger must not hold up
     /// every other reply: a run waiting for its turn asks again at that
     /// very moment, and a reply later than `REQUEST_TIMEOUT` ended it
@@ -3176,7 +3178,9 @@ mod tests {
 
         // Another process holds the ledger's write lock for longer than a
         // request may take.
-        let held = Duration::from_secs(8);
+        // Shorter than the ledger's 5 s busy timeout, so the binding's
+        // write waits it out and lands.
+        let held = Duration::from_secs(3);
         let path = ledger.path().to_path_buf();
         let (locked, is_locked) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
@@ -3204,11 +3208,15 @@ mod tests {
         );
 
         holder.join().expect("holder");
-        // The binding's own caller waits for its durable write, however
-        // long the ledger's busy timeout lets it take.
+        // The binding's own caller waits for its durable write.
         assert!(
             matches!(binding.join().expect("bind thread"), Ok(BindOutcome::Bound)),
             "the binding's caller gave up before its write was answered"
+        );
+        let persisted = ledger.group_bindings().expect("rows");
+        assert!(
+            persisted.iter().any(|row| row.dispatch_id == "held"),
+            "the binding is in the ledger once its caller hears of it: {persisted:?}"
         );
         check.kill().ok();
         check.wait().ok();
@@ -3216,6 +3224,9 @@ mod tests {
         server.join().expect("server").expect("served");
     }
 
+    /// The hold is in the ledger from the moment the group is bound until
+    /// it is given back; a coordinator that starts from it holds the same
+    /// tokens and reconciles the orphan.
     #[cfg(unix)]
     #[test]
     fn a_hold_bound_before_a_restart_is_still_held_and_reconciled_after_it() {

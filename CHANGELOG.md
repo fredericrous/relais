@@ -8,7 +8,7 @@ missing here.
 
 ## Unreleased
 
-A run waiting for its turn on the heavy lease no longer ends `blocked (admission_unavailable)` with "reading the response: Resource temporarily unavailable" when another lease is bound. The coordinator wrote a group binding to the ledger before answering, under a lock every reply took, so while another process held the ledger for its 5 s busy timeout, every request waited behind that write and missed the client's 5 s deadline. Now a request that changed no binding waits on no write, and `bind_group`, `release` and `settle`, which are answered only once their change is durable, wait up to 30 s for that answer.
+A run waiting for its turn on the heavy lease no longer ends `blocked (admission_unavailable)` with "reading the response: Resource temporarily unavailable" when another lease is bound. The coordinator wrote a group binding to the ledger before answering, under a lock every reply took, so while another process held the ledger for its 5 s busy timeout, every request waited behind that write and missed the client's 5 s deadline. Now a request that changed no binding waits on no write, and `bind_group`, and `release`, `settle`, `acknowledge_cancel` and `end_training` (which can give a bound lease back), are answered only once their change is durable and wait up to 30 s for that answer.
 
 ## v0.29.0
 
