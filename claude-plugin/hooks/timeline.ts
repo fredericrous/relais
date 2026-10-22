@@ -370,6 +370,10 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
       return text.includes('no progress') ? withEntry(m, at, 'heartbeat', text) : m
     }
     case 'waiting_for_slot': {
+      if (event.class === 'coordinator_unreachable') {
+        const text = `coordinator unreachable, retrying · ${minutesOrSeconds(Number(event.waited_s) || 0)}`
+        return withEntry({ ...m, wait: text }, at, 'waiting', text)
+      }
       const where = event.class === 'host_slot' ? 'a host slot' : `a ${String(event.class ?? 'heavy').replace(/_/g, ' ')} slot`
       const place = typeof event.position === 'number' && event.position > 0 ? `, position ${event.position}` : ''
       const text = `waiting for ${where}${place} · ${minutesOrSeconds(Number(event.waited_s) || 0)}`

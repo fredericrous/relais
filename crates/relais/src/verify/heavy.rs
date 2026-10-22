@@ -367,11 +367,13 @@ impl<'a> HeavyAdmission<'a> {
     }
 
     /// Ask the coordinator. An unreachable coordinator is retried with
-    /// backoff (1 s doubling to 30 s) for [`UNREACHABLE_BOUND`], emitting a
-    /// `waiting_for_slot` of class [`COORDINATOR_UNREACHABLE_CLASS`] on each
-    /// retry. Once, when it has forgotten the run (a
-    /// restart empties its registry), register the run again and ask
-    /// again. A second `UnknownRun` is the coordinator's answer.
+    /// backoff (1 s doubling to 30 s) for [`UNREACHABLE_BOUND`] of wall time,
+    /// emitting a `waiting_for_slot` of class
+    /// [`COORDINATOR_UNREACHABLE_CLASS`] on each retry. Once, when it has
+    /// forgotten the run (a restart empties its registry), register the run
+    /// again and ask again; an unreachable coordinator on that path is
+    /// retried the same way. A second `UnknownRun` is the coordinator's
+    /// answer.
     fn ask(
         &self,
         gate: &(dyn Gate + Sync),
@@ -386,15 +388,20 @@ impl<'a> HeavyAdmission<'a> {
                     code: Refusal::UnknownRun,
                     ..
                 }) if !*registered_again && self.registration.is_some() => {
-                    *registered_again = true;
                     if let Some(registration) = &self.registration {
-                        gate.register_run(registration).map_err(LeaseStop::Gate)?;
+                        match gate.register_run(registration) {
+                            Ok(()) => *registered_again = true,
+                            Err(e) if e.unavailable() => {
+                                self.retry_unreachable(e, &mut retrying, cancel)?
+                            }
+                            Err(e) => return Err(LeaseStop::Gate(e)),
+                        }
                     }
                 }
                 // The coordinator granted this id but its answer was lost
                 // (the read timed out): asked again, it says the id is
                 // already admitted. The lease is this request's own.
-                Ok(Decision::AlreadyAdmitted) if retrying.spent > Duration::ZERO => {
+                Ok(Decision::AlreadyAdmitted) if retrying.first.is_some() => {
                     return Ok(Decision::Granted)
                 }
                 Ok(decision) => return Ok(decision),
@@ -405,18 +412,22 @@ impl<'a> HeavyAdmission<'a> {
     }
 
     /// One backoff after an unreachable coordinator: stop when cancelled or
-    /// when the bound is spent (naming how long it retried), else say the
-    /// run is alive and sleep.
+    /// when the bound (wall time since the first failure) is spent, naming
+    /// how long it retried, else say the run is alive and sleep.
     fn retry_unreachable(
         &self,
         error: GateError,
         state: &mut Unreachable,
         cancel: Option<&AtomicBool>,
     ) -> Result<(), LeaseStop> {
-        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
+        if cancelled() {
             return Err(LeaseStop::Cancelled);
         }
-        if state.spent >= UNREACHABLE_BOUND {
+        let now = self.budgets.now();
+        let first = *state.first.get_or_insert(now);
+        let spent = Duration::from_millis(u64::try_from((now - first).max(0)).unwrap_or(0));
+        if spent >= UNREACHABLE_BOUND {
             return Err(LeaseStop::Gate(match error {
                 GateError::Unavailable {
                     operation,
@@ -425,7 +436,7 @@ impl<'a> HeavyAdmission<'a> {
                 } => GateError::Unavailable {
                     operation,
                     socket,
-                    cause: format!("{cause}; retried for {} s", state.spent.as_secs()).into(),
+                    cause: format!("{cause}; retried for {} s", spent.as_secs()).into(),
                 },
                 other => other,
             }));
@@ -433,15 +444,23 @@ impl<'a> HeavyAdmission<'a> {
         self.events.emit(Event::WaitingForSlot {
             class: COORDINATOR_UNREACHABLE_CLASS.to_string(),
             position: 0,
-            waited_s: state.spent.as_secs(),
+            waited_s: spent.as_secs(),
         });
         let pause = state
             .next
             .max(UNREACHABLE_BACKOFF_START)
-            .min(UNREACHABLE_BOUND - state.spent);
-        self.sleeper.sleep(pause);
-        state.spent += pause;
+            .min(UNREACHABLE_BOUND - spent);
         state.next = (pause * 2).min(UNREACHABLE_BACKOFF_MAX);
+        let slice = self.poll.max(Duration::from_millis(1));
+        let mut left = pause;
+        while !left.is_zero() {
+            let step = left.min(slice);
+            self.sleeper.sleep(step);
+            left -= step;
+            if cancelled() {
+                return Err(LeaseStop::Cancelled);
+            }
+        }
         Ok(())
     }
 
@@ -497,7 +516,12 @@ impl<'a> HeavyAdmission<'a> {
                 disk: self.disk.ask(estimate),
             };
             loop {
-                match self.ask(gate, &request, &mut registered_again, ask.cancel)? {
+                let answer = self.ask(gate, &request, &mut registered_again, ask.cancel);
+                if matches!(answer, Err(LeaseStop::Cancelled)) {
+                    // Best effort, as in the queue: nothing started.
+                    let _ = gate.withdraw(&id);
+                }
+                match answer? {
                     Decision::Granted => break,
                     Decision::AlreadyAdmitted => return Err(LeaseStop::Duplicate(id)),
                     Decision::Refused { code, detail } => {
@@ -581,11 +605,11 @@ impl<'a> HeavyAdmission<'a> {
     }
 }
 
-/// The tries made so far at an unreachable coordinator: the time slept and
-/// the next wait.
+/// The tries made so far at an unreachable coordinator: the clock's reading
+/// at the first failure and the next wait.
 #[derive(Default)]
 struct Unreachable {
-    spent: Duration,
+    first: Option<i64>,
     next: Duration,
 }
 

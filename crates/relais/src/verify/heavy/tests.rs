@@ -601,7 +601,7 @@ fn a_run_the_coordinator_still_refuses_after_registering_again_is_refused() {
 }
 
 #[test]
-fn a_coordinator_that_cannot_be_reached_is_a_gate_error_not_a_refusal() {
+fn a_coordinator_that_cannot_be_reached_is_a_gate_error_after_the_bounded_retry_not_a_refusal() {
     struct Unreachable;
     impl Gate for Unreachable {
         fn register_run(&self, _: &RunRegistration) -> Result<(), GateError> {
@@ -657,12 +657,20 @@ fn a_coordinator_that_cannot_be_reached_is_a_gate_error_not_a_refusal() {
     }
     let clock = ManualClock::new();
     let mut down = admission(&Unreachable, "run-d", 1, 4);
+    down.budgets = budgets_on(&clock, 1800);
+    down.poll = Duration::from_secs(60);
     down.sleeper = Advancing::new(&clock);
     down.registration = Some(registration("run-d"));
-    assert!(matches!(
-        down.admit(&ask(&BTreeMap::new(), 1)),
-        Err(LeaseStop::Gate(_))
-    ));
+    let Err(LeaseStop::Gate(error)) = down.admit(&ask(&BTreeMap::new(), 1)) else {
+        panic!("expected a gate error, not a refusal");
+    };
+    assert!(error.unavailable());
+    assert!(error.to_string().contains("retried for 600 s"), "{error}");
+    assert_eq!(
+        clock.now_millis(),
+        1_000_000 + 600_000,
+        "bounded, then stopped"
+    );
 }
 
 #[test]
@@ -1253,7 +1261,12 @@ fn a_checks_growth_is_recorded_and_is_its_next_estimate_with_two_gib_before() {
 struct Flaky {
     down: usize,
     calls: std::sync::atomic::AtomicUsize,
-    after: Box<dyn Fn() + Send + Sync>,
+    /// `register_run` is unreachable this many times, then succeeds.
+    register_down: usize,
+    /// After the unreachable answers, this many `UnknownRun` refusals.
+    unknown: usize,
+    registers: std::sync::atomic::AtomicUsize,
+    withdrawn: std::sync::atomic::AtomicUsize,
     then: Decision,
 }
 
@@ -1262,7 +1275,10 @@ impl Flaky {
         Self {
             down,
             calls: std::sync::atomic::AtomicUsize::new(0),
-            after: Box::new(|| {}),
+            register_down: 0,
+            unknown: 0,
+            registers: std::sync::atomic::AtomicUsize::new(0),
+            withdrawn: std::sync::atomic::AtomicUsize::new(0),
             then: Decision::Granted,
         }
     }
@@ -1270,16 +1286,27 @@ impl Flaky {
 
 impl Gate for Flaky {
     fn register_run(&self, _: &RunRegistration) -> Result<(), GateError> {
+        if self.registers.fetch_add(1, Ordering::SeqCst) < self.register_down {
+            return Err(GateError::Unavailable {
+                operation: "register_run",
+                socket: "none".into(),
+                cause: "Resource temporarily unavailable".into(),
+            });
+        }
         Ok(())
     }
     fn admit(&self, _: &DispatchRequest) -> Result<Decision, GateError> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
-        (self.after)();
         if n < self.down {
             Err(GateError::Unavailable {
                 operation: "admit",
                 socket: "none".into(),
                 cause: "Resource temporarily unavailable".into(),
+            })
+        } else if n < self.down + self.unknown {
+            Ok(Decision::Refused {
+                code: Refusal::UnknownRun,
+                detail: "forgotten".into(),
             })
         } else {
             Ok(self.then.clone())
@@ -1304,7 +1331,8 @@ impl Gate for Flaky {
         unreachable!()
     }
     fn withdraw(&self, _: &str) -> Result<WithdrawOutcome, GateError> {
-        unreachable!()
+        self.withdrawn.fetch_add(1, Ordering::SeqCst);
+        Ok(WithdrawOutcome::Withdrawn)
     }
     fn acquire_write(&self, _: &str, _: &str) -> Result<WriteLeaseOutcome, GateError> {
         unreachable!()
@@ -1333,6 +1361,8 @@ fn a_grant_whose_answer_was_lost_is_the_lease_on_retry() {
         ..Flaky::new(1)
     };
     let mut heavy = admission(&gate, "run-l", 1, 4);
+    heavy.budgets = budgets_on(&clock, 1800);
+    heavy.poll = Duration::from_secs(60);
     heavy.sleeper = Advancing::new(&clock);
     let env = BTreeMap::new();
     let lease = heavy.admit(&ask(&env, 1)).map_err(|e| e.to_string());
@@ -1346,7 +1376,11 @@ fn an_unreachable_coordinator_is_retried_with_backoff_and_the_lease_is_granted()
     let clock = ManualClock::new();
     let sleeper = Advancing::new(&clock);
     let gate = Flaky::new(6);
+    let dir = temp_dir("unreachable-events");
     let mut heavy = admission(&gate, "run-r", 1, 4);
+    heavy.budgets = budgets_on(&clock, 1800);
+    heavy.poll = Duration::from_secs(60);
+    heavy.events = Events::for_run_on("run-r", &dir, crate::protocol::Wire::to(std::io::sink()));
     heavy.sleeper = sleeper.clone();
     let env = BTreeMap::new();
     let lease = heavy.admit(&ask(&env, 1)).map_err(|e| e.to_string());
@@ -1362,6 +1396,16 @@ fn an_unreachable_coordinator_is_retried_with_backoff_and_the_lease_is_granted()
         .collect();
     assert_eq!(slept, vec![1, 2, 4, 8, 16, 30]);
     assert_eq!(gate.calls.load(Ordering::SeqCst), 7);
+    let written = std::fs::read_to_string(dir.join("events.jsonl")).expect("events");
+    let waits: Vec<&str> = written
+        .lines()
+        .filter(|line| line.contains("\"coordinator_unreachable\""))
+        .collect();
+    assert_eq!(waits.len(), 6, "{written}");
+    assert!(waits[0].contains("\"waited_s\":0"), "{}", waits[0]);
+    assert!(waits[1].contains("\"waited_s\":1"), "{}", waits[1]);
+    assert!(waits[5].contains("\"waited_s\":31"), "{}", waits[5]);
+    assert!(waits[5].contains("\"position\":0"), "{}", waits[5]);
 }
 
 #[test]
@@ -1370,6 +1414,8 @@ fn an_unreachable_coordinator_is_given_up_on_after_the_bound() {
     let sleeper = Advancing::new(&clock);
     let gate = Flaky::new(usize::MAX);
     let mut heavy = admission(&gate, "run-g", 1, 4);
+    heavy.budgets = budgets_on(&clock, 1800);
+    heavy.poll = Duration::from_secs(60);
     heavy.sleeper = sleeper.clone();
     let env = BTreeMap::new();
     let Err(LeaseStop::Gate(error)) = heavy.admit(&ask(&env, 1)) else {
@@ -1398,10 +1444,85 @@ fn a_cancel_set_while_the_coordinator_is_unreachable_stops_the_retries() {
     };
     let gate = Flaky::new(usize::MAX);
     let mut heavy = admission(&gate, "run-c", 1, 4);
+    heavy.budgets = budgets_on(&clock, 1800);
+    heavy.poll = Duration::from_secs(60);
     heavy.sleeper = sleeper.clone();
     let env = BTreeMap::new();
     let mut request = ask(&env, 1);
     request.cancel = Some(&flag);
     assert!(matches!(heavy.admit(&request), Err(LeaseStop::Cancelled)));
     assert_eq!(sleeper.slept.lock().expect("sleeps").len(), 3);
+    assert_eq!(
+        gate.withdrawn.load(Ordering::SeqCst),
+        1,
+        "withdrawn on cancel"
+    );
+}
+
+#[test]
+fn a_duplicate_with_no_prior_retry_still_stops_as_duplicate() {
+    let gate = Flaky {
+        then: Decision::AlreadyAdmitted,
+        ..Flaky::new(0)
+    };
+    let heavy = admission(&gate, "run-dup", 1, 4);
+    let env = BTreeMap::new();
+    assert!(matches!(
+        heavy.admit(&ask(&env, 1)),
+        Err(LeaseStop::Duplicate(_))
+    ));
+}
+
+#[test]
+fn a_registration_that_is_unreachable_once_is_retried_and_the_lease_is_granted() {
+    let clock = ManualClock::new();
+    let sleeper = Advancing::new(&clock);
+    let gate = Flaky {
+        register_down: 1,
+        unknown: 2,
+        ..Flaky::new(0)
+    };
+    let mut heavy = admission(&gate, "run-reg", 1, 4);
+    heavy.budgets = budgets_on(&clock, 1800);
+    heavy.poll = Duration::from_secs(60);
+    heavy.sleeper = sleeper.clone();
+    heavy.registration = Some(registration("run-reg"));
+    let env = BTreeMap::new();
+    let lease = heavy.admit(&ask(&env, 1)).map_err(|e| e.to_string());
+    std::mem::forget(lease.expect("granted"));
+    assert_eq!(
+        gate.registers.load(Ordering::SeqCst),
+        2,
+        "one failed, one made"
+    );
+    assert_eq!(sleeper.slept.lock().expect("sleeps").len(), 1);
+}
+
+#[test]
+fn a_cancel_during_a_long_backoff_is_seen_within_one_poll() {
+    let clock = ManualClock::new();
+    let flag = Arc::new(AtomicBool::new(false));
+    let sleeper = {
+        let flag = Arc::clone(&flag);
+        Advancing::then(&clock, move |n| {
+            // Each backoff is sliced by the 100 ms poll: the 1, 2, 4, 8
+            // and 16 s backoffs take slices 1-310, so slice 320 is ten
+            // slices into the 30 s one. Cancel there.
+            if n == 320 {
+                flag.store(true, Ordering::SeqCst);
+            }
+        })
+    };
+    let gate = Flaky::new(usize::MAX);
+    let mut heavy = admission(&gate, "run-p", 1, 4);
+    heavy.budgets = budgets_on(&clock, 1800);
+    heavy.poll = Duration::from_millis(100);
+    heavy.sleeper = sleeper.clone();
+    let env = BTreeMap::new();
+    let mut request = ask(&env, 1);
+    request.cancel = Some(&flag);
+    assert!(matches!(heavy.admit(&request), Err(LeaseStop::Cancelled)));
+    let slept = sleeper.slept.lock().expect("sleeps");
+    assert_eq!(slept.len(), 320, "stopped on the slice that set the flag");
+    assert!(slept.iter().all(|d| *d <= Duration::from_millis(100)));
 }
