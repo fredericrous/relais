@@ -84,7 +84,7 @@ fn step(step: Step, tally: Tally) -> HarnessStep {
 }
 
 /// How a run's review ended: with a verdict (its findings raised a decision,
-/// or the run was accepted past it), and whether those findings were
+/// or the run has a `checks_and_review_passed` transition, whatever it ended as), and whether those findings were
 /// answered with `revise`; or with no verdict (the reviewer was unavailable,
 /// failed to launch, or the run is still in flight).
 enum ReviewEnd {
@@ -101,9 +101,14 @@ fn review_end(ledger: &Ledger, run: &RunId) -> Result<ReviewEnd, LedgerError> {
         let revised = decision.is_some_and(|d| d.resolution == Some(Reason::DecisionRevised));
         return Ok(ReviewEnd::Verdict { revised });
     }
-    Ok(match ledger.run_status(run)? {
-        Some(State::Accepted) => ReviewEnd::Verdict { revised: false },
-        _ => ReviewEnd::NoVerdict,
+    let passed_clean = ledger
+        .transitions(run)?
+        .iter()
+        .any(|t| t.reason == Reason::ChecksAndReviewPassed.as_str());
+    Ok(if passed_clean {
+        ReviewEnd::Verdict { revised: false }
+    } else {
+        ReviewEnd::NoVerdict
     })
 }
 
