@@ -151,6 +151,14 @@ impl HarnessReport {
                 out.push('\n');
             }
         }
+        let any_unknown = self
+            .steps
+            .iter()
+            .flat_map(|s| &s.models)
+            .any(|row| row.model == UNKNOWN_MODEL);
+        if any_unknown {
+            out.push_str("  unknown: no usage row named the dispatch's model\n");
+        }
         out
     }
 }
