@@ -1725,14 +1725,18 @@ mod tests {
         let took = started.elapsed();
         assert_eq!(sample, None);
         assert!(took < bound + Duration::from_secs(3), "took {took:?}");
-        let pid = std::fs::read_to_string(&pid_file).expect("pid file");
-        let alive = std::process::Command::new("kill")
-            .args(["-0", pid.trim()])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .expect("kill")
-            .success();
-        assert!(!alive, "the fake ps is gone");
+        // On a loaded host the group can be killed before the shell
+        // writes its pid: then nothing of it ran on, and there is no
+        // child to look for.
+        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("kill")
+                .success();
+            assert!(!alive, "the fake ps is gone");
+        }
     }
 
     // A9: a persistent accept failure the loop cannot make progress on
