@@ -160,7 +160,11 @@ impl<'a> RunEngine<'a> {
         request: &ReviewRequest<'_>,
         spend: &mut RunSpend,
     ) -> ReviewOutcome {
-        let artifact = self.artifacts.join("review.txt");
+        // One file per dispatch, named for the candidate it judges, so a
+        // second review never overwrites the first's evidence.
+        let artifact = self
+            .artifacts
+            .join(format!("review-{}.txt", request.candidate_sha));
         self.review_unit(request, spend, None, &artifact).outcome
     }
 
@@ -272,18 +276,12 @@ impl<'a> RunEngine<'a> {
         // The artifact and its evidence row are one operation: a review
         // the run cannot record is a review it cannot show, and a run
         // that cannot show its review does not accept (X5).
-        // A part's answer lives at a path of its own attempt, so an
-        // earlier attempt's answer and its evidence row stay as they were.
-        let (recorded, kept_at) = if part.is_some() {
-            let own = artifact.with_extension(format!("{dispatch_id}.txt"));
-            let recorded = self.record_immutable_artifact(EvidenceKind::ReviewResult, &own, &text);
-            (recorded, Some(own))
-        } else {
-            (
-                self.record_artifact(None, EvidenceKind::ReviewResult, artifact, &text),
-                None,
-            )
-        };
+        // Every answer, whole or a part's, lives at a path of its own
+        // dispatch, so an earlier review's answer and its evidence row stay
+        // as they were.
+        let own = artifact.with_extension(format!("{dispatch_id}.txt"));
+        let recorded = self.record_immutable_artifact(EvidenceKind::ReviewResult, &own, &text);
+        let kept_at = part.is_some().then_some(own);
         if let Err(e) = recorded {
             return Reviewed {
                 dispatch_id: Some(dispatch_id),
@@ -465,6 +463,7 @@ impl<'a> RunEngine<'a> {
             max_attempts: request.authority.max_attempts,
             repairs_used: 0,
             max_repairs: 0,
+            review_repairs_used: 0,
             tier: reviewer_tier,
             rung: RungIndex::INITIAL,
             escalation_tier: None,

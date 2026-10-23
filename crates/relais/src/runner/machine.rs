@@ -171,6 +171,10 @@ pub struct Budget {
     pub max_attempts: u32,
     pub repairs_used: u32,
     pub max_repairs: u32,
+    /// Repairs already spent on a review's findings: the count of the run's
+    /// recorded `review_repair` transitions, set where a review's verdict is
+    /// decided (`with_recorded_review_repairs`). A run gets at most one.
+    pub review_repairs_used: u32,
     /// The tier of the rung the run is on.
     pub tier: Tier,
     /// The rung of the ladder the run is on: the attempt just dispatched.
@@ -579,12 +583,41 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
             )
         }
 
-        Observation::ReviewFindings(detail, _severities) => Decision::stop(
-            State::NeedsReview,
-            Reason::ReviewFindings,
-            serde_json::json!({ "detail": detail }),
-            Terminal::NeedsReview { detail },
-        ),
+        Observation::ReviewFindings(detail, severities) => {
+            // Findings no worse than medium, a repair slot left and no
+            // review repair yet: the worker gets one try at them. Unparsed
+            // severities, anything higher, or a second set of findings
+            // stops for a person.
+            let repairable = severities.as_ref().is_some_and(|all| {
+                !all.is_empty()
+                    && all
+                        .iter()
+                        .all(|sev| matches!(sev, Severity::Medium | Severity::Low))
+            });
+            if repairable
+                && budget.review_repairs_used == 0
+                && budget.repairs_used < budget.max_repairs
+            {
+                return Decision {
+                    state: State::Repairing,
+                    reason: Reason::ReviewRepair,
+                    detail: serde_json::json!({
+                        "detail": detail,
+                        "attempt": budget.attempts_used,
+                    }),
+                    next: Next::Attempt {
+                        kind: AttemptKind::Repair,
+                        rung: budget.rung.next(),
+                    },
+                };
+            }
+            Decision::stop(
+                State::NeedsReview,
+                Reason::ReviewFindings,
+                serde_json::json!({ "detail": detail }),
+                Terminal::NeedsReview { detail },
+            )
+        }
 
         Observation::ReviewUnavailable(detail) => Decision::stop(
             State::NeedsReview,
@@ -705,10 +738,58 @@ mod tests {
             max_attempts: 3,
             repairs_used,
             max_repairs: 1,
+            review_repairs_used: 0,
             tier: Tier::Implementation,
             rung: rung_after(repairs_used),
             escalation_tier: escalation,
         }
+    }
+
+    fn findings(severities: Option<Vec<Severity>>) -> Observation {
+        Observation::ReviewFindings("1. [low] x".into(), severities)
+    }
+
+    #[test]
+    fn low_and_medium_findings_go_back_to_the_worker_once() {
+        let b = Budget {
+            max_repairs: 2,
+            ..budget(0, None)
+        };
+        let d = decide(&b, findings(Some(vec![Severity::Low, Severity::Medium])));
+        assert_eq!(d.state, State::Repairing);
+        assert_eq!(d.reason, Reason::ReviewRepair);
+        assert!(matches!(
+            d.next,
+            Next::Attempt {
+                kind: AttemptKind::Repair,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn high_blocking_unparsed_or_second_findings_stop_for_review() {
+        let b = Budget {
+            max_repairs: 2,
+            ..budget(0, None)
+        };
+        for severities in [
+            Some(vec![Severity::Low, Severity::High]),
+            Some(vec![Severity::Blocking]),
+            Some(vec![]),
+            None,
+        ] {
+            let d = decide(&b, findings(severities));
+            assert_eq!(d.state, State::NeedsReview);
+            assert_eq!(d.reason, Reason::ReviewFindings);
+        }
+        let spent = Budget {
+            review_repairs_used: 1,
+            ..b
+        };
+        let d = decide(&spent, findings(Some(vec![Severity::Low])));
+        assert_eq!(d.state, State::NeedsReview);
+        assert!(matches!(d.next, Next::Stop(_)));
     }
 
     fn failed(unchanged: bool, same: bool, preexisting: bool) -> Observation {

@@ -1,8 +1,10 @@
 //! What a run has spent and its per-attempt progress.
 
 use super::{
-    AttemptKind, Budget, CostCompleteness, EffortId, Limit, MicroUsd, Preflight, RungIndex,
+    AttemptKind, Budget, CostCompleteness, EffortId, Limit, MicroUsd, Preflight, Reason, RungIndex,
 };
+use crate::ids::RunId;
+use crate::ledger::{Ledger, LedgerError};
 
 /// What a run has spent so far, and how well that figure is known.
 ///
@@ -83,6 +85,9 @@ pub(super) struct Progress {
     pub(super) budget: Budget,
     pub(super) kind: AttemptKind,
     pub(super) last_failures: Option<Vec<String>>,
+    /// The findings of the review that sent the run back to its worker,
+    /// until that repair's prompt quotes them.
+    pub(super) review_findings: Option<String>,
     pub(super) last_candidate: Option<String>,
     pub(super) spend: RunSpend,
     pub(super) models_used: Vec<String>,
@@ -90,6 +95,24 @@ pub(super) struct Progress {
     /// price: its cost settled as the whole reservation, so no further
     /// attempt is admitted (SPEC §11).
     pub(super) unpriced_model: Option<Vec<String>>,
+}
+
+/// `budget` with `review_repairs_used` counted from the run's recorded
+/// `review_repair` transitions, the one place the figure is kept.
+pub(super) fn with_recorded_review_repairs(
+    budget: Budget,
+    ledger: &Ledger,
+    run: &RunId,
+) -> Result<Budget, LedgerError> {
+    let used = ledger
+        .transitions(run)?
+        .iter()
+        .filter(|t| t.reason == Reason::ReviewRepair.as_str())
+        .count();
+    Ok(Budget {
+        review_repairs_used: u32::try_from(used).unwrap_or(u32::MAX),
+        ..budget
+    })
 }
 
 /// The state a run starts its attempts from.
@@ -102,6 +125,9 @@ pub(super) fn fresh_progress(preflight: &Preflight) -> Progress {
             max_attempts: authority.max_attempts,
             repairs_used: 0,
             max_repairs: authority.max_repairs_before_escalation,
+            // Zero here; a review's verdict reads the real count off the
+            // run's recorded transitions (`with_recorded_review_repairs`).
+            review_repairs_used: 0,
             tier: decision.tier,
             rung: RungIndex::INITIAL,
             // The route's kept tier: `None` when `allowed_models`
@@ -112,6 +138,7 @@ pub(super) fn fresh_progress(preflight: &Preflight) -> Progress {
         },
         kind: AttemptKind::Initial,
         last_failures: None,
+        review_findings: None,
         last_candidate: None,
         spend: RunSpend::zero(),
         models_used: Vec::new(),

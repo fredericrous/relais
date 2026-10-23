@@ -17,7 +17,7 @@ fn launches() -> Arc<AtomicUsize> {
 
 /// A source run that removes `src/main.rs`, accepted: its candidate is what
 /// the tests verify. Returns its id and its receipt.
-fn accepted_source(fixture: &Fixture) -> (RunId, Receipt) {
+pub(super) fn accepted_source(fixture: &Fixture) -> (RunId, Receipt) {
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
     let backend = conditional_worker("relais task");
     let RunOutcome {

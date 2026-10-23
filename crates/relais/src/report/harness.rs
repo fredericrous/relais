@@ -94,18 +94,27 @@ enum ReviewEnd {
 
 fn review_end(ledger: &Ledger, run: &RunId) -> Result<ReviewEnd, LedgerError> {
     let decision = ledger.decision_of_run(run)?;
+    let transitions = ledger.transitions(run)?;
+    // Findings the worker was sent back to repair were caught by review
+    // as much as findings a person revised.
+    let repaired = transitions
+        .iter()
+        .any(|t| t.reason == Reason::ReviewRepair.as_str());
     let raised_by_findings = decision
         .as_ref()
         .is_some_and(|d| d.raised_reason == Reason::ReviewFindings.as_str());
     if raised_by_findings {
         let revised = decision.is_some_and(|d| d.resolution == Some(Reason::DecisionRevised));
-        return Ok(ReviewEnd::Verdict { revised });
+        return Ok(ReviewEnd::Verdict {
+            revised: revised || repaired,
+        });
     }
-    let passed_clean = ledger
-        .transitions(run)?
+    let passed_clean = transitions
         .iter()
         .any(|t| t.reason == Reason::ChecksAndReviewPassed.as_str());
-    Ok(if passed_clean {
+    Ok(if repaired {
+        ReviewEnd::Verdict { revised: true }
+    } else if passed_clean {
         ReviewEnd::Verdict { revised: false }
     } else {
         ReviewEnd::NoVerdict
@@ -187,5 +196,61 @@ impl HarnessReport {
             out.push_str("  unknown: no usage row named the model that ran the step\n");
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::{DispatchId, TaskId};
+    use crate::ledger::{now_rfc3339, Transition};
+    use crate::route::RoutedBy;
+
+    /// A run that was sent back to its worker on a review's findings and
+    /// then passed clean was caught by review.
+    #[test]
+    fn a_review_repair_run_that_passes_counts_as_caught_by_review() {
+        let dir = crate::test_support::temp_dir("harness-review-repair");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = RunId::from_stored("run-h");
+        ledger
+            .insert_run(&run, "/repo", None, &TaskId::from_stored("task-h"), "rk")
+            .expect("run");
+        ledger
+            .record_dispatch_intent(
+                &DispatchId::from_stored("d-review-h"),
+                &run,
+                None,
+                &serde_json::json!({ "kind": "review" }),
+                0,
+                RoutedBy::ConservativeBaseline,
+            )
+            .expect("dispatch");
+        for (state, reason) in [
+            (State::Verifying, "verification_started"),
+            (State::Repairing, "review_repair"),
+            (State::Verifying, "verification_started"),
+            (State::Accepted, "checks_and_review_passed"),
+        ] {
+            ledger
+                .record_transition(&Transition {
+                    run_id: run.clone(),
+                    attempt_id: None,
+                    from_state: None,
+                    to_state: state,
+                    reason: reason.into(),
+                    detail: None,
+                    at: now_rfc3339(),
+                })
+                .expect("transition");
+        }
+        let report = harness_report(&ledger, &[(run, State::Accepted)]).expect("report");
+        let review = report
+            .steps
+            .iter()
+            .find(|s| s.step == Step::Review)
+            .expect("review step");
+        assert_eq!(review.models.len(), 1, "{review:?}");
+        assert_eq!((review.models[0].ran, review.models[0].caught), (1, 1));
     }
 }

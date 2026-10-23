@@ -2340,8 +2340,14 @@ fn required_review_accepts_only_with_findings_none() {
         matches!(outcome.terminal, Terminal::Accepted { .. }),
         "FINDINGS: none accepts: {outcome:?}"
     );
-    let review = fixture.artifacts.join(outcome.run_id()).join("review.txt");
-    assert!(review.is_file(), "review evidence is retained");
+    let kept = fixture
+        .ledger
+        .evidence(&RunId::from_stored(outcome.run_id()))
+        .expect("evidence")
+        .into_iter()
+        .filter(|row| row.kind == EvidenceKind::ReviewResult)
+        .count();
+    assert_eq!(kept, 1, "review evidence is retained");
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
@@ -8292,6 +8298,7 @@ mod budgets;
 mod exhaustion;
 mod native;
 mod review_parts;
+mod review_repair;
 mod review_stop;
 // Shells out to `sh` and a fake `claude` script made executable with
 // unix permissions: unix only, like the script it tests.

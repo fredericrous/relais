@@ -69,6 +69,9 @@ pub enum Reason {
     VerificationGap,
     BaselineFailureNotWaived,
     ReviewFindings,
+    /// A review's findings were all medium or low: the worker is sent back
+    /// once to repair them.
+    ReviewRepair,
     VerificationInputsChanged,
     AdmissionUnavailable,
     PlanAccepted,
@@ -198,7 +201,7 @@ impl Reason {
     ///
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it.
-    pub const ALL: [Self; 65] = [
+    pub const ALL: [Self; 66] = [
         Self::ChecksAndReviewPassed,
         Self::BehavioralFailure,
         Self::RepairExhausted,
@@ -223,6 +226,7 @@ impl Reason {
         Self::VerificationGap,
         Self::BaselineFailureNotWaived,
         Self::ReviewFindings,
+        Self::ReviewRepair,
         Self::VerificationInputsChanged,
         Self::AdmissionUnavailable,
         Self::PlanAccepted,
@@ -292,6 +296,7 @@ impl Reason {
             Self::VerificationGap => "verification_gap",
             Self::BaselineFailureNotWaived => "baseline_failure_not_waived",
             Self::ReviewFindings => "review_findings",
+            Self::ReviewRepair => "review_repair",
             Self::VerificationInputsChanged => "verification_inputs_changed",
             Self::AdmissionUnavailable => "admission_unavailable",
             Self::PlanAccepted => "plan_accepted",

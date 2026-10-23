@@ -293,6 +293,7 @@ fn ended_on(fixture: &Fixture, exhausted: Exhausted) -> RunOutcome {
         max_attempts: 3,
         repairs_used: 0,
         max_repairs: 1,
+        review_repairs_used: 0,
         tier: Tier::Implementation,
         rung: RungIndex::INITIAL,
         escalation_tier: None,

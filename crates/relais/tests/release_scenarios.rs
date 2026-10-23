@@ -859,7 +859,19 @@ minimum_tier = "escalation"
     // A native worker is priced from the usage the plugin reports.
     assert_eq!(receipt["cost_completeness"], "estimated");
     assert!(run_dir.join("candidate-1.patch").exists());
-    assert!(run_dir.join("review.txt").exists());
+    // Each review dispatch keeps its own answer, `review-<candidate>.<dispatch>.txt`.
+    let reviews = std::fs::read_dir(&run_dir)
+        .expect("run dir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("review-") && name.ends_with(".txt"))
+        .count();
+    assert_eq!(
+        reviews,
+        1,
+        "one review answer file in {}",
+        run_dir.display()
+    );
     // The candidate the receipt names is a real commit in the repo.
     let candidate = receipt["candidate_sha"].as_str().unwrap();
     git(&world.repo, &["cat-file", "-e", candidate]);
