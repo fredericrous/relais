@@ -298,21 +298,59 @@ pub fn own_process_group(command: &mut Command) {
 pub fn group_cpu_time(pgid: u32) -> Option<Duration> {
     #[cfg(unix)]
     {
-        let out = Command::new("ps")
-            .args(["-A", "-o", "pgid=,time="])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        sum_group_cpu(&String::from_utf8_lossy(&out.stdout), pgid)
+        sample_group_cpu(
+            Path::new("ps"),
+            &["-A", "-o", "pgid=,time="],
+            pgid,
+            PS_SAMPLE_TIMEOUT,
+        )
     }
     #[cfg(not(unix))]
     {
         let _ = pgid;
         None
+    }
+}
+
+/// How long one `ps` sample may take before it is given up as "no sample".
+/// A twelfth of the 60 s heartbeat interval: the heartbeat thread is joined
+/// when its check ends, so a hung `ps` must not outlast a beat.
+#[cfg(unix)]
+const PS_SAMPLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run `program args` under [`wait_for_exit`] with `timeout` as its wall
+/// clock, its output read on a helper thread: past the bound the process
+/// group is killed and reaped and the answer is `None`, so a hanging `ps`
+/// never holds the caller. Only a clean exit is a sample.
+#[cfg(unix)]
+fn sample_group_cpu(
+    program: &Path,
+    args: &[&str],
+    pgid: u32,
+    timeout: Duration,
+) -> Option<Duration> {
+    use std::io::Read;
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    own_process_group(&mut command);
+    let mut child = command.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    // The group is killed when the wait ends, so the pipe reaches end of
+    // file and this thread returns on every path.
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let supervised = wait_for_exit(&mut child, timeout, None);
+    let bytes = reader.join().ok()?;
+    match supervised.ok()?.ended {
+        Ended::Exited(0) => sum_group_cpu(&String::from_utf8_lossy(&bytes), pgid),
+        _ => None,
     }
 }
 
@@ -1661,6 +1699,44 @@ mod tests {
         let _ = idle.wait();
         assert!(rose, "a busy loop used at least a second of CPU");
         assert!(sleeper.is_some_and(|used| used < Duration::from_secs(1)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hanging_ps_gives_no_sample_within_the_bound_and_leaves_no_child() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        let dir = crate::test_support::temp_dir("slow-ps");
+        let pid_file = dir.join("pid");
+        let script = dir.join("ps");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = prime ] && exit 0\necho $$ > '{}'\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .expect("write");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::test_support::prime_script(&script);
+        let bound = Duration::from_millis(300);
+        let started = Instant::now();
+        let sample = super::sample_group_cpu(&script, &[], 1, bound);
+        let took = started.elapsed();
+        assert_eq!(sample, None);
+        assert!(took < bound + Duration::from_secs(3), "took {took:?}");
+        // On a loaded host the group can be killed before the shell
+        // writes its pid: then nothing of it ran on, and there is no
+        // child to look for.
+        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("kill")
+                .success();
+            assert!(!alive, "the fake ps is gone");
+        }
     }
 
     // A9: a persistent accept failure the loop cannot make progress on
