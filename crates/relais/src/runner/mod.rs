@@ -237,6 +237,9 @@ pub(crate) struct RunEngine<'a> {
     /// The reviewer's constraint statements that did not fit its prompt:
     /// known only once the review prompt is built, shown in the receipt.
     pub(in crate::runner) reviewer_gap: Option<GuidanceGap>,
+    /// The worker's full-text code rules that did not fit its prompt, or
+    /// whose text was unavailable: known once the attempt's prompt is built.
+    pub(in crate::runner) worker_code_rules_gap: Option<GuidanceGap>,
     /// Set once the coordinator reports this run cancelled while no
     /// dispatch heartbeat was running (a check, or between phases).
     pub(in crate::runner) cancel_asked: Arc<AtomicBool>,

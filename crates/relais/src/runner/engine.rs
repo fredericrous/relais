@@ -53,6 +53,7 @@ impl<'a> RunEngine<'a> {
             inplace: None,
             last_snapshot: None,
             reviewer_gap: None,
+            worker_code_rules_gap: None,
             cancel_asked: Arc::new(AtomicBool::new(false)),
             budgets: Budgets::unbounded(),
             heavy_tries: verify::Tries::for_epoch(epoch),

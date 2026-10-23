@@ -1,9 +1,9 @@
 //! Reading a reviewer's answer and building its prompts.
 
-use super::prompt::relevant_block;
+use super::prompt::{fit_statements, relevant_block, RenderedRule, RuleKind};
 use super::{
     context, data_block, data_list_block, verify, workspace, Duration, EffectiveAuthority,
-    Guidance, GuidanceGap, GuidanceSource, Path, PathBuf, Reason, RuleRef, RunId, Tier,
+    Guidance, GuidanceGap, GuidanceSource, Path, PathBuf, Reason, RunId, Tier,
 };
 
 pub use super::machine::Severity;
@@ -109,7 +109,7 @@ pub(in crate::runner) const REVIEW_PATCH_BUDGET_BYTES: usize = 192 * 1024;
 /// What the reviewer's constraint statements and guidance may occupy, in
 /// bytes, on their own: the patch is not in the prompt, so it no longer
 /// starves them.
-pub(in crate::runner) const REVIEW_CONSTRAINTS_BUDGET_BYTES: usize = 32 * 1024;
+pub(in crate::runner) const REVIEW_CONSTRAINTS_BUDGET_BYTES: usize = 96 * 1024;
 
 /// Lines per `Read` call the reviewer is told to use on the patch.
 const REVIEW_READ_WINDOW_LINES: usize = 2000;
@@ -478,47 +478,6 @@ pub(crate) fn reviewer_tier(
     Some((tier, same_model))
 }
 
-/// The statement lines of the rules that fit `budget` bytes, whole and in
-/// order, and the gap naming the ones that did not. Never cuts a statement.
-pub(in crate::runner) fn fit_statements(
-    rules: &[RuleRef],
-    budget: usize,
-) -> (Vec<&RuleRef>, Option<GuidanceGap>) {
-    let line_bytes = |rule: &RuleRef| rule.id.len() + rule.statement.len() + 8;
-    let mut used = 0usize;
-    let mut shown = Vec::new();
-    for rule in rules {
-        let next = used + line_bytes(rule);
-        if next > budget {
-            break;
-        }
-        used = next;
-        shown.push(rule);
-    }
-    if shown.len() == rules.len() {
-        return (shown, None);
-    }
-    let omitted: Vec<&str> = rules[shown.len()..]
-        .iter()
-        .map(|rule| rule.id.as_str())
-        .collect();
-    let measured: usize = rules.iter().map(line_bytes).sum();
-    let gap = GuidanceGap::new(
-        GuidanceSource::Reviewer,
-        context::guidance::GapCause::OverBudget {
-            measured,
-            budget,
-        },
-        format!(
-            "{} of {} constraint statements fit the reviewer prompt ({measured} bytes against the {budget}-byte constraints budget); omitted: {}",
-            shown.len(),
-            rules.len(),
-            omitted.join(", ")
-        ),
-    );
-    (shown, Some(gap))
-}
-
 /// The reviewer's note on the paths a successor's scope was widened to
 /// (relais's own test widen, or a person's `--widen-scope`): edits the
 /// original contract did not cover, to check closely. Empty when nothing was
@@ -536,36 +495,195 @@ pub(in crate::runner) fn widened_scope_block(paths: &[String]) -> String {
     block
 }
 
-/// What the reviewer reads of aval: the full statement of every active
-/// constraint (it cannot run `aval rule`, so never the bare index and
-/// never that instruction), then the relevant block without the rules
-/// already stated above it. `budget` is the constraints budget; statements
-/// that do not fit whole are left out and named in the returned gap.
+/// What the reviewer reads of aval: the full text of every active code
+/// rule, then the statement of every other active constraint (it cannot
+/// run `aval rule`, so never the bare index and never that instruction),
+/// then the relevant block without the rules already stated above it.
+/// `budget` is the constraints budget; rules that do not fit whole are left
+/// out and named in the returned gap.
 pub(in crate::runner) fn reviewer_guidance(
     guidance: &Guidance,
     budget: usize,
 ) -> (String, Option<GuidanceGap>) {
-    let (shown, gap) = fit_statements(&guidance.rules, budget);
+    let code: Vec<RenderedRule> = guidance
+        .code_rules
+        .iter()
+        .filter_map(RenderedRule::full_text_of)
+        .collect();
+    let others: Vec<RenderedRule> = guidance
+        .rules
+        .iter()
+        .filter(|rule| !code.iter().any(|full| full.id == rule.id))
+        .map(RenderedRule::statement_of)
+        .collect();
+    let unreadable: Vec<&str> = guidance
+        .code_rules
+        .iter()
+        .filter(|rule| RenderedRule::full_text_of(rule).is_none())
+        .map(|rule| rule.id.as_str())
+        .collect();
+    let unreadable_gap = (!unreadable.is_empty()).then(|| {
+        GuidanceGap::new(
+            GuidanceSource::Reviewer,
+            context::guidance::GapCause::TextUnavailable,
+            format!(
+                "the full text of these code rules is unavailable to the reviewer: {}",
+                unreadable.join(", ")
+            ),
+        )
+    });
+    let (code_shown, code_gap) = fit_statements(
+        &code,
+        budget,
+        0,
+        GuidanceSource::Reviewer,
+        RuleKind::CodeRules,
+    );
+    let code_bytes: usize = code_shown.iter().map(|rule| rule.bytes()).sum();
+    let (shown, other_gap) = fit_statements(
+        &others,
+        budget,
+        code_bytes,
+        GuidanceSource::Reviewer,
+        RuleKind::Statements,
+    );
+    let gap = merge_gaps([unreadable_gap, code_gap, other_gap]);
     let mut text = String::new();
-    if !shown.is_empty() {
-        let statements: Vec<String> = shown
-            .iter()
-            .map(|rule| format!("`{}`: {}", rule.id, rule.statement))
-            .collect();
+    if !code_shown.is_empty() || !shown.is_empty() {
         text.push_str("the constraint rules below are in force; review blocks on them.\n");
-        if let Some(gap) = &gap {
-            text.push_str(&format!(
-                "only {} of {} could be shown; the rest are not available to you ({}).\n",
-                shown.len(),
-                guidance.rules.len(),
-                gap.detail
-            ));
-        }
+    }
+    let total = code.len() + others.len();
+    let shown_count = code_shown.len() + shown.len();
+    if let Some(gap) = gap.as_ref().filter(|_| shown_count < total) {
+        text.push_str(&format!(
+            "only {shown_count} of {total} could be shown; the rest are not available to you ({}).\n",
+            gap.detail
+        ));
+    }
+    if !code_shown.is_empty() {
+        text.push_str(
+            "the code rules below are given in full; a violation of one that this diff \
+             introduces is a finding.\n",
+        );
+        let full: Vec<&str> = code_shown.iter().map(|rule| rule.text.as_str()).collect();
+        text.push_str(&data_block("code rules in force", &full.join("\n\n")));
+    }
+    if !shown.is_empty() {
+        let statements: Vec<String> = shown.iter().map(|rule| rule.text.clone()).collect();
         text.push_str(&data_list_block("constraints in force", &statements));
     }
-    let stated: Vec<&str> = shown.iter().map(|rule| rule.id.as_str()).collect();
+    let stated: Vec<&str> = code_shown
+        .iter()
+        .chain(shown.iter())
+        .map(|rule| rule.id.as_str())
+        .collect();
     text.push_str(&relevant_block(guidance, &stated));
     (text, gap)
+}
+
+/// The decisions that apply to the files a candidate patch changes, as a
+/// fenced block, within `budget` bytes less the `reserved` already used (whole entries, dropped from the end
+/// with a gap). No file means no call and no gap; an aval failure is a gap
+/// and an empty block, never a failed review.
+pub(in crate::runner) fn reviewer_decisions(
+    resolver: &dyn context::DecisionResolver,
+    changed_files: &[String],
+    budget: usize,
+    reserved: usize,
+) -> (String, Option<GuidanceGap>) {
+    if changed_files.is_empty() {
+        return (String::new(), None);
+    }
+    // The choice aval ranks beside each key is `aval resolve` on that key at
+    // the default scope. holds-until: relais resolves keys by scope; then a
+    // scoped decision is carried with its scope (follow-up in the plan).
+    let ranked = match resolver.decisions_for(changed_files) {
+        Ok(ranked) => ranked,
+        Err(gap) => return (decisions_gap_line(&gap), Some(gap)),
+    };
+    let entries: Vec<RenderedRule> = ranked
+        .iter()
+        .filter(|key| key.state == context::guidance::RankState::Active)
+        .map(|key| {
+            let choice = key.choice.as_deref().unwrap_or("(choice unavailable)");
+            let record = key.adr.as_deref().unwrap_or("no record");
+            RenderedRule {
+                id: key.key.clone(),
+                text: format!("`{}` ({record}): {choice}", key.key),
+            }
+        })
+        .collect();
+    let (shown, gap) = fit_statements(
+        &entries,
+        budget,
+        reserved,
+        GuidanceSource::Decisions,
+        RuleKind::Decisions,
+    );
+    let gap_line = gap.as_ref().map(decisions_gap_line).unwrap_or_default();
+    if shown.is_empty() {
+        return (gap_line, gap);
+    }
+    let lines: Vec<String> = shown.iter().map(|entry| entry.text.clone()).collect();
+    let text = format!(
+        "the decisions below apply to the files this diff changes.\n{}{gap_line}",
+        data_list_block("decisions that apply", &lines)
+    );
+    (text, gap)
+}
+
+/// The prompt line that tells the reviewer the decisions it was given are
+/// missing or partial, so it reports that as uncertainty.
+fn decisions_gap_line(gap: &GuidanceGap) -> String {
+    format!(
+        "the decisions that apply to this diff are missing or partial ({}); \
+         report that as uncertainty, not as approval.\n",
+        gap.detail
+    )
+}
+
+/// The reviewer's constraints gap and decisions gap as one gap that keeps
+/// both labels: the decisions gap rides in the detail under its own
+/// description, and the cause follows `merge_gaps`.
+pub(in crate::runner) fn merge_reviewer_gaps(
+    constraints_gap: Option<GuidanceGap>,
+    decisions_gap: Option<GuidanceGap>,
+) -> Option<GuidanceGap> {
+    match (constraints_gap, decisions_gap) {
+        (Some(constraints), Some(decisions)) => {
+            let labelled = GuidanceGap {
+                detail: decisions.describe(),
+                ..decisions
+            };
+            merge_gaps([Some(constraints), Some(labelled)])
+        }
+        (constraints, decisions) => constraints.or(decisions),
+    }
+}
+
+/// One gap for several: the details joined, and a cause that covers every
+/// figure (budget gaps add their measured bytes; a budget cause wins over
+/// an unavailable-text cause, and the detail still names both).
+pub(in crate::runner) fn merge_gaps(
+    gaps: impl IntoIterator<Item = Option<GuidanceGap>>,
+) -> Option<GuidanceGap> {
+    let mut present = gaps.into_iter().flatten();
+    let mut merged = present.next()?;
+    for next in present {
+        merged.cause = match (&merged.cause, &next.cause) {
+            (
+                context::guidance::GapCause::OverBudget { measured, budget },
+                context::guidance::GapCause::OverBudget { measured: more, .. },
+            ) => context::guidance::GapCause::OverBudget {
+                measured: measured + more,
+                budget: *budget,
+            },
+            (_, over @ context::guidance::GapCause::OverBudget { .. }) => over.clone(),
+            _ => merged.cause.clone(),
+        };
+        merged.detail = format!("{}; {}", merged.detail, next.detail);
+    }
+    Some(merged)
 }
 
 #[cfg(test)]

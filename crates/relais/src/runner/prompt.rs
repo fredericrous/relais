@@ -1,6 +1,12 @@
 //! The worker's prompt and the quoted-data blocks it is built from.
 
-use super::{AttemptKind, ContextManifest, Guidance, TaskContract};
+use super::{
+    context, AttemptKind, ContextManifest, Guidance, GuidanceGap, GuidanceSource, RuleRef,
+    TaskContract,
+};
+
+/// What the worker's full-text code rules may occupy, in bytes.
+pub(super) const WORKER_CODE_RULES_BUDGET_BYTES: usize = 64 * 1024;
 
 pub(super) fn build_prompt(
     contract: &TaskContract,
@@ -8,8 +14,14 @@ pub(super) fn build_prompt(
     verification_commands: usize,
     previous_failures: Option<&[String]>,
     kind: AttemptKind,
-) -> String {
-    let mut prompt = String::from("[relais task]\n");
+) -> (String, Option<GuidanceGap>) {
+    let (code_rules_text, code_rules_gap) =
+        worker_code_rules_block(&manifest.guidance, WORKER_CODE_RULES_BUDGET_BYTES);
+    let mut prompt = code_rules_text;
+    if let Some(gap) = &code_rules_gap {
+        prompt.push_str(&format!("note: {}\n", gap.describe()));
+    }
+    prompt.push_str("[relais task]\n");
     prompt.push_str(&data_block("objective", &contract.objective));
     prompt.push_str("verification decides whether the criteria below are met, not you.\n");
     prompt.push_str(&data_list_block(
@@ -114,7 +126,7 @@ pub(super) fn build_prompt(
             AttemptKind::Initial => {}
         }
     }
-    prompt
+    (prompt, code_rules_gap)
 }
 
 /// The prompt of the one repair a review's findings buy: the task as the
@@ -161,6 +173,157 @@ pub(super) fn worker_rules() -> String {
      not run the full suite yourself; run only focused tests for what you\n\
      changed, and finish with DONE once those pass.\n"
         .to_string()
+}
+
+/// One rule as a prompt prints it: the id, and the whole rendered text
+/// (statement, and for a code rule its body).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenderedRule {
+    pub id: String,
+    pub text: String,
+}
+
+impl RenderedRule {
+    /// A constraint shown as its statement alone.
+    pub(in crate::runner) fn statement_of(rule: &RuleRef) -> Self {
+        Self {
+            id: rule.id.clone(),
+            text: format!("`{}`: {}", rule.id, rule.statement),
+        }
+    }
+
+    /// A `governs: code` rule shown in full; none when neither its
+    /// statement nor its body is present (a manifest read back from disk).
+    pub(in crate::runner) fn full_text_of(rule: &context::guidance::CodeRule) -> Option<Self> {
+        if rule.statement.is_empty() && rule.body.is_empty() {
+            return None;
+        }
+        Some(Self {
+            id: rule.id.clone(),
+            text: format!("`{}`: {}\n{}", rule.id, rule.statement, rule.body)
+                .trim_end()
+                .to_string(),
+        })
+    }
+
+    pub(in crate::runner) fn bytes(&self) -> usize {
+        self.text.len() + 1
+    }
+}
+
+/// The rules that fit `budget` bytes of rendered text, whole and in the
+/// order given, and the gap (of `source`) naming the ones that did not.
+/// Whole rules are dropped from the end; a rule is never cut. `reserved`
+/// is what earlier rules already took of the same `budget`; the gap quotes
+/// the whole budget so merged gaps agree on one figure.
+pub(in crate::runner) fn fit_statements(
+    rules: &[RenderedRule],
+    budget: usize,
+    reserved: usize,
+    source: GuidanceSource,
+    kind: RuleKind,
+) -> (Vec<&RenderedRule>, Option<GuidanceGap>) {
+    let room = budget.saturating_sub(reserved);
+    let mut used = 0usize;
+    let mut shown = Vec::new();
+    for rule in rules {
+        let next = used + rule.bytes();
+        if next > room {
+            break;
+        }
+        used = next;
+        shown.push(rule);
+    }
+    if shown.len() == rules.len() {
+        return (shown, None);
+    }
+    let omitted: Vec<&str> = rules[shown.len()..]
+        .iter()
+        .map(|rule| rule.id.as_str())
+        .collect();
+    let measured: usize = rules.iter().map(RenderedRule::bytes).sum();
+    let prompt = match source {
+        GuidanceSource::Reviewer => "reviewer",
+        GuidanceSource::Index | GuidanceSource::CodeRules | GuidanceSource::Relevant => "worker",
+    };
+    let gap = GuidanceGap::new(
+        source,
+        crate::context::guidance::GapCause::OverBudget { measured, budget },
+        format!(
+            "{} of {} {} fit the {prompt} prompt ({measured} bytes against the {budget}-byte {} budget); omitted: {}",
+            shown.len(),
+            rules.len(),
+            kind.plural(),
+            kind.budget_name(),
+            omitted.join(", ")
+        ),
+    );
+    (shown, Some(gap))
+}
+
+/// What a budget gap counts: full-text code rules or constraint statements.
+#[derive(Clone, Copy)]
+pub(in crate::runner) enum RuleKind {
+    CodeRules,
+    Statements,
+}
+
+impl RuleKind {
+    fn plural(self) -> &'static str {
+        match self {
+            RuleKind::CodeRules => "code rules",
+            RuleKind::Statements => "constraint statements",
+        }
+    }
+
+    fn budget_name(self) -> &'static str {
+        match self {
+            RuleKind::CodeRules => "code-rules",
+            RuleKind::Statements => "constraints",
+        }
+    }
+}
+
+/// The full text of the `governs: code` rules for the worker, whole rules in
+/// the order aval listed them under `budget`, and the gap naming what did
+/// not fit, or that the text is not available (a manifest read back from
+/// disk keeps ids and hashes only). Nothing when there are no code rules.
+pub(super) fn worker_code_rules_block(
+    guidance: &Guidance,
+    budget: usize,
+) -> (String, Option<GuidanceGap>) {
+    if guidance.code_rules.is_empty() {
+        return (String::new(), None);
+    }
+    let rendered: Vec<RenderedRule> = guidance
+        .code_rules
+        .iter()
+        .filter_map(RenderedRule::full_text_of)
+        .collect();
+    if rendered.is_empty() {
+        let gap = GuidanceGap::new(
+            GuidanceSource::CodeRules,
+            context::guidance::GapCause::NoAnswer,
+            "the code rules are not available in this prompt",
+        );
+        return (String::new(), Some(gap));
+    }
+    let (shown, gap) = fit_statements(
+        &rendered,
+        budget,
+        0,
+        GuidanceSource::CodeRules,
+        RuleKind::CodeRules,
+    );
+    if shown.is_empty() {
+        return (String::new(), gap);
+    }
+    let texts: Vec<&str> = shown.iter().map(|rule| rule.text.as_str()).collect();
+    let text = format!(
+        "the code rules below are in force, in full; review blocks on them.\n{}",
+        data_block("code rules in force", &texts.join("\n\n"))
+    );
+    (text, gap)
 }
 
 /// The worker's constraint index: full ids grouped by prefix, and the

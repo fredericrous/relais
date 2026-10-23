@@ -371,7 +371,7 @@ impl<'a> RunEngine<'a> {
     ) -> (String, Option<GuidanceGap>) {
         let mut prompt = String::from(
             "You are a semantic reviewer. You cannot edit or waive checks; you report findings only.\n\
-             Report each finding with file/range, the violated acceptance criterion, evidence, and suggested verification.\n\
+             Report each finding with file/range, the violated acceptance criterion or code rule id, evidence, and suggested verification.\n\
              You may only run read-only commands (reading files, git log/diff/show, searching). \
              Do not build, test or run checks: the runner has run the profile's checks already, \
              and a command you could not run is not a finding.\n\
@@ -382,7 +382,11 @@ impl<'a> RunEngine<'a> {
              copies disagree, so the passing checks above are not evidence about this.\n\
              Ask the same of what it READS: a record appended after a run is already terminal \
              (a retired worktree writes a same-state transition) means the NEWEST row matching \
-             a state is usually not the event that caused it.\n",
+             a state is usually not the event that caused it.\n\
+             A violation of a code rule that THIS diff introduces, deletions included, is a \
+             finding citing the rule id and `file:line` (the old-side location for a deletion). \
+             It blocks like an unmet acceptance criterion. Violations that were already there \
+             and are unchanged are not reported.\n",
         );
         prompt.push('\n');
         prompt.push_str(&data_block("objective", &self.config.contract.objective));
