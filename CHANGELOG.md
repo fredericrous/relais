@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+Every line the coordinator writes to its log (`coordinator.log`) now starts with an RFC 3339 UTC timestamp, and a request that takes longer than 1 s in total logs one `slow request <kind>` line with the milliseconds spent reading it, waiting for the admission lock, handling it, delivering signals, flushing, and writing the reply, so the next slow reply shows where the time went (#284).
+
 ## v0.29.3
 
 A heavy-lease admission whose coordinator is unreachable (a read timeout, or a refused connection while it restarts) no longer stops the run on the first failure. It retries with backoff (1 s doubling to 30 s) for up to 10 minutes of wall time from the first failure, on the registration made again after `unknown_run` as well, emitting a `waiting_for_slot` event of class `coordinator_unreachable` (position 0, `waited_s` since the first failure) on each retry. A cancel is seen within one poll and withdraws the request. An `AlreadyAdmitted` answer after a retry is taken as the lease; without a retry it is still a duplicate. When the bound is spent the run stops `blocked (admission_unavailable)` with an error naming how long it retried.
