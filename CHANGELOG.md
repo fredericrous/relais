@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+The CPU-time sample the check heartbeat takes with `ps` is now bounded at 5 s: a hanging `ps` is killed and reaped and counts as no sample, instead of holding the run past its check (#290).
+
 ## v0.29.5
 
 The heavy lease's retry of an unreachable coordinator now applies full jitter to each backoff (a random wait in `[0, backoff]`, the backoff still 1 s doubling to 30 s) so runs that lost the coordinator together do not retry together, and gives up after 2 minutes instead of 10, which covers a reply slower than the 5 s request timeout and a coordinator restart or re-election.
