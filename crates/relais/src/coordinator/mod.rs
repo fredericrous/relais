@@ -39,8 +39,9 @@ pub use crate::procs::alive as process_alive;
 use crate::procs::{kill, terminate, LockFile};
 
 /// Write one line to the daemon's stderr (the coordinator log), starting
-/// with an RFC 3339 UTC timestamp. Every line the daemon writes goes
-/// through here.
+/// with an RFC 3339 UTC timestamp. Every line the serving daemon writes
+/// goes through here; the two notes `daemon_log` prints on the starting
+/// CLI's terminal, before the log exists, stay unstamped.
 macro_rules! coordinator_log {
     ($($arg:tt)*) => {
         log_line(&format!($($arg)*))
@@ -48,7 +49,7 @@ macro_rules! coordinator_log {
 }
 
 /// The one place the daemon writes to stderr.
-fn log_line(message: &str) {
+pub fn log_line(message: &str) {
     eprintln!("{}", stamped(chrono::Utc::now(), message));
 }
 
@@ -66,6 +67,7 @@ const SLOW_REQUEST: Duration = Duration::from_secs(1);
 /// How long each phase of serving one request took.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PhaseTimings {
+    queued: Duration,
     read: Duration,
     admission_wait: Duration,
     handling: Duration,
@@ -76,7 +78,13 @@ struct PhaseTimings {
 
 impl PhaseTimings {
     fn total(&self) -> Duration {
-        self.read + self.admission_wait + self.handling + self.signals + self.flush + self.write
+        self.queued
+            + self.read
+            + self.admission_wait
+            + self.handling
+            + self.signals
+            + self.flush
+            + self.write
     }
 }
 
@@ -89,8 +97,9 @@ fn slow_request_line(kind: &str, timings: &PhaseTimings) -> Option<String> {
     }
     let ms = |d: Duration| d.as_millis();
     Some(format!(
-        "slow request {kind}: total {}ms (read {}ms, admission_wait {}ms, handling {}ms, signals {}ms, flush {}ms, write {}ms)",
+        "slow request {kind}: total {}ms (queued {}ms, read {}ms, admission_wait {}ms, handling {}ms, signals {}ms, flush {}ms, write {}ms)",
         ms(total),
+        ms(timings.queued),
         ms(timings.read),
         ms(timings.admission_wait),
         ms(timings.handling),
@@ -927,7 +936,7 @@ impl Coordinator {
             );
         });
 
-        let (work, queue) = std::sync::mpsc::sync_channel::<Stream>(ACCEPT_BACKLOG);
+        let (work, queue) = std::sync::mpsc::sync_channel::<Queued>(ACCEPT_BACKLOG);
         let queue = Arc::new(Mutex::new(queue));
         let mut handlers = Vec::with_capacity(HANDLER_THREADS);
         for _ in 0..HANDLER_THREADS {
@@ -979,7 +988,7 @@ impl Coordinator {
     fn accept_loop(
         &self,
         listener: &Listener,
-        work: &std::sync::mpsc::SyncSender<Stream>,
+        work: &std::sync::mpsc::SyncSender<Queued>,
     ) -> Result<(), CoordinatorError> {
         // Non-blocking so the flag is read BEFORE each accept: a
         // blocking accept could only observe shutdown by consuming the
@@ -1003,7 +1012,7 @@ impl Coordinator {
                     // queued: back-pressure on the kernel's own accept
                     // queue, which is a bounded wait rather than a
                     // thread per connection (A9).
-                    if work.send(stream).is_err() {
+                    if work.send((stream, Instant::now())).is_err() {
                         return Ok(());
                     }
                 }
@@ -1262,7 +1271,7 @@ fn daemon_log() -> std::process::Stdio {
     let path = dir.join(DAEMON_LOG);
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > DAEMON_LOG_MAX) {
         if let Err(e) = std::fs::rename(&path, dir.join(format!("{DAEMON_LOG}.1"))) {
-            coordinator_log!("{} not rotated: {e}", path.display());
+            eprintln!("relais coordinator: {} not rotated: {e}", path.display());
         }
     }
     let mut options = std::fs::OpenOptions::new();
@@ -1276,7 +1285,10 @@ fn daemon_log() -> std::process::Stdio {
         Ok(file) => file.into(),
         // Said on the starting CLI's stderr, the one place left to say it.
         Err(e) => {
-            coordinator_log!("no daemon log at {}: {e}", path.display());
+            eprintln!(
+                "relais coordinator: no daemon log at {}: {e}",
+                path.display()
+            );
             std::process::Stdio::null()
         }
     }
@@ -1377,10 +1389,32 @@ fn deliver_signals(state: &Mutex<AdmissionState>, signals: Vec<PendingSignal>) {
     }
 }
 
+/// A connection waiting for a handler, with the instant it was accepted.
+type Queued = (Stream, Instant);
+
+/// What is known of a request while it is served, kept on every exit
+/// path so the slow-request line can name it even when serving fails.
+struct Served {
+    kind: &'static str,
+    timings: PhaseTimings,
+}
+
+impl Served {
+    fn new(queued: Duration) -> Self {
+        Served {
+            kind: "unread",
+            timings: PhaseTimings {
+                queued,
+                ..PhaseTimings::default()
+            },
+        }
+    }
+}
+
 /// One handler thread: take connections off the queue until the queue's
 /// last sender is gone.
 fn handler_loop(
-    queue: &Mutex<std::sync::mpsc::Receiver<Stream>>,
+    queue: &Mutex<std::sync::mpsc::Receiver<Queued>>,
     state: &Mutex<AdmissionState>,
     store: &GroupStore,
     shutdown: &std::sync::atomic::AtomicBool,
@@ -1394,13 +1428,18 @@ fn handler_loop(
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             queue.recv()
         };
-        let Ok(stream) = next else { return };
-        match handle_connection(stream, state, store, shutdown) {
-            Ok(Some(slow)) => coordinator_log!("{slow}"),
-            Ok(None) => {}
-            // The connection is gone and there is nobody left to tell;
-            // the daemon keeps serving every other one.
-            Err(e) => coordinator_log!("connection: {e}"),
+        let Ok((stream, accepted)) = next else { return };
+        let mut served = Served::new(accepted.elapsed());
+        let outcome = handle_connection(stream, state, store, shutdown, &mut served);
+        // The slow line is written whether or not serving succeeded: a
+        // reply that fails because the client gave up is the slow one.
+        if let Some(slow) = slow_request_line(served.kind, &served.timings) {
+            log_line(&slow);
+        }
+        // The connection is gone and there is nobody left to tell; the
+        // daemon keeps serving every other one.
+        if let Err(e) = outcome {
+            coordinator_log!("connection ({}): {e}", served.kind);
         }
     }
 }
@@ -1421,7 +1460,8 @@ fn handle_connection(
     state: &Mutex<AdmissionState>,
     store: &GroupStore,
     shutdown: &std::sync::atomic::AtomicBool,
-) -> Result<Option<String>, CoordinatorError> {
+    served: &mut Served,
+) -> Result<(), CoordinatorError> {
     let io = |operation: &'static str| {
         move |cause: std::io::Error| CoordinatorError::Io { operation, cause }
     };
@@ -1437,13 +1477,12 @@ fn handle_connection(
         .take(MAX_REQUEST_BYTES);
     let mut writer = stream;
     let mut line = String::new();
-    let mut timings = PhaseTimings::default();
     let phase = Instant::now();
-    let mut read = reader
-        .read_line(&mut line)
-        .map_err(io("reading the request"))?;
+    let first = reader.read_line(&mut line);
+    served.timings.read = phase.elapsed();
+    let mut read = first.map_err(io("reading the request"))?;
     if read == 0 {
-        return Ok(None);
+        return Ok(());
     }
     let mut cap = MAX_REQUEST_BYTES;
     // Only a native registration may exceed the ordinary cap: read on
@@ -1454,17 +1493,16 @@ fn handle_connection(
     {
         cap = MAX_NATIVE_REQUEST_BYTES;
         reader.set_limit(MAX_NATIVE_REQUEST_BYTES - MAX_REQUEST_BYTES);
-        read += reader
-            .read_line(&mut line)
-            .map_err(io("reading the request"))?;
+        let more = reader.read_line(&mut line);
+        served.timings.read = phase.elapsed();
+        read += more.map_err(io("reading the request"))?;
     }
-    timings.read = phase.elapsed();
     let oversized = read as u64 == cap && !line.ends_with('\n');
     let mut signals = Vec::new();
     let mut journaled = None;
     // The kind of the request served, from its typed value; a line that
     // was refused before it became one is named for why.
-    let mut kind = "oversized";
+    served.kind = "oversized";
     let response = if oversized {
         Response::Error {
             detail: format!("request exceeds {cap} bytes"),
@@ -1472,7 +1510,7 @@ fn handle_connection(
     } else {
         match serde_json::from_str::<Request>(line.trim()) {
             Ok(Request::Shutdown) => {
-                kind = Request::Shutdown.method();
+                served.kind = Request::Shutdown.method();
                 shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
                 Response::Ack
             }
@@ -1481,26 +1519,26 @@ fn handle_connection(
             // reads at the client as "EOF while parsing" and loses
             // whatever the call was about (A11).
             Ok(request) if shutdown.load(std::sync::atomic::Ordering::SeqCst) => {
-                kind = request.method();
+                served.kind = request.method();
                 Response::ShuttingDown
             }
             Ok(request) => {
-                kind = request.method();
+                served.kind = request.method();
                 let waiting = Instant::now();
                 let mut guard = lock_state(state);
-                timings.admission_wait = waiting.elapsed();
+                served.timings.admission_wait = waiting.elapsed();
                 let handling = Instant::now();
                 let before = guard.group_journal_end();
                 let (response, pending) = handle(request, &mut guard, Instant::now());
                 let after = guard.group_journal_end();
                 drop(guard);
-                timings.handling = handling.elapsed();
+                served.timings.handling = handling.elapsed();
                 journaled = (after > before).then_some(after);
                 signals = pending;
                 response
             }
             Err(e) => {
-                kind = "unparseable";
+                served.kind = "unparseable";
                 Response::Error {
                     detail: format!("unparseable request: {e}"),
                 }
@@ -1512,22 +1550,22 @@ fn handle_connection(
     // may be stopped.
     let phase = Instant::now();
     deliver_signals(state, signals);
-    timings.signals = phase.elapsed();
+    served.timings.signals = phase.elapsed();
     // A group binding or its removal is durable before the caller hears of
     // it (SPEC §23). A request that changed none waits on no write.
     let phase = Instant::now();
     if let Some(end) = journaled {
         store.flush_through(state, end);
     }
-    timings.flush = phase.elapsed();
+    served.timings.flush = phase.elapsed();
     let payload = serde_json::to_string(&response).map_err(|e| CoordinatorError::Protocol {
         operation: "serializing the response",
         detail: e.to_string(),
     })?;
     let phase = Instant::now();
-    writeln!(writer, "{payload}").map_err(io("writing the response"))?;
-    writer.flush().map_err(io("flushing the response"))?;
-    timings.write = phase.elapsed();
+    let written = writeln!(writer, "{payload}").and_then(|()| writer.flush());
+    served.timings.write = phase.elapsed();
+    written.map_err(io("writing the response"))?;
     if oversized {
         // The answer is written, but the client is still sending the
         // rest of its over-long request. Dropping the stream now closes
@@ -1541,7 +1579,7 @@ fn handle_connection(
         let _ = writer.shutdown_write();
         drain_and_discard(&writer);
     }
-    Ok(slow_request_line(kind, &timings))
+    Ok(())
 }
 
 /// Briefly read and throw away whatever the peer is still sending, so
@@ -4361,8 +4399,14 @@ mod tests {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 let stream = listener.accept().expect("accept").expect("a connection");
-                handle_connection(stream, &state, &GroupStore::new(None), &shutdown)
-                    .expect("answered");
+                handle_connection(
+                    stream,
+                    &state,
+                    &GroupStore::new(None),
+                    &shutdown,
+                    &mut Served::new(Duration::ZERO),
+                )
+                .expect("answered");
             });
             let err = Client::new(socket.clone())
                 .request(&Request::RegisterRun {
@@ -4393,6 +4437,7 @@ mod tests {
     #[test]
     fn a_request_over_the_threshold_names_its_kind_and_phases() {
         let timings = PhaseTimings {
+            queued: Duration::from_millis(4),
             read: Duration::from_millis(5),
             admission_wait: Duration::from_millis(6),
             handling: Duration::from_millis(7),
@@ -4403,7 +4448,8 @@ mod tests {
         let line = slow_request_line("bind_group", &timings).expect("slow");
         for part in [
             "bind_group",
-            "total 2535ms",
+            "total 2539ms",
+            "queued 4ms",
             "read 5ms",
             "admission_wait 6ms",
             "handling 7ms",
@@ -4426,31 +4472,150 @@ mod tests {
         );
     }
 
-    /// `method()` names a request as its wire tag does.
+    /// `method()` names every request as its wire tag does.
     #[test]
     fn a_request_kind_is_its_method_tag() {
-        for request in [
+        let id = || String::from("d");
+        let run = || String::from("r");
+        let session = || String::from("s");
+        let agent = || String::from("a");
+        let requests = vec![
             Request::Ping,
-            Request::Shutdown,
-            Request::Release {
-                dispatch_id: "d".into(),
+            Request::RegisterSession {
+                session_id: session(),
             },
+            Request::RegisterRun {
+                registration: registration("r", "s"),
+            },
+            Request::RequestAdmission {
+                request: request("d", "r", "s"),
+            },
+            Request::Bind {
+                dispatch_id: id(),
+                agent_id: None,
+                pid: None,
+            },
+            Request::Heartbeat { dispatch_id: id() },
             Request::BindGroup {
-                dispatch_id: "d".into(),
+                dispatch_id: id(),
                 runner: 1,
                 pgid: 2,
             },
-        ] {
-            let wire = serde_json::to_value(&request).expect("serializes");
+            Request::AcknowledgeCancel { dispatch_id: id() },
+            Request::MarkWaiting { dispatch_id: id() },
+            Request::Resume { dispatch_id: id() },
+            Request::Release { dispatch_id: id() },
+            Request::Settle {
+                dispatch_id: id(),
+                spent_micros: None,
+            },
+            Request::Withdraw { dispatch_id: id() },
+            Request::BindAgentLease {
+                dispatch_id: id(),
+                agent_id: agent(),
+                provenance: Provenance::Known,
+            },
+            Request::SettleByAgent {
+                session_id: session(),
+                agent_id: agent(),
+                spent_micros: None,
+            },
+            Request::RegisterNative {
+                session_id: session(),
+                dispatch_id: id(),
+                ask: NativeAsk::Continue {
+                    agent_id: agent(),
+                    message: "m".into(),
+                },
+            },
+            Request::ClaimNative {
+                session_id: session(),
+                dispatch_id: id(),
+                to: None,
+            },
+            Request::NativeWorktree {
+                session_id: session(),
+                name: "n".into(),
+            },
+            Request::BindNative {
+                session_id: session(),
+                dispatch_id: id(),
+                agent_id: agent(),
+            },
+            Request::StopNative {
+                session_id: session(),
+                agent_id: agent(),
+                last_assistant_message: None,
+            },
+            Request::NativeHello {
+                session_id: session(),
+            },
+            Request::NativeHelloAge {
+                session_id: session(),
+            },
+            Request::NativeBound {
+                dispatch_id: id(),
+                agent_id: agent(),
+            },
+            Request::NativeStopped {
+                dispatch_id: id(),
+                report: StoppedReport {
+                    agent_id: agent(),
+                    status: crate::admission::AgentStatus::Completed,
+                    usage: None,
+                    answer: None,
+                },
+            },
+            Request::IsNativeAgent {
+                session_id: session(),
+                agent_id: agent(),
+            },
+            Request::NativeStatus { dispatch_id: id() },
+            Request::FinishRun { run_id: run() },
+            Request::AcquireWrite {
+                dispatch_id: id(),
+                worktree: "w".into(),
+            },
+            Request::ReleaseWrite {
+                dispatch_id: id(),
+                worktree: "w".into(),
+            },
+            Request::WriteLeaseHolder {
+                worktree: "w".into(),
+            },
+            Request::AcquireTraining {
+                registration: registration("r", "s"),
+                request: request("d", "r", "s"),
+                pid: 1,
+                started_at: "t".into(),
+            },
+            Request::EndTraining {
+                dispatch_id: id(),
+                run_id: run(),
+            },
+            Request::CancelDispatch { dispatch_id: id() },
+            Request::CancelRun { run_id: run() },
+            Request::CancelSession {
+                session_id: session(),
+            },
+            Request::Status,
+            Request::Shutdown,
+        ];
+        assert_eq!(requests.len(), 37, "one value per variant");
+        for request in &requests {
+            let wire = serde_json::to_value(request).expect("serializes");
             assert_eq!(wire["method"], request.method(), "{request:?}");
         }
     }
 
     /// The bind_group of the busy-ledger case, served directly: its flush
-    /// waits on the ledger's write lock and the slow-request line says so.
+    /// waits on the ledger's write lock, the client gives up before the
+    /// late reply (the #284 case), and the slow-request line is still
+    /// there with the request's kind and its flush phase.
     #[cfg(unix)]
     #[test]
-    fn a_slow_bind_group_is_reported_with_its_flush_phase() {
+    fn a_slow_bind_group_is_reported_even_when_the_client_gave_up() {
+        use std::io::Read as _;
         use std::os::unix::process::CommandExt;
         let dir = crate::test_support::short_temp_dir("slow-flush");
         let ledger = Ledger::open(&dir.join("ledger.db")).expect("ledger");
@@ -4478,22 +4643,37 @@ mod tests {
             conn.execute_batch("ROLLBACK").expect("unlock");
         });
         is_locked.recv().expect("locked");
-        let pgid = check.id();
-        let slow = std::thread::scope(|scope| {
+        let request = serde_json::to_string(&Request::BindGroup {
+            dispatch_id: "held".into(),
+            runner: std::process::id(),
+            pgid: check.id(),
+        })
+        .expect("request");
+        let mut served = Served::new(Duration::from_millis(7));
+        std::thread::scope(|scope| {
             let server = scope.spawn(|| {
                 let stream = listener.accept().expect("accept").expect("a connection");
-                handle_connection(stream, &state, &store, &shutdown).expect("served")
+                let _ = handle_connection(stream, &state, &store, &shutdown, &mut served);
             });
-            let bound =
-                RemoteGate::new(socket.clone()).bind_group("held", std::process::id(), pgid);
-            assert!(matches!(bound, Ok(BindOutcome::Bound)), "{bound:?}");
-            server.join().expect("server")
+            let mut client = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
+            writeln!(client, "{request}").expect("send");
+            client
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .expect("timeout");
+            let mut reply = String::new();
+            assert!(
+                client.read_to_string(&mut reply).is_err(),
+                "the reply is late"
+            );
+            drop(client);
+            server.join().expect("server");
         });
         holder.join().expect("holder");
         check.kill().ok();
         check.wait().ok();
-        let line = slow.expect("a slow-request line");
+        let line = slow_request_line(served.kind, &served.timings).expect("a slow-request line");
         assert!(line.contains("bind_group"), "{line}");
+        assert!(line.contains("queued 7ms"), "{line}");
         let flush_ms: u128 = line
             .split("flush ")
             .nth(1)
