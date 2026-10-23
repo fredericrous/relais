@@ -1403,6 +1403,65 @@ mod tests {
         assert!(manifest.architecture.resolved.is_empty());
     }
 
+    fn two_rules_with_note(code_rules: Vec<guidance::CodeRule>, notes: Vec<GuidanceGap>) -> Guided {
+        Guided {
+            rules: Ok(Rules {
+                rules: vec![rule("errors.never-swallowed"), rule("errors.typed-values")],
+                code_rules,
+                notes,
+                ..Rules::default()
+            }),
+            relevant: Ok(Relevant::default()),
+        }
+    }
+
+    fn assert_fallback_keeps_every_id_and_names_the_fix(cause: guidance::GapCause) {
+        let note = GuidanceGap::new(
+            GuidanceSource::CodeRules,
+            cause,
+            "code rules are not carried; upgrade aval or run `aval add`",
+        );
+        let resolver = two_rules_with_note(Vec::new(), vec![note]);
+        let manifest = assemble(inputs(&contract(&[]), &repo(), &resolver)).expect("assembles");
+        let guidance = &manifest.guidance;
+        assert_eq!(
+            guidance.index,
+            ["errors.never-swallowed", "errors.typed-values"]
+        );
+        let line = guidance::gap_line(&guidance.gaps).expect("the gap is reported");
+        assert!(line.contains("code rules missing"), "{line}");
+        assert!(
+            line.contains("upgrade aval") || line.contains("aval add"),
+            "{line}"
+        );
+        assert!(!line.contains("index missing"), "{line}");
+    }
+
+    #[test]
+    fn a_code_rule_stays_out_of_the_index_but_in_the_rules() {
+        let code_rule = guidance::CodeRule {
+            id: "errors.typed-values".into(),
+            ..guidance::CodeRule::default()
+        };
+        let resolver = two_rules_with_note(vec![code_rule], Vec::new());
+        let manifest = assemble(inputs(&contract(&[]), &repo(), &resolver)).expect("assembles");
+        let guidance = &manifest.guidance;
+        assert_eq!(guidance.index, ["errors.never-swallowed"]);
+        assert_eq!(guidance.rules.len(), 2);
+        assert_eq!(guidance.code_rules.len(), 1);
+        assert_eq!(guidance.code_rules[0].id, "errors.typed-values");
+    }
+
+    #[test]
+    fn an_old_aval_fallback_keeps_every_id_in_the_index() {
+        assert_fallback_keeps_every_id_and_names_the_fix(guidance::GapCause::AvalTooOld);
+    }
+
+    #[test]
+    fn a_stale_pack_fallback_keeps_every_id_in_the_index() {
+        assert_fallback_keeps_every_id_and_names_the_fix(guidance::GapCause::StalePack);
+    }
+
     #[test]
     fn a_binding_key_is_not_repeated_among_the_relevant_ones() {
         let c = contract(&["a.b"]);
