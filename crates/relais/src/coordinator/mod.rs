@@ -4653,7 +4653,7 @@ mod tests {
         std::thread::scope(|scope| {
             let server = scope.spawn(|| {
                 let stream = listener.accept().expect("accept").expect("a connection");
-                let _ = handle_connection(stream, &state, &store, &shutdown, &mut served);
+                handle_connection(stream, &state, &store, &shutdown, &mut served)
             });
             let mut client = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
             writeln!(client, "{request}").expect("send");
@@ -4666,7 +4666,12 @@ mod tests {
                 "the reply is late"
             );
             drop(client);
-            server.join().expect("server");
+            // The client is gone before the reply: writing it fails, and
+            // the slow line below is the one that error path kept.
+            assert!(
+                server.join().expect("server").is_err(),
+                "the late reply's write fails"
+            );
         });
         holder.join().expect("holder");
         check.kill().ok();
