@@ -40,7 +40,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -66,9 +66,9 @@ pub const HOST_SLOT_ENV: &str = "AMONT_HOST_SLOT";
 pub const LEASE_HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 
 /// How long an unreachable coordinator is retried before the run stops.
-/// Ten minutes, because a machine-wide stall of 5 minutes was observed on
-/// 2026-10-22: a bound under that would stop runs that a short wait saves.
-pub const UNREACHABLE_BOUND: Duration = Duration::from_secs(600);
+/// Two minutes: it covers a reply slower than the 5 s request timeout and a
+/// coordinator restart or re-election, with margin.
+pub const UNREACHABLE_BOUND: Duration = Duration::from_secs(120);
 
 /// The first wait between tries of an unreachable coordinator; it doubles
 /// up to [`UNREACHABLE_BACKOFF_MAX`].
@@ -101,6 +101,63 @@ pub struct ThreadSleeper;
 impl Sleeper for ThreadSleeper {
     fn sleep(&self, duration: Duration) {
         std::thread::sleep(duration);
+    }
+}
+
+/// Randomness, made injectable: the wait between tries of an unreachable
+/// coordinator is drawn through this, so a test fixes the draw.
+pub trait Jitter: Send + Sync {
+    /// A duration in `[0, max]`.
+    fn within(&self, max: Duration) -> Duration;
+}
+
+/// The real thing: a splitmix64 stream seeded once per process from values
+/// the boundary hands in (run id, pid, time), so runs that start together
+/// do not retry together.
+pub struct SeededJitter {
+    state: AtomicU64,
+}
+
+impl SeededJitter {
+    /// A stream from the run id, the process id and a time in nanoseconds.
+    pub fn new(run_id: &str, pid: u32, nanos: u128) -> Self {
+        let mut seed = nanos as u64 ^ ((nanos >> 64) as u64) ^ (u64::from(pid) << 32);
+        for byte in run_id.bytes() {
+            seed = (seed ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        Self {
+            state: AtomicU64::new(seed),
+        }
+    }
+
+    /// The stream of this process: reads the pid and the clock, at the
+    /// boundary where the admission is built.
+    pub fn for_process(run_id: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        Self::new(run_id, std::process::id(), nanos)
+    }
+
+    fn next(&self) -> u64 {
+        let step = self
+            .state
+            .fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
+            .wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = step;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+}
+
+impl Jitter for SeededJitter {
+    fn within(&self, max: Duration) -> Duration {
+        let millis = u64::try_from(max.as_millis()).unwrap_or(u64::MAX);
+        match millis.checked_add(1) {
+            Some(span) => Duration::from_millis(self.next() % span),
+            None => Duration::from_millis(self.next()),
+        }
     }
 }
 
@@ -299,6 +356,9 @@ pub struct HeavyAdmission<'a> {
     pub heartbeat_every: Duration,
     /// How a queued command waits.
     pub sleeper: Arc<dyn Sleeper>,
+    /// Where the jitter of the retries of an unreachable coordinator comes
+    /// from.
+    pub jitter: Arc<dyn Jitter>,
     /// What the run registered with the coordinator, to register again
     /// once if a restarted coordinator does not know it.
     pub registration: Option<RunRegistration>,
@@ -333,6 +393,9 @@ impl<'a> HeavyAdmission<'a> {
             announce_every: ANNOUNCE_EVERY,
             heartbeat_every: LEASE_HEARTBEAT_EVERY,
             sleeper: Arc::new(ThreadSleeper),
+            // No gate is asked here, so nothing is drawn: a fixed stream,
+            // with no clock or pid read for it.
+            jitter: Arc::new(SeededJitter::new("", 0, 0)),
             registration: None,
             tries: Tries::default(),
             disk: DiskCheck::off(),
@@ -367,7 +430,8 @@ impl<'a> HeavyAdmission<'a> {
     }
 
     /// Ask the coordinator. An unreachable coordinator is retried with
-    /// backoff (1 s doubling to 30 s) for [`UNREACHABLE_BOUND`] of wall time,
+    /// full-jitter backoff (a random wait in `[0, backoff]`, the backoff
+    /// 1 s doubling to 30 s) for [`UNREACHABLE_BOUND`] of wall time,
     /// emitting a `waiting_for_slot` of class
     /// [`COORDINATOR_UNREACHABLE_CLASS`] on each retry. Once, when it has
     /// forgotten the run (a restart empties its registry), register the run
@@ -446,11 +510,12 @@ impl<'a> HeavyAdmission<'a> {
             position: 0,
             waited_s: spent.as_secs(),
         });
-        let pause = state
-            .next
-            .max(UNREACHABLE_BACKOFF_START)
+        let backoff = state.next.max(UNREACHABLE_BACKOFF_START);
+        state.next = (backoff * 2).min(UNREACHABLE_BACKOFF_MAX);
+        let pause = self
+            .jitter
+            .within(backoff.min(UNREACHABLE_BACKOFF_MAX))
             .min(UNREACHABLE_BOUND - spent);
-        state.next = (pause * 2).min(UNREACHABLE_BACKOFF_MAX);
         let slice = self.poll.max(Duration::from_millis(1));
         let mut left = pause;
         while !left.is_zero() {

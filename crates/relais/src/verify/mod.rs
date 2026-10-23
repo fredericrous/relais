@@ -40,8 +40,8 @@ mod junit;
 pub use end::CheckEnd;
 pub use heavy::{
     ancestor_holds_slots, child_environment, cores, default_heavy_commands, dispatch_id, heavy_cap,
-    overweight, parallelism, Admitted, Ask, HeavyAdmission, LeaseStop, Sleeper, ThreadSleeper,
-    Tries, ANNOUNCE_EVERY, HOST_SLOT_ENV, LEASE_HEARTBEAT_EVERY,
+    overweight, parallelism, Admitted, Ask, HeavyAdmission, Jitter, LeaseStop, SeededJitter,
+    Sleeper, ThreadSleeper, Tries, ANNOUNCE_EVERY, HOST_SLOT_ENV, LEASE_HEARTBEAT_EVERY,
 };
 pub use junit::{parse_junit, parse_report, JunitArtifact, JunitError, JunitReport, TestOutcome};
 

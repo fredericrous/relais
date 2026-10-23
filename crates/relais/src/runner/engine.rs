@@ -694,6 +694,7 @@ impl<'a> RunEngine<'a> {
             announce_every: verify::ANNOUNCE_EVERY,
             heartbeat_every: verify::LEASE_HEARTBEAT_EVERY,
             sleeper: Arc::new(verify::ThreadSleeper),
+            jitter: Arc::new(verify::SeededJitter::for_process(self.run_id.as_str())),
             registration: self.registration.clone(),
             tries: self.heavy_tries.clone(),
             exhausted: |ended, tail| crate::exhaustion::classify(ended, tail).is_some(),

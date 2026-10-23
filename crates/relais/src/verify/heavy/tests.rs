@@ -107,6 +107,40 @@ fn register(gate: &LocalGate, run: &str) {
     .expect("register");
 }
 
+/// A jitter source that always draws the whole backoff.
+struct Full;
+
+impl Jitter for Full {
+    fn within(&self, max: Duration) -> Duration {
+        max
+    }
+}
+
+/// A jitter source that draws the given thousandths of each backoff, in
+/// order, and remembers each backoff it was asked about.
+struct Scripted {
+    permille: Vec<u32>,
+    asked: Mutex<Vec<Duration>>,
+}
+
+impl Scripted {
+    fn new(permille: &[u32]) -> Arc<Self> {
+        Arc::new(Self {
+            permille: permille.to_vec(),
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl Jitter for Scripted {
+    fn within(&self, max: Duration) -> Duration {
+        let mut asked = self.asked.lock().expect("asked");
+        let share = self.permille[asked.len() % self.permille.len()];
+        asked.push(max);
+        max * share / 1000
+    }
+}
+
 fn admission<'a>(
     gate: &'a (dyn Gate + Sync),
     run: &str,
@@ -127,6 +161,7 @@ fn admission<'a>(
         announce_every: ANNOUNCE_EVERY,
         heartbeat_every: Duration::from_millis(10),
         sleeper: Arc::new(ThreadSleeper),
+        jitter: Arc::new(Full),
         registration: None,
         tries: Tries::default(),
         exhausted: |_, _| false,
@@ -665,10 +700,10 @@ fn a_coordinator_that_cannot_be_reached_is_a_gate_error_after_the_bounded_retry_
         panic!("expected a gate error, not a refusal");
     };
     assert!(error.unavailable());
-    assert!(error.to_string().contains("retried for 600 s"), "{error}");
+    assert!(error.to_string().contains("retried for 120 s"), "{error}");
     assert_eq!(
         clock.now_millis(),
-        1_000_000 + 600_000,
+        1_000_000 + 120_000,
         "bounded, then stopped"
     );
 }
@@ -1375,6 +1410,7 @@ fn a_grant_whose_answer_was_lost_is_the_lease_on_retry() {
 fn an_unreachable_coordinator_is_retried_with_backoff_and_the_lease_is_granted() {
     let clock = ManualClock::new();
     let sleeper = Advancing::new(&clock);
+    let jitter = Scripted::new(&[750]);
     let gate = Flaky::new(6);
     let dir = temp_dir("unreachable-events");
     let mut heavy = admission(&gate, "run-r", 1, 4);
@@ -1382,19 +1418,24 @@ fn an_unreachable_coordinator_is_retried_with_backoff_and_the_lease_is_granted()
     heavy.poll = Duration::from_secs(60);
     heavy.events = Events::for_run_on("run-r", &dir, crate::protocol::Wire::to(std::io::sink()));
     heavy.sleeper = sleeper.clone();
+    heavy.jitter = jitter.clone();
     let env = BTreeMap::new();
     let lease = heavy.admit(&ask(&env, 1)).map_err(|e| e.to_string());
     let lease = lease.expect("granted after the coordinator came back");
     // `release` and `settle` are not wired in the fake gate.
     std::mem::forget(lease);
-    let slept: Vec<u64> = sleeper
-        .slept
-        .lock()
-        .expect("sleeps")
-        .iter()
-        .map(Duration::as_secs)
-        .collect();
-    assert_eq!(slept, vec![1, 2, 4, 8, 16, 30]);
+    let slept = sleeper.slept.lock().expect("sleeps").clone();
+    let backoffs = jitter.asked.lock().expect("asked").clone();
+    let secs = |n: &[u64]| {
+        n.iter()
+            .map(|s| Duration::from_secs(*s))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(backoffs, secs(&[1, 2, 4, 8, 16, 30]), "doubles, capped");
+    assert_eq!(slept.len(), backoffs.len());
+    for (wait, backoff) in slept.iter().zip(&backoffs) {
+        assert!(wait <= backoff, "{wait:?} within [0, {backoff:?}]");
+    }
     assert_eq!(gate.calls.load(Ordering::SeqCst), 7);
     let written = std::fs::read_to_string(dir.join("events.jsonl")).expect("events");
     let waits: Vec<&str> = written
@@ -1403,9 +1444,53 @@ fn an_unreachable_coordinator_is_retried_with_backoff_and_the_lease_is_granted()
         .collect();
     assert_eq!(waits.len(), 6, "{written}");
     assert!(waits[0].contains("\"waited_s\":0"), "{}", waits[0]);
-    assert!(waits[1].contains("\"waited_s\":1"), "{}", waits[1]);
-    assert!(waits[5].contains("\"waited_s\":31"), "{}", waits[5]);
+    assert!(waits[1].contains("\"waited_s\":0"), "{}", waits[1]);
+    assert!(waits[5].contains("\"waited_s\":"), "{}", waits[5]);
     assert!(waits[5].contains("\"position\":0"), "{}", waits[5]);
+}
+
+#[test]
+fn a_fixed_jitter_source_gives_an_exact_jittered_sequence() {
+    let clock = ManualClock::new();
+    let sleeper = Advancing::new(&clock);
+    let gate = Flaky::new(6);
+    let mut heavy = admission(&gate, "run-j", 1, 4);
+    heavy.budgets = budgets_on(&clock, 1800);
+    heavy.poll = Duration::from_secs(60);
+    heavy.sleeper = sleeper.clone();
+    heavy.jitter = Scripted::new(&[500, 250, 750, 1000, 0, 100]);
+    let env = BTreeMap::new();
+    std::mem::forget(
+        heavy
+            .admit(&ask(&env, 1))
+            .map_err(|e| e.to_string())
+            .expect("granted"),
+    );
+    let slept: Vec<u128> = sleeper
+        .slept
+        .lock()
+        .expect("sleeps")
+        .iter()
+        .map(Duration::as_millis)
+        .collect();
+    // 1 s*0.5, 2 s*0.25, 4 s*0.75, 8 s*1, 16 s*0 (no sleep), 30 s*0.1.
+    assert_eq!(slept, vec![500, 500, 3000, 8000, 3000]);
+}
+
+#[test]
+fn the_seeded_jitter_stays_within_zero_and_the_backoff_and_differs_by_seed() {
+    let a = SeededJitter::new("run-a", 1, 42);
+    let b = SeededJitter::new("run-b", 1, 42);
+    let max = Duration::from_secs(30);
+    let draws_a: Vec<Duration> = (0..200).map(|_| a.within(max)).collect();
+    let draws_b: Vec<Duration> = (0..200).map(|_| b.within(max)).collect();
+    assert!(draws_a.iter().all(|d| *d <= max));
+    assert!(draws_a.iter().any(|d| !d.is_zero()));
+    assert_ne!(draws_a, draws_b);
+    assert_eq!(
+        SeededJitter::new("r", 1, 1).within(Duration::ZERO),
+        Duration::ZERO
+    );
 }
 
 #[test]
@@ -1422,12 +1507,13 @@ fn an_unreachable_coordinator_is_given_up_on_after_the_bound() {
         panic!("expected a gate stop");
     };
     assert!(error.unavailable());
-    assert!(error.to_string().contains("retried for 600 s"), "{error}");
+    assert!(error.to_string().contains("retried for 120 s"), "{error}");
     let total: Duration = sleeper.slept.lock().expect("sleeps").iter().sum();
     assert_eq!(total, UNREACHABLE_BOUND);
-    assert_eq!(clock.now_millis(), 1_000_000 + 600_000);
-    // 1+2+4+8+16 then 30s steps: 31 + 30*k, the last clamped to the bound.
-    assert!(gate.calls.load(Ordering::SeqCst) > 10);
+    assert_eq!(clock.now_millis(), 1_000_000 + 120_000);
+    // Whole backoffs 1+2+4+8+16 (31 s), then 30 + 30, then 29 s clamped
+    // to the bound: eight sleeps, nine asks.
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 9);
 }
 
 #[test]
