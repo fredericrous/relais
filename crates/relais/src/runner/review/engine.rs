@@ -14,10 +14,12 @@ use crate::verify;
 use crate::workspace;
 
 use super::{
-    patch_section, report_review_prompt, review_verdict, reviewer_tier, stage_patch, ReviewOutcome,
-    ReviewPurpose, ReviewRequest, ReviewSeat, StagedPatch, UnavailableCause,
-    REVIEW_CONSTRAINTS_BUDGET_BYTES, REVIEW_MIN_WALL, REVIEW_PART_TIMEOUT,
+    merge_reviewer_gaps, patch_section, report_review_prompt, review_verdict, reviewer_decisions,
+    reviewer_tier, stage_patch, ReviewOutcome, ReviewPurpose, ReviewRequest, ReviewSeat,
+    StagedPatch, UnavailableCause, REVIEW_CONSTRAINTS_BUDGET_BYTES, REVIEW_MIN_WALL,
+    REVIEW_PART_TIMEOUT,
 };
+use crate::runner::prompt::DECISION_PRECEDENCE;
 use crate::runner::{
     data_block, data_list_block, effort_str, reviewer_guidance, utc_day_start, Budget, Candidate,
     Ceiling, ManagedDispatch, Reason, RunEngine, RunError, RunSpend, State,
@@ -388,6 +390,7 @@ impl<'a> RunEngine<'a> {
              It blocks like an unmet acceptance criterion. Violations that were already there \
              and are unchanged are not reported.\n",
         );
+        prompt.push_str(DECISION_PRECEDENCE);
         prompt.push('\n');
         prompt.push_str(&data_block("objective", &self.config.contract.objective));
         prompt.push_str(&data_list_block(
@@ -410,6 +413,14 @@ impl<'a> RunEngine<'a> {
         let (guidance_text, reviewer_gap) =
             reviewer_guidance(&request.manifest.guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES);
         prompt.push_str(&guidance_text);
+        let (decisions_text, decisions_gap) = reviewer_decisions(
+            self.config.aval_resolver,
+            &staged.files,
+            REVIEW_CONSTRAINTS_BUDGET_BYTES,
+            guidance_text.len(),
+        );
+        prompt.push_str(&decisions_text);
+        let reviewer_gap = merge_reviewer_gaps(reviewer_gap, decisions_gap);
         match self.config.ledger.intent_of_run(&self.run_id) {
             Ok(Some(intent)) => prompt.push_str(&super::widened_scope_block(&intent.scope_delta)),
             Ok(None) => {}

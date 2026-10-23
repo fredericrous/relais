@@ -25,7 +25,7 @@ pub const GUIDANCE_BUDGET_BYTES: usize = 16 * 1024;
 pub const OBJECTIVE_ARGV_BYTES: usize = 2048;
 
 /// How many ranked entries aval is asked for.
-pub const RELEVANT_TOP: usize = 5;
+pub const RELEVANT_TOP: usize = 20;
 
 /// Which part of the guidance a gap is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +39,9 @@ pub enum GuidanceSource {
     Relevant,
     /// The full statements the reviewer prompt carries.
     Reviewer,
+    /// `aval relevant` for the paths the candidate patch changes: the
+    /// decisions the reviewer is given.
+    Decisions,
 }
 
 /// Guidance that is missing, and why. Its own type: a guidance failure is
@@ -94,6 +97,7 @@ impl GuidanceGap {
             GuidanceSource::CodeRules => "code rules missing",
             GuidanceSource::Relevant => "relevant missing",
             GuidanceSource::Reviewer => "reviewer constraints partial",
+            GuidanceSource::Decisions => "reviewer decisions missing",
         };
         format!("{what} ({})", self.detail)
     }
@@ -565,6 +569,34 @@ pub fn relevant_args(query: &RelevantQuery) -> Vec<String> {
     args
 }
 
+/// The argv of `aval relevant` for the paths a candidate patch changes: the
+/// joined `--path=` form, one per file, and no objective text.
+pub fn decisions_args(paths: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "relevant".to_string(),
+        "--json".to_string(),
+        "--top".to_string(),
+        RELEVANT_TOP.to_string(),
+    ];
+    args.extend(paths.iter().map(|path| format!("--path={path}")));
+    args
+}
+
+/// The ranked keys aval returns for `paths`, through `run` (one bounded
+/// spawn of the given argv). A failure is a gap of `Decisions`.
+pub fn fetch_decisions(
+    run: &dyn Fn(&[String]) -> Result<String, GuidanceGap>,
+    paths: &[String],
+) -> Result<Vec<RankedKey>, GuidanceGap> {
+    let stdout = run(&decisions_args(paths))?;
+    parse_relevant_output(&stdout)
+        .map(|relevant| relevant.keys)
+        .map_err(|gap| GuidanceGap {
+            source: GuidanceSource::Decisions,
+            ..gap
+        })
+}
+
 /// The argv of `aval rules` for the constraints, full text included.
 pub fn rules_args() -> Vec<String> {
     ["rules", "--level", "constraint", "--full", "--json"]
@@ -872,6 +904,46 @@ EOF"#;
             ),
             ["a/b", "README.md"]
         );
+    }
+
+    #[test]
+    fn the_worker_asks_for_the_top_20() {
+        let args = relevant_args(&RelevantQuery::default());
+        let top = args.iter().position(|arg| arg == "--top").expect("--top");
+        assert_eq!(args[top + 1], "20");
+    }
+
+    #[test]
+    fn the_decisions_argv_has_one_path_per_file_and_no_changed_flag() {
+        let args = decisions_args(&["a/b.rs".to_string(), "c.md".to_string()]);
+        assert_eq!(
+            args,
+            [
+                "relevant",
+                "--json",
+                "--top",
+                "20",
+                "--path=a/b.rs",
+                "--path=c.md"
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg.contains("changed")));
+    }
+
+    #[test]
+    fn decisions_come_from_a_bounded_spawn_and_a_failure_is_a_decisions_gap() {
+        let ok = fake_aval(
+            r#"printf '%s' '{"keys":[{"key":"k.k","state":"active","adr":"ADR-1","choice":"c"}],"rules":[]}'"#,
+        );
+        let keys = fetch_decisions(&ok, &["a".to_string()]).expect("keys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "k.k");
+        let failing = fake_aval("exit 3");
+        let gap = fetch_decisions(&failing, &["a".to_string()]).expect_err("gap");
+        assert_eq!(gap.cause, GapCause::Exited(3));
+        let garbled = fake_aval("printf '%s' nope");
+        let gap = fetch_decisions(&garbled, &["a".to_string()]).expect_err("gap");
+        assert_eq!(gap.source, GuidanceSource::Decisions);
     }
 
     #[test]

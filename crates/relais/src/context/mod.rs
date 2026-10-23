@@ -140,6 +140,12 @@ pub trait DecisionResolver {
     fn relevant(&self, _query: &RelevantQuery) -> Result<Relevant, GuidanceGap> {
         Ok(Relevant::default())
     }
+
+    /// The ranked keys that apply to the paths a candidate patch changes,
+    /// for the reviewer. Same failure policy; the default knows none.
+    fn decisions_for(&self, _paths: &[String]) -> Result<Vec<RankedKey>, GuidanceGap> {
+        Ok(Vec::new())
+    }
 }
 
 /// A closure is a resolver: the shape tests and the CLI both already use.
@@ -214,6 +220,22 @@ impl DecisionResolver for AvalCli {
             self.cancel.as_deref(),
         )
         .and_then(|stdout| guidance::parse_relevant_output(&stdout))
+    }
+
+    fn decisions_for(&self, paths: &[String]) -> Result<Vec<RankedKey>, GuidanceGap> {
+        guidance::fetch_decisions(
+            &|args| {
+                guidance::run_aval(
+                    "aval",
+                    args,
+                    &self.root,
+                    GuidanceSource::Decisions,
+                    crate::tooling::GUIDANCE_TIMEOUT,
+                    self.cancel.as_deref(),
+                )
+            },
+            paths,
+        )
     }
 }
 

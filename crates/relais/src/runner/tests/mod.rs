@@ -7943,7 +7943,201 @@ fn the_review_prompt_ends_with_the_verdict_instruction() {
         review.contains("is usually not the event that caused it"),
         "{review}"
     );
+    assert!(
+        review.contains(super::prompt::DECISION_PRECEDENCE.trim_end()),
+        "{review}"
+    );
     std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+#[test]
+fn the_worker_prompt_states_the_decision_precedence() {
+    let fixture = Fixture::new();
+    let contract = fixture.contract(Review::Off);
+    let manifest = manifest_with(Vec::new());
+    let prompt = build_prompt(&contract, &manifest, 1, None, AttemptKind::Initial).0;
+    let sentence = super::prompt::DECISION_PRECEDENCE.trim_end();
+    assert!(prompt.contains(sentence), "{prompt}");
+    assert!(
+        sentence.contains("an applicable decision outranks an adopted rule")
+            && sentence.contains("is not reported where a listed decision decides otherwise")
+            && sentence.contains("reported as uncertainty, not as permission"),
+        "{sentence}"
+    );
+}
+
+/// A resolver whose decisions for the changed files are the answer given,
+/// counting its calls.
+struct DecisionsFor {
+    answer: Result<Vec<crate::context::RankedKey>, crate::context::GuidanceGap>,
+    calls: std::cell::Cell<usize>,
+}
+
+impl crate::context::DecisionResolver for DecisionsFor {
+    fn resolve(&self, _key: &str, _scope: Option<&str>) -> AvalVerdict {
+        AvalVerdict::Unknown
+    }
+
+    fn decisions_for(
+        &self,
+        _paths: &[String],
+    ) -> Result<Vec<crate::context::RankedKey>, crate::context::GuidanceGap> {
+        self.calls.set(self.calls.get() + 1);
+        self.answer.clone()
+    }
+}
+
+fn ranked(key: &str, state: &str, choice: Option<&str>) -> crate::context::RankedKey {
+    crate::context::RankedKey {
+        key: key.to_string(),
+        state: context::guidance::RankState::from(state.to_string()),
+        adr: Some("ADR-0009".to_string()),
+        choice: choice.map(str::to_string),
+    }
+}
+
+#[test]
+fn the_reviewer_gets_the_active_decisions_for_the_changed_files() {
+    let resolver = DecisionsFor {
+        answer: Ok(vec![
+            ranked("workspace.local-reuse", "active", Some("fork in place")),
+            ranked("storage.engine", "undecided", None),
+        ]),
+        calls: std::cell::Cell::new(0),
+    };
+    let files = vec!["src/a.rs".to_string()];
+    let (text, gap) = super::review::reviewer_decisions(&resolver, &files, 4096, 0);
+    assert_eq!(gap, None);
+    let block = fenced(&text, "decisions that apply").expect("a decisions block");
+    assert!(
+        block.contains("`workspace.local-reuse` (ADR-0009): fork in place"),
+        "{block}"
+    );
+    assert!(!block.contains("storage.engine"), "{block}");
+}
+
+#[test]
+fn an_empty_patch_skips_the_decisions_call_and_records_no_gap() {
+    let resolver = DecisionsFor {
+        answer: Ok(vec![ranked("k.k", "active", Some("c"))]),
+        calls: std::cell::Cell::new(0),
+    };
+    let (text, gap) = super::review::reviewer_decisions(&resolver, &[], 4096, 0);
+    assert!(text.is_empty());
+    assert_eq!(gap, None);
+    assert_eq!(resolver.calls.get(), 0);
+}
+
+#[test]
+fn an_aval_failure_is_a_gap_and_the_review_text_is_just_empty() {
+    let failure = GuidanceGap::new(
+        GuidanceSource::Decisions,
+        context::guidance::GapCause::Exited(3),
+        "aval exit 3",
+    );
+    let resolver = DecisionsFor {
+        answer: Err(failure.clone()),
+        calls: std::cell::Cell::new(0),
+    };
+    let files = vec!["src/a.rs".to_string()];
+    let (text, gap) = super::review::reviewer_decisions(&resolver, &files, 4096, 0);
+    assert!(text.is_empty());
+    assert_eq!(gap, Some(failure));
+    assert_eq!(resolver.calls.get(), 1);
+}
+
+#[test]
+fn decisions_over_the_budget_are_dropped_whole_with_a_gap() {
+    let resolver = DecisionsFor {
+        answer: Ok(vec![
+            ranked("a.one", "active", Some("first")),
+            ranked("a.two", "active", Some(&"long ".repeat(100))),
+        ]),
+        calls: std::cell::Cell::new(0),
+    };
+    let files = vec!["src/a.rs".to_string()];
+    let (text, gap) = super::review::reviewer_decisions(&resolver, &files, 100, 0);
+    let block = fenced(&text, "decisions that apply").expect("the first fits");
+    assert!(
+        block.contains("a.one") && !block.contains("a.two"),
+        "{block}"
+    );
+    let gap = gap.expect("a gap");
+    assert_eq!(gap.source, GuidanceSource::Decisions);
+    assert!(gap.detail.ends_with("omitted: a.two"), "{}", gap.detail);
+}
+
+#[test]
+fn a_decision_overflow_quotes_the_whole_budget_when_rules_used_part_of_it() {
+    let resolver = DecisionsFor {
+        answer: Ok(vec![ranked("a.long", "active", Some(&"long ".repeat(100)))]),
+        calls: std::cell::Cell::new(0),
+    };
+    let files = vec!["src/a.rs".to_string()];
+    let whole_budget = REVIEW_CONSTRAINTS_BUDGET_BYTES;
+    let used_by_rules = whole_budget - 100;
+    let (_, gap) =
+        super::review::reviewer_decisions(&resolver, &files, whole_budget, used_by_rules);
+    let gap = gap.expect("a gap");
+    assert!(gap.detail.contains("98304"), "{}", gap.detail);
+    assert!(gap.detail.contains("omitted: a.long"), "{}", gap.detail);
+}
+
+#[test]
+fn an_active_decision_without_a_choice_is_shown_with_a_marker() {
+    let resolver = DecisionsFor {
+        answer: Ok(vec![ranked("a.nochoice", "active", None)]),
+        calls: std::cell::Cell::new(0),
+    };
+    let files = vec!["src/a.rs".to_string()];
+    let (text, gap) = super::review::reviewer_decisions(&resolver, &files, 4096, 0);
+    assert_eq!(gap, None);
+    let block = fenced(&text, "decisions that apply").expect("a decisions block");
+    assert!(block.contains("a.nochoice"), "{block}");
+    assert!(block.contains("(choice unavailable)"), "{block}");
+}
+
+/// A resolver whose decisions lookup fails.
+struct FailingDecisions;
+
+impl crate::context::DecisionResolver for FailingDecisions {
+    fn resolve(&self, _key: &str, _scope: Option<&str>) -> AvalVerdict {
+        AvalVerdict::Unknown
+    }
+
+    fn decisions_for(
+        &self,
+        _paths: &[String],
+    ) -> Result<Vec<crate::context::RankedKey>, crate::context::GuidanceGap> {
+        Err(GuidanceGap::new(
+            GuidanceSource::Decisions,
+            context::guidance::GapCause::Exited(3),
+            "aval exit 3",
+        ))
+    }
+}
+
+#[test]
+fn a_failing_decisions_lookup_still_reaches_the_review_verdict_and_is_a_receipt_line() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let backend = conditional_worker("relais task");
+    let outcome = fixture.execute_resolving(
+        &FailingDecisions,
+        &fixture.contract(Review::Required),
+        &repo,
+        &backend,
+    );
+    let Terminal::Accepted(receipt) = &outcome.terminal else {
+        panic!("expected acceptance after the review, got {outcome:?}");
+    };
+    let note = receipt
+        .verification
+        .notes
+        .iter()
+        .find(|note| note.starts_with("guidance:"))
+        .expect("a guidance line");
+    assert!(note.contains("reviewer decisions missing"), "{note}");
 }
 
 /// A worker that ends with `relais-blocked:` is blocked, not repaired.

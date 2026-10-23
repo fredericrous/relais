@@ -8,6 +8,12 @@ use super::{
 /// What the worker's full-text code rules may occupy, in bytes.
 pub(super) const WORKER_CODE_RULES_BUDGET_BYTES: usize = 64 * 1024;
 
+/// aval's precedence, as the worker and the reviewer are both told it.
+pub(in crate::runner) const DECISION_PRECEDENCE: &str = "aval's precedence is an applicable \
+scoped decision, then a default-scope decision, then an adopted rule: an applicable decision \
+outranks an adopted rule, and a code-rule violation is not reported where a listed decision \
+decides otherwise; missing decision evidence is reported as uncertainty, not as permission.\n";
+
 pub(super) fn build_prompt(
     contract: &TaskContract,
     manifest: &ContextManifest,
@@ -22,6 +28,7 @@ pub(super) fn build_prompt(
         prompt.push_str(&format!("note: {}\n", gap.describe()));
     }
     prompt.push_str("[relais task]\n");
+    prompt.push_str(DECISION_PRECEDENCE);
     prompt.push_str(&data_block("objective", &contract.objective));
     prompt.push_str("verification decides whether the criteria below are met, not you.\n");
     prompt.push_str(&data_list_block(
@@ -243,7 +250,7 @@ pub(in crate::runner) fn fit_statements(
         .collect();
     let measured: usize = rules.iter().map(RenderedRule::bytes).sum();
     let prompt = match source {
-        GuidanceSource::Reviewer => "reviewer",
+        GuidanceSource::Reviewer | GuidanceSource::Decisions => "reviewer",
         GuidanceSource::Index | GuidanceSource::CodeRules | GuidanceSource::Relevant => "worker",
     };
     let gap = GuidanceGap::new(
@@ -266,6 +273,7 @@ pub(in crate::runner) fn fit_statements(
 pub(in crate::runner) enum RuleKind {
     CodeRules,
     Statements,
+    Decisions,
 }
 
 impl RuleKind {
@@ -273,6 +281,7 @@ impl RuleKind {
         match self {
             RuleKind::CodeRules => "code rules",
             RuleKind::Statements => "constraint statements",
+            RuleKind::Decisions => "decisions",
         }
     }
 
@@ -280,6 +289,7 @@ impl RuleKind {
         match self {
             RuleKind::CodeRules => "code-rules",
             RuleKind::Statements => "constraints",
+            RuleKind::Decisions => "constraints",
         }
     }
 }
