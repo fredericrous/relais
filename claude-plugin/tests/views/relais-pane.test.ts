@@ -355,3 +355,35 @@ test('the agent view’s first three rows fit whole in a 72-column body', async 
   expect(view.texts.some(t => t.startsWith('Esc hands') || t.includes('Esc hands the keys back'))).toBe(true)
   expect(Array.from(view.texts.find(t => t.includes('Esc hands'))!).length + '[ back ]'.length).toBeLessThanOrEqual(72)
 })
+
+test('a Button is still drawn after a second run finishes and folds the first', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  const second = engine.feed('second-task.json')
+  engine.stream.push('stdout', phase(0, 'running') + started(1, 'd1') + spawnLine('d1'))
+  await settle(engine)
+  await $.tool.call({ tool: 'mcp__relais__run', task: 'second-task.json', cwd: '/repo' })
+  await startQueued(engine)
+  second.push(
+    'stdout',
+    event('run-two', 0, { kind: 'phase', state: 'running', reason: 'ok', detail: {} }) +
+      event('run-two', 1, { kind: 'dispatch_started', dispatch: 'd2', agent_kind: 'worker', attempt: 1, model: 'sonnet', effort: 'medium' }) +
+      spawnLine('d2'),
+  )
+  await settle(engine)
+  const before = await drawn($, engine, [])
+  const buttons = (rows: any[]) => rows.filter((r: any) => r.type === 'Button')
+  expect(buttons(before.rows).map((b: any) => b.props.key)).toEqual(['agent:agent-1', 'agent:agent-2'])
+  await before.ui.unmount()
+  // The first run finishes: it folds to one row and its Button goes.
+  const after = await drawn($, engine, [event(RUN, 2, { kind: 'outcome', state: 'accepted', receipt: null })])
+  expect(after.texts.some(t => t.startsWith('run ') && t.includes('accepted'))).toBe(true)
+  // A Button is still drawn, found by its label.
+  const left = buttons(after.rows)
+  expect(left.length).toBe(1)
+  expect(left[0].props.label).toContain('worker agent-2')
+  // The harness draws no Client and cannot focus a Button, so where focus
+  // goes after a fold is not observable here (plan Decision log); the
+  // surviving Button is the live run's, and none claims focus on its own.
+  expect(left[0].props.key).toBe('agent:agent-2')
+  expect(after.rows.filter((r: any) => r.props.autoFocus !== undefined).length).toBe(0)
+})

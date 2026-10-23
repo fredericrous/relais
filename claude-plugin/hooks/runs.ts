@@ -9,6 +9,8 @@ import { parseProtocolLine, splitLines } from './lines.ts'
 import {
   applyEvent,
   applyLine,
+  awaitsAPerson,
+  awaitsState,
   changedText,
   emptyRun,
   isLive,
@@ -46,9 +48,6 @@ const CANCEL_TIMEOUT_MS = 20_000
 const FRESHEN_TIMEOUT_MS = 1_000
 // Runs a status reply without `run` lists at most this many.
 const STATUS_PAGE = 10
-// The states whose outcome message asks a person for something, as the
-// `done` line spells them (`State::awaits_a_person` in relais).
-const AWAITS_A_PERSON = new Set(['needs_decision', 'needs_review', 'interrupted'])
 // The closing line of an outcome that waits on a person: the step that
 // settles it (ADR-0004).
 export const DECIDE_STEP =
@@ -489,7 +488,7 @@ async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number
       ? `relais ${trial ? 'replay' : 'run'} ${run} finished: ${outcome}${why}.`
       : `relais ${trial ? 'replay' : 'run'} ${outcome}${why}. Nothing ran.`
   const facts = [receipt ? `Receipt: ${receipt}` : '', summaryText(line.summary), trial ? `Replay trial: ${trial}` : '', commandsChangedText(model)].filter(Boolean)
-  const awaits = AWAITS_A_PERSON.has(outcome) && typeof line.run === 'string'
+  const awaits = awaitsState(outcome) && typeof line.run === 'string'
   const text = [headline, ...facts, code ? NEXT_STEP[code] ?? '' : '', awaits ? DECIDE_STEP : '', outcome === 'accepted' && typeof line.run === 'string' && !trial ? FEEDBACK_STEP : ''].filter(Boolean).join('\n')
   // The stream hook descends from the `run` tool call, and a prompt cannot
   // be submitted from under a tool or command hook: the session's timer
@@ -607,7 +606,7 @@ async function readRun(fx: Fx, store: Store, run: string) {
     }
     if (!isLive(held)) {
       // A run that stopped awaiting a person may have been answered since.
-      if (held.outcome && AWAITS_A_PERSON.has(held.outcome.state) && fresh.outcome && fresh.outcome.state !== held.outcome.state) {
+      if (awaitsAPerson(held) && fresh.outcome && fresh.outcome.state !== held.outcome.state) {
         const outcome = { ...held.outcome, state: fresh.outcome.state, ...(fresh.outcome.answer ? { answer: fresh.outcome.answer } : {}) }
         store.models = { ...store.models, [run]: { ...held, phase: fresh.outcome.state, outcome } }
         markDirty(store)
@@ -637,7 +636,7 @@ export async function statusOf(fx: Fx, store: Store, run?: string, opts: { outpu
   const now = await fx.clock.now()
   const known = () => Object.values(store.models).filter(m => (run ? m.run === run : !m.foreign))
   const live = known().filter(
-    m => !m.run.startsWith('starting-') && (isLive(m) || (m.outcome !== undefined && AWAITS_A_PERSON.has(m.outcome.state))),
+    m => !m.run.startsWith('starting-') && (isLive(m) || awaitsAPerson(m)),
   )
   await Promise.all(live.map(m => refreshRun(fx, store, m.run)))
   if (known().length === 0) await reloadTimeline(fx, store, run)
@@ -653,7 +652,7 @@ export async function statusOf(fx: Fx, store: Store, run?: string, opts: { outpu
   }
   // Without a run: at most STATUS_PAGE runs, the live or waiting-for-a-person
   // ones first, then the most recent; `offset` pages through the rest.
-  const needsLook = (m: RunModel) => isLive(m) || (m.outcome !== undefined && AWAITS_A_PERSON.has(m.outcome.state))
+  const needsLook = (m: RunModel) => isLive(m) || awaitsAPerson(m)
   const ordered = [...models].sort((a, b) => Number(needsLook(b)) - Number(needsLook(a)) || b.startedAt - a.startedAt)
   // The tool handler refuses an offset that is not a whole number >= 0.
   const offset = opts.offset ?? 0

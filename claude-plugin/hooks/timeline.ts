@@ -120,6 +120,12 @@ const isFailing = (state: string) => FAILED_STATES.includes(state)
 
 export const isLive = (m: RunModel) => m.outcome === undefined
 
+// The states whose outcome message asks a person for something, as the
+// `done` line spells them (`State::awaits_a_person` in relais).
+const AWAITS_STATES = new Set(['needs_decision', 'needs_review', 'interrupted'])
+export const awaitsState = (state: string) => AWAITS_STATES.has(state)
+export const awaitsAPerson = (m: RunModel) => m.outcome !== undefined && awaitsState(m.outcome.state)
+
 // Control characters out, the line cut: a stored line is never wider than MAX_LINE.
 export function cutLine(line: string): string {
   const clean = line
