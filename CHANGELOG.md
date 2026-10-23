@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.29.4
+
 Every line the coordinator writes to its log (`coordinator.log`) now starts with an RFC 3339 UTC timestamp, and a request that takes longer than 1 s in total logs one `slow request <kind>` line with the milliseconds spent queued for a handler, reading it, waiting for the admission lock, handling it, delivering signals, flushing, and writing the reply, so the next slow reply shows where the time went (#284). The line is logged even when serving fails, such as a reply written to a client that already gave up. The two notes printed on the terminal of the command that starts the daemon keep their old unstamped format.
 
 ## v0.29.3
