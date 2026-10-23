@@ -363,6 +363,32 @@ impl LaunchResult {
     pub fn terminal_result_missing(&self) -> bool {
         !self.ended.succeeded() || self.result_text.is_none()
     }
+
+    /// How the dispatch ended, as evidence a later count can name a cause
+    /// from: the exit, the assistant turns its transcript shows and the
+    /// last line it wrote to stderr.
+    pub fn dispatch_end(&self) -> String {
+        let turns = self
+            .stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event.get("type").and_then(|t| t.as_str()) == Some("assistant"))
+            .count();
+        let stderr = self
+            .stderr
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map_or_else(
+                || "none".to_string(),
+                |line| line.chars().take(200).collect::<String>(),
+            );
+        format!(
+            "dispatch end: {}, {turns} turns, last stderr: {stderr}",
+            self.ended.describe()
+        )
+    }
 }
 
 /// Does the model the harness ran satisfy the model the route requested?

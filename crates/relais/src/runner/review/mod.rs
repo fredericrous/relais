@@ -14,7 +14,7 @@ mod parts;
 pub(in crate::runner) use parts::write_immutable;
 mod types;
 pub(crate) use types::{ReviewOutcome, ReviewRequest};
-pub(in crate::runner) use types::{ReviewPurpose, ReviewSeat};
+pub(in crate::runner) use types::{ReviewPurpose, ReviewSeat, UnavailableCause};
 
 /// The verdict, read from the LAST non-empty line of a reviewer's
 /// answer.

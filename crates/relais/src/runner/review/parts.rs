@@ -95,6 +95,7 @@ impl<'a> RunEngine<'a> {
                     on_dispatch: &on_dispatch,
                 }),
                 &result_stem,
+                None,
             );
             let (status, detail) = match &reviewed.outcome {
                 ReviewOutcome::NoFindings => (PartStatus::Passed, None),
