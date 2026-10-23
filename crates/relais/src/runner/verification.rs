@@ -83,7 +83,13 @@ impl<'a> RunEngine<'a> {
             match review {
                 ReviewOutcome::NoFindings => {}
                 ReviewOutcome::Findings(detail) => {
-                    return self.stop(&progress.budget, Observation::ReviewFindings(detail));
+                    return self.stop(
+                        &progress.budget,
+                        Observation::ReviewFindings(
+                            detail.clone(),
+                            super::review::finding_severities(&detail),
+                        ),
+                    );
                 }
                 ReviewOutcome::Unavailable(detail) => {
                     return self.stop_for_review(

@@ -6,6 +6,7 @@ use super::{
     Guidance, GuidanceGap, GuidanceSource, Path, PathBuf, Reason, RuleRef, RunId, Tier,
 };
 
+pub use super::machine::Severity;
 pub(in crate::runner) use super::machine::REVIEW_MAX_PARTS;
 
 mod engine;
@@ -48,6 +49,46 @@ pub(crate) fn review_verdict(text: &str) -> ReviewOutcome {
              and no findings are declared. The answer is preserved:\n{text}"
         )),
     }
+}
+
+fn parse_severity(word: &str) -> Option<Severity> {
+    match word.trim().to_ascii_lowercase().as_str() {
+        "blocking" => Some(Severity::Blocking),
+        "high" => Some(Severity::High),
+        "medium" => Some(Severity::Medium),
+        "low" => Some(Severity::Low),
+        _ => None,
+    }
+}
+
+/// The severity of each finding in a reviewer's answer: a finding is a
+/// numbered line (`1.` or `1)`) under the verdict line that starts with
+/// `[blocking|high|medium|low]`. `None` when any finding lacks a severity
+/// or when no finding is tagged.
+pub fn finding_severities(text: &str) -> Option<Vec<Severity>> {
+    let mut lines = text.lines().skip_while(|line| {
+        let words = verdict_words(line);
+        !(words.starts_with("FINDINGS") && words != "FINDINGS: NONE")
+    });
+    lines.next()?;
+    let severities = lines
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let digits = line.chars().take_while(char::is_ascii_digit).count();
+            let rest = line[digits..].strip_prefix(['.', ')'])?;
+            (digits > 0).then(|| {
+                let rest = rest.trim_start().strip_prefix('[')?;
+                parse_severity(rest.split_once(']')?.0)
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!severities.is_empty()).then_some(severities)
+}
+
+/// The instruction every findings-reporting reviewer prompt carries.
+pub(in crate::runner) fn report_severity_instruction() -> &'static str {
+    "Start each finding with its severity in brackets, `[blocking|high|medium|low]`, as a \
+     numbered line, for example `1. [high] path:line — defect. Fix.`\n"
 }
 
 /// A line with Markdown emphasis and heading marks stripped from both
@@ -508,4 +549,33 @@ pub(in crate::runner) fn reviewer_guidance(
     let stated: Vec<&str> = shown.iter().map(|rule| rule.id.as_str()).collect();
     text.push_str(&relevant_block(guidance, &stated));
     (text, gap)
+}
+
+#[cfg(test)]
+mod severity_tests {
+    use super::*;
+
+    #[test]
+    fn tagged_findings_give_their_severities() {
+        let text = "Verdict: x\nFINDINGS:\n1. [low] a.rs:1 — d\n2. [medium] b.rs — e\n";
+        assert_eq!(
+            finding_severities(text),
+            Some(vec![Severity::Low, Severity::Medium])
+        );
+    }
+
+    #[test]
+    fn prose_untagged_mixed_and_none_give_none() {
+        assert_eq!(
+            finding_severities("FINDINGS:\n- src/main.rs: stale\n"),
+            None
+        );
+        assert_eq!(finding_severities("FINDINGS:\n1. [high] a\n2. b\n"), None);
+        assert_eq!(finding_severities("FINDINGS: none"), None);
+    }
+
+    #[test]
+    fn the_reviewer_prompt_asks_for_a_severity_tag() {
+        assert!(report_severity_instruction().contains("[blocking|high|medium|low]"));
+    }
 }

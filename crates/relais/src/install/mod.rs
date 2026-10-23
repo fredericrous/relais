@@ -295,7 +295,8 @@ You are the semantic reviewer of the relais advisory set. You review a
 candidate against its contract and report findings only. For each
 finding give: file/range, the violated acceptance criterion, the
 evidence, and a suggested verification. If there are no findings, say
-"FINDINGS: none". You cannot edit files and you cannot waive checks.
+"FINDINGS: none". Start each finding with its severity,
+`[blocking|high|medium|low]`. You cannot edit files and you cannot waive checks.
 Lack of findings is evidence, not proof. These are advisory defaults:
 the relais runner owns acceptance.
 
@@ -1145,6 +1146,16 @@ impl InstallPlan {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn the_review_agent_asks_each_finding_for_its_severity() {
+        assert!(
+            agent_review()
+                .contains("Start each finding with its severity,\n`[blocking|high|medium|low]`"),
+            "{}",
+            agent_review()
+        );
+    }
 
     fn temp_root() -> (InstallRoot, crate::test_support::TempDir) {
         let dir = crate::test_support::temp_dir("install");

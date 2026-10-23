@@ -1047,7 +1047,13 @@ fn accept_integrated(
         match review {
             ReviewOutcome::NoFindings => {}
             ReviewOutcome::Findings(detail) => {
-                return engine.stop(&budget, Observation::ReviewFindings(detail));
+                return engine.stop(
+                    &budget,
+                    Observation::ReviewFindings(
+                        detail.clone(),
+                        super::review::finding_severities(&detail),
+                    ),
+                );
             }
             ReviewOutcome::Unavailable(detail) => {
                 let assembly = &*assembly;

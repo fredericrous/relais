@@ -7885,6 +7885,12 @@ fn the_review_prompt_ends_with_the_verdict_instruction() {
         "the verdict instruction is the last thing the reviewer reads:\n{review}"
     );
     assert!(review.contains("`FINDINGS: none`"), "{review}");
+    assert!(
+        review.contains(
+            "Start each finding with its severity in brackets, `[blocking|high|medium|low]`"
+        ),
+        "every finding is asked for its severity:\n{review}"
+    );
     assert!(review.contains("only run read-only commands"), "{review}");
     assert!(
         review.contains("a command you could not run is not a finding"),

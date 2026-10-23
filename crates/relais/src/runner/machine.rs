@@ -213,6 +213,15 @@ pub enum Limit {
     Total,
 }
 
+/// How serious a reviewer calls one finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Blocking,
+    High,
+    Medium,
+    Low,
+}
+
 /// One row's worth of input: what the runner observed about the
 /// candidate or the dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,7 +259,7 @@ pub enum Observation {
     /// The worker proposed that something outside the task blocks it.
     WorkerBlockage(String),
     /// The reviewer reported findings.
-    ReviewFindings(String),
+    ReviewFindings(String, Option<Vec<Severity>>),
     /// Required review could not be obtained.
     ReviewUnavailable(String),
     /// The candidate patch is larger than one reviewer is given to read, so
@@ -570,7 +579,7 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
             )
         }
 
-        Observation::ReviewFindings(detail) => Decision::stop(
+        Observation::ReviewFindings(detail, _severities) => Decision::stop(
             State::NeedsReview,
             Reason::ReviewFindings,
             serde_json::json!({ "detail": detail }),
@@ -876,7 +885,7 @@ mod tests {
             Reason::VerificationGap
         );
         assert_eq!(
-            decide(&b, Observation::ReviewFindings("f".into())).state,
+            decide(&b, Observation::ReviewFindings("f".into(), None)).state,
             State::NeedsReview
         );
         assert_eq!(

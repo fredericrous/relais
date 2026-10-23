@@ -371,6 +371,8 @@ impl<'a> RunEngine<'a> {
         }
         prompt.push_str(&patch_section(staged));
         prompt.push_str(&format!("source to inspect: {}\n", review_dir.display()));
+        prompt.push('\n');
+        prompt.push_str(super::report_severity_instruction());
         prompt.push_str(
             "\nFinish your answer with exactly one of these, and nothing after it: the line \
              `FINDINGS: none` when there are no findings, or the line `FINDINGS:` followed by \
