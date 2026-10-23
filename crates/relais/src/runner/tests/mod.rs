@@ -7967,7 +7967,7 @@ impl crate::context::DecisionResolver for StatedRules {
     fn constraint_rules(&self) -> Result<crate::context::Rules, crate::context::GuidanceGap> {
         Ok(crate::context::Rules {
             rules: self.0.clone(),
-            omitted: Default::default(),
+            ..Default::default()
         })
     }
 }

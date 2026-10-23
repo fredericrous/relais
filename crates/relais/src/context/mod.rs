@@ -190,15 +190,16 @@ impl DecisionResolver for AvalCli {
     fn constraint_rules(&self) -> Result<Rules, GuidanceGap> {
         self.rules
             .get_or_init(|| {
-                guidance::run_aval(
-                    "aval",
-                    &guidance::rules_args(),
-                    &self.root,
-                    GuidanceSource::Index,
-                    crate::tooling::GUIDANCE_TIMEOUT,
-                    self.cancel.as_deref(),
-                )
-                .and_then(|stdout| guidance::parse_rules_output(&stdout))
+                guidance::fetch_rules(&|args| {
+                    guidance::run_aval(
+                        "aval",
+                        args,
+                        &self.root,
+                        GuidanceSource::Index,
+                        crate::tooling::GUIDANCE_TIMEOUT,
+                        self.cancel.as_deref(),
+                    )
+                })
             })
             .clone()
     }
@@ -889,9 +890,16 @@ pub fn gather_guidance(
     let mut aval_missing = false;
     match resolver.constraint_rules() {
         Ok(rules) => {
-            guidance.index = rules.rules.iter().map(|rule| rule.id.clone()).collect();
+            guidance.index = rules
+                .rules
+                .iter()
+                .filter(|rule| !rules.code_rules.iter().any(|code| code.id == rule.id))
+                .map(|rule| rule.id.clone())
+                .collect();
             guidance.rules = rules.rules;
             guidance.omitted = rules.omitted;
+            guidance.code_rules = rules.code_rules;
+            guidance.gaps.extend(rules.notes);
         }
         Err(gap) => {
             aval_missing = gap.is_not_launched();
@@ -1363,7 +1371,7 @@ mod tests {
         Guided {
             rules: Ok(Rules {
                 rules: vec![rule("errors.never-swallowed"), rule("errors.typed-values")],
-                omitted: guidance::Omitted::default(),
+                ..Rules::default()
             }),
             relevant: Ok(Relevant {
                 keys: vec![ranked("a.b", "active"), ranked("c.d", "undecided")],
@@ -1474,7 +1482,7 @@ mod tests {
         let huge = Guided {
             rules: Ok(Rules {
                 rules: (0..400).map(|i| rule(&format!("g{i}.rule-{i}"))).collect(),
-                omitted: guidance::Omitted::default(),
+                ..Rules::default()
             }),
             relevant: Ok(Relevant::default()),
         };

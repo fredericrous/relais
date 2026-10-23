@@ -33,6 +33,8 @@ pub const RELEVANT_TOP: usize = 5;
 pub enum GuidanceSource {
     /// `aval rules`: the constraint index.
     Index,
+    /// The full text of the `governs: code` rules.
+    CodeRules,
     /// `aval relevant`: the relevance ranking.
     Relevant,
     /// The full statements the reviewer prompt carries.
@@ -65,6 +67,10 @@ pub enum GapCause {
     OverBudget { measured: usize, budget: usize },
     /// aval answered, and the answer was not the expected shape.
     Unparseable,
+    /// aval answered, and the decisions pack it read predates `governs`.
+    StalePack,
+    /// aval answered, and it is too old for `--full`/`governs`.
+    AvalTooOld,
 }
 
 impl GuidanceGap {
@@ -85,6 +91,7 @@ impl GuidanceGap {
     pub fn describe(&self) -> String {
         let what = match self.source {
             GuidanceSource::Index => "index missing",
+            GuidanceSource::CodeRules => "code rules missing",
             GuidanceSource::Relevant => "relevant missing",
             GuidanceSource::Reviewer => "reviewer constraints partial",
         };
@@ -121,11 +128,45 @@ pub struct Omitted {
     pub traits: Vec<String>,
 }
 
+/// A constraint rule that declares `governs: code`. The manifest records
+/// its id and a hash of its body, never the text; the statement and the
+/// body live in memory only, for the prompt builders, and read as empty
+/// from a manifest read back from disk.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeRule {
+    pub id: String,
+    #[serde(skip)]
+    pub statement: String,
+    #[serde(skip)]
+    pub body: String,
+    /// SHA-256, hex, of `body`.
+    #[serde(default)]
+    pub body_sha256: String,
+}
+
+impl CodeRule {
+    pub fn new(id: String, statement: String, body: String) -> Self {
+        let body_sha256 = crate::ids::sha256_hex(body.as_bytes());
+        Self {
+            id,
+            statement,
+            body,
+            body_sha256,
+        }
+    }
+}
+
 /// The active constraint rules of the repository.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Rules {
+    /// Every active constraint, code rules included.
     pub rules: Vec<RuleRef>,
     pub omitted: Omitted,
+    /// The ones that declare `governs: code`, with their full text.
+    pub code_rules: Vec<CodeRule>,
+    /// Gaps of a fetch that still produced rules (an old aval, a stale
+    /// pack), each naming its fix.
+    pub notes: Vec<GuidanceGap>,
 }
 
 /// A ranked key's state as aval reports it; anything but the two known
@@ -195,6 +236,10 @@ pub struct Guidance {
     /// gave none or the budget dropped it.
     #[serde(default)]
     pub index: Vec<String>,
+    /// The constraints that govern code: id and body hash in the manifest,
+    /// full text in memory only (see `CodeRule`).
+    #[serde(default)]
+    pub code_rules: Vec<CodeRule>,
     /// Every active constraint rule with its statement: what the reviewer
     /// is shown in place of the index, since it cannot run aval.
     #[serde(default)]
@@ -317,6 +362,10 @@ struct RawRule {
     statement: String,
     #[serde(default = "active_by_default")]
     active: bool,
+    #[serde(default)]
+    governs: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
 }
 
 fn active_by_default() -> bool {
@@ -340,8 +389,10 @@ struct RawRules {
     omitted: Omitted,
 }
 
-/// Parse `aval rules --level constraint --json` (aval 1.9.0): the active
-/// rules and what aval omitted. Any other shape is a gap.
+/// Parse `aval rules --level constraint --full --json` (aval 1.10.0), or
+/// the same without `--full` (1.9.0, no `governs`, no `body`): the active
+/// rules, the ones that govern code, and what aval omitted. Any other
+/// shape is a gap.
 pub fn parse_rules_output(stdout: &str) -> Result<Rules, GuidanceGap> {
     let raw: RawRules = serde_json::from_str(stdout.trim()).map_err(|e| {
         GuidanceGap::new(
@@ -350,15 +401,54 @@ pub fn parse_rules_output(stdout: &str) -> Result<Rules, GuidanceGap> {
             format!("unparseable aval rules output: {e}"),
         )
     })?;
+    let active: Vec<RawRule> = raw.rules.into_iter().filter(|rule| rule.active).collect();
+    let code_rules = active
+        .iter()
+        .filter(|rule| rule.governs.as_deref() == Some("code"))
+        .map(|rule| {
+            CodeRule::new(
+                rule.id.clone(),
+                rule.statement.clone(),
+                rule.body.clone().unwrap_or_default(),
+            )
+        })
+        .collect();
     Ok(Rules {
-        rules: raw
-            .rules
-            .into_iter()
-            .filter(|rule| rule.active)
-            .map(RawRule::into_rule)
-            .collect(),
+        rules: active.into_iter().map(RawRule::into_rule).collect(),
         omitted: raw.omitted,
+        code_rules,
+        notes: Vec::new(),
     })
+}
+
+/// Fetch the constraints with `run` (one spawn of the given argv). An aval
+/// that exits 2 on the new argv is too old for it: the previous argv is
+/// tried, and the gap naming the fix is kept only when that succeeds. Rules
+/// without any `governs: code` mean a stale decisions pack. Other failures
+/// are returned as they are.
+pub fn fetch_rules(
+    run: &dyn Fn(&[String]) -> Result<String, GuidanceGap>,
+) -> Result<Rules, GuidanceGap> {
+    let (stdout, old_aval) = match run(&rules_args()) {
+        Ok(stdout) => (stdout, false),
+        Err(gap) if gap.cause == GapCause::Exited(2) => (run(&legacy_rules_args())?, true),
+        Err(gap) => return Err(gap),
+    };
+    let mut rules = parse_rules_output(&stdout)?;
+    if old_aval {
+        rules.notes.push(GuidanceGap::new(
+            GuidanceSource::CodeRules,
+            GapCause::AvalTooOld,
+            "aval is too old for `--full`/`governs` (exit 2); code rules are not carried; upgrade aval",
+        ));
+    } else if !rules.rules.is_empty() && rules.code_rules.is_empty() {
+        rules.notes.push(GuidanceGap::new(
+            GuidanceSource::CodeRules,
+            GapCause::StalePack,
+            "no constraint declares `governs: code`; the decisions pack is stale, so code rules are not carried; run `aval add` for the decisions pack",
+        ));
+    }
+    Ok(rules)
 }
 
 #[derive(Deserialize)]
@@ -475,8 +565,16 @@ pub fn relevant_args(query: &RelevantQuery) -> Vec<String> {
     args
 }
 
-/// The argv of `aval rules` for the constraint index.
+/// The argv of `aval rules` for the constraints, full text included.
 pub fn rules_args() -> Vec<String> {
+    ["rules", "--level", "constraint", "--full", "--json"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The previous argv, for an aval that does not know `--full`.
+pub fn legacy_rules_args() -> Vec<String> {
     ["rules", "--level", "constraint", "--json"]
         .into_iter()
         .map(str::to_string)
@@ -539,6 +637,157 @@ mod tests {
         {"adr":"ADR-0009","key":"storage.engine","state":"undecided","score":2.0}],
       "rules":[
         {"adopts":"decisions:ADR-0015","id":"effects.at-the-boundary","level":"constraint","score":6.4,"statement":"Effects are pushed to the boundary."}]}"#;
+
+    /// Trimmed from the real output of aval 1.10.0 in this repository
+    /// (`aval --json rules --level constraint --full`): three rules, two
+    /// declaring `governs: code`, one with `governs: null`; the first body
+    /// is cut to its first line.
+    const FULL_RULES_JSON: &str = r#"{"omitted":{"constraints":11,"heuristics":0,"traits":["cli"]},"rules":[{"active":true,"adopts":"decisions:ADR-0011","body":"**⇢** The use-case crate owns the `Repository` trait; the persistence crate","file":".adr/packs/decisions.pack","governs":"code","id":"architecture.boundary-data-is-owned","level":"constraint","pack":"decisions","source":"Clean Architecture (Robert C. Martin, 2017)","statement":"Data crossing a boundary is a simple structure the inner side defines, and control crossing outward goes through an interface declared in the inner circle and implemented in the outer one."},{"active":true,"adopts":"decisions:ADR-0017","body":"","file":".adr/packs/decisions.pack","governs":null,"id":"ci.from-first-commit","level":"constraint","pack":"decisions","source":"The relais repository's first two merges, gated by one workstation and nothing else (2026-09)","statement":"A repository has a continuous-integration workflow in its first commit."},{"active":true,"adopts":"decisions:ADR-0011","body":"**⇢** No `_ = err`, no `let _ = fallible()`, no empty `catch`, no\n`.catchAll(() => Effect.void)` without a comment on the same line saying why\nthe failure is genuinely irrelevant.","file":".adr/packs/decisions.pack","governs":"code","id":"errors.never-swallowed","level":"constraint","pack":"decisions","source":"Clean Code (Robert C. Martin, 2008)","statement":"An error is never silently suppressed."}]}"#;
+
+    #[test]
+    fn full_rules_json_splits_the_code_rules_with_a_body_hash() {
+        let rules = parse_rules_output(FULL_RULES_JSON).expect("parses");
+        assert_eq!(rules.rules.len(), 3);
+        let ids: Vec<&str> = rules.code_rules.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "architecture.boundary-data-is-owned",
+                "errors.never-swallowed"
+            ]
+        );
+        let second = &rules.code_rules[1];
+        assert!(second.body.contains("No `_ = err`"));
+        assert!(second.statement.starts_with("An error is never"));
+        assert_eq!(
+            second.body_sha256,
+            crate::ids::sha256_hex(second.body.as_bytes())
+        );
+    }
+
+    #[test]
+    fn the_manifest_form_of_a_code_rule_holds_no_text() {
+        let rules = parse_rules_output(FULL_RULES_JSON).expect("parses");
+        let guidance = Guidance {
+            code_rules: rules.code_rules,
+            ..Guidance::default()
+        };
+        let json = serde_json::to_string(&guidance).expect("serializes");
+        assert!(!json.contains("No `_ = err`"), "{json}");
+        assert!(!json.contains("never silently suppressed"), "{json}");
+        assert!(json.contains("body_sha256"), "{json}");
+        let back: Guidance = serde_json::from_str(&json).expect("reads back");
+        assert_eq!(back.code_rules.len(), 2);
+        assert_eq!(
+            back.code_rules[0].body_sha256,
+            guidance.code_rules[0].body_sha256
+        );
+        assert!(back.code_rules[0].body.is_empty());
+    }
+
+    #[test]
+    fn a_manifest_without_code_rules_still_deserializes() {
+        let parsed: Guidance =
+            serde_json::from_str(r#"{"index":["a.b"],"gaps":[]}"#).expect("parses");
+        assert_eq!(parsed.index, ["a.b"]);
+        assert!(parsed.code_rules.is_empty());
+    }
+
+    /// A fake aval: `script` is run by `sh` with the argv after `aval`.
+    fn fake_aval(script: &'static str) -> impl Fn(&[String]) -> Result<String, GuidanceGap> {
+        move |args: &[String]| {
+            let mut argv = vec!["-c".to_string(), script.to_string(), "aval".to_string()];
+            argv.extend(args.iter().cloned());
+            run_aval(
+                "sh",
+                &argv,
+                Path::new("."),
+                GuidanceSource::Index,
+                Duration::from_secs(5),
+                None,
+            )
+        }
+    }
+
+    #[test]
+    fn the_new_argv_is_one_spawn_and_the_old_one_drops_full() {
+        assert_eq!(
+            rules_args(),
+            ["rules", "--level", "constraint", "--full", "--json"]
+        );
+        assert_eq!(
+            legacy_rules_args(),
+            ["rules", "--level", "constraint", "--json"]
+        );
+    }
+
+    #[test]
+    fn an_old_aval_is_retried_with_the_previous_argv_and_names_the_fix() {
+        let script = r#"for a in "$@"; do [ "$a" = --full ] && exit 2; done
+printf '%s' '{"rules":[{"id":"errors.typed-values","level":"constraint","statement":"s"}]}'"#;
+        let rules = fetch_rules(&fake_aval(script)).expect("retry succeeds");
+        assert_eq!(rules.rules.len(), 1);
+        assert!(rules.code_rules.is_empty());
+        assert_eq!(rules.notes.len(), 1);
+        let detail = &rules.notes[0].detail;
+        assert!(
+            detail.contains("too old")
+                && detail.contains("--full")
+                && detail.contains("upgrade aval"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_failed_retry_is_the_retrys_gap_and_no_note() {
+        let gap = fetch_rules(&fake_aval("exit 2")).expect_err("both fail");
+        assert_eq!(gap.cause, GapCause::Exited(2));
+        let gap = fetch_rules(&fake_aval(
+            r#"for a in "$@"; do [ "$a" = --full ] && exit 2; done; exit 3"#,
+        ))
+        .expect_err("retry fails");
+        assert_eq!(gap.cause, GapCause::Exited(3));
+    }
+
+    #[test]
+    fn rules_without_a_code_rule_name_the_stale_pack_and_stay_in_the_index() {
+        let script = r#"printf '%s' '{"rules":[{"id":"errors.typed-values","level":"constraint","statement":"s","governs":null,"body":""}]}'"#;
+        let rules = fetch_rules(&fake_aval(script)).expect("parses");
+        assert_eq!(rules.rules.len(), 1);
+        assert_eq!(rules.notes.len(), 1);
+        assert_eq!(rules.notes[0].cause, GapCause::StalePack);
+        assert!(
+            rules.notes[0].detail.contains("aval add"),
+            "{:?}",
+            rules.notes
+        );
+    }
+
+    #[test]
+    fn exit_1_exit_3_and_a_timeout_are_a_gap_without_retry() {
+        for (script, cause) in [
+            ("exit 1", GapCause::Exited(1)),
+            ("exit 3", GapCause::Exited(3)),
+        ] {
+            let gap = fetch_rules(&fake_aval(script)).expect_err(script);
+            assert_eq!(gap.cause, cause);
+        }
+        let slow = |_: &[String]| sh("sleep 5", GuidanceSource::Index, Duration::from_millis(100));
+        assert_eq!(
+            fetch_rules(&slow).expect_err("timeout").cause,
+            GapCause::NoAnswer
+        );
+    }
+
+    #[test]
+    fn a_full_answer_with_code_rules_has_no_note() {
+        let script = r#"cat <<'EOF'
+{"rules":[{"id":"a.b","level":"constraint","statement":"s","governs":"code","body":"b"}]}
+EOF"#;
+        let rules = fetch_rules(&fake_aval(script)).expect("parses");
+        assert!(rules.notes.is_empty());
+        assert_eq!(rules.code_rules.len(), 1);
+    }
 
     #[test]
     fn rules_json_parses_to_the_active_rules_and_the_omitted_counts() {
