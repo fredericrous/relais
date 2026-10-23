@@ -1511,8 +1511,8 @@ fn an_unreachable_coordinator_is_given_up_on_after_the_bound() {
     let total: Duration = sleeper.slept.lock().expect("sleeps").iter().sum();
     assert_eq!(total, UNREACHABLE_BOUND);
     assert_eq!(clock.now_millis(), 1_000_000 + 120_000);
-    // Whole backoffs 1+2+4+8+16 then 30 s steps: 31 + 30 + 30, the last
-    // clamped to the bound (29 s): eight sleeps, nine asks.
+    // Whole backoffs 1+2+4+8+16 (31 s), then 30 + 30, then 29 s clamped
+    // to the bound: eight sleeps, nine asks.
     assert_eq!(gate.calls.load(Ordering::SeqCst), 9);
 }
 

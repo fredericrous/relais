@@ -393,7 +393,9 @@ impl<'a> HeavyAdmission<'a> {
             announce_every: ANNOUNCE_EVERY,
             heartbeat_every: LEASE_HEARTBEAT_EVERY,
             sleeper: Arc::new(ThreadSleeper),
-            jitter: Arc::new(SeededJitter::for_process("")),
+            // No gate is asked here, so nothing is drawn: a fixed stream,
+            // with no clock or pid read for it.
+            jitter: Arc::new(SeededJitter::new("", 0, 0)),
             registration: None,
             tries: Tries::default(),
             disk: DiskCheck::off(),
