@@ -8029,7 +8029,7 @@ fn an_empty_patch_skips_the_decisions_call_and_records_no_gap() {
 }
 
 #[test]
-fn an_aval_failure_is_a_gap_and_the_review_text_is_just_empty() {
+fn an_aval_failure_is_a_gap_and_the_review_text_only_says_so() {
     let failure = GuidanceGap::new(
         GuidanceSource::Decisions,
         context::guidance::GapCause::Exited(3),
@@ -8041,7 +8041,11 @@ fn an_aval_failure_is_a_gap_and_the_review_text_is_just_empty() {
     };
     let files = vec!["src/a.rs".to_string()];
     let (text, gap) = super::review::reviewer_decisions(&resolver, &files, 4096, 0);
-    assert!(text.is_empty());
+    assert!(
+        text.contains("decisions that apply to this diff are missing or partial (aval exit 3)"),
+        "{text}"
+    );
+    assert!(!text.contains("decisions that apply\n```"), "{text}");
     assert_eq!(gap, Some(failure));
     assert_eq!(resolver.calls.get(), 1);
 }
@@ -8122,11 +8126,19 @@ fn a_failing_decisions_lookup_still_reaches_the_review_verdict_and_is_a_receipt_
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
     let backend = conditional_worker("relais task");
+    let review_prompts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let kept = Arc::clone(&review_prompts);
+    let spy = MockBackend::new(move |spec| {
+        if spec.prompt.contains("semantic reviewer") {
+            kept.lock().unwrap().push(spec.prompt.clone());
+        }
+        (backend.behavior)(spec)
+    });
     let outcome = fixture.execute_resolving(
         &FailingDecisions,
         &fixture.contract(Review::Required),
         &repo,
-        &backend,
+        &spy,
     );
     let Terminal::Accepted(receipt) = &outcome.terminal else {
         panic!("expected acceptance after the review, got {outcome:?}");
@@ -8138,6 +8150,69 @@ fn a_failing_decisions_lookup_still_reaches_the_review_verdict_and_is_a_receipt_
         .find(|note| note.starts_with("guidance:"))
         .expect("a guidance line");
     assert!(note.contains("reviewer decisions missing"), "{note}");
+    let prompts = review_prompts.lock().unwrap();
+    assert!(!prompts.is_empty(), "the reviewer was dispatched");
+    for prompt in prompts.iter() {
+        assert!(
+            prompt
+                .contains("decisions that apply to this diff are missing or partial (aval exit 3)"),
+            "{prompt}"
+        );
+    }
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+/// Rules too large for the reviewer's budget, with decisions that fail.
+struct OverflowingRulesFailingDecisions(StatedRules);
+
+impl crate::context::DecisionResolver for OverflowingRulesFailingDecisions {
+    fn resolve(&self, key: &str, scope: Option<&str>) -> AvalVerdict {
+        self.0.resolve(key, scope)
+    }
+
+    fn constraint_rules(&self) -> Result<crate::context::Rules, crate::context::GuidanceGap> {
+        self.0.constraint_rules()
+    }
+
+    fn decisions_for(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<crate::context::RankedKey>, crate::context::GuidanceGap> {
+        FailingDecisions.decisions_for(paths)
+    }
+}
+
+#[test]
+fn a_constraints_overflow_and_a_decisions_failure_keep_both_labels_and_causes() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let backend = conditional_worker("relais task");
+    let rules = OverflowingRulesFailingDecisions(StatedRules(
+        (0..40)
+            .map(|number| crate::context::RuleRef {
+                id: format!("r.{number:04}"),
+                level: "constraint".into(),
+                statement: "x".repeat(4096),
+            })
+            .collect(),
+    ));
+    let outcome =
+        fixture.execute_resolving(&rules, &fixture.contract(Review::Required), &repo, &backend);
+    let Terminal::Accepted(receipt) = &outcome.terminal else {
+        panic!("expected acceptance after the review, got {outcome:?}");
+    };
+    let note = receipt
+        .verification
+        .notes
+        .iter()
+        .find(|note| note.starts_with("guidance:"))
+        .expect("a guidance line");
+    assert!(note.contains("reviewer constraints partial"), "{note}");
+    assert!(
+        note.contains("reviewer decisions missing (aval exit 3)"),
+        "{note}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
 /// A worker that ends with `relais-blocked:` is blocked, not repaired.
