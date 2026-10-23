@@ -248,11 +248,11 @@ pub(crate) fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome,
                         machine.resources.min_free_bytes(),
                     ),
                     Err(e) => {
-                        eprintln!(
-                            "relais coordinator: {} is invalid: {e}; refusing to serve with \
+                        coordinator::log_line(&format!(
+                            "{} is invalid: {e}; refusing to serve with \
                              default limits in place of the ones it states",
                             path.display()
-                        );
+                        ));
                         return Ok(CliOutcome::InvalidInput);
                     }
                 },
@@ -263,18 +263,18 @@ pub(crate) fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome,
             let ledger = match paths::ledger_path().map(|path| (Ledger::open(&path), path)) {
                 Ok((Ok(ledger), _)) => Some(ledger),
                 Ok((Err(e), path)) => {
-                    eprintln!(
-                        "relais coordinator: the ledger at {} is unreadable ({e}); serving \
+                    coordinator::log_line(&format!(
+                        "the ledger at {} is unreadable ({e}); serving \
                          without it means no dispatch is adopted at election",
                         path.display()
-                    );
+                    ));
                     None
                 }
                 Err(e) => {
-                    eprintln!(
-                        "relais coordinator: the ledger path is unavailable ({e}); serving \
+                    coordinator::log_line(&format!(
+                        "the ledger path is unavailable ({e}); serving \
                          without it means no dispatch is adopted at election"
-                    );
+                    ));
                     None
                 }
             };
@@ -287,7 +287,7 @@ pub(crate) fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome,
             ) {
                 Ok(()) => Ok(CliOutcome::Accepted),
                 Err(e) => {
-                    eprintln!("relais coordinator: {e}");
+                    coordinator::log_line(&e.to_string());
                     Ok(CliOutcome::OperationalFailure)
                 }
             }
