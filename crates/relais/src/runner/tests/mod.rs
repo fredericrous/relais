@@ -8312,6 +8312,7 @@ mod exhaustion;
 mod native;
 mod review_parts;
 mod review_repair;
+mod review_retry;
 mod review_stop;
 // Shells out to `sh` and a fake `claude` script made executable with
 // unix permissions: unix only, like the script it tests.
