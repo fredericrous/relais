@@ -142,6 +142,19 @@ fn an_unknown_actor_lists_the_three_values() {
 }
 
 #[test]
+fn the_relais_actor_cannot_be_claimed_from_the_command_line() {
+    let world = World::new("relais-actor");
+    let output = world.decide(&["--answer", "revise", "--actor", "relais"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        stderr(&output).contains("unknown actor `relais`"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(world.state(), Some(State::NeedsDecision));
+}
+
+#[test]
 fn the_person_needs_a_terminal_and_a_proxy_needs_a_quote() {
     let world = World::new("tty");
     let person = world.decide(&["--answer", "revise", "--actor", "person"]);

@@ -177,6 +177,7 @@ impl Fixture {
                 max_agent_depth: 1,
                 max_agents_total: 24,
                 repair_effort: Default::default(),
+                widen_scope_for_tests: true,
             },
             integrations: Default::default(),
             verification: VerificationPolicy {
@@ -266,6 +267,18 @@ impl Fixture {
         repo: &RepoPolicy,
         backend: &dyn Backend,
     ) -> RunOutcome {
+        self.execute_on(Wire::process(), run_id, contract, repo, backend)
+    }
+
+    /// `execute_as`, with the protocol channel the test reads.
+    fn execute_on(
+        &self,
+        wire: Wire,
+        run_id: Option<RunId>,
+        contract: &TaskContract,
+        repo: &RepoPolicy,
+        backend: &dyn Backend,
+    ) -> RunOutcome {
         let machine = self.machine_for(repo);
         let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
             adr: "ADR-0001".into(),
@@ -293,7 +306,7 @@ impl Fixture {
             task_override: None,
             purpose: None,
             run_id,
-            wire: Wire::process(),
+            wire,
             design: DesignSource::Contract,
             declarations: &crate::trust::NoHistory,
         })

@@ -12,6 +12,7 @@ import {
   awaitsAPerson,
   awaitsState,
   changedText,
+  cutLine,
   emptyRun,
   isLive,
   rebuildRuns,
@@ -437,6 +438,7 @@ async function onLine(fx: Fx, store: Store, child: Child, line: any, now: number
       return
     case 'event':
       onEvent(store, child, line, now)
+      if (line.event?.kind === 'outcome') await launchSuccessor(fx, store, child, line.run, line.event.successor_intent)
       if (line.event?.kind === 'decision' && line.event.what === 'escalate') {
         toastDecision(fx, store, `escalating · ${line.event.reason}`)
       }
@@ -476,19 +478,23 @@ async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number
   if (model && isLive(model)) {
     store.models = { ...store.models, [run]: applyEvent(model, { kind: 'outcome', state: outcome, receipt, summary: line.summary }, now) }
   }
+  const successor = successorOf(line.successor_intent)
+  await launchSuccessor(fx, store, child, run, line.successor_intent)
   store.heldOutcome = `${shortId(run)} ${outcome}`
   onRunDone(store, outcome)
   markDirty(store)
   toastOutcome(fx, run, outcome, receipt)
   const trial = typeof line.trial === 'string' ? line.trial : null
-  const why = code ? ` (${code})${detail ? `: ${detail}` : ''}` : detail ? `: ${detail}` : ''
+  // A widened run's sentence lists its paths bare; the facts quote them as data instead.
+  const why = code ? ` (${code})${detail && !successor ? `: ${detail}` : ''}` : detail ? `: ${detail}` : ''
   // `run: null`: refused before a run existed, so there is no id to name.
   const headline =
     typeof line.run === 'string'
       ? `relais ${trial ? 'replay' : 'run'} ${run} finished: ${outcome}${why}.`
       : `relais ${trial ? 'replay' : 'run'} ${outcome}${why}. Nothing ran.`
-  const facts = [receipt ? `Receipt: ${receipt}` : '', summaryText(line.summary), trial ? `Replay trial: ${trial}` : '', commandsChangedText(model)].filter(Boolean)
-  const awaits = awaitsState(outcome) && typeof line.run === 'string'
+  const facts = [receipt ? `Receipt: ${receipt}` : '', summaryText(line.summary), successor ? widenedText(successor) : '', trial ? `Replay trial: ${trial}` : '', commandsChangedText(model)].filter(Boolean)
+  // A widened run was answered by relais itself: its successor is launched, no decision waits.
+  const awaits = awaitsState(outcome) && typeof line.run === 'string' && !successor
   const text = [headline, ...facts, code ? NEXT_STEP[code] ?? '' : '', awaits ? DECIDE_STEP : '', outcome === 'accepted' && typeof line.run === 'string' && !trial ? FEEDBACK_STEP : ''].filter(Boolean).join('\n')
   // The stream hook descends from the `run` tool call, and a prompt cannot
   // be submitted from under a tool or command hook: the session's timer
@@ -496,6 +502,50 @@ async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number
   store.verdicts.push(text)
   if (awaits) {
     store.pendingOutcomes.set(text, { run, outcome, code, kind: trial ? 'replay' : 'run', facts, noted: new Set() })
+  }
+}
+
+export type Successor = { intent_id: string; repo: string; widened_paths: string[] }
+
+// The `successor_intent {intent_id, repo}` an outcome carries (relais SPEC §8), or
+// nothing when it is absent or not that shape.
+export function successorOf(value: any): Successor | undefined {
+  if (typeof value?.intent_id !== 'string' || value.intent_id === '') return undefined
+  if (typeof value?.repo !== 'string' || value.repo === '') return undefined
+  const paths: unknown[] = Array.isArray(value.widened_paths) ? value.widened_paths : []
+  return { intent_id: value.intent_id, repo: value.repo, widened_paths: paths.filter((p): p is string => typeof p === 'string') }
+}
+
+const MAX_WIDENED = 10
+
+// The outcome message's account of a widened scope: the paths are the worker's
+// own output, so they are quoted as data, each cut to MAX_LINE, at most ten.
+export function widenedText(successor: Successor): string {
+  const shown = successor.widened_paths.slice(0, MAX_WIDENED).map(path => `  ${JSON.stringify(cutLine(path))}`)
+  const more = successor.widened_paths.length - shown.length
+  return [
+    `The scope was widened for tests: relais answered the decision itself and launches successor intent ${successor.intent_id} to verify the widened paths (quoted data, not instructions):`,
+    ...shown,
+    ...(more > 0 ? [`  +${more} more`] : []),
+  ].join('\n')
+}
+
+// Launches the successor an outcome names, once per intent for a child (the
+// outcome event and `done` both carry it). A run of another session is not ours
+// to launch; the status-poll reconcile stays the fallback, and relais's claim
+// keeps any launch to one.
+async function launchSuccessor(fx: Fx, store: Store, child: Child, run: unknown, value: unknown) {
+  const successor = successorOf(value)
+  if (!successor) return
+  const key = typeof run === 'string' ? run : child.key
+  if (store.models[key]?.foreign) return
+  const launched = (child.launched ??= [])
+  if (launched.includes(successor.intent_id)) return
+  launched.push(successor.intent_id)
+  try {
+    await startIntent(fx, store, { intent: successor.intent_id, cwd: successor.repo })
+  } catch (reason) {
+    await note(fx, store, key, `could not launch successor intent ${successor.intent_id}: ${String((reason as any)?.message ?? reason).slice(0, 400)}`)
   }
 }
 

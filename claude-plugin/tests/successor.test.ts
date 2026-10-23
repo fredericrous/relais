@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import { launchableIntents } from '../hooks/runs.ts'
-import { nativeCalls, scriptedEngine, settle } from './support.ts'
+import { DECIDE_STEP, widenedText } from '../hooks/runs.ts'
+import { event, line, nativeCalls, scriptedEngine, settle, startedRun } from './support.ts'
 
 const result = (stdout: string, exitCode = 0) => ({ exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
 
@@ -225,4 +226,44 @@ test('widen_scope does not go with review-parts', async ($: any, on: any) => {
   await settle(engine)
   const wrong = await decide($, { answer: 'review-parts' })
   expect(wrong.deny ?? wrong.result).toContain('belong to answer revise')
+})
+
+const WIDENED_RUN = 'run-widened-1'
+const widenedPaths = ['tests/a_test.rs', ...Array.from({ length: 11 }, (_, i) => `tests/b${i}.rs`), 'x'.repeat(400)]
+const successor = { intent_id: 'intent-w', repo: '/repo', widened_paths: widenedPaths }
+
+test('one outcome line carrying a successor intent launches exactly one child and sends no decide prompt', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push(
+    'stdout',
+    event(WIDENED_RUN, 0, { kind: 'outcome', state: 'cancelled', receipt: null, reason: 'widened', successor_intent: successor }) +
+      line({ relais: 'done', run: WIDENED_RUN, outcome: 'cancelled', receipt: null, code: 'scope_widened_for_tests', detail: 'widened', successor_intent: successor }),
+  )
+  await settle(engine)
+  await engine.clock.advance(200)
+  await settle(engine)
+  expect(launches(engine).map((e: any) => [e.argv, e.cwd])).toEqual([[['relais', 'run', '--intent', 'intent-w', '--protocol'], '/repo']])
+  const prompts = engine.calls.prompts.map((p: any) => p.text).join('\n')
+  expect(prompts).toContain('cancelled (scope_widened_for_tests)')
+  expect(prompts).toContain("+3 more")
+  expect(prompts).not.toContain(DECIDE_STEP)
+  expect(prompts).not.toContain('tests/b9.rs')
+})
+
+test('the widened paths are quoted data, each cut to MAX_LINE, at most ten, then +k more', () => {
+  const text = widenedText({ intent_id: 'i', repo: '/r', widened_paths: widenedPaths })
+  const quoted = text.split('\n').filter(l => l.startsWith('  "'))
+  expect(quoted.length).toBe(10)
+  expect(text).toContain('  +3 more')
+  expect(text).not.toContain('x'.repeat(300))
+})
+
+test('models rebuilt from status launch no child', async ($: any, on: any) => {
+  const engine = scriptedEngine(on)
+  engine.script.runResult = () => result(JSON.stringify({ runs: [], intents: [] }))
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await settle(engine)
+  await $.tool.call({ tool: 'mcp__relais__status' })
+  await settle(engine)
+  expect(launches(engine)).toEqual([])
 })

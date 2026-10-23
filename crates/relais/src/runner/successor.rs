@@ -12,6 +12,9 @@ use crate::contract::{ContractError, TaskContract};
 use crate::ids::RunId;
 use crate::ledger::{IntentReview, Ledger, LedgerError, NewIntent};
 use crate::lifecycle::{Reason, State};
+use crate::policy::VerificationProfile;
+use crate::verify::classify_verification_inputs;
+use crate::workspace::is_protected_path;
 
 use super::candidate::{self, Refusal, Resolution, Source};
 use super::RunError;
@@ -120,6 +123,40 @@ pub fn out_of_scope_paths(ledger: &Ledger, run: &RunId) -> Result<Vec<String>, P
         )));
     }
     Ok(paths)
+}
+
+/// Whether every out-of-scope path is a test-tree path (the globs of
+/// [`crate::verify::TEST_TREE_INPUTS`]) that is neither one of the
+/// profile's own verification inputs nor under a protected prefix. An empty
+/// list is not a tests-only overflow, and a pattern that cannot be
+/// compiled makes no path a test.
+pub fn is_tests_only(profile: &VerificationProfile, paths: &[String]) -> bool {
+    if paths.is_empty() || paths.iter().any(|path| is_protected_path(path)) {
+        return false;
+    }
+    match classify_verification_inputs(profile, paths) {
+        Ok(touched) => touched.policy.is_empty() && touched.tests.len() == paths.len(),
+        Err(_) => false,
+    }
+}
+
+/// The successor `scope_exceeded` is answered with when relais settles it
+/// itself: `Ok(None)` unless the overflow is tests only, else the intent
+/// widening the scope by exactly those paths, and the paths.
+pub fn plan_test_widening(
+    ledger: &Ledger,
+    run: &RunId,
+    contract: &TaskContract,
+    profile: &VerificationProfile,
+    runs_dir: &Path,
+) -> Result<Option<(NewIntent, Vec<String>)>, PlanError> {
+    let paths = out_of_scope_paths(ledger, run)?;
+    if !is_tests_only(profile, &paths) {
+        return Ok(None);
+    }
+    let widened = widened_contract(contract, run, &paths).map_err(PlanError::Contract)?;
+    let intent = plan(ledger, run, &widened, paths.clone(), runs_dir)?;
+    Ok(Some((intent, paths)))
 }
 
 /// The contract `--widen-scope` builds: the decided run's own, as a

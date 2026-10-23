@@ -168,6 +168,7 @@ pub fn reap(
             receipt: None,
             summary: None,
             reason: Some(sentence),
+            successor_intent: None,
         },
     );
     match stderr.and(outcome) {

@@ -519,11 +519,28 @@ pub(in crate::runner) fn fit_statements(
     (shown, Some(gap))
 }
 
+/// The reviewer's note on the paths a successor's scope was widened to
+/// (relais's own test widen, or a person's `--widen-scope`): edits the
+/// original contract did not cover, to check closely. Empty when nothing was
+/// widened. The paths come out of a diff, so they are quoted as data.
+pub(in crate::runner) fn widened_scope_block(paths: &[String]) -> String {
+    if paths.is_empty() {
+        return String::new();
+    }
+    let mut block = String::from(
+        "this candidate was verified with its scope WIDENED: the paths below are OUT-OF-SCOPE \
+         edits the original contract did not cover. Check them closely: an edit nobody asked \
+         for is a finding, and in a test a deleted, skipped or loosened case is too.\n",
+    );
+    block.push_str(&super::data_list_block("widened paths", paths));
+    block
+}
+
 /// What the reviewer reads of aval: the full statement of every active
 /// constraint (it cannot run `aval rule`, so never the bare index and
 /// never that instruction), then the relevant block without the rules
-/// already stated above it. `budget` is the constraints budget; statements that do not fit whole are left out and
-/// named in the returned gap.
+/// already stated above it. `budget` is the constraints budget; statements
+/// that do not fit whole are left out and named in the returned gap.
 pub(in crate::runner) fn reviewer_guidance(
     guidance: &Guidance,
     budget: usize,

@@ -1718,6 +1718,17 @@ pub fn matcher(patterns: &[String]) -> Result<globset::GlobSet, VerifyError> {
     })
 }
 
+/// The matcher over [`TEST_TREE_INPUTS`], shared by the classification of
+/// a candidate's changes and the scope-overflow rule that widens for tests.
+pub fn test_tree_matcher() -> Result<globset::GlobSet, VerifyError> {
+    matcher(
+        &TEST_TREE_INPUTS
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>(),
+    )
+}
+
 /// Which of `changed` are verification inputs, and of which class. A
 /// path in both classes (a `tests/Cargo.toml`) is policy: the stricter
 /// outcome wins.
@@ -1726,12 +1737,7 @@ pub fn classify_verification_inputs(
     changed: &[String],
 ) -> Result<TouchedInputs, VerifyError> {
     let policy_set = matcher(&verification_inputs(profile))?;
-    let test_set = matcher(
-        &TEST_TREE_INPUTS
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>(),
-    )?;
+    let test_set = test_tree_matcher()?;
     let mut touched = TouchedInputs::default();
     for path in changed {
         if policy_set.is_match(path.as_str()) {

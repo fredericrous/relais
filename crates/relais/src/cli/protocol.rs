@@ -45,6 +45,7 @@ pub(crate) fn announce_unstarted(outcome: CliOutcome, error: Option<&CliError>) 
         trial: None,
         code: Some(code),
         detail: Some(&detail),
+        successor_intent: None,
     });
 }
 

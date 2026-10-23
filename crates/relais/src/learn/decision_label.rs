@@ -76,20 +76,24 @@ pub enum DecisionLabel {
     Excluded(&'static str),
 }
 
-/// Who answered, as far as the rule cares: the advisor never trains on its
-/// own unlabelled guesses.
+/// Who answered, as far as the rule cares: neither the advisor nor relais
+/// itself (a policy rule settling a test-only scope overflow) is a judge
+/// whose unlabelled answer trains a model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answerer {
     Advisor,
+    Relais,
     Anyone,
 }
 
 impl Answerer {
-    /// Read the stored actor text; `advisor` is the fourth actor a later
-    /// release records, which no `--actor` accepts.
+    /// Read the stored actor text; `advisor` and `relais` are actors no
+    /// `--actor` accepts: a later release records the first, relais itself
+    /// the second.
     pub fn of_stored(actor: Option<&str>) -> Self {
         match actor {
             Some("advisor") => Self::Advisor,
+            Some("relais") => Self::Relais,
             Some(_) | None => Self::Anyone,
         }
     }
@@ -174,7 +178,7 @@ const NOT_AN_ANSWER: &str = "the decision is open, or was not answered with a de
 ///
 /// - an approval: its task's outcome decides (stands → yes, withdrawn →
 ///   no with the reporter's source); with no outcome the answer does (yes),
-///   unless the advisor gave it;
+///   unless the advisor or relais gave it;
 /// - a salvage raised for review findings: the verified candidate landing
 ///   intact is yes, the landed commit rewriting it is no (`rewritten`), a
 ///   withdrawn outcome beats containment; unknown containment and any
@@ -182,7 +186,7 @@ const NOT_AN_ANSWER: &str = "the decision is open, or was not answered with a de
 /// - a revision that asked for a review in parts: excluded, the candidate
 ///   was not judged;
 /// - revise, reject and abandon: no from the answer, unless the advisor
-///   gave it;
+///   or relais gave it;
 /// - `decided`/`recorded`, a run raised from any other state, and a
 ///   `never_shipped` task: excluded.
 pub fn decision_label_of(facts: &DecisionFacts) -> DecisionLabel {
@@ -204,6 +208,7 @@ pub fn decision_label_of(facts: &DecisionFacts) -> DecisionLabel {
         Reason::DecisionRevised | Reason::DecisionRejected | Reason::DecisionAbandoned => {
             match facts.answerer {
                 Answerer::Advisor => DecisionLabel::Excluded("the advisor's own unlabelled answer"),
+                Answerer::Relais => DecisionLabel::Excluded("relais's own answer, not a judgement"),
                 Answerer::Anyone => DecisionLabel::No(DecisionLabelSource::Answer),
             }
         }
@@ -226,6 +231,9 @@ fn approval_label(facts: &DecisionFacts) -> DecisionLabel {
         (Judgement::Silent, _) => DecisionLabel::Excluded("never shipped: no quality label"),
         (Judgement::NoOutcome, Answerer::Advisor) => {
             DecisionLabel::Excluded("the advisor's own unlabelled answer")
+        }
+        (Judgement::NoOutcome, Answerer::Relais) => {
+            DecisionLabel::Excluded("relais's own answer, not a judgement")
         }
         (Judgement::NoOutcome, Answerer::Anyone) => DecisionLabel::Yes(DecisionLabelSource::Answer),
     }
@@ -505,7 +513,18 @@ mod tests {
     }
 
     #[test]
+    fn a_relais_answer_is_excluded_like_the_advisors() {
+        let revised = DecisionFacts {
+            raised_state: State::NeedsDecision,
+            answerer: Answerer::of_stored(Some("relais")),
+            ..facts(Reason::DecisionRevised)
+        };
+        assert!(matches!(decision_label_of(&revised), Excluded(_)));
+    }
+
+    #[test]
     fn the_stored_spellings_read_back() {
+        assert_eq!(Answerer::of_stored(Some("relais")), Answerer::Relais);
         assert_eq!(Answerer::of_stored(Some("advisor")), Answerer::Advisor);
         assert_eq!(Answerer::of_stored(Some("orchestrator")), Answerer::Anyone);
         assert_eq!(Answerer::of_stored(None), Answerer::Anyone);

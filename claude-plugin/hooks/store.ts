@@ -44,6 +44,8 @@ export type Child = {
   // Set by its `done` line. A child that exits without one still owes the
   // model a message: the exit code and the end of its stderr.
   doneSeen?: boolean
+  // The successor intents this child's outcome already launched.
+  launched?: string[]
   // The last stderr lines, for that message.
   stderrTail?: string[]
 }

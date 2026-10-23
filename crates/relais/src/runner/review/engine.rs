@@ -345,6 +345,15 @@ impl<'a> RunEngine<'a> {
         let (guidance_text, reviewer_gap) =
             reviewer_guidance(&request.manifest.guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES);
         prompt.push_str(&guidance_text);
+        match self.config.ledger.intent_of_run(&self.run_id) {
+            Ok(Some(intent)) => prompt.push_str(&super::widened_scope_block(&intent.scope_delta)),
+            Ok(None) => {}
+            // Not fatal, and said: the reviewer is told what it was not.
+            Err(e) => prompt.push_str(&format!(
+                "the paths this run's scope was widened to could not be read ({e}); check \
+                 every out-of-scope edit in the patch closely.\n"
+            )),
+        }
         if !request.verification_inputs_changed.is_empty() {
             prompt.push_str(
                 "this candidate CHANGES THE TEST TREE (tests or fixtures the checks execute). \

@@ -146,10 +146,18 @@ pub enum Event {
         /// pane's outcome row, and a timeline rebuilt from the events.
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<Summary>,
-        /// Why the run ended this way, as a sentence, when a process other
-        /// than the driver ended it (a reap).
+        /// Why the run ended this way, as a sentence: a reap (a process other
+        /// than the driver ended it) or relais settling a test-only scope
+        /// overflow itself (the state is then the resolved one, `cancelled`).
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// The successor intent relais recorded when it answered a
+        /// test-only scope overflow itself (SPEC §8); the outcome's state is
+        /// then `cancelled`, and the plugin launches the intent (through
+        /// `startIntent`, without a decide prompt) while a CLI run prints
+        /// the command that does.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        successor_intent: Option<SuccessorRef>,
     },
     /// Something about the machine the run could not check and went on
     /// without: `what` names it (`kind` is the event's own tag), `detail`
@@ -293,7 +301,23 @@ pub enum Request<'a> {
         /// The same sentence the CLI prints on stderr.
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<&'a str>,
+        /// The successor intent relais recorded when it settled a test-only
+        /// scope overflow itself (SPEC §8); `outcome` is then `cancelled`
+        /// with code `scope_widened_for_tests`, and the plugin launches it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        successor_intent: Option<&'a SuccessorRef>,
     },
+}
+
+/// The successor intent an outcome names: its id, and the repository the
+/// plugin starts it in. `widened_paths` are the test paths the scope was
+/// widened to; the plugin quotes them as data in its outcome message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SuccessorRef {
+    pub intent_id: String,
+    pub repo: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub widened_paths: Vec<String>,
 }
 
 /// What the run's candidate changed.
@@ -944,6 +968,7 @@ mod tests {
                 receipt: None,
                 summary: None,
                 reason: Some("run run-w interrupted: its driver (pid 1) is gone".into()),
+                successor_intent: None,
             },
         )
         .expect("outcome");
@@ -1213,6 +1238,7 @@ mod tests {
                 deletions: 1,
             }),
             reason: None,
+            successor_intent: None,
         });
         let text = std::fs::read_to_string(dir.join("run-1/events.jsonl")).expect("events");
         let timeline = timeline("run-1", &text);
@@ -1304,6 +1330,7 @@ mod tests {
             trial: None,
             code: None,
             detail: None,
+            successor_intent: None,
         })
         .expect("sent");
         let written: Vec<Vec<u8>> = rx.try_iter().collect();
