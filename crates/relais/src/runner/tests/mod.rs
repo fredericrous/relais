@@ -8713,6 +8713,7 @@ fn code_rules_without_text_are_not_rendered_as_empty_rules() {
     let (text, gap) = prompt::worker_code_rules_block(&guidance, 1024);
     assert!(text.is_empty(), "{text}");
     let gap = gap.expect("a gap");
+    assert_eq!(gap.cause, context::guidance::GapCause::TextUnavailable);
     assert!(gap.detail.contains("not available in this prompt"));
 }
 

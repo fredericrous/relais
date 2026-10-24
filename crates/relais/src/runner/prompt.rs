@@ -313,7 +313,7 @@ pub(super) fn worker_code_rules_block(
     if rendered.is_empty() {
         let gap = GuidanceGap::new(
             GuidanceSource::CodeRules,
-            context::guidance::GapCause::NoAnswer,
+            context::guidance::GapCause::TextUnavailable,
             "the code rules are not available in this prompt",
         );
         return (String::new(), Some(gap));

@@ -74,6 +74,9 @@ pub enum GapCause {
     StalePack,
     /// aval answered, and it is too old for `--full`/`governs`.
     AvalTooOld,
+    /// The full text of a code rule is not in memory, so it cannot be carried;
+    /// this is missing text, never a timeout.
+    TextUnavailable,
 }
 
 impl GuidanceGap {
@@ -448,7 +451,7 @@ pub fn fetch_rules(
         rules.notes.push(GuidanceGap::new(
             GuidanceSource::CodeRules,
             GapCause::AvalTooOld,
-            "aval is too old for `--full`/`governs` (exit 2); code rules are not carried; upgrade aval",
+            "aval is older than 1.10.0 (no --full/governs; exit 2): code rules are not carried; upgrade it, e.g. `brew upgrade aval` or aval's install/install.sh",
         ));
     } else if !rules.rules.is_empty() && rules.code_rules.is_empty() {
         rules.notes.push(GuidanceGap::new(
@@ -768,9 +771,7 @@ printf '%s' '{"rules":[{"id":"errors.typed-values","level":"constraint","stateme
         assert_eq!(rules.notes.len(), 1);
         let detail = &rules.notes[0].detail;
         assert!(
-            detail.contains("too old")
-                && detail.contains("--full")
-                && detail.contains("upgrade aval"),
+            detail.contains("1.10.0") && detail.contains("--full") && detail.contains("upgrade it"),
             "{detail}"
         );
     }
