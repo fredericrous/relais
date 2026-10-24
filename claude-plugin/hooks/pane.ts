@@ -213,7 +213,8 @@ function agentRows(m: RunModel): AgentLine[] {
 // The output a run shows, `cap` lines at most: the last ones, so the
 // extra (earlier) lines are dropped, not wrapped. A step running no check
 // shows what its agent does instead. A live run's active step always shows
-// one row: its latest line, or a waiting row when it is silent.
+// one row: its latest line, the activity row while its check runs, or a
+// waiting row when it is silent and no check runs.
 function outputRows(m: RunModel, cap: number): Row[] {
   if (cap < 0) return []
   const live = isLive(m)
@@ -264,7 +265,8 @@ const OUTPUT_FLOOR = 8
 // frame's ledger, session and hint rows, then the output down to 1 row, then
 // the tail's dim rows. Still too tall: the other focus runs shrink to their
 // head (and outcome) row and the top is cut behind `↑ N rows above`. The kept
-// frame's head and agent Buttons always stay.
+// frame's head, its agent Buttons, its latest output line and the activity
+// row under it always stay.
 export function layoutPane(runs: RunModel[], room: Room, quiet: QuietPane = NO_QUIET): Row[] {
   const down: Row[] = quiet.down ? [{ text: 'quiet watcher down', dim: true }] : []
   if (runs.length === 0 && quiet.runs.length === 0) {
@@ -300,8 +302,10 @@ function drawFrame(f: Frame & { m: RunModel; now: number }, cap: number, trim: T
       const out = outputRows(f.m, cap)
       rows.push(...out)
       const activity = activityRow(f.m, f.now)
-      if (activity) rows.push(activity)
-      if (activity) keep.add(activity)
+      if (activity) {
+        rows.push(activity)
+        keep.add(activity)
+      }
       if (out.length > 0) keep.add(out[out.length - 1])
     }
   }

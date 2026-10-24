@@ -316,6 +316,9 @@ test('at 40 rows the activity row is drawn and the bound holds', () => {
   const rows = rowsOf([liveTimeline('run-65d322006dd13-c35c')], 40)
   expect(rows.length).toBeLessThanOrEqual(40)
   expect(activityOf(rows)).toHaveLength(1)
+  // The row the activity row needs is the earliest output line, nothing else.
+  const first = ONE_LIVE_RUN.findIndex(r => r.text.startsWith('  │ line '))
+  expect(rows).toEqual(ONE_LIVE_RUN.filter((_, i) => i !== first))
 })
 
 test('when rows are cut, the latest output line stays right above the activity row', () => {
