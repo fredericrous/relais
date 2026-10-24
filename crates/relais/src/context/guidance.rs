@@ -257,6 +257,11 @@ pub struct Guidance {
     pub relevant_rules: Vec<RuleRef>,
     #[serde(default)]
     pub gaps: Vec<GuidanceGap>,
+    /// The directory name of the repository root this run is for, which is
+    /// the name aval's corpus knows the repository by; the worker passes it
+    /// as `repo` to the `aval_rule` tool. `None` when unknown.
+    #[serde(default)]
+    pub repo_name: Option<String>,
 }
 
 impl Guidance {

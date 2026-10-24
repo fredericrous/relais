@@ -344,9 +344,14 @@ pub(super) fn constraint_index_block(guidance: &Guidance) -> String {
     if lines.is_empty() {
         return String::new();
     }
+    let instruction = match &guidance.repo_name {
+        Some(name) => format!(
+            "read one rule with the `aval_rule` tool, passing `repo: \"{name}\"`, or run `aval rule <id>` in the working directory when that tool is not available or answers with an error, before you write code it governs."
+        ),
+        None => "run `aval rule <id>` in the working directory to read one rule before you write code it governs.".to_string(),
+    };
     format!(
-        "the constraint rules below are in force; review blocks on them.\n\
-         run `aval rule <id>` for one rule's text before you write code it governs.\n{}",
+        "the constraint rules below are in force; review blocks on them.\n{instruction}\n{}",
         data_block("constraint index", &lines.join("\n"))
     )
 }

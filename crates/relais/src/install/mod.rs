@@ -256,7 +256,7 @@ fn agent_implementation() -> String {
     let body = r#"---
 name: relais-implementation
 description: Implementation worker (relais advisory default) for bounded changes under a task contract.
-tools: Read, Grep, Glob, LSP, Edit, Write, Bash
+tools: Read, Grep, Glob, LSP, Edit, Write, Bash, mcp__aval__aval_rule, mcp__aval__aval_resolve, mcp__aval__aval_relevant
 model: sonnet
 ---
 

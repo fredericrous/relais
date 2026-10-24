@@ -6727,7 +6727,12 @@ fn the_worker_prompt_fences_the_index_and_the_relevant_block_once_each() {
     assert_eq!(prompt.matches("--- end constraint index ---").count(), 1);
     assert_eq!(prompt.matches("--- begin relevant guidance (").count(), 1);
     assert_eq!(prompt.matches("--- end relevant guidance ---").count(), 1);
-    assert!(prompt.contains("run `aval rule <id>`"), "{prompt}");
+    assert!(!prompt.contains("repo: \"\""), "{prompt}");
+    assert!(!prompt.contains("`aval_rule` tool"), "{prompt}");
+    assert!(
+        prompt.contains("run `aval rule <id>` in the working directory"),
+        "{prompt}"
+    );
     let index = fenced(&prompt, "constraint index").expect("index");
     assert_eq!(
         index,
@@ -6739,6 +6744,29 @@ fn the_worker_prompt_fences_the_index_and_the_relevant_block_once_each() {
         relevant.contains("`routing.session-model` (ADR-0001): route the session model"),
         "{relevant}"
     );
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+#[test]
+fn the_index_instruction_names_the_repository_root_never_the_task_worktree() {
+    let fixture = Fixture::new();
+    let contract = fixture.contract(Review::Off);
+    let mut manifest = guided_manifest(&["errors.never-swallowed"], &[]);
+    let source_root = std::path::Path::new("/work/known-repo");
+    let task_worktree = source_root.join(".relais").join("task");
+    assert_eq!(
+        task_worktree.file_name().and_then(|name| name.to_str()),
+        Some("task")
+    );
+    manifest.guidance.repo_name = source_root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    let prompt = build_prompt(&contract, &manifest, 1, None, AttemptKind::Initial).0;
+    assert!(
+        prompt.contains("passing `repo: \"known-repo\"`"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("repo: \"task\""), "{prompt}");
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 

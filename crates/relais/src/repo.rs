@@ -5,7 +5,7 @@
 //! a policy document, which is why they are here and not in `policy`:
 //! that module decides authority from parsed text and touches nothing.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::policy::{RepoIdentity, INIT_TEMPLATE};
 
@@ -84,13 +84,30 @@ pub fn identity(root: &Path) -> RepoIdentity {
     if let Some(url) = git_answer(root, &["remote", "get-url", "origin"]) {
         return RepoIdentity::origin(url);
     }
-    let common_dir = git_answer(root, &["rev-parse", "--git-common-dir"])
-        // Relative when run from the main worktree (`.git`); absolute
-        // from a linked worktree. Anchored at `root` either way.
-        .map(|dir| root.join(dir))
-        .unwrap_or_else(|| root.to_path_buf());
+    let common_dir = git_common_dir(root).unwrap_or_else(|| root.to_path_buf());
     let canonical = std::fs::canonicalize(&common_dir).unwrap_or(common_dir);
     RepoIdentity::common_dir(&canonical)
+}
+
+/// The git common directory of `root`, anchored at `root`: relative from
+/// the main worktree (`.git`), absolute from a linked worktree. `None`
+/// when git names none.
+fn git_common_dir(root: &Path) -> Option<PathBuf> {
+    git_answer(root, &["rev-parse", "--git-common-dir"]).map(|dir| root.join(dir))
+}
+
+/// The directory name of the repository's MAIN checkout, which is the name
+/// aval's corpus knows the repository by: the parent of the canonical git
+/// common directory, so a linked worktree names its main checkout and not
+/// its own directory. `None` when git names no common directory or it has
+/// no named parent.
+pub fn main_checkout_name(root: &Path) -> Option<String> {
+    let common_dir = git_common_dir(root)?;
+    let canonical = std::fs::canonicalize(&common_dir).unwrap_or(common_dir);
+    canonical
+        .parent()?
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 /// Is `root` a LINKED worktree — a checkout made by `git worktree add` —
@@ -442,6 +459,47 @@ mod tests {
     /// checkout path used to be hashed in, so a run started from a
     /// worktree blocked on a grant the user had issued from the live
     /// checkout.
+    #[test]
+    fn a_linked_worktree_names_the_main_checkout() {
+        let base = temp_dir("main-name");
+        let main_checkout = base.join("main-checkout-name");
+        std::fs::create_dir_all(&main_checkout).expect("mkdir");
+        let no_hooks = base.join("no-hooks");
+        std::fs::create_dir_all(&no_hooks).expect("mkdir");
+        git(&main_checkout, &["init", "-q"]);
+        git(
+            &main_checkout,
+            &["config", "core.hooksPath", &no_hooks.to_string_lossy()],
+        );
+        git(&main_checkout, &["config", "user.email", "relais@test"]);
+        git(&main_checkout, &["config", "user.name", "relais test"]);
+        git(
+            &main_checkout,
+            &["commit", "-q", "--allow-empty", "-m", "base"],
+        );
+        let linked = base.join("other-linked-name");
+        git(
+            &main_checkout,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                &linked.to_string_lossy(),
+                "HEAD",
+            ],
+        );
+        assert_eq!(
+            main_checkout_name(&linked).as_deref(),
+            Some("main-checkout-name")
+        );
+        assert_eq!(
+            main_checkout_name(&main_checkout).as_deref(),
+            Some("main-checkout-name")
+        );
+        assert_eq!(main_checkout_name(&base.join("absent")), None);
+    }
+
     #[test]
     fn every_worktree_of_one_repository_has_the_repositorys_identity() {
         let base = temp_dir("identity-wt");

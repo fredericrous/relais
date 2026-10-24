@@ -738,6 +738,9 @@ pub struct ContextInputs<'a> {
     /// The contract's design as read from the base revision
     /// ([`read_design`]); `None` when the contract names none.
     pub design: Option<DesignInput>,
+    /// The directory name of the source repository's root (never a task
+    /// worktree's directory), as aval's corpus names the repository.
+    pub repo_name: Option<String>,
 }
 
 /// Assemble the context manifest. Fails on contradiction (blocked), on
@@ -756,6 +759,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         turn_ceiling,
         resolver,
         design,
+        repo_name,
     } = inputs;
 
     let manifest_aval_version = tool_versions.aval.clone();
@@ -799,7 +803,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         resolved.push((key.clone(), verdict));
     }
 
-    let guidance = gather_guidance(
+    let mut guidance = gather_guidance(
         resolver,
         &RelevantQuery {
             paths: guidance::query_paths(contract.scope_patterns(), &contract.read_hints),
@@ -808,6 +812,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         &keys,
         manifest_aval_version,
     );
+    guidance.repo_name = repo_name;
 
     // The constraint is the decision in the record's own words — what
     // `aval resolve --json` carries as `choice` and `reason`; the full
@@ -1017,6 +1022,7 @@ mod tests {
             turn_ceiling: crate::backend::TurnCeiling::Unavailable,
             resolver,
             design: None,
+            repo_name: Some("relais".into()),
         }
     }
 

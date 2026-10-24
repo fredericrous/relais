@@ -564,6 +564,7 @@ impl<'a> RunEngine<'a> {
             turn_ceiling,
             resolver: self.config.aval_resolver,
             design,
+            repo_name: crate::repo::main_checkout_name(self.config.repo_dir),
         });
         match assembled {
             Ok(manifest) => {
