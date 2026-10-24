@@ -222,6 +222,75 @@ pub(crate) fn decide_in(
     request: &DecideRequest<'_>,
     locate: &dyn Fn() -> Result<StateLocations, CliError>,
 ) -> Result<Decision, CliError> {
+    let mut decision = record_answer(request, locate)?;
+    if let Ok(done) = &mut decision {
+        let frees_in_place = matches!(
+            request.answer,
+            DecideAnswer::Salvaged | DecideAnswer::Abandon | DecideAnswer::Decided
+        );
+        if frees_in_place && done.from_state == State::Interrupted {
+            let locations = locate()?;
+            let ledger = operational(Ledger::open(&locations.ledger), "the ledger is unavailable")?;
+            let run = RunId::from_stored(&done.run);
+            if let Some(report) = free_kept_in_place(&ledger, &run, done.to_state, &locations.runs)?
+            {
+                done.sentence = format!("{}; {report}", done.sentence);
+            }
+        }
+    }
+    Ok(decision)
+}
+
+/// What answering an interrupted in-place run does to its worktree marker.
+/// Only a moved HEAD means the tree and branch are the person's, so only
+/// then is the marker retired (the code `relais resume --retire` runs);
+/// otherwise it stays and the command that retires it is named.
+fn free_kept_in_place(
+    ledger: &Ledger,
+    run: &RunId,
+    state: State,
+    runs_dir: &Path,
+) -> Result<Option<String>, CliError> {
+    use relais::workspace::inplace;
+    let Some(workspace) = operational(ledger.run_workspace(run), "decide")? else {
+        return Ok(None);
+    };
+    let Ok(git_dir) = inplace::git_dir(&workspace.repo_path) else {
+        return Ok(None);
+    };
+    let Ok(marker) = inplace::read_marker(&git_dir, run.as_str()) else {
+        return Ok(None);
+    };
+    let head_moved = match inplace::head(&workspace.repo_path) {
+        Ok((_, now)) => now != marker.head_sha,
+        Err(_) => false,
+    };
+    if !head_moved {
+        return Ok(Some(format!(
+            "the in-place worktree {} still holds a marker for it; HEAD did not move, so \
+             finish it with `relais resume --retire {run}`",
+            workspace.repo_path.display()
+        )));
+    }
+    let reconciliation = super::resume::reconcile_run(ledger, run)?;
+    let mut lines = Vec::new();
+    super::resume::retire_in_place_saying(
+        ledger,
+        run,
+        state,
+        &reconciliation,
+        runs_dir,
+        &mut |line| {
+            lines.push(line);
+        },
+    )?;
+    Ok(Some(lines.join("; ")))
+}
+
+fn record_answer(
+    request: &DecideRequest<'_>,
+    locate: &dyn Fn() -> Result<StateLocations, CliError>,
+) -> Result<Decision, CliError> {
     use std::io::IsTerminal;
     let actor = match check_decide_arguments(request, std::io::stdin().is_terminal()) {
         Ok(actor) => actor,
@@ -739,6 +808,7 @@ mod tests {
     fn waiting_run(
         ledger: &Ledger,
         name: &str,
+        repo: &str,
         state: State,
         reason: Reason,
         detail: Option<serde_json::Value>,
@@ -746,7 +816,7 @@ mod tests {
     ) {
         let run = RunId::from_stored(name);
         ledger
-            .insert_run(&run, "/repo", None, &TaskId::from_stored(name), "rk")
+            .insert_run(&run, repo, None, &TaskId::from_stored(name), "rk")
             .expect("run");
         let revision = ledger
             .insert_contract_revision(&run, "h", "{}", "HEAD", None)
@@ -847,6 +917,7 @@ mod tests {
         waiting_run(
             &ledger,
             "run-ok",
+            "/repo",
             State::NeedsDecision,
             Reason::ReviewOverBudget,
             None,
@@ -855,6 +926,7 @@ mod tests {
         waiting_run(
             &ledger,
             "run-gaps",
+            "/repo",
             State::NeedsDecision,
             Reason::ReviewOverBudget,
             Some(gaps),
@@ -863,6 +935,7 @@ mod tests {
         waiting_run(
             &ledger,
             "run-old",
+            "/repo",
             State::NeedsReview,
             Reason::ReviewUnavailable,
             None,
@@ -871,6 +944,7 @@ mod tests {
         waiting_run(
             &ledger,
             "run-stale",
+            "/repo",
             State::NeedsDecision,
             Reason::ReviewOverBudget,
             None,
@@ -949,5 +1023,178 @@ mod tests {
             None
         );
         assert!(!runs.join("run-old").exists());
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = relais::workspace::git_command(dir)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A linked worktree whose run was interrupted: its marker is on disk,
+    /// the lease released, and the ledger holds the run waiting as
+    /// `interrupted` with the worktree as its workspace.
+    fn interrupted_in_place(dir: &Path, name: &str) -> (Ledger, PathBuf) {
+        use relais::workspace::inplace::{Lease, Marker, Stage};
+        let live = dir.join("live");
+        std::fs::create_dir_all(&live).expect("mkdir");
+        git(&live, &["init", "-q", "-b", "main"]);
+        git(&live, &["config", "user.email", "t@t"]);
+        git(&live, &["config", "user.name", "t"]);
+        git(&live, &["config", "commit.gpgsign", "false"]);
+        let no_hooks = dir.join("no-hooks");
+        std::fs::create_dir_all(&no_hooks).expect("mkdir");
+        git(
+            &live,
+            &["config", "core.hooksPath", &no_hooks.to_string_lossy()],
+        );
+        std::fs::write(live.join("a.txt"), "a\n").expect("a");
+        git(&live, &["add", "-A"]);
+        git(&live, &["commit", "-q", "-m", "base"]);
+        let worktree = dir.join("wt");
+        git(
+            &live,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task",
+                &worktree.to_string_lossy(),
+            ],
+        );
+        let lease = Lease::acquire(&worktree, name).expect("lease");
+        let start = relais::workspace::inplace::start_snapshot(&lease).expect("start");
+        lease
+            .write_marker(&Marker {
+                run: name.to_string(),
+                stage: Stage::Running,
+                head_symbolic: start.head_symbolic.clone(),
+                head_sha: start.head_sha.clone(),
+                start: start.sha.clone(),
+                index_listing: start.index_listing.clone(),
+                target: None,
+                exported: None,
+            })
+            .expect("marker");
+        drop(lease);
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        waiting_run(
+            &ledger,
+            name,
+            &worktree.to_string_lossy(),
+            State::Interrupted,
+            Reason::ReconciledInterrupted,
+            None,
+            None,
+        );
+        (ledger, worktree)
+    }
+
+    fn answer_with(dir: &Path, run_id: &str, answer: DecideAnswer) -> Decided {
+        let locations = || {
+            Ok(StateLocations {
+                ledger: dir.join("ledger.sqlite"),
+                runs: dir.join("runs"),
+            })
+        };
+        decide_in(
+            &DecideRequest {
+                run_id,
+                answer,
+                actor: "orchestrator",
+                person_quote: None,
+                note: None,
+                successor: None,
+                criterion: None,
+                candidate: (answer == DecideAnswer::Salvaged).then_some("cand"),
+                widen_scope: false,
+                rerun_verify: false,
+                successor_contract: None,
+                json: false,
+                proof_stdin: false,
+            },
+            &locations,
+        )
+        .expect("decide runs")
+        .expect("answered")
+    }
+
+    fn marker_exists(worktree: &Path, run: &str) -> bool {
+        let git_dir = relais::workspace::inplace::git_dir(worktree).expect("git dir");
+        git_dir
+            .join("relais-inplace")
+            .join(format!("{run}.json"))
+            .exists()
+    }
+
+    fn move_head(worktree: &Path) {
+        std::fs::write(worktree.join("a.txt"), "moved\n").expect("edit");
+        git(worktree, &["commit", "-q", "-am", "worker"]);
+    }
+
+    #[test]
+    fn salvaging_an_interrupted_run_whose_head_moved_frees_its_worktree() {
+        let dir = relais::test_support::short_temp_dir("decide-inplace-salvage");
+        let (_ledger, worktree) = interrupted_in_place(&dir, "run-moved");
+        move_head(&worktree);
+        let decided = answer_with(&dir, "run-moved", DecideAnswer::Salvaged);
+        assert!(decided.sentence.contains("kept"), "{}", decided.sentence);
+        assert!(!marker_exists(&worktree, "run-moved"));
+        relais::workspace::inplace::Lease::acquire(&worktree, "run-next")
+            .unwrap_or_else(|_| panic!("a new run is not refused"));
+    }
+
+    #[test]
+    fn abandoning_an_interrupted_run_whose_head_moved_frees_its_worktree() {
+        let dir = relais::test_support::short_temp_dir("decide-inplace-abandon");
+        let (_ledger, worktree) = interrupted_in_place(&dir, "run-moved");
+        move_head(&worktree);
+        answer_with(&dir, "run-moved", DecideAnswer::Abandon);
+        assert!(!marker_exists(&worktree, "run-moved"));
+        relais::workspace::inplace::Lease::acquire(&worktree, "run-next")
+            .unwrap_or_else(|_| panic!("a new run is not refused"));
+    }
+
+    #[test]
+    fn answering_an_interrupted_run_whose_head_did_not_move_keeps_the_marker_and_names_the_retire()
+    {
+        let dir = relais::test_support::short_temp_dir("decide-inplace-unmoved");
+        let (_ledger, worktree) = interrupted_in_place(&dir, "run-still");
+        let decided = answer_with(&dir, "run-still", DecideAnswer::Decided);
+        assert!(marker_exists(&worktree, "run-still"));
+        assert!(
+            decided
+                .sentence
+                .contains("relais resume --retire run-still"),
+            "{}",
+            decided.sentence
+        );
+    }
+
+    #[test]
+    fn answering_a_run_that_is_not_in_place_says_nothing_about_a_worktree() {
+        let dir = relais::test_support::short_temp_dir("decide-not-in-place");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        waiting_run(
+            &ledger,
+            "run-plain",
+            "/repo",
+            State::Interrupted,
+            Reason::ReconciledInterrupted,
+            None,
+            None,
+        );
+        let decided = answer_with(&dir, "run-plain", DecideAnswer::Abandon);
+        assert_eq!(
+            decided.sentence,
+            format!(
+                "recorded {} for run-plain by orchestrator",
+                Reason::DecisionAbandoned.as_str()
+            )
+        );
     }
 }

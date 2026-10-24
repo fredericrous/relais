@@ -561,6 +561,22 @@ pub(crate) fn retire_in_place(
     state: State,
     reconciliation: &resume::Reconciliation,
 ) -> Result<Option<CliOutcome>, CliError> {
+    let runs_dir = paths::runs_dir().map_err(CliError::Home)?;
+    retire_in_place_saying(ledger, run, state, reconciliation, &runs_dir, &mut |line| {
+        println!("{line}");
+    })
+}
+
+/// [`retire_in_place`] with its report lines handed to `say`, so `relais
+/// decide` can fold them into its own answer instead of printing them.
+pub(crate) fn retire_in_place_saying(
+    ledger: &Ledger,
+    run: &RunId,
+    state: State,
+    reconciliation: &resume::Reconciliation,
+    runs_dir: &Path,
+    say: &mut dyn FnMut(String),
+) -> Result<Option<CliOutcome>, CliError> {
     use relais::workspace::inplace::{self, Lease, LeaseRefusal, Outcome, Target, TargetKind};
     let Some(workspace) = operational(ledger.run_workspace(run), "resume")? else {
         return Ok(None);
@@ -573,28 +589,31 @@ pub(crate) fn retire_in_place(
         return Ok(None);
     };
     if !reconciliation.all_provably_dead() {
-        println!(
+        say(format!(
             "{run}: kept, a dispatch may still write {} ({})",
             root.display(),
             reconciliation.detail()
-        );
+        ));
         return Ok(Some(CliOutcome::OperationalFailure));
     }
     let lease = match Lease::reclaim(&root, run.as_str()) {
         Ok(lease) => lease,
         Err(LeaseRefusal::Busy { holder }) => {
-            println!(
+            say(format!(
                 "{run}: kept, run {} holds {}",
                 holder.as_deref().unwrap_or("?"),
                 root.display()
-            );
+            ));
             return Ok(Some(CliOutcome::OperationalFailure));
         }
         Err(LeaseRefusal::Interrupted { .. } | LeaseRefusal::UnreadableMarker { .. }) => {
             return Ok(None)
         }
         Err(LeaseRefusal::Io(e)) => {
-            println!("{run}: kept, {} could not be taken: {e}", root.display());
+            say(format!(
+                "{run}: kept, {} could not be taken: {e}",
+                root.display()
+            ));
             return Ok(Some(CliOutcome::OperationalFailure));
         }
     };
@@ -609,9 +628,7 @@ pub(crate) fn retire_in_place(
     };
     // An accepted run is left holding its change, also when it died before
     // the marker said so: the ledger and the receipt know.
-    let artifacts = paths::runs_dir()
-        .map_err(CliError::Home)?
-        .join(run.as_str());
+    let artifacts = runs_dir.join(run.as_str());
     let accepted = (state == State::Accepted)
         .then(|| std::fs::read_to_string(artifacts.join("receipt.json")).ok())
         .flatten()
@@ -645,29 +662,29 @@ pub(crate) fn retire_in_place(
     Ok(Some(
         match inplace::finalize(lease, target, keep, &mut export) {
             Ok(Outcome::Applied { index }) => {
-                println!(
+                say(format!(
                     "{run}: restored to {} in {} (directory kept)",
                     inplace::short(&marker.start),
                     root.display()
-                );
+                ));
                 if matches!(index, inplace::IndexOutcome::Changed(_)) {
-                    println!(
+                    say(format!(
                     "{run}: your git index changed during the run; the original is kept at {}/relais-inplace/{run}.index.orig",
                     git_dir.display()
-                );
+                ));
                 }
                 CliOutcome::Accepted
             }
             Ok(Outcome::HeadMoved { was, now }) => {
-                println!(
+                say(format!(
                 "{run}: kept, HEAD moved from {} to {} during the run; the tree and the branch were not touched, review them yourself",
                 inplace::short(&was),
                 inplace::short(&now)
-            );
+            ));
                 CliOutcome::OperationalFailure
             }
             Err(e) => {
-                println!("{run}: kept, {e}");
+                say(format!("{run}: kept, {e}"));
                 CliOutcome::OperationalFailure
             }
         },
