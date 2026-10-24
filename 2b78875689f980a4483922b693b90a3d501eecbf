@@ -1,0 +1,16 @@
+amont-provenance-v1
+commit 2b78875689f980a4483922b693b90a3d501eecbf
+tree 45c118b737b35ad707a95d2ff6967f450935c523
+canon f271e2a008f67acf613d08cb4d63ecebf8df679a
+patch e80ad611e7f153ff2884e7628b050975e96163ac
+plan docs/plans/2026-10-23-relais-shows-and-settles.md 7ad78abc3e79c0e75f58372615e1c865a2aa8944f3cecbf3115c06f14099cf1c
+review reviewed f96838fc0e0cf758aa87f0fe22aea10a1996fb9c042d8dc9d55a6344ee16ed95
+preview not-required
+producer amont-agent 3.1.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAEBr11e9EIVC9Dp5oQBgsjAmdiUZNQ/tDyl1neO/k+k+3O6fM7
+CRCfgpGYjfIPvHWpPq+6J/4T1MnxOBDcSFEHIG
+-----END SSH SIGNATURE-----
