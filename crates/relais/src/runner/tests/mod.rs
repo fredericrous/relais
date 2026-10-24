@@ -8861,6 +8861,7 @@ fn code_rules_without_text_tell_the_reviewer_the_text_is_unavailable() {
     assert!(gap.detail.contains("full text"), "{}", gap.detail);
     assert!(gap.detail.contains("unavailable"), "{}", gap.detail);
     assert!(gap.detail.contains("a.gone"), "{}", gap.detail);
+    assert_eq!(gap.cause, context::guidance::GapCause::TextUnavailable);
 }
 
 #[test]
