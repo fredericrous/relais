@@ -419,10 +419,11 @@ pub fn decide(env: &Environment<'_>) -> Result<Decision, LedgerError> {
 /// A trial's outcome from a run's terminal state, and whether it was
 /// accepted without escalation. The one mapping `dataset replay` and a
 /// live arm share: an infrastructure end is `Errored`, never a failure
-/// of the arm.
-pub fn trial_outcome_of(terminal: &Terminal) -> (TrialOutcome, bool) {
+/// of the arm. `escalated` is whether any attempt ran on the escalation
+/// tier (`Ledger::escalation_attempted`); a same-tier repair is not one.
+pub fn trial_outcome_of(terminal: &Terminal, escalated: bool) -> (TrialOutcome, bool) {
     match terminal {
-        Terminal::Accepted(receipt) => (TrialOutcome::Accepted, receipt.attempts <= 1),
+        Terminal::Accepted(_) => (TrialOutcome::Accepted, !escalated),
         Terminal::Failed { .. } | Terminal::NeedsReview { .. } | Terminal::NeedsDecision { .. } => {
             (TrialOutcome::Rejected, false)
         }
@@ -550,7 +551,9 @@ pub fn settle(
     trial_id: &TrialId,
     outcome: &RunOutcome,
 ) -> Result<TrialOutcome, LedgerError> {
-    let (trial_outcome, accepted_without_escalation) = trial_outcome_of(&outcome.terminal);
+    let escalated = ledger.escalation_attempted(&outcome.run_id)?;
+    let (trial_outcome, accepted_without_escalation) =
+        trial_outcome_of(&outcome.terminal, escalated);
     let (cost, duration_ms) = settled_figures(ledger, &outcome.run_id)?;
     ledger.settle_trial(
         trial_id,

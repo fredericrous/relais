@@ -593,13 +593,17 @@ pub(crate) fn record_replay_trial(
             .and_then(|m| m.as_str())
             .map(str::to_string)
     });
+    let escalated = operational(
+        ledger.escalation_attempted(&outcome.run_id),
+        "dataset replay",
+    )?;
     let verdict = live_trial::ReplayCheck {
         arm_model: arm.model.unwrap_or_default(),
         dispatched_model: dispatched_model.as_deref(),
         requires_design: arm.spec.requires_design,
         design_sha256: trial.design_sha256,
     }
-    .settle(live_trial::trial_outcome_of(&outcome.terminal));
+    .settle(live_trial::trial_outcome_of(&outcome.terminal, escalated));
     let (cost, duration_ms) = operational(
         live_trial::settled_figures(ledger, &outcome.run_id),
         "dataset replay",
