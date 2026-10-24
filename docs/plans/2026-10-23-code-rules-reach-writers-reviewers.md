@@ -55,9 +55,9 @@ Before the push (branch tree, `cargo test -p relais` via the pre-commit gate, 1,
   of only built-ins gets no MCP tools (why workers never saw aval);
   `mcpServers` in frontmatter is ignored for plugin agents. Listing the three
   tools is enough where the session has the aval server.
-- `make plugin` → 313/313 → 313 pass, 0 fail (29.5 s) at load average 3.5,
-  2026-10-24; a first run at load average 224 failed 11 tests, every one
-  "timed out after 5000 ms".
+- `make plugin` → all pass → 313/313 at load 3.5 before the rebase; after the
+  rebase onto v0.30.0, 325/325 run alone (inside a commit beside `cargo test`
+  it times out at load 180, every failure "timed out after 5000 ms").
 
 Not observed before the push, each run right after the release (they need this
 relais installed; a branch binary on the real state would migrate the ledger):
@@ -92,5 +92,8 @@ relais installed; a branch binary on the real state would migrate the ledger):
 - Fixed: old-aval gap names 1.10.0, `TextUnavailable` cause, `holds-until:`
   on default-scope decisions, override check and docs answer recorded,
   `make plugin` 313/313 under load.
+- 2026-10-24 — rebased onto v0.30.0 (review-repair prompts, widened-scope
+  note); `build_review_repair_prompt` now passes the code-rules gap through
+  (`3211cba8`).
 - Next: release relais, install it, run the three live checks; then tick
   Phases 1-4 in the canonical plan in aval.
