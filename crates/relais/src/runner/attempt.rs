@@ -641,7 +641,17 @@ impl<'a> RunEngine<'a> {
 
         // Write scope is checked on the actual diff; a violation can
         // never be accepted (SPEC §8, §9).
-        match workspace::check_scope(ctx.worktree, &sha, self.config.contract) {
+        // A `from_candidate` run is measured from the merged candidate
+        // tree it began from; a verify applies its candidate as its own
+        // change, so it stays measured from the base (SPEC §8).
+        let floor = match (
+            &ctx.preflight.candidate,
+            self.config.contract.from_candidate(),
+        ) {
+            (Some(prepared), Some(_)) => workspace::ScopeFloor::Tree(&prepared.tree),
+            _ => workspace::ScopeFloor::WorktreeBase,
+        };
+        match workspace::check_scope_from(ctx.worktree, &sha, self.config.contract, floor) {
             Ok(_) => {}
             Err(WorkspaceError::ScopeViolation(paths)) => {
                 ledger.finish_attempt(attempt_id, State::NeedsDecision, None, Some(&sha))?;
@@ -649,7 +659,7 @@ impl<'a> RunEngine<'a> {
                     &progress.budget,
                     Observation::ScopeViolation(workspace::out_of_scope(
                         self.config.repo_dir,
-                        &ctx.preflight.base_sha,
+                        floor.revision(ctx.worktree),
                         &sha,
                         paths,
                     )),
