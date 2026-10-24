@@ -8,6 +8,16 @@ missing here.
 
 ## Unreleased
 
+## v0.31.0
+
+Workers and the reviewer now read the code rules in full (decisions ADR-0043). A worker used to get the constraint ids and an instruction to run `aval rule <id>`, which no worker followed, and the reviewer got each rule's first sentence, so the clauses that make a rule checkable (single-letter names, swallowed errors, unbounded waits) reached neither.
+
+- **Code rules in full.** relais asks aval 1.10.0 for every active constraint with its body in one call. The rules whose file declares `governs: code` go in full into the worker prompt ("code rules in force", 64 KiB, before the task) and the reviewer prompt (96 KiB); other constraints stay the id index and the statements. A rule that does not fit is dropped whole and named on the receipt's `guidance:` line. An older aval, or a decisions pack not yet refreshed with `aval add`, keeps every id in the index and says how to fix it.
+- **The reviewer blocks on code rules.** A violation the diff introduces, deletions included, is a finding citing the rule id and `file:line`; violations that were already there are not reported. The reviewer also gets the decisions aval ranks for the changed files, since an applicable decision outranks a rule, and is told when those could not be fetched.
+- **Workers hold aval's MCP tools.** `aval_rule`, `aval_resolve` and `aval_relevant` come from the session's aval server; the prompt names the repository by its main checkout and falls back to the `aval` CLI.
+
+Upgrade aval to 1.10.0 and run `aval add` for the decisions pack, then reinstall the plugin.
+
 ## v0.30.0
 
 The relais pane draws the live run first. Finished runs fold to one row each (the three most recent, then `+N earlier runs`; a failure reads `FAIL`), so the run in progress keeps its check output however many runs the session has had: with three or more earlier runs, that output used to get no rows at all and only a timer showed. A silent step says `waiting for output`, and the pane never draws more rows than it has, trimming from the top behind an `↑ N rows above` row, so the live run stays on screen without scrolling.
