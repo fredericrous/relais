@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/settle-and-show
 repos: [relais]
 adrs: [decisions:ADR-0042, ADR-0010, ADR-0004]
@@ -57,7 +57,7 @@ Each salvage also spends the main (Opus) session's tokens finishing the work by 
 - **Overflow.**
   - The newest live run's frame is kept (else the newest awaiting run's).
   - Everything above it is trimmed from the top, and the first row becomes a dim `↑ N rows above`.
-  - Each other focus run keeps at least its head row. An awaiting run also keeps its outcome row.
+  - Each other focus run keeps at least its head row when rows allow (the newest live frame and its output win). An awaiting run also keeps its outcome row when rows allow.
   - Inside a kept frame that is still too tall, the trim order is: output down to its minimum row, then the folded rows, then the tail's dim rows. Its head and its agent Buttons always stay. `isLast` (the HINT row) means the last focus run.
 - **Files:**
   - `docs/plans/2026-10-06-all-native-mod.pane.txt`, with a folded-runs example added before the code;
@@ -144,5 +144,40 @@ Phases 1–4 each go to a relais run with its own contract and write scope; revi
 
 1. A review repair applies to `medium` and `low` only, while `high` and `blocking` still stop (proposed). The alternative also repairs `high` once.
 2. The automatic widen is on by default, with a policy switch (proposed).
+
+## Verification record
+
+- **1 (pane):** `make plugin`, PLUGIN_SKIP_OK unset, on the final tree (f96838fc…) → exit 0, 325 pass, 0 fail. New tests:
+  - "one live run alone draws as it did before the fold" (the literal snapshot, committed in d7497dcd before the change);
+  - "20 finished runs and a live run mid-check: output first, the head drawn, 40 rows at most";
+  - "the same at 24 rows keeps 8 output rows and folds the runs to one count row";
+  - "a live run with 3 agents and 3 stderr lines in a 12-row body keeps its head and Buttons";
+  - "a live run older than an awaiting one keeps its head and output, behind a rows-above row";
+  - "a folded failed run starts with FAIL in the error colour; an accepted one is dim";
+  - "relais rows are the same with or without a quiet run at 8 / 24 rows";
+  - "a Button is still drawn after a second run finishes and folds the first".
+  - The red loop over this session's real runs (0 output rows with 3 or more earlier runs) became these synthetic tests, and the throwaway loop was deleted.
+  - The live pane check after the release and plugin reinstall is a release step, not a row here.
+- **2–4:** on the rebased tree, `cargo clippy --workspace --all-targets -- -D warnings` → exit 0; `cargo test --workspace` → exit 0 (439 s). New tests:
+  - Severity parser: `tagged_findings_give_their_severities`, `prose_untagged_mixed_and_none_give_none`, `the_reviewer_prompt_asks_for_a_severity_tag`.
+  - Review repair (runner/tests/review_repair.rs): `low_findings_are_repaired_once_and_the_run_is_accepted` (both review evidence files keep their hashes), a high finding, a verify run, low findings twice; plus report and harness tests for `review_repair`.
+  - Widen (verify_kind.rs, decide_actor.rs, release_scenarios.rs): the tests-only overflow (ledger, outcome event and Done agree on cancelled with the successor intent), mixed and protected overflows, the policy switched off, the CLI refusing `--actor relais`, the relais answer excluded from labels, the successor reviewer prompt naming the widened path, the CLI printing the intent; plugin "one outcome line carrying a successor intent launches exactly one child and sends no decide prompt" and "models rebuilt from status launch no child".
+  - Retry (runner/tests/review_retry.rs, 8 tests): a missing result retried once then reviewed; twice, then unavailable; launch failure, cancel, timeout, work and total budgets (scripted ledger clock) not retried; the transition names the dispatch end.
+- **Gates:** every commit ran the pre-commit gate. Six skipped only `plugin-test`, which timed out at 5 s under load averages of 40 to 125 (every failure a timeout): phase 3, phase 4, the retry tests, the ADR commit, and the review-fix commit. The two that change plugin code or tests (phase 3 and the review fix) were proven with the plugin tests run alone on the same tree; the review fix is covered by the `make plugin` run above.
+- **Cost:** no `review_repair` run exists before the release. The October ledger gives a median of $0.20 per repair (48 repairs) and $0.68 per review (91 reviews), so about $0.89 for one repair plus one re-review, against a hand salvage finished on Opus in the main session.
+- **After 7 days (10-30):** salvages raised for review_findings, scope_exceeded and review_unavailable together must stay under 29 (half of 33 in 4 days), read from the decisions table.
+
+## Decision log
+
+- 2026-10-23: the rendered focus test asserts that a Button survives the fold and that none claims autoFocus. The test harness draws no client and cannot focus a Button, so where focus lands after a fold is not observable in tests.
+- 2026-10-23: on overflow, the newest live frame and its output take the rows first. Other focus runs keep their head row only when rows remain (implementation review finding 6; Section 1 amended).
+- 2026-10-23: phases 2 and 3 were each split into two relais runs to fit the 45-minute work budget.
+- 2026-10-23: four new relais snags hit while building this (next plan): accepting a run whose required tests do not exist (phase 4); a `from_candidate` run scope-checked against its parent's changes; an answered interrupted in-place run blocking its worktree until `resume --retire`; a successor contract unable to read-hint a file its candidate creates.
+
+## Implementation review
+
+approve-with-changes (round 1: 109k, 79 s; delta: 113k, 21 s).
+- Fixed: the timeout test; a successor rebuild test that can fail; the artboard row; this record (results, gates, cost, Decision log); line 60 amended.
+- New finding 8: the plugin tests had not been shown on the edited test. They were then run with `make plugin` on the final tree, and the result is recorded above.
 
 <!-- panel: repos=relais adds=ui,lang:typescript reviewers=backend,lang:typescript,react,ui-design,ux-research,game-ux,codex body-sha=2277ae68b8bb -->
