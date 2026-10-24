@@ -191,7 +191,7 @@ fn the_review_repair_prompt_quotes_the_findings_as_data() {
     let fixture = Fixture::new();
     let contract = fixture.contract(Review::Required);
     let manifest = manifest_with(Vec::new());
-    let prompt = build_review_repair_prompt(&contract, &manifest, 1, LOW);
+    let (prompt, _code_rules_gap) = build_review_repair_prompt(&contract, &manifest, 1, LOW);
     assert!(prompt.contains("a reviewer found these"), "{prompt}");
     assert!(prompt.contains("quoted data"), "{prompt}");
     assert!(prompt.contains("stale comment"), "{prompt}");

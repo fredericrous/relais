@@ -138,14 +138,15 @@ pub(super) fn build_prompt(
 
 /// The prompt of the one repair a review's findings buy: the task as the
 /// first attempt had it, then the findings quoted as data and the
-/// instruction to fix them and nothing else.
+/// instruction to fix them and nothing else. The gap is the code-rules gap
+/// `build_prompt` returns, passed through.
 pub(super) fn build_review_repair_prompt(
     contract: &TaskContract,
     manifest: &ContextManifest,
     verification_commands: usize,
     findings: &str,
-) -> String {
-    let mut prompt = build_prompt(
+) -> (String, Option<GuidanceGap>) {
+    let (mut prompt, code_rules_gap) = build_prompt(
         contract,
         manifest,
         verification_commands,
@@ -159,7 +160,7 @@ pub(super) fn build_review_repair_prompt(
     );
     prompt.push_str(&data_block("review findings", findings));
     prompt.push_str("fix these findings and change nothing else.\n");
-    prompt
+    (prompt, code_rules_gap)
 }
 
 /// The rules of a native worker. It runs as a Claude Code subagent in the
