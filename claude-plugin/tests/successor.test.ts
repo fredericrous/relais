@@ -260,7 +260,18 @@ test('the widened paths are quoted data, each cut to MAX_LINE, at most ten, then
 
 test('models rebuilt from status launch no child', async ($: any, on: any) => {
   const engine = scriptedEngine(on)
-  engine.script.runResult = () => result(JSON.stringify({ runs: [], intents: [] }))
+  // The status carries a finished run whose outcome names a successor
+  // intent: rebuilding it must not launch that intent again (the outcome
+  // line already did, or the status-poll reconcile owns it).
+  const widened = {
+    run: WIDENED_RUN,
+    revision: 1,
+    events: [
+      { relais: 'event', run: WIDENED_RUN, seq: 0, at: '2026-10-23T12:00:00Z', event: { kind: 'outcome', state: 'cancelled', receipt: null, reason: 'widened', successor_intent: successor } },
+    ],
+    current: { state: 'cancelled', session: undefined },
+  }
+  engine.script.runResult = () => result(JSON.stringify({ runs: [widened], intents: [] }))
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   await settle(engine)
   await $.tool.call({ tool: 'mcp__relais__status' })

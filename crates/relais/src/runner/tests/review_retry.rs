@@ -232,6 +232,25 @@ fn a_cancelled_reviewer_is_not_retried() {
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
+#[test]
+fn a_reviewer_that_timed_out_is_not_retried() {
+    // A timeout is a resource ending (ADR-0010: evidence, never a repair),
+    // not a missing result a second dispatch would settle.
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let (backend, dispatched) = scripted(|_, result| {
+        result.ended = Ended::TimedOut;
+        result.result_text = None;
+    });
+    let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+    let run = outcome.run_id.clone();
+    // An unconditional retry, or one that reads a timeout as a missing
+    // result, makes this 2 dispatches and one warning.
+    assert_eq!(dispatched.load(Ordering::SeqCst), 1, "{outcome:?}");
+    assert!(retries(&fixture, &run).is_empty());
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
 /// A ledger clock a test moves: a fixed instant plus the seconds the
 /// reviewer's first dispatch added. No test waits for real time.
 struct Movable {
