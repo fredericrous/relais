@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.30.0
+
 The relais pane draws the live run first. Finished runs fold to one row each (the three most recent, then `+N earlier runs`; a failure reads `FAIL`), so the run in progress keeps its check output however many runs the session has had: with three or more earlier runs, that output used to get no rows at all and only a timer showed. A silent step says `waiting for output`, and the pane never draws more rows than it has, trimming from the top behind an `↑ N rows above` row, so the live run stays on screen without scrolling.
 
 A run now settles three stops itself before asking a person (ADR-0011):
