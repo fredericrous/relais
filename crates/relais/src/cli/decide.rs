@@ -229,11 +229,17 @@ pub(crate) fn decide_in(
             DecideAnswer::Salvaged | DecideAnswer::Abandon | DecideAnswer::Decided
         );
         if frees_in_place && done.from_state == State::Interrupted {
-            let locations = locate()?;
-            let ledger = operational(Ledger::open(&locations.ledger), "the ledger is unavailable")?;
-            let run = RunId::from_stored(&done.run);
-            if let Some(report) = free_kept_in_place(&ledger, &run, done.to_state, &locations.runs)?
-            {
+            // The answer is already recorded: whatever goes wrong freeing
+            // the worktree is reported inside the answer, never as an error.
+            let report = match free_after_answer(locate, done) {
+                Ok(report) => report,
+                Err(e) => Some(format!(
+                    "the in-place worktree could not be freed ({e}); finish it with \
+                     `relais resume --retire {}`",
+                    done.run
+                )),
+            };
+            if let Some(report) = report {
                 done.sentence = format!("{}; {report}", done.sentence);
             }
         }
@@ -241,10 +247,22 @@ pub(crate) fn decide_in(
     Ok(decision)
 }
 
+fn free_after_answer(
+    locate: &dyn Fn() -> Result<StateLocations, CliError>,
+    done: &Decided,
+) -> Result<Option<String>, CliError> {
+    let locations = locate()?;
+    let ledger = operational(Ledger::open(&locations.ledger), "the ledger is unavailable")?;
+    let run = RunId::from_stored(&done.run);
+    free_kept_in_place(&ledger, &run, done.to_state, &locations.runs)
+}
+
 /// What answering an interrupted in-place run does to its worktree marker.
 /// Only a moved HEAD means the tree and branch are the person's, so only
 /// then is the marker retired (the code `relais resume --retire` runs);
-/// otherwise it stays and the command that retires it is named.
+/// otherwise it stays and the command that retires it is named. Only a
+/// missing marker means there is nothing to free; every other failure is
+/// named in the returned report.
 fn free_kept_in_place(
     ledger: &Ledger,
     run: &RunId,
@@ -255,15 +273,44 @@ fn free_kept_in_place(
     let Some(workspace) = operational(ledger.run_workspace(run), "decide")? else {
         return Ok(None);
     };
-    let Ok(git_dir) = inplace::git_dir(&workspace.repo_path) else {
+    // The ledger records the run's directory, not whether it ran in place.
+    // A directory that is not on disk holds nothing this can read, so there
+    // is nothing to free here (a deleted, unpruned worktree's marker under
+    // the common git dir is left to `relais resume --retire`). A directory
+    // that exists but whose git dir cannot be read is a failure, named.
+    if !workspace.repo_path.is_dir() {
         return Ok(None);
+    }
+    let git_dir = match inplace::git_dir(&workspace.repo_path) {
+        Ok(git_dir) => git_dir,
+        Err(e) => {
+            return Ok(Some(format!(
+                "the git directory of {} could not be read ({e}); finish it with \
+                 `relais resume --retire {run}`",
+                workspace.repo_path.display()
+            )))
+        }
     };
-    let Ok(marker) = inplace::read_marker(&git_dir, run.as_str()) else {
-        return Ok(None);
+    let marker = match inplace::read_marker(&git_dir, run.as_str()) {
+        Ok(marker) => marker,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Ok(Some(format!(
+                "the in-place marker for it in {} could not be read ({e}); finish it with \
+                 `relais resume --retire {run}`",
+                workspace.repo_path.display()
+            )))
+        }
     };
     let head_moved = match inplace::head(&workspace.repo_path) {
         Ok((_, now)) => now != marker.head_sha,
-        Err(_) => false,
+        Err(e) => {
+            return Ok(Some(format!(
+                "the in-place worktree {} still holds a marker for it; HEAD could not be \
+                 read ({e}), so finish it with `relais resume --retire {run}`",
+                workspace.repo_path.display()
+            )))
+        }
     };
     if !head_moved {
         return Ok(Some(format!(
@@ -1170,6 +1217,58 @@ mod tests {
             decided
                 .sentence
                 .contains("relais resume --retire run-still"),
+            "{}",
+            decided.sentence
+        );
+    }
+
+    #[test]
+    fn a_corrupt_marker_is_reported_and_the_answer_still_recorded() {
+        let dir = relais::test_support::short_temp_dir("decide-inplace-corrupt");
+        let (ledger, worktree) = interrupted_in_place(&dir, "run-corrupt");
+        let git_dir = relais::workspace::inplace::git_dir(&worktree).expect("git dir");
+        std::fs::write(
+            git_dir.join("relais-inplace").join("run-corrupt.json"),
+            "not json",
+        )
+        .expect("corrupt");
+        let decided = answer_with(&dir, "run-corrupt", DecideAnswer::Abandon);
+        assert!(
+            decided.sentence.contains("marker") && decided.sentence.contains("could not be read"),
+            "{}",
+            decided.sentence
+        );
+        assert!(decided
+            .sentence
+            .contains("relais resume --retire run-corrupt"));
+        assert_eq!(
+            ledger
+                .run_status(&RunId::from_stored("run-corrupt"))
+                .expect("status"),
+            Some(DecideAnswer::Abandon.terminal_state())
+        );
+    }
+
+    #[test]
+    fn an_unreadable_head_is_reported_instead_of_claiming_it_did_not_move() {
+        let dir = relais::test_support::short_temp_dir("decide-inplace-head");
+        let (_ledger, worktree) = interrupted_in_place(&dir, "run-head");
+        let git_dir = relais::workspace::inplace::git_dir(&worktree).expect("git dir");
+        let branch = git(&worktree, &["symbolic-ref", "HEAD"]);
+        let reference = git_dir
+            .parent()
+            .and_then(Path::parent)
+            .expect("common dir")
+            .join(branch);
+        std::fs::write(&reference, "garbage\n").expect("break the branch");
+        let decided = answer_with(&dir, "run-head", DecideAnswer::Decided);
+        assert!(
+            decided.sentence.contains("HEAD could not be read"),
+            "{}",
+            decided.sentence
+        );
+        assert!(
+            !decided.sentence.contains("HEAD did not move"),
             "{}",
             decided.sentence
         );

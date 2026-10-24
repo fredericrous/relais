@@ -99,6 +99,140 @@ fn a_declared_test_criterion_without_an_added_test_takes_one_repair_then_fails()
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
+/// A check that deletes the base commit's loose object, so the patch the
+/// declared-test rule must read can no longer be derived.
+fn base_destroying_check(fixture: &Fixture) -> CommandSpec {
+    let head = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    let base = head.trim();
+    let object = fixture
+        .repo
+        .join(".git/objects")
+        .join(&base[..2])
+        .join(&base[2..]);
+    CommandSpec {
+        argv: vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "test -f src/main.rs || {{ chmod u+w '{0}' 2>/dev/null; rm -f '{0}'; }}",
+                object.display()
+            ),
+        ],
+        ..passing_check()
+    }
+}
+
+#[test]
+fn an_unreadable_diff_on_a_worker_backed_change_is_an_error_never_met() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![base_destroying_check(&fixture)], 3);
+    let backend = removing_worker(launch_counter(), TEST_LINE);
+    let outcome = fixture.execute(
+        &declared_test_contract(serde_json::json!({})),
+        &repo,
+        &backend,
+    );
+    let Terminal::Interrupted { detail } = &outcome.terminal else {
+        panic!("an unreadable diff ends the run in an error: {outcome:?}");
+    };
+    assert!(
+        detail.contains("the runner could not continue")
+            && detail.contains("git failed: git -c diff.noprefix=false")
+            && detail.contains("bad object"),
+        "{detail}"
+    );
+    assert_eq!(
+        fixture.ledger.receipt(&outcome.run_id).expect("reads"),
+        None,
+        "no receipt row: the criterion was never met"
+    );
+    assert!(
+        !fixture
+            .artifacts
+            .join(outcome.run_id.as_str())
+            .join("receipt.json")
+            .exists(),
+        "no accepted receipt"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+/// A declared-test run whose first attempt adds no test and whose one
+/// repair does, settled as the arm of a trial through `live_trial::settle`.
+#[test]
+fn a_run_accepted_after_a_same_tier_repair_settles_accepted_without_escalation() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let launches = launch_counter();
+    let seen = Arc::clone(&launches);
+    let backend = MockBackend::new(move |spec| {
+        let earlier = seen.fetch_add(1, Ordering::SeqCst);
+        std::fs::remove_file(spec.work_dir.join("src/main.rs")).ok();
+        let content = if earlier == 0 {
+            "// no test\n"
+        } else {
+            TEST_LINE
+        };
+        std::fs::write(spec.work_dir.join("src/tests.rs"), content).expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let outcome = fixture.execute(
+        &declared_test_contract(serde_json::json!({})),
+        &repo,
+        &backend,
+    );
+    assert!(
+        matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(launches.load(Ordering::SeqCst), 2, "one repair");
+    assert!(!fixture
+        .ledger
+        .escalation_attempted(&outcome.run_id)
+        .expect("reads"));
+
+    let task = fixture
+        .ledger
+        .task_of_run(&outcome.run_id)
+        .expect("reads")
+        .expect("the run's task");
+    let source = RunId::from_stored("run-source");
+    fixture
+        .ledger
+        .insert_run(&source, "/repo", None, &task, "rk")
+        .expect("source run");
+    let trial_id = crate::ids::TrialId::from_stored("trial-repaired");
+    fixture
+        .ledger
+        .insert_replay_trial(&crate::ledger::NewReplayTrial {
+            trial_id: &trial_id,
+            task_id: &task,
+            source_run_id: &source,
+            incumbent_recipe_id: "incumbent",
+            arm_recipe_id: "arm",
+            base_sha: "base",
+            contract_hash: "contract",
+            verification_profile_hash: "profile",
+            workspace_isolation: "fresh_checkout_no_accepted_answer",
+            arm_run_id: &outcome.run_id,
+            design_sha256: None,
+        })
+        .expect("trial");
+    crate::runner::live_trial::settle(&fixture.ledger, &trial_id, &outcome).expect("settles");
+    let settled = fixture
+        .ledger
+        .trial(&trial_id)
+        .expect("reads")
+        .expect("row");
+    assert_eq!(settled.accepted_without_escalation, Some(true));
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
 #[test]
 fn a_verify_only_contract_with_declared_test_evidence_is_settled_as_before() {
     let fixture = Fixture::new();
@@ -142,6 +276,7 @@ fn a_verify_only_contract_with_declared_test_evidence_is_settled_as_before() {
 fn child_of_a_testing_parent(
     fixture: &Fixture,
     child_file: &'static str,
+    after_parent: &dyn Fn(&Fixture),
 ) -> (RunOutcome, Arc<std::sync::atomic::AtomicUsize>) {
     let repo = fixture.repo_policy(vec![passing_check()], 3);
     let parent = MockBackend::new(|spec| {
@@ -160,6 +295,7 @@ fn child_of_a_testing_parent(
     else {
         panic!("the parent is accepted");
     };
+    after_parent(fixture);
     let launches = launch_counter();
     let seen = Arc::clone(&launches);
     let child = MockBackend::new(move |spec| {
@@ -181,7 +317,7 @@ fn child_of_a_testing_parent(
 #[test]
 fn a_follow_up_gets_no_credit_for_the_tests_its_parent_added() {
     let fixture = Fixture::new();
-    let (outcome, _) = child_of_a_testing_parent(&fixture, "pub fn child() {}\n");
+    let (outcome, _) = child_of_a_testing_parent(&fixture, "pub fn child() {}\n", &|_| {});
     assert!(
         matches!(outcome.terminal, Terminal::Failed { .. }),
         "the parent's tests are the lower bound, not the child's: {outcome:?}"
@@ -190,9 +326,31 @@ fn a_follow_up_gets_no_credit_for_the_tests_its_parent_added() {
 }
 
 #[test]
+fn a_follow_up_gets_no_credit_for_tests_the_target_base_gained_after_the_parent() {
+    let fixture = Fixture::new();
+    let (outcome, _) = child_of_a_testing_parent(&fixture, "pub fn child() {}\n", &|fixture| {
+        super::scope_floor::commit_on_base(fixture, "src/base_tests.rs");
+        std::fs::write(fixture.repo.join("src/base_tests.rs"), TEST_LINE).expect("write");
+        git(&fixture.repo, &["add", "-A"]);
+        git(
+            &fixture.repo,
+            &["commit", "-q", "-m", "the base gains a test"],
+        );
+    });
+    let Terminal::Failed { detail } = &outcome.terminal else {
+        panic!("inherited tests are not new tests: {outcome:?}");
+    };
+    assert!(
+        detail.contains("declared test evidence, but the patch adds no test"),
+        "{detail}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+#[test]
 fn a_follow_up_that_adds_its_own_test_is_accepted() {
     let fixture = Fixture::new();
-    let (outcome, _) = child_of_a_testing_parent(&fixture, TEST_LINE);
+    let (outcome, _) = child_of_a_testing_parent(&fixture, TEST_LINE, &|_| {});
     assert!(
         matches!(outcome.terminal, Terminal::Accepted(_)),
         "{outcome:?}"

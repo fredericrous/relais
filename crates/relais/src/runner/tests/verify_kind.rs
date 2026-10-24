@@ -763,6 +763,73 @@ fn a_from_candidate_hint_hash_matches_the_merged_tree_after_the_target_advanced(
 }
 
 #[test]
+fn a_conflicting_from_candidate_resolves_its_hints_against_the_prepared_conflict_tree() {
+    let fixture = Fixture::new();
+    let source = rewriting_source(&fixture);
+    commit_file(
+        &fixture,
+        "src/main.rs",
+        "fn main() { println!(\"target\"); }\n",
+    );
+    let target_blob = git(&fixture.repo, &["rev-parse", "HEAD:src/main.rs"]);
+    let candidate_commit = fixture
+        .ledger
+        .latest_attempt_candidate(&source)
+        .expect("reads")
+        .expect("the source run has a candidate");
+    let candidate_blob = git(
+        &fixture.repo,
+        &["rev-parse", &format!("{candidate_commit}:src/main.rs")],
+    );
+    // The blob of the conflicted file as the worker finds it at launch.
+    let worker_blob: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let record = Arc::clone(&worker_blob);
+    let backend = MockBackend::new(move |spec| {
+        let mut record = record.lock().expect("lock");
+        record.push(git(&spec.work_dir, &["hash-object", "src/main.rs"]));
+        if record.len() == 1 {
+            std::fs::write(
+                spec.work_dir.join("src/main.rs"),
+                "fn main() { /* both */ }\n",
+            )
+            .expect("resolve");
+            git(&spec.work_dir, &["add", "src/main.rs"]);
+        }
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let outcome = fixture.execute(
+        &hinted_continue_contract(&source, "src/main.rs"),
+        &repo,
+        &backend,
+    );
+    let RunOutcome {
+        run_id,
+        terminal: Terminal::Accepted(_),
+    } = outcome
+    else {
+        panic!("{outcome:?}");
+    };
+    let manifest = manifest_of(&fixture, &run_id);
+    assert_eq!(manifest.fingerprints.len(), 1);
+    let hinted = manifest.fingerprints[0].blob.as_str();
+    let conflicted = worker_blob.lock().expect("lock")[0].clone();
+    assert_eq!(
+        hinted,
+        conflicted.trim(),
+        "the hint is the conflict tree's file"
+    );
+    assert_ne!(hinted, target_blob.trim(), "not the target base's file");
+    assert_ne!(hinted, candidate_blob.trim(), "not the candidate's file");
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+#[test]
 fn a_change_without_from_candidate_still_blocks_on_a_hint_missing_at_base() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![passing_check()], 3);

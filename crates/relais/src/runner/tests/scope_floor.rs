@@ -55,7 +55,7 @@ fn accepted_parent(fixture: &Fixture, repo: &RepoPolicy) -> RunId {
     run_id
 }
 
-fn commit_on_base(fixture: &Fixture, path: &str) {
+pub(super) fn commit_on_base(fixture: &Fixture, path: &str) {
     let target = fixture.repo.join(path);
     std::fs::create_dir_all(target.parent().expect("a parent")).expect("mkdir");
     std::fs::write(target, "base\n").expect("write");

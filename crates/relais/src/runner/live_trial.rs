@@ -1015,6 +1015,123 @@ mod tests {
         );
     }
 
+    fn accepted_outcome(run: &str, attempts: u32) -> RunOutcome {
+        use crate::verify::{
+            LadderRecord, Receipt, ReviewNotRun, ReviewRecord, VerificationReport,
+        };
+        let receipt = Receipt {
+            run_id: run.into(),
+            candidate_sha: "cand".into(),
+            base_sha: "base".into(),
+            contract_hash: "ch".into(),
+            policy_hash: "ph".into(),
+            outcome: crate::lifecycle::State::Accepted.as_str().into(),
+            verification: VerificationReport {
+                candidate_sha: "cand".into(),
+                base_sha: "base".into(),
+                contract_hash: "ch".into(),
+                policy_hash: "ph".into(),
+                checks: Vec::new(),
+                gaps: Vec::new(),
+                gaps_not_judged: Vec::new(),
+                notes: Vec::new(),
+                baseline_failures: Vec::new(),
+                amont_bypasses: Vec::new(),
+                amont_downgrades: Vec::new(),
+                verification_inputs_changed: Vec::new(),
+                integration_gaps: Vec::new(),
+                baseline_cached: false,
+                baseline_cache_refused: None,
+            },
+            kind: crate::contract::Kind::Change,
+            candidate: None,
+            predecessor: None,
+            models_used: Vec::new(),
+            attempts,
+            cost_completeness: CostCompleteness::Actual,
+            cost: crate::money::MicroUsd::from_micros(1),
+            criteria: Vec::new(),
+            mandatory_evidence_independence: None,
+            recipe: crate::policy::RecipeRecord::NotRecorded,
+            verification_profile_hash: "vph".into(),
+            review: ReviewRecord::NotRun(ReviewNotRun::OverBudget {
+                patch_bytes: 1,
+                budget_bytes: 1,
+            }),
+            ladder: LadderRecord::NotRecorded,
+            efforts_used: Vec::new(),
+        };
+        RunOutcome {
+            run_id: RunId::from_stored(run),
+            terminal: Terminal::Accepted(Box::new(receipt)),
+        }
+    }
+
+    /// Settle, through `settle` itself, a trial whose arm run made a second
+    /// attempt in `second_phase`; returns the recorded flag.
+    fn settled_flag(name: &str, second_phase: crate::lifecycle::UsagePhase) -> Option<bool> {
+        use crate::lifecycle::UsagePhase;
+        let dir = short_temp_dir(name);
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let task = TaskId::from_stored("task-t");
+        let source = RunId::from_stored("run-src");
+        let arm = RunId::from_stored("run-arm");
+        for run in [&source, &arm] {
+            ledger
+                .insert_run(run, "/repo", None, &task, "rk")
+                .expect("run");
+        }
+        let revision = ledger
+            .insert_contract_revision(&arm, "h", "{}", "HEAD", None)
+            .expect("revision");
+        for (index, phase) in [(1, UsagePhase::Initial), (2, second_phase)] {
+            ledger
+                .insert_attempt(&arm, revision, index, "research", phase)
+                .expect("attempt");
+        }
+        let trial_id = TrialId::from_stored("trial-arm");
+        ledger
+            .insert_replay_trial(&crate::ledger::NewReplayTrial {
+                trial_id: &trial_id,
+                task_id: &task,
+                source_run_id: &source,
+                incumbent_recipe_id: "incumbent",
+                arm_recipe_id: "arm",
+                base_sha: "base",
+                contract_hash: "contract",
+                verification_profile_hash: "profile",
+                workspace_isolation: "fresh_checkout_no_accepted_answer",
+                arm_run_id: &arm,
+                design_sha256: None,
+            })
+            .expect("trial");
+        let settled = settle(&ledger, &trial_id, &accepted_outcome("run-arm", 2)).expect("settle");
+        assert_eq!(settled, TrialOutcome::Accepted);
+        ledger
+            .trial(&trial_id)
+            .expect("reads")
+            .expect("row")
+            .accepted_without_escalation
+    }
+
+    #[test]
+    fn settle_scores_a_same_tier_repair_as_accepted_without_escalation() {
+        use crate::lifecycle::UsagePhase;
+        assert_eq!(
+            settled_flag("lt-settle-repair", UsagePhase::Repair),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn settle_scores_an_escalation_as_not_accepted_without_escalation() {
+        use crate::lifecycle::UsagePhase;
+        assert_eq!(
+            settled_flag("lt-settle-escalation", UsagePhase::Escalation),
+            Some(false)
+        );
+    }
+
     #[test]
     fn enabled_without_a_seed_draws_nothing_and_records_nothing() {
         let dir = short_temp_dir("lt-unseeded");
