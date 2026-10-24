@@ -307,3 +307,63 @@ fn a_decomposed_integration_repair_that_adds_a_test_can_accept() {
     );
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
+
+#[test]
+fn a_declared_test_gap_after_a_spent_check_repair_fails_without_a_second_repair() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let launches = launch_counter();
+    let counted = Arc::clone(&launches);
+    let backend = MockBackend::new(move |spec| {
+        let attempt = counted.fetch_add(1, Ordering::SeqCst);
+        if attempt > 0 {
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).ok();
+        }
+        std::fs::write(spec.work_dir.join("src/notes.rs"), "// no test here\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let outcome = fixture.execute(
+        &declared_test_contract(serde_json::json!({})),
+        &repo,
+        &backend,
+    );
+    let Terminal::Failed { detail, .. } = &outcome.terminal else {
+        panic!("a spent repair budget leaves the missing test a failure: {outcome:?}");
+    };
+    assert!(
+        detail.contains("declared test evidence, but the patch adds no test"),
+        "{detail}"
+    );
+    assert_eq!(
+        launches.load(Ordering::SeqCst),
+        2,
+        "the first attempt and the check repair, no second repair"
+    );
+    assert_eq!(
+        fixture
+            .ledger
+            .dispatch_count(&outcome.run_id)
+            .expect("count"),
+        2
+    );
+    let transitions = fixture
+        .ledger
+        .transitions(&outcome.run_id)
+        .expect("history");
+    let first_repair = transitions
+        .iter()
+        .find(|transition| transition.to_state == State::Repairing)
+        .expect("the failed check takes the one repair");
+    assert_eq!(first_repair.reason, Reason::BehavioralFailure.as_str());
+    let detail = first_repair.detail.as_ref().expect("repair detail");
+    assert!(
+        detail.get("failures").is_some() && detail.get("criteria").is_none(),
+        "the repair answers the failed check, not the criteria: {detail}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
