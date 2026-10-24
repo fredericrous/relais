@@ -140,6 +140,12 @@ pub trait DecisionResolver {
     fn relevant(&self, _query: &RelevantQuery) -> Result<Relevant, GuidanceGap> {
         Ok(Relevant::default())
     }
+
+    /// The ranked keys that apply to the paths a candidate patch changes,
+    /// for the reviewer. Same failure policy; the default knows none.
+    fn decisions_for(&self, _paths: &[String]) -> Result<Vec<RankedKey>, GuidanceGap> {
+        Ok(Vec::new())
+    }
 }
 
 /// A closure is a resolver: the shape tests and the CLI both already use.
@@ -190,15 +196,16 @@ impl DecisionResolver for AvalCli {
     fn constraint_rules(&self) -> Result<Rules, GuidanceGap> {
         self.rules
             .get_or_init(|| {
-                guidance::run_aval(
-                    "aval",
-                    &guidance::rules_args(),
-                    &self.root,
-                    GuidanceSource::Index,
-                    crate::tooling::GUIDANCE_TIMEOUT,
-                    self.cancel.as_deref(),
-                )
-                .and_then(|stdout| guidance::parse_rules_output(&stdout))
+                guidance::fetch_rules(&|args| {
+                    guidance::run_aval(
+                        "aval",
+                        args,
+                        &self.root,
+                        GuidanceSource::Index,
+                        crate::tooling::GUIDANCE_TIMEOUT,
+                        self.cancel.as_deref(),
+                    )
+                })
             })
             .clone()
     }
@@ -213,6 +220,22 @@ impl DecisionResolver for AvalCli {
             self.cancel.as_deref(),
         )
         .and_then(|stdout| guidance::parse_relevant_output(&stdout))
+    }
+
+    fn decisions_for(&self, paths: &[String]) -> Result<Vec<RankedKey>, GuidanceGap> {
+        guidance::fetch_decisions(
+            &|args| {
+                guidance::run_aval(
+                    "aval",
+                    args,
+                    &self.root,
+                    GuidanceSource::Decisions,
+                    crate::tooling::GUIDANCE_TIMEOUT,
+                    self.cancel.as_deref(),
+                )
+            },
+            paths,
+        )
     }
 }
 
@@ -715,6 +738,9 @@ pub struct ContextInputs<'a> {
     /// The contract's design as read from the base revision
     /// ([`read_design`]); `None` when the contract names none.
     pub design: Option<DesignInput>,
+    /// The directory name of the source repository's root (never a task
+    /// worktree's directory), as aval's corpus names the repository.
+    pub repo_name: Option<String>,
 }
 
 /// Assemble the context manifest. Fails on contradiction (blocked), on
@@ -733,6 +759,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         turn_ceiling,
         resolver,
         design,
+        repo_name,
     } = inputs;
 
     let manifest_aval_version = tool_versions.aval.clone();
@@ -776,7 +803,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         resolved.push((key.clone(), verdict));
     }
 
-    let guidance = gather_guidance(
+    let mut guidance = gather_guidance(
         resolver,
         &RelevantQuery {
             paths: guidance::query_paths(contract.scope_patterns(), &contract.read_hints),
@@ -785,6 +812,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         &keys,
         manifest_aval_version,
     );
+    guidance.repo_name = repo_name;
 
     // The constraint is the decision in the record's own words — what
     // `aval resolve --json` carries as `choice` and `reason`; the full
@@ -889,9 +917,16 @@ pub fn gather_guidance(
     let mut aval_missing = false;
     match resolver.constraint_rules() {
         Ok(rules) => {
-            guidance.index = rules.rules.iter().map(|rule| rule.id.clone()).collect();
+            guidance.index = rules
+                .rules
+                .iter()
+                .filter(|rule| !rules.code_rules.iter().any(|code| code.id == rule.id))
+                .map(|rule| rule.id.clone())
+                .collect();
             guidance.rules = rules.rules;
             guidance.omitted = rules.omitted;
+            guidance.code_rules = rules.code_rules;
+            guidance.gaps.extend(rules.notes);
         }
         Err(gap) => {
             aval_missing = gap.is_not_launched();
@@ -987,6 +1022,7 @@ mod tests {
             turn_ceiling: crate::backend::TurnCeiling::Unavailable,
             resolver,
             design: None,
+            repo_name: Some("relais".into()),
         }
     }
 
@@ -1363,7 +1399,7 @@ mod tests {
         Guided {
             rules: Ok(Rules {
                 rules: vec![rule("errors.never-swallowed"), rule("errors.typed-values")],
-                omitted: guidance::Omitted::default(),
+                ..Rules::default()
             }),
             relevant: Ok(Relevant {
                 keys: vec![ranked("a.b", "active"), ranked("c.d", "undecided")],
@@ -1393,6 +1429,65 @@ mod tests {
         );
         assert!(g.gaps.is_empty());
         assert!(manifest.architecture.resolved.is_empty());
+    }
+
+    fn two_rules_with_note(code_rules: Vec<guidance::CodeRule>, notes: Vec<GuidanceGap>) -> Guided {
+        Guided {
+            rules: Ok(Rules {
+                rules: vec![rule("errors.never-swallowed"), rule("errors.typed-values")],
+                code_rules,
+                notes,
+                ..Rules::default()
+            }),
+            relevant: Ok(Relevant::default()),
+        }
+    }
+
+    fn assert_fallback_keeps_every_id_and_names_the_fix(cause: guidance::GapCause) {
+        let note = GuidanceGap::new(
+            GuidanceSource::CodeRules,
+            cause,
+            "code rules are not carried; upgrade aval or run `aval add`",
+        );
+        let resolver = two_rules_with_note(Vec::new(), vec![note]);
+        let manifest = assemble(inputs(&contract(&[]), &repo(), &resolver)).expect("assembles");
+        let guidance = &manifest.guidance;
+        assert_eq!(
+            guidance.index,
+            ["errors.never-swallowed", "errors.typed-values"]
+        );
+        let line = guidance::gap_line(&guidance.gaps).expect("the gap is reported");
+        assert!(line.contains("code rules missing"), "{line}");
+        assert!(
+            line.contains("upgrade aval") || line.contains("aval add"),
+            "{line}"
+        );
+        assert!(!line.contains("index missing"), "{line}");
+    }
+
+    #[test]
+    fn a_code_rule_stays_out_of_the_index_but_in_the_rules() {
+        let code_rule = guidance::CodeRule {
+            id: "errors.typed-values".into(),
+            ..guidance::CodeRule::default()
+        };
+        let resolver = two_rules_with_note(vec![code_rule], Vec::new());
+        let manifest = assemble(inputs(&contract(&[]), &repo(), &resolver)).expect("assembles");
+        let guidance = &manifest.guidance;
+        assert_eq!(guidance.index, ["errors.never-swallowed"]);
+        assert_eq!(guidance.rules.len(), 2);
+        assert_eq!(guidance.code_rules.len(), 1);
+        assert_eq!(guidance.code_rules[0].id, "errors.typed-values");
+    }
+
+    #[test]
+    fn an_old_aval_fallback_keeps_every_id_in_the_index() {
+        assert_fallback_keeps_every_id_and_names_the_fix(guidance::GapCause::AvalTooOld);
+    }
+
+    #[test]
+    fn a_stale_pack_fallback_keeps_every_id_in_the_index() {
+        assert_fallback_keeps_every_id_and_names_the_fix(guidance::GapCause::StalePack);
     }
 
     #[test]
@@ -1474,7 +1569,7 @@ mod tests {
         let huge = Guided {
             rules: Ok(Rules {
                 rules: (0..400).map(|i| rule(&format!("g{i}.rule-{i}"))).collect(),
-                omitted: guidance::Omitted::default(),
+                ..Rules::default()
             }),
             relevant: Ok(Relevant::default()),
         };

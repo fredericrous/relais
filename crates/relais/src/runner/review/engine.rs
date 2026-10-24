@@ -14,10 +14,12 @@ use crate::verify;
 use crate::workspace;
 
 use super::{
-    patch_section, report_review_prompt, review_verdict, reviewer_tier, stage_patch, ReviewOutcome,
-    ReviewPurpose, ReviewRequest, ReviewSeat, StagedPatch, UnavailableCause,
-    REVIEW_CONSTRAINTS_BUDGET_BYTES, REVIEW_MIN_WALL, REVIEW_PART_TIMEOUT,
+    merge_reviewer_gaps, patch_section, report_review_prompt, review_verdict, reviewer_decisions,
+    reviewer_tier, stage_patch, ReviewOutcome, ReviewPurpose, ReviewRequest, ReviewSeat,
+    StagedPatch, UnavailableCause, REVIEW_CONSTRAINTS_BUDGET_BYTES, REVIEW_MIN_WALL,
+    REVIEW_PART_TIMEOUT,
 };
+use crate::runner::prompt::DECISION_PRECEDENCE;
 use crate::runner::{
     data_block, data_list_block, effort_str, reviewer_guidance, utc_day_start, Budget, Candidate,
     Ceiling, ManagedDispatch, Reason, RunEngine, RunError, RunSpend, State,
@@ -371,7 +373,7 @@ impl<'a> RunEngine<'a> {
     ) -> (String, Option<GuidanceGap>) {
         let mut prompt = String::from(
             "You are a semantic reviewer. You cannot edit or waive checks; you report findings only.\n\
-             Report each finding with file/range, the violated acceptance criterion, evidence, and suggested verification.\n\
+             Report each finding with file/range, the violated acceptance criterion or code rule id, evidence, and suggested verification.\n\
              You may only run read-only commands (reading files, git log/diff/show, searching). \
              Do not build, test or run checks: the runner has run the profile's checks already, \
              and a command you could not run is not a finding.\n\
@@ -382,8 +384,13 @@ impl<'a> RunEngine<'a> {
              copies disagree, so the passing checks above are not evidence about this.\n\
              Ask the same of what it READS: a record appended after a run is already terminal \
              (a retired worktree writes a same-state transition) means the NEWEST row matching \
-             a state is usually not the event that caused it.\n",
+             a state is usually not the event that caused it.\n\
+             A violation of a code rule that THIS diff introduces, deletions included, is a \
+             finding citing the rule id and `file:line` (the old-side location for a deletion). \
+             It blocks like an unmet acceptance criterion. Violations that were already there \
+             and are unchanged are not reported.\n",
         );
+        prompt.push_str(DECISION_PRECEDENCE);
         prompt.push('\n');
         prompt.push_str(&data_block("objective", &self.config.contract.objective));
         prompt.push_str(&data_list_block(
@@ -406,6 +413,14 @@ impl<'a> RunEngine<'a> {
         let (guidance_text, reviewer_gap) =
             reviewer_guidance(&request.manifest.guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES);
         prompt.push_str(&guidance_text);
+        let (decisions_text, decisions_gap) = reviewer_decisions(
+            self.config.aval_resolver,
+            &staged.files,
+            REVIEW_CONSTRAINTS_BUDGET_BYTES,
+            guidance_text.len(),
+        );
+        prompt.push_str(&decisions_text);
+        let reviewer_gap = merge_reviewer_gaps(reviewer_gap, decisions_gap);
         match self.config.ledger.intent_of_run(&self.run_id) {
             Ok(Some(intent)) => prompt.push_str(&super::widened_scope_block(&intent.scope_delta)),
             Ok(None) => {}

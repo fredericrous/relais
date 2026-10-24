@@ -192,7 +192,7 @@ impl<'a> RunEngine<'a> {
         // `route()` resolved and validated it: tier, model and effort.
         let model_profile = rung.profile();
         // Findings are quoted once, to the repair they caused.
-        let mut prompt = match progress.review_findings.take() {
+        let (mut prompt, code_rules_gap) = match progress.review_findings.take() {
             Some(findings) => build_review_repair_prompt(
                 self.config.contract,
                 &ctx.preflight.manifest,
@@ -207,6 +207,12 @@ impl<'a> RunEngine<'a> {
                 kind,
             ),
         };
+        if let Some(gap) = &code_rules_gap {
+            self.emit_guidance_gap(gap);
+        }
+        // Like `reviewer_gap`, this gap lives outside the manifest: the
+        // manifest is built before the prompt, so the receipt reads it from here.
+        self.worker_code_rules_gap = code_rules_gap;
         // A continued candidate that conflicted: what is still open is the
         // worker's first job (plan A4). A path it already resolved is not
         // listed again.

@@ -1,6 +1,18 @@
 //! The worker's prompt and the quoted-data blocks it is built from.
 
-use super::{AttemptKind, ContextManifest, Guidance, TaskContract};
+use super::{
+    context, AttemptKind, ContextManifest, Guidance, GuidanceGap, GuidanceSource, RuleRef,
+    TaskContract,
+};
+
+/// What the worker's full-text code rules may occupy, in bytes.
+pub(super) const WORKER_CODE_RULES_BUDGET_BYTES: usize = 64 * 1024;
+
+/// aval's precedence, as the worker and the reviewer are both told it.
+pub(in crate::runner) const DECISION_PRECEDENCE: &str = "aval's precedence is an applicable \
+scoped decision, then a default-scope decision, then an adopted rule: an applicable decision \
+outranks an adopted rule, and a code-rule violation is not reported where a listed decision \
+decides otherwise; missing decision evidence is reported as uncertainty, not as permission.\n";
 
 pub(super) fn build_prompt(
     contract: &TaskContract,
@@ -8,8 +20,15 @@ pub(super) fn build_prompt(
     verification_commands: usize,
     previous_failures: Option<&[String]>,
     kind: AttemptKind,
-) -> String {
-    let mut prompt = String::from("[relais task]\n");
+) -> (String, Option<GuidanceGap>) {
+    let (code_rules_text, code_rules_gap) =
+        worker_code_rules_block(&manifest.guidance, WORKER_CODE_RULES_BUDGET_BYTES);
+    let mut prompt = code_rules_text;
+    if let Some(gap) = &code_rules_gap {
+        prompt.push_str(&format!("note: {}\n", gap.describe()));
+    }
+    prompt.push_str("[relais task]\n");
+    prompt.push_str(DECISION_PRECEDENCE);
     prompt.push_str(&data_block("objective", &contract.objective));
     prompt.push_str("verification decides whether the criteria below are met, not you.\n");
     prompt.push_str(&data_list_block(
@@ -114,19 +133,20 @@ pub(super) fn build_prompt(
             AttemptKind::Initial => {}
         }
     }
-    prompt
+    (prompt, code_rules_gap)
 }
 
 /// The prompt of the one repair a review's findings buy: the task as the
 /// first attempt had it, then the findings quoted as data and the
-/// instruction to fix them and nothing else.
+/// instruction to fix them and nothing else. The gap is the code-rules gap
+/// `build_prompt` returns, passed through.
 pub(super) fn build_review_repair_prompt(
     contract: &TaskContract,
     manifest: &ContextManifest,
     verification_commands: usize,
     findings: &str,
-) -> String {
-    let mut prompt = build_prompt(
+) -> (String, Option<GuidanceGap>) {
+    let (mut prompt, code_rules_gap) = build_prompt(
         contract,
         manifest,
         verification_commands,
@@ -140,7 +160,7 @@ pub(super) fn build_review_repair_prompt(
     );
     prompt.push_str(&data_block("review findings", findings));
     prompt.push_str("fix these findings and change nothing else.\n");
-    prompt
+    (prompt, code_rules_gap)
 }
 
 /// The rules of a native worker. It runs as a Claude Code subagent in the
@@ -163,6 +183,160 @@ pub(super) fn worker_rules() -> String {
         .to_string()
 }
 
+/// One rule as a prompt prints it: the id, and the whole rendered text
+/// (statement, and for a code rule its body).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenderedRule {
+    pub id: String,
+    pub text: String,
+}
+
+impl RenderedRule {
+    /// A constraint shown as its statement alone.
+    pub(in crate::runner) fn statement_of(rule: &RuleRef) -> Self {
+        Self {
+            id: rule.id.clone(),
+            text: format!("`{}`: {}", rule.id, rule.statement),
+        }
+    }
+
+    /// A `governs: code` rule shown in full; none when neither its
+    /// statement nor its body is present (a manifest read back from disk).
+    pub(in crate::runner) fn full_text_of(rule: &context::guidance::CodeRule) -> Option<Self> {
+        if rule.statement.is_empty() && rule.body.is_empty() {
+            return None;
+        }
+        Some(Self {
+            id: rule.id.clone(),
+            text: format!("`{}`: {}\n{}", rule.id, rule.statement, rule.body)
+                .trim_end()
+                .to_string(),
+        })
+    }
+
+    pub(in crate::runner) fn bytes(&self) -> usize {
+        self.text.len() + 1
+    }
+}
+
+/// The rules that fit `budget` bytes of rendered text, whole and in the
+/// order given, and the gap (of `source`) naming the ones that did not.
+/// Whole rules are dropped from the end; a rule is never cut. `reserved`
+/// is what earlier rules already took of the same `budget`; the gap quotes
+/// the whole budget so merged gaps agree on one figure.
+pub(in crate::runner) fn fit_statements(
+    rules: &[RenderedRule],
+    budget: usize,
+    reserved: usize,
+    source: GuidanceSource,
+    kind: RuleKind,
+) -> (Vec<&RenderedRule>, Option<GuidanceGap>) {
+    let room = budget.saturating_sub(reserved);
+    let mut used = 0usize;
+    let mut shown = Vec::new();
+    for rule in rules {
+        let next = used + rule.bytes();
+        if next > room {
+            break;
+        }
+        used = next;
+        shown.push(rule);
+    }
+    if shown.len() == rules.len() {
+        return (shown, None);
+    }
+    let omitted: Vec<&str> = rules[shown.len()..]
+        .iter()
+        .map(|rule| rule.id.as_str())
+        .collect();
+    let measured: usize = rules.iter().map(RenderedRule::bytes).sum();
+    let prompt = match source {
+        GuidanceSource::Reviewer | GuidanceSource::Decisions => "reviewer",
+        GuidanceSource::Index | GuidanceSource::CodeRules | GuidanceSource::Relevant => "worker",
+    };
+    let gap = GuidanceGap::new(
+        source,
+        crate::context::guidance::GapCause::OverBudget { measured, budget },
+        format!(
+            "{} of {} {} fit the {prompt} prompt ({measured} bytes against the {budget}-byte {} budget); omitted: {}",
+            shown.len(),
+            rules.len(),
+            kind.plural(),
+            kind.budget_name(),
+            omitted.join(", ")
+        ),
+    );
+    (shown, Some(gap))
+}
+
+/// What a budget gap counts: full-text code rules or constraint statements.
+#[derive(Clone, Copy)]
+pub(in crate::runner) enum RuleKind {
+    CodeRules,
+    Statements,
+    Decisions,
+}
+
+impl RuleKind {
+    fn plural(self) -> &'static str {
+        match self {
+            RuleKind::CodeRules => "code rules",
+            RuleKind::Statements => "constraint statements",
+            RuleKind::Decisions => "decisions",
+        }
+    }
+
+    fn budget_name(self) -> &'static str {
+        match self {
+            RuleKind::CodeRules => "code-rules",
+            RuleKind::Statements => "constraints",
+            RuleKind::Decisions => "constraints",
+        }
+    }
+}
+
+/// The full text of the `governs: code` rules for the worker, whole rules in
+/// the order aval listed them under `budget`, and the gap naming what did
+/// not fit, or that the text is not available (a manifest read back from
+/// disk keeps ids and hashes only). Nothing when there are no code rules.
+pub(super) fn worker_code_rules_block(
+    guidance: &Guidance,
+    budget: usize,
+) -> (String, Option<GuidanceGap>) {
+    if guidance.code_rules.is_empty() {
+        return (String::new(), None);
+    }
+    let rendered: Vec<RenderedRule> = guidance
+        .code_rules
+        .iter()
+        .filter_map(RenderedRule::full_text_of)
+        .collect();
+    if rendered.is_empty() {
+        let gap = GuidanceGap::new(
+            GuidanceSource::CodeRules,
+            context::guidance::GapCause::TextUnavailable,
+            "the code rules are not available in this prompt",
+        );
+        return (String::new(), Some(gap));
+    }
+    let (shown, gap) = fit_statements(
+        &rendered,
+        budget,
+        0,
+        GuidanceSource::CodeRules,
+        RuleKind::CodeRules,
+    );
+    if shown.is_empty() {
+        return (String::new(), gap);
+    }
+    let texts: Vec<&str> = shown.iter().map(|rule| rule.text.as_str()).collect();
+    let text = format!(
+        "the code rules below are in force, in full; review blocks on them.\n{}",
+        data_block("code rules in force", &texts.join("\n\n"))
+    );
+    (text, gap)
+}
+
 /// The worker's constraint index: full ids grouped by prefix, and the
 /// instruction to fetch one rule's text. The instruction exists only with
 /// the index it refers to. Nothing when aval gave no index.
@@ -171,9 +345,14 @@ pub(super) fn constraint_index_block(guidance: &Guidance) -> String {
     if lines.is_empty() {
         return String::new();
     }
+    let instruction = match &guidance.repo_name {
+        Some(name) => format!(
+            "read one rule with the `aval_rule` tool, passing `repo: \"{name}\"`, or run `aval rule <id>` in the working directory when that tool is not available or answers with an error, before you write code it governs."
+        ),
+        None => "run `aval rule <id>` in the working directory to read one rule before you write code it governs.".to_string(),
+    };
     format!(
-        "the constraint rules below are in force; review blocks on them.\n\
-         run `aval rule <id>` for one rule's text before you write code it governs.\n{}",
+        "the constraint rules below are in force; review blocks on them.\n{instruction}\n{}",
         data_block("constraint index", &lines.join("\n"))
     )
 }

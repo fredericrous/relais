@@ -39,7 +39,18 @@ fn field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
 /// The tools each kind of agent may use; none has Agent.
 fn tools_of(kind: AgentKind) -> &'static [&'static str] {
     match kind {
-        AgentKind::Worker => &["Read", "Grep", "Glob", "LSP", "Edit", "Write", "Bash"],
+        AgentKind::Worker => &[
+            "Read",
+            "Grep",
+            "Glob",
+            "LSP",
+            "Edit",
+            "Write",
+            "Bash",
+            "mcp__aval__aval_rule",
+            "mcp__aval__aval_resolve",
+            "mcp__aval__aval_relevant",
+        ],
         AgentKind::Reviewer => &["Read", "Grep", "Glob", "LSP"],
         AgentKind::Planner => &["Read", "Grep", "Glob", "LSP", "Bash"],
     }

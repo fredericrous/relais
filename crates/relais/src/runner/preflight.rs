@@ -564,6 +564,7 @@ impl<'a> RunEngine<'a> {
             turn_ceiling,
             resolver: self.config.aval_resolver,
             design,
+            repo_name: crate::repo::main_checkout_name(self.config.repo_dir),
         });
         match assembled {
             Ok(manifest) => {
@@ -624,6 +625,7 @@ impl<'a> RunEngine<'a> {
     /// a gap, the reviewer's included.
     pub(in crate::runner) fn guidance_note(&self, manifest: &ContextManifest) -> Option<String> {
         let mut gaps = manifest.guidance.gaps.clone();
+        gaps.extend(self.worker_code_rules_gap.clone());
         gaps.extend(self.reviewer_gap.clone());
         context::guidance::gap_line(&gaps)
     }
