@@ -395,7 +395,12 @@ fn execute_waves(
             rung: RungIndex::INITIAL,
             escalation_tier: None,
         };
-        match workspace::check_scope(integration, &assembly.head, contract) {
+        // A change with `from_candidate` cannot be decomposed (the
+        // contract refuses it), so the root has no merged tree and the
+        // floor is the integration worktree's base; `of_run` keeps the
+        // decision in the one place attempt.rs also asks.
+        let floor = workspace::ScopeFloor::of_run(None, contract);
+        match workspace::check_scope_from(integration, &assembly.head, contract, floor) {
             Ok(_) => {}
             Err(WorkspaceError::ScopeViolation(paths)) => {
                 return engine.stop(

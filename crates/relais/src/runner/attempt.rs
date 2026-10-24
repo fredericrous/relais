@@ -644,13 +644,13 @@ impl<'a> RunEngine<'a> {
         // A `from_candidate` run is measured from the merged candidate
         // tree it began from; a verify applies its candidate as its own
         // change, so it stays measured from the base (SPEC §8).
-        let floor = match (
-            &ctx.preflight.candidate,
-            self.config.contract.from_candidate(),
-        ) {
-            (Some(prepared), Some(_)) => workspace::ScopeFloor::Tree(&prepared.tree),
-            _ => workspace::ScopeFloor::WorktreeBase,
-        };
+        let floor = workspace::ScopeFloor::of_run(
+            ctx.preflight
+                .candidate
+                .as_ref()
+                .map(|prepared| prepared.tree.as_str()),
+            self.config.contract,
+        );
         match workspace::check_scope_from(ctx.worktree, &sha, self.config.contract, floor) {
             Ok(_) => {}
             Err(WorkspaceError::ScopeViolation(paths)) => {

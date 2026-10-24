@@ -781,6 +781,17 @@ pub enum ScopeFloor<'a> {
 }
 
 impl<'a> ScopeFloor<'a> {
+    /// The floor a run's scope is measured from: the merged candidate
+    /// tree when the contract continues from a candidate, else the
+    /// worktree's base. A verify applies its candidate as its own change,
+    /// so it has a merged tree but stays measured from the base (SPEC §8).
+    pub fn of_run(merged_tree: Option<&'a str>, contract: &TaskContract) -> Self {
+        match (merged_tree, contract.from_candidate()) {
+            (Some(tree), Some(_)) => ScopeFloor::Tree(tree),
+            _ => ScopeFloor::WorktreeBase,
+        }
+    }
+
     /// The revision a diff of the run's changes starts from.
     pub fn revision(self, worktree: &'a TaskWorktree) -> &'a str {
         match self {
