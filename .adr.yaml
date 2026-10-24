@@ -43,6 +43,8 @@ keys:
     description: Where a local run works (a fork with copy-on-write dependencies, or the caller's own linked worktree) and what a server or CI run keeps
   execution.resource-budgets:
     description: How a run spends time on a loaded machine (work, admission wait, disk wait and total), what each budget's exhaustion ends as, and why resource exhaustion is evidence rather than a verdict
+  execution.settle-before-asking:
+    description: Which stops a run settles itself before asking a person (minor review findings, a tests-only scope overflow, a reviewer with no result), and the bound on each
 
 # Which parts of this repository have which traits (aval 1.7, SEMANTICS
 # section 2.5), as `aval traits --detect` proposed and a reviewer accepted.
