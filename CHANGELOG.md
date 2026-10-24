@@ -8,6 +8,16 @@ missing here.
 
 ## Unreleased
 
+The relais pane draws the live run first. Finished runs fold to one row each (the three most recent, then `+N earlier runs`; a failure reads `FAIL`), so the run in progress keeps its check output however many runs the session has had: with three or more earlier runs, that output used to get no rows at all and only a timer showed. A silent step says `waiting for output`, and the pane never draws more rows than it has, trimming from the top behind an `↑ N rows above` row, so the live run stays on screen without scrolling.
+
+A run now settles three stops itself before asking a person (ADR-0011):
+
+- **Minor review findings get one repair.** Reviewers tag each finding `[blocking|high|medium|low]`. When every finding is `medium` or `low`, a `change` run goes back to its worker once with the findings, and is then checked and reviewed again. Each review keeps its own evidence file.
+- **A scope overflow made only of tests is verified with the scope widened.** relais answers the decision itself (actor `relais`) and the plugin launches the widened `verify` successor. `[execution] widen_scope_for_tests = false` restores the stop.
+- **A reviewer that ended with no result is retried once.** It is not retried after a cancel or an exhausted budget.
+
+Reinstall the plugin after upgrading.
+
 The CPU-time sample the check heartbeat takes with `ps` is now bounded at 5 s: a hanging `ps` is killed and reaped and counts as no sample, instead of holding the run past its check (#290).
 
 ## v0.29.5

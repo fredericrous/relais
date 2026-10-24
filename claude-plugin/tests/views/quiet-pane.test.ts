@@ -251,9 +251,13 @@ for (const rows of [8, 24]) {
     engine.quiet.push('stdout', started('q1') + lines('q1', ...Array.from({ length: 12 }, (_, i) => `q-${i}`)))
     await pass(engine, 1500)
     const withQuiet = masked((await drawn($, engine, rows)).texts)
+    // The relais rows come first and are untouched; the quiet run gets only
+    // the rows they leave, right below them, and the pane never grows past
+    // its body.
     expect(withQuiet.slice(0, baseline.length)).toEqual(baseline)
-    expect(withQuiet.length).toBeGreaterThan(baseline.length)
-    expect(withQuiet[baseline.length]).toMatch(/^amont · clippy/)
+    expect(withQuiet.length).toBeLessThanOrEqual(Math.max(rows, 6))
+    if (baseline.length < Math.max(rows, 6)) expect(withQuiet[baseline.length]).toMatch(/^amont · clippy/)
+    else expect(withQuiet.length).toBe(baseline.length)
   })
 }
 

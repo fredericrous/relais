@@ -177,6 +177,7 @@ impl Fixture {
                 max_agent_depth: 1,
                 max_agents_total: 24,
                 repair_effort: Default::default(),
+                widen_scope_for_tests: true,
             },
             integrations: Default::default(),
             verification: VerificationPolicy {
@@ -266,6 +267,18 @@ impl Fixture {
         repo: &RepoPolicy,
         backend: &dyn Backend,
     ) -> RunOutcome {
+        self.execute_on(Wire::process(), run_id, contract, repo, backend)
+    }
+
+    /// `execute_as`, with the protocol channel the test reads.
+    fn execute_on(
+        &self,
+        wire: Wire,
+        run_id: Option<RunId>,
+        contract: &TaskContract,
+        repo: &RepoPolicy,
+        backend: &dyn Backend,
+    ) -> RunOutcome {
         let machine = self.machine_for(repo);
         let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
             adr: "ADR-0001".into(),
@@ -293,7 +306,7 @@ impl Fixture {
             task_override: None,
             purpose: None,
             run_id,
-            wire: Wire::process(),
+            wire,
             design: DesignSource::Contract,
             declarations: &crate::trust::NoHistory,
         })
@@ -2340,8 +2353,14 @@ fn required_review_accepts_only_with_findings_none() {
         matches!(outcome.terminal, Terminal::Accepted { .. }),
         "FINDINGS: none accepts: {outcome:?}"
     );
-    let review = fixture.artifacts.join(outcome.run_id()).join("review.txt");
-    assert!(review.is_file(), "review evidence is retained");
+    let kept = fixture
+        .ledger
+        .evidence(&RunId::from_stored(outcome.run_id()))
+        .expect("evidence")
+        .into_iter()
+        .filter(|row| row.kind == EvidenceKind::ReviewResult)
+        .count();
+    assert_eq!(kept, 1, "review evidence is retained");
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
@@ -7885,6 +7904,12 @@ fn the_review_prompt_ends_with_the_verdict_instruction() {
         "the verdict instruction is the last thing the reviewer reads:\n{review}"
     );
     assert!(review.contains("`FINDINGS: none`"), "{review}");
+    assert!(
+        review.contains(
+            "Start each finding with its severity in brackets, `[blocking|high|medium|low]`"
+        ),
+        "every finding is asked for its severity:\n{review}"
+    );
     assert!(review.contains("only run read-only commands"), "{review}");
     assert!(
         review.contains("a command you could not run is not a finding"),
@@ -8286,6 +8311,8 @@ mod budgets;
 mod exhaustion;
 mod native;
 mod review_parts;
+mod review_repair;
+mod review_retry;
 mod review_stop;
 // Shells out to `sh` and a fake `claude` script made executable with
 // unix permissions: unix only, like the script it tests.

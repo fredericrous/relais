@@ -1,12 +1,13 @@
 //! The attempt loop: dispatch, snapshot, verify and judge each attempt.
 
 use super::{
-    build_prompt, conflict_block, effort_str, fresh_progress, spend_limit, split_profile_gaps,
-    unpriced_native_model, verify, workspace, AgentKind, AttemptContext, AttemptKind, AttemptLabel,
-    Attempted, BlockCode, Candidate, Ceiling, Dispatched, Duration, Ended, EvidenceKind, Instant,
-    LaunchSpec, Limit, ManagedDispatch, Next, Observation, PathBuf, PendingEvidence, Phase,
-    Progress, Reason, Review, RunEngine, RunError, RunOutcome, Snapshot, State, Step, Terminal,
-    UsageEvent, Verified, VerifyFailure, WorkspaceError,
+    build_prompt, build_review_repair_prompt, conflict_block, effort_str, fresh_progress,
+    spend_limit, split_profile_gaps, unpriced_native_model, verify, workspace, AgentKind,
+    AttemptContext, AttemptKind, AttemptLabel, Attempted, BlockCode, Candidate, Ceiling,
+    Dispatched, Duration, Ended, EvidenceKind, Instant, LaunchSpec, Limit, ManagedDispatch, Next,
+    Observation, PathBuf, PendingEvidence, Phase, Progress, Reason, Review, RunEngine, RunError,
+    RunOutcome, Snapshot, State, Step, Terminal, UsageEvent, Verified, VerifyFailure,
+    WorkspaceError,
 };
 
 impl<'a> RunEngine<'a> {
@@ -190,13 +191,22 @@ impl<'a> RunEngine<'a> {
         // The ladder's rung at the index the machine named, exactly as
         // `route()` resolved and validated it: tier, model and effort.
         let model_profile = rung.profile();
-        let mut prompt = build_prompt(
-            self.config.contract,
-            &ctx.preflight.manifest,
-            authority.verification_profile.commands.len(),
-            progress.last_failures.as_deref(),
-            kind,
-        );
+        // Findings are quoted once, to the repair they caused.
+        let mut prompt = match progress.review_findings.take() {
+            Some(findings) => build_review_repair_prompt(
+                self.config.contract,
+                &ctx.preflight.manifest,
+                authority.verification_profile.commands.len(),
+                &findings,
+            ),
+            None => build_prompt(
+                self.config.contract,
+                &ctx.preflight.manifest,
+                authority.verification_profile.commands.len(),
+                progress.last_failures.as_deref(),
+                kind,
+            ),
+        };
         // A continued candidate that conflicted: what is still open is the
         // worker's first job (plan A4). A path it already resolved is not
         // listed again.
@@ -987,7 +997,6 @@ impl<'a> RunEngine<'a> {
             return self.judge_inspection(ctx, progress, &candidate, verified);
         }
         self.accept_candidate(ctx, progress, &candidate, verified, None)
-            .map(Step::Ended)
     }
 
     /// Record the machine's decision on an observation and follow it:
@@ -998,7 +1007,19 @@ impl<'a> RunEngine<'a> {
         progress: &mut Progress,
         observation: Observation,
     ) -> Result<Step, RunError> {
-        match self.decide(&progress.budget, observation)? {
+        let next = self.decide(&progress.budget, observation)?;
+        self.proceed(ctx, progress, next)
+    }
+
+    /// Carry out the step the machine named: another attempt, or the end
+    /// of the run.
+    pub(super) fn proceed(
+        &mut self,
+        ctx: &AttemptContext<'_>,
+        progress: &mut Progress,
+        next: Next,
+    ) -> Result<Step, RunError> {
+        match next {
             Next::Attempt { kind, rung } => {
                 if kind == AttemptKind::Repair {
                     progress.budget.repairs_used += 1;

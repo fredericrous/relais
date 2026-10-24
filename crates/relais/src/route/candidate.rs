@@ -758,6 +758,7 @@ fn validate_new_recipe(
             max_agent_depth,
             max_agents_total,
             repair_effort,
+            widen_scope_for_tests,
         } = execution;
         // NOT a knob. Raising effort on repair is spend, and a learner
         // does not choose its own.
@@ -765,6 +766,13 @@ fn validate_new_recipe(
             return Err(CandidateRejection::FixedRecipeFieldChanged {
                 name: new_name.clone(),
                 field: "execution.repair_effort",
+            });
+        }
+        // NOT a knob either: it widens what a run may write.
+        if *widen_scope_for_tests != incumbent.execution.widen_scope_for_tests {
+            return Err(CandidateRejection::FixedRecipeFieldChanged {
+                name: new_name.clone(),
+                field: "execution.widen_scope_for_tests",
             });
         }
         check_cap(

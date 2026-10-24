@@ -26,6 +26,10 @@ pub enum Actor {
     /// person's words is recorded with the answer.
     #[serde(rename = "person-via-orchestrator")]
     PersonViaOrchestrator,
+    /// relais answered on its own, by a policy rule that settles the
+    /// decision without anyone asking (`[execution] widen_scope_for_tests`).
+    #[serde(rename = "relais")]
+    Relais,
 }
 
 /// How an answer reached relais (ADR-0004): through the plugin's decide
@@ -834,7 +838,16 @@ impl Ledger {
 type StoredAdvice = (Option<f64>, Option<String>, Option<String>, Option<String>);
 
 impl Actor {
-    pub const ALL: [Actor; 3] = [
+    pub const ALL: [Actor; 4] = [
+        Actor::Orchestrator,
+        Actor::Person,
+        Actor::PersonViaOrchestrator,
+        Actor::Relais,
+    ];
+
+    /// The values the command line may name: `relais` is written only by
+    /// relais itself.
+    pub const CLI: [Actor; 3] = [
         Actor::Orchestrator,
         Actor::Person,
         Actor::PersonViaOrchestrator,
@@ -845,13 +858,14 @@ impl Actor {
             Actor::Orchestrator => "orchestrator",
             Actor::Person => "person",
             Actor::PersonViaOrchestrator => "person-via-orchestrator",
+            Actor::Relais => "relais",
         }
     }
 
     /// Parse what the command line names. An old spelling is refused with
     /// the actor that replaces it; any other string with the three values.
     pub fn parse(text: &str) -> std::result::Result<Actor, String> {
-        if let Some(actor) = Actor::ALL.into_iter().find(|a| a.as_str() == text) {
+        if let Some(actor) = Actor::CLI.into_iter().find(|a| a.as_str() == text) {
             return Ok(actor);
         }
         if let Some((_, actor)) = LEGACY_ACTORS.iter().find(|(old, _)| *old == text) {
@@ -859,7 +873,7 @@ impl Actor {
         }
         Err(format!(
             "unknown actor `{text}` — one of: {}",
-            Actor::ALL.map(Actor::as_str).join(", ")
+            Actor::CLI.map(Actor::as_str).join(", ")
         ))
     }
 
@@ -1921,15 +1935,18 @@ mod tests {
 
     #[test]
     fn actor_parse_names_the_replacement_and_lists_the_three_values() {
-        for actor in Actor::ALL {
+        for actor in Actor::CLI {
             assert_eq!(Actor::parse(actor.as_str()), Ok(actor));
         }
+        let relais = Actor::parse("relais").unwrap_err();
+        assert!(relais.contains("unknown actor"), "{relais}");
         assert!(Actor::parse("claude")
             .unwrap_err()
             .contains("`orchestrator`"));
         let unknown = Actor::parse("bob").unwrap_err();
-        for actor in Actor::ALL {
+        for actor in Actor::CLI {
             assert!(unknown.contains(actor.as_str()), "{unknown}");
         }
+        assert!(!unknown.contains("relais"), "{unknown}");
     }
 }

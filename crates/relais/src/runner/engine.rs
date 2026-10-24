@@ -265,6 +265,7 @@ impl<'a> RunEngine<'a> {
                         trial: None,
                         code: code.as_deref(),
                         detail,
+                        successor_intent: None,
                     });
                 }
                 return Ok(outcome);
@@ -279,11 +280,20 @@ impl<'a> RunEngine<'a> {
             .is_file()
             .then(|| written.to_string_lossy().into_owned());
         let summary = Summary::of_candidate(&self.artifacts);
+        let widened = self.widen_for_tests(&outcome);
+        // The state the ledger now holds: a widened run was answered
+        // (`revise`) and cancelled, whatever its terminal said.
+        let resolved = if widened.is_some() {
+            State::Cancelled
+        } else {
+            outcome.state()
+        };
         self.events.emit(Event::Outcome {
-            state: outcome.state().as_str().to_string(),
+            state: resolved.as_str().to_string(),
             receipt: receipt.clone(),
             summary,
-            reason: None,
+            reason: widened.as_ref().map(|(sentence, _)| sentence.clone()),
+            successor_intent: widened.as_ref().map(|(_, successor)| successor.clone()),
         });
         // A replay's `done` waits for its trial to be recorded: its caller
         // sends it (`relais dataset replay`).
@@ -292,21 +302,117 @@ impl<'a> RunEngine<'a> {
             Some(crate::lifecycle::RunPurpose::TrialArm) | None => self.parent.is_none(),
         };
         if announces {
-            let (code, detail) = outcome.terminal.named_reason();
+            let (code, detail) = match &widened {
+                Some((sentence, _)) => (
+                    Some("scope_widened_for_tests".to_string()),
+                    Some(sentence.as_str()),
+                ),
+                None => outcome.terminal.named_reason(),
+            };
             let done = Request::Done {
                 run: Some(self.run_id.as_str()),
-                outcome: outcome.state().as_str(),
+                outcome: resolved.as_str(),
                 receipt: receipt.as_deref(),
                 summary,
                 trial: None,
                 code: code.as_deref(),
                 detail,
+                successor_intent: widened.as_ref().map(|(_, successor)| successor),
             };
             // Dropped on failure: the plugin that was reading is gone, the
             // run's outcome is in the ledger and in `events.jsonl`.
             let _ = self.config.wire.send(&done);
         }
-        Ok(outcome)
+        // The caller (CLI exit status, stderr, trial settlement) reads the
+        // resolved state, not the terminal the decision was opened from.
+        match widened {
+            Some((sentence, _)) => Ok(RunOutcome {
+                run_id: outcome.run_id,
+                terminal: Terminal::Cancelled { detail: sentence },
+            }),
+            None => Ok(outcome),
+        }
+    }
+
+    /// A scope overflow made only of tests is answered here, by relais:
+    /// `revise` with the scope widened to those paths, as a successor
+    /// intent (SPEC §8). Returns the sentence the outcome carries and the
+    /// intent it names; `None` when the run did not stop that way, policy
+    /// says no, or the planning or the write failed, in which case the
+    /// decision stays open for a person, as it always did.
+    fn widen_for_tests(
+        &self,
+        outcome: &RunOutcome,
+    ) -> Option<(String, crate::protocol::SuccessorRef)> {
+        let config = self.config;
+        let overflowed = matches!(
+            outcome.terminal,
+            Terminal::NeedsDecision {
+                reason: Reason::ScopeExceeded,
+                ..
+            }
+        );
+        let ordinary =
+            self.parent.is_none() && config.purpose != Some(crate::lifecycle::RunPurpose::Replay);
+        if !overflowed || !ordinary || !config.repo_policy.execution.widen_scope_for_tests {
+            return None;
+        }
+        let profile = config
+            .repo_policy
+            .verification
+            .profiles
+            .get(&config.contract.verification_profile)?;
+        let planned = super::successor::plan_test_widening(
+            config.ledger,
+            &self.run_id,
+            config.contract,
+            profile,
+            &config.artifacts_dir,
+        );
+        let (intent, paths) = match planned {
+            Ok(Some(planned)) => planned,
+            Ok(None) => return None,
+            Err(e) => {
+                self.step("widen_scope_for_tests", format!("not widened: {e}"));
+                return None;
+            }
+        };
+        let written = config.ledger.resolve_decision_with_intent(
+            &self.run_id,
+            &crate::ledger::DecisionAnswer {
+                resolution: Reason::DecisionRevised,
+                actor: crate::ledger::Actor::Relais,
+                person_quote: None,
+                recorded_via: crate::ledger::RecordedVia::Cli,
+                note: Some("scope widened for test paths (execution.widen_scope_for_tests)"),
+                successor_run: None,
+                from_state: State::NeedsDecision,
+                to_state: State::Cancelled,
+            },
+            &intent,
+        );
+        let stored = match written {
+            Ok(Some(stored)) => stored,
+            Ok(None) => return None,
+            Err(e) => {
+                self.step("widen_scope_for_tests", format!("not widened: {e}"));
+                return None;
+            }
+        };
+        let sentence = format!(
+            "the diff left the scope only by test paths; relais widened the scope to them and \
+             recorded successor intent {} to verify and review the candidate again: {}",
+            stored.intent_id,
+            paths.join(", ")
+        );
+        Some((
+            sentence,
+            crate::protocol::SuccessorRef {
+                intent_id: stored.intent_id,
+                repo: config.repo_dir.to_string_lossy().into_owned(),
+                widened_paths: paths,
+            },
+        ))
     }
 
     fn run_to_outcome(&mut self) -> Finish {

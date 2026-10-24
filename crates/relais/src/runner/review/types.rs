@@ -102,3 +102,35 @@ pub(crate) enum ReviewOutcome {
     Findings(String),
     Unavailable(String),
 }
+
+/// Why a review ended `Unavailable`, chosen from how the reviewer dispatch
+/// ended. The retry decision reads this, never the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runner) enum UnavailableCause {
+    /// The reviewer ran and ended with no terminal result to read.
+    TerminalMissing,
+    /// The reviewer could not be launched, or the harness reported why it
+    /// could not run.
+    LaunchFailed,
+    /// A cancellation request ended the reviewer.
+    Cancelled,
+    /// The reviewer ran out of wall clock, or a budget ended the review.
+    ResourceExhausted,
+    /// No model is configured to review.
+    NoReviewerTier,
+    /// The runner could not stage, record or read the review.
+    NotRead,
+}
+
+impl UnavailableCause {
+    pub(in crate::runner) fn as_str(self) -> &'static str {
+        match self {
+            Self::TerminalMissing => "terminal_missing",
+            Self::LaunchFailed => "launch_failed",
+            Self::Cancelled => "cancelled",
+            Self::ResourceExhausted => "resource_exhausted",
+            Self::NoReviewerTier => "no_reviewer_tier",
+            Self::NotRead => "not_read",
+        }
+    }
+}

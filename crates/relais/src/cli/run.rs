@@ -610,7 +610,25 @@ pub(crate) fn run_command(
             Ok(CliOutcome::Interrupted)
         }
         Terminal::Cancelled { detail } => {
-            eprintln!("cancelled: {detail}");
+            // relais answered a test-only scope overflow itself (SPEC §8):
+            // the run is cancelled with that code, and there is nothing to
+            // decide, only the successor to launch.
+            match ledger.intent_of_decision(&outcome.run_id) {
+                Ok(Some(intent)) => {
+                    eprintln!("cancelled (scope_widened_for_tests): {detail}");
+                    for line in widened_lines(&intent) {
+                        eprintln!("{line}");
+                    }
+                }
+                Ok(None) => eprintln!("cancelled: {detail}"),
+                Err(e) => {
+                    eprintln!("cancelled: {detail}");
+                    eprintln!(
+                        "could not read whether relais recorded a successor intent for {}: {e}",
+                        outcome.run_id
+                    );
+                }
+            }
             eprintln!(
                 "the preserved candidate and evidence are under {}",
                 run_dir.display()
@@ -619,6 +637,19 @@ pub(crate) fn run_command(
         }
     };
     result
+}
+
+/// What a CLI run says when relais settled its scope overflow itself: the
+/// successor intent and the command that launches it.
+fn widened_lines(intent: &relais::ledger::SuccessorIntent) -> Vec<String> {
+    vec![
+        format!(
+            "relais widened the scope to the test paths and answered the decision (actor relais); \
+             successor intent {}",
+            intent.intent_id
+        ),
+        format!("run it with: relais run --intent {}", intent.intent_id),
+    ]
 }
 
 /// Make the state directory's ballast file when it is missing and the
@@ -689,6 +720,18 @@ mod tests {
             .expect("written")
             .expect("open decision");
         (ledger, intent.intent_id, dir)
+    }
+
+    #[test]
+    fn a_widened_run_prints_the_intent_and_the_command_that_launches_it() {
+        let (ledger, id, _dir) = ledger_with_intent("intent-widened-lines");
+        let intent = ledger
+            .successor_intent(&id)
+            .expect("read")
+            .expect("the intent");
+        let lines = widened_lines(&intent);
+        assert!(lines[0].contains(&id), "{lines:?}");
+        assert_eq!(lines[1], format!("run it with: relais run --intent {id}"));
     }
 
     #[test]

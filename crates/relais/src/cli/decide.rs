@@ -181,11 +181,12 @@ pub(crate) fn check_decide_arguments(
     }
     if request.criterion.is_some() {
         match actor {
-            Actor::Orchestrator => {
+            Actor::Orchestrator | Actor::Relais => {
                 return refusal(
                     CliOutcome::InvalidInput,
-                    "`--criterion` signs off a human criterion and an orchestrator never does: \
-                     the person signs it off from their own terminal (`--actor person`)",
+                    "`--criterion` signs off a human criterion and neither an orchestrator nor \
+                     relais ever does: the person signs it off from their own terminal \
+                     (`--actor person`)",
                 );
             }
             Actor::PersonViaOrchestrator if !request.proof_stdin => {

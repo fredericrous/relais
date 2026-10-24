@@ -49,6 +49,7 @@ pub(crate) fn announce_replay_done(
         trial,
         code: None,
         detail: None,
+        successor_intent: None,
     });
 }
 

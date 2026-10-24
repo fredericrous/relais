@@ -390,6 +390,7 @@ fn execute_waves(
             max_attempts: root.authority.max_attempts,
             repairs_used: 0,
             max_repairs: 0,
+            review_repairs_used: 0,
             tier: root.decision.tier,
             rung: RungIndex::INITIAL,
             escalation_tier: None,
@@ -606,6 +607,7 @@ fn run_package(
         max_attempts: root.authority.max_attempts,
         repairs_used: 0,
         max_repairs: 0,
+        review_repairs_used: 0,
         tier: root.decision.tier,
         rung: RungIndex::INITIAL,
         escalation_tier: None,
@@ -951,6 +953,7 @@ fn accept_integrated(
         max_attempts: root.authority.max_attempts,
         repairs_used: 0,
         max_repairs: 0,
+        review_repairs_used: 0,
         tier: root.decision.tier,
         rung: RungIndex::INITIAL,
         escalation_tier: None,
@@ -1047,7 +1050,13 @@ fn accept_integrated(
         match review {
             ReviewOutcome::NoFindings => {}
             ReviewOutcome::Findings(detail) => {
-                return engine.stop(&budget, Observation::ReviewFindings(detail));
+                return engine.stop(
+                    &budget,
+                    Observation::ReviewFindings(
+                        detail.clone(),
+                        super::review::finding_severities(&detail),
+                    ),
+                );
             }
             ReviewOutcome::Unavailable(detail) => {
                 let assembly = &*assembly;
@@ -1282,6 +1291,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         max_attempts: root.authority.max_attempts,
         repairs_used: 0,
         max_repairs: 0,
+        review_repairs_used: 0,
         tier: Tier::Research,
         rung: RungIndex::INITIAL,
         escalation_tier: None,

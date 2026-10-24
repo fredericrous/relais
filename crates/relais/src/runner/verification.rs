@@ -25,7 +25,7 @@ impl<'a> RunEngine<'a> {
         candidate: &Candidate,
         verified: Verified,
         verdict: Option<&verify::ReportVerdict>,
-    ) -> Result<RunOutcome, RunError> {
+    ) -> Result<Step, RunError> {
         let preflight = ctx.preflight;
         // An inspection has no patch to review: its report review has
         // already run (`judge_inspection`).
@@ -47,22 +47,24 @@ impl<'a> RunEngine<'a> {
                     patch_bytes: over.patch_bytes,
                     budget_bytes: over.budget_bytes,
                 });
-                return self.stop_for_review(
-                    &progress.budget,
-                    &|engine| {
-                        engine.candidate_receipt(
-                            ctx,
-                            progress,
-                            candidate,
-                            &verified,
-                            verdict,
-                            State::NeedsDecision,
-                            review.clone(),
-                        )
-                    },
-                    Reason::ReviewOverBudget,
-                    Observation::ReviewOverBudget(over),
-                );
+                return self
+                    .stop_for_review(
+                        &progress.budget,
+                        &|engine| {
+                            engine.candidate_receipt(
+                                ctx,
+                                progress,
+                                candidate,
+                                &verified,
+                                verdict,
+                                State::NeedsDecision,
+                                review.clone(),
+                            )
+                        },
+                        Reason::ReviewOverBudget,
+                        Observation::ReviewOverBudget(over),
+                    )
+                    .map(Step::Ended);
             }
             let request = ReviewRequest {
                 manifest: &preflight.manifest,
@@ -83,25 +85,49 @@ impl<'a> RunEngine<'a> {
             match review {
                 ReviewOutcome::NoFindings => {}
                 ReviewOutcome::Findings(detail) => {
-                    return self.stop(&progress.budget, Observation::ReviewFindings(detail));
+                    // Only a change a worker wrote, reviewed whole, can be
+                    // repaired: a `kind: verify` run and a review in parts
+                    // have no worker to send findings back to, so their
+                    // severities are withheld and the machine stops them.
+                    // (Only a change reaches this review; a verify reports the
+                    // `change` kind too, so `is_verify` is the test that matters.)
+                    let repairable = !in_parts && !self.config.contract.is_verify();
+                    let severities = repairable
+                        .then(|| super::review::finding_severities(&detail))
+                        .flatten();
+                    let budget = super::spend::with_recorded_review_repairs(
+                        progress.budget,
+                        self.config.ledger,
+                        &self.run_id,
+                    )?;
+                    let next = self.decide(
+                        &budget,
+                        Observation::ReviewFindings(detail.clone(), severities),
+                    )?;
+                    if matches!(next, Next::Attempt { .. }) {
+                        progress.review_findings = Some(detail);
+                    }
+                    return self.proceed(ctx, progress, next);
                 }
                 ReviewOutcome::Unavailable(detail) => {
-                    return self.stop_for_review(
-                        &progress.budget,
-                        &|engine| {
-                            engine.candidate_receipt(
-                                ctx,
-                                progress,
-                                candidate,
-                                &verified,
-                                verdict,
-                                State::NeedsDecision,
-                                engine.unavailable_review_record(&detail)?,
-                            )
-                        },
-                        Reason::ReviewUnavailable,
-                        Observation::ReviewUnavailable(detail.clone()),
-                    );
+                    return self
+                        .stop_for_review(
+                            &progress.budget,
+                            &|engine| {
+                                engine.candidate_receipt(
+                                    ctx,
+                                    progress,
+                                    candidate,
+                                    &verified,
+                                    verdict,
+                                    State::NeedsDecision,
+                                    engine.unavailable_review_record(&detail)?,
+                                )
+                            },
+                            Reason::ReviewUnavailable,
+                            Observation::ReviewUnavailable(detail.clone()),
+                        )
+                        .map(Step::Ended);
                 }
             }
         }
@@ -130,10 +156,10 @@ impl<'a> RunEngine<'a> {
             Some(ctx.worktree_path),
             &candidate.sha,
         )?;
-        Ok(RunOutcome {
+        Ok(Step::Ended(RunOutcome {
             run_id: self.run_id.clone(),
             terminal: Terminal::Accepted(Box::new(receipt)),
-        })
+        }))
     }
 
     /// What the snapshot saved at a review that could not be had says of the
@@ -414,7 +440,6 @@ impl<'a> RunEngine<'a> {
             )?));
         }
         self.accept_candidate(ctx, progress, candidate, verified, Some(&verdict))
-            .map(Step::Ended)
     }
 
     /// Verify the immutable candidate copy: a throwaway worktree at the

@@ -5,6 +5,7 @@
 // that candidate to the current base without a worker.
 
 use std::sync::atomic::AtomicUsize;
+use std::sync::Mutex;
 
 use crate::verify::Receipt;
 
@@ -17,7 +18,7 @@ fn launches() -> Arc<AtomicUsize> {
 
 /// A source run that removes `src/main.rs`, accepted: its candidate is what
 /// the tests verify. Returns its id and its receipt.
-fn accepted_source(fixture: &Fixture) -> (RunId, Receipt) {
+pub(super) fn accepted_source(fixture: &Fixture) -> (RunId, Receipt) {
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
     let backend = conditional_worker("relais task");
     let RunOutcome {
@@ -1098,4 +1099,268 @@ fn a_launch_that_dies_before_its_id_is_returned_leaves_exactly_one_successor_run
     );
     assert_eq!(fixture.ledger.count_successor_intents().expect("count"), 1);
     std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+// -- a scope overflow made only of tests is widened by relais ------------
+
+/// A run whose worker writes `files` beside its edit of `src/main.rs`,
+/// under `repo`'s policy.
+fn overflowing_run(fixture: &Fixture, repo: &RepoPolicy, files: &[&str]) -> RunOutcome {
+    overflowing_run_on(fixture, repo, files, Review::Off, Wire::process())
+}
+
+/// `overflowing_run` with the contract's review setting and the protocol
+/// channel the test reads.
+fn overflowing_run_on(
+    fixture: &Fixture,
+    repo: &RepoPolicy,
+    files: &[&str],
+    review: Review,
+    wire: Wire,
+) -> RunOutcome {
+    let files: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+    let backend = MockBackend::new(move |spec| {
+        for file in &files {
+            let path = spec.work_dir.join(file);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(path, "// edit\n").expect("write");
+        }
+        std::fs::write(spec.work_dir.join("src/main.rs"), "fn main() {}\n// e\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    fixture.execute_on(wire, None, &fixture.contract(review), repo, &backend)
+}
+
+/// A protocol channel whose lines the test reads back.
+#[derive(Clone, Default)]
+struct Lines(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Lines {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("lines").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Lines {
+    fn done(&self) -> serde_json::Value {
+        let text = String::from_utf8(self.0.lock().expect("lines").clone()).expect("utf8");
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|line| line["relais"] == "done")
+            .expect("a done line")
+    }
+}
+
+/// The run a tests-only overflow ended: relais answered it, so the
+/// outcome is the resolved `cancelled` carrying the widening code's sentence.
+fn widened_run(outcome: RunOutcome) -> RunId {
+    assert!(
+        matches!(&outcome.terminal, Terminal::Cancelled { detail }
+            if detail.contains("relais widened the scope")),
+        "{outcome:?}"
+    );
+    outcome.run_id
+}
+
+fn needs_decision_run(outcome: RunOutcome) -> RunId {
+    assert!(
+        matches!(
+            outcome.terminal,
+            Terminal::NeedsDecision {
+                reason: Reason::ScopeExceeded,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    outcome.run_id
+}
+
+#[test]
+fn a_tests_only_overflow_is_answered_by_relais_with_a_widened_successor() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let wire = Lines::default();
+    let run = widened_run(overflowing_run_on(
+        &fixture,
+        &repo,
+        &["tests/extra_test.rs", "pkg/fixtures/data.json"],
+        Review::Off,
+        Wire::to(wire.clone()),
+    ));
+
+    let decision = fixture
+        .ledger
+        .decision_of_run(&run)
+        .expect("read")
+        .expect("a decision row");
+    assert_eq!(decision.resolution, Some(Reason::DecisionRevised));
+    assert_eq!(decision.actor.as_deref(), Some("relais"));
+    let intent = fixture
+        .ledger
+        .intent_of_decision(&run)
+        .expect("read")
+        .expect("a successor intent");
+    let mut delta = intent.scope_delta.clone();
+    delta.sort();
+    assert_eq!(
+        delta,
+        vec![
+            "pkg/fixtures/data.json".to_string(),
+            "tests/extra_test.rs".to_string()
+        ]
+    );
+    let contract = TaskContract::from_json_str(&intent.contract_json).expect("contract");
+    assert!(contract.is_verify());
+    let patterns = contract.scope_patterns();
+    assert_eq!(patterns.len(), 3, "{patterns:?}");
+    assert_eq!(&patterns[0], "src/**");
+
+    let events = std::fs::read_to_string(fixture.artifacts.join(run.as_str()).join("events.jsonl"))
+        .expect("events");
+    let outcome: serde_json::Value = events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .map(|line| line["event"].clone())
+        .find(|event| event["kind"] == "outcome")
+        .expect("an outcome event");
+    assert_eq!(
+        outcome["successor_intent"]["intent_id"],
+        intent.intent_id.as_str()
+    );
+    assert!(outcome["successor_intent"]["repo"].is_string(), "{outcome}");
+
+    // The ledger, the outcome event and the `done` message agree on the
+    // resolved state, and both carry the successor.
+    assert_eq!(
+        fixture.ledger.run_status(&run).expect("status"),
+        Some(State::Cancelled)
+    );
+    assert_eq!(outcome["state"], "cancelled", "{outcome}");
+    let done = wire.done();
+    assert_eq!(done["outcome"], "cancelled", "{done}");
+    assert_eq!(done["code"], "scope_widened_for_tests", "{done}");
+    assert_eq!(done["successor_intent"], outcome["successor_intent"]);
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+/// The successor of a tests-only overflow, run with review on: the
+/// reviewer's prompt names the widened test path.
+#[test]
+fn the_successors_reviewer_prompt_names_the_widened_test_path() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let run = widened_run(overflowing_run_on(
+        &fixture,
+        &repo,
+        &["tests/extra_test.rs"],
+        Review::Required,
+        Wire::process(),
+    ));
+    let intent = fixture
+        .ledger
+        .intent_of_decision(&run)
+        .expect("read")
+        .expect("a successor intent");
+    let new_run = fixture.ids.run_id().expect("a run id");
+    assert!(matches!(
+        fixture
+            .ledger
+            .claim_intent(&intent.intent_id, &new_run, &|_| {
+                crate::ledger::SuccessorProcess::Alive { started: None }
+            })
+            .expect("claim"),
+        crate::ledger::Claim::Claimed(_)
+    ));
+    let contract = TaskContract::from_json_str(&intent.contract_json).expect("the contract");
+    let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log = Arc::clone(&prompts);
+    let backend = MockBackend::new(move |spec| {
+        log.lock().expect("log").push(spec.prompt.clone());
+        MockOutcome {
+            result_text: Some("FINDINGS: none".into()),
+            exit_code: Some(0),
+            usage: Some(usage(10)),
+            ..Default::default()
+        }
+    });
+    fixture.execute_as(Some(new_run), &contract, &repo, &backend);
+    let seen = prompts.lock().expect("log");
+    let reviewer = seen
+        .iter()
+        .find(|prompt| prompt.contains("semantic reviewer"))
+        .unwrap_or_else(|| panic!("a reviewer was launched: {seen:?}"));
+    assert!(reviewer.contains("WIDENED"), "{reviewer}");
+    assert!(reviewer.contains("tests/extra_test.rs"), "{reviewer}");
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+#[test]
+fn a_mixed_overflow_still_waits_on_a_person() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let run = needs_decision_run(overflowing_run(
+        &fixture,
+        &repo,
+        &["tests/extra_test.rs", "docs/extra.md"],
+    ));
+    assert!(fixture
+        .ledger
+        .intent_of_decision(&run)
+        .expect("read")
+        .is_none());
+    assert_eq!(fixture.ledger.open_decisions().expect("open").len(), 1);
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+#[test]
+fn a_test_path_under_a_protected_prefix_still_waits_on_a_person() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let run = needs_decision_run(overflowing_run(
+        &fixture,
+        &repo,
+        &[".claude/tests/a_test.rs"],
+    ));
+    assert!(fixture
+        .ledger
+        .intent_of_decision(&run)
+        .expect("read")
+        .is_none());
+    assert_eq!(fixture.ledger.open_decisions().expect("open").len(), 1);
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+#[test]
+fn widening_for_tests_can_be_switched_off_in_policy() {
+    let fixture = Fixture::new();
+    let mut repo = fixture.repo_policy(vec![passing_check()], 3);
+    repo.execution.widen_scope_for_tests = false;
+    let run = needs_decision_run(overflowing_run(&fixture, &repo, &["tests/extra_test.rs"]));
+    assert!(fixture
+        .ledger
+        .intent_of_decision(&run)
+        .expect("read")
+        .is_none());
+    assert_eq!(fixture.ledger.open_decisions().expect("open").len(), 1);
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+#[test]
+fn a_persons_non_test_widen_gets_a_block_that_does_not_call_it_a_test() {
+    let block = crate::runner::review::widened_scope_block(&["docs/extra.md".to_string()]);
+    assert!(block.contains("OUT-OF-SCOPE"), "{block}");
+    assert!(block.contains("docs/extra.md"), "{block}");
+    assert!(!block.contains("(tests the original"), "{block}");
+    assert!(!block.contains("tests"), "{block}");
+    assert!(crate::runner::review::widened_scope_block(&[]).is_empty());
 }

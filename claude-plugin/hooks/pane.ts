@@ -10,6 +10,7 @@ import {
   type RunModel,
   type Step,
   attemptText,
+  awaitsAPerson,
   elapsedOf,
   formatCost,
   isLive,
@@ -90,7 +91,11 @@ function stepRow(step: Step): Row {
 }
 
 // Rows of a run that are not live output: header, steps, stderr, footer.
-function frame(m: RunModel, room: Room, isLast: boolean): { head: Row[]; steps: Row[]; tail: Row[] } {
+// `meta` are the tail rows (ledger, session, hint) that go first when rows are short.
+type Frame = { head: Row[]; steps: Row[]; tail: Row[]; meta: Set<Row> }
+
+function frame(m: RunModel, room: Room, isLast: boolean): Frame {
+  const meta = new Set<Row>()
   const head: Row[] = [
     {
       // Before relais names the run, the plugin's placeholder key is no id.
@@ -147,7 +152,11 @@ function frame(m: RunModel, room: Room, isLast: boolean): { head: Row[]; steps: 
   if (agents.length > shown.length) {
     tail.push({ text: `        +${agents.length - shown.length} more agents`, dim: true })
   }
-  if (isLast && hasButton) tail.push({ text: HINT, dim: true })
+  if (isLast && hasButton) {
+    const hint: Row = { text: HINT, dim: true }
+    meta.add(hint)
+    tail.push(hint)
+  }
   tail.push({ text: `cost    ${formatCost(m.cost)}` })
   if (m.wait && isLive(m)) tail.push({ text: m.wait, dim: true })
   if (m.stalled && isLive(m)) tail.push({ text: m.stalled, dim: true })
@@ -162,10 +171,18 @@ function frame(m: RunModel, room: Room, isLast: boolean): { head: Row[]; steps: 
   if (m.outcome?.reason) {
     for (const text of wrapWords(m.outcome.reason, WRAP_COLUMNS, '        ')) tail.push({ text, dim: true })
   }
-  if (m.ledger) tail.push({ text: `ledger  ${m.ledger}`, dim: true })
+  if (m.ledger) {
+    const ledger: Row = { text: `ledger  ${m.ledger}`, dim: true }
+    meta.add(ledger)
+    tail.push(ledger)
+  }
   // The full id is in `status --run`'s reply; the pane shows a prefix.
-  if (m.session) tail.push({ text: `session ${m.session.slice(0, 8)}`, dim: true })
-  return { head, steps, tail }
+  if (m.session) {
+    const session: Row = { text: `session ${m.session.slice(0, 8)}`, dim: true }
+    meta.add(session)
+    tail.push(session)
+  }
+  return { head, steps, tail, meta }
 }
 
 type AgentLine = {
@@ -195,12 +212,17 @@ function agentRows(m: RunModel): AgentLine[] {
 
 // The output a run shows, `cap` lines at most: the last ones, so the
 // extra (earlier) lines are dropped, not wrapped. A step running no check
-// shows what its agent does instead.
+// shows what its agent does instead. A live run's active step always shows
+// one row: its latest line, or a waiting row when it is silent.
 function outputRows(m: RunModel, cap: number): Row[] {
-  if (cap <= 0) return []
+  if (cap < 0) return []
+  const live = isLive(m)
+  const n = live ? Math.max(cap, 1) : cap
+  if (n <= 0) return []
   const current = m.steps.find(s => s.state === 'active') ?? m.steps[m.steps.length - 1]
   const lines = current ? stepOutput(current) : []
-  return lines.slice(-cap).map(text => ({ text: `  │ ${text}`, dim: true }))
+  if (lines.length === 0) return live ? [{ text: '  │ waiting for output', dim: true }] : []
+  return lines.slice(-n).map(text => ({ text: `  │ ${text}`, dim: true }))
 }
 
 // The quiet runs to draw (already of this session and past the anti-flash),
@@ -210,36 +232,165 @@ export type QuietPane = { runs: QuietRun[]; down: boolean }
 const MAX_QUIET_HEADS = 3
 const NO_QUIET: QuietPane = { runs: [], down: false }
 
+// The most finished runs listed one per row; older ones are one count row.
+const MAX_FOLDED = 3
+// The output a frame gets before the folded rows give way.
+const OUTPUT_FLOOR = 8
+
+// The pane never returns more than max(room.rows, MIN_ROWS) rows, quiet rows
+// included. The trim order, followed in `relaisRows`: the output down to 8
+// lines, then the folded rows to one `+N earlier runs` row, then the live
+// frame's ledger, session and hint rows, then the output down to 1 row, then
+// the tail's dim rows. Still too tall: the other focus runs shrink to their
+// head (and outcome) row and the top is cut behind `↑ N rows above`. The kept
+// frame's head and agent Buttons always stay.
 export function layoutPane(runs: RunModel[], room: Room, quiet: QuietPane = NO_QUIET): Row[] {
   const down: Row[] = quiet.down ? [{ text: 'quiet watcher down', dim: true }] : []
   if (runs.length === 0 && quiet.runs.length === 0) {
     return [{ text: 'relais · waiting for the first event', dim: true }, ...down]
   }
-  const rows = Math.max(room.rows, MIN_ROWS)
-  const relais = relaisRows(runs, room, rows)
-  return [...relais.out, ...quietRows(quiet.runs, room, rows - relais.used), ...down]
+  const limit = Math.max(room.rows, MIN_ROWS)
+  // The relais frames come first; the quiet runs get only the rows they leave.
+  const relais = relaisRows(runs, room, limit - down.length)
+  const spare = Math.max(0, limit - down.length - relais.length)
+  return [...relais, ...quietRows(quiet.runs, room, spare).slice(0, spare), ...down]
 }
 
-// The relais runs' rows, and how many rows they use at most (the fixed rows
-// and the output cap's share): the quiet runs get only what is left.
-function relaisRows(runs: RunModel[], room: Room, rows: number): { out: Row[]; used: number } {
-  const frames = runs.map((m, i) => ({ m, ...frame(m, room, i === runs.length - 1) }))
-  const fixed = frames.reduce((n, f) => n + f.head.length + f.steps.length + f.m.steps.length + f.tail.length, 0)
-  const withOutput = frames.filter(f => isLive(f.m) || f.m.steps.some(s => s.checks.length > 0)).length
-  const cap = withOutput > 0 ? Math.floor(Math.max(0, rows - fixed) / withOutput) : 0
-  const out: Row[] = []
-  for (const f of frames) {
-    out.push(...f.head)
-    f.m.steps.forEach(step => {
-      out.push(stepRow(step))
-      if (step.state === 'active') out.push(...outputRows(f.m, cap))
-    })
-    // A run that ended failing keeps its failed check's output while rows
-    // are spare; an accepted one does not (its failure was repaired).
-    if (!isLive(f.m) && !f.m.outcome?.state.startsWith('accepted')) out.push(...outputRowsOfFailed(f.m, cap))
-    out.push(...f.steps, ...f.tail)
+// A finished run on one row: dim when accepted, else `FAIL` in the error colour.
+function foldedRow(m: RunModel, now: number): Row {
+  const state = m.outcome?.state ?? 'ended'
+  const awaits = awaitsAPerson(m) ? ' · awaits you' : ''
+  const body = `run ${shortId(m.run)} · ${state} · ${formatCost(m.cost)} · ${mmss(elapsedOf(m, now))}${awaits}`
+  return state.startsWith('accepted') ? { text: body, dim: true } : { text: `FAIL ${body}`, color: 'error' }
+}
+
+type Trim = { meta: boolean; dim: boolean }
+type Drawn = { rows: Row[]; keep: Set<Row> }
+
+// One expanded frame with `cap` output lines (-1: none); `keep` are the rows
+// that never go: the head, the output's latest line, the agent Buttons.
+function drawFrame(f: Frame & { m: RunModel }, cap: number, trim: Trim): Drawn {
+  const rows: Row[] = [...f.head]
+  const keep = new Set<Row>([f.head[0]])
+  for (const step of f.m.steps) {
+    rows.push(stepRow(step))
+    if (step.state === 'active') {
+      const out = outputRows(f.m, cap)
+      rows.push(...out)
+      if (out.length > 0) keep.add(out[out.length - 1])
+    }
   }
-  return { out, used: fixed + cap * withOutput }
+  // A run that ended failing keeps its failed check's output while rows
+  // are spare; an accepted one does not (its failure was repaired).
+  if (!isLive(f.m) && !f.m.outcome?.state.startsWith('accepted')) rows.push(...outputRowsOfFailed(f.m, cap))
+  rows.push(...f.steps)
+  for (const row of f.tail) {
+    if (row.button) keep.add(row)
+    else if (trim.dim && row.dim) continue
+    else if (trim.meta && f.meta.has(row)) continue
+    rows.push(row)
+  }
+  return { rows, keep }
+}
+
+// A frame cut to its head, and the outcome row of a run awaiting a person.
+function minimalFrame(f: Frame & { m: RunModel }): Row[] {
+  const outcome = awaitsAPerson(f.m) ? f.tail.find(r => r.text.startsWith('outcome ')) : undefined
+  return outcome ? [f.head[0], outcome] : [f.head[0]]
+}
+
+// The lines a frame would draw if given all it wants.
+function wantedLines(m: RunModel): number {
+  const current = m.steps.find(s => s.state === 'active')
+  const active = current ? stepOutput(current).length : 0
+  const failed = m.steps.find(s => s.state === 'fail' && s.checks.some(c => c.exit !== 0 && c.exit !== undefined))
+  const failedLines = !isLive(m) && failed ? (failed.checks.filter(c => c.exit !== 0)[0]?.output.length ?? 0) : 0
+  return Math.max(isLive(m) && current ? 1 : 0, active, failedLines)
+}
+
+// The relais runs' rows, at most `limit` of them when they can be (see
+// `layoutPane` for the trim order).
+function relaisRows(runs: RunModel[], room: Room, limit: number): Row[] {
+  if (runs.length === 0) return []
+  const lastLive = runs.map(isLive).lastIndexOf(true)
+  let focus = runs.flatMap((m, i) => (isLive(m) ? [i] : []))
+  let awaiting = -1
+  runs.forEach((m, i) => {
+    if (awaitsAPerson(m)) awaiting = i
+  })
+  if (awaiting >= 0) focus.push(awaiting)
+  // With no focus run the most recent one stays expanded: its outcome stays readable.
+  if (focus.length === 0) focus = [runs.length - 1]
+  focus = [...new Set(focus)].sort((a, b) => a - b)
+  const keptIndex = lastLive >= 0 ? lastLive : focus[focus.length - 1]
+  const folded = runs.filter((_, i) => !focus.includes(i))
+  const frames = focus.map((i, n) => ({ m: runs[i], ...frame(runs[i], room, n === focus.length - 1), index: i }))
+  const withOutput = frames.filter(f => isLive(f.m) || f.m.steps.some(s => s.checks.length > 0)).length
+  const wanted = Math.max(0, ...frames.map(f => wantedLines(f.m)))
+
+  const foldedRows = (collapsed: boolean): Row[] => {
+    if (folded.length === 0) return []
+    if (collapsed) return [{ text: `+${folded.length} earlier runs`, dim: true }]
+    const shown = folded.slice(-MAX_FOLDED)
+    const earlier = folded.length - shown.length
+    return [
+      ...(earlier > 0 ? [{ text: `+${earlier} earlier runs`, dim: true }] : []),
+      ...shown.map(m => foldedRow(m, room.now)),
+    ]
+  }
+
+  const stages: { collapsed: boolean; trim: Trim; floor: number }[] = [
+    { collapsed: false, trim: { meta: false, dim: false }, floor: Math.min(OUTPUT_FLOOR, wanted) },
+    { collapsed: true, trim: { meta: false, dim: false }, floor: Math.min(OUTPUT_FLOOR, wanted) },
+    { collapsed: true, trim: { meta: true, dim: false }, floor: Math.min(OUTPUT_FLOOR, wanted) },
+    { collapsed: true, trim: { meta: true, dim: false }, floor: Math.min(1, wanted) },
+    { collapsed: true, trim: { meta: true, dim: true }, floor: Math.min(1, wanted) },
+  ]
+  for (const stage of stages) {
+    const top = foldedRows(stage.collapsed)
+    const fixed = top.length + frames.reduce((n, f) => n + drawFrame(f, -1, stage.trim).rows.length, 0)
+    const cap = withOutput > 0 ? Math.floor(Math.max(0, limit - fixed) / withOutput) : 0
+    if (cap < stage.floor) continue
+    const drawn = frames.map(f => drawFrame(f, cap, stage.trim))
+    const rows = [...top, ...drawn.flatMap(d => d.rows)]
+    if (rows.length <= limit) return rows
+  }
+
+  // Still too tall: every focus run but the kept one shrinks to its head.
+  const trim: Trim = { meta: true, dim: true }
+  const top = foldedRows(true)
+  const before: Row[] = [...top]
+  const after: Row[] = []
+  let kept: Drawn = { rows: [], keep: new Set() }
+  for (const f of frames) {
+    if (f.index === keptIndex) continue
+    ;(f.index < keptIndex ? before : after).push(...minimalFrame(f))
+  }
+  const keptFrame = frames.find(f => f.index === keptIndex)!
+  const others = before.length + after.length
+  const base = drawFrame(keptFrame, -1, trim).rows.length
+  kept = drawFrame(keptFrame, Math.max(0, limit - others - base), trim)
+  let body = kept.rows
+  const total = () => before.length + body.length + after.length
+  let above = 0
+  if (total() > limit) {
+    const cut = Math.min(before.length, total() - limit + 1)
+    before.splice(0, cut)
+    above = cut
+  }
+  const indicator = above > 0 ? 1 : 0
+  let over = total() + indicator - limit
+  if (over > 0) {
+    // Inside the kept frame, from the top, except what must stay.
+    body = body.filter(row => {
+      if (over <= 0 || kept.keep.has(row)) return true
+      over -= 1
+      return false
+    })
+  }
+  if (over > 0) after.splice(after.length - Math.min(over, after.length))
+  const head: Row[] = above > 0 ? [{ text: `↑ ${above} rows above`, dim: true }] : []
+  return [...head, ...before, ...body, ...after]
 }
 
 // Quiet runs below every relais run: Text only, so the agent Buttons keep
@@ -265,6 +416,7 @@ function quietRows(runs: QuietRun[], room: Room, spare: number): Row[] {
 // A run that ended on a failing check shows that check's output under its
 // failed step, which is no longer "active".
 function outputRowsOfFailed(m: RunModel, cap: number): Row[] {
+  if (cap <= 0) return []
   const failed = m.steps.find(s => s.state === 'fail' && s.checks.some(c => c.exit !== 0 && c.exit !== undefined))
   if (!failed) return []
   const check = failed.checks.filter(c => c.exit !== 0)[0]

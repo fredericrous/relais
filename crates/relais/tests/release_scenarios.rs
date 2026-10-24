@@ -723,7 +723,8 @@ fn text(bytes: &[u8]) -> String {
 ///
 /// Prompt markers select misbehaviour, so one script covers every
 /// scenario: "blockage-please" claims blockage; "sleep-please" outlives
-/// the run's wall clock and is killed; "policy-edit-please" edits the
+/// the run's wall clock and is killed; "tests-only-please" writes only
+/// `tests/extra_test.rs`; "policy-edit-please" edits the
 /// repository's own `relais.toml`; "late-write-please" writes a file in
 /// the background AFTER printing its terminal result.
 ///
@@ -775,6 +776,12 @@ if printf '%s' "$prompt" | grep -q "late-write-please"; then
   ( sleep 2; echo late > src/late.txt; echo done > "$here/late-write.log" ) >/dev/null 2>&1 &
   rm -f src/main.rs
   printf '{"result":"DONE","session_id":"w-l","total_cost_usd":0.01,"modelUsage":{"%s":{"outputTokens":10}},"permission_denials":[],"usage":{"input_tokens":100,"output_tokens":10}}\n' "$model"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "tests-only-please"; then
+  mkdir -p tests
+  echo "// extra" > tests/extra_test.rs
+  printf '{"result":"DONE","session_id":"w-t","total_cost_usd":0.01,"modelUsage":{"%s":{"outputTokens":10}},"permission_denials":[],"usage":{"input_tokens":100,"output_tokens":10}}\n' "$model"
   exit 0
 fi
 if printf '%s' "$prompt" | grep -q "an easy one"; then
@@ -859,7 +866,19 @@ minimum_tier = "escalation"
     // A native worker is priced from the usage the plugin reports.
     assert_eq!(receipt["cost_completeness"], "estimated");
     assert!(run_dir.join("candidate-1.patch").exists());
-    assert!(run_dir.join("review.txt").exists());
+    // Each review dispatch keeps its own answer, `review-<candidate>.<dispatch>.txt`.
+    let reviews = std::fs::read_dir(&run_dir)
+        .expect("run dir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("review-") && name.ends_with(".txt"))
+        .count();
+    assert_eq!(
+        reviews,
+        1,
+        "one review answer file in {}",
+        run_dir.display()
+    );
     // The candidate the receipt names is a real commit in the repo.
     let candidate = receipt["candidate_sha"].as_str().unwrap();
     git(&world.repo, &["cat-file", "-e", candidate]);
@@ -2352,6 +2371,45 @@ fn out_of_scope_edits_and_misspelled_controls_are_refused() {
         text(&plan.stderr).contains("unknown field `reveiw`"),
         "{}",
         text(&plan.stderr)
+    );
+}
+
+// A scope overflow made only of tests is answered by relais itself (SPEC
+// §8): the run's stderr names the successor intent and the command that
+// launches it.
+#[test]
+fn a_tests_only_overflow_prints_the_successor_intent_and_the_command_to_run_it() {
+    let world = World::new("widen");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    let path = world.write_task_scoped("widen", "tests-only-please", "off", &["docs/**"]);
+    let run = world.relais(&["run", "--task", path.to_str().unwrap()]);
+    let stderr = text(&run.stderr);
+    // The run ends cancelled (exit 7), the state the ledger holds.
+    assert_eq!(run.status.code(), Some(7), "{stderr}");
+    assert!(
+        stderr.contains("cancelled (scope_widened_for_tests)"),
+        "{stderr}"
+    );
+    let ledger = relais::ledger::Ledger::open(&world.state.join("ledger.sqlite")).expect("ledger");
+    assert_eq!(
+        ledger
+            .run_status(&relais::ids::RunId::from_stored(world.only_run_id()))
+            .expect("status"),
+        Some(relais::lifecycle::State::Cancelled),
+        "{stderr}"
+    );
+    let decisions = ledger.answered_decisions().expect("decisions");
+    assert_eq!(decisions.len(), 1, "{stderr}");
+    assert_eq!(decisions[0].actor.as_deref(), Some("relais"));
+    let intent = ledger
+        .intent_of_decision(&decisions[0].run)
+        .expect("read")
+        .expect("a successor intent");
+    assert!(stderr.contains(&intent.intent_id), "{stderr}");
+    assert!(
+        stderr.contains(&format!("relais run --intent {}", intent.intent_id)),
+        "{stderr}"
     );
 }
 

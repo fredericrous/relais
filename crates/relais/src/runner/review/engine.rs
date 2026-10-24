@@ -7,6 +7,7 @@ use crate::backend::{LaunchResult, LaunchSpec};
 use crate::context::GuidanceGap;
 use crate::ledger::{EvidenceKind, Ledger, UsageEvent};
 use crate::money::MicroUsd;
+use crate::procs::Ended;
 use crate::protocol::{AgentKind, Event};
 use crate::route::RungIndex;
 use crate::verify;
@@ -14,8 +15,8 @@ use crate::workspace;
 
 use super::{
     patch_section, report_review_prompt, review_verdict, reviewer_tier, stage_patch, ReviewOutcome,
-    ReviewPurpose, ReviewRequest, ReviewSeat, StagedPatch, REVIEW_CONSTRAINTS_BUDGET_BYTES,
-    REVIEW_MIN_WALL, REVIEW_PART_TIMEOUT,
+    ReviewPurpose, ReviewRequest, ReviewSeat, StagedPatch, UnavailableCause,
+    REVIEW_CONSTRAINTS_BUDGET_BYTES, REVIEW_MIN_WALL, REVIEW_PART_TIMEOUT,
 };
 use crate::runner::{
     data_block, data_list_block, effort_str, reviewer_guidance, utc_day_start, Budget, Candidate,
@@ -63,10 +64,7 @@ impl<'a> RunEngine<'a> {
         };
         let result = match self.dispatch_reviewer(request, seat, prompt, spend) {
             Ok((result, _)) => result,
-            Err(ReviewOutcome::Unavailable(detail)) => return Err(detail),
-            Err(ReviewOutcome::NoFindings | ReviewOutcome::Findings(_)) => {
-                return Err("the report review dispatch answered with a verdict".into());
-            }
+            Err(failure) => return Err(failure.detail),
         };
         let text = result.result_text.unwrap_or_default();
         self.record_artifact(
@@ -160,8 +158,61 @@ impl<'a> RunEngine<'a> {
         request: &ReviewRequest<'_>,
         spend: &mut RunSpend,
     ) -> ReviewOutcome {
-        let artifact = self.artifacts.join("review.txt");
-        self.review_unit(request, spend, None, &artifact).outcome
+        // One file per dispatch, named for the candidate it judges, so a
+        // second review never overwrites the first's evidence.
+        let artifact = self
+            .artifacts
+            .join(format!("review-{}.txt", request.candidate_sha));
+        let first = self.review_unit(request, spend, None, &artifact, None);
+        let ReviewOutcome::Unavailable(detail) = first.outcome else {
+            return first.outcome;
+        };
+        // The retry reads the cause, never the sentence: only a reviewer
+        // that ended with no result is worth asking again. A refusal, a
+        // cancellation or an exhausted resource would end the same way.
+        if first.cause != Some(UnavailableCause::TerminalMissing) {
+            return ReviewOutcome::Unavailable(detail);
+        }
+        let wall = match self.review_retry_wall(spend.total) {
+            Ok(wall) => wall,
+            Err(why) => {
+                return ReviewOutcome::Unavailable(format!("{detail}; not retried: {why}"));
+            }
+        };
+        self.events.emit(Event::EnvironmentWarning {
+            what: "review_retry".to_string(),
+            detail: format!(
+                "the reviewer ended with cause {}; retrying once: {detail}",
+                UnavailableCause::TerminalMissing.as_str()
+            ),
+        });
+        match self
+            .review_unit(request, spend, None, &artifact, Some(wall))
+            .outcome
+        {
+            ReviewOutcome::Unavailable(second) => ReviewOutcome::Unavailable(format!(
+                "{second}; the first dispatch had also failed: {detail}"
+            )),
+            decided => decided,
+        }
+    }
+
+    /// The wall clock a second reviewer dispatch may have, or why it may
+    /// not be had: a spend ceiling, or a work or total budget with nothing
+    /// left. The floor of a first review is not renewed.
+    fn review_retry_wall(&self, total_cost: MicroUsd) -> Result<std::time::Duration, String> {
+        if let Some(blocked) = self.review_spend_blocked(total_cost) {
+            return Err(blocked);
+        }
+        let work = self.budgets.work_remaining();
+        if work.is_zero() {
+            return Err("the work budget is exhausted".to_string());
+        }
+        let total = self.budgets.total_remaining();
+        if total.is_zero() {
+            return Err("the total budget is exhausted".to_string());
+        }
+        Ok(work.min(total))
     }
 
     /// One reviewer dispatch about the patch `request` names: the whole
@@ -173,6 +224,7 @@ impl<'a> RunEngine<'a> {
         spend: &mut RunSpend,
         part: Option<PartRun<'_>>,
         artifact: &Path,
+        wall_limit: Option<std::time::Duration>,
     ) -> Reviewed {
         let on_dispatch = part.as_ref().map(|part| part.on_dispatch);
         let part = part.map(|part| part.label);
@@ -184,7 +236,10 @@ impl<'a> RunEngine<'a> {
             request.candidate_tier,
             request.candidate_model,
         ) else {
-            return Reviewed::unavailable("no reviewer model is configured at any tier".into());
+            return Reviewed::unavailable(
+                UnavailableCause::NoReviewerTier,
+                "no reviewer model is configured at any tier".into(),
+            );
         };
         // The review is a dispatch and costs money like any other. It is
         // reached after the loop-top check, with the attempt that
@@ -194,14 +249,17 @@ impl<'a> RunEngine<'a> {
         // zero and the run was accepted on a review nobody paid for
         // (SPEC §11: stop admitting work once the ceiling is reached).
         if let Some(exhausted) = self.review_spend_blocked(spend.total) {
-            return Reviewed::unavailable(exhausted);
+            return Reviewed::unavailable(UnavailableCause::ResourceExhausted, exhausted);
         }
         self.step("review", format!("{} tier", reviewer_tier.as_str()));
         let Some(profile) = request.authority.models.get(&reviewer_tier).cloned() else {
-            return Reviewed::unavailable(format!(
-                "no reviewer model configured at the {} tier",
-                reviewer_tier.as_str()
-            ));
+            return Reviewed::unavailable(
+                UnavailableCause::NoReviewerTier,
+                format!(
+                    "no reviewer model configured at the {} tier",
+                    reviewer_tier.as_str()
+                ),
+            );
         };
         // "A separate reviewer" (SPEC §10) is separate in fact, not just
         // in dispatch: when the model that wrote the candidate is the one
@@ -221,9 +279,10 @@ impl<'a> RunEngine<'a> {
                     "candidate": request.candidate_sha,
                 }),
             ) {
-                return Reviewed::unavailable(format!(
-                    "the ledger refused the reviewer-tier record: {e}"
-                ));
+                return Reviewed::unavailable(
+                    UnavailableCause::NotRead,
+                    format!("the ledger refused the reviewer-tier record: {e}"),
+                );
             }
         }
         let review_dir = self.review_dir();
@@ -234,9 +293,10 @@ impl<'a> RunEngine<'a> {
         let staged = match stage_patch(&review_dir, &self.run_id, &request.patch_path) {
             Ok(staged) => staged,
             Err(e) => {
-                return Reviewed::unavailable(format!(
-                    "the candidate patch could not be staged for the reviewer: {e}"
-                ))
+                return Reviewed::unavailable(
+                    UnavailableCause::NotRead,
+                    format!("the candidate patch could not be staged for the reviewer: {e}"),
+                )
             }
         };
         let (prompt, reviewer_gap) = self.review_prompt(request, &review_dir, &staged, part);
@@ -249,7 +309,7 @@ impl<'a> RunEngine<'a> {
             tier: reviewer_tier,
             dir: review_dir,
             purpose: ReviewPurpose::Patch,
-            wall: part.map(|_| REVIEW_PART_TIMEOUT),
+            wall: part.map(|_| REVIEW_PART_TIMEOUT).or(wall_limit),
             on_dispatch,
         };
         let dispatched = self.dispatch_reviewer(request, seat, prompt, spend);
@@ -266,34 +326,33 @@ impl<'a> RunEngine<'a> {
         }
         let (result, dispatch_id) = match dispatched {
             Ok(dispatched) => dispatched,
-            Err(unavailable) => return Reviewed::of(unavailable),
+            Err(failure) => return Reviewed::failed(failure),
         };
         let text = result.result_text.unwrap_or_default();
         // The artifact and its evidence row are one operation: a review
         // the run cannot record is a review it cannot show, and a run
         // that cannot show its review does not accept (X5).
-        // A part's answer lives at a path of its own attempt, so an
-        // earlier attempt's answer and its evidence row stay as they were.
-        let (recorded, kept_at) = if part.is_some() {
-            let own = artifact.with_extension(format!("{dispatch_id}.txt"));
-            let recorded = self.record_immutable_artifact(EvidenceKind::ReviewResult, &own, &text);
-            (recorded, Some(own))
-        } else {
-            (
-                self.record_artifact(None, EvidenceKind::ReviewResult, artifact, &text),
-                None,
-            )
-        };
+        // Every answer, whole or a part's, lives at a path of its own
+        // dispatch, so an earlier review's answer and its evidence row stay
+        // as they were.
+        let own = artifact.with_extension(format!("{dispatch_id}.txt"));
+        let recorded = self.record_immutable_artifact(EvidenceKind::ReviewResult, &own, &text);
+        let kept_at = part.is_some().then_some(own);
         if let Err(e) = recorded {
             return Reviewed {
                 dispatch_id: Some(dispatch_id),
-                ..Reviewed::unavailable(format!(
-                    "the review could not be recorded as evidence: {e}"
-                ))
+                ..Reviewed::unavailable(
+                    UnavailableCause::NotRead,
+                    format!("the review could not be recorded as evidence: {e}"),
+                )
             };
         }
+        let outcome = review_verdict(&text);
+        let cause =
+            matches!(outcome, ReviewOutcome::Unavailable(_)).then_some(UnavailableCause::NotRead);
         Reviewed {
-            outcome: review_verdict(&text),
+            outcome,
+            cause,
             dispatch_id: Some(dispatch_id),
             result_sha256: Some(crate::ids::sha256_hex(text.as_bytes())),
             result_path: kept_at,
@@ -347,6 +406,15 @@ impl<'a> RunEngine<'a> {
         let (guidance_text, reviewer_gap) =
             reviewer_guidance(&request.manifest.guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES);
         prompt.push_str(&guidance_text);
+        match self.config.ledger.intent_of_run(&self.run_id) {
+            Ok(Some(intent)) => prompt.push_str(&super::widened_scope_block(&intent.scope_delta)),
+            Ok(None) => {}
+            // Not fatal, and said: the reviewer is told what it was not.
+            Err(e) => prompt.push_str(&format!(
+                "the paths this run's scope was widened to could not be read ({e}); check \
+                 every out-of-scope edit in the patch closely.\n"
+            )),
+        }
         if !request.verification_inputs_changed.is_empty() {
             prompt.push_str(
                 "this candidate CHANGES THE TEST TREE (tests or fixtures the checks execute). \
@@ -371,6 +439,8 @@ impl<'a> RunEngine<'a> {
         }
         prompt.push_str(&patch_section(staged));
         prompt.push_str(&format!("source to inspect: {}\n", review_dir.display()));
+        prompt.push('\n');
+        prompt.push_str(super::report_severity_instruction());
         prompt.push_str(
             "\nFinish your answer with exactly one of these, and nothing after it: the line \
              `FINDINGS: none` when there are no findings, or the line `FINDINGS:` followed by \
@@ -389,7 +459,7 @@ impl<'a> RunEngine<'a> {
         seat: ReviewSeat<'_>,
         prompt: String,
         spend: &mut RunSpend,
-    ) -> Result<(LaunchResult, String), ReviewOutcome> {
+    ) -> Result<(LaunchResult, String), ReviewFailure> {
         let ReviewSeat {
             profile,
             tier: reviewer_tier,
@@ -402,7 +472,7 @@ impl<'a> RunEngine<'a> {
         // cannot dispatch: `Unavailable`, never a silent acceptance.
         let dispatch_id = match self.config.ids.dispatch_id() {
             Ok(id) => id,
-            Err(e) => return Err(ReviewOutcome::Unavailable(e.to_string())),
+            Err(e) => return Err(ReviewFailure::new(UnavailableCause::NotRead, e.to_string())),
         };
         let remaining_budget = self
             .config
@@ -447,13 +517,14 @@ impl<'a> RunEngine<'a> {
         );
         let recorded = recorded.and_then(|_| self.record_native_row(&dispatch_id, None));
         if let Err(e) = recorded {
-            return Err(ReviewOutcome::Unavailable(format!(
-                "the ledger refused the review intent: {e}"
-            )));
+            return Err(ReviewFailure::new(
+                UnavailableCause::NotRead,
+                format!("the ledger refused the review intent: {e}"),
+            ));
         }
         if let Some(on_dispatch) = on_dispatch {
             if let Err(e) = on_dispatch(dispatch_id.as_str()) {
-                return Err(ReviewOutcome::Unavailable(e));
+                return Err(ReviewFailure::new(UnavailableCause::NotRead, e));
             }
         }
         // A review dispatch ends the run only through `Unavailable`, so
@@ -463,6 +534,7 @@ impl<'a> RunEngine<'a> {
             max_attempts: request.authority.max_attempts,
             repairs_used: 0,
             max_repairs: 0,
+            review_repairs_used: 0,
             tier: reviewer_tier,
             rung: RungIndex::INITIAL,
             escalation_tier: None,
@@ -490,16 +562,20 @@ impl<'a> RunEngine<'a> {
                     Ok(()) => String::new(),
                     Err(e) => format!("; the ledger also refused the dispatch record: {e}"),
                 };
-                return Err(ReviewOutcome::Unavailable(format!(
-                    "reviewer dispatch ended {}: {}{detail}",
-                    outcome.state(),
-                    outcome.detail()
-                )));
+                return Err(ReviewFailure::new(
+                    UnavailableCause::LaunchFailed,
+                    format!(
+                        "reviewer dispatch ended {}: {}{detail}",
+                        outcome.state(),
+                        outcome.detail()
+                    ),
+                ));
             }
             Err(e) => {
-                return Err(ReviewOutcome::Unavailable(format!(
-                    "reviewer dispatch failed: {e}"
-                )));
+                return Err(ReviewFailure::new(
+                    UnavailableCause::LaunchFailed,
+                    format!("reviewer dispatch failed: {e}"),
+                ));
             }
         };
         if let Err(e) = self
@@ -508,9 +584,10 @@ impl<'a> RunEngine<'a> {
             .finish_dispatch(&dispatch_id, "completed")
             .and_then(|()| self.record_native_row(&dispatch_id, result.session_id.as_deref()))
         {
-            return Err(ReviewOutcome::Unavailable(format!(
-                "the ledger refused the review record: {e}"
-            )));
+            return Err(ReviewFailure::new(
+                UnavailableCause::NotRead,
+                format!("the ledger refused the review record: {e}"),
+            ));
         }
         let event = UsageEvent {
             event_id: dispatch_id.as_str().to_string(),
@@ -534,23 +611,65 @@ impl<'a> RunEngine<'a> {
             harness: self.harness.clone(),
         };
         if let Err(e) = self.book_usage(&event, &result) {
-            return Err(ReviewOutcome::Unavailable(format!(
-                "the ledger refused the review usage: {e}"
-            )));
+            return Err(ReviewFailure::new(
+                UnavailableCause::NotRead,
+                format!("the ledger refused the review usage: {e}"),
+            ));
         }
         spend.fold(event.cost, result.usage.cost.completeness());
         if result.terminal_result_missing() {
-            // A launch that failed says why; the generic sentence is for
-            // an end with nothing to report.
-            return Err(ReviewOutcome::Unavailable(match &result.failure_detail {
-                Some(detail) if !detail.is_empty() => {
-                    format!("the reviewer could not be launched: {detail}")
-                }
-                _ => "the reviewer ended without a terminal result".into(),
-            }));
+            return Err(unanswered(&result));
         }
         Ok((result, dispatch_id.as_str().to_string()))
     }
+}
+
+/// A reviewer dispatch that gave no answer to record: what happened, and
+/// the cause the retry decision reads.
+pub(in crate::runner) struct ReviewFailure {
+    pub(in crate::runner) cause: UnavailableCause,
+    pub(in crate::runner) detail: String,
+}
+
+impl ReviewFailure {
+    fn new(cause: UnavailableCause, detail: String) -> Self {
+        Self { cause, detail }
+    }
+}
+
+/// The cause a reviewer's end names, from how the process ended and
+/// whether the harness said why it could not run.
+fn unanswered_cause(result: &LaunchResult) -> UnavailableCause {
+    match result.ended {
+        Ended::Cancelled => UnavailableCause::Cancelled,
+        Ended::TimedOut => UnavailableCause::ResourceExhausted,
+        Ended::Exited(_) | Ended::Signalled => {
+            if result
+                .failure_detail
+                .as_deref()
+                .is_some_and(|d| !d.is_empty())
+            {
+                UnavailableCause::LaunchFailed
+            } else {
+                UnavailableCause::TerminalMissing
+            }
+        }
+    }
+}
+
+/// A reviewer that ended without a result, with its dispatch end named so
+/// the next count can tell why.
+fn unanswered(result: &LaunchResult) -> ReviewFailure {
+    let cause = unanswered_cause(result);
+    let sentence = match &result.failure_detail {
+        // A launch that failed says why; the generic sentence is for an
+        // end with nothing to report.
+        Some(detail) if !detail.is_empty() => {
+            format!("the reviewer could not be launched: {detail}")
+        }
+        _ => "the reviewer ended without a terminal result".to_string(),
+    };
+    ReviewFailure::new(cause, format!("{sentence} ({})", result.dispatch_end()))
 }
 
 /// Which part of a patch a reviewer is asked about: `part 2 of 5`, counted
@@ -578,6 +697,8 @@ pub(in crate::runner) struct PartRun<'a> {
 /// and the hash of the answer kept as evidence.
 pub(in crate::runner) struct Reviewed {
     pub(in crate::runner) outcome: ReviewOutcome,
+    /// Why the outcome is `Unavailable`; `None` for any other outcome.
+    pub(in crate::runner) cause: Option<UnavailableCause>,
     pub(in crate::runner) dispatch_id: Option<String>,
     pub(in crate::runner) result_sha256: Option<String>,
     /// Where a part's answer is kept: a path naming the attempt.
@@ -585,16 +706,17 @@ pub(in crate::runner) struct Reviewed {
 }
 
 impl Reviewed {
-    pub(in crate::runner) fn of(outcome: ReviewOutcome) -> Self {
+    pub(in crate::runner) fn failed(failure: ReviewFailure) -> Self {
         Self {
-            outcome,
+            outcome: ReviewOutcome::Unavailable(failure.detail),
+            cause: Some(failure.cause),
             dispatch_id: None,
             result_sha256: None,
             result_path: None,
         }
     }
 
-    pub(in crate::runner) fn unavailable(detail: String) -> Self {
-        Self::of(ReviewOutcome::Unavailable(detail))
+    pub(in crate::runner) fn unavailable(cause: UnavailableCause, detail: String) -> Self {
+        Self::failed(ReviewFailure::new(cause, detail))
     }
 }

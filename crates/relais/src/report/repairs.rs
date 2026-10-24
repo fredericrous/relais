@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use crate::ids::RunId;
 use crate::ledger::{Ledger, LedgerError, Transition};
-use crate::lifecycle::{State, UsagePhase};
+use crate::lifecycle::{Reason, State, UsagePhase};
 use crate::money::MicroUsd;
 
 /// Why a repair's own verification has no verdict.
@@ -58,6 +58,15 @@ enum Verdict {
 /// closes, or `None` when the repair is still running or being verified.
 /// Exhaustive over [`State`]: a state added later is a decision made here.
 fn closing_verdict(from: State, to_state: State, reason: &str) -> Option<Verdict> {
+    // A review repair is opened from `verifying` after the checks passed, so
+    // it closes the repair before it as passed: the checks were green, a
+    // reviewer then asked for more.
+    if to_state == State::Repairing
+        && from == State::Verifying
+        && reason == Reason::ReviewRepair.as_str()
+    {
+        return Some(Verdict::Passed);
+    }
     match to_state {
         State::Running | State::Verifying => None,
         // Another repair, an escalation, or a terminal failure, reached
@@ -118,7 +127,9 @@ impl Repair {
 /// them. `transitions.attempt_id` is NULL in practice, so it cannot be
 /// joined: the k-th transition into `repairing` opens the run's k-th repair
 /// attempt (by `attempt_index`), and that repair's verification ends at the
-/// first later transition that leaves `running`/`verifying`.
+/// first later transition that leaves `running`/`verifying`. A repair a
+/// `review_repair` transition opened answers a reviewer, not a failed check:
+/// it is left out of the verification repairs.
 fn repairs_of_run(ledger: &Ledger, run_id: &RunId) -> Result<Vec<Repair>, LedgerError> {
     let transitions = ledger.transitions(run_id)?;
     let openings: Vec<usize> = transitions
@@ -127,12 +138,20 @@ fn repairs_of_run(ledger: &Ledger, run_id: &RunId) -> Result<Vec<Repair>, Ledger
         .filter(|(_, transition)| transition.to_state == State::Repairing)
         .map(|(position, _)| position)
         .collect();
+    let answers_review = |k: usize| {
+        openings
+            .get(k)
+            .is_some_and(|&opened| transitions[opened].reason == Reason::ReviewRepair.as_str())
+    };
     let repair_attempts = ledger
         .worker_attempts(run_id)?
         .into_iter()
         .filter(|attempt| attempt.phase == UsagePhase::Repair);
     let mut repairs = Vec::new();
     for (k, attempt) in repair_attempts.enumerate() {
+        if answers_review(k) {
+            continue;
+        }
         let verdict = match openings.get(k) {
             Some(&opened) => closing_of(&transitions[opened..]),
             None => Verdict::NoVerdict(NoVerdict::Unrecorded),
@@ -347,5 +366,78 @@ impl EffortRepairs {
             .collect();
         out.push_str(&format!("  their runs: {}\n", statuses.join(", ")));
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::{DispatchId, TaskId};
+    use crate::route::RoutedBy;
+
+    fn go(ledger: &Ledger, run: &RunId, to_state: State, reason: &str) {
+        ledger
+            .record_transition(&Transition {
+                run_id: run.clone(),
+                attempt_id: None,
+                from_state: None,
+                to_state,
+                reason: reason.into(),
+                detail: None,
+                at: crate::ledger::now_rfc3339(),
+            })
+            .expect("transition");
+    }
+
+    /// A behavioural repair closed by a review repair passed its checks; the
+    /// review repair itself is no verification repair.
+    #[test]
+    fn a_review_repair_closes_the_repair_before_it_as_passed_and_is_not_tallied() {
+        let dir = crate::test_support::temp_dir("report-review-repair");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = RunId::from_stored("run-r");
+        ledger
+            .insert_run(&run, "/repo", None, &TaskId::from_stored("task-r"), "rk")
+            .expect("run");
+        for index in 1..=3 {
+            let phase = if index == 1 {
+                UsagePhase::Initial
+            } else {
+                UsagePhase::Repair
+            };
+            let attempt = ledger
+                .insert_attempt(&run, 1, index, "implementation", phase)
+                .expect("attempt");
+            ledger
+                .record_dispatch_intent(
+                    &DispatchId::from_stored(format!("d-r-{index}")),
+                    &run,
+                    Some(attempt),
+                    &serde_json::json!({ "effort": "low" }),
+                    0,
+                    RoutedBy::ConservativeBaseline,
+                )
+                .expect("dispatch");
+        }
+        for (state, reason) in [
+            (State::Running, "worker_dispatched"),
+            (State::Verifying, "verification_started"),
+            (State::Repairing, "behavioral_failure"),
+            (State::Running, "worker_dispatched"),
+            (State::Verifying, "verification_started"),
+            (State::Repairing, "review_repair"),
+            (State::Running, "worker_dispatched"),
+            (State::Verifying, "verification_started"),
+            (State::Accepted, "checks_and_review_passed"),
+        ] {
+            go(&ledger, &run, state, reason);
+        }
+        let outcomes = repair_outcomes(&ledger, &[(run, State::Accepted)]).expect("outcomes");
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        let low = &outcomes[0];
+        assert_eq!(low.repairs, 1, "only the behavioural repair is tallied");
+        assert_eq!(low.verification_passed, 1);
+        assert_eq!(low.verification_failed, 0);
+        assert_eq!(low.no_verdict, 0);
     }
 }

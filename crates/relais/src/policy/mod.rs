@@ -453,6 +453,24 @@ pub struct ExecutionPolicy {
     /// never names it keeps its authority hash.
     #[serde(default, skip_serializing_if = "RepairEffort::is_default")]
     pub repair_effort: RepairEffort,
+    /// Whether a scope overflow made only of test-tree paths is answered
+    /// by relais itself, as `revise` with the scope widened to those paths
+    /// (SPEC §8). `false` keeps the stop for a person. Left out of the
+    /// serialized declaration while it is the default, so a policy that
+    /// never names it keeps its authority hash.
+    #[serde(
+        default = "default_widen_scope_for_tests",
+        skip_serializing_if = "is_true"
+    )]
+    pub widen_scope_for_tests: bool,
+}
+
+fn default_widen_scope_for_tests() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 /// How a repair's effort follows the attempt it repairs (SPEC §6).
