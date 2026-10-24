@@ -633,6 +633,154 @@ fn a_clean_from_candidate_starts_with_the_candidate_applied_and_no_conflict_text
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
+// -- from_candidate read hints resolve in the merged tree ------------------
+
+/// A source run whose candidate adds `src/parent_only.rs`, accepted.
+fn creating_source(fixture: &Fixture) -> RunId {
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let backend = MockBackend::new(|spec| {
+        std::fs::write(spec.work_dir.join("src/parent_only.rs"), "// parent\n")
+            .expect("the worker creates the file");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let RunOutcome {
+        run_id,
+        terminal: Terminal::Accepted(_),
+    } = fixture.execute(&fixture.contract(Review::Off), &repo, &backend)
+    else {
+        panic!("the source run is accepted");
+    };
+    run_id
+}
+
+fn hinted_continue_contract(source: &RunId, hint: &str) -> TaskContract {
+    let mut contract = continue_contract(source);
+    contract.read_hints = vec![hint.into()];
+    contract
+}
+
+fn manifest_of(fixture: &Fixture, run_id: &RunId) -> ContextManifest {
+    serde_json::from_str(
+        &std::fs::read_to_string(
+            fixture
+                .artifacts
+                .join(run_id.as_str())
+                .join("manifest.json"),
+        )
+        .expect("manifest"),
+    )
+    .expect("parses")
+}
+
+#[test]
+fn a_from_candidate_hint_may_name_a_file_only_its_parent_created() {
+    let fixture = Fixture::new();
+    let source = creating_source(&fixture);
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let backend = conditional_worker("relais task");
+    let outcome = fixture.execute(
+        &hinted_continue_contract(&source, "src/parent_only.rs"),
+        &repo,
+        &backend,
+    );
+    let RunOutcome {
+        run_id,
+        terminal: Terminal::Accepted(receipt),
+    } = outcome
+    else {
+        panic!("a parent-created hint resolves: {outcome:?}");
+    };
+    let manifest = manifest_of(&fixture, &run_id);
+    assert_eq!(manifest.fingerprints.len(), 1);
+    assert_eq!(manifest.fingerprints[0].path, "src/parent_only.rs");
+    let source_candidate = receipt
+        .candidate
+        .as_ref()
+        .expect("candidate")
+        .candidate_commit
+        .clone();
+    let expected = git(
+        &fixture.repo,
+        &[
+            "rev-parse",
+            &format!("{source_candidate}:src/parent_only.rs"),
+        ],
+    );
+    assert_eq!(manifest.fingerprints[0].blob, expected.trim());
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+#[test]
+fn a_from_candidate_hint_hash_matches_the_merged_tree_after_the_target_advanced() {
+    let fixture = Fixture::new();
+    let source = creating_source(&fixture);
+    commit_file(&fixture, "src/other.rs", "// target\n");
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let backend = conditional_worker("relais task");
+    let outcome = fixture.execute(&hinted_continue_contract(&source, "src"), &repo, &backend);
+    let RunOutcome {
+        run_id,
+        terminal: Terminal::Accepted(receipt),
+    } = outcome
+    else {
+        panic!("{outcome:?}");
+    };
+    let manifest = manifest_of(&fixture, &run_id);
+    let paths: Vec<&str> = manifest
+        .fingerprints
+        .iter()
+        .map(|f| f.path.as_str())
+        .collect();
+    assert!(
+        paths.contains(&"src/parent_only.rs") && paths.contains(&"src/other.rs"),
+        "the merged tree has both sides: {paths:?}"
+    );
+    let source_candidate = receipt
+        .candidate
+        .as_ref()
+        .expect("candidate")
+        .candidate_commit
+        .clone();
+    let expected = git(
+        &fixture.repo,
+        &[
+            "rev-parse",
+            &format!("{source_candidate}:src/parent_only.rs"),
+        ],
+    );
+    let parent_only = manifest
+        .fingerprints
+        .iter()
+        .find(|f| f.path == "src/parent_only.rs")
+        .expect("fingerprinted");
+    assert_eq!(parent_only.blob, expected.trim());
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+#[test]
+fn a_change_without_from_candidate_still_blocks_on_a_hint_missing_at_base() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let backend = conditional_worker("relais task");
+    let mut contract = fixture.contract(Review::Off);
+    contract.read_hints = vec!["src/parent_only.rs".into()];
+    let outcome = fixture.execute(&contract, &repo, &backend);
+    let RunOutcome {
+        terminal: Terminal::Blocked { code, .. },
+        ..
+    } = outcome
+    else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(code, BlockCode::ReadHintUnresolvable);
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
 // -- successor intent: widen scope (A5) -----------------------------------
 
 #[test]

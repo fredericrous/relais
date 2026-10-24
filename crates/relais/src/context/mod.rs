@@ -394,7 +394,7 @@ impl std::fmt::Display for UnresolvableHints {
             .collect();
         write!(
             f,
-            "the contract's read hints do not resolve at the base revision: {}",
+            "the contract's read hints do not resolve in the tree they are read from: {}",
             listed.join(", ")
         )
     }
@@ -427,7 +427,8 @@ impl Fingerprinted {
     }
 }
 
-/// Fingerprint the files under each read hint at `base_sha`, from the
+/// Fingerprint the files under each read hint in `hint_tree` (the base
+/// revision, or the merged candidate tree under `from_candidate`), from the
 /// tree itself (`git ls-tree`), so what the worker was pointed at is
 /// recorded exactly as it was — whatever the working tree does later.
 /// Git is the injected port, which is also what keeps the `GIT_*`
@@ -435,7 +436,7 @@ impl Fingerprinted {
 pub fn fingerprint_hints(
     git: &dyn Git,
     repo_dir: &Path,
-    base_sha: &str,
+    hint_tree: &str,
     hints: &[String],
 ) -> Result<Fingerprinted, UnresolvableHints> {
     let mut resolved = Vec::new();
@@ -444,7 +445,7 @@ pub fn fingerprint_hints(
     for hint in hints {
         let listing = match git.run(
             repo_dir,
-            &["ls-tree", "-r", base_sha, "--", hint.trim_end_matches('/')],
+            &["ls-tree", "-r", hint_tree, "--", hint.trim_end_matches('/')],
         ) {
             Ok(listing) => listing,
             Err(e) => {
@@ -483,7 +484,7 @@ pub fn fingerprint_hints(
         if files.is_empty() && !truncated {
             unresolvable.push(UnresolvableHint {
                 hint: hint.clone(),
-                detail: format!("no file under it exists at {base_sha}"),
+                detail: format!("no file under it exists at {hint_tree}"),
             });
             continue;
         }
@@ -1336,6 +1337,25 @@ mod tests {
         assert_eq!(missing.0.len(), 2, "{missing}");
         assert_eq!(missing.0[0].hint, "gone");
         assert!(missing.to_string().contains("`boom`"), "{missing}");
+    }
+
+    /// `from_candidate`: a hint naming a file only the parent created
+    /// resolves in the merged tree, and the fingerprint is that tree's blob.
+    #[test]
+    fn a_hint_resolves_in_the_tree_it_is_given_not_the_base() {
+        let git = crate::workspace::FakeGit::new(|_dir, args| match args {
+            ["ls-tree", "-r", "merged", "--", "parent_only.rs"] => {
+                Ok("100644 blob parentblob\tparent_only.rs\n".to_string())
+            }
+            _ => Ok(String::new()),
+        });
+        let hints = ["parent_only.rs".to_string()];
+        let merged = fingerprint_hints(&git, Path::new("."), "merged", &hints)
+            .expect("the merged tree has the file");
+        assert_eq!(merged.files()[0].blob, "parentblob");
+        let at_base = fingerprint_hints(&git, Path::new("."), "base", &hints)
+            .expect_err("the base does not have it");
+        assert_eq!(at_base.0[0].hint, "parent_only.rs");
     }
 
     /// The cap is a flag on the hint, not a fingerprint row whose `path`
