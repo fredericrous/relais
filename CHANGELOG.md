@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.32.0
+
 The relais pane draws one activity row under a running check's output: a spinner that turns on each redraw, and how long ago the last line came (or that none came yet). A check that is still writing and one that stalled no longer look the same (#300).
 
 relais now holds a run to what it was asked, and stops tripping over its own bookkeeping:
