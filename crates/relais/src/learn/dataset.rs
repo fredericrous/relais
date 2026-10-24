@@ -1101,6 +1101,148 @@ mod tests {
         fixture.settle(replay, State::Accepted);
     }
 
+    /// Settle a replay of `task` whose arm run made one extra attempt in
+    /// `extra_phase` (none for a single attempt) through the gate's own
+    /// mapping; returns the trial's recorded flag and the dataset row's
+    /// flag for that same run.
+    fn settled_replay_flags(name: &str, extra_phase: Option<UsagePhase>) -> (Option<bool>, bool) {
+        let fixture = LedgerFixture::open(name);
+        fixture.dispatched_for_task("run-src", "task-t", "implementation", "initial");
+        fixture.usage("u-source", "run-src", "sonnet");
+        fixture.settle("run-src", State::Accepted);
+        let revision = fixture.dispatched_for_task("run-rep", "task-t", "research", "initial");
+        fixture
+            .ledger
+            .set_run_purpose(&run_id("run-rep"), RunPurpose::Replay)
+            .expect("purpose");
+        if let Some(phase) = extra_phase {
+            fixture
+                .ledger
+                .insert_attempt(&run_id("run-rep"), revision, 2, "research", phase)
+                .expect("second attempt");
+        }
+        fixture.usage("u-replay", "run-rep", "haiku");
+        fixture.settle("run-rep", State::Accepted);
+        let trial_id = crate::ids::TrialId::from_stored("trial-rep");
+        fixture
+            .ledger
+            .insert_replay_trial(&crate::ledger::NewReplayTrial {
+                trial_id: &trial_id,
+                task_id: &TaskId::from_stored("task-t"),
+                source_run_id: &run_id("run-src"),
+                incumbent_recipe_id: "incumbent",
+                arm_recipe_id: "cheap-rev2",
+                base_sha: "base",
+                contract_hash: "contract",
+                verification_profile_hash: "profile",
+                workspace_isolation: "fresh_checkout_no_accepted_answer",
+                arm_run_id: &run_id("run-rep"),
+                design_sha256: None,
+            })
+            .expect("replay trial");
+        let escalated = fixture
+            .ledger
+            .escalation_attempted(&run_id("run-rep"))
+            .expect("escalation read");
+        let (trial_outcome, accepted_without_escalation) =
+            crate::runner::live_trial::trial_outcome_of(
+                &crate::runner::Terminal::Accepted(Box::new(accepted_receipt("run-rep"))),
+                escalated,
+            );
+        assert_eq!(trial_outcome, TrialOutcome::Accepted);
+        fixture
+            .ledger
+            .settle_trial(
+                &trial_id,
+                trial_outcome,
+                accepted_without_escalation,
+                crate::ledger::TrialCost::UNKNOWN,
+                1,
+            )
+            .expect("settle");
+        let trial_flag = fixture
+            .ledger
+            .trial(&trial_id)
+            .expect("trial read")
+            .expect("trial row")
+            .accepted_without_escalation;
+        let dataset = fixture.build();
+        let row_flag = dataset
+            .records
+            .iter()
+            .find(|r| r.origin == Origin::Replay)
+            .expect("replay example")
+            .accepted_without_escalation;
+        (trial_flag, row_flag)
+    }
+
+    fn accepted_receipt(run: &str) -> crate::verify::Receipt {
+        use crate::verify::{LadderRecord, ReviewNotRun, ReviewRecord, VerificationReport};
+        crate::verify::Receipt {
+            run_id: run.into(),
+            candidate_sha: "cand".into(),
+            base_sha: "base".into(),
+            contract_hash: "ch".into(),
+            policy_hash: "ph".into(),
+            outcome: State::Accepted.as_str().into(),
+            verification: VerificationReport {
+                candidate_sha: "cand".into(),
+                base_sha: "base".into(),
+                contract_hash: "ch".into(),
+                policy_hash: "ph".into(),
+                checks: Vec::new(),
+                gaps: Vec::new(),
+                gaps_not_judged: Vec::new(),
+                notes: Vec::new(),
+                baseline_failures: Vec::new(),
+                amont_bypasses: Vec::new(),
+                amont_downgrades: Vec::new(),
+                verification_inputs_changed: Vec::new(),
+                integration_gaps: Vec::new(),
+                baseline_cached: false,
+                baseline_cache_refused: None,
+            },
+            kind: crate::contract::Kind::Change,
+            candidate: None,
+            predecessor: None,
+            models_used: Vec::new(),
+            attempts: 2,
+            cost_completeness: crate::money::CostCompleteness::Actual,
+            cost: MicroUsd::from_micros(1),
+            criteria: Vec::new(),
+            mandatory_evidence_independence: None,
+            recipe: crate::policy::RecipeRecord::NotRecorded,
+            verification_profile_hash: "vph".into(),
+            review: ReviewRecord::NotRun(ReviewNotRun::OverBudget {
+                patch_bytes: 1,
+                budget_bytes: 1,
+            }),
+            ladder: LadderRecord::NotRecorded,
+            efforts_used: Vec::new(),
+        }
+    }
+
+    /// A same-tier repair is not escalation: the gate's trial and the
+    /// dataset row agree the run was accepted without escalation.
+    #[test]
+    fn a_replay_accepted_after_a_review_repair_is_accepted_without_escalation() {
+        let (trial, row) = settled_replay_flags("dataset-gate-repair", Some(UsagePhase::Repair));
+        assert_eq!((trial, row), (Some(true), true));
+    }
+
+    #[test]
+    fn a_replay_accepted_after_an_escalation_attempt_is_not() {
+        let (trial, row) =
+            settled_replay_flags("dataset-gate-escalation", Some(UsagePhase::Escalation));
+        assert_eq!((trial, row), (Some(false), false));
+    }
+
+    #[test]
+    fn a_single_attempt_replay_accept_is_accepted_without_escalation() {
+        let (trial, row) = settled_replay_flags("dataset-gate-single", None);
+        assert_eq!((trial, row), (Some(true), true));
+    }
+
     #[test]
     fn a_replay_does_not_supersede_its_accepted_source() {
         let fixture = LedgerFixture::open("dataset-replay-keeps-source");

@@ -641,7 +641,17 @@ impl<'a> RunEngine<'a> {
 
         // Write scope is checked on the actual diff; a violation can
         // never be accepted (SPEC §8, §9).
-        match workspace::check_scope(ctx.worktree, &sha, self.config.contract) {
+        // A `from_candidate` run is measured from the merged candidate
+        // tree it began from; a verify applies its candidate as its own
+        // change, so it stays measured from the base (SPEC §8).
+        let floor = workspace::ScopeFloor::of_run(
+            ctx.preflight
+                .candidate
+                .as_ref()
+                .map(|prepared| prepared.tree.as_str()),
+            self.config.contract,
+        );
+        match workspace::check_scope_from(ctx.worktree, &sha, self.config.contract, floor) {
             Ok(_) => {}
             Err(WorkspaceError::ScopeViolation(paths)) => {
                 ledger.finish_attempt(attempt_id, State::NeedsDecision, None, Some(&sha))?;
@@ -649,7 +659,7 @@ impl<'a> RunEngine<'a> {
                     &progress.budget,
                     Observation::ScopeViolation(workspace::out_of_scope(
                         self.config.repo_dir,
-                        &ctx.preflight.base_sha,
+                        floor.revision(ctx.worktree),
                         &sha,
                         paths,
                     )),
@@ -1001,6 +1011,14 @@ impl<'a> RunEngine<'a> {
         };
         if inspecting {
             return self.judge_inspection(ctx, progress, &candidate, verified);
+        }
+        // Criteria are settled before acceptance: declared test evidence
+        // that the patch never wrote is a gap the worker repairs (SPEC §10).
+        let missing_tests = self.missing_test_gaps(ctx, &candidate.sha)?;
+        if !missing_tests.is_empty() {
+            progress.last_candidate = Some(candidate.sha.clone());
+            progress.last_failures = Some(missing_tests.clone());
+            return self.follow(ctx, progress, Observation::CriteriaUnmet(missing_tests));
         }
         self.accept_candidate(ctx, progress, &candidate, verified, None)
     }

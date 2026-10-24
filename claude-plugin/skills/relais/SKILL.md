@@ -62,6 +62,11 @@ up, and the person answers there.
 }
 ```
 
+   A criterion that asks for new tests is declared as an object with
+   `"evidence": {"kind": "test", "authorship": "model_added"}`: relais
+   then meets it only when the checks pass AND the patch adds at least
+   one test (a bare string criterion is settled by the checks alone).
+
    Use `"kind": "inspect"` with evidence criteria for investigations
    that must not edit files.
    - **An existing candidate.** To verify one, use `"kind": "verify"`

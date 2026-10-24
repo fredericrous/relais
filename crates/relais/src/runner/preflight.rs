@@ -276,10 +276,17 @@ impl<'a> RunEngine<'a> {
         // efforts the CLI accepts are the same answer about the same
         // installed harness.
         let capabilities = self.config.backend.probe();
+        // A `from_candidate` worker sees the merged candidate tree, so its
+        // hints resolve there; every other run reads hints at the base.
+        let hint_tree = match (&candidate, self.config.contract.from_candidate()) {
+            (Some(prepared), Some(_)) => prepared.tree.clone(),
+            _ => base_sha.clone(),
+        };
         let manifest = match self.assemble_context(
             &authority,
             &contract_hash,
             &base_sha,
+            &hint_tree,
             capabilities.as_ref(),
         )? {
             Phase::Ended(outcome) => return Ok(Phase::Ended(outcome)),
@@ -501,15 +508,16 @@ impl<'a> RunEngine<'a> {
         authority: &EffectiveAuthority,
         contract_hash: &str,
         base_sha: &str,
+        hint_tree: &str,
         capabilities: Option<&crate::backend::Capabilities>,
     ) -> Result<Phase<ContextManifest>, RunError> {
-        // Read hints are fingerprinted from the base tree; one that
+        // Read hints are fingerprinted from `hint_tree`; one that
         // resolves to nothing would point the worker at a path this
         // revision does not have, which is a preflight problem (V15).
         let fingerprints = match context::fingerprint_hints(
             self.config.git,
             self.config.repo_dir,
-            base_sha,
+            hint_tree,
             &self.config.contract.read_hints,
         ) {
             Ok(fingerprints) => fingerprints,

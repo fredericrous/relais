@@ -780,15 +780,102 @@ fn verdict_of(rest: &str) -> Option<CriterionVerdict> {
     }
 }
 
+/// Whether a worker-backed change's patch adds a test, as its caller
+/// measured it from the run's lower bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchAddsTest {
+    /// No patch is judged: a verify-only contract has no worker.
+    NotJudged,
+    /// The patch adds at least one test.
+    Added,
+    /// The patch adds no test.
+    Absent,
+}
+
+impl PatchAddsTest {
+    /// Judge a unified diff: an added line that, trimmed, starts a Rust
+    /// `#[test]`/`#[tokio::test]`/`#[rstest]`/`proptest!`, a TS/JS `test(`
+    /// or `it(`, a Python `def test_`/`async def test_` or a Go `func Test`.
+    pub fn of_patch(patch: &str) -> Self {
+        const STARTS: [&str; 9] = [
+            "#[test]",
+            "#[tokio::test",
+            "#[rstest",
+            "proptest!",
+            "test(",
+            "it(",
+            "def test_",
+            "async def test_",
+            "func Test",
+        ];
+        let adds = patch.lines().any(|line| {
+            line.strip_prefix('+')
+                .filter(|_| !line.starts_with("+++"))
+                .is_some_and(|added| {
+                    let added = added.trim();
+                    STARTS.iter().any(|start| added.starts_with(start))
+                })
+        });
+        if adds {
+            Self::Added
+        } else {
+            Self::Absent
+        }
+    }
+
+    /// The gap a declared-test criterion reports when this is
+    /// [`Self::Absent`].
+    pub const GAP: &'static str = "declared test evidence, but the patch adds no test";
+}
+
+/// The gaps a patch that adds no test leaves in the mandatory criteria
+/// that declare test evidence without naming a test: one per criterion.
+/// Empty unless `patch_adds_test` is [`PatchAddsTest::Absent`].
+pub fn missing_test_gaps(
+    entries: &[AcceptanceEntry],
+    patch_adds_test: PatchAddsTest,
+) -> Vec<String> {
+    if patch_adds_test != PatchAddsTest::Absent {
+        return Vec::new();
+    }
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.mandatory() && matches!(entry.evidence(), Some(Evidence::Test { name: None, .. }))
+        })
+        .map(|entry| {
+            format!(
+                "criterion `{}` is not met: {}",
+                entry.id(),
+                PatchAddsTest::GAP
+            )
+        })
+        .collect()
+}
+
+/// What the run itself cannot establish and others answer: the criteria a
+/// person signed off, and amont's answer per gate.
+#[derive(Clone, Copy)]
+pub struct Attestations<'a> {
+    pub signoffs: &'a HashSet<String>,
+    pub gate_coverage: &'a BTreeMap<String, Result<bool, AttestError>>,
+}
+
 /// Settle every acceptance criterion against a finished verification
 /// report. A named check is met exactly when its own outcome succeeded.
-/// A test, a review, or a bare string with no evidence declared is met
-/// exactly when the report as a whole is accepted, because nothing here
-/// can isolate one test's result inside a command that runs many. A
-/// criterion settled only by a model-added test or an LLM review is
-/// still accepted when the checks pass: relais reports what it knows
-/// (the evidence was not independent) rather than inventing a stricter
-/// rule than the contract asked for (SPEC §10).
+/// A review, or a bare string with no evidence declared, is met exactly
+/// when the report as a whole is accepted, because nothing here can
+/// isolate one test's result inside a command that runs many. An LLM
+/// review is still accepted when the checks pass: relais reports what it
+/// knows (the evidence was not independent) rather than inventing a
+/// stricter rule than the contract asked for (SPEC §10).
+///
+/// A test that declares test evidence but names none
+/// (`Evidence::Test { name: None }`) is met on a worker-backed change only
+/// when the checks pass AND the candidate patch adds at least one test
+/// (`patch_adds_test`, SPEC §10): passing checks alone say nothing about a
+/// test the patch never wrote. [`PatchAddsTest::NotJudged`] (a verify-only
+/// contract, which has no worker) keeps the settlement above.
 ///
 /// A test that names itself (`Evidence::Test { name: Some(_) }`) is the
 /// exception to that: it is met exactly when some command's parsed JUnit
@@ -810,9 +897,9 @@ pub fn settle_acceptance(
     entries: &[AcceptanceEntry],
     profile: &VerificationProfile,
     report: &VerificationReport,
-    signoffs: &HashSet<String>,
-    gate_coverage: &BTreeMap<String, Result<bool, AttestError>>,
+    attestations: Attestations<'_>,
     kind: Kind,
+    patch_adds_test: PatchAddsTest,
     review: Option<&ReportVerdict>,
 ) -> (Vec<CriterionOutcome>, Option<IndependenceSummary>) {
     let accepted = report.accepted_for(kind);
@@ -858,15 +945,20 @@ pub fn settle_acceptance(
                     Some(Evidence::Test { name: None, .. } | Evidence::LlmReview) | None,
                     Kind::Inspect,
                 ) => (by_report(at), SettledVia::ReportReview),
-                (Some(Evidence::Test { name: None, .. } | Evidence::LlmReview), Kind::Change) => {
+                (Some(Evidence::Test { name: None, .. }), Kind::Change) => (
+                    accepted && patch_adds_test != PatchAddsTest::Absent,
+                    SettledVia::DeclaredEvidence,
+                ),
+                (Some(Evidence::LlmReview), Kind::Change) => {
                     (accepted, SettledVia::DeclaredEvidence)
                 }
                 (None, Kind::Change) => (accepted, SettledVia::ProfileChecks),
-                (Some(Evidence::HumanSignOff), _) => {
-                    (signoffs.contains(&entry.id()), SettledVia::HumanSignOff)
-                }
+                (Some(Evidence::HumanSignOff), _) => (
+                    attestations.signoffs.contains(&entry.id()),
+                    SettledVia::HumanSignOff,
+                ),
                 (Some(Evidence::AmontGate { gate }), _) => (
-                    matches!(gate_coverage.get(gate), Some(Ok(true))),
+                    matches!(attestations.gate_coverage.get(gate), Some(Ok(true))),
                     SettledVia::DeclaredEvidence,
                 ),
             };
@@ -4674,9 +4766,12 @@ mod tests {
             &entries,
             &profile,
             &report,
-            &HashSet::new(),
-            &BTreeMap::new(),
+            Attestations {
+                signoffs: &HashSet::new(),
+                gate_coverage: &BTreeMap::new(),
+            },
             Kind::Change,
+            PatchAddsTest::NotJudged,
             None,
         );
         assert!(
@@ -4838,9 +4933,12 @@ mod tests {
             &entries,
             profile,
             &report_of(checks),
-            &HashSet::new(),
-            &BTreeMap::new(),
+            Attestations {
+                signoffs: &HashSet::new(),
+                gate_coverage: &BTreeMap::new(),
+            },
             Kind::Change,
+            PatchAddsTest::NotJudged,
             None,
         );
         (criteria.remove(0), gaps)
@@ -5158,9 +5256,12 @@ mod tests {
             &entries,
             &profile,
             &report,
-            &HashSet::new(),
-            &BTreeMap::new(),
+            Attestations {
+                signoffs: &HashSet::new(),
+                gate_coverage: &BTreeMap::new(),
+            },
             Kind::Change,
+            PatchAddsTest::NotJudged,
             None,
         );
         assert!(
@@ -5227,9 +5328,12 @@ mod tests {
             &entries,
             &profile,
             &report,
-            &signed_off,
-            &BTreeMap::new(),
+            Attestations {
+                signoffs: &signed_off,
+                gate_coverage: &BTreeMap::new(),
+            },
             Kind::Change,
+            PatchAddsTest::NotJudged,
             None,
         );
         assert!(criteria[0].met, "a recorded sign-off is met: {criteria:?}");
@@ -5340,9 +5444,12 @@ mod tests {
             &entries,
             &profile,
             &report,
-            &HashSet::new(),
-            &coverage,
+            Attestations {
+                signoffs: &HashSet::new(),
+                gate_coverage: &coverage,
+            },
             Kind::Change,
+            PatchAddsTest::NotJudged,
             None,
         );
         assert!(criteria[0].met, "a covered gate is met: {criteria:?}");
@@ -5425,9 +5532,12 @@ mod tests {
             &entries,
             &profile,
             &report,
-            &HashSet::new(),
-            &coverage,
+            Attestations {
+                signoffs: &HashSet::new(),
+                gate_coverage: &coverage,
+            },
             Kind::Change,
+            PatchAddsTest::NotJudged,
             None,
         );
         assert!(
@@ -5510,9 +5620,12 @@ mod tests {
             entries,
             profile,
             &report,
-            &HashSet::new(),
-            &BTreeMap::new(),
+            Attestations {
+                signoffs: &HashSet::new(),
+                gate_coverage: &BTreeMap::new(),
+            },
             Kind::Inspect,
+            PatchAddsTest::NotJudged,
             Some(verdict),
         )
     }
@@ -5538,9 +5651,12 @@ mod tests {
             &entries,
             &profile,
             &report_of(Vec::new()),
-            &HashSet::new(),
-            &BTreeMap::new(),
+            Attestations {
+                signoffs: &HashSet::new(),
+                gate_coverage: &BTreeMap::new(),
+            },
             Kind::Inspect,
+            PatchAddsTest::NotJudged,
             None,
         );
         assert!(
@@ -5659,9 +5775,12 @@ mod tests {
             &[AcceptanceEntry::Bare("it builds".into())],
             &profile,
             &accepted,
-            &HashSet::new(),
-            &BTreeMap::new(),
+            Attestations {
+                signoffs: &HashSet::new(),
+                gate_coverage: &BTreeMap::new(),
+            },
             Kind::Change,
+            PatchAddsTest::NotJudged,
             None,
         );
         assert_eq!(all_independent, Some(IndependenceSummary::AllIndependent));
@@ -5677,9 +5796,12 @@ mod tests {
             &mixed,
             &profile,
             &accepted,
-            &HashSet::new(),
-            &BTreeMap::new(),
+            Attestations {
+                signoffs: &HashSet::new(),
+                gate_coverage: &BTreeMap::new(),
+            },
             Kind::Change,
+            PatchAddsTest::NotJudged,
             None,
         );
         assert_eq!(partly, Some(IndependenceSummary::PartlyIndependent));
@@ -5693,9 +5815,12 @@ mod tests {
             &only_optional,
             &profile,
             &accepted,
-            &HashSet::new(),
-            &BTreeMap::new(),
+            Attestations {
+                signoffs: &HashSet::new(),
+                gate_coverage: &BTreeMap::new(),
+            },
             Kind::Change,
+            PatchAddsTest::NotJudged,
             None,
         );
         assert_eq!(none_mandatory, None);
@@ -5871,5 +5996,106 @@ mod tests {
         let none = integration_gaps(&integrations, &|_| false);
         assert_eq!(none.len(), 2, "required missing + optional missing");
         assert!(none[0].starts_with("aval: required"));
+    }
+
+    #[test]
+    fn a_patch_adds_a_test_only_by_an_added_line_that_starts_one() {
+        let added = |line: &str| PatchAddsTest::of_patch(&format!("+++ b/x\n@@\n+{line}\n"));
+        for line in [
+            "    #[test]",
+            "#[tokio::test]",
+            "#[rstest]",
+            "  proptest! {",
+            "test('a', () => {})",
+            "  it('b', () => {})",
+            "def test_c():",
+            "async def test_d():",
+            "func TestE(t *testing.T) {",
+        ] {
+            assert_eq!(added(line), PatchAddsTest::Added, "{line}");
+        }
+        assert_eq!(added("fn helper() {}"), PatchAddsTest::Absent);
+        assert_eq!(
+            PatchAddsTest::of_patch("-    #[test]\n #[test]\n+++ #[test]\n"),
+            PatchAddsTest::Absent,
+            "a removed, a context and a header line add nothing"
+        );
+    }
+
+    #[test]
+    fn declared_test_evidence_needs_an_added_test_beyond_the_checks() {
+        let profile = VerificationProfile {
+            setup: Vec::new(),
+            commands: vec![named("check", &["sh", "-c", "true"], 10)],
+            amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
+            inputs: Vec::new(),
+            cache_baseline: false,
+        };
+        let report = VerificationReport {
+            candidate_sha: "abc".into(),
+            base_sha: "def".into(),
+            contract_hash: "ch".into(),
+            policy_hash: "ph".into(),
+            checks: vec![CheckOutcome {
+                label: check_label(&profile.commands[0]),
+                argv: profile.commands[0].argv.clone(),
+                ended: Ended::Exited(0).into(),
+                log_path: "x.log".into(),
+                log_sha256: "h".into(),
+                junit: None,
+                attempts: Vec::new(),
+                flaky: false,
+            }],
+            gaps: Vec::new(),
+            gaps_not_judged: Vec::new(),
+            notes: Vec::new(),
+            baseline_failures: Vec::new(),
+            amont_bypasses: Vec::new(),
+            amont_downgrades: Vec::new(),
+            verification_inputs_changed: Vec::new(),
+            integration_gaps: Vec::new(),
+            baseline_cached: false,
+            baseline_cache_refused: None,
+        };
+        let entries = vec![
+            declared(
+                "tests are added",
+                crate::acceptance::Evidence::Test {
+                    authorship: crate::acceptance::TestAuthorship::ModelAdded,
+                    name: None,
+                },
+            ),
+            declared("a review", crate::acceptance::Evidence::LlmReview),
+            AcceptanceEntry::Bare("a bare string criterion".into()),
+        ];
+        let settle = |adds| {
+            settle_acceptance(
+                &entries,
+                &profile,
+                &report,
+                Attestations {
+                    signoffs: &HashSet::new(),
+                    gate_coverage: &BTreeMap::new(),
+                },
+                Kind::Change,
+                adds,
+                None,
+            )
+            .0
+        };
+        assert!(settle(PatchAddsTest::Added).iter().all(|c| c.met));
+        assert!(settle(PatchAddsTest::NotJudged).iter().all(|c| c.met));
+        let absent = settle(PatchAddsTest::Absent);
+        assert!(!absent[0].met, "no test added: unmet");
+        assert!(absent[1].met, "an LLM review is unchanged");
+        assert!(absent[2].met, "a bare string criterion is unchanged");
+        assert_eq!(
+            missing_test_gaps(&entries, PatchAddsTest::Absent).len(),
+            1,
+            "{}",
+            PatchAddsTest::GAP
+        );
+        assert!(missing_test_gaps(&entries, PatchAddsTest::Added).is_empty());
     }
 }

@@ -438,6 +438,16 @@ impl TaskWorktree {
     /// unquoted: git C-quotes non-ASCII names on the line-oriented form,
     /// which would defeat both the glob and the protected-prefix test.
     pub fn changed_paths_in(&self, candidate_sha: &str) -> Result<Vec<String>> {
+        self.changed_paths_from(&self.base_sha, candidate_sha)
+    }
+
+    /// The paths that differ between `lower_bound` (any commit or tree)
+    /// and the candidate, sorted and unique.
+    pub fn changed_paths_from(
+        &self,
+        lower_bound: &str,
+        candidate_sha: &str,
+    ) -> Result<Vec<String>> {
         let output = git_raw(
             &self.path,
             &[
@@ -445,7 +455,7 @@ impl TaskWorktree {
                 "--name-only",
                 "-z",
                 "--no-renames",
-                &self.base_sha,
+                lower_bound,
                 candidate_sha,
             ],
         )?;
@@ -757,6 +767,49 @@ pub fn check_scope(
     candidate_sha: &str,
     contract: &TaskContract,
 ) -> std::result::Result<Vec<String>, WorkspaceError> {
+    check_scope_from(worktree, candidate_sha, contract, ScopeFloor::WorktreeBase)
+}
+
+/// Where a run's own changes start, for the scope check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeFloor<'a> {
+    /// The worktree's base commit.
+    WorktreeBase,
+    /// A tree the run began from (a `from_candidate` run's merged
+    /// candidate tree): what it already holds is not this run's change.
+    Tree(&'a str),
+}
+
+impl<'a> ScopeFloor<'a> {
+    /// The floor a run's scope is measured from: the merged candidate
+    /// tree when the contract continues from a candidate, else the
+    /// worktree's base. A verify applies its candidate as its own change,
+    /// so it has a merged tree but stays measured from the base (SPEC §8).
+    pub fn of_run(merged_tree: Option<&'a str>, contract: &TaskContract) -> Self {
+        match (merged_tree, contract.from_candidate()) {
+            (Some(tree), Some(_)) => ScopeFloor::Tree(tree),
+            _ => ScopeFloor::WorktreeBase,
+        }
+    }
+
+    /// The revision a diff of the run's changes starts from.
+    pub fn revision(self, worktree: &'a TaskWorktree) -> &'a str {
+        match self {
+            ScopeFloor::WorktreeBase => &worktree.base_sha,
+            ScopeFloor::Tree(tree) => tree,
+        }
+    }
+}
+
+/// `check_scope` with the run's changes measured from `floor`. Only the
+/// lower bound of the diff moves; the scope patterns and the
+/// protected-prefix rule apply to what it yields unchanged.
+pub fn check_scope_from(
+    worktree: &TaskWorktree,
+    candidate_sha: &str,
+    contract: &TaskContract,
+    floor: ScopeFloor<'_>,
+) -> std::result::Result<Vec<String>, WorkspaceError> {
     // The scope arrives compiled: `TaskContract::from_json_str` judged
     // every pattern before the worker ran (P5), so there is nothing to
     // fail here and no glob error to report as a git failure.
@@ -764,7 +817,7 @@ pub fn check_scope(
     let patterns: &[String] = scope.map_or(&[], |scope| scope.patterns());
 
     let mut violations = Vec::new();
-    for path in worktree.changed_paths_in(candidate_sha)? {
+    for path in worktree.changed_paths_from(floor.revision(worktree), candidate_sha)? {
         let in_scope = scope.is_some_and(|scope| scope.is_match(&path));
         // "Explicitly within an approved contract" (SPEC §8) means the
         // scope NAMES this protected area — a pattern carrying its

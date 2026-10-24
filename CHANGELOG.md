@@ -8,6 +8,18 @@ missing here.
 
 ## Unreleased
 
+The relais pane draws one activity row under a running check's output: a spinner that turns on each redraw, and how long ago the last line came (or that none came yet). A check that is still writing and one that stalled no longer look the same (#300).
+
+relais now holds a run to what it was asked, and stops tripping over its own bookkeeping:
+
+- **Declared test evidence needs a test.** On a worker-backed change, a criterion declared `{"evidence": {"kind": "test", "authorship": "model_added"}}` with no test name is met only when the patch adds a test, measured from the run's own starting tree. It is settled before acceptance: a missing test takes a repair, then fails, on single and decomposed runs. Bare-string criteria and verify-only contracts are unchanged. The relais skill tells the orchestrator to declare it.
+- **A same-tier repair is not escalation** in the typed-research gate (ADR-0006 amended): a replay accepted after a check or review repair counts as accepted without escalation.
+- **A follow-up run is scope-checked against its own changes.** A `from_candidate` run is measured from the merged tree it began from, so its parent's and the target base's paths no longer stop it.
+- **Answering an interrupted in-place run frees its worktree** when HEAD moved since it started (the same retire `relais resume --retire` runs); otherwise the command is named.
+- **A follow-up run's read hints resolve against the merged tree** its worker sees, so it can name a file only its parent created.
+
+Reinstall the plugin after upgrading.
+
 ## v0.31.0
 
 Workers and the reviewer now read the code rules in full (decisions ADR-0043). A worker used to get the constraint ids and an instruction to run `aval rule <id>`, which no worker followed, and the reviewer got each rule's first sentence, so the clauses that make a rule checkable (single-letter names, swallowed errors, unbounded waits) reached neither.
