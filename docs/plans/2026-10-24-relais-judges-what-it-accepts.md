@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/judge-what-it-accepts
 repos: [relais]
 adrs: [ADR-0006, ADR-0011, ADR-0010]
@@ -101,5 +101,68 @@ Each of 1–5 goes to one relais run in a worktree, with its tests declared as `
 - `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings` → exit 0, with the new tests named.
 - `make plugin` → exit 0 (the SKILL.md edit).
 - After the release, on live data: `relais recipe evaluate ~/.config/relais/candidates/change-feature-haiku.toml` still reports 7 qualifying trials. The first resumed replay that is review-repaired settles `accepted_without_escalation = 1`.
+
+## Verification record
+
+- **Code checks**, on the final rebased tree (c2c78085…):
+  - `cargo clippy --workspace --all-targets -- -D warnings` → exit 0.
+  - `cargo test --workspace` → exit 0 (510 s).
+  - `make plugin` (PLUGIN_SKIP_OK unset) → exit 0, 332 pass. The only plugin edit is SKILL.md; the plugin tests also carry #300's tests.
+- **1, a repair is not escalation** (`runner/live_trial.rs`, `cli/replay.rs`, `learn/dataset.rs`):
+  - `a_replay_accepted_after_a_review_repair_is_accepted_without_escalation`;
+  - `a_replay_accepted_after_an_escalation_attempt_is_not`;
+  - `a_single_attempt_replay_accept_is_accepted_without_escalation`;
+  - the gate and dataset agreement test;
+  - an end-to-end repaired run through `live_trial::settle` (stores `Some(true)`), and a settle unit test with an escalation (stores `Some(false)`).
+- **2, declared test evidence needs a test** (`runner/tests/declared_tests.rs`):
+  - `a_declared_test_criterion_is_met_when_the_patch_adds_a_test`;
+  - `…_without_an_added_test_takes_one_repair_then_fails`;
+  - `a_declared_test_gap_after_a_spent_check_repair_fails_without_a_second_repair`;
+  - `a_verify_only_contract_with_declared_test_evidence_is_settled_as_before`;
+  - `a_follow_up_gets_no_credit_for_the_tests_its_parent_added`, plus the advanced-base case asserting the gap;
+  - `a_decomposed_run_with_no_added_test_stops_after_its_one_integration_repair`;
+  - `a_decomposed_integration_repair_that_adds_a_test_can_accept`;
+  - an unreadable diff on a worker change ends Interrupted with no receipt.
+- **3, follow-up scope** (`runner/tests/scope_floor.rs`, 6 tests):
+  - an in-scope follow-up;
+  - a parent's file out of scope;
+  - an advanced base;
+  - a protected path;
+  - a verify measured from the base;
+  - a decomposed `from_candidate` contract refused.
+- **4, decide frees a kept worktree** (`cli/decide.rs` tests):
+  - HEAD moved, salvage and abandon: the marker is retired;
+  - HEAD unmoved: the marker is kept and the command named;
+  - a run that was not in place: nothing said;
+  - a corrupt marker, an unreadable HEAD and an unreadable git dir are named, with the answer still recorded.
+- **5, read hints of a follow-up** (`runner/tests/verify_kind.rs`, `context/mod.rs`):
+  - a hint resolves in the tree it is given;
+  - a parent-only file;
+  - the hint hash after the target advanced;
+  - a hint in a resolved conflict tree;
+  - a change without `from_candidate` still blocks.
+
+## Post-release step
+
+After the release, on live data:
+- `relais recipe evaluate ~/.config/relais/candidates/change-feature-haiku.toml` still reports 7 qualifying trials.
+- The first resumed Haiku replay that is review-repaired settles `accepted_without_escalation = 1`.
+- **Replay cost estimate:** an accepted Haiku trial costs $0.55 on average (5 trials, at most $0.62). With a repair (October median $0.20) that is about $0.75. The 7 pool replays come to about $5.50, inside the $20 cap.
+- The person checks the pane loader row (#300) after reinstalling the plugin.
+
+## Decision log
+
+- 2026-10-24: Phase 3's scheduler criterion ("the decomposed path measures a `from_candidate` run from the merged tree") cannot be tested. `contract/mod.rs` refuses to decompose a `from_candidate` change, so it was replaced by a test of that refusal.
+- 2026-10-24: `decide` stays silent when a run's directory is not on disk. The ledger records the run's directory, not whether it ran in place. A deleted, unpruned worktree's marker is left to `relais resume --retire`. holds-until: the ledger records whether a run ran in place (implementation review delta, finding 9).
+- 2026-10-24: Phase 5's manifest records `base_sha` beside hint fingerprints taken from the merged tree. SPEC §7/§8 documents how that tree is rebuilt (phase 5 reviewer, low).
+- 2026-10-24: The release carries #300, the pane loader row. It was merged to main after v0.31.0 and is unreleased, so the CHANGELOG names it.
+- 2026-10-24: The person approved committing with only the `plugin-test` gate skipped (`git -c hook.skip=plugin-test`), after `make plugin` passes alone on the same tree, when the gate times out under load. It was used on several commits here; every other gate ran.
+- 2026-10-24: Two runs were accepted by relais 0.30.0 without their required tests (phase 3 `run-65e920f8510c0`, recorded corrected; the phase 2 gap). Follow-up runs added the tests. This is the defect phase 2 fixes.
+
+## Implementation review
+
+approve-with-changes (round 1: 94k, 191 s; delta: 109k, 27 s).
+- Fixed: the unreadable-diff test; `decide` no longer swallows errors; phase 5's conflict and advanced-base tests; phase 1 settled end to end; `decide` returns Ok once recorded; SPEC §17.
+- Recorded here: the Verification record, the #300 changelog note, and the deferral's `holds-until`.
 
 <!-- panel: repos=relais reviewers=backend,codex body-sha=f646fb5454cd -->
