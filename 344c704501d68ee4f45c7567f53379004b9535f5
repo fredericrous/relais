@@ -1,0 +1,16 @@
+amont-provenance-v1
+commit 3f2aa349dda300e00acd30f98d81cbab697731ab
+tree 344c704501d68ee4f45c7567f53379004b9535f5
+canon a323d4ba90d9a1df63016f011ef7843983b6bced
+patch d2fe1b39d1d9d6035133c8cd52ccb82ed6318fc0
+plan docs/plans/2026-10-24-relais-judges-what-it-accepts.md 112a832d1332a61b9ae796722fad5449927ba7cf2ea7bb1cbd3cb6484697de41
+review reviewed c2c780857f6792a860a73c1c61fde415985659ed73f5f1ddbf0d2f9012867e37
+preview not-required
+producer amont-agent 3.1.1
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAEARekbmoHXobuxmDpvT5HlF5o+jmGArzy4QEEHvaINUrlaI5/
+gQ5/t0eV3tog9Ane+a2vg+T0B+xsEO56BECpMD
+-----END SSH SIGNATURE-----
