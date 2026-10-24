@@ -20,6 +20,8 @@ export type Check = {
   // Whether the last stored output line is still being written.
   isOpen: boolean
   elidedBytes: number
+  // When the check's last output event arrived; undefined before the first.
+  lastOutputAt: number | undefined
 }
 
 export type Step = {
@@ -342,6 +344,7 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
         output: [],
         isOpen: false,
         elidedBytes: 0,
+        lastOutputAt: undefined,
       }
       m = { ...m, wait: undefined }
       m = mapLast(m, s => ({ ...s, checks: [...s.checks, check], detail: (event.argv ?? []).join(' ') }))
@@ -352,6 +355,7 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
       return mapCheck(m, event.label, c => ({
         ...appendOutput(c, event.text ?? ''),
         elidedBytes: Math.max(c.elidedBytes, elided),
+        lastOutputAt: at,
       }))
     }
     case 'check_ended': {

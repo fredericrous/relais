@@ -29,7 +29,10 @@ const rowsOf = (timelines: any[], rows: number) =>
   )
 
 // Today's rows for one live run alone, captured before the fold change
-// (2026-10-23): the change must leave this case exactly as it was.
+// (2026-10-23), plus the one dim activity row under the streaming output
+// (2026-10-24): every other row is byte-identical to that capture. It is drawn
+// in 41 rows, the 40 of the capture plus the activity row, which counts
+// inside the bound.
 const ONE_LIVE_RUN = [
   {
     "text": "relais · run run-…c35c · verifying · attempt 1 · 9:59",
@@ -168,6 +171,10 @@ const ONE_LIVE_RUN = [
     "dim": true
   },
   {
+    "text": "  │ ⠋ running · last line 564s ago",
+    "dim": true
+  },
+  {
     "text": "· review                —",
     "dim": true
   },
@@ -199,8 +206,8 @@ const ONE_LIVE_RUN = [
   }
 ]
 
-test('one live run alone draws as it did before the fold', () => {
-  expect(rowsOf([liveTimeline('run-65d322006dd13-c35c')], 40)).toEqual(ONE_LIVE_RUN)
+test('one live run alone draws as before the fold, plus the activity row', () => {
+  expect(rowsOf([liveTimeline('run-65d322006dd13-c35c')], 41)).toEqual(ONE_LIVE_RUN)
 })
 
 // A finished run (accepted or not) that started `offset` seconds after the base.
@@ -301,6 +308,57 @@ test('a live run older than an awaiting one keeps its head and output, behind a 
   expect(rows[0].dim).toBe(true)
   expect(rows.some(r => r.text.startsWith('relais · run live-1'))).toBe(true)
   expect(outputs(rows)).toBeGreaterThanOrEqual(1)
+})
+
+const activityOf = (rows: { text: string }[]) => rows.filter(r => r.text.includes(' running · '))
+
+test('at 40 rows the activity row is drawn and the bound holds', () => {
+  const rows = rowsOf([liveTimeline('run-65d322006dd13-c35c')], 40)
+  expect(rows.length).toBeLessThanOrEqual(40)
+  expect(activityOf(rows)).toHaveLength(1)
+})
+
+test('when rows are cut, the latest output line stays right above the activity row', () => {
+  const rows = run([...finished(3), liveAt('live-1', 100, 40, 3), doneTimeline('wait-1', 200, 'needs_review')], 12)
+  const index = rows.findIndex(r => r.text.includes(' running · '))
+  expect(index).toBeGreaterThan(0)
+  expect(rows[index - 1].text).toBe('  │ line 39')
+  expect(rows.length).toBeLessThanOrEqual(12)
+})
+
+test('a running check draws one activity row right under its last output line', () => {
+  const rows = rowsOf([liveTimeline('run-a', 5)], 40)
+  const index = rows.findIndex(r => r.text === '  │ line 4')
+  expect(activityOf(rows)).toHaveLength(1)
+  expect(rows[index + 1].text).toBe('  │ ⠋ running · last line 589s ago')
+  expect(rows[index + 1].dim).toBe(true)
+})
+
+test('the spinner frame advances with room.now one second later', () => {
+  const draw = (now: number) =>
+    layoutPane(Object.values(rebuildRuns({ runs: [liveTimeline('run-a', 5)] }, NOW)) as any, { rows: 40, columns: 72, now })
+  expect(activityOf(draw(NOW))[0].text).toContain('⠋ running · last line 589s ago')
+  expect(activityOf(draw(NOW + 1000))[0].text).toContain('⠙ running · last line 590s ago')
+})
+
+test('a running check with no output yet says so, in one row', () => {
+  const rows = rowsOf([liveTimeline('run-a', 0)], 40)
+  expect(activityOf(rows).map(r => r.text)).toEqual(['  │ ⠋ running · no output yet'])
+  expect(rows.some(r => r.text === '  │ waiting for output')).toBe(false)
+})
+
+test('a finished check draws no activity row', () => {
+  const t = liveTimeline('run-a', 3)
+  t.events.push({ relais: 'event', run: 'run-a', seq: 99, at: at(99), event: { kind: 'check_ended', label: 'make@1', exit: 0, duration_ms: 1 } })
+  expect(activityOf(rowsOf([t], 40))).toHaveLength(0)
+})
+
+test('the activity row counts inside the row bound', () => {
+  for (const bound of [12, 40]) {
+    const rows = rowsOf([liveTimeline('run-a', 60)], bound)
+    expect(rows.length).toBeLessThanOrEqual(bound)
+    expect(activityOf(rows)).toHaveLength(1)
+  }
 })
 
 test('a live run in review with no output shows a waiting row', () => {

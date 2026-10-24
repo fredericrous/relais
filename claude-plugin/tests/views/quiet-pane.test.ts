@@ -234,7 +234,7 @@ test('live runs come before kept failures, and the status line lists both', asyn
   expect(lastStatus(engine)).toMatch(/amont clippy 0:0\d, amont test failed 0:0\d/)
 })
 
-const masked = (texts: string[]) => texts.map(t => t.replace(/\d+:\d\d/g, 'm:ss'))
+const masked = (texts: string[]) => texts.map(t => t.replace(/\d+:\d\d/g, 'm:ss').replace(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/g, '*'))
 
 for (const rows of [8, 24]) {
   test(`relais rows are the same with or without a quiet run at ${rows} rows`, async ($: any, on: any) => {

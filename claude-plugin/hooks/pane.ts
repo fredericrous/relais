@@ -221,8 +221,29 @@ function outputRows(m: RunModel, cap: number): Row[] {
   if (n <= 0) return []
   const current = m.steps.find(s => s.state === 'active') ?? m.steps[m.steps.length - 1]
   const lines = current ? stepOutput(current) : []
-  if (lines.length === 0) return live ? [{ text: '  │ waiting for output', dim: true }] : []
+  if (lines.length === 0) return live && !runningCheck(current) ? [{ text: '  │ waiting for output', dim: true }] : []
   return lines.slice(-n).map(text => ({ text: `  │ ${text}`, dim: true }))
+}
+
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+const runningCheck = (step: Step | undefined) => {
+  const check = step?.checks[step.checks.length - 1]
+  return check?.running ? check : undefined
+}
+
+// The dim row after a running check's output: a spinner frame that advances
+// with each one-second redraw, and how long ago the check last wrote.
+function activityRow(m: RunModel, now: number): Row | undefined {
+  const current = m.steps.find(s => s.state === 'active')
+  const check = runningCheck(current)
+  if (!check) return undefined
+  const frame = SPINNER_FRAMES[Math.floor(now / 1000) % SPINNER_FRAMES.length]
+  const since =
+    check.lastOutputAt === undefined
+      ? 'no output yet'
+      : `last line ${Math.max(0, Math.floor((now - check.lastOutputAt) / 1000))}s ago`
+  return { text: `  │ ${frame} running · ${since}`, dim: true }
 }
 
 // The quiet runs to draw (already of this session and past the anti-flash),
@@ -268,8 +289,9 @@ type Trim = { meta: boolean; dim: boolean }
 type Drawn = { rows: Row[]; keep: Set<Row> }
 
 // One expanded frame with `cap` output lines (-1: none); `keep` are the rows
-// that never go: the head, the output's latest line, the agent Buttons.
-function drawFrame(f: Frame & { m: RunModel }, cap: number, trim: Trim): Drawn {
+// that never go: the head, the output's latest line, the activity row under it,
+// the agent Buttons.
+function drawFrame(f: Frame & { m: RunModel; now: number }, cap: number, trim: Trim): Drawn {
   const rows: Row[] = [...f.head]
   const keep = new Set<Row>([f.head[0]])
   for (const step of f.m.steps) {
@@ -277,6 +299,9 @@ function drawFrame(f: Frame & { m: RunModel }, cap: number, trim: Trim): Drawn {
     if (step.state === 'active') {
       const out = outputRows(f.m, cap)
       rows.push(...out)
+      const activity = activityRow(f.m, f.now)
+      if (activity) rows.push(activity)
+      if (activity) keep.add(activity)
       if (out.length > 0) keep.add(out[out.length - 1])
     }
   }
@@ -324,7 +349,7 @@ function relaisRows(runs: RunModel[], room: Room, limit: number): Row[] {
   focus = [...new Set(focus)].sort((a, b) => a - b)
   const keptIndex = lastLive >= 0 ? lastLive : focus[focus.length - 1]
   const folded = runs.filter((_, i) => !focus.includes(i))
-  const frames = focus.map((i, n) => ({ m: runs[i], ...frame(runs[i], room, n === focus.length - 1), index: i }))
+  const frames = focus.map((i, n) => ({ m: runs[i], ...frame(runs[i], room, n === focus.length - 1), index: i, now: room.now }))
   const withOutput = frames.filter(f => isLive(f.m) || f.m.steps.some(s => s.checks.length > 0)).length
   const wanted = Math.max(0, ...frames.map(f => wantedLines(f.m)))
 
