@@ -8623,6 +8623,7 @@ fn dependency_enum_used() {
 }
 
 mod budgets;
+mod declared_tests;
 mod exhaustion;
 mod native;
 mod review_parts;

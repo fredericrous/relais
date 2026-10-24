@@ -9,7 +9,7 @@ use super::{
     RunOutcome, State, Step, Terminal, Verified, VerifyFailure,
 };
 use crate::acceptance::Evidence;
-use crate::contract::Review;
+use crate::contract::{Kind, Review};
 use crate::ledger::{EvidenceKind, EvidenceOrigin, IntentReview, VerificationSnapshot};
 use crate::policy::EffectiveAuthority;
 use crate::route::Recipe;
@@ -198,8 +198,14 @@ impl<'a> RunEngine<'a> {
             notes,
             ..verification_report(ctx, candidate, verified)
         };
-        let (criteria, mandatory_evidence_independence) =
-            self.settle(ctx, &report, &verified.gate_coverage, verdict)?;
+        let patch_adds_test = self.patch_adds_test(ctx, &candidate.sha)?;
+        let (criteria, mandatory_evidence_independence) = self.settle(
+            ctx,
+            &report,
+            &verified.gate_coverage,
+            patch_adds_test,
+            verdict,
+        )?;
         Ok(Receipt {
             run_id: self.run_id.as_str().to_string(),
             candidate_sha: candidate.sha.clone(),
@@ -282,6 +288,7 @@ impl<'a> RunEngine<'a> {
         ctx: &AttemptContext<'_>,
         report: &VerificationReport,
         gate_coverage: &BTreeMap<String, Result<bool, verify::AttestError>>,
+        patch_adds_test: verify::PatchAddsTest,
         verdict: Option<&verify::ReportVerdict>,
     ) -> Result<
         (
@@ -301,10 +308,50 @@ impl<'a> RunEngine<'a> {
             &self.config.contract.acceptance,
             &ctx.preflight.authority.verification_profile,
             report,
-            &signoffs,
-            gate_coverage,
+            verify::Attestations {
+                signoffs: &signoffs,
+                gate_coverage,
+            },
             self.config.contract.kind(),
+            patch_adds_test,
             verdict,
+        ))
+    }
+
+    /// Whether `candidate_sha` adds a test, measured from the run's lower
+    /// bound: the merged parent tree under `from_candidate`, else the
+    /// base. A verify-only contract and an inspection have no worker patch
+    /// to judge. A diff that cannot be read is an error, never a pass.
+    pub(super) fn patch_adds_test(
+        &self,
+        ctx: &AttemptContext<'_>,
+        candidate_sha: &str,
+    ) -> Result<verify::PatchAddsTest, RunError> {
+        if self.config.contract.is_verify() || self.config.contract.kind() == Kind::Inspect {
+            return Ok(verify::PatchAddsTest::NotJudged);
+        }
+        let lower_bound = ctx
+            .preflight
+            .candidate
+            .as_ref()
+            .map_or(ctx.preflight.base_sha.as_str(), |prepared| {
+                prepared.tree.as_str()
+            });
+        let patch = crate::workspace::derive_patch(ctx.worktree_path, lower_bound, candidate_sha)?;
+        Ok(verify::PatchAddsTest::of_patch(&patch))
+    }
+
+    /// The gaps a change's declared-test criteria carry because its patch
+    /// adds no test; empty when it adds one or none is declared.
+    pub(super) fn missing_test_gaps(
+        &self,
+        ctx: &AttemptContext<'_>,
+        candidate_sha: &str,
+    ) -> Result<Vec<String>, RunError> {
+        let adds = self.patch_adds_test(ctx, candidate_sha)?;
+        Ok(verify::missing_test_gaps(
+            &self.config.contract.acceptance,
+            adds,
         ))
     }
 
@@ -373,7 +420,13 @@ impl<'a> RunEngine<'a> {
             }
         };
         let report = verification_report(ctx, candidate, &verified);
-        let (criteria, _) = self.settle(ctx, &report, &verified.gate_coverage, Some(&verdict))?;
+        let (criteria, _) = self.settle(
+            ctx,
+            &report,
+            &verified.gate_coverage,
+            verify::PatchAddsTest::NotJudged,
+            Some(&verdict),
+        )?;
         let unmet: Vec<(usize, &verify::CriterionOutcome)> = criteria
             .iter()
             .enumerate()

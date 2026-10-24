@@ -1002,6 +1002,14 @@ impl<'a> RunEngine<'a> {
         if inspecting {
             return self.judge_inspection(ctx, progress, &candidate, verified);
         }
+        // Criteria are settled before acceptance: declared test evidence
+        // that the patch never wrote is a gap the worker repairs (SPEC §10).
+        let missing_tests = self.missing_test_gaps(ctx, &candidate.sha)?;
+        if !missing_tests.is_empty() {
+            progress.last_candidate = Some(candidate.sha.clone());
+            progress.last_failures = Some(missing_tests.clone());
+            return self.follow(ctx, progress, Observation::CriteriaUnmet(missing_tests));
+        }
         self.accept_candidate(ctx, progress, &candidate, verified, None)
     }
 

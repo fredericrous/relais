@@ -473,11 +473,22 @@ fn execute_waves(
         if !gaps.is_empty() {
             return engine.stop(&budget, Observation::VerificationGap(gaps));
         }
-        let failures: Vec<String> = checks
+        let mut failures: Vec<String> = checks
             .iter()
             .filter(|check| check.failed())
             .map(|check| check.label.clone())
             .collect();
+        // Passing checks do not show a test the assembled patch never
+        // wrote: the missing-test gap goes through the same bounded repair.
+        let mut patch_adds_test = verify::PatchAddsTest::NotJudged;
+        if failures.is_empty() {
+            patch_adds_test = verify::PatchAddsTest::of_patch(&workspace::derive_patch(
+                &integration.path,
+                root.base_sha,
+                &assembly.head,
+            )?);
+            failures = verify::missing_test_gaps(&contract.acceptance, patch_adds_test);
+        }
         if failures.is_empty() {
             let patch_path = engine.artifacts.join(INTEGRATED_PATCH);
             integration.export_patch(&assembly.head, &patch_path)?;
@@ -495,6 +506,7 @@ fn execute_waves(
                     touched_inputs,
                     patch_path,
                     gate_coverage,
+                    patch_adds_test,
                 },
                 assembly,
             );
@@ -936,6 +948,8 @@ struct Assembled {
     /// What amont answered about every gate a declared criterion names,
     /// asked against the assembled head (SPEC §10, §18).
     gate_coverage: std::collections::BTreeMap<String, Result<bool, verify::AttestError>>,
+    /// Whether the assembled patch adds a test, measured from the base.
+    patch_adds_test: verify::PatchAddsTest,
 }
 
 /// The assembled candidate passed the profile's checks: review it where
@@ -1165,9 +1179,12 @@ fn integrated_receipt(
         &engine.config.contract.acceptance,
         &root.authority.verification_profile,
         &report,
-        &signoffs,
-        &assembled.gate_coverage,
+        verify::Attestations {
+            signoffs: &signoffs,
+            gate_coverage: &assembled.gate_coverage,
+        },
         engine.config.contract.kind(),
+        assembled.patch_adds_test,
         None,
     );
     Ok(Receipt {

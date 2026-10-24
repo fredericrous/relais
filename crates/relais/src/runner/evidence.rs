@@ -231,8 +231,14 @@ impl<'a> RunEngine<'a> {
             baseline_cached: ctx.baseline.cached,
             baseline_cache_refused: ctx.baseline.cache_refused.clone(),
         };
-        let (criteria, mandatory_evidence_independence) =
-            self.settle(ctx, &report, &gate_coverage, verdict.as_ref())?;
+        let patch_adds_test = self.patch_adds_test(ctx, &candidate.sha)?;
+        let (criteria, mandatory_evidence_independence) = self.settle(
+            ctx,
+            &report,
+            &gate_coverage,
+            patch_adds_test,
+            verdict.as_ref(),
+        )?;
         let receipt = Receipt {
             run_id: self.run_id.as_str().to_string(),
             candidate_sha: candidate.sha.clone(),
