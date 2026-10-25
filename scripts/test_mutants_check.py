@@ -170,9 +170,23 @@ class Gate(unittest.TestCase):
         self.assertIn("const LIMIT", "\n".join(report))
 
     def test_helper_entry_covers_its_item(self):
-        manifest = f"helper\t{FILE}\tLIMIT\n"
-        code, _, _ = gate(diff_removing(line_of("const LIMIT: usize = 3;")), manifest)
+        manifest = f"helper\t{FILE}\tLIMIT\ntest\trelais\ttests::keeps\t{FILE}\n"
+        code, _, affected = gate(diff_removing(line_of("const LIMIT: usize = 3;")), manifest)
         self.assertEqual(code, 0)
+        self.assertIn(("relais", "tests::keeps"), affected)
+
+    def test_a_helper_entry_without_any_test_entry_is_refused(self):
+        # Nothing would run on base: the change to LIMIT would go unchecked.
+        code, report, _ = gate(diff_removing(line_of("const LIMIT: usize = 3;")), f"helper\t{FILE}\tLIMIT\n")
+        self.assertEqual(code, 2)
+        self.assertIn("needs the tests that use it", "\n".join(report))
+
+    def test_a_test_entry_must_name_its_fn_by_module_path(self):
+        # `keeps` exists in FILE, but as tests::keeps, not other::keeps.
+        base = {("relais", "tests::keeps"), ("relais", "tests::goes"), ("relais", "other::keeps")}
+        code, report, _ = gate(diff_removing(line_of(KEPT_ASSERTION)), f"test\trelais\tother::keeps\t{FILE}\n", base=base)
+        self.assertEqual(code, 2)
+        self.assertIn("defines no test fn named other::keeps", "\n".join(report))
 
     def test_addition_only_diff_with_empty_manifest_passes(self):
         diff = f"--- a/{FILE}\n+++ b/{FILE}\n@@ -3,0 +4,2 @@\n+fn new() {{}}\n+\n"
@@ -229,6 +243,19 @@ class Reconcile(unittest.TestCase):
 
     def test_timeout_is_2(self):
         self.assertEqual(self.verdict(["a", "b"], self.outdir(caught=["a"], timeout=["b"]))[0], 2)
+
+    def test_a_mutant_in_two_outcome_files_is_2(self):
+        code, report = self.verdict(["a"], self.outdir(caught=["a"], missed=["a"]))
+        self.assertEqual(code, 2)
+        self.assertIn("    a", report)
+
+    def test_step1_timeout_is_not_dropped(self):
+        # A hang on base is a detection: the mutant is at risk.
+        listed = ["f.rs:1:1: d", "f.rs:2:1: e"]
+        code, _, rows, names = mc.step1(listed, self.outdir(caught=["f.rs:1:1: d"], timeout=["f.rs:2:1: e"]), listed)
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(names), sorted(listed))
+        self.assertEqual(len(rows), 2)
 
     def test_caught_plus_unviable_is_2(self):
         self.assertEqual(self.verdict(["a", "b"], self.outdir(caught=["a"], unviable=["b"]))[0], 2)

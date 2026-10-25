@@ -96,7 +96,8 @@ list_tests() { # dir target-dir
             echo "mutants-check: cargo test -- --list failed for $pkg in $1" >&2
             return 2
         fi
-        printf '%s\n' "$listing" | sed -n "s/: test\$//p" | sed "s/^/$pkg\t/"
+        # awk, not sed: BSD sed writes `\t` as a literal t.
+        printf '%s\n' "$listing" | awk -v pkg="$pkg" 'sub(/: test$/, "") { print pkg "\t" $0 }'
     done | sort -u
 }
 

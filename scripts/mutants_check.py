@@ -306,6 +306,17 @@ def module_path(path: str) -> Optional[List[str]]:
     return rest
 
 
+def fns_of(items: List["Item"]) -> List[Tuple[List[str], "Item"]]:
+    """Each fn item with the names of the inline modules around it,
+    outermost first."""
+    ordered = sorted(items, key=lambda i: i.start)
+    return [
+        ([m.name for m in ordered if m.kind == "mod" and m.start <= fn.start and fn.end <= m.end], fn)
+        for fn in ordered
+        if fn.kind == "fn"
+    ]
+
+
 def names_this_fn(test_name: str, path: str, mods: List[str], fn: str) -> bool:
     """Whether `test_name` (as `cargo test -- --list` prints it) is exactly
     the test fn `fn` that `path` defines inside the inline modules `mods`
@@ -341,9 +352,14 @@ def validate_manifest(
         items = sources.items(entry.file)
         if items is None:
             raise UsageError(f"{where}: {entry.file} does not exist on base")
-        wanted = last_segment(entry.name)
-        if not any(i.kind == "fn" and i.name == wanted for i in items):
-            raise UsageError(f"{where}: no fn {wanted} in {entry.file} on base")
+        if not any(names_this_fn(entry.name, entry.file, mods, fn.name) for mods, fn in fns_of(items)):
+            raise UsageError(f"{where}: {entry.file} defines no test fn named {entry.name} on base")
+    if helpers and not tests:
+        # A helper's change is checked through the tests that use it: with
+        # none listed, no test would run on base and nothing would be checked.
+        raise UsageError(
+            f"manifest line {helpers[0].number}: a helper entry needs the tests that use it as `test` entries"
+        )
     for entry in helpers:
         where = f"manifest line {entry.number}"
         items = sources.items(entry.file)
@@ -402,24 +418,18 @@ def lost_coverage(
     sources: SourceCache,
 ) -> List[str]:
     """One message per removed base line no affected test or helper covers."""
-    manifest_tests = {(t.file, last_segment(t.name)) for t in tests}
+    # `deleted_names` holds the manifest's tests too (affected = deleted or
+    # listed); each is matched to a fn by its exact module path.
     helper_set = {(h.file, h.item) for h in helpers}
     problems: List[str] = []
     for path, line in removed:
         items = sources.items(path)
         enclosing = [i for i in (items or []) if i.start <= line <= i.end]
+        mods_of = {fn: mods for mods, fn in fns_of(items or [])}
 
         def covers(item: Item) -> bool:
-            if item.kind == "fn":
-                mods = [
-                    i.name
-                    for i in sorted(items or [], key=lambda i: i.start)
-                    if i.kind == "mod" and i.start <= item.start and item.end <= i.end
-                ]
-                if (path, item.name) in manifest_tests or any(
-                    names_this_fn(n, path, mods, item.name) for n in deleted_names
-                ):
-                    return True
+            if item in mods_of and any(names_this_fn(n, path, mods_of[item], item.name) for n in deleted_names):
+                return True
             return any((path, alias) in helper_set for alias in item.aliases)
 
         if any(covers(i) for i in enclosing):
@@ -559,8 +569,11 @@ def step1(requested: List[str], outdir: str, listed: List[str]) -> Tuple[int, Li
         report += _annotate("absent", incomplete)
         return 2, report, [], []
     index = index_listed(listed)
-    rows = [index[n] for n in outcomes.caught if n in index]
-    names = [n for n in outcomes.caught if n in index]
+    # A mutant that makes the affected tests hang is one they detect: it is
+    # at risk like a caught one, and the remaining suite must catch it too.
+    detected = outcomes.caught + outcomes.timeout
+    rows = [index[n] for n in detected if n in index]
+    names = [n for n in detected if n in index]
     return 0, report, rows, names
 
 
