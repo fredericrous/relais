@@ -76,6 +76,7 @@ impl<'a> RunEngine<'a> {
                 patch_path: candidate.latest_patch.clone(),
                 routed_by: preflight.decision.routed_by,
                 covering: preflight.decision.covering.clone(),
+                base_sha: &preflight.base_sha,
             };
             let review = if in_parts {
                 self.review_candidate_in_parts(&request, &mut progress.spend)
@@ -237,6 +238,7 @@ impl<'a> RunEngine<'a> {
             review,
             ladder: verify::LadderRecord::Single(preflight.decision.ladder.rungs().to_vec()),
             efforts_used: self.config.ledger.efforts_used(&self.run_id)?,
+            candidates: self.candidates_record(&candidate.sha),
         })
     }
 
@@ -386,6 +388,7 @@ impl<'a> RunEngine<'a> {
             patch_path: candidate.latest_patch.clone(),
             routed_by: preflight.decision.routed_by,
             covering: preflight.decision.covering.clone(),
+            base_sha: &preflight.base_sha,
         };
         // Not fatal: without the listing the reviewer works as it did before,
         // and the prompt says so.

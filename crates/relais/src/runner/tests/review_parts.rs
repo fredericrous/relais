@@ -20,7 +20,7 @@ use super::*;
 
 /// What a reviewer saw of one part.
 #[derive(Debug, Clone)]
-struct Seen {
+pub(super) struct Seen {
     label: String,
     patch: Vec<u8>,
 }
@@ -29,8 +29,8 @@ struct Seen {
 /// `src/main.rs`, and whose reviewer records the part it is asked about,
 /// answers `FINDINGS: none` except at `findings_at`, and is refused at
 /// `refused_at`. Both are 1-based part numbers.
-struct Parts {
-    inner: MockBackend,
+pub(super) struct Parts {
+    pub(super) inner: MockBackend,
     refused_at: Option<u32>,
 }
 
@@ -57,7 +57,7 @@ impl Backend for Parts {
     }
 }
 
-fn parts_backend(
+pub(super) fn parts_backend(
     files: usize,
     lines: usize,
     findings_at: Option<u32>,
@@ -112,23 +112,27 @@ fn parts_backend(
     (Parts { inner, refused_at }, seen)
 }
 
-/// A first run that stops at the review: over budget when its patch is
-/// large, unavailable when its reviewer is refused.
-fn stopped_run(fixture: &Fixture, files: usize, lines: usize, refuse_review: bool) -> RunId {
+/// A first run whose reviewer is refused: it stops `needs_review`.
+pub(super) fn run_stopped_unreviewed(fixture: &Fixture, files: usize, lines: usize) -> RunId {
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
     let (backend, _) = parts_backend(files, lines, None, None);
-    if refuse_review {
-        let refusing = RefuseAll(backend);
-        let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &refusing);
-        let RunOutcome {
-            run_id,
-            terminal: Terminal::NeedsReview { .. },
-        } = outcome
-        else {
-            panic!("an unlaunched reviewer is needs_review, got {outcome:?}");
-        };
-        return run_id;
-    }
+    let refusing = RefuseAll(backend);
+    let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &refusing);
+    let RunOutcome {
+        run_id,
+        terminal: Terminal::NeedsReview { .. },
+    } = outcome
+    else {
+        panic!("an unlaunched reviewer is needs_review, got {outcome:?}");
+    };
+    run_id
+}
+
+/// A first run whose patch is too large for one review: it stops
+/// `needs_decision` on `review_over_budget`.
+pub(super) fn run_stopped_over_budget(fixture: &Fixture, files: usize, lines: usize) -> RunId {
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let (backend, _) = parts_backend(files, lines, None, None);
     let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
     let RunOutcome {
         run_id,
@@ -167,7 +171,11 @@ impl Backend for RefuseAll {
 
 /// Answer `review-parts` to the stopped run as the CLI does (plan, then one
 /// transaction), claim the intent and return the successor's contract and id.
-fn answer_review_parts(fixture: &Fixture, run: &RunId, from_state: State) -> (TaskContract, RunId) {
+pub(super) fn answer_review_parts(
+    fixture: &Fixture,
+    run: &RunId,
+    from_state: State,
+) -> (TaskContract, RunId) {
     let intent =
         successor::plan_review_parts(&fixture.ledger, run, &fixture.artifacts).expect("planned");
     assert_eq!(intent.review, Some(IntentReview::Parts));
@@ -229,7 +237,7 @@ fn manifest(fixture: &Fixture, run: &RunId) -> Vec<crate::ledger::ReviewPartRow>
 fn an_over_budget_patch_is_reviewed_in_parts_cut_at_file_boundaries_and_all_must_pass() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
-    let run = stopped_run(&fixture, 2, 2300, false);
+    let run = run_stopped_over_budget(&fixture, 2, 2300);
     let (contract, new_run) = answer_review_parts(&fixture, &run, State::NeedsDecision);
     let (backend, seen) = parts_backend(2, 2300, None, None);
 
@@ -309,7 +317,7 @@ fn an_over_budget_patch_is_reviewed_in_parts_cut_at_file_boundaries_and_all_must
 fn a_failing_part_fails_the_review_with_its_findings_and_earlier_evidence_stands() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
-    let run = stopped_run(&fixture, 3, 2300, false);
+    let run = run_stopped_over_budget(&fixture, 3, 2300);
     let (contract, new_run) = answer_review_parts(&fixture, &run, State::NeedsDecision);
     let (backend, seen) = parts_backend(3, 2300, Some(2), None);
 
@@ -342,7 +350,7 @@ fn a_failing_part_fails_the_review_with_its_findings_and_earlier_evidence_stands
 fn a_later_dispatch_failure_keeps_the_earlier_evidence_and_says_which_parts_never_ran() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
-    let run = stopped_run(&fixture, 3, 2300, false);
+    let run = run_stopped_over_budget(&fixture, 3, 2300);
     let (contract, new_run) = answer_review_parts(&fixture, &run, State::NeedsDecision);
     let (backend, seen) = parts_backend(3, 2300, None, Some(2));
 
@@ -394,7 +402,7 @@ fn a_later_dispatch_failure_keeps_the_earlier_evidence_and_says_which_parts_neve
 fn review_parts_on_an_unavailable_review_within_the_budget_reviews_it_as_one_part() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
-    let run = stopped_run(&fixture, 0, 0, true);
+    let run = run_stopped_unreviewed(&fixture, 0, 0);
     let (contract, new_run) = answer_review_parts(&fixture, &run, State::NeedsReview);
     let (backend, seen) = parts_backend(0, 0, None, None);
 
@@ -424,7 +432,7 @@ fn review_parts_on_an_unavailable_review_within_the_budget_reviews_it_as_one_par
 #[test]
 fn a_single_file_over_the_budget_is_not_planned_and_dispatches_nothing() {
     let fixture = Fixture::new();
-    let run = stopped_run(&fixture, 1, 4000, false);
+    let run = run_stopped_over_budget(&fixture, 1, 4000);
     let refused = successor::plan_review_parts(&fixture.ledger, &run, &fixture.artifacts);
     let Err(successor::PlanError::NotReviewable(why)) = refused else {
         panic!("a file over the budget is refused: {refused:?}");
@@ -579,7 +587,7 @@ fn seed_interrupted_review(fixture: &Fixture, run: &RunId, new_run: &RunId) {
 fn a_retried_part_keeps_the_answer_an_earlier_attempt_left() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
-    let run = stopped_run(&fixture, 3, 2300, false);
+    let run = run_stopped_over_budget(&fixture, 3, 2300);
     let (contract, new_run) = answer_review_parts(&fixture, &run, State::NeedsDecision);
     seed_interrupted_review(&fixture, &run, &new_run);
     let (backend, _seen) = parts_backend(3, 2300, None, None);
@@ -637,7 +645,7 @@ fn a_retried_part_keeps_the_answer_an_earlier_attempt_left() {
 fn an_interrupted_review_in_parts_resumes_skipping_the_passed_and_dispatching_the_rest() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
-    let run = stopped_run(&fixture, 3, 2300, false);
+    let run = run_stopped_over_budget(&fixture, 3, 2300);
     let (contract, new_run) = answer_review_parts(&fixture, &run, State::NeedsDecision);
     seed_interrupted_review(&fixture, &run, &new_run);
     let (backend, seen) = parts_backend(3, 2300, None, None);
@@ -676,7 +684,7 @@ fn an_interrupted_review_in_parts_resumes_skipping_the_passed_and_dispatching_th
 #[test]
 fn a_part_left_dispatched_becomes_unavailable_interrupted_and_keeps_its_dispatch() {
     let fixture = Fixture::new();
-    let run = stopped_run(&fixture, 3, 2300, false);
+    let run = run_stopped_over_budget(&fixture, 3, 2300);
     let (_, new_run) = answer_review_parts(&fixture, &run, State::NeedsDecision);
     seed_interrupted_review(&fixture, &run, &new_run);
     let sha = fixture
@@ -714,7 +722,7 @@ fn a_part_left_dispatched_becomes_unavailable_interrupted_and_keeps_its_dispatch
 fn approving_a_failed_parts_successor_seals_a_receipt_listing_every_part() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
-    let run = stopped_run(&fixture, 3, 2300, false);
+    let run = run_stopped_over_budget(&fixture, 3, 2300);
     let (contract, new_run) = answer_review_parts(&fixture, &run, State::NeedsDecision);
     let (backend, _) = parts_backend(3, 2300, None, Some(2));
     let outcome = fixture.execute_as(Some(new_run.clone()), &contract, &repo, &backend);

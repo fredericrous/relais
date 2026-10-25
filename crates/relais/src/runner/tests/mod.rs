@@ -313,6 +313,44 @@ impl Fixture {
         .expect("the fixture's id source mints identifiers")
     }
 
+    /// `execute_as` with a resolver the test supplies.
+    fn execute_as_resolving(
+        &self,
+        resolver: &dyn crate::context::DecisionResolver,
+        run_id: Option<RunId>,
+        contract: &TaskContract,
+        repo: &RepoPolicy,
+        backend: &dyn Backend,
+    ) -> RunOutcome {
+        let machine = self.machine_for(repo);
+        execute(&RunConfig {
+            workspace: crate::workspace::reuse::Workspace::Isolated,
+            repo_dir: &self.repo,
+            contract,
+            repo_policy: repo,
+            machine: &machine,
+            ledger: &self.ledger,
+            ids: &self.ids,
+            backend,
+            git: &crate::workspace::SystemGit,
+            hooks: &crate::verify::FixedInventory(None),
+            attest: &crate::verify::FixedAttest::default(),
+            artifacts_dir: self.artifacts.clone(),
+            aval_resolver: resolver,
+            predictor: None,
+            gate: None,
+            session_id: "test-session".into(),
+            heartbeat_every: Duration::from_millis(50),
+            task_override: None,
+            purpose: None,
+            run_id,
+            wire: Wire::process(),
+            design: DesignSource::Contract,
+            declarations: &crate::trust::NoHistory,
+        })
+        .expect("the fixture's id source mints identifiers")
+    }
+
     /// `execute` with a resolver the test supplies, for guidance.
     fn execute_resolving(
         &self,
@@ -7071,6 +7109,7 @@ fn guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_g
         patch_path: PathBuf::from("candidate.patch"),
         routed_by: RoutedBy::ConservativeBaseline,
         covering: None,
+        base_sha: "base",
     };
     let mut spend = RunSpend::zero();
     let outcome = engine.review_candidate(&request, &mut spend);
@@ -8680,6 +8719,7 @@ fn dependency_enum_used() {
 }
 
 mod budgets;
+mod candidates;
 mod declared_tests;
 mod exhaustion;
 mod native;

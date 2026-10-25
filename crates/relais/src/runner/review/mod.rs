@@ -9,8 +9,10 @@ use super::{
 pub use super::machine::Severity;
 pub(in crate::runner) use super::machine::REVIEW_MAX_PARTS;
 
+mod candidates;
 mod engine;
 mod parts;
+pub(in crate::runner) use candidates::CandidatesRun;
 pub(in crate::runner) use parts::write_immutable;
 mod types;
 pub(crate) use types::{ReviewOutcome, ReviewRequest};
@@ -642,23 +644,23 @@ fn decisions_gap_line(gap: &GuidanceGap) -> String {
     )
 }
 
-/// The reviewer's constraints gap and decisions gap as one gap that keeps
-/// both labels: the decisions gap rides in the detail under its own
-/// description, and the cause follows `merge_gaps`.
+/// The reviewer's constraints, decisions and candidates gaps as one gap that
+/// keeps every label: the first gap present leads, each later one rides in
+/// the detail under its own description, and the cause follows `merge_gaps`.
 pub(in crate::runner) fn merge_reviewer_gaps(
     constraints_gap: Option<GuidanceGap>,
     decisions_gap: Option<GuidanceGap>,
+    candidates_gap: Option<GuidanceGap>,
 ) -> Option<GuidanceGap> {
-    match (constraints_gap, decisions_gap) {
-        (Some(constraints), Some(decisions)) => {
-            let labelled = GuidanceGap {
-                detail: decisions.describe(),
-                ..decisions
-            };
-            merge_gaps([Some(constraints), Some(labelled)])
-        }
-        (constraints, decisions) => constraints.or(decisions),
-    }
+    let mut present = [constraints_gap, decisions_gap, candidates_gap]
+        .into_iter()
+        .flatten();
+    let leading = present.next()?;
+    let labelled = present.map(|gap| GuidanceGap {
+        detail: gap.describe(),
+        ..gap
+    });
+    merge_gaps(std::iter::once(leading).chain(labelled).map(Some))
 }
 
 /// One gap for several: the details joined, and a cause that covers every

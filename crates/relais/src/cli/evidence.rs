@@ -280,6 +280,7 @@ mod tests {
             review: relais::verify::ReviewRecord::NoReview,
             ladder: relais::verify::LadderRecord::NotRecorded,
             efforts_used: Vec::new(),
+            candidates: relais::verify::CandidatesRecord::NotRecorded,
         }
     }
 

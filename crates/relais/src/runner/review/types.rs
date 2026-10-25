@@ -78,6 +78,9 @@ pub(crate) struct ReviewRequest<'r> {
     /// The recipe that covered the candidate's own dispatch, if any —
     /// carried the same way as `routed_by`, for the same reason.
     pub(crate) covering: Option<Recipe>,
+    /// The run's base: adr-lint's candidates are the lines between it and
+    /// `candidate_sha`.
+    pub(crate) base_sha: &'r str,
 }
 
 impl ReviewRequest<'_> {
@@ -93,6 +96,7 @@ impl ReviewRequest<'_> {
             patch_path,
             routed_by: self.routed_by,
             covering: self.covering.clone(),
+            base_sha: self.base_sha,
         }
     }
 }

@@ -42,6 +42,8 @@ pub enum GuidanceSource {
     /// `aval relevant` for the paths the candidate patch changes: the
     /// decisions the reviewer is given.
     Decisions,
+    /// `adr-lint candidates`: the lines the reviewer is asked to rule on.
+    Candidates,
 }
 
 /// Guidance that is missing, and why. Its own type: a guidance failure is
@@ -101,6 +103,7 @@ impl GuidanceGap {
             GuidanceSource::Relevant => "relevant missing",
             GuidanceSource::Reviewer => "reviewer constraints partial",
             GuidanceSource::Decisions => "reviewer decisions missing",
+            GuidanceSource::Candidates => "candidates missing",
         };
         format!("{what} ({})", self.detail)
     }
@@ -631,6 +634,19 @@ pub fn run_aval(
     timeout: Duration,
     cancel: Option<&AtomicBool>,
 ) -> Result<String, GuidanceGap> {
+    run_tool("aval", program, args, dir, source, timeout, cancel)
+}
+
+/// [`run_aval`] for any guidance tool: `tool` is the name its gaps carry.
+pub fn run_tool(
+    tool: &str,
+    program: &str,
+    args: &[String],
+    dir: &Path,
+    source: GuidanceSource,
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> Result<String, GuidanceGap> {
     let mut command = std::process::Command::new(program);
     command.args(args).current_dir(dir);
     match crate::procs::run_with_timeout(command, timeout, None, cancel) {
@@ -639,20 +655,20 @@ pub fn run_aval(
             crate::procs::Ended::Exited(code) => Err(GuidanceGap::new(
                 source,
                 GapCause::Exited(code),
-                format!("aval exit {code}"),
+                format!("{tool} exit {code}"),
             )),
             ended @ (crate::procs::Ended::TimedOut
             | crate::procs::Ended::Cancelled
             | crate::procs::Ended::Signalled) => Err(GuidanceGap::new(
                 source,
                 GapCause::NoAnswer,
-                format!("aval did not answer: {}", ended.describe()),
+                format!("{tool} did not answer: {}", ended.describe()),
             )),
         },
         Err(e) => Err(GuidanceGap::new(
             source,
             GapCause::NotLaunched,
-            format!("aval could not be launched: {e}"),
+            format!("{tool} could not be launched: {e}"),
         )),
     }
 }
