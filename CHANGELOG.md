@@ -8,6 +8,14 @@ missing here.
 
 ## Unreleased
 
+## v0.33.0
+
+- The reviewer now also gets adr-lint's candidate lines for the candidate commit: lines a decided code rule may cover that a linter cannot decide alone (decisions ADR-0044). relais runs `adr-lint candidates --base <run base> --head <candidate> --json --max 40` once per candidate commit, and each review part lists only the candidates in its own files.
+  - The reviewer rules on each one in a `Candidates:` block: `violation` with a finding, or `fine` with a clause quoted from the rule.
+  - The receipt has a new `candidates` field, which is `not_recorded`, `unavailable` or `counted` (listed, violation, fine, undisposed, overflow). Each ruling is also written as an `adr-lint.ruling/1` line in the run's `rulings.jsonl`.
+  - This needs adr-lint 0.4.0 or later (`--head`). Without it, or when it fails, the receipt says `candidates missing (…)` and the review runs as before. `RELAIS_ADR_LINT` names another adr-lint program.
+- relais's own tests are faster and stricter: the integration tests share one binary, the fork tests no longer wait out the quiet window, and the mutants check fails closed.
+
 ## v0.32.0
 
 The relais pane draws one activity row under a running check's output: a spinner that turns on each redraw, and how long ago the last line came (or that none came yet). A check that is still writing and one that stalled no longer look the same (#300).
