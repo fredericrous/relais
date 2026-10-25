@@ -140,6 +140,29 @@ Two optional fields describe the work itself, both `#[serde(default, skip_serial
 - `task_type` is what kind of work the task is, one of `report`, `mechanical`, `pattern`, `review-fix`, `feature`, `refactor`, `ui` and `infra` (the closed `TaskType` enum, taxonomy version `TASK_TYPE_TAXONOMY_VERSION` = 1). The orchestrator declares it when it writes the contract; relais never infers it from prose at routing time and links no model (§16). Any other value is refused at parse time and the error names the eight; `unclassified` exists only for history the classifier could not place and is refused in a contract. The type is stored with the task at creation as `tasks.task_type` with `task_type_source = declared`, `tasks.taxonomy_version` and (ledger step v29) `trials.design_sha256`. A declared type replaces a classified one, and an import never replaces a declared one. A package run (§19) inherits its root's type.
 - `design` is a repo-relative path to a markdown file (at most 16 KiB) holding the program design the worker should build to: the call-stack tree, the file-tree diff and the key types and signatures. relais reads it at preflight from `base_sha` (`git show`, never the working tree), refuses the contract (`design_unreadable`, before any worker is paid for) when the file is missing, over 16 KiB or not UTF-8, and refuses it at parse time when the path is not clean (absolute, `.` or `..` segments) or lies inside the write scope. The text goes verbatim into the worker's context package (§7), is counted in `package_bytes` against `budget_bytes`, and its SHA-256 is recorded as `ContextManifest.design_sha256`; the contract hash covers only the path. The semantic reviewer is handed the same design. `relais plan` makes the same refusal.
 
+A declared acceptance criterion may name a **holdout** as its evidence (ADR-0045): `{"statement": "...", "evidence": {"kind": "holdout", "name": "json-escaping"}}`. A holdout is an acceptance test that lives outside the repository, in a store the person controls. It is independent evidence (written apart from the change), and a contract without one hashes exactly as before. The declaration is in machine.toml only, never in the repository's policy or in any authority hash, and no flag or environment variable sets it:
+
+```toml
+[holdouts]
+store = "git+ssh://git@git.daddyshome.fr/fredericrous/holdouts.git"
+ref = "main"
+[holdouts.amont.json-escaping]        # [holdouts.<repo directory name>.<holdout name>]
+path = "amont/json-escaping.rs"       # inside the store
+overlay = "crates/amont/tests/holdout_json_escaping.rs"   # repo-relative, clean
+config = "amont/nextest.toml"         # optional runner config inside the store
+command = { argv = ["cargo", "nextest", "run", "-p", "amont", "--test", "holdout_json_escaping"], junit = "target/nextest/default/junit.xml" }
+```
+
+A machine.toml with no `[holdouts]` parses as before; an unknown key inside a holdout declaration is refused. `relais run` and `relais plan` resolve every holdout criterion at preflight, before any worker is paid for, and refuse the contract with one of five codes, checked in this order for each holdout:
+
+- `holdout_unknown`: no `[holdouts.<repo>.<name>]` declaration exists; the detail lists the declared names.
+- `holdout_no_junit`: the declaration's `command` names no `junit` report, so the holdout could not settle through a parsed report.
+- `holdout_bad_overlay`: `overlay` is not a clean repo-relative path (absolute, or a `.`/`..` segment).
+- `holdout_overlay_exists`: the overlay path already exists at `base_sha`.
+- `holdout_unreadable`: the store does not resolve `ref` to exactly one commit. relais runs `git ls-remote <store> <ref>` with `GIT_TERMINAL_PROMPT=0`, ssh in `BatchMode`, stdin from `/dev/null` and a 30 s bound; the detail gives the store, the ref, git's last stderr line and the command to retry.
+
+The overlay may lie inside `write_scope`. A resolved holdout is recorded in the context manifest as `holdouts: [{name, sha, digest}]` (the digest is the SHA-256 of a canonical JSON of the repo, name, store, commit, path, overlay, command argv, junit path and config), never the store URL, path or overlay. The worker's prompt carries the criterion's statement only. This relais does not fetch or run a holdout: a mandatory holdout criterion is an unsettled gap at verification ("holdout `<name>` is not run by this relais (phase 3)"), so the run is not accepted; an optional one is simply unmet.
+
 A third kind, `verify`, applies an existing candidate and runs no worker, repair or escalation. It needs a `write_scope` (what the candidate may change) and `candidate: { "run": "<run>" }`, or `{ "run": "<run>", "index": <attempt> }` (the latest attempt when `index` is absent); `candidate` is refused on any other kind, and a verify cannot be decomposed. It is optional on the wire and absent from every other contract's canonical form, so no existing contract hash moves. A verify is judged as a change (patch, scope, checks, review); the receipt, `relais report` and learning tell it apart. A `kind: change` can instead start from a candidate with `from_candidate: { "run": ..., "index": ... }` (refused on any other kind, and with a decomposition); it is resolved exactly as a verify's `candidate` is, and §8 says what a conflict does. Relais resolves `candidate` once, in preflight, to a `ResolvedCandidate { source_run, index, candidate_commit, patch_sha256, source_base_sha, target_base_sha }` (§8), stored in the ledger table `candidate_inputs` and repeated on the receipt as `candidate`.
 
 Worker-supplied risk hints may increase caution but cannot lower repository risk floors. Acceptance text is checked for contradictions and missing prerequisites during preflight; unresolved requirements return `needs_decision`.

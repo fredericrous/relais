@@ -69,6 +69,10 @@ pub enum Evidence {
     /// own — relais never reads `refs/notes/amont-attest`, parses an
     /// attestation format, or verifies a signature itself.
     AmontGate { gate: String },
+    /// A holdout (ADR-0045): a test kept outside the candidate's
+    /// repository, declared in machine.toml `[holdouts]`. Resolved at
+    /// preflight; this relais does not run it, so it stays a gap.
+    Holdout { name: String },
 }
 
 /// Who wrote the test that is a criterion's evidence.
@@ -104,6 +108,7 @@ pub fn independent(evidence: &Evidence) -> bool {
         Evidence::LlmReview => false,
         Evidence::HumanSignOff => true,
         Evidence::AmontGate { .. } => true,
+        Evidence::Holdout { .. } => true,
     }
 }
 
@@ -312,6 +317,26 @@ mod tests {
             Some(&Evidence::AmontGate {
                 gate: "pre-push-cargo-test".into()
             })
+        );
+    }
+
+    #[test]
+    fn a_holdout_criterion_parses_and_round_trips() {
+        let json = serde_json::json!({
+            "statement": "the escaping holdout passes",
+            "evidence": {"kind": "holdout", "name": "x"}
+        });
+        let entry: AcceptanceEntry = serde_json::from_value(json.clone()).expect("parses");
+        assert_eq!(
+            entry.evidence(),
+            Some(&Evidence::Holdout { name: "x".into() })
+        );
+        assert!(independent(&Evidence::Holdout { name: "x".into() }));
+        let back = serde_json::to_value(&entry).expect("serializes");
+        assert_eq!(back["evidence"], json["evidence"]);
+        assert_eq!(
+            serde_json::from_value::<AcceptanceEntry>(back).expect("round trip"),
+            entry
         );
     }
 

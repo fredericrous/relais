@@ -730,6 +730,11 @@ pub struct ContextManifest {
     /// SHA-256 of `design`; the contract hash covers only the path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design_sha256: Option<String>,
+    /// The holdouts the contract's criteria name, resolved at preflight
+    /// (ADR-0045): name, store commit and digest, never the store, path
+    /// or overlay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holdouts: Vec<crate::holdout::HoldoutRecord>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -786,6 +791,8 @@ pub struct ContextInputs<'a> {
     /// The directory name of the source repository's root (never a task
     /// worktree's directory), as aval's corpus names the repository.
     pub repo_name: Option<String>,
+    /// Holdouts resolved at preflight; recorded in the manifest.
+    pub holdouts: Vec<crate::holdout::HoldoutRecord>,
 }
 
 /// Assemble the context manifest. Fails on contradiction (blocked), on
@@ -805,6 +812,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         resolver,
         design,
         repo_name,
+        holdouts,
     } = inputs;
 
     let manifest_aval_version = tool_versions.aval.clone();
@@ -934,6 +942,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         guidance,
         design_sha256: design.as_ref().map(|d| sha256_hex(d.text.as_bytes())),
         design: design.map(|d| d.text),
+        holdouts,
     };
 
     if manifest.package_bytes > manifest.budget_bytes {
@@ -1068,6 +1077,7 @@ mod tests {
             resolver,
             design: None,
             repo_name: Some("relais".into()),
+            holdouts: Vec::new(),
         }
     }
 

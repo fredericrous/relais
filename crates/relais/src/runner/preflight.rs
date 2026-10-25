@@ -544,6 +544,21 @@ impl<'a> RunEngine<'a> {
                 }
             }
         };
+        // Holdout criteria are resolved here too: an undeclared, unusable
+        // or unreachable holdout refuses the contract before any worker is
+        // paid for. Only name, commit and digest are kept.
+        let holdouts = match crate::holdout::resolve_all(
+            &self.config.contract.acceptance,
+            &self.config.machine.holdouts,
+            &crate::repo::main_checkout_name(self.config.repo_dir).unwrap_or_default(),
+            self.config.git,
+            self.config.repo_dir,
+            base_sha,
+            &crate::holdout::machine_toml_label(),
+        ) {
+            Ok(resolved) => resolved.iter().map(|holdout| holdout.record()).collect(),
+            Err(block) => return Ok(Phase::Ended(self.fail_preflight(block.code, block.detail)?)),
+        };
         let (turn_ceiling, warning) = harness_reading(
             capabilities,
             capabilities
@@ -573,6 +588,7 @@ impl<'a> RunEngine<'a> {
             resolver: self.config.aval_resolver,
             design,
             repo_name: crate::repo::main_checkout_name(self.config.repo_dir),
+            holdouts,
         });
         match assembled {
             Ok(manifest) => {

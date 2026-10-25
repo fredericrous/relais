@@ -529,6 +529,7 @@ fn record_answer(
                             format!("a test ({})", authorship_label(*authorship)),
                         Some(Evidence::LlmReview) => "an LLM review".to_string(),
                         Some(Evidence::AmontGate { gate }) => format!("amont gate `{gate}`"),
+                        Some(Evidence::Holdout { name }) => format!("holdout `{name}`"),
                         Some(Evidence::HumanSignOff) => unreachable!("guarded above"),
                         None => "the verification profile as a whole".to_string(),
                     }

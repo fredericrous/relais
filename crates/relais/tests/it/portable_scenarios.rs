@@ -1032,6 +1032,65 @@ fn plan_prints_the_session_line_to_stderr_not_stdout() {
     );
 }
 
+// ADR-0045: `plan` refuses a holdout criterion exactly as `run` does, by
+// the code that names the problem.
+#[test]
+fn plan_refuses_each_unusable_holdout_by_its_own_code() {
+    let world = World::new("plan-holdouts");
+    world.write_policy();
+    let repo_name = world
+        .repo
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("repo dir name")
+        .to_string();
+    let task = world.root.join("holdout-task.json");
+    std::fs::write(
+        &task,
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "change",
+            "objective": "Remove the obsolete entry point",
+            "base_ref": "HEAD",
+            "write_scope": ["src/**"],
+            "acceptance": [{
+                "statement": "the escaping holdout passes",
+                "evidence": {"kind": "holdout", "name": "escaping"}
+            }],
+            "verification_profile": "default",
+            "review": "off",
+        })
+        .to_string(),
+    )
+    .expect("task");
+    let missing_store = format!("file://{}/no-such-store", world.root.display());
+    let declaration = |junit: &str, overlay: &str| {
+        format!(
+            "schema_version = 1\n\n[holdouts]\nstore = '{missing_store}'\n\n\
+             [holdouts.{repo_name}.escaping]\npath = \"p.rs\"\noverlay = \"{overlay}\"\n\
+             command = {{ argv = [\"true\"]{junit} }}\n"
+        )
+    };
+    let junit = ", junit = \"j.xml\"";
+    let cases = [
+        ("schema_version = 1\n".to_string(), "holdout_unknown"),
+        (declaration("", "t/h.rs"), "holdout_no_junit"),
+        (declaration(junit, "../h.rs"), "holdout_bad_overlay"),
+        (declaration(junit, "relais.toml"), "holdout_overlay_exists"),
+        (declaration(junit, "t/h.rs"), "holdout_unreadable"),
+    ];
+    for (settings, code) in cases {
+        std::fs::write(world.config.join("machine.toml"), settings).expect("settings");
+        let plan = world.relais(&["plan", "--task", task.to_str().unwrap()]);
+        let stderr = text(&plan.stderr);
+        assert_ne!(plan.status.code(), Some(0), "{code}: {stderr}");
+        assert!(
+            stderr.contains(&format!("blocked ({code})")),
+            "{code}: {stderr}"
+        );
+    }
+}
+
 // C3: `coordinator status --json` is a document in every state,
 // including the one where nothing answers — never an English sentence a
 // parser would choke on, and never a silent zero.

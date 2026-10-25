@@ -823,6 +823,9 @@ pub(super) fn unmet_evidence(evidence: Option<&Evidence>) -> String {
             name: Some(test), ..
         }) => format!("test `{test}` did not pass"),
         Some(Evidence::AmontGate { gate }) => format!("amont gate `{gate}` is not covered"),
+        Some(Evidence::Holdout { name }) => {
+            format!("holdout `{name}` is not run by this relais (phase 3)")
+        }
         Some(Evidence::Test { name: None, .. } | Evidence::LlmReview | Evidence::HumanSignOff)
         | None => "its evidence is not met".into(),
     }
