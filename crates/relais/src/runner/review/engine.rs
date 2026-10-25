@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::backend::{LaunchResult, LaunchSpec};
+use crate::context::candidates::parse_rulings;
 use crate::context::GuidanceGap;
 use crate::ledger::{EvidenceKind, Ledger, UsageEvent};
 use crate::money::MicroUsd;
@@ -13,6 +14,10 @@ use crate::route::RungIndex;
 use crate::verify;
 use crate::workspace;
 
+use super::candidates::{
+    append_rulings, candidates_block, candidates_unavailable_line, utc_seconds, CandidatesRun,
+    PartCandidates, RulingContext,
+};
 use super::{
     merge_reviewer_gaps, patch_section, report_review_prompt, review_verdict, reviewer_decisions,
     reviewer_tier, stage_patch, ReviewOutcome, ReviewPurpose, ReviewRequest, ReviewSeat,
@@ -301,7 +306,9 @@ impl<'a> RunEngine<'a> {
                 )
             }
         };
-        let (prompt, reviewer_gap) = self.review_prompt(request, &review_dir, &staged, part);
+        let part_candidates = self.part_candidates(request, &staged.files);
+        let (prompt, reviewer_gap) =
+            self.review_prompt(request, &review_dir, &staged, part, &part_candidates);
         if let Some(gap) = &reviewer_gap {
             self.emit_guidance_gap(gap);
         }
@@ -349,6 +356,9 @@ impl<'a> RunEngine<'a> {
                 )
             };
         }
+        if let Ok(listed) = &part_candidates {
+            self.record_rulings(request, listed, &text, &dispatch_id);
+        }
         let outcome = review_verdict(&text);
         let cause =
             matches!(outcome, ReviewOutcome::Unavailable(_)).then_some(UnavailableCause::NotRead);
@@ -361,6 +371,86 @@ impl<'a> RunEngine<'a> {
         }
     }
 
+    /// The candidates this dispatch lists: adr-lint is asked once per
+    /// candidate commit, and each dispatch gets those on the files of the
+    /// patch it reads. A gap is the answer when adr-lint gave none.
+    fn part_candidates(
+        &mut self,
+        request: &ReviewRequest<'_>,
+        files: &[String],
+    ) -> Result<PartCandidates, GuidanceGap> {
+        let sha = request.candidate_sha;
+        let mut run = match self.candidates_run.take() {
+            Some(run) if run.is_for(sha) => run,
+            _ => CandidatesRun::new(
+                sha,
+                self.config
+                    .aval_resolver
+                    .candidates_for(request.base_sha, sha),
+            ),
+        };
+        let part = run
+            .fetched()
+            .as_ref()
+            .map(|list| PartCandidates::of(list, files))
+            .map_err(Clone::clone);
+        if let Ok(part) = &part {
+            run.list(&part.items);
+        }
+        self.candidates_run = Some(run);
+        part
+    }
+
+    /// Read the reviewer's rulings out of its answer, count them, and append
+    /// one `adr-lint.ruling/1` line for each. A file that cannot be written
+    /// is an environment warning, never a failed run.
+    fn record_rulings(
+        &mut self,
+        request: &ReviewRequest<'_>,
+        listed: &PartCandidates,
+        answer: &str,
+        dispatch_id: &str,
+    ) {
+        if listed.items.is_empty() {
+            return;
+        }
+        let ids: Vec<&str> = listed.items.iter().map(|item| item.id.as_str()).collect();
+        let rulings = parse_rulings(answer, &ids);
+        if let Some(run) = self.candidates_run.as_mut() {
+            run.rule(&rulings);
+        }
+        if rulings.is_empty() {
+            return;
+        }
+        let written = std::fs::read(&request.patch_path).and_then(|patch| {
+            let at = utc_seconds(&self.config.ledger.now())
+                .ok_or_else(|| std::io::Error::other("the ledger clock is not RFC 3339"))?;
+            let repo = self
+                .config
+                .repo_dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            append_rulings(
+                &self.artifacts,
+                &RulingContext {
+                    review: dispatch_id,
+                    repo: &repo,
+                    patch_bytes: &patch,
+                    at: &at,
+                },
+                &listed.items,
+                &rulings,
+            )
+        });
+        if let Err(e) = written {
+            self.events.emit(Event::EnvironmentWarning {
+                what: "rulings_not_written".to_string(),
+                detail: format!("the candidate rulings could not be written: {e}"),
+            });
+        }
+    }
+
     /// What the reviewer is asked. Every piece of project text — the
     /// objective, the criteria, the constraints, the changed paths — is
     /// quoted as data, never as instructions (SPEC §16).
@@ -370,6 +460,7 @@ impl<'a> RunEngine<'a> {
         review_dir: &Path,
         staged: &StagedPatch,
         part: Option<PartLabel>,
+        candidates: &Result<PartCandidates, GuidanceGap>,
     ) -> (String, Option<GuidanceGap>) {
         let mut prompt = String::from(
             "You are a semantic reviewer. You cannot edit or waive checks; you report findings only.\n\
@@ -420,7 +511,15 @@ impl<'a> RunEngine<'a> {
             guidance_text.len(),
         );
         prompt.push_str(&decisions_text);
-        let reviewer_gap = merge_reviewer_gaps(reviewer_gap, decisions_gap);
+        match candidates {
+            Ok(listed) => prompt.push_str(&candidates_block(listed)),
+            Err(gap) => prompt.push_str(&candidates_unavailable_line(gap)),
+        }
+        let reviewer_gap = merge_reviewer_gaps(
+            reviewer_gap,
+            decisions_gap,
+            candidates.as_ref().err().cloned(),
+        );
         match self.config.ledger.intent_of_run(&self.run_id) {
             Ok(Some(intent)) => prompt.push_str(&super::widened_scope_block(&intent.scope_delta)),
             Ok(None) => {}

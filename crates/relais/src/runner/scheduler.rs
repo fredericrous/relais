@@ -1063,6 +1063,7 @@ fn accept_integrated(
                 patch_path: assembled.patch_path.clone(),
                 routed_by: root.decision.routed_by,
                 covering: root.decision.covering.clone(),
+                base_sha: root.base_sha,
             },
             &mut spend,
         );
@@ -1219,6 +1220,7 @@ fn integrated_receipt(
         review,
         ladder: verify::LadderRecord::PerPackage(assembly.ladders.clone()),
         efforts_used: assembly.efforts_used.clone(),
+        candidates: engine.candidates_record(&assembly.head),
     })
 }
 

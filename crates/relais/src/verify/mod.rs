@@ -2862,6 +2862,38 @@ pub struct Receipt {
     /// record.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub efforts_used: Vec<String>,
+    /// What became of adr-lint's candidate lines at the review (SPEC §7).
+    /// `NotRecorded` on a receipt written before this existed, which still
+    /// parses, and on a run whose candidates were never asked for.
+    #[serde(default, skip_serializing_if = "CandidatesRecord::is_not_recorded")]
+    pub candidates: CandidatesRecord,
+}
+
+/// What a receipt records about the candidate lines the reviewer was asked
+/// to rule on, summed across the parts of a review in parts.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidatesRecord {
+    #[default]
+    NotRecorded,
+    /// adr-lint's candidates could not be had; the review ran without them.
+    Unavailable { detail: String },
+    /// `listed` were put to the reviewer; it ruled `violation` on some and
+    /// `fine` on others, and `undisposed` got no ruling. `overflow` is what
+    /// adr-lint left out beyond its cap, across rules.
+    Counted {
+        listed: u64,
+        violation: u64,
+        fine: u64,
+        undisposed: u64,
+        overflow: u64,
+    },
+}
+
+impl CandidatesRecord {
+    fn is_not_recorded(&self) -> bool {
+        matches!(self, Self::NotRecorded)
+    }
 }
 
 /// What a receipt records about the ladder that ran. A decomposed run's
@@ -5969,6 +6001,7 @@ mod tests {
             review: ReviewRecord::NotRecorded,
             ladder: LadderRecord::NotRecorded,
             efforts_used: Vec::new(),
+            candidates: CandidatesRecord::NotRecorded,
         };
         let hash = receipt.hash();
         let mut other = receipt.clone();

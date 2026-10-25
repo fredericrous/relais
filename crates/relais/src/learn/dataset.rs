@@ -1219,6 +1219,7 @@ mod tests {
             }),
             ladder: LadderRecord::NotRecorded,
             efforts_used: Vec::new(),
+            candidates: crate::verify::CandidatesRecord::NotRecorded,
         }
     }
 

@@ -20,7 +20,7 @@ use super::*;
 
 /// What a reviewer saw of one part.
 #[derive(Debug, Clone)]
-struct Seen {
+pub(super) struct Seen {
     label: String,
     patch: Vec<u8>,
 }
@@ -29,8 +29,8 @@ struct Seen {
 /// `src/main.rs`, and whose reviewer records the part it is asked about,
 /// answers `FINDINGS: none` except at `findings_at`, and is refused at
 /// `refused_at`. Both are 1-based part numbers.
-struct Parts {
-    inner: MockBackend,
+pub(super) struct Parts {
+    pub(super) inner: MockBackend,
     refused_at: Option<u32>,
 }
 
@@ -57,7 +57,7 @@ impl Backend for Parts {
     }
 }
 
-fn parts_backend(
+pub(super) fn parts_backend(
     files: usize,
     lines: usize,
     findings_at: Option<u32>,
@@ -114,7 +114,12 @@ fn parts_backend(
 
 /// A first run that stops at the review: over budget when its patch is
 /// large, unavailable when its reviewer is refused.
-fn stopped_run(fixture: &Fixture, files: usize, lines: usize, refuse_review: bool) -> RunId {
+pub(super) fn stopped_run(
+    fixture: &Fixture,
+    files: usize,
+    lines: usize,
+    refuse_review: bool,
+) -> RunId {
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
     let (backend, _) = parts_backend(files, lines, None, None);
     if refuse_review {
@@ -167,7 +172,11 @@ impl Backend for RefuseAll {
 
 /// Answer `review-parts` to the stopped run as the CLI does (plan, then one
 /// transaction), claim the intent and return the successor's contract and id.
-fn answer_review_parts(fixture: &Fixture, run: &RunId, from_state: State) -> (TaskContract, RunId) {
+pub(super) fn answer_review_parts(
+    fixture: &Fixture,
+    run: &RunId,
+    from_state: State,
+) -> (TaskContract, RunId) {
     let intent =
         successor::plan_review_parts(&fixture.ledger, run, &fixture.artifacts).expect("planned");
     assert_eq!(intent.review, Some(IntentReview::Parts));

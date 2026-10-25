@@ -251,7 +251,9 @@ pub(in crate::runner) fn fit_statements(
         .collect();
     let measured: usize = rules.iter().map(RenderedRule::bytes).sum();
     let prompt = match source {
-        GuidanceSource::Reviewer | GuidanceSource::Decisions => "reviewer",
+        GuidanceSource::Reviewer | GuidanceSource::Decisions | GuidanceSource::Candidates => {
+            "reviewer"
+        }
         GuidanceSource::Index | GuidanceSource::CodeRules | GuidanceSource::Relevant => "worker",
     };
     let gap = GuidanceGap::new(

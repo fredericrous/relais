@@ -11,6 +11,7 @@
 //! only a contradiction blocks affected work, and a missing answer gates
 //! only tasks that depend on it.
 
+pub mod candidates;
 pub mod guidance;
 
 use serde::{Deserialize, Serialize};
@@ -146,6 +147,16 @@ pub trait DecisionResolver {
     fn decisions_for(&self, _paths: &[String]) -> Result<Vec<RankedKey>, GuidanceGap> {
         Ok(Vec::new())
     }
+
+    /// adr-lint's candidate lines between a run's base and a candidate
+    /// commit, for the reviewer. Same failure policy; the default knows none.
+    fn candidates_for(
+        &self,
+        _base: &str,
+        _head: &str,
+    ) -> Result<candidates::CandidateList, GuidanceGap> {
+        Ok(candidates::CandidateList::default())
+    }
 }
 
 /// A closure is a resolver: the shape tests and the CLI both already use.
@@ -165,6 +176,8 @@ pub struct AvalCli {
     /// The constraint index is the same for every package of a run, so it
     /// is fetched once per `AvalCli` (one per run) and shared.
     rules: OnceLock<Result<Rules, GuidanceGap>>,
+    /// The adr-lint program: `RELAIS_ADR_LINT`, else `adr-lint` from PATH.
+    adr_lint: String,
 }
 
 impl AvalCli {
@@ -174,6 +187,7 @@ impl AvalCli {
             root,
             cancel: None,
             rules: OnceLock::new(),
+            adr_lint: adr_lint_program(),
         }
     }
 
@@ -184,8 +198,24 @@ impl AvalCli {
             root,
             cancel: Some(cancel),
             rules: OnceLock::new(),
+            adr_lint: adr_lint_program(),
         }
     }
+
+    /// The same, spawning `program` for adr-lint.
+    pub fn with_adr_lint(mut self, program: impl Into<String>) -> Self {
+        self.adr_lint = program.into();
+        self
+    }
+}
+
+/// The program that answers `adr-lint candidates`: the one place the
+/// environment is read for it.
+fn adr_lint_program() -> String {
+    std::env::var(candidates::ADR_LINT_ENV)
+        .ok()
+        .filter(|program| !program.is_empty())
+        .unwrap_or_else(|| "adr-lint".to_string())
 }
 
 impl DecisionResolver for AvalCli {
@@ -235,6 +265,20 @@ impl DecisionResolver for AvalCli {
                 )
             },
             paths,
+        )
+    }
+
+    fn candidates_for(
+        &self,
+        base: &str,
+        head: &str,
+    ) -> Result<candidates::CandidateList, GuidanceGap> {
+        candidates::fetch_candidates(
+            &self.adr_lint,
+            &self.root,
+            base,
+            head,
+            self.cancel.as_deref(),
         )
     }
 }

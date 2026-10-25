@@ -270,6 +270,7 @@ impl<'a> RunEngine<'a> {
             review: review_record_of(self.config.ledger, &self.run_id)?,
             ladder: verify::LadderRecord::Single(preflight.decision.ladder.rungs().to_vec()),
             efforts_used: self.config.ledger.efforts_used(&self.run_id)?,
+            candidates: self.candidates_record(&candidate.sha),
         };
         // No attempt id: this receipt belongs to the run, and the
         // attempt that earned it is not finished — the run is waiting on
