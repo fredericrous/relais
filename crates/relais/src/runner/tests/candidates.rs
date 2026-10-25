@@ -7,7 +7,6 @@
 use std::sync::Mutex;
 
 use crate::context::candidates::{Candidate, CandidateList};
-#[cfg(unix)]
 use crate::context::AvalCli;
 use crate::verify::CandidatesRecord;
 
@@ -285,10 +284,8 @@ fn no_candidates_adds_nothing_to_the_prompt() {
 
 /// A resolver that asks the real adapter for adr-lint's candidates, with
 /// `program` standing in for adr-lint.
-#[cfg(unix)]
 struct SpawningAdrLint(AvalCli);
 
-#[cfg(unix)]
 impl crate::context::DecisionResolver for SpawningAdrLint {
     fn resolve(&self, _key: &str, _scope: Option<&str>) -> AvalVerdict {
         AvalVerdict::Unknown
@@ -310,51 +307,60 @@ fn fake_adr_lint(fixture: &Fixture, body: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Runs a reviewed task whose adr-lint is the one `program` names, and checks
+/// that it gave no candidates: a `candidates missing (<detail>…` receipt note,
+/// the reviewer still dispatched and told no ruling is needed.
+fn the_review_runs_without_candidates(program: impl FnOnce(&Fixture) -> String, detail: &str) {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let program = program(&fixture);
+    let resolver = SpawningAdrLint(AvalCli::new(fixture.repo.clone()).with_adr_lint(program));
+    let (backend, prompts) = ruling_backend(conditional_worker("relais task"), |_| String::new());
+    let receipt = accepted(fixture.execute_as_resolving(
+        &resolver,
+        None,
+        &fixture.contract(Review::Required),
+        &repo,
+        &backend,
+    ));
+    let note = receipt
+        .verification
+        .notes
+        .iter()
+        .find(|note| note.starts_with("guidance:"))
+        .expect("a guidance line");
+    assert!(note.contains("candidates missing ("), "{note}");
+    assert!(note.contains(detail), "{note}");
+    let prompts = prompts.lock().expect("prompts");
+    let prompt = prompts.first().expect("the reviewer was still dispatched");
+    assert!(
+        prompt.contains("adr-lint's candidates are unavailable (")
+            && prompt.contains("): no ruling is needed"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("report as uncertainty"), "{prompt}");
+    assert!(matches!(
+        receipt.candidates,
+        CandidatesRecord::Unavailable { .. }
+    ));
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
 #[cfg(unix)] // the fake adr-lint is a shell script
 #[test]
-fn an_adr_lint_that_fails_or_is_missing_is_a_receipt_note_and_the_review_still_runs() {
-    for (script, detail) in [
-        (Some("exit 3"), "adr-lint exit 3"),
-        (None, "adr-lint could not be launched"),
-    ] {
-        let fixture = Fixture::new();
-        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
-        let program = match script {
-            Some(body) => fake_adr_lint(&fixture, body),
-            None => "/nonexistent/relais-adr-lint".to_string(),
-        };
-        let resolver = SpawningAdrLint(AvalCli::new(fixture.repo.clone()).with_adr_lint(program));
-        let (backend, prompts) =
-            ruling_backend(conditional_worker("relais task"), |_| String::new());
-        let receipt = accepted(fixture.execute_as_resolving(
-            &resolver,
-            None,
-            &fixture.contract(Review::Required),
-            &repo,
-            &backend,
-        ));
-        let note = receipt
-            .verification
-            .notes
-            .iter()
-            .find(|note| note.starts_with("guidance:"))
-            .expect("a guidance line");
-        assert!(note.contains("candidates missing ("), "{note}");
-        assert!(note.contains(detail), "{note}");
-        let prompts = prompts.lock().expect("prompts");
-        let prompt = prompts.first().expect("the reviewer was still dispatched");
-        assert!(
-            prompt.contains("adr-lint's candidates are unavailable (")
-                && prompt.contains("): no ruling is needed"),
-            "{prompt}"
-        );
-        assert!(!prompt.contains("report as uncertainty"), "{prompt}");
-        assert!(matches!(
-            receipt.candidates,
-            CandidatesRecord::Unavailable { .. }
-        ));
-        std::fs::remove_dir_all(&fixture.dir).ok();
-    }
+fn an_adr_lint_that_fails_is_a_receipt_note_and_the_review_still_runs() {
+    the_review_runs_without_candidates(
+        |fixture| fake_adr_lint(fixture, "exit 3"),
+        "adr-lint exit 3",
+    );
+}
+
+#[test]
+fn a_missing_adr_lint_is_a_receipt_note_and_the_review_still_runs() {
+    the_review_runs_without_candidates(
+        |_| "/nonexistent/relais-adr-lint".to_string(),
+        "adr-lint could not be launched",
+    );
 }
 
 #[cfg(unix)] // the fake adr-lint is a shell script
