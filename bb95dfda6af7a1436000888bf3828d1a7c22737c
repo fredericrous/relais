@@ -1,0 +1,16 @@
+amont-provenance-v1
+commit bb95dfda6af7a1436000888bf3828d1a7c22737c
+tree 18dee26dbd46a87c5a57543ecfa62950892c4c50
+canon 877a89a46e30b7924d250c84f165681356eae518
+patch 0d20b123a8cb7dde7672f8e3287088cb49130f7b
+plan docs/plans/2026-10-25-holdout-acceptance-in-relais.md 413608bff3012d1e7dadbf2d90b1cc699328afb962bbc7e9ce0ea23a99caf59a
+review reviewed a9a49192ea30f0da35e9ab58e5193ad11d4106dd6e9dafe92ab9d91db0c212fe
+preview not-required
+producer amont-agent 3.4.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAEC0q3Y4XHpxJn/a59kQE12XGdvX/nQwnwIq39BFvMjJwxiXk2
+Kiy4xZPsqeRMRxt/5ocWhe+FwtG0U4TFUo3G4D
+-----END SSH SIGNATURE-----
