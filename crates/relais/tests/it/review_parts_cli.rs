@@ -4,7 +4,7 @@
 //! single file over the review budget, or more than 8 parts) is refused by
 //! name before any intent is written.
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
@@ -39,12 +39,29 @@ struct World {
     _scratch: relais::test_support::TempDir,
     root: PathBuf,
     state: PathBuf,
+    /// Released only after the scratch directory is gone, so the cap bounds
+    /// live worlds, not finished ones.
+    _permit: std::sync::Arc<common::WorldPermit>,
 }
 
 impl World {
     /// `run-1`: a run in `needs_decision (review_over_budget)` whose
     /// candidate adds `files` (name, bytes) under `src/`.
     fn new(tag: &str, files: &[(&str, usize)]) -> Self {
+        Self::with_permit(
+            tag,
+            files,
+            std::sync::Arc::new(common::WorldPermit::acquire(1)),
+        )
+    }
+
+    /// Builds a world under a permit the caller already holds, so a test
+    /// with several worlds takes one `acquire(n)` for all of them.
+    fn with_permit(
+        tag: &str,
+        files: &[(&str, usize)],
+        permit: std::sync::Arc<common::WorldPermit>,
+    ) -> Self {
         let scratch = short_temp_dir(&format!("rp-{tag}"));
         let root = scratch.to_path_buf();
         let state = root.join("state");
@@ -130,6 +147,7 @@ impl World {
                 .expect("transition");
         }
         Self {
+            _permit: permit,
             _scratch: scratch,
             root,
             state,

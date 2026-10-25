@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
+use crate::common;
+
 use relais::admission::{DispatchRequest, DispatchSource, ResourceClass, RunRegistration};
 use relais::coordinator::{Client, Coordinator, Request};
 use relais::ledger::{LearningAction, LearningSource, Ledger};
@@ -30,10 +32,19 @@ struct World {
     state: PathBuf,
     config: PathBuf,
     claude: PathBuf,
+    /// Released only after the scratch directory is gone, so the cap bounds
+    /// live worlds, not finished ones.
+    _permit: std::sync::Arc<common::WorldPermit>,
 }
 
 impl World {
     fn new(tag: &str) -> Self {
+        Self::with_permit(tag, std::sync::Arc::new(common::WorldPermit::acquire(1)))
+    }
+
+    /// Builds a world under a permit the caller already holds, so a test
+    /// with several worlds takes one `acquire(n)` for all of them.
+    fn with_permit(tag: &str, permit: std::sync::Arc<common::WorldPermit>) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let scratch = short_temp_dir(&format!("lc-{tag}"));
         let root = scratch.to_path_buf();
@@ -53,6 +64,7 @@ impl World {
         .expect("fake claude");
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         Self {
+            _permit: permit,
             _scratch: scratch,
             root,
             repo,

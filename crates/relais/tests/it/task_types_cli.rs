@@ -2,7 +2,7 @@
 //! binary (docs/plans/2026-10-12-task-types.md, Phase 1): what the export
 //! carries, how it ends on a closed pipe, and the all-or-nothing import.
 
-mod common;
+use crate::common;
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -19,15 +19,25 @@ struct World {
     _scratch: relais::test_support::TempDir,
     root: PathBuf,
     state: PathBuf,
+    /// Released only after the scratch directory is gone, so the cap bounds
+    /// live worlds, not finished ones.
+    _permit: std::sync::Arc<common::WorldPermit>,
 }
 
 impl World {
     fn new(tag: &str) -> Self {
+        Self::with_permit(tag, std::sync::Arc::new(common::WorldPermit::acquire(1)))
+    }
+
+    /// Builds a world under a permit the caller already holds, so a test
+    /// with several worlds takes one `acquire(n)` for all of them.
+    fn with_permit(tag: &str, permit: std::sync::Arc<common::WorldPermit>) -> Self {
         let scratch = short_temp_dir(&format!("tt-{tag}"));
         let root = scratch.to_path_buf();
         let state = root.join("state");
         std::fs::create_dir_all(&state).expect("state");
         Self {
+            _permit: permit,
             _scratch: scratch,
             state,
             root,

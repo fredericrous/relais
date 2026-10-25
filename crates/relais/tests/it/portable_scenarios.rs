@@ -10,9 +10,9 @@
 //! had its PATH lookup broken for a release because of it (audit C2).
 //! They live here, with no shell and no fake worker anywhere.
 
-mod common;
+use crate::common;
 #[cfg(unix)]
-mod fake_bin;
+use crate::fake_bin;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -40,10 +40,19 @@ struct World {
     /// The Claude Code this world's relais finds: one that does not exist,
     /// unless the scenario installs the plugin (`with_plugin_claude`).
     claude: PathBuf,
+    /// Released only after the scratch directory is gone, so the cap bounds
+    /// live worlds, not finished ones.
+    _permit: std::sync::Arc<common::WorldPermit>,
 }
 
 impl World {
     fn new(tag: &str) -> Self {
+        Self::with_permit(tag, std::sync::Arc::new(common::WorldPermit::acquire(1)))
+    }
+
+    /// Builds a world under a permit the caller already holds, so a test
+    /// with several worlds takes one `acquire(n)` for all of them.
+    fn with_permit(tag: &str, permit: std::sync::Arc<common::WorldPermit>) -> Self {
         // Short paths under /tmp where there is one: the coordinator
         // socket lives in the state directory and a Unix socket path is
         // capped near 100 bytes. Windows has neither /tmp nor the cap.
@@ -69,6 +78,7 @@ impl World {
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-q", "-m", "base"]);
         Self {
+            _permit: permit,
             _scratch: scratch,
             claude: root.join("no-such-claude"),
             root,

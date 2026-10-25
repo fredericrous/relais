@@ -11,7 +11,7 @@
 //! function, produces a refusal on stdout for a refusing coordinator and
 //! nothing at all for a granting one, and that it exits zero regardless.
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -37,16 +37,26 @@ struct World {
     _scratch: relais::test_support::TempDir,
     state: PathBuf,
     config: PathBuf,
+    /// Released only after the scratch directory is gone, so the cap bounds
+    /// live worlds, not finished ones.
+    _permit: std::sync::Arc<common::WorldPermit>,
 }
 
 impl World {
     fn new(tag: &str) -> Self {
+        Self::with_permit(tag, std::sync::Arc::new(common::WorldPermit::acquire(1)))
+    }
+
+    /// Builds a world under a permit the caller already holds, so a test
+    /// with several worlds takes one `acquire(n)` for all of them.
+    fn with_permit(tag: &str, permit: std::sync::Arc<common::WorldPermit>) -> Self {
         let scratch = short_temp_dir(&format!("hook-{tag}"));
         let state = scratch.join("state");
         let config = scratch.join("cfg");
         std::fs::create_dir_all(&state).expect("state");
         std::fs::create_dir_all(&config).expect("config");
         Self {
+            _permit: permit,
             _scratch: scratch,
             state,
             config,

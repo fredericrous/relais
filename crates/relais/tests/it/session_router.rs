@@ -4,7 +4,7 @@
 //! scenario runs in a world of its own (state, config and home), with no
 //! git, no shell and no harness, so it runs on every platform CI builds.
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -21,10 +21,19 @@ struct World {
     repo: PathBuf,
     state: PathBuf,
     config: PathBuf,
+    /// Released only after the scratch directory is gone, so the cap bounds
+    /// live worlds, not finished ones.
+    _permit: std::sync::Arc<common::WorldPermit>,
 }
 
 impl World {
     fn new(tag: &str) -> Self {
+        Self::with_permit(tag, std::sync::Arc::new(common::WorldPermit::acquire(1)))
+    }
+
+    /// Builds a world under a permit the caller already holds, so a test
+    /// with several worlds takes one `acquire(n)` for all of them.
+    fn with_permit(tag: &str, permit: std::sync::Arc<common::WorldPermit>) -> Self {
         let scratch = short_temp_dir(&format!("sr-{tag}"));
         let root = scratch.to_path_buf();
         let repo = root.join("repo");
@@ -34,6 +43,7 @@ impl World {
         std::fs::create_dir_all(repo.join(".git")).expect("repo");
         std::fs::create_dir_all(&config).expect("config");
         Self {
+            _permit: permit,
             _scratch: scratch,
             root,
             repo,
@@ -917,8 +927,9 @@ fn a_classification_writes_a_private_redacted_day_file_and_a_ledger_row_without_
 
 #[test]
 fn the_off_switches_capture_nothing() {
+    let permit = std::sync::Arc::new(common::WorldPermit::acquire(2));
     // keep_classifier_inputs = false
-    let world = World::new("cls-off");
+    let world = World::with_permit("cls-off", permit.clone());
     std::fs::write(
         world.machine(),
         "schema_version = 1\n[session_routing]\nkeep_classifier_inputs = false\n",
@@ -945,7 +956,7 @@ fn the_off_switches_capture_nothing() {
         .is_some());
 
     // RELAIS_SESSION_ROUTING=off
-    let world = World::new("cls-env");
+    let world = World::with_permit("cls-env", permit.clone());
     let mut child = world
         .command(&["native", "router-observe"])
         .env("RELAIS_SESSION_ROUTING", "off")
