@@ -659,8 +659,33 @@ fn usage(cost_micros: i64) -> crate::backend::UsageReport {
 /// — its prompt contains `signal`. Review prompts answer FINDINGS:
 /// none.
 fn conditional_worker(signal: &str) -> MockBackend {
+    conditional_worker_after(signal, |_| {})
+}
+
+/// A fork's task tree holds a fresh clone of the caller's dependency
+/// directories, whose directory mtimes are the clone's own; the
+/// verification trees seed from it and would wait out the quiet window.
+/// This worker ages them first, as an install that finished long ago.
+fn quiet_dependencies_worker(signal: &str) -> MockBackend {
+    conditional_worker_after(signal, |work_dir| {
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        let dependency = work_dir.join("node_modules/dep");
+        if dependency.is_dir() {
+            // Files first: a copy that is not copy-on-write gives them
+            // fresh mtimes too. The directory's mtime is set last.
+            backdate(&dependency.join("index.js"), long_ago);
+            backdate(&dependency, long_ago);
+        }
+    })
+}
+
+fn conditional_worker_after(
+    signal: &str,
+    before: impl Fn(&std::path::Path) + Send + Sync + 'static,
+) -> MockBackend {
     let signal = signal.to_string();
     MockBackend::new(move |spec| {
+        before(&spec.work_dir);
         if spec.prompt.contains("semantic reviewer") {
             return MockOutcome {
                 result_text: Some("review ok\nFINDINGS: none".into()),
@@ -5490,7 +5515,36 @@ fn fixture_with_installed_deps() -> Fixture {
     git(&fixture.repo, &["commit", "-q", "-m", "ignore deps"]);
     std::fs::create_dir_all(fixture.repo.join("node_modules/dep")).expect("mkdir");
     std::fs::write(fixture.repo.join("node_modules/dep/index.js"), "ok").expect("dep");
+    // The seed gate waits for the tree to be quiet (30 s); the entries it
+    // reads (depth 1 and 2) are made older than that so a fork does not
+    // wait. Files first: the directory's mtime is set last.
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    backdate(&fixture.repo.join("node_modules/dep/index.js"), long_ago);
+    backdate(&fixture.repo.join("node_modules/dep"), long_ago);
     fixture
+}
+
+fn backdate(path: &std::path::Path, modified: std::time::SystemTime) {
+    #[cfg(windows)]
+    let handle = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .access_mode(0x100 /* FILE_WRITE_ATTRIBUTES */)
+            .custom_flags(0x0200_0000 /* FILE_FLAG_BACKUP_SEMANTICS */)
+            .open(path)
+            .expect("open for backdating")
+    };
+    #[cfg(not(windows))]
+    let handle = std::fs::File::open(path).expect("open for backdating");
+    handle.set_modified(modified).expect("backdate");
+}
+
+fn assert_no_seed_wait(fixture: &Fixture, run_id: &RunId, run: &str) {
+    assert!(
+        !decisions_of(fixture, run_id).contains(&"workspace_seed_waiting".to_string()),
+        "{run}: the backdated tree is quiet, so the fork must not wait: {:?}",
+        decisions_of(fixture, run_id)
+    );
 }
 
 fn bash_step(script: &str) -> CommandSpec {
@@ -5529,7 +5583,7 @@ fn a_fork_seeds_the_callers_dependencies_and_isolated_does_not() {
         3,
     );
     let machine = fixture.machine_for(&repo);
-    let backend = conditional_worker("relais task");
+    let backend = quiet_dependencies_worker("relais task");
     let isolated = fixture.execute_in(
         Workspace::Isolated,
         &fixture.contract(Review::Off),
@@ -5553,6 +5607,7 @@ fn a_fork_seeds_the_callers_dependencies_and_isolated_does_not() {
         &machine,
         &backend,
     );
+    assert_no_seed_wait(&fixture, &fork.run_id, "the fork");
     if cow_here(&fixture) {
         let RunOutcome {
             run_id,
@@ -5656,7 +5711,7 @@ fn a_fork_skips_a_step_only_when_it_proved_its_result() {
     let repo =
         fixture.repo_policy_with_setup(vec![step.clone()], vec![versionable_main_gone_check()], 3);
     let machine = fixture.machine_for(&repo);
-    let backend = conditional_worker("relais task");
+    let backend = quiet_dependencies_worker("relais task");
 
     stamp_the_callers_workspace(&fixture, &step);
     let skipped = fixture.execute_in(
@@ -5673,6 +5728,7 @@ fn a_fork_skips_a_step_only_when_it_proved_its_result() {
     else {
         panic!("the step proved its result and must not run: {skipped:?}");
     };
+    assert_no_seed_wait(&fixture, &run_id, "the skipped fork");
     let logs = fixture.artifacts.join(run_id.as_str()).join("logs");
     for stem in ["base", "task", "attempt1"] {
         assert!(
@@ -5692,6 +5748,7 @@ fn a_fork_skips_a_step_only_when_it_proved_its_result() {
         &machine,
         &backend,
     );
+    assert_no_seed_wait(&fixture, &ran.run_id, "the changed-input fork");
     let RunOutcome {
         terminal: Terminal::Blocked { code, .. },
         ..
