@@ -10,7 +10,7 @@ use crate::context::candidates::{Candidate, CandidateList};
 use crate::context::AvalCli;
 use crate::verify::CandidatesRecord;
 
-use super::review_parts::{answer_review_parts, parts_backend, stopped_run};
+use super::review_parts::{answer_review_parts, parts_backend, run_stopped_over_budget};
 use super::*;
 
 fn candidate_on(path: &str, seed: char) -> Candidate {
@@ -395,7 +395,7 @@ fn the_real_adapter_spawns_adr_lint_with_the_runs_base_and_the_candidate() {
 fn a_review_in_two_parts_asks_adr_lint_once_and_lists_each_candidate_in_one_part() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
-    let run = stopped_run(&fixture, 2, 2300, false);
+    let run = run_stopped_over_budget(&fixture, 2, 2300);
     let (contract, new_run) = answer_review_parts(&fixture, &run, State::NeedsDecision);
     let (parts, _) = parts_backend(2, 2300, None, None);
     let (backend, prompts) = ruling_backend(parts.inner, |ids| {

@@ -425,11 +425,15 @@ impl<'a> RunEngine<'a> {
         let written = std::fs::read(&request.patch_path).and_then(|patch| {
             let at = utc_seconds(&self.config.ledger.now())
                 .ok_or_else(|| std::io::Error::other("the ledger clock is not RFC 3339"))?;
-            let repo = self
-                .config
-                .repo_dir
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
+            // The main checkout's name, so a linked worktree's rulings carry
+            // the repository's name and not the worktree directory's.
+            let repo = crate::repo::main_checkout_name(self.config.repo_dir)
+                .or_else(|| {
+                    self.config
+                        .repo_dir
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
                 .unwrap_or_default();
             append_rulings(
                 &self.artifacts,
