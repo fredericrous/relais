@@ -125,6 +125,23 @@ class Gate(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn(("relais", "tests::keeps"), affected)
 
+    def test_a_whole_deleted_test_with_its_blank_line_passes(self):
+        # The real shape of a deletion: the blank line before the test and
+        # the test, as `git diff -U0` prints them with their base text.
+        lines = BASE_SOURCE.split("\n")
+        first = line_of("    fn goes() {") - 2  # the blank line above `#[test]`
+        last = line_of("    fn goes() {") + 2  # the closing brace
+        body = [f"-{lines[n - 1]}" for n in range(first, last + 1)]
+        diff = "\n".join([f"--- a/{FILE}", f"+++ b/{FILE}", f"@@ -{first},{last - first + 1} +{first - 1},0 @@"] + body) + "\n"
+        self.assertEqual(lines[first - 1], "")
+        code, report, _ = gate(diff)
+        self.assertEqual(code, 0, report)
+
+    def test_a_removed_comment_or_blank_line_alone_needs_no_entry(self):
+        source_diff = "\n".join([f"--- a/{FILE}", f"+++ b/{FILE}", "@@ -2 +1,0 @@", "-", "@@ -14 +12,0 @@", "-    // a note"]) + "\n"
+        code, report, _ = gate(source_diff, head={("relais", "tests::keeps"), ("relais", "tests::goes")})
+        self.assertEqual(code, 0, report)
+
     def test_removed_lines_of_a_disappeared_test_pass(self):
         code, _, _ = gate(diff_removing(line_of("        assert_eq!(product(2), 3);")))
         self.assertEqual(code, 0)
