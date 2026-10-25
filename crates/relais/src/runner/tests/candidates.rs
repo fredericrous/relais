@@ -7,6 +7,7 @@
 use std::sync::Mutex;
 
 use crate::context::candidates::{Candidate, CandidateList};
+#[cfg(unix)]
 use crate::context::AvalCli;
 use crate::verify::CandidatesRecord;
 
@@ -284,8 +285,10 @@ fn no_candidates_adds_nothing_to_the_prompt() {
 
 /// A resolver that asks the real adapter for adr-lint's candidates, with
 /// `program` standing in for adr-lint.
+#[cfg(unix)]
 struct SpawningAdrLint(AvalCli);
 
+#[cfg(unix)]
 impl crate::context::DecisionResolver for SpawningAdrLint {
     fn resolve(&self, _key: &str, _scope: Option<&str>) -> AvalVerdict {
         AvalVerdict::Unknown
@@ -296,6 +299,7 @@ impl crate::context::DecisionResolver for SpawningAdrLint {
     }
 }
 
+#[cfg(unix)]
 fn fake_adr_lint(fixture: &Fixture, body: &str) -> String {
     use std::os::unix::fs::PermissionsExt;
     let path = fixture.dir.join("fake-adr-lint");
@@ -306,6 +310,7 @@ fn fake_adr_lint(fixture: &Fixture, body: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
+#[cfg(unix)] // the fake adr-lint is a shell script
 #[test]
 fn an_adr_lint_that_fails_or_is_missing_is_a_receipt_note_and_the_review_still_runs() {
     for (script, detail) in [
@@ -352,6 +357,7 @@ fn an_adr_lint_that_fails_or_is_missing_is_a_receipt_note_and_the_review_still_r
     }
 }
 
+#[cfg(unix)] // the fake adr-lint is a shell script
 #[test]
 fn the_real_adapter_spawns_adr_lint_with_the_runs_base_and_the_candidate() {
     let fixture = Fixture::new();
