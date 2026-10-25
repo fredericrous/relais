@@ -1,0 +1,136 @@
+# Did a branch delete a test whose bugs nothing else catches?
+#
+# The bar of decisions' plan 2026-10-17-amont-tests-follow-user-flows: a
+# test may go only if every mutant it caught is still caught by the tests
+# that remain. scripts/mutants-check.sh says how that is checked; this runs
+# it on a branch, on demand, for the product files a pull request names:
+#
+#   gh workflow run mutants.yaml --ref <branch> -f files="crates/amont-runtime/src/manifest.rs"
+#
+# Each file is checked on its own runners, `shards` of them, in parallel: a
+# mutant costs a build and the whole suite (about 100 s), so one runner
+# over ten files took more than two hours, and one file whose deleted tests
+# ran nearly every line took 162 minutes alone (amont#364). `verdict` is the
+# one result to read.
+#
+# On demand, not on every pull request: only a branch that deletes or
+# rewrites tests needs it, and only the author knows which product files the
+# deleted tests exercised. The pull request quotes the summary.
+#
+# cargo-mutants and cargo-llvm-cov are CI tools here, like cargo-audit: they
+# build and run the tests, and link into nothing amont ships (ADR-0020).
+name: mutants
+
+on:
+  workflow_dispatch:
+    inputs:
+      files:
+        description: The product files the deleted tests exercise, space-separated
+        required: true
+      base:
+        description: The branch to compare with
+        default: main
+      shards:
+        description: Runners per file
+        default: "3"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - id: matrix
+        env:
+          FILES: ${{ inputs.files }}
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          set -eu
+          read -r -a files <<< "$FILES"
+          python3 - "$SHARDS" "${files[@]}" >> "$GITHUB_OUTPUT" << 'EOF'
+          import json, sys
+          n, files = int(sys.argv[1]), sys.argv[2:]
+          if n < 1 or not files:
+              sys.exit("mutants: name at least one file, and at least one shard")
+          cells = [{"file": f, "shard": f"{k}/{n}"} for f in files for k in range(n)]
+          print("matrix=" + json.dumps({"include": cells}))
+          EOF
+
+  check:
+    name: ${{ matrix.file }} ${{ matrix.shard }}
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-mutants
+            ~/.cargo/bin/cargo-llvm-cov
+            target
+          key: mutants-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: cargo-mutants 27.1.0 and cargo-llvm-cov 0.9.1
+        run: |
+          set -eu
+          if ! cargo mutants --version 2> /dev/null | grep -qx 'cargo-mutants 27.1.0'; then
+            cargo install cargo-mutants --locked --version 27.1.0
+          fi
+          # Coverage of the deleted tests decides which mutants are worth a
+          # build: only those on a line the tests run.
+          rustup component add llvm-tools-preview
+          if ! cargo llvm-cov --version 2> /dev/null | grep -qx 'cargo-llvm-cov 0.9.1'; then
+            cargo install cargo-llvm-cov --locked --version 0.9.1
+          fi
+      # The tests make commits in scratch repositories.
+      - run: |
+          git config --global user.email ci@example.com
+          git config --global user.name "amont ci"
+          git config --global init.defaultBranch main
+      - name: the deleted tests' mutants are still caught
+        env:
+          FILE: ${{ matrix.file }}
+          BASE: ${{ inputs.base }}
+          MUTANTS_ARGS: -j 2
+          MUTANTS_SHARD: ${{ matrix.shard }}
+        run: |
+          set -o pipefail
+          scripts/mutants-check.sh --base "origin/$BASE" "$FILE" 2>&1 | tee "$RUNNER_TEMP/mutants.txt"
+      - if: ${{ always() }}
+        env:
+          FILE: ${{ matrix.file }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          {
+            echo "## mutants-check: $FILE, shard $SHARD"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/mutants.txt" 2> /dev/null || echo "(no output)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # One result for the whole check: every file, every shard.
+  verdict:
+    needs: check
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RESULT: ${{ needs.check.result }}
+        run: |
+          echo "mutants-check over every file and shard: $RESULT"
+          [ "$RESULT" = success ]
