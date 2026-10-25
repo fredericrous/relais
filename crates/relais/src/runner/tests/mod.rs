@@ -226,6 +226,7 @@ impl Fixture {
             },
         );
         MachineSettings {
+            holdouts: Default::default(),
             workspace: Default::default(),
             resources: crate::policy::ResourceSettings {
                 min_free_bytes: Some(0),
@@ -307,6 +308,49 @@ impl Fixture {
             purpose: None,
             run_id,
             wire,
+            design: DesignSource::Contract,
+            declarations: &crate::trust::NoHistory,
+        })
+        .expect("the fixture's id source mints identifiers")
+    }
+
+    /// `execute`, on a machine that declares `holdouts` in `[holdouts]`.
+    fn execute_with_holdouts(
+        &self,
+        holdouts: crate::policy::HoldoutSettings,
+        contract: &TaskContract,
+        repo: &RepoPolicy,
+        backend: &dyn Backend,
+    ) -> RunOutcome {
+        let mut machine = self.machine_for(repo);
+        machine.holdouts = holdouts;
+        let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
+            adr: "ADR-0001".into(),
+            choice: None,
+            reason: None,
+        };
+        execute(&RunConfig {
+            workspace: crate::workspace::reuse::Workspace::Isolated,
+            repo_dir: &self.repo,
+            contract,
+            repo_policy: repo,
+            machine: &machine,
+            ledger: &self.ledger,
+            ids: &self.ids,
+            backend,
+            git: &crate::workspace::SystemGit,
+            hooks: &crate::verify::FixedInventory(None),
+            attest: &crate::verify::FixedAttest::default(),
+            artifacts_dir: self.artifacts.clone(),
+            aval_resolver: &resolver,
+            predictor: None,
+            gate: None,
+            session_id: "test-session".into(),
+            heartbeat_every: Duration::from_millis(50),
+            task_override: None,
+            purpose: None,
+            run_id: None,
+            wire: Wire::process(),
             design: DesignSource::Contract,
             declarations: &crate::trust::NoHistory,
         })
@@ -6627,6 +6671,7 @@ fn a_proposed_plan_is_validated_not_trusted() {
 
 fn manifest_with(constraints: Vec<String>) -> ContextManifest {
     ContextManifest {
+        holdouts: Default::default(),
         contract_hash: "contract".into(),
         base_sha: "base".into(),
         policy_hash: "policy".into(),
@@ -7397,6 +7442,7 @@ fn the_prompt_counts_verification_commands_not_attempts() {
     let fixture = Fixture::new();
     let contract = fixture.contract(Review::Off);
     let manifest = ContextManifest {
+        holdouts: Default::default(),
         contract_hash: "c".into(),
         base_sha: "b".into(),
         policy_hash: "p".into(),
@@ -8722,6 +8768,7 @@ mod budgets;
 mod candidates;
 mod declared_tests;
 mod exhaustion;
+mod holdouts;
 mod native;
 mod review_parts;
 mod review_repair;

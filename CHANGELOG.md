@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+- A contract criterion can name a holdout as its evidence (ADR-0045, phase 2): `{"kind": "holdout", "name": "..."}`, declared in machine.toml `[holdouts]`. `relais run` and `relais plan` resolve it before any worker runs and refuse it with `holdout_unknown`, `holdout_no_junit`, `holdout_bad_overlay`, `holdout_overlay_exists` or `holdout_unreadable`; the context manifest records each holdout's name, commit and digest. Nothing fetches or runs a holdout yet, so a mandatory holdout criterion stays an unsettled gap and the run is not accepted.
+
 ## v0.33.0
 
 - The reviewer now also gets adr-lint's candidate lines for the candidate commit: lines a decided code rule may cover that a linter cannot decide alone (decisions ADR-0044). relais runs `adr-lint candidates --base <run base> --head <candidate> --json --max 40` once per candidate commit, and each review part lists only the candidates in its own files.

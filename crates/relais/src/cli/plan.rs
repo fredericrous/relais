@@ -194,6 +194,23 @@ pub(crate) fn plan_command(
             return Ok(CliOutcome::Blocked);
         }
     }
+    // And the holdouts: `run` refuses a holdout criterion it cannot
+    // resolve, with the same codes.
+    if let Err(block) = relais::holdout::resolve_all(
+        &contract.acceptance,
+        &machine.holdouts,
+        &relais::repo::main_checkout_name(&root).unwrap_or_default(),
+        &relais::workspace::SystemGit,
+        &root,
+        &base_sha,
+        &relais::holdout::machine_toml_label(),
+    ) {
+        eprintln!(
+            "relais plan: blocked ({}): {} (base {base_sha})",
+            block.code, block.detail
+        );
+        return Ok(CliOutcome::Blocked);
+    }
     let repo_identity = relais::repo::identity(&root);
     let authority = effective_authority(&repo, &machine, &contract, &repo_identity);
     let probe = harness_identity();

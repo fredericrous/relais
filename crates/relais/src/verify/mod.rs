@@ -228,6 +228,7 @@ pub fn guarded_preexisting(
         | Some(Evidence::LlmReview)
         | Some(Evidence::HumanSignOff)
         | Some(Evidence::AmontGate { .. })
+        | Some(Evidence::Holdout { .. })
         | None => false,
     });
     (!targeted).then_some(found)
@@ -364,6 +365,10 @@ pub fn acceptance_gaps(
                     missing: MissingEvidence::SignOffUnrecorded,
                 })
             }
+            Some(Evidence::Holdout { name }) => gaps.push(AcceptanceGap {
+                criterion_id: entry.id(),
+                missing: MissingEvidence::HoldoutNotRun { name: name.clone() },
+            }),
             Some(Evidence::AmontGate { gate }) => match gate_coverage.get(gate) {
                 Some(Ok(true)) => {}
                 Some(Ok(false)) | None => gaps.push(AcceptanceGap {
@@ -463,6 +468,9 @@ pub enum MissingEvidence {
     /// absent, too old to have the subcommand, or failed some other way.
     /// The cause relais actually observed, never guessed.
     GateUnavailable { gate: String, detail: String },
+    /// A holdout criterion (ADR-0045): this relais resolves it at
+    /// preflight but does not run it, so it is never settled.
+    HoldoutNotRun { name: String },
     /// A named test, and no verification command declares a JUnit report:
     /// nothing produced per-test results at all.
     NoPerTestResults { test: String },
@@ -507,6 +515,9 @@ impl AcceptanceGap {
             MissingEvidence::GateUnavailable { gate, detail } => format!(
                 "acceptance criterion `{id}` names amont gate `{gate}`, which could not be \
                  asked about: {detail}"
+            ),
+            MissingEvidence::HoldoutNotRun { name } => format!(
+                "acceptance criterion `{id}`: holdout `{name}` is not run by this relais (phase 3)"
             ),
             MissingEvidence::NoPerTestResults { test } => format!(
                 "acceptance criterion `{id}` names test `{test}`, but no verification command \
@@ -957,6 +968,7 @@ pub fn settle_acceptance(
                     attestations.signoffs.contains(&entry.id()),
                     SettledVia::HumanSignOff,
                 ),
+                (Some(Evidence::Holdout { .. }), _) => (false, SettledVia::DeclaredEvidence),
                 (Some(Evidence::AmontGate { gate }), _) => (
                     matches!(attestations.gate_coverage.get(gate), Some(Ok(true))),
                     SettledVia::DeclaredEvidence,
@@ -2353,6 +2365,7 @@ pub fn amont_gate_names(entries: &[AcceptanceEntry]) -> Vec<String> {
                 Evidence::Check { .. }
                 | Evidence::Test { .. }
                 | Evidence::LlmReview
+                | Evidence::Holdout { .. }
                 | Evidence::HumanSignOff => None,
             })
         })

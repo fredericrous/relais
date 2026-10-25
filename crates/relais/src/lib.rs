@@ -18,6 +18,7 @@ pub mod doctor;
 pub mod exhaustion;
 pub mod fsclone;
 pub mod fsutil;
+pub mod holdout;
 pub mod hook;
 pub mod ids;
 pub mod install;

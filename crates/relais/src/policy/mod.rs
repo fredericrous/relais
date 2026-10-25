@@ -985,6 +985,120 @@ pub struct MachineSettings {
     /// `auto_promote` the cycle stops at `awaiting_promotion`.
     #[serde(default)]
     pub learning: LearningSettings,
+    /// `[holdouts]`: where the acceptance tests kept outside a repository
+    /// live (ADR-0045). Machine-owned, read from machine.toml only: no
+    /// flag or environment variable sets it, and it feeds no authority hash.
+    #[serde(default, skip_serializing_if = "HoldoutSettings::is_default")]
+    pub holdouts: HoldoutSettings,
+}
+
+/// `[holdouts]` in machine.toml (ADR-0045): the store every holdout is
+/// read from, and per repository directory name the holdouts it declares
+/// (`[holdouts.<repo>.<name>]`). Read by preflight only; a worker never
+/// sees any of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldoutSettings {
+    /// A git URL.
+    pub store: Option<String>,
+    pub git_ref: String,
+    pub repos: BTreeMap<String, BTreeMap<String, HoldoutDecl>>,
+}
+
+/// The default `ref` of the holdout store.
+const DEFAULT_HOLDOUT_REF: &str = "main";
+
+impl Default for HoldoutSettings {
+    fn default() -> Self {
+        Self {
+            store: None,
+            git_ref: DEFAULT_HOLDOUT_REF.to_string(),
+            repos: BTreeMap::new(),
+        }
+    }
+}
+
+impl HoldoutSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The declaration of holdout `name` for the repository directory `repo`.
+    pub fn declaration(&self, repo: &str, name: &str) -> Option<&HoldoutDecl> {
+        self.repos.get(repo).and_then(|named| named.get(name))
+    }
+
+    /// Every holdout name declared for `repo`.
+    pub fn declared_names(&self, repo: &str) -> Vec<String> {
+        self.repos
+            .get(repo)
+            .map(|named| named.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// One `[holdouts.<repo>.<name>]` declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HoldoutDecl {
+    /// The holdout's file inside the store.
+    pub path: String,
+    /// Where it is copied in the verification tree: repo-relative, clean.
+    pub overlay: String,
+    /// What runs it; `junit` is required for a holdout.
+    pub command: CommandSpec,
+    /// A runner config inside the store (for example a nextest.toml).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HoldoutEntry {
+    Text(String),
+    Repo(BTreeMap<String, HoldoutDecl>),
+}
+
+impl<'de> Deserialize<'de> for HoldoutSettings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let entries = BTreeMap::<String, HoldoutEntry>::deserialize(deserializer)?;
+        let mut settings = Self::default();
+        for (key, entry) in entries {
+            match (key.as_str(), entry) {
+                ("store", HoldoutEntry::Text(url)) => settings.store = Some(url),
+                ("ref", HoldoutEntry::Text(git_ref)) => settings.git_ref = git_ref,
+                ("store" | "ref", HoldoutEntry::Repo(_)) => {
+                    return Err(serde::de::Error::custom(format!(
+                        "[holdouts] `{key}` must be a string"
+                    )))
+                }
+                (_, HoldoutEntry::Repo(named)) => {
+                    settings.repos.insert(key, named);
+                }
+                (_, HoldoutEntry::Text(_)) => {
+                    return Err(serde::de::Error::custom(format!(
+                        "unknown key `{key}` in [holdouts]: expected `store`, `ref` or a \
+                         repository table"
+                    )))
+                }
+            }
+        }
+        Ok(settings)
+    }
+}
+
+impl Serialize for HoldoutSettings {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(store) = &self.store {
+            map.serialize_entry("store", store)?;
+        }
+        map.serialize_entry("ref", &self.git_ref)?;
+        for (repo, named) in &self.repos {
+            map.serialize_entry(repo, named)?;
+        }
+        map.end()
+    }
 }
 
 /// `[learning]` in machine.toml. Only `auto_promote` is authority, and
@@ -1768,6 +1882,18 @@ pub enum BlockCode {
     /// The contract's `design` cannot be read at the base revision: it is
     /// missing there, oversized or not text.
     DesignUnreadable,
+    /// A holdout criterion names a holdout machine.toml `[holdouts]` does
+    /// not declare for this repository (ADR-0045).
+    HoldoutUnknown,
+    /// A declared holdout names no `command.junit`: it could not settle
+    /// through a parsed report.
+    HoldoutNoJunit,
+    /// A holdout's overlay path is not a clean repo-relative path.
+    HoldoutBadOverlay,
+    /// A holdout's overlay path already exists at the base revision.
+    HoldoutOverlayExists,
+    /// The holdout store does not resolve its ref to one commit.
+    HoldoutUnreadable,
     /// Another run holds the caller's worktree (ADR-0008).
     WorkspaceBusy,
     /// A run was interrupted in the caller's worktree and has not been
@@ -1817,6 +1943,11 @@ impl BlockCode {
             Self::SandboxUnverified => "sandbox_unverified",
             Self::NativeUnpriced => "native_unpriced",
             Self::DesignUnreadable => "design_unreadable",
+            Self::HoldoutUnknown => "holdout_unknown",
+            Self::HoldoutNoJunit => "holdout_no_junit",
+            Self::HoldoutBadOverlay => "holdout_bad_overlay",
+            Self::HoldoutOverlayExists => "holdout_overlay_exists",
+            Self::HoldoutUnreadable => "holdout_unreadable",
             Self::WorkspaceBusy => "workspace_busy",
             Self::WorkspaceHasInterruptedRun => "workspace_has_interrupted_run",
             Self::InPlaceHeadMoved => "inplace_head_moved",
@@ -3512,6 +3643,59 @@ amont = { mode = "optional", bin = "/opt/amont/bin/amont" }
         let back: crate::admission::DispatchRequest =
             serde_json::from_str(&wire).expect("round trip");
         assert_eq!(back, asked);
+    }
+
+    #[test]
+    fn holdouts_parse_from_the_design_example_and_default_when_absent() {
+        let bare = "schema_version = 1\n";
+        assert!(MachineSettings::from_toml_str(bare)
+            .expect("parses")
+            .holdouts
+            .is_default());
+        let with_table = r#"schema_version = 1
+
+[holdouts]
+store = "git+ssh://git@git.example.org/holdouts.git"
+ref = "main"
+
+[holdouts.amont.json-escaping]
+path = "amont/json-escaping.rs"
+overlay = "crates/amont/tests/holdout_json_escaping.rs"
+config = "amont/nextest.toml"
+command = { argv = ["cargo", "nextest", "run", "-p", "amont"], junit = "target/nextest/default/junit.xml" }
+"#;
+        let machine = MachineSettings::from_toml_str(with_table).expect("parses");
+        let declared = machine
+            .holdouts
+            .declaration("amont", "json-escaping")
+            .expect("declared");
+        assert_eq!(
+            declared.overlay,
+            "crates/amont/tests/holdout_json_escaping.rs"
+        );
+        assert_eq!(declared.config.as_deref(), Some("amont/nextest.toml"));
+        assert_eq!(machine.holdouts.git_ref, "main");
+        let written = toml::to_string(&machine).expect("writes back");
+        assert_eq!(
+            MachineSettings::from_toml_str(&written).expect("reads back"),
+            machine
+        );
+    }
+
+    #[test]
+    fn a_holdout_declaration_refuses_an_unknown_key() {
+        let text = r#"schema_version = 1
+
+[holdouts]
+store = "s"
+
+[holdouts.amont.x]
+path = "p"
+overlay = "o"
+secret = "no"
+command = { argv = ["true"], junit = "j.xml" }
+"#;
+        MachineSettings::from_toml_str(text).unwrap_err();
     }
 
     #[test]

@@ -1222,6 +1222,7 @@ mod tests {
 
     fn machine_for(repo: &RepoPolicy) -> MachineSettings {
         let mut machine = MachineSettings {
+            holdouts: Default::default(),
             workspace: Default::default(),
             resources: Default::default(),
             schema_version: 1,
@@ -1585,6 +1586,7 @@ mod tests {
     fn authority_blockers_stop_routing_before_dispatch() {
         let repo = repo_policy();
         let machine = MachineSettings {
+            holdouts: Default::default(),
             workspace: Default::default(),
             resources: Default::default(),
             schema_version: 1,
@@ -2099,6 +2101,7 @@ mod tests {
     fn blocked_explanation_lists_codes() {
         let repo = repo_policy();
         let machine = MachineSettings {
+            holdouts: Default::default(),
             workspace: Default::default(),
             resources: Default::default(),
             schema_version: 1,
