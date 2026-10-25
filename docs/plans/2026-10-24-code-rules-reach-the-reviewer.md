@@ -31,4 +31,5 @@ Input → expected → actual:
   - a ruling's `repo` is the main checkout's name;
   - SPEC §7 says what `repo` and `tree` hold.
 - The reviewer ruled the other 3 candidates `fine`; their ids stayed the same across both rounds.
+- After that approval, relais#307's Windows test job failed to compile: the fake adr-lint is a shell script, written with Unix-only APIs. The fix gates only what needs the script with `#[cfg(unix)]`: the exit-3 test and the argv test. The missing-binary test and the spawning resolver run on every platform; the reviewer asked for that split. Both re-bindings: approve-with-changes, then approve; 84k + 90k tokens.
 - The relais runs: `run-65ea960a85370-d257` was approved after its parts review, then applied by hand (an approval does not apply the candidate), with its one citation fix made by hand.
