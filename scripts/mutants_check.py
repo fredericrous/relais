@@ -373,7 +373,12 @@ def validate_manifest(
 
 
 def removed_lines(diff: str) -> List[Tuple[str, int]]:
-    """(file, base line) of every line the diff removes or modifies."""
+    """(file, base line) of every line the diff removes or modifies.
+
+    A blank or `//`-comment line is left out: it carries no behaviour and no
+    assertion, and the blank line between two tests sits outside both, so
+    deleting a test would otherwise always fail the gate (seen on the first
+    proof dispatches, relais#306)."""
     out: List[Tuple[str, int]] = []
     current: Optional[str] = None
     old_left = new_left = 0
@@ -382,7 +387,8 @@ def removed_lines(diff: str) -> List[Tuple[str, int]]:
     for line in diff.split("\n"):
         if old_left > 0 or new_left > 0:
             if line.startswith("-"):
-                if current:
+                text = line[1:].strip()
+                if current and text and not text.startswith("//"):
                     out.append((current, next_old))
                 next_old += 1
                 old_left -= 1
