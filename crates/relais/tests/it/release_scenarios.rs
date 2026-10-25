@@ -12,12 +12,11 @@
 //! and run on Windows too, along with the library-level tests.
 #![cfg(unix)]
 
-mod common;
-mod fake_bin;
+use crate::common;
+use crate::fake_bin;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::{Condvar, Mutex};
 
 use relais::policy::RepoPolicy;
 use relais::test_support::short_temp_dir;
@@ -44,64 +43,6 @@ cache_read = 0\ncache_write_5m = 0\ncache_write_1h = 0\n";
 /// gives the library's own tests — this suite is a separate crate and
 /// cannot reach a `pub(crate)` helper, which is why `test_support` is
 /// `pub`. `root` stays a plain `PathBuf`, derived from the guard, since
-/// How many scenario worlds may be alive at once.
-///
-/// Not a CPU bound — these scenarios are process bound. Each world spawns
-/// the `relais` binary, which lazily starts its own coordinator daemon,
-/// and `cargo test` runs as many scenarios in parallel as the machine has
-/// cores (12 here). Measured: the suite is 28/28 alone and 7–9 FAILED when
-/// another `cargo test` or `make check` is running on the same machine.
-///
-/// That flakiness is not free. relais verifies a candidate by running this
-/// project's own `make check`, so a saturated machine turns a passing
-/// candidate into a `behavioral_failure`, which buys a REPAIR ATTEMPT —
-/// another dispatch, another worker, another verification — and can
-/// exhaust the run's wall clock outright. `run-65c7e51b58e6f-10970` lost
-/// $3.98 that way on a candidate that passes cleanly (relais#115).
-///
-/// Four, so the suite still overlaps its slow scenarios without every
-/// core racing to spawn a daemon. The bound is on WORLDS rather than on
-/// `--test-threads`, because a test harness flag cannot be set per-suite
-/// from `Cargo.toml` and the scenarios that do not build a world have no
-/// reason to queue.
-const MAX_LIVE_WORLDS: usize = 4;
-
-static LIVE_WORLD_PERMITS: Mutex<usize> = Mutex::new(MAX_LIVE_WORLDS);
-static A_WORLD_ENDED: Condvar = Condvar::new();
-
-/// A permit to hold one world, returned when the world drops.
-struct WorldPermit;
-
-impl WorldPermit {
-    fn acquire() -> Self {
-        // Poisoning is tolerated deliberately: a panicking scenario must
-        // not wedge every scenario after it. The count is a plain usize
-        // and a panic cannot leave it in a shape the next waiter cannot
-        // read — and `a_panicking_test_still_loses_its_world` exists
-        // precisely because scenarios do panic on purpose here.
-        let mut free = LIVE_WORLD_PERMITS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while *free == 0 {
-            free = A_WORLD_ENDED
-                .wait(free)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        *free -= 1;
-        WorldPermit
-    }
-}
-
-impl Drop for WorldPermit {
-    fn drop(&mut self) {
-        let mut free = LIVE_WORLD_PERMITS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *free += 1;
-        A_WORLD_ENDED.notify_one();
-    }
-}
-
 /// the rest of this file joins paths off it throughout.
 struct World {
     _scratch: relais::test_support::TempDir,
@@ -114,14 +55,19 @@ struct World {
     /// after `_scratch`, which is what actually tears the world down.
     /// Bounding live worlds is what keeps a saturated machine from
     /// failing a candidate that passes (relais#115).
-    _permit: WorldPermit,
+    _permit: std::sync::Arc<common::WorldPermit>,
 }
 
 impl World {
     fn new(tag: &str) -> Self {
         // Before any directory or process exists: the point is to bound
         // how many of these are ALIVE, not how many have finished.
-        let permit = WorldPermit::acquire();
+        Self::with_permit(tag, std::sync::Arc::new(common::WorldPermit::acquire(1)))
+    }
+
+    /// Builds a world under a permit the caller already holds, so a test
+    /// with several worlds takes one `acquire(n)` for all of them.
+    fn with_permit(tag: &str, permit: std::sync::Arc<common::WorldPermit>) -> Self {
         let scratch = short_temp_dir(&format!("it-{tag}"));
         let root = scratch.to_path_buf();
         let repo = root.join("repo");
@@ -799,9 +745,10 @@ printf '{"result":"DONE","session_id":"w-1","total_cost_usd":0.01,"modelUsage":{
 // first-exec check inside relais's 30 s `claude --version` probe.
 #[test]
 fn every_worlds_fake_claude_is_the_one_warmed_inode() {
+    let permit = std::sync::Arc::new(common::WorldPermit::acquire(2));
     use std::os::unix::fs::MetadataExt;
-    let a = World::new("ino-a");
-    let b = World::new("ino-b");
+    let a = World::with_permit("ino-a", permit.clone());
+    let b = World::with_permit("ino-b", permit.clone());
     let meta_a = std::fs::metadata(&a.claude).expect("meta a");
     let meta_b = std::fs::metadata(&b.claude).expect("meta b");
     assert_eq!(
@@ -1490,7 +1437,8 @@ fn assert_seq_counts_from_zero(events: &[serde_json::Value]) {
 // run without the flag writes that file and leaves stdout alone.
 #[test]
 fn a_protocol_run_keeps_stdout_for_events_and_events_jsonl_holds_the_same() {
-    let protocol_world = World::new("proto");
+    let permit = std::sync::Arc::new(common::WorldPermit::acquire(2));
+    let protocol_world = World::with_permit("proto", permit.clone());
     let hash = protocol_world.write_policy(3);
     protocol_world.write_machine(&hash, "");
     let task = protocol_world.write_task("task.json", "off");
@@ -1566,7 +1514,7 @@ fn a_protocol_run_keeps_stdout_for_events_and_events_jsonl_holds_the_same() {
         "the run's own human lines are mirrored into events.jsonl"
     );
 
-    let plain_world = World::new("plain");
+    let plain_world = World::with_permit("plain", permit.clone());
     let hash = plain_world.write_policy(3);
     plain_world.write_machine(&hash, "");
     let task = plain_world.write_task("task.json", "off");
@@ -2963,7 +2911,7 @@ fn every_decide_answer_ends_the_run_they_answered_with_its_own_terminal_status()
 // Unix only: the sign-off is `--actor person`, which relais accepts only
 // from a terminal, and the test makes one with `script(1)`; Windows has no
 // equivalent a test can drive. The refusals themselves run everywhere
-// (tests/decide_actor.rs).
+// (tests/it/decide_actor.rs).
 #[cfg(unix)]
 #[test]
 fn a_human_sign_off_gap_is_cleared_only_by_decide_and_then_feedback_accepts_it() {
@@ -4080,9 +4028,10 @@ fn a_native_dispatch_is_judged_by_silence_not_by_its_sessions_hello() {
 
 #[test]
 fn the_orphan_threshold_comes_from_the_runs_own_repository() {
+    let permit = std::sync::Arc::new(common::WorldPermit::acquire(2));
     // B holds the run, with a 5000 s wall time; A, the cwd, says 120 s.
     let (b, run_id) = {
-        let world = World::new("orphanrepob");
+        let world = World::with_permit("orphanrepob", permit.clone());
         let hash = world.write_policy_with_wall(1, 5000);
         world.write_machine(&hash, "");
         let task = world.write_task("task.json", "off");
@@ -4091,7 +4040,7 @@ fn the_orphan_threshold_comes_from_the_runs_own_repository() {
         let run_id = world.only_run_id();
         (world, run_id)
     };
-    let a = World::new("orphanrepoa");
+    let a = World::with_permit("orphanrepoa", permit.clone());
     a.write_policy(1);
     let leftover = leftover_worktree(&b, &run_id);
     let from_a = |b: &World| {
@@ -5251,7 +5200,8 @@ fn trust_status_of(world: &World, run_id: &str) -> Option<String> {
 // its commands runs, warns once on stderr and is recorded on the run.
 #[test]
 fn a_repository_is_trusted_once_and_a_command_change_warns_once() {
-    let world = World::new("trust-once");
+    let permit = std::sync::Arc::new(common::WorldPermit::acquire(2));
+    let world = World::with_permit("trust-once", permit.clone());
     world.write_policy(3);
     let machine = world.config.join("machine.toml");
     std::fs::write(
@@ -5369,7 +5319,7 @@ fn a_repository_is_trusted_once_and_a_command_change_warns_once() {
     assert!(!text(&plan.stderr).contains("commands changed"));
 
     // Another repository stays blocked: the grant is this repository's.
-    let other = World::new("trust-once-other");
+    let other = World::with_permit("trust-once-other", permit.clone());
     other.write_policy(3);
     std::fs::write(
         other.config.join("machine.toml"),
@@ -5386,7 +5336,8 @@ fn a_repository_is_trusted_once_and_a_command_change_warns_once() {
 // counts over the last 30 days.
 #[test]
 fn a_legacy_key_grant_still_works_is_deprecated_and_counted_by_doctor() {
-    let world = World::new("trust-legacy");
+    let permit = std::sync::Arc::new(common::WorldPermit::acquire(2));
+    let world = World::with_permit("trust-legacy", permit.clone());
     let hash = world.write_policy(3);
     world.write_machine(&hash, "");
     let task = world.write_task("task.json", "off");
@@ -5414,7 +5365,7 @@ fn a_legacy_key_grant_still_works_is_deprecated_and_counted_by_doctor() {
     );
 
     // The deprecated spelling, on a machine with no grant yet.
-    let fresh = World::new("trust-legacy-key");
+    let fresh = World::with_permit("trust-legacy-key", permit.clone());
     fresh.write_policy(3);
     let show = fresh.relais(&["trust", "show", "--json"]);
     let shown: serde_json::Value = serde_json::from_slice(&show.stdout).expect("show json");
@@ -5557,11 +5508,12 @@ fn golden_document(world: &World, run_id: &str, label: &str) -> serde_json::Valu
 
 #[test]
 fn the_isolated_path_leaves_what_it_always_left() {
+    let permit = std::sync::Arc::new(common::WorldPermit::acquire(2));
     let isolated = [("RELAIS_WORKSPACE", "isolated")];
     let mut scenarios = Vec::new();
 
     // An accepted run with one setup step.
-    let world = World::new("golden-accepted");
+    let world = World::with_permit("golden-accepted", permit.clone());
     let hash = world.write_policy_verifying(
         3,
         120,
@@ -5586,7 +5538,7 @@ fn the_isolated_path_leaves_what_it_always_left() {
     scenarios.push(golden_document(&world, &run_id, "accepted-with-setup"));
 
     // A base whose setup fails: blocked before any launch.
-    let world = World::new("golden-blocked");
+    let world = World::with_permit("golden-blocked", permit.clone());
     let hash = world.write_policy_verifying(
         3,
         120,

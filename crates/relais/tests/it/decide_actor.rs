@@ -2,7 +2,7 @@
 //! plan, Phase 1): a typed actor, the refusals that keep a model from
 //! writing the person's name, and the `--json` shapes.
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::process::{Output, Stdio};
@@ -19,17 +19,27 @@ struct World {
     _scratch: relais::test_support::TempDir,
     root: PathBuf,
     state: PathBuf,
+    /// Released only after the scratch directory is gone, so the cap bounds
+    /// live worlds, not finished ones.
+    _permit: std::sync::Arc<common::WorldPermit>,
 }
 
 impl World {
     /// A world with one run, `run-1`, waiting in `needs_decision` and
     /// carrying a sealed receipt.
     fn new(tag: &str) -> Self {
+        Self::with_permit(tag, std::sync::Arc::new(common::WorldPermit::acquire(1)))
+    }
+
+    /// Builds a world under a permit the caller already holds, so a test
+    /// with several worlds takes one `acquire(n)` for all of them.
+    fn with_permit(tag: &str, permit: std::sync::Arc<common::WorldPermit>) -> Self {
         let scratch = short_temp_dir(&format!("da-{tag}"));
         let root = scratch.to_path_buf();
         let state = root.join("state");
         std::fs::create_dir_all(&state).expect("state");
         let world = Self {
+            _permit: permit,
             _scratch: scratch,
             state,
             root,
@@ -198,7 +208,8 @@ fn a_proxy_answer_without_a_plugin_proof_cannot_sign_off() {
 
 #[test]
 fn every_actor_but_the_terminal_one_round_trips_and_json_has_the_documented_shape() {
-    let world = World::new("json");
+    let permit = std::sync::Arc::new(common::WorldPermit::acquire(2));
+    let world = World::with_permit("json", permit.clone());
     let output = world.decide(&[
         "--answer",
         "revise",
@@ -227,7 +238,7 @@ fn every_actor_but_the_terminal_one_round_trips_and_json_has_the_documented_shap
     assert_eq!(row.actor.as_deref(), Some("person-via-orchestrator"));
     // Orchestrator round-trips on a second run.
     drop(ledger);
-    let second = World::new("json2");
+    let second = World::with_permit("json2", permit.clone());
     let output = second.decide(&["--answer", "abandon", "--actor", "orchestrator", "--json"]);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");

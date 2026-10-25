@@ -2,7 +2,7 @@
 //! cumulative usage is booked as a delta, once, whatever the order and the
 //! number of callers.
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -20,15 +20,25 @@ struct World {
     _scratch: relais::test_support::TempDir,
     root: PathBuf,
     state: PathBuf,
+    /// Released only after the scratch directory is gone, so the cap bounds
+    /// live worlds, not finished ones.
+    _permit: std::sync::Arc<common::WorldPermit>,
 }
 
 impl World {
     fn new(tag: &str) -> Self {
+        Self::with_permit(tag, std::sync::Arc::new(common::WorldPermit::acquire(1)))
+    }
+
+    /// Builds a world under a permit the caller already holds, so a test
+    /// with several worlds takes one `acquire(n)` for all of them.
+    fn with_permit(tag: &str, permit: std::sync::Arc<common::WorldPermit>) -> Self {
         let scratch = short_temp_dir(&format!("nu-{tag}"));
         let root = scratch.to_path_buf();
         let state = root.join("state");
         std::fs::create_dir_all(&state).expect("state");
         let world = Self {
+            _permit: permit,
             _scratch: scratch,
             state,
             root,

@@ -15,3 +15,13 @@ applies (ADR-0040). This repository carries phases [2, 3, 4, 5, 6, 7].
   - Fixed: the worker also backdates the cloned `dep/index.js`; the `relais.toml` note now dates its figure.
   - deliberate: the timings are recorded in the PR body, and the worker backdating the task tree is noted in Phase 8's decision log, because the canonical plan lives in decisions.
   - Still open: Windows is proven by the CI test matrix, and the full-suite before figure was not measured under the same load.
+- Phase 3 (move): approve-with-changes after a Delta.
+  - Round 1, approve-with-changes (70k, 137 s). Delta, approve-with-changes (74k, 22 s).
+  - Fixed:
+    - `WorldPermit::acquire` waits at most 600 s, then panics with the counts.
+    - The README paths name `tests/it/`.
+    - The measurements are recorded in the PR body: a peak of 4 live worlds, rebuild and relink times, nextest and `cargo test`.
+  - deliberate, all moved to the Phase 7 PR:
+    - The doc comment and panic wording on `acquire`.
+    - The harness-test fold, which waits for Phase 4.
+    - The unexplained nextest slowdown in the library's tests (code Phase 3 does not change).

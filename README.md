@@ -34,7 +34,7 @@ pull request: lint (fmt, clippy `-D warnings`, the module-cycle gate) on
 coordinator's endpoint and process handling are a different
 implementation on Windows, and the product ships to a macOS workstation)
 — including the release scenarios in
-`crates/relais/tests/portable_scenarios.rs`, which drive the real binary
+`crates/relais/tests/it/portable_scenarios.rs`, which drive the real binary
 on all three; the ones in `release_scenarios.rs` need a `sh` fake worker
 and stay unix-only;
 the msrv build on Ubuntu, against the `rust-version` it reads from
@@ -134,7 +134,7 @@ One crate, `crates/relais`, one binary. Modules follow SPEC §13:
 | `learn` | features, dataset, learner, predict, evaluate, registry (§16, §17) |
 | `router` | the session router's relais side: state, observations, envelope, report (§30) |
 
-`crates/relais/tests/release_scenarios.rs` runs the §14 release scenarios
+`crates/relais/tests/it/release_scenarios.rs` runs the §14 release scenarios
 through the real binary against a fake `claude`; the §23 concurrency
 scenarios are unit tests over the admission state machine.
 

@@ -7,8 +7,8 @@
 //! Unix only: the fake `claude` is a `sh` script.
 #![cfg(unix)]
 
-mod common;
-mod fake_bin;
+use crate::common;
+use crate::fake_bin;
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -42,10 +42,19 @@ struct World {
     fake: PathBuf,
     project: PathBuf,
     state: PathBuf,
+    /// Released only after the scratch directory is gone, so the cap bounds
+    /// live worlds, not finished ones.
+    _permit: std::sync::Arc<common::WorldPermit>,
 }
 
 impl World {
     fn new(tag: &str) -> Self {
+        Self::with_permit(tag, std::sync::Arc::new(common::WorldPermit::acquire(1)))
+    }
+
+    /// Builds a world under a permit the caller already holds, so a test
+    /// with several worlds takes one `acquire(n)` for all of them.
+    fn with_permit(tag: &str, permit: std::sync::Arc<common::WorldPermit>) -> Self {
         let scratch = short_temp_dir(&format!("pi-{tag}"));
         let root = scratch.to_path_buf();
         let fake = root.join("fake");
@@ -57,6 +66,7 @@ impl World {
         let claude = fake.join("claude");
         fake_bin::install_script(&claude, FAKE_CLAUDE);
         let world = Self {
+            _permit: permit,
             _scratch: scratch,
             root,
             fake,
@@ -206,7 +216,8 @@ fn a_preview_names_the_steps_and_writes_and_runs_nothing() {
 
 #[test]
 fn a_claude_that_fails_fails_the_install_with_its_stderr() {
-    let world = World::new("fails");
+    let permit = std::sync::Arc::new(common::WorldPermit::acquire(2));
+    let world = World::with_permit("fails", permit.clone());
     world.fail(
         "plugin install relais@relais-local",
         "marketplace is broken",
@@ -220,7 +231,7 @@ fn a_claude_that_fails_fails_the_install_with_its_stderr() {
         "{stderr}"
     );
 
-    let world = World::new("fails-add");
+    let world = World::with_permit("fails-add", permit.clone());
     world.fail(
         &format!("plugin marketplace add {}", world.marketplace().display()),
         "cannot add",
@@ -278,7 +289,8 @@ fn uninstall_removes_the_plugin_the_marketplace_and_the_directory() {
 
 #[test]
 fn uninstall_accepts_what_is_already_absent_and_reports_any_other_failure() {
-    let world = World::new("uninstall-absent");
+    let permit = std::sync::Arc::new(common::WorldPermit::acquire(2));
+    let world = World::with_permit("uninstall-absent", permit.clone());
     world.fail(
         "plugin uninstall relais@relais-local",
         "Plugin relais@relais-local not found",
@@ -292,7 +304,7 @@ fn uninstall_accepts_what_is_already_absent_and_reports_any_other_failure() {
     );
     assert_eq!(world.calls().len(), 2, "{:?}", world.calls());
 
-    let world = World::new("uninstall-fails");
+    let world = World::with_permit("uninstall-fails", permit.clone());
     std::fs::create_dir_all(world.marketplace()).expect("mkdir");
     world.fail("plugin marketplace remove relais-local", "disk on fire");
     let out = world.relais(&["uninstall", "--claude", "--write"]);
