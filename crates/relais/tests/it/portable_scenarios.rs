@@ -1066,7 +1066,7 @@ fn plan_refuses_each_unusable_holdout_by_its_own_code() {
     let missing_store = format!("file://{}/no-such-store", world.root.display());
     let declaration = |junit: &str, overlay: &str| {
         format!(
-            "schema_version = 1\n\n[holdouts]\nstore = \"{missing_store}\"\n\n\
+            "schema_version = 1\n\n[holdouts]\nstore = '{missing_store}'\n\n\
              [holdouts.{repo_name}.escaping]\npath = \"p.rs\"\noverlay = \"{overlay}\"\n\
              command = {{ argv = [\"true\"]{junit} }}\n"
         )
