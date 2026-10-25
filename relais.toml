@@ -63,7 +63,8 @@ timeout_seconds = 300
 
 [[verification.profiles.default.commands]]
 argv = ["make", "test"]
-# Measured 339 s. Weight 2: it is the heaviest command on the machine, so
+# Measured 367 s on 2026-10-25 from a fresh worktree, build included (the
+# library's tests 139 s, release_scenarios 117 s). Weight 2: it is the heaviest command on the machine, so
 # it takes two heavy slots. It writes no JUnit (plain `cargo test`), so no
 # `junit` is declared and the pre-existing shortcut does not apply to it.
 timeout_seconds = 1020
