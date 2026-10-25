@@ -60,6 +60,8 @@ jobs:
       # the top-level module).
       - run: python3 scripts/check-child-cycles.py crates/relais/src/ledger
       - run: python3 scripts/check-child-cycles.py crates/relais/src/runner
+      # The deletion check's pure logic, on fixtures (no cargo, no network).
+      - run: python3 scripts/test_mutants_check.py
 
   # `make test`: the library suite plus the release scenarios, which drive
   # the real binary against a fake `claude`, a temporary repository and a

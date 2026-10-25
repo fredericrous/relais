@@ -1,16 +1,24 @@
 # Did a branch delete a test whose bugs nothing else catches?
 #
+# Copied from amont's .github/workflows/mutants.yaml at b247e39 (2026-10-19)
+# and hardened for relais by Phase 4 of decisions'
+# docs/plans/2026-10-25-relais-tests-follow-user-flows.md: the check fails
+# closed, and each cell reports `exit=<rc>` (0 nothing lost, 1 a mutant lost,
+# 2 an invalid manifest or incomplete evidence).
+#
 # The bar of decisions' plan 2026-10-17-amont-tests-follow-user-flows: a
 # test may go only if every mutant it caught is still caught by the tests
 # that remain. scripts/mutants-check.sh says how that is checked; this runs
 # it on a branch, on demand, for the product files a pull request names:
 #
-#   gh workflow run mutants.yaml --ref <branch> -f files="crates/amont-runtime/src/manifest.rs"
+#   gh workflow run mutants.yaml --ref <branch> -f files="crates/relais/src/runner/mod.rs" \
+#     -f manifest="$(cat manifest.tsv)"
 #
 # Each file is checked on its own runners, `shards` of them, in parallel: a
-# mutant costs a build and the whole suite (about 100 s), so one runner
-# over ten files took more than two hours, and one file whose deleted tests
-# ran nearly every line took 162 minutes alone (amont#364). `verdict` is the
+# mutant costs a build and the whole suite (about 190 s on ubuntu here,
+# relais#305). In amont, whose suite was about 100 s, one runner over ten
+# files took more than two hours, and one file whose deleted tests ran
+# nearly every line took 162 minutes alone (amont#364). `verdict` is the
 # one result to read.
 #
 # On demand, not on every pull request: only a branch that deletes or
@@ -18,7 +26,7 @@
 # deleted tests exercised. The pull request quotes the summary.
 #
 # cargo-mutants and cargo-llvm-cov are CI tools here, like cargo-audit: they
-# build and run the tests, and link into nothing amont ships (ADR-0020).
+# build and run the tests, and link into nothing relais ships (ADR-0020).
 name: mutants
 
 on:
@@ -33,6 +41,14 @@ on:
       shards:
         description: Runners per file
         default: "3"
+      manifest:
+        description: "Affected-test manifest (TSV text; see scripts/mutants-check.sh), may be empty"
+        required: false
+        default: ""
+      equivalents:
+        description: "Equivalent mutants (TSV text: base mutant name, tab, reason), may be empty"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -59,6 +75,8 @@ jobs:
           n, files = int(sys.argv[1]), sys.argv[2:]
           if n < 1 or not files:
               sys.exit("mutants: name at least one file, and at least one shard")
+          if n * len(files) > 12:
+              sys.exit(f"mutants: {len(files)} files x {n} shards is {n * len(files)} cells; the most is 12")
           cells = [{"file": f, "shard": f"{k}/{n}"} for f in files for k in range(n)]
           print("matrix=" + json.dumps({"include": cells}))
           EOF
@@ -68,6 +86,7 @@ jobs:
     needs: plan
     strategy:
       fail-fast: false
+      max-parallel: 6
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
@@ -83,7 +102,7 @@ jobs:
             ~/.cargo/bin/cargo-mutants
             ~/.cargo/bin/cargo-llvm-cov
             target
-          key: mutants-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: mutants-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - name: cargo-mutants 27.1.0 and cargo-llvm-cov 0.9.1
         run: |
           set -eu
@@ -98,18 +117,29 @@ jobs:
           fi
       # The tests make commits in scratch repositories.
       - run: |
-          git config --global user.email ci@example.com
-          git config --global user.name "amont ci"
+          git config --global user.email "ci@relais.invalid"
+          git config --global user.name "relais ci"
           git config --global init.defaultBranch main
       - name: the deleted tests' mutants are still caught
         env:
           FILE: ${{ matrix.file }}
           BASE: ${{ inputs.base }}
+          MANIFEST: ${{ inputs.manifest }}
+          EQUIVALENTS: ${{ inputs.equivalents }}
           MUTANTS_ARGS: -j 2
           MUTANTS_SHARD: ${{ matrix.shard }}
         run: |
-          set -o pipefail
-          scripts/mutants-check.sh --base "origin/$BASE" "$FILE" 2>&1 | tee "$RUNNER_TEMP/mutants.txt"
+          printf '%s' "$MANIFEST" > "$RUNNER_TEMP/manifest.tsv"
+          printf '%s' "$EQUIVALENTS" > "$RUNNER_TEMP/equivalents.tsv"
+          rc=0
+          scripts/mutants-check.sh --base "origin/$BASE" \
+            --manifest "$RUNNER_TEMP/manifest.tsv" \
+            --equivalents "$RUNNER_TEMP/equivalents.tsv" "$FILE" \
+            > "$RUNNER_TEMP/mutants.txt" 2>&1 || rc=$?
+          cat "$RUNNER_TEMP/mutants.txt"
+          echo "exit=$rc" | tee -a "$RUNNER_TEMP/mutants.txt"
+          echo "exit=$rc" >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
       - if: ${{ always() }}
         env:
           FILE: ${{ matrix.file }}
