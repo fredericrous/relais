@@ -25,3 +25,13 @@ applies (ADR-0040). This repository carries phases [2, 3, 4, 5, 6, 7].
     - The doc comment and panic wording on `acquire`.
     - The harness-test fold, which waits for Phase 4.
     - The unexplained nextest slowdown in the library's tests (code Phase 3 does not change).
+- Phase 4 (check, part 1: the script and the workflow): approve after a Delta.
+  - Round 1, approve-with-changes (75k, 125 s). Delta, approve (81k, 21 s).
+  - Fixed:
+    - A base timeout counts as a detection.
+    - A manifest with helper entries but no test entry is refused.
+    - Test entries and the deleted-test cover both match by exact module path.
+    - The listing uses awk, BSD-safe.
+    - A fixture covers the ambiguous outcome.
+  - deliberate: entries are not checked to belong to the right package, because relais is one crate.
+  - Part 2 is the proof dispatches, after this merges, because `workflow_dispatch` needs the file on main.

@@ -3,3 +3,4 @@ target/
 # declarations, for this build); never edited, never committed.
 claude-plugin/.claude-plugin/types/
 claude-plugin/tsconfig.json
+__pycache__/
