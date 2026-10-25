@@ -28,6 +28,9 @@ pub fn relais(bin: &str) -> Command {
 /// scenarios that build no world have no reason to queue.
 pub const MAX_LIVE_WORLDS: usize = 4;
 
+/// How long `WorldPermit::acquire` waits before it calls the wait a hang.
+const PERMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
 static FREE_PERMITS: std::sync::Mutex<usize> = std::sync::Mutex::new(MAX_LIVE_WORLDS);
 static PERMITS_RETURNED: std::sync::Condvar = std::sync::Condvar::new();
 
@@ -40,7 +43,10 @@ pub struct WorldPermit {
 
 impl WorldPermit {
     /// Waits until `count` places are free, then takes them. `count` must
-    /// not exceed `MAX_LIVE_WORLDS`, or the wait never ends.
+    /// not exceed `MAX_LIVE_WORLDS`, or the wait never ends. A wait past
+    /// `PERMIT_WAIT` panics, naming what it asked for and what was free:
+    /// the slowest scenario takes well under a minute, so a wait that long
+    /// is a test holding part of the cap while it waits for more.
     pub fn acquire(count: usize) -> Self {
         assert!(
             (1..=MAX_LIVE_WORLDS).contains(&count),
@@ -53,10 +59,19 @@ impl WorldPermit {
         let mut free = FREE_PERMITS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let deadline = std::time::Instant::now() + PERMIT_WAIT;
         while *free < count {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !left.is_zero(),
+                "waited {PERMIT_WAIT:?} for {count} of {MAX_LIVE_WORLDS} world permits, \
+                 {} free: a test is holding permits while it waits for more",
+                *free
+            );
             free = PERMITS_RETURNED
-                .wait(free)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .wait_timeout(free, left)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
         }
         *free -= count;
         Self { count }
