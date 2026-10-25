@@ -671,6 +671,9 @@ fn quiet_dependencies_worker(signal: &str) -> MockBackend {
         let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
         let dependency = work_dir.join("node_modules/dep");
         if dependency.is_dir() {
+            // Files first: a copy that is not copy-on-write gives them
+            // fresh mtimes too. The directory's mtime is set last.
+            backdate(&dependency.join("index.js"), long_ago);
             backdate(&dependency, long_ago);
         }
     })
