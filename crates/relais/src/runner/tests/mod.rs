@@ -9116,12 +9116,22 @@ fn a_fork_seeds_its_verification_tree_from_a_fresh_task_tree_without_waiting() {
             "{outcome:?}"
         );
     } else {
+        // No clone: the verification tree gets a full setup instead.
+        let events = event_kinds(&fixture, &outcome.run_id);
+        let unavailable = events
+            .iter()
+            .position(|(kind, what)| {
+                kind == "decision" && what.as_deref() == Some("workspace_cow_unavailable")
+            })
+            .unwrap_or_else(|| panic!("no workspace_cow_unavailable: {events:?}"));
         assert!(
-            decisions.contains(&"workspace_cow_unavailable".to_string()),
-            "{decisions:?}"
+            events[unavailable..]
+                .iter()
+                .any(|(kind, _)| kind == "check_started"),
+            "the setup step runs after the unavailable clone: {events:?}"
         );
     }
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // temp dir: a leftover only costs disk
 }
 
 /// An in-place run's base seed still takes the caller's window (the
@@ -9157,7 +9167,7 @@ fn an_in_place_runs_base_seed_keeps_the_callers_window() {
             "the base seed and the verification seed both clone: {decisions:?}"
         );
     }
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // temp dir: a leftover only costs disk
 }
 
 /// `QuietFor` on a source that changed just now waits through the injected
@@ -9200,7 +9210,7 @@ fn seeding_from_a_fresh_source_waits_through_the_injected_sleep() {
     );
     assert!(logged.contains("workspace_seed_waiting"), "{logged}");
     assert!(!logged.contains("workspace_seed_unwaited"), "{logged}");
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // temp dir: a leftover only costs disk
 }
 
 /// A partial `node_modules` in the task tree whose setup step repairs it
@@ -9209,9 +9219,6 @@ fn seeding_from_a_fresh_source_waits_through_the_injected_sleep() {
 fn a_partial_seed_that_setup_repairs_verifies_like_a_clean_tree() {
     use crate::workspace::reuse::Workspace;
     let fixture = fixture_with_installed_deps();
-    if !cow_here(&fixture) {
-        return;
-    }
     let repo = fixture.repo_policy_with_setup(
         vec![bash_step(
             "mkdir -p node_modules/dep && echo ok > node_modules/dep/index.js",
@@ -9240,7 +9247,7 @@ fn a_partial_seed_that_setup_repairs_verifies_like_a_clean_tree() {
         0,
         "{decisions:?}"
     );
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // temp dir: a leftover only costs disk
 }
 
 /// A partial seed whose setup step fails is a setup gap: recorded, and no
@@ -9249,9 +9256,6 @@ fn a_partial_seed_that_setup_repairs_verifies_like_a_clean_tree() {
 fn a_partial_seed_that_setup_cannot_repair_is_a_gap_and_runs_no_check() {
     use crate::workspace::reuse::Workspace;
     let fixture = fixture_with_installed_deps();
-    if !cow_here(&fixture) {
-        return;
-    }
     let repo = fixture.repo_policy_with_setup(
         vec![bash_step("test \"$(cat node_modules/dep/index.js)\" = ok")],
         vec![versionable_main_gone_check()],
@@ -9278,5 +9282,5 @@ fn a_partial_seed_that_setup_cannot_repair_is_a_gap_and_runs_no_check() {
             .all(|(kind, _)| kind != "check_started"),
         "no verification check after the gap: {events:?}"
     );
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // temp dir: a leftover only costs disk
 }

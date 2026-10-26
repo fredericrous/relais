@@ -53,6 +53,12 @@ pub enum SeedWait {
     QuietFor(Quiet),
     /// The source is the run's own tree and every writer the run started
     /// has ended: there is nothing to wait for.
+    ///
+    /// holds-until: a seed-related `verification_setup_gap` shows up. This
+    /// trusts the worker's end: a native worker's untracked background
+    /// child (`cargo build &`), or the person in an in-place tree, can still
+    /// be writing. The rollback is a release that turns this back into
+    /// `QuietFor(Quiet::CALLER)` at its two call sites.
     WritersEnded,
 }
 
