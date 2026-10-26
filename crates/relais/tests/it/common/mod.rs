@@ -55,43 +55,48 @@ impl Permits {
     }
 }
 
-static PERMITS: std::sync::Mutex<Permits> = std::sync::Mutex::new(Permits {
-    free: MAX_LIVE_WORLDS,
-    next: 0,
-    serving: 0,
-    abandoned: std::collections::BTreeSet::new(),
-});
-static PERMITS_RETURNED: std::sync::Condvar = std::sync::Condvar::new();
-
-/// `count` places in the cap, returned together when this drops. A test
-/// holding several worlds takes one permit for all of them and shares it
-/// (`Arc`), so it never waits on itself while holding part of the cap.
-pub struct WorldPermit {
-    count: usize,
+/// A cap of places served in ticket order. One process-wide instance bounds
+/// the worlds ([`WorldPermit`]); a test builds its own with a short `wait`.
+pub struct Gate {
+    cap: usize,
+    wait: std::time::Duration,
+    permits: std::sync::Mutex<Permits>,
+    returned: std::sync::Condvar,
 }
 
-impl WorldPermit {
-    /// Waits for its turn and for `count` free places, then takes them. A `count` above
-    /// `MAX_LIVE_WORLDS` is refused before any wait. A wait past
-    /// `PERMIT_WAIT` panics, naming what it asked for and what was free: the
-    /// slowest scenario takes well under a minute, so a wait that long is a
-    /// test holding part of the cap while it waits for more, or scenarios
-    /// slowed by a loaded machine.
-    pub fn acquire(count: usize) -> Self {
+impl Gate {
+    pub const fn new(cap: usize, wait: std::time::Duration) -> Self {
+        Self {
+            cap,
+            wait,
+            permits: std::sync::Mutex::new(Permits {
+                free: cap,
+                next: 0,
+                serving: 0,
+                abandoned: std::collections::BTreeSet::new(),
+            }),
+            returned: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Waits for its turn and for `count` free places, then takes them. A
+    /// `count` outside `1..=cap` is refused before any wait. A wait past
+    /// `wait` panics, naming what it asked for and what was free.
+    pub fn take(&self, count: usize) {
         assert!(
-            (1..=MAX_LIVE_WORLDS).contains(&count),
+            (1..=self.cap).contains(&count),
             "a permit of {count} worlds can never be granted"
         );
-        // Poisoning is tolerated deliberately: a panicking scenario must
-        // not wedge every scenario after it. The count is a plain usize
-        // and a panic cannot leave it in a shape the next waiter cannot
-        // read.
-        let mut permits = PERMITS
+        // A poisoned lock is reused: no critical section below can panic
+        // (the explicit panic runs after the guard is dropped), so a
+        // panicking scenario elsewhere leaves the queue readable.
+        let mut permits = self
+            .permits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let ticket = permits.next;
         permits.next += 1;
-        let deadline = std::time::Instant::now() + PERMIT_WAIT;
+        let deadline = std::time::Instant::now() + self.wait;
         while permits.serving != ticket || permits.free < count {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
@@ -104,14 +109,16 @@ impl WorldPermit {
                     permits.abandoned.insert(ticket);
                 }
                 drop(permits);
-                PERMITS_RETURNED.notify_all();
+                self.returned.notify_all();
                 panic!(
-                    "waited {PERMIT_WAIT:?} for {count} of {MAX_LIVE_WORLDS} world permits, \
-                     {free} free: a test holding permits while it waits for more, \
-                     or scenarios slowed by machine load"
+                    "waited {:?} for {count} of {} world permits, {free} free: a test \
+                     holding permits while it waits for more, or scenarios slowed by \
+                     machine load",
+                    self.wait, self.cap
                 );
             }
-            permits = PERMITS_RETURNED
+            permits = self
+                .returned
                 .wait_timeout(permits, left)
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .0;
@@ -120,20 +127,116 @@ impl WorldPermit {
         permits.advance();
         drop(permits);
         // The next ticket may be able to go now.
-        PERMITS_RETURNED.notify_all();
+        self.returned.notify_all();
+    }
+
+    pub fn give(&self, count: usize) {
+        let mut permits = self
+            .permits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        permits.free += count;
+        drop(permits);
+        // Every waiter, not one: only the ticket being served may go, and a
+        // single wakeup could land on another.
+        self.returned.notify_all();
+    }
+}
+
+/// The process-wide cap on live worlds. The slowest scenario takes well
+/// under a minute, so a wait of `PERMIT_WAIT` is a hang.
+static WORLDS: Gate = Gate::new(MAX_LIVE_WORLDS, PERMIT_WAIT);
+
+/// `count` places in the cap, returned together when this drops. A test
+/// holding several worlds takes one permit for all of them and shares it
+/// (`Arc`), so it never waits on itself while holding part of the cap.
+pub struct WorldPermit {
+    count: usize,
+}
+
+impl WorldPermit {
+    /// See [`Gate::take`].
+    pub fn acquire(count: usize) -> Self {
+        WORLDS.take(count);
         Self { count }
     }
 }
 
 impl Drop for WorldPermit {
     fn drop(&mut self) {
-        let mut permits = PERMITS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        permits.free += self.count;
-        drop(permits);
-        // Every waiter, not one: only the ticket being served may go, and a
-        // single wakeup could land on another.
-        PERMITS_RETURNED.notify_all();
+        WORLDS.give(self.count);
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::Gate;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Waits until `gate` has handed out exactly `next` tickets, so threads
+    /// queue in a known order.
+    fn queued(gate: &Gate, next: u64) {
+        while gate.permits.lock().unwrap().next < next {
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn a_two_place_waiter_is_served_before_later_one_place_waiters() {
+        let gate = Arc::new(Gate::new(4, Duration::from_secs(30)));
+        gate.take(1);
+        gate.take(1);
+        gate.take(1);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut threads = Vec::new();
+        for (name, count) in [("two", 2), ("one-a", 1), ("one-b", 1)] {
+            let (waiter, order) = (gate.clone(), order.clone());
+            let next = gate.permits.lock().unwrap().next;
+            threads.push(std::thread::spawn(move || {
+                waiter.take(count);
+                order.lock().unwrap().push(name);
+            }));
+            queued(&gate, next + 1);
+        }
+        // One place is free, but the head of the queue wants two: the
+        // one-place waiters behind it must not overtake it.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "{:?}",
+            order.lock().unwrap()
+        );
+        gate.give(3);
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(order.lock().unwrap()[0], "two");
+    }
+
+    #[test]
+    fn a_waiter_that_gives_up_does_not_block_the_queue() {
+        let gate = Arc::new(Gate::new(2, Duration::from_millis(200)));
+        gate.take(2);
+        // The head times out, and so does the waiter behind it; both pass
+        // their turn on, so a later waiter is served once places return.
+        let head = {
+            let gate = gate.clone();
+            std::thread::spawn(move || gate.take(2))
+        };
+        queued(&gate, 2);
+        let behind = {
+            let gate = gate.clone();
+            std::thread::spawn(move || gate.take(1))
+        };
+        assert!(head.join().is_err(), "the head gives up after its wait");
+        assert!(behind.join().is_err(), "so does the waiter behind it");
+        gate.give(2);
+        gate.take(1);
+        let state = gate.permits.lock().unwrap_or_else(|p| p.into_inner());
+        // Tickets 0 (the first take), 1 and 2 (the two that gave up) and 3
+        // (the last take) were all served or passed: nothing is pending.
+        assert_eq!((state.free, state.serving, state.next), (1, 4, 4));
+        assert!(state.abandoned.is_empty(), "{:?}", state.abandoned);
     }
 }
