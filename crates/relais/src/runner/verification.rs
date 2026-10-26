@@ -182,7 +182,10 @@ impl<'a> RunEngine<'a> {
     /// by the caller: `accepted` for the run's own acceptance,
     /// `needs_decision` for the snapshot a run keeps when it stops for a
     /// review it could not have.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an existing arity, kept until these parameters are grouped into a struct"
+    )]
     fn candidate_receipt(
         &self,
         ctx: &AttemptContext<'_>,

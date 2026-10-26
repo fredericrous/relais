@@ -1134,7 +1134,10 @@ pub fn run_observed(
 /// own log (`<stem>.log`, `<stem>-retry1.log`); a failure that shows
 /// resource exhaustion, and a cancellation, are never retried. A
 /// fail-then-pass is a pass marked `flaky`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "an existing arity, kept until these parameters are grouped into a struct"
+)]
 pub fn run_observed_within(
     dir: &Path,
     spec: &CommandSpec,
@@ -1193,7 +1196,10 @@ fn retryable(outcome: &CheckOutcome, admission: &HeavyAdmission<'_>) -> bool {
 }
 
 /// One run of one command: the body of [`run_observed_within`].
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "an existing arity, kept until these parameters are grouped into a struct"
+)]
 fn run_attempt(
     dir: &Path,
     spec: &CommandSpec,
@@ -1660,7 +1666,10 @@ pub fn run_setup_gated(
 
 /// [`run_setup_gated`] under a run's budgets and heavy leases: each step
 /// waits for its lease, then is clipped to what is left when it starts.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "an existing arity, kept until these parameters are grouped into a struct"
+)]
 pub fn run_setup_gated_within(
     dir: &Path,
     profile: &VerificationProfile,

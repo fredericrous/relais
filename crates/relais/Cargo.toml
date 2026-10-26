@@ -80,3 +80,6 @@ windows-sys = { version = "0.61", features = [
 # tier eligibility did not offer. Examples prove a case; these prove the
 # rule over generated inputs.
 proptest = "1.11"
+
+[lints]
+workspace = true

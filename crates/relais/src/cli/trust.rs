@@ -187,7 +187,10 @@ pub(crate) fn previous_grant_steps(repo_key: &str) -> Option<Vec<relais::trust::
 
 /// The ledger row of a grant just written: who, from where, and the steps
 /// it authorized.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "an existing arity, kept until these parameters are grouped into a struct"
+)]
 pub(crate) fn record_grant(
     shown: &relais::trust::Shown,
     key: &str,
