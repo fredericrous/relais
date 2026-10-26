@@ -1178,7 +1178,7 @@ fn accept_integrated(
 /// snapshot a run keeps when it stops for a review it could not have).
 #[expect(
     clippy::too_many_arguments,
-    reason = "the receipt takes each recorded field positionally"
+    reason = "an existing arity, kept until these parameters are grouped into a struct"
 )]
 fn integrated_receipt(
     engine: &RunEngine<'_>,

@@ -486,7 +486,7 @@ pub fn available_bytes(path: &Path) -> Option<u64> {
             target_pointer_width = "64",
             expect(
                 clippy::useless_conversion,
-                reason = "on 64-bit targets `f_frsize`, a C `unsigned long`, is already u64"
+                reason = "on 64-bit targets `f_frsize` (and `f_bavail` on Linux) is already u64"
             )
         )]
         Some(u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize)))

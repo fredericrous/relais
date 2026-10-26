@@ -189,7 +189,7 @@ pub(crate) fn previous_grant_steps(repo_key: &str) -> Option<Vec<relais::trust::
 /// it authorized.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the grant row takes each recorded field positionally"
+    reason = "an existing arity, kept until these parameters are grouped into a struct"
 )]
 pub(crate) fn record_grant(
     shown: &relais::trust::Shown,

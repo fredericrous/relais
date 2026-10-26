@@ -65,6 +65,8 @@ jobs:
       # general.no-disabled-safety: the clippy settings that refuse a
       # reasonless `#[allow]` are still in Cargo.toml (ADR-0044). The
       # release tarball is pinned by its checksum, so a moved tag fails here.
+      # CI only, not `make lint`: a contributor need not install adr-lint to
+      # build relais, and the commit gate's clippy already refuses an `#[allow]`.
       - name: adr-lint sync --check
         env:
           ADR_LINT: "0.8.0"

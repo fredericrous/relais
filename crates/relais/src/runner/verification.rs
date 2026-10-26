@@ -184,7 +184,7 @@ impl<'a> RunEngine<'a> {
     /// review it could not have.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the receipt takes each recorded field positionally"
+        reason = "an existing arity, kept until these parameters are grouped into a struct"
     )]
     fn candidate_receipt(
         &self,

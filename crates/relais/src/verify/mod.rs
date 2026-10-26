@@ -1136,7 +1136,7 @@ pub fn run_observed(
 /// fail-then-pass is a pass marked `flaky`.
 #[expect(
     clippy::too_many_arguments,
-    reason = "each argument is a distinct recorded field of the verification call"
+    reason = "an existing arity, kept until these parameters are grouped into a struct"
 )]
 pub fn run_observed_within(
     dir: &Path,
@@ -1198,7 +1198,7 @@ fn retryable(outcome: &CheckOutcome, admission: &HeavyAdmission<'_>) -> bool {
 /// One run of one command: the body of [`run_observed_within`].
 #[expect(
     clippy::too_many_arguments,
-    reason = "each argument is a distinct recorded field of the verification call"
+    reason = "an existing arity, kept until these parameters are grouped into a struct"
 )]
 fn run_attempt(
     dir: &Path,
@@ -1668,7 +1668,7 @@ pub fn run_setup_gated(
 /// waits for its lease, then is clipped to what is left when it starts.
 #[expect(
     clippy::too_many_arguments,
-    reason = "each argument is a distinct recorded field of the verification call"
+    reason = "an existing arity, kept until these parameters are grouped into a struct"
 )]
 pub fn run_setup_gated_within(
     dir: &Path,
