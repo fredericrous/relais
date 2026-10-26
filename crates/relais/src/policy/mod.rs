@@ -1049,6 +1049,12 @@ pub struct HoldoutDecl {
     /// A runner config inside the store (for example a nextest.toml).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<String>,
+    /// Repo-relative globs of the files in the candidate's tree the
+    /// holdout command depends on (a crate's `Cargo.toml`, a
+    /// `.config/nextest.toml`). They are protected verification inputs for
+    /// a run whose contract names this holdout.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -3700,6 +3706,27 @@ secret = "no"
 command = { argv = ["true"], junit = "j.xml" }
 "#;
         MachineSettings::from_toml_str(text).unwrap_err();
+    }
+
+    #[test]
+    fn a_holdout_declaration_reads_inputs_and_defaults_them_to_none() {
+        let text = |inputs: &str| {
+            format!(
+                "schema_version = 1\n[holdouts]\nstore = \"s\"\n[holdouts.r.x]\npath = \"p\"\n\
+                 overlay = \"o\"\n{inputs}command = {{ argv = [\"true\"], junit = \"j.xml\" }}\n"
+            )
+        };
+        let declared = |inputs: &str| {
+            MachineSettings::from_toml_str(&text(inputs))
+                .expect("parses")
+                .holdouts
+                .declaration("r", "x")
+                .expect("declared")
+                .inputs
+                .clone()
+        };
+        assert!(declared("").is_empty());
+        assert_eq!(declared("inputs = [\"Cargo.toml\"]\n"), ["Cargo.toml"]);
     }
 
     #[test]

@@ -1881,7 +1881,20 @@ pub fn classify_verification_inputs(
     profile: &VerificationProfile,
     changed: &[String],
 ) -> Result<TouchedInputs, VerifyError> {
-    let policy_set = matcher(&verification_inputs(profile))?;
+    classify_with_holdout_inputs(profile, &[], changed)
+}
+
+/// [`classify_verification_inputs`] for a run whose contract names
+/// holdouts: the globs their declarations list join the policy class
+/// (ADR-0045).
+pub fn classify_with_holdout_inputs(
+    profile: &VerificationProfile,
+    holdout_inputs: &[String],
+    changed: &[String],
+) -> Result<TouchedInputs, VerifyError> {
+    let mut patterns = verification_inputs(profile);
+    patterns.extend(holdout_inputs.iter().cloned());
+    let policy_set = matcher(&patterns)?;
     let test_set = test_tree_matcher()?;
     let mut touched = TouchedInputs::default();
     for path in changed {

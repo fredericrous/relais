@@ -73,6 +73,12 @@ pub enum Reason {
     /// once to repair them.
     ReviewRepair,
     VerificationInputsChanged,
+    /// A candidate wrote a resolved holdout's overlay path: the run ends
+    /// failed, with no repair (ADR-0045).
+    HoldoutOverlayCollision,
+    /// The attempts ran out and every remaining failure is a holdout
+    /// gap: a person decides (ADR-0045).
+    HoldoutFailed,
     AdmissionUnavailable,
     PlanAccepted,
     PlanRejected,
@@ -201,7 +207,7 @@ impl Reason {
     ///
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it.
-    pub const ALL: [Self; 66] = [
+    pub const ALL: [Self; 68] = [
         Self::ChecksAndReviewPassed,
         Self::BehavioralFailure,
         Self::RepairExhausted,
@@ -228,6 +234,8 @@ impl Reason {
         Self::ReviewFindings,
         Self::ReviewRepair,
         Self::VerificationInputsChanged,
+        Self::HoldoutOverlayCollision,
+        Self::HoldoutFailed,
         Self::AdmissionUnavailable,
         Self::PlanAccepted,
         Self::PlanRejected,
@@ -298,6 +306,8 @@ impl Reason {
             Self::ReviewFindings => "review_findings",
             Self::ReviewRepair => "review_repair",
             Self::VerificationInputsChanged => "verification_inputs_changed",
+            Self::HoldoutOverlayCollision => "holdout_overlay_collision",
+            Self::HoldoutFailed => "holdout_failed",
             Self::AdmissionUnavailable => "admission_unavailable",
             Self::PlanAccepted => "plan_accepted",
             Self::PlanRejected => "plan_rejected",

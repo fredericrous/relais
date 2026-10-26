@@ -547,6 +547,27 @@ impl<'a> RunEngine<'a> {
                 request.verification_inputs_changed,
             ));
         }
+        if !request.holdouts.is_empty() {
+            prompt.push_str(&data_list_block(
+                "holdout results",
+                &request
+                    .holdouts
+                    .iter()
+                    .map(|run| {
+                        format!(
+                            "{}: {} ({})",
+                            run.name,
+                            run.outcome.as_str(),
+                            run.tests
+                                .iter()
+                                .map(|test| test.id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            ));
+        }
         prompt.push_str(&format!("\ncandidate commit: {}\n", request.candidate_sha));
         if let Some(part) = part {
             prompt.push_str(&format!(

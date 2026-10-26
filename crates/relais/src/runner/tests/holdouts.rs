@@ -1,7 +1,10 @@
 //! Holdout criteria at preflight and at verification (ADR-0045 phases 2, 3a).
 
 use super::*;
+use crate::ledger::{Actor, DecisionAnswer, RecordedVia};
 use crate::policy::{HoldoutDecl, HoldoutSettings};
+use crate::runner::approval::{approve_from_snapshot, ApprovalError};
+use crate::runner::prompt::RepairFailure;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -19,6 +22,7 @@ fn declaration(junit: Option<&str>, overlay: &str) -> HoldoutDecl {
         )
         .expect("a command"),
         config: Some(RUNNER_CONFIG.into()),
+        inputs: Vec::new(),
     }
 }
 
@@ -84,12 +88,23 @@ fn store_with(fixture: &Fixture, files: &[(&str, &str)]) -> (String, String) {
     (format!("file://{}", store.display()), sha)
 }
 
+/// A removal that finds nothing to remove is the expected case; any other
+/// error is a broken fixture.
+fn ignore_not_found(removal: std::io::Result<()>) {
+    match removal {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("fixture removal failed: {e}"),
+    }
+}
+
 fn counting_worker(launches: Arc<AtomicUsize>, prompts: Arc<Mutex<Vec<String>>>) -> MockBackend {
     MockBackend::new(move |spec| {
         launches.fetch_add(1, Ordering::SeqCst);
         prompts.lock().expect("lock").push(spec.prompt.clone());
         if !spec.prompt.contains("semantic reviewer") {
-            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("worker completes");
+            // A repair finds the file already gone.
+            ignore_not_found(std::fs::remove_file(spec.work_dir.join("src/main.rs")));
         }
         MockOutcome {
             result_text: Some("DONE".into()),
@@ -148,7 +163,7 @@ fn each_unusable_holdout_is_refused_by_its_own_code_before_any_worker() {
         assert_eq!(blocked_code(outcome), expected);
         assert_eq!(launches.load(Ordering::SeqCst), 0, "{expected}");
     }
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
 
 #[test]
@@ -214,7 +229,7 @@ fn a_resolved_holdout_is_recorded_without_its_location_and_stays_a_gap() {
         matches!(optional.terminal, Terminal::Accepted(_)),
         "{optional:?}"
     );
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
 
 const SCRIPT_MARKER: &str = "SECRET-SCRIPT-LINE";
@@ -235,6 +250,7 @@ fn script_declaration(argv: &[&str], config: Option<&str>) -> HoldoutDecl {
         command: serde_json::from_value(serde_json::json!({ "argv": argv, "junit": "j.xml" }))
             .expect("a command"),
         config: config.map(Into::into),
+        inputs: Vec::new(),
     }
 }
 
@@ -314,7 +330,7 @@ fn a_passing_holdout_settles_its_criterion_and_is_listed_on_the_receipt() {
             "a holdout log is not a check log: {path}"
         );
     }
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
 
 #[test]
@@ -337,7 +353,7 @@ fn a_failing_holdout_test_leaves_the_criterion_unmet_without_leaking_the_holdout
     );
     assert_gap_leaks_nothing(detail, &format!("file://{}", fixture.dir.display()));
     assert!(!holdout_dir_of(&fixture, &outcome).exists());
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
 
 #[test]
@@ -355,7 +371,7 @@ fn a_skipped_holdout_test_is_not_a_pass_even_on_exit_zero() {
         "{}",
         outcome.detail()
     );
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
 
 #[test]
@@ -376,7 +392,7 @@ fn a_holdout_that_writes_no_report_did_not_build() {
         "{detail}"
     );
     assert_gap_leaks_nothing(detail, &format!("file://{}", fixture.dir.display()));
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
 
 #[test]
@@ -390,7 +406,7 @@ fn the_config_placeholder_reaches_the_holdout_command_as_the_stores_config_path(
         matches!(outcome.terminal, Terminal::Accepted(_)),
         "{outcome:?}"
     );
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
 
 #[test]
@@ -430,7 +446,7 @@ fn a_store_deleted_after_preflight_blocks_the_run_and_keeps_the_candidate() {
         ],
     );
     assert!(!holdout_dir_of(&fixture, &outcome).exists());
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
 
 #[test]
@@ -454,7 +470,7 @@ fn the_store_is_fetched_once_and_reused_across_attempts() {
             if launch == 0 {
                 std::fs::write(spec.work_dir.join("src/other.rs"), "// first\n").expect("write");
             } else {
-                std::fs::remove_file(spec.work_dir.join("src/main.rs")).ok();
+                ignore_not_found(std::fs::remove_file(spec.work_dir.join("src/main.rs")));
             }
         }
         MockOutcome {
@@ -472,7 +488,7 @@ fn the_store_is_fetched_once_and_reused_across_attempts() {
         "the second attempt fetched again: {outcome:?}"
     );
     assert!(!holdout_dir_of(&fixture, &outcome).exists());
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
 
 #[test]
@@ -537,5 +553,500 @@ fn ended_run_holdout_dirs_are_swept_at_run_start_and_live_or_unknown_ones_kept()
     assert!(!ended_again.exists(), "the retire sweep removes it too");
     assert!(live_dir.join("x").is_file());
     assert!(unknown_dir.join("x").is_file());
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+/// A run of the failing holdout script with `backend` as the worker.
+fn run_failing_with(
+    fixture: &Fixture,
+    inputs: Vec<String>,
+    mandatory: bool,
+    review: Review,
+    max_attempts: u32,
+    backend: &MockBackend,
+) -> (RunOutcome, String, String) {
+    let (store, sha) = store_with(fixture, &[(STORE_PATH_IN_STORE, &writes(FAILING))]);
+    let repo = fixture.repo_policy(vec![passing_check()], max_attempts);
+    let mut declared = script_declaration(&["sh", OVERLAY], None);
+    declared.inputs = inputs;
+    let settings = settings_for(fixture, &store, declared);
+    let mut contract = holdout_contract(fixture, mandatory);
+    contract.review = review;
+    let outcome = fixture.execute_with_holdouts(settings, &contract, &repo, backend);
+    (outcome, store, sha)
+}
+
+/// The detail of the transition that raised the run's open decision,
+/// found the way `decide` finds the gaps that refuse an approval.
+fn holdout_failed_detail(fixture: &Fixture, outcome: &RunOutcome) -> serde_json::Value {
+    let decision = fixture
+        .ledger
+        .decision_of_run(&outcome.run_id)
+        .expect("decision")
+        .expect("an open decision");
+    let raising = fixture
+        .ledger
+        .transitions(&outcome.run_id)
+        .expect("transitions")
+        .into_iter()
+        .find(|transition| {
+            transition.at == decision.raised_at && transition.to_state.awaits_a_person()
+        })
+        .expect("the transition that raised the decision");
+    assert_eq!(raising.reason, "holdout_failed");
+    raising.detail.expect("a detail")
+}
+
+fn reason_of_end(fixture: &Fixture, outcome: &RunOutcome) -> String {
+    fixture
+        .ledger
+        .transitions(&outcome.run_id)
+        .expect("transitions")
+        .iter()
+        .find(|transition| {
+            transition.to_state.is_terminal() || transition.to_state.awaits_a_person()
+        })
+        .map(|transition| transition.reason.clone())
+        .expect("a terminal transition")
+}
+
+/// Every file under the run's artifacts, with its path and content.
+fn artifact_files(fixture: &Fixture, outcome: &RunOutcome) -> Vec<(std::path::PathBuf, String)> {
+    let mut pending = vec![fixture.artifacts.join(outcome.run_id.as_str())];
+    let mut files = Vec::new();
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir).expect("artifacts").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if let Ok(content) = std::fs::read_to_string(&path) {
+                files.push((path, content));
+            }
+        }
+    }
+    files
+}
+
+#[test]
+fn a_worker_that_writes_the_overlay_path_ends_the_run_failed_with_no_repair() {
+    let fixture = Fixture::new();
+    let launches = Arc::new(AtomicUsize::new(0));
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let (counted, seen) = (launches.clone(), prompts.clone());
+    let backend = MockBackend::new(move |spec| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        seen.lock().expect("lock").push(spec.prompt.clone());
+        std::fs::write(spec.work_dir.join(OVERLAY), "// planted\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let (outcome, _store, _sha) =
+        run_failing_with(&fixture, Vec::new(), true, Review::Off, 3, &backend);
+    assert!(
+        matches!(outcome.terminal, Terminal::Failed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        reason_of_end(&fixture, &outcome),
+        "holdout_overlay_collision"
+    );
+    assert!(outcome.detail().contains(OVERLAY), "{}", outcome.detail());
+    assert_eq!(
+        launches.load(Ordering::SeqCst),
+        1,
+        "no repair, no escalation"
+    );
+    for prompt in prompts.lock().expect("lock").iter() {
+        assert!(!prompt.contains(OVERLAY), "a prompt carries the overlay");
+    }
+    let files = artifact_files(&fixture, &outcome);
+    assert!(!files.is_empty(), "the run keeps artifacts");
+    // The candidate's patch is the worker's own text and the event log
+    // carries the detail only the person reads; every other artifact (the
+    // manifest a successor's context is built from, receipts) must not
+    // name the overlay.
+    for (path, content) in files.into_iter().filter(|(path, _)| {
+        path.extension().is_none_or(|ext| ext != "patch")
+            && path.file_name().is_none_or(|name| name != "events.jsonl")
+    }) {
+        assert!(
+            !content.contains(OVERLAY),
+            "{} carries the overlay",
+            path.display()
+        );
+    }
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_worker_that_changes_a_declared_holdout_input_stops_for_a_person() {
+    let fixture = Fixture::new();
+    let backend = MockBackend::new(move |spec| {
+        std::fs::create_dir_all(spec.work_dir.join("src/guarded")).expect("dir");
+        std::fs::write(spec.work_dir.join("src/guarded/runner.toml"), "x = 1\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let (outcome, _store, _sha) = run_failing_with(
+        &fixture,
+        vec!["src/guarded/**".into()],
+        true,
+        Review::Off,
+        3,
+        &backend,
+    );
+    let Terminal::NeedsDecision { reason, detail } = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(*reason, Reason::VerificationInputsChanged);
+    assert!(detail.contains("src/guarded/runner.toml"), "{detail}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+/// A worker whose every attempt writes a different file, so no attempt
+/// repeats the one before and the run goes on to escalate.
+fn changing_worker(prompts: Arc<Mutex<Vec<String>>>) -> MockBackend {
+    let launches = Arc::new(AtomicUsize::new(0));
+    MockBackend::new(move |spec| {
+        let launch = launches.fetch_add(1, Ordering::SeqCst);
+        prompts.lock().expect("lock").push(spec.prompt.clone());
+        if !spec.prompt.contains("semantic reviewer") {
+            std::fs::write(
+                spec.work_dir.join(format!("src/attempt_{launch}.rs")),
+                "//\n",
+            )
+            .expect("write");
+        }
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    })
+}
+
+#[test]
+fn every_attempt_failing_on_the_holdout_ends_for_a_person_with_what_a_worker_never_sees() {
+    let fixture = Fixture::new();
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let backend = changing_worker(prompts.clone());
+    let (outcome, store, sha) =
+        run_failing_with(&fixture, Vec::new(), true, Review::Off, 3, &backend);
+    let Terminal::NeedsDecision { reason, detail } = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(*reason, Reason::HoldoutFailed);
+    let recorded = holdout_failed_detail(&fixture, &outcome);
+    assert_eq!(recorded["holdouts"][0]["name"], "escaping");
+    assert_eq!(recorded["holdouts"][0]["sha"], sha.as_str());
+    assert_eq!(recorded["holdouts"][0]["failing"][0], "h::escapes");
+    assert!(
+        recorded["holdouts"][0]["log"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("holdouts/escaping/log.txt")),
+        "{recorded}"
+    );
+    assert!(
+        recorded["holdouts"][0]["report"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("holdouts/escaping/report.xml")),
+        "{recorded}"
+    );
+    assert!(detail.contains(&sha), "{detail}");
+    assert_eq!(reason_of_end(&fixture, &outcome), "holdout_failed");
+    assert!(detail.contains("escaping"), "{detail}");
+    assert!(detail.contains("h::escapes"), "{detail}");
+    assert!(detail.contains("holdouts/escaping/log.txt"), "{detail}");
+    assert!(
+        detail.contains("--answer approve|revise|reject"),
+        "{detail}"
+    );
+
+    let prompts = prompts.lock().expect("lock");
+    assert!(prompts.len() >= 2, "a repair was dispatched");
+    for prompt in prompts.iter() {
+        for hidden in [
+            store.as_str(),
+            STORE_PATH_IN_STORE,
+            OVERLAY,
+            RUNNER_CONFIG,
+            SCRIPT_MARKER,
+            "log.txt",
+            "report.xml",
+        ] {
+            assert!(!prompt.contains(hidden), "a prompt leaks {hidden}");
+        }
+    }
+    let repair = prompts
+        .iter()
+        .find(|prompt| prompt.contains("[repair addendum]"))
+        .expect("a repair prompt");
+    assert!(
+        repair.contains(STATEMENT) && repair.contains("h::escapes"),
+        "{repair}"
+    );
+    assert!(!repair.contains("(log under logs/)"), "{repair}");
+    let escalation = prompts
+        .iter()
+        .find(|prompt| prompt.contains("[escalation addendum]"))
+        .expect("an escalation prompt");
+    assert!(
+        escalation.contains(STATEMENT) && escalation.contains("h::escapes"),
+        "{escalation}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn running_out_of_attempts_on_a_holdout_alone_ends_holdout_failed_not_budget_exhausted() {
+    let fixture = Fixture::new();
+    let backend = changing_worker(Arc::default());
+    let (outcome, _store, _sha) =
+        run_failing_with(&fixture, Vec::new(), true, Review::Off, 2, &backend);
+    let Terminal::NeedsDecision { reason, .. } = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(*reason, Reason::HoldoutFailed);
+    let recorded = holdout_failed_detail(&fixture, &outcome);
+    assert!(
+        recorded["gaps"]
+            .as_array()
+            .is_some_and(|gaps| !gaps.is_empty()),
+        "the raising transition names the gaps that make `decide` refuse approve: {recorded}"
+    );
+    // The text `decide`'s refusal quotes (cli/decide.rs's holdout_failed test
+    // uses this same format): it must keep naming the holdout and its test.
+    assert!(
+        recorded["gaps"][0]
+            .as_str()
+            .is_some_and(|gap| gap.contains("holdout `escaping` failed: h::escapes")),
+        "{recorded}"
+    );
+    let states: Vec<State> = fixture
+        .ledger
+        .transitions(&outcome.run_id)
+        .expect("transitions")
+        .iter()
+        .map(|transition| transition.to_state)
+        .collect();
+    assert!(states.contains(&State::Escalating), "{states:?}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_holdout_failed_stop_saves_no_verification_snapshot() {
+    let fixture = Fixture::new();
+    let backend = changing_worker(Arc::default());
+    let (outcome, _store, _sha) =
+        run_failing_with(&fixture, Vec::new(), true, Review::Off, 2, &backend);
+    let Terminal::NeedsDecision { reason, .. } = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(*reason, Reason::HoldoutFailed);
+    let refused = approve_from_snapshot(
+        &fixture.ledger,
+        &fixture.artifacts,
+        &outcome.run_id,
+        &DecisionAnswer {
+            resolution: Reason::DecisionApproved,
+            actor: Actor::Orchestrator,
+            person_quote: None,
+            recorded_via: RecordedVia::Cli,
+            note: None,
+            successor_run: None,
+            from_state: State::NeedsDecision,
+            to_state: State::Accepted,
+        },
+        &|| Ok(()),
+    );
+    // A holdout stop saves no snapshot, so this library call can only say
+    // NoSnapshot. The refusal `relais decide --answer approve` really gives
+    // (the holdout gap) is covered by the decide test
+    // `approving_a_holdout_failed_stop_is_refused_naming_the_holdout_gap`.
+    assert!(
+        matches!(refused, Err(ApprovalError::NoSnapshot { .. })),
+        "{refused:?}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_check_label_that_mentions_a_criterion_still_gets_the_log_hint() {
+    let fixture = Fixture::new();
+    let contract = holdout_contract(&fixture, true);
+    let failures = vec![RepairFailure::Check(
+        "lint (criterion: looks like a holdout)".to_string(),
+    )];
+    let (prompt, _) = build_prompt(
+        &contract,
+        &manifest_with(Vec::new()),
+        1,
+        Some(&failures),
+        AttemptKind::Repair,
+    );
+    assert!(
+        prompt.contains("  - lint (criterion: looks like a holdout) (log under logs/)\n"),
+        "{prompt}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_holdout_failure_beside_a_failing_check_still_ends_failed() {
+    let fixture = Fixture::new();
+    let (store, _) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(FAILING))]);
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let settings = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
+    let backend = MockBackend::new(move |spec| {
+        std::fs::write(spec.work_dir.join("src/other.rs"), "// again\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let outcome =
+        fixture.execute_with_holdouts(settings, &holdout_contract(&fixture, true), &repo, &backend);
+    assert!(
+        matches!(outcome.terminal, Terminal::Failed { .. }),
+        "{outcome:?}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn the_reviewer_is_given_each_holdout_as_name_outcome_and_test_ids_only() {
+    let fixture = Fixture::new();
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let backend = counting_worker(Arc::default(), prompts.clone());
+    let (outcome, store, _) =
+        run_failing_with(&fixture, Vec::new(), false, Review::Required, 3, &backend);
+    let prompts = prompts.lock().expect("lock");
+    let reviewer = prompts
+        .iter()
+        .find(|prompt| prompt.contains("semantic reviewer"))
+        .expect("a reviewer prompt");
+    assert!(
+        reviewer.contains("escaping: failed (h::escapes)"),
+        "{reviewer}"
+    );
+    assert!(reviewer.contains(STATEMENT));
+    let report_path = artifact_files(&fixture, &outcome)
+        .iter()
+        .map(|(path, _)| path.to_string_lossy().into_owned())
+        .find(|path| path.ends_with("holdouts/escaping/report.xml"))
+        .expect("the kept report");
+    for hidden in [
+        store.as_str(),
+        report_path.as_str(),
+        STORE_PATH_IN_STORE,
+        OVERLAY,
+        RUNNER_CONFIG,
+        SCRIPT_MARKER,
+        "log.txt",
+    ] {
+        assert!(
+            !reviewer.contains(hidden),
+            "the reviewer prompt leaks {hidden}"
+        );
+    }
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_failed_holdout_beside_another_gap_is_named_in_the_gap_stop() {
+    let fixture = Fixture::new();
+    let (store, _) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(FAILING))]);
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let settings = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
+    let mut contract = holdout_contract(&fixture, true);
+    contract
+        .acceptance
+        .push(crate::acceptance::AcceptanceEntry::Declared(
+            crate::acceptance::DeclaredCriterion {
+                statement: "a person signs off".into(),
+                id: None,
+                mandatory: true,
+                evidence: crate::acceptance::Evidence::HumanSignOff,
+            },
+        ));
+    let backend = counting_worker(Arc::default(), Arc::default());
+    let outcome = fixture.execute_with_holdouts(settings, &contract, &repo, &backend);
+    let Terminal::NeedsDecision { reason, detail } = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(*reason, Reason::VerificationGap);
+    assert!(
+        detail.contains("holdout `escaping` failed: h::escapes"),
+        "{detail}"
+    );
+    assert!(detail.contains("human sign-off"), "{detail}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_holdouts_output_is_never_quoted_by_the_exhaustion_detail() {
+    let fixture = Fixture::new();
+    let script = format!(
+        "#!/bin/sh\necho 'No space left on device'\necho 'Cannot allocate memory'\n{}",
+        writes(FAILING)
+    );
+    let (store, _) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &script)]);
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let settings = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
+    let backend = counting_worker(Arc::default(), Arc::default());
+    let outcome =
+        fixture.execute_with_holdouts(settings, &holdout_contract(&fixture, true), &repo, &backend);
+    assert!(
+        !matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    assert_ne!(reason_of_end(&fixture, &outcome), "resource_exhausted");
+    let detail = outcome.detail();
+    assert!(
+        !detail.contains("No space left") && !detail.contains("Cannot allocate"),
+        "{detail}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_holdout_failure_line_omits_the_log_hint_and_a_check_line_keeps_it() {
+    let fixture = Fixture::new();
+    let contract = holdout_contract(&fixture, true);
+    let failures = vec![
+        RepairFailure::Holdout(format!("a gap (criterion: {STATEMENT})")),
+        RepairFailure::Check("make@1".to_string()),
+        RepairFailure::Check("lint (criterion: looks like a holdout)".to_string()),
+    ];
+    let (prompt, _) = build_prompt(
+        &contract,
+        &manifest_with(Vec::new()),
+        1,
+        Some(&failures),
+        AttemptKind::Repair,
+    );
+    assert!(
+        prompt.contains(&format!("  - {}\n", failures[0].text())),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("  - lint (criterion: looks like a holdout) (log under logs/)\n"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("  - make@1 (log under logs/)\n"),
+        "{prompt}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }

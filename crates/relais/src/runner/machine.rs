@@ -226,6 +226,39 @@ pub enum Severity {
     Low,
 }
 
+/// What a run that ends on holdout gaps alone tells the person and records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldoutStop {
+    /// The sentence the person reads in `relais decide`.
+    pub detail: String,
+    /// Per holdout: name, sha, failing test ids, kept log and report.
+    pub holdouts: serde_json::Value,
+}
+
+impl HoldoutStop {
+    /// The transition detail: the failures as gaps (so approve is refused)
+    /// and the holdouts' records.
+    fn recorded(&self, failures: &[String]) -> serde_json::Value {
+        serde_json::json!({
+            "failures": failures,
+            "gaps": failures,
+            "holdouts": self.holdouts,
+        })
+    }
+
+    fn decision(&self, failures: &[String]) -> Decision {
+        Decision::stop(
+            State::NeedsDecision,
+            Reason::HoldoutFailed,
+            self.recorded(failures),
+            Terminal::NeedsDecision {
+                reason: Reason::HoldoutFailed,
+                detail: self.detail.clone(),
+            },
+        )
+    }
+}
+
 /// One row's worth of input: what the runner observed about the
 /// candidate or the dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +274,15 @@ pub enum Observation {
         same_failures: bool,
         /// Every failure also fails at the base revision.
         all_preexisting: bool,
+        /// Set when every failure is a holdout gap (ADR-0045): the
+        /// sentence a person reads if the run ends on it.
+        holdout_only: Option<HoldoutStop>,
+    },
+    /// The attempt ceiling was reached while every failure left was a
+    /// holdout gap (ADR-0045): a person decides, never `budget_exhausted`.
+    HoldoutsOutOfAttempts {
+        failures: Vec<String>,
+        holdout: HoldoutStop,
     },
     /// Every failing check fails only tests that also fail at the base,
     /// both sides' JUnit complete, and no criterion targets them: no
@@ -373,7 +415,27 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
             unchanged_candidate,
             same_failures,
             all_preexisting,
+            holdout_only,
         } => {
+            // A run that ends on failures that are all holdout gaps goes
+            // to a person, not to `failed` (ADR-0045).
+            let ended = |failed: Reason, detail: String| match &holdout_only {
+                Some(person) => (
+                    State::NeedsDecision,
+                    Reason::HoldoutFailed,
+                    Terminal::NeedsDecision {
+                        reason: Reason::HoldoutFailed,
+                        detail: person.detail.clone(),
+                    },
+                ),
+                None => (State::Failed, failed, Terminal::Failed { detail }),
+            };
+            // The gaps ride in the record so `decide --answer approve` is
+            // refused, as for any gap (SPEC §9).
+            let recorded = |failures: &[String]| match &holdout_only {
+                Some(person) => person.recorded(failures),
+                None => serde_json::json!({ "failures": failures }),
+            };
             // Same failure on an unchanged candidate: another attempt of
             // the same kind would be a no-op. Fail immediately; buying a
             // stronger model for a worker that changed nothing is not
@@ -383,12 +445,8 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
                     "same failure on an unchanged candidate: {}; failing immediately",
                     failures.join(", ")
                 );
-                return Decision::stop(
-                    State::Failed,
-                    Reason::SameFailureRecurrence,
-                    serde_json::json!({ "failures": failures }),
-                    Terminal::Failed { detail },
-                );
+                let (state, reason, terminal) = ended(Reason::SameFailureRecurrence, detail);
+                return Decision::stop(state, reason, recorded(&failures), terminal);
             }
             // A behavioural failure with allowance left: one localized
             // repair. Pre-existing failures are chased too — a task may
@@ -448,13 +506,11 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
                 "verification failed and no repair or escalation remains: {}",
                 failures.join(", ")
             );
-            Decision::stop(
-                State::Failed,
-                Reason::RepairExhausted,
-                serde_json::json!({ "failures": failures }),
-                Terminal::Failed { detail },
-            )
+            let (state, reason, terminal) = ended(Reason::RepairExhausted, detail);
+            Decision::stop(state, reason, recorded(&failures), terminal)
         }
+
+        Observation::HoldoutsOutOfAttempts { failures, holdout } => holdout.decision(&failures),
 
         Observation::PreexistingTestFailures { failures, tests } => {
             let lists: Vec<serde_json::Value> = tests
@@ -798,6 +854,34 @@ mod tests {
             unchanged_candidate: unchanged,
             same_failures: same,
             all_preexisting: preexisting,
+            holdout_only: None,
+        }
+    }
+
+    #[test]
+    fn holdout_only_failures_end_for_a_person_and_refuse_approval() {
+        let only = |unchanged: bool| Observation::VerificationFailed {
+            failures: vec!["a holdout gap".into()],
+            unchanged_candidate: unchanged,
+            same_failures: unchanged,
+            all_preexisting: false,
+            holdout_only: Some(HoldoutStop {
+                detail: "for the person".into(),
+                holdouts: serde_json::json!([]),
+            }),
+        };
+        for unchanged in [false, true] {
+            let decision = decide(&budget(1, None), only(unchanged));
+            assert_eq!(decision.state, State::NeedsDecision);
+            assert_eq!(decision.reason, Reason::HoldoutFailed);
+            assert_eq!(
+                decision.detail["gaps"],
+                serde_json::json!(["a holdout gap"])
+            );
+            assert!(matches!(
+                decision.next,
+                Next::Stop(Terminal::NeedsDecision { .. })
+            ));
         }
     }
 

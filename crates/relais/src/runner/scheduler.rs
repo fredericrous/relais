@@ -63,6 +63,9 @@ pub(crate) struct RootContext<'a> {
     /// Why the baseline could not be cached, when it could not (V2).
     pub baseline_cache_refused: &'a Option<crate::verify::CacheRefused>,
     pub logs_dir: &'a Path,
+    /// The holdouts the root contract names (ADR-0045): their overlay paths
+    /// are reserved and their inputs protected on the assembled candidate.
+    pub holdouts: &'a [crate::holdout::ResolvedHoldout],
 }
 
 pub(crate) enum Decomposed {
@@ -400,6 +403,28 @@ fn execute_waves(
         // floor is the integration worktree's base; `of_run` keeps the
         // decision in the one place attempt.rs also asks.
         let floor = workspace::ScopeFloor::of_run(None, contract);
+        let written =
+            match integration.changed_paths_from(floor.revision(integration), &assembly.head) {
+                Ok(written) => written,
+                Err(e) => return engine.fail_preflight(BlockCode::ScopeCheckFailed, e.to_string()),
+            };
+        if let Some((holdout, overlay)) = crate::holdout::overlay_collision(root.holdouts, &written)
+        {
+            let detail = format!(
+                "the assembled candidate wrote `{overlay}`, the overlay path of holdout `{}`; a \
+                 holdout's overlay is reserved, so the run ends without a repair",
+                holdout.name
+            );
+            return engine.finish(
+                Reason::HoldoutOverlayCollision,
+                serde_json::json!({
+                    "holdout": holdout.name,
+                    "overlay": overlay,
+                    "candidate": assembly.head,
+                }),
+                Terminal::Failed { detail },
+            );
+        }
         match workspace::check_scope_from(integration, &assembly.head, contract, floor) {
             Ok(_) => {}
             Err(WorkspaceError::ScopeViolation(paths)) => {
@@ -463,7 +488,7 @@ fn execute_waves(
             gate_coverage,
             // holds-until: assembled candidates run no holdout, so their
             // holdout criteria stay unsettled gaps (fail closed); ends
-            // with ADR-0045 phase 3b.
+            // when the integration path runs resolved holdouts.
             holdouts: _,
         } = match engine.verify_candidate(
             &assembly.head,
@@ -505,8 +530,9 @@ fn execute_waves(
         if failures.is_empty() {
             let patch_path = engine.artifacts.join(INTEGRATED_PATCH);
             integration.export_patch(&assembly.head, &patch_path)?;
-            let touched_inputs = verify::classify_verification_inputs(
+            let touched_inputs = verify::classify_with_holdout_inputs(
                 &root.authority.verification_profile,
+                &crate::holdout::protected_inputs(root.holdouts),
                 &integration.changed_paths_in(&assembly.head)?,
             )?;
             return accept_integrated(
@@ -1072,6 +1098,7 @@ fn accept_integrated(
                 routed_by: root.decision.routed_by,
                 covering: root.decision.covering.clone(),
                 base_sha: root.base_sha,
+                holdouts: &[],
             },
             &mut spend,
         );

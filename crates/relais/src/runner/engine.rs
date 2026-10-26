@@ -624,6 +624,7 @@ impl<'a> RunEngine<'a> {
                 baseline_cached: baseline.cached,
                 baseline_cache_refused: &baseline.cache_refused,
                 logs_dir: &baseline.logs_dir,
+                holdouts: &preflight.holdouts,
             };
             match scheduler::run_decomposed(self, &root, decomposition)? {
                 scheduler::Decomposed::Outcome(outcome) => return Ok(outcome),

@@ -19,6 +19,16 @@ pub enum HoldoutVerdict {
     DidNotBuild,
 }
 
+impl HoldoutVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::DidNotBuild => "did_not_build",
+        }
+    }
+}
+
 /// One test a holdout's report named.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HoldoutTest {
