@@ -77,7 +77,7 @@ Each test drives a full `RunEngine` run against a local bare-repo store.
 
 ### Verification (3b)
 
-Observed 2026-10-26 on `feat/holdout-guards`. relais run run-65ebabd29ba10-11f16 was accepted with all 5 profile checks at exit 0; the pre-commit gate ran the full `cargo test` green. Each row names its test. Rows 1 to 6 drive a full `RunEngine` run against a local store. The log-hint, repository-name and `decide` rows are unit tests.
+Observed 2026-10-26 on `feat/holdout-guards`. relais run run-65ebabd29ba10-11f16 was accepted with all 5 profile checks at exit 0; the pre-commit gate ran the full `cargo test` green. Each row names its test. Rows 1–4, 6 and 7 drive a full `RunEngine` run against a local store; the `decide`, log-hint and repository-name rows are unit tests.
 - A worker writes the overlay path → expected `failed (holdout_overlay_collision)`, no repair, and no artifact besides the patch and events naming the overlay → observed (`a_worker_that_writes_the_overlay_path_ends_the_run_failed_with_no_repair`).
 - A worker changes a declared holdout input → expected `needs_decision` → observed (`a_worker_that_changes_a_declared_holdout_input_stops_for_a_person`).
 - A failing holdout with repair and escalation → expected: the repair and escalation prompts carry the statement and `h::escapes`, and none of the store, path, overlay, config, script lines or kept paths → observed (`every_attempt_failing_on_the_holdout_ends_for_a_person_with_what_a_worker_never_sees`). The reviewer sees `name: outcome (ids)` only → observed (`the_reviewer_is_given_each_holdout_as_name_outcome_and_test_ids_only`).
@@ -94,3 +94,4 @@ Observed 2026-10-26 on `feat/holdout-guards`. relais run run-65ebabd29ba10-11f16
   - `holds-until:` markers now sit at `widened_contract` and `widen_for_tests` for the deferred overlay filter;
   - the Verification wording now says which rows drive a full run.
 - Candidates: both `mandatory`/`unchanged` bools are data, not selectors, so fine.
+- Delta: approve-with-changes (85k tokens, 21 s). The holds-until markers are resolved. The row numbering was wrong and is corrected; that change is plan-only, outside the reviewed tree. Two notes are carried to phase 3c: a test that a `kind: verify` reaches the overlay check, and the ledger rows on the scheduler's collision path.
