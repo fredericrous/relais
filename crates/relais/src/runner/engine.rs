@@ -251,6 +251,7 @@ impl<'a> RunEngine<'a> {
             self.sweep_ended_holdouts();
         }
         let finish = self.run_to_outcome();
+        self.count_holdout_exposures();
         // A package (child) run has its own run id and so its own holdout
         // directory; it removes it here like a root run does.
         self.remove_holdout_dir();

@@ -500,6 +500,13 @@ pub trait Harness {
 pub trait Backend: Harness {
     /// Launch one dispatch and wait for its terminal result.
     fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError>;
+
+    /// The transcript of the agent a dispatch ran as, when this backend
+    /// keeps one. `None` for a backend with no transcript, and for one
+    /// missing or unreadable: both are the same fact to the caller.
+    fn transcript_of(&self, _agent_id: &str) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(test)]

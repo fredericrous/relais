@@ -815,6 +815,10 @@ impl<'a> RunEngine<'a> {
                 }
             }
         }
+        // The profile is green when no check failed and no profile gap
+        // stands (the acceptance gaps are added below, apart).
+        let profile_green = gaps.is_empty() && checks.iter().all(|check| !check.failed());
+        self.record_holdout_outcomes(label, &holdouts, profile_green)?;
         let acceptance_gaps = verify::acceptance_gaps(
             &self.config.contract.acceptance,
             &authority.verification_profile,

@@ -19,6 +19,7 @@ mod clock;
 mod error;
 mod evidence;
 pub(crate) mod failpoint;
+mod holdout_counts;
 mod holdout_definitions;
 mod learning;
 mod outcomes;
@@ -40,6 +41,7 @@ pub use clock::{now_rfc3339, Clock, FixedClock, SystemClock};
 pub use error::LedgerError;
 use error::{parse_state, Result};
 pub use evidence::{EvidenceKind, EvidenceOrigin, EvidenceRow};
+pub use holdout_counts::HoldoutOutcomeRow;
 pub use learning::{
     LearningAction, LearningCycleFinish, LearningCycleRow, LearningSource, LearningVerdict, LiveRun,
 };

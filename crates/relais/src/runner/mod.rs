@@ -54,6 +54,7 @@ mod config;
 mod engine;
 mod error;
 mod evidence;
+mod holdout_exposure;
 mod holdouts;
 mod launch;
 pub mod live_trial;

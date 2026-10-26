@@ -861,7 +861,7 @@ impl<'a> NativeBackend<'a> {
     /// `<projects>/*/<session>/subagents/agent-<agent>.jsonl`. `None` when
     /// the file is missing or unreadable: an unreadable directory is the
     /// same fact as a missing file.
-    fn transcript_of(&self, agent_id: &str) -> Option<String> {
+    fn read_transcript(&self, agent_id: &str) -> Option<String> {
         let projects = self.link.projects_dir.as_ref()?;
         let slugs = std::fs::read_dir(projects).ok()?;
         let file = format!("agent-{agent_id}.jsonl");
@@ -881,7 +881,7 @@ impl<'a> NativeBackend<'a> {
     /// file is missing or holds no message, which the run says as
     /// `rollback_ids_missing`.
     fn rollback_ids(&self, agent_id: &str) -> Vec<String> {
-        self.transcript_of(agent_id)
+        self.read_transcript(agent_id)
             .map(|content| {
                 parse_transcript(&content)
                     .into_iter()
@@ -903,7 +903,7 @@ impl<'a> NativeBackend<'a> {
         let Some(path) = &self.advisor_ledger else {
             return Ok(Vec::new());
         };
-        let Some(content) = self.transcript_of(agent_id) else {
+        let Some(content) = self.read_transcript(agent_id) else {
             return Ok(Vec::new());
         };
         let advisors: Vec<UsageRecord> = parse_transcript(&content)
@@ -1049,6 +1049,10 @@ impl Harness for NativeBackend<'_> {
 }
 
 impl Backend for NativeBackend<'_> {
+    fn transcript_of(&self, agent_id: &str) -> Option<String> {
+        self.read_transcript(agent_id)
+    }
+
     fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
         self.launch_native(spec)
     }

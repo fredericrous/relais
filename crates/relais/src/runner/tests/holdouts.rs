@@ -1,6 +1,7 @@
 //! Holdout criteria at preflight and at verification (ADR-0045 phases 2, 3a).
 
 use super::*;
+use crate::backend::{BackendError, Harness};
 use crate::ledger::{Actor, DecisionAnswer, RecordedVia};
 use crate::policy::{HoldoutDecl, HoldoutSettings};
 use crate::runner::approval::{approve_from_snapshot, ApprovalError};
@@ -1473,5 +1474,467 @@ fn a_decomposed_run_whose_assembled_candidate_wrote_the_overlay_leaves_no_attemp
         .collect::<Result<_, _>>()
         .expect("rows");
     assert!(unfinished.is_empty(), "{unfinished:?}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+/// A backend that runs as an agent with a transcript: each dispatch is
+/// recorded as a native agent in the ledger, and `transcript_of` answers
+/// with the given text.
+struct TranscriptBackend {
+    inner: MockBackend,
+    ledger_path: std::path::PathBuf,
+    transcript: Option<String>,
+}
+
+impl Harness for TranscriptBackend {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn probe(&self) -> Option<crate::backend::Capabilities> {
+        self.inner.probe()
+    }
+}
+
+impl Backend for TranscriptBackend {
+    fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
+        let result = self.inner.launch(spec)?;
+        let ledger = crate::ledger::Ledger::open(&self.ledger_path).expect("ledger");
+        ledger
+            .record_native_dispatch(
+                &crate::ids::DispatchId::from_stored(spec.dispatch_id.clone()),
+                Some("agent-1"),
+            )
+            .expect("the dispatch is recorded as an agent");
+        Ok(result)
+    }
+
+    fn transcript_of(&self, agent_id: &str) -> Option<String> {
+        assert_eq!(agent_id, "agent-1");
+        self.transcript.clone()
+    }
+}
+
+fn holdout_counts(fixture: &Fixture) -> crate::report::HoldoutsReport {
+    crate::report::runs_report(&fixture.ledger, "1970-01-01T00:00:00Z", None)
+        .expect("a report")
+        .holdouts
+}
+
+#[test]
+fn a_failing_holdout_on_green_checks_is_one_catch_and_a_passing_one_is_none() {
+    let failing = Fixture::new();
+    let outcome = run_script(&failing, &writes(FAILING), None);
+    assert!(
+        !matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    let counts = holdout_counts(&failing);
+    assert_eq!(counts.holdout_runs, 1);
+    assert_eq!(counts.holdout_catches, 1);
+    assert_eq!(counts.holdout_exposures.runs, 0);
+    std::fs::remove_dir_all(&failing.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+
+    let passing = Fixture::new();
+    let outcome = run_script(&passing, &writes(PASSING), None);
+    assert!(
+        matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    let counts = holdout_counts(&passing);
+    assert_eq!(counts.holdout_runs, 1);
+    assert_eq!(counts.holdout_catches, 0);
+    std::fs::remove_dir_all(&passing.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_holdout_failing_beside_a_red_check_is_not_a_catch() {
+    let fixture = Fixture::new();
+    let (store, _) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(FAILING))]);
+    let repo = fixture.repo_policy(vec![main_gone_check()], 1);
+    let settings = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
+    let backend = MockBackend::new(|spec| {
+        std::fs::write(spec.work_dir.join("src/other.rs"), "// again\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let outcome =
+        fixture.execute_with_holdouts(settings, &holdout_contract(&fixture, true), &repo, &backend);
+    assert!(
+        !matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    let counts = holdout_counts(&fixture);
+    assert_eq!(counts.holdout_runs, 1);
+    assert_eq!(counts.holdout_catches, 0, "the checks were not green");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_worker_transcript_that_reads_the_settings_file_is_one_exposure_by_marker() {
+    let fixture = Fixture::new();
+    let (store, _) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(PASSING))]);
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let settings = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
+    let settings_path = crate::holdout::machine_toml_label();
+    let transcript = serde_json::json!({
+        "type": "assistant",
+        "message": { "content": [{
+            "type": "tool_use",
+            "id": "toolu-1",
+            "name": "Read",
+            "input": { "file_path": settings_path },
+        }] },
+    })
+    .to_string();
+    let backend = TranscriptBackend {
+        inner: counting_worker(Arc::default(), Arc::default()),
+        ledger_path: fixture.dir.join("ledger.sqlite"),
+        transcript: Some(transcript),
+    };
+    let outcome =
+        fixture.execute_with_holdouts(settings, &holdout_contract(&fixture, true), &repo, &backend);
+    assert!(
+        matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    let counts = holdout_counts(&fixture);
+    assert_eq!(counts.holdout_exposures.runs, 1);
+    assert_eq!(
+        counts.holdout_exposures.by_marker.get("machine_toml"),
+        Some(&1)
+    );
+    let stored: Vec<(String, String)> =
+        rusqlite::Connection::open(fixture.dir.join("ledger.sqlite"))
+            .expect("ledger")
+            .prepare("SELECT tool, marker FROM holdout_exposures")
+            .expect("prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+    assert_eq!(stored, [("Read".to_string(), "machine_toml".to_string())]);
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn an_unreadable_worker_transcript_is_no_exposure_and_says_so() {
+    let fixture = Fixture::new();
+    let (store, _) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(PASSING))]);
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let settings = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
+    let backend = TranscriptBackend {
+        inner: counting_worker(Arc::default(), Arc::default()),
+        ledger_path: fixture.dir.join("ledger.sqlite"),
+        transcript: None,
+    };
+    let outcome =
+        fixture.execute_with_holdouts(settings, &holdout_contract(&fixture, true), &repo, &backend);
+    assert!(
+        matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(holdout_counts(&fixture).holdout_exposures.runs, 0);
+    assert!(
+        events_text(&fixture, &outcome.run_id).contains("holdout_exposure_unread"),
+        "the unread transcript is a run event"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn the_report_json_carries_the_holdout_counts_under_holdouts() {
+    let fixture = Fixture::new();
+    let outcome = run_script(&fixture, &writes(FAILING), None);
+    assert!(!matches!(outcome.terminal, Terminal::Accepted(_)));
+    let report = crate::report::runs_report(&fixture.ledger, "1970-01-01T00:00:00Z", None)
+        .expect("a report");
+    let json = serde_json::to_value(&report).expect("json");
+    assert_eq!(json["schema_version"], 14);
+    assert_eq!(crate::report::REPORT_SCHEMA_VERSION, 14);
+    assert_eq!(json["holdouts"]["holdout_runs"], 1);
+    assert_eq!(json["holdouts"]["holdout_catches"], 1);
+    assert_eq!(json["holdouts"]["holdout_exposures"]["runs"], 0);
+    assert!(json["holdouts"]["holdout_exposures"]["by_marker"]
+        .as_object()
+        .expect("by marker")
+        .is_empty());
+    assert!(report.render().contains("holdout_catches: 1"));
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_verify_of_a_candidate_with_green_checks_and_a_failing_holdout_is_not_accepted() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let RunOutcome {
+        run_id: source,
+        terminal: Terminal::Accepted(_),
+    } = fixture.execute(
+        &fixture.contract(Review::Off),
+        &repo,
+        &counting_worker(Arc::default(), Arc::default()),
+    )
+    else {
+        panic!("the source run is accepted");
+    };
+    let (store, _) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(FAILING))]);
+    let settings = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
+    let verify_json = serde_json::json!({
+        "schema_version": 1,
+        "kind": "verify",
+        "objective": "Verify the candidate on the current base",
+        "base_ref": "HEAD",
+        "write_scope": ["src/**"],
+        "candidate": { "run": source.as_str() },
+        "acceptance": [{
+            "statement": STATEMENT,
+            "evidence": { "kind": "holdout", "name": "escaping" },
+        }],
+        "verification_profile": "profile",
+        "review": "off",
+    });
+    let contract =
+        TaskContract::from_json_str(&verify_json.to_string()).expect("a verify contract");
+    let launches = Arc::new(AtomicUsize::new(0));
+    let backend = counting_worker(launches.clone(), Arc::default());
+    let outcome = fixture.execute_with_holdouts(settings, &contract, &repo, &backend);
+    assert!(
+        !matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        launches.load(Ordering::SeqCst),
+        0,
+        "a verify runs no worker"
+    );
+    let counts = holdout_counts(&fixture);
+    assert_eq!(counts.holdout_runs, 1);
+    assert_eq!(counts.holdout_catches, 1);
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+/// A worker that leaves its scope, so the run waits for a person.
+fn scope_leaving_worker() -> MockBackend {
+    MockBackend::new(|spec| {
+        std::fs::create_dir_all(spec.work_dir.join("docs")).expect("mkdir");
+        std::fs::write(spec.work_dir.join("docs/extra.md"), "one\n").expect("write");
+        std::fs::write(spec.work_dir.join("src/main.rs"), "fn main() {}\n// e\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    })
+}
+
+/// Answer `decided` with a successor intent carrying `contract` (and
+/// `review`), and claim it under a new run id.
+fn claimed_intent(
+    fixture: &Fixture,
+    decided: &RunId,
+    contract: &TaskContract,
+    review: Option<crate::ledger::IntentReview>,
+) -> (RunId, TaskContract) {
+    use crate::runner::successor;
+
+    let mut intent = successor::plan(
+        &fixture.ledger,
+        decided,
+        contract,
+        Vec::new(),
+        &fixture.artifacts,
+    )
+    .expect("planned");
+    intent.review = review;
+    let stored = fixture
+        .ledger
+        .resolve_decision_with_intent(
+            decided,
+            &DecisionAnswer {
+                resolution: Reason::DecisionRevised,
+                actor: crate::ledger::Actor::Orchestrator,
+                person_quote: None,
+                recorded_via: crate::ledger::RecordedVia::Cli,
+                note: None,
+                successor_run: None,
+                from_state: State::NeedsDecision,
+                to_state: State::Failed,
+            },
+            &intent,
+        )
+        .expect("written")
+        .expect("open decision");
+    let new_run = fixture.ids.run_id().expect("a run id");
+    assert!(matches!(
+        fixture
+            .ledger
+            .claim_intent(&stored.intent_id, &new_run, &|_| {
+                crate::ledger::SuccessorProcess::Alive { started: None }
+            })
+            .expect("claim"),
+        crate::ledger::Claim::Claimed(_)
+    ));
+    let claimed = fixture
+        .ledger
+        .intent_of_run(&new_run)
+        .expect("read")
+        .expect("the claimed run reaches its intent");
+    assert_eq!(claimed.review, review);
+    (
+        new_run,
+        TaskContract::from_json_str(&stored.contract_json).expect("the contract"),
+    )
+}
+
+/// Settings declaring `escaping` differently from the frozen definition.
+fn edited_settings(fixture: &Fixture, store: &str) -> HoldoutSettings {
+    let mut edited = settings_for(
+        fixture,
+        store,
+        script_declaration(&["sh", "src/other_overlay.rs"], None),
+    );
+    let repo_name = crate::repo::main_checkout_name(&fixture.repo).expect("repo name");
+    let declared = edited.repos.get_mut(&repo_name).expect("repo");
+    let mut changed = script_declaration(&["sh", "src/other_overlay.rs"], None);
+    changed.overlay = "src/other_overlay.rs".into();
+    declared.insert("escaping".into(), changed);
+    edited
+}
+
+#[test]
+fn a_successor_of_each_kind_reaches_its_intent_and_is_judged_by_the_frozen_definition() {
+    use crate::ledger::IntentReview;
+    use crate::runner::successor;
+
+    // rerun-verify and review-parts answer with the decided run's own
+    // contract as a verify; successor-contract supplies one. The preconditions
+    // the CLI checks for the first and last (resource exhaustion, a review
+    // stop) concern the decided run's state, not what the successor is
+    // judged by, so the intents are written directly.
+    for kind in ["rerun-verify", "successor-contract", "review-parts"] {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let (store, sha_a) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(PASSING))]);
+        let settings = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
+        let decided = fixture
+            .execute_with_holdouts(
+                settings,
+                &holdout_contract(&fixture, true),
+                &repo,
+                &scope_leaving_worker(),
+            )
+            .run_id;
+        let frozen = fixture
+            .ledger
+            .holdout_definitions(&decided)
+            .expect("definitions");
+        let [frozen] = frozen.as_slice() else {
+            panic!("{kind}: one frozen definition: {frozen:?}");
+        };
+        advance_store(&fixture, &format!("{}# moved\n", writes(PASSING)));
+
+        let (original, _) = fixture
+            .ledger
+            .run_contract_and_tier(&decided)
+            .expect("read")
+            .expect("recorded");
+        let rerun = successor::widened_contract(&original, &decided, &[]).expect("a verify");
+        let (contract, review) = match kind {
+            "successor-contract" => {
+                let mut supplied = rerun.canonical_value();
+                supplied["objective"] = "Verify the candidate again, by a supplied contract".into();
+                (
+                    TaskContract::from_json_str(&supplied.to_string()).expect("a contract"),
+                    None,
+                )
+            }
+            "review-parts" => (rerun, Some(IntentReview::Parts)),
+            _ => (rerun, None),
+        };
+        let (new_run, contract) = claimed_intent(&fixture, &decided, &contract, review);
+        let backend = counting_worker(Arc::default(), Arc::default());
+        fixture.execute_with_holdouts_as(
+            Some(new_run.clone()),
+            edited_settings(&fixture, &store),
+            &contract,
+            &repo,
+            &backend,
+        );
+        let inherited = fixture
+            .ledger
+            .holdout_definitions(&new_run)
+            .expect("definitions");
+        let [inherited] = inherited.as_slice() else {
+            panic!("{kind}: one inherited definition: {inherited:?}");
+        };
+        assert_eq!(inherited.digest, frozen.digest, "{kind}");
+        assert_eq!(inherited.sha, sha_a, "{kind}");
+        assert!(
+            events_text(&fixture, &new_run).contains("holdout_definition_changed"),
+            "{kind}: the edited declaration is noticed and the frozen one judges"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+    }
+}
+
+#[test]
+fn a_successor_of_a_successor_is_judged_by_the_first_runs_frozen_definition() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let (store, sha_a) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(PASSING))]);
+    let settings = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
+    let contract = holdout_contract(&fixture, true);
+    let first = fixture
+        .execute_with_holdouts(settings, &contract, &repo, &scope_leaving_worker())
+        .run_id;
+    let frozen = fixture
+        .ledger
+        .holdout_definitions(&first)
+        .expect("definitions");
+    let [frozen] = frozen.as_slice() else {
+        panic!("one frozen definition: {frozen:?}");
+    };
+    advance_store(&fixture, &format!("{}# moved\n", writes(PASSING)));
+
+    // The second run is a change again, supplied by contract, and leaves
+    // its scope again, so it too waits for a person.
+    let (second, second_contract) = claimed_intent(&fixture, &first, &contract, None);
+    fixture.execute_with_holdouts_as(
+        Some(second.clone()),
+        edited_settings(&fixture, &store),
+        &second_contract,
+        &repo,
+        &scope_leaving_worker(),
+    );
+    assert_eq!(
+        fixture
+            .ledger
+            .holdout_definitions(&second)
+            .expect("definitions")[0]
+            .digest,
+        frozen.digest
+    );
+
+    let (third, third_contract) = claimed_successor(&fixture, &second, None);
+    let outcome = fixture.execute_with_holdouts_as(
+        Some(third.clone()),
+        edited_settings(&fixture, &store),
+        &third_contract,
+        &repo,
+        &counting_worker(Arc::default(), Arc::default()),
+    );
+    let Terminal::Accepted(receipt) = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    let [judged] = receipt.holdouts.as_slice() else {
+        panic!("{:?}", receipt.holdouts);
+    };
+    assert_eq!(judged.sha, sha_a, "the first run's commit");
+    assert_eq!(judged.digest, frozen.digest);
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
