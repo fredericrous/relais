@@ -96,9 +96,9 @@ caller's workspace keeps the 30 s politeness.
 
 ## Phases
 
-- [ ] Phase 1 — relais: this plan in `docs/plans/` (replaces the first
+- [x] Phase 1 — relais: this plan in `docs/plans/` (replaces the first
       draft committed on this branch).
-- [ ] Phase 2 — relais: `SeedWait`, through relais.
+- [x] Phase 2 — relais: `SeedWait`, through relais.
   - Files: `runner/setup_gate.rs`, `runner/workspace_ops.rs`, and the four
     callers `runner/verification.rs`, `runner/holdouts.rs`,
     `runner/baseline.rs`, `runner/engine.rs`.
@@ -121,9 +121,9 @@ caller's workspace keeps the 30 s politeness.
       time.
   - Remove `quiet_dependencies_worker` (`runner/tests/mod.rs`) where the
     own-tree seed no longer needs it.
-  - Find the event that marks a verification setup gap (a first count found
-    no `setup_gap` event in 373 recorded verification starts), and name it
-    in this plan for Phase 3.
+  - No event marked a verification setup gap (none in 373 recorded
+    verification starts), so Phase 2 emits a `verification_setup_gap`
+    decision. Its baseline count therefore starts at this release.
 - [ ] Phase 3 — relais: release, and observe.
   - Cut the next relais release (`tag-release`) and install it.
   - Over the next 30 real runs, against the figures in Context:
@@ -137,6 +137,19 @@ caller's workspace keeps the 30 s politeness.
     close relais#304 with the numbers.
 
 ## Verification
+
+Phase 2, observed before the push:
+- relais run `run-65ebf8aa7b2fa-b789` passed lint and the full `make test`
+  (497 s). Its budget ran out during msrv; `make msrv` run by hand: green,
+  233 s.
+- `cargo test --lib -- runner::tests::a_fork_ … a_partial_seed`: 8 passed,
+  in 4.6 s.
+- The partial-seed tests no longer return early without copy-on-write, so
+  they gate the release on every runner.
+- Without copy-on-write: the four seed tests run with `TMPDIR` on a
+  temporary HFS+ volume, where `clonefile` fails "Operation not supported"
+  (APFS: ok). 4 passed. Without a clone the gap test is blocked at the base
+  setup (`VerificationSetupFailed`), as the implementation review found.
 
 - **Phase 2:** `cargo test --lib runner::tests` passes with the four tests
   above. `make check` green locally and on CI (ubuntu, macOS, Windows).
