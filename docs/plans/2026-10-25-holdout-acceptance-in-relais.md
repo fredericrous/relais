@@ -30,3 +30,10 @@ The plan lives in the decisions repository, which owns ADR-0045
   - deliberate: when the repository name is missing, preflight refuses as `holdout_unknown (declared: none)`. That fails closed; phase 3 gives it a clearer detail.
   - Candidate `functions.no-flag-arguments` at `runner/tests/holdouts.rs:39`: fine, because the bool is data passed into `DeclaredCriterion.mandatory`.
 - Delta after the Windows CI fix (`store` written as a TOML literal string): approve (88k tokens, 35 s). No new finding. The missing-repository-name detail is still deliberate and goes to phase 3.
+- 2026-10-26 — Phase 3 is split into three relais tasks: 3a runs and
+  settles holdouts (`docs/design/holdout-phase-3a.md`); 3b covers the
+  overlay collision, the protected verification inputs and the repair and
+  escalation feedback rule; 3c covers successor inheritance and the
+  missing-repository-name detail. The Forgejo `holdouts` repository is
+  created at the phase 5 pilot, its first use; phase 3 tests use local
+  stores.
