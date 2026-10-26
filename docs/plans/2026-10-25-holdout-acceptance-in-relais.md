@@ -124,3 +124,16 @@ Observed 2026-10-26 on `feat/holdout-frozen-definition`; the pre-commit gate pas
   - exposures counted from the workers' own transcripts at run end;
   - `relais report` counts;
   - the three cases carried from phase 3.
+
+### Verification (4)
+
+Observed 2026-10-26 on `feat/holdout-report-counts`; `cargo test -p relais --lib holdout` passed, and the pre-commit gate passed the full `cargo test`.
+- Scan: each marker (store, state_dir, machine_toml, overlay, config) is found in a `tool_use` input and only its name is kept; a transcript naming none gives no row; a double hit is one row (`each_marker_is_found_in_a_tool_use_input_and_only_its_name_is_kept`, `a_transcript_naming_none_gives_no_row`, `a_marker_hit_twice_in_one_tool_is_one_row`).
+- Catches: a failing holdout on green checks counts 1, a passing one 0, and a failing holdout beside a red check counts 0 (`a_failing_holdout_on_green_checks_is_one_catch_and_a_passing_one_is_none`, `a_holdout_failing_beside_a_red_check_is_not_a_catch`).
+- Positive control: a worker transcript that reads machine.toml → `holdout_exposures` = 1 with marker `machine_toml` (`a_worker_transcript_that_reads_the_settings_file_is_one_exposure_by_marker`). A mutation that makes the scan find nothing turns it red. An unreadable transcript is no exposure and emits `holdout_exposure_unread` (`an_unreadable_worker_transcript_is_no_exposure_and_says_so`).
+- Report: `--json` carries `holdouts.{holdout_runs, holdout_catches, holdout_exposures}`, schema 14 (`the_report_json_carries_the_holdout_counts_under_holdouts`).
+- Carried from phase 3:
+  - a verify of a candidate with green checks and a failing holdout is not accepted, launches no worker and counts one catch (`a_verify_of_a_candidate_with_green_checks_and_a_failing_holdout_is_not_accepted`);
+  - `--rerun-verify`, `--successor-contract` and `review-parts` successors reach their intent and are judged by the frozen definition (`a_successor_of_each_kind_reaches_its_intent_and_is_judged_by_the_frozen_definition`);
+  - a successor of a successor is judged by the first run's definition (`a_successor_of_a_successor_is_judged_by_the_first_runs_frozen_definition`).
+- Migration: a schema-43 ledger takes both tables, empty (`a_v43_ledger_takes_the_holdout_count_tables_empty`).
