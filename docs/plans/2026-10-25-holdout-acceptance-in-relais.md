@@ -109,3 +109,10 @@ Observed 2026-10-26 on `feat/holdout-frozen-definition`; the pre-commit gate pas
 3. A schema-42 ledger upgrades to 43 with an empty `holdout_definitions` table → observed (`a_v42_ledger_takes_the_holdout_definitions_table_empty`).
 4. A `kind: verify` whose candidate wrote the overlay → expected `failed (holdout_overlay_collision)` → observed (`a_verify_whose_candidate_wrote_the_overlay_ends_failed_with_the_collision_code`).
 5. A decomposed run's assembled candidate writes the overlay → expected the collision with the "assembled candidate" detail, and no attempt row left open → observed (`a_decomposed_run_whose_assembled_candidate_wrote_the_overlay_leaves_no_attempt_open`). The scheduler checks for the collision before it opens an integration attempt, so no scheduler change was needed.
+
+### Implementation review (3c)
+
+- Round 1 was approve-with-changes (63k tokens, 92 s); the scheduler claim was judged to hold.
+- Fixed the blocking finding (`errors.explicit-absence`): the `undeclared` sentinel is now an `Option`. Also fixed: one transaction for the frozen rows, and a test for the undeclared case.
+- Delta: approve (68k tokens, 27 s).
+- Carried to phase 4: test that the `--rerun-verify`, `--successor-contract` and `review-parts` intents reach `intent_of_run`, and a chain of three runs.
