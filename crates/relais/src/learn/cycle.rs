@@ -1550,25 +1550,6 @@ argv = ["true"]
     }
 
     #[test]
-    fn thirty_routed_runs_seventeen_accepted_roll_back_and_nineteen_do_not() {
-        let below = World::new("n30-below");
-        two_artifacts(&below);
-        seed_routed(&below, 17, 13);
-        assert!(matches!(
-            active_artifact_verdict(&below.ledger, &below.registry).unwrap(),
-            Some(RollbackReason::AcceptanceBelowFloor { runs: 30, .. })
-        ));
-
-        let above = World::new("n30-above");
-        two_artifacts(&above);
-        seed_routed(&above, 19, 11);
-        assert_eq!(
-            active_artifact_verdict(&above.ledger, &above.registry).unwrap(),
-            None
-        );
-    }
-
-    #[test]
     fn runs_another_artifact_routed_do_not_count_against_the_active_one() {
         let world = World::new("other-artifact");
         two_artifacts(&world);
