@@ -73,3 +73,17 @@ Each test drives a full `RunEngine` run against a local bare-repo store.
   - the proof that the repair, escalation and reviewer prompts and the exhaustion detail hold nothing of a holdout;
   - `needs_decision (holdout_failed)` at the attempt ceiling;
   - the missing-repository-name detail, carried from phase 2.
+- 2026-10-26 — Deferred from 3b with a reason. The widen-scope overlay filter and the `read_hints`/successor-context assertion are the design's second guards. The overlay collision ends the run before any scope can be widened, and a hint under the state dir is already refused. They come back if phase 5 counts a `holdout_exposures` that bypassed the collision.
+
+### Verification (3b)
+
+Observed 2026-10-26 on `feat/holdout-guards`. relais run run-65ebabd29ba10-11f16 was accepted with all 5 profile checks at exit 0; the pre-commit gate ran the full `cargo test` green. Each row is a test that drives a full `RunEngine` run against a local store:
+- A worker writes the overlay path → expected `failed (holdout_overlay_collision)`, no repair, and no artifact besides the patch and events naming the overlay → observed (`a_worker_that_writes_the_overlay_path_ends_the_run_failed_with_no_repair`).
+- A worker changes a declared holdout input → expected `needs_decision` → observed (`a_worker_that_changes_a_declared_holdout_input_stops_for_a_person`).
+- A failing holdout with repair and escalation → expected: the repair and escalation prompts carry the statement and `h::escapes`, and none of the store, path, overlay, config, script lines or kept paths → observed (`every_attempt_failing_on_the_holdout_ends_for_a_person_with_what_a_worker_never_sees`). The reviewer sees `name: outcome (ids)` only → observed (`the_reviewer_is_given_each_holdout_as_name_outcome_and_test_ids_only`).
+- Out of attempts on a holdout alone, with `max_attempts = 2` → expected `needs_decision (holdout_failed)`, not `budget_exhausted`; the raising transition's gap reads `holdout `escaping` failed: h::escapes` → observed (`running_out_of_attempts_on_a_holdout_alone_ends_holdout_failed_not_budget_exhausted`). A mutation of the gap wording turns it red.
+- `relais decide --answer approve` on that stop → expected a refusal naming the holdout gap → observed (`cli::decide::tests::approving_a_holdout_failed_stop_is_refused_naming_the_holdout_gap`).
+- A holdout beside a failing check → expected `failed`; beside another gap → expected a gap stop naming both → observed (`a_holdout_failure_beside_a_failing_check_still_ends_failed`, `a_failed_holdout_beside_another_gap_is_named_in_the_gap_stop`).
+- A holdout log saying "No space left on device" → expected no exhaustion stop → observed (`a_holdouts_output_is_never_quoted_by_the_exhaustion_detail`).
+- The repair log hint: a holdout line has none, while a check whose label mentions "(criterion:" keeps it → observed (`a_holdout_failure_line_omits_the_log_hint_and_a_check_line_keeps_it`, `a_check_label_that_mentions_a_criterion_still_gets_the_log_hint`).
+- A missing repository name → expected `holdout_unknown` with its own detail → observed (`a_missing_repository_name_is_refused_by_its_own_detail`).
