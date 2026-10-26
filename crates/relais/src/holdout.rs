@@ -252,7 +252,7 @@ pub fn substitute_config(
         None => Some(argv.to_vec()),
         Some(relative) if !clean_relative(relative) => None,
         Some(relative) => {
-            let absolute = source.join(relative).to_string_lossy().into_owned();
+            let absolute = source.join(relative).to_string_lossy().replace('\\', "/");
             Some(
                 argv.iter()
                     .map(|arg| arg.replace(PLACEHOLDER, &absolute))
@@ -620,15 +620,19 @@ mod tests {
 
     #[test]
     fn the_config_placeholder_becomes_the_stores_absolute_config_path() {
-        let source = Path::new("/state/holdouts/run/src/abc");
+        let source = Path::new("state").join("holdouts").join("run").join("abc");
+        let source = source.as_path();
         let argv = vec!["runner".to_string(), "--config={config}".to_string()];
+        let substituted = substitute_config(&argv, Some("cfg/runner.toml"), source)
+            .expect("a clean relative config substitutes");
         assert_eq!(
-            substitute_config(&argv, Some("cfg/runner.toml"), source),
-            Some(vec![
+            substituted,
+            vec![
                 "runner".to_string(),
-                "--config=/state/holdouts/run/src/abc/cfg/runner.toml".to_string()
-            ])
+                "--config=state/holdouts/run/abc/cfg/runner.toml".to_string()
+            ]
         );
+        assert!(!substituted[1].contains('\\'));
         assert_eq!(substitute_config(&argv, None, source), None);
         assert_eq!(substitute_config(&argv, Some("../out.toml"), source), None);
         let plain = vec!["runner".to_string()];
