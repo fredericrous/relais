@@ -305,12 +305,14 @@ mod tests {
         CliOutcome::PromotionRefused,
         CliOutcome::StaleGrantKey,
         CliOutcome::NothingDetected,
+        CliOutcome::TrainingLeaseHeld,
+        CliOutcome::StorageFull,
     ];
 
     #[test]
     fn the_exit_code_table_is_total_and_injective() {
         let mut seen: Vec<i32> = ALL.iter().map(exit_code).collect();
-        assert_eq!(seen.len(), 20, "every documented outcome is listed");
+        assert_eq!(seen.len(), 22, "every documented outcome is listed");
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(
