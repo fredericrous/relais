@@ -9116,19 +9116,31 @@ fn a_fork_seeds_its_verification_tree_from_a_fresh_task_tree_without_waiting() {
             "{outcome:?}"
         );
     } else {
-        // No clone: the verification tree gets a full setup instead.
-        let events = event_kinds(&fixture, &outcome.run_id);
-        let unavailable = events
+        // No clone: the verification tree gets a full setup instead. The
+        // last unavailable clone is the verification seed's (the first is
+        // the base's), and the setup step's own check must start after it.
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(
+            fixture
+                .artifacts
+                .join(outcome.run_id.as_str())
+                .join("events.jsonl"),
+        )
+        .expect("events.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("json"))
+        .collect();
+        let unavailable = lines
             .iter()
-            .position(|(kind, what)| {
-                kind == "decision" && what.as_deref() == Some("workspace_cow_unavailable")
-            })
-            .unwrap_or_else(|| panic!("no workspace_cow_unavailable: {events:?}"));
+            .rposition(|line| line["event"]["what"] == "workspace_cow_unavailable")
+            .unwrap_or_else(|| panic!("no workspace_cow_unavailable: {lines:?}"));
         assert!(
-            events[unavailable..]
-                .iter()
-                .any(|(kind, _)| kind == "check_started"),
-            "the setup step runs after the unavailable clone: {events:?}"
+            lines[unavailable..].iter().any(|line| {
+                line["event"]["kind"] == "check_started"
+                    && line["event"]["label"]
+                        .as_str()
+                        .is_some_and(|label| label.starts_with("setup:"))
+            }),
+            "the setup step runs after the unavailable clone: {lines:?}"
         );
     }
     std::fs::remove_dir_all(&fixture.dir).ok(); // temp dir: a leftover only costs disk
@@ -9270,6 +9282,26 @@ fn a_partial_seed_that_setup_cannot_repair_is_a_gap_and_runs_no_check() {
         &dependency_writing_worker("node_modules/dep/index.js", "partial"),
     );
     let events = event_kinds(&fixture, &outcome.run_id);
+    if !cow_here(&fixture) {
+        // No clone: the base tree has no `node_modules` either, so the same
+        // setup step fails there first and the run ends before any worker.
+        let RunOutcome {
+            terminal: Terminal::Blocked { code, .. },
+            ..
+        } = &outcome
+        else {
+            panic!("without a clone the base setup fails: {outcome:?}");
+        };
+        assert_eq!(*code, BlockCode::VerificationSetupFailed);
+        assert!(
+            events
+                .iter()
+                .all(|(_, what)| what.as_deref() != Some("verification_setup_gap")),
+            "{events:?}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok(); // temp dir: a leftover only costs disk
+        return;
+    }
     let gap = events
         .iter()
         .position(|(kind, what)| {
