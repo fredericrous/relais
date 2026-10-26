@@ -1249,6 +1249,42 @@ fn a_successor_is_judged_by_its_predecessors_frozen_holdout_and_resolves_a_new_n
 }
 
 #[test]
+fn a_successor_does_not_ask_the_store_again_for_a_frozen_holdout() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let (store, _sha) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(PASSING))]);
+    let settings = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
+    let contract = holdout_contract(&fixture, true);
+    // The worker leaves its scope, so the run waits for a person.
+    let leaving = MockBackend::new(|spec| {
+        std::fs::create_dir_all(spec.work_dir.join("docs")).expect("mkdir");
+        std::fs::write(spec.work_dir.join("docs/extra.md"), "one\n").expect("write");
+        std::fs::write(spec.work_dir.join("src/main.rs"), "fn main() {}\n// e\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let decided = fixture
+        .execute_with_holdouts(settings.clone(), &contract, &repo, &leaving)
+        .run_id;
+
+    // The store disappears before the successor starts. Preflight must not
+    // ask it again (that would refuse `holdout_unreadable`); the frozen
+    // definition carries the run to the fetch, which is where a gone store
+    // is reported.
+    std::fs::remove_dir_all(fixture.dir.join("holdout-store")).expect("the store is removed");
+    let (new_run, contract) = claimed_successor(&fixture, &decided, None);
+    let backend = counting_worker(Arc::default(), Arc::default());
+    let outcome =
+        fixture.execute_with_holdouts_as(Some(new_run), settings, &contract, &repo, &backend);
+    assert_eq!(blocked_code(outcome), BlockCode::HoldoutUnfetchable);
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
 fn a_verify_whose_candidate_wrote_the_overlay_ends_failed_with_the_collision_code() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![passing_check()], 3);
