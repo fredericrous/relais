@@ -1,5 +1,6 @@
 //! The baseline of a run: the checks on the unmodified base.
 
+use super::setup_gate;
 use super::{
     fresh_progress, Baseline, BlockCode, Ended, Event, EvidenceKind, Path, Phase, Preflight,
     RunEngine, RunError, VerificationProfile,
@@ -84,7 +85,10 @@ impl<'a> RunEngine<'a> {
                     let setup = self.while_watching_cancel(|cancel| {
                         self.setup_tree(
                             baseline.path(),
-                            Some(self.config.repo_dir),
+                            Some(setup_gate::SeedSource {
+                                path: self.config.repo_dir,
+                                wait: setup_gate::SeedWait::QuietFor(setup_gate::Quiet::CALLER),
+                            }),
                             &authority.verification_profile,
                             &logs_dir,
                             "base",

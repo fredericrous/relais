@@ -294,11 +294,12 @@ impl<'a> RunEngine<'a> {
     /// exactly [`verify::run_setup`]. A `Fork` or `InPlace` run first seeds
     /// `dir` with the dependency directories of `seed_from` copy-on-write,
     /// then runs every step, skipping only one that declared `reuse` and
-    /// proved its outputs (ADR-0008).
+    /// proved its outputs (ADR-0008). `seed_from` carries the caller's knowledge
+    /// of who may be writing the source.
     pub(super) fn setup_tree(
         &self,
         dir: &Path,
-        seed_from: Option<&Path>,
+        seed_from: Option<setup_gate::SeedSource<'_>>,
         profile: &crate::policy::VerificationProfile,
         logs_dir: &Path,
         prefix: &str,
@@ -317,10 +318,19 @@ impl<'a> RunEngine<'a> {
                 &self.heavy(),
             );
         }
-        let source = seed_from.filter(|source| *source != dir);
-        if let Some(source) = source {
+        let seed_from = seed_from.filter(|seed| seed.path != dir);
+        let source = seed_from.map(|seed| seed.path);
+        if let Some(seed) = seed_from {
             let own_run = self.inplace.is_some().then(|| self.run_id.as_str());
-            setup_gate::seed_tree(self.config.repo_policy, source, dir, own_run, &self.events);
+            setup_gate::seed_tree(
+                self.config.repo_policy,
+                seed.path,
+                dir,
+                own_run,
+                seed.wait,
+                &mut std::thread::sleep,
+                &self.events,
+            );
         }
         let state = self
             .config

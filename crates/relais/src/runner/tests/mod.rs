@@ -757,23 +757,6 @@ fn conditional_worker(signal: &str) -> MockBackend {
     conditional_worker_after(signal, |_| {})
 }
 
-/// A fork's task tree holds a fresh clone of the caller's dependency
-/// directories, whose directory mtimes are the clone's own; the
-/// verification trees seed from it and would wait out the quiet window.
-/// This worker ages them first, as an install that finished long ago.
-fn quiet_dependencies_worker(signal: &str) -> MockBackend {
-    conditional_worker_after(signal, |work_dir| {
-        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
-        let dependency = work_dir.join("node_modules/dep");
-        if dependency.is_dir() {
-            // Files first: a copy that is not copy-on-write gives them
-            // fresh mtimes too. The directory's mtime is set last.
-            backdate(&dependency.join("index.js"), long_ago);
-            backdate(&dependency, long_ago);
-        }
-    })
-}
-
 fn conditional_worker_after(
     signal: &str,
     before: impl Fn(&std::path::Path) + Send + Sync + 'static,
@@ -5679,7 +5662,7 @@ fn a_fork_seeds_the_callers_dependencies_and_isolated_does_not() {
         3,
     );
     let machine = fixture.machine_for(&repo);
-    let backend = quiet_dependencies_worker("relais task");
+    let backend = conditional_worker("relais task");
     let isolated = fixture.execute_in(
         Workspace::Isolated,
         &fixture.contract(Review::Off),
@@ -5807,7 +5790,7 @@ fn a_fork_skips_a_step_only_when_it_proved_its_result() {
     let repo =
         fixture.repo_policy_with_setup(vec![step.clone()], vec![versionable_main_gone_check()], 3);
     let machine = fixture.machine_for(&repo);
-    let backend = quiet_dependencies_worker("relais task");
+    let backend = conditional_worker("relais task");
 
     stamp_the_callers_workspace(&fixture, &step);
     let skipped = fixture.execute_in(
@@ -9068,4 +9051,281 @@ fn merged_reviewer_gaps_agree_on_one_budget_and_name_every_omitted_rule() {
     );
     assert!(gap.detail.contains("omitted: c.two"), "{}", gap.detail);
     assert!(gap.detail.contains("omitted: s.two"), "{}", gap.detail);
+}
+
+/// A worker that writes into the task tree's `node_modules` just before
+/// the run verifies: the tree is fresh, the writer has ended.
+fn dependency_writing_worker(file: &'static str, contents: &'static str) -> MockBackend {
+    conditional_worker_after("relais task", move |work_dir| {
+        let path = work_dir.join(file);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(path, contents).expect("worker writes a dependency");
+    })
+}
+
+fn count_of(decisions: &[String], what: &str) -> usize {
+    decisions.iter().filter(|d| d.as_str() == what).count()
+}
+
+fn event_kinds(fixture: &Fixture, run_id: &RunId) -> Vec<(String, Option<String>)> {
+    std::fs::read_to_string(fixture.artifacts.join(run_id.as_str()).join("events.jsonl"))
+        .expect("events.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json"))
+        .map(|line| {
+            (
+                line["event"]["kind"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                line["event"]["what"].as_str().map(str::to_string),
+            )
+        })
+        .collect()
+}
+
+/// The verification tree is seeded from the run's own task tree without
+/// waiting: its writers ended, so the freshly written file is there.
+#[test]
+fn a_fork_seeds_its_verification_tree_from_a_fresh_task_tree_without_waiting() {
+    use crate::workspace::reuse::Workspace;
+    let fixture = fixture_with_installed_deps();
+    let repo = fixture.repo_policy_with_setup(
+        vec![bash_step("true")],
+        vec![
+            versionable_main_gone_check(),
+            bash_step("test -f node_modules/fresh/new.js"),
+        ],
+        1,
+    );
+    let machine = fixture.machine_for(&repo);
+    let outcome = fixture.execute_in(
+        Workspace::Fork,
+        &fixture.contract(Review::Off),
+        &repo,
+        &machine,
+        &dependency_writing_worker("node_modules/fresh/new.js", "fresh"),
+    );
+    let decisions = decisions_of(&fixture, &outcome.run_id);
+    assert_eq!(
+        count_of(&decisions, "workspace_seed_waiting"),
+        0,
+        "{decisions:?}"
+    );
+    assert_eq!(
+        count_of(&decisions, "workspace_seed_unwaited"),
+        1,
+        "{decisions:?}"
+    );
+    if cow_here(&fixture) {
+        assert!(
+            decisions.contains(&"workspace_seeded".to_string()),
+            "{decisions:?}"
+        );
+        assert!(
+            matches!(outcome.terminal, Terminal::Accepted(_)),
+            "{outcome:?}"
+        );
+    } else {
+        // No clone: the verification tree gets a full setup instead. The
+        // last unavailable clone is the verification seed's (the first is
+        // the base's), and the setup step's own check must start after it.
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(
+            fixture
+                .artifacts
+                .join(outcome.run_id.as_str())
+                .join("events.jsonl"),
+        )
+        .expect("events.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("json"))
+        .collect();
+        let unavailable = lines
+            .iter()
+            .rposition(|line| line["event"]["what"] == "workspace_cow_unavailable")
+            .unwrap_or_else(|| panic!("no workspace_cow_unavailable: {lines:?}"));
+        assert!(
+            lines[unavailable..].iter().any(|line| {
+                line["event"]["kind"] == "check_started"
+                    && line["event"]["label"]
+                        .as_str()
+                        .is_some_and(|label| label.starts_with("setup:"))
+            }),
+            "the setup step runs after the unavailable clone: {lines:?}"
+        );
+    }
+    std::fs::remove_dir_all(&fixture.dir).ok(); // temp dir: a leftover only costs disk
+}
+
+/// An in-place run's base seed still takes the caller's window (the
+/// source is already quiet, so it seeds at once); only the verification
+/// seed from the run's own tree is unwaited.
+#[test]
+fn an_in_place_runs_base_seed_keeps_the_callers_window() {
+    use crate::workspace::reuse::Workspace;
+    let fixture = fixture_in_a_linked_worktree();
+    std::fs::write(fixture.repo.join(".gitignore"), "node_modules/\n").expect("ignore");
+    std::fs::create_dir_all(fixture.repo.join("node_modules/dep")).expect("mkdir");
+    std::fs::write(fixture.repo.join("node_modules/dep/index.js"), "ok").expect("dep");
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    backdate(&fixture.repo.join("node_modules/dep/index.js"), long_ago);
+    backdate(&fixture.repo.join("node_modules/dep"), long_ago);
+    let (repo, machine) = in_place_policy(&fixture);
+    let outcome = fixture.execute_in(
+        Workspace::InPlace,
+        &fixture.contract(Review::Off),
+        &repo,
+        &machine,
+        &conditional_worker("relais task"),
+    );
+    let decisions = decisions_of(&fixture, &outcome.run_id);
+    assert_eq!(
+        count_of(&decisions, "workspace_seed_unwaited"),
+        1,
+        "{decisions:?}"
+    );
+    if cow_here(&fixture) {
+        assert!(
+            count_of(&decisions, "workspace_seeded") >= 2,
+            "the base seed and the verification seed both clone: {decisions:?}"
+        );
+    }
+    std::fs::remove_dir_all(&fixture.dir).ok(); // temp dir: a leftover only costs disk
+}
+
+/// `QuietFor` on a source that changed just now waits through the injected
+/// sleep and says so; no wall-clock time passes.
+#[test]
+fn seeding_from_a_fresh_source_waits_through_the_injected_sleep() {
+    let fixture = fixture_with_installed_deps();
+    let repo = fixture.repo_policy_with_setup(Vec::new(), Vec::new(), 1);
+    let source = fixture.dir.join("fresh-source");
+    std::fs::create_dir_all(source.join("node_modules/dep")).expect("mkdir");
+    std::fs::write(source.join("node_modules/dep/index.js"), "ok").expect("dep");
+    git(&source, &["init", "-q"]);
+    std::fs::write(source.join(".gitignore"), "node_modules/\n").expect("ignore");
+    let dest = fixture.dir.join("fresh-dest");
+    std::fs::create_dir_all(&dest).expect("mkdir");
+    let artifacts = fixture.dir.join("seed-events");
+    let events = crate::protocol::Events::for_run_on(
+        "run-seed",
+        &artifacts,
+        crate::protocol::Wire::to(std::io::sink()),
+    );
+    let mut slept = Vec::new();
+    setup_gate::seed_tree(
+        &repo,
+        &source,
+        &dest,
+        None,
+        setup_gate::SeedWait::QuietFor(setup_gate::Quiet {
+            still_for: std::time::Duration::from_secs(10),
+            poll: std::time::Duration::from_secs(5),
+            give_up: std::time::Duration::from_secs(20),
+        }),
+        &mut |d| slept.push(d),
+        &events,
+    );
+    let logged = std::fs::read_to_string(artifacts.join("events.jsonl")).expect("events");
+    assert!(
+        !slept.is_empty(),
+        "the wait went through the sleeper: {logged}"
+    );
+    assert!(logged.contains("workspace_seed_waiting"), "{logged}");
+    assert!(!logged.contains("workspace_seed_unwaited"), "{logged}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // temp dir: a leftover only costs disk
+}
+
+/// A partial `node_modules` in the task tree whose setup step repairs it
+/// sets the verification tree up like a clean one.
+#[test]
+fn a_partial_seed_that_setup_repairs_verifies_like_a_clean_tree() {
+    use crate::workspace::reuse::Workspace;
+    let fixture = fixture_with_installed_deps();
+    let repo = fixture.repo_policy_with_setup(
+        vec![bash_step(
+            "mkdir -p node_modules/dep && echo ok > node_modules/dep/index.js",
+        )],
+        vec![
+            versionable_main_gone_check(),
+            bash_step("grep -q ok node_modules/dep/index.js"),
+        ],
+        1,
+    );
+    let machine = fixture.machine_for(&repo);
+    let outcome = fixture.execute_in(
+        Workspace::Fork,
+        &fixture.contract(Review::Off),
+        &repo,
+        &machine,
+        &dependency_writing_worker("node_modules/dep/index.js", "partial"),
+    );
+    assert!(
+        matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    let decisions = decisions_of(&fixture, &outcome.run_id);
+    assert_eq!(
+        count_of(&decisions, "verification_setup_gap"),
+        0,
+        "{decisions:?}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // temp dir: a leftover only costs disk
+}
+
+/// A partial seed whose setup step fails is a setup gap: recorded, and no
+/// verification check starts after it.
+#[test]
+fn a_partial_seed_that_setup_cannot_repair_is_a_gap_and_runs_no_check() {
+    use crate::workspace::reuse::Workspace;
+    let fixture = fixture_with_installed_deps();
+    let repo = fixture.repo_policy_with_setup(
+        vec![bash_step("test \"$(cat node_modules/dep/index.js)\" = ok")],
+        vec![versionable_main_gone_check()],
+        1,
+    );
+    let machine = fixture.machine_for(&repo);
+    let outcome = fixture.execute_in(
+        Workspace::Fork,
+        &fixture.contract(Review::Off),
+        &repo,
+        &machine,
+        &dependency_writing_worker("node_modules/dep/index.js", "partial"),
+    );
+    let events = event_kinds(&fixture, &outcome.run_id);
+    if !cow_here(&fixture) {
+        // No clone: the base tree has no `node_modules` either, so the same
+        // setup step fails there first and the run ends before any worker.
+        let RunOutcome {
+            terminal: Terminal::Blocked { code, .. },
+            ..
+        } = &outcome
+        else {
+            panic!("without a clone the base setup fails: {outcome:?}");
+        };
+        assert_eq!(*code, BlockCode::VerificationSetupFailed);
+        assert!(
+            events
+                .iter()
+                .all(|(_, what)| what.as_deref() != Some("verification_setup_gap")),
+            "{events:?}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok(); // temp dir: a leftover only costs disk
+        return;
+    }
+    let gap = events
+        .iter()
+        .position(|(kind, what)| {
+            kind == "decision" && what.as_deref() == Some("verification_setup_gap")
+        })
+        .unwrap_or_else(|| panic!("no setup gap: {events:?}"));
+    assert!(
+        events[gap..]
+            .iter()
+            .all(|(kind, _)| kind != "check_started"),
+        "no verification check after the gap: {events:?}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // temp dir: a leftover only costs disk
 }

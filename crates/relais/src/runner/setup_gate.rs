@@ -18,12 +18,50 @@ use crate::workspace::reuse::{
 };
 
 /// How long a source's dependency tree must have been still before it is
-/// cloned, and how long to wait for that at most. A politeness toward an
-/// install in progress, never an identity (a rewrite that preserves
-/// timestamps defeats it): every setup step still runs afterwards.
-const QUIET_FOR: Duration = Duration::from_secs(30);
-const GIVE_UP: Duration = Duration::from_secs(60);
-const POLL: Duration = Duration::from_secs(5);
+/// cloned, how often to look, and how long to wait for that at most. A
+/// politeness toward an install in progress, never an identity (a rewrite
+/// that preserves timestamps defeats it): every setup step still runs
+/// afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quiet {
+    pub still_for: Duration,
+    pub poll: Duration,
+    pub give_up: Duration,
+}
+
+impl Quiet {
+    /// The window for a tree somebody else may be writing: the caller's
+    /// workspace.
+    pub const CALLER: Quiet = Quiet {
+        still_for: Duration::from_secs(30),
+        poll: Duration::from_secs(5),
+        give_up: Duration::from_secs(60),
+    };
+}
+
+/// Where a tree is seeded from, and what the caller knows of its writers.
+#[derive(Debug, Clone, Copy)]
+pub struct SeedSource<'a> {
+    pub path: &'a Path,
+    pub wait: SeedWait,
+}
+
+/// What a seed knows about the writers of its source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedWait {
+    /// Writers may be active: wait for the tree to be still.
+    QuietFor(Quiet),
+    /// The source is the run's own tree and every writer the run started
+    /// has ended: there is nothing to wait for.
+    ///
+    /// holds-until: a seed-related `verification_setup_gap` shows up. This
+    /// trusts the worker's end: a native worker's untracked background
+    /// child (`cargo build &`), or the person in an in-place tree, can still
+    /// be writing. The rollback is a release that turns this back into
+    /// `QuietFor(Quiet::CALLER)` at its two call sites.
+    WritersEnded,
+}
+
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn decision(events: &Events, what: &str, reason: String) {
@@ -47,6 +85,8 @@ pub fn seed_tree(
     source: &Path,
     dest: &Path,
     own_run: Option<&str>,
+    wait: SeedWait,
+    sleep: &mut dyn FnMut(Duration),
     events: &Events,
 ) {
     let deps = reuse::detect_deps(source, &policy.workspace.deps);
@@ -57,12 +97,31 @@ pub fn seed_tree(
         return;
     }
     for dep in &deps {
+        let quiet = match wait {
+            SeedWait::WritersEnded => {
+                let place = if own_run.is_some() {
+                    "in place"
+                } else {
+                    "fork"
+                };
+                decision(
+                    events,
+                    "workspace_seed_unwaited",
+                    format!(
+                        "{}: the run's own writers ended ({place} run)",
+                        dep.display()
+                    ),
+                );
+                continue;
+            }
+            SeedWait::QuietFor(quiet) => quiet,
+        };
         let settled = reuse::wait_until_quiet(
             &source.join(dep),
-            QUIET_FOR,
-            POLL,
-            GIVE_UP,
-            &mut std::thread::sleep,
+            quiet.still_for,
+            quiet.poll,
+            quiet.give_up,
+            sleep,
             &mut |waited| {
                 decision(
                     events,
@@ -82,7 +141,7 @@ pub fn seed_tree(
                 format!(
                     "{} kept changing for {}s: source busy",
                     dep.display(),
-                    GIVE_UP.as_secs()
+                    quiet.give_up.as_secs()
                 ),
             );
             return;

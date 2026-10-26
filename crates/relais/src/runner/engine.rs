@@ -1,5 +1,6 @@
 //! The run engine: its state, constructor, core and run driver.
 
+use super::setup_gate;
 use super::{
     admission_block, baseline_summary, decide, exhaustion, fresh_progress, scheduler,
     setup_failure_detail, state_sibling, verify, verify_root, workspace, worktree_root, Arc,
@@ -681,7 +682,10 @@ impl<'a> RunEngine<'a> {
         let setup = self.while_watching_cancel(|cancel| {
             self.setup_tree(
                 &worktree_path,
-                Some(self.config.repo_dir),
+                Some(setup_gate::SeedSource {
+                    path: self.config.repo_dir,
+                    wait: setup_gate::SeedWait::QuietFor(setup_gate::Quiet::CALLER),
+                }),
                 &preflight.authority.verification_profile,
                 &baseline.logs_dir,
                 "task",

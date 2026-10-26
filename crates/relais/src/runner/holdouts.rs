@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use super::config::holdout_root;
+use super::setup_gate;
 use super::{AttemptLabel, HoldoutStop, RunEngine, VerifyFailure};
 use crate::holdout::{self, ResolvedHoldout};
 use crate::policy::{CommandSpec, EffectiveAuthority};
@@ -209,7 +210,12 @@ impl<'a> RunEngine<'a> {
             .while_watching_cancel(|cancel| {
                 self.setup_tree(
                     copy,
-                    self.task_tree().as_deref(),
+                    self.task_tree()
+                        .as_deref()
+                        .map(|path| setup_gate::SeedSource {
+                            path,
+                            wait: setup_gate::SeedWait::WritersEnded,
+                        }),
                     &authority.verification_profile,
                     &logs,
                     &prefix,
