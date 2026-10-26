@@ -137,3 +137,14 @@ Observed 2026-10-26 on `feat/holdout-report-counts`; `cargo test -p relais --lib
   - `--rerun-verify`, `--successor-contract` and `review-parts` successors reach their intent and are judged by the frozen definition (`a_successor_of_each_kind_reaches_its_intent_and_is_judged_by_the_frozen_definition`);
   - a successor of a successor is judged by the first run's definition (`a_successor_of_a_successor_is_judged_by_the_first_runs_frozen_definition`).
 - Migration: a schema-43 ledger takes both tables, empty (`a_v43_ledger_takes_the_holdout_count_tables_empty`).
+
+### Implementation review (4)
+
+- Round 1: approve-with-changes (98k tokens, 289 s). This was the only review of this candidate. All six findings are fixed in 85f8ecb7 (relais run-65ec58b0ce88a-18238):
+  - placeholder names renamed;
+  - only `failed` is a catch, so `did_not_build` is not;
+  - the bare `machine.toml` marker is dropped, so ordinary work in relais or amont no longer counts as an exposure;
+  - `label_kind` is in the `holdout_outcomes` key;
+  - package workers' transcripts are counted on the root run;
+  - `relais report --json` is tested through the binary.
+- Verification added: `holdout_report::the_report_json_counts_one_catch_and_one_exposure_under_holdouts` runs the binary on a fixture ledger and asserts the printed `holdouts` counts. ok.
