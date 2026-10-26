@@ -1538,6 +1538,10 @@ argv = ["true"]
         let below = World::new("n10-below");
         two_artifacts(&below);
         seed_routed(&below, 4, 6);
+        assert!(matches!(
+            active_artifact_verdict(&below.ledger, &below.registry).unwrap(),
+            Some(RollbackReason::AcceptanceBelowFloor { runs: 10, .. })
+        ));
         assert_rolled_back_by_the_cycle(&below);
 
         let above = World::new("n10-above");
