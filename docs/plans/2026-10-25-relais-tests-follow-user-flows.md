@@ -1,7 +1,7 @@
 ---
 canonical: decisions:docs/plans/2026-10-25-relais-tests-follow-user-flows.md
 phases: [2, 3, 4, 5, 6, 7]
-status: active
+status: done
 ---
 # relais tests follow user flows (pointer)
 
@@ -35,3 +35,4 @@ applies (ADR-0040). This repository carries phases [2, 3, 4, 5, 6, 7].
     - A fixture covers the ambiguous outcome.
   - deliberate: entries are not checked to belong to the right package, because relais is one crate.
   - Part 2 is the proof dispatches, after this merges, because `workflow_dispatch` needs the file on main.
+- Close-out: the plan is done (Phase 8 in decisions#99). Phases 5–7 were narrowed by the person to relais#312. This PR carries the one Phase 7 item that remained: the wording of `WorldPermit::acquire`'s doc comment and panic message.
