@@ -116,3 +116,11 @@ Observed 2026-10-26 on `feat/holdout-frozen-definition`; the pre-commit gate pas
 - Fixed the blocking finding (`errors.explicit-absence`): the `undeclared` sentinel is now an `Option`. Also fixed: one transaction for the frozen rows, and a test for the undeclared case.
 - Delta: approve (68k tokens, 27 s).
 - Carried to phase 4: test that the `--rerun-verify`, `--successor-contract` and `review-parts` intents reach `intent_of_run`, and a chain of three runs.
+
+## Phase 4
+
+- 2026-10-26 — 3c merged (relais#317, 8f306673), and phase 3 is recorded in decisions#100. Phase 4 is built to `docs/design/holdout-phase-4.md`:
+  - `holdout_outcomes` and `holdout_exposures` tables (schema 44);
+  - exposures counted from the workers' own transcripts at run end;
+  - `relais report` counts;
+  - the three cases carried from phase 3.
