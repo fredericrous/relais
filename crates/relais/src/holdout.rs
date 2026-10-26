@@ -237,6 +237,21 @@ pub fn resolve(
     })
 }
 
+/// A path as the holdout command receives it. On Unix the string is kept
+/// as is (a backslash is an ordinary filename character). On Windows a
+/// verbatim `\\?\` prefix is stripped (`\\?\UNC\` becomes `\\`) and
+/// separators become `/`, which both Git-for-Windows `sh` and Win32 open.
+fn render_config_path(path: &str, windows: bool) -> String {
+    if !windows {
+        return path.to_string();
+    }
+    let stripped = match path.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => path.strip_prefix(r"\\?\").unwrap_or(path).to_string(),
+    };
+    stripped.replace('\\', "/")
+}
+
 /// The holdout command's argv with `{config}` replaced by the absolute
 /// path of the store's config file. `None` when the argv names `{config}`
 /// and the declaration has no usable config, or the config is not a clean
@@ -252,7 +267,8 @@ pub fn substitute_config(
         None => Some(argv.to_vec()),
         Some(relative) if !clean_relative(relative) => None,
         Some(relative) => {
-            let absolute = source.join(relative).to_string_lossy().replace('\\', "/");
+            let joined = source.join(relative);
+            let absolute = render_config_path(&joined.to_string_lossy(), cfg!(windows));
             Some(
                 argv.iter()
                     .map(|arg| arg.replace(PLACEHOLDER, &absolute))
@@ -637,6 +653,19 @@ mod tests {
         assert_eq!(substitute_config(&argv, Some("../out.toml"), source), None);
         let plain = vec!["runner".to_string()];
         assert_eq!(substitute_config(&plain, None, source), Some(plain.clone()));
+    }
+
+    #[test]
+    fn the_config_path_is_rendered_per_platform() {
+        let table = [
+            (false, r"a/b\c.toml", r"a/b\c.toml"),
+            (true, r"\\?\C:\x\cfg\r.toml", "C:/x/cfg/r.toml"),
+            (true, r"C:\x\r.toml", "C:/x/r.toml"),
+            (true, r"\\?\UNC\srv\share\r.toml", "//srv/share/r.toml"),
+        ];
+        for (windows, input, expected) in table {
+            assert_eq!(render_config_path(input, windows), expected, "{input}");
+        }
     }
 
     #[test]
