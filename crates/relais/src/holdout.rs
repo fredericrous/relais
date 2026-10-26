@@ -241,15 +241,32 @@ pub fn resolve(
 /// as is (a backslash is an ordinary filename character). On Windows a
 /// verbatim `\\?\` prefix is stripped (`\\?\UNC\` becomes `\\`) and
 /// separators become `/`, which both Git-for-Windows `sh` and Win32 open.
-fn render_config_path(path: &str, windows: bool) -> String {
-    if !windows {
-        return path.to_string();
+fn render_config_path(path: &str, style: PathStyle) -> String {
+    match style {
+        PathStyle::Unix => path.to_string(),
+        PathStyle::Windows => {
+            let stripped = match path.strip_prefix(r"\\?\UNC\") {
+                Some(rest) => format!(r"\\{rest}"),
+                None => path.strip_prefix(r"\\?\").unwrap_or(path).to_string(),
+            };
+            stripped.replace('\\', "/")
+        }
     }
-    let stripped = match path.strip_prefix(r"\\?\UNC\") {
-        Some(rest) => format!(r"\\{rest}"),
-        None => path.strip_prefix(r"\\?\").unwrap_or(path).to_string(),
+}
+
+/// The path conventions a config path is rendered for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathStyle {
+    Unix,
+    Windows,
+}
+
+impl PathStyle {
+    const NATIVE: PathStyle = if cfg!(windows) {
+        PathStyle::Windows
+    } else {
+        PathStyle::Unix
     };
-    stripped.replace('\\', "/")
 }
 
 /// The holdout command's argv with `{config}` replaced by the absolute
@@ -268,7 +285,7 @@ pub fn substitute_config(
         Some(relative) if !clean_relative(relative) => None,
         Some(relative) => {
             let joined = source.join(relative);
-            let absolute = render_config_path(&joined.to_string_lossy(), cfg!(windows));
+            let absolute = render_config_path(&joined.to_string_lossy(), PathStyle::NATIVE);
             Some(
                 argv.iter()
                     .map(|arg| arg.replace(PLACEHOLDER, &absolute))
@@ -658,13 +675,21 @@ mod tests {
     #[test]
     fn the_config_path_is_rendered_per_platform() {
         let table = [
-            (false, r"a/b\c.toml", r"a/b\c.toml"),
-            (true, r"\\?\C:\x\cfg\r.toml", "C:/x/cfg/r.toml"),
-            (true, r"C:\x\r.toml", "C:/x/r.toml"),
-            (true, r"\\?\UNC\srv\share\r.toml", "//srv/share/r.toml"),
+            (PathStyle::Unix, r"a/b\c.toml", r"a/b\c.toml"),
+            (
+                PathStyle::Windows,
+                r"\\?\C:\x\cfg\r.toml",
+                "C:/x/cfg/r.toml",
+            ),
+            (PathStyle::Windows, r"C:\x\r.toml", "C:/x/r.toml"),
+            (
+                PathStyle::Windows,
+                r"\\?\UNC\srv\share\r.toml",
+                "//srv/share/r.toml",
+            ),
         ];
-        for (windows, input, expected) in table {
-            assert_eq!(render_config_path(input, windows), expected, "{input}");
+        for (style, input, expected) in table {
+            assert_eq!(render_config_path(input, style), expected, "{input}");
         }
     }
 
