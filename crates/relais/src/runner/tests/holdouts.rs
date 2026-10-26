@@ -1547,6 +1547,26 @@ fn a_failing_holdout_on_green_checks_is_one_catch_and_a_passing_one_is_none() {
 }
 
 #[test]
+fn a_holdout_that_did_not_build_on_green_checks_is_not_a_catch() {
+    // A broken store or runner config is not a catch: it says nothing about
+    // the candidate, and the pilot's keep bar must not count it.
+    let fixture = Fixture::new();
+    let outcome = run_script(
+        &fixture,
+        &format!("#!/bin/sh\n# {SCRIPT_MARKER}\nexit 0\n"),
+        None,
+    );
+    assert!(
+        !matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    let counts = holdout_counts(&fixture);
+    assert_eq!(counts.holdout_runs, 1);
+    assert_eq!(counts.holdout_catches, 0);
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
 fn a_holdout_failing_beside_a_red_check_is_not_a_catch() {
     let fixture = Fixture::new();
     let (store, _) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(FAILING))]);

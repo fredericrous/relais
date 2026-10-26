@@ -69,6 +69,9 @@ impl Ledger {
     /// The dispatches of the run and of its package runs that name a native
     /// agent, as (dispatch id, agent id), oldest first: the ones that have a
     /// transcript to read.
+    // holds-until: decomposition is one level deep (a package run does not
+    // decompose again), so `parent_run = ?1` reaches every worker; becomes a
+    // recursive CTE if packages ever decompose.
     pub fn agent_dispatches_of_tree(&self, run_id: &RunId) -> Result<Vec<(String, String)>> {
         let mut statement = self.conn.prepare(
             "SELECT dispatch_id, agent_id FROM dispatches
