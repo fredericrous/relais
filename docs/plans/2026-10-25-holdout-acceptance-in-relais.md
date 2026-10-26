@@ -61,3 +61,6 @@ Each test drives a full `RunEngine` run against a local bare-repo store.
   - Fixed the low finding: an empty failing list now reads "did not exit 0 (a non-zero exit, a timeout, a signal or a cancel)".
   - Candidates: `f` in `Display::fmt` is fine, and so is `_ =>` over a tuple.
 - Delta: approve (113k tokens, 16 s). Carried to 3b: keep the kept `log.txt`/`report.xml` out of reach of `read_hints` and successor context; check the fetch-by-ref fallback against the real Forgejo store at the phase 5 pilot.
+- Windows CI fixes after the delta. `{config}` is now rendered per platform through a `PathStyle` sum type: Unix keeps the path as is, Windows strips canonicalize's `\\?\` prefix and uses `/`.
+  - The first fix took a `windows: bool`, which I had asked for in the contract. The review flagged it under `functions.no-flag-arguments`, and it was replaced.
+  - Fresh round 1 on the final tree: approve (33k tokens, 47 s).
