@@ -130,10 +130,12 @@ file_args=()
 for f in "${files[@]}"; do file_args+=(--file "$f"); done
 read -r -a extra <<< "${MUTANTS_ARGS:-}"
 # holds-until: the suite grows past what two parallel runs finish in 900 s.
-# Basis: the CI ubuntu `cargo test` step took 191 s including the cached
-# build (relais#305, 2026-10-25); two suites run at once under `-j 2`, so
-# 900 s is about 3x headroom. cargo-mutants' automatic timeout, scaled from
-# a filtered baseline, would read every mutant as a timeout.
+# Basis, measured on the first 15 shards (runs 40217946779, 40227912253,
+# 40239375221, 40281104200, 2026-10-25/26): a whole shard took 315-1540 s,
+# and the largest step-2 batch, 8 mutants at `-j 2`, fits about 225 s per
+# mutant for build and suite. No mutant timed out, so 900 s is about 3x
+# headroom. cargo-mutants' automatic timeout, scaled from a filtered
+# baseline, would read every mutant as a timeout.
 timeout=${MUTANTS_TIMEOUT:-900}
 read -r -a test_extra <<< "${MUTANTS_TEST_ARGS:-}"
 
