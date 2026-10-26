@@ -77,7 +77,7 @@ Each test drives a full `RunEngine` run against a local bare-repo store.
 
 ### Verification (3b)
 
-Observed 2026-10-26 on `feat/holdout-guards`. relais run run-65ebabd29ba10-11f16 was accepted with all 5 profile checks at exit 0; the pre-commit gate ran the full `cargo test` green. Each row is a test that drives a full `RunEngine` run against a local store:
+Observed 2026-10-26 on `feat/holdout-guards`. relais run run-65ebabd29ba10-11f16 was accepted with all 5 profile checks at exit 0; the pre-commit gate ran the full `cargo test` green. Each row names its test. Rows 1 to 6 drive a full `RunEngine` run against a local store. The log-hint, repository-name and `decide` rows are unit tests.
 - A worker writes the overlay path → expected `failed (holdout_overlay_collision)`, no repair, and no artifact besides the patch and events naming the overlay → observed (`a_worker_that_writes_the_overlay_path_ends_the_run_failed_with_no_repair`).
 - A worker changes a declared holdout input → expected `needs_decision` → observed (`a_worker_that_changes_a_declared_holdout_input_stops_for_a_person`).
 - A failing holdout with repair and escalation → expected: the repair and escalation prompts carry the statement and `h::escapes`, and none of the store, path, overlay, config, script lines or kept paths → observed (`every_attempt_failing_on_the_holdout_ends_for_a_person_with_what_a_worker_never_sees`). The reviewer sees `name: outcome (ids)` only → observed (`the_reviewer_is_given_each_holdout_as_name_outcome_and_test_ids_only`).
@@ -87,3 +87,10 @@ Observed 2026-10-26 on `feat/holdout-guards`. relais run run-65ebabd29ba10-11f16
 - A holdout log saying "No space left on device" → expected no exhaustion stop → observed (`a_holdouts_output_is_never_quoted_by_the_exhaustion_detail`).
 - The repair log hint: a holdout line has none, while a check whose label mentions "(criterion:" keeps it → observed (`a_holdout_failure_line_omits_the_log_hint_and_a_check_line_keeps_it`, `a_check_label_that_mentions_a_criterion_still_gets_the_log_hint`).
 - A missing repository name → expected `holdout_unknown` with its own detail → observed (`a_missing_repository_name_is_refused_by_its_own_detail`).
+
+## Implementation review (3b)
+
+- Round 1: approve-with-changes (81k tokens, 88 s). Both findings fixed:
+  - `holds-until:` markers now sit at `widened_contract` and `widen_for_tests` for the deferred overlay filter;
+  - the Verification wording now says which rows drive a full run.
+- Candidates: both `mandatory`/`unchanged` bools are data, not selectors, so fine.
