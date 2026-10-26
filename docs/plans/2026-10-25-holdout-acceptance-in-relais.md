@@ -64,3 +64,35 @@ Each test drives a full `RunEngine` run against a local bare-repo store.
 - Windows CI fixes after the delta. `{config}` is now rendered per platform through a `PathStyle` sum type: Unix keeps the path as is, Windows strips canonicalize's `\\?\` prefix and uses `/`.
   - The first fix took a `windows: bool`, which I had asked for in the contract. The review flagged it under `functions.no-flag-arguments`, and it was replaced.
   - Fresh round 1 on the final tree: approve (33k tokens, 47 s).
+
+## Phase 3b
+
+- 2026-10-26 — 3a merged (relais#311, 30a54188). 3b is built to `docs/design/holdout-phase-3b.md`. It covers:
+  - the reserved overlay (`failed (holdout_overlay_collision)`);
+  - the holdout's declared `inputs` as protected verification inputs;
+  - the proof that the repair, escalation and reviewer prompts and the exhaustion detail hold nothing of a holdout;
+  - `needs_decision (holdout_failed)` at the attempt ceiling;
+  - the missing-repository-name detail, carried from phase 2.
+- 2026-10-26 — Deferred from 3b with a reason. The widen-scope overlay filter and the `read_hints`/successor-context assertion are the design's second guards. The overlay collision ends the run before any scope can be widened, and a hint under the state dir is already refused. They come back if phase 5 counts a `holdout_exposures` that bypassed the collision.
+
+### Verification (3b)
+
+Observed 2026-10-26 on `feat/holdout-guards`. relais run run-65ebabd29ba10-11f16 was accepted with all 5 profile checks at exit 0; the pre-commit gate ran the full `cargo test` green. Each row names its test. Rows 1–4, 6 and 7 drive a full `RunEngine` run against a local store; the `decide`, log-hint and repository-name rows are unit tests.
+- A worker writes the overlay path → expected `failed (holdout_overlay_collision)`, no repair, and no artifact besides the patch and events naming the overlay → observed (`a_worker_that_writes_the_overlay_path_ends_the_run_failed_with_no_repair`).
+- A worker changes a declared holdout input → expected `needs_decision` → observed (`a_worker_that_changes_a_declared_holdout_input_stops_for_a_person`).
+- A failing holdout with repair and escalation → expected: the repair and escalation prompts carry the statement and `h::escapes`, and none of the store, path, overlay, config, script lines or kept paths → observed (`every_attempt_failing_on_the_holdout_ends_for_a_person_with_what_a_worker_never_sees`). The reviewer sees `name: outcome (ids)` only → observed (`the_reviewer_is_given_each_holdout_as_name_outcome_and_test_ids_only`).
+- Out of attempts on a holdout alone, with `max_attempts = 2` → expected `needs_decision (holdout_failed)`, not `budget_exhausted`; the raising transition's gap reads `holdout `escaping` failed: h::escapes` → observed (`running_out_of_attempts_on_a_holdout_alone_ends_holdout_failed_not_budget_exhausted`). A mutation of the gap wording turns it red.
+- `relais decide --answer approve` on that stop → expected a refusal naming the holdout gap → observed (`cli::decide::tests::approving_a_holdout_failed_stop_is_refused_naming_the_holdout_gap`).
+- A holdout beside a failing check → expected `failed`; beside another gap → expected a gap stop naming both → observed (`a_holdout_failure_beside_a_failing_check_still_ends_failed`, `a_failed_holdout_beside_another_gap_is_named_in_the_gap_stop`).
+- A holdout log saying "No space left on device" → expected no exhaustion stop → observed (`a_holdouts_output_is_never_quoted_by_the_exhaustion_detail`).
+- The repair log hint: a holdout line has none, while a check whose label mentions "(criterion:" keeps it → observed (`a_holdout_failure_line_omits_the_log_hint_and_a_check_line_keeps_it`, `a_check_label_that_mentions_a_criterion_still_gets_the_log_hint`).
+- A missing repository name → expected `holdout_unknown` with its own detail → observed (`a_missing_repository_name_is_refused_by_its_own_detail`).
+
+## Implementation review (3b)
+
+- Round 1: approve-with-changes (81k tokens, 88 s). Both findings fixed:
+  - `holds-until:` markers now sit at `widened_contract` and `widen_for_tests` for the deferred overlay filter;
+  - the Verification wording now says which rows drive a full run.
+- Candidates: both `mandatory`/`unchanged` bools are data, not selectors, so fine.
+- Delta: approve-with-changes (85k tokens, 21 s). The holds-until markers are resolved. The row numbering was wrong and is corrected; that change is plan-only, outside the reviewed tree. Two notes are carried to phase 3c: a test that a `kind: verify` reaches the overlay check, and the ledger rows on the scheduler's collision path.
+- Windows CI fix after the rebase review: two holdout tests now match kept-artifact paths with `Path::ends_with`, and the `detail` check now looks for the exact recorded log path. Review on tree f5db2e2c: approve (27k tokens, 59 s). The local commit gate hit the `budgets::total_seconds_caps_the_run_end_to_end` timing test under a load average of about 214; the test passed alone and on a retry.

@@ -5,8 +5,8 @@ use std::path::Path;
 
 use super::{
     review_record_of, AttemptContext, AttemptLabel, Budget, Candidate, Next, Observation,
-    PendingEvidence, Progress, Reason, ReviewOutcome, ReviewRequest, RunEngine, RunError,
-    RunOutcome, State, Step, Terminal, Verified, VerifyFailure,
+    PendingEvidence, Progress, Reason, RepairFailure, ReviewOutcome, ReviewRequest, RunEngine,
+    RunError, RunOutcome, State, Step, Terminal, Verified, VerifyFailure,
 };
 use crate::acceptance::Evidence;
 use crate::contract::{Kind, Review};
@@ -77,6 +77,7 @@ impl<'a> RunEngine<'a> {
                 routed_by: preflight.decision.routed_by,
                 covering: preflight.decision.covering.clone(),
                 base_sha: &preflight.base_sha,
+                holdouts: &verified.holdouts,
             };
             let review = if in_parts {
                 self.review_candidate_in_parts(&request, &mut progress.spend)
@@ -393,6 +394,7 @@ impl<'a> RunEngine<'a> {
             routed_by: preflight.decision.routed_by,
             covering: preflight.decision.covering.clone(),
             base_sha: &preflight.base_sha,
+            holdouts: &verified.holdouts,
         };
         // Not fatal: without the listing the reviewer works as it did before,
         // and the prompt says so.
@@ -476,7 +478,13 @@ impl<'a> RunEngine<'a> {
             .collect();
         if !by_report.is_empty() {
             progress.last_candidate = Some(candidate.sha.clone());
-            progress.last_failures = Some(by_report.clone());
+            progress.last_failures = Some(
+                by_report
+                    .iter()
+                    .cloned()
+                    .map(RepairFailure::Check)
+                    .collect(),
+            );
             return self.follow(ctx, progress, Observation::CriteriaUnmet(by_report));
         }
         if !unmet.is_empty() {

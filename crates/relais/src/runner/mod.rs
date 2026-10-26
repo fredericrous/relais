@@ -78,9 +78,10 @@ pub use error::RunError;
 pub use holdouts::sweep_ended_holdouts;
 use launch::admission_block;
 pub use machine::{
-    decide, AttemptKind, Budget, Limit, Next, Observation, OverBudget, Terminal, WorktreeEnd,
+    decide, AttemptKind, Budget, HoldoutStop, Limit, Next, Observation, OverBudget, Terminal,
+    WorktreeEnd,
 };
-use prompt::{build_prompt, build_review_repair_prompt, conflict_block};
+use prompt::{build_prompt, build_review_repair_prompt, conflict_block, RepairFailure};
 pub(crate) use prompt::{data_block, data_list_block, relevant_block};
 use review::reviewer_guidance;
 pub(crate) use review::{review_record_of, ReviewOutcome, ReviewRequest};

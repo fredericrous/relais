@@ -1075,6 +1075,45 @@ mod tests {
         assert!(!runs.join("run-old").exists());
     }
 
+    #[test]
+    fn approving_a_holdout_failed_stop_is_refused_naming_the_holdout_gap() {
+        let dir = relais::test_support::short_temp_dir("decide-holdout");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        // The runner's real gap format (verify::MissingEvidence::HoldoutFailed),
+        // pinned by the runner's holdout_failed test.
+        let failure = "acceptance criterion `c1`: holdout `escaping` failed: h::escapes";
+        // The shape `HoldoutStop::recorded` writes: failures, the same as
+        // gaps, and the holdouts' records. No verification snapshot. The runner
+        // test `running_out_of_attempts_on_a_holdout_alone_ends_holdout_failed_not_budget_exhausted`
+        // checks that the runner really records `gaps`; this hand-copied
+        // detail must stay in step with it.
+        let detail = serde_json::json!({
+            "failures": [failure],
+            "gaps": [failure],
+            "holdouts": [],
+        });
+        waiting_run(
+            &ledger,
+            "run-holdout",
+            "/repo",
+            State::NeedsDecision,
+            Reason::HoldoutFailed,
+            Some(detail),
+            None,
+        );
+        let refused = approve(&dir, "run-holdout");
+        assert_eq!(exit_of(&refused), 2);
+        let message = refused.err().expect("refused").message;
+        assert!(message.contains("verification gaps"), "{message}");
+        assert!(message.contains("holdout `escaping` failed"), "{message}");
+        assert_eq!(
+            ledger
+                .run_status(&RunId::from_stored("run-holdout"))
+                .expect("status"),
+            Some(State::NeedsDecision)
+        );
+    }
+
     fn git(dir: &Path, args: &[&str]) -> String {
         let output = relais::workspace::git_command(dir)
             .args(args)

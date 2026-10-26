@@ -349,6 +349,10 @@ impl<'a> RunEngine<'a> {
     /// intent it names; `None` when the run did not stop that way, policy
     /// says no, or the planning or the write failed, in which case the
     /// decision stays open for a person, as it always did.
+    // holds-until: no overlay filter here; the holdout overlay collision
+    // (runner/attempt.rs, runner/scheduler.rs) ends a run before any scope can
+    // be widened. Ends if phase 5 of the holdout plan counts a
+    // holdout_exposures that bypassed the collision (ADR-0045).
     fn widen_for_tests(
         &self,
         outcome: &RunOutcome,
@@ -624,6 +628,7 @@ impl<'a> RunEngine<'a> {
                 baseline_cached: baseline.cached,
                 baseline_cache_refused: &baseline.cache_refused,
                 logs_dir: &baseline.logs_dir,
+                holdouts: &preflight.holdouts,
             };
             match scheduler::run_decomposed(self, &root, decomposition)? {
                 scheduler::Decomposed::Outcome(outcome) => return Ok(outcome),

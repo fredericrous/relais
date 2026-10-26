@@ -3639,6 +3639,7 @@ fn only_an_inspect_prompt_names_the_deliverable() {
 fn an_inspect_repair_is_told_what_caused_it() {
     let manifest = manifest_with(Vec::new());
     let repair = |failures: Vec<String>| {
+        let failures: Vec<RepairFailure> = failures.into_iter().map(RepairFailure::Check).collect();
         build_prompt(
             &inspect_contract(),
             &manifest,
@@ -7155,6 +7156,7 @@ fn guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_g
         routed_by: RoutedBy::ConservativeBaseline,
         covering: None,
         base_sha: "base",
+        holdouts: &[],
     };
     let mut spend = RunSpend::zero();
     let outcome = engine.review_candidate(&request, &mut spend);
@@ -7167,7 +7169,7 @@ fn guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_g
 fn every_attempt_kind_carries_the_native_rules() {
     let fixture = Fixture::new();
     let contract = fixture.contract(Review::Off);
-    let failures = vec!["make check".to_string()];
+    let failures = vec![RepairFailure::Check("make check".to_string())];
     for (previous, kind) in [
         (None, AttemptKind::Initial),
         (Some(failures.as_slice()), AttemptKind::Repair),

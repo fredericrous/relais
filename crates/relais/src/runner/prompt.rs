@@ -14,11 +14,42 @@ scoped decision, then a default-scope decision, then an adopted rule: an applica
 outranks an adopted rule, and a code-rule violation is not reported where a listed decision \
 decides otherwise; missing decision evidence is reported as uncertainty, not as permission.\n";
 
+/// Why a repair is needed: a profile check that failed, or a holdout gap.
+/// The kind decides what the worker is shown beside the line: a check's log
+/// is the worker's to read, a holdout's never is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::runner) enum RepairFailure {
+    Check(String),
+    Holdout(String),
+}
+
+impl RepairFailure {
+    pub(in crate::runner) fn text(&self) -> &str {
+        match self {
+            Self::Check(text) | Self::Holdout(text) => text,
+        }
+    }
+
+    pub(in crate::runner) fn texts(failures: &[RepairFailure]) -> Vec<String> {
+        failures
+            .iter()
+            .map(|failure| failure.text().to_string())
+            .collect()
+    }
+
+    fn repair_line(&self) -> String {
+        match self {
+            Self::Check(text) => format!("  - {text} (log under logs/)\n"),
+            Self::Holdout(text) => format!("  - {text}\n"),
+        }
+    }
+}
+
 pub(super) fn build_prompt(
     contract: &TaskContract,
     manifest: &ContextManifest,
     verification_commands: usize,
-    previous_failures: Option<&[String]>,
+    previous_failures: Option<&[RepairFailure]>,
     kind: AttemptKind,
 ) -> (String, Option<GuidanceGap>) {
     let (code_rules_text, code_rules_gap) =
@@ -83,8 +114,9 @@ pub(super) fn build_prompt(
                 // Labelled by what caused the repair: a report criterion
                 // (`[n] …`, from the report review), an empty report, or
                 // a check that newly failed on the unchanged tree.
-                let (criteria, rest): (Vec<String>, Vec<String>) =
-                    failures.iter().cloned().partition(|failure| {
+                let (criteria, rest): (Vec<String>, Vec<String>) = RepairFailure::texts(failures)
+                    .into_iter()
+                    .partition(|failure| {
                         failure.starts_with('[')
                             && failure[1..].starts_with(|c: char| c.is_ascii_digit())
                     });
@@ -113,7 +145,7 @@ pub(super) fn build_prompt(
                 prompt.push_str("\n[repair addendum]\n");
                 prompt.push_str("the previous candidate failed verification on these checks:\n");
                 for failure in failures {
-                    prompt.push_str(&format!("  - {failure} (log under logs/)\n"));
+                    prompt.push_str(&failure.repair_line());
                 }
                 prompt.push_str("fix only the failures; do not rewrite unrelated work.\n");
             }
@@ -124,7 +156,7 @@ pub(super) fn build_prompt(
                      the same checks failed:\n",
                 );
                 for failure in failures {
-                    prompt.push_str(&format!("  - {failure}\n"));
+                    prompt.push_str(&format!("  - {}\n", failure.text()));
                 }
                 prompt.push_str(
                     "judge from the contract and the evidence; acceptance criteria are unchanged.\n",

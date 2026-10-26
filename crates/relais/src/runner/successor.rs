@@ -163,6 +163,10 @@ pub fn plan_test_widening(
 /// `kind: verify` of that run's candidate, whose write scope is the old one
 /// plus exactly `paths`. A verify has no worker and no decomposition, so
 /// those fields do not carry over.
+// holds-until: no overlay filter here; the holdout overlay collision
+// (runner/attempt.rs, runner/scheduler.rs) ends a run before any scope can
+// be widened. Ends if phase 5 of the holdout plan counts a
+// holdout_exposures that bypassed the collision (ADR-0045).
 pub fn widened_contract(
     contract: &TaskContract,
     run: &RunId,

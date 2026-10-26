@@ -84,7 +84,7 @@ pub(crate) fn utc_day_start(now_rfc3339: &str) -> Option<String> {
 pub(super) struct Progress {
     pub(super) budget: Budget,
     pub(super) kind: AttemptKind,
-    pub(super) last_failures: Option<Vec<String>>,
+    pub(super) last_failures: Option<Vec<super::prompt::RepairFailure>>,
     /// The findings of the review that sent the run back to its worker,
     /// until that repair's prompt quotes them.
     pub(super) review_findings: Option<String>,
@@ -95,6 +95,9 @@ pub(super) struct Progress {
     /// price: its cost settled as the whole reservation, so no further
     /// attempt is admitted (SPEC §11).
     pub(super) unpriced_model: Option<Vec<String>>,
+    /// Set while the last verification failed on holdout gaps alone; an
+    /// attempt ceiling reached then ends for a person (ADR-0045).
+    pub(super) holdout_stop: Option<super::HoldoutStop>,
 }
 
 /// `budget` with `review_repairs_used` counted from the run's recorded
@@ -143,5 +146,6 @@ pub(super) fn fresh_progress(preflight: &Preflight) -> Progress {
         spend: RunSpend::zero(),
         models_used: Vec::new(),
         unpriced_model: None,
+        holdout_stop: None,
     }
 }

@@ -155,6 +155,35 @@ pub fn holdout_names(entries: &[AcceptanceEntry]) -> Vec<String> {
     names
 }
 
+/// The holdout whose overlay a candidate wrote, with the overlay path: a
+/// changed path equal to a resolved holdout's overlay, or under it when the
+/// overlay is a directory. The overlay is the holdout's, never a worker's.
+pub fn overlay_collision<'h>(
+    resolved: &'h [ResolvedHoldout],
+    changed: &[String],
+) -> Option<(&'h ResolvedHoldout, &'h str)> {
+    resolved.iter().find_map(|holdout| {
+        let overlay = holdout.decl.overlay.trim_end_matches('/');
+        changed
+            .iter()
+            .any(|path| {
+                path == overlay
+                    || path
+                        .strip_prefix(overlay)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+            .then_some((holdout, overlay))
+    })
+}
+
+/// The declared `inputs` globs of every resolved holdout.
+pub fn protected_inputs(resolved: &[ResolvedHoldout]) -> Vec<String> {
+    resolved
+        .iter()
+        .flat_map(|holdout| holdout.decl.inputs.iter().cloned())
+        .collect()
+}
+
 /// Resolve every holdout criterion, stopping at the first refusal.
 pub fn resolve_all(
     entries: &[AcceptanceEntry],
@@ -165,7 +194,23 @@ pub fn resolve_all(
     base_sha: &str,
     machine_toml: &str,
 ) -> Result<Vec<ResolvedHoldout>, HoldoutBlock> {
-    holdout_names(entries)
+    let names = holdout_names(entries);
+    if repo.is_empty() && !names.is_empty() {
+        return Err(HoldoutBlock {
+            code: BlockCode::HoldoutUnknown,
+            detail: format!(
+                "the repository name could not be determined, so the holdout{} {} cannot be \
+                 looked up in {machine_toml} [holdouts]",
+                if names.len() == 1 { "" } else { "s" },
+                names
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+    }
+    names
         .iter()
         .map(|name| {
             resolve(settings, repo, name, git, repo_dir, base_sha).map_err(|refusal| HoldoutBlock {
@@ -581,6 +626,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_missing_repository_name_is_refused_by_its_own_detail() {
+        let entries = [AcceptanceEntry::Declared(
+            crate::acceptance::DeclaredCriterion {
+                statement: "s".into(),
+                id: None,
+                mandatory: true,
+                evidence: Evidence::Holdout { name: "x".into() },
+            },
+        )];
+        let git = crate::workspace::SystemGit;
+        let block = resolve_all(
+            &entries,
+            &HoldoutSettings::default(),
+            "",
+            &git,
+            Path::new("."),
+            "base",
+            "machine.toml",
+        )
+        .expect_err("refused");
+        assert_eq!(block.code, BlockCode::HoldoutUnknown);
+        assert!(
+            block
+                .detail
+                .contains("repository name could not be determined"),
+            "{}",
+            block.detail
+        );
+        assert!(!block.detail.contains("declared: none"));
+    }
+
+    #[test]
+    fn an_overlay_collides_with_its_path_and_with_a_path_under_it() {
+        let resolved = ResolvedHoldout {
+            name: "h".into(),
+            repo: "r".into(),
+            store: "s".into(),
+            git_ref: "main".into(),
+            sha: "abc".into(),
+            decl: decl(Some("j.xml"), "tests/holdout"),
+            digest: "d".into(),
+        };
+        let hit = |path: &str| overlay_collision(std::slice::from_ref(&resolved), &[path.into()]);
+        assert!(hit("tests/holdout").is_some());
+        assert!(hit("tests/holdout/a.rs").is_some());
+        assert!(hit("tests/holdout_other.rs").is_none());
+        assert!(hit("src/lib.rs").is_none());
+    }
+
     fn decl(junit: Option<&str>, overlay: &str) -> HoldoutDecl {
         HoldoutDecl {
             path: "p.rs".into(),
@@ -590,6 +685,7 @@ mod tests {
             )
             .expect("a command spec"),
             config: None,
+            inputs: Vec::new(),
         }
     }
 

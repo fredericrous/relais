@@ -1,13 +1,14 @@
 //! The attempt loop: dispatch, snapshot, verify and judge each attempt.
 
+use super::holdouts::split_holdout_gaps;
 use super::{
     build_prompt, build_review_repair_prompt, conflict_block, effort_str, fresh_progress,
     spend_limit, split_profile_gaps, unpriced_native_model, verify, workspace, AgentKind,
     AttemptContext, AttemptKind, AttemptLabel, Attempted, BlockCode, Candidate, Ceiling,
     Dispatched, Duration, Ended, EvidenceKind, Instant, LaunchSpec, Limit, ManagedDispatch, Next,
-    Observation, PathBuf, PendingEvidence, Phase, Progress, Reason, Review, RunEngine, RunError,
-    RunOutcome, Snapshot, State, Step, Terminal, UsageEvent, Verified, VerifyFailure,
-    WorkspaceError,
+    Observation, PathBuf, PendingEvidence, Phase, Progress, Reason, RepairFailure, Review,
+    RunEngine, RunError, RunOutcome, Snapshot, State, Step, Terminal, UsageEvent, Verified,
+    VerifyFailure, WorkspaceError,
 };
 
 impl<'a> RunEngine<'a> {
@@ -114,13 +115,28 @@ impl<'a> RunEngine<'a> {
     /// §11). `Some(outcome)` means one was reached and the run ended.
     fn ceiling_reached(&mut self, progress: &Progress) -> Result<Option<RunOutcome>, RunError> {
         if progress.budget.attempts_used >= progress.budget.max_attempts {
-            return Ok(Some(self.stop(
-                &progress.budget,
-                Observation::LimitReached(Limit::Attempts {
-                    max: progress.budget.max_attempts,
-                    last_failures: progress.last_failures.clone().unwrap_or_default(),
-                }),
-            )?));
+            if let (Some(holdout), Some(failures)) = (
+                progress.holdout_stop.clone(),
+                progress.last_failures.as_deref().map(RepairFailure::texts),
+            ) {
+                return Ok(Some(self.stop(
+                    &progress.budget,
+                    Observation::HoldoutsOutOfAttempts { failures, holdout },
+                )?));
+            }
+            return Ok(Some(
+                self.stop(
+                    &progress.budget,
+                    Observation::LimitReached(Limit::Attempts {
+                        max: progress.budget.max_attempts,
+                        last_failures: progress
+                            .last_failures
+                            .as_deref()
+                            .map(RepairFailure::texts)
+                            .unwrap_or_default(),
+                    }),
+                )?,
+            ));
         }
         if let Some(exhausted) = self.budgets.exhausted() {
             return Ok(Some(self.end_on_exhausted(exhausted, &progress.budget)?));
@@ -165,6 +181,7 @@ impl<'a> RunEngine<'a> {
         let ledger = self.config.ledger;
         let authority = &ctx.preflight.authority;
         progress.budget.attempts_used += 1;
+        progress.holdout_stop = None;
         let index = progress.budget.attempts_used;
         let rung_index = progress.budget.rung;
         let rung = ctx
@@ -651,6 +668,39 @@ impl<'a> RunEngine<'a> {
                 .map(|prepared| prepared.tree.as_str()),
             self.config.contract,
         );
+        // A holdout's overlay path is the holdout's: a candidate that
+        // wrote it ends the run, before any scope answer that could offer
+        // to widen to it, and with nothing for a repair prompt to carry.
+        let written = match ctx
+            .worktree
+            .changed_paths_from(floor.revision(ctx.worktree), &sha)
+        {
+            Ok(written) => written,
+            Err(e) => {
+                return Ok(Snapshot::Ended(
+                    self.fail_preflight(BlockCode::ScopeCheckFailed, e.to_string())?,
+                ));
+            }
+        };
+        if let Some((holdout, overlay)) =
+            crate::holdout::overlay_collision(&ctx.preflight.holdouts, &written)
+        {
+            ledger.finish_attempt(attempt_id, State::Failed, None, Some(&sha))?;
+            let detail = format!(
+                "the candidate wrote `{overlay}`, the overlay path of holdout `{}`; a holdout's \
+                 overlay is reserved, so the run ends without a repair",
+                holdout.name
+            );
+            return Ok(Snapshot::Ended(self.finish(
+                Reason::HoldoutOverlayCollision,
+                serde_json::json!({
+                    "holdout": holdout.name,
+                    "overlay": overlay,
+                    "candidate": sha,
+                }),
+                Terminal::Failed { detail },
+            )?));
+        }
         match workspace::check_scope_from(ctx.worktree, &sha, self.config.contract, floor) {
             Ok(_) => {}
             Err(WorkspaceError::ScopeViolation(paths)) => {
@@ -697,8 +747,10 @@ impl<'a> RunEngine<'a> {
             .ledger
             .finish_attempt(attempt_id, State::Failed, None, None)?;
         let failures = vec![format!("unresolved_conflict: {}", paths.join(", "))];
-        let same_failures = progress.last_failures.as_deref() == Some(failures.as_slice());
-        progress.last_failures = Some(failures.clone());
+        let repair_failures: Vec<RepairFailure> =
+            failures.iter().cloned().map(RepairFailure::Check).collect();
+        let same_failures = progress.last_failures.as_deref() == Some(repair_failures.as_slice());
+        progress.last_failures = Some(repair_failures);
         self.follow(
             ctx,
             progress,
@@ -707,6 +759,7 @@ impl<'a> RunEngine<'a> {
                 unchanged_candidate: false,
                 same_failures,
                 all_preexisting: false,
+                holdout_only: None,
             },
         )
     }
@@ -723,6 +776,7 @@ impl<'a> RunEngine<'a> {
         let ledger = self.config.ledger;
         let authority = &ctx.preflight.authority;
         let worktree_path = ctx.worktree_path;
+        progress.holdout_stop = None;
         let held_worktree = worktree_path.to_string_lossy().into_owned();
 
         // A candidate that changes what verification IS gets neither
@@ -735,8 +789,9 @@ impl<'a> RunEngine<'a> {
         // Editing the TEST TREE is work §10 explicitly invites, so
         // it stays what it was: explicit review, whatever the route
         // said (audit B8).
-        let touched_inputs = verify::classify_verification_inputs(
+        let touched_inputs = verify::classify_with_holdout_inputs(
             &authority.verification_profile,
+            &crate::holdout::protected_inputs(&ctx.preflight.holdouts),
             &ctx.worktree.changed_paths_in(&candidate.sha)?,
         )?;
         if !touched_inputs.policy.is_empty() {
@@ -831,7 +886,7 @@ impl<'a> RunEngine<'a> {
         let verify::Verified {
             checks,
             mut gaps,
-            acceptance_gaps,
+            mut acceptance_gaps,
             amont_bypasses,
             amont_downgrades,
             gate_coverage,
@@ -882,6 +937,19 @@ impl<'a> RunEngine<'a> {
             return Ok(Step::Ended(
                 self.end_on_candidate_exhaustion(ctx, &candidate, exhausted)?,
             ));
+        }
+        // A holdout that failed is a failure the worker may repair, not a
+        // gap: what it is told is the criterion and the failing test ids.
+        // Only when no other gap stands beside it: a run that stops on a
+        // gap names the failed holdout in it.
+        let mut holdout_gaps = Vec::new();
+        if !inspecting && !self.config.contract.is_verify() {
+            let split = split_holdout_gaps(gaps.clone(), acceptance_gaps.clone());
+            if split.gaps.is_empty() {
+                gaps = split.gaps;
+                acceptance_gaps = split.acceptance_gaps;
+                holdout_gaps = split.holdout;
+            }
         }
         // An inspection judges its report: a gap about the profile's own
         // checks is recorded, not a stop. The acceptance-evidence gaps
@@ -939,6 +1007,9 @@ impl<'a> RunEngine<'a> {
                 .map(|check| check.label.clone())
                 .collect()
         };
+        let check_count = failures.len();
+        let holdout_failures = self.holdout_failures(&holdout_gaps);
+        failures.extend(holdout_failures.iter().cloned());
         // An inspection's deliverable is its report: an empty one is a
         // failure the worker may repair once, as an empty candidate is
         // for a change.
@@ -970,24 +1041,47 @@ impl<'a> RunEngine<'a> {
             )?));
         }
         if !failures.is_empty() {
-            let same_failures = progress.last_failures.as_deref() == Some(failures.as_slice());
+            let holdout_range = check_count..check_count + holdout_failures.len();
+            let repair_failures: Vec<RepairFailure> = failures
+                .iter()
+                .enumerate()
+                .map(|(at, failure)| {
+                    if holdout_range.contains(&at) {
+                        RepairFailure::Holdout(failure.clone())
+                    } else {
+                        RepairFailure::Check(failure.clone())
+                    }
+                })
+                .collect();
+            let same_failures =
+                progress.last_failures.as_deref() == Some(repair_failures.as_slice());
             progress.last_candidate = Some(candidate.sha.clone());
             let all_preexisting = failures
                 .iter()
                 .all(|label| ctx.baseline.failures.contains(label));
-            progress.last_failures = Some(failures.clone());
+            progress.last_failures = Some(repair_failures);
             // Plan C1: complete JUnit on both sides says every failing
             // test already fails at the base and nothing targets it. A
             // cached base keeps no failing checks, so it never applies.
-            if let Some(tests) = ctx.baseline.checks.as_deref().and_then(|base| {
-                verify::guarded_preexisting(
-                    &failures,
-                    base,
-                    &checks,
-                    &ctx.preflight.authority.verification_profile,
-                    &self.config.contract.acceptance,
-                )
-            }) {
+            let holdout_only = (!holdout_failures.is_empty()
+                && failures.len() == holdout_failures.len())
+            .then(|| self.holdout_stop(&holdout_gaps, &holdouts));
+            progress.holdout_stop = holdout_only.clone();
+            if let Some(tests) = ctx
+                .baseline
+                .checks
+                .as_deref()
+                .filter(|_| holdout_failures.is_empty())
+                .and_then(|base| {
+                    verify::guarded_preexisting(
+                        &failures,
+                        base,
+                        &checks,
+                        &ctx.preflight.authority.verification_profile,
+                        &self.config.contract.acceptance,
+                    )
+                })
+            {
                 return self.follow(
                     ctx,
                     progress,
@@ -1002,6 +1096,7 @@ impl<'a> RunEngine<'a> {
                     unchanged_candidate: unchanged,
                     same_failures,
                     all_preexisting,
+                    holdout_only,
                 },
             );
         }
@@ -1026,7 +1121,13 @@ impl<'a> RunEngine<'a> {
         let missing_tests = self.missing_test_gaps(ctx, &candidate.sha)?;
         if !missing_tests.is_empty() {
             progress.last_candidate = Some(candidate.sha.clone());
-            progress.last_failures = Some(missing_tests.clone());
+            progress.last_failures = Some(
+                missing_tests
+                    .iter()
+                    .cloned()
+                    .map(RepairFailure::Check)
+                    .collect(),
+            );
             return self.follow(ctx, progress, Observation::CriteriaUnmet(missing_tests));
         }
         self.accept_candidate(ctx, progress, &candidate, verified, None)

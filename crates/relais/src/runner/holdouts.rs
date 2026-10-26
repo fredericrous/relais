@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use super::config::holdout_root;
-use super::{AttemptLabel, RunEngine, VerifyFailure};
+use super::{AttemptLabel, HoldoutStop, RunEngine, VerifyFailure};
 use crate::holdout::{self, ResolvedHoldout};
 use crate::policy::{CommandSpec, EffectiveAuthority};
 use crate::protocol::Events;
@@ -41,6 +41,76 @@ impl<'a> RunEngine<'a> {
             &holdout_root(&self.config.artifacts_dir),
             self.config.ledger,
         );
+    }
+
+    /// What a worker is told of a failed holdout: the criterion's statement
+    /// and the failing test ids, nothing else.
+    pub(super) fn holdout_failures(&self, gaps: &[HoldoutGap]) -> Vec<String> {
+        gaps.iter()
+            .map(|HoldoutGap { gap, .. }| {
+                let statement = self
+                    .config
+                    .contract
+                    .acceptance
+                    .iter()
+                    .find(|entry| entry.id() == gap.criterion_id)
+                    .map_or("", |entry| entry.statement());
+                format!("{} (criterion: {statement})", gap.message())
+            })
+            .collect()
+    }
+
+    /// What a person is told when the attempts ran out on holdout gaps
+    /// alone: each holdout with its commit, the failing test ids and the
+    /// kept log and report. Only the person's `relais decide` reads it.
+    pub(super) fn holdout_stop(&self, gaps: &[HoldoutGap], runs: &[HoldoutRun]) -> HoldoutStop {
+        let records = gaps
+            .iter()
+            .map(|HoldoutGap { name, .. }| {
+                let kept = runs.iter().find(|run| run.name == *name);
+                serde_json::json!({
+                    "name": name,
+                    "sha": kept.map(|run| run.sha.as_str()),
+                    "failing": kept.map(HoldoutRun::failing).unwrap_or_default(),
+                    "log": kept.and_then(|run| run.log.as_ref()),
+                    "report": kept.and_then(|run| run.report.as_ref()),
+                })
+            })
+            .collect::<Vec<_>>();
+        HoldoutStop {
+            detail: self.holdout_decision_detail(gaps, runs),
+            holdouts: serde_json::Value::Array(records),
+        }
+    }
+
+    fn holdout_decision_detail(&self, gaps: &[HoldoutGap], runs: &[HoldoutRun]) -> String {
+        let named = gaps
+            .iter()
+            .map(|HoldoutGap { name, gap }| {
+                let kept = runs.iter().find(|run| run.name == *name);
+                let place = |label: &str, path: Option<&String>| {
+                    path.map(|path| format!("; {label} {path}"))
+                        .unwrap_or_default()
+                };
+                format!(
+                    "{} (holdout `{name}` at {}, failing tests: {}{}{})",
+                    gap.message(),
+                    kept.map_or("an unknown commit", |run| run.sha.as_str()),
+                    kept.map(HoldoutRun::failing)
+                        .filter(|ids| !ids.is_empty())
+                        .map_or_else(|| "none reported".to_string(), |ids| ids.join(", ")),
+                    place("log", kept.and_then(|run| run.log.as_ref())),
+                    place("report", kept.and_then(|run| run.report.as_ref())),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "the attempts ran out and the only failures left are holdout gaps: {named}. Answer \
+             with `relais decide {} --answer approve|revise|reject`; approve is refused, as for \
+             any gap",
+            self.run_id
+        )
     }
 
     /// Fetch and run every resolved holdout, in contract order. A store
@@ -196,6 +266,58 @@ impl<'a> RunEngine<'a> {
             run.report = Some(kept_report.to_string_lossy().into_owned());
         }
         Ok(run)
+    }
+}
+
+/// A holdout gap a repair can answer, with the holdout it names.
+pub(super) struct HoldoutGap {
+    pub(super) name: String,
+    pub(super) gap: verify::AcceptanceGap,
+}
+
+/// `gaps` and `acceptance_gaps` split into the holdout gaps a repair can
+/// answer (a failed holdout, one that did not build) and the rest. A
+/// holdout that was not run stays a gap.
+pub(super) struct HoldoutSplit {
+    pub(super) holdout: Vec<HoldoutGap>,
+    pub(super) gaps: Vec<String>,
+    pub(super) acceptance_gaps: Vec<verify::AcceptanceGap>,
+}
+
+pub(super) fn split_holdout_gaps(
+    mut gaps: Vec<String>,
+    acceptance_gaps: Vec<verify::AcceptanceGap>,
+) -> HoldoutSplit {
+    let mut holdout = Vec::new();
+    let mut kept = Vec::new();
+    for gap in acceptance_gaps {
+        match &gap.missing {
+            verify::MissingEvidence::HoldoutFailed { name, .. }
+            | verify::MissingEvidence::HoldoutDidNotBuild { name } => {
+                let message = gap.message();
+                if let Some(at) = gaps.iter().position(|sentence| *sentence == message) {
+                    gaps.remove(at);
+                }
+                holdout.push(HoldoutGap {
+                    name: name.clone(),
+                    gap,
+                });
+            }
+            verify::MissingEvidence::CheckProducedNothing { .. }
+            | verify::MissingEvidence::CheckUndefined { .. }
+            | verify::MissingEvidence::SignOffUnrecorded
+            | verify::MissingEvidence::GateNotCovered { .. }
+            | verify::MissingEvidence::GateUnavailable { .. }
+            | verify::MissingEvidence::HoldoutNotRun { .. }
+            | verify::MissingEvidence::NoPerTestResults { .. }
+            | verify::MissingEvidence::TestNotReported { .. }
+            | verify::MissingEvidence::TestNotPassed { .. } => kept.push(gap),
+        }
+    }
+    HoldoutSplit {
+        holdout,
+        gaps,
+        acceptance_gaps: kept,
     }
 }
 

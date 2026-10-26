@@ -81,6 +81,9 @@ pub(crate) struct ReviewRequest<'r> {
     /// The run's base: adr-lint's candidates are the lines between it and
     /// `candidate_sha`.
     pub(crate) base_sha: &'r str,
+    /// How each holdout ended on this candidate: the reviewer is given
+    /// the name, the outcome and the test ids, nothing else (ADR-0045).
+    pub(crate) holdouts: &'r [crate::verify::HoldoutRun],
 }
 
 impl ReviewRequest<'_> {
@@ -97,6 +100,7 @@ impl ReviewRequest<'_> {
             routed_by: self.routed_by,
             covering: self.covering.clone(),
             base_sha: self.base_sha,
+            holdouts: self.holdouts,
         }
     }
 }
