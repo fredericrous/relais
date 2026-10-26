@@ -246,7 +246,14 @@ impl<'a> RunEngine<'a> {
     }
 
     pub(super) fn run(mut self) -> Result<RunOutcome, RunError> {
-        let outcome = match self.run_to_outcome() {
+        if self.parent.is_none() {
+            self.sweep_ended_holdouts();
+        }
+        let finish = self.run_to_outcome();
+        // A package (child) run has its own run id and so its own holdout
+        // directory; it removes it here like a root run does.
+        self.remove_holdout_dir();
+        let outcome = match finish {
             Finish::Own(outcome) => outcome,
             Finish::Exit(error) => return Err(error),
             // Another process ended the run (a reap, a workerless cancel)

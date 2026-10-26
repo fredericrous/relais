@@ -204,6 +204,7 @@ impl<'a> RunEngine<'a> {
             ctx,
             &report,
             &verified.gate_coverage,
+            &verified.holdouts,
             patch_adds_test,
             verdict,
         )?;
@@ -239,6 +240,7 @@ impl<'a> RunEngine<'a> {
             ladder: verify::LadderRecord::Single(preflight.decision.ladder.rungs().to_vec()),
             efforts_used: self.config.ledger.efforts_used(&self.run_id)?,
             candidates: self.candidates_record(&candidate.sha),
+            holdouts: verified.holdouts.clone(),
         })
     }
 
@@ -290,6 +292,7 @@ impl<'a> RunEngine<'a> {
         ctx: &AttemptContext<'_>,
         report: &VerificationReport,
         gate_coverage: &BTreeMap<String, Result<bool, verify::AttestError>>,
+        holdouts: &[verify::HoldoutRun],
         patch_adds_test: verify::PatchAddsTest,
         verdict: Option<&verify::ReportVerdict>,
     ) -> Result<
@@ -313,6 +316,7 @@ impl<'a> RunEngine<'a> {
             verify::Attestations {
                 signoffs: &signoffs,
                 gate_coverage,
+                holdouts,
             },
             self.config.contract.kind(),
             patch_adds_test,
@@ -427,6 +431,7 @@ impl<'a> RunEngine<'a> {
             ctx,
             &report,
             &verified.gate_coverage,
+            &verified.holdouts,
             verify::PatchAddsTest::NotJudged,
             Some(&verdict),
         )?;
@@ -487,6 +492,7 @@ impl<'a> RunEngine<'a> {
                     gaps_not_judged: verified.gaps_not_judged,
                     notes: verified.notes,
                     gate_coverage: verified.gate_coverage,
+                    holdouts: verified.holdouts,
                     verdict: Some(verdict),
                 },
             )?;
@@ -508,6 +514,7 @@ impl<'a> RunEngine<'a> {
         logs_dir: &Path,
         label: AttemptLabel,
         reuse: Option<&[verify::CheckOutcome]>,
+        resolved_holdouts: &[crate::holdout::ResolvedHoldout],
     ) -> Result<verify::Verified, VerifyFailure> {
         // amont's effective inventory (SPEC §10): consulted whenever the
         // integration is on, for the bypasses and downgrades it declares
@@ -755,12 +762,41 @@ impl<'a> RunEngine<'a> {
                 }
             }
         }
+        // Holdouts run in a second copy made now that the profile's
+        // commands have finished (ADR-0045). Their logs are not check logs.
+        let holdouts = self.run_holdouts(candidate_sha, authority, label, resolved_holdouts)?;
+        for entry in &self.config.contract.acceptance {
+            if let Some(crate::acceptance::Evidence::Holdout { name }) = entry.evidence() {
+                let passed = holdouts
+                    .iter()
+                    .find(|run| run.name == *name && run.outcome == verify::HoldoutVerdict::Passed);
+                if let Some(run) = passed {
+                    let criterion_id = entry.id();
+                    let external_id = format!("{}@{}", run.name, run.sha);
+                    self.config
+                        .ledger
+                        .attach_evidence(
+                            &self.run_id,
+                            Path::new(&format!("relais-holdout:{external_id}")),
+                            None,
+                            EvidenceOrigin {
+                                tool: Some("relais-holdout"),
+                                external_id: Some(&external_id),
+                                subject: Some(candidate_sha),
+                                criterion_id: Some(&criterion_id),
+                            },
+                        )
+                        .map_err(|e| format!("the ledger refused a holdout evidence row: {e}"))?;
+                }
+            }
+        }
         let acceptance_gaps = verify::acceptance_gaps(
             &self.config.contract.acceptance,
             &authority.verification_profile,
             &checks,
             &signoffs,
             &gate_coverage,
+            &holdouts,
         );
         gaps.extend(acceptance_gaps.iter().map(verify::AcceptanceGap::message));
         // The throwaway worktree has done its work. Releasing it here —
@@ -784,6 +820,7 @@ impl<'a> RunEngine<'a> {
                 .map(|inventory| inventory.downgrades.clone())
                 .unwrap_or_default(),
             gate_coverage,
+            holdouts,
         })
     }
 }
@@ -824,7 +861,7 @@ pub(super) fn unmet_evidence(evidence: Option<&Evidence>) -> String {
         }) => format!("test `{test}` did not pass"),
         Some(Evidence::AmontGate { gate }) => format!("amont gate `{gate}` is not covered"),
         Some(Evidence::Holdout { name }) => {
-            format!("holdout `{name}` is not run by this relais (phase 3)")
+            format!("holdout `{name}` did not pass")
         }
         Some(Evidence::Test { name: None, .. } | Evidence::LlmReview | Evidence::HumanSignOff)
         | None => "its evidence is not met".into(),

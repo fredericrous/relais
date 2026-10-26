@@ -461,17 +461,25 @@ fn execute_waves(
             amont_bypasses,
             amont_downgrades,
             gate_coverage,
+            // holds-until: assembled candidates run no holdout, so their
+            // holdout criteria stay unsettled gaps (fail closed); ends
+            // with ADR-0045 phase 3b.
+            holdouts: _,
         } = match engine.verify_candidate(
             &assembly.head,
             root.authority,
             root.logs_dir,
             AttemptLabel::Integration(integration_repairs),
             None,
+            &[],
         ) {
             Ok(result) => result,
             Err(VerifyFailure::Lease(stop)) => return engine.end_on_lease_stop(stop, &budget),
             Err(VerifyFailure::Unavailable(e)) => {
                 return engine.fail_preflight(BlockCode::VerificationUnavailable, e)
+            }
+            Err(VerifyFailure::HoldoutUnfetchable(e)) => {
+                return engine.fail_preflight(BlockCode::HoldoutUnfetchable, e)
             }
             Err(VerifyFailure::Full(e)) => return Err(e),
         };
@@ -1188,6 +1196,7 @@ fn integrated_receipt(
         verify::Attestations {
             signoffs: &signoffs,
             gate_coverage: &assembled.gate_coverage,
+            holdouts: &[],
         },
         engine.config.contract.kind(),
         assembled.patch_adds_test,
@@ -1221,6 +1230,7 @@ fn integrated_receipt(
         ladder: verify::LadderRecord::PerPackage(assembly.ladders.clone()),
         efforts_used: assembly.efforts_used.clone(),
         candidates: engine.candidates_record(&assembly.head),
+        holdouts: Vec::new(),
     })
 }
 

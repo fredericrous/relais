@@ -281,6 +281,7 @@ mod tests {
             ladder: relais::verify::LadderRecord::NotRecorded,
             efforts_used: Vec::new(),
             candidates: relais::verify::CandidatesRecord::NotRecorded,
+            holdouts: Vec::new(),
         }
     }
 

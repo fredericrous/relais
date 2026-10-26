@@ -487,6 +487,7 @@ fn a_candidates_block_before_the_findings_line_changes_neither_verdict_nor_sever
 fn a_receipt_without_the_candidates_field_still_parses() {
     let receipt = crate::verify::Receipt {
         candidates: CandidatesRecord::NotRecorded,
+        holdouts: Vec::new(),
         ..sample_receipt()
     };
     let mut json = serde_json::to_value(&receipt).expect("serializes");
@@ -549,5 +550,6 @@ fn sample_receipt() -> crate::verify::Receipt {
         ladder: LadderRecord::NotRecorded,
         efforts_used: Vec::new(),
         candidates: CandidatesRecord::NotRecorded,
+        holdouts: Vec::new(),
     }
 }

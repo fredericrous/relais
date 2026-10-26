@@ -35,6 +35,7 @@ use crate::workspace::{Git, WorkspaceError};
 mod end;
 mod follow;
 mod heavy;
+mod holdout_run;
 mod junit;
 
 pub use end::CheckEnd;
@@ -43,6 +44,7 @@ pub use heavy::{
     overweight, parallelism, Admitted, Ask, HeavyAdmission, Jitter, LeaseStop, SeededJitter,
     Sleeper, ThreadSleeper, Tries, ANNOUNCE_EVERY, HOST_SLOT_ENV, LEASE_HEARTBEAT_EVERY,
 };
+pub use holdout_run::{HoldoutRun, HoldoutTest, HoldoutVerdict};
 pub use junit::{parse_junit, parse_report, JunitArtifact, JunitError, JunitReport, TestOutcome};
 
 /// Why verification could not be carried out as the policy declares it.
@@ -337,6 +339,7 @@ pub fn acceptance_gaps(
     checks: &[CheckOutcome],
     signoffs: &HashSet<String>,
     gate_coverage: &BTreeMap<String, Result<bool, AttestError>>,
+    holdouts: &[HoldoutRun],
 ) -> Vec<AcceptanceGap> {
     let mut gaps = Vec::new();
     for entry in entries {
@@ -365,10 +368,25 @@ pub fn acceptance_gaps(
                     missing: MissingEvidence::SignOffUnrecorded,
                 })
             }
-            Some(Evidence::Holdout { name }) => gaps.push(AcceptanceGap {
-                criterion_id: entry.id(),
-                missing: MissingEvidence::HoldoutNotRun { name: name.clone() },
-            }),
+            Some(Evidence::Holdout { name }) => {
+                let missing = match holdouts.iter().find(|run| run.name == *name) {
+                    None => Some(MissingEvidence::HoldoutNotRun { name: name.clone() }),
+                    Some(run) => match run.outcome {
+                        HoldoutVerdict::Passed => None,
+                        HoldoutVerdict::Failed => Some(MissingEvidence::HoldoutFailed {
+                            name: name.clone(),
+                            failing: run.failing(),
+                        }),
+                        HoldoutVerdict::DidNotBuild => {
+                            Some(MissingEvidence::HoldoutDidNotBuild { name: name.clone() })
+                        }
+                    },
+                };
+                gaps.extend(missing.map(|missing| AcceptanceGap {
+                    criterion_id: entry.id(),
+                    missing,
+                }));
+            }
             Some(Evidence::AmontGate { gate }) => match gate_coverage.get(gate) {
                 Some(Ok(true)) => {}
                 Some(Ok(false)) | None => gaps.push(AcceptanceGap {
@@ -468,9 +486,14 @@ pub enum MissingEvidence {
     /// absent, too old to have the subcommand, or failed some other way.
     /// The cause relais actually observed, never guessed.
     GateUnavailable { gate: String, detail: String },
-    /// A holdout criterion (ADR-0045): this relais resolves it at
-    /// preflight but does not run it, so it is never settled.
+    /// A holdout criterion (ADR-0045) with no run on record; defensive,
+    /// since every resolved holdout is run at verification.
     HoldoutNotRun { name: String },
+    /// A holdout that ran and failed: the ids of its failed and skipped
+    /// tests, empty when it did not exit 0 (non-zero, timeout, signal, cancel) over passing tests.
+    HoldoutFailed { name: String, failing: Vec<String> },
+    /// A holdout that wrote no usable report.
+    HoldoutDidNotBuild { name: String },
     /// A named test, and no verification command declares a JUnit report:
     /// nothing produced per-test results at all.
     NoPerTestResults { test: String },
@@ -516,8 +539,19 @@ impl AcceptanceGap {
                 "acceptance criterion `{id}` names amont gate `{gate}`, which could not be \
                  asked about: {detail}"
             ),
-            MissingEvidence::HoldoutNotRun { name } => format!(
-                "acceptance criterion `{id}`: holdout `{name}` is not run by this relais (phase 3)"
+            MissingEvidence::HoldoutNotRun { name } => {
+                format!("acceptance criterion `{id}`: holdout `{name}` was not run")
+            }
+            MissingEvidence::HoldoutFailed { name, failing } => format!(
+                "acceptance criterion `{id}`: holdout `{name}` failed: {}",
+                if failing.is_empty() {
+                    "did not exit 0 (a non-zero exit, a timeout, a signal or a cancel)".to_string()
+                } else {
+                    failing.join(", ")
+                }
+            ),
+            MissingEvidence::HoldoutDidNotBuild { name } => format!(
+                "acceptance criterion `{id}`: holdout `{name}` did not build or wrote no report"
             ),
             MissingEvidence::NoPerTestResults { test } => format!(
                 "acceptance criterion `{id}` names test `{test}`, but no verification command \
@@ -870,6 +904,7 @@ pub fn missing_test_gaps(
 pub struct Attestations<'a> {
     pub signoffs: &'a HashSet<String>,
     pub gate_coverage: &'a BTreeMap<String, Result<bool, AttestError>>,
+    pub holdouts: &'a [HoldoutRun],
 }
 
 /// Settle every acceptance criterion against a finished verification
@@ -968,7 +1003,13 @@ pub fn settle_acceptance(
                     attestations.signoffs.contains(&entry.id()),
                     SettledVia::HumanSignOff,
                 ),
-                (Some(Evidence::Holdout { .. }), _) => (false, SettledVia::DeclaredEvidence),
+                (Some(Evidence::Holdout { name }), _) => (
+                    attestations
+                        .holdouts
+                        .iter()
+                        .any(|run| run.name == *name && run.outcome == HoldoutVerdict::Passed),
+                    SettledVia::DeclaredEvidence,
+                ),
                 (Some(Evidence::AmontGate { gate }), _) => (
                     matches!(attestations.gate_coverage.get(gate), Some(Ok(true))),
                     SettledVia::DeclaredEvidence,
@@ -2405,6 +2446,8 @@ pub struct Verified {
     /// keyed by gate name — settlement reads this, never `accepted`
     /// (SPEC §10, §18).
     pub gate_coverage: BTreeMap<String, Result<bool, AttestError>>,
+    /// What each holdout run established (ADR-0045).
+    pub holdouts: Vec<HoldoutRun>,
 }
 
 /// The toolchain a profile's commands actually run on: for every program
@@ -2880,6 +2923,11 @@ pub struct Receipt {
     /// parses, and on a run whose candidates were never asked for.
     #[serde(default, skip_serializing_if = "CandidatesRecord::is_not_recorded")]
     pub candidates: CandidatesRecord,
+    /// What each holdout run established (ADR-0045): name, commit, outcome
+    /// and test ids, never the store, the script or its log lines. Absent
+    /// on a receipt written before holdouts ran, which still parses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holdouts: Vec<HoldoutRun>,
 }
 
 /// What a receipt records about the candidate lines the reviewer was asked
@@ -4717,6 +4765,7 @@ mod tests {
             &checks,
             &HashSet::new(),
             &BTreeMap::new(),
+            &[],
         );
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(
@@ -4814,6 +4863,7 @@ mod tests {
             Attestations {
                 signoffs: &HashSet::new(),
                 gate_coverage: &BTreeMap::new(),
+                holdouts: &[],
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
@@ -4973,6 +5023,7 @@ mod tests {
             &checks,
             &HashSet::new(),
             &BTreeMap::new(),
+            &[],
         );
         let (mut criteria, _) = settle_acceptance(
             &entries,
@@ -4981,6 +5032,7 @@ mod tests {
             Attestations {
                 signoffs: &HashSet::new(),
                 gate_coverage: &BTreeMap::new(),
+                holdouts: &[],
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
@@ -5265,6 +5317,7 @@ mod tests {
             &checks,
             &HashSet::new(),
             &BTreeMap::new(),
+            &[],
         );
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(
@@ -5304,6 +5357,7 @@ mod tests {
             Attestations {
                 signoffs: &HashSet::new(),
                 gate_coverage: &BTreeMap::new(),
+                holdouts: &[],
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
@@ -5346,7 +5400,14 @@ mod tests {
         )];
         let signed_off: HashSet<String> = [entries[0].id()].into_iter().collect();
 
-        let gaps = acceptance_gaps(&entries, &profile, &checks, &signed_off, &BTreeMap::new());
+        let gaps = acceptance_gaps(
+            &entries,
+            &profile,
+            &checks,
+            &signed_off,
+            &BTreeMap::new(),
+            &[],
+        );
         assert!(gaps.is_empty(), "{gaps:?}");
         let gaps: Vec<String> = gaps.iter().map(AcceptanceGap::message).collect();
 
@@ -5376,6 +5437,7 @@ mod tests {
             Attestations {
                 signoffs: &signed_off,
                 gate_coverage: &BTreeMap::new(),
+                holdouts: &[],
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
@@ -5465,7 +5527,7 @@ mod tests {
             Path::new("/does/not/matter"),
         );
 
-        let gaps = acceptance_gaps(&entries, &profile, &checks, &HashSet::new(), &coverage);
+        let gaps = acceptance_gaps(&entries, &profile, &checks, &HashSet::new(), &coverage, &[]);
         assert!(gaps.is_empty(), "{gaps:?}");
 
         let report = VerificationReport {
@@ -5492,6 +5554,7 @@ mod tests {
             Attestations {
                 signoffs: &HashSet::new(),
                 gate_coverage: &coverage,
+                holdouts: &[],
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
@@ -5543,7 +5606,7 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        let gaps = acceptance_gaps(&entries, &profile, &checks, &HashSet::new(), &coverage);
+        let gaps = acceptance_gaps(&entries, &profile, &checks, &HashSet::new(), &coverage, &[]);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(
             gaps[0].missing,
@@ -5580,6 +5643,7 @@ mod tests {
             Attestations {
                 signoffs: &HashSet::new(),
                 gate_coverage: &coverage,
+                holdouts: &[],
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
@@ -5613,7 +5677,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let gaps = acceptance_gaps(&entries, &profile, &[], &HashSet::new(), &coverage);
+        let gaps = acceptance_gaps(&entries, &profile, &[], &HashSet::new(), &coverage, &[]);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         let message = gaps[0].message();
         assert!(
@@ -5668,6 +5732,7 @@ mod tests {
             Attestations {
                 signoffs: &HashSet::new(),
                 gate_coverage: &BTreeMap::new(),
+                holdouts: &[],
             },
             Kind::Inspect,
             PatchAddsTest::NotJudged,
@@ -5699,6 +5764,7 @@ mod tests {
             Attestations {
                 signoffs: &HashSet::new(),
                 gate_coverage: &BTreeMap::new(),
+                holdouts: &[],
             },
             Kind::Inspect,
             PatchAddsTest::NotJudged,
@@ -5823,6 +5889,7 @@ mod tests {
             Attestations {
                 signoffs: &HashSet::new(),
                 gate_coverage: &BTreeMap::new(),
+                holdouts: &[],
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
@@ -5844,6 +5911,7 @@ mod tests {
             Attestations {
                 signoffs: &HashSet::new(),
                 gate_coverage: &BTreeMap::new(),
+                holdouts: &[],
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
@@ -5863,6 +5931,7 @@ mod tests {
             Attestations {
                 signoffs: &HashSet::new(),
                 gate_coverage: &BTreeMap::new(),
+                holdouts: &[],
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
@@ -6015,6 +6084,7 @@ mod tests {
             ladder: LadderRecord::NotRecorded,
             efforts_used: Vec::new(),
             candidates: CandidatesRecord::NotRecorded,
+            holdouts: Vec::new(),
         };
         let hash = receipt.hash();
         let mut other = receipt.clone();
@@ -6123,6 +6193,7 @@ mod tests {
                 Attestations {
                     signoffs: &HashSet::new(),
                     gate_coverage: &BTreeMap::new(),
+                    holdouts: &[],
                 },
                 Kind::Change,
                 adds,

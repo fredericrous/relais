@@ -211,6 +211,7 @@ impl<'a> RunEngine<'a> {
             gaps_not_judged,
             notes,
             gate_coverage,
+            holdouts,
             verdict,
         } = pending;
         let preflight = ctx.preflight;
@@ -236,6 +237,7 @@ impl<'a> RunEngine<'a> {
             ctx,
             &report,
             &gate_coverage,
+            &holdouts,
             patch_adds_test,
             verdict.as_ref(),
         )?;
@@ -271,6 +273,7 @@ impl<'a> RunEngine<'a> {
             ladder: verify::LadderRecord::Single(preflight.decision.ladder.rungs().to_vec()),
             efforts_used: self.config.ledger.efforts_used(&self.run_id)?,
             candidates: self.candidates_record(&candidate.sha),
+            holdouts,
         };
         // No attempt id: this receipt belongs to the run, and the
         // attempt that earned it is not finished — the run is waiting on

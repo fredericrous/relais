@@ -8,7 +8,8 @@ missing here.
 
 ## Unreleased
 
-- A contract criterion can name a holdout as its evidence (ADR-0045, phase 2): `{"kind": "holdout", "name": "..."}`, declared in machine.toml `[holdouts]`. `relais run` and `relais plan` resolve it before any worker runs and refuse it with `holdout_unknown`, `holdout_no_junit`, `holdout_bad_overlay`, `holdout_overlay_exists` or `holdout_unreadable`; the context manifest records each holdout's name, commit and digest. Nothing fetches or runs a holdout yet, so a mandatory holdout criterion stays an unsettled gap and the run is not accepted.
+- A contract criterion can name a holdout as its evidence (ADR-0045, phase 2): `{"kind": "holdout", "name": "..."}`, declared in machine.toml `[holdouts]`. `relais run` and `relais plan` resolve it before any worker runs and refuse it with `holdout_unknown`, `holdout_no_junit`, `holdout_bad_overlay`, `holdout_overlay_exists` or `holdout_unreadable`; the context manifest records each holdout's name, commit and digest.
+- A holdout now runs at verification (ADR-0045, phase 3a). relais fetches the store at the recorded commit outside every worktree, runs the holdout command in a second verification copy made after the profile's checks, and settles the criterion from the exit status and the JUnit report: a failed or skipped test, or a missing report, leaves it unmet, and the gap names the criterion, the holdout and the failing test ids only. The receipt gains `holdouts`. A store that cannot be fetched ends the run `blocked (holdout_unfetchable)` with the candidate kept. The store is fetched once per run, each fetch step is bounded by the smaller of 60 s and what is left of the run's budgets, and the run's holdout directory is removed at its terminal state; run start and `relais resume --retire` sweep the directories of ended runs.
 
 ## v0.33.0
 

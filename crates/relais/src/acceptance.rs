@@ -71,7 +71,8 @@ pub enum Evidence {
     AmontGate { gate: String },
     /// A holdout (ADR-0045): a test kept outside the candidate's
     /// repository, declared in machine.toml `[holdouts]`. Resolved at
-    /// preflight; this relais does not run it, so it stays a gap.
+    /// preflight, fetched and run at verification, and settled only by
+    /// the command's exit status and its parsed JUnit report.
     Holdout { name: String },
 }
 

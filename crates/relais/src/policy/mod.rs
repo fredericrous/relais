@@ -1894,6 +1894,9 @@ pub enum BlockCode {
     HoldoutOverlayExists,
     /// The holdout store does not resolve its ref to one commit.
     HoldoutUnreadable,
+    /// A holdout store could not be fetched at the commit recorded at
+    /// preflight, when verification came to run it.
+    HoldoutUnfetchable,
     /// Another run holds the caller's worktree (ADR-0008).
     WorkspaceBusy,
     /// A run was interrupted in the caller's worktree and has not been
@@ -1948,6 +1951,7 @@ impl BlockCode {
             Self::HoldoutBadOverlay => "holdout_bad_overlay",
             Self::HoldoutOverlayExists => "holdout_overlay_exists",
             Self::HoldoutUnreadable => "holdout_unreadable",
+            Self::HoldoutUnfetchable => "holdout_unfetchable",
             Self::WorkspaceBusy => "workspace_busy",
             Self::WorkspaceHasInterruptedRun => "workspace_has_interrupted_run",
             Self::InPlaceHeadMoved => "inplace_head_moved",
