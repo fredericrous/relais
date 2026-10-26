@@ -835,12 +835,14 @@ impl<'a> RunEngine<'a> {
             amont_bypasses,
             amont_downgrades,
             gate_coverage,
+            holdouts,
         } = match self.verify_candidate(
             &candidate.sha,
             authority,
             &ctx.baseline.logs_dir,
             AttemptLabel::Attempt(candidate.index),
             reuse,
+            &ctx.preflight.holdouts,
         ) {
             Ok(result) => result,
             Err(VerifyFailure::Lease(stop)) => {
@@ -849,6 +851,11 @@ impl<'a> RunEngine<'a> {
             Err(VerifyFailure::Unavailable(e)) => {
                 return Ok(Step::Ended(
                     self.fail_preflight(BlockCode::VerificationUnavailable, e)?,
+                ));
+            }
+            Err(VerifyFailure::HoldoutUnfetchable(e)) => {
+                return Ok(Step::Ended(
+                    self.fail_preflight(BlockCode::HoldoutUnfetchable, e)?,
                 ));
             }
             Err(VerifyFailure::Full(e)) => return Err(e),
@@ -912,6 +919,7 @@ impl<'a> RunEngine<'a> {
                         gaps_not_judged: gaps_not_judged.clone(),
                         notes: Vec::new(),
                         gate_coverage: gate_coverage.clone(),
+                        holdouts: holdouts.clone(),
                         verdict: None,
                     },
                 )?;
@@ -1008,6 +1016,7 @@ impl<'a> RunEngine<'a> {
             verification_inputs_changed,
             review_required,
             gate_coverage,
+            holdouts,
         };
         if inspecting {
             return self.judge_inspection(ctx, progress, &candidate, verified);

@@ -1,13 +1,14 @@
-//! Holdout evidence, resolved at preflight (ADR-0045, SPEC §4).
+//! Holdout evidence (ADR-0045, SPEC §4, §10).
 //!
 //! A holdout is an acceptance test kept outside the candidate's repository.
-//! This module only checks that a holdout criterion can be settled later: the
-//! declaration exists in machine.toml, names a JUnit report and a clean
-//! overlay path, the overlay is free at the base revision, and the store
-//! resolves to one commit. Nothing here fetches or runs a holdout, and
-//! nothing it learns is shown to a worker.
+//! At preflight this module checks that a holdout criterion can be settled
+//! later: the declaration exists in machine.toml, names a JUnit report and a
+//! clean overlay path, the overlay is free at the base revision, and the
+//! store resolves to one commit. At verification it fetches the store at
+//! that commit, outside every worktree. Nothing it learns is shown to a
+//! worker.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -21,12 +22,13 @@ use crate::workspace::Git;
 /// How long `git ls-remote` may take before the store counts as unreadable.
 const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A holdout whose store resolved: everything phase 3 needs to run it.
+/// A holdout whose store resolved: everything verification needs to fetch and run it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedHoldout {
     pub name: String,
     pub repo: String,
     pub store: String,
+    pub git_ref: String,
     pub sha: String,
     pub decl: HoldoutDecl,
     pub digest: String,
@@ -228,13 +230,62 @@ pub fn resolve(
         name: name.to_string(),
         repo: repo.to_string(),
         store,
+        git_ref: settings.git_ref.clone(),
         sha,
         decl: decl.clone(),
         digest,
     })
 }
 
-fn clean_relative(path: &str) -> bool {
+/// The holdout command's argv with `{config}` replaced by the absolute
+/// path of the store's config file. `None` when the argv names `{config}`
+/// and the declaration has no usable config, or the config is not a clean
+/// store-relative path.
+pub fn substitute_config(
+    argv: &[String],
+    config: Option<&str>,
+    source: &Path,
+) -> Option<Vec<String>> {
+    const PLACEHOLDER: &str = "{config}";
+    match config {
+        None if argv.iter().any(|arg| arg.contains(PLACEHOLDER)) => None,
+        None => Some(argv.to_vec()),
+        Some(relative) if !clean_relative(relative) => None,
+        Some(relative) => {
+            let absolute = source.join(relative).to_string_lossy().into_owned();
+            Some(
+                argv.iter()
+                    .map(|arg| arg.replace(PLACEHOLDER, &absolute))
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// Copy a holdout (a file or a directory of the fetched store) to `dest`,
+/// creating parent directories. A store's `.git` is never copied.
+pub fn copy_into(source: &Path, dest: &Path) -> std::io::Result<()> {
+    if source.is_dir() {
+        std::fs::create_dir_all(dest)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            copy_into(&entry.path(), &dest.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(source, dest).map(|_| ())
+    }
+}
+
+/// Whether `path` is a clean relative path: no leading `/`, no empty, `.`
+/// or `..` segment.
+pub fn clean_relative(path: &str) -> bool {
     !path.trim().is_empty()
         && !path.starts_with('/')
         && !Path::new(path).is_absolute()
@@ -263,11 +314,8 @@ fn digest_of(repo: &str, name: &str, store: &str, sha: &str, decl: &HoldoutDecl)
 /// [`LS_REMOTE_TIMEOUT`]. The one sha the ref names, or the reason it
 /// could not be had.
 fn ls_remote(store: &str, git_ref: &str) -> Result<String, String> {
-    let mut command = Command::new("git");
-    command
-        .args(["ls-remote", store, git_ref])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    let mut command = unattended_git(Path::new("."));
+    command.args(["ls-remote", store, git_ref]);
     let output = crate::procs::run_with_timeout(command, LS_REMOTE_TIMEOUT, None, None)
         .map_err(|e| format!("git ls-remote could not be run: {e}"))?;
     match output.ended {
@@ -300,6 +348,177 @@ fn ls_remote(store: &str, git_ref: &str) -> Result<String, String> {
     }
 }
 
+/// A `git` command that cannot prompt: no terminal prompt, ssh in batch
+/// mode. [`crate::procs::run_with_timeout`] gives it stdin from /dev/null.
+fn unattended_git(dir: &Path) -> Command {
+    let mut command = crate::workspace::git_command(dir);
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    command
+}
+
+/// A store that could not be fetched at the recorded commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unfetchable {
+    pub store: String,
+    pub sha: String,
+    pub detail: String,
+}
+
+impl std::fmt::Display for Unfetchable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "holdout store `{}` could not be fetched at {}: {}",
+            self.store, self.sha, self.detail
+        )
+    }
+}
+
+/// How long each git call of a fetch may take, before the run's budgets
+/// narrow it.
+const FETCH_STEP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The bound of one fetch step: its own 60 s, or what is left of the run's
+/// work and total budgets, whichever is smaller.
+pub fn fetch_step_bound(budget_left: Duration) -> Duration {
+    FETCH_STEP_TIMEOUT.min(budget_left)
+}
+
+/// Fetch the store at the recorded commit into `<dest_root>/src/<sha>/`,
+/// outside every worktree, and return that directory. An existing
+/// directory is reused. The tree is built beside its final name and
+/// renamed into place once complete, so a half-fetched tree is never
+/// taken for a whole one. Any failure, or a commit that is not the
+/// recorded one, is [`Unfetchable`]. `budget_left` is asked before each git
+/// call, which is bounded by [`fetch_step_bound`] of the answer.
+pub fn fetch(
+    resolved: &ResolvedHoldout,
+    dest_root: &Path,
+    budget_left: &dyn Fn() -> Duration,
+) -> Result<PathBuf, Unfetchable> {
+    let unfetchable = |detail: String| Unfetchable {
+        store: resolved.store.clone(),
+        sha: resolved.sha.clone(),
+        detail,
+    };
+    let target = dest_root.join("src").join(&resolved.sha);
+    if target.is_dir() {
+        return Ok(target);
+    }
+    let partial = dest_root
+        .join("src")
+        .join(format!("{}.partial", resolved.sha));
+    match std::fs::remove_dir_all(&partial) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(unfetchable(e.to_string())),
+    }
+    std::fs::create_dir_all(&partial).map_err(|e| unfetchable(e.to_string()))?;
+    let git = |args: &[&str]| -> Result<String, String> {
+        let bound = fetch_step_bound(budget_left());
+        if bound.is_zero() {
+            return Err("the run's time budget is spent".to_string());
+        }
+        let mut command = unattended_git(&partial);
+        command.args(args);
+        let output = crate::procs::run_with_timeout(command, bound, None, None)
+            .map_err(|e| format!("git could not be run: {e}"))?;
+        match output.ended {
+            crate::procs::Ended::Exited(0) => Ok(output.stdout),
+            crate::procs::Ended::Exited(_) | crate::procs::Ended::Signalled => {
+                Err(last_line(&output.stderr, "git failed"))
+            }
+            crate::procs::Ended::TimedOut | crate::procs::Ended::Cancelled => {
+                Err(format!("git did not answer within {} s", bound.as_secs()))
+            }
+        }
+    };
+    git(&["init", "-q"]).map_err(unfetchable)?;
+    // A server may refuse to serve an unadvertised commit: fall back to
+    // the ref and require that it still names the recorded commit.
+    if git(&[
+        "fetch",
+        "-q",
+        "--depth",
+        "1",
+        &resolved.store,
+        &resolved.sha,
+    ])
+    .is_err()
+    {
+        git(&[
+            "fetch",
+            "-q",
+            "--depth",
+            "1",
+            &resolved.store,
+            &resolved.git_ref,
+        ])
+        .map_err(unfetchable)?;
+        let fetched = git(&["rev-parse", "FETCH_HEAD"]).map_err(unfetchable)?;
+        if fetched.trim() != resolved.sha {
+            return Err(unfetchable(format!(
+                "`{}` now names {}, not the recorded commit",
+                resolved.git_ref,
+                fetched.trim()
+            )));
+        }
+    }
+    git(&["checkout", "-q", "--detach", &resolved.sha]).map_err(unfetchable)?;
+    std::fs::rename(&partial, &target).map_err(|e| unfetchable(e.to_string()))?;
+    Ok(target)
+}
+
+/// Remove `<root>/<run>/` for every run `has_ended` says is over, so a run
+/// that died before its own cleanup leaves nothing behind. A directory of a
+/// run still alive, or not on record, is kept by an answer of `Ok(false)`.
+/// Only a missing root is silent: every other read, entry or ledger error is
+/// printed on stderr and the directory is kept.
+pub fn sweep_ended(root: &Path, has_ended: &dyn Fn(&str) -> Result<bool, String>) {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            eprintln!(
+                "relais: the holdout directory {} could not be read: {e}",
+                root.display()
+            );
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                eprintln!(
+                    "relais: an entry of the holdout directory {} could not be read: {e}",
+                    root.display()
+                );
+                continue;
+            }
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        match has_ended(&name) {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                    eprintln!(
+                        "relais: the holdout directory {} could not be removed: {e}",
+                        entry.path().display()
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "relais: the run {name} could not be looked up, its holdout directory is kept: {e}"
+            ),
+        }
+    }
+}
+
 fn last_line(text: &str, fallback: &str) -> String {
     text.lines()
         .rev()
@@ -320,6 +539,14 @@ pub fn machine_toml_label() -> String {
 mod tests {
     use super::*;
     use crate::policy::CommandSpec;
+
+    #[test]
+    fn a_fetch_step_is_bounded_by_the_smaller_of_sixty_seconds_and_the_budget_left() {
+        let seconds = Duration::from_secs;
+        for (left, bound) in [(0, 0), (5, 5), (60, 60), (61, 60), (3600, 60)] {
+            assert_eq!(fetch_step_bound(seconds(left)), seconds(bound), "{left}");
+        }
+    }
 
     fn decl(junit: Option<&str>, overlay: &str) -> HoldoutDecl {
         HoldoutDecl {
@@ -389,6 +616,23 @@ mod tests {
             ),
             BlockCode::HoldoutUnreadable
         );
+    }
+
+    #[test]
+    fn the_config_placeholder_becomes_the_stores_absolute_config_path() {
+        let source = Path::new("/state/holdouts/run/src/abc");
+        let argv = vec!["runner".to_string(), "--config={config}".to_string()];
+        assert_eq!(
+            substitute_config(&argv, Some("cfg/runner.toml"), source),
+            Some(vec![
+                "runner".to_string(),
+                "--config=/state/holdouts/run/src/abc/cfg/runner.toml".to_string()
+            ])
+        );
+        assert_eq!(substitute_config(&argv, None, source), None);
+        assert_eq!(substitute_config(&argv, Some("../out.toml"), source), None);
+        let plain = vec!["runner".to_string()];
+        assert_eq!(substitute_config(&plain, None, source), Some(plain.clone()));
     }
 
     #[test]

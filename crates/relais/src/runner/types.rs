@@ -107,6 +107,10 @@ pub(super) struct Preflight {
     /// The contract revision row every attempt of this run belongs to.
     pub(super) revision_id: i64,
     pub(super) manifest: ContextManifest,
+    /// The holdouts the contract names, resolved at preflight. Kept
+    /// whole for verification; never serialized into the manifest or any
+    /// prompt (ADR-0045).
+    pub(super) holdouts: Vec<crate::holdout::ResolvedHoldout>,
     pub(super) decision: Route,
     /// The candidate a `kind: verify` run applies, or a `kind: change` run
     /// continues from, resolved and merge-checked in preflight; `None`
@@ -220,6 +224,7 @@ pub(super) struct PendingEvidence {
     pub(super) gaps_not_judged: Vec<String>,
     pub(super) notes: Vec<String>,
     pub(super) gate_coverage: BTreeMap<String, Result<bool, verify::AttestError>>,
+    pub(super) holdouts: Vec<verify::HoldoutRun>,
     /// An inspection's report review, which the pending receipt keeps.
     pub(super) verdict: Option<verify::ReportVerdict>,
 }
@@ -253,6 +258,7 @@ pub(super) struct Verified {
     pub(super) verification_inputs_changed: Vec<String>,
     pub(super) review_required: bool,
     pub(super) gate_coverage: BTreeMap<String, Result<bool, verify::AttestError>>,
+    pub(super) holdouts: Vec<verify::HoldoutRun>,
 }
 
 /// How one verification's artifacts are named: its throwaway worktree

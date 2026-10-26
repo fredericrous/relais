@@ -1061,6 +1061,7 @@ mod tests {
             ladder: LadderRecord::NotRecorded,
             efforts_used: Vec::new(),
             candidates: crate::verify::CandidatesRecord::NotRecorded,
+            holdouts: Vec::new(),
         };
         RunOutcome {
             run_id: RunId::from_stored(run),

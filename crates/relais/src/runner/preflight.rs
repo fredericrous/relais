@@ -282,7 +282,7 @@ impl<'a> RunEngine<'a> {
             (Some(prepared), Some(_)) => prepared.tree.clone(),
             _ => base_sha.clone(),
         };
-        let manifest = match self.assemble_context(
+        let (manifest, holdouts) = match self.assemble_context(
             &authority,
             &contract_hash,
             &base_sha,
@@ -290,7 +290,7 @@ impl<'a> RunEngine<'a> {
             capabilities.as_ref(),
         )? {
             Phase::Ended(outcome) => return Ok(Phase::Ended(outcome)),
-            Phase::Ready(manifest) => manifest,
+            Phase::Ready(assembled) => assembled,
         };
 
         // Route (SPEC §6). The catalogs are resolved here, from the probe
@@ -366,6 +366,7 @@ impl<'a> RunEngine<'a> {
             contract_hash,
             revision_id,
             manifest,
+            holdouts,
             decision,
             candidate,
             predecessor,
@@ -510,7 +511,7 @@ impl<'a> RunEngine<'a> {
         base_sha: &str,
         hint_tree: &str,
         capabilities: Option<&crate::backend::Capabilities>,
-    ) -> Result<Phase<ContextManifest>, RunError> {
+    ) -> Result<Phase<(ContextManifest, Vec<crate::holdout::ResolvedHoldout>)>, RunError> {
         // Read hints are fingerprinted from `hint_tree`; one that
         // resolves to nothing would point the worker at a path this
         // revision does not have, which is a preflight problem (V15).
@@ -546,7 +547,7 @@ impl<'a> RunEngine<'a> {
         };
         // Holdout criteria are resolved here too: an undeclared, unusable
         // or unreachable holdout refuses the contract before any worker is
-        // paid for. Only name, commit and digest are kept.
+        // paid for. The manifest keeps only name, commit and digest.
         let holdouts = match crate::holdout::resolve_all(
             &self.config.contract.acceptance,
             &self.config.machine.holdouts,
@@ -556,7 +557,7 @@ impl<'a> RunEngine<'a> {
             base_sha,
             &crate::holdout::machine_toml_label(),
         ) {
-            Ok(resolved) => resolved.iter().map(|holdout| holdout.record()).collect(),
+            Ok(resolved) => resolved,
             Err(block) => return Ok(Phase::Ended(self.fail_preflight(block.code, block.detail)?)),
         };
         let (turn_ceiling, warning) = harness_reading(
@@ -588,7 +589,7 @@ impl<'a> RunEngine<'a> {
             resolver: self.config.aval_resolver,
             design,
             repo_name: crate::repo::main_checkout_name(self.config.repo_dir),
-            holdouts,
+            holdouts: holdouts.iter().map(|holdout| holdout.record()).collect(),
         });
         match assembled {
             Ok(manifest) => {
@@ -607,7 +608,7 @@ impl<'a> RunEngine<'a> {
                     &manifest_path,
                     Some(&context::manifest_hash(&manifest)),
                 )?;
-                Ok(Phase::Ready(manifest))
+                Ok(Phase::Ready((manifest, holdouts)))
             }
             Err(ContextError::ContradictionBlocked { key, heads }) => {
                 Ok(Phase::Ended(self.block(

@@ -117,6 +117,14 @@ pub fn verify_root(artifacts_dir: &Path) -> PathBuf {
     state_sibling(artifacts_dir, "verify")
 }
 
+/// Where a run's fetched holdout stores, second verification copies and
+/// holdout logs live: beside the artifacts, never inside a worktree and
+/// never where a prompt names (ADR-0045). Removed when the run's
+/// verification ends.
+pub fn holdout_root(artifacts_dir: &Path) -> PathBuf {
+    state_sibling(artifacts_dir, "holdouts")
+}
+
 pub(super) fn state_sibling(artifacts_dir: &Path, name: &str) -> PathBuf {
     artifacts_dir.parent().unwrap_or(artifacts_dir).join(name)
 }

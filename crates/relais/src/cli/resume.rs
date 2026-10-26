@@ -315,6 +315,7 @@ pub(crate) fn reconcile_run(
 pub(crate) fn retire_all_command() -> Result<CliOutcome, CliError> {
     let ledger = open_ledger()?;
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
+    sweep_ended_holdouts(&ledger, &state_dir);
     let retained = retained_with_verification(&state_dir)?;
     let InPlaceScan {
         runs: in_place,
@@ -691,6 +692,14 @@ pub(crate) fn retire_in_place_saying(
     ))
 }
 
+/// Remove the holdout directory of every run the ledger records as ended.
+fn sweep_ended_holdouts(ledger: &Ledger, state_dir: &Path) {
+    relais::runner::sweep_ended_holdouts(
+        &relais::runner::holdout_root(&state_dir.join(paths::RUNS_DIR)),
+        ledger,
+    );
+}
+
 /// Retire every worktree one terminal run still holds.
 pub(crate) fn retire_run(
     ledger: &Ledger,
@@ -698,10 +707,11 @@ pub(crate) fn retire_run(
     state: State,
     reconciliation: &resume::Reconciliation,
 ) -> Result<CliOutcome, CliError> {
+    let state_dir = paths::state_dir().map_err(CliError::Home)?;
+    sweep_ended_holdouts(ledger, &state_dir);
     if let Some(done) = retire_in_place(ledger, run, state, reconciliation)? {
         return Ok(done);
     }
-    let state_dir = paths::state_dir().map_err(CliError::Home)?;
     let retained: Vec<_> = retained_with_verification(&state_dir)?
         .into_iter()
         .filter(|(worktree, _)| worktree.run_id == run.as_str())

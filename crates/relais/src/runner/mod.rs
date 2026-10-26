@@ -54,6 +54,7 @@ mod config;
 mod engine;
 mod error;
 mod evidence;
+mod holdouts;
 mod launch;
 pub mod live_trial;
 pub mod machine;
@@ -70,10 +71,11 @@ mod workspace_ops;
 
 pub use crate::workspace::OutOfScope;
 use baseline::{baseline_summary, setup_failure_detail};
+pub use config::{holdout_root, verify_root, worktree_root, DesignSource, RunConfig};
 use config::{retirement_detail, state_sibling};
-pub use config::{verify_root, worktree_root, DesignSource, RunConfig};
 use error::Finish;
 pub use error::RunError;
+pub use holdouts::sweep_ended_holdouts;
 use launch::admission_block;
 pub use machine::{
     decide, AttemptKind, Budget, Limit, Next, Observation, OverBudget, Terminal, WorktreeEnd,
@@ -125,6 +127,9 @@ impl RunOutcome {
 pub(crate) enum VerifyFailure {
     Unavailable(String),
     Lease(verify::LeaseStop),
+    /// A holdout store could not be fetched: the run ends blocked
+    /// (`holdout_unfetchable`) with the candidate kept.
+    HoldoutUnfetchable(String),
     /// relais's own write met a full disk: the run's to end on (SPEC §10),
     /// not a profile that could not be carried out.
     Full(RunError),
