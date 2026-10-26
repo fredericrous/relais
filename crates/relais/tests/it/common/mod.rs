@@ -42,11 +42,12 @@ pub struct WorldPermit {
 }
 
 impl WorldPermit {
-    /// Waits until `count` places are free, then takes them. `count` must
-    /// not exceed `MAX_LIVE_WORLDS`, or the wait never ends. A wait past
-    /// `PERMIT_WAIT` panics, naming what it asked for and what was free:
-    /// the slowest scenario takes well under a minute, so a wait that long
-    /// is a test holding part of the cap while it waits for more.
+    /// Waits until `count` places are free, then takes them. A `count` above
+    /// `MAX_LIVE_WORLDS` is refused before any wait. A wait past
+    /// `PERMIT_WAIT` panics, naming what it asked for and what was free: the
+    /// slowest scenario takes well under a minute, so a wait that long is a
+    /// test holding part of the cap while it waits for more, or scenarios
+    /// slowed by a loaded machine.
     pub fn acquire(count: usize) -> Self {
         assert!(
             (1..=MAX_LIVE_WORLDS).contains(&count),
@@ -65,7 +66,8 @@ impl WorldPermit {
             assert!(
                 !left.is_zero(),
                 "waited {PERMIT_WAIT:?} for {count} of {MAX_LIVE_WORLDS} world permits, \
-                 {} free: a test is holding permits while it waits for more",
+                 {} free: a test holding permits while it waits for more, \
+                 or scenarios slowed by machine load",
                 *free
             );
             free = PERMITS_RETURNED
