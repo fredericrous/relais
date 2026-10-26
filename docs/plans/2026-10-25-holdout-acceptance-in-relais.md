@@ -140,7 +140,7 @@ Observed 2026-10-26 on `feat/holdout-report-counts`; `cargo test -p relais --lib
 
 ### Implementation review (4)
 
-- Round 1: approve-with-changes (98k tokens, 289 s). This was the only review of this candidate. All six findings are fixed in 85f8ecb7 (relais run-65ec58b0ce88a-18238):
+- Round 1: approve-with-changes (98k tokens, 289 s). This was the only review of this candidate. All six findings are fixed: 85f8ecb7 (relais run-65ec58b0ce88a-18238) fixed five and changed the catch query, and the delta found the did-not-build test missing, so I wrote it by hand:
   - placeholder names renamed;
   - only `failed` is a catch, so `did_not_build` is not;
   - the bare `machine.toml` marker is dropped, so ordinary work in relais or amont no longer counts as an exposure;
@@ -148,3 +148,8 @@ Observed 2026-10-26 on `feat/holdout-report-counts`; `cargo test -p relais --lib
   - package workers' transcripts are counted on the root run;
   - `relais report --json` is tested through the binary.
 - Verification added: `holdout_report::the_report_json_counts_one_catch_and_one_exposure_under_holdouts` runs the binary on a fixture ledger and asserts the printed `holdouts` counts. ok.
+- More verification:
+  - A holdout that did not build on green checks gives `holdout_runs` = 1 and `holdout_catches` = 0 (`a_holdout_that_did_not_build_on_green_checks_is_not_a_catch`). A mutation back to `outcome != 'passed'` turns it red.
+  - The bare text `machine.toml` gives no exposure, while the absolute path gives one (`the_bare_file_name_is_no_exposure_and_the_absolute_path_is`).
+  - A package worker's transcript that names a marker counts on the root run (`a_package_workers_transcript_counts_as_an_exposure_on_the_root_run`).
+- Delta 1: approve-with-changes (113k tokens, 34 s). Fixed: the did-not-build test above; the one-level package query now carries a `holds-until:` marker (package contracts set `decomposition: None`); this record is completed. Schema v44 was edited in place, which is safe: 43 and 44 are unreleased (the latest relais release is v0.33.0, schema 42).
