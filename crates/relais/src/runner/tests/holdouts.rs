@@ -750,22 +750,25 @@ fn every_attempt_failing_on_the_holdout_ends_for_a_person_with_what_a_worker_nev
     assert_eq!(recorded["holdouts"][0]["sha"], sha.as_str());
     assert_eq!(recorded["holdouts"][0]["failing"][0], "h::escapes");
     assert!(
-        recorded["holdouts"][0]["log"]
-            .as_str()
-            .is_some_and(|path| path.ends_with("holdouts/escaping/log.txt")),
+        recorded["holdouts"][0]["log"].as_str().is_some_and(|path| {
+            Path::new(path).ends_with(Path::new("holdouts").join("escaping").join("log.txt"))
+        }),
         "{recorded}"
     );
     assert!(
         recorded["holdouts"][0]["report"]
             .as_str()
-            .is_some_and(|path| path.ends_with("holdouts/escaping/report.xml")),
+            .is_some_and(|path| {
+                Path::new(path).ends_with(Path::new("holdouts").join("escaping").join("report.xml"))
+            }),
         "{recorded}"
     );
     assert!(detail.contains(&sha), "{detail}");
     assert_eq!(reason_of_end(&fixture, &outcome), "holdout_failed");
     assert!(detail.contains("escaping"), "{detail}");
     assert!(detail.contains("h::escapes"), "{detail}");
-    assert!(detail.contains("holdouts/escaping/log.txt"), "{detail}");
+    let recorded_log = recorded["holdouts"][0]["log"].as_str().expect("a log path");
+    assert!(detail.contains(recorded_log), "{detail}");
     assert!(
         detail.contains("--answer approve|revise|reject"),
         "{detail}"
@@ -944,7 +947,9 @@ fn the_reviewer_is_given_each_holdout_as_name_outcome_and_test_ids_only() {
     let report_path = artifact_files(&fixture, &outcome)
         .iter()
         .map(|(path, _)| path.to_string_lossy().into_owned())
-        .find(|path| path.ends_with("holdouts/escaping/report.xml"))
+        .find(|path| {
+            Path::new(path).ends_with(Path::new("holdouts").join("escaping").join("report.xml"))
+        })
         .expect("the kept report");
     for hidden in [
         store.as_str(),
