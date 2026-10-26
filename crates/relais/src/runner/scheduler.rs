@@ -1176,7 +1176,10 @@ fn accept_integrated(
 /// The root's receipt for an assembled candidate that passed its checks,
 /// `outcome` named by the caller (`accepted`, or `needs_decision` for the
 /// snapshot a run keeps when it stops for a review it could not have).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the receipt takes each recorded field positionally"
+)]
 fn integrated_receipt(
     engine: &RunEngine<'_>,
     root: &RootContext<'_>,

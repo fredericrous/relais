@@ -15,6 +15,11 @@ repository = "https://github.com/fredericrous/relais"
 authors = ["Frederic Rousseau"]
 edition = "2021"
 
+[workspace.lints.clippy]
+# adr-lint sync: general.linters-police-suppressions
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+
 # NOT on the commit-hook path — amont's std-only constraint does not apply
 # here (SPEC §13) — but the CLI starts often enough that size and start-up
 # cost are still worth having.

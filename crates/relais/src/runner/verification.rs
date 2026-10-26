@@ -182,7 +182,10 @@ impl<'a> RunEngine<'a> {
     /// by the caller: `accepted` for the run's own acceptance,
     /// `needs_decision` for the snapshot a run keeps when it stops for a
     /// review it could not have.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the receipt takes each recorded field positionally"
+    )]
     fn candidate_receipt(
         &self,
         ctx: &AttemptContext<'_>,

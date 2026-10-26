@@ -127,7 +127,10 @@ struct Row {
 /// verdict are read.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "the fields are validated by deserialisation and only some are read"
+)]
 struct MergeRow {
     schema: String,
     recorded_at: i64,

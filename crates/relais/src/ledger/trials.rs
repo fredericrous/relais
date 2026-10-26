@@ -333,7 +333,6 @@ pub struct RecipePromotion {
 
 /// Raw columns of one `trials` row, in the order [`parse_trial_row`]
 /// expects them.
-#[allow(clippy::type_complexity)]
 pub(super) type TrialColumns = (
     String,
     String,
