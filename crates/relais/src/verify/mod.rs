@@ -490,7 +490,7 @@ pub enum MissingEvidence {
     /// since every resolved holdout is run at verification.
     HoldoutNotRun { name: String },
     /// A holdout that ran and failed: the ids of its failed and skipped
-    /// tests, empty when it exited non-zero over passing tests.
+    /// tests, empty when it did not exit 0 (non-zero, timeout, signal, cancel) over passing tests.
     HoldoutFailed { name: String, failing: Vec<String> },
     /// A holdout that wrote no usable report.
     HoldoutDidNotBuild { name: String },
@@ -545,7 +545,7 @@ impl AcceptanceGap {
             MissingEvidence::HoldoutFailed { name, failing } => format!(
                 "acceptance criterion `{id}`: holdout `{name}` failed: {}",
                 if failing.is_empty() {
-                    "exited non-zero".to_string()
+                    "did not exit 0 (a non-zero exit, a timeout, a signal or a cancel)".to_string()
                 } else {
                     failing.join(", ")
                 }

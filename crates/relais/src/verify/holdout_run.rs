@@ -186,7 +186,7 @@ mod tests {
         let expected = [
             "was not run",
             "failed: t::a, t::b",
-            "failed: exited non-zero",
+            "failed: did not exit 0 (a non-zero exit, a timeout, a signal or a cancel)",
             "did not build or wrote no report",
         ];
         for (missing, tail) in gaps.into_iter().zip(expected) {
