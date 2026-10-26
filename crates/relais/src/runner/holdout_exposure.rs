@@ -38,18 +38,12 @@ pub(crate) struct Markers {
 impl Markers {
     /// The markers of a run's resolved holdouts: the store URL and its
     /// path without the scheme, the holdouts state directory, the
-    /// settings file's path and its file name, each overlay path and each
+    /// settings file's absolute path, each overlay path and each
     /// config path inside the store. Empty strings are dropped.
-    pub(crate) fn of(
-        holdouts: &[ResolvedHoldout],
-        state_dir: &str,
-        settings_path: &str,
-        settings_file_name: &str,
-    ) -> Self {
+    pub(crate) fn of(holdouts: &[ResolvedHoldout], state_dir: &str, settings_path: &str) -> Self {
         let mut needles = vec![
             (Marker::StateDir, state_dir.to_string()),
             (Marker::MachineToml, settings_path.to_string()),
-            (Marker::MachineToml, settings_file_name.to_string()),
         ];
         for holdout in holdouts {
             needles.push((Marker::Store, holdout.store.clone()));
@@ -103,8 +97,8 @@ pub(crate) fn scan_transcript(text: &str, markers: &Markers) -> BTreeSet<(String
     hits
 }
 
-fn markers_in(value: &serde_json::Value, markers: &Markers) -> Vec<Marker> {
-    match value {
+fn markers_in(node: &serde_json::Value, markers: &Markers) -> Vec<Marker> {
+    match node {
         serde_json::Value::String(text) => markers.matching(text).collect(),
         serde_json::Value::Array(items) => items
             .iter()
@@ -134,7 +128,6 @@ mod tests {
                     Marker::MachineToml,
                     "/home/me/.config/relais/settings-file".into(),
                 ),
-                (Marker::MachineToml, "settings-file".into()),
                 (Marker::Overlay, "tests/holdout_overlay.rs".into()),
                 (Marker::Config, ".config/nextest.toml".into()),
             ],
@@ -159,7 +152,10 @@ mod tests {
                 Marker::MachineToml,
             ),
             (
-                tool_use("Bash", r#"{"command":"cat settings-file"}"#),
+                tool_use(
+                    "Bash",
+                    r#"{"command":"cat /home/me/.config/relais/settings-file"}"#,
+                ),
                 "Bash",
                 Marker::MachineToml,
             ),
@@ -207,7 +203,7 @@ mod tests {
             tool_use("Read", r#"{"file_path":"src/main.rs"}"#),
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I read /vault/store"}]}}"#
                 .to_string(),
-            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"settings-file"}]}}"#
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"/home/me/.config/relais/settings-file"}]}}"#
                 .to_string(),
             "not json /vault/store".to_string(),
         ]
@@ -216,10 +212,31 @@ mod tests {
     }
 
     #[test]
+    fn the_bare_file_name_is_no_exposure_and_the_absolute_path_is() {
+        let cases = [
+            (r#"{"command":"ls settings-file"}"#, false),
+            (
+                r#"{"command":"cat /home/me/.config/relais/settings-file"}"#,
+                true,
+            ),
+        ];
+        for (input, exposed) in cases {
+            let hits = scan_transcript(&tool_use("Bash", input), &markers());
+            assert_eq!(!hits.is_empty(), exposed, "{input} -> {hits:?}");
+        }
+    }
+
+    #[test]
     fn a_marker_hit_twice_in_one_tool_is_one_row() {
         let transcript = [
-            tool_use("Read", r#"{"file_path":"settings-file"}"#),
-            tool_use("Read", r#"{"file_path":"/x/settings-file"}"#),
+            tool_use(
+                "Read",
+                r#"{"file_path":"/home/me/.config/relais/settings-file"}"#,
+            ),
+            tool_use(
+                "Read",
+                r#"{"command":"cat /home/me/.config/relais/settings-file"}"#,
+            ),
         ]
         .join("\n");
         let hits = scan_transcript(&transcript, &markers());

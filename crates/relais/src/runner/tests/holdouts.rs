@@ -1497,7 +1497,7 @@ impl Harness for TranscriptBackend {
 
 impl Backend for TranscriptBackend {
     fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
-        let result = self.inner.launch(spec)?;
+        let launched = self.inner.launch(spec)?;
         let ledger = crate::ledger::Ledger::open(&self.ledger_path).expect("ledger");
         ledger
             .record_native_dispatch(
@@ -1505,7 +1505,7 @@ impl Backend for TranscriptBackend {
                 Some("agent-1"),
             )
             .expect("the dispatch is recorded as an agent");
-        Ok(result)
+        Ok(launched)
     }
 
     fn transcript_of(&self, agent_id: &str) -> Option<String> {
@@ -1617,6 +1617,77 @@ fn a_worker_transcript_that_reads_the_settings_file_is_one_exposure_by_marker() 
             .collect::<Result<_, _>>()
             .expect("rows");
     assert_eq!(stored, [("Read".to_string(), "machine_toml".to_string())]);
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_package_workers_transcript_counts_as_an_exposure_on_the_root_run() {
+    let fixture = Fixture::new();
+    let (store, _) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(PASSING))]);
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let settings = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
+    let mut decomposed_json = holdout_contract(&fixture, true).canonical_value();
+    decomposed_json["decomposition"] = plan_json(false);
+    let contract =
+        TaskContract::from_json_str(&decomposed_json.to_string()).expect("a decomposed contract");
+    let settings_path = crate::holdout::machine_toml_label();
+    let transcript = serde_json::json!({
+        "type": "assistant",
+        "message": { "content": [{
+            "type": "tool_use",
+            "id": "toolu-1",
+            "name": "Read",
+            "input": { "file_path": settings_path },
+        }] },
+    })
+    .to_string();
+    let package_worker = MockBackend::new(|spec| {
+        if spec.prompt.contains("bounded planner") {
+            return MockOutcome {
+                result_text: Some(
+                    "here you go:\n{\"packages\":[],\"integration_acceptance\":[]}".into(),
+                ),
+                exit_code: Some(0),
+                usage: Some(usage(7)),
+                ..Default::default()
+            };
+        }
+        let dir = if spec.prompt.contains("work package `a`") {
+            "src/a"
+        } else {
+            "src/b"
+        };
+        std::fs::create_dir_all(spec.work_dir.join(dir)).expect("mkdir");
+        std::fs::write(
+            spec.work_dir.join(dir).join("lib.rs"),
+            "pub fn module() {}\n",
+        )
+        .expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let backend = TranscriptBackend {
+        inner: package_worker,
+        ledger_path: fixture.dir.join("ledger.sqlite"),
+        transcript: Some(transcript),
+    };
+    let outcome = fixture.execute_with_holdouts(settings, &contract, &repo, &backend);
+    let from_package_runs: i64 = rusqlite::Connection::open(fixture.dir.join("ledger.sqlite"))
+        .expect("ledger")
+        .query_row(
+            "SELECT COUNT(*) FROM holdout_exposures e
+               JOIN dispatches d ON d.dispatch_id = e.dispatch_id
+               JOIN runs package_run ON package_run.id = d.run_id
+              WHERE e.run_id = ?1 AND package_run.parent_run = ?1",
+            [outcome.run_id.as_str()],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert!(from_package_runs >= 1, "{outcome:?}");
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
 

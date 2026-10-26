@@ -1160,11 +1160,12 @@ pub(in crate::ledger) const MIGRATIONS: &[(&str, &str)] = &[
         r#"
     CREATE TABLE holdout_outcomes (
         run_id TEXT NOT NULL REFERENCES runs(id),
+        label_kind TEXT NOT NULL,
         attempt_index INTEGER NOT NULL,
         name TEXT NOT NULL,
         outcome TEXT NOT NULL,
         profile_green INTEGER NOT NULL,
-        PRIMARY KEY (run_id, attempt_index, name)
+        PRIMARY KEY (run_id, label_kind, attempt_index, name)
     );
     CREATE TABLE holdout_exposures (
         run_id TEXT NOT NULL REFERENCES runs(id),

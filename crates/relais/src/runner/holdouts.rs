@@ -55,6 +55,9 @@ impl<'a> RunEngine<'a> {
     /// said as `holdout_exposure_unread`. Counting never changes the run's
     /// outcome: a ledger failure is reported and the run ends as it did.
     pub(super) fn count_holdout_exposures(&self) {
+        if self.parent.is_some() {
+            return;
+        }
         let ledger = self.config.ledger;
         let held = match ledger.holdout_definitions(&self.run_id) {
             Ok(held) => held,
@@ -66,7 +69,7 @@ impl<'a> RunEngine<'a> {
         if held.is_empty() {
             return;
         }
-        let dispatches = match ledger.agent_dispatches(&self.run_id) {
+        let dispatches = match ledger.agent_dispatches_of_tree(&self.run_id) {
             Ok(dispatches) => dispatches,
             Err(e) => {
                 eprintln!("relais: the run's dispatches could not be read to count exposures: {e}");
@@ -77,7 +80,6 @@ impl<'a> RunEngine<'a> {
             &held,
             &holdout_root(&self.config.artifacts_dir).to_string_lossy(),
             &holdout::machine_toml_label(),
-            "machine.toml",
         );
         for (dispatch, agent) in dispatches {
             let Some(transcript) = self.config.backend.transcript_of(&agent) else {
@@ -111,6 +113,7 @@ impl<'a> RunEngine<'a> {
                 .record_holdout_outcome(
                     &self.run_id,
                     &HoldoutOutcomeRow {
+                        label_kind: label.kind(),
                         attempt_index: label.ordinal(),
                         name: &run.name,
                         outcome: run.outcome.as_str(),

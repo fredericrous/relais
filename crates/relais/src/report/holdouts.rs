@@ -4,7 +4,7 @@
 //!
 //! * `holdout_runs`: runs that named at least one holdout, the base of the
 //!   other two counts.
-//! * `holdout_catches`: runs with a holdout that failed (or did not build)
+//! * `holdout_catches`: runs with a holdout that failed
 //!   on a candidate whose profile checks were all green: acceptance on
 //!   evidence the worker controlled, which a holdout stopped.
 //! * `holdout_exposures`: runs whose workers named a holdout location in a

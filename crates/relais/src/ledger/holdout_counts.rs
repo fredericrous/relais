@@ -14,6 +14,8 @@ use super::{Ledger, Result};
 /// One holdout a verification ran, as the ledger keeps it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HoldoutOutcomeRow<'a> {
+    /// `attempt` or `integration`: the ordinal alone repeats across them.
+    pub label_kind: &'a str,
     pub attempt_index: u32,
     pub name: &'a str,
     /// `passed`, `failed` or `did_not_build`.
@@ -24,7 +26,7 @@ pub struct HoldoutOutcomeRow<'a> {
 }
 
 impl Ledger {
-    /// Record one holdout outcome; the same (run, attempt, name) again
+    /// Record one holdout outcome; the same (run, label kind, attempt, name) again
     /// replaces the row, so a re-entered verification is safe.
     pub fn record_holdout_outcome(
         &self,
@@ -33,10 +35,11 @@ impl Ledger {
     ) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO holdout_outcomes
-                (run_id, attempt_index, name, outcome, profile_green)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+                (run_id, label_kind, attempt_index, name, outcome, profile_green)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 run_id.as_str(),
+                row.label_kind,
                 i64::from(row.attempt_index),
                 row.name,
                 row.outcome,
@@ -63,13 +66,14 @@ impl Ledger {
         Ok(())
     }
 
-    /// The run's dispatches that name a native agent, as
-    /// (dispatch id, agent id), oldest first: the ones that have a
+    /// The dispatches of the run and of its package runs that name a native
+    /// agent, as (dispatch id, agent id), oldest first: the ones that have a
     /// transcript to read.
-    pub fn agent_dispatches(&self, run_id: &RunId) -> Result<Vec<(String, String)>> {
+    pub fn agent_dispatches_of_tree(&self, run_id: &RunId) -> Result<Vec<(String, String)>> {
         let mut statement = self.conn.prepare(
             "SELECT dispatch_id, agent_id FROM dispatches
-              WHERE run_id = ?1 AND agent_id IS NOT NULL
+              WHERE (run_id = ?1 OR run_id IN (SELECT id FROM runs WHERE parent_run = ?1))
+                AND agent_id IS NOT NULL
               ORDER BY created_at, dispatch_id",
         )?;
         let rows = statement
@@ -88,13 +92,13 @@ impl Ledger {
         Ok(count > 0)
     }
 
-    /// Whether the run has an outcome row that failed (or did not build)
-    /// while the profile's checks were green on that candidate: the
+    /// Whether the run has an outcome row that failed (a holdout that did
+    /// not build is no catch) while the profile's checks were green on that candidate: the
     /// acceptance on evidence the worker controlled that a holdout stopped.
     pub fn run_holdout_caught(&self, run_id: &RunId) -> Result<bool> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM holdout_outcomes
-              WHERE run_id = ?1 AND profile_green = 1 AND outcome != 'passed'",
+              WHERE run_id = ?1 AND profile_green = 1 AND outcome = 'failed'",
             [run_id.as_str()],
             |row| row.get(0),
         )?;
