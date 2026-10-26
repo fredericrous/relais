@@ -1,8 +1,8 @@
 ---
 canonical: decisions:docs/plans/2026-10-24-code-rules-reach-the-reviewer.md
-phases: [4]
+phases: [4, 7]
 status: active
-branch: feat/candidates-in-review
+branch: feat/adr-lint-pilot
 ---
 # Code rules reach the reviewer (pointer)
 
@@ -13,6 +13,12 @@ This repository carries relais's half of Phase 4 (behaviour 3):
 - a missing or failing adr-lint is a receipt gap, `candidates missing (…)`, and never a silent drop;
 - the receipt counts the dispositions (violation, fine, undisposed);
 - each ruling is written as an `adr-lint.ruling/1` record with `tool: relais`.
+
+This repository also carries the Phase 7 pilot (behaviour 8, step 1), Rust only, because `claude-plugin` has no Node toolchain:
+- vendor adr-lint's `amont.pack` row (`amont add github:fredericrous/adr-lint`), at `warn`;
+- `adr-lint sync`: clippy `allow_attributes` and `allow_attributes_without_reason` at `deny` in `[workspace.lints.clippy]`, with `lints.workspace = true` in the member;
+- the nine reasonless `#[allow]` become `#[expect(…, reason = "…")]`;
+- `adr-lint sync --check` runs in CI.
 
 ## Verification
 
