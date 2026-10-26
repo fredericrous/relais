@@ -94,6 +94,20 @@ caller's workspace keeps the 30 s politeness.
   - So Phase 2 gates the release on partial-seed tests, and Phase 3 watches
     setup gaps. A seed-related regression restores the wait.
 
+## Implementation review
+
+- Round 1, approve-with-changes (54k, 77 s), then Delta, approve-with-changes (62k, 29 s), then a fresh round 1 on the changed tree, approve-with-changes (62k, 90 s).
+  - Fixed:
+    - reasons on the dropped cleanup errors;
+    - partial-seed tests without the early return;
+    - the gap test's no-clone branch;
+    - a setup-step check after the last unavailable clone;
+    - `holds-until:` on `WritersEnded`;
+    - the Verification wording;
+    - "every runner" corrected to "copy-on-write runners".
+  - deliberate: the repair test does not assert `workspace_seeded`, because the own-tree test asserts it on the same fixture.
+  - Also left out: a setup failure in a holdout tree emits no `verification_setup_gap`. Holdouts are rare, and Phase 3 counts verification gaps only.
+
 ## Phases
 
 - [x] Phase 1 — relais: this plan in `docs/plans/` (replaces the first
@@ -144,15 +158,19 @@ Phase 2, observed before the push:
   233 s.
 - `cargo test --lib -- runner::tests::a_fork_ … a_partial_seed`: 8 passed,
   in 4.6 s.
-- The partial-seed tests no longer return early without copy-on-write, so
-  they gate the release on every runner.
+- The partial-seed tests exercise a partial seed only where copy-on-write
+  works (macOS APFS and macOS CI). Without it they check the fallback: the
+  repair test sets up from nothing, and the gap test is blocked at the base.
 - Without copy-on-write: the four seed tests run with `TMPDIR` on a
   temporary HFS+ volume, where `clonefile` fails "Operation not supported"
   (APFS: ok). 4 passed. Without a clone the gap test is blocked at the base
   setup (`VerificationSetupFailed`), as the implementation review found.
 
-- **Phase 2:** `cargo test --lib runner::tests` passes with the four tests
-  above. `make check` green locally and on CI (ubuntu, macOS, Windows).
+- **Phase 2 bar:** the four tests above pass, `make check` locally, and CI
+  on ubuntu, macOS and Windows (the CI result is read on the PR).
+- **Phase 2 observed on 7afd3018:** the pre-commit `cargo-test` gate, which
+  runs the whole `cargo test` (`runner::tests` included), passed. `make msrv`
+  green. clippy `-D warnings` clean.
 - **Phase 3:** the counts above, read from the `events.jsonl` of runs
   started after the install, and posted in relais#304.
 
