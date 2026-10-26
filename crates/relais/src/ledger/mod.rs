@@ -19,6 +19,7 @@ mod clock;
 mod error;
 mod evidence;
 pub(crate) mod failpoint;
+mod holdout_definitions;
 mod learning;
 mod outcomes;
 mod review;

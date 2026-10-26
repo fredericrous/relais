@@ -322,6 +322,19 @@ impl Fixture {
         repo: &RepoPolicy,
         backend: &dyn Backend,
     ) -> RunOutcome {
+        self.execute_with_holdouts_as(None, holdouts, contract, repo, backend)
+    }
+
+    /// `execute_with_holdouts`, under a run id the test minted first (a
+    /// successor intent's claimed run).
+    fn execute_with_holdouts_as(
+        &self,
+        run_id: Option<RunId>,
+        holdouts: crate::policy::HoldoutSettings,
+        contract: &TaskContract,
+        repo: &RepoPolicy,
+        backend: &dyn Backend,
+    ) -> RunOutcome {
         let mut machine = self.machine_for(repo);
         machine.holdouts = holdouts;
         let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
@@ -349,7 +362,7 @@ impl Fixture {
             heartbeat_every: Duration::from_millis(50),
             task_override: None,
             purpose: None,
-            run_id: None,
+            run_id,
             wire: Wire::process(),
             design: DesignSource::Contract,
             declarations: &crate::trust::NoHistory,
