@@ -131,7 +131,8 @@ caller's workspace keeps the 30 s politeness.
     - `workspace_seed_unwaited` count;
     - median and p90 from `verification_started` to the first verification
       check (before: 30.9 s and 232 s);
-    - setup gaps per verification start.
+    - setup gaps per verification start (the `verification_setup_gap`
+      decision).
   - If setup gaps rise and trace to a seed, restore the wait. Otherwise
     close relais#304 with the numbers.
 

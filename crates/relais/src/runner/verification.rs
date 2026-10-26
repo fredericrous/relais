@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use super::setup_gate;
 use super::{
     review_record_of, AttemptContext, AttemptLabel, Budget, Candidate, Next, Observation,
     PendingEvidence, Progress, Reason, RepairFailure, ReviewOutcome, ReviewRequest, RunEngine,
@@ -578,7 +579,12 @@ impl<'a> RunEngine<'a> {
                     .while_watching_cancel(|cancel| {
                         self.setup_tree(
                             holder.path(),
-                            self.task_tree().as_deref(),
+                            self.task_tree()
+                                .as_deref()
+                                .map(|path| setup_gate::SeedSource {
+                                    path,
+                                    wait: setup_gate::SeedWait::WritersEnded,
+                                }),
                             &authority.verification_profile,
                             logs_dir,
                             &label.log_prefix(),
@@ -599,6 +605,14 @@ impl<'a> RunEngine<'a> {
                     // dependencies (SPEC §10). If the candidate changed
                     // the lockfile, that is reported on its own.
                     Some(failed) => {
+                        self.events.emit(crate::protocol::Event::Decision {
+                            what: "verification_setup_gap".to_string(),
+                            reason: format!(
+                                "setup step {} did not complete ({})",
+                                failed.label,
+                                failed.ended.describe()
+                            ),
+                        });
                         setup_gap = Some(format!(
                             "verification setup did not complete: {} ({}); the profile's \
                              commands did not run — see {}",
