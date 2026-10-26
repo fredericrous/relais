@@ -64,3 +64,12 @@ Each test drives a full `RunEngine` run against a local bare-repo store.
 - Windows CI fixes after the delta. `{config}` is now rendered per platform through a `PathStyle` sum type: Unix keeps the path as is, Windows strips canonicalize's `\\?\` prefix and uses `/`.
   - The first fix took a `windows: bool`, which I had asked for in the contract. The review flagged it under `functions.no-flag-arguments`, and it was replaced.
   - Fresh round 1 on the final tree: approve (33k tokens, 47 s).
+
+## Phase 3b
+
+- 2026-10-26 — 3a merged (relais#311, 30a54188). 3b is built to `docs/design/holdout-phase-3b.md`. It covers:
+  - the reserved overlay (`failed (holdout_overlay_collision)`);
+  - the holdout's declared `inputs` as protected verification inputs;
+  - the proof that the repair, escalation and reviewer prompts and the exhaustion detail hold nothing of a holdout;
+  - `needs_decision (holdout_failed)` at the attempt ceiling;
+  - the missing-repository-name detail, carried from phase 2.
