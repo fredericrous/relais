@@ -1,0 +1,16 @@
+amont-provenance-v1
+commit 14d483eef903ed2653f96837846023f7a2be886c
+tree abfab0006d8a6966923d85ff9037754a7c2ec258
+canon 198d52ba3839c2f8f3be48c1bd7ca901bd621c2a
+patch 1c374da32231ce415353ac8fb119490e7db1f4f4
+plan docs/plans/2026-10-26-relais-seeds-its-own-tree.md 5b380aace4be90349c0de682b11661e7391369bc9425ca43f936e0fa0daa31d0
+review reviewed cf31d589b2841086d804c127a7afdb4af8a88589ae5716dd9f7c8e160da2c14d
+preview not-required
+producer amont-agent 3.4.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAECe+PvCPgJ05MunBI+qTmLUmYBQT8MEZTI6NWNpfg6Z3cclWg
+BGc7DnuC/iEppr7Qos/nRImZ6TiHgWNRYtIW4A
+-----END SSH SIGNATURE-----
