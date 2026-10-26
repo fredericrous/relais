@@ -1055,3 +1055,423 @@ fn a_holdout_failure_line_omits_the_log_hint_and_a_check_line_keeps_it() {
     );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
+
+/// Commit `content` as the store's script and leave `main` on the new commit.
+fn advance_store(fixture: &Fixture, content: &str) -> String {
+    let store = fixture.dir.join("holdout-store");
+    std::fs::write(store.join(STORE_PATH_IN_STORE), content).expect("write");
+    git(&store, &["add", STORE_PATH_IN_STORE]);
+    git(
+        &store,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "test: store moves on",
+        ],
+    );
+    git(&store, &["rev-parse", "main"]).trim().to_string()
+}
+
+/// The events of a run, as the file the pane reads holds them.
+fn events_text(fixture: &Fixture, run: &RunId) -> String {
+    std::fs::read_to_string(fixture.artifacts.join(run.as_str()).join("events.jsonl"))
+        .expect("events")
+}
+
+/// A widening successor of a run waiting for a decision, claimed under a
+/// run id, with its contract (one more holdout criterion when `added` names one).
+fn claimed_successor(
+    fixture: &Fixture,
+    decided: &RunId,
+    added: Option<&str>,
+) -> (RunId, TaskContract) {
+    use crate::ledger::DecisionAnswer;
+    use crate::runner::successor;
+
+    let (original, _) = fixture
+        .ledger
+        .run_contract_and_tier(decided)
+        .expect("read")
+        .expect("recorded");
+    let paths = successor::out_of_scope_paths(&fixture.ledger, decided).expect("paths");
+    let widened = successor::widened_contract(&original, decided, &paths).expect("widened");
+    let mut widened_json = widened.canonical_value();
+    if let Some(name) = added {
+        widened_json["acceptance"]
+            .as_array_mut()
+            .expect("acceptance")
+            .push(serde_json::json!({
+                "statement": "the added holdout passes",
+                "evidence": { "kind": "holdout", "name": name },
+            }));
+    }
+    let widened = TaskContract::from_json_str(&widened_json.to_string()).expect("a contract");
+    let intent = successor::plan(
+        &fixture.ledger,
+        decided,
+        &widened,
+        paths,
+        &fixture.artifacts,
+    )
+    .expect("planned");
+    let stored = fixture
+        .ledger
+        .resolve_decision_with_intent(
+            decided,
+            &DecisionAnswer {
+                resolution: Reason::DecisionRevised,
+                actor: crate::ledger::Actor::Orchestrator,
+                person_quote: None,
+                recorded_via: crate::ledger::RecordedVia::Cli,
+                note: None,
+                successor_run: None,
+                from_state: State::NeedsDecision,
+                to_state: State::Failed,
+            },
+            &intent,
+        )
+        .expect("written")
+        .expect("open decision");
+    let new_run = fixture.ids.run_id().expect("a run id");
+    assert!(matches!(
+        fixture
+            .ledger
+            .claim_intent(&stored.intent_id, &new_run, &|_| {
+                crate::ledger::SuccessorProcess::Alive { started: None }
+            })
+            .expect("claim"),
+        crate::ledger::Claim::Claimed(_)
+    ));
+    let contract = TaskContract::from_json_str(&stored.contract_json).expect("the contract");
+    (new_run, contract)
+}
+
+#[test]
+fn a_successor_is_judged_by_its_predecessors_frozen_holdout_and_resolves_a_new_name_fresh() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let (store, sha_a) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(PASSING))]);
+    let settings = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
+    let contract = holdout_contract(&fixture, true);
+    // The worker leaves its scope, so the run waits for a person.
+    let leaving = MockBackend::new(|spec| {
+        std::fs::create_dir_all(spec.work_dir.join("docs")).expect("mkdir");
+        std::fs::write(spec.work_dir.join("docs/extra.md"), "one\n").expect("write");
+        std::fs::write(spec.work_dir.join("src/main.rs"), "fn main() {}\n// e\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let decided = fixture
+        .execute_with_holdouts(settings.clone(), &contract, &repo, &leaving)
+        .run_id;
+    let frozen = fixture
+        .ledger
+        .holdout_definitions(&decided)
+        .expect("definitions");
+    let [frozen] = frozen.as_slice() else {
+        panic!("one frozen definition: {frozen:?}");
+    };
+    assert_eq!(frozen.sha, sha_a);
+
+    // The person edits machine.toml and the store's ref moves on.
+    let sha_b = advance_store(&fixture, &format!("{}# moved\n", writes(PASSING)));
+    assert_ne!(sha_a, sha_b);
+    let mut edited = settings_for(
+        &fixture,
+        &store,
+        script_declaration(&["sh", "src/other_overlay.rs"], None),
+    );
+    let repo_name = crate::repo::main_checkout_name(&fixture.repo).expect("repo name");
+    let mut changed = script_declaration(&["sh", "src/other_overlay.rs"], None);
+    changed.overlay = "src/other_overlay.rs".into();
+    let edited_declaration = changed.clone();
+    let mut fresh = script_declaration(&["sh", "src/fresh_overlay.rs"], None);
+    fresh.overlay = "src/fresh_overlay.rs".into();
+    let declared = edited.repos.get_mut(&repo_name).expect("repo");
+    declared.insert("escaping".into(), changed);
+    declared.insert("fresh".into(), fresh);
+
+    let (new_run, contract) = claimed_successor(&fixture, &decided, Some("fresh"));
+    let backend = counting_worker(Arc::default(), Arc::default());
+    let outcome =
+        fixture.execute_with_holdouts_as(Some(new_run.clone()), edited, &contract, &repo, &backend);
+    let Terminal::Accepted(receipt) = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    let judged = |name: &str| {
+        receipt
+            .holdouts
+            .iter()
+            .find(|run| run.name == name)
+            .unwrap_or_else(|| panic!("no {name} in {:?}", receipt.holdouts))
+    };
+    assert_eq!(judged("escaping").sha, sha_a, "the predecessor's commit");
+    assert_eq!(judged("escaping").digest, frozen.digest);
+    assert_eq!(judged("fresh").sha, sha_b, "a new name resolves fresh");
+
+    let events = events_text(&fixture, &new_run);
+    assert!(events.contains("holdout_definition_changed"), "{events}");
+    let current_digest =
+        crate::holdout::digest_of(&repo_name, "escaping", &store, &sha_a, &edited_declaration);
+    assert_ne!(current_digest, frozen.digest);
+    assert!(
+        events.contains(&format!(
+            "frozen digest {}, current digest {current_digest}",
+            frozen.digest
+        )),
+        "{events}"
+    );
+    let inherited = fixture
+        .ledger
+        .holdout_definitions(&new_run)
+        .expect("definitions");
+    assert_eq!(
+        inherited
+            .iter()
+            .find(|held| held.name == "escaping")
+            .map(|held| held.digest.as_str()),
+        Some(frozen.digest.as_str())
+    );
+    assert!(
+        !events_text(&fixture, &decided).contains("holdout_definition_changed"),
+        "the predecessor froze its own definition"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_successor_is_judged_by_the_frozen_definition_of_a_name_machine_toml_no_longer_declares() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let (store, sha_a) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(PASSING))]);
+    let settings = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
+    let contract = holdout_contract(&fixture, true);
+    let leaving = MockBackend::new(|spec| {
+        std::fs::create_dir_all(spec.work_dir.join("docs")).expect("mkdir");
+        std::fs::write(spec.work_dir.join("docs/extra.md"), "one\n").expect("write");
+        std::fs::write(spec.work_dir.join("src/main.rs"), "fn main() {}\n// e\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let decided = fixture
+        .execute_with_holdouts(settings, &contract, &repo, &leaving)
+        .run_id;
+    let frozen = fixture
+        .ledger
+        .holdout_definitions(&decided)
+        .expect("definitions");
+    let [frozen] = frozen.as_slice() else {
+        panic!("one frozen definition: {frozen:?}");
+    };
+
+    // The person edits machine.toml so that it no longer declares `escaping`.
+    let edited = HoldoutSettings {
+        store: Some(store.clone()),
+        ..HoldoutSettings::default()
+    };
+    let (new_run, contract) = claimed_successor(&fixture, &decided, None);
+    let backend = counting_worker(Arc::default(), Arc::default());
+    let outcome =
+        fixture.execute_with_holdouts_as(Some(new_run.clone()), edited, &contract, &repo, &backend);
+    let Terminal::Accepted(receipt) = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    let judged = receipt
+        .holdouts
+        .iter()
+        .find(|run| run.name == "escaping")
+        .unwrap_or_else(|| panic!("no escaping in {:?}", receipt.holdouts));
+    assert_eq!(judged.sha, sha_a, "the predecessor's commit");
+    assert_eq!(judged.digest, frozen.digest);
+    let events = events_text(&fixture, &new_run);
+    assert!(
+        events.contains(&format!(
+            "frozen digest {}, current digest undeclared",
+            frozen.digest
+        )),
+        "{events}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_successor_does_not_ask_the_store_again_for_a_frozen_holdout() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let (store, _sha) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(PASSING))]);
+    let settings = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
+    let contract = holdout_contract(&fixture, true);
+    // The worker leaves its scope, so the run waits for a person.
+    let leaving = MockBackend::new(|spec| {
+        std::fs::create_dir_all(spec.work_dir.join("docs")).expect("mkdir");
+        std::fs::write(spec.work_dir.join("docs/extra.md"), "one\n").expect("write");
+        std::fs::write(spec.work_dir.join("src/main.rs"), "fn main() {}\n// e\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let decided = fixture
+        .execute_with_holdouts(settings.clone(), &contract, &repo, &leaving)
+        .run_id;
+
+    // The store disappears before the successor starts. Preflight must not
+    // ask it again (that would refuse `holdout_unreadable`); the frozen
+    // definition carries the run to the fetch, which is where a gone store
+    // is reported.
+    std::fs::remove_dir_all(fixture.dir.join("holdout-store")).expect("the store is removed");
+    let (new_run, contract) = claimed_successor(&fixture, &decided, None);
+    let backend = counting_worker(Arc::default(), Arc::default());
+    let outcome =
+        fixture.execute_with_holdouts_as(Some(new_run), settings, &contract, &repo, &backend);
+    assert_eq!(blocked_code(outcome), BlockCode::HoldoutUnfetchable);
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_verify_whose_candidate_wrote_the_overlay_ends_failed_with_the_collision_code() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    // The source run has no holdout, so its candidate may write the path.
+    let writing = MockBackend::new(|spec| {
+        std::fs::write(spec.work_dir.join(OVERLAY), "// planted\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let RunOutcome {
+        run_id: source,
+        terminal: Terminal::Accepted(_),
+    } = fixture.execute(&fixture.contract(Review::Off), &repo, &writing)
+    else {
+        panic!("the source run is accepted");
+    };
+    let (store, _) = local_store(&fixture);
+    let settings = settings_for(&fixture, &store, declaration(Some("j.xml"), OVERLAY));
+    let verify_json = serde_json::json!({
+        "schema_version": 1,
+        "kind": "verify",
+        "objective": "Verify the candidate on the current base",
+        "base_ref": "HEAD",
+        "write_scope": ["src/**"],
+        "candidate": { "run": source.as_str() },
+        "acceptance": [{
+            "statement": STATEMENT,
+            "evidence": { "kind": "holdout", "name": "escaping" },
+        }],
+        "verification_profile": "profile",
+        "review": "off",
+    });
+    let contract =
+        TaskContract::from_json_str(&verify_json.to_string()).expect("a verify contract");
+    let launches = Arc::new(AtomicUsize::new(0));
+    let backend = counting_worker(launches.clone(), Arc::default());
+    let outcome = fixture.execute_with_holdouts(settings, &contract, &repo, &backend);
+    assert!(
+        matches!(outcome.terminal, Terminal::Failed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        reason_of_end(&fixture, &outcome),
+        "holdout_overlay_collision"
+    );
+    assert_eq!(
+        launches.load(Ordering::SeqCst),
+        0,
+        "a verify runs no worker"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_decomposed_run_whose_assembled_candidate_wrote_the_overlay_leaves_no_attempt_open() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let (store, _) = local_store(&fixture);
+    // The overlay lies inside package b's scope, so only the assembled
+    // candidate is checked against it.
+    let overlay = "src/b/holdout_escaping.rs";
+    let settings = settings_for(&fixture, &store, declaration(Some("j.xml"), overlay));
+    let mut decomposed_json = holdout_contract(&fixture, true).canonical_value();
+    decomposed_json["decomposition"] = plan_json(false);
+    let contract =
+        TaskContract::from_json_str(&decomposed_json.to_string()).expect("a decomposed contract");
+    let backend = MockBackend::new(|spec| {
+        if spec.prompt.contains("bounded planner") {
+            return MockOutcome {
+                result_text: Some(
+                    "here you go:\n{\"packages\":[],\"integration_acceptance\":[]}".into(),
+                ),
+                exit_code: Some(0),
+                usage: Some(usage(7)),
+                ..Default::default()
+            };
+        }
+        let (dir, file) = if spec.prompt.contains("work package `a`") {
+            ("src/a", "lib.rs")
+        } else if spec.prompt.contains("work package `b`") {
+            ("src/b", "lib.rs")
+        } else {
+            ("src", "unexpected.rs")
+        };
+        std::fs::create_dir_all(spec.work_dir.join(dir)).expect("mkdir");
+        std::fs::write(spec.work_dir.join(dir).join(file), "pub fn module() {}\n").expect("write");
+        if spec.prompt.contains("work package `b`") {
+            std::fs::write(
+                spec.work_dir.join("src/b/holdout_escaping.rs"),
+                "// planted\n",
+            )
+            .expect("write");
+        }
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let outcome = fixture.execute_with_holdouts(settings, &contract, &repo, &backend);
+    assert!(
+        matches!(outcome.terminal, Terminal::Failed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        reason_of_end(&fixture, &outcome),
+        "holdout_overlay_collision"
+    );
+    let Terminal::Failed { detail } = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    assert!(
+        detail.contains("the assembled candidate wrote `src/b/holdout_escaping.rs`"),
+        "{detail}"
+    );
+    let ledger = rusqlite::Connection::open(fixture.dir.join("ledger.sqlite")).expect("ledger");
+    let unfinished: Vec<(String, i64, String)> = ledger
+        .prepare("SELECT run_id, attempt_index, state FROM attempts WHERE ended_at IS NULL")
+        .expect("prepare")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert!(unfinished.is_empty(), "{unfinished:?}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}

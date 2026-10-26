@@ -96,3 +96,23 @@ Observed 2026-10-26 on `feat/holdout-guards`. relais run run-65ebabd29ba10-11f16
 - Candidates: both `mandatory`/`unchanged` bools are data, not selectors, so fine.
 - Delta: approve-with-changes (85k tokens, 21 s). The holds-until markers are resolved. The row numbering was wrong and is corrected; that change is plan-only, outside the reviewed tree. Two notes are carried to phase 3c: a test that a `kind: verify` reaches the overlay check, and the ledger rows on the scheduler's collision path.
 - Windows CI fix after the rebase review: two holdout tests now match kept-artifact paths with `Path::ends_with`, and the `detail` check now looks for the exact recorded log path. Review on tree f5db2e2c: approve (27k tokens, 59 s). The local commit gate hit the `budgets::total_seconds_caps_the_run_end_to_end` timing test under a load average of about 214; the test passed alone and on a retry.
+
+## Phase 3c
+
+- 2026-10-26 — 3b merged (relais#314, b527f74f). 3c is built to `docs/design/holdout-phase-3c.md`: a successor inherits its predecessor's frozen holdout definition from the ledger (schema 43), plus the two checks carried from the 3b review.
+
+### Verification (3c)
+
+Observed 2026-10-26 on `feat/holdout-frozen-definition`; the pre-commit gate passed the full `cargo test` on both commits. Rows 1, 2, 4 and 5 drive a full `RunEngine` run against a local store; row 3 is a ledger test.
+1. A predecessor resolves `escaping` at sha A. The test then edits machine.toml's declaration and moves the store to sha B. Expected for the `--widen-scope` successor: judged at sha A with the frozen digest; the new name `fresh` is resolved at sha B; the events carry `holdout_definition_changed` with the frozen digest and the current one (computed from the edited declaration and sha A). Observed (`a_successor_is_judged_by_its_predecessors_frozen_holdout_and_resolves_a_new_name_fresh`).
+2. The store is deleted before the successor starts. Expected: preflight does not ask the store, and the run ends `blocked (holdout_unfetchable)` at fetch, not `holdout_unreadable`. Observed (`a_successor_does_not_ask_the_store_again_for_a_frozen_holdout`). I wrote this test by hand after the worker described it without writing it; a mutation that re-resolves a frozen name through `ls-remote` turns it red.
+3. A schema-42 ledger upgrades to 43 with an empty `holdout_definitions` table → observed (`a_v42_ledger_takes_the_holdout_definitions_table_empty`).
+4. A `kind: verify` whose candidate wrote the overlay → expected `failed (holdout_overlay_collision)` → observed (`a_verify_whose_candidate_wrote_the_overlay_ends_failed_with_the_collision_code`).
+5. A decomposed run's assembled candidate writes the overlay → expected the collision with the "assembled candidate" detail, and no attempt row left open → observed (`a_decomposed_run_whose_assembled_candidate_wrote_the_overlay_leaves_no_attempt_open`). The scheduler checks for the collision before it opens an integration attempt, so no scheduler change was needed.
+
+### Implementation review (3c)
+
+- Round 1 was approve-with-changes (63k tokens, 92 s); the scheduler claim was judged to hold.
+- Fixed the blocking finding (`errors.explicit-absence`): the `undeclared` sentinel is now an `Option`. Also fixed: one transaction for the frozen rows, and a test for the undeclared case.
+- Delta: approve (68k tokens, 27 s).
+- Carried to phase 4: test that the `--rerun-verify`, `--successor-contract` and `review-parts` intents reach `intent_of_run`, and a chain of three runs.

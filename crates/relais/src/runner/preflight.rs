@@ -548,18 +548,49 @@ impl<'a> RunEngine<'a> {
         // Holdout criteria are resolved here too: an undeclared, unusable
         // or unreachable holdout refuses the contract before any worker is
         // paid for. The manifest keeps only name, commit and digest.
-        let holdouts = match crate::holdout::resolve_all(
-            &self.config.contract.acceptance,
-            &self.config.machine.holdouts,
-            &crate::repo::main_checkout_name(self.config.repo_dir).unwrap_or_default(),
-            self.config.git,
-            self.config.repo_dir,
+        let repo_name = crate::repo::main_checkout_name(self.config.repo_dir).unwrap_or_default();
+        let machine_toml = crate::holdout::machine_toml_label();
+        let lookup = crate::holdout::Lookup {
+            settings: &self.config.machine.holdouts,
+            repo: &repo_name,
+            git: self.config.git,
+            repo_dir: self.config.repo_dir,
             base_sha,
-            &crate::holdout::machine_toml_label(),
-        ) {
-            Ok(resolved) => resolved,
-            Err(block) => return Ok(Phase::Ended(self.fail_preflight(block.code, block.detail)?)),
+            machine_toml: &machine_toml,
         };
+        // A successor is judged by the definitions its predecessor froze.
+        let frozen = match self.config.ledger.intent_of_run(&self.run_id)? {
+            Some(intent) => self
+                .config
+                .ledger
+                .holdout_definitions(&intent.predecessor)?,
+            None => Vec::new(),
+        };
+        let crate::holdout::Resolution { holdouts, changes } =
+            match crate::holdout::resolve_inheriting(
+                &self.config.contract.acceptance,
+                &lookup,
+                &frozen,
+            ) {
+                Ok(resolution) => resolution,
+                Err(block) => {
+                    return Ok(Phase::Ended(self.fail_preflight(block.code, block.detail)?))
+                }
+            };
+        self.config
+            .ledger
+            .record_holdout_definitions(&self.run_id, &holdouts)?;
+        for change in &changes {
+            let current = change.current_digest.as_deref().unwrap_or("undeclared");
+            self.events.emit(Event::Decision {
+                what: "holdout_definition_changed".to_string(),
+                reason: format!(
+                    "holdout `{}`: frozen digest {}, current digest {}; the frozen definition \
+                     judges this run",
+                    change.name, change.frozen_digest, current
+                ),
+            });
+        }
         let (turn_ceiling, warning) = harness_reading(
             capabilities,
             capabilities

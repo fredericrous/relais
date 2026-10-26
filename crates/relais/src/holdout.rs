@@ -23,7 +23,7 @@ use crate::workspace::Git;
 const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A holdout whose store resolved: everything verification needs to fetch and run it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedHoldout {
     pub name: String,
     pub repo: String,
@@ -184,6 +184,35 @@ pub fn protected_inputs(resolved: &[ResolvedHoldout]) -> Vec<String> {
         .collect()
 }
 
+/// Where a holdout's declaration and store are looked up.
+#[derive(Clone, Copy)]
+pub struct Lookup<'a> {
+    pub settings: &'a HoldoutSettings,
+    pub repo: &'a str,
+    pub git: &'a dyn Git,
+    pub repo_dir: &'a Path,
+    pub base_sha: &'a str,
+    pub machine_toml: &'a str,
+}
+
+/// A holdout whose current declaration resolves to another digest than the
+/// definition a predecessor froze.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionChange {
+    pub name: String,
+    pub frozen_digest: String,
+    /// `None` when machine.toml no longer declares the frozen name.
+    pub current_digest: Option<String>,
+}
+
+/// The holdouts a run is judged by, and which frozen definitions today's
+/// machine.toml and store would no longer give.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolution {
+    pub holdouts: Vec<ResolvedHoldout>,
+    pub changes: Vec<DefinitionChange>,
+}
+
 /// Resolve every holdout criterion, stopping at the first refusal.
 pub fn resolve_all(
     entries: &[AcceptanceEntry],
@@ -194,15 +223,51 @@ pub fn resolve_all(
     base_sha: &str,
     machine_toml: &str,
 ) -> Result<Vec<ResolvedHoldout>, HoldoutBlock> {
+    let lookup = Lookup {
+        settings,
+        repo,
+        git,
+        repo_dir,
+        base_sha,
+        machine_toml,
+    };
+    resolve_inheriting(entries, &lookup, &[]).map(|resolution| resolution.holdouts)
+}
+
+/// Resolve every holdout criterion for a successor: a name the
+/// predecessor froze keeps that definition as is, and the store is not
+/// contacted for it. The current machine.toml declaration and store URL are
+/// read only to report a change: their digest, computed with the frozen
+/// commit, differs from the frozen digest, or the name is no longer declared.
+/// A moved ref alone is not a change, and the declaration never judges. Any
+/// other name resolves as [`resolve_all`] does, stopping at the first
+/// refusal.
+pub fn resolve_inheriting(
+    entries: &[AcceptanceEntry],
+    lookup: &Lookup<'_>,
+    frozen: &[ResolvedHoldout],
+) -> Result<Resolution, HoldoutBlock> {
+    let Lookup {
+        settings,
+        repo,
+        git,
+        repo_dir,
+        base_sha,
+        machine_toml,
+    } = *lookup;
     let names = holdout_names(entries);
-    if repo.is_empty() && !names.is_empty() {
+    let fresh: Vec<&String> = names
+        .iter()
+        .filter(|name| !frozen.iter().any(|held| &held.name == *name))
+        .collect();
+    if repo.is_empty() && !fresh.is_empty() {
         return Err(HoldoutBlock {
             code: BlockCode::HoldoutUnknown,
             detail: format!(
                 "the repository name could not be determined, so the holdout{} {} cannot be \
                  looked up in {machine_toml} [holdouts]",
-                if names.len() == 1 { "" } else { "s" },
-                names
+                if fresh.len() == 1 { "" } else { "s" },
+                fresh
                     .iter()
                     .map(|name| format!("`{name}`"))
                     .collect::<Vec<_>>()
@@ -210,15 +275,35 @@ pub fn resolve_all(
             ),
         });
     }
-    names
-        .iter()
-        .map(|name| {
-            resolve(settings, repo, name, git, repo_dir, base_sha).map_err(|refusal| HoldoutBlock {
-                code: refusal.code(),
-                detail: refusal.describe(name, machine_toml),
-            })
-        })
-        .collect()
+    let mut holdouts = Vec::with_capacity(names.len());
+    let mut changes = Vec::new();
+    for name in &names {
+        match frozen.iter().find(|held| &held.name == name) {
+            Some(held) => {
+                let current_digest = settings.declaration(repo, name).map(|decl| {
+                    let store = settings.store.clone().unwrap_or_default();
+                    digest_of(repo, name, &store, &held.sha, decl)
+                });
+                if current_digest.as_deref() != Some(held.digest.as_str()) {
+                    changes.push(DefinitionChange {
+                        name: name.clone(),
+                        frozen_digest: held.digest.clone(),
+                        current_digest,
+                    });
+                }
+                holdouts.push(held.clone());
+            }
+            None => holdouts.push(
+                resolve(settings, repo, name, git, repo_dir, base_sha).map_err(|refusal| {
+                    HoldoutBlock {
+                        code: refusal.code(),
+                        detail: refusal.describe(name, machine_toml),
+                    }
+                })?,
+            ),
+        }
+    }
+    Ok(Resolution { holdouts, changes })
 }
 
 /// Resolve one holdout. The order of the checks is the order of the
@@ -372,7 +457,13 @@ pub fn clean_relative(path: &str) -> bool {
             .any(|segment| segment.is_empty() || segment == "." || segment == "..")
 }
 
-fn digest_of(repo: &str, name: &str, store: &str, sha: &str, decl: &HoldoutDecl) -> String {
+pub(crate) fn digest_of(
+    repo: &str,
+    name: &str,
+    store: &str,
+    sha: &str,
+    decl: &HoldoutDecl,
+) -> String {
     let canonical = serde_json::json!({
         "repo": repo,
         "name": name,

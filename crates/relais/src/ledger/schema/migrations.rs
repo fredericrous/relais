@@ -1132,4 +1132,21 @@ pub(in crate::ledger) const MIGRATIONS: &[(&str, &str)] = &[
     );
     "#,
     ),
+    (
+        // The holdout definitions a run resolved at preflight (ADR-0045
+        // phase 3c): a successor intent judges by its predecessor's rows
+        // instead of resolving machine.toml and the store again.
+        // Expand-only: one new table, nothing an older binary reads, no
+        // existing value rewritten.
+        "v43",
+        r#"
+    CREATE TABLE holdout_definitions (
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        name TEXT NOT NULL,
+        definition_json TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        PRIMARY KEY (run_id, name)
+    );
+    "#,
+    ),
 ];

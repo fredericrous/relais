@@ -212,7 +212,7 @@ pub(super) fn apply_step(conn: &Connection, version: &str, sql: &str, now: &str)
     Ok(())
 }
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 42;
+pub const LEDGER_SCHEMA_VERSION: u64 = 43;
 
 #[cfg(test)]
 mod tests {
@@ -956,8 +956,8 @@ mod tests {
             .expect("a v38 row");
         }
         let ledger = Ledger::open(&path).expect("upgrade to current schema");
-        assert_eq!(ledger.schema_version().expect("version"), 42);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 42);
+        assert_eq!(ledger.schema_version().expect("version"), 43);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 43);
         let tables: Vec<String> = ledger
             .conn
             .prepare(
@@ -1022,8 +1022,8 @@ mod tests {
             .expect("a run written at v40");
         }
         let ledger = Ledger::open(&path).expect("upgrade to v41");
-        assert_eq!(ledger.schema_version().expect("version"), 42);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 42);
+        assert_eq!(ledger.schema_version().expect("version"), 43);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 43);
         let runs: i64 = ledger
             .conn
             .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
@@ -1080,8 +1080,8 @@ mod tests {
             .expect("an intent written at v41");
         }
         let ledger = Ledger::open(&path).expect("upgrade to v42");
-        assert_eq!(ledger.schema_version().expect("version"), 42);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 42);
+        assert_eq!(ledger.schema_version().expect("version"), 43);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 43);
         let runs: i64 = ledger
             .conn
             .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
@@ -1102,6 +1102,54 @@ mod tests {
             .expect("the table exists");
         assert_eq!(parts, 0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v43 adds the holdout definitions table beside what a v42 ledger
+    /// holds: every v42 row survives and the table starts empty.
+    #[test]
+    fn a_v42_ledger_takes_the_holdout_definitions_table_empty() {
+        let dir = temp_dir("v42-to-v43");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            assert_eq!(MIGRATIONS[41].0, "v42", "pinned to v42");
+            for (version, sql) in &MIGRATIONS[..42] {
+                conn.execute_batch(sql).expect("apply step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "then"],
+                )
+                .expect("record step");
+            }
+            conn.execute(
+                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES ('run-old', '/repo', 'accepted', 'now', 'now')",
+                [],
+            )
+            .expect("a run written at v42");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade to v43");
+        assert_eq!(ledger.schema_version().expect("version"), 43);
+        let runs: i64 = ledger
+            .conn
+            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(runs, 1, "the v42 row survives the upgrade");
+        let definitions: i64 = ledger
+            .conn
+            .query_row("SELECT COUNT(*) FROM holdout_definitions", [], |row| {
+                row.get(0)
+            })
+            .expect("the table exists");
+        assert_eq!(definitions, 0);
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
     }
 
     /// A ledger frozen at exactly v13 upgrades to v14 without losing any
