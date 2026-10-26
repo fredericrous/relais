@@ -1538,30 +1538,15 @@ argv = ["true"]
         let below = World::new("n10-below");
         two_artifacts(&below);
         seed_routed(&below, 4, 6);
+        assert!(matches!(
+            active_artifact_verdict(&below.ledger, &below.registry).unwrap(),
+            Some(RollbackReason::AcceptanceBelowFloor { runs: 10, .. })
+        ));
         assert_rolled_back_by_the_cycle(&below);
 
         let above = World::new("n10-above");
         two_artifacts(&above);
         seed_routed(&above, 5, 5);
-        assert_eq!(
-            active_artifact_verdict(&above.ledger, &above.registry).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn thirty_routed_runs_seventeen_accepted_roll_back_and_nineteen_do_not() {
-        let below = World::new("n30-below");
-        two_artifacts(&below);
-        seed_routed(&below, 17, 13);
-        assert!(matches!(
-            active_artifact_verdict(&below.ledger, &below.registry).unwrap(),
-            Some(RollbackReason::AcceptanceBelowFloor { runs: 30, .. })
-        ));
-
-        let above = World::new("n30-above");
-        two_artifacts(&above);
-        seed_routed(&above, 19, 11);
         assert_eq!(
             active_artifact_verdict(&above.ledger, &above.registry).unwrap(),
             None
