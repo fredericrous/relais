@@ -195,16 +195,14 @@ pub struct Lookup<'a> {
     pub machine_toml: &'a str,
 }
 
-/// Stands for the current digest of a frozen name machine.toml no longer declares.
-const UNDECLARED_DIGEST: &str = "undeclared";
-
 /// A holdout whose current declaration resolves to another digest than the
 /// definition a predecessor froze.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefinitionChange {
     pub name: String,
     pub frozen_digest: String,
-    pub current_digest: String,
+    /// `None` when machine.toml no longer declares the frozen name.
+    pub current_digest: Option<String>,
 }
 
 /// The holdouts a run is judged by, and which frozen definitions today's
@@ -282,14 +280,11 @@ pub fn resolve_inheriting(
     for name in &names {
         match frozen.iter().find(|held| &held.name == name) {
             Some(held) => {
-                let current_digest = settings.declaration(repo, name).map_or_else(
-                    || UNDECLARED_DIGEST.to_string(),
-                    |decl| {
-                        let store = settings.store.clone().unwrap_or_default();
-                        digest_of(repo, name, &store, &held.sha, decl)
-                    },
-                );
-                if current_digest != held.digest {
+                let current_digest = settings.declaration(repo, name).map(|decl| {
+                    let store = settings.store.clone().unwrap_or_default();
+                    digest_of(repo, name, &store, &held.sha, decl)
+                });
+                if current_digest.as_deref() != Some(held.digest.as_str()) {
                     changes.push(DefinitionChange {
                         name: name.clone(),
                         frozen_digest: held.digest.clone(),

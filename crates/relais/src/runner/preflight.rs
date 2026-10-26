@@ -581,12 +581,13 @@ impl<'a> RunEngine<'a> {
             .ledger
             .record_holdout_definitions(&self.run_id, &holdouts)?;
         for change in &changes {
+            let current = change.current_digest.as_deref().unwrap_or("undeclared");
             self.events.emit(Event::Decision {
                 what: "holdout_definition_changed".to_string(),
                 reason: format!(
                     "holdout `{}`: frozen digest {}, current digest {}; the frozen definition \
                      judges this run",
-                    change.name, change.frozen_digest, change.current_digest
+                    change.name, change.frozen_digest, current
                 ),
             });
         }

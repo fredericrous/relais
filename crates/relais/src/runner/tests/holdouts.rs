@@ -1249,6 +1249,65 @@ fn a_successor_is_judged_by_its_predecessors_frozen_holdout_and_resolves_a_new_n
 }
 
 #[test]
+fn a_successor_is_judged_by_the_frozen_definition_of_a_name_machine_toml_no_longer_declares() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let (store, sha_a) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(PASSING))]);
+    let settings = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
+    let contract = holdout_contract(&fixture, true);
+    let leaving = MockBackend::new(|spec| {
+        std::fs::create_dir_all(spec.work_dir.join("docs")).expect("mkdir");
+        std::fs::write(spec.work_dir.join("docs/extra.md"), "one\n").expect("write");
+        std::fs::write(spec.work_dir.join("src/main.rs"), "fn main() {}\n// e\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let decided = fixture
+        .execute_with_holdouts(settings, &contract, &repo, &leaving)
+        .run_id;
+    let frozen = fixture
+        .ledger
+        .holdout_definitions(&decided)
+        .expect("definitions");
+    let [frozen] = frozen.as_slice() else {
+        panic!("one frozen definition: {frozen:?}");
+    };
+
+    // The person edits machine.toml so that it no longer declares `escaping`.
+    let edited = HoldoutSettings {
+        store: Some(store.clone()),
+        ..HoldoutSettings::default()
+    };
+    let (new_run, contract) = claimed_successor(&fixture, &decided, None);
+    let backend = counting_worker(Arc::default(), Arc::default());
+    let outcome =
+        fixture.execute_with_holdouts_as(Some(new_run.clone()), edited, &contract, &repo, &backend);
+    let Terminal::Accepted(receipt) = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    let judged = receipt
+        .holdouts
+        .iter()
+        .find(|run| run.name == "escaping")
+        .unwrap_or_else(|| panic!("no escaping in {:?}", receipt.holdouts));
+    assert_eq!(judged.sha, sha_a, "the predecessor's commit");
+    assert_eq!(judged.digest, frozen.digest);
+    let events = events_text(&fixture, &new_run);
+    assert!(
+        events.contains(&format!(
+            "frozen digest {}, current digest undeclared",
+            frozen.digest
+        )),
+        "{events}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
 fn a_successor_does_not_ask_the_store_again_for_a_frozen_holdout() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![passing_check()], 3);

@@ -19,18 +19,20 @@ impl Ledger {
         run_id: &RunId,
         holdouts: &[ResolvedHoldout],
     ) -> Result<()> {
+        let transaction = self.write_tx()?;
         for holdout in holdouts {
             let definition = serde_json::to_string(holdout).map_err(|e| LedgerError::Corrupt {
                 what: "holdout definition".into(),
                 detail: e.to_string(),
             })?;
-            self.conn.execute(
+            transaction.execute(
                 "INSERT OR REPLACE INTO holdout_definitions
                     (run_id, name, definition_json, digest)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![run_id.as_str(), holdout.name, definition, holdout.digest],
             )?;
         }
+        transaction.commit()?;
         Ok(())
     }
 
