@@ -220,6 +220,9 @@ pub struct RankedKey {
     pub adr: Option<String>,
     #[serde(default)]
     pub choice: Option<String>,
+    /// The scope that answered (aval 1.11.0); absent from an older aval.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 /// What `aval relevant` ranked for a query.
@@ -474,6 +477,8 @@ struct RawKey {
     adr: Option<String>,
     #[serde(default)]
     choice: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -506,6 +511,7 @@ pub fn parse_relevant_output(stdout: &str) -> Result<Relevant, GuidanceGap> {
                 state: RankState::from(key.state),
                 adr: key.adr,
                 choice: key.choice,
+                scope: key.scope,
             })
             .collect(),
         rules: raw

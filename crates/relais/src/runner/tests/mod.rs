@@ -6840,6 +6840,7 @@ fn guided_manifest(index: &[&str], relevant: &[(&str, &str)]) -> ContextManifest
                 state: context::guidance::RankState::Active,
                 adr: Some("ADR-0001".into()),
                 choice: Some(choice.to_string()),
+                scope: None,
             })
             .collect(),
         ..Guidance::default()
@@ -8161,6 +8162,7 @@ fn ranked(key: &str, state: &str, choice: Option<&str>) -> crate::context::Ranke
         state: context::guidance::RankState::from(state.to_string()),
         adr: Some("ADR-0009".to_string()),
         choice: choice.map(str::to_string),
+        scope: None,
     }
 }
 
@@ -8182,6 +8184,23 @@ fn the_reviewer_gets_the_active_decisions_for_the_changed_files() {
         "{block}"
     );
     assert!(!block.contains("storage.engine"), "{block}");
+}
+
+#[test]
+fn the_decisions_block_names_the_answering_scope() {
+    let mut scoped = ranked("stack.sql-layer", "active", Some("effect-sql"));
+    scoped.scope = Some("duro-stack".to_string());
+    let resolver = DecisionsFor {
+        answer: Ok(vec![scoped]),
+        calls: std::cell::Cell::new(0),
+    };
+    let files = vec!["src/a.rs".to_string()];
+    let (text, _) = super::review::reviewer_decisions(&resolver, &files, 4096, 0);
+    let block = fenced(&text, "decisions that apply").expect("a decisions block");
+    assert!(
+        block.contains("`stack.sql-layer` (ADR-0009, duro-stack): effect-sql"),
+        "{block}"
+    );
 }
 
 #[test]

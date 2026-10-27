@@ -42,7 +42,12 @@ pub enum AvalVerdict {
     },
     Undecided,
     Contradiction {
-        heads: usize,
+        /// The ADR ids of the competing heads.
+        #[serde(default)]
+        heads: Vec<String>,
+        /// Each scope and the ADR it answered with (aval 1.11.0 cross-scope).
+        #[serde(default)]
+        by_scope: Vec<ScopedHead>,
     },
     Retired {
         adr: String,
@@ -55,6 +60,20 @@ pub enum AvalVerdict {
         exit: i32,
         detail: String,
     },
+}
+
+/// One scope of a cross-scope contradiction and the ADR it answered with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopedHead {
+    pub scope: String,
+    pub adr: String,
+}
+
+fn string_field(entry: &serde_json::Value, field: &str) -> Option<String> {
+    entry
+        .get(field)
+        .and_then(|text| text.as_str())
+        .map(str::to_string)
 }
 
 /// Parse `aval resolve <key> --json` output (SEMANTICS.md v1.2.0 is the
@@ -102,9 +121,28 @@ pub fn parse_aval_output(exit_code: i32, stdout: &str) -> AvalVerdict {
         Some("contradiction") => AvalVerdict::Contradiction {
             heads: value
                 .get("heads")
-                .and_then(|h| h.as_array())
-                .map(|heads| heads.len())
-                .unwrap_or(0),
+                .and_then(|heads| heads.as_array())
+                .map(|heads| {
+                    heads
+                        .iter()
+                        .filter_map(|head| string_field(head, "adr"))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            by_scope: value
+                .get("by_scope")
+                .and_then(|rows| rows.as_array())
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|row| {
+                            Some(ScopedHead {
+                                scope: string_field(row, "scope")?,
+                                adr: string_field(row, "adr")?,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         },
         Some("retired") => AvalVerdict::Retired {
             adr: value
@@ -119,6 +157,22 @@ pub fn parse_aval_output(exit_code: i32, stdout: &str) -> AvalVerdict {
             detail: format!("aval emitted an unrecognized state: {other:?}"),
         },
     }
+}
+
+/// Who disagrees: each scope with its ADR when aval named the scopes,
+/// else the head ADR ids.
+pub fn contradiction_detail(heads: &[String], by_scope: &[ScopedHead]) -> String {
+    if !by_scope.is_empty() {
+        let rows: Vec<String> = by_scope
+            .iter()
+            .map(|row| format!("{} at scope {}", row.adr, row.scope))
+            .collect();
+        return rows.join(", ");
+    }
+    if heads.is_empty() {
+        return "no heads named".to_string();
+    }
+    format!("heads {}", heads.join(", "))
 }
 
 /// What the decision corpus currently says. The interface belongs to
@@ -349,7 +403,8 @@ pub enum ContextError {
     /// A contradiction on a key the task depends on blocks affected work.
     ContradictionBlocked {
         key: String,
-        heads: usize,
+        heads: Vec<String>,
+        by_scope: Vec<ScopedHead>,
     },
     /// The task depends on a key aval cannot currently answer.
     NeedsDecision {
@@ -372,9 +427,14 @@ impl std::fmt::Display for ContextError {
                 f,
                 "sizing problem: required context is {required_bytes} bytes against a {budget_bytes}-byte budget; raise the budget or split the task"
             ),
-            Self::ContradictionBlocked { key, heads } => write!(
+            Self::ContradictionBlocked {
+                key,
+                heads,
+                by_scope,
+            } => write!(
                 f,
-                "aval reports a contradiction on `{key}` ({heads} heads); affected work is blocked until it is resolved"
+                "aval reports a contradiction on `{key}` ({}); affected work is blocked until it is resolved",
+                contradiction_detail(heads, by_scope)
             ),
             Self::NeedsDecision { key, verdict } => write!(
                 f,
@@ -833,10 +893,11 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
     for key in &keys {
         let verdict = resolver.resolve(key, contract.architecture.scope.as_deref());
         match &verdict {
-            AvalVerdict::Contradiction { heads } => {
+            AvalVerdict::Contradiction { heads, by_scope } => {
                 return Err(ContextError::ContradictionBlocked {
                     key: key.clone(),
-                    heads: *heads,
+                    heads: heads.clone(),
+                    by_scope: by_scope.clone(),
                 })
             }
             AvalVerdict::Undecided | AvalVerdict::Unknown | AvalVerdict::Retired { .. } => {
@@ -1113,7 +1174,10 @@ mod tests {
                 5,
                 r#"{"state":"contradiction","exit":5,"heads":[{"adr":"ADR-0001"},{"adr":"ADR-0002"}]}"#
             ),
-            AvalVerdict::Contradiction { heads: 2 }
+            AvalVerdict::Contradiction {
+                heads: vec!["ADR-0001".into(), "ADR-0002".into()],
+                by_scope: Vec::new(),
+            }
         );
         assert_eq!(
             parse_aval_output(6, r#"{"state":"retired","exit":6,"adr":"ADR-0002"}"#),
@@ -1164,15 +1228,57 @@ mod tests {
     fn contradiction_blocks_affected_work() {
         let c = contract(&["api.gateway"]);
         let r = repo();
-        let contradiction = |_: &str, _: Option<&str>| AvalVerdict::Contradiction { heads: 2 };
+        let contradiction = |_: &str, _: Option<&str>| AvalVerdict::Contradiction {
+            heads: vec!["ADR-0001".into(), "ADR-0002".into()],
+            by_scope: Vec::new(),
+        };
         let err = assemble(inputs(&c, &r, &contradiction)).unwrap_err();
         assert_eq!(
             err,
             ContextError::ContradictionBlocked {
                 key: "api.gateway".into(),
-                heads: 2
+                heads: vec!["ADR-0001".into(), "ADR-0002".into()],
+                by_scope: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn a_cross_scope_contradiction_names_each_scope_and_adr() {
+        let two_adrs = parse_aval_output(
+            5,
+            r#"{"state":"contradiction","exit":5,"matched_scope":null,"heads":[{"adr":"ADR-0010"},{"adr":"ADR-0020"}],"by_scope":[{"scope":"duro-stack","adr":"ADR-0010"},{"scope":"*","adr":"ADR-0020"}]}"#,
+        );
+        let one_adr = parse_aval_output(
+            5,
+            r#"{"state":"contradiction","exit":5,"matched_scope":null,"heads":[{"adr":"ADR-0010"}],"by_scope":[{"scope":"duro-stack","adr":"ADR-0010"},{"scope":"*","adr":"ADR-0010"}]}"#,
+        );
+        for verdict in [two_adrs, one_adr] {
+            let AvalVerdict::Contradiction { heads, by_scope } = verdict else {
+                panic!("expected a contradiction");
+            };
+            let message = ContextError::ContradictionBlocked {
+                key: "stack.sql-layer".into(),
+                heads,
+                by_scope,
+            }
+            .to_string();
+            assert!(message.contains("scope duro-stack"), "{message}");
+            assert!(message.contains("scope *"), "{message}");
+            assert!(message.contains("ADR-0010"), "{message}");
+            assert!(!message.contains("0 heads"), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_contradiction_without_by_scope_names_the_head_ids() {
+        let message = ContextError::ContradictionBlocked {
+            key: "k".into(),
+            heads: vec!["ADR-0001".into(), "ADR-0002".into()],
+            by_scope: Vec::new(),
+        }
+        .to_string();
+        assert!(message.contains("ADR-0001, ADR-0002"), "{message}");
     }
 
     #[test]
@@ -1466,6 +1572,7 @@ mod tests {
             state: guidance::RankState::from(state.to_string()),
             adr: Some("ADR-0001".into()),
             choice: (state == "active").then(|| "the choice".to_string()),
+            scope: None,
         }
     }
 
