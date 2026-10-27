@@ -12,6 +12,7 @@
 
 mod decision_data;
 mod harness;
+mod holdouts;
 mod repairs;
 mod reviewers;
 
@@ -22,6 +23,7 @@ pub use decision_data::{
     FloorProjection, Fraction, SourceCount,
 };
 pub use harness::{harness_report, HarnessReport, HarnessStep, Step, StepModel};
+pub use holdouts::{holdouts_report, HoldoutExposures, HoldoutsReport};
 pub use repairs::{EffortRepairs, RepairCost};
 pub use reviewers::{reviewer_report, ReviewerClass, ReviewerReport};
 
@@ -72,8 +74,8 @@ fn accepted_by_person(
 /// status` prints, so its JSON agrees with the sentence a person sees),
 /// so a downstream parser can tell an old shape from a new one instead of
 /// guessing from key presence. 9: `never_shipped_tasks`. 10:
-/// `repair_outcomes`. 11: `advisor_data`. 12: `advisor_data` becomes `decision_labels`. 13: `harness`.
-pub const REPORT_SCHEMA_VERSION: u32 = 13;
+/// `repair_outcomes`. 11: `advisor_data`. 12: `advisor_data` becomes `decision_labels`. 13: `harness`. 14: `holdouts`.
+pub const REPORT_SCHEMA_VERSION: u32 = 14;
 
 /// A dimension `relais report --by` groups the window's tasks over (SPEC
 /// §11: "compare like task classes and policy versions"). Total over the
@@ -785,6 +787,9 @@ pub struct Report {
     /// Per pipeline step and model, how often it ran and how often it caught
     /// what it guards against (decisions ADR-0042); ledger facts only.
     pub harness: HarnessReport,
+    /// What holdouts caught and leaked over the window's runs (ADR-0045
+    /// phase 4): the runs that named one, the catches and the exposures.
+    pub holdouts: HoldoutsReport,
     /// The same enforcement summary `relais coordinator status` prints,
     /// carried as structured data (SPEC §23) so a later tool reading this
     /// report's JSON is never told something the coordinator disagrees
@@ -1206,6 +1211,7 @@ pub fn runs_report(
     let observational = recipe_view.then(|| RECIPE_OBSERVATIONAL_NOTE.to_string());
     let repair_outcomes = repairs::repair_outcomes(ledger, &window_runs)?;
     let harness = harness::harness_report(ledger, &window_runs)?;
+    let holdouts = holdouts::holdouts_report(ledger, &window_runs)?;
     let accepted_tasks = tasks.iter().filter(|task| task.accepted).count();
     let accepted_tasks_by_person = tasks
         .iter()
@@ -1285,6 +1291,7 @@ pub fn runs_report(
         cohorts,
         repair_outcomes,
         harness,
+        holdouts,
         enforcement: EnforcementReport::observed(),
         orchestration,
         cost_per_accepted_task_with_orchestration,
@@ -1309,6 +1316,7 @@ impl Report {
             self.push_repair_lines(&mut out);
             out.push('\n');
             out.push_str(&self.harness.render());
+            out.push_str(&self.holdouts.render());
             self.push_recipe_lines(&mut out);
             self.push_orchestration_lines(&mut out);
             return out;
@@ -1541,6 +1549,7 @@ impl Report {
         self.push_repair_lines(&mut out);
         out.push('\n');
         out.push_str(&self.harness.render());
+        out.push_str(&self.holdouts.render());
         self.push_recipe_lines(&mut out);
         out.push('\n');
         self.push_orchestration_lines(&mut out);
@@ -2073,6 +2082,7 @@ mod tests {
             cohorts: None,
             repair_outcomes: Vec::new(),
             harness: HarnessReport { steps: Vec::new() },
+            holdouts: HoldoutsReport::default(),
             trial_spend: None,
             observational: None,
             enforcement: EnforcementReport::observed(),
@@ -2291,6 +2301,7 @@ mod tests {
                 "decision_labels",
                 "enforcement",
                 "harness",
+                "holdouts",
                 "learning",
                 "never_shipped_tasks",
                 "observational",

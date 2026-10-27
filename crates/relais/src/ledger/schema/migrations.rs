@@ -1149,4 +1149,31 @@ pub(in crate::ledger) const MIGRATIONS: &[(&str, &str)] = &[
     );
     "#,
     ),
+    (
+        // What holdouts catch and leak (ADR-0045 phase 4): one row per
+        // holdout a verification ran, with whether the profile's checks
+        // were green on that candidate, and one row per tool call of a
+        // worker that named a holdout location (the marker's name only,
+        // never the matched text). Expand-only: two new tables, nothing an
+        // older binary reads, no existing value rewritten.
+        "v44",
+        r#"
+    CREATE TABLE holdout_outcomes (
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        label_kind TEXT NOT NULL,
+        attempt_index INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        profile_green INTEGER NOT NULL,
+        PRIMARY KEY (run_id, label_kind, attempt_index, name)
+    );
+    CREATE TABLE holdout_exposures (
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        dispatch_id TEXT NOT NULL,
+        tool TEXT NOT NULL,
+        marker TEXT NOT NULL,
+        PRIMARY KEY (run_id, dispatch_id, tool, marker)
+    );
+    "#,
+    ),
 ];

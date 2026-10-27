@@ -8,6 +8,7 @@ mod decide_actor;
 #[cfg(unix)]
 mod fake_bin;
 mod feedback_cli;
+mod holdout_report;
 mod hook_event_fixtures;
 mod hook_respond;
 mod learning_cycle;

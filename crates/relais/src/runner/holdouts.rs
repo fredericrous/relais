@@ -9,10 +9,13 @@
 use std::path::{Path, PathBuf};
 
 use super::config::holdout_root;
+use super::holdout_exposure::{scan_transcript, Markers};
 use super::setup_gate;
 use super::{AttemptLabel, HoldoutStop, RunEngine, VerifyFailure};
 use crate::holdout::{self, ResolvedHoldout};
+use crate::ledger::HoldoutOutcomeRow;
 use crate::policy::{CommandSpec, EffectiveAuthority};
+use crate::protocol::Event;
 use crate::protocol::Events;
 use crate::verify::{self, HoldoutRun, JunitReport};
 
@@ -42,6 +45,84 @@ impl<'a> RunEngine<'a> {
             &holdout_root(&self.config.artifacts_dir),
             self.config.ledger,
         );
+    }
+
+    /// Count the holdout locations this run's workers named in their own
+    /// tool calls: the transcript of each dispatch that ran as an agent is
+    /// scanned for the markers of the run's frozen holdouts, and every
+    /// (dispatch, tool, marker) hit is one ledger row holding the marker's
+    /// name only. A transcript that cannot be read is no exposure and is
+    /// said as `holdout_exposure_unread`. Counting never changes the run's
+    /// outcome: a ledger failure is reported and the run ends as it did.
+    pub(super) fn count_holdout_exposures(&self) {
+        if self.parent.is_some() {
+            return;
+        }
+        let ledger = self.config.ledger;
+        let held = match ledger.holdout_definitions(&self.run_id) {
+            Ok(held) => held,
+            Err(e) => {
+                eprintln!("relais: the run's holdouts could not be read to count exposures: {e}");
+                return;
+            }
+        };
+        if held.is_empty() {
+            return;
+        }
+        let dispatches = match ledger.agent_dispatches_of_tree(&self.run_id) {
+            Ok(dispatches) => dispatches,
+            Err(e) => {
+                eprintln!("relais: the run's dispatches could not be read to count exposures: {e}");
+                return;
+            }
+        };
+        let markers = Markers::of(
+            &held,
+            &holdout_root(&self.config.artifacts_dir).to_string_lossy(),
+            &holdout::machine_toml_label(),
+        );
+        for (dispatch, agent) in dispatches {
+            let Some(transcript) = self.config.backend.transcript_of(&agent) else {
+                self.events.emit(Event::Decision {
+                    what: "holdout_exposure_unread".to_string(),
+                    reason: dispatch,
+                });
+                continue;
+            };
+            for (tool, marker) in scan_transcript(&transcript, &markers) {
+                if let Err(e) =
+                    ledger.record_holdout_exposure(&self.run_id, &dispatch, &tool, marker.as_str())
+                {
+                    eprintln!("relais: a holdout exposure could not be recorded: {e}");
+                }
+            }
+        }
+    }
+
+    /// Record one holdout outcome row per holdout a verification ran, with
+    /// whether the profile's checks were green on that candidate.
+    pub(super) fn record_holdout_outcomes(
+        &self,
+        label: AttemptLabel,
+        runs: &[HoldoutRun],
+        profile_green: bool,
+    ) -> Result<(), String> {
+        for run in runs {
+            self.config
+                .ledger
+                .record_holdout_outcome(
+                    &self.run_id,
+                    &HoldoutOutcomeRow {
+                        label_kind: label.kind(),
+                        attempt_index: label.ordinal(),
+                        name: &run.name,
+                        outcome: run.outcome.as_str(),
+                        profile_green,
+                    },
+                )
+                .map_err(|e| format!("the ledger refused a holdout outcome row: {e}"))?;
+        }
+        Ok(())
     }
 
     /// What a worker is told of a failed holdout: the criterion's statement

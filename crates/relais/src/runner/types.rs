@@ -276,6 +276,22 @@ pub(crate) enum AttemptLabel {
 }
 
 impl AttemptLabel {
+    /// The attempt number a ledger row is keyed by: the attempt's own
+    /// index, or the integration repairs so far.
+    pub(super) fn ordinal(self) -> u32 {
+        match self {
+            Self::Attempt(index) | Self::Integration(index) => index,
+        }
+    }
+
+    /// The kind of verification, as the ledger keys an outcome row by it.
+    pub(super) fn kind(self) -> &'static str {
+        match self {
+            Self::Attempt(_) => "attempt",
+            Self::Integration(_) => "integration",
+        }
+    }
+
     /// The suffix of the throwaway verification worktree.
     pub(super) fn worktree_suffix(self) -> String {
         match self {

@@ -116,3 +116,41 @@ Observed 2026-10-26 on `feat/holdout-frozen-definition`; the pre-commit gate pas
 - Fixed the blocking finding (`errors.explicit-absence`): the `undeclared` sentinel is now an `Option`. Also fixed: one transaction for the frozen rows, and a test for the undeclared case.
 - Delta: approve (68k tokens, 27 s).
 - Carried to phase 4: test that the `--rerun-verify`, `--successor-contract` and `review-parts` intents reach `intent_of_run`, and a chain of three runs.
+
+## Phase 4
+
+- 2026-10-26 — 3c merged (relais#317, 8f306673), and phase 3 is recorded in decisions#100. Phase 4 is built to `docs/design/holdout-phase-4.md`:
+  - `holdout_outcomes` and `holdout_exposures` tables (schema 44);
+  - exposures counted from the workers' own transcripts at run end;
+  - `relais report` counts;
+  - the three cases carried from phase 3.
+
+### Verification (4)
+
+Observed 2026-10-26 on `feat/holdout-report-counts`; `cargo test -p relais --lib holdout` passed, and the pre-commit gate passed the full `cargo test`.
+- Scan: each marker (store, state_dir, machine_toml, overlay, config) is found in a `tool_use` input and only its name is kept; a transcript naming none gives no row; a double hit is one row (`each_marker_is_found_in_a_tool_use_input_and_only_its_name_is_kept`, `a_transcript_naming_none_gives_no_row`, `a_marker_hit_twice_in_one_tool_is_one_row`).
+- Catches: a failing holdout on green checks counts 1, a passing one 0, and a failing holdout beside a red check counts 0 (`a_failing_holdout_on_green_checks_is_one_catch_and_a_passing_one_is_none`, `a_holdout_failing_beside_a_red_check_is_not_a_catch`).
+- Positive control: a worker transcript that reads machine.toml → `holdout_exposures` = 1 with marker `machine_toml` (`a_worker_transcript_that_reads_the_settings_file_is_one_exposure_by_marker`). A mutation that makes the scan find nothing turns it red. An unreadable transcript is no exposure and emits `holdout_exposure_unread` (`an_unreadable_worker_transcript_is_no_exposure_and_says_so`).
+- Report: `--json` carries `holdouts.{holdout_runs, holdout_catches, holdout_exposures}`, schema 14 (`the_report_json_carries_the_holdout_counts_under_holdouts`).
+- Carried from phase 3:
+  - a verify of a candidate with green checks and a failing holdout is not accepted, launches no worker and counts one catch (`a_verify_of_a_candidate_with_green_checks_and_a_failing_holdout_is_not_accepted`);
+  - `--rerun-verify`, `--successor-contract` and `review-parts` successors reach their intent and are judged by the frozen definition (`a_successor_of_each_kind_reaches_its_intent_and_is_judged_by_the_frozen_definition`);
+  - a successor of a successor is judged by the first run's definition (`a_successor_of_a_successor_is_judged_by_the_first_runs_frozen_definition`).
+- Migration: a schema-43 ledger takes both tables, empty (`a_v43_ledger_takes_the_holdout_count_tables_empty`).
+
+### Implementation review (4)
+
+- Round 1: approve-with-changes (98k tokens, 289 s). This was the only review of this candidate. All six findings are fixed: 85f8ecb7 (relais run-65ec58b0ce88a-18238) fixed five and changed the catch query, and the delta found the did-not-build test missing, so I wrote it by hand:
+  - placeholder names renamed;
+  - only `failed` is a catch, so `did_not_build` is not;
+  - the bare `machine.toml` marker is dropped, so ordinary work in relais or amont no longer counts as an exposure;
+  - `label_kind` is in the `holdout_outcomes` key;
+  - package workers' transcripts are counted on the root run;
+  - `relais report --json` is tested through the binary.
+- Verification added: `holdout_report::the_report_json_counts_one_catch_and_one_exposure_under_holdouts` runs the binary on a fixture ledger and asserts the printed `holdouts` counts. ok.
+- More verification:
+  - A holdout that did not build on green checks gives `holdout_runs` = 1 and `holdout_catches` = 0 (`a_holdout_that_did_not_build_on_green_checks_is_not_a_catch`). A mutation back to `outcome != 'passed'` turns it red.
+  - The bare text `machine.toml` gives no exposure, while the absolute path gives one (`the_bare_file_name_is_no_exposure_and_the_absolute_path_is`).
+  - A package worker's transcript that names a marker counts on the root run (`a_package_workers_transcript_counts_as_an_exposure_on_the_root_run`).
+- Delta 1: approve-with-changes (113k tokens, 34 s). Fixed: the did-not-build test above; the one-level package query now carries a `holds-until:` marker (package contracts set `decomposition: None`); this record is completed. Schema v44 was edited in place, which is safe: 44 is unreleased (the tags show v0.34.0, released 2026-10-26, at schema 43, which includes 3c).
+- Final round 1 on tree 09d4a164: approve (70k tokens, 50 s). Its low finding stays deliberate: `a_holdout_that_writes_no_report_did_not_build` already pins that the fixture ends `did_not_build`. The tags put v0.34.0 at schema 43; 44 is unreleased.
