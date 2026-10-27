@@ -1,0 +1,7 @@
+# Reviews: relais keeps the best guidance that fits
+
+## Full reviews (reference)
+
+- **backend r1** (45k, 115 s) approve-with-changes. 1 [high] `score: Option<f64>` breaks the `Eq` derives: accepted. 2 [high] stripping code rules from `relevant_rules` loses them for the planner and a code-rule-less worker: accepted. 3 [medium] keep keys that render nothing: accepted. 4 [medium] one query is not one scale: accepted as an open point in D2. 5 [medium] wait row with no active step, the `waiting for output` placeholder, shrunk frames above the kept one: accepted. 6 [low] example arithmetic: accepted. 7 [low] name the make targets: rejected (`make check` is the aggregate target, Makefile:21).
+- **backend r2** (21k, 100 s) approve-with-changes; 1-6 resolved. Carried: 8 [low] `&amp;amp;[]` artifact in the planner bullet means `&[]`; 9 [medium] the planner, and a worker without code-rule text, render up to the skipped code rules' bytes over the measured budget (about 1.3 KB): accept it as bounded and test the planner case; 10 [low] the 19146-byte run is about 1460 bytes over; 11 [low] the interleaving test depends on D2's outcome.
+- **codex** (gpt, high effort, exit 0) approve-with-changes. Carried: 1 [medium] trim collapsed frames as head+wait groups at the top cut (`pane.ts:405-408`) so a wait row never survives without its head; 2 [medium] carry typed `kept`/`total` counts on `GuidanceGap` (serde default) and derive partial/missing from them, never from `detail`.
