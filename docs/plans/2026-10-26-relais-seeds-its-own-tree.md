@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: perf/own-tree-seed-wait
 repos: [relais]
 adrs: [ADR-0009]
@@ -138,7 +138,7 @@ caller's workspace keeps the 30 s politeness.
   - No event marked a verification setup gap (none in 373 recorded
     verification starts), so Phase 2 emits a `verification_setup_gap`
     decision. Its baseline count therefore starts at this release.
-- [ ] Phase 3 — relais: release, and observe.
+- [x] Phase 3 — relais: release, and observe (v0.34.0, #319; relais#304 closed).
   - Cut the next relais release (`tag-release`) and install it.
   - Over the next 30 real runs, against the figures in Context:
     - `workspace_seed_waiting` after `verification_started` (expected 0);
@@ -173,5 +173,22 @@ Phase 2, observed before the push:
   green. clippy `-D warnings` clean.
 - **Phase 3:** the counts above, read from the `events.jsonl` of runs
   started after the install, and posted in relais#304.
+
+## Outcome
+
+These are the first 78 runs after installing v0.34.0 (2026-10-27 02:05), with 60 verification starts, compared with the 662 runs recorded before.
+
+| | Before | After |
+|---|---|---|
+| `workspace_seed_waiting` after `verification_started` | 161 of 178 waiting episodes | 0 |
+| `workspace_seed_unwaited` | — | 157 (126 in place, 31 fork) |
+| verification start → first check, median | 30.9 s (n = 361) | 2.6 s (n = 55) |
+| same, p90 | 232 s | 523 s |
+| `verification_setup_gap` per verification start | — | 1 of 60 |
+
+- **The p90 tail is queueing for a heavy verification slot**, not seeding. 15 of the 55 starts logged `waiting_for_slot`, behind other runs on a machine with a load average of about 190. Without that queueing, the interval is median 2.6 s and p90 31.8 s. A yarn monorepo with 18 dependency directories accounts for 5 of the 55 starts; without it, the p90 is still 451 s, so that repository is not the cause.
+- **The one gap is not seed-related.** In `run-65ed50a8d67b8-940c`, the run was suspended for about 15 hours in the middle of a setup step, which left the next step a 48 s timeout. The same step had passed twice earlier in this run (156 s and 50 s).
+- **The rollback was not triggered.** The relais#304 closing comment has the full figures.
+
 
 <!-- panel: repos=relais reviewers=backend,codex body-sha=41f6e915fb81 -->
