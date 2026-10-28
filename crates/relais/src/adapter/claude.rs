@@ -457,7 +457,11 @@ mod tests {
         ));
     }
 
-    /// A fake `claude` that answers `--version` only after `delay`.
+    /// A fake `claude` running `script`. Its probe may take
+    /// `ANSWER_BUDGET`: a fake that answers does so at once, and a tighter
+    /// bound would time it out on a loaded host (load 300 on 2026-10-28
+    /// turned an exit 1 into a timeout). A fake that must time out sets its
+    /// own bound.
     #[cfg(unix)]
     fn fake_claude(dir: &Path, script: &str) -> ClaudeBackend {
         use std::os::unix::fs::PermissionsExt;
@@ -469,10 +473,14 @@ mod tests {
         crate::test_support::prime_script(&binary);
         ClaudeBackend::with_binary(binary)
             .expect("backend")
-            .with_probe_timeout(Duration::from_millis(200))
+            .with_probe_timeout(ANSWER_BUDGET)
     }
 
-    /// A fake `claude` that never answers in time, counting its starts.
+    #[cfg(unix)]
+    const ANSWER_BUDGET: Duration = Duration::from_secs(10);
+
+    /// A fake `claude` that never answers in time, counting its starts:
+    /// 200 ms against a 5 s sleep.
     #[cfg(unix)]
     fn slow_claude(dir: &Path, count: &Path) -> ClaudeBackend {
         fake_claude(
@@ -482,6 +490,7 @@ mod tests {
                 count.display()
             ),
         )
+        .with_probe_timeout(Duration::from_millis(200))
     }
 
     #[cfg(unix)]
