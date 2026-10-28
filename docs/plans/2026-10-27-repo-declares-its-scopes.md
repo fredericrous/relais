@@ -25,6 +25,17 @@ relais (branch, `cargo test -p relais` through the pre-commit gate, 31 checks):
   `the_decisions_block_names_the_answering_scope` passes.
 - The default-scope `holds-until:` → removed, replaced by a comment naming
   `in_scopes` (ADR-0046).
+- Budget trim → partial gap reads `relevant partial`, only shown keys named →
+  `a_block_a_little_over_keeps_its_ranked_keys_and_drops_trailing_rules` passes.
+
+Not observed before the push: the relais end-to-end check (a review run in
+customer-vision whose decisions block lists `ui.design-system (ADR-0006,
+duro-stack)`). Two runs there waited out the 30-minute lease budget while other
+sessions held the heavy slots, and the branch's own decisions-block rendering
+needs this relais released. It runs after the next relais release, when the
+machine is quiet. Its input already holds: in customer-vision `aval relevant`
+ranks `ui.design-system` active at duro-stack, and `amont-agent review-brief`
+carries it (Phase 3 record).
 
 ## Decision log
 

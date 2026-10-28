@@ -37,6 +37,8 @@ pub enum GuidanceSource {
     CodeRules,
     /// `aval relevant`: the relevance ranking.
     Relevant,
+    /// The relevance ranking, some entries dropped over the budget.
+    RelevantPartial,
     /// The full statements the reviewer prompt carries.
     Reviewer,
     /// `aval relevant` for the paths the candidate patch changes: the
@@ -101,6 +103,7 @@ impl GuidanceGap {
             GuidanceSource::Index => "index missing",
             GuidanceSource::CodeRules => "code rules missing",
             GuidanceSource::Relevant => "relevant missing",
+            GuidanceSource::RelevantPartial => "relevant partial",
             GuidanceSource::Reviewer => "reviewer constraints partial",
             GuidanceSource::Decisions => "reviewer decisions missing",
             GuidanceSource::Candidates => "candidates missing",
@@ -315,8 +318,11 @@ pub fn rendered_bytes(lines: &[String]) -> usize {
     lines.iter().map(|line| line.len() + 1).sum()
 }
 
-/// Keep the guidance inside `budget`: the relevant block goes first, then
-/// the index. Each drop is a gap with the measured and the budget bytes.
+/// Keep the guidance inside `budget`: whole ranked entries leave from the
+/// end of the relevant block, rules before keys, and the gap names them
+/// (`relevant partial`, or `relevant missing` when none is left); the index
+/// is dropped only when it alone is over. Each drop is a gap with the
+/// measured and the budget bytes.
 /// The reviewer's statements are not counted here.
 pub fn fit_budget(guidance: &mut Guidance, budget: usize) {
     let index = rendered_bytes(&guidance.index_lines());
@@ -330,15 +336,24 @@ pub fn fit_budget(guidance: &mut Guidance, budget: usize) {
             if let Some(rule) = guidance.relevant_rules.pop() {
                 dropped.push(format!("rule {}", rule.id));
             } else if let Some(ranked) = guidance.relevant_keys.pop() {
-                dropped.push(ranked.key);
+                // A key the block never showed (not active, no choice) is
+                // not a loss worth naming.
+                if ranked.state == RankState::Active && ranked.choice.is_some() {
+                    dropped.push(ranked.key);
+                }
             } else {
                 break;
             }
         }
         if !dropped.is_empty() {
             dropped.reverse();
+            let source = if guidance.relevant_entries(&[]).is_empty() {
+                GuidanceSource::Relevant
+            } else {
+                GuidanceSource::RelevantPartial
+            };
             guidance.record(GuidanceGap::new(
-                GuidanceSource::Relevant,
+                source,
                 GapCause::OverBudget { measured, budget },
                 format!(
                     "{} ranked entries dropped over budget (guidance measured {measured} bytes \
@@ -1181,6 +1196,8 @@ EOF"#;
         assert!(detail.contains("3 ranked entries dropped"), "{detail}");
         assert!(detail.contains("rule rel.rule-2"), "{detail}");
         assert!(!detail.contains("ui.design-system"), "{detail}");
+        assert_eq!(guidance.gaps[0].source, GuidanceSource::RelevantPartial);
+        assert!(guidance.gaps[0].describe().starts_with("relevant partial"));
     }
 
     #[test]
