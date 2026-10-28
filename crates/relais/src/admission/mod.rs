@@ -3970,6 +3970,9 @@ mod tests {
             state.request(&request, t0),
             Decision::WaitingForDisk { .. }
         ));
+        // A path asked about once, at t0, and never again: the next miss
+        // past the TTL evicts it.
+        state.volumes_for(&["/ccc".to_string()], t0);
         disk.available.store(1_000, Ordering::SeqCst);
         let early = t0 + DISK_PROBE_TTL / 2;
         assert!(matches!(
@@ -3978,8 +3981,31 @@ mod tests {
         ));
         let later = t0 + DISK_PROBE_TTL;
         assert!(granted(state.request(&request, later)));
-        assert_eq!(disk.probes.load(Ordering::SeqCst), 4);
-        assert!(state.disk_measured.len() <= 2);
+        assert_eq!(disk.probes.load(Ordering::SeqCst), 5);
+        assert!(!state.disk_measured.contains_key("/ccc"), "evicted");
+        assert_eq!(state.disk_measured.len(), 2);
+    }
+
+    /// A lease admitted on a cached reading is reserved before the next
+    /// decision: a second request in the same second sees its estimate, so
+    /// two cannot pass on one reading unless both fit.
+    #[test]
+    fn a_lease_admitted_on_a_cached_reading_is_reserved_for_the_next() {
+        use std::sync::atomic::Ordering;
+        let disk = std::sync::Arc::new(CountingDisk {
+            available: 115.into(),
+            probes: 0.into(),
+        });
+        let mut state = disk_state(&disk);
+        let t0 = Instant::now();
+        assert!(granted(
+            state.request(&heavy_on_disk("h0", "run-a", "tab-a"), t0)
+        ));
+        assert!(matches!(
+            state.request(&heavy_on_disk("h1", "run-a", "tab-a"), t0),
+            Decision::WaitingForDisk { reserved: 10, .. }
+        ));
+        assert_eq!(disk.probes.load(Ordering::SeqCst), 2);
     }
 
     fn granted(decision: Decision) -> bool {
