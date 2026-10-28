@@ -1744,8 +1744,8 @@ fn the_report_json_carries_the_holdout_counts_under_holdouts() {
     let report = crate::report::runs_report(&fixture.ledger, "1970-01-01T00:00:00Z", None)
         .expect("a report");
     let json = serde_json::to_value(&report).expect("json");
-    assert_eq!(json["schema_version"], 14);
-    assert_eq!(crate::report::REPORT_SCHEMA_VERSION, 14);
+    assert_eq!(json["schema_version"], 15);
+    assert_eq!(crate::report::REPORT_SCHEMA_VERSION, 15);
     assert_eq!(json["holdouts"]["holdout_runs"], 1);
     assert_eq!(json["holdouts"]["holdout_catches"], 1);
     assert_eq!(json["holdouts"]["holdout_exposures"]["runs"], 0);

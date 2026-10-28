@@ -27,6 +27,7 @@ import {
   afterStep,
   beforeStep,
   flag,
+  noteRelaisLaunch,
   onPrompt,
   onSessionEnd,
   onToolResult,
@@ -302,6 +303,7 @@ export function register(on: any) {
     ensurePump(fx)
     const workspace = workspaceOf(e.workspace)
     if (workspace.deny) return { deny: workspace.deny }
+    noteRelaisLaunch(store)
     return { result: await startRun(fx, store, { task: task.path, cwd: e.cwd, workspace: workspace.value }) }
   })
 
@@ -341,6 +343,7 @@ export function register(on: any) {
       return { deny: 'relais replay needs a task, a recipe and a cwd (all text).' }
     }
     const fx = effects($)
+    noteRelaisLaunch(store)
     ensurePump(fx)
     return { result: await startReplay(fx, store, {
       task: e.task,

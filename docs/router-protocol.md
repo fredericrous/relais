@@ -102,14 +102,14 @@ Record kinds (field `kind`):
   "files": ["16 hex"], "at": "RFC3339" }
 
 { "kind": "task", "task_id": "s", "agent_id": "s|null", "started_at": "RFC3339", "ended_at": "RFC3339|null",
-  "class": { … }, "outcome": "completed_verified|completed_accepted|corrected|unknown",
-  "completed_at_end": "completed_verified|completed_accepted|corrected|unknown|null",
+  "class": { … }, "outcome": "completed_verified|completed_accepted|corrected|answered|unknown",
+  "completed_at_end": "completed_verified|completed_accepted|corrected|answered|unknown|null",
   "inferred": ["aborted", "no_complaint", "respawned"], "files": ["16 hex"],
   "escalations": 0, "exhausted": false, "turns": 1, "explicit_quote": "s|null",
   "checks": [{ "name": "go vet ./...", "kind": "test|lint|build|gate", "passed": true }] }
 
 { "kind": "task_outcome", "task_id": "s", "agent_id": "s|null",
-  "outcome": "completed_verified|completed_accepted|corrected|unknown", "at": "RFC3339" }
+  "outcome": "completed_verified|completed_accepted|corrected|answered|unknown", "at": "RFC3339" }
 
 { "kind": "classification", "call_id": "s", "purpose": "prompt|spawn", "model": "full id",
   "prompt_version": "64 lowercase hex: SHA-256 of the classifier's system prompt",
@@ -126,8 +126,8 @@ Record kinds (field `kind`):
 - **`files`** are the first 16 hex digits of the SHA-256 of a repo-relative path (relative to the session's cwd, no leading `./`), lowercase. On a `task`: every file the task edited (Edit, Write, MultiEdit, NotebookEdit successes). On a `reassess` with `event: "revert"`: the files a successful Bash `git revert …` (`[]`: its files are not known here), `git checkout [<ref>] -- <paths>` or `git restore <paths>` (not `--staged` alone) put back; a revert is never escalating. Optional, default `[]`. R2 matches reverts and later corrections to the tasks whose files they touch (plan §5, missed failures).
 - **`table_version`** is the capability table's `version` the decision was made under. Optional, default `null`.
 - **`checks`** are the checks the task ran (its last 20), each with the kind of check it matched (`test`, `lint`, `build`) or `gate` for an amont stamp. `name` is the command, or `amont-gate@<first 7 of the tree>`. Optional, default `[]`; a later record with checks replaces the stored list.
-- **`task_outcome`** amends a subagent's task with its parent's outcome. A subagent's task is sent when the subagent completes, before its parent ends; when the parent ends the plugin sends one `task_outcome` per router-created subagent task it spawned (never one for an `unknown` outcome). relais sets that task's `outcome` and `outcome_source = parent` only when the stored outcome is `unknown`, and does nothing when the task has no record yet. A task's own record sets `outcome_source = own` (every task recorded before ledger step v23 is `own`), and a later own record of a higher rank takes the outcome back.
-- **`completed_at_end`** is the outcome when the task ended (`null` while it is open). relais keeps the first one it receives; a later record never moves it, so a correction that arrives after the end is measured against it. Optional, default `null`.
+- **`task_outcome`** amends a subagent's task with its parent's outcome. A subagent's task is sent when the subagent completes, before its parent ends; when the parent ends the plugin sends one `task_outcome` per router-created subagent task it spawned (never one for an `unknown` or `answered` outcome). relais sets that task's `outcome` and `outcome_source = parent` only when the stored outcome is `unknown` or `answered`, and does nothing when the task has no record yet. A task's own record sets `outcome_source = own` (every task recorded before ledger step v23 is `own`), and a later own record of a higher rank takes the outcome back.
+- **`completed_at_end`** is the outcome when the task ended (`null` while it is open). relais keeps the first one it receives; a later record never moves it, so a correction that arrives after the end is measured against it. The one exception: a stored `answered` becomes `unknown` when a later record forces the merged outcome to `unknown`. Optional, default `null`.
 
 Idempotency keys:
 - decision: `(session, task_id, turn_id, agent_id)`;
@@ -137,7 +137,9 @@ Idempotency keys:
 - task_outcome: `(session, task_id, agent_id)` (it updates that task);
 - classification: `(session, call_id)`.
 
-A `task` record may be sent again with a later outcome. Its rank is `corrected` > `completed_verified` = `completed_accepted` > `unknown`. A higher-ranked outcome overwrites a lower one; a lower one never overwrites. `unknown` never overwrites anything. `files` and `inferred` only gain; `completed_at_end` is never overwritten once set.
+A `task` record may be sent again with a later outcome. Its rank is `corrected` > `completed_verified` = `completed_accepted` > `unknown` = `answered` (rank 0, so stored ranks need no rescale). A higher-ranked outcome overwrites a lower one; a lower one never overwrites. At rank 0 `unknown` wins over `answered` in either arrival order, and a merged task with files is never `answered`: the plugin's rule is monotone within a task, so once a write is seen it reports `unknown`. `files` and `inferred` only gain; `completed_at_end` is never overwritten once set, except that `answered` becomes `unknown` when the merged outcome is forced to `unknown`.
+
+**`answered`.** A task ends `answered` when it is not corrected, verified or accepted, has no explicit accept quote, edited no file, did nothing the hook could not see that may write one (a Bash writer such as `sed -i`, a redirection, `tee`, `git apply|checkout|commit|merge|rebase` or a formatter with a write flag; a subagent the router did not create; a relais run or replay), and was not aborted. A question or a review that changed nothing is the typical case. `answered` is neither completed nor a strong outcome: it is reported on its own line, and is never a learning label. The plugin sends `answered` only to a relais of version 0.36 or later (`relais --version`, asked once per session; a failed or unreadable answer counts as older for the session); to an older one it sends `unknown`, the v0.35 form. relais 0.36 (ledger step v45) backfills `answered` onto ended `unknown` question and review rows with no files and no `aborted` signal, marking them `outcome_source = backfill_v45`; undo with `UPDATE router_tasks SET outcome = 'unknown', outcome_source = 'own', completed_at_end = CASE WHEN completed_at_end = 'answered' THEN 'unknown' ELSE completed_at_end END WHERE outcome_source = 'backfill_v45'` (the backfill also sets `completed_at_end = 'answered'` where it was `unknown`).
 
 ## `relais native router-envelope --by <name> (--epsilon-max <f> | --off) [--source plugin-ask]`
 

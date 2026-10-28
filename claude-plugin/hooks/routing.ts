@@ -23,6 +23,7 @@ import {
   evidenceOf,
   gateChecks,
   hash,
+  mayWrite,
   modeEffective,
   newTask,
   onEvidence,
@@ -417,6 +418,8 @@ async function afterSpawn(
   const now = await fx.clock.now()
   const agentId: string | undefined = typeof result?.agentId === 'string' ? result.agentId : undefined
   let owner: TaskState | undefined = r.task
+  // A subagent the router did not create edits files the hook never sees.
+  if (!(spawn.isRouted && spawn.decision && spawn.class) && r.task) r.task = { ...r.task, maybeWrote: true }
   if (spawn.isRouted && spawn.decision && spawn.class) {
     const task = newTask(taskId, agentId ?? null, `${description}\n${prompt}`, spawn.class, spawn.decision.tier, now)
     task.lastReason = 'table'
@@ -481,9 +484,15 @@ export function onToolResult(fx: Fx, store: Store, e: any, result: any, now: num
   const task = agentId ? r.subtasks[agentId] : r.task
   if (!task) return
   noteRevert(store, state, task, e, result, now)
+  const wrote = String(e.tool) === 'Bash' && typeof e.command === 'string' && mayWrite(e.command)
+  const noted = wrote && !task.maybeWrote ? { ...task, maybeWrote: true } : task
+  if (noted !== task) {
+    if (agentId) r.subtasks[agentId] = noted
+    else r.task = noted
+  }
   const evidence = evidenceOf(String(e.tool), e, result, state.checks, state.check_kinds)
   if (!evidence) return
-  const out = onEvidence(state, task, evidence, r.cwd)
+  const out = onEvidence(state, noted, evidence, r.cwd)
   if (agentId) r.subtasks[agentId] = out.task
   else r.task = out.task
   if (out.reassess) {
@@ -560,7 +569,7 @@ async function endTask(fx: Fx, store: Store, task: TaskState, now: number) {
     gate.length === 0 ? task : { ...task, verifications: [...task.verifications, ...gate].slice(-20) }
   queue(store, taskRecord(ended, now, store.router.cwd))
   const outcome = outcomeOf(ended)
-  if (outcome === 'unknown') return
+  if (outcome === 'unknown' || outcome === 'answered') return
   for (const sub of ended.subagentTasks ?? []) {
     if (sub.agentId) queue(store, taskOutcomeRecord(sub, outcome, now))
   }
@@ -605,11 +614,19 @@ async function readGateChecks(fx: Fx, store: Store, task: TaskState, now: number
   return stamps.flatMap(stamp => (stamp ? gateChecks(stamp, task.startedAt, now) : [])).map(c => ({ command: c.name, kind: c.kind, passed: c.passed }))
 }
 
+// A relais run or replay was launched from the task: it may write files the
+// hook never sees.
+export function noteRelaisLaunch(store: Store) {
+  const r = store.router
+  if (r.task) r.task = { ...r.task, maybeWrote: true }
+}
+
 // A relais run ended: its acceptance verifies the task, which ends at the
 // next prompt.
 export function onRunDone(store: Store, outcome: string) {
   const r = store.router
   if (!r.task) return
+  r.task = { ...r.task, maybeWrote: true }
   if (outcome === 'accepted') r.task = { ...r.task, relaisAccepted: true }
   r.isTaskEndRequested = true
 }
@@ -647,11 +664,47 @@ export async function flushObservations(fx: Fx, store: Store, options: { isFinal
   if (r.queue.length === 0) return
   const batch = r.queue
   r.queue = []
+  const understandsAnswered = await supportsAnswered(fx, store)
   const bySession = new Map<string, unknown[]>()
-  for (const { session, record } of batch) bySession.set(session, [...(bySession.get(session) ?? []), record])
+  for (const { session, record } of batch) {
+    const sent = understandsAnswered ? record : withoutAnswered(record)
+    bySession.set(session, [...(bySession.get(session) ?? []), sent])
+  }
   for (const [session, records] of bySession) {
     await observe(fx, store, { schema: 1, session, records }, 0, options.isFinal === true)
   }
+}
+
+// The first relais release that accepts the `answered` outcome.
+const ANSWERED_MIN_VERSION: [number, number] = [0, 36]
+
+// Whether the installed relais accepts `answered`, asked once per session
+// through `relais --version`. A failed or unreadable answer is cached as "no"
+// for the session (docs/router-protocol.md), so the batch goes in the v0.35
+// form and the probe is not repeated.
+async function supportsAnswered(fx: Fx, store: Store): Promise<boolean> {
+  const r = store.router
+  if (r.supportsAnswered !== undefined) return r.supportsAnswered
+  let versionText = ''
+  try {
+    const versionRun = await fx.process.run(['relais', '--version'], { timeoutMs: OBSERVE_TIMEOUT_MS })
+    if (versionRun?.exitCode === 0) versionText = String(versionRun.stdout ?? '')
+  } catch {
+    // An unreadable version is cached as "no" below.
+  }
+  const found = /(\d+)\.(\d+)\.(\d+)/.exec(versionText)
+  const [major, minor] = found ? [Number(found[1]), Number(found[2])] : [0, 0]
+  r.supportsAnswered = found !== null && (major > ANSWERED_MIN_VERSION[0] || (major === ANSWERED_MIN_VERSION[0] && minor >= ANSWERED_MIN_VERSION[1]))
+  return r.supportsAnswered
+}
+
+// The v0.35 form of a record: `answered` did not exist, so it is `unknown`.
+function withoutAnswered(record: any): unknown {
+  if (!record || typeof record !== 'object') return record
+  const out = { ...record }
+  if (out.outcome === 'answered') out.outcome = 'unknown'
+  if (out.completed_at_end === 'answered') out.completed_at_end = 'unknown'
+  return out
 }
 
 async function observe(fx: Fx, store: Store, payload: unknown, attempt: number, isFinal: boolean): Promise<void> {

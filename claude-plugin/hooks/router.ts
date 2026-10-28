@@ -22,7 +22,7 @@ export type Reason =
   | 'timeout_kept'
   | 'abstained'
   | 'cache_gate'
-export type Outcome = 'completed_verified' | 'completed_accepted' | 'corrected' | 'unknown'
+export type Outcome = 'completed_verified' | 'completed_accepted' | 'corrected' | 'answered' | 'unknown'
 export type ReassessEvent = 'failed_verification' | 'repair_failed' | 'scope_growth' | 'spawn' | 'correction' | 'flag' | 'revert'
 
 const KINDS: readonly Kind[] = ['question', 'edit', 'debug', 'design', 'review']
@@ -97,6 +97,11 @@ export type TaskState = {
   escalations: number
   exhausted: boolean
   hasEdit: boolean
+  // Sticky: the task did something that could have written a file the hook
+  // cannot see (a Bash writer, a subagent the router did not create, a
+  // relais run or replay). With it a task with no recorded edit is `unknown`,
+  // never `answered`.
+  maybeWrote: boolean
   // Edits since the last verification, and whether the last verification
   // that counted as escalating evidence failed with no pass since.
   editedSinceCheck: boolean
@@ -514,6 +519,7 @@ export function newTask(id: string, agentId: string | null, opening: string, c: 
     escalations: 0,
     exhausted: false,
     hasEdit: false,
+    maybeWrote: false,
     editedSinceCheck: false,
     lastCountedFailure: false,
     verifications: [],
@@ -756,6 +762,52 @@ export function checkIndex(command: string, checks: string[][]): number | undefi
     if (at >= 0) return at
   }
   return undefined
+}
+
+// Drops, in place, the programs that only run another one (`env`, `xargs`,
+// `npx`, `bunx`, `pnpm exec`, `uv run`) with their flags and assignments, so
+// the program they run is the one judged.
+function stripLauncher(argv: string[]) {
+  for (;;) {
+    const program = (argv[0] ?? '').replace(/^.*\//, '')
+    const runs = program === 'pnpm' ? argv[1] === 'exec' : program === 'uv' ? argv[1] === 'run' : ['env', 'xargs', 'npx', 'bunx'].includes(program)
+    if (!runs) return
+    argv.splice(0, program === 'pnpm' || program === 'uv' ? 2 : 1)
+    while (argv.length > 0 && (argv[0].startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[0]))) argv.shift()
+  }
+}
+
+// Whether a Bash command may write a file: a `sed -i`, a redirection or
+// `tee`, a `git` command that changes the tree, a formatter with a write
+// flag, or a plain file-changing program. A guess toward "yes": a task that
+// might have written is `unknown`, never `answered`.
+export function mayWrite(command: string): boolean {
+  for (const segment of command.split(/&&|\|\||\||;|\n/)) {
+    const text = segment.trim().replace(/\d*>&\d+/g, '').replace(/\d*>>?\s*\/dev\/null/g, '')
+    if (/(^|[^<>=-])>>?(?![>&=])/.test(text)) return true
+    const argv = words(text)
+    while (argv.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[0])) argv.shift()
+    if (argv.length === 0) continue
+    stripLauncher(argv)
+    if (argv.length === 0) continue
+    const program = argv[0].replace(/^.*\//, '')
+    const rest = argv.slice(1)
+    if (['tee', 'mv', 'cp', 'rm', 'touch', 'patch', 'truncate', 'install', 'ln'].includes(program)) return true
+    if (program === 'sed' && rest.some(w => /^-[a-zA-Z]*i/.test(w) || w === '--in-place' || w.startsWith('--in-place='))) return true
+    if (program === 'git' && rest.some(w => ['apply', 'checkout', 'commit', 'merge', 'rebase', 'restore', 'reset', 'stash', 'cherry-pick', 'revert', 'pull', 'switch', 'am', 'rm', 'mv', 'clean'].includes(w))) return true
+    const writeFlag = rest.some(w => w === '--write' || w === '--fix' || w === '--apply' || w === '-w' || w === '-i')
+    const checkFlag = rest.some(w => w === '--check' || w === '--diff' || w === '--dry-run' || w === '-l')
+    if (['prettier', 'biome', 'eslint', 'gofmt', 'goimports', 'rustfmt', 'ruff', 'black', 'isort', 'clang-format'].includes(program)) {
+      if (writeFlag || (['rustfmt', 'black', 'isort'].includes(program) && !checkFlag)) return true
+    }
+    if (program === 'cargo' && (rest[0] === 'fmt' || rest[0] === 'fix') && !checkFlag) return true
+    if (program === 'go' && rest[0] === 'fmt') return true
+    if (program === 'cargo' && rest[0] === 'clippy' && rest.includes('--fix')) return true
+    if (program === 'perl' && rest.some(w => /^-[a-zA-Z]*i/.test(w))) return true
+    if (program === 'relais' && rest[0] === 'run') return true
+    if (program === 'relais' && rest[0] === 'dataset' && rest[1] === 'replay' && !rest.includes('--dry-run')) return true
+  }
+  return false
 }
 
 // What a finished tool call says, or undefined when it is no evidence.
@@ -1067,7 +1119,10 @@ export function outcomeOf(task: TaskState): Outcome {
   const last = task.verifications[task.verifications.length - 1]
   if ((last && last.passed) || task.relaisAccepted) return 'completed_verified'
   if (task.acceptQuote !== null) return 'completed_accepted'
-  return 'unknown'
+  // Nothing was edited and nothing could have been: a question, a review.
+  // An aborted task says nothing about what it would have done.
+  if (task.hasEdit || task.files.length > 0 || task.maybeWrote || task.inferred.includes('aborted')) return 'unknown'
+  return 'answered'
 }
 
 // --- records (docs/router-protocol.md) ---------------------------------------------
@@ -1292,6 +1347,8 @@ export type RouterMemory = {
   lastContext: number
   queue: { session: string; record: unknown }[]
   status: string | undefined
+  // Whether the installed relais accepts `answered`: undefined until asked.
+  supportsAnswered: boolean | undefined
 }
 
 export const createRouterMemory = (): RouterMemory => ({
@@ -1312,6 +1369,7 @@ export const createRouterMemory = (): RouterMemory => ({
   lastContext: 0,
   queue: [],
   status: undefined,
+  supportsAnswered: undefined,
 })
 
 // The status line's routing part.

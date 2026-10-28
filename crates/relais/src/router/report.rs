@@ -62,6 +62,12 @@ pub struct SessionRoutingReport {
     pub completed: usize,
     pub corrected: usize,
     pub unknown: usize,
+    /// Tasks that edited no file and could not have: reported apart from
+    /// `unknown`, never a learning label.
+    pub answered: usize,
+    /// `answered` tasks per class kind, by kind.
+    pub answered_by_class_kind: Vec<(String, usize)>,
+    /// `unknown / tasks`: `answered` is not unknown.
     pub unknown_rate: Option<f64>,
     pub classifier: Classifier,
     /// Cache-write tokens on the first request after a model switch,
@@ -318,6 +324,16 @@ pub fn session_routing(
     };
     let tasks = window.tasks.len();
     let unknown = count(|o| o == TaskOutcome::Unknown);
+    let mut answered_kinds: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, task) in &window.tasks {
+        if outcome(&task.outcome) == TaskOutcome::Answered {
+            let kind = task
+                .class
+                .as_ref()
+                .map_or("unclassified", |class| class.kind.as_str());
+            *answered_kinds.entry(kind.to_string()).or_default() += 1;
+        }
+    }
     let classifier_rows: Vec<&RouterUsageRow> = window
         .usage
         .iter()
@@ -333,6 +349,8 @@ pub fn session_routing(
         completed: count(TaskOutcome::is_completed),
         corrected: count(|o| o == TaskOutcome::Corrected),
         unknown,
+        answered: count(|o| o == TaskOutcome::Answered),
+        answered_by_class_kind: answered_kinds.into_iter().collect(),
         unknown_rate: (tasks > 0).then(|| unknown as f64 / tasks as f64),
         classifier: Classifier {
             calls: classifier_rows.len(),
@@ -391,6 +409,16 @@ impl SessionRoutingReport {
             "  outcomes: {} completed, {} corrected, {} unknown (unknown rate {rate})\n",
             self.completed, self.corrected, self.unknown
         ));
+        out.push_str(&format!(
+            "  answered (no file edited, never a label): {}\n",
+            self.answered
+        ));
+        if !self.answered_by_class_kind.is_empty() {
+            out.push_str("  answered by class kind:\n");
+            for (kind, count) in &self.answered_by_class_kind {
+                out.push_str(&format!("    {kind} {count}\n"));
+            }
+        }
         let classifier = match self.classifier.cost {
             Some(cost) => cost.to_string(),
             None => unknown_cost(&self.classifier.unpriced_models),
@@ -559,6 +587,59 @@ mod tests {
         assert_eq!(report.cache_rebuild_tokens, 500);
         assert_eq!(report.arms[2].arm, "shadow");
         assert_eq!(report.arms[2].sessions, 1);
+    }
+
+    #[test]
+    fn answered_is_reported_apart_and_is_not_unknown() {
+        let mut fixture = window();
+        let mut question = task("e", "answered");
+        question.class = Some(crate::ledger::RouterClass {
+            kind: "question".into(),
+            difficulty: 1,
+            scope: "file".into(),
+            uncertainty: "low".into(),
+            verifiable: false,
+            confidence: 0.9,
+        });
+        fixture.tasks.push(("shadow-1".into(), question));
+        fixture
+            .tasks
+            .push(("shadow-1".into(), task("f", "answered")));
+        let report = session_routing(&fixture, &pricing(), ExplorationReport::default());
+        assert_eq!((report.tasks, report.unknown, report.answered), (6, 1, 2));
+        assert_eq!(report.unknown_rate, Some(1.0 / 6.0));
+        assert_eq!(
+            report.answered_by_class_kind,
+            vec![("question".to_string(), 1), ("unclassified".to_string(), 1)]
+        );
+        let text = report.render();
+        assert!(
+            text.contains("  outcomes: 2 completed, 1 corrected, 1 unknown (unknown rate 17%)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  answered (no file edited, never a label): 2\n"),
+            "{text}"
+        );
+        assert!(text.contains("  answered by class kind:\n    question 1\n"));
+    }
+
+    #[test]
+    fn every_session_routing_line_fits_eighty_columns_with_four_digit_counts() {
+        let mut report = session_routing(&window(), &pricing(), ExplorationReport::default());
+        report.completed = 9999;
+        report.corrected = 9999;
+        report.unknown = 9999;
+        report.answered = 9999;
+        report.unknown_rate = Some(1.0);
+        report.answered_by_class_kind = vec![("question".into(), 9999), ("review".into(), 9999)];
+        for line in report
+            .render()
+            .lines()
+            .filter(|l| l.contains("outcomes:") || l.contains("answered") || l.starts_with("    "))
+        {
+            assert!(line.chars().count() <= 80, "{line}");
+        }
     }
 
     #[test]

@@ -68,6 +68,8 @@ export type Routed = Engine & {
   labels: Map<string, unknown>
   fallback: unknown
   observeExits: number[]
+  // What `relais --version` answers.
+  version: string
 }
 
 // A session started with the router-state given; `state` is the live
@@ -81,6 +83,7 @@ export async function routedSession(
   engine.labels = new Map()
   engine.fallback = label()
   engine.observeExits = []
+  engine.version = '0.36.0'
   const state: Record<string, unknown> = { ...ROUTER_STATE, ...(options.state ?? {}) }
   engine.state = state
   engine.script.runResult = (argv: string[]) => {
@@ -89,6 +92,7 @@ export async function routedSession(
       const code = engine.observeExits.length > 0 ? engine.observeExits.shift()! : 0
       return { ...ok, exitCode: code, stderr: code === 0 ? '' : `exit ${code}` }
     }
+    if (argv[1] === '--version') return { ...ok, stdout: `relais ${engine.version}\n` }
     return ok
   }
   engine.script.complete = (e: any) => {

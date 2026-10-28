@@ -3,7 +3,8 @@
 
 import { expect, test } from 'claude-code/testing'
 import { nativeCalls, settle, spawnLine, startQueued } from './support.ts'
-import { CLASSIFIER_SYSTEM, sha256Hex } from '../hooks/router.ts'
+import { CLASSIFIER_SYSTEM, createRouterMemory, newTask, outcomeOf, sha256Hex } from '../hooks/router.ts'
+import { noteRelaisLaunch } from '../hooks/routing.ts'
 import {
   answered,
   bash,
@@ -670,17 +671,98 @@ test('a subagent that ended before its parent is amended with the parent’s out
   await endSession($, engine)
   const records = nativeCalls(engine.calls, 'router-observe').flatMap((c: any) => c.payload.records)
   const sub = records.find((r: any) => r.kind === 'task' && r.agent_id === 'agent-1')
-  expect(sub.outcome).toBe('unknown')
+  expect(sub.outcome).toBe('answered')
   const outcomes = records.filter((r: any) => r.kind === 'task_outcome')
   expect(outcomes.map((r: any) => [r.task_id, r.agent_id, r.outcome])).toEqual([[sub.task_id, 'agent-1', 'completed_verified']])
   expect(records.indexOf(outcomes[0])).toBeGreaterThan(records.indexOf(sub))
+})
+
+test('a question task with no edit is recorded answered', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'what does this function do?')
+  await toolCall($, engine, bash('grep -rn foo src'), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  expect(observed(engine, 'task').map((r: any) => r.outcome)).toEqual(['answered'])
+})
+
+test('a sed -i keeps a task with no recorded edit unknown', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'what does this function do?')
+  await toolCall($, engine, bash("sed -i 's/a/b/' src/a.rs"), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  expect(observed(engine, 'task').map((r: any) => r.outcome)).toEqual(['unknown'])
+})
+
+test('a subagent the router did not create keeps the parent task unknown', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'what does this function do?')
+  await $.agent.spawn({ prompt: 'look around', description: 'look', subagentType: 'pinned-agent' })
+  await endSession($, engine)
+  expect(observed(engine, 'task').find((r: any) => r.agent_id === null).outcome).toBe('unknown')
+})
+
+test('a relais run or replay launched from the task keeps it unknown', () => {
+  const store: any = { router: createRouterMemory() }
+  store.router.task = newTask('t', null, 'what is this?', { kind: 'question', difficulty: 1, scope: 'local', uncertainty: 'low', verifiable: false, confidence: 0.9 } as any, 'research', 0)
+  expect(outcomeOf(store.router.task)).toBe('answered')
+  noteRelaisLaunch(store)
+  expect(store.router.task.maybeWrote).toBe(true)
+  expect(outcomeOf(store.router.task)).toBe('unknown')
+})
+
+test('the run tool launched in a routed session ends the task unknown', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'what does this function do?')
+  const reply = await $.tool.call({ tool: 'mcp__relais__run', task: 'fix-it.json', cwd: '/repo' })
+  expect(reply.result).toContain('Started relais run')
+  await startQueued(engine)
+  engine.stream.push('stdout', JSON.stringify({ relais: 'done', run: 'run-1', outcome: 'blocked' }) + '\n')
+  await settle(engine)
+  await engine.clock.advance(100)
+  await personTurn($, engine, 'and this one?')
+  await settle(engine)
+  expect(observed(engine, 'task').map((r: any) => r.outcome)).toEqual(['unknown'])
+})
+
+test('a run call refused for its workspace leaves the task answered', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'what does this function do?')
+  const reply = await $.tool.call({ tool: 'mcp__relais__run', task: 'fix-it.json', cwd: '/repo', workspace: 'everywhere' })
+  expect(reply.deny).toContain('auto, fork, in-place, isolated')
+  await endSession($, engine)
+  expect(observed(engine, 'task').map((r: any) => r.outcome)).toEqual(['answered'])
+})
+
+test('an answered parent sends no task_outcome', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  await $.agent.spawn({ prompt: 'rename in the module', description: 'rename foo', subagentType: 'general-purpose' })
+  await endSession($, engine)
+  expect(observed(engine, 'task').find((r: any) => r.agent_id === null).outcome).toBe('answered')
+  expect(observed(engine, 'task_outcome')).toEqual([])
+})
+
+test('a relais older than 0.36 gets the v0.35 form: answered is sent as unknown, and the version is asked once', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  engine.version = '0.35.0'
+  await personTurn($, engine, 'what does this function do?')
+  await personTurn($, engine, 'and this one?')
+  await endSession($, engine)
+  const tasks = observed(engine, 'task')
+  expect(tasks.length).toBeGreaterThan(0)
+  expect(tasks.map((r: any) => r.outcome)).toEqual(tasks.map(() => 'unknown'))
+  expect(tasks.every((r: any) => r.completed_at_end !== 'answered')).toBe(true)
+  const asked = engine.calls.run.filter((c: any) => c.argv?.[1] === '--version')
+  expect(asked.length).toBe(1)
 })
 
 test('a parent whose outcome is unknown sends no task_outcome', async ($: any, on: any) => {
   const engine = await routedSession($, on)
   await personTurn($, engine, 'rename foo to bar, tests exist')
   await $.agent.spawn({ prompt: 'rename in the module', description: 'rename foo', subagentType: 'general-purpose' })
+  await toolCall($, engine, bash("sed -i 's/foo/bar/' src/a.rs"), { result: {}, text: 'ok' })
   await endSession($, engine)
+  expect(observed(engine, 'task').find((r: any) => r.agent_id === null).outcome).toBe('unknown')
   expect(observed(engine, 'task_outcome')).toEqual([])
 })
 

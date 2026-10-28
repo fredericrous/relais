@@ -25,7 +25,7 @@ mod learning;
 mod outcomes;
 mod review;
 mod review_parts;
-mod router;
+pub(crate) mod router;
 mod runs;
 mod schema;
 mod sessions;

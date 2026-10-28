@@ -801,6 +801,15 @@ mod tests {
     }
 
     #[test]
+    fn an_answered_task_parses_with_rank_zero() {
+        let mut batch_json: serde_json::Value = serde_json::from_str(&sample_batch("s1")).unwrap();
+        batch_json["records"][3]["outcome"] = serde_json::json!("answered");
+        let batch = parse_batch(&batch_json.to_string()).unwrap();
+        assert!(matches!(&batch.records[3], RouterRecord::Task(t)
+            if t.outcome == "answered" && t.outcome_rank == 0));
+    }
+
+    #[test]
     fn the_new_fields_and_the_task_outcome_record_parse() {
         let mut value: serde_json::Value = serde_json::from_str(&sample_batch("s1")).unwrap();
         value["records"][0]["table_version"] = serde_json::json!(2);
