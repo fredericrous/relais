@@ -286,7 +286,10 @@ pub(in crate::runner) fn fit_statements(
         GuidanceSource::Reviewer | GuidanceSource::Decisions | GuidanceSource::Candidates => {
             "reviewer"
         }
-        GuidanceSource::Index | GuidanceSource::CodeRules | GuidanceSource::Relevant => "worker",
+        GuidanceSource::Index
+        | GuidanceSource::CodeRules
+        | GuidanceSource::Relevant
+        | GuidanceSource::RelevantPartial => "worker",
     };
     let gap = GuidanceGap::new(
         source,

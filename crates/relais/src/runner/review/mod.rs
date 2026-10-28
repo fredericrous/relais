@@ -596,9 +596,8 @@ pub(in crate::runner) fn reviewer_decisions(
     if changed_files.is_empty() {
         return (String::new(), None);
     }
-    // The choice aval ranks beside each key is `aval resolve` on that key at
-    // the default scope. holds-until: relais resolves keys by scope; then a
-    // scoped decision is carried with its scope (follow-up in the plan).
+    // The choice aval ranks beside each key is the answer at the repository's
+    // declared `in_scopes` (aval 1.11.0, ADR-0046); the row names the scope.
     let ranked = match resolver.decisions_for(changed_files) {
         Ok(ranked) => ranked,
         Err(gap) => return (decisions_gap_line(&gap), Some(gap)),
@@ -609,9 +608,13 @@ pub(in crate::runner) fn reviewer_decisions(
         .map(|key| {
             let choice = key.choice.as_deref().unwrap_or("(choice unavailable)");
             let record = key.adr.as_deref().unwrap_or("no record");
+            let origin = match key.scope.as_deref() {
+                Some(scope) => format!("{record}, {scope}"),
+                None => record.to_string(),
+            };
             RenderedRule {
                 id: key.key.clone(),
-                text: format!("`{}` ({record}): {choice}", key.key),
+                text: format!("`{}` ({origin}): {choice}", key.key),
             }
         })
         .collect();

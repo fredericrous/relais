@@ -641,13 +641,18 @@ impl<'a> RunEngine<'a> {
                 )?;
                 Ok(Phase::Ready((manifest, holdouts)))
             }
-            Err(ContextError::ContradictionBlocked { key, heads }) => {
-                Ok(Phase::Ended(self.block(
-                    Reason::ArchitectureContradiction,
-                    BlockCode::ArchitectureContradiction,
-                    format!("aval contradiction on `{key}` ({heads} heads)"),
-                )?))
-            }
+            Err(ContextError::ContradictionBlocked {
+                key,
+                heads,
+                by_scope,
+            }) => Ok(Phase::Ended(self.block(
+                Reason::ArchitectureContradiction,
+                BlockCode::ArchitectureContradiction,
+                format!(
+                    "aval contradiction on `{key}` ({})",
+                    context::contradiction_detail(&heads, &by_scope)
+                ),
+            )?)),
             Err(ContextError::NeedsDecision { key, verdict }) => {
                 let detail = format!("the task depends on `{key}` but aval answers {verdict:?}");
                 Ok(Phase::Ended(self.finish(
