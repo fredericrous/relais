@@ -1068,13 +1068,15 @@ fn accept_integrated(
                 &|engine| {
                     integrated_receipt(
                         engine,
-                        root,
-                        &assembled,
-                        assembly,
-                        &spend,
-                        &verification_inputs_changed,
-                        State::NeedsDecision,
-                        review.clone(),
+                        IntegratedReceiptInput {
+                            root,
+                            assembled: &assembled,
+                            assembly,
+                            spend: &spend,
+                            verification_inputs_changed: &verification_inputs_changed,
+                            outcome: State::NeedsDecision,
+                            review: review.clone(),
+                        },
                     )
                 },
                 Reason::ReviewOverBudget,
@@ -1120,14 +1122,16 @@ fn accept_integrated(
                     &|engine| {
                         integrated_receipt(
                             engine,
-                            root,
-                            &assembled,
-                            assembly,
-                            &spend,
-                            &verification_inputs_changed,
-                            State::NeedsDecision,
-                            verify::ReviewRecord::Unavailable {
-                                detail: detail.clone(),
+                            IntegratedReceiptInput {
+                                root,
+                                assembled: &assembled,
+                                assembly,
+                                spend: &spend,
+                                verification_inputs_changed: &verification_inputs_changed,
+                                outcome: State::NeedsDecision,
+                                review: verify::ReviewRecord::Unavailable {
+                                    detail: detail.clone(),
+                                },
                             },
                         )
                     },
@@ -1148,13 +1152,15 @@ fn accept_integrated(
     let review = super::review_record_of(ledger, &engine.run_id)?;
     let receipt = integrated_receipt(
         engine,
-        root,
-        &assembled,
-        assembly,
-        &spend,
-        &verification_inputs_changed,
-        State::Accepted,
-        review,
+        IntegratedReceiptInput {
+            root,
+            assembled: &assembled,
+            assembly,
+            spend: &spend,
+            verification_inputs_changed: &verification_inputs_changed,
+            outcome: State::Accepted,
+            review,
+        },
     )?;
     engine.seal(&receipt, None, None, &head)?;
     // The assembled revision is named under this run so the retirement
@@ -1176,20 +1182,29 @@ fn accept_integrated(
 /// The root's receipt for an assembled candidate that passed its checks,
 /// `outcome` named by the caller (`accepted`, or `needs_decision` for the
 /// snapshot a run keeps when it stops for a review it could not have).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "an existing arity, kept until these parameters are grouped into a struct"
-)]
-fn integrated_receipt(
-    engine: &RunEngine<'_>,
-    root: &RootContext<'_>,
-    assembled: &Assembled,
-    assembly: &Assembly,
-    spend: &crate::runner::RunSpend,
-    verification_inputs_changed: &[String],
+struct IntegratedReceiptInput<'a> {
+    root: &'a RootContext<'a>,
+    assembled: &'a Assembled,
+    assembly: &'a Assembly,
+    spend: &'a crate::runner::RunSpend,
+    verification_inputs_changed: &'a [String],
     outcome: State,
     review: verify::ReviewRecord,
+}
+
+fn integrated_receipt(
+    engine: &RunEngine<'_>,
+    input: IntegratedReceiptInput<'_>,
 ) -> Result<Receipt, RunError> {
+    let IntegratedReceiptInput {
+        root,
+        assembled,
+        assembly,
+        spend,
+        verification_inputs_changed,
+        outcome,
+        review,
+    } = input;
     let ledger = engine.config.ledger;
     let head = assembly.head.clone();
     let report = VerificationReport {
