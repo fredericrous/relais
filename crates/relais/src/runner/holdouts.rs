@@ -322,16 +322,16 @@ impl<'a> RunEngine<'a> {
         let silent = Events::silent();
         let check = self
             .while_watching_cancel(|cancel| {
-                verify::run_observed_within(
-                    copy,
+                verify::run_observed_within(verify::ObservedRun {
+                    dir: copy,
                     spec,
-                    &logs,
-                    &verify::check_label(spec),
-                    &format!("{prefix}-run"),
-                    &silent,
+                    logs_dir: &logs,
+                    label: &verify::check_label(spec),
+                    log_stem: &format!("{prefix}-run"),
+                    events: &silent,
                     cancel,
-                    &self.heavy(),
-                )
+                    admission: &self.heavy(),
+                })
             })
             .map_err(VerifyFailure::from)?;
         let mut run = HoldoutRun::settled(&holdout.name, &holdout.sha, &holdout.digest, &check);

@@ -1121,7 +1121,7 @@ pub fn run_observed(
     events: &Events,
     cancel: Option<&AtomicBool>,
 ) -> Result<CheckOutcome, VerifyError> {
-    run_observed_within(
+    run_observed_within(ObservedRun {
         dir,
         spec,
         logs_dir,
@@ -1129,8 +1129,22 @@ pub fn run_observed(
         log_stem,
         events,
         cancel,
-        &HeavyAdmission::unmanaged(),
-    )
+        admission: &HeavyAdmission::unmanaged(),
+    })
+}
+
+/// The inputs of one observed run of one command, grouped for
+/// [`run_observed_within`].
+#[derive(Clone, Copy)]
+pub struct ObservedRun<'a> {
+    pub dir: &'a Path,
+    pub spec: &'a CommandSpec,
+    pub logs_dir: &'a Path,
+    pub label: &'a str,
+    pub log_stem: &'a str,
+    pub events: &'a Events,
+    pub cancel: Option<&'a AtomicBool>,
+    pub admission: &'a HeavyAdmission<'a>,
 }
 
 /// [`run_observed`] under a run's budgets and heavy lease (ADR-0010,
@@ -1143,20 +1157,17 @@ pub fn run_observed(
 /// own log (`<stem>.log`, `<stem>-retry1.log`); a failure that shows
 /// resource exhaustion, and a cancellation, are never retried. A
 /// fail-then-pass is a pass marked `flaky`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "an existing arity, kept until these parameters are grouped into a struct"
-)]
-pub fn run_observed_within(
-    dir: &Path,
-    spec: &CommandSpec,
-    logs_dir: &Path,
-    label: &str,
-    log_stem: &str,
-    events: &Events,
-    cancel: Option<&AtomicBool>,
-    admission: &HeavyAdmission<'_>,
-) -> Result<CheckOutcome, VerifyError> {
+pub fn run_observed_within(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
+    let ObservedRun {
+        dir,
+        spec,
+        logs_dir,
+        label,
+        log_stem,
+        events,
+        cancel,
+        admission,
+    } = run;
     let mut outcome = run_attempt(
         dir, spec, logs_dir, label, log_stem, events, cancel, admission,
     )?;
@@ -1588,9 +1599,16 @@ pub fn run_profile_within(
     for (index, command) in profile.commands.iter().enumerate() {
         let label = check_label(command);
         let log_stem = format!("{prefix}-cmd{index}");
-        outcomes.push(run_observed_within(
-            dir, command, logs_dir, &label, &log_stem, events, cancel, admission,
-        )?);
+        outcomes.push(run_observed_within(ObservedRun {
+            dir,
+            spec: command,
+            logs_dir,
+            label: &label,
+            log_stem: &log_stem,
+            events,
+            cancel,
+            admission,
+        })?);
     }
     Ok(outcomes)
 }
@@ -1696,9 +1714,16 @@ pub fn run_setup_gated_within(
         }
         let label = setup_label(command);
         let log_stem = format!("{prefix}-setup{index}");
-        let outcome = run_observed_within(
-            dir, command, logs_dir, &label, &log_stem, events, cancel, admission,
-        )?;
+        let outcome = run_observed_within(ObservedRun {
+            dir,
+            spec: command,
+            logs_dir,
+            label: &label,
+            log_stem: &log_stem,
+            events,
+            cancel,
+            admission,
+        })?;
         let failed = outcome.failed();
         gate.ran(index, command, !failed);
         outcomes.push(outcome);
@@ -3453,16 +3478,16 @@ mod tests {
             exhausted: |ended, tail| crate::exhaustion::classify(ended, tail).is_some(),
             ..HeavyAdmission::unmanaged()
         };
-        let outcome = run_observed_within(
-            &dir,
-            &retrying(&script),
-            &dir.join("logs"),
-            "c",
-            "s",
-            &Events::silent(),
-            None,
-            &admission,
-        )
+        let outcome = run_observed_within(ObservedRun {
+            dir: &dir,
+            spec: &retrying(&script),
+            logs_dir: &dir.join("logs"),
+            label: "c",
+            log_stem: "s",
+            events: &Events::silent(),
+            cancel: None,
+            admission: &admission,
+        })
         .expect("runs");
         assert!(outcome.failed());
         assert_eq!(runs_of(&dir), 1);
@@ -3538,19 +3563,19 @@ mod tests {
         );
         budgets.begin_work();
         let started = std::time::Instant::now();
-        let clipped = run_observed_within(
-            &dir,
-            &command(&["sh", "-c", "sleep 20"], 30),
-            &logs,
-            "cmd0",
-            "x-cmd0",
-            &Events::silent(),
-            None,
-            &HeavyAdmission {
+        let clipped = run_observed_within(ObservedRun {
+            dir: &dir,
+            spec: &command(&["sh", "-c", "sleep 20"], 30),
+            logs_dir: &logs,
+            label: "cmd0",
+            log_stem: "x-cmd0",
+            events: &Events::silent(),
+            cancel: None,
+            admission: &HeavyAdmission {
                 budgets: budgets.clone(),
                 ..HeavyAdmission::unmanaged()
             },
-        )
+        })
         .expect("run");
         assert_eq!(clipped.ended, Ended::TimedOut);
         assert!(
@@ -3572,19 +3597,19 @@ mod tests {
             BudgetLimits::resolve(600, 60, 60, Some(2), 0),
         );
         let started = std::time::Instant::now();
-        let clipped = run_observed_within(
-            &dir,
-            &command(&["sh", "-c", "sleep 20"], 30),
-            &logs,
-            "cmd0",
-            "x-cmd0",
-            &Events::silent(),
-            None,
-            &HeavyAdmission {
+        let clipped = run_observed_within(ObservedRun {
+            dir: &dir,
+            spec: &command(&["sh", "-c", "sleep 20"], 30),
+            logs_dir: &logs,
+            label: "cmd0",
+            log_stem: "x-cmd0",
+            events: &Events::silent(),
+            cancel: None,
+            admission: &HeavyAdmission {
                 budgets: budgets.clone(),
                 ..HeavyAdmission::unmanaged()
             },
-        )
+        })
         .expect("run");
         assert_eq!(clipped.ended, Ended::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(10));
