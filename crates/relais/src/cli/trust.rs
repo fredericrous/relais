@@ -110,16 +110,16 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
             // said, not turned into a failed grant: the grant stands
             // either way.
             if granted == relais::trust::Granted::Written {
-                if let Err(e) = record_grant(
-                    &shown,
-                    &recorded_key,
-                    &repo_key,
-                    &identity,
-                    &reviewed_by,
+                if let Err(e) = record_grant(&GrantRecord {
+                    shown: &shown,
+                    key: &recorded_key,
+                    repo_key: &repo_key,
+                    identity: &identity,
+                    reviewed_by: &reviewed_by,
                     source,
                     scope,
-                    &policy,
-                ) {
+                    policy: &policy,
+                }) {
                     eprintln!(
                         "relais trust grant: warning: the grant is in machine.toml, but the ledger \
                          did not record it ({e}); the next question will not mark what changed"
@@ -187,20 +187,28 @@ pub(crate) fn previous_grant_steps(repo_key: &str) -> Option<Vec<relais::trust::
 
 /// The ledger row of a grant just written: who, from where, and the steps
 /// it authorized.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "an existing arity, kept until these parameters are grouped into a struct"
-)]
-pub(crate) fn record_grant(
-    shown: &relais::trust::Shown,
-    key: &str,
-    repo_key: &str,
-    identity: &RepoIdentity,
-    reviewed_by: &str,
-    source: GrantSource,
-    scope: GrantScope,
-    policy: &RepoPolicy,
-) -> Result<(), CliError> {
+pub(crate) struct GrantRecord<'a> {
+    pub(crate) shown: &'a relais::trust::Shown,
+    pub(crate) key: &'a str,
+    pub(crate) repo_key: &'a str,
+    pub(crate) identity: &'a RepoIdentity,
+    pub(crate) reviewed_by: &'a str,
+    pub(crate) source: GrantSource,
+    pub(crate) scope: GrantScope,
+    pub(crate) policy: &'a RepoPolicy,
+}
+
+pub(crate) fn record_grant(grant: &GrantRecord<'_>) -> Result<(), CliError> {
+    let GrantRecord {
+        shown,
+        key,
+        repo_key,
+        identity,
+        reviewed_by,
+        source,
+        scope,
+        policy,
+    } = *grant;
     let steps = operational(
         serde_json::to_string(&shown.declaration.steps),
         "rendering the granted steps",
