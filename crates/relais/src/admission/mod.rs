@@ -1184,7 +1184,15 @@ pub struct AdmissionState {
     /// The disk floor in bytes (zero: none) and how space is measured.
     disk_floor: u64,
     disk_probe: std::sync::Arc<dyn crate::disk::DiskProbe>,
+    /// The last measurement of each path (`None`: it could not be
+    /// measured) and when it was taken, so the queue is not re-measured
+    /// on every poll. See `volumes_for`.
+    disk_measured: BTreeMap<String, (Option<crate::disk::Volume>, Instant)>,
 }
+
+/// How long a measurement of a path's volume is reused before the disk is
+/// asked again.
+pub const DISK_PROBE_TTL: Duration = Duration::from_secs(1);
 
 /// Default duration a hook-admitted agent's lease is held before it
 /// lapses, absent an operator override — this module does not import
@@ -1226,6 +1234,7 @@ impl AdmissionState {
             group_probe: crate::procs::group_alive,
             disk_floor: 0,
             disk_probe: std::sync::Arc::new(crate::disk::StatvfsProbe),
+            disk_measured: BTreeMap::new(),
         }
     }
 
@@ -1235,17 +1244,58 @@ impl AdmissionState {
     pub fn set_disk(&mut self, floor: u64, probe: std::sync::Arc<dyn crate::disk::DiskProbe>) {
         self.disk_floor = floor;
         self.disk_probe = probe;
+        self.disk_measured.clear();
+    }
+
+    /// The volumes of `paths`, one per device in the order first met, as
+    /// `crate::disk::volumes` returns them, but a path measured less than
+    /// `DISK_PROBE_TTL` before `now` is not measured again. Probing a path
+    /// first drops every entry older than the TTL, which bounds the cache
+    /// to the paths asked about within it.
+    fn volumes_for(&mut self, paths: &[String], now: Instant) -> Vec<crate::disk::Volume> {
+        let fresh =
+            |measured_at: Instant| now.saturating_duration_since(measured_at) < DISK_PROBE_TTL;
+        let mut found: Vec<crate::disk::Volume> = Vec::new();
+        for path in paths {
+            let cached = self
+                .disk_measured
+                .get(path)
+                .filter(|(_, measured_at)| fresh(*measured_at))
+                .map(|(volume, _)| volume.clone());
+            let volume = match cached {
+                Some(volume) => volume,
+                None => {
+                    self.disk_measured
+                        .retain(|_, (_, measured_at)| fresh(*measured_at));
+                    let volume = self.disk_probe.volume_of(std::path::Path::new(path));
+                    self.disk_measured
+                        .insert(path.clone(), (volume.clone(), now));
+                    volume
+                }
+            };
+            if let Some(volume) = volume {
+                if !found.iter().any(|seen| seen.id == volume.id) {
+                    found.push(volume);
+                }
+            }
+        }
+        found
     }
 
     /// Why the disk holds this request, if it does: a volume it writes
     /// where what is available, less the estimates of the leases running
-    /// there, would not stay above the floor plus its own estimate.
-    fn disk_hold(&self, request: &DispatchRequest) -> Option<crate::disk::Shortfall> {
+    /// there, would not stay above the floor plus its own estimate. Each
+    /// path's volume is measured at most once a second.
+    fn disk_hold(
+        &mut self,
+        request: &DispatchRequest,
+        now: Instant,
+    ) -> Option<crate::disk::Shortfall> {
         let ask = request.disk.as_ref()?;
         if self.disk_floor == 0 {
             return None;
         }
-        let volumes = crate::disk::volumes(self.disk_probe.as_ref(), &ask.paths);
+        let volumes = self.volumes_for(&ask.paths, now);
         crate::disk::shortfall(
             &volumes,
             |id| self.reserved_on(id),
@@ -1267,7 +1317,7 @@ impl AdmissionState {
 
     /// What a queued or held request is told: the disk when tokens are
     /// free and the disk is what holds it, else its place in the queue.
-    fn waiting(&self, request: &DispatchRequest, position: usize) -> Decision {
+    fn waiting(&mut self, request: &DispatchRequest, position: usize, now: Instant) -> Decision {
         let tokens_free = self
             .group_cap(request.resource.cap_group())
             .is_none_or(|cap| {
@@ -1275,7 +1325,7 @@ impl AdmissionState {
                     .saturating_add(request.weight.max(1))
                     <= cap
             });
-        match self.disk_hold(request) {
+        match self.disk_hold(request, now) {
             Some(short) if tokens_free => Decision::WaitingForDisk {
                 volume: short.volume,
                 available: short.available,
@@ -1458,13 +1508,13 @@ impl AdmissionState {
                 .position(|queued| queued.request.dispatch_id == request.dispatch_id)
                 .unwrap_or(position)
                 + 1;
-            return self.waiting(request, position);
+            return self.waiting(request, position, now);
         }
         if let Some(refusal) = self.check_hard_limits(request) {
             return refusal;
         }
         self.register_session(&request.session_id);
-        if self.admissible(request) {
+        if self.admissible(request, now) {
             self.admit(
                 request.clone(),
                 now,
@@ -1478,7 +1528,7 @@ impl AdmissionState {
             request: request.clone(),
             enqueued_at: now,
         });
-        self.waiting(request, self.queue.len())
+        self.waiting(request, self.queue.len(), now)
     }
 
     /// Ask for the Training lease WITHOUT queueing (SPEC §17): granted, or
@@ -1529,7 +1579,7 @@ impl AdmissionState {
         }
         self.release_dead_training_holders(now, alive);
         self.register_session(&request.session_id);
-        if !self.admissible(&request) {
+        if !self.admissible(&request, now) {
             return TrainingDecision::Busy {
                 holder: self.training_holder(),
             };
@@ -1804,7 +1854,7 @@ impl AdmissionState {
     }
 
     /// Capacity caps only; hard limits were checked before queueing.
-    fn admissible(&self, request: &DispatchRequest) -> bool {
+    fn admissible(&mut self, request: &DispatchRequest, now: Instant) -> bool {
         let group = request.resource.cap_group();
         if self.group_cap(group).is_some_and(|cap| {
             self.active_count(group, None)
@@ -1813,7 +1863,7 @@ impl AdmissionState {
         }) {
             return false;
         }
-        if self.disk_hold(request).is_some() {
+        if self.disk_hold(request, now).is_some() {
             return false;
         }
         if group == CapGroup::Remote {
@@ -1843,7 +1893,8 @@ impl AdmissionState {
         let depth = self.effective_depth(&request);
         let disk = request.disk.as_ref().map(|ask| DiskHold {
             estimate: ask.estimate_bytes,
-            volumes: crate::disk::volumes(self.disk_probe.as_ref(), &ask.paths)
+            volumes: self
+                .volumes_for(&ask.paths, now)
                 .iter()
                 .map(|volume| volume.id)
                 .collect(),
@@ -1913,20 +1964,25 @@ impl AdmissionState {
     /// over-admit.
     fn drain(&mut self, now: Instant) {
         loop {
-            let mut candidates: Vec<(bool, Option<Instant>, Instant, usize)> = self
-                .queue
+            // The queue is set aside while it is judged: judging a request
+            // may measure the disk, which needs `&mut self`.
+            let queue = std::mem::take(&mut self.queue);
+            let mut candidates: Vec<(bool, Option<Instant>, Instant, usize)> = queue
                 .iter()
                 .enumerate()
-                .filter(|(_, queued)| self.admissible(&queued.request))
-                .map(|(index, queued)| {
+                .filter_map(|(index, queued)| {
+                    if !self.admissible(&queued.request, now) {
+                        return None;
+                    }
                     let aged = now.saturating_duration_since(queued.enqueued_at) >= AGING_AFTER;
                     let last_served = self
                         .sessions
                         .get(&queued.request.session_id)
                         .and_then(|session| session.last_served);
-                    (!aged, last_served, queued.enqueued_at, index)
+                    Some((!aged, last_served, queued.enqueued_at, index))
                 })
                 .collect();
+            self.queue = queue;
             if candidates.is_empty() {
                 return;
             }
@@ -3828,6 +3884,102 @@ mod tests {
             depth,
             ..req(dispatch, run, session)
         }
+    }
+
+    /// A disk that reports one volume per path and counts how often it is asked.
+    #[derive(Debug)]
+    struct CountingDisk {
+        available: std::sync::atomic::AtomicU64,
+        probes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::disk::DiskProbe for CountingDisk {
+        fn volume_of(&self, path: &std::path::Path) -> Option<crate::disk::Volume> {
+            use std::sync::atomic::Ordering;
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            Some(crate::disk::Volume {
+                id: path.as_os_str().len() as u64,
+                mount: path.display().to_string(),
+                available: self.available.load(Ordering::SeqCst),
+            })
+        }
+    }
+
+    fn heavy_on_disk(dispatch: &str, run: &str, session: &str) -> DispatchRequest {
+        DispatchRequest {
+            disk: Some(crate::disk::DiskAsk {
+                estimate_bytes: 10,
+                paths: vec!["/a".into(), "/bb".into()],
+            }),
+            resource: ResourceClass::HeavyLocal,
+            ..req(dispatch, run, session)
+        }
+    }
+
+    fn disk_state(disk: &std::sync::Arc<CountingDisk>) -> AdmissionState {
+        let mut state = state();
+        state.limits.max_heavy_commands = Some(8);
+        state.set_disk(
+            100,
+            std::sync::Arc::clone(disk) as std::sync::Arc<dyn crate::disk::DiskProbe>,
+        );
+        state
+    }
+
+    #[test]
+    fn queued_polls_within_the_ttl_probe_each_path_once() {
+        use std::sync::atomic::Ordering;
+        let disk = std::sync::Arc::new(CountingDisk {
+            available: 50.into(),
+            probes: 0.into(),
+        });
+        let mut state = disk_state(&disk);
+        let t0 = Instant::now();
+        let queued: Vec<_> = (0..5)
+            .map(|n| heavy_on_disk(&format!("h{n}"), "run-a", "tab-a"))
+            .collect();
+        for request in &queued {
+            assert!(matches!(
+                state.request(request, t0),
+                Decision::WaitingForDisk { .. }
+            ));
+        }
+        for request in &queued {
+            let polled = t0 + Duration::from_millis(500);
+            assert!(matches!(
+                state.request(request, polled),
+                Decision::WaitingForDisk { .. }
+            ));
+        }
+        // Two distinct paths, measured once for t0; the polls at +500 ms
+        // reuse them.
+        assert_eq!(disk.probes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_poll_after_the_ttl_probes_again_and_sees_the_raised_space() {
+        use std::sync::atomic::Ordering;
+        let disk = std::sync::Arc::new(CountingDisk {
+            available: 50.into(),
+            probes: 0.into(),
+        });
+        let mut state = disk_state(&disk);
+        let t0 = Instant::now();
+        let request = heavy_on_disk("h0", "run-a", "tab-a");
+        assert!(matches!(
+            state.request(&request, t0),
+            Decision::WaitingForDisk { .. }
+        ));
+        disk.available.store(1_000, Ordering::SeqCst);
+        let early = t0 + DISK_PROBE_TTL / 2;
+        assert!(matches!(
+            state.request(&request, early),
+            Decision::WaitingForDisk { .. }
+        ));
+        let later = t0 + DISK_PROBE_TTL;
+        assert!(granted(state.request(&request, later)));
+        assert_eq!(disk.probes.load(Ordering::SeqCst), 4);
+        assert!(state.disk_measured.len() <= 2);
     }
 
     fn granted(decision: Decision) -> bool {

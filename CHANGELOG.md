@@ -6,6 +6,10 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
+- The coordinator measures the disk at most once a second per path (relais#284). Polling a queue held back by the disk floor used to probe every queued request's paths on every poll, under the admission lock; a measurement is now reused for one second, so the cost of a poll no longer grows with the queue. A raised `available` is seen within a second.
+
 ## v0.35.1
 
 - Scoped decisions reach the agents (decisions ADR-0046, aval 1.11.0). A repository that declares `in_scopes` gets its stack decisions from aval by default; the reviewer's decisions block now names the scope that answered (`key (record, scope): choice`), and worker lines do too. A cross-scope contradiction keeps its head ADR ids and the scopes that disagree, so the blocked message names each scope and ADR instead of a count.
