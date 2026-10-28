@@ -186,8 +186,8 @@ These are the first 78 runs after installing v0.34.0 (2026-10-27 02:05), with 60
 | same, p90 | 232 s | 523 s |
 | `verification_setup_gap` per verification start | — | 1 of 60 |
 
-- **The p90 tail.** It is one yarn monorepo with 18 dependency directories: clones and setup steps that take minutes, with heavy-slot queueing between them, and no quiet wait.
-- **The one gap is not seed-related.** In `run-65ed50a8d67b8-940c`, the run was suspended for about 15 hours in the middle of a setup step, which left the next step a 48 s timeout. The same step had passed on the same seed in attempt 1.
+- **The p90 tail is queueing for a heavy verification slot**, not seeding. 15 of the 55 starts logged `waiting_for_slot`, behind other runs on a machine with a load average of about 190. Without that queueing, the interval is median 2.6 s and p90 31.8 s. A yarn monorepo with 18 dependency directories accounts for 5 of the 55 starts; without it, the p90 is still 451 s, so that repository is not the cause.
+- **The one gap is not seed-related.** In `run-65ed50a8d67b8-940c`, the run was suspended for about 15 hours in the middle of a setup step, which left the next step a 48 s timeout. The same step had passed twice earlier in this run (156 s and 50 s).
 - **The rollback was not triggered.** The relais#304 closing comment has the full figures.
 
 
