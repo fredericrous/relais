@@ -6,6 +6,11 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.35.1
+
+- Scoped decisions reach the agents (decisions ADR-0046, aval 1.11.0). A repository that declares `in_scopes` gets its stack decisions from aval by default; the reviewer's decisions block now names the scope that answered (`key (record, scope): choice`), and worker lines do too. A cross-scope contradiction keeps its head ADR ids and the scopes that disagree, so the blocked message names each scope and ADR instead of a count.
+- The worker's ranked decisions are trimmed whole entries at a time when they pass the 16 KiB guidance budget, rules before keys, named in a `relevant partial` gap. Before, the whole block was dropped once it passed the budget, which `aval relevant --top 20` made common, so a worker could get no decisions at all.
+
 ## v0.35.0
 
 - Holdouts are counted (ADR-0045, phase 4). Each holdout a verification runs is recorded with whether the profile's checks were green on that candidate, and when a run ends relais scans the transcript of each of its agent dispatches for tool calls that named a holdout location (the store, the holdouts state directory, machine.toml, an overlay path, a config path), storing the marker's name only. A transcript that cannot be read is no exposure and is a run event, `holdout_exposure_unread`. `relais report` and `relais report --json` (schema 14) gain `holdouts`: `holdout_runs`, `holdout_catches` (runs where a holdout failed while the profile checks passed) and `holdout_exposures` (runs where a worker named a holdout location, with a count per marker). The ledger moves to schema v44 (the `holdout_outcomes` and `holdout_exposures` tables, expand-only); a relais from before schema 44 cannot read the upgraded ledger, so before upgrading stop the coordinator and copy the ledger with `sqlite3 <state>/ledger.sqlite ".backup <file>"`.
