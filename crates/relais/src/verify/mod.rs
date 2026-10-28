@@ -1159,34 +1159,25 @@ pub struct ObservedRun<'a> {
 /// fail-then-pass is a pass marked `flaky`.
 pub fn run_observed_within(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
     let ObservedRun {
-        dir,
         spec,
-        logs_dir,
         label,
         log_stem,
         events,
-        cancel,
         admission,
+        ..
     } = run;
-    let mut outcome = run_attempt(
-        dir, spec, logs_dir, label, log_stem, events, cancel, admission,
-    )?;
+    let mut outcome = run_attempt(run)?;
     let mut attempts = Vec::new();
     for number in 1..=spec.retry.unwrap_or(0) {
         if !retryable(&outcome, admission) {
             break;
         }
         attempts.push(outcome.attempt());
-        outcome = run_attempt(
-            dir,
-            spec,
-            logs_dir,
-            label,
-            &format!("{log_stem}-retry{number}"),
-            events,
-            cancel,
-            admission,
-        )?;
+        let retry_stem = format!("{log_stem}-retry{number}");
+        outcome = run_attempt(ObservedRun {
+            log_stem: &retry_stem,
+            ..run
+        })?;
     }
     if !attempts.is_empty() {
         attempts.push(outcome.attempt());
@@ -1216,20 +1207,17 @@ fn retryable(outcome: &CheckOutcome, admission: &HeavyAdmission<'_>) -> bool {
 }
 
 /// One run of one command: the body of [`run_observed_within`].
-#[expect(
-    clippy::too_many_arguments,
-    reason = "an existing arity, kept until these parameters are grouped into a struct"
-)]
-fn run_attempt(
-    dir: &Path,
-    spec: &CommandSpec,
-    logs_dir: &Path,
-    label: &str,
-    log_stem: &str,
-    events: &Events,
-    cancel: Option<&AtomicBool>,
-    admission: &HeavyAdmission<'_>,
-) -> Result<CheckOutcome, VerifyError> {
+fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
+    let ObservedRun {
+        dir,
+        spec,
+        logs_dir,
+        label,
+        log_stem,
+        events,
+        cancel,
+        admission,
+    } = run;
     let own_timeout = command_timeout(spec)?;
     std::fs::create_dir_all(logs_dir)?;
     // A cancelled queue wait runs nothing; every other refusal is the
