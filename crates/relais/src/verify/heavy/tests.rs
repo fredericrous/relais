@@ -844,6 +844,13 @@ fn an_ancestor_that_holds_host_slots_is_not_queued_behind_and_the_fact_is_passed
     assert_eq!(log.trim(), "slot=held", "the check sees the variable");
 }
 
+/// `.cargo/config.toml` reaches the tests: without it, every test that
+/// builds a runner with default settings would queue on the real host slots.
+#[test]
+fn cargo_pins_the_host_slot_for_tests() {
+    assert_eq!(std::env::var(HOST_SLOT_ENV).as_deref(), Ok("held"));
+}
+
 #[cfg(unix)]
 mod host_slots {
     use super::*;
@@ -901,7 +908,7 @@ mod host_slots {
             & 0o777;
         assert_eq!(mode, 0o700);
         drop(lease);
-        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&scratch).ok(); // best-effort: a scratch dir
     }
 
     /// A directory another user could have made (0755) is refused by the
@@ -932,7 +939,7 @@ mod host_slots {
             1,
             "said once, however often it is asked: {written}"
         );
-        std::fs::remove_dir_all(&open).ok();
+        std::fs::remove_dir_all(&open).ok(); // best-effort: a scratch dir
     }
 
     #[test]
@@ -962,7 +969,7 @@ mod host_slots {
                 .admit(&ask(&BTreeMap::new(), 2))
                 .expect("no token was kept"),
         );
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort: a scratch dir
     }
 
     /// An older relais counted the `slot-*` files of the directory to size
@@ -982,7 +989,7 @@ mod host_slots {
             .count();
         assert_eq!(counted, 1, "one slot, one file");
         drop(held);
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort: a scratch dir
     }
 
     #[test]
@@ -1001,22 +1008,29 @@ mod host_slots {
             Events::for_run_on("run-s", &dir, crate::protocol::Wire::to(std::io::sink()));
         with_slots.announce_every = Duration::from_millis(1);
         with_slots.poll = Duration::from_millis(5);
-        // The other holder lets go during the third wait; the order of
-        // what the gate saw proves the check did not run before that.
+        // The other holder lets go once a wait has named it (or after 200
+        // waits): a process another test forks holds copies of every
+        // descriptor until its exec, so a few polls can find the admission
+        // lock busy, which answers with no holder. The order of what the
+        // gate saw proves the check did not run before the release.
         let order = Arc::new(Mutex::new(Vec::<String>::new()));
         let noted = Arc::clone(&order);
         let release = Arc::clone(&held);
+        let events_file = dir.join("events.jsonl");
         with_slots.sleeper = Advancing::then(&clock, move |number| {
             noted
                 .lock()
                 .expect("order")
                 .push(format!("waited {number}"));
-            if number == 3 {
+            let named = std::fs::read_to_string(&events_file)
+                .is_ok_and(|text| text.contains("other: xcodebuild"));
+            let mut held = release.lock().expect("held");
+            if held.is_some() && (named || number >= 200) {
                 noted
                     .lock()
                     .expect("order")
                     .push("other holder let go".into());
-                release.lock().expect("held").take();
+                held.take();
             }
         });
         let outcome = run_observed_within(ObservedRun {
@@ -1034,10 +1048,14 @@ mod host_slots {
         let log = std::fs::read_to_string(outcome.log_path).expect("log");
         assert_eq!(log.trim(), "slot=held");
         let order = order.lock().expect("order");
-        assert_eq!(
-            order[..4],
-            ["waited 1", "waited 2", "waited 3", "other holder let go"],
-            "{order:?}"
+        let let_go = order
+            .iter()
+            .position(|e| e == "other holder let go")
+            .expect("the other holder let go");
+        assert!(let_go >= 1, "at least one wait came first: {order:?}");
+        assert!(
+            order[..let_go].iter().all(|e| e.starts_with("waited ")),
+            "nothing ran before the release: {order:?}"
         );
         assert_eq!(order.last().map(String::as_str), Some("check finished"));
         // While it waited for the slot it held its token and said so.
@@ -1049,7 +1067,7 @@ mod host_slots {
             written.contains("\"behind\":\"other: xcodebuild"),
             "{written}"
         );
-        std::fs::remove_dir_all(&slots_dir).ok();
+        std::fs::remove_dir_all(&slots_dir).ok(); // best-effort: a scratch dir
     }
 }
 

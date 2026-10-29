@@ -60,7 +60,7 @@ pub const ANNOUNCE_EVERY: Duration = Duration::from_secs(30);
 
 /// The environment variable a held host slot exports, so an amont started
 /// inside the check does not queue again (amont ADR-0009).
-pub const HOST_SLOT_ENV: &str = "AMONT_HOST_SLOT";
+pub const HOST_SLOT_ENV: &str = amont_slots::HELD_ENV;
 
 /// How often a lease the coordinator could not tie to a process group says
 /// it is alive while its check runs (the coordinator frees a lease it has
@@ -984,7 +984,7 @@ mod slots {
             // The tokens are held while the slots are awaited: say so, so
             // the coordinator does not take the lease for abandoned.
             let _ = gate.heartbeat(lease); // best-effort: the next poll beats again
-            queue.wait(
+            let waited = queue.wait(
                 Holding::Slot {
                     class: "host_slot",
                     position: queued.position,
@@ -992,7 +992,19 @@ mod slots {
                 },
                 ask.cancel,
                 admission.sleeper.as_ref(),
-            )?;
+            );
+            if let Err(stop) = waited {
+                // Ended by the budget or a cancel: a sample too, or the
+                // day-14 wait percentiles would see only the admissions.
+                amont_slots::record_wait(
+                    dir,
+                    "relais",
+                    ask.weight,
+                    started.elapsed().as_millis(),
+                    "deferred",
+                );
+                return Err(stop);
+            }
         }
     }
 

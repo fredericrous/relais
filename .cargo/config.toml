@@ -1,0 +1,12 @@
+# relais's tests run beside amont's own gate on a loaded workstation, and on
+# CI. Since relais joins amont's host slot queue by default (amont ADR-0014),
+# a test that builds a runner with default settings would queue on the REAL
+# host slots: behind the very suite running it locally, and behind its
+# sibling tests on CI, one per 60 s ramp. `AMONT_HOST_SLOT=held` says an
+# ancestor holds the slots, so nothing queues. The slot tests set their own
+# directory and ancestor flag, and still exercise the queue.
+#
+# `cargo_pins_the_host_slot_for_tests` in verify/heavy/tests.rs fails if this
+# file stops reaching the tests.
+[env]
+AMONT_HOST_SLOT = "held"
