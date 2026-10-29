@@ -18,7 +18,7 @@ pub struct HoldoutOutcomeRow<'a> {
     pub label_kind: &'a str,
     pub attempt_index: u32,
     pub name: &'a str,
-    /// `passed`, `failed` or `did_not_build`.
+    /// `passed`, `failed`, `did_not_build` or `timed_out`.
     pub outcome: &'a str,
     /// Every profile check passed on that candidate (no failed check, no
     /// profile gap).
@@ -117,5 +117,41 @@ impl Ledger {
             .query_map([run_id.as_str()], |row| row.get(0))?
             .collect::<std::result::Result<Vec<String>, _>>()?;
         Ok(markers)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::TaskId;
+
+    #[test]
+    fn a_timed_out_holdout_on_green_checks_is_not_a_catch() {
+        let dir = crate::test_support::short_temp_dir("ho-timeout");
+        let ledger = Ledger::open(&dir.to_path_buf().join("ledger.sqlite")).expect("ledger");
+        let run = RunId::from_stored("run-timeout");
+        ledger
+            .insert_run(
+                &run,
+                "/repo",
+                None,
+                &TaskId::from_stored("run-timeout"),
+                "rk",
+            )
+            .expect("run");
+        ledger
+            .record_holdout_outcome(
+                &run,
+                &HoldoutOutcomeRow {
+                    label_kind: "attempt",
+                    attempt_index: 1,
+                    name: "slow",
+                    outcome: "timed_out",
+                    profile_green: true,
+                },
+            )
+            .expect("outcome");
+        assert!(ledger.run_named_a_holdout(&run).expect("named"));
+        assert!(!ledger.run_holdout_caught(&run).expect("caught"));
     }
 }
