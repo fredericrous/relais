@@ -331,8 +331,10 @@ pub(crate) fn permissions_finding(settings: &MachineSettings) -> Option<Finding>
 
 /// The `heavy` finding: how many heavy-command tokens the machine hands
 /// out (`max_heavy_commands`, else a quarter of the cores, at least one),
-/// and the shared host-slot directory when `[resources] shared_host_slots`
-/// names one (SPEC §23). Information, never a warning.
+/// and the host slots every heavy job queues on: amont's directory unless
+/// `[resources] shared_host_slots` names another or says `"off"`, sized
+/// automatically unless `host_slots` fixes it (SPEC §23). Information,
+/// never a warning.
 pub(crate) fn heavy_finding(settings: &MachineSettings, cores: u32) -> Finding {
     let configured = settings.concurrency.max_heavy_commands;
     let cap = crate::verify::heavy_cap(configured, cores);
@@ -341,9 +343,17 @@ pub(crate) fn heavy_finding(settings: &MachineSettings, cores: u32) -> Finding {
     } else {
         "a quarter of the cores"
     };
-    let slots = match &settings.resources.shared_host_slots {
-        Some(dir) => format!("shared host slots in {dir}"),
-        None => "no shared host slots (the coordinator queue only)".to_string(),
+    let sizing = match settings.resources.host_slots {
+        Some(n) => format!("{n} fixed"),
+        None => "sized from the load".to_string(),
+    };
+    let slots = match settings.resources.shared_host_slots.as_deref() {
+        Some("off") => "no shared host slots (the coordinator queue only)".to_string(),
+        Some(dir) => format!("shared host slots in {dir}, {sizing}"),
+        None => format!(
+            "shared host slots in {}, {sizing}",
+            amont_slots::dir().display()
+        ),
     };
     Finding {
         component: "heavy",
@@ -3661,13 +3671,23 @@ mod tests {
             default.detail
         );
         assert!(
-            default.detail.contains("no shared host slots"),
-            "{}",
+            default.detail.contains("shared host slots in")
+                && default.detail.contains("sized from the load"),
+            "on by default, in amont's directory: {}",
             default.detail
+        );
+        let off = heavy_finding(
+            &machine_with("[resources]\nshared_host_slots = \"off\"\n"),
+            16,
+        );
+        assert!(
+            off.detail.contains("no shared host slots"),
+            "{}",
+            off.detail
         );
         let set = heavy_finding(
             &machine_with(
-                "[concurrency]\nmax_heavy_commands = 3\n[resources]\nshared_host_slots = \"/run/slots\"\n",
+                "[concurrency]\nmax_heavy_commands = 3\n[resources]\nshared_host_slots = \"/run/slots\"\nhost_slots = 2\n",
             ),
             16,
         );
@@ -3677,6 +3697,7 @@ mod tests {
             set.detail
         );
         assert!(set.detail.contains("/run/slots"), "{}", set.detail);
+        assert!(set.detail.contains("2 fixed"), "{}", set.detail);
     }
 
     /// One volume with the space a test gives it.

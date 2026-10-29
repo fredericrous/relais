@@ -51,6 +51,12 @@ quick-xml = "0.42"
 # crate, no dependencies and no build script, released with amont.
 amont-quiet = "1.60"
 
+# The host slots every heavy job on the machine queues on (amont ADR-0014,
+# decisions ADR-0049): amont owns the protocol and `amont-slots` is its one
+# implementation, so relais links it instead of carrying a copy. What it
+# pulls: one std-only crate, no dependencies, released with amont.
+amont-slots = "1.62"
+
 # Process facts and signals live in `procs`; the endpoint in `ipc`. Each
 # platform gets the one binding crate it needs and nothing else.
 # kill(pid, 0) for coordinator lease reconciliation — checking liveness

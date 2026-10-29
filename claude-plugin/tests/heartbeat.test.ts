@@ -36,6 +36,11 @@ test('waiting_for_slot reads as text with its class, position and wait', () => {
   expect(fold({ kind: 'waiting_for_slot', class: 'coordinator_unreachable', position: 0, waited_s: 90 }).wait).toBe(
     'coordinator unreachable, retrying · 90s',
   )
+  // A host slot names whom it waits behind, when the holders said so.
+  expect(
+    fold({ kind: 'waiting_for_slot', class: 'host_slot', position: 0, waited_s: 60, behind: 'amont: cargo-test (amont, 2m)' })
+      .wait,
+  ).toBe('waiting for a host slot behind amont: cargo-test (amont, 2m) · 60s')
 })
 
 test('waiting_for_disk reads as text with the volume and the floor', () => {
