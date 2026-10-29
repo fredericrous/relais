@@ -112,7 +112,7 @@ impl GuidanceGap {
             GuidanceSource::Candidates => "candidates missing",
             GuidanceSource::DecisionKeys => {
                 return format!(
-                    "decision keys not checked (reported, not passed): {}",
+                    "aval: not installed, decision keys {} not checked (reported, not passed)",
                     self.detail
                 )
             }
