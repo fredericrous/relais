@@ -361,7 +361,14 @@ pub(crate) fn replay_command(
     };
 
     let git = relais::workspace::SystemGit;
-    let aval_resolver = relais::context::AvalCli::new(checkout_dir.clone());
+    let aval_resolver = relais::context::AvalCli::new(checkout_dir.clone()).with_bin(
+        candidate
+            .policy()
+            .integrations
+            .aval
+            .as_ref()
+            .and_then(|aval| aval.bin()),
+    );
     let hooks = relais::verify::AmontCli::new();
     let attest = relais::verify::AmontCli::new();
     let prices = load_price_table()?;

@@ -6669,6 +6669,7 @@ fn a_proposed_plan_is_validated_not_trusted() {
 fn manifest_with(constraints: Vec<String>) -> ContextManifest {
     ContextManifest {
         holdouts: Default::default(),
+        unchecked_keys: Vec::new(),
         contract_hash: "contract".into(),
         base_sha: "base".into(),
         policy_hash: "policy".into(),
@@ -7442,6 +7443,7 @@ fn the_prompt_counts_verification_commands_not_attempts() {
     let contract = fixture.contract(Review::Off);
     let manifest = ContextManifest {
         holdouts: Default::default(),
+        unchecked_keys: Vec::new(),
         contract_hash: "c".into(),
         base_sha: "b".into(),
         policy_hash: "p".into(),

@@ -46,6 +46,9 @@ pub enum GuidanceSource {
     Decisions,
     /// `adr-lint candidates`: the lines the reviewer is asked to rule on.
     Candidates,
+    /// Decision keys the task depends on that were not checked because
+    /// aval is not installed.
+    DecisionKeys,
 }
 
 /// Guidance that is missing, and why. Its own type: a guidance failure is
@@ -107,8 +110,23 @@ impl GuidanceGap {
             GuidanceSource::Reviewer => "reviewer constraints partial",
             GuidanceSource::Decisions => "reviewer decisions missing",
             GuidanceSource::Candidates => "candidates missing",
+            GuidanceSource::DecisionKeys => {
+                return format!(
+                    "decision keys not checked (reported, not passed): {}",
+                    self.detail
+                )
+            }
         };
         format!("{what} ({})", self.detail)
+    }
+}
+
+/// Up to five keys, then "and N more".
+pub fn key_list(keys: &[String]) -> String {
+    let shown = keys.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+    match keys.len().saturating_sub(5) {
+        0 => shown,
+        more => format!("{shown} and {more} more"),
     }
 }
 

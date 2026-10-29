@@ -98,8 +98,10 @@ fn detect_policy_with(root: &Path, amont: Option<&Path>) -> Proposal {
     let setup = detect_setup(root, &mut skipped);
     skipped.extend(amont_gates(root, amont, &mut notes));
     let integrations = ProposedIntegrations {
-        amont: required_if(root.join("amont.conf").is_file()),
-        aval: required_if(root.join(".adr.yaml").is_file()),
+        // Every integration is proposed optional: a missing tool is
+        // reported, never a reason a run cannot start (ADR-0047).
+        amont: "optional",
+        aval: "optional",
         amont_agent: "optional",
     };
     let toml = render_toml(&setup, &commands, &integrations);
@@ -111,14 +113,6 @@ fn detect_policy_with(root: &Path, amont: Option<&Path>) -> Proposal {
         integrations,
         toml,
         notes,
-    }
-}
-
-fn required_if(present: bool) -> &'static str {
-    if present {
-        "required"
-    } else {
-        "optional"
     }
 }
 
@@ -427,7 +421,8 @@ fn render_toml(
     out.push_str(
         "# Proposed by `relais init --detect` from this repository's files.\n\
          # Nothing here runs until a person grants trust for it.\n\
-         # required blocks execution when missing; optional gaps are reported.\n",
+         # \"required\" blocks runs on machines without the tool;\n\
+         # \"optional\" reports it missing; \"off\" skips it.\n",
     );
     out.push_str("[integrations]\n");
     out.push_str(&format!("aval = {}\n", quoted(integrations.aval)));
@@ -842,9 +837,17 @@ mod tests {
             }]
         );
         assert_eq!(argvs(&proposal.commands), [["cargo", "test"]]);
-        assert_eq!(proposal.integrations.amont, "required");
-        assert_eq!(proposal.integrations.aval, "required");
+        assert_eq!(proposal.integrations.amont, "optional");
+        assert_eq!(proposal.integrations.aval, "optional");
         assert_eq!(proposal.integrations.amont_agent, "optional");
+        assert!(
+            proposal.toml.contains(
+                "# \"required\" blocks runs on machines without the tool;\n\
+                 # \"optional\" reports it missing; \"off\" skips it.\n[integrations]\n"
+            ),
+            "{}",
+            proposal.toml
+        );
         parses(&proposal);
     }
 

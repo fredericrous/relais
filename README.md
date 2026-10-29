@@ -251,6 +251,10 @@ declares no setup:
  ! setup        package-lock.json present, and profile `default` declares no setup step: …
 ```
 
+### Runs alone
+
+relais runs on a machine with none of its sibling tools. Without aval, decision keys it cannot resolve are not looked up: they are listed once as "not checked (reported, not passed)" in the receipt and the run goes on, unless `[integrations] aval = "required"` makes the missing tool block. Without amont, its hook and attestation checks are skipped and the missing tool is reported as a gap, not a pass. Without amont-agent, the guard it would add is absent and that is reported too. A tool that is installed but fails still blocks. `relais init` proposes all three as `"optional"`, and `relais doctor` lists each with its mode and whether it is installed.
+
 ### Session routing
 
 The plugin can also route the model of your own session (SPEC §30): a
