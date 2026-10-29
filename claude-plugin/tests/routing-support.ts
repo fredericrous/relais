@@ -83,7 +83,7 @@ export async function routedSession(
   engine.labels = new Map()
   engine.fallback = label()
   engine.observeExits = []
-  engine.version = '0.37.0'
+  engine.version = '0.38.0'
   const state: Record<string, unknown> = { ...ROUTER_STATE, ...(options.state ?? {}) }
   engine.state = state
   engine.script.runResult = (argv: string[]) => {

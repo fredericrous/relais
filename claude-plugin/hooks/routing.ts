@@ -705,7 +705,7 @@ export async function flushObservations(fx: Fx, store: Store, options: { isFinal
 }
 
 // The first relais release that accepts the `answered` outcome.
-const ANSWERED_MIN_VERSION: [number, number] = [0, 37]
+const ANSWERED_MIN_VERSION: [number, number] = [0, 38]
 
 // Whether the installed relais accepts `answered`, asked once per session
 // through `relais --version`. A failed or unreadable answer is cached as "no"

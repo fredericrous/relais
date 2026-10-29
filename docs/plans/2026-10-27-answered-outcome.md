@@ -113,6 +113,7 @@ The person chose (2026-10-27): reduce unknown outcomes and run the replays first
 - D9 (2026-10-28, person) Phases 1–3 ship together: "Les trois ensemble".
 - D10 (2026-10-29) v0.36.0 was cut from main by another session meanwhile; this ships as v0.37.0. Ledger schema 45 and report schema 15 are still free on main (44 and 14).
 - D12 (2026-10-29, implementation review) Two departures from the Behaviour text: Phase 2 adds the `parent_link_recorded` field and column (carried codex finding), so the report counts captured rows by that marker (`parent link not captured: N`) instead of by release (`recorded before v0.36.0`); and `outcomeOf` keeps `hasEdit` alongside `files.length === 0`, so an edit with no file still keeps the task `unknown`. The version gate is 0.37, not 0.36 (D10).
+- D13 (2026-10-29) v0.37.0 was also cut from main meanwhile (#342, still ledger schema 44, report schema 14), so this ships as v0.38.0 and the plugin gates on 0.38; a 0.37.0 binary gets the v0.35 form (test "relais 0.37.0, released without the answered outcome, gets the v0.35 form"). Rebased on `d4907526`.
 - D11 (2026-10-29) Phase 0 has not run: the one replay attempted (task-99ca98bffacc8624) errored at the baseline under a load average of 60, nothing spent. It runs after this release, in a quiet window; the plan stays `active` for it.
 
 ## Implementation review
