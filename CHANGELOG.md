@@ -8,6 +8,11 @@ missing here.
 
 ## Unreleased
 
+## v0.37.0
+
+- A holdout command killed by its timeout now settles as its own outcome, `timed_out` (relais#324). It used to read as `did_not_build`, or as `failed` when it had written a report, and a `failed` holdout on green checks counts as a holdout catch, so machine load could produce a false catch. A timed-out holdout is never a catch; its gap says ``holdout `<name>` timed out after its time limit; raise the holdout's `timeout_seconds` ``, and its kept log ends `holdout timed out after <n> s`. SPEC §10 documents the 300 s default and suggests declaring a timeout for a holdout that builds.
+- A base check cut off by a spent run budget ends the run on that budget, `budget_exhausted` naming the total, instead of `blocked (baseline_unrunnable)` quoting the check's own limit (relais#329). A base check's timeout is clipped to what is left of the total, so with a short total on a slow machine the budget, not the check, ended it. A check cut off by its own `timeout_seconds` with budget left is still `baseline_unrunnable`.
+
 ## v0.36.0
 
 - relais runs without aval installed (decisions ADR-0047). When aval is confirmed absent (no `bin` declared under `[integrations]`, and no `PATH` entry named `aval` in any form) and `[integrations] aval` is optional or unset, the decision keys a contract names or a mapping matches are not resolved: they are one guidance gap, `aval: not installed, decision keys <k> not checked (reported, not passed)`, and the run goes on. Before, the run ended in preflight with `AvalToolFailure`. An installed aval that fails, a non-executable or dangling `aval`, a bad shebang or a declared `bin` that is missing still block, and `required` and `off` behave as before. The declared `bin` is now the program resolved, as the probe already used.
