@@ -439,10 +439,23 @@ fn blocked_code(outcome: &RunOutcome) -> BlockCode {
     }
 }
 
+/// Whether any profile of `repo` reuses a cached baseline verdict, which
+/// would skip the base commands these tests need to run.
+fn uses_the_baseline_cache(repo: &RepoPolicy) -> bool {
+    repo.verification
+        .profiles
+        .values()
+        .any(|profile| profile.cache_baseline)
+}
+
 #[test]
 fn a_baseline_check_cut_by_the_total_ends_on_the_total() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![sleeping_check(30)], 3);
+    assert!(
+        !uses_the_baseline_cache(&repo),
+        "the base commands must run"
+    );
     let mut contract = fixture.contract(Review::Off);
     contract.limits.total_seconds = Some(1);
     let outcome = fixture.execute(&contract, &repo, &conditional_worker(""));
@@ -510,6 +523,10 @@ fn a_baseline_check_cut_by_the_total_ends_on_the_total() {
 fn a_base_setup_cut_by_the_total_ends_on_the_total() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy_with_setup(vec![sleeping_check(30)], vec![passing_check()], 3);
+    assert!(
+        !uses_the_baseline_cache(&repo),
+        "the base commands must run"
+    );
     let mut contract = fixture.contract(Review::Off);
     contract.limits.total_seconds = Some(1);
     let outcome = fixture.execute(&contract, &repo, &conditional_worker(""));
@@ -523,6 +540,10 @@ fn a_base_setup_cut_by_the_total_ends_on_the_total() {
 fn a_baseline_check_that_hits_its_own_limit_stays_unrunnable() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![sleeping_check(1)], 3);
+    assert!(
+        !uses_the_baseline_cache(&repo),
+        "the base commands must run"
+    );
     let outcome = fixture.execute(
         &fixture.contract(Review::Off),
         &repo,
@@ -532,6 +553,10 @@ fn a_baseline_check_that_hits_its_own_limit_stays_unrunnable() {
         blocked_code(&outcome),
         BlockCode::BaselineUnrunnable,
         "{outcome:?}"
+    );
+    assert!(
+        matches!(&outcome.terminal, Terminal::Blocked { detail, .. } if detail.contains("(1s wall limit)")),
+        "the detail names the declared limit: {outcome:?}"
     );
 }
 
