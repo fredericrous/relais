@@ -4,7 +4,12 @@
 # host slots: behind the very suite running it locally, and behind its
 # sibling tests on CI, one per 60 s ramp. `AMONT_HOST_SLOT=held` says an
 # ancestor holds the slots, so nothing queues. The slot tests set their own
-# directory and ancestor flag, and still exercise the queue.
+# directory and ancestor flag, and still exercise the queue. A check whose
+# runner holds slots gets the variable from the admission alone (the spawn
+# removes an inherited one), so `slot=held` in those tests stays meaningful.
+#
+# `[env]` reaches `cargo run` too: a relais started that way from this
+# checkout never queues on host slots. The installed binary is unaffected.
 #
 # `cargo_pins_the_host_slot_for_tests` in verify/heavy/tests.rs fails if this
 # file stops reaching the tests.

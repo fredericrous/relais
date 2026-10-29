@@ -1270,7 +1270,12 @@ fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
     if let Some(admitted) = &admitted {
         // The runner holds the host slots (`admitted`), never the check:
         // their descriptors are close-on-exec, so nothing the check leaves
-        // behind keeps one.
+        // behind keeps one. When it holds them, `AMONT_HOST_SLOT=held` must
+        // come from the admission alone, not from an environment the
+        // runner inherited.
+        if admitted.host_slots() > 0 {
+            command.env_remove(HOST_SLOT_ENV);
+        }
         command.envs(admitted.env());
     }
     events.emit(Event::CheckStarted {
