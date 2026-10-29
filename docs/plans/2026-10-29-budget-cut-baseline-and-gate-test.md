@@ -52,6 +52,13 @@ PR #333 (answered outcome) is green everywhere but `test (windows-latest)`, and 
 - Gate test: run it 200 times (`cargo test -p relais --test it gate_tests -- --test-threads=1` in a loop), 0 failures.
 - CI: the PR's `test (windows-latest)` green; then #333 rebased on it and its checks re-run.
 
+## Verification record (2026-10-29, before push)
+
+- `make check` on the applied candidate (`d5368133`): Rust 2042 + 34 + 258 + 1 passed, 0 failed, including `a_baseline_check_cut_by_the_total_ends_on_the_total`, `a_base_setup_cut_by_the_total_ends_on_the_total`, `a_baseline_check_that_hits_its_own_limit_stays_unrunnable`, `after_a_spent_admission_wait_a_check_on_its_own_limit_is_not_a_budget_cut`, `a_check_outcome_without_an_applied_limit_still_parses`, `an_applied_limit_round_trips`, `total_seconds_caps_the_run_end_to_end`, `the_total_ends_a_queued_run_before_its_wait_budget_does` and `a_two_place_waiter_is_served_before_later_one_place_waiters`. The plugin suite (untouched by this branch) had 16 failures at load 224: 14 were 5000 ms per-test timeouts and 2 assertions; the commit's pre-commit gate (31 checks, plugin included) passed afterwards.
+- Red proof: with `origin/main`'s `runner/baseline.rs` put back, `a_baseline_check_cut_by_the_total_ends_on_the_total` and `a_base_setup_cut_by_the_total_ends_on_the_total` both fail (budgets.rs:449, :516); restored, both pass.
+- Stress loop, 20 runs each at load 60-96: `total_seconds_caps_the_run_end_to_end` and `the_total_ends_a_queued_run_before_its_wait_budget_does` failed 0/20 on `origin/main` and 0/20 on the branch. The plan's "at least one fails on `origin/main`" was not met (D3).
+- Gate test: 200 runs, 0 failed.
+
 ## Not in scope
 
 - The other timing-sensitive tests not seen failing.
@@ -62,6 +69,7 @@ PR #333 (answered outcome) is green everywhere but `test (windows-latest)`, and 
 
 - D1 (2026-10-29, person) Fix the flaky tests in a separate PR before #333: "Corriger les tests instables d'abord".
 - D2 (2026-10-29, person) Both, with a small plan: "Les deux, avec un petit plan (Recommandé)".
-
+- D3 (2026-10-29) The local stress loop did not reproduce the Windows failure on `origin/main` (0/20 each at load 60-96): the race needs a process spawn slower than the 1 s total, which this Mac never reached. The deterministic regressions stand in for it: both fail on `origin/main`'s baseline and pass with the fix. CI on `windows-latest` is the remaining check.
+- D4 (2026-10-29) Carried findings applied in the code: the rule lives in `budget_cut` (applied limit known and below the declared one), the applied limit is an optional serde-default field with millisecond precision, and the regressions use a base command that runs until killed.
 
 <!-- panel: repos=relais adds= reviewers=backend,codex body-sha=f8799191435f -->
