@@ -21,7 +21,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::contract::TaskContract;
 use crate::ids::sha256_hex;
-use crate::policy::RepoPolicy;
+use crate::policy::{DependencyMode, RepoPolicy};
 use crate::workspace::Git;
 pub use guidance::{
     Guidance, GuidanceGap, GuidanceSource, RankedKey, Relevant, RelevantQuery, RuleRef, Rules,
@@ -53,6 +53,9 @@ pub enum AvalVerdict {
         adr: String,
     },
     Unknown,
+    /// No `aval` anywhere on PATH, confirmed before the spawn. Not a
+    /// verdict and not a pass: the key was not checked (ADR-0047).
+    NotInstalled,
     /// Exit 1/2/3 from aval: a tool or corpus failure, NOT a verdict.
     /// Kept distinct so a broken corpus can never read as a decision
     /// (SPEC §7).
@@ -226,6 +229,8 @@ where
 /// The `aval` binary on this machine — the one place it is spawned.
 pub struct AvalCli {
     root: PathBuf,
+    /// The `[integrations] aval` `bin` override, when one is declared.
+    bin: Option<String>,
     cancel: Option<Arc<AtomicBool>>,
     /// The constraint index is the same for every package of a run, so it
     /// is fetched once per `AvalCli` (one per run) and shared.
@@ -239,6 +244,7 @@ impl AvalCli {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
+            bin: None,
             cancel: None,
             rules: OnceLock::new(),
             adr_lint: adr_lint_program(),
@@ -250,10 +256,18 @@ impl AvalCli {
     pub fn watching(root: PathBuf, cancel: Arc<AtomicBool>) -> Self {
         Self {
             root,
+            bin: None,
             cancel: Some(cancel),
             rules: OnceLock::new(),
             adr_lint: adr_lint_program(),
         }
+    }
+
+    /// The same, resolving keys with the declared `[integrations] aval`
+    /// `bin` instead of `aval` from PATH.
+    pub fn with_bin(mut self, bin: Option<&str>) -> Self {
+        self.bin = bin.map(str::to_string);
+        self
     }
 
     /// The same, spawning `program` for adr-lint.
@@ -274,7 +288,13 @@ fn adr_lint_program() -> String {
 
 impl DecisionResolver for AvalCli {
     fn resolve(&self, key: &str, scope: Option<&str>) -> AvalVerdict {
-        aval_resolve(&self.root, key, scope, self.cancel.as_deref())
+        aval_resolve(
+            &self.root,
+            key,
+            scope,
+            self.bin.as_deref(),
+            self.cancel.as_deref(),
+        )
     }
 
     fn constraint_rules(&self) -> Result<Rules, GuidanceGap> {
@@ -347,6 +367,28 @@ pub fn aval_resolve(
     repo_dir: &Path,
     key: &str,
     scope: Option<&str>,
+    bin: Option<&str>,
+    cancel: Option<&AtomicBool>,
+) -> AvalVerdict {
+    aval_resolve_in(
+        repo_dir,
+        key,
+        scope,
+        bin,
+        std::env::var_os("PATH").unwrap_or_default(),
+        cancel,
+    )
+}
+
+/// [`aval_resolve`] with the search path given, so a test controls it
+/// without touching the process environment. The spawned command sees the
+/// same path the lookup used.
+pub fn aval_resolve_in(
+    repo_dir: &Path,
+    key: &str,
+    scope: Option<&str>,
+    bin: Option<&str>,
+    path: std::ffi::OsString,
     cancel: Option<&AtomicBool>,
 ) -> AvalVerdict {
     // aval takes no `--` separator, so a key that looks like a flag would
@@ -358,11 +400,28 @@ pub fn aval_resolve(
             detail: format!("decision key `{key}` is not a key aval can be asked for"),
         };
     }
-    let mut command = std::process::Command::new("aval");
+    // Absence is confirmed only when nothing was declared, the directory
+    // to run in exists, and no PATH entry named `aval` exists in any form:
+    // a non-executable file or a dangling link is a broken install, which
+    // keeps blocking.
+    let confirmed_absent = bin.is_none() && repo_dir.is_dir() && {
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        let extensions = crate::tooling::path_extensions(std::env::var_os("PATHEXT").as_ref());
+        crate::tooling::resolve_in("aval", &dirs, &extensions, &|candidate| {
+            match std::fs::symlink_metadata(candidate) {
+                Ok(_) => true,
+                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+            }
+        })
+        .is_none()
+    };
+    let program = bin.unwrap_or("aval");
+    let mut command = std::process::Command::new(program);
     command
         .arg("resolve")
         .arg(key)
         .arg("--json")
+        .env("PATH", &path)
         .current_dir(repo_dir);
     if let Some(scope) = scope {
         command.arg("--scope").arg(scope);
@@ -375,6 +434,11 @@ pub fn aval_resolve(
                 detail: format!("aval did not answer: {}", other.describe()),
             },
         },
+        Err(crate::procs::RunError::Spawn(e))
+            if confirmed_absent && e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            AvalVerdict::NotInstalled
+        }
         Err(e) => AvalVerdict::ToolFailure {
             exit: -1,
             detail: format!("aval could not be launched: {e}"),
@@ -795,6 +859,11 @@ pub struct ContextManifest {
     /// or overlay.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holdouts: Vec<crate::holdout::HoldoutRecord>,
+    /// Decision keys the task depends on that were not checked because
+    /// aval is not installed and not required (ADR-0047). Reported through
+    /// a guidance gap; never read as resolved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unchecked_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -889,6 +958,8 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
     keys.sort();
     keys.dedup();
 
+    let aval_mode = repo.integrations.aval.as_ref().map(|d| d.mode());
+    let mut unchecked_keys: Vec<String> = Vec::new();
     let mut resolved = Vec::new();
     for key in &keys {
         let verdict = resolver.resolve(key, contract.architecture.scope.as_deref());
@@ -912,6 +983,20 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
                     detail: detail.clone(),
                 })
             }
+            // Confirmed absent and not required: the key is reported as
+            // unchecked, never as resolved (ADR-0047).
+            AvalVerdict::NotInstalled
+                if matches!(aval_mode, None | Some(DependencyMode::Optional)) =>
+            {
+                unchecked_keys.push(key.clone());
+                continue;
+            }
+            AvalVerdict::NotInstalled => {
+                return Err(ContextError::ToolFailure {
+                    key: key.clone(),
+                    detail: "aval is not installed".to_string(),
+                })
+            }
             AvalVerdict::Active { .. } => {}
         }
         resolved.push((key.clone(), verdict));
@@ -927,6 +1012,13 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         manifest_aval_version,
     );
     guidance.repo_name = repo_name;
+    if !unchecked_keys.is_empty() {
+        guidance.record(GuidanceGap::new(
+            GuidanceSource::DecisionKeys,
+            guidance::GapCause::NotLaunched,
+            guidance::key_list(&unchecked_keys),
+        ));
+    }
 
     // The constraint is the decision in the record's own words — what
     // `aval resolve --json` carries as `choice` and `reason`; the full
@@ -954,6 +1046,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
             | AvalVerdict::Unknown
             | AvalVerdict::Retired { .. }
             | AvalVerdict::Contradiction { .. }
+            | AvalVerdict::NotInstalled
             | AvalVerdict::ToolFailure { .. } => None,
         })
         .collect();
@@ -1004,6 +1097,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         design_sha256: design.as_ref().map(|d| sha256_hex(d.text.as_bytes())),
         design: design.map(|d| d.text),
         holdouts,
+        unchecked_keys,
     };
 
     if manifest.package_bytes > manifest.budget_bytes {
@@ -1304,6 +1398,187 @@ mod tests {
         };
         let err = assemble(inputs(&c, &r, &broken)).unwrap_err();
         assert!(matches!(err, ContextError::ToolFailure { .. }), "{err:?}");
+    }
+
+    fn repo_with_aval(mode: Option<crate::policy::DependencyMode>) -> RepoPolicy {
+        let mut r = repo();
+        r.integrations.aval = mode.map(crate::policy::Dependency::Mode);
+        r
+    }
+
+    fn not_installed(_: &str, _: Option<&str>) -> AvalVerdict {
+        AvalVerdict::NotInstalled
+    }
+
+    fn assert_unchecked(keys: &[&str], mode: Option<crate::policy::DependencyMode>) -> String {
+        let c = contract(keys);
+        let r = repo_with_aval(mode);
+        let manifest = assemble(inputs(&c, &r, &not_installed)).expect("absence does not block");
+        assert_eq!(
+            manifest.unchecked_keys,
+            keys.iter().map(|k| k.to_string()).collect::<Vec<_>>()
+        );
+        assert!(manifest.architecture.resolved.is_empty());
+        let gaps: Vec<_> = manifest
+            .guidance
+            .gaps
+            .iter()
+            .filter(|g| g.source == GuidanceSource::DecisionKeys)
+            .collect();
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        gaps[0].describe()
+    }
+
+    #[test]
+    fn not_installed_with_optional_aval_reports_the_key_unchecked() {
+        let described = assert_unchecked(&["k"], Some(crate::policy::DependencyMode::Optional));
+        assert_eq!(
+            described,
+            "aval: not installed, decision keys k not checked (reported, not passed)"
+        );
+    }
+
+    #[test]
+    fn not_installed_with_aval_unset_reports_the_key_unchecked() {
+        let described = assert_unchecked(&["k"], None);
+        assert_eq!(
+            described,
+            "aval: not installed, decision keys k not checked (reported, not passed)"
+        );
+    }
+
+    #[test]
+    fn not_installed_with_required_aval_blocks() {
+        let c = contract(&["k"]);
+        let r = repo_with_aval(Some(crate::policy::DependencyMode::Required));
+        let err = assemble(inputs(&c, &r, &not_installed)).unwrap_err();
+        assert!(matches!(err, ContextError::ToolFailure { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn not_installed_with_aval_off_blocks() {
+        let c = contract(&["k"]);
+        let r = repo_with_aval(Some(crate::policy::DependencyMode::Off));
+        let err = assemble(inputs(&c, &r, &not_installed)).unwrap_err();
+        assert!(matches!(err, ContextError::ToolFailure { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn tool_failure_blocks_even_with_optional_aval() {
+        let c = contract(&["k"]);
+        let r = repo_with_aval(Some(crate::policy::DependencyMode::Optional));
+        let broken = |_: &str, _: Option<&str>| AvalVerdict::ToolFailure {
+            exit: 3,
+            detail: "unreadable".into(),
+        };
+        let err = assemble(inputs(&c, &r, &broken)).unwrap_err();
+        assert!(matches!(err, ContextError::ToolFailure { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn unchecked_keys_beyond_five_are_summarised() {
+        let described = assert_unchecked(
+            &["k1", "k2", "k3", "k4", "k5", "k6", "k7"],
+            Some(crate::policy::DependencyMode::Optional),
+        );
+        assert_eq!(
+            described,
+            "aval: not installed, decision keys k1, k2, k3, k4, k5 and 2 more not checked (reported, not passed)"
+        );
+    }
+
+    fn resolve_with_path(repo_dir: &Path, bin: Option<&str>, path_dir: &Path) -> AvalVerdict {
+        aval_resolve_in(
+            repo_dir,
+            "k",
+            None,
+            bin,
+            path_dir.as_os_str().to_owned(),
+            None,
+        )
+    }
+
+    #[test]
+    fn an_empty_path_with_no_declared_bin_is_not_installed() {
+        let dir = crate::test_support::temp_dir("aval-absent");
+        assert_eq!(
+            resolve_with_path(&dir, None, &dir),
+            AvalVerdict::NotInstalled
+        );
+    }
+
+    #[test]
+    fn a_declared_bin_that_does_not_exist_is_a_tool_failure() {
+        let dir = crate::test_support::temp_dir("aval-bin");
+        let verdict = resolve_with_path(&dir, Some("/nonexistent/aval"), &dir);
+        assert!(
+            matches!(verdict, AvalVerdict::ToolFailure { .. }),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_repo_dir_is_a_tool_failure_not_absence() {
+        let dir = crate::test_support::temp_dir("aval-nodir");
+        let verdict = resolve_with_path(&dir.join("missing"), None, &dir);
+        assert!(
+            matches!(verdict, AvalVerdict::ToolFailure { .. }),
+            "{verdict:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_aval_with_a_missing_interpreter_is_a_tool_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::temp_dir("aval-shebang");
+        let aval = dir.join("aval");
+        std::fs::write(&aval, "#!/nonexistent/sh\n").expect("write");
+        std::fs::set_permissions(&aval, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let verdict = resolve_with_path(&dir, None, &dir);
+        assert!(
+            matches!(verdict, AvalVerdict::ToolFailure { .. }),
+            "{verdict:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_aval_is_a_tool_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::temp_dir("aval-noexec");
+        let aval = dir.join("aval");
+        std::fs::write(&aval, "#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&aval, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let verdict = resolve_with_path(&dir, None, &dir);
+        assert!(
+            matches!(verdict, AvalVerdict::ToolFailure { .. }),
+            "{verdict:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_aval_symlink_is_a_tool_failure() {
+        let dir = crate::test_support::temp_dir("aval-dangling");
+        std::os::unix::fs::symlink(dir.join("gone"), dir.join("aval")).expect("symlink");
+        let verdict = resolve_with_path(&dir, None, &dir);
+        assert!(
+            matches!(verdict, AvalVerdict::ToolFailure { .. }),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_without_unchecked_keys_still_parses_as_empty() {
+        let mut manifest_json = serde_json::to_value(manifest()).expect("json");
+        // Empty is skipped on write; remove defensively all the same.
+        manifest_json
+            .as_object_mut()
+            .expect("an object")
+            .remove("unchecked_keys");
+        let parsed: ContextManifest = serde_json::from_value(manifest_json).expect("still parses");
+        assert!(parsed.unchecked_keys.is_empty());
     }
 
     #[test]

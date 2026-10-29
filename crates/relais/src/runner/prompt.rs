@@ -289,7 +289,8 @@ pub(in crate::runner) fn fit_statements(
         GuidanceSource::Index
         | GuidanceSource::CodeRules
         | GuidanceSource::Relevant
-        | GuidanceSource::RelevantPartial => "worker",
+        | GuidanceSource::RelevantPartial
+        | GuidanceSource::DecisionKeys => "worker",
     };
     let gap = GuidanceGap::new(
         source,

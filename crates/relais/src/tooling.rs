@@ -55,7 +55,9 @@ pub fn probe_integrations(repo: &RepoPolicy) -> Vec<Blocker> {
                         blockers.push(Blocker {
                             code: BlockCode::IntegrationMissing,
                             detail: format!(
-                                "required integration `{name}` is not available on PATH"
+                                "required integration `{name}` is not available on PATH; \
+                                 set [integrations] {name} = \"optional\" in relais.toml \
+                                 to run without it"
                             ),
                         });
                     }

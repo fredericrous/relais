@@ -255,7 +255,8 @@ pub(crate) fn run_command(
     // The three tools a run talks to, each behind the port this crate
     // owns: git, the decision corpus and the check inventory.
     let git = relais::workspace::SystemGit;
-    let aval_resolver = relais::context::AvalCli::new(root.clone());
+    let aval_resolver = relais::context::AvalCli::new(root.clone())
+        .with_bin(repo.integrations.aval.as_ref().and_then(|aval| aval.bin()));
     let hooks = relais::verify::AmontCli::new();
     let attest = relais::verify::AmontCli::new();
     // Managed dispatch is the only path `relais run` takes: a missing
