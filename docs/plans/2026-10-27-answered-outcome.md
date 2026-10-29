@@ -83,6 +83,15 @@ The person chose (2026-10-27): reduce unknown outcomes and run the replays first
 - Phase 0: dry-run table of 26 tasks; each spent replay's outcome; cumulative spend read from the ledger cost of the replay runs after each one, stopping before a launch that would cross $20 at the $0.44 mean; `counterfactual gap` after the next learn cycle.
 - At day 7 after release: the test-split floor projection and outcome-grade label counts against today's (about 2027-10-03; 25 yes / 87 no), and `answered` by `class_kind`. The `answered` rule is rolled back (SQL in Phase 1) if more than 5% of `answered` tasks are later corrected or reverted, or if any row with a file is `answered`.
 
+## Verification record (2026-10-29, before push)
+
+- Phases 1–3 implemented; Phase 0 not run (D11).
+- `make lint`, `make test`, `make msrv`, `make audit`, `make plugin`: pass on the Phase 1 candidate in a quiet window (relais run-65ee9a72c9098-1861a, load about 10); the commits' pre-commit gate (31 checks) passed for `feat(router): an answered outcome, never a label` and `feat(router): parent link and unmatched checks`. Earlier `make plugin` failures were 5000 ms per-test timeouts in untouched tests at load averages of 145–691, different tests on each pass.
+- New wire tests: `a_task_record_with_parent_marker_and_unmatched_checks_parses`, `a_task_record_without_the_new_fields_parses_with_defaults`, `an_unmatched_entry_with_a_path_word_is_refused`, `an_unmatched_entry_whose_repository_is_not_a_basename_is_refused`, `an_unmatched_entry_with_a_trailing_argument_is_refused`, `an_unmatched_subcommand_word_over_40_bytes_is_refused`: pass. Ledger test `a_first_answered_record_with_files_is_stored_unknown`: pass.
+- Piloted run, the rebased branch binary on a `.backup` copy of the live ledger (`RELAIS_STATE_DIR`), live ledger untouched:
+  - v45 WHERE clause before the upgrade: 271 rows → after it, `backfill_v45` rows: 271; `answered` with files: 0; schema migrations: 45; the three new columns present.
+  - `relais report --since 2026-10-01`: `outcomes: 422 completed, 27 corrected, 163 unknown (unknown rate 18%)`, `answered (no file edited, never a label): 271` (question 96, review 175), the `subagent unknown by parent:` buckets, `parent link not captured: 15`, `unmatched check commands: none recorded`; no new line over 80 columns.
+
 ## Not in scope
 
 - Laya (classifier distillation or routing); the person chose labels and replays first.
@@ -96,5 +105,12 @@ The person chose (2026-10-27): reduce unknown outcomes and run the replays first
 - D2 (2026-10-27, person) Questions and no-edit tasks get a distinct `answered` outcome, never a label: "Issue « answered » (Recommandé)".
 - D3 (2026-10-27) `answered` shares rank 0 with `unknown` so stored ranks need no rescale; the equal-rank `unknown → answered` step is the one special case in `merge_task`.
 - D4 (2026-10-27) Unmatched commands are kept as program + first subcommand only, capped at 5 per task.
+- D5 (2026-10-28) Superseded by the Phase 1 merge rule: at rank 0 `unknown` wins over `answered` in either order (D3's "one special case" is not what shipped).
+- D6 (2026-10-28, implementation review) The v45 backfill also sets `completed_at_end = 'answered'` where it was `unknown`, so the day-7 trigger can see backfilled rows. The undo that shipped (`docs/router-protocol.md`, the v45 test) is `UPDATE router_tasks SET outcome = 'unknown', completed_at_end = 'unknown', outcome_source = 'own' WHERE outcome_source = 'backfill_v45'`; use it, not the Phase 1 text.
+- D7 (2026-10-28) The outcomes line keeps its shape, `(unknown rate R)`: `, answered excluded` does not fit 80 columns with 4-digit counts. The `answered` line under it says what the rate leaves out.
+- D8 (2026-10-28) A first `answered` record that carries files is stored `unknown` at insert (`first_task`), not only on a merge.
+- D9 (2026-10-28, person) Phases 1–3 ship together: "Les trois ensemble".
+- D10 (2026-10-29) v0.36.0 was cut from main by another session meanwhile; this ships as v0.37.0. Ledger schema 45 and report schema 15 are still free on main (44 and 14).
+- D11 (2026-10-29) Phase 0 has not run: the one replay attempted (task-99ca98bffacc8624) errored at the baseline under a load average of 60, nothing spent. It runs after this release, in a quiet window; the plan stays `active` for it.
 
 <!-- panel: repos=relais adds= reviewers=architect,backend,lang:rust,po,tui,unix,codex body-sha=cf8c58d9122a -->
