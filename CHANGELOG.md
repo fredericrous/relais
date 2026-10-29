@@ -8,6 +8,11 @@ missing here.
 
 ## Unreleased
 
+## v0.36.0
+
+- relais runs without aval installed (decisions ADR-0047). When aval is confirmed absent (no `bin` declared under `[integrations]`, and no `PATH` entry named `aval` in any form) and `[integrations] aval` is optional or unset, the decision keys a contract names or a mapping matches are not resolved: they are one guidance gap, `aval: not installed, decision keys <k> not checked (reported, not passed)`, and the run goes on. Before, the run ended in preflight with `AvalToolFailure`. An installed aval that fails, a non-executable or dangling `aval`, a bad shebang or a declared `bin` that is missing still block, and `required` and `off` behave as before. The declared `bin` is now the program resolved, as the probe already used.
+- `relais init` proposes every integration `optional`, under two comment lines that name what each mode does; it used to propose `required` for aval and amont when the repository used them. A run blocked on a missing `required` integration names the edit: `set [integrations] <name> = "optional" in relais.toml to run without it`. Existing `relais.toml` files are not changed.
+
 ## v0.35.2
 
 - The coordinator measures the disk at most once a second per path (relais#284). Polling a queue held back by the disk floor used to probe every queued request's paths on every poll, under the admission lock; a measurement is now reused for one second, so the cost of a poll no longer grows with the queue. A raised `available` is seen within a second.
