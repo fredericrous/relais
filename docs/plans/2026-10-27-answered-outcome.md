@@ -115,4 +115,11 @@ The person chose (2026-10-27): reduce unknown outcomes and run the replays first
 - D12 (2026-10-29, implementation review) Two departures from the Behaviour text: Phase 2 adds the `parent_link_recorded` field and column (carried codex finding), so the report counts captured rows by that marker (`parent link not captured: N`) instead of by release (`recorded before v0.36.0`); and `outcomeOf` keeps `hasEdit` alongside `files.length === 0`, so an edit with no file still keeps the task `unknown`. The version gate is 0.37, not 0.36 (D10).
 - D11 (2026-10-29) Phase 0 has not run: the one replay attempted (task-99ca98bffacc8624) errored at the baseline under a load average of 60, nothing spent. It runs after this release, in a quiet window; the plan stays `active` for it.
 
+## Implementation review
+
+- Verdict: approve on tree 82726511 (Delta), after approve-with-changes on 410d77b1 (round 1).
+- Fixed: version gate 0.36 → 0.37 with a 0.36.0 test (blocking); exhaustive match in `first_task`, split bool test helper, named binding (blocking); D12, D6 CASE form, `make check` record on head.
+- Deliberate: none. Next: Phase 0 (D11) after the v0.37.0 release; the plan stays `active`.
+- Round 1 94k tokens, 325 s; Delta 107k tokens, 43 s.
+
 <!-- panel: repos=relais adds= reviewers=architect,backend,lang:rust,po,tui,unix,codex body-sha=cf8c58d9122a -->
