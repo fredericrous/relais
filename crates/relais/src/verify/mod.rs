@@ -1667,7 +1667,7 @@ pub fn run_setup_gated(
     cancel: Option<&AtomicBool>,
     gate: &mut dyn SetupGate,
 ) -> Result<Vec<CheckOutcome>, VerifyError> {
-    run_setup_gated_within(
+    run_setup_gated_within(SetupRun {
         dir,
         profile,
         logs_dir,
@@ -1675,26 +1675,35 @@ pub fn run_setup_gated(
         events,
         cancel,
         gate,
-        &HeavyAdmission::unmanaged(),
-    )
+        admission: &HeavyAdmission::unmanaged(),
+    })
+}
+
+/// The inputs of one gated setup, grouped for [`run_setup_gated_within`].
+pub struct SetupRun<'a> {
+    pub dir: &'a Path,
+    pub profile: &'a VerificationProfile,
+    pub logs_dir: &'a Path,
+    pub prefix: &'a str,
+    pub events: &'a Events,
+    pub cancel: Option<&'a AtomicBool>,
+    pub gate: &'a mut dyn SetupGate,
+    pub admission: &'a HeavyAdmission<'a>,
 }
 
 /// [`run_setup_gated`] under a run's budgets and heavy leases: each step
 /// waits for its lease, then is clipped to what is left when it starts.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "an existing arity, kept until these parameters are grouped into a struct"
-)]
-pub fn run_setup_gated_within(
-    dir: &Path,
-    profile: &VerificationProfile,
-    logs_dir: &Path,
-    prefix: &str,
-    events: &Events,
-    cancel: Option<&AtomicBool>,
-    gate: &mut dyn SetupGate,
-    admission: &HeavyAdmission<'_>,
-) -> Result<Vec<CheckOutcome>, VerifyError> {
+pub fn run_setup_gated_within(run: SetupRun<'_>) -> Result<Vec<CheckOutcome>, VerifyError> {
+    let SetupRun {
+        dir,
+        profile,
+        logs_dir,
+        prefix,
+        events,
+        cancel,
+        gate,
+        admission,
+    } = run;
     let mut outcomes = Vec::new();
     for (index, command) in profile.setup.iter().enumerate() {
         if gate.skip(index, command) {
