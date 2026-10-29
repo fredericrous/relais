@@ -24,6 +24,7 @@ fn declaration(junit: Option<&str>, overlay: &str) -> HoldoutDecl {
         .expect("a command"),
         config: Some(RUNNER_CONFIG.into()),
         inputs: Vec::new(),
+        attach: None,
     }
 }
 
@@ -252,6 +253,7 @@ fn script_declaration(argv: &[&str], config: Option<&str>) -> HoldoutDecl {
             .expect("a command"),
         config: config.map(Into::into),
         inputs: Vec::new(),
+        attach: None,
     }
 }
 

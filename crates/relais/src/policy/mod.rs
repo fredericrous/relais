@@ -1063,13 +1063,95 @@ pub struct HoldoutDecl {
     /// a run whose contract names this holdout.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<String>,
+    /// Where the holdout attaches to a task that does not name it: parsed
+    /// and validated only, nothing attaches from it yet, and it is not
+    /// part of `holdout::digest_of`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach: Option<HoldoutAttach>,
+}
+
+/// `[holdouts.<repo>.<name>].attach`: both lists are non-empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HoldoutAttach {
+    /// Contract task types; never `unclassified`.
+    pub task_types: Vec<crate::contract::TaskType>,
+    /// Repo-relative globs.
+    pub paths: Vec<String>,
+}
+
+/// A declaration as written, before `attach` is checked against the key
+/// path it sits under.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHoldoutDecl {
+    path: String,
+    overlay: String,
+    command: CommandSpec,
+    #[serde(default)]
+    config: Option<String>,
+    #[serde(default)]
+    inputs: Vec<String>,
+    #[serde(default)]
+    attach: Option<RawHoldoutAttach>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHoldoutAttach {
+    task_types: Vec<String>,
+    paths: Vec<String>,
+}
+
+impl RawHoldoutDecl {
+    fn validate(self, repo: &str, name: &str) -> Result<HoldoutDecl, String> {
+        let key = format!("[holdouts.{repo}.{name}].attach");
+        let attach = self
+            .attach
+            .map(|raw| {
+                if raw.task_types.is_empty() {
+                    return Err(format!(
+                        "{key}.task_types must not be empty; allowed: {}",
+                        crate::contract::TaskType::declarable_list()
+                    ));
+                }
+                if raw.paths.is_empty() {
+                    return Err(format!("{key}.paths must not be empty"));
+                }
+                let task_types = raw
+                    .task_types
+                    .iter()
+                    .map(|text| {
+                        crate::contract::TaskType::parse_declared(text).ok_or_else(|| {
+                            format!(
+                                "{key}.task_types: `{text}` is not a task type; allowed: {}",
+                                crate::contract::TaskType::declarable_list()
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(HoldoutAttach {
+                    task_types,
+                    paths: raw.paths,
+                })
+            })
+            .transpose()?;
+        Ok(HoldoutDecl {
+            path: self.path,
+            overlay: self.overlay,
+            command: self.command,
+            config: self.config,
+            inputs: self.inputs,
+            attach,
+        })
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum HoldoutEntry {
     Text(String),
-    Repo(BTreeMap<String, HoldoutDecl>),
+    Repo(BTreeMap<String, RawHoldoutDecl>),
 }
 
 impl<'de> Deserialize<'de> for HoldoutSettings {
@@ -1086,7 +1168,14 @@ impl<'de> Deserialize<'de> for HoldoutSettings {
                     )))
                 }
                 (_, HoldoutEntry::Repo(named)) => {
-                    settings.repos.insert(key, named);
+                    let mut declared = BTreeMap::new();
+                    for (name, raw) in named {
+                        let decl = raw
+                            .validate(&key, &name)
+                            .map_err(serde::de::Error::custom)?;
+                        declared.insert(name, decl);
+                    }
+                    settings.repos.insert(key, declared);
                 }
                 (_, HoldoutEntry::Text(_)) => {
                     return Err(serde::de::Error::custom(format!(
@@ -3715,6 +3804,46 @@ secret = "no"
 command = { argv = ["true"], junit = "j.xml" }
 "#;
         MachineSettings::from_toml_str(text).unwrap_err();
+    }
+
+    fn holdout_with_attach(attach: &str) -> Result<MachineSettings, PolicyError> {
+        MachineSettings::from_toml_str(&format!(
+            "schema_version = 1\n[holdouts]\nstore = \"s\"\n[holdouts.r.x]\npath = \"p\"\n\
+             overlay = \"o\"\ncommand = {{ argv = [\"true\"], junit = \"j.xml\" }}\n\
+             [holdouts.r.x.attach]\n{attach}"
+        ))
+    }
+
+    #[test]
+    fn a_holdout_attach_is_read_and_a_bad_one_names_its_key_path_and_the_types() {
+        let attach = holdout_with_attach("task_types = [\"feature\"]\npaths = [\"src/**\"]\n")
+            .expect("parses")
+            .holdouts
+            .declaration("r", "x")
+            .expect("declared")
+            .attach
+            .clone()
+            .expect("attach");
+        assert_eq!(attach.paths, ["src/**"]);
+        for bad in [
+            "task_types = [\"bogus\"]\npaths = [\"a\"]\n",
+            "task_types = [\"unclassified\"]\npaths = [\"a\"]\n",
+        ] {
+            let message = holdout_with_attach(bad).unwrap_err().to_string();
+            assert!(
+                message.contains("[holdouts.r.x].attach.task_types"),
+                "{message}"
+            );
+            assert!(message.contains("review-fix"), "{message}");
+            assert!(message.contains("mechanical"), "{message}");
+        }
+        for empty in [
+            "task_types = []\npaths = [\"a\"]\n",
+            "task_types = [\"ui\"]\npaths = []\n",
+        ] {
+            let message = holdout_with_attach(empty).unwrap_err().to_string();
+            assert!(message.contains("must not be empty"), "{message}");
+        }
     }
 
     #[test]

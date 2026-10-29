@@ -777,7 +777,22 @@ mod tests {
             .expect("a command spec"),
             config: None,
             inputs: Vec::new(),
+            attach: None,
         }
+    }
+
+    #[test]
+    fn attach_leaves_the_digest_unchanged() {
+        let plain = decl(Some("j.xml"), "o");
+        let mut attached = plain.clone();
+        attached.attach = Some(crate::policy::HoldoutAttach {
+            task_types: vec![crate::contract::TaskType::Feature],
+            paths: vec!["src/**".into()],
+        });
+        assert_eq!(
+            digest_of("r", "n", "s", "sha", &plain),
+            digest_of("r", "n", "s", "sha", &attached)
+        );
     }
 
     fn settings(store: &str, decl: HoldoutDecl) -> HoldoutSettings {
