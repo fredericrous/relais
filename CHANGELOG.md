@@ -8,6 +8,12 @@ missing here.
 
 ## Unreleased
 
+## v0.38.0
+
+- relais joins amont's one host queue by default (amont ADR-0014, relais#343). Its checks take host slots through amont's `amont-slots` crate instead of relais's own copy of the flock protocol, in amont's slot directory, with no `machine.toml` needed. Every heavy job on the machine, amont's git-hook gates, relais's checks and anything run through `amont slot run`, then waits in one ordered queue. `[resources] shared_host_slots = "off"` keeps the coordinator's queue alone. The queue sizes itself from the machine, unless `[resources] host_slots = N` fixes it; set that to match `git config amont.hostSlots` when you set one.
+- The runner holds a check's host slots, never the check: a daemon a check leaves behind no longer keeps a slot.
+- A wait for a host slot says whom it waits behind. `waiting_for_slot` carries `behind`, and the pane reads "waiting for a host slot behind relais: cargo test (amont-wt-x, 4m)".
+
 ## v0.37.0
 
 - A holdout command killed by its timeout now settles as its own outcome, `timed_out` (relais#324). It used to read as `did_not_build`, or as `failed` when it had written a report, and a `failed` holdout on green checks counts as a holdout catch, so machine load could produce a false catch. A timed-out holdout is never a catch; its gap says ``holdout `<name>` timed out after its time limit; raise the holdout's `timeout_seconds` ``, and its kept log ends `holdout timed out after <n> s`. SPEC §10 documents the 300 s default and suggests declaring a timeout for a holdout that builds.
