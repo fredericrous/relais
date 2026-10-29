@@ -1,0 +1,16 @@
+amont-provenance-v1
+commit b3ebc30124a8b6143657f383698fa032685adaba
+tree 12cc249efd751bdeb90214704b1f301b01bfbfba
+canon 2c704e6daf40414e8915734e9fff7e5c47c0e0bf
+patch 503f5a6aa98fe89549a40094bc46e7b6f133a1e5
+plan docs/plans/2026-10-29-budget-cut-baseline-and-gate-test.md dac5772716ca05fa8e17875ff105c902ee3a7e9f90317dc29f10fb754ce8b2d9
+review reviewed f0d32385cbbdf96eaf62bb6046dea138395a6185c4e35ffb874a6013595d605c
+preview not-required
+producer amont-agent 3.8.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAED0oAgR+aaTLVUo9/vFJiYcF6m51H0GiAkZ+NlVVTUb+/pFMv
+Vl1Z2y7tqIAKVLZBiTnUCSAKJUI2riLw10evIN
+-----END SSH SIGNATURE-----
