@@ -177,6 +177,21 @@ impl<'a> RunEngine<'a> {
                     // still judged as a failure (verify::CheckOutcome::
                     // failed); this reclassification happens only here,
                     // where the base is judged.
+                    //
+                    // A base check's timeout is clipped to what is left of
+                    // the total: when the total ran out, it was the run's
+                    // own budget that ended it, not the check's limit, and
+                    // the run ends on that budget (#329).
+                    let timed_out = checks
+                        .iter()
+                        .any(|check| check.ended.recorded() == Some(Ended::TimedOut));
+                    if let Some(exhausted) = timed_out.then(|| self.budgets.exhausted()).flatten() {
+                        if let Err(e) = baseline.release() {
+                            eprintln!("relais: {e}");
+                        }
+                        let nominal = fresh_progress(preflight).budget;
+                        return Ok(Phase::Ended(self.end_on_exhausted(exhausted, &nominal)?));
+                    }
                     let unrunnable: Vec<&verify::CheckOutcome> = checks
                         .iter()
                         .filter(|check| {
