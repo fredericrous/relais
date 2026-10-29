@@ -5,7 +5,7 @@
 //! API-equivalent estimate; an unpriced model makes its arm's cost
 //! unknown, never zero (SPEC §11). Pure.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::Serialize;
 
@@ -53,6 +53,23 @@ pub struct Classifier {
     pub unpriced_models: Vec<String>,
 }
 
+/// The most unmatched check commands the report lists.
+pub const UNMATCHED_SHOWN: usize = 5;
+
+/// The widest line the section prints.
+const LINE_COLUMNS: usize = 80;
+
+/// Unknown subagent tasks by parent. The first four count only rows whose
+/// record says the parent link was captured; `not_captured` counts the rest.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ParentBuckets {
+    pub parent_strong: usize,
+    pub parent_answered: usize,
+    pub parent_unknown: usize,
+    pub no_parent: usize,
+    pub not_captured: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SessionRoutingReport {
     pub basis: &'static str,
@@ -69,6 +86,11 @@ pub struct SessionRoutingReport {
     pub answered_by_class_kind: Vec<(String, usize)>,
     /// `unknown / tasks`: `answered` is not unknown.
     pub unknown_rate: Option<f64>,
+    /// Subagent tasks that ended `unknown`, by what their parent task ended.
+    pub subagent_unknown: ParentBuckets,
+    /// The build or test commands no check covers, by tasks that ran them,
+    /// most first, at most [`UNMATCHED_SHOWN`].
+    pub unmatched_checks: Vec<(String, usize)>,
     pub classifier: Classifier,
     /// Cache-write tokens on the first request after a model switch,
     /// within one session's main thread or one subagent.
@@ -334,6 +356,8 @@ pub fn session_routing(
             *answered_kinds.entry(kind.to_string()).or_default() += 1;
         }
     }
+    let subagent_unknown = parent_buckets(window);
+    let unmatched_checks = unmatched_top(window);
     let classifier_rows: Vec<&RouterUsageRow> = window
         .usage
         .iter()
@@ -352,6 +376,8 @@ pub fn session_routing(
         answered: count(|o| o == TaskOutcome::Answered),
         answered_by_class_kind: answered_kinds.into_iter().collect(),
         unknown_rate: (tasks > 0).then(|| unknown as f64 / tasks as f64),
+        subagent_unknown,
+        unmatched_checks,
         classifier: Classifier {
             calls: classifier_rows.len(),
             captured: 0,
@@ -361,6 +387,78 @@ pub fn session_routing(
         cache_rebuild_tokens: cache_rebuild_tokens(&window.usage),
         exploration,
     }
+}
+
+/// Each unknown subagent task, by the outcome its parent task has in the
+/// window (a parent outside it counts as unknown).
+fn parent_buckets(window: &RouterWindow) -> ParentBuckets {
+    let mut outcome_of_task: HashMap<(&str, &str), Option<TaskOutcome>> =
+        HashMap::with_capacity(window.tasks.len());
+    for (session, task) in &window.tasks {
+        outcome_of_task
+            .entry((session.as_str(), task.task_id.as_str()))
+            .or_insert_with(|| TaskOutcome::parse(&task.outcome));
+    }
+    let mut buckets = ParentBuckets::default();
+    for (session, task) in &window.tasks {
+        let is_unknown_subagent = task.agent_id.is_some()
+            && TaskOutcome::parse(&task.outcome) == Some(TaskOutcome::Unknown);
+        if !is_unknown_subagent {
+            continue;
+        }
+        if !task.parent_link_recorded {
+            buckets.not_captured += 1;
+            continue;
+        }
+        let Some(parent_id) = &task.parent_task_id else {
+            buckets.no_parent += 1;
+            continue;
+        };
+        let parent = outcome_of_task
+            .get(&(session.as_str(), parent_id.as_str()))
+            .copied()
+            .flatten();
+        match parent {
+            Some(
+                TaskOutcome::CompletedVerified
+                | TaskOutcome::CompletedAccepted
+                | TaskOutcome::Corrected,
+            ) => buckets.parent_strong += 1,
+            Some(TaskOutcome::Answered) => buckets.parent_answered += 1,
+            None | Some(TaskOutcome::Unknown) => buckets.parent_unknown += 1,
+        }
+    }
+    buckets
+}
+
+/// The most common unmatched check commands: tasks, not invocations.
+fn unmatched_top(window: &RouterWindow) -> Vec<(String, usize)> {
+    let mut tasks_per_entry: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, task) in &window.tasks {
+        for entry in &task.unmatched_checks {
+            *tasks_per_entry.entry(entry.as_str()).or_default() += 1;
+        }
+    }
+    let mut entries: Vec<(String, usize)> = tasks_per_entry
+        .into_iter()
+        .map(|(entry, count)| (entry.to_string(), count))
+        .collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    entries.truncate(UNMATCHED_SHOWN);
+    entries
+}
+
+/// `    <entry> <count>`, the entry cut with `~` so the line fits the
+/// section's width.
+fn counted_line(entry: &str, count: usize) -> String {
+    let count = count.to_string();
+    let room = LINE_COLUMNS - 4 - 1 - count.len();
+    let shown: String = if entry.chars().count() > room {
+        entry.chars().take(room - 1).chain(['~']).collect()
+    } else {
+        entry.to_string()
+    };
+    format!("    {shown} {count}\n")
 }
 
 fn unknown_cost(unpriced: &[String]) -> String {
@@ -417,6 +515,28 @@ impl SessionRoutingReport {
             out.push_str("  answered by class kind:\n");
             for (kind, count) in &self.answered_by_class_kind {
                 out.push_str(&format!("    {kind} {count}\n"));
+            }
+        }
+        let parents = &self.subagent_unknown;
+        out.push_str("  subagent unknown by parent:\n");
+        for (label, count) in [
+            ("parent strong", parents.parent_strong),
+            ("parent answered", parents.parent_answered),
+            ("parent unknown", parents.parent_unknown),
+            ("no parent", parents.no_parent),
+        ] {
+            out.push_str(&counted_line(label, count));
+        }
+        out.push_str(&format!(
+            "  parent link not captured: {}\n",
+            parents.not_captured
+        ));
+        if self.unmatched_checks.is_empty() {
+            out.push_str("  unmatched check commands: none recorded\n");
+        } else {
+            out.push_str("  unmatched check commands (top 5, tasks per entry):\n");
+            for (entry, count) in &self.unmatched_checks {
+                out.push_str(&counted_line(entry, *count));
             }
         }
         let classifier = match self.classifier.cost {
@@ -480,6 +600,9 @@ mod tests {
             explicit_quote: None,
             outcome_source: Some("own".into()),
             checks: vec![],
+            parent_task_id: None,
+            parent_link_recorded: false,
+            unmatched_checks: vec![],
         }
     }
 
@@ -638,6 +761,96 @@ mod tests {
             .lines()
             .filter(|l| l.contains("outcomes:") || l.contains("answered") || l.starts_with("    "))
         {
+            assert!(line.chars().count() <= 80, "{line}");
+        }
+    }
+
+    fn subagent(id: &str, parent: Option<&str>, link_recorded: bool) -> RouterTaskRow {
+        let mut row = task(id, "unknown");
+        row.agent_id = Some(format!("agent-{id}"));
+        row.parent_task_id = parent.map(str::to_string);
+        row.parent_link_recorded = link_recorded;
+        row
+    }
+
+    #[test]
+    fn unknown_subagent_tasks_are_bucketed_by_their_parents_outcome() {
+        let mut fixture = window();
+        fixture.tasks = vec![
+            ("s".into(), task("strong", "completed_verified")),
+            ("s".into(), task("accepted", "completed_accepted")),
+            ("s".into(), task("corrected", "corrected")),
+            ("s".into(), task("answer", "answered")),
+            ("s".into(), task("unsure", "unknown")),
+            ("s".into(), subagent("c1", Some("strong"), true)),
+            ("s".into(), subagent("c2", Some("accepted"), true)),
+            ("s".into(), subagent("c3", Some("corrected"), true)),
+            ("s".into(), subagent("c4", Some("answer"), true)),
+            ("s".into(), subagent("c5", Some("unsure"), true)),
+            ("s".into(), subagent("c6", Some("outside-window"), true)),
+            ("other".into(), subagent("c7", Some("strong"), true)),
+            ("s".into(), subagent("c8", None, true)),
+            ("s".into(), subagent("c9", Some("strong"), false)),
+            ("s".into(), subagent("c10", None, false)),
+        ];
+        let buckets =
+            session_routing(&fixture, &pricing(), ExplorationReport::default()).subagent_unknown;
+        assert_eq!(
+            (
+                buckets.parent_strong,
+                buckets.parent_answered,
+                buckets.parent_unknown,
+                buckets.no_parent,
+                buckets.not_captured
+            ),
+            (3, 1, 3, 1, 2)
+        );
+    }
+
+    #[test]
+    fn the_parent_and_unmatched_lines_render_and_fit_eighty_columns() {
+        let mut fixture = window();
+        fixture.tasks.push(("s".into(), subagent("c", None, false)));
+        let mut report = session_routing(&fixture, &pricing(), ExplorationReport::default());
+        let text = report.render();
+        assert!(text.contains("  subagent unknown by parent:\n"), "{text}");
+        assert!(text.contains("    parent strong 0\n"), "{text}");
+        assert!(text.contains("    no parent 0\n"), "{text}");
+        assert!(text.contains("  parent link not captured: 1\n"), "{text}");
+        assert!(
+            text.contains("  unmatched check commands: none recorded\n"),
+            "{text}"
+        );
+
+        report.subagent_unknown.parent_strong = 9999;
+        report.subagent_unknown.parent_answered = 9999;
+        report.subagent_unknown.parent_unknown = 9999;
+        report.subagent_unknown.no_parent = 9999;
+        report.subagent_unknown.not_captured = 9999;
+        report.unmatched_checks = vec![
+            ("repo: make check".into(), 9999),
+            (format!("{}: cargo nextest", "r".repeat(100)), 9999),
+        ];
+        let text = report.render();
+        assert!(
+            text.contains("  parent link not captured: 9999\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  unmatched check commands (top 5, tasks per entry):\n    repo: make check 9999\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("none recorded"), "{text}");
+        let long = text
+            .lines()
+            .find(|line| line.starts_with("    rrr"))
+            .expect("the long entry is shown");
+        assert!(long.ends_with("~ 9999"), "{long}");
+        for line in text.lines().filter(|line| {
+            line.starts_with("    ") || line.contains("parent") || line.contains("unmatched")
+        }) {
             assert!(line.chars().count() <= 80, "{line}");
         }
     }

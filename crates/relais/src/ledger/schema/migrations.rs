@@ -1181,8 +1181,9 @@ pub(in crate::ledger) const MIGRATIONS: &[(&str, &str)] = &[
         // question or review task with no edited file and no `aborted`
         // signal is `answered`, not `unknown`. Old rows carry no
         // "could have written" signal, so only the two non-editing kinds
-        // are judged. Rows are marked `backfill_v45` so the step can be
-        // undone with
+        // are judged. The same step adds the parent link (phase 2) and the
+        // unmatched check commands (phase 3), both optional. Backfilled rows
+        // are marked `backfill_v45` so the step can be undone with
         //   UPDATE router_tasks
         //      SET outcome = 'unknown', outcome_source = 'own',
         //          completed_at_end = CASE WHEN completed_at_end = 'answered'
@@ -1190,6 +1191,9 @@ pub(in crate::ledger) const MIGRATIONS: &[(&str, &str)] = &[
         //    WHERE outcome_source = 'backfill_v45'.
         "v45",
         r#"
+    ALTER TABLE router_tasks ADD COLUMN parent_task_id TEXT;
+    ALTER TABLE router_tasks ADD COLUMN parent_link_recorded INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE router_tasks ADD COLUMN unmatched_checks_json TEXT;
     UPDATE router_tasks
        SET outcome = 'answered', outcome_source = 'backfill_v45',
            completed_at_end = CASE WHEN completed_at_end = 'unknown'

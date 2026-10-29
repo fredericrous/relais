@@ -77,7 +77,7 @@ export type Routed = Engine & {
 export async function routedSession(
   $: any,
   on: any,
-  options: { state?: Record<string, unknown> } = {},
+  options: { state?: Record<string, unknown>; cwd?: string } = {},
 ): Promise<Routed & { state: Record<string, unknown> }> {
   const engine = scriptedEngine(on) as Routed & { state: Record<string, unknown> }
   engine.labels = new Map()
@@ -104,7 +104,7 @@ export async function routedSession(
     if (typeof chosen === 'function') return (chosen as () => unknown)()
     return answered(chosen)
   }
-  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await $.session.start({ cwd: options.cwd ?? '/repo', surface: 'terminal', isInteractive: true })
   await settle(engine)
   return engine
 }

@@ -102,6 +102,12 @@ export type TaskState = {
   // relais run or replay). With it a task with no recorded edit is `unknown`,
   // never `answered`.
   maybeWrote: boolean
+  // The task that spawned this one: set for a router-created subagent, absent
+  // for a main task or a spawn with no active parent.
+  parentTaskId?: string
+  // The argv prefixes of build or test commands that matched no check (at
+  // most UNMATCHED_CHECKS_MAX distinct), without the repository.
+  unmatchedChecks: string[]
   // Edits since the last verification, and whether the last verification
   // that counted as escalating evidence failed with no pass since.
   editedSinceCheck: boolean
@@ -503,7 +509,7 @@ const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value))
 
 // --- tasks ------------------------------------------------------------------
 
-export function newTask(id: string, agentId: string | null, opening: string, c: Class, tier: Tier, now: number): TaskState {
+export function newTask(id: string, agentId: string | null, opening: string, c: Class, tier: Tier, now: number, parentTaskId?: string): TaskState {
   return {
     id,
     agentId,
@@ -520,6 +526,8 @@ export function newTask(id: string, agentId: string | null, opening: string, c: 
     exhausted: false,
     hasEdit: false,
     maybeWrote: false,
+    ...(parentTaskId ? { parentTaskId } : {}),
+    unmatchedChecks: [],
     editedSinceCheck: false,
     lastCountedFailure: false,
     verifications: [],
@@ -763,6 +771,50 @@ export function checkIndex(command: string, checks: string[][]): number | undefi
   }
   return undefined
 }
+
+const UNMATCHED_CHECKS_MAX = 5
+const RUNNER_PROGRAMS = ['make', 'just', 'cargo', 'npm', 'pnpm', 'yarn', 'bun', 'go', 'pytest', 'uv', 'mvn', 'gradle', './gradlew', 'deno', 'tox', 'nox']
+const SUBCOMMAND = /^[a-z][a-z0-9:_-]*$/
+const SUBCOMMAND_MAX_BYTES = 40
+const REPOSITORY_MAX_BYTES = 100
+
+function isSubcommandWord(word: string | undefined): word is string {
+  return word !== undefined && encoder.encode(word).length <= SUBCOMMAND_MAX_BYTES && SUBCOMMAND.test(word)
+}
+
+// The argv prefixes of the build or test runners a command starts that no
+// check covers: what a person would paste into `checks`, and nothing more.
+// Leading assignments and flags are skipped, then the program, the next word
+// when it looks like a subcommand, and after `run` or `exec` one more. No
+// path, flag or value is kept. A command a check covers has none.
+export function unmatchedChecksOf(command: string, checks: string[][]): string[] {
+  if (checkIndex(command, checks) !== undefined) return []
+  const found: string[] = []
+  for (const segment of command.split(/&&|\|\||\||;|\n/)) {
+    const argv = words(segment.trim())
+    while (argv.length > 0 && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[0]) || argv[0].startsWith('-'))) argv.shift()
+    const program = argv[0]
+    if (program === undefined || !RUNNER_PROGRAMS.includes(program)) continue
+    const prefix = [program]
+    if (isSubcommandWord(argv[1])) {
+      prefix.push(argv[1])
+      if ((argv[1] === 'run' || argv[1] === 'exec') && isSubcommandWord(argv[2])) prefix.push(argv[2])
+    }
+    found.push(prefix.join(' '))
+  }
+  return found
+}
+
+// `task` with `prefixes` added to its unmatched checks: distinct, at most
+// UNMATCHED_CHECKS_MAX, the first ones kept.
+export function withUnmatchedChecks(task: TaskState, prefixes: string[]): TaskState {
+  const merged = [...new Set([...task.unmatchedChecks, ...prefixes])].slice(0, UNMATCHED_CHECKS_MAX)
+  return merged.length === task.unmatchedChecks.length ? task : { ...task, unmatchedChecks: merged }
+}
+
+// The last path word of a directory: the repository name when it is the git
+// root.
+export const repositoryName = (directory: string): string => directory.replace(/\/+$/, '').replace(/^.*\//, '')
 
 // Drops, in place, the programs that only run another one (`env`, `xargs`,
 // `npx`, `bunx`, `pnpm exec`, `uv run`) with their flags and assignments, so
@@ -1249,7 +1301,8 @@ export function reassessRecord(task: TaskState, r: ReassessRecord, now: number) 
   return { kind: 'reassess', task_id: task.id, agent_id: task.agentId, ...r, at: iso(now) }
 }
 
-export function taskRecord(task: TaskState, endedAt: number | null, cwd: string | undefined) {
+export function taskRecord(task: TaskState, endedAt: number | null, cwd: string | undefined, repository?: string) {
+  const repositoryOfTask = repository ?? ''
   const outcome = outcomeOf(task)
   return {
     kind: 'task',
@@ -1269,6 +1322,10 @@ export function taskRecord(task: TaskState, endedAt: number | null, cwd: string 
     turns: task.turns,
     explicit_quote: task.explicitQuote,
     checks: task.verifications.map(v => ({ name: v.command, kind: v.kind ?? 'test', passed: v.passed })),
+    parent_task_id: task.parentTaskId ?? null,
+    // Dates are not evidence of capture: a record says it carries the link.
+    parent_link_recorded: true,
+    unmatched_checks: repositoryOfTask === '' || /\s/.test(repositoryOfTask) || encoder.encode(repositoryOfTask).length > REPOSITORY_MAX_BYTES ? [] : task.unmatchedChecks.map(prefix => `${repositoryOfTask}: ${prefix}`),
   }
 }
 
@@ -1349,6 +1406,8 @@ export type RouterMemory = {
   status: string | undefined
   // Whether the installed relais accepts `answered`: undefined until asked.
   supportsAnswered: boolean | undefined
+  // The git-root name of `cwd` once asked, for the unmatched checks.
+  repository: { cwd: string; name: string } | undefined
 }
 
 export const createRouterMemory = (): RouterMemory => ({
@@ -1370,6 +1429,7 @@ export const createRouterMemory = (): RouterMemory => ({
   queue: [],
   status: undefined,
   supportsAnswered: undefined,
+  repository: undefined,
 })
 
 // The status line's routing part.

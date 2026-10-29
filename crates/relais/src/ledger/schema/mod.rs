@@ -1349,6 +1349,55 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
     }
 
+    /// v45 adds the parent link and unmatched-check columns, and a task
+    /// written at v44 reads back with their defaults.
+    #[test]
+    fn v45_adds_the_parent_and_unmatched_check_columns_with_their_defaults() {
+        let dir = temp_dir("v44-to-v45-columns");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            for (version, sql) in &MIGRATIONS[..44] {
+                conn.execute_batch(sql).expect("apply step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "then"],
+                )
+                .expect("record step");
+            }
+            conn.execute(
+                "INSERT INTO router_tasks (session, task_id, agent_id, started_at, ended_at,
+                    class_kind, outcome, outcome_rank, inferred_json, files_json,
+                    escalations, exhausted, turns, recorded_at, updated_at, outcome_source,
+                    completed_at_end)
+                 VALUES ('s', 't0', 'a', '2026-10-01T00:00:00Z', NULL, 'debug', 'unknown', 0,
+                    '[]', '[]', 0, 0, 1, 'now', 'now', 'own', NULL)",
+                [],
+            )
+            .expect("a task written at v44");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade to v45");
+        assert_eq!(ledger.schema_version().expect("version"), 45);
+        let (parent, recorded, unmatched): (Option<String>, i64, Option<String>) = ledger
+            .conn
+            .query_row(
+                "SELECT parent_task_id, parent_link_recorded, unmatched_checks_json
+                   FROM router_tasks WHERE task_id = 't0'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("the three columns exist");
+        assert_eq!((parent, recorded, unmatched), (None, 0, None));
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+    }
+
     /// A ledger frozen at exactly v13 upgrades to v14 without losing any
     /// existing row: the `trials` table, `runs.purpose` and
     /// `dispatches.trial_id` all appear, and every pre-existing row
