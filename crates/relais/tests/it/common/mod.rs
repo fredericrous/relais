@@ -207,11 +207,22 @@ mod gate_tests {
             "{:?}",
             order.lock().unwrap()
         );
-        gate.give(3);
+        // Two places free: only the head can be served, so "two" is
+        // checked alone. Giving back all three at once would let a
+        // one-place waiter be served next and push its name before "two"
+        // pushes its own (#338).
+        gate.give(1);
+        let mut threads = threads.into_iter();
+        threads
+            .next()
+            .expect("the two-place waiter")
+            .join()
+            .unwrap();
+        assert_eq!(*order.lock().unwrap(), ["two"]);
+        gate.give(2);
         for thread in threads {
             thread.join().unwrap();
         }
-        assert_eq!(order.lock().unwrap()[0], "two");
     }
 
     #[test]
