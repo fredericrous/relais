@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.35.2
+
 - The coordinator measures the disk at most once a second per path (relais#284). Polling a queue held back by the disk floor used to probe every queued request's paths on every poll, under the admission lock; a measurement is now reused for one second, so the cost of a poll no longer grows with the queue. A raised `available` is seen within a second.
 
 ## v0.35.1
