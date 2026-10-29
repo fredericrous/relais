@@ -176,6 +176,11 @@ pub enum Event {
         class: String,
         position: usize,
         waited_s: u64,
+        /// For `host_slot`: who holds the slots, where they said so
+        /// (`relais: cargo test (amont-wt-x, 4m)`). Absent otherwise, and
+        /// from a runner older than the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        behind: Option<String>,
     },
     /// A command waits for the disk floor: every 30 s while it waits.
     /// `volume` is a path on the volume that holds it, the byte counts are

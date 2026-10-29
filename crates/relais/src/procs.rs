@@ -389,49 +389,6 @@ pub fn parse_cpu_time(text: &str) -> Option<Duration> {
     Some(Duration::from_secs(days * 86_400) + Duration::from_secs_f64(seconds))
 }
 
-/// Take an exclusive, non-blocking `flock` on `file`: `Ok(true)` when
-/// taken, `Ok(false)` when another open file description holds it. The
-/// lock lasts as long as any descriptor of the open file does.
-#[cfg(unix)]
-pub fn try_flock(file: &std::fs::File) -> io::Result<bool> {
-    use std::os::fd::AsRawFd;
-    // SAFETY: a descriptor `file` keeps open; flock touches no memory.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(true);
-    }
-    let error = io::Error::last_os_error();
-    if error.kind() == io::ErrorKind::WouldBlock {
-        Ok(false)
-    } else {
-        Err(error)
-    }
-}
-
-/// Let `command`, and only `command`, inherit these descriptors across
-/// its exec. Descriptors relais opens are close-on-exec; clearing the flag
-/// inside the child (between fork and exec) keeps every other process
-/// relais starts from inheriting them. A host slot held through such a
-/// descriptor lasts as long as any process of the command's group does.
-/// Unix only: Windows has no `flock` slots to pass.
-#[cfg(unix)]
-pub fn inherit_fds(command: &mut Command, fds: Vec<std::os::fd::RawFd>) {
-    use std::os::unix::process::CommandExt;
-    // SAFETY: the closure runs between fork and exec and calls only
-    // `fcntl`, which is async-signal-safe, on descriptors the parent holds
-    // open until the child has been spawned.
-    unsafe {
-        command.pre_exec(move || {
-            for fd in &fds {
-                let flags = libc::fcntl(*fd, libc::F_GETFD);
-                if flags >= 0 {
-                    libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-                }
-            }
-            Ok(())
-        });
-    }
-}
-
 /// Kill the child and everything it spawned: a harness that started its
 /// own children must not survive the kill (SPEC §23 cancellation).
 pub fn kill_tree(child: &mut Child) -> io::Result<()> {

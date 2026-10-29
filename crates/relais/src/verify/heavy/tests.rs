@@ -156,6 +156,7 @@ fn admission<'a>(
         cap,
         cores,
         slots: None,
+        sizing: amont_slots::Sizing::Fixed(4),
         ancestor_holds_slots: false,
         poll: Duration::from_millis(10),
         announce_every: ANNOUNCE_EVERY,
@@ -821,8 +822,7 @@ fn an_ancestor_that_holds_host_slots_is_not_queued_behind_and_the_fact_is_passed
         lease.env().get(HOST_SLOT_ENV).map(String::as_str),
         Some("held")
     );
-    #[cfg(unix)]
-    assert!(lease.slot_fds().is_empty(), "no host slot was queued for");
+    assert_eq!(lease.host_slots(), 0, "no host slot was queued for");
     assert!(
         !dir.join("no-such-slots").exists(),
         "nothing was created either"
@@ -847,82 +847,70 @@ fn an_ancestor_that_holds_host_slots_is_not_queued_behind_and_the_fact_is_passed
 #[cfg(unix)]
 mod host_slots {
     use super::*;
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
-    /// A slot directory as amont leaves it: private, with `files` slot files.
-    fn slot_dir(tag: &str, files: u32) -> PathBuf {
+    /// A private slot directory, as `amont-slots` requires (0700, ours).
+    fn slot_dir(tag: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("relais-heavy-slots-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: a fresh scratch dir
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(&dir)
             .expect("slot dir");
-        for index in 0..files {
-            std::fs::write(dir.join(format!("slot-{index}")), b"").expect("slot file");
-        }
         dir
     }
 
-    fn lock(path: &Path) -> std::fs::File {
-        let file = std::fs::File::open(path).expect("slot file");
-        let locked = crate::procs::try_flock(&file).expect("flock");
-        assert!(locked, "the slot was free");
-        file
+    /// Another holder of one slot in `dir`, through the same crate.
+    fn other_holder(dir: &Path, command: &str) -> amont_slots::Lease {
+        let mut waiter = amont_slots::Waiter::new_in(
+            dir,
+            amont_slots::Sizing::Fixed(1),
+            1,
+            amont_slots::Holder::here("other", command),
+        )
+        .expect("waiter");
+        match waiter.poll().expect("poll") {
+            amont_slots::Poll::Granted(lease) => lease,
+            amont_slots::Poll::Waiting(q) => panic!("the slot was free: {q:?}"),
+        }
     }
 
-    fn files(dir: &Path) -> Vec<PathBuf> {
-        slots::slot_files(dir).expect("slot files")
-    }
-
-    fn entries(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(dir)
-            .expect("dir")
-            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
-    }
-
+    /// A missing directory is made, private, and the command holds a slot
+    /// in it: relais joins the host queue with nothing configured.
     #[test]
-    fn a_partial_set_is_released_and_nothing_stays_held() {
-        let dir = slot_dir("partial", 2);
-        let all = files(&dir);
-        let other = lock(&dir.join("slot-1"));
-        assert!(
-            matches!(
-                slots::try_take(&all, 2).expect("tried"),
-                slots::Taken::Short { missing: 1 }
-            ),
-            "slot-1 is taken elsewhere, so a weight of two gets nothing"
+    fn a_missing_directory_is_made_private_and_a_slot_is_held() {
+        let scratch = temp_dir("slots-new");
+        let missing = scratch.join("made-here");
+        let gate = gate_with(1);
+        register(&gate, "run-n");
+        let mut shared = admission(&gate, "run-n", 1, 4);
+        shared.slots = Some(missing.clone());
+        shared.sizing = amont_slots::Sizing::Fixed(1);
+        let lease = shared.admit(&ask(&BTreeMap::new(), 1)).expect("admitted");
+        assert_eq!(lease.host_slots(), 1);
+        assert_eq!(
+            lease.env().get(HOST_SLOT_ENV).map(String::as_str),
+            Some("held")
         );
-        // slot-0 was released on the back-off: a taker of one gets it.
-        // (A process forked by another test in this binary can hold a copy
-        // of the descriptor for the instant before its exec, so a few
-        // short retries are allowed.)
-        let one = (0..200)
-            .find_map(|_| match slots::try_take(&all, 1).expect("tried") {
-                slots::Taken::All(held) => Some(held),
-                slots::Taken::Short { .. } => {
-                    std::thread::sleep(Duration::from_millis(5));
-                    None
-                }
-            })
-            .expect("slot-0 is free");
-        assert_eq!(one.len(), 1);
-        drop(other);
-        drop(one);
-        std::fs::remove_dir_all(&dir).ok();
+        let mode = std::fs::metadata(&missing)
+            .expect("made")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        drop(lease);
+        std::fs::remove_dir_all(&scratch).ok();
     }
 
+    /// A directory another user could have made (0755) is refused by the
+    /// crate: said once, and the coordinator's queue alone is used.
     #[test]
-    fn a_missing_directory_or_one_with_no_slot_files_warns_once_and_creates_nothing() {
+    fn an_unsafe_directory_warns_once_and_falls_back() {
         let scratch = temp_dir("slots-off");
-        let missing = scratch.join("never-made");
-        let empty = slot_dir("empty", 0);
-        std::fs::write(empty.join("not-a-slot"), b"").expect("other file");
-        let before = entries(&empty);
+        let open = slot_dir("open");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let gate = gate_with(1);
         register(&gate, "run-o");
         let mut off = admission(&gate, "run-o", 1, 4);
@@ -931,32 +919,30 @@ mod host_slots {
             &scratch,
             crate::protocol::Wire::to(std::io::sink()),
         );
-        for dir in [&missing, &empty, &missing, &empty] {
-            off.slots = Some(dir.clone());
-            drop(
-                off.admit(&ask(&BTreeMap::new(), 1))
-                    .expect("falls back to the coordinator queue"),
-            );
+        off.slots = Some(open.clone());
+        for _ in 0..3 {
+            let lease = off
+                .admit(&ask(&BTreeMap::new(), 1))
+                .expect("falls back to the coordinator queue");
+            assert_eq!(lease.host_slots(), 0);
         }
-        assert!(!missing.exists(), "the directory is amont's to make");
-        assert_eq!(entries(&empty), before, "no slot file was created");
         let written = std::fs::read_to_string(scratch.join("events.jsonl")).expect("events");
         assert_eq!(
             written.matches("host_slots_off").count(),
             1,
             "said once, however often it is asked: {written}"
         );
-        std::fs::remove_dir_all(&empty).ok();
+        std::fs::remove_dir_all(&open).ok();
     }
 
     #[test]
-    fn a_weight_above_the_number_of_slot_files_is_refused_not_capped() {
-        // Four cores' worth of tokens, but amont made one slot file.
-        let dir = slot_dir("short", 1);
+    fn a_weight_above_the_cap_is_refused_not_capped() {
+        let dir = slot_dir("short");
         let gate = gate_with(2);
         register(&gate, "run-w");
         let mut shared = admission(&gate, "run-w", 2, 16);
         shared.slots = Some(dir.clone());
+        shared.sizing = amont_slots::Sizing::Fixed(1);
         let refused = shared.admit(&ask(&BTreeMap::new(), 2)).err();
         assert!(
             matches!(
@@ -979,16 +965,37 @@ mod host_slots {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// An older relais counted the `slot-*` files of the directory to size
+    /// the queue. The holder records live under `holders/`, so that count
+    /// never grows past the real slots while one is held.
+    #[test]
+    fn an_old_relais_counting_slot_files_never_counts_a_holder_record() {
+        let dir = slot_dir("old-reader");
+        let held = other_holder(&dir, "cargo test");
+        assert!(dir.join("holders/slot-0.who").exists());
+        // The old `slot_files`, as it read the directory.
+        let counted = std::fs::read_dir(&dir)
+            .expect("dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("slot-"))
+            .filter(|e| e.file_type().is_ok_and(|kind| kind.is_file()))
+            .count();
+        assert_eq!(counted, 1, "one slot, one file");
+        drop(held);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_check_waits_for_a_held_host_slot_and_runs_holding_it() {
         let dir = temp_dir("slots");
-        let slots_dir = slot_dir("wait", 1);
-        let held = Mutex::new(Some(lock(&slots_dir.join("slot-0"))));
+        let slots_dir = slot_dir("wait");
+        let held = Arc::new(Mutex::new(Some(other_holder(&slots_dir, "xcodebuild"))));
         let gate = Recording::new(gate_with(1));
         register(&gate.inner, "run-s");
         let clock = ManualClock::new();
         let mut with_slots = admission(&gate, "run-s", 1, 4);
         with_slots.slots = Some(slots_dir.clone());
+        with_slots.sizing = amont_slots::Sizing::Fixed(1);
         with_slots.budgets = budgets_on(&clock, 60);
         with_slots.events =
             Events::for_run_on("run-s", &dir, crate::protocol::Wire::to(std::io::sink()));
@@ -998,7 +1005,6 @@ mod host_slots {
         // what the gate saw proves the check did not run before that.
         let order = Arc::new(Mutex::new(Vec::<String>::new()));
         let noted = Arc::clone(&order);
-        let held = Arc::new(held);
         let release = Arc::clone(&held);
         with_slots.sleeper = Advancing::then(&clock, move |number| {
             noted
@@ -1027,9 +1033,6 @@ mod host_slots {
         order.lock().expect("order").push("check finished".into());
         let log = std::fs::read_to_string(outcome.log_path).expect("log");
         assert_eq!(log.trim(), "slot=held");
-        // A process forked elsewhere in this test binary can hold the
-        // descriptor for an instant, so the waits after the release are
-        // not counted: the order of events is what is asserted.
         let order = order.lock().expect("order");
         assert_eq!(
             order[..4],
@@ -1039,10 +1042,13 @@ mod host_slots {
         assert_eq!(order.last().map(String::as_str), Some("check finished"));
         // While it waited for the slot it held its token and said so.
         assert!(gate.events().iter().any(|e| e.starts_with("heartbeat ")));
-        // The queue position is the real shortfall: one slot to be freed.
+        // The wait names whom it waited behind.
         let written = std::fs::read_to_string(dir.join("events.jsonl")).expect("events");
         assert!(written.contains("\"class\":\"host_slot\""), "{written}");
-        assert!(written.contains("\"position\":1"), "{written}");
+        assert!(
+            written.contains("\"behind\":\"other: xcodebuild"),
+            "{written}"
+        );
         std::fs::remove_dir_all(&slots_dir).ok();
     }
 }

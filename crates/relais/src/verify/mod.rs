@@ -1268,14 +1268,10 @@ fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
         .env("RELAIS_CHECK", "1");
     crate::procs::own_process_group(&mut command);
     if let Some(admitted) = &admitted {
+        // The runner holds the host slots (`admitted`), never the check:
+        // their descriptors are close-on-exec, so nothing the check leaves
+        // behind keeps one.
         command.envs(admitted.env());
-        #[cfg(unix)]
-        {
-            let fds = admitted.slot_fds();
-            if !fds.is_empty() {
-                crate::procs::inherit_fds(&mut command, fds);
-            }
-        }
     }
     events.emit(Event::CheckStarted {
         label: label.to_string(),

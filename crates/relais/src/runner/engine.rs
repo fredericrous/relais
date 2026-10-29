@@ -805,13 +805,15 @@ impl<'a> RunEngine<'a> {
             events: self.events.clone(),
             cap: verify::heavy_cap(self.config.machine.concurrency.max_heavy_commands, cores),
             cores,
-            slots: self
-                .config
-                .machine
-                .resources
-                .shared_host_slots
-                .as_ref()
-                .map(PathBuf::from),
+            slots: match self.config.machine.resources.shared_host_slots.as_deref() {
+                None => Some(amont_slots::dir()),
+                Some("off") => None,
+                Some(dir) => Some(PathBuf::from(dir)),
+            },
+            sizing: match self.config.machine.resources.host_slots {
+                Some(n) => amont_slots::Sizing::Fixed(n),
+                None => amont_slots::Sizing::Auto,
+            },
             ancestor_holds_slots: verify::ancestor_holds_slots(
                 std::env::var(verify::HOST_SLOT_ENV).ok().as_deref(),
             ),

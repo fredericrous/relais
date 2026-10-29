@@ -386,7 +386,8 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
       }
       const where = event.class === 'host_slot' ? 'a host slot' : `a ${String(event.class ?? 'heavy').replace(/_/g, ' ')} slot`
       const place = typeof event.position === 'number' && event.position > 0 ? `, position ${event.position}` : ''
-      const text = `waiting for ${where}${place} · ${minutesOrSeconds(Number(event.waited_s) || 0)}`
+      const behind = typeof event.behind === 'string' && event.behind ? ` behind ${event.behind}` : ''
+      const text = `waiting for ${where}${place}${behind} · ${minutesOrSeconds(Number(event.waited_s) || 0)}`
       return withEntry({ ...m, wait: text }, at, 'waiting', text)
     }
     case 'waiting_for_disk': {

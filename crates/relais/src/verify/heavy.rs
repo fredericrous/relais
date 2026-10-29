@@ -7,13 +7,15 @@
 //!
 //! 1. the coordinator's tokens (`weight` of them, queued behind whoever
 //!    holds them);
-//! 2. when `[resources] shared_host_slots` names amont's directory, `weight`
-//!    of its existing `slot-*` files, locked with `flock`, all or none, so
-//!    amont's heavy checks and relais's share one host queue (amont
-//!    ADR-0009). The directory and its files are amont's: relais creates
-//!    neither, sizes the queue by counting the files, and falls back to the
-//!    coordinator's queue alone (said once as `host_slots_off`) when there
-//!    are none. Where an ancestor already holds slots
+//! 2. `weight` host slots, all or none, through amont's `amont-slots` crate
+//!    (amont ADR-0014, decisions ADR-0049), so every heavy job on the
+//!    machine shares one queue: amont's gates, relais's checks, anything run
+//!    through `amont slot run`. The directory is amont's by default
+//!    (`[resources] shared_host_slots`, `"off"` for the coordinator's queue
+//!    alone); a directory the crate refuses is said once as
+//!    `host_slots_off`. The runner holds the slots, never the check: their
+//!    descriptors are close-on-exec, so a daemon a check leaves behind does
+//!    not keep one. Where an ancestor already holds slots
 //!    (`AMONT_HOST_SLOT=held` in relais's own environment) nothing is
 //!    queued for, and the variable is passed on;
 //! 3. the child's environment: the parallelism bounds below, then the
@@ -347,6 +349,9 @@ pub struct HeavyAdmission<'a> {
     pub cap: u32,
     pub cores: u32,
     pub slots: Option<PathBuf>,
+    /// How many host slots there are (`[resources] host_slots`, else the
+    /// automatic sizing).
+    pub sizing: amont_slots::Sizing,
     /// An ancestor holds host slots for this tree: nothing is queued for
     /// here, and the fact is passed on to the check.
     pub ancestor_holds_slots: bool,
@@ -388,6 +393,7 @@ impl<'a> HeavyAdmission<'a> {
             cap: 1,
             cores: 1,
             slots: None,
+            sizing: amont_slots::Sizing::Auto,
             ancestor_holds_slots: false,
             poll: ADMISSION_POLL,
             announce_every: ANNOUNCE_EVERY,
@@ -509,6 +515,7 @@ impl<'a> HeavyAdmission<'a> {
             class: COORDINATOR_UNREACHABLE_CLASS.to_string(),
             position: 0,
             waited_s: spent.as_secs(),
+            behind: None,
         });
         let backoff = state.next.max(UNREACHABLE_BACKOFF_START);
         state.next = (backoff * 2).min(UNREACHABLE_BACKOFF_MAX);
@@ -550,7 +557,7 @@ impl<'a> HeavyAdmission<'a> {
         // token is queued for, so a weight it can never grant is refused
         // without waiting.
         let shared = match (&self.slots, self.ancestor_holds_slots) {
-            (Some(dir), false) => slots::inventory(dir, ask.weight, self)?,
+            (Some(dir), false) => slots::usable(dir, ask.weight, self)?,
             _ => None,
         };
         let estimate = self.disk.estimate(ask.label);
@@ -608,6 +615,7 @@ impl<'a> HeavyAdmission<'a> {
                             Decision::Queued { position } => Holding::Slot {
                                 class: "heavy_local",
                                 position: *position,
+                                behind: None,
                             },
                             _ => unreachable!("granted, duplicate and refused return above"),
                         };
@@ -621,12 +629,10 @@ impl<'a> HeavyAdmission<'a> {
                 }
             }
             let mut lease = Admitted::leased(gate, id, environment.clone());
-            if let Some(files) = &shared {
+            if let Some(dir) = &shared {
                 // `lease` drops on an error and gives its tokens back.
-                if let Some(held) = slots::take(
-                    files, ask.weight, self, &mut queue, ask.cancel, gate, &lease.id,
-                )? {
-                    lease.slots = held;
+                if let Some(held) = slots::take(dir, ask, self, &mut queue, gate, &lease.id)? {
+                    lease.slots = Some(held);
                     lease
                         .env
                         .insert(HOST_SLOT_ENV.to_string(), "held".to_string());
@@ -680,7 +686,12 @@ struct Unreachable {
 
 /// What holds a command: its place in a queue, or the disk floor.
 enum Holding<'h> {
-    Slot { class: &'h str, position: usize },
+    /// `behind`: who holds the host slots, when they said so.
+    Slot {
+        class: &'h str,
+        position: usize,
+        behind: Option<String>,
+    },
     Disk(Shortfall),
 }
 
@@ -741,9 +752,9 @@ impl<'q> Queue<'q> {
     ) -> Result<(), LeaseStop> {
         if let Some(exhausted) = self.charging(holding.kind()).tick() {
             let reason = match &holding {
-                Holding::Slot { class, position } => {
-                    format!("still queued for {class} at position {position}")
-                }
+                Holding::Slot {
+                    class, position, ..
+                } => format!("still queued for {class} at position {position}"),
                 Holding::Disk(short) => format!(
                     "still waiting for {} to rise above the floor ({} available, floor {})",
                     short.volume,
@@ -766,10 +777,15 @@ impl<'q> Queue<'q> {
             self.last_announced = now;
             let waited_s = u64::try_from((now - self.started).max(0) / 1000).unwrap_or(0);
             self.admission.events.emit(match holding {
-                Holding::Slot { class, position } => Event::WaitingForSlot {
+                Holding::Slot {
+                    class,
+                    position,
+                    behind,
+                } => Event::WaitingForSlot {
                     class: class.to_string(),
                     position,
                     waited_s,
+                    behind,
                 },
                 Holding::Disk(short) => Event::WaitingForDisk {
                     volume: short.volume,
@@ -791,10 +807,9 @@ pub struct Admitted<'a> {
     id: String,
     /// The environment the command starts with.
     env: BTreeMap<String, String>,
-    /// The host slot files held. Their descriptors are passed to the
-    /// command (`procs::inherit_fds`), so a slot lasts as long as any
-    /// descendant does.
-    slots: Vec<std::fs::File>,
+    /// The host slots held, by this runner and never by the check: released
+    /// when the lease drops, after the check ended.
+    slots: Option<amont_slots::Lease>,
 }
 
 impl<'a> Admitted<'a> {
@@ -803,7 +818,7 @@ impl<'a> Admitted<'a> {
             gate: None,
             id: String::new(),
             env,
-            slots: Vec::new(),
+            slots: None,
         }
     }
 
@@ -812,7 +827,7 @@ impl<'a> Admitted<'a> {
             gate: Some(gate),
             id,
             env,
-            slots: Vec::new(),
+            slots: None,
         }
     }
 
@@ -826,11 +841,9 @@ impl<'a> Admitted<'a> {
         &self.env
     }
 
-    /// The raw descriptors of the host slots held.
-    #[cfg(unix)]
-    pub fn slot_fds(&self) -> Vec<std::os::fd::RawFd> {
-        use std::os::fd::AsRawFd;
-        self.slots.iter().map(AsRawFd::as_raw_fd).collect()
+    /// How many host slots this lease holds.
+    pub fn host_slots(&self) -> usize {
+        self.slots.as_ref().map_or(0, amont_slots::Lease::weight)
     }
 
     /// Tell the coordinator which process group runs the command, so the
@@ -890,182 +903,108 @@ impl Drop for Admitted<'_> {
     }
 }
 
-#[cfg(unix)]
 mod slots {
-    //! amont's host-slot protocol (ADR-0009): `slot-<i>` files in amont's
-    //! private directory, locked with `flock(LOCK_EX | LOCK_NB)`. The
-    //! directory and the files are amont's: nothing here creates them.
+    //! The host slots, through amont's `amont-slots` crate (amont ADR-0014):
+    //! a waiter keeps its place across polls, and relais drives the polling
+    //! from its own queue, so the coordinator lease keeps its heartbeat and
+    //! the wait is charged like any other.
 
-    use std::fs::File;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::AtomicBool;
 
-    use super::{Gate, HeavyAdmission, Holding, LeaseStop, Queue};
+    use super::{Ask, Gate, HeavyAdmission, Holding, LeaseStop, Queue};
 
-    /// What a try at the slots found.
-    pub(super) enum Taken {
-        All(Vec<File>),
-        /// Not enough are free: this many more must be released.
-        Short {
-            missing: u32,
-        },
-    }
-
-    /// Take `want` of the slot files, all or none: on a partial set every
-    /// file taken is released and the attempt backs off. The files are
-    /// opened, never created.
-    pub(super) fn try_take(files: &[PathBuf], want: u32) -> std::io::Result<Taken> {
-        let mut held = Vec::new();
-        for path in files {
-            if held.len() as u32 == want {
-                break;
-            }
-            let file = File::open(path)?;
-            if crate::procs::try_flock(&file)? {
-                held.push(file);
-            }
-        }
-        // Dropping `held` on a partial set unlocks it.
-        let got = held.len() as u32;
-        Ok(if got == want {
-            Taken::All(held)
-        } else {
-            Taken::Short {
-                missing: want - got,
-            }
-        })
-    }
-
-    /// Accept the directory only when it is a real directory this user
-    /// owns with mode 0700: on a shared `/tmp`, another user could create
-    /// it first and hold every slot. Nothing is created.
-    fn private(dir: &Path) -> Result<(), String> {
-        let meta = dir
-            .symlink_metadata()
-            .map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
-        if meta.file_type().is_symlink() || !meta.is_dir() {
-            return Err(format!("{} is not a plain directory", dir.display()));
-        }
-        if meta.uid() != crate::procs::uid() {
-            return Err(format!("{} belongs to another user", dir.display()));
-        }
-        let mode = meta.permissions().mode() & 0o777;
-        if mode != 0o700 {
-            return Err(format!("{} has mode {mode:o}, not 700", dir.display()));
-        }
-        Ok(())
-    }
-
-    /// The existing `slot-*` files of the directory, in name order.
-    pub(super) fn slot_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
-        private(dir)?;
-        let entries =
-            std::fs::read_dir(dir).map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
-        let mut files: Vec<PathBuf> = entries
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with("slot-"))
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-            .map(|entry| entry.path())
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            return Err(format!("{} has no slot-* files", dir.display()));
-        }
-        Ok(files)
-    }
-
-    /// Count the slot files before anything is queued for. `Ok(None)`: the
-    /// shared queue is not usable, which is said once and not fatal, the
-    /// host queue being amont's courtesy and not relais's rule. A weight
-    /// above the number of files is refused: capping it would let a
-    /// command that asked for more than the host has run as if it had not.
-    pub(super) fn inventory(
+    /// Whether the slot directory can be used, before anything is queued
+    /// for. `Ok(None)`: it cannot, which is said once and not fatal, the
+    /// host queue being a courtesy to the machine. A weight above the cap
+    /// is refused: capping it would let a command that asked for more than
+    /// the host has run as if it had not.
+    pub(super) fn usable(
         dir: &Path,
         weight: u32,
         admission: &HeavyAdmission<'_>,
-    ) -> Result<Option<Vec<PathBuf>>, LeaseStop> {
-        match slot_files(dir) {
-            Err(why) => {
-                admission.host_slots_off(&why);
-                Ok(None)
-            }
-            Ok(files) if weight as usize > files.len() => Err(LeaseStop::HostSlots {
-                weight,
-                slots: files.len(),
-                dir: dir.display().to_string(),
-            }),
-            Ok(files) => Ok(Some(files)),
+    ) -> Result<Option<PathBuf>, LeaseStop> {
+        if !amont_slots::SUPPORTED {
+            admission.host_slots_off("host slots need flock, which this platform does not have");
+            return Ok(None);
         }
+        if let Err(why) = amont_slots::safe_dir(dir) {
+            admission.host_slots_off(&why);
+            return Ok(None);
+        }
+        let cap = admission.sizing.cap();
+        if weight > cap {
+            return Err(LeaseStop::HostSlots {
+                weight,
+                slots: cap as usize,
+                dir: dir.display().to_string(),
+            });
+        }
+        Ok(Some(dir.to_path_buf()))
     }
 
-    /// Wait for `weight` of the slot files, charging the wait like the
-    /// queue for tokens and reporting how many more must be released as the
-    /// queue position. `Ok(None)`: the files became unusable, which is
-    /// said once and not fatal.
+    /// Wait for `ask.weight` host slots. `Ok(None)`: the slots became
+    /// unusable, which is said once and not fatal.
     pub(super) fn take(
-        files: &[PathBuf],
-        weight: u32,
+        dir: &Path,
+        ask: &Ask<'_>,
         admission: &HeavyAdmission<'_>,
         queue: &mut Queue<'_>,
-        cancel: Option<&AtomicBool>,
         gate: &(dyn Gate + Sync),
         lease: &str,
-    ) -> Result<Option<Vec<File>>, LeaseStop> {
-        loop {
-            let missing = match try_take(files, weight) {
-                Ok(Taken::All(held)) => return Ok(Some(held)),
-                Ok(Taken::Short { missing }) => missing,
+    ) -> Result<Option<amont_slots::Lease>, LeaseStop> {
+        let mut holder = amont_slots::Holder::here("relais", ask.label);
+        holder.session = admission.run_id.clone();
+        let started = std::time::Instant::now();
+        let mut waiter =
+            match amont_slots::Waiter::new_in(dir, admission.sizing, ask.weight, holder) {
+                Ok(waiter) => waiter,
                 Err(e) => {
-                    admission.host_slots_off(&format!("a slot file could not be locked: {e}"));
+                    admission.host_slots_off(&format!("a host slot could not be queued for: {e}"));
+                    return Ok(None);
+                }
+            };
+        loop {
+            let queued = match waiter.poll() {
+                Ok(amont_slots::Poll::Granted(held)) => {
+                    amont_slots::record_wait(
+                        dir,
+                        "relais",
+                        ask.weight,
+                        started.elapsed().as_millis(),
+                        "admitted",
+                    );
+                    return Ok(Some(held));
+                }
+                Ok(amont_slots::Poll::Waiting(queued)) => queued,
+                Err(e) => {
+                    admission.host_slots_off(&format!("a host slot could not be locked: {e}"));
                     return Ok(None);
                 }
             };
             // The tokens are held while the slots are awaited: say so, so
             // the coordinator does not take the lease for abandoned.
-            let _ = gate.heartbeat(lease);
+            let _ = gate.heartbeat(lease); // best-effort: the next poll beats again
             queue.wait(
                 Holding::Slot {
                     class: "host_slot",
-                    position: missing as usize,
+                    position: queued.position,
+                    behind: behind(&queued),
                 },
-                cancel,
+                ask.cancel,
                 admission.sleeper.as_ref(),
             )?;
         }
     }
-}
 
-#[cfg(not(unix))]
-mod slots {
-    //! `flock` is unix-only: on other platforms the coordinator's token
-    //! queue is the whole queue.
-
-    use std::fs::File;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::AtomicBool;
-
-    use super::{Gate, HeavyAdmission, LeaseStop, Queue};
-
-    pub(super) fn inventory(
-        _dir: &Path,
-        _weight: u32,
-        admission: &HeavyAdmission<'_>,
-    ) -> Result<Option<Vec<PathBuf>>, LeaseStop> {
-        admission.host_slots_off("host slots need flock, which this platform does not have");
-        Ok(None)
-    }
-
-    pub(super) fn take(
-        _files: &[PathBuf],
-        _weight: u32,
-        _admission: &HeavyAdmission<'_>,
-        _queue: &mut Queue<'_>,
-        _cancel: Option<&AtomicBool>,
-        _gate: &(dyn Gate + Sync),
-        _lease: &str,
-    ) -> Result<Option<Vec<File>>, LeaseStop> {
-        Ok(None)
+    /// `relais: cargo test (amont-wt-x, 4m), 1 unknown (old client)`, or
+    /// nothing when no holder said who it is.
+    fn behind(queued: &amont_slots::Queue) -> Option<String> {
+        let now = amont_slots::now_ms();
+        let mut who: Vec<String> = queued.holders.iter().map(|h| h.describe(now)).collect();
+        if queued.unknown > 0 {
+            who.push(format!("{} unknown (old client)", queued.unknown));
+        }
+        (!who.is_empty()).then(|| who.join(", "))
     }
 }
 
