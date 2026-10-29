@@ -1571,13 +1571,13 @@ mod tests {
 
     #[test]
     fn a_manifest_without_unchecked_keys_still_parses_as_empty() {
-        let mut value = serde_json::to_value(manifest()).expect("json");
+        let mut manifest_json = serde_json::to_value(manifest()).expect("json");
         // Empty is skipped on write; remove defensively all the same.
-        value
+        manifest_json
             .as_object_mut()
             .expect("an object")
             .remove("unchecked_keys");
-        let parsed: ContextManifest = serde_json::from_value(value).expect("still parses");
+        let parsed: ContextManifest = serde_json::from_value(manifest_json).expect("still parses");
         assert!(parsed.unchecked_keys.is_empty());
     }
 
