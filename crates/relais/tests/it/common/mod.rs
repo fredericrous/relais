@@ -207,11 +207,15 @@ mod gate_tests {
             "{:?}",
             order.lock().unwrap()
         );
-        gate.give(3);
+        // Two places are free: only the head can be served, and it takes
+        // both, so no one-place waiter can have taken a place yet.
+        gate.give(1);
+        threads.remove(0).join().unwrap();
+        assert_eq!(*order.lock().unwrap(), ["two"]);
+        gate.give(2);
         for thread in threads {
             thread.join().unwrap();
         }
-        assert_eq!(order.lock().unwrap()[0], "two");
     }
 
     #[test]

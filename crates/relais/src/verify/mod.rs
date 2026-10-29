@@ -138,6 +138,32 @@ pub struct CheckOutcome {
     /// A check that failed and then passed on a retry: a pass, marked.
     #[serde(default, skip_serializing_if = "is_false")]
     pub flaky: bool,
+    /// The limit the check ran under next to the one it declared. Absent
+    /// for a record written before this field existed: unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<AppliedLimit>,
+}
+
+/// A check's wall limit as applied (its own timeout clipped to what the
+/// run's budgets had left) and as declared, in milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedLimit {
+    pub applied_ms: u64,
+    pub declared_ms: u64,
+}
+
+impl AppliedLimit {
+    pub fn new(applied: Duration, declared: Duration) -> Self {
+        Self {
+            applied_ms: applied.as_millis() as u64,
+            declared_ms: declared.as_millis() as u64,
+        }
+    }
+
+    /// Whether a budget of the run cut the limit below the declared one.
+    pub fn was_clipped(&self) -> bool {
+        self.applied_ms < self.declared_ms
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1379,6 +1405,7 @@ fn run_attempt(
         junit,
         attempts: Vec::new(),
         flaky: false,
+        limit: Some(AppliedLimit::new(timeout, own_timeout)),
     })
 }
 
@@ -3461,6 +3488,36 @@ mod tests {
     }
 
     #[test]
+    fn a_check_outcome_without_an_applied_limit_still_parses() {
+        let outcome = serde_json::from_str::<CheckOutcome>(
+            r#"{"label":"c","argv":["true"],"ended":{"exited":0},"log_path":"l","log_sha256":"h"}"#,
+        )
+        .expect("a record written before the field parses");
+        assert_eq!(outcome.limit, None);
+        assert!(!serde_json::to_string(&outcome).unwrap().contains("limit"));
+    }
+
+    #[test]
+    fn an_applied_limit_round_trips() {
+        let dir = temp_dir("limit");
+        let outcome = run_command(
+            &dir,
+            &command(&["sh", "-c", "true"], 10),
+            &dir.join("logs"),
+            "c",
+            "s",
+        )
+        .expect("runs");
+        let limit = outcome.limit.expect("a run records its limit");
+        assert_eq!(limit.declared_ms, 10_000);
+        assert!(!limit.was_clipped());
+        let written = serde_json::to_string(&outcome).unwrap();
+        assert!(written.contains(r#""applied_ms":10000"#), "{written}");
+        let read: CheckOutcome = serde_json::from_str(&written).unwrap();
+        assert_eq!(read, outcome);
+    }
+
+    #[test]
     fn a_check_sees_relais_check_in_its_environment() {
         let dir = temp_dir("env");
         let spec = command(&["sh", "-c", "echo \"[$RELAIS_CHECK]\""], 10);
@@ -3787,6 +3844,7 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            limit: None,
         }
     }
 
@@ -4689,6 +4747,7 @@ mod tests {
                 junit: None,
                 attempts: Vec::new(),
                 flaky: false,
+                limit: None,
             }],
             gaps: vec![],
             baseline_failures: vec![],
@@ -4780,6 +4839,7 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            limit: None,
         }];
         let gaps = acceptance_gaps(
             &entries,
@@ -4845,6 +4905,7 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            limit: None,
         }];
         let report = VerificationReport {
             candidate_sha: "abc".into(),
@@ -4988,6 +5049,7 @@ mod tests {
             junit,
             attempts: Vec::new(),
             flaky: false,
+            limit: None,
         }
     }
 
@@ -5327,6 +5389,7 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            limit: None,
         }];
         let entries = vec![declared(
             "a person signed off on the migration",
@@ -5415,6 +5478,7 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            limit: None,
         }];
         let entries = vec![declared(
             "a person signed off on the migration",
@@ -5527,6 +5591,7 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            limit: None,
         }];
         let entries = vec![declared(
             "the pre-push cargo test gate covers this candidate",
@@ -5616,6 +5681,7 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            limit: None,
         }];
         let entries = vec![declared(
             "the pre-push cargo test gate covers this candidate",
@@ -5817,6 +5883,7 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            limit: None,
         };
         let entries = vec![
             AcceptanceEntry::Bare("the layout is listed".into()),
@@ -6021,6 +6088,7 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            limit: None,
         };
         let report = VerificationReport {
             candidate_sha: "abc".into(),
@@ -6184,6 +6252,7 @@ mod tests {
                 junit: None,
                 attempts: Vec::new(),
                 flaky: false,
+                limit: None,
             }],
             gaps: Vec::new(),
             gaps_not_judged: Vec::new(),

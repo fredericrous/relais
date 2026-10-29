@@ -743,6 +743,25 @@ impl<'a> RunEngine<'a> {
         Some((label, found, measured))
     }
 
+    /// The budget a check was cut by: it ended `TimedOut` under a limit
+    /// the run's budgets had clipped below its declared one, and a budget
+    /// is spent. A check that hit its own limit, or whose limit is
+    /// unknown, says something about the code and is judged as such.
+    pub(super) fn budget_cut(&self, check: &verify::CheckOutcome) -> Option<Exhausted> {
+        let clipped = check.limit.is_some_and(|limit| limit.was_clipped());
+        let timed_out = matches!(check.ended.recorded(), Some(crate::procs::Ended::TimedOut));
+        if clipped && timed_out {
+            self.budgets.exhausted()
+        } else {
+            None
+        }
+    }
+
+    /// The first check of a set that a budget cut, with the budget.
+    pub(super) fn budget_cut_in(&self, checks: &[verify::CheckOutcome]) -> Option<Exhausted> {
+        checks.iter().find_map(|check| self.budget_cut(check))
+    }
+
     /// The base's failed check showed exhaustion: `blocked
     /// (baseline_resource_exhausted)`, never a red base.
     pub(super) fn end_on_baseline_exhaustion(

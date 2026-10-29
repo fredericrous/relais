@@ -119,6 +119,13 @@ impl<'a> RunEngine<'a> {
                         }
                         return Ok(Phase::Ended(outcome));
                     }
+                    if let Some(exhausted) = self.budget_cut_in(&setup) {
+                        if let Err(e) = baseline.release() {
+                            eprintln!("relais: {e}");
+                        }
+                        let nominal = fresh_progress(preflight).budget;
+                        return Ok(Phase::Ended(self.end_on_exhausted(exhausted, &nominal)?));
+                    }
                     if let Some(failed) = verify::setup_failure(&setup) {
                         let detail = setup_failure_detail(failed, "the base revision");
                         if let Err(e) = baseline.release() {
@@ -165,6 +172,14 @@ impl<'a> RunEngine<'a> {
                             eprintln!("relais: {e}");
                         }
                         return Ok(Phase::Ended(outcome));
+                    }
+                    // A check a budget of the run cut says nothing about the base.
+                    if let Some(exhausted) = self.budget_cut_in(&checks) {
+                        if let Err(e) = baseline.release() {
+                            eprintln!("relais: {e}");
+                        }
+                        let nominal = fresh_progress(preflight).budget;
+                        return Ok(Phase::Ended(self.end_on_exhausted(exhausted, &nominal)?));
                     }
                     // A check that gave no verdict at the base — the
                     // program was not found (exit 127), or the wall clock

@@ -130,6 +130,7 @@ mod tests {
             junit,
             attempts: Vec::new(),
             flaky: false,
+            limit: None,
         }
     }
 

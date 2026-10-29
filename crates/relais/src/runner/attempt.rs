@@ -921,15 +921,10 @@ impl<'a> RunEngine<'a> {
         // A check that timed out because a budget ran out under it says
         // nothing about the code: the run ends on the budget (ADR-0010),
         // with the candidate kept, rather than repairing a clock.
-        if checks
-            .iter()
-            .any(|check| matches!(check.ended.recorded(), Some(Ended::TimedOut)))
-        {
-            if let Some(exhausted) = self.budgets.exhausted() {
-                return Ok(Step::Ended(
-                    self.end_on_exhausted(exhausted, &progress.budget)?,
-                ));
-            }
+        if let Some(exhausted) = self.budget_cut_in(&checks) {
+            return Ok(Step::Ended(
+                self.end_on_exhausted(exhausted, &progress.budget)?,
+            ));
         }
         // A failed check that shows a full disk or no memory is evidence
         // for a person: no repair, no escalation, the candidate kept.
