@@ -1,0 +1,7 @@
+# Reviews: a baseline cut by the run's budget
+
+## Full reviews (reference)
+
+- **backend r1** (37k, 74 s) approve-with-changes. 1 [high] `exhausted()` can name AdmissionWait/DiskWait for a check killed by its own limit: accepted. 2 [medium] the clipped wording would never show: accepted. 3 [medium] release the base worktree and pass the budget: accepted. 4 [medium] the stress loop must fail on `origin/main` first: accepted. 5 [low] turn the baseline cache off in tests: accepted. 6 [low] drop the gate-race claim: accepted.
+- **backend r2** (41k, 113 s) approve-with-changes; 1-6 resolved. Carried: 1 [medium] the first bullet of section 1 still states the old rule: implement the `budget_cut` helper rule (clipped below the declared limit) and pass `&budget`; 2 [low] the shared helper changes the candidate's judgement after a spent admission wait: test a baseline and a candidate hitting their own limit then. 3 [low] `None` handled: no edit.
+- **codex** (gpt, high effort, exit 0) approve-with-changes. Carried: 1 [medium] the clipped limit rides receipts and baseline caches: optional serde-default fields, subsecond precision, legacy records still parse, missing means unknown; 2 [medium] a zero-total test can pass on old code because a quick child exits before the deadline check (`procs.rs:955-963`): use a child that runs until killed, assert `TimedOut` and the applied limit, and show both regressions fail on `origin/main`.
