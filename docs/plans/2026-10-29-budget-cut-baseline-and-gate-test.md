@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: fix/budget-cut-baseline-and-gate-test
 repos: [relais]
 adrs: [ADR-0010]
@@ -74,5 +74,12 @@ PR #333 (answered outcome) is green everywhere but `test (windows-latest)`, and 
 - D5 (2026-10-29, implementation review) Deliberate departure from "not a sleep": the two end-to-end regressions run a real `sleep 30` base command under a 1 s total, because the bug is a real child killed at a real clipped deadline and a fixture clock kills no process; each costs about 1 s and passes on any machine speed (a slow one still ends `budget_exhausted (total)`). The helper's rule is also covered without real time by `after_a_spent_admission_wait_a_check_on_its_own_limit_is_not_a_budget_cut`.
 - D6 (2026-10-29) The refreshed decisions pack and its `HEADS.md` row (ADR-0047) ride this branch's first commit, as `guidance.generated-block-rides-the-change` asks of every task branch.
 - D7 (2026-10-29) On the candidate path, a check that ran its full declared limit while a wait budget ran out is now judged on its own (a failed check, repaired), not `budget_exhausted`: that is backend r1 finding 1 applied to both paths, so the run names the budget only when the budget shortened the command.
+
+## Implementation review
+
+- Verdict: approve on tree f0d32385 (Delta), after approve-with-changes on c3773bdb (round 1).
+- Fixed: the own-limit test asserts the declared limit; the three baseline tests pin the cache off.
+- Deliberate: real `sleep 30` base commands in the two end-to-end regressions (D5); the pack refresh rides the branch (D6); the candidate narrowing (D7).
+- Round 1 53k tokens, 70 s; Delta 58k tokens, 16 s. Remaining check: `test (windows-latest)` on this PR, then on #333 rebased on it.
 
 <!-- panel: repos=relais adds= reviewers=backend,codex body-sha=f8799191435f -->
