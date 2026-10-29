@@ -1,7 +1,7 @@
 ---
 canonical: github:fredericrous/aval/docs/plans/2026-10-27-repo-declares-its-scopes.md
 phases: [4]
-status: active
+status: done
 branch: feat/scoped-decisions
 ---
 # A repository declares the scopes it is in
@@ -36,6 +36,12 @@ needs this relais released. It runs after the next relais release, when the
 machine is quiet. Its input already holds: in customer-vision `aval relevant`
 ranks `ui.design-system` active at duro-stack, and `amont-agent review-brief`
 carries it (Phase 3 record).
+
+Observed 2026-10-29, after the v0.35.1 release: run-65eeb3c270e97-1545c in
+customer-vision (isolated, review required, accepted). The worker's guidance
+and the reviewer's decisions block both list `ui.design-system`
+(decisions:ADR-0006, duro-stack), beside `stack.web-framework` (effect-stack)
+and `ui.policy-enforcement`, `ui.mockup-handoff`, `ui.measures` (duro-stack).
 
 ## Decision log
 
