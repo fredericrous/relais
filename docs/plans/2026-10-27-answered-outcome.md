@@ -10,7 +10,7 @@ adrs: [ADR-0002, ADR-0003]
 ## Review panel
 
 👉 **Decide:** none — approve if `answered` (never a label, question/review only in backfill), a parent link, counted unmatched checks and 26 replays make the loop honest.
-📍 relais · plan reviewed · next: Phase 0 dry runs, then the v0.36.0 branch. Panel: architect, backend, lang:rust, po, tui, unix (opus-5-5), codex (gpt).
+📍 relais · plan reviewed · next: Phase 0 dry runs, then the v0.38.0 release (D13). Panel: architect, backend, lang:rust, po, tui, unix (opus-5-5), codex (gpt).
 **Changed by review:** install binary before plugin + version check; `maybeWrote`/aborted keep `unknown`, backfill 277 rows; unmatched prefixes safe and per repository.
 📄 Full reviews: [2026-10-27-answered-outcome.reviews.md](2026-10-27-answered-outcome.reviews.md)
 **Verdicts:** round 1: 6 approve-with-changes (1 blocking, fixed); round 2 backend approve-with-changes ×2; codex approve-with-changes (1 high applied); 9 findings carried into implementation.
@@ -60,12 +60,12 @@ The person chose (2026-10-27): reduce unknown outcomes and run the replays first
 
 ## Delivery
 
-- One branch, one PR in relais; phases 1–3 share ledger step v45 and the wire change, so they ship together as v0.36.0 (CHANGELOG `## v0.36.0` section names schema 45, report schema 15, the backup advice, and "reinstall the plugin": an old relais refuses the new wire fields because of `deny_unknown_fields`).
-- Install order: the v0.36.0 binary first, then the plugin. A new plugin against an old binary gets exit 2, and `observe` drops the whole batch, decisions and usage included (routing.ts:675-677). The PR states why the ADR-0030 steps are collapsed: nothing persisted is in an old form, the Rust side only adds and every new field is optional, and the plugin is the only producer.
-- The plugin checks `relais --version` ≥ 0.36 before it sends `answered` or the new fields, and sends the v0.35 form otherwise, so a wrong order never drops a batch.
+- One branch, one PR in relais; phases 1–3 share ledger step v45 and the wire change, so they ship together as v0.38.0 (D10, D13; CHANGELOG `## v0.38.0` section names schema 45, report schema 15, the backup advice, and "reinstall the plugin": an old relais refuses the new wire fields because of `deny_unknown_fields`).
+- Install order: the v0.38.0 binary first, then the plugin. A new plugin against an old binary gets exit 2, and `observe` drops the whole batch, decisions and usage included (routing.ts:675-677). The PR states why the ADR-0030 steps are collapsed: nothing persisted is in an old form, the Rust side only adds and every new field is optional, and the plugin is the only producer.
+- The plugin checks `relais --version` ≥ 0.38 (D13) before it sends `answered` or the new fields, and sends the v0.35 form otherwise, so a wrong order never drops a batch.
 - Phase 0 runs before the release, against v0.35.0, since it needs no code.
 - Each phase's implementation is routed through relais as a bounded change task in the task worktree.
-- Rollback: v0.35 refuses a v45 ledger (`ledger/schema/mod.rs:52`), so going back is a fix-forward v0.36.x, or the pre-upgrade backup at the cost of the rows written since; the backfill alone is undone with the SQL in Phase 1.
+- Rollback: v0.35 refuses a v45 ledger (`ledger/schema/mod.rs:52`), so going back is a fix-forward v0.38.x, or the pre-upgrade backup at the cost of the rows written since; the backfill alone is undone with the SQL in Phase 1.
 
 ## Verification
 
@@ -86,6 +86,8 @@ The person chose (2026-10-27): reduce unknown outcomes and run the replays first
 ## Verification record (2026-10-29, before push)
 
 - Phases 1–3 implemented; Phase 0 not run (D11).
+- `make check` on the rebased head `8cde9421` (main `d4907526`, v0.37.0; 0.38 gate): Rust 2063 + 34 + 258 + 1 passed, 0 failed. Plugin: the seven plugin tests this branch adds all pass, in both passes — "a relais older than 0.38 gets the v0.35 form…", "relais 0.37.0, released without the answered outcome, gets the v0.35 form", "a parent whose outcome is unknown sends no task_outcome", "a git root whose name has a space sends no unmatched entry", "a 41-byte script name ends the prefix", "a failing rev-parse from a subdirectory stores no unmatched entry", "a relais older than 0.38 receives none of the parent or unmatched fields". The suite as a whole failed at load 256: 40 failures were 5000 ms per-test timeouts and 2 were timing assertions, all in dispatch and pane tests this branch does not touch. The PR's `plugin` CI job is the check for those.
+- Piloted run on `8cde9421`, a `.backup` copy of the live ledger at schema 44: the v45 WHERE clause counts 273 rows before the upgrade; after it there are 273 `backfill_v45` rows, 0 `answered` rows with files, and the schema is 45. The report shows `outcomes: 425 completed, 27 corrected, 168 unknown (unknown rate 19%)`, `answered (no file edited, never a label): 273`, `parent link not captured: 15`, `unmatched check commands: none recorded`. Superseded by these two lines: the `59d97d19` record and the piloted run below, which predate the rebase.
 - `make check` on the branch head `59d97d19` (after rebase on v0.36.0 and the implementation-review fixes): exit 0 in 797 s at load about 10. Rust: 2059 + 34 + 258 + 1 passed, 0 failed. Plugin: 353 pass, 0 fail. Named results, all pass: `a_first_answered_record_with_files_is_stored_unknown`, `v45_adds_the_parent_and_unmatched_check_columns_with_their_defaults`, `v45_backfills_only_ended_file_free_question_and_review_rows`, `every_rank_zero_outcome_is_covered_by_the_ledgers_rank_zero_merge`, `answered_is_reported_apart_and_is_not_unknown`, the six wire tests below, and the plugin tests "a relais older than 0.37 gets the v0.35 form…", "relais 0.36.0, released without the answered outcome, gets the v0.35 form", "a parent whose outcome is unknown sends no task_outcome", "a git root whose name has a space sends no unmatched entry", "a failing rev-parse from a subdirectory stores no unmatched entry", "a relais older than 0.37 receives none of the parent or unmatched fields".
 - `make lint`, `make test`, `make msrv`, `make audit`, `make plugin`: pass on the Phase 1 candidate in a quiet window (relais run-65ee9a72c9098-1861a, load about 10); the commits' pre-commit gate (31 checks) passed for `feat(router): an answered outcome, never a label` and `feat(router): parent link and unmatched checks`. Earlier `make plugin` failures were 5000 ms per-test timeouts in untouched tests at load averages of 145–691, different tests on each pass.
 - New wire tests: `a_task_record_with_parent_marker_and_unmatched_checks_parses`, `a_task_record_without_the_new_fields_parses_with_defaults`, `an_unmatched_entry_with_a_path_word_is_refused`, `an_unmatched_entry_whose_repository_is_not_a_basename_is_refused`, `an_unmatched_entry_with_a_trailing_argument_is_refused`, `an_unmatched_subcommand_word_over_40_bytes_is_refused`: pass. Ledger test `a_first_answered_record_with_files_is_stored_unknown`: pass.
@@ -120,7 +122,7 @@ The person chose (2026-10-27): reduce unknown outcomes and run the replays first
 
 - Verdict: approve on tree 82726511 (Delta), after approve-with-changes on 410d77b1 (round 1).
 - Fixed: version gate 0.36 → 0.37 with a 0.36.0 test (blocking); exhaustive match in `first_task`, split bool test helper, named binding (blocking); D12, D6 CASE form, `make check` record on head.
-- Deliberate: none. Next: Phase 0 (D11) after the v0.37.0 release; the plan stays `active`.
+- Deliberate: none. Next: Phase 0 (D11) after the v0.38.0 release (D13); the plan stays `active`.
 - Round 1 94k tokens, 325 s; Delta 107k tokens, 43 s.
 
 <!-- panel: repos=relais adds= reviewers=architect,backend,lang:rust,po,tui,unix,codex body-sha=cf8c58d9122a -->
