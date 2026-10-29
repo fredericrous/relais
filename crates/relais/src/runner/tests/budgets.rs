@@ -234,6 +234,30 @@ fn total_seconds_caps_the_run_end_to_end() {
     );
 }
 
+#[test]
+fn a_base_check_cut_off_by_the_total_ends_on_the_total() {
+    // The check's own limit is far away; the one second total clips it.
+    // The total ended it, so the run ends on the total, not as a base
+    // that gave no verdict (#329). A check cut off by its own limit stays
+    // `baseline_unrunnable`
+    // (`a_baseline_check_the_wall_clock_kills_is_unrunnable_not_failed`).
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(
+        vec![CommandSpec {
+            argv: vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            ..passing_check()
+        }],
+        3,
+    );
+    let mut contract = fixture.contract(Review::Off);
+    contract.limits.total_seconds = Some(1);
+    let outcome = fixture.execute(&contract, &repo, &conditional_worker(""));
+    assert!(
+        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail } if detail.contains("total")),
+        "{outcome:?}"
+    );
+}
+
 /// An engine for a run already on record and `running`, to end on a budget.
 fn ended_on(fixture: &Fixture, exhausted: Exhausted) -> RunOutcome {
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
