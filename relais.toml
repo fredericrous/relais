@@ -68,13 +68,17 @@ argv = ["make", "test"]
 # release_scenarios 117 s). Weight 2: it is the heaviest command on the machine, so
 # it takes two heavy slots. It writes no JUnit (plain `cargo test`), so no
 # `junit` is declared and the pre-existing shortcut does not apply to it.
-timeout_seconds = 1020
+# Raised from 1020 s on 2026-10-29: it took 837 s at a load average near
+# 150 and timed out at 1020 s near 110, each time making the base
+# `baseline_unrunnable`; 1800 s is the single `make check`'s old limit.
+timeout_seconds = 1800
 weight = 2
 
 [[verification.profiles.default.commands]]
 argv = ["make", "msrv"]
-# Measured 152 s (a second build on the declared floor).
-timeout_seconds = 480
+# Measured 152 s (a second build on the declared floor). Raised from 480 s
+# on 2026-10-29, when it timed out at a load average near 470.
+timeout_seconds = 900
 
 [[verification.profiles.default.commands]]
 argv = ["make", "audit"]

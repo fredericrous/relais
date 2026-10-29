@@ -4,7 +4,7 @@ use crate::admission::{
     RunRegistration, WaitOutcome, WithdrawOutcome, WriteLeaseOutcome,
 };
 use crate::policy::{BudgetClock, BudgetLimits, CommandSpec, ConcurrencyLimits};
-use crate::verify::run_observed_within;
+use crate::verify::{run_observed_within, ObservedRun};
 use std::path::Path;
 use std::sync::atomic::AtomicI64;
 
@@ -345,16 +345,16 @@ fn with_one_heavy_slot_two_runs_checks_never_overlap() {
             let (gate, dir) = (&gate, &dir);
             scope.spawn(move || {
                 let admission = admission(gate, run, 1, 4);
-                run_observed_within(
+                run_observed_within(ObservedRun {
                     dir,
-                    &sh("sleep 0.02"),
-                    &dir.join(format!("logs-{run}")),
-                    "cmd0",
-                    "x-cmd0",
-                    &Events::silent(),
-                    None,
-                    &admission,
-                )
+                    spec: &sh("sleep 0.02"),
+                    logs_dir: &dir.join(format!("logs-{run}")),
+                    label: "cmd0",
+                    log_stem: "x-cmd0",
+                    events: &Events::silent(),
+                    cancel: None,
+                    admission: &admission,
+                })
                 .expect("run");
             });
         }
@@ -379,16 +379,16 @@ fn an_admitted_check_carries_parallelism_bounds_and_its_own_env_wins() {
     let print = "echo $MAKEFLAGS $CARGO_BUILD_JOBS $RUST_TEST_THREADS $NEXTEST_TEST_THREADS";
 
     // Weight 1 of cap 2 on 8 cores: four jobs.
-    let outcome = run_observed_within(
-        &dir,
-        &sh(print),
-        &dir.join("logs"),
-        "plain",
-        "x-cmd0",
-        &Events::silent(),
-        None,
-        &admission,
-    )
+    let outcome = run_observed_within(ObservedRun {
+        dir: &dir,
+        spec: &sh(print),
+        logs_dir: &dir.join("logs"),
+        label: "plain",
+        log_stem: "x-cmd0",
+        events: &Events::silent(),
+        cancel: None,
+        admission: &admission,
+    })
     .expect("run");
     let log = std::fs::read_to_string(&outcome.log_path).expect("log");
     assert_eq!(log.trim(), "-j4 4 4 4");
@@ -397,16 +397,16 @@ fn an_admitted_check_carries_parallelism_bounds_and_its_own_env_wins() {
     let mut heavy = sh(print);
     heavy.weight = Some(2);
     heavy.env.insert("CARGO_BUILD_JOBS".into(), "1".into());
-    let outcome = run_observed_within(
-        &dir,
-        &heavy,
-        &dir.join("logs"),
-        "heavy",
-        "x-cmd1",
-        &Events::silent(),
-        None,
-        &admission,
-    )
+    let outcome = run_observed_within(ObservedRun {
+        dir: &dir,
+        spec: &heavy,
+        logs_dir: &dir.join("logs"),
+        label: "heavy",
+        log_stem: "x-cmd1",
+        events: &Events::silent(),
+        cancel: None,
+        admission: &admission,
+    })
     .expect("run");
     let log = std::fs::read_to_string(&outcome.log_path).expect("log");
     assert_eq!(log.trim(), "-j8 1 8 8");
@@ -420,16 +420,16 @@ fn a_weight_above_max_heavy_commands_is_refused_and_nothing_runs() {
     let admission = admission(&gate, "run-w", 2, 8);
     let mut too_heavy = sh("echo ran > ran");
     too_heavy.weight = Some(3);
-    let refused = run_observed_within(
-        &dir,
-        &too_heavy,
-        &dir.join("logs"),
-        "heavy",
-        "x-cmd0",
-        &Events::silent(),
-        None,
-        &admission,
-    );
+    let refused = run_observed_within(ObservedRun {
+        dir: &dir,
+        spec: &too_heavy,
+        logs_dir: &dir.join("logs"),
+        label: "heavy",
+        log_stem: "x-cmd0",
+        events: &Events::silent(),
+        cancel: None,
+        admission: &admission,
+    });
     assert!(
         matches!(
             refused,
@@ -484,16 +484,16 @@ fn queued_time_is_charged_to_the_admission_wait_and_the_total_not_to_work() {
     queued.budgets = budgets.clone();
     queued.sleeper = Advancing::new(&clock);
     queued.poll = Duration::from_millis(500);
-    let stopped = run_observed_within(
-        &dir,
-        &sh("echo ran > ran"),
-        &dir.join("logs"),
-        "cmd0",
-        "x-cmd0",
-        &Events::silent(),
-        None,
-        &queued,
-    );
+    let stopped = run_observed_within(ObservedRun {
+        dir: &dir,
+        spec: &sh("echo ran > ran"),
+        logs_dir: &dir.join("logs"),
+        label: "cmd0",
+        log_stem: "x-cmd0",
+        events: &Events::silent(),
+        cancel: None,
+        admission: &queued,
+    });
     assert!(
         matches!(
             stopped,
@@ -779,16 +779,16 @@ fn a_lease_the_coordinator_could_not_tie_to_the_group_is_kept_alive_while_the_ch
     let mut with_events = admission;
     with_events.events =
         Events::for_run_on("run-u", &dir, crate::protocol::Wire::to(std::io::sink()));
-    run_observed_within(
-        &dir,
-        &sh("sleep 0.04"),
-        &dir.join("logs"),
-        "cmd0",
-        "x-cmd0",
-        &with_events.events.clone(),
-        None,
-        &with_events,
-    )
+    run_observed_within(ObservedRun {
+        dir: &dir,
+        spec: &sh("sleep 0.04"),
+        logs_dir: &dir.join("logs"),
+        label: "cmd0",
+        log_stem: "x-cmd0",
+        events: &with_events.events.clone(),
+        cancel: None,
+        admission: &with_events,
+    })
     .expect("run");
     let events = gate.events();
     assert!(
@@ -829,16 +829,16 @@ fn an_ancestor_that_holds_host_slots_is_not_queued_behind_and_the_fact_is_passed
     );
     drop(lease);
 
-    let outcome = run_observed_within(
-        &dir,
-        &sh("echo slot=$AMONT_HOST_SLOT"),
-        &dir.join("logs"),
-        "cmd0",
-        "x-cmd0",
-        &Events::silent(),
-        None,
-        &inside,
-    )
+    let outcome = run_observed_within(ObservedRun {
+        dir: &dir,
+        spec: &sh("echo slot=$AMONT_HOST_SLOT"),
+        logs_dir: &dir.join("logs"),
+        label: "cmd0",
+        log_stem: "x-cmd0",
+        events: &Events::silent(),
+        cancel: None,
+        admission: &inside,
+    })
     .expect("run");
     let log = std::fs::read_to_string(outcome.log_path).expect("log");
     assert_eq!(log.trim(), "slot=held", "the check sees the variable");
@@ -1013,16 +1013,16 @@ mod host_slots {
                 release.lock().expect("held").take();
             }
         });
-        let outcome = run_observed_within(
-            &dir,
-            &sh("echo slot=$AMONT_HOST_SLOT"),
-            &dir.join("logs"),
-            "cmd0",
-            "x-cmd0",
-            &with_slots.events.clone(),
-            None,
-            &with_slots,
-        )
+        let outcome = run_observed_within(ObservedRun {
+            dir: &dir,
+            spec: &sh("echo slot=$AMONT_HOST_SLOT"),
+            logs_dir: &dir.join("logs"),
+            label: "cmd0",
+            log_stem: "x-cmd0",
+            events: &with_slots.events.clone(),
+            cancel: None,
+            admission: &with_slots,
+        })
         .expect("run");
         order.lock().expect("order").push("check finished".into());
         let log = std::fs::read_to_string(outcome.log_path).expect("log");
@@ -1208,16 +1208,16 @@ fn the_floor_is_checked_again_after_the_grant_and_the_command_queues_instead_of_
     stuck.sleeper = Advancing::new(&clock);
     stuck.poll = Duration::from_secs(10);
     stuck.tries = Tries::for_epoch(1);
-    let stopped = run_observed_within(
-        &dir,
-        &sh("echo ran > ran"),
-        &dir.join("logs"),
-        "cmd0",
-        "x-cmd0",
-        &Events::silent(),
-        None,
-        &stuck,
-    );
+    let stopped = run_observed_within(ObservedRun {
+        dir: &dir,
+        spec: &sh("echo ran > ran"),
+        logs_dir: &dir.join("logs"),
+        label: "cmd0",
+        log_stem: "x-cmd0",
+        events: &Events::silent(),
+        cancel: None,
+        admission: &stuck,
+    });
     assert!(
         matches!(
             stopped,
@@ -1267,16 +1267,16 @@ fn a_checks_growth_is_recorded_and_is_its_next_estimate_with_two_gib_before() {
         2 * GIB,
         "2 GiB before any measurement"
     );
-    let outcome = run_observed_within(
-        &dir,
-        &sh("head -c 1048576 /dev/zero > big"),
-        &dir.join("logs"),
-        "cmd0",
-        "x-cmd0",
-        &Events::silent(),
-        None,
-        &measured,
-    )
+    let outcome = run_observed_within(ObservedRun {
+        dir: &dir,
+        spec: &sh("head -c 1048576 /dev/zero > big"),
+        logs_dir: &dir.join("logs"),
+        label: "cmd0",
+        log_stem: "x-cmd0",
+        events: &Events::silent(),
+        cancel: None,
+        admission: &measured,
+    })
     .expect("run");
     assert!(outcome.ended.succeeded());
     assert_eq!(

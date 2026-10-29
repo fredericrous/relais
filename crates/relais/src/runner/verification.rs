@@ -16,6 +16,17 @@ use crate::policy::EffectiveAuthority;
 use crate::route::Recipe;
 use crate::verify::{self, amont_gaps, Receipt, VerificationReport};
 
+/// What `candidate_receipt` builds a receipt from.
+struct CandidateReceiptInput<'a> {
+    attempt: &'a AttemptContext<'a>,
+    progress: &'a Progress,
+    candidate: &'a Candidate,
+    verified: &'a Verified,
+    verdict: Option<&'a verify::ReportVerdict>,
+    outcome: State,
+    review: verify::ReviewRecord,
+}
+
 impl<'a> RunEngine<'a> {
     /// Checks pass: semantic review where the risk asks for it, then a
     /// receipt bound to this candidate (SPEC §10, §12).
@@ -52,15 +63,15 @@ impl<'a> RunEngine<'a> {
                     .stop_for_review(
                         &progress.budget,
                         &|engine| {
-                            engine.candidate_receipt(
-                                ctx,
+                            engine.candidate_receipt(CandidateReceiptInput {
+                                attempt: ctx,
                                 progress,
                                 candidate,
-                                &verified,
+                                verified: &verified,
                                 verdict,
-                                State::NeedsDecision,
-                                review.clone(),
-                            )
+                                outcome: State::NeedsDecision,
+                                review: review.clone(),
+                            })
                         },
                         Reason::ReviewOverBudget,
                         Observation::ReviewOverBudget(over),
@@ -117,15 +128,15 @@ impl<'a> RunEngine<'a> {
                         .stop_for_review(
                             &progress.budget,
                             &|engine| {
-                                engine.candidate_receipt(
-                                    ctx,
+                                engine.candidate_receipt(CandidateReceiptInput {
+                                    attempt: ctx,
                                     progress,
                                     candidate,
-                                    &verified,
+                                    verified: &verified,
                                     verdict,
-                                    State::NeedsDecision,
-                                    engine.unavailable_review_record(&detail)?,
-                                )
+                                    outcome: State::NeedsDecision,
+                                    review: engine.unavailable_review_record(&detail)?,
+                                })
                             },
                             Reason::ReviewUnavailable,
                             Observation::ReviewUnavailable(detail.clone()),
@@ -144,15 +155,15 @@ impl<'a> RunEngine<'a> {
             }
         }
         let review = review_record_of(self.config.ledger, &self.run_id)?;
-        let receipt = self.candidate_receipt(
-            ctx,
+        let receipt = self.candidate_receipt(CandidateReceiptInput {
+            attempt: ctx,
             progress,
             candidate,
-            &verified,
+            verified: &verified,
             verdict,
-            State::Accepted,
+            outcome: State::Accepted,
             review,
-        )?;
+        })?;
         self.seal(
             &receipt,
             Some(candidate.attempt_id),
@@ -183,30 +194,26 @@ impl<'a> RunEngine<'a> {
     /// by the caller: `accepted` for the run's own acceptance,
     /// `needs_decision` for the snapshot a run keeps when it stops for a
     /// review it could not have.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "an existing arity, kept until these parameters are grouped into a struct"
-    )]
-    fn candidate_receipt(
-        &self,
-        ctx: &AttemptContext<'_>,
-        progress: &Progress,
-        candidate: &Candidate,
-        verified: &Verified,
-        verdict: Option<&verify::ReportVerdict>,
-        outcome: State,
-        review: verify::ReviewRecord,
-    ) -> Result<Receipt, RunError> {
-        let preflight = ctx.preflight;
+    fn candidate_receipt(&self, input: CandidateReceiptInput<'_>) -> Result<Receipt, RunError> {
+        let CandidateReceiptInput {
+            attempt,
+            progress,
+            candidate,
+            verified,
+            verdict,
+            outcome,
+            review,
+        } = input;
+        let preflight = attempt.preflight;
         let mut notes = verified.notes.clone();
         notes.extend(self.guidance_note(&preflight.manifest));
         let report = VerificationReport {
             notes,
-            ..verification_report(ctx, candidate, verified)
+            ..verification_report(attempt, candidate, verified)
         };
-        let patch_adds_test = self.patch_adds_test(ctx, &candidate.sha)?;
+        let patch_adds_test = self.patch_adds_test(attempt, &candidate.sha)?;
         let (criteria, mandatory_evidence_independence) = self.settle(
-            ctx,
+            attempt,
             &report,
             &verified.gate_coverage,
             &verified.holdouts,
@@ -415,17 +422,17 @@ impl<'a> RunEngine<'a> {
                 return Ok(Step::Ended(self.stop_for_review(
                     &progress.budget,
                     &|engine| {
-                        engine.candidate_receipt(
-                            ctx,
+                        engine.candidate_receipt(CandidateReceiptInput {
+                            attempt: ctx,
                             progress,
                             candidate,
-                            &verified,
-                            None,
-                            State::NeedsDecision,
-                            verify::ReviewRecord::Unavailable {
+                            verified: &verified,
+                            verdict: None,
+                            outcome: State::NeedsDecision,
+                            review: verify::ReviewRecord::Unavailable {
                                 detail: detail.clone(),
                             },
-                        )
+                        })
                     },
                     Reason::ReviewUnavailable,
                     Observation::ReviewUnavailable(detail.clone()),

@@ -307,16 +307,16 @@ impl<'a> RunEngine<'a> {
     ) -> Result<Vec<verify::CheckOutcome>, verify::VerifyError> {
         use crate::workspace::reuse::{StampStore, Workspace};
         if self.config.workspace == Workspace::Isolated {
-            return verify::run_setup_gated_within(
+            return verify::run_setup_gated_within(verify::SetupRun {
                 dir,
                 profile,
                 logs_dir,
                 prefix,
-                &self.events,
+                events: &self.events,
                 cancel,
-                &mut verify::RunEveryStep,
-                &self.heavy(),
-            );
+                gate: &mut verify::RunEveryStep,
+                admission: &self.heavy(),
+            });
         }
         let seed_from = seed_from.filter(|seed| seed.path != dir);
         let source = seed_from.map(|seed| seed.path);
@@ -339,16 +339,16 @@ impl<'a> RunEngine<'a> {
             .unwrap_or(&self.config.artifacts_dir);
         let stamps = StampStore::new(state);
         let mut gate = setup_gate::ReuseGate::new(dir, source, &stamps, &self.events);
-        verify::run_setup_gated_within(
+        verify::run_setup_gated_within(verify::SetupRun {
             dir,
             profile,
             logs_dir,
             prefix,
-            &self.events,
+            events: &self.events,
             cancel,
-            &mut gate,
-            &self.heavy(),
-        )
+            gate: &mut gate,
+            admission: &self.heavy(),
+        })
     }
 
     /// Say, once, that the commands this repository runs changed since the
