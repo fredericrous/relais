@@ -377,6 +377,9 @@ pub fn acceptance_gaps(
                             name: name.clone(),
                             failing: run.failing(),
                         }),
+                        HoldoutVerdict::TimedOut => {
+                            Some(MissingEvidence::HoldoutTimedOut { name: name.clone() })
+                        }
                         HoldoutVerdict::DidNotBuild => {
                             Some(MissingEvidence::HoldoutDidNotBuild { name: name.clone() })
                         }
@@ -494,6 +497,8 @@ pub enum MissingEvidence {
     HoldoutFailed { name: String, failing: Vec<String> },
     /// A holdout that wrote no usable report.
     HoldoutDidNotBuild { name: String },
+    /// A holdout whose command was killed by its timeout.
+    HoldoutTimedOut { name: String },
     /// A named test, and no verification command declares a JUnit report:
     /// nothing produced per-test results at all.
     NoPerTestResults { test: String },
@@ -549,6 +554,10 @@ impl AcceptanceGap {
                 } else {
                     failing.join(", ")
                 }
+            ),
+            MissingEvidence::HoldoutTimedOut { name } => format!(
+                "acceptance criterion `{id}`: holdout `{name}` timed out after its time limit; \
+                 raise the holdout's `timeout_seconds`"
             ),
             MissingEvidence::HoldoutDidNotBuild { name } => format!(
                 "acceptance criterion `{id}`: holdout `{name}` did not build or wrote no report"

@@ -17,6 +17,8 @@ pub enum HoldoutVerdict {
     Failed,
     /// No usable report: the holdout could not be built or wrote none.
     DidNotBuild,
+    /// The command was killed by its timeout.
+    TimedOut,
 }
 
 impl HoldoutVerdict {
@@ -25,6 +27,7 @@ impl HoldoutVerdict {
             Self::Passed => "passed",
             Self::Failed => "failed",
             Self::DidNotBuild => "did_not_build",
+            Self::TimedOut => "timed_out",
         }
     }
 }
@@ -73,6 +76,12 @@ impl HoldoutRun {
     /// Settle a holdout from its command's outcome: the exit status
     /// together with the parsed report, nothing else.
     pub fn settled(name: &str, sha: &str, digest: &str, check: &CheckOutcome) -> Self {
+        if matches!(check.ended.recorded(), Some(Ended::TimedOut)) {
+            return Self {
+                outcome: HoldoutVerdict::TimedOut,
+                ..Self::did_not_build(name, sha, digest)
+            };
+        }
         let tests: Vec<HoldoutTest> = match &check.junit {
             Some(JunitReport::Reported { tests, .. }) => tests
                 .iter()
@@ -170,13 +179,41 @@ mod tests {
             ),
             (Ended::Exited(1), reported(&[("a", Red)]), Failed, vec!["a"]),
             (Ended::Exited(1), reported(&[("a", Green)]), Failed, vec![]),
-            (Ended::TimedOut, reported(&[("a", Green)]), Failed, vec![]),
         ];
         for (ended, junit, verdict, failing) in cases {
             let run = settled(&check(ended, junit.clone()));
             assert_eq!(run.outcome, verdict, "{ended:?} {junit:?}");
             assert_eq!(run.failing(), failing, "{ended:?} {junit:?}");
         }
+    }
+
+    #[test]
+    fn a_timed_out_command_settles_as_timed_out_with_or_without_a_report() {
+        for junit in [
+            reported(&[("a", TestOutcome::Passed)]),
+            reported(&[("a", TestOutcome::Failed)]),
+            Some(JunitReport::Missing),
+            None,
+        ] {
+            let run = settled(&check(Ended::TimedOut, junit));
+            assert_eq!(run.outcome, HoldoutVerdict::TimedOut);
+            assert_eq!(run.outcome.as_str(), "timed_out");
+            assert_eq!(
+                serde_json::to_string(&run.outcome).unwrap(),
+                "\"timed_out\""
+            );
+        }
+    }
+
+    #[test]
+    fn a_timed_out_gap_says_to_raise_the_timeout() {
+        let message = AcceptanceGap {
+            criterion_id: "c-1".into(),
+            missing: MissingEvidence::HoldoutTimedOut { name: "h".into() },
+        }
+        .message();
+        assert!(message.contains("timed out after"), "{message}");
+        assert!(message.contains("timeout_seconds"), "{message}");
     }
 
     #[test]

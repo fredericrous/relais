@@ -342,6 +342,19 @@ impl<'a> RunEngine<'a> {
         std::fs::create_dir_all(&kept).map_err(|e| e.to_string())?;
         let log = kept.join("log.txt");
         std::fs::copy(&check.log_path, &log).map_err(|e| e.to_string())?;
+        if run.outcome == verify::HoldoutVerdict::TimedOut {
+            use std::io::Write;
+            let mut kept_log = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log)
+                .map_err(|e| e.to_string())?;
+            writeln!(
+                kept_log,
+                "\nholdout timed out after {} s",
+                spec.timeout_seconds
+            )
+            .map_err(|e| e.to_string())?;
+        }
         run.log = Some(log.to_string_lossy().into_owned());
         if let Some(JunitReport::Reported {
             artifact: Some(report),
@@ -380,7 +393,8 @@ pub(super) fn split_holdout_gaps(
     for gap in acceptance_gaps {
         match &gap.missing {
             verify::MissingEvidence::HoldoutFailed { name, .. }
-            | verify::MissingEvidence::HoldoutDidNotBuild { name } => {
+            | verify::MissingEvidence::HoldoutDidNotBuild { name }
+            | verify::MissingEvidence::HoldoutTimedOut { name } => {
                 let message = gap.message();
                 if let Some(at) = gaps.iter().position(|sentence| *sentence == message) {
                     gaps.remove(at);
