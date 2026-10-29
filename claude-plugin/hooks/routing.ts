@@ -705,15 +705,15 @@ export async function flushObservations(fx: Fx, store: Store, options: { isFinal
 }
 
 // The first relais release that accepts the `answered` outcome.
-const ANSWERED_MIN_VERSION: [number, number] = [0, 36]
+const ANSWERED_MIN_VERSION: [number, number] = [0, 37]
 
 // Whether the installed relais accepts `answered`, asked once per session
 // through `relais --version`. A failed or unreadable answer is cached as "no"
 // for the session (docs/router-protocol.md), so the batch goes in the v0.35
 // form and the probe is not repeated.
 async function supportsAnswered(fx: Fx, store: Store): Promise<boolean> {
-  const r = store.router
-  if (r.supportsAnswered !== undefined) return r.supportsAnswered
+  const router = store.router
+  if (router.supportsAnswered !== undefined) return router.supportsAnswered
   let versionText = ''
   try {
     const versionRun = await fx.process.run(['relais', '--version'], { timeoutMs: OBSERVE_TIMEOUT_MS })
@@ -723,8 +723,8 @@ async function supportsAnswered(fx: Fx, store: Store): Promise<boolean> {
   }
   const found = /(\d+)\.(\d+)\.(\d+)/.exec(versionText)
   const [major, minor] = found ? [Number(found[1]), Number(found[2])] : [0, 0]
-  r.supportsAnswered = found !== null && (major > ANSWERED_MIN_VERSION[0] || (major === ANSWERED_MIN_VERSION[0] && minor >= ANSWERED_MIN_VERSION[1]))
-  return r.supportsAnswered
+  router.supportsAnswered = found !== null && (major > ANSWERED_MIN_VERSION[0] || (major === ANSWERED_MIN_VERSION[0] && minor >= ANSWERED_MIN_VERSION[1]))
+  return router.supportsAnswered
 }
 
 // The v0.35 form of a record: `answered` and the parent and unmatched-check

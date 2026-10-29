@@ -765,12 +765,21 @@ mod tests {
         }
     }
 
-    fn subagent(id: &str, parent: Option<&str>, link_recorded: bool) -> RouterTaskRow {
+    /// An unknown subagent task recorded with the parent link captured.
+    fn linked_subagent(id: &str, parent: Option<&str>) -> RouterTaskRow {
         let mut row = task(id, "unknown");
         row.agent_id = Some(format!("agent-{id}"));
         row.parent_task_id = parent.map(str::to_string);
-        row.parent_link_recorded = link_recorded;
+        row.parent_link_recorded = true;
         row
+    }
+
+    /// An unknown subagent task recorded before the parent link was captured.
+    fn unlinked_subagent(id: &str, parent: Option<&str>) -> RouterTaskRow {
+        RouterTaskRow {
+            parent_link_recorded: false,
+            ..linked_subagent(id, parent)
+        }
     }
 
     #[test]
@@ -782,16 +791,16 @@ mod tests {
             ("s".into(), task("corrected", "corrected")),
             ("s".into(), task("answer", "answered")),
             ("s".into(), task("unsure", "unknown")),
-            ("s".into(), subagent("c1", Some("strong"), true)),
-            ("s".into(), subagent("c2", Some("accepted"), true)),
-            ("s".into(), subagent("c3", Some("corrected"), true)),
-            ("s".into(), subagent("c4", Some("answer"), true)),
-            ("s".into(), subagent("c5", Some("unsure"), true)),
-            ("s".into(), subagent("c6", Some("outside-window"), true)),
-            ("other".into(), subagent("c7", Some("strong"), true)),
-            ("s".into(), subagent("c8", None, true)),
-            ("s".into(), subagent("c9", Some("strong"), false)),
-            ("s".into(), subagent("c10", None, false)),
+            ("s".into(), linked_subagent("c1", Some("strong"))),
+            ("s".into(), linked_subagent("c2", Some("accepted"))),
+            ("s".into(), linked_subagent("c3", Some("corrected"))),
+            ("s".into(), linked_subagent("c4", Some("answer"))),
+            ("s".into(), linked_subagent("c5", Some("unsure"))),
+            ("s".into(), linked_subagent("c6", Some("outside-window"))),
+            ("other".into(), linked_subagent("c7", Some("strong"))),
+            ("s".into(), linked_subagent("c8", None)),
+            ("s".into(), unlinked_subagent("c9", Some("strong"))),
+            ("s".into(), unlinked_subagent("c10", None)),
         ];
         let buckets =
             session_routing(&fixture, &pricing(), ExplorationReport::default()).subagent_unknown;
@@ -810,7 +819,9 @@ mod tests {
     #[test]
     fn the_parent_and_unmatched_lines_render_and_fit_eighty_columns() {
         let mut fixture = window();
-        fixture.tasks.push(("s".into(), subagent("c", None, false)));
+        fixture
+            .tasks
+            .push(("s".into(), unlinked_subagent("c", None)));
         let mut report = session_routing(&fixture, &pricing(), ExplorationReport::default());
         let text = report.render();
         assert!(text.contains("  subagent unknown by parent:\n"), "{text}");

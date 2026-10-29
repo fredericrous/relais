@@ -369,7 +369,9 @@ fn first_task(incoming: &RouterTaskRow) -> RouterTaskRow {
         .map(RankZeroOutcome::parse)
     {
         Some(Some(RankZeroOutcome::Answered)) => Some(outcome.clone()),
-        _ => incoming.completed_at_end.clone(),
+        Some(Some(RankZeroOutcome::Unknown)) | Some(None) | None => {
+            incoming.completed_at_end.clone()
+        }
     };
     RouterTaskRow {
         outcome,

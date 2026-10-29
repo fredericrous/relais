@@ -742,7 +742,7 @@ test('an answered parent sends no task_outcome', async ($: any, on: any) => {
   expect(observed(engine, 'task_outcome')).toEqual([])
 })
 
-test('a relais older than 0.36 gets the v0.35 form: answered is sent as unknown, and the version is asked once', async ($: any, on: any) => {
+test('a relais older than 0.37 gets the v0.35 form: answered is sent as unknown, and the version is asked once', async ($: any, on: any) => {
   const engine = await routedSession($, on)
   engine.version = '0.35.0'
   await personTurn($, engine, 'what does this function do?')
@@ -754,6 +754,21 @@ test('a relais older than 0.36 gets the v0.35 form: answered is sent as unknown,
   expect(tasks.every((r: any) => r.completed_at_end !== 'answered')).toBe(true)
   const asked = engine.calls.run.filter((c: any) => c.argv?.[1] === '--version')
   expect(asked.length).toBe(1)
+})
+
+test('relais 0.36.0, released without the answered outcome, gets the v0.35 form', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  engine.version = '0.36.0'
+  await personTurn($, engine, 'what does this function do?')
+  await toolCall($, engine, bash('make check'), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  const tasks = observed(engine, 'task')
+  expect(tasks.length).toBeGreaterThan(0)
+  for (const record of tasks) {
+    expect(record.outcome).not.toBe('answered')
+    expect('parent_task_id' in record).toBe(false)
+    expect('unmatched_checks' in record).toBe(false)
+  }
 })
 
 test('a parent whose outcome is unknown sends no task_outcome', async ($: any, on: any) => {
@@ -907,7 +922,7 @@ test('a failing rev-parse from a subdirectory stores no unmatched entry', async 
   for (const record of tasks) expect(record.unmatched_checks).toEqual([])
 })
 
-test('a relais older than 0.36 receives none of the parent or unmatched fields', async ($: any, on: any) => {
+test('a relais older than 0.37 receives none of the parent or unmatched fields', async ($: any, on: any) => {
   const engine = await routedSession($, on)
   engine.version = '0.35.0'
   await personTurn($, engine, 'what does this function do?')
