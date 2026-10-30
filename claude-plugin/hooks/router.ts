@@ -514,13 +514,13 @@ const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value))
 
 // --- tasks ------------------------------------------------------------------
 
-export function newTask(id: string, agentId: string | null, opening: string, c: Class, tier: Tier, now: number, parentTaskId?: string): TaskState {
+export function newTask(id: string, agentId: string | null, opening: string, taskClass: Class, tier: Tier, now: number, parentTaskId?: string): TaskState {
   return {
     id,
     agentId,
     opening: clip(opening, OPENING_BYTES),
     startedAt: now,
-    class: c,
+    class: taskClass,
     tier,
     effort: null,
     override: true,

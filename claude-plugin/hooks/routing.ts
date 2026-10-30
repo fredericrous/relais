@@ -705,12 +705,16 @@ export async function flushObservations(fx: Fx, store: Store, options: { isFinal
 }
 
 // Whether the relais this session talks to accepts `answered` and the parent
-// and unmatched-check fields: it says so in router-state's `accepts`. A
+// and unmatched-check fields: it lists all three in router-state's `accepts`. A
 // router-state that was not read, or that lists nothing, gets the v0.35 form,
 // so an older relais never sees a field it refuses (docs/router-protocol.md).
 function supportsAnswered(store: Store): boolean {
-  return store.router.state?.accepts.includes('answered') === true
+  const accepts = store.router.state?.accepts ?? []
+  return NEW_FORM.every((field) => accepts.includes(field))
 }
+
+// The fields of the new form, all sent together or not at all.
+const NEW_FORM: readonly string[] = ['answered', 'parent_task_id', 'unmatched_checks']
 
 // The v0.35 form of a record: `answered` and the parent and unmatched-check
 // fields did not exist (relais refuses unknown fields), so they are dropped.

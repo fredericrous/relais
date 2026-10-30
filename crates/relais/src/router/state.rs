@@ -476,6 +476,15 @@ mod tests {
     }
 
     #[test]
+    fn the_document_accepts_the_answered_form() {
+        let machine = machine("");
+        assert_eq!(
+            build(inputs(&machine, None)).accepts,
+            ["answered", "parent_task_id", "unmatched_checks"]
+        );
+    }
+
+    #[test]
     fn the_document_has_exactly_the_contracts_keys() {
         let machine = machine("");
         let value = serde_json::to_value(build(inputs(&machine, None))).unwrap();
