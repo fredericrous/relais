@@ -106,3 +106,79 @@ impl Ledger {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::{run, task, temp_ledger};
+    use super::*;
+
+    fn stored_definition(attach: serde_json::Value) -> String {
+        serde_json::json!({
+            "name": "h",
+            "repo": "r",
+            "store": "s",
+            "git_ref": "main",
+            "sha": "abc",
+            "decl": {
+                "path": "p.rs",
+                "overlay": "tests/holdout",
+                "command": { "argv": ["true"], "junit": "j.xml" },
+                "attach": attach,
+            },
+            "digest": "d",
+        })
+        .to_string()
+    }
+
+    fn store(ledger: &Ledger, run_id: &RunId, definition_json: &str) {
+        ledger
+            .conn
+            .execute(
+                "INSERT INTO holdout_definitions
+                    (run_id, name, definition_json, digest, source)
+                 VALUES (?1, 'h', ?2, 'd', 'attached')",
+                params![run_id.as_str(), definition_json],
+            )
+            .expect("a stored definition");
+    }
+
+    #[test]
+    fn a_stored_attach_is_revalidated_when_read_back() {
+        let (ledger, _dir) = temp_ledger();
+        let run_id = run("run-attach");
+        ledger
+            .insert_run(&run_id, "/repo", None, &task("run-attach"), "rk")
+            .expect("run");
+        store(
+            &ledger,
+            &run_id,
+            &stored_definition(serde_json::json!({
+                "task_types": ["feature"],
+                "paths": ["src/**"],
+            })),
+        );
+        assert_eq!(
+            ledger
+                .attached_holdout_definitions(&run_id)
+                .expect("a valid attach loads")
+                .len(),
+            1
+        );
+        ledger
+            .conn
+            .execute("DELETE FROM holdout_definitions", [])
+            .expect("clear");
+        store(
+            &ledger,
+            &run_id,
+            &stored_definition(serde_json::json!({ "task_types": [], "paths": ["src/**"] })),
+        );
+        let refused = ledger
+            .attached_holdout_definitions(&run_id)
+            .expect_err("an invalid attach is refused");
+        assert!(
+            matches!(refused, LedgerError::Corrupt { .. }),
+            "{refused:?}"
+        );
+    }
+}
