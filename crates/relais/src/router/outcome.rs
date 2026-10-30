@@ -15,6 +15,9 @@ pub enum TaskOutcome {
     CompletedAccepted,
     /// The person corrected the work, or flagged it.
     Corrected,
+    /// Nothing was edited and nothing could have been: a question, a
+    /// review. Never a learning label.
+    Answered,
     Unknown,
 }
 
@@ -24,6 +27,7 @@ impl TaskOutcome {
             Self::CompletedVerified => "completed_verified",
             Self::CompletedAccepted => "completed_accepted",
             Self::Corrected => "corrected",
+            Self::Answered => "answered",
             Self::Unknown => "unknown",
         }
     }
@@ -33,6 +37,7 @@ impl TaskOutcome {
             "completed_verified" => Self::CompletedVerified,
             "completed_accepted" => Self::CompletedAccepted,
             "corrected" => Self::Corrected,
+            "answered" => Self::Answered,
             "unknown" => Self::Unknown,
             _ => return None,
         })
@@ -45,7 +50,7 @@ impl TaskOutcome {
     /// anything.
     pub fn rank(self) -> u8 {
         match self {
-            Self::Unknown => 0,
+            Self::Unknown | Self::Answered => 0,
             Self::CompletedVerified | Self::CompletedAccepted => 1,
             Self::Corrected => 2,
         }
@@ -57,9 +62,9 @@ impl TaskOutcome {
     }
 
     /// An outcome learning may count (plan §5): every
-    /// one but `unknown`.
+    /// one but `unknown` and `answered`.
     pub fn is_strong(self) -> bool {
-        self != Self::Unknown
+        !matches!(self, Self::Unknown | Self::Answered)
     }
 }
 
@@ -67,10 +72,11 @@ impl TaskOutcome {
 mod tests {
     use super::*;
 
-    const ALL: [TaskOutcome; 4] = [
+    const ALL: [TaskOutcome; 5] = [
         TaskOutcome::CompletedVerified,
         TaskOutcome::CompletedAccepted,
         TaskOutcome::Corrected,
+        TaskOutcome::Answered,
         TaskOutcome::Unknown,
     ];
 
@@ -86,6 +92,27 @@ mod tests {
         );
         assert!(TaskOutcome::Corrected.rank() > TaskOutcome::CompletedVerified.rank());
         assert!(TaskOutcome::CompletedAccepted.rank() > TaskOutcome::Unknown.rank());
+    }
+
+    #[test]
+    fn answered_is_neither_completed_nor_strong() {
+        assert_eq!(TaskOutcome::Answered.rank(), 0);
+        assert!(!TaskOutcome::Answered.is_completed());
+        assert!(!TaskOutcome::Answered.is_strong());
+        assert!(!TaskOutcome::Unknown.is_strong());
+        assert!(TaskOutcome::Corrected.is_strong());
+        assert_eq!(ALL.len(), 5);
+    }
+
+    #[test]
+    fn every_rank_zero_outcome_is_covered_by_the_ledgers_rank_zero_merge() {
+        for outcome in ALL {
+            assert_eq!(
+                crate::ledger::router::RankZeroOutcome::parse(outcome.as_str()).is_some(),
+                outcome.rank() == 0,
+                "{outcome:?}"
+            );
+        }
     }
 
     #[test]

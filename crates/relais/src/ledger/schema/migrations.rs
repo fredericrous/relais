@@ -1176,4 +1176,35 @@ pub(in crate::ledger) const MIGRATIONS: &[(&str, &str)] = &[
     );
     "#,
     ),
+    (
+        // The `answered` outcome (answered-outcome plan, phase 1): an ended
+        // question or review task with no edited file and no `aborted`
+        // signal is `answered`, not `unknown`. Old rows carry no
+        // "could have written" signal, so only the two non-editing kinds
+        // are judged. The same step adds the parent link (phase 2) and the
+        // unmatched check commands (phase 3), both optional. Backfilled rows
+        // are marked `backfill_v45` so the step can be undone with
+        //   UPDATE router_tasks
+        //      SET outcome = 'unknown', outcome_source = 'own',
+        //          completed_at_end = CASE WHEN completed_at_end = 'answered'
+        //                                  THEN 'unknown' ELSE completed_at_end END
+        //    WHERE outcome_source = 'backfill_v45'.
+        "v45",
+        r#"
+    ALTER TABLE router_tasks ADD COLUMN parent_task_id TEXT;
+    ALTER TABLE router_tasks ADD COLUMN parent_link_recorded INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE router_tasks ADD COLUMN unmatched_checks_json TEXT;
+    UPDATE router_tasks
+       SET outcome = 'answered', outcome_source = 'backfill_v45',
+           completed_at_end = CASE WHEN completed_at_end = 'unknown'
+                                   THEN 'answered' ELSE completed_at_end END
+     WHERE outcome = 'unknown'
+       AND files_json = '[]'
+       AND ended_at IS NOT NULL
+       AND class_kind IN ('question', 'review')
+       AND NOT EXISTS (
+            SELECT 1 FROM json_each(router_tasks.inferred_json) WHERE value = 'aborted'
+       );
+    "#,
+    ),
 ];

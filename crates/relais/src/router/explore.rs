@@ -29,9 +29,10 @@ pub fn band(difficulty: u8) -> &'static str {
     }
 }
 
-/// Whether an outcome counts as strong evidence (every one but `unknown`).
+/// Whether an outcome counts as strong evidence (every one but `unknown`
+/// and `answered`).
 fn strong(outcome: &str) -> Option<TaskOutcome> {
-    TaskOutcome::parse(outcome).filter(|o| *o != TaskOutcome::Unknown)
+    TaskOutcome::parse(outcome).filter(|o| o.is_strong())
 }
 
 /// Strong-outcome counts of one stratum.
@@ -296,6 +297,21 @@ mod tests {
         unknown.outcome = "unknown".into();
         tasks.push(unknown);
         assert!(!stop_check(&strata(&tasks)).stop, "20 drawn, one unknown");
+    }
+
+    #[test]
+    fn an_answered_outcome_is_no_evidence_for_the_stop() {
+        // 19 drawn tasks with strong outcomes, 4 of them corrected: 21
+        // points over the clean undrawn arm, but one short of twenty.
+        let mut tasks = fixture(4);
+        tasks.remove(19);
+        assert!(!stop_check(&strata(&tasks)).stop, "19 drawn");
+        // A twentieth, answered: were it counted, the stop would fire.
+        let mut answered = task(true, false);
+        answered.outcome = "answered".into();
+        tasks.push(answered);
+        let check = stop_check(&strata(&tasks));
+        assert!(!check.stop, "{check:?}");
     }
 
     #[test]

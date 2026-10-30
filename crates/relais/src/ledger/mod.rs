@@ -25,7 +25,7 @@ mod learning;
 mod outcomes;
 mod review;
 mod review_parts;
-mod router;
+pub(crate) mod router;
 mod runs;
 mod schema;
 mod sessions;
@@ -75,7 +75,7 @@ pub use review_parts::{PartResult, PartStatus, PlannedPart, ReviewPartRow};
 pub use router::{
     ExplorationTask, RouterCheck, RouterClass, RouterClassificationRow, RouterDecisionRow,
     RouterExplorationStop, RouterProvenance, RouterReassessRow, RouterRecord, RouterTaskOutcomeRow,
-    RouterTaskRow, RouterUsageRow, RouterWindow,
+    RouterTaskRow, RouterUsageRow, RouterWindow, UNMATCHED_CHECKS_MAX,
 };
 pub use task_types::{
     ExportedTasks, ImportedTaskTypes, StoredTaskType, TaskExportRow, TaskTypeSource,

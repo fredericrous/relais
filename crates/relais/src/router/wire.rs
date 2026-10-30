@@ -9,7 +9,7 @@ use super::capture::{ClassifierInput, INPUT_MAX_BYTES};
 use super::outcome::TaskOutcome;
 use crate::ledger::{
     RouterCheck, RouterClass, RouterClassificationRow, RouterDecisionRow, RouterReassessRow,
-    RouterRecord, RouterTaskOutcomeRow, RouterTaskRow, RouterUsageRow,
+    RouterRecord, RouterTaskOutcomeRow, RouterTaskRow, RouterUsageRow, UNMATCHED_CHECKS_MAX,
 };
 
 /// The wire schema this relais reads.
@@ -198,6 +198,85 @@ fn file_hashes(files: Vec<String>) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// What this relais accepts on the wire beyond the v0.35 form: the
+/// `answered` outcome, a task's `parent_task_id` and `parent_link_recorded`,
+/// and its `unmatched_checks`. `router-state` serves the list as `accepts`,
+/// so the plugin sends the new form only to a relais that lists it, whatever
+/// its version number.
+pub const WIRE_ACCEPTS: [&str; 3] = ["answered", "parent_task_id", "unmatched_checks"];
+
+/// The build and test runners whose argv prefix may be stored; the plugin's
+/// list, checked again here because the wire is the trust boundary.
+const RUNNER_PROGRAMS: [&str; 16] = [
+    "make",
+    "just",
+    "cargo",
+    "npm",
+    "pnpm",
+    "yarn",
+    "bun",
+    "go",
+    "pytest",
+    "uv",
+    "mvn",
+    "gradle",
+    "./gradlew",
+    "deno",
+    "tox",
+    "nox",
+];
+
+/// A subcommand word: `^[a-z][a-z0-9:_-]*$`, at most 40 bytes.
+fn is_subcommand_word(word: &str) -> bool {
+    let mut bytes = word.bytes();
+    word.len() <= 40
+        && bytes.next().is_some_and(|b| b.is_ascii_lowercase())
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b":_-".contains(&b))
+}
+
+/// `<program> [subcommand [word]]`: a runner, then a subcommand, then one
+/// more word only after `run` or `exec`; nothing else follows.
+fn is_runner_prefix(prefix: &str) -> bool {
+    let words: Vec<&str> = prefix.split(' ').collect();
+    match words.as_slice() {
+        [program] => RUNNER_PROGRAMS.contains(program),
+        [program, subcommand] => {
+            RUNNER_PROGRAMS.contains(program) && is_subcommand_word(subcommand)
+        }
+        [program, "run" | "exec", word] => {
+            RUNNER_PROGRAMS.contains(program) && is_subcommand_word(word)
+        }
+        _ => false,
+    }
+}
+
+/// `<repository>: <program> [subcommand [word]]`, distinct, at most
+/// [`UNMATCHED_CHECKS_MAX`]: the argv prefix a person would paste into
+/// `checks` and nothing else, so no argument or path is stored. The
+/// repository part is a basename: no `/`, no space.
+fn unmatched_check_entries(entries: Vec<String>) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let valid = entry.split_once(": ").is_some_and(|(repository, prefix)| {
+            !repository.is_empty()
+                && repository.len() <= 100
+                && !repository.contains(['/', ' '])
+                && is_runner_prefix(prefix)
+        });
+        if !valid {
+            return Err(format!(
+                "unmatched_checks `{entry}` is not `<repository>: <program> [word [word]]`"
+            ));
+        }
+        if !out.contains(&entry) {
+            out.push(entry);
+        }
+    }
+    out.sort();
+    out.truncate(UNMATCHED_CHECKS_MAX);
+    Ok(out)
+}
+
 fn named(field: &str, value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         Err(format!("{field} is empty"))
@@ -282,6 +361,12 @@ struct Task {
     explicit_quote: Option<String>,
     #[serde(default)]
     checks: Vec<Check>,
+    #[serde(default)]
+    parent_task_id: Option<String>,
+    #[serde(default)]
+    parent_link_recorded: bool,
+    #[serde(default)]
+    unmatched_checks: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -593,6 +678,10 @@ fn task(t: Task) -> Result<RouterRecord, String> {
         }
     }
     inferred.sort();
+    if let Some(parent) = &t.parent_task_id {
+        named("parent_task_id", parent)?;
+    }
+    let unmatched_checks = unmatched_check_entries(t.unmatched_checks)?;
     Ok(RouterRecord::Task(RouterTaskRow {
         class: t.class.as_ref().map(Class::row).transpose()?,
         outcome: t.outcome.as_str().into(),
@@ -610,6 +699,9 @@ fn task(t: Task) -> Result<RouterRecord, String> {
         explicit_quote: t.explicit_quote,
         outcome_source: Some("own".into()),
         checks,
+        parent_task_id: t.parent_task_id,
+        parent_link_recorded: t.parent_link_recorded,
+        unmatched_checks,
     }))
 }
 
@@ -724,6 +816,74 @@ mod tests {
         assert!(matches!(&batch.records[3], RouterRecord::Task(t) if t.outcome_rank == 0));
     }
 
+    /// The sample batch with its task record's `unmatched_checks` set.
+    fn with_unmatched(entries: &[&str]) -> String {
+        let mut batch_json: serde_json::Value = serde_json::from_str(&sample_batch("s1")).unwrap();
+        batch_json["records"][3]["unmatched_checks"] = serde_json::json!(entries);
+        batch_json.to_string()
+    }
+
+    fn refused_task_record(entries: &[&str]) {
+        let error = parse_batch(&with_unmatched(entries)).unwrap_err();
+        assert_eq!(error.record, Some((3, "task".into())), "{entries:?}");
+        assert!(error.detail.contains("unmatched_checks"), "{error}");
+    }
+
+    #[test]
+    fn a_task_record_with_parent_marker_and_unmatched_checks_parses() {
+        let mut batch_json: serde_json::Value = serde_json::from_str(&sample_batch("s1")).unwrap();
+        let task = &mut batch_json["records"][3];
+        task["parent_task_id"] = serde_json::json!("t0");
+        task["parent_link_recorded"] = serde_json::json!(true);
+        task["unmatched_checks"] = serde_json::json!([
+            "relais: npm run test",
+            "relais: make check",
+            "relais: make check",
+            "relais: cargo"
+        ]);
+        let batch = parse_batch(&batch_json.to_string()).unwrap();
+        assert!(matches!(&batch.records[3], RouterRecord::Task(t)
+            if t.parent_task_id.as_deref() == Some("t0")
+                && t.parent_link_recorded
+                && t.unmatched_checks
+                    == vec!["relais: cargo", "relais: make check", "relais: npm run test"]));
+    }
+
+    #[test]
+    fn a_task_record_without_the_new_fields_parses_with_defaults() {
+        let batch = parse_batch(&sample_batch("s1")).unwrap();
+        assert!(matches!(&batch.records[3], RouterRecord::Task(t)
+            if t.parent_task_id.is_none()
+                && !t.parent_link_recorded
+                && t.unmatched_checks.is_empty()));
+    }
+
+    #[test]
+    fn an_unmatched_entry_with_a_path_word_is_refused() {
+        refused_task_record(&["repo: make /p"]);
+        refused_task_record(&["repo: make ./x"]);
+    }
+
+    #[test]
+    fn an_unmatched_entry_whose_repository_is_not_a_basename_is_refused() {
+        refused_task_record(&["a/b: make"]);
+        refused_task_record(&["my repo: make"]);
+    }
+
+    #[test]
+    fn an_unmatched_entry_with_a_trailing_argument_is_refused() {
+        refused_task_record(&["repo: make check extra"]);
+        refused_task_record(&["repo: npm run test --watch"]);
+    }
+
+    #[test]
+    fn an_unmatched_subcommand_word_over_40_bytes_is_refused() {
+        let at_limit = format!("repo: npm run {}", "a".repeat(40));
+        assert!(parse_batch(&with_unmatched(&[&at_limit])).is_ok());
+        let over = format!("repo: npm run {}", "a".repeat(41));
+        refused_task_record(&[&over]);
+    }
+
     #[test]
     fn a_bad_record_is_named_by_index_and_kind() {
         let mut value: serde_json::Value = serde_json::from_str(&sample_batch("s1")).unwrap();
@@ -798,6 +958,15 @@ mod tests {
         );
         assert!(matches!(&batch.records[3], RouterRecord::Task(t)
             if t.checks.is_empty() && t.outcome_source.as_deref() == Some("own")));
+    }
+
+    #[test]
+    fn an_answered_task_parses_with_rank_zero() {
+        let mut batch_json: serde_json::Value = serde_json::from_str(&sample_batch("s1")).unwrap();
+        batch_json["records"][3]["outcome"] = serde_json::json!("answered");
+        let batch = parse_batch(&batch_json.to_string()).unwrap();
+        assert!(matches!(&batch.records[3], RouterRecord::Task(t)
+            if t.outcome == "answered" && t.outcome_rank == 0));
     }
 
     #[test]

@@ -123,7 +123,7 @@ impl Ledger {
     }
 
     /// A fallback subagent's merge outcome, over its router task: written
-    /// only where the stored outcome is still `unknown` and the new rank is
+    /// only where the stored outcome is still `unknown` or `answered` and the new rank is
     /// higher, with `outcome_source = 'merge'`, so a second ingest changes
     /// nothing. The `router-observe` statement is not reused: it keys on
     /// the session, which the amont-agent ledger does not carry, and names
@@ -143,7 +143,7 @@ impl Ledger {
                 SET outcome = ?1, outcome_rank = ?2, outcome_source = 'merge',
                     updated_at = ?3
               WHERE task_id = ?4 AND agent_id = ?5
-                AND outcome = 'unknown' AND outcome_rank < ?2",
+                AND outcome IN ('unknown', 'answered') AND outcome_rank < ?2",
             params![outcome, i64::from(rank), self.now(), task_id, agent_id,],
         )?;
         Ok(changed > 0)
