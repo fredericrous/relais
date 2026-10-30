@@ -920,6 +920,20 @@ test('a failing rev-parse from a subdirectory stores no unmatched entry', async 
   for (const record of tasks) expect(record.unmatched_checks).toEqual([])
 })
 
+test('a router-state that accepts answered alone gets the v0.35 form: the three fields go together', async ($: any, on: any) => {
+  const engine = await routedSession($, on, { state: { accepts: ['answered'] } })
+  await personTurn($, engine, 'what does this function do?')
+  await toolCall($, engine, bash('make check'), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  const tasks = observed(engine, 'task')
+  expect(tasks.length).toBeGreaterThan(0)
+  for (const record of tasks) {
+    expect(record.outcome).not.toBe('answered')
+    expect('parent_task_id' in record).toBe(false)
+    expect('unmatched_checks' in record).toBe(false)
+  }
+})
+
 test('a router-state whose accepts lacks answered receives none of the parent or unmatched fields', async ($: any, on: any) => {
   const engine = await routedSession($, on, { state: { accepts: [] } })
   await personTurn($, engine, 'what does this function do?')
