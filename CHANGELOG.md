@@ -8,6 +8,15 @@ missing here.
 
 ## Unreleased
 
+## v0.40.0
+
+- A routed task that edited no file, launched nothing that could write one (a Bash writer such as `sed -i`, a subagent the router did not create, a relais run or replay) and was not aborted now ends `answered` instead of `unknown` (answered-outcome plan, relais#333). `answered` is reported on its own line, `answered (no file edited, never a label): N`, broken down by task kind, and it is never a completed task, a strong outcome or a learning label. The outcomes line keeps its shape, so `unknown rate` now counts only tasks that edited, or could have edited, something without a recognised check: on one live ledger it went from 50% to 19%.
+- A subagent task records its parent task (`parent_task_id`, with `parent_link_recorded` on every new record), and the report buckets unknown subagents by their parent's outcome (`subagent unknown by parent:`). Rows recorded before this release count on their own line, `parent link not captured: N`.
+- A Bash command that runs a build or test runner but matches no check records the prefix you would paste into `checks`, such as `make check` or `npm run test`, and nothing more (no path, value or later argument; at most 5 per task, prefixed with the repository's name). The report lists the top five under `unmatched check commands`; relais refuses any other shape.
+- `relais native router-state` serves `accepts`: `answered`, `parent_task_id`, `unmatched_checks`. The plugin sends the new form only when all three are listed, so a plugin talking to an older relais sends `unknown` and none of the new fields, whatever the version numbers.
+- Ledger schema 45 (expand-only): it adds three `router_tasks` columns and backfills `answered` onto ended `unknown` question and review rows with no files and no `aborted` signal, marked `outcome_source = 'backfill_v45'`. Undo with `UPDATE router_tasks SET outcome = 'unknown', outcome_source = 'own', completed_at_end = CASE WHEN completed_at_end = 'answered' THEN 'unknown' ELSE completed_at_end END WHERE outcome_source = 'backfill_v45'`. `relais report --json` is at schema 15 (`answered` under `session_routing`).
+- Before upgrading, stop the coordinator and back the ledger up (`sqlite3 <state>/ledger.sqlite ".backup <file>"`): v0.39 and older refuse a schema 45 ledger. Install the binary, then reinstall the plugin.
+
 ## v0.39.0
 
 - `relais doctor --json` carries an `integration` object (`state`, `plugin_version`, `binary`, and `reason` when the state is `unknown`), documented in docs/INTEGRATIONS.md. It is derived from the same single `claude plugin list --json` reading as the `plugin` finding, so the two agree, including for a plugin installed at project scope only.
