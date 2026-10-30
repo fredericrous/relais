@@ -495,7 +495,13 @@ pub fn resolve_with_attachments(
         let single = [attached_criterion(name)];
         match resolve_inheriting(&single, lookup, frozen) {
             Ok(one) => {
+                resolution
+                    .holdouts
+                    .retain(|named| !one.holdouts.iter().any(|held| held.name == named.name));
                 resolution.holdouts.extend(one.holdouts);
+                resolution
+                    .changes
+                    .retain(|named| !one.changes.iter().any(|moved| moved.name == named.name));
                 resolution.changes.extend(one.changes);
             }
             Err(block) if block.code == BlockCode::HoldoutUnreadable => {
@@ -1149,6 +1155,54 @@ mod tests {
         assert!(block.detail.contains("mine"), "{}", block.detail);
         assert!(block.detail.contains("attached by the machine declaration"));
         assert!(attachment_collision(&contract, &[]).is_none());
+    }
+
+    #[test]
+    fn a_name_both_optional_in_the_contract_and_attached_resolves_once() {
+        let entries = [crate::acceptance::AcceptanceEntry::Declared(
+            crate::acceptance::DeclaredCriterion {
+                statement: "x holds".into(),
+                id: None,
+                mandatory: false,
+                evidence: crate::acceptance::Evidence::Holdout { name: "x".into() },
+            },
+        )];
+        let declared = decl(Some("j.xml"), "o");
+        let frozen = [ResolvedHoldout {
+            name: "x".into(),
+            repo: "r".into(),
+            store: "s".into(),
+            git_ref: "main".into(),
+            sha: "abc".into(),
+            digest: digest_of("r", "x", "s", "abc", &declared),
+            decl: declared,
+        }];
+        let held = HoldoutSettings::default();
+        let git = never_exists();
+        let lookup = Lookup {
+            settings: &held,
+            repo: "r",
+            git: &git,
+            repo_dir: Path::new("."),
+            base_sha: "abc",
+            machine_toml: "machine.toml",
+        };
+        let resolved = resolve_with_attachments(&entries, &["x".to_string()], &lookup, &frozen)
+            .expect("resolves");
+        let names: Vec<&str> = resolved
+            .resolution
+            .holdouts
+            .iter()
+            .map(|held| held.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["x"]);
+        let changed: Vec<&str> = resolved
+            .resolution
+            .changes
+            .iter()
+            .map(|change| change.name.as_str())
+            .collect();
+        assert_eq!(changed, vec!["x"], "the undeclared name is reported once");
     }
 
     fn settings(store: &str, decl: HoldoutDecl) -> HoldoutSettings {

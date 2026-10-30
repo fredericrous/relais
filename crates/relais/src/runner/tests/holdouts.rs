@@ -2161,6 +2161,17 @@ fn an_optional_named_criterion_still_attaches_and_a_failed_holdout_prevents_acce
         "{}",
         outcome.detail()
     );
+
+    let passing_settings = attach_settings(&fixture, &writes(PASSING));
+    let passed = fixture.execute_with_holdouts(passing_settings, &contract, &repo, &backend);
+    let Terminal::Accepted(receipt) = &passed.terminal else {
+        panic!("{passed:?}");
+    };
+    let [run] = receipt.holdouts.as_slice() else {
+        panic!("the holdout ran more than once: {:?}", receipt.holdouts);
+    };
+    assert_eq!(run.name, "escaping");
+    assert_eq!(run.source, Some(crate::holdout::HoldoutSource::Attached));
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
 
