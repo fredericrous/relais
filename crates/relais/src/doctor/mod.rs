@@ -1140,7 +1140,13 @@ fn merge_tree_finding(support: Result<(), String>) -> Finding {
     }
 }
 
-pub fn doctor(repo_dir: &Path) -> DoctorReport {
+/// `plugin` is the one `claude plugin list --json` reading of this run, so
+/// the `plugin` finding and `doctor --json`'s integration object cannot
+/// disagree.
+pub fn doctor(
+    repo_dir: &Path,
+    plugin: Result<crate::install::plugin::Installed, crate::install::plugin::PluginError>,
+) -> DoctorReport {
     // No home directory is a fact about the machine, not a doctor
     // failure: every finding that needs one reports its own absence, and
     // `paths::home_dir`'s error is already surfaced by the findings that
@@ -1379,9 +1385,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     ));
     findings.push(strays_finding_on_disk());
     findings.push(coordinator_finding());
-    findings.push(plugin_finding(
-        crate::install::plugin::Claude::discover().and_then(|claude| claude.installed()),
-    ));
+    findings.push(plugin_finding(plugin));
     findings.push(hook_live_finding(merged_roots(repo_dir, home.as_deref())));
     findings.extend(hook_wiring_finding(merged_roots(repo_dir, home.as_deref())));
 

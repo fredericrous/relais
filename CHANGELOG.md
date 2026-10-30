@@ -8,6 +8,9 @@ missing here.
 
 ## Unreleased
 
+- `relais doctor --json` carries an `integration` object (`state`, `plugin_version`, `binary`, and `reason` when the state is `unknown`), documented in docs/INTEGRATIONS.md. It is derived from the same single `claude plugin list --json` reading as the `plugin` finding, so the two agree, including for a plugin installed at project scope only.
+- The Claude Code install no longer writes the `relais-verified-push` and `relais-architecture-conflict` skills, and removes the unmodified copies it wrote earlier. Published skills come from the `greenharness/skills` repository, placed by `grh` (ADR-0050); relais keeps its plugin, the `/relais` skill and its three agents.
+
 ## v0.38.0
 
 - relais joins amont's one host queue by default (amont ADR-0014, relais#343). Its checks take host slots through amont's `amont-slots` crate instead of relais's own copy of the flock protocol, in amont's slot directory, with no `machine.toml` needed. Every heavy job on the machine, amont's git-hook gates, relais's checks and anything run through `amont slot run`, then waits in one ordered queue. `[resources] shared_host_slots = "off"` keeps the coordinator's queue alone. The queue sizes itself from the machine, unless `[resources] host_slots = N` fixes it; set that to match `git config amont.hostSlots` when you set one.

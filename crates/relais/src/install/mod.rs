@@ -180,9 +180,9 @@ fn read_block(text: &str) -> BlockRead {
     })
 }
 
-/// Files relais owns, in install order: the advisory agents, then the two
-/// skills that stay user-level. The `/relais` skill and the native
-/// worker agents live in the plugin ([`plugin`]).
+/// Files relais owns, in install order: the advisory agents. The `/relais`
+/// skill and the native worker agents live in the plugin ([`plugin`]); the
+/// published skills ship from greenharness/skills.
 pub fn owned_files() -> Vec<(PathBuf, String)> {
     vec![
         (
@@ -194,23 +194,12 @@ pub fn owned_files() -> Vec<(PathBuf, String)> {
             agent_implementation(),
         ),
         (Path::new("agents").join("relais-review.md"), agent_review()),
-        (
-            Path::new("skills")
-                .join("relais-verified-push")
-                .join("SKILL.md"),
-            skill_relais_verified_push(),
-        ),
-        (
-            Path::new("skills")
-                .join("relais-architecture-conflict")
-                .join("SKILL.md"),
-            skill_relais_architecture_conflict(),
-        ),
     ]
 }
 
-/// Files an earlier relais wrote that the plugin replaced: the per-(model,
-/// effort) native worker agents and the `/relais` skill. No template is
+/// Files an earlier relais wrote that the plugin or grh replaced: the
+/// per-(model, effort) native worker agents, the `/relais` skill and the
+/// `relais-verified-push` and `relais-architecture-conflict` skills. No template is
 /// kept for them — what is removed is judged by the marker each carries.
 pub fn retired_files() -> Vec<PathBuf> {
     let workers = crate::native::worker_agent_types()
@@ -220,7 +209,15 @@ pub fn retired_files() -> Vec<PathBuf> {
             Path::new("agents").join(format!("{agent_type}.md"))
         });
     workers
-        .chain([Path::new("skills").join("relais").join("SKILL.md")])
+        .chain([
+            Path::new("skills").join("relais").join("SKILL.md"),
+            Path::new("skills")
+                .join("relais-verified-push")
+                .join("SKILL.md"),
+            Path::new("skills")
+                .join("relais-architecture-conflict")
+                .join("SKILL.md"),
+        ])
         .collect()
 }
 
@@ -304,124 +301,6 @@ Find and follow code with LSP where it answers (workspaceSymbol,
 goToDefinition, findReferences, incomingCalls), and Read only the
 range it points to; grep and whole-file Reads are for text LSP cannot
 see (comments, strings, config).
-"#;
-    body.trim_end().to_string()
-}
-
-fn skill_relais_verified_push() -> String {
-    let body = r#"---
-name: relais-verified-push
-description: Verify a push actually left before trusting it — gate status, rehearsal, a bare push, then confirm the remote ref moved.
----
-
-# /relais-verified-push
-
-A push that "succeeded" is not the same claim as a push that left. Run
-these four steps in order, from the repository the branch lives in.
-
-## Steps
-
-1. Check what pushing next gates: `amont list --json --stage pre-push
-   --pushed`. The output is the `amont-list-v1` envelope: a `checks`
-   array whose rows carry `id`, `effective_severity` and `status`. Read
-   it before assuming the push is clean.
-
-2. Rehearse the push gate on a snapshot of HEAD, ahead of time:
-   `amont rehearse --wait`. This runs the same checks `git push` would
-   run, with no remote connection open, so the push itself is fast and
-   does not hold the remote idle while a suite runs.
-
-3. Land the branch, bare, alone in its command, in the foreground:
-
-   ```sh
-   amont land --json
-   ```
-
-   It pushes the branch and reads the remote back. The push guards judge
-   a land as they judge a `git push`, in that shape only; any other shape
-   is held under deny. Where amont or amont-agent is missing, or
-   `amont --version` is below 1.54 or `amont-agent --version` below 2.41
-   (the guards would not see the land), push instead, bare:
-
-   ```sh
-   git push
-   ```
-
-   Never pipe `amont land` or `git push` into `tail`, `head` or `grep`. A
-   pipeline's exit status is the LAST command's, so the trimming command
-   reports exit 0 however the push actually ended, and the trimmed output
-   discards the one line that would have said why it failed. If output
-   must be trimmed, redirect to a file and read the file — never pipe a
-   mutating command's own exit status away.
-
-4. Confirm the ref actually moved, against the remote, not the local
-   log. After `amont land`, exit 0 is that proof. Exit 4: the remote
-   accepted the push but shows another sha, so read `remote_after` before
-   anything else. Exit 1 is refused. Exit 3 is unreachable (nothing
-   pushed) or unverified (the push was accepted but could not be read
-   back): run the `git ls-remote` that land prints before landing again.
-   After a `git push`:
-   `git ls-remote origin refs/heads/<branch>`, and compare the sha it
-   reports to `git log --oneline -1 <branch>`; only a match is a push
-   that left.
-
-## Rules
-
-- Never trust a `git push` exit code alone; step 4 is the actual
-  verification. `amont land` does step 4 itself, which is why its exit
-  code can be trusted.
-- A rehearsal failure is the push gate telling you now what `git push`
-  would have refused later — fix it before step 3, not after.
-"#;
-    body.trim_end().to_string()
-}
-
-fn skill_relais_architecture_conflict() -> String {
-    let body = r#"---
-name: relais-architecture-conflict
-description: Resolve an architecture decision key and handle every outcome aval can return, including a corpus that contradicts itself.
----
-
-# /relais-architecture-conflict
-
-`aval resolve <key> --json` has a stable exit-code contract; read the
-code, not just stdout, before deciding what happened.
-
-## Exit codes
-
-| exit | meaning |
-|---|---|
-| 0 | active — a decision exists and holds |
-| 4 | undecided — no record answers this key |
-| 5 | contradiction — the corpus disagrees with itself |
-| 6 | retired — a decision existed and was withdrawn |
-| 7 | unknown — the key is not one aval recognises |
-| 1 | tool failure |
-| 2 | usage error |
-| 3 | corpus unreadable |
-
-## On exit 5 (contradiction)
-
-Do not pick a side. aval is read-only and deciding between two
-contradicting records is not this skill's call, or the caller's model's
-call, to make silently. Instead:
-
-1. Write an inspect contract (`"kind": "inspect"`) capturing the
-   evidence: the key, the scope, and both records aval's contradiction
-   names.
-2. Hand back a decision that names BOTH readings the corpus supports,
-   with their evidence, and says explicitly that the corpus contradicts
-   itself here.
-3. Let a person or an explicit decision step choose; never resolve the
-   contradiction by preferring one record over the other on your own
-   initiative.
-
-## Rules
-
-- Exit 1/2/3 are tool or corpus failures, not decisions — retry or
-  report the failure, never treat them as "undecided".
-- A `suggestion` field in aval's output is advisory: it resolves
-  nothing and is never a substitute for calling `aval resolve` again.
 "#;
     body.trim_end().to_string()
 }
@@ -1179,8 +1058,11 @@ mod tests {
         let applied = root.apply(&plan).expect("apply");
         assert_eq!(applied.applied.len(), owned_files().len());
         assert!(applied.not_applied.is_empty(), "{applied:?}");
-        let skill = root.claude_dir.join("skills/relais-verified-push/SKILL.md");
-        assert!(skill.is_file());
+        assert!(root.claude_dir.join("agents/relais-research.md").is_file());
+        assert!(
+            !root.claude_dir.join("skills").exists(),
+            "the skills ship from greenharness/skills, not from this install"
+        );
         // Unrelated content survives untouched.
         let settings = root.claude_dir.join("settings.json");
         std::fs::write(&settings, r#"{"hooks": {"PreToolUse": []}}"#).expect("unrelated");
@@ -1241,13 +1123,13 @@ mod tests {
         root.apply(&root.plan()).expect("apply");
         // Foreign file stays; owned file gets a user edit.
         std::fs::write(root.claude_dir.join("agents/custom.md"), "# custom\n").expect("foreign");
-        let owned = root.claude_dir.join("skills/relais-verified-push/SKILL.md");
+        let owned = root.claude_dir.join("agents/relais-implementation.md");
         let original = std::fs::read_to_string(&owned).expect("read");
         std::fs::write(&owned, format!("{original}\n<!-- user note -->\n")).expect("edit");
 
         let plan = root.uninstall_plan();
         let applied = root.apply_uninstall(&plan).expect("uninstall").applied;
-        // The three unchanged agents are removed entirely; the skill's
+        // The unchanged agents are removed entirely; the edited agent's
         // owned block is removed but the user's note survives; the
         // foreign agent was never ours.
         assert_eq!(applied.len(), owned_files().len(), "{applied:?}");
@@ -1539,47 +1421,6 @@ mod tests {
         }
     }
 
-    /// The relais-verified-push skill exists to stop exactly one failure
-    /// mode: a piped `git push` reporting success when the push did not
-    /// happen. It must name every step, and must not itself contain the
-    /// pattern it teaches against.
-    #[test]
-    fn relais_verified_push_names_every_step_and_never_pipes_a_mutation() {
-        let body = skill_relais_verified_push();
-        for needle in [
-            "amont list",
-            "amont rehearse --wait",
-            "amont land --json",
-            "git push",
-            "git ls-remote",
-        ] {
-            assert!(
-                body.contains(needle),
-                "the skill must name `{needle}`:\n{body}"
-            );
-        }
-        // No exemption, deliberately. An earlier version of this test
-        // skipped any line containing `…` or "Do not", so that the prose
-        // warning could quote the anti-pattern — and that exemption let
-        // `git push origin … | tail -1` sit INSIDE the fenced step a
-        // reader copies from and still pass (verified by injecting it).
-        // The body is worded so no single line ever needs the exemption:
-        // the warning names `git push` and the trimming commands in
-        // separate code spans, so a line carrying both is always a
-        // genuine invocation.
-        for line in body.lines() {
-            let has_mutation = line.contains("git push")
-                || line.contains("git commit")
-                || line.contains("amont land");
-            let pipes_into_trim =
-                line.contains("| tail") || line.contains("| head") || line.contains("| grep");
-            assert!(
-                !(has_mutation && pipes_into_trim),
-                "a mutating command must never be piped into tail/head/grep: {line:?}"
-            );
-        }
-    }
-
     /// The plugin starts a run with its own session; the skill must not
     /// tell a caller to shell out `RELAIS_SESSION_ID="${CLAUDE_SESSION_ID:-$$}"`
     /// by hand, which named the wrong variable and stood in a raw shell
@@ -1608,9 +1449,9 @@ mod tests {
         let (root, dir) = temp_root();
         // What relais 0.1.4 wrote: an HTML marker as line 1, the whole
         // template (opener included) inside the block.
-        let skill = root.claude_dir.join("skills/relais-verified-push/SKILL.md");
+        let skill = root.claude_dir.join("agents/relais-research.md");
         std::fs::create_dir_all(skill.parent().unwrap()).expect("mkdir");
-        let content = skill_relais_verified_push();
+        let content = agent_research();
         let old_layout = format!(
             "{BEGIN_MARKER} {} -->\n{}\n{END_MARKER}\n",
             sha256_hex(content.trim_end_matches('\n').as_bytes()),
@@ -1621,7 +1462,7 @@ mod tests {
         assert!(
             plan.actions.iter().any(|action| matches!(
                 action,
-                Action::Update { relative } if relative.ends_with("SKILL.md")
+                Action::Update { relative } if relative.ends_with("relais-research.md")
             )),
             "an untouched old-layout file is an upgrade, not a conflict: {plan:?}"
         );
@@ -1820,9 +1661,7 @@ mod tests {
         let written = install(&request, &home).expect("apply");
         assert_eq!(written.applied.len(), owned_files().len(), "{written:?}");
         assert!(written.not_applied.is_empty(), "{written:?}");
-        assert!(home
-            .join(".claude/skills/relais-verified-push/SKILL.md")
-            .is_file());
+        assert!(!home.join(".claude/skills").exists());
         assert!(home.join(".claude/agents/relais-research.md").is_file());
 
         let removed = uninstall(
@@ -2251,7 +2090,7 @@ mod tests {
         for relative in retired_files() {
             assert!(!root.owned_path(&relative).exists(), "{relative:?}");
         }
-        assert_eq!(retired_files().len(), 19 + 1);
+        assert_eq!(retired_files().len(), 19 + 3);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2283,6 +2122,31 @@ mod tests {
             "the directory relais made goes with its file"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn install_writes_neither_published_skill_and_judges_old_copies_by_the_marker() {
+        let (root, dir) = temp_root();
+        root.apply(&root.plan()).expect("apply");
+        let names = ["relais-verified-push", "relais-architecture-conflict"];
+        for name in names {
+            assert!(!root.claude_dir.join("skills").join(name).exists());
+        }
+        // A copy relais wrote earlier is removed; grh's copy has no marker
+        // and is never touched.
+        let marked = root.claude_dir.join("skills/relais-verified-push/SKILL.md");
+        install_older_template(&marked, "---\nname: relais-verified-push\n---\nold\n");
+        let unmarked = root
+            .claude_dir
+            .join("skills/relais-architecture-conflict/SKILL.md");
+        std::fs::create_dir_all(unmarked.parent().expect("parent")).expect("mkdir");
+        let theirs = "---\nname: relais-architecture-conflict\n---\ngrh's copy\n";
+        std::fs::write(&unmarked, theirs).expect("write");
+        let plan = root.plan();
+        root.apply(&plan).expect("apply");
+        assert!(!marked.exists(), "a marked copy is retired");
+        assert_eq!(std::fs::read_to_string(&unmarked).expect("kept"), theirs);
+        std::fs::remove_dir_all(&dir).ok(); // scratch dir cleanup; a leftover temp dir is harmless
     }
 
     #[test]

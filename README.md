@@ -312,8 +312,7 @@ or the reason it was kept, and a scorecard re-measured afterwards.
   verify (no `SHA256SUMS`, no sha256 tool). `RELAIS_SKIP_CHECKSUM=1` is
   the explicit way to accept an unverified binary.
 
-`relais install --claude` writes the `/relais-verified-push` and
-`/relais-architecture-conflict` skills and the three advisory agents
+`relais install --claude` writes the three advisory agents
 (`relais-research`, `relais-implementation`, `relais-review`), and installs the
 relais plugin, `relais@relais-local`, which carries the mod, the agent
 definitions (`relais-worker-<model>-<effort>` and the reviewer and planner ones)
