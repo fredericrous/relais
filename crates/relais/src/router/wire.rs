@@ -198,6 +198,13 @@ fn file_hashes(files: Vec<String>) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// What this relais accepts on the wire beyond the v0.35 form: the
+/// `answered` outcome, a task's `parent_task_id` and `parent_link_recorded`,
+/// and its `unmatched_checks`. `router-state` serves the list as `accepts`,
+/// so the plugin sends the new form only to a relais that lists it, whatever
+/// its version number.
+pub const WIRE_ACCEPTS: [&str; 3] = ["answered", "parent_task_id", "unmatched_checks"];
+
 /// The build and test runners whose argv prefix may be stored; the plugin's
 /// list, checked again here because the wire is the trust boundary.
 const RUNNER_PROGRAMS: [&str; 16] = [

@@ -71,6 +71,10 @@ export type RouterState = {
   // The kind of each entry of `checks` (same order): test, lint or build.
   // Empty from a relais that predates it: the kind is then read off the argv.
   check_kinds: string[]
+  // What `router-observe` accepts beyond the v0.35 form (`answered`, the
+  // parent link, unmatched checks). Empty from a relais that predates it, so
+  // records go in the v0.35 form whatever the relais version number.
+  accepts: string[]
 }
 
 // What a check proves. `gate` is an amont stamp, read at task end.
@@ -337,6 +341,7 @@ export function parseRouterState(text: unknown): RouterState | undefined {
     pins: raw.pins && typeof raw.pins === 'object' ? raw.pins : {},
     excluded_models: Array.isArray(raw.excluded_models) ? raw.excluded_models.filter((m: unknown) => typeof m === 'string') : [],
     ...parseChecks(raw),
+    accepts: Array.isArray(raw.accepts) ? raw.accepts.filter((a: unknown) => typeof a === 'string') : [],
   }
 }
 
@@ -1404,8 +1409,6 @@ export type RouterMemory = {
   lastContext: number
   queue: { session: string; record: unknown }[]
   status: string | undefined
-  // Whether the installed relais accepts `answered`: undefined until asked.
-  supportsAnswered: boolean | undefined
   // The git-root name of `cwd` once asked, for the unmatched checks.
   repository: { cwd: string; name: string } | undefined
 }
@@ -1428,7 +1431,6 @@ export const createRouterMemory = (): RouterMemory => ({
   lastContext: 0,
   queue: [],
   status: undefined,
-  supportsAnswered: undefined,
   repository: undefined,
 })
 

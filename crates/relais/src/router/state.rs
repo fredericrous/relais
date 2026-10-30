@@ -123,6 +123,10 @@ pub struct RouterState {
     /// order and length.
     pub check_kinds: Vec<&'static str>,
     pub adjustments: Vec<serde_json::Value>,
+    /// What `router-observe` accepts beyond the v0.35 form
+    /// ([`super::wire::WIRE_ACCEPTS`]); a plugin sends the new form only when
+    /// it is listed here.
+    pub accepts: Vec<&'static str>,
 }
 
 /// What [`build`] is assembled from.
@@ -303,6 +307,7 @@ pub fn build(inputs: Inputs<'_>) -> RouterState {
         checks,
         check_kinds,
         adjustments: Vec::new(),
+        accepts: super::wire::WIRE_ACCEPTS.to_vec(),
     }
 }
 
@@ -484,6 +489,7 @@ mod tests {
         assert_eq!(
             keys,
             vec![
+                "accepts",
                 "adjustments",
                 "capability_table",
                 "check_kinds",

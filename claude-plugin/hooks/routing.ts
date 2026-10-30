@@ -693,7 +693,7 @@ export async function flushObservations(fx: Fx, store: Store, options: { isFinal
   if (r.queue.length === 0) return
   const batch = r.queue
   r.queue = []
-  const understandsAnswered = await supportsAnswered(fx, store)
+  const understandsAnswered = supportsAnswered(store)
   const bySession = new Map<string, unknown[]>()
   for (const { session, record } of batch) {
     const sent = understandsAnswered ? record : withoutAnswered(record)
@@ -704,27 +704,12 @@ export async function flushObservations(fx: Fx, store: Store, options: { isFinal
   }
 }
 
-// The first relais release that accepts the `answered` outcome.
-const ANSWERED_MIN_VERSION: [number, number] = [0, 38]
-
-// Whether the installed relais accepts `answered`, asked once per session
-// through `relais --version`. A failed or unreadable answer is cached as "no"
-// for the session (docs/router-protocol.md), so the batch goes in the v0.35
-// form and the probe is not repeated.
-async function supportsAnswered(fx: Fx, store: Store): Promise<boolean> {
-  const router = store.router
-  if (router.supportsAnswered !== undefined) return router.supportsAnswered
-  let versionText = ''
-  try {
-    const versionRun = await fx.process.run(['relais', '--version'], { timeoutMs: OBSERVE_TIMEOUT_MS })
-    if (versionRun?.exitCode === 0) versionText = String(versionRun.stdout ?? '')
-  } catch {
-    // An unreadable version is cached as "no" below.
-  }
-  const found = /(\d+)\.(\d+)\.(\d+)/.exec(versionText)
-  const [major, minor] = found ? [Number(found[1]), Number(found[2])] : [0, 0]
-  router.supportsAnswered = found !== null && (major > ANSWERED_MIN_VERSION[0] || (major === ANSWERED_MIN_VERSION[0] && minor >= ANSWERED_MIN_VERSION[1]))
-  return router.supportsAnswered
+// Whether the relais this session talks to accepts `answered` and the parent
+// and unmatched-check fields: it says so in router-state's `accepts`. A
+// router-state that was not read, or that lists nothing, gets the v0.35 form,
+// so an older relais never sees a field it refuses (docs/router-protocol.md).
+function supportsAnswered(store: Store): boolean {
+  return store.router.state?.accepts.includes('answered') === true
 }
 
 // The v0.35 form of a record: `answered` and the parent and unmatched-check

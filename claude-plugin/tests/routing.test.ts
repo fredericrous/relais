@@ -742,9 +742,8 @@ test('an answered parent sends no task_outcome', async ($: any, on: any) => {
   expect(observed(engine, 'task_outcome')).toEqual([])
 })
 
-test('a relais older than 0.38 gets the v0.35 form: answered is sent as unknown, and the version is asked once', async ($: any, on: any) => {
-  const engine = await routedSession($, on)
-  engine.version = '0.35.0'
+test('a router-state whose accepts lacks answered gets the v0.35 form: answered is sent as unknown, and no version is asked', async ($: any, on: any) => {
+  const engine = await routedSession($, on, { state: { accepts: [] } })
   await personTurn($, engine, 'what does this function do?')
   await personTurn($, engine, 'and this one?')
   await endSession($, engine)
@@ -753,12 +752,11 @@ test('a relais older than 0.38 gets the v0.35 form: answered is sent as unknown,
   expect(tasks.map((r: any) => r.outcome)).toEqual(tasks.map(() => 'unknown'))
   expect(tasks.every((r: any) => r.completed_at_end !== 'answered')).toBe(true)
   const asked = engine.calls.run.filter((c: any) => c.argv?.[1] === '--version')
-  expect(asked.length).toBe(1)
+  expect(asked.length).toBe(0)
 })
 
-test('relais 0.37.0, released without the answered outcome, gets the v0.35 form', async ($: any, on: any) => {
-  const engine = await routedSession($, on)
-  engine.version = '0.37.0'
+test('a router-state from a relais that predates accepts (0.38.0 and older) gets the v0.35 form', async ($: any, on: any) => {
+  const engine = await routedSession($, on, { state: { accepts: undefined } })
   await personTurn($, engine, 'what does this function do?')
   await toolCall($, engine, bash('make check'), { result: {}, text: 'ok' })
   await endSession($, engine)
@@ -922,9 +920,8 @@ test('a failing rev-parse from a subdirectory stores no unmatched entry', async 
   for (const record of tasks) expect(record.unmatched_checks).toEqual([])
 })
 
-test('a relais older than 0.38 receives none of the parent or unmatched fields', async ($: any, on: any) => {
-  const engine = await routedSession($, on)
-  engine.version = '0.35.0'
+test('a router-state whose accepts lacks answered receives none of the parent or unmatched fields', async ($: any, on: any) => {
+  const engine = await routedSession($, on, { state: { accepts: [] } })
   await personTurn($, engine, 'what does this function do?')
   await toolCall($, engine, bash('make check'), { result: {}, text: 'ok' })
   await endSession($, engine)
