@@ -1,0 +1,16 @@
+amont-provenance-v1
+commit 3f87331a57ce4794d40ffb41da3672e005219375
+tree 0ab00266f0d69761ba3d8ea690abf127e8d55648
+canon 4bc7eb04bc1bc87a390634e304864ecdd0844ac4
+patch 8e54976ff1acf09e6aa8804188abfc148fe1d0a4
+plan docs/plans/2026-10-29-widen-holdout-acceptance.md fcc0505736ec88427f40817a913e52bc36d2e00ff43d1c3b62912b226d2cf206
+review reviewed e8c3715ed8f10abbcba78e4f1c92bc7458e8582f265b9da3005ae38e6c0841f4
+preview not-required
+producer amont-agent 3.9.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAEDMg/FYBqrYGpzCSycWp/YG/lCaSSikgqy+/1EMH8955v6MvG
+DWbTtl798e6QOXEhuN7MvI/V9+stIJbgkiPCAL
+-----END SSH SIGNATURE-----
