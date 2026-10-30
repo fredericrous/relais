@@ -102,8 +102,8 @@ impl Ledger {
         Ok(rows)
     }
 
-    /// The names of the run's attached holdouts recorded as skipped: their
-    /// definitions stay frozen, but they no longer judge the run.
+    /// The names of the run's attached holdouts recorded as skipped: they
+    /// leave no definition and no longer judge the run.
     pub fn skipped_attached_holdouts(&self, run_id: &RunId) -> Result<Vec<String>> {
         let mut statement = self.conn.prepare(
             "SELECT DISTINCT name FROM holdout_outcomes

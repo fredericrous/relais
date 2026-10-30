@@ -261,8 +261,9 @@ impl<'a> RunEngine<'a> {
             .ledger
             .skipped_attached_holdouts(&self.run_id)
             .map_err(|e| VerifyFailure::from(e.to_string()))?;
-        // An attached holdout skipped by an earlier verification of this run
-        // keeps its frozen definition but is not asked for again.
+        // A skipped attached holdout leaves no definition; the filter guards
+        // the `resolved` list, which was captured before the definition was
+        // dropped, so it is not asked for again.
         let live: Vec<&ResolvedHoldout> = resolved
             .iter()
             .filter(|holdout| !skipped.contains(&holdout.name))
@@ -311,6 +312,10 @@ impl<'a> RunEngine<'a> {
                                 source: holdout::HoldoutSource::Attached.as_str(),
                             },
                         )
+                        .map_err(|e| VerifyFailure::from(e.to_string()))?;
+                    self.config
+                        .ledger
+                        .forget_attached_holdout_definition(&self.run_id, &holdout.name)
                         .map_err(|e| VerifyFailure::from(e.to_string()))?;
                     self.events.emit(Event::Decision {
                         what: "holdout_attach_skipped".to_string(),

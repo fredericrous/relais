@@ -43,6 +43,17 @@ impl Ledger {
         Ok(())
     }
 
+    /// Drop the run's definition of an attached holdout that was skipped: a
+    /// skipped holdout leaves no definition, so it neither judges the run nor
+    /// passes to a successor.
+    pub fn forget_attached_holdout_definition(&self, run_id: &RunId, name: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM holdout_definitions WHERE run_id = ?1 AND name = ?2 AND source = ?3",
+            params![run_id.as_str(), name, HoldoutSource::Attached.as_str()],
+        )?;
+        Ok(())
+    }
+
     /// The definitions a run froze, ordered by name; empty for a run that
     /// resolved no holdout.
     pub fn holdout_definitions(&self, run_id: &RunId) -> Result<Vec<ResolvedHoldout>> {

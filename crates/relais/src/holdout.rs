@@ -464,6 +464,55 @@ pub fn resolve_inheriting(
     Ok(Resolution { holdouts, changes })
 }
 
+/// An attached holdout whose store was unreachable when the run resolved it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedAttachment {
+    pub name: String,
+    pub detail: String,
+}
+
+/// The holdouts a run is judged by, with the attached ones whose store was
+/// unreachable set apart: they are skipped, never refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedResolution {
+    pub resolution: Resolution,
+    pub skipped: Vec<SkippedAttachment>,
+}
+
+/// Resolve the contract's named holdouts as [`resolve_inheriting`] does, then
+/// each attached name on its own: an attached holdout whose store is
+/// unreachable ([`BlockCode::HoldoutUnreadable`]) is skipped, any other
+/// refusal of it, and every refusal of a named one, stops the run.
+pub fn resolve_with_attachments(
+    entries: &[AcceptanceEntry],
+    attached_names: &[String],
+    lookup: &Lookup<'_>,
+    frozen: &[ResolvedHoldout],
+) -> Result<AttachedResolution, HoldoutBlock> {
+    let mut resolution = resolve_inheriting(entries, lookup, frozen)?;
+    let mut skipped = Vec::new();
+    for name in attached_names {
+        let single = [attached_criterion(name)];
+        match resolve_inheriting(&single, lookup, frozen) {
+            Ok(one) => {
+                resolution.holdouts.extend(one.holdouts);
+                resolution.changes.extend(one.changes);
+            }
+            Err(block) if block.code == BlockCode::HoldoutUnreadable => {
+                skipped.push(SkippedAttachment {
+                    name: name.clone(),
+                    detail: block.detail,
+                });
+            }
+            Err(block) => return Err(block),
+        }
+    }
+    Ok(AttachedResolution {
+        resolution,
+        skipped,
+    })
+}
+
 /// Resolve one holdout. The order of the checks is the order of the
 /// refusals in SPEC §4.
 pub fn resolve(
@@ -967,7 +1016,7 @@ mod tests {
         scope: &[&str],
         acceptance: serde_json::Value,
     ) -> crate::contract::TaskContract {
-        let mut value = serde_json::json!({
+        let mut contract_json = serde_json::json!({
             "schema_version": 1,
             "kind": kind,
             "objective": "o",
@@ -976,9 +1025,10 @@ mod tests {
             "verification_profile": "profile",
         });
         if kind == "change" {
-            value["write_scope"] = serde_json::json!(scope);
+            contract_json["write_scope"] = serde_json::json!(scope);
         }
-        crate::contract::TaskContract::from_json_str(&value.to_string()).expect("a contract")
+        crate::contract::TaskContract::from_json_str(&contract_json.to_string())
+            .expect("a contract")
     }
 
     fn attached_names(

@@ -80,6 +80,7 @@ pub(crate) fn plan_json(
     authority: &EffectiveAuthority,
     contract: &TaskContract,
     attached: &[relais::holdout::Attachment],
+    skipped: &[relais::holdout::SkippedAttachment],
 ) -> Result<CliOutcome, CliError> {
     let (mut value, outcome) = match decision {
         route::Routed::Route(routed) => (
@@ -111,6 +112,10 @@ pub(crate) fn plan_json(
         ),
     };
     value["holdouts"] = serde_json::json!({
+        "skipped": skipped
+            .iter()
+            .map(|gone| serde_json::json!({"name": gone.name}))
+            .collect::<Vec<_>>(),
         "attached": attached
             .iter()
             .filter_map(|attachment| {
@@ -209,23 +214,6 @@ pub(crate) fn plan_command(
             return Ok(CliOutcome::Blocked);
         }
     }
-    // And the holdouts: `run` refuses a holdout criterion it cannot
-    // resolve, with the same codes.
-    if let Err(block) = relais::holdout::resolve_all(
-        &contract.acceptance,
-        &machine.holdouts,
-        &relais::repo::main_checkout_name(&root).unwrap_or_default(),
-        &relais::workspace::SystemGit,
-        &root,
-        &base_sha,
-        &relais::holdout::machine_toml_label(),
-    ) {
-        eprintln!(
-            "relais plan: blocked ({}): {} (base {base_sha})",
-            block.code, block.detail
-        );
-        return Ok(CliOutcome::Blocked);
-    }
     let repo_identity = relais::repo::identity(&root);
     let authority = effective_authority(&repo, &machine, &contract, &repo_identity);
     let probe = harness_identity();
@@ -240,12 +228,50 @@ pub(crate) fn plan_command(
         (Some(task), None) => operational(open_ledger()?.routing_type(task, None), "plan")?,
         (None, None) => None,
     };
-    let attached = relais::holdout::attachments(
-        &machine.holdouts,
-        &relais::repo::main_checkout_name(&root).unwrap_or_default(),
-        &contract,
-        task_type,
-    );
+    let repo_name = relais::repo::main_checkout_name(&root).unwrap_or_default();
+    let attached =
+        relais::holdout::attachments(&machine.holdouts, &repo_name, &contract, task_type);
+    // And the holdouts: `run` refuses a holdout criterion it cannot resolve,
+    // with the same codes; an attached one whose store is unreachable is
+    // skipped, as `run` skips it.
+    let machine_toml = relais::holdout::machine_toml_label();
+    let lookup = relais::holdout::Lookup {
+        settings: &machine.holdouts,
+        repo: &repo_name,
+        git: &relais::workspace::SystemGit,
+        repo_dir: &root,
+        base_sha: &base_sha,
+        machine_toml: &machine_toml,
+    };
+    let attached_names: Vec<String> = attached
+        .iter()
+        .map(|attachment| attachment.name.clone())
+        .collect();
+    let skipped = match relais::holdout::resolve_with_attachments(
+        &contract.acceptance,
+        &attached_names,
+        &lookup,
+        &[],
+    ) {
+        Ok(resolved) => resolved.skipped,
+        Err(block) => {
+            eprintln!(
+                "relais plan: blocked ({}): {} (base {base_sha})",
+                block.code, block.detail
+            );
+            return Ok(CliOutcome::Blocked);
+        }
+    };
+    let attached: Vec<relais::holdout::Attachment> = attached
+        .into_iter()
+        .filter(|attachment| !skipped.iter().any(|gone| gone.name == attachment.name))
+        .collect();
+    for gone in &skipped {
+        eprintln!(
+            "relais plan: holdout_attach_skipped: {}; the run settles without it",
+            gone.detail
+        );
+    }
     let decision = route::route(route::RouteInputs {
         draw_key: None,
         task_type,
@@ -261,13 +287,16 @@ pub(crate) fn plan_command(
         catalogs: &catalogs,
     });
     if let PlanFormat::Json = format {
-        return plan_json(&decision, &authority, &contract, &attached);
+        return plan_json(&decision, &authority, &contract, &attached, &skipped);
     }
     let session = relais::coordinator::resolve_session();
     println!("contract hash: {}", contract.hash());
     println!("policy hash: {}", authority.authority_hash);
     println!("repository: {repo_identity}");
     println!("base: {} ({})", base_sha, contract.base_ref);
+    for gone in &skipped {
+        println!("holdout {} skipped: store unreachable", gone.name);
+    }
     for attachment in &attached {
         if let Some(matched) = &attachment.matched {
             println!(

@@ -2399,8 +2399,8 @@ fn an_unreachable_store_skips_an_attached_holdout_and_blocks_for_a_named_one() {
             .attached_holdout_definitions(&outcome.run_id)
             .expect("definitions")
             .len(),
-        1,
-        "the frozen definition stays for exposure counting and successors"
+        0,
+        "a skipped attached holdout leaves no definition"
     );
     assert_eq!(
         fixture
@@ -2420,6 +2420,102 @@ fn an_unreachable_store_skips_an_attached_holdout_and_blocks_for_a_named_one() {
         .ledger
         .run_holdout_caught(&outcome.run_id)
         .expect("caught"));
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_store_unreachable_at_preflight_skips_an_attached_holdout_and_refuses_a_named_one() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let missing_store = format!("file://{}/no-such-store", fixture.dir.display());
+
+    let mut acceptance = bare_acceptance();
+    acceptance.push(named_criterion("named"));
+    let both = settings_with(
+        &fixture,
+        &missing_store,
+        vec![
+            (
+                "escaping",
+                attached_declared_at(STORE_PATH_IN_STORE, OVERLAY),
+            ),
+            (
+                "named",
+                named_declared_at(STORE_PATH_IN_STORE, "src/holdout_named.rs"),
+            ),
+        ],
+    );
+    let outcome = fixture.execute_with_holdouts(
+        both,
+        &feature_contract(&fixture, acceptance),
+        &repo,
+        &MockBackend::new(|_| MockOutcome::default()),
+    );
+    assert_eq!(blocked_code(outcome), BlockCode::HoldoutUnreadable);
+
+    let named_only = settings_with(
+        &fixture,
+        &missing_store,
+        vec![(
+            "named",
+            named_declared_at(STORE_PATH_IN_STORE, "src/holdout_named.rs"),
+        )],
+    );
+    let mut named_acceptance = bare_acceptance();
+    named_acceptance.push(named_criterion("named"));
+    let outcome = fixture.execute_with_holdouts(
+        named_only,
+        &feature_contract(&fixture, named_acceptance),
+        &repo,
+        &MockBackend::new(|_| MockOutcome::default()),
+    );
+    assert_eq!(blocked_code(outcome), BlockCode::HoldoutUnreadable);
+
+    let attached_only = settings_with(
+        &fixture,
+        &missing_store,
+        vec![(
+            "escaping",
+            attached_declared_at(STORE_PATH_IN_STORE, OVERLAY),
+        )],
+    );
+    let outcome = fixture.execute_with_holdouts(
+        attached_only,
+        &feature_contract(&fixture, bare_acceptance()),
+        &repo,
+        &counting_worker(Arc::default(), Arc::default()),
+    );
+    let Terminal::Accepted(receipt) = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    assert!(receipt
+        .criteria
+        .iter()
+        .all(|criterion| criterion.id != "attached:escaping"));
+    let events = events_text(&fixture, &outcome.run_id);
+    assert!(events.contains("holdout_attach_skipped"), "{events}");
+    assert!(
+        fixture
+            .ledger
+            .holdout_definitions(&outcome.run_id)
+            .expect("definitions")
+            .is_empty(),
+        "a skipped holdout leaves no definition"
+    );
+    assert_eq!(
+        fixture
+            .ledger
+            .skipped_attached_holdouts(&outcome.run_id)
+            .expect("skipped"),
+        vec!["escaping".to_string()]
+    );
+    assert_eq!(
+        fixture
+            .ledger
+            .holdout_outcome_sources(&outcome.run_id)
+            .expect("sources"),
+        vec![("escaping".to_string(), "attached".to_string())]
+    );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
 

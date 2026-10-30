@@ -600,25 +600,22 @@ impl<'a> RunEngine<'a> {
         if let Some(block) = crate::holdout::attachment_collision(self.config.contract, &attached) {
             return Ok(Phase::Ended(self.fail_preflight(block.code, block.detail)?));
         }
-        let entries: Vec<crate::acceptance::AcceptanceEntry> = self
-            .config
-            .contract
-            .acceptance
+        let attached_names: Vec<String> = attached
             .iter()
-            .cloned()
-            .chain(
-                attached
-                    .iter()
-                    .map(|attachment| crate::holdout::attached_criterion(&attachment.name)),
-            )
+            .map(|attachment| attachment.name.clone())
             .collect();
-        let crate::holdout::Resolution { holdouts, changes } =
-            match crate::holdout::resolve_inheriting(&entries, &lookup, &frozen) {
-                Ok(resolution) => resolution,
-                Err(block) => {
-                    return Ok(Phase::Ended(self.fail_preflight(block.code, block.detail)?))
-                }
-            };
+        let crate::holdout::AttachedResolution {
+            resolution: crate::holdout::Resolution { holdouts, changes },
+            skipped,
+        } = match crate::holdout::resolve_with_attachments(
+            &self.config.contract.acceptance,
+            &attached_names,
+            &lookup,
+            &frozen,
+        ) {
+            Ok(resolved) => resolved,
+            Err(block) => return Ok(Phase::Ended(self.fail_preflight(block.code, block.detail)?)),
+        };
         let sourced: Vec<(
             crate::holdout::ResolvedHoldout,
             crate::holdout::HoldoutSource,
@@ -639,10 +636,30 @@ impl<'a> RunEngine<'a> {
         self.config
             .ledger
             .record_holdout_definitions(&self.run_id, &sourced)?;
-        for attachment in &attached {
+        for attachment in attached
+            .iter()
+            .filter(|attachment| !skipped.iter().any(|gone| gone.name == attachment.name))
+        {
             self.events.emit(Event::Decision {
                 what: "holdout_attached".to_string(),
                 reason: format!("holdout `{}`: {}", attachment.name, attachment.rule),
+            });
+        }
+        for gone in &skipped {
+            self.config.ledger.record_holdout_outcome(
+                &self.run_id,
+                &crate::ledger::HoldoutOutcomeRow {
+                    label_kind: "attempt",
+                    attempt_index: 0,
+                    name: &gone.name,
+                    outcome: crate::holdout::SKIPPED_OUTCOME,
+                    profile_green: false,
+                    source: crate::holdout::HoldoutSource::Attached.as_str(),
+                },
+            )?;
+            self.events.emit(Event::Decision {
+                what: "holdout_attach_skipped".to_string(),
+                reason: format!("{}; the run settles without it", gone.detail),
             });
         }
         for change in &changes {
