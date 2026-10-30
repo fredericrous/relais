@@ -282,7 +282,18 @@ impl<'a> RunEngine<'a> {
             (Some(prepared), Some(_)) => prepared.tree.clone(),
             _ => base_sha.clone(),
         };
+        // The declared type, else the ledger's classified one. Only a run
+        // the replay command started (`RunPurpose::Replay`, set nowhere
+        // else) is admitted below the implementation tier for a change.
+        // Read ahead of the context because a declared holdout's `attach`
+        // asks for the same type.
+        let task = ledger.task_of_run(&self.run_id)?;
+        let task_type = match &task {
+            Some(task) => ledger.routing_type(task, self.config.contract.task_type)?,
+            None => self.config.contract.task_type,
+        };
         let (manifest, holdouts) = match self.assemble_context(
+            task_type,
             &authority,
             &contract_hash,
             &base_sha,
@@ -301,14 +312,6 @@ impl<'a> RunEngine<'a> {
             self.config.machine,
             capabilities.as_ref().map(|c| &c.accepted_efforts),
         );
-        // The declared type, else the ledger's classified one. Only a run
-        // the replay command started (`RunPurpose::Replay`, set nowhere
-        // else) is admitted below the implementation tier for a change.
-        let task = ledger.task_of_run(&self.run_id)?;
-        let task_type = match &task {
-            Some(task) => ledger.routing_type(task, self.config.contract.task_type)?,
-            None => self.config.contract.task_type,
-        };
         let decision = match route(RouteInputs {
             draw_key: task.as_ref().map(|task| crate::route::DrawKey {
                 task: task.as_str(),
@@ -506,6 +509,7 @@ impl<'a> RunEngine<'a> {
     /// referenced by hash (SPEC §7, §12).
     fn assemble_context(
         &mut self,
+        task_type: Option<crate::contract::TaskType>,
         authority: &EffectiveAuthority,
         contract_hash: &str,
         base_sha: &str,
@@ -558,28 +562,106 @@ impl<'a> RunEngine<'a> {
             base_sha,
             machine_toml: &machine_toml,
         };
-        // A successor is judged by the definitions its predecessor froze.
-        let frozen = match self.config.ledger.intent_of_run(&self.run_id)? {
-            Some(intent) => self
-                .config
-                .ledger
-                .holdout_definitions(&intent.predecessor)?,
-            None => Vec::new(),
+        // A successor is judged by the definitions its predecessor froze,
+        // attached ones included: they are carried, not matched again.
+        let intent = self.config.ledger.intent_of_run(&self.run_id)?;
+        let (frozen, carried) = match &intent {
+            Some(intent) => (
+                self.config
+                    .ledger
+                    .holdout_definitions(&intent.predecessor)?,
+                self.config
+                    .ledger
+                    .attached_holdout_definitions(&intent.predecessor)?,
+            ),
+            None => (Vec::new(), Vec::new()),
         };
-        let crate::holdout::Resolution { holdouts, changes } =
-            match crate::holdout::resolve_inheriting(
-                &self.config.contract.acceptance,
-                &lookup,
-                &frozen,
-            ) {
-                Ok(resolution) => resolution,
-                Err(block) => {
-                    return Ok(Phase::Ended(self.fail_preflight(block.code, block.detail)?))
-                }
-            };
+        // A declared holdout's `attach` applies to a root run that is not a
+        // successor; a work package is judged by its own contract.
+        let attached: Vec<crate::holdout::Attachment> = if intent.is_some() {
+            carried
+                .iter()
+                .map(|holdout| crate::holdout::Attachment {
+                    name: holdout.name.clone(),
+                    rule: "retained from the predecessor".to_string(),
+                    matched: None,
+                })
+                .collect()
+        } else if self.parent.is_none() {
+            crate::holdout::attachments(
+                &self.config.machine.holdouts,
+                &repo_name,
+                self.config.contract,
+                task_type,
+            )
+        } else {
+            Vec::new()
+        };
+        if let Some(block) = crate::holdout::attachment_collision(self.config.contract, &attached) {
+            return Ok(Phase::Ended(self.fail_preflight(block.code, block.detail)?));
+        }
+        let attached_names: Vec<String> = attached
+            .iter()
+            .map(|attachment| attachment.name.clone())
+            .collect();
+        let crate::holdout::AttachedResolution {
+            resolution: crate::holdout::Resolution { holdouts, changes },
+            skipped,
+        } = match crate::holdout::resolve_with_attachments(
+            &self.config.contract.acceptance,
+            &attached_names,
+            &lookup,
+            &frozen,
+        ) {
+            Ok(resolved) => resolved,
+            Err(block) => return Ok(Phase::Ended(self.fail_preflight(block.code, block.detail)?)),
+        };
+        let sourced: Vec<(
+            crate::holdout::ResolvedHoldout,
+            crate::holdout::HoldoutSource,
+        )> = holdouts
+            .iter()
+            .map(|holdout| {
+                let source = if attached
+                    .iter()
+                    .any(|attachment| attachment.name == holdout.name)
+                {
+                    crate::holdout::HoldoutSource::Attached
+                } else {
+                    crate::holdout::HoldoutSource::Named
+                };
+                (holdout.clone(), source)
+            })
+            .collect();
         self.config
             .ledger
-            .record_holdout_definitions(&self.run_id, &holdouts)?;
+            .record_holdout_definitions(&self.run_id, &sourced)?;
+        for attachment in attached
+            .iter()
+            .filter(|attachment| !skipped.iter().any(|gone| gone.name == attachment.name))
+        {
+            self.events.emit(Event::Decision {
+                what: "holdout_attached".to_string(),
+                reason: format!("holdout `{}`: {}", attachment.name, attachment.rule),
+            });
+        }
+        for gone in &skipped {
+            self.config.ledger.record_holdout_outcome(
+                &self.run_id,
+                &crate::ledger::HoldoutOutcomeRow {
+                    label_kind: "attempt",
+                    attempt_index: 0,
+                    name: &gone.name,
+                    outcome: crate::holdout::SKIPPED_OUTCOME,
+                    profile_green: false,
+                    source: crate::holdout::HoldoutSource::Attached.as_str(),
+                },
+            )?;
+            self.events.emit(Event::Decision {
+                what: "holdout_attach_skipped".to_string(),
+                reason: format!("{}; the run settles without it", gone.detail),
+            });
+        }
         for change in &changes {
             let current = change.current_digest.as_deref().unwrap_or("undeclared");
             self.events.emit(Event::Decision {

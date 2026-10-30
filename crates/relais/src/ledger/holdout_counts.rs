@@ -18,11 +18,15 @@ pub struct HoldoutOutcomeRow<'a> {
     pub label_kind: &'a str,
     pub attempt_index: u32,
     pub name: &'a str,
-    /// `passed`, `failed`, `did_not_build` or `timed_out`.
+    /// `passed`, `failed`, `did_not_build`, `timed_out` or `skipped` (an
+    /// attached holdout whose store could not be fetched).
     pub outcome: &'a str,
     /// Every profile check passed on that candidate (no failed check, no
-    /// profile gap).
+    /// profile gap). Meaningless on a `skipped` row, which is written before
+    /// the profile is known: readers ignore it there.
     pub profile_green: bool,
+    /// `named` or `attached`.
+    pub source: &'a str,
 }
 
 impl Ledger {
@@ -35,15 +39,16 @@ impl Ledger {
     ) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO holdout_outcomes
-                (run_id, label_kind, attempt_index, name, outcome, profile_green)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (run_id, label_kind, attempt_index, name, outcome, profile_green, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 run_id.as_str(),
                 row.label_kind,
                 i64::from(row.attempt_index),
                 row.name,
                 row.outcome,
-                i64::from(row.profile_green)
+                i64::from(row.profile_green),
+                row.source
             ],
         )?;
         Ok(())
@@ -85,11 +90,66 @@ impl Ledger {
         Ok(rows)
     }
 
-    /// Whether the run named at least one holdout (it has an outcome row).
+    /// The (holdout name, source) of every outcome row of the run, ordered.
+    pub fn holdout_outcome_sources(&self, run_id: &RunId) -> Result<Vec<(String, String)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT name, source FROM holdout_outcomes WHERE run_id = ?1
+              ORDER BY label_kind, attempt_index, name",
+        )?;
+        let rows = statement
+            .query_map([run_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The names of the run's attached holdouts recorded as skipped: they
+    /// leave no definition and no longer judge the run.
+    pub fn skipped_attached_holdouts(&self, run_id: &RunId) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT name FROM holdout_outcomes
+              WHERE run_id = ?1 AND outcome = ?2 AND source = ?3 ORDER BY name",
+        )?;
+        let names = statement
+            .query_map(
+                params![
+                    run_id.as_str(),
+                    crate::holdout::SKIPPED_OUTCOME,
+                    crate::holdout::HoldoutSource::Attached.as_str()
+                ],
+                |row| row.get(0),
+            )?
+            .collect::<std::result::Result<Vec<String>, _>>()?;
+        Ok(names)
+    }
+
+    /// Whether the run ran at least one holdout (it has an outcome row that
+    /// was not skipped).
     pub fn run_named_a_holdout(&self, run_id: &RunId) -> Result<bool> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM holdout_outcomes WHERE run_id = ?1",
-            [run_id.as_str()],
+            "SELECT COUNT(*) FROM holdout_outcomes WHERE run_id = ?1 AND outcome <> ?2",
+            params![run_id.as_str(), crate::holdout::SKIPPED_OUTCOME],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Whether the run ran (did not skip) a holdout of this `source`.
+    pub fn run_ran_holdout_of_source(&self, run_id: &RunId, source: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM holdout_outcomes
+              WHERE run_id = ?1 AND source = ?2 AND outcome <> ?3",
+            params![run_id.as_str(), source, crate::holdout::SKIPPED_OUTCOME],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Whether a holdout of this `source` failed on green profile checks.
+    pub fn run_holdout_of_source_caught(&self, run_id: &RunId, source: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM holdout_outcomes
+              WHERE run_id = ?1 AND source = ?2 AND profile_green = 1 AND outcome = 'failed'",
+            params![run_id.as_str(), source],
             |row| row.get(0),
         )?;
         Ok(count > 0)
@@ -148,6 +208,7 @@ mod tests {
                     name: "slow",
                     outcome: "timed_out",
                     profile_green: true,
+                    source: "named",
                 },
             )
             .expect("outcome");

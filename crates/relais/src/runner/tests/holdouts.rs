@@ -24,6 +24,7 @@ fn declaration(junit: Option<&str>, overlay: &str) -> HoldoutDecl {
         .expect("a command"),
         config: Some(RUNNER_CONFIG.into()),
         inputs: Vec::new(),
+        attach: None,
     }
 }
 
@@ -252,6 +253,7 @@ fn script_declaration(argv: &[&str], config: Option<&str>) -> HoldoutDecl {
             .expect("a command"),
         config: config.map(Into::into),
         inputs: Vec::new(),
+        attach: None,
     }
 }
 
@@ -308,6 +310,7 @@ fn a_passing_holdout_settles_its_criterion_and_is_listed_on_the_receipt() {
         panic!("{:?}", receipt.holdouts);
     };
     assert_eq!(run.name, "escaping");
+    assert_eq!(run.source, Some(crate::holdout::HoldoutSource::Named));
     assert_eq!(run.outcome, crate::verify::HoldoutVerdict::Passed);
     assert_eq!(run.tests.len(), 1);
     assert_eq!(run.tests[0].id, "h::escapes");
@@ -1744,8 +1747,8 @@ fn the_report_json_carries_the_holdout_counts_under_holdouts() {
     let report = crate::report::runs_report(&fixture.ledger, "1970-01-01T00:00:00Z", None)
         .expect("a report");
     let json = serde_json::to_value(&report).expect("json");
-    assert_eq!(json["schema_version"], 15);
-    assert_eq!(crate::report::REPORT_SCHEMA_VERSION, 15);
+    assert_eq!(json["schema_version"], 16);
+    assert_eq!(crate::report::REPORT_SCHEMA_VERSION, 16);
     assert_eq!(json["holdouts"]["holdout_runs"], 1);
     assert_eq!(json["holdouts"]["holdout_catches"], 1);
     assert_eq!(json["holdouts"]["holdout_exposures"]["runs"], 0);
@@ -2027,5 +2030,599 @@ fn a_successor_of_a_successor_is_judged_by_the_first_runs_frozen_definition() {
     };
     assert_eq!(judged.sha, sha_a, "the first run's commit");
     assert_eq!(judged.digest, frozen.digest);
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+fn attaching(declared: HoldoutDecl) -> HoldoutDecl {
+    HoldoutDecl {
+        attach: Some(crate::policy::HoldoutAttach {
+            task_types: vec![crate::contract::TaskType::Feature],
+            paths: vec!["src/**".into()],
+        }),
+        ..declared
+    }
+}
+
+/// A feature contract scoped to `src/**` whose criteria are `acceptance`.
+fn feature_contract(
+    fixture: &Fixture,
+    acceptance: Vec<crate::acceptance::AcceptanceEntry>,
+) -> TaskContract {
+    let mut contract = fixture.contract(Review::Off);
+    contract.task_type = Some(crate::contract::TaskType::Feature);
+    contract.acceptance = acceptance;
+    contract
+}
+
+fn bare_acceptance() -> Vec<crate::acceptance::AcceptanceEntry> {
+    vec!["src/main.rs no longer exists".into()]
+}
+
+fn attach_settings(fixture: &Fixture, script: &str) -> HoldoutSettings {
+    let (store, _) = store_with(fixture, &[(STORE_PATH_IN_STORE, script)]);
+    settings_for(
+        fixture,
+        &store,
+        attaching(script_declaration(&["sh", OVERLAY], None)),
+    )
+}
+
+#[test]
+fn an_attached_holdout_runs_records_source_attached_and_settles_its_criterion() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let settings = attach_settings(&fixture, &writes(PASSING));
+    let contract = feature_contract(&fixture, bare_acceptance());
+    let backend = counting_worker(Arc::default(), Arc::default());
+    let outcome = fixture.execute_with_holdouts(settings, &contract, &repo, &backend);
+    let Terminal::Accepted(receipt) = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    let [run] = receipt.holdouts.as_slice() else {
+        panic!("{:?}", receipt.holdouts);
+    };
+    assert_eq!(run.name, "escaping");
+    assert_eq!(run.source, Some(crate::holdout::HoldoutSource::Attached));
+    let attached = receipt
+        .criteria
+        .iter()
+        .find(|criterion| criterion.id == "attached:escaping")
+        .expect("the attached criterion is on the receipt");
+    assert!(attached.met);
+    assert_eq!(
+        attached.statement,
+        "holdout escaping passes (attached by the machine declaration)"
+    );
+    assert_eq!(
+        fixture
+            .ledger
+            .holdout_outcome_sources(&outcome.run_id)
+            .expect("sources"),
+        vec![("escaping".to_string(), "attached".to_string())]
+    );
+    let events = events_text(&fixture, &outcome.run_id);
+    assert!(events.contains("holdout_attached"), "{events}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn plan_and_preflight_attach_the_same_holdout_names() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let settings = attach_settings(&fixture, &writes(PASSING));
+    let contract = feature_contract(&fixture, bare_acceptance());
+    let planned: Vec<String> = crate::holdout::attachments(
+        &settings,
+        &crate::repo::main_checkout_name(&fixture.repo).unwrap_or_default(),
+        &contract,
+        contract.task_type,
+    )
+    .into_iter()
+    .map(|attachment| attachment.name)
+    .collect();
+    let backend = counting_worker(Arc::default(), Arc::default());
+    let outcome = fixture.execute_with_holdouts(settings, &contract, &repo, &backend);
+    let preflight: Vec<String> = fixture
+        .ledger
+        .attached_holdout_definitions(&outcome.run_id)
+        .expect("definitions")
+        .into_iter()
+        .map(|holdout| holdout.name)
+        .collect();
+    assert_eq!(planned, vec!["escaping".to_string()]);
+    assert_eq!(planned, preflight);
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn an_optional_named_criterion_still_attaches_and_a_failed_holdout_prevents_acceptance() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 1);
+    let settings = attach_settings(&fixture, &writes(FAILING));
+    let mut acceptance = bare_acceptance();
+    acceptance.extend(holdout_contract(&fixture, false).acceptance);
+    let contract = feature_contract(&fixture, acceptance);
+    let backend = counting_worker(Arc::default(), Arc::default());
+    let outcome = fixture.execute_with_holdouts(settings, &contract, &repo, &backend);
+    assert!(
+        !matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        fixture
+            .ledger
+            .holdout_outcome_sources(&outcome.run_id)
+            .expect("sources"),
+        vec![("escaping".to_string(), "attached".to_string())],
+        "the holdout ran once"
+    );
+    assert!(
+        outcome.detail().contains("attached:escaping"),
+        "{}",
+        outcome.detail()
+    );
+
+    let passing_settings = attach_settings(&fixture, &writes(PASSING));
+    let passed = fixture.execute_with_holdouts(passing_settings, &contract, &repo, &backend);
+    let Terminal::Accepted(receipt) = &passed.terminal else {
+        panic!("{passed:?}");
+    };
+    let [run] = receipt.holdouts.as_slice() else {
+        panic!("the holdout ran more than once: {:?}", receipt.holdouts);
+    };
+    assert_eq!(run.name, "escaping");
+    assert_eq!(run.source, Some(crate::holdout::HoldoutSource::Attached));
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_successor_of_an_attached_run_runs_the_frozen_holdout_once_as_attached() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let settings = attach_settings(&fixture, &writes(PASSING));
+    let contract = feature_contract(&fixture, bare_acceptance());
+    let leaving = MockBackend::new(|spec| {
+        std::fs::create_dir_all(spec.work_dir.join("docs")).expect("mkdir");
+        std::fs::write(spec.work_dir.join("docs/extra.md"), "one\n").expect("write");
+        std::fs::write(spec.work_dir.join("src/main.rs"), "fn main() {}\n// e\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let decided = fixture
+        .execute_with_holdouts(settings.clone(), &contract, &repo, &leaving)
+        .run_id;
+    assert_eq!(
+        fixture
+            .ledger
+            .attached_holdout_definitions(&decided)
+            .expect("definitions")
+            .len(),
+        1
+    );
+
+    // The person removed `attach`: the successor still keeps the frozen holdout.
+    let mut without_attach = settings.clone();
+    let repo_name = crate::repo::main_checkout_name(&fixture.repo).expect("repo name");
+    without_attach
+        .repos
+        .get_mut(&repo_name)
+        .and_then(|declared| declared.get_mut("escaping"))
+        .expect("the declaration")
+        .attach = None;
+    let (new_run, successor_contract) = claimed_successor(&fixture, &decided, None);
+    let backend = counting_worker(Arc::default(), Arc::default());
+    let outcome = fixture.execute_with_holdouts_as(
+        Some(new_run.clone()),
+        without_attach,
+        &successor_contract,
+        &repo,
+        &backend,
+    );
+    assert!(
+        matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        fixture
+            .ledger
+            .holdout_outcome_sources(&new_run)
+            .expect("sources"),
+        vec![("escaping".to_string(), "attached".to_string())]
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_contract_criterion_with_the_attached_id_is_refused_before_any_worker() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let settings = attach_settings(&fixture, &writes(PASSING));
+    let mut acceptance = bare_acceptance();
+    acceptance.push(crate::acceptance::AcceptanceEntry::Declared(
+        crate::acceptance::DeclaredCriterion {
+            statement: "the contract's own criterion".into(),
+            id: Some("attached:escaping".into()),
+            mandatory: true,
+            evidence: crate::acceptance::Evidence::LlmReview,
+        },
+    ));
+    let contract = feature_contract(&fixture, acceptance);
+    let launches = Arc::new(AtomicUsize::new(0));
+    let backend = counting_worker(launches.clone(), Arc::default());
+    let outcome = fixture.execute_with_holdouts(settings, &contract, &repo, &backend);
+    let detail = outcome.detail().to_string();
+    assert_eq!(blocked_code(outcome), BlockCode::HoldoutCriterionCollision);
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    assert!(detail.contains("the contract's own criterion"), "{detail}");
+    assert!(
+        detail.contains("holdout escaping passes (attached by the machine declaration)"),
+        "{detail}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_retry_prompt_for_an_attached_holdout_hides_machine_toml_and_decide_names_it() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let settings = attach_settings(&fixture, &writes(FAILING));
+    let contract = feature_contract(&fixture, bare_acceptance());
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let backend = counting_worker(Arc::default(), prompts.clone());
+    let outcome = fixture.execute_with_holdouts(settings, &contract, &repo, &backend);
+    let Terminal::NeedsDecision { detail, .. } = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    assert!(detail.contains("attached:escaping"), "{detail}");
+    assert!(detail.contains("machine.toml"), "{detail}");
+    let prompts = prompts.lock().expect("lock");
+    let repair = prompts
+        .iter()
+        .find(|prompt| prompt.contains("[repair addendum]"))
+        .expect("a repair prompt");
+    assert!(repair.contains("h::escapes"), "{repair}");
+    assert!(!repair.contains("attached:"), "{repair}");
+    for prompt in prompts.iter() {
+        assert!(!prompt.contains("machine.toml"), "{prompt}");
+        assert!(!prompt.contains(".attach"), "{prompt}");
+    }
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+fn named_declared_at(path: &str, overlay: &str) -> HoldoutDecl {
+    HoldoutDecl {
+        path: path.into(),
+        overlay: overlay.into(),
+        ..script_declaration(&["sh", overlay], None)
+    }
+}
+
+fn attached_declared_at(path: &str, overlay: &str) -> HoldoutDecl {
+    attaching(named_declared_at(path, overlay))
+}
+
+fn settings_with(
+    fixture: &Fixture,
+    store: &str,
+    declared: Vec<(&str, HoldoutDecl)>,
+) -> HoldoutSettings {
+    let repo_name = crate::repo::main_checkout_name(&fixture.repo).expect("repo name");
+    let mut settings = HoldoutSettings {
+        store: Some(store.into()),
+        ..HoldoutSettings::default()
+    };
+    for (name, decl) in declared {
+        settings
+            .repos
+            .entry(repo_name.clone())
+            .or_default()
+            .insert(name.into(), decl);
+    }
+    settings
+}
+
+fn named_criterion(name: &str) -> crate::acceptance::AcceptanceEntry {
+    crate::acceptance::AcceptanceEntry::Declared(crate::acceptance::DeclaredCriterion {
+        statement: format!("the {name} holdout passes"),
+        id: None,
+        mandatory: true,
+        evidence: crate::acceptance::Evidence::Holdout { name: name.into() },
+    })
+}
+
+fn store_vanishing_worker(store_dir: std::path::PathBuf) -> MockBackend {
+    MockBackend::new(move |spec| {
+        ignore_not_found(std::fs::remove_file(spec.work_dir.join("src/main.rs")));
+        ignore_not_found(std::fs::remove_dir_all(&store_dir));
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    })
+}
+
+#[test]
+fn an_unreachable_store_skips_an_attached_holdout_and_blocks_for_a_named_one() {
+    let fixture = Fixture::new();
+    let (store, _) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(PASSING))]);
+    let store_dir = fixture.dir.join("holdout-store");
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+
+    let both = settings_with(
+        &fixture,
+        &store,
+        vec![
+            (
+                "escaping",
+                attached_declared_at(STORE_PATH_IN_STORE, OVERLAY),
+            ),
+            (
+                "named",
+                named_declared_at(STORE_PATH_IN_STORE, "src/holdout_named.rs"),
+            ),
+        ],
+    );
+    let mut acceptance = bare_acceptance();
+    acceptance.push(named_criterion("named"));
+    let outcome = fixture.execute_with_holdouts(
+        both,
+        &feature_contract(&fixture, acceptance),
+        &repo,
+        &store_vanishing_worker(store_dir.clone()),
+    );
+    assert_eq!(blocked_code(outcome), BlockCode::HoldoutUnfetchable);
+
+    let (store, _) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(PASSING))]);
+    let attached_only = settings_with(
+        &fixture,
+        &store,
+        vec![(
+            "escaping",
+            attached_declared_at(STORE_PATH_IN_STORE, OVERLAY),
+        )],
+    );
+    let outcome = fixture.execute_with_holdouts(
+        attached_only,
+        &feature_contract(&fixture, bare_acceptance()),
+        &repo,
+        &store_vanishing_worker(store_dir),
+    );
+    let Terminal::Accepted(receipt) = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    assert!(receipt.holdouts.is_empty(), "{:?}", receipt.holdouts);
+    assert!(receipt
+        .criteria
+        .iter()
+        .all(|criterion| criterion.id != "attached:escaping"));
+    let events = events_text(&fixture, &outcome.run_id);
+    assert!(events.contains("holdout_attach_skipped"), "{events}");
+    assert!(events.contains("escaping"), "{events}");
+    assert_eq!(
+        fixture
+            .ledger
+            .attached_holdout_definitions(&outcome.run_id)
+            .expect("definitions")
+            .len(),
+        0,
+        "a skipped attached holdout leaves no definition"
+    );
+    assert_eq!(
+        fixture
+            .ledger
+            .skipped_attached_holdouts(&outcome.run_id)
+            .expect("skipped"),
+        vec!["escaping".to_string()]
+    );
+    assert_eq!(
+        fixture
+            .ledger
+            .holdout_outcome_sources(&outcome.run_id)
+            .expect("sources"),
+        vec![("escaping".to_string(), "attached".to_string())]
+    );
+    assert!(!fixture
+        .ledger
+        .run_holdout_caught(&outcome.run_id)
+        .expect("caught"));
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_store_unreachable_at_preflight_skips_an_attached_holdout_and_refuses_a_named_one() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let missing_store = format!("file://{}/no-such-store", fixture.dir.display());
+
+    let mut acceptance = bare_acceptance();
+    acceptance.push(named_criterion("named"));
+    let both = settings_with(
+        &fixture,
+        &missing_store,
+        vec![
+            (
+                "escaping",
+                attached_declared_at(STORE_PATH_IN_STORE, OVERLAY),
+            ),
+            (
+                "named",
+                named_declared_at(STORE_PATH_IN_STORE, "src/holdout_named.rs"),
+            ),
+        ],
+    );
+    let outcome = fixture.execute_with_holdouts(
+        both,
+        &feature_contract(&fixture, acceptance),
+        &repo,
+        &MockBackend::new(|_| MockOutcome::default()),
+    );
+    assert_eq!(blocked_code(outcome), BlockCode::HoldoutUnreadable);
+
+    let named_only = settings_with(
+        &fixture,
+        &missing_store,
+        vec![(
+            "named",
+            named_declared_at(STORE_PATH_IN_STORE, "src/holdout_named.rs"),
+        )],
+    );
+    let mut named_acceptance = bare_acceptance();
+    named_acceptance.push(named_criterion("named"));
+    let outcome = fixture.execute_with_holdouts(
+        named_only,
+        &feature_contract(&fixture, named_acceptance),
+        &repo,
+        &MockBackend::new(|_| MockOutcome::default()),
+    );
+    assert_eq!(blocked_code(outcome), BlockCode::HoldoutUnreadable);
+
+    let attached_only = settings_with(
+        &fixture,
+        &missing_store,
+        vec![(
+            "escaping",
+            attached_declared_at(STORE_PATH_IN_STORE, OVERLAY),
+        )],
+    );
+    let outcome = fixture.execute_with_holdouts(
+        attached_only,
+        &feature_contract(&fixture, bare_acceptance()),
+        &repo,
+        &counting_worker(Arc::default(), Arc::default()),
+    );
+    let Terminal::Accepted(receipt) = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    assert!(receipt
+        .criteria
+        .iter()
+        .all(|criterion| criterion.id != "attached:escaping"));
+    let events = events_text(&fixture, &outcome.run_id);
+    assert!(events.contains("holdout_attach_skipped"), "{events}");
+    assert!(
+        fixture
+            .ledger
+            .holdout_definitions(&outcome.run_id)
+            .expect("definitions")
+            .is_empty(),
+        "a skipped holdout leaves no definition"
+    );
+    assert_eq!(
+        fixture
+            .ledger
+            .skipped_attached_holdouts(&outcome.run_id)
+            .expect("skipped"),
+        vec!["escaping".to_string()]
+    );
+    assert_eq!(
+        fixture
+            .ledger
+            .holdout_outcome_sources(&outcome.run_id)
+            .expect("sources"),
+        vec![("escaping".to_string(), "attached".to_string())]
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+fn report_named(test: &str) -> String {
+    format!(
+        r#"<testsuite tests="1" failures="0"><testcase classname="{test}" name="t"/></testsuite>"#
+    )
+}
+
+fn script_writing(report: &str, before: &str) -> String {
+    format!("#!/bin/sh\n# {SCRIPT_MARKER}\n{before}\ncat > j.xml <<'EOF'\n{report}\nEOF\n")
+}
+
+fn two_named(
+    fixture: &Fixture,
+    first_script: &str,
+    second_script: &str,
+    second_overlay: &str,
+) -> RunOutcome {
+    let (store, _) = store_with(fixture, &[("a.sh", first_script), ("b.sh", second_script)]);
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let settings = settings_with(
+        fixture,
+        &store,
+        vec![
+            ("first", named_declared_at("a.sh", OVERLAY)),
+            ("second", named_declared_at("b.sh", second_overlay)),
+        ],
+    );
+    let mut contract = fixture.contract(Review::Off);
+    contract.acceptance = vec![named_criterion("first"), named_criterion("second")];
+    fixture.execute_with_holdouts(
+        settings,
+        &contract,
+        &repo,
+        &counting_worker(Arc::default(), Arc::default()),
+    )
+}
+
+#[test]
+fn holdouts_run_side_by_side_and_the_receipt_carries_each_wall_duration() {
+    let fixture = Fixture::new();
+    // Each script waits (at most 20 s) for the other's marker, which only
+    // appears if both are running at the same time.
+    let meets = |mine: &str, theirs: &str, test: &str| {
+        let dir = fixture.dir.display();
+        script_writing(
+            &report_named(test),
+            &format!(
+                "touch '{dir}/{mine}.up'\nfor _ in $(seq 200); do [ -e '{dir}/{theirs}.up' ] && break; sleep 0.1; done\n[ -e '{dir}/{theirs}.up' ] || exit 1"
+            ),
+        )
+    };
+    let outcome = two_named(
+        &fixture,
+        &meets("a", "b", "a"),
+        &meets("b", "a", "b"),
+        "src/holdout_second.rs",
+    );
+    let Terminal::Accepted(receipt) = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(receipt.holdouts.len(), 2);
+    for run in &receipt.holdouts {
+        assert!(run.wall_ms.is_some(), "{} has no wall duration", run.name);
+    }
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn two_holdouts_overlaying_one_path_each_see_only_their_own_files() {
+    let fixture = Fixture::new();
+    let outcome = two_named(
+        &fixture,
+        &script_writing(
+            &report_named("a"),
+            "grep -q 'writes a' \"$0\" || exit 1\n# writes a",
+        ),
+        &script_writing(
+            &report_named("b"),
+            "grep -q 'writes b' \"$0\" || exit 1\n# writes b",
+        ),
+        OVERLAY,
+    );
+    let Terminal::Accepted(receipt) = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    let tests_of = |name: &str| -> Vec<String> {
+        receipt
+            .holdouts
+            .iter()
+            .find(|run| run.name == name)
+            .map(|run| run.tests.iter().map(|test| test.id.clone()).collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(tests_of("first"), vec!["a::t".to_string()]);
+    assert_eq!(tests_of("second"), vec!["b::t".to_string()]);
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }

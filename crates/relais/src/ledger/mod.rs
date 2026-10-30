@@ -36,7 +36,7 @@ mod transitions;
 mod trials;
 mod trust;
 mod usage;
-pub use admission::GroupBindingRow;
+pub use admission::{GroupBindingRow, LedgerGrowth};
 pub use clock::{now_rfc3339, Clock, FixedClock, SystemClock};
 pub use error::LedgerError;
 use error::{parse_state, Result};

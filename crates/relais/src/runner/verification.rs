@@ -322,7 +322,7 @@ impl<'a> RunEngine<'a> {
             .map(|(criterion_id, _actor)| criterion_id)
             .collect();
         Ok(verify::settle_acceptance(
-            &self.config.contract.acceptance,
+            &self.effective_acceptance()?,
             &ctx.preflight.authority.verification_profile,
             report,
             verify::Attestations {
@@ -368,7 +368,7 @@ impl<'a> RunEngine<'a> {
     ) -> Result<Vec<String>, RunError> {
         let adds = self.patch_adds_test(ctx, candidate_sha)?;
         Ok(verify::missing_test_gaps(
-            &self.config.contract.acceptance,
+            &self.effective_acceptance()?,
             adds,
         ))
     }
@@ -550,7 +550,8 @@ impl<'a> RunEngine<'a> {
         // evidence: asked through `amont attest covered`, on the
         // candidate's own tree, whenever there is at least one (SPEC
         // §10, §18).
-        let gate_names = verify::amont_gate_names(&self.config.contract.acceptance);
+        let acceptance = self.effective_acceptance().map_err(|e| e.to_string())?;
+        let gate_names = verify::amont_gate_names(&acceptance);
         // The inventory is read INSIDE the immutable copy the receipt
         // binds to, never in the user's checkout — a hook the candidate
         // adds or removes must be seen as the candidate has it, and the
@@ -771,7 +772,7 @@ impl<'a> RunEngine<'a> {
         // against the run and the criterion it answers, so the receipt
         // and `relais explain` show what settled it and where it came
         // from (SPEC §10, §12).
-        for entry in &self.config.contract.acceptance {
+        for entry in &acceptance {
             if let Some(crate::acceptance::Evidence::AmontGate { gate }) = entry.evidence() {
                 if matches!(gate_coverage.get(gate), Some(Ok(true))) {
                     let criterion_id = entry.id();
@@ -797,7 +798,9 @@ impl<'a> RunEngine<'a> {
         // Holdouts run in a second copy made now that the profile's
         // commands have finished (ADR-0045). Their logs are not check logs.
         let holdouts = self.run_holdouts(candidate_sha, authority, label, resolved_holdouts)?;
-        for entry in &self.config.contract.acceptance {
+        // An attached holdout skipped just now has left the ledger.
+        let acceptance = self.effective_acceptance().map_err(|e| e.to_string())?;
+        for entry in &acceptance {
             if let Some(crate::acceptance::Evidence::Holdout { name }) = entry.evidence() {
                 let passed = holdouts
                     .iter()
@@ -827,7 +830,7 @@ impl<'a> RunEngine<'a> {
         let profile_green = gaps.is_empty() && checks.iter().all(|check| !check.failed());
         self.record_holdout_outcomes(label, &holdouts, profile_green)?;
         let acceptance_gaps = verify::acceptance_gaps(
-            &self.config.contract.acceptance,
+            &acceptance,
             &authority.verification_profile,
             &checks,
             &signoffs,

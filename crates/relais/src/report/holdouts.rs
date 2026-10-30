@@ -24,6 +24,28 @@ pub struct HoldoutsReport {
     pub holdout_runs: usize,
     pub holdout_catches: usize,
     pub holdout_exposures: HoldoutExposures,
+    pub by_source: HoldoutsBySource,
+}
+
+/// Runs and catches per holdout source; a run counts once per source it ran.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct HoldoutsBySource {
+    pub named: SourceCounts,
+    pub attached: AttachedCounts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct SourceCounts {
+    pub runs: usize,
+    pub catches: usize,
+}
+
+/// Attached counts plus the runs whose attached holdout was skipped.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct AttachedCounts {
+    pub runs: usize,
+    pub catches: usize,
+    pub skipped: usize,
 }
 
 /// Runs with at least one exposure, and how many runs hit each marker.
@@ -40,6 +62,23 @@ pub fn holdouts_report(
 ) -> Result<HoldoutsReport, LedgerError> {
     let mut report = HoldoutsReport::default();
     for (run, _) in window {
+        if !ledger.skipped_attached_holdouts(run)?.is_empty() {
+            report.by_source.attached.skipped += 1;
+        }
+        let named = crate::holdout::HoldoutSource::Named.as_str();
+        let attached = crate::holdout::HoldoutSource::Attached.as_str();
+        if ledger.run_ran_holdout_of_source(run, named)? {
+            report.by_source.named.runs += 1;
+            if ledger.run_holdout_of_source_caught(run, named)? {
+                report.by_source.named.catches += 1;
+            }
+        }
+        if ledger.run_ran_holdout_of_source(run, attached)? {
+            report.by_source.attached.runs += 1;
+            if ledger.run_holdout_of_source_caught(run, attached)? {
+                report.by_source.attached.catches += 1;
+            }
+        }
         if !ledger.run_named_a_holdout(run)? {
             continue;
         }
@@ -68,8 +107,17 @@ impl HoldoutsReport {
     pub fn render(&self) -> String {
         let mut out = String::from("holdouts:\n");
         out.push_str(&format!(
-            "  holdout_runs: {} (runs that named a holdout)\n",
+            "  holdout_runs: {} (runs with a holdout)\n",
             self.holdout_runs
+        ));
+        let by_source = &self.by_source;
+        out.push_str(&format!(
+            "  by source: named {}/{}, attached {}/{}, skipped {}\n",
+            by_source.named.runs,
+            by_source.named.catches,
+            by_source.attached.runs,
+            by_source.attached.catches,
+            by_source.attached.skipped
         ));
         out.push_str(&format!(
             "  holdout_catches: {} (failed while the profile checks passed)\n",
@@ -103,6 +151,7 @@ mod tests {
         let report = HoldoutsReport {
             holdout_runs: 12,
             holdout_catches: 3,
+            by_source: HoldoutsBySource::default(),
             holdout_exposures: HoldoutExposures {
                 runs: 2,
                 by_marker: [("machine_toml", 1), ("overlay", 1)]
@@ -113,6 +162,11 @@ mod tests {
         };
         let text = report.render();
         assert!(text.contains("holdout_catches: 3"), "{text}");
+        assert!(text.contains("(runs with a holdout)"), "{text}");
+        assert!(
+            text.contains("by source: named 0/0, attached 0/0, skipped 0"),
+            "{text}"
+        );
         assert!(text.contains("machine_toml 1, overlay 1"), "{text}");
         for line in text.lines() {
             assert!(line.chars().count() <= 80, "{line}");

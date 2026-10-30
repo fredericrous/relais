@@ -34,6 +34,164 @@ pub struct ResolvedHoldout {
     pub digest: String,
 }
 
+/// The outcome a ledger row records for an attached holdout that was skipped
+/// because its store could not be fetched; it is never a catch.
+pub const SKIPPED_OUTCOME: &str = "skipped";
+
+/// Where a run's holdout came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldoutSource {
+    /// A contract criterion names it.
+    Named,
+    /// The machine declaration's `attach` put it on the run.
+    Attached,
+}
+
+impl HoldoutSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Named => "named",
+            Self::Attached => "attached",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "named" => Some(Self::Named),
+            "attached" => Some(Self::Attached),
+            _ => None,
+        }
+    }
+}
+
+/// The id of the criterion relais adds for an attached holdout.
+pub fn attached_criterion_id(name: &str) -> String {
+    format!("attached:{name}")
+}
+
+/// The mandatory criterion an attached holdout adds to the run.
+pub fn attached_criterion(name: &str) -> AcceptanceEntry {
+    AcceptanceEntry::Declared(crate::acceptance::DeclaredCriterion {
+        statement: format!("holdout {name} passes (attached by the machine declaration)"),
+        id: Some(attached_criterion_id(name)),
+        mandatory: true,
+        evidence: Evidence::Holdout {
+            name: name.to_string(),
+        },
+    })
+}
+
+/// A holdout the machine declaration attaches to a run, with the rule
+/// that matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub name: String,
+    pub rule: String,
+    /// The routing type and declared path that matched; none for a holdout
+    /// carried over from a predecessor, which is not matched again.
+    pub matched: Option<AttachMatch>,
+}
+
+/// What an `attach` declaration matched on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachMatch {
+    pub task_type: String,
+    pub path: String,
+}
+
+/// Whether `decl` attaches to a run of this routing type and contract: the
+/// type is listed (none never matches) and the write scope could touch one
+/// of the declared paths. The matching rule, as a sentence, when it does.
+pub fn attach_rule(
+    decl: &HoldoutDecl,
+    task_type: Option<crate::contract::TaskType>,
+    contract: &crate::contract::TaskContract,
+) -> Option<(String, AttachMatch)> {
+    let attach = decl.attach.as_ref()?;
+    let task_type = task_type.filter(|kind| *kind != crate::contract::TaskType::Unclassified)?;
+    if !attach.task_types.contains(&task_type) {
+        return None;
+    }
+    let path = attach
+        .paths
+        .iter()
+        .find(|path| crate::contract::scope::write_scope_could_touch(contract, path))?;
+    Some((
+        format!(
+            "task type {} listed, write scope could touch {path}",
+            task_type.as_str()
+        ),
+        AttachMatch {
+            task_type: task_type.as_str().to_string(),
+            path: path.to_string(),
+        },
+    ))
+}
+
+/// The holdouts declared for `repo` that attach to this run, in name order:
+/// those whose `attach` matches and that no mandatory criterion of the
+/// contract names (an optional one does not suppress attachment).
+pub fn attachments(
+    settings: &HoldoutSettings,
+    repo: &str,
+    contract: &crate::contract::TaskContract,
+    task_type: Option<crate::contract::TaskType>,
+) -> Vec<Attachment> {
+    let named_mandatory: Vec<&str> = contract
+        .acceptance
+        .iter()
+        .filter(|entry| entry.mandatory())
+        .filter_map(|entry| match entry.evidence() {
+            Some(Evidence::Holdout { name }) => Some(name.as_str()),
+            Some(
+                Evidence::Check { .. }
+                | Evidence::Test { .. }
+                | Evidence::LlmReview
+                | Evidence::HumanSignOff
+                | Evidence::AmontGate { .. },
+            )
+            | None => None,
+        })
+        .collect();
+    settings
+        .declared_names(repo)
+        .into_iter()
+        .filter(|name| !named_mandatory.contains(&name.as_str()))
+        .filter_map(|name| {
+            let decl = settings.declaration(repo, &name)?;
+            let (rule, matched) = attach_rule(decl, task_type, contract)?;
+            Some(Attachment {
+                name,
+                rule,
+                matched: Some(matched),
+            })
+        })
+        .collect()
+}
+
+/// The refusal for a contract criterion whose id is one relais would give
+/// an attached holdout's criterion.
+pub fn attachment_collision(
+    contract: &crate::contract::TaskContract,
+    attached: &[Attachment],
+) -> Option<HoldoutBlock> {
+    attached.iter().find_map(|attachment| {
+        let id = attached_criterion_id(&attachment.name);
+        let existing = contract.acceptance.iter().find(|entry| entry.id() == id)?;
+        Some(HoldoutBlock {
+            code: BlockCode::HoldoutCriterionCollision,
+            detail: format!(
+                "the contract's criterion `{id}` (\"{}\") has the id of the criterion relais \
+                 would attach for holdout `{}` (\"{}\"); rename the contract's criterion",
+                existing.statement(),
+                attachment.name,
+                attached_criterion(&attachment.name).statement()
+            ),
+        })
+    })
+}
+
 /// What the context manifest keeps of a resolved holdout: no store URL,
 /// path or overlay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,6 +462,61 @@ pub fn resolve_inheriting(
         }
     }
     Ok(Resolution { holdouts, changes })
+}
+
+/// An attached holdout whose store was unreachable when the run resolved it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedAttachment {
+    pub name: String,
+    pub detail: String,
+}
+
+/// The holdouts a run is judged by, with the attached ones whose store was
+/// unreachable set apart: they are skipped, never refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedResolution {
+    pub resolution: Resolution,
+    pub skipped: Vec<SkippedAttachment>,
+}
+
+/// Resolve the contract's named holdouts as [`resolve_inheriting`] does, then
+/// each attached name on its own: an attached holdout whose store is
+/// unreachable ([`BlockCode::HoldoutUnreadable`]) is skipped, any other
+/// refusal of it, and every refusal of a named one, stops the run.
+pub fn resolve_with_attachments(
+    entries: &[AcceptanceEntry],
+    attached_names: &[String],
+    lookup: &Lookup<'_>,
+    frozen: &[ResolvedHoldout],
+) -> Result<AttachedResolution, HoldoutBlock> {
+    let mut resolution = resolve_inheriting(entries, lookup, frozen)?;
+    let mut skipped = Vec::new();
+    for name in attached_names {
+        let single = [attached_criterion(name)];
+        match resolve_inheriting(&single, lookup, frozen) {
+            Ok(one) => {
+                resolution
+                    .holdouts
+                    .retain(|named| !one.holdouts.iter().any(|held| held.name == named.name));
+                resolution.holdouts.extend(one.holdouts);
+                resolution
+                    .changes
+                    .retain(|named| !one.changes.iter().any(|moved| moved.name == named.name));
+                resolution.changes.extend(one.changes);
+            }
+            Err(block) if block.code == BlockCode::HoldoutUnreadable => {
+                skipped.push(SkippedAttachment {
+                    name: name.clone(),
+                    detail: block.detail,
+                });
+            }
+            Err(block) => return Err(block),
+        }
+    }
+    Ok(AttachedResolution {
+        resolution,
+        skipped,
+    })
 }
 
 /// Resolve one holdout. The order of the checks is the order of the
@@ -777,7 +990,219 @@ mod tests {
             .expect("a command spec"),
             config: None,
             inputs: Vec::new(),
+            attach: None,
         }
+    }
+
+    #[test]
+    fn attach_leaves_the_digest_unchanged() {
+        let plain = decl(Some("j.xml"), "o");
+        let mut attached = plain.clone();
+        attached.attach = Some(crate::policy::HoldoutAttach {
+            task_types: vec![crate::contract::TaskType::Feature],
+            paths: vec!["src/**".into()],
+        });
+        assert_eq!(
+            digest_of("r", "n", "s", "sha", &plain),
+            digest_of("r", "n", "s", "sha", &attached)
+        );
+    }
+
+    fn attach_decl(types: &[crate::contract::TaskType], paths: &[&str]) -> HoldoutDecl {
+        let mut declared = decl(Some("j.xml"), "o");
+        declared.attach = Some(crate::policy::HoldoutAttach {
+            task_types: types.to_vec(),
+            paths: paths.iter().map(|path| (*path).to_string()).collect(),
+        });
+        declared
+    }
+
+    fn contract_of(
+        kind: &str,
+        scope: &[&str],
+        acceptance: serde_json::Value,
+    ) -> crate::contract::TaskContract {
+        let mut contract_json = serde_json::json!({
+            "schema_version": 1,
+            "kind": kind,
+            "objective": "o",
+            "base_ref": "HEAD",
+            "acceptance": acceptance,
+            "verification_profile": "profile",
+        });
+        if kind == "change" {
+            contract_json["write_scope"] = serde_json::json!(scope);
+        }
+        crate::contract::TaskContract::from_json_str(&contract_json.to_string())
+            .expect("a contract")
+    }
+
+    fn attached_names(
+        declared: HoldoutDecl,
+        task_type: Option<crate::contract::TaskType>,
+        contract: &crate::contract::TaskContract,
+    ) -> Vec<String> {
+        let mut settings = HoldoutSettings::default();
+        settings
+            .repos
+            .entry("r".into())
+            .or_default()
+            .insert("x".into(), declared);
+        attachments(&settings, "r", contract, task_type)
+            .into_iter()
+            .map(|attachment| attachment.name)
+            .collect()
+    }
+
+    #[test]
+    fn an_attachment_carries_the_type_and_path_that_matched() {
+        let src = contract_of("change", &["src/**"], serde_json::json!(["bare"]));
+        let mut settings = HoldoutSettings::default();
+        settings.repos.entry("r".into()).or_default().insert(
+            "x".into(),
+            attach_decl(&[crate::contract::TaskType::Feature], &["src/**"]),
+        );
+        let found = attachments(
+            &settings,
+            "r",
+            &src,
+            Some(crate::contract::TaskType::Feature),
+        );
+        assert_eq!(
+            found[0].matched,
+            Some(AttachMatch {
+                task_type: "feature".into(),
+                path: "src/**".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_holdout_attaches_by_type_scope_and_mandatory_naming() {
+        use crate::contract::TaskType::{Feature, Infra, Unclassified};
+        let src = contract_of("change", &["src/**"], serde_json::json!(["bare"]));
+        let docs = contract_of("change", &["docs/**"], serde_json::json!(["bare"]));
+        let inspect = contract_of("inspect", &[], serde_json::json!(["bare"]));
+        let named = |mandatory: bool| {
+            contract_of(
+                "change",
+                &["src/**"],
+                serde_json::json!([{
+                    "statement": "s",
+                    "mandatory": mandatory,
+                    "evidence": { "kind": "holdout", "name": "x" },
+                }]),
+            )
+        };
+        let listed = || attach_decl(&[Feature], &["src/**"]);
+        let attaches = |declared, task_type, contract: &crate::contract::TaskContract| {
+            !attached_names(declared, task_type, contract).is_empty()
+        };
+        assert!(
+            attaches(listed(), Some(Feature), &src),
+            "listed and touched"
+        );
+        assert!(!attaches(listed(), Some(Infra), &src), "type not listed");
+        assert!(!attaches(listed(), None, &src), "no type");
+        assert!(
+            !attaches(
+                attach_decl(&[Unclassified], &["src/**"]),
+                Some(Unclassified),
+                &src
+            ),
+            "unclassified never attaches"
+        );
+        assert!(
+            !attaches(listed(), Some(Feature), &docs),
+            "scope cannot touch"
+        );
+        assert!(
+            !attaches(listed(), Some(Feature), &inspect),
+            "inspect writes nothing"
+        );
+        assert!(
+            !attaches(listed(), Some(Feature), &named(true)),
+            "a mandatory criterion names it"
+        );
+        assert!(
+            attaches(listed(), Some(Feature), &named(false)),
+            "an optional criterion does not suppress it"
+        );
+        assert!(
+            !attaches(decl(Some("j.xml"), "o"), Some(Feature), &src),
+            "no attach"
+        );
+    }
+
+    #[test]
+    fn an_attached_criterion_id_collides_with_a_contract_criterion_of_that_id() {
+        let contract = contract_of(
+            "change",
+            &["src/**"],
+            serde_json::json!([{
+                "statement": "mine",
+                "id": "attached:x",
+                "evidence": { "kind": "llm_review" },
+            }]),
+        );
+        let attached = [Attachment {
+            name: "x".into(),
+            rule: "r".into(),
+            matched: None,
+        }];
+        let block = attachment_collision(&contract, &attached).expect("a collision");
+        assert_eq!(block.code, BlockCode::HoldoutCriterionCollision);
+        assert!(block.detail.contains("mine"), "{}", block.detail);
+        assert!(block.detail.contains("attached by the machine declaration"));
+        assert!(attachment_collision(&contract, &[]).is_none());
+    }
+
+    #[test]
+    fn a_name_both_optional_in_the_contract_and_attached_resolves_once() {
+        let entries = [crate::acceptance::AcceptanceEntry::Declared(
+            crate::acceptance::DeclaredCriterion {
+                statement: "x holds".into(),
+                id: None,
+                mandatory: false,
+                evidence: crate::acceptance::Evidence::Holdout { name: "x".into() },
+            },
+        )];
+        let declared = decl(Some("j.xml"), "o");
+        let frozen = [ResolvedHoldout {
+            name: "x".into(),
+            repo: "r".into(),
+            store: "s".into(),
+            git_ref: "main".into(),
+            sha: "abc".into(),
+            digest: digest_of("r", "x", "s", "abc", &declared),
+            decl: declared,
+        }];
+        let held = HoldoutSettings::default();
+        let git = never_exists();
+        let lookup = Lookup {
+            settings: &held,
+            repo: "r",
+            git: &git,
+            repo_dir: Path::new("."),
+            base_sha: "abc",
+            machine_toml: "machine.toml",
+        };
+        let resolved = resolve_with_attachments(&entries, &["x".to_string()], &lookup, &frozen)
+            .expect("resolves");
+        let names: Vec<&str> = resolved
+            .resolution
+            .holdouts
+            .iter()
+            .map(|held| held.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["x"]);
+        let changed: Vec<&str> = resolved
+            .resolution
+            .changes
+            .iter()
+            .map(|change| change.name.as_str())
+            .collect();
+        assert_eq!(changed, vec!["x"], "the undeclared name is reported once");
     }
 
     fn settings(store: &str, decl: HoldoutDecl) -> HoldoutSettings {

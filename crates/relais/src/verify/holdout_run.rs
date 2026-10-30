@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{CheckOutcome, JunitReport, TestOutcome};
+use crate::holdout::HoldoutSource;
 use crate::procs::Ended;
 
 /// How a holdout ended.
@@ -45,6 +46,9 @@ pub struct HoldoutRun {
     pub name: String,
     pub sha: String,
     pub digest: String,
+    /// Where the holdout came from; absent on a receipt written before it was carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<HoldoutSource>,
     pub outcome: HoldoutVerdict,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit: Option<i32>,
@@ -56,6 +60,9 @@ pub struct HoldoutRun {
     /// The kept copy of the command's log, inside the run's artifacts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<String>,
+    /// Wall-clock milliseconds the holdout took, copy and setup included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_ms: Option<u64>,
 }
 
 impl HoldoutRun {
@@ -65,11 +72,13 @@ impl HoldoutRun {
             name: name.to_string(),
             sha: sha.to_string(),
             digest: digest.to_string(),
+            source: None,
             outcome: HoldoutVerdict::DidNotBuild,
             exit: None,
             tests: Vec::new(),
             report: None,
             log: None,
+            wall_ms: None,
         }
     }
 

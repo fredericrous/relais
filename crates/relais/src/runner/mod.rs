@@ -222,6 +222,8 @@ fn finished(config: &RunConfig<'_>, outcome: RunOutcome) -> RunOutcome {
 pub(crate) type Launched = Result<LaunchResult, RunOutcome>;
 
 pub(crate) struct RunEngine<'a> {
+    /// Where commands keep their measured disk growth.
+    pub(crate) growth: crate::ledger::LedgerGrowth,
     pub(crate) config: &'a RunConfig<'a>,
     pub(crate) run_id: RunId,
     pub(crate) artifacts: PathBuf,

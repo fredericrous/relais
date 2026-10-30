@@ -1207,4 +1207,15 @@ pub(in crate::ledger) const MIGRATIONS: &[(&str, &str)] = &[
        );
     "#,
     ),
+    (
+        // Where a holdout came from (ADR-0045 attach): `named` by a contract
+        // criterion, or `attached` by a machine.toml declaration. Existing
+        // rows were all named. Expand-only: one defaulted column on each
+        // table, nothing an older binary reads is rewritten.
+        "v46",
+        r#"
+    ALTER TABLE holdout_definitions ADD COLUMN source TEXT NOT NULL DEFAULT 'named';
+    ALTER TABLE holdout_outcomes ADD COLUMN source TEXT NOT NULL DEFAULT 'named';
+    "#,
+    ),
 ];

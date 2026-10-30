@@ -1140,6 +1140,15 @@ fn merge_tree_finding(support: Result<(), String>) -> Finding {
     }
 }
 
+/// An invalid machine.toml is a failure that names the offending key.
+fn machine_invalid_finding(error: &dyn std::fmt::Display) -> Finding {
+    Finding {
+        component: "machine.toml",
+        level: Level::Fail,
+        detail: error.to_string(),
+    }
+}
+
 /// `plugin` is the one `claude plugin list --json` reading of this run, so
 /// the `plugin` finding and `doctor --json`'s integration object cannot
 /// disagree.
@@ -1357,11 +1366,7 @@ pub fn doctor(
                         &settings.admission,
                     ));
                 }
-                Err(e) => findings.push(Finding {
-                    component: "machine.toml",
-                    level: Level::Fail,
-                    detail: e.to_string(),
-                }),
+                Err(e) => findings.push(machine_invalid_finding(&e)),
             },
         },
     }
@@ -3807,6 +3812,26 @@ mod tests {
         let json = serde_json::to_value(&report).expect("serializes");
         assert_eq!(json["findings"][0]["component"], "sandbox");
         assert_eq!(json["findings"][0]["detail"], sentence);
+    }
+
+    #[test]
+    fn an_invalid_holdout_attach_fails_the_machine_toml_finding() {
+        let error = MachineSettings::from_toml_str(
+            "schema_version = 1\n[holdouts]\nstore = \"s\"\n[holdouts.r.x]\npath = \"p\"\n\
+             overlay = \"o\"\ncommand = { argv = [\"true\"], junit = \"j.xml\" }\n\
+             [holdouts.r.x.attach]\ntask_types = [\"bogus\"]\npaths = [\"src\"]\n",
+        )
+        .expect_err("a bogus task type is refused");
+        let finding = machine_invalid_finding(&error);
+        assert_eq!(finding.component, "machine.toml");
+        assert_eq!(finding.level, Level::Fail);
+        for needle in [
+            "[holdouts.r.x].attach.task_types",
+            "review-fix",
+            "mechanical",
+        ] {
+            assert!(finding.detail.contains(needle), "{}", finding.detail);
+        }
     }
 
     fn workspace_facts() -> WorkspaceFacts {

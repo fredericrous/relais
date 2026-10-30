@@ -1008,7 +1008,8 @@ impl<'a> RunEngine<'a> {
                 .collect()
         };
         let check_count = failures.len();
-        let holdout_failures = self.holdout_failures(&holdout_gaps);
+        let acceptance = self.effective_acceptance()?;
+        let holdout_failures = self.holdout_failures(&holdout_gaps)?;
         failures.extend(holdout_failures.iter().cloned());
         // An inspection's deliverable is its report: an empty one is a
         // failure the worker may repair once, as an empty candidate is
@@ -1063,9 +1064,12 @@ impl<'a> RunEngine<'a> {
             // Plan C1: complete JUnit on both sides says every failing
             // test already fails at the base and nothing targets it. A
             // cached base keeps no failing checks, so it never applies.
-            let holdout_only = (!holdout_failures.is_empty()
-                && failures.len() == holdout_failures.len())
-            .then(|| self.holdout_stop(&holdout_gaps, &holdouts));
+            let holdout_only =
+                if !holdout_failures.is_empty() && failures.len() == holdout_failures.len() {
+                    Some(self.holdout_stop(&holdout_gaps, &holdouts)?)
+                } else {
+                    None
+                };
             progress.holdout_stop = holdout_only.clone();
             if let Some(tests) = ctx
                 .baseline
@@ -1078,7 +1082,7 @@ impl<'a> RunEngine<'a> {
                         base,
                         &checks,
                         &ctx.preflight.authority.verification_profile,
-                        &self.config.contract.acceptance,
+                        &acceptance,
                     )
                 })
             {

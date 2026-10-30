@@ -4682,6 +4682,58 @@ mod tests {
     }
 
     #[test]
+    fn releasing_one_holdout_copy_leaves_the_overlay_of_another_in_place() {
+        let dir = temp_dir("overlay-copies");
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        let no_hooks = dir.join("no-hooks");
+        std::fs::create_dir_all(&no_hooks).expect("mkdir");
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "core.hooksPath", &no_hooks.to_string_lossy()]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "base\n").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        let system = crate::workspace::SystemGit;
+
+        let overlay = "tests/holdout.rs";
+        let mut first_copy =
+            verification_worktree(&system, &repo, &head, &dir.join("copies/copy-0")).expect("copy");
+        let second_copy =
+            verification_worktree(&system, &repo, &head, &dir.join("copies/copy-1")).expect("copy");
+        let stores = dir.join("stores");
+        std::fs::create_dir_all(&stores).expect("mkdir");
+        for (copy, content) in [
+            (&first_copy, "first overlay\n"),
+            (&second_copy, "second overlay\n"),
+        ] {
+            let source = stores.join(content.trim());
+            std::fs::write(&source, content).expect("store file");
+            crate::holdout::copy_into(&source, &copy.path().join(overlay)).expect("overlay");
+        }
+
+        first_copy.release().expect("released");
+        assert!(!dir.join("copies/copy-0").exists());
+        assert_eq!(
+            std::fs::read_to_string(second_copy.path().join(overlay)).expect("overlay survives"),
+            "second overlay\n"
+        );
+        drop(second_copy);
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+    }
+
+    #[test]
     fn wrong_amont_envelope_is_rejected_not_guessed() {
         assert!(parse_amont_list(r#"{"format": "something-else-v9"}"#).is_err());
         assert!(parse_amont_list("not json").is_err());

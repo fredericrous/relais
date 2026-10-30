@@ -7,11 +7,13 @@
 //! check, and nothing it reads is shown to a worker.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use super::config::holdout_root;
+use super::engine::{watch_cancel, CancelWatch};
 use super::holdout_exposure::{scan_transcript, Markers};
 use super::setup_gate;
-use super::{AttemptLabel, HoldoutStop, RunEngine, VerifyFailure};
+use super::{AttemptLabel, HoldoutStop, RunEngine, RunError, VerifyFailure};
 use crate::holdout::{self, ResolvedHoldout};
 use crate::ledger::HoldoutOutcomeRow;
 use crate::policy::{CommandSpec, EffectiveAuthority};
@@ -38,6 +40,16 @@ impl<'a> RunEngine<'a> {
                 self.holdout_dir().display()
             ),
         }
+    }
+
+    /// The criteria that settle this run: the contract's own plus one per
+    /// attached holdout, read from the ledger the run froze them in.
+    pub(super) fn effective_acceptance(
+        &self,
+    ) -> Result<Vec<crate::acceptance::AcceptanceEntry>, crate::ledger::LedgerError> {
+        self.config
+            .ledger
+            .effective_acceptance(&self.run_id, self.config.contract)
     }
 
     pub(super) fn sweep_ended_holdouts(&self) {
@@ -108,6 +120,7 @@ impl<'a> RunEngine<'a> {
         profile_green: bool,
     ) -> Result<(), String> {
         for run in runs {
+            let source = run.source.unwrap_or(holdout::HoldoutSource::Named);
             self.config
                 .ledger
                 .record_holdout_outcome(
@@ -118,6 +131,7 @@ impl<'a> RunEngine<'a> {
                         name: &run.name,
                         outcome: run.outcome.as_str(),
                         profile_green,
+                        source: source.as_str(),
                     },
                 )
                 .map_err(|e| format!("the ledger refused a holdout outcome row: {e}"))?;
@@ -127,25 +141,31 @@ impl<'a> RunEngine<'a> {
 
     /// What a worker is told of a failed holdout: the criterion's statement
     /// and the failing test ids, nothing else.
-    pub(super) fn holdout_failures(&self, gaps: &[HoldoutGap]) -> Vec<String> {
-        gaps.iter()
-            .map(|HoldoutGap { gap, .. }| {
-                let statement = self
-                    .config
-                    .contract
-                    .acceptance
+    pub(super) fn holdout_failures(&self, gaps: &[HoldoutGap]) -> Result<Vec<String>, RunError> {
+        let acceptance = self.effective_acceptance()?;
+        Ok(gaps
+            .iter()
+            .map(|HoldoutGap { name, gap }| {
+                let statement = acceptance
                     .iter()
                     .find(|entry| entry.id() == gap.criterion_id)
                     .map_or("", |entry| entry.statement());
+                if gap.criterion_id == holdout::attached_criterion_id(name) {
+                    return attached_failure_line(statement, &gap.missing);
+                }
                 format!("{} (criterion: {statement})", gap.message())
             })
-            .collect()
+            .collect())
     }
 
     /// What a person is told when the attempts ran out on holdout gaps
     /// alone: each holdout with its commit, the failing test ids and the
     /// kept log and report. Only the person's `relais decide` reads it.
-    pub(super) fn holdout_stop(&self, gaps: &[HoldoutGap], runs: &[HoldoutRun]) -> HoldoutStop {
+    pub(super) fn holdout_stop(
+        &self,
+        gaps: &[HoldoutGap],
+        runs: &[HoldoutRun],
+    ) -> Result<HoldoutStop, RunError> {
         let records = gaps
             .iter()
             .map(|HoldoutGap { name, .. }| {
@@ -159,13 +179,17 @@ impl<'a> RunEngine<'a> {
                 })
             })
             .collect::<Vec<_>>();
-        HoldoutStop {
-            detail: self.holdout_decision_detail(gaps, runs),
+        Ok(HoldoutStop {
+            detail: self.holdout_decision_detail(gaps, runs)?,
             holdouts: serde_json::Value::Array(records),
-        }
+        })
     }
 
-    fn holdout_decision_detail(&self, gaps: &[HoldoutGap], runs: &[HoldoutRun]) -> String {
+    fn holdout_decision_detail(
+        &self,
+        gaps: &[HoldoutGap],
+        runs: &[HoldoutRun],
+    ) -> Result<String, RunError> {
         let named = gaps
             .iter()
             .map(|HoldoutGap { name, gap }| {
@@ -187,17 +211,35 @@ impl<'a> RunEngine<'a> {
             })
             .collect::<Vec<_>>()
             .join("; ");
-        format!(
+        let attached = self
+            .config
+            .ledger
+            .attached_holdout_definitions(&self.run_id)?;
+        let provenance = gaps
+            .iter()
+            .filter_map(|HoldoutGap { name, .. }| {
+                let held = attached.iter().find(|held| held.name == *name)?;
+                Some(format!(
+                    " Holdout `{name}` was attached by machine.toml [holdouts.{}.{name}].attach; \
+                     removing attach stops attachment on future root runs; successors retain \
+                     frozen holdouts.",
+                    held.repo
+                ))
+            })
+            .collect::<String>();
+        Ok(format!(
             "the attempts ran out and the only failures left are holdout gaps: {named}. Answer \
              with `relais decide {} --answer approve|revise|reject`; approve is refused, as for \
-             any gap",
+             any gap.{provenance}",
             self.run_id
-        )
+        ))
     }
 
-    /// Fetch and run every resolved holdout, in contract order. A store
-    /// that cannot be fetched is the run's to end on, never a failed
-    /// criterion.
+    /// Fetch every resolved holdout on its own, then run them concurrently.
+    /// A store that cannot be fetched for a named holdout is the run's to end
+    /// on, never a failed criterion; for an attached holdout it skips that
+    /// holdout alone (`holdout_attach_skipped`) and records it as skipped, so
+    /// its criterion leaves the run's effective acceptance.
     pub(super) fn run_holdouts(
         &self,
         candidate_sha: &str,
@@ -209,136 +251,312 @@ impl<'a> RunEngine<'a> {
             return Ok(Vec::new());
         }
         let root = self.holdout_dir();
-        let sources = resolved
+        let attached = self
+            .config
+            .ledger
+            .attached_holdout_definitions(&self.run_id)
+            .map_err(|e| VerifyFailure::from(e.to_string()))?;
+        let skipped = self
+            .config
+            .ledger
+            .skipped_attached_holdouts(&self.run_id)
+            .map_err(|e| VerifyFailure::from(e.to_string()))?;
+        // A skipped attached holdout leaves no definition; the filter guards
+        // the `resolved` list, which was captured before the definition was
+        // dropped, so it is not asked for again.
+        let live: Vec<&ResolvedHoldout> = resolved
             .iter()
-            .map(|holdout| {
-                holdout::fetch(holdout, &root, &|| self.budgets.remaining())
-                    .map_err(|e| VerifyFailure::HoldoutUnfetchable(e.to_string()))
+            .filter(|holdout| !skipped.contains(&holdout.name))
+            .collect();
+        let fetched: Vec<Result<PathBuf, holdout::Unfetchable>> = live
+            .iter()
+            .map(|holdout| holdout::fetch(holdout, &root, &|| self.budgets.remaining()))
+            .collect();
+        let is_attached_name = |name: &str| attached.iter().any(|held| held.name == name);
+        let is_attached = |holdout: &ResolvedHoldout| is_attached_name(&holdout.name);
+        if let Some(e) = live
+            .iter()
+            .zip(&fetched)
+            .find_map(|(holdout, fetch)| match fetch {
+                Err(e) if !is_attached(holdout) => Some(e),
+                _ => None,
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        resolved
-            .iter()
-            .zip(&sources)
-            .enumerate()
-            .map(|(index, (holdout, source))| {
-                let site = HoldoutSite {
+        {
+            return Err(VerifyFailure::HoldoutUnfetchable(e.to_string()));
+        }
+        let running_together = fetched.iter().filter(|fetch| fetch.is_ok()).count();
+        let mut sites = Vec::new();
+        for (index, (holdout, fetch)) in live.iter().zip(&fetched).enumerate() {
+            match fetch {
+                Ok(source) => sites.push(HoldoutSite {
                     root: &root,
                     index,
+                    running_together,
                     label,
                     holdout,
                     source,
-                };
-                self.run_holdout(&site, candidate_sha, authority)
+                }),
+                Err(e) => {
+                    // A skipped holdout is counted per run and source, never as
+                    // a catch: the profile's state is not what it was skipped on.
+                    self.config
+                        .ledger
+                        .record_holdout_outcome(
+                            &self.run_id,
+                            &HoldoutOutcomeRow {
+                                label_kind: label.kind(),
+                                attempt_index: label.ordinal(),
+                                name: &holdout.name,
+                                outcome: holdout::SKIPPED_OUTCOME,
+                                profile_green: false,
+                                source: holdout::HoldoutSource::Attached.as_str(),
+                            },
+                        )
+                        .map_err(|e| VerifyFailure::from(e.to_string()))?;
+                    self.config
+                        .ledger
+                        .forget_attached_holdout_definition(&self.run_id, &holdout.name)
+                        .map_err(|e| VerifyFailure::from(e.to_string()))?;
+                    self.events.emit(Event::Decision {
+                        what: "holdout_attach_skipped".to_string(),
+                        reason: format!(
+                            "holdout `{}`: its store could not be fetched ({e}); the run \
+                             settles without it",
+                            holdout.name
+                        ),
+                    });
+                }
+            }
+        }
+        // holds-until: a holdout's setup time stays small against its command
+        // time (setup is a dependency fetch or a reused cache); setups run
+        // concurrently once `setup_tree` stops borrowing the engine and a
+        // run's holdouts spend more time in setup than in commands.
+        // Setting a copy up needs the engine; the commands, which are the
+        // long part, run side by side.
+        let mut prepared: Vec<Prepared<'_, '_>> = sites
+            .iter()
+            .map(|site| self.prepare_holdout(site, candidate_sha, authority))
+            .collect();
+        let gate = self.config.gate;
+        let every = self.config.heartbeat_every;
+        let run_id = self.run_id.as_str();
+        let asked: &AtomicBool = &self.cancel_asked;
+        let artifacts = self.artifacts.as_path();
+        let ran: Vec<Result<HoldoutRun, VerifyFailure>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = prepared
+                .iter_mut()
+                .map(|slot| {
+                    let prepared_for = slot.prepared_for;
+                    let state = &mut slot.state;
+                    let admission = self.heavy();
+                    scope.spawn(move || {
+                        let started = std::time::Instant::now();
+                        let watch = CancelWatch {
+                            gate,
+                            every,
+                            run_id,
+                            asked,
+                        };
+                        let run = match state {
+                            Settled::Done(run) => {
+                                run.take().expect("a settled holdout is read once")
+                            }
+                            Settled::Ready(job) => job.run_command(artifacts, &admission, &watch),
+                        };
+                        let wall = prepared_for + started.elapsed();
+                        run.map(|run| HoldoutRun {
+                            wall_ms: Some(u64::try_from(wall.as_millis()).unwrap_or(u64::MAX)),
+                            ..run
+                        })
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| match handle.join() {
+                    Ok(run) => run,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                })
+                .collect()
+        });
+        for slot in &mut prepared {
+            if let Some(copy) = slot.copy.as_mut() {
+                if let Err(e) = copy.release() {
+                    eprintln!("relais: {e}");
+                }
+            }
+        }
+        ran.into_iter()
+            .map(|run| {
+                run.map(|run| HoldoutRun {
+                    source: Some(if is_attached_name(&run.name) {
+                        holdout::HoldoutSource::Attached
+                    } else {
+                        holdout::HoldoutSource::Named
+                    }),
+                    ..run
+                })
             })
             .collect()
     }
 
-    fn run_holdout(
+    /// Make the holdout's verification copy, set it up and place its
+    /// overlay: everything before its command runs.
+    fn prepare_holdout<'s>(
         &self,
-        site: &HoldoutSite<'_>,
+        site: &HoldoutSite<'s>,
         candidate_sha: &str,
         authority: &EffectiveAuthority,
-    ) -> Result<HoldoutRun, VerifyFailure> {
+    ) -> Prepared<'s, 'a> {
+        let started = std::time::Instant::now();
         let holdout = site.holdout;
         let did_not_build =
             || HoldoutRun::did_not_build(&holdout.name, &holdout.sha, &holdout.digest);
+        let ready = |copy: Option<verify::VerificationWorktree<'a>>,
+                     run: Result<HoldoutRun, VerifyFailure>| Prepared {
+            copy,
+            state: Settled::Done(Some(run)),
+            prepared_for: started.elapsed(),
+        };
         let decl = &holdout.decl;
-        let source = std::fs::canonicalize(site.source).map_err(|e| e.to_string())?;
+        let source = match std::fs::canonicalize(site.source) {
+            Ok(source) => source,
+            Err(e) => return ready(None, Err(VerifyFailure::from(e.to_string()))),
+        };
         let Some(argv) =
             holdout::substitute_config(&decl.command.argv, decl.config.as_deref(), &source)
         else {
-            return Ok(did_not_build());
+            return ready(None, Ok(did_not_build()));
         };
         if !holdout::clean_relative(&decl.path) {
-            return Ok(did_not_build());
+            return ready(None, Ok(did_not_build()));
         }
         let copy_path = site.root.join(format!(
             "copy-{}-{}",
             site.label.worktree_suffix(),
             site.index
         ));
-        let mut copy = verify::verification_worktree(
+        let copy = match verify::verification_worktree(
             self.config.git,
             self.config.repo_dir,
             candidate_sha,
             &copy_path,
-        )?;
-        let spec = CommandSpec {
+        ) {
+            Ok(copy) => copy,
+            Err(e) => return ready(None, Err(e.into())),
+        };
+        let mut spec = CommandSpec {
             argv,
             ..decl.command.clone()
         };
-        let settled = self.run_in_copy(site, &source, copy.path(), &spec, authority);
-        if let Err(e) = copy.release() {
-            eprintln!("relais: {e}");
+        // Side by side with another holdout, its own build directory: no
+        // other holdout's cargo takes the lock. A lone holdout builds as it
+        // always did.
+        if site.running_together > 1 {
+            spec.env
+                .entry("CARGO_TARGET_DIR".to_string())
+                .or_insert_with(|| copy.path().join("target").to_string_lossy().into_owned());
         }
-        settled
-    }
-
-    fn run_in_copy(
-        &self,
-        site: &HoldoutSite<'_>,
-        source: &Path,
-        copy: &Path,
-        spec: &CommandSpec,
-        authority: &EffectiveAuthority,
-    ) -> Result<HoldoutRun, VerifyFailure> {
-        let holdout = site.holdout;
-        let did_not_build =
-            || HoldoutRun::did_not_build(&holdout.name, &holdout.sha, &holdout.digest);
         let logs = site.root.join("logs");
         let prefix = format!("{}-holdout{}", site.label.log_prefix(), site.index);
-        let setup = self
-            .while_watching_cancel(|cancel| {
-                self.setup_tree(
-                    copy,
-                    self.task_tree()
-                        .as_deref()
-                        .map(|path| setup_gate::SeedSource {
-                            path,
-                            wait: setup_gate::SeedWait::WritersEnded,
-                        }),
-                    &authority.verification_profile,
-                    &logs,
-                    &prefix,
-                    cancel,
-                )
-            })
-            .map_err(VerifyFailure::from)?;
+        let setup = self.while_watching_cancel(|cancel| {
+            self.setup_tree(
+                copy.path(),
+                self.task_tree()
+                    .as_deref()
+                    .map(|path| setup_gate::SeedSource {
+                        path,
+                        wait: setup_gate::SeedWait::WritersEnded,
+                    }),
+                &authority.verification_profile,
+                &logs,
+                &prefix,
+                cancel,
+            )
+        });
+        let setup = match setup {
+            Ok(setup) => setup,
+            Err(e) => return ready(Some(copy), Err(e.into())),
+        };
         if verify::setup_failure(&setup).is_some() {
-            return Ok(did_not_build());
+            return ready(Some(copy), Ok(did_not_build()));
         }
         if let Err(e) = holdout::copy_into(
             &source.join(&holdout.decl.path),
-            &copy.join(&holdout.decl.overlay),
+            &copy.path().join(&holdout.decl.overlay),
         ) {
             eprintln!(
                 "relais: holdout `{}` could not be placed in the verification copy: {e}",
                 holdout.name
             );
-            return Ok(did_not_build());
+            return ready(Some(copy), Ok(did_not_build()));
         }
+        let job = Job {
+            holdout,
+            dir: copy.path().to_path_buf(),
+            spec,
+            logs,
+            prefix,
+        };
+        Prepared {
+            copy: Some(copy),
+            state: Settled::Ready(job),
+            prepared_for: started.elapsed(),
+        }
+    }
+}
+
+/// A holdout after its copy was made: its copy, and either its settled
+/// result or the job that still has to run its command.
+struct Prepared<'h, 'g> {
+    copy: Option<verify::VerificationWorktree<'g>>,
+    state: Settled<'h>,
+    prepared_for: std::time::Duration,
+}
+
+enum Settled<'h> {
+    Done(Option<Result<HoldoutRun, VerifyFailure>>),
+    Ready(Job<'h>),
+}
+
+/// What a holdout's command needs, none of it tied to the engine, so the
+/// commands can run on separate threads.
+struct Job<'h> {
+    holdout: &'h ResolvedHoldout,
+    dir: PathBuf,
+    spec: CommandSpec,
+    logs: PathBuf,
+    prefix: String,
+}
+
+impl Job<'_> {
+    fn run_command(
+        &self,
+        artifacts: &Path,
+        admission: &verify::HeavyAdmission<'_>,
+        watch: &CancelWatch<'_>,
+    ) -> Result<HoldoutRun, VerifyFailure> {
+        let holdout = self.holdout;
+        let spec = &self.spec;
         // Silent events: the holdout's output and arguments stay off
         // every channel but the kept log.
         let silent = Events::silent();
-        let check = self
-            .while_watching_cancel(|cancel| {
-                verify::run_observed_within(verify::ObservedRun {
-                    dir: copy,
-                    spec,
-                    logs_dir: &logs,
-                    label: &verify::check_label(spec),
-                    log_stem: &format!("{prefix}-run"),
-                    events: &silent,
-                    cancel,
-                    admission: &self.heavy(),
-                })
+        let check = watch_cancel(watch, |cancel| {
+            verify::run_observed_within(verify::ObservedRun {
+                dir: &self.dir,
+                spec,
+                logs_dir: &self.logs,
+                label: &verify::check_label(spec),
+                log_stem: &format!("{}-run", self.prefix),
+                events: &silent,
+                cancel,
+                admission,
             })
-            .map_err(VerifyFailure::from)?;
+        })
+        .map_err(VerifyFailure::from)?;
         let mut run = HoldoutRun::settled(&holdout.name, &holdout.sha, &holdout.digest, &check);
-        let kept = self
-            .artifacts
-            .join("holdouts")
-            .join(file_safe(&holdout.name));
+        let kept = artifacts.join("holdouts").join(file_safe(&holdout.name));
         std::fs::create_dir_all(&kept).map_err(|e| e.to_string())?;
         let log = kept.join("log.txt");
         std::fs::copy(&check.log_path, &log).map_err(|e| e.to_string())?;
@@ -367,6 +585,32 @@ impl<'a> RunEngine<'a> {
         }
         Ok(run)
     }
+}
+
+/// What a worker is told of an attached holdout's failure: the criterion's
+/// statement, the verdict and the failing test names, and nothing of where
+/// the holdout was declared.
+fn attached_failure_line(statement: &str, missing: &verify::MissingEvidence) -> String {
+    let verdict = match missing {
+        verify::MissingEvidence::HoldoutFailed { failing, .. } if !failing.is_empty() => {
+            format!("failed: {}", failing.join(", "))
+        }
+        verify::MissingEvidence::HoldoutFailed { .. } => "failed".to_string(),
+        verify::MissingEvidence::HoldoutDidNotBuild { .. } => {
+            "did not build or wrote no report".to_string()
+        }
+        verify::MissingEvidence::HoldoutTimedOut { .. } => "timed out".to_string(),
+        verify::MissingEvidence::HoldoutNotRun { .. }
+        | verify::MissingEvidence::CheckProducedNothing { .. }
+        | verify::MissingEvidence::CheckUndefined { .. }
+        | verify::MissingEvidence::SignOffUnrecorded
+        | verify::MissingEvidence::GateNotCovered { .. }
+        | verify::MissingEvidence::GateUnavailable { .. }
+        | verify::MissingEvidence::NoPerTestResults { .. }
+        | verify::MissingEvidence::TestNotReported { .. }
+        | verify::MissingEvidence::TestNotPassed { .. } => "unmet".to_string(),
+    };
+    format!("{statement}: {verdict}")
 }
 
 /// A holdout gap a repair can answer, with the holdout it names.
@@ -438,6 +682,8 @@ pub fn sweep_ended_holdouts(root: &Path, ledger: &crate::ledger::Ledger) {
 struct HoldoutSite<'h> {
     root: &'h Path,
     index: usize,
+    /// How many holdouts of this verification run side by side.
+    running_together: usize,
     label: AttemptLabel,
     holdout: &'h ResolvedHoldout,
     source: &'h Path,
