@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.39.0
+
 - `relais doctor --json` carries an `integration` object (`state`, `plugin_version`, `binary`, and `reason` when the state is `unknown`), documented in docs/INTEGRATIONS.md. It is derived from the same single `claude plugin list --json` reading as the `plugin` finding, so the two agree, including for a plugin installed at project scope only.
 - The Claude Code install no longer writes the `relais-verified-push` and `relais-architecture-conflict` skills, and removes the unmodified copies it wrote earlier. Published skills come from the `greenharness/skills` repository, placed by `grh` (ADR-0050); relais keeps its plugin, the `/relais` skill and its three agents.
 
