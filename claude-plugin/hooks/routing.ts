@@ -23,6 +23,10 @@ import {
   evidenceOf,
   gateChecks,
   hash,
+  mayWrite,
+  repositoryName,
+  unmatchedChecksOf,
+  withUnmatchedChecks,
   modeEffective,
   newTask,
   onEvidence,
@@ -276,7 +280,7 @@ async function pin(fx: Fx, store: Store, e: any, remainingMs: number) {
   if (out.task) {
     queueClassifierUsage(store, out.task.id, classified)
     for (const record of out.reassess) queue(store, reassessRecord(out.task, record, now))
-    if (out.relation === 'correction') queueCorrected(store, out.task)
+    if (out.relation === 'correction') detach(queueCorrected(fx, store, out.task))
     if (out.decision && out.relation) {
       queue(
         store,
@@ -417,8 +421,10 @@ async function afterSpawn(
   const now = await fx.clock.now()
   const agentId: string | undefined = typeof result?.agentId === 'string' ? result.agentId : undefined
   let owner: TaskState | undefined = r.task
+  // A subagent the router did not create edits files the hook never sees.
+  if (!(spawn.isRouted && spawn.decision && spawn.class) && r.task) r.task = { ...r.task, maybeWrote: true }
   if (spawn.isRouted && spawn.decision && spawn.class) {
-    const task = newTask(taskId, agentId ?? null, `${description}\n${prompt}`, spawn.class, spawn.decision.tier, now)
+    const task = newTask(taskId, agentId ?? null, `${description}\n${prompt}`, spawn.class, spawn.decision.tier, now, r.task?.id)
     task.lastReason = 'table'
     // A drawn spawn keeps its lowered floor: its own re-runs may raise the
     // tier to one step under the table's, never back to it.
@@ -481,9 +487,22 @@ export function onToolResult(fx: Fx, store: Store, e: any, result: any, now: num
   const task = agentId ? r.subtasks[agentId] : r.task
   if (!task) return
   noteRevert(store, state, task, e, result, now)
+  const wrote = String(e.tool) === 'Bash' && typeof e.command === 'string' && mayWrite(e.command)
+  const noted = wrote && !task.maybeWrote ? { ...task, maybeWrote: true } : task
+  if (noted !== task) {
+    if (agentId) r.subtasks[agentId] = noted
+    else r.task = noted
+  }
+  const unmatched = String(e.tool) === 'Bash' && typeof e.command === 'string' && result?.deny === undefined ? unmatchedChecksOf(e.command, state.checks) : []
+  const counted = unmatched.length > 0 ? withUnmatchedChecks(noted, unmatched) : noted
+  if (counted !== noted) {
+    if (agentId) r.subtasks[agentId] = counted
+    else r.task = counted
+    resolveRepository(fx, store).catch(() => {}) // best effort: no unmatched entry is sent until the git root is known
+  }
   const evidence = evidenceOf(String(e.tool), e, result, state.checks, state.check_kinds)
   if (!evidence) return
-  const out = onEvidence(state, task, evidence, r.cwd)
+  const out = onEvidence(state, counted, evidence, r.cwd)
   if (agentId) r.subtasks[agentId] = out.task
   else r.task = out.task
   if (out.reassess) {
@@ -521,7 +540,7 @@ export async function flag(fx: Fx, store: Store): Promise<string> {
   const out = escalate(r.state, corrected, 'flag')
   r.task = out.task
   queue(store, reassessRecord(out.task, out.record, now))
-  queueCorrected(store, out.task)
+  await queueCorrected(fx, store, out.task)
   refreshRoute(store)
   const to = decisionOf(r.state, out.task, 'recovery')
   return `Flagged: this task counts as corrected, and its next request runs at ${to.tier} (${to.model}${to.effort ? `, effort ${to.effort}` : ''})${modeOf(r) === 'on' ? '' : ` once routing is on (now ${modeOf(r)})`}.`
@@ -547,8 +566,11 @@ export function onTurnComplete(fx: Fx, store: Store, e: any, now: number) {
 // before its end (a crash, a kill) would leave the reassessment in the
 // ledger with no task for it to belong to. The end's record, later,
 // carries the outcome at the end; relais keeps the first one it gets.
-function queueCorrected(store: Store, task: TaskState) {
-  queue(store, taskRecord(task, null, store.router.cwd))
+// The repository name is resolved first: a name guessed from a subdirectory
+// would be stored with the unmatched checks.
+async function queueCorrected(fx: Fx, store: Store, task: TaskState) {
+  const repository = await resolveRepository(fx, store).catch(() => undefined)
+  queue(store, taskRecord(task, null, store.router.cwd, repository))
 }
 
 // The task ends: the amont stamp on the trees it edited is read (bounded,
@@ -558,12 +580,28 @@ async function endTask(fx: Fx, store: Store, task: TaskState, now: number) {
   const gate = await gateEvidence(fx, store, task, now).catch(() => [])
   const ended: TaskState =
     gate.length === 0 ? task : { ...task, verifications: [...task.verifications, ...gate].slice(-20) }
-  queue(store, taskRecord(ended, now, store.router.cwd))
+  const repository = await resolveRepository(fx, store).catch(() => undefined)
+  queue(store, taskRecord(ended, now, store.router.cwd, repository))
   const outcome = outcomeOf(ended)
-  if (outcome === 'unknown') return
+  if (outcome === 'unknown' || outcome === 'answered') return
   for (const sub of ended.subagentTasks ?? []) {
     if (sub.agentId) queue(store, taskOutcomeRecord(sub, outcome, now))
   }
+}
+
+// The basename of the session directory's git root, asked once per directory;
+// undefined (and nothing cached) when git cannot say.
+async function resolveRepository(fx: Fx, store: Store): Promise<string | undefined> {
+  const router = store.router
+  const cwd = router.cwd
+  if (!cwd) return undefined
+  if (router.repository?.cwd === cwd) return router.repository.name
+  const toplevelRun = await fx.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd, timeoutMs: GATE_TIMEOUT_MS }).catch(() => undefined)
+  const toplevel = toplevelRun?.exitCode === 0 ? String(toplevelRun.stdout ?? '').trim() : ''
+  if (toplevel === '') return undefined
+  const name = repositoryName(toplevel)
+  router.repository = { cwd, name }
+  return name
 }
 
 // The directory a path lies in, the session's cwd for a bare name.
@@ -605,11 +643,19 @@ async function readGateChecks(fx: Fx, store: Store, task: TaskState, now: number
   return stamps.flatMap(stamp => (stamp ? gateChecks(stamp, task.startedAt, now) : [])).map(c => ({ command: c.name, kind: c.kind, passed: c.passed }))
 }
 
+// A relais run or replay was launched from the task: it may write files the
+// hook never sees.
+export function noteRelaisLaunch(store: Store) {
+  const r = store.router
+  if (r.task) r.task = { ...r.task, maybeWrote: true }
+}
+
 // A relais run ended: its acceptance verifies the task, which ends at the
 // next prompt.
 export function onRunDone(store: Store, outcome: string) {
   const r = store.router
   if (!r.task) return
+  r.task = { ...r.task, maybeWrote: true }
   if (outcome === 'accepted') r.task = { ...r.task, relaisAccepted: true }
   r.isTaskEndRequested = true
 }
@@ -647,11 +693,40 @@ export async function flushObservations(fx: Fx, store: Store, options: { isFinal
   if (r.queue.length === 0) return
   const batch = r.queue
   r.queue = []
+  const understandsAnswered = supportsAnswered(store)
   const bySession = new Map<string, unknown[]>()
-  for (const { session, record } of batch) bySession.set(session, [...(bySession.get(session) ?? []), record])
+  for (const { session, record } of batch) {
+    const sent = understandsAnswered ? record : withoutAnswered(record)
+    bySession.set(session, [...(bySession.get(session) ?? []), sent])
+  }
   for (const [session, records] of bySession) {
     await observe(fx, store, { schema: 1, session, records }, 0, options.isFinal === true)
   }
+}
+
+// Whether the relais this session talks to accepts `answered` and the parent
+// and unmatched-check fields: it lists all three in router-state's `accepts`. A
+// router-state that was not read, or that lists nothing, gets the v0.35 form,
+// so an older relais never sees a field it refuses (docs/router-protocol.md).
+function supportsAnswered(store: Store): boolean {
+  const accepts = store.router.state?.accepts ?? []
+  return NEW_FORM.every((field) => accepts.includes(field))
+}
+
+// The fields of the new form, all sent together or not at all.
+const NEW_FORM: readonly string[] = ['answered', 'parent_task_id', 'unmatched_checks']
+
+// The v0.35 form of a record: `answered` and the parent and unmatched-check
+// fields did not exist (relais refuses unknown fields), so they are dropped.
+function withoutAnswered(record: any): unknown {
+  if (!record || typeof record !== 'object') return record
+  const out = { ...record }
+  delete out.parent_task_id
+  delete out.parent_link_recorded
+  delete out.unmatched_checks
+  if (out.outcome === 'answered') out.outcome = 'unknown'
+  if (out.completed_at_end === 'answered') out.completed_at_end = 'unknown'
+  return out
 }
 
 async function observe(fx: Fx, store: Store, payload: unknown, attempt: number, isFinal: boolean): Promise<void> {

@@ -136,7 +136,7 @@ fn the_report_json_splits_holdouts_by_source_and_counts_skipped_attached() {
         .expect("relais runs");
     assert_eq!(output.status.code(), Some(0));
     let report: Value = serde_json::from_slice(&output.stdout).expect("json");
-    assert_eq!(report["schema_version"], 15, "{report}");
+    assert_eq!(report["schema_version"], 16, "{report}");
     let holdouts = &report["holdouts"];
     assert_eq!(holdouts["holdout_runs"], 2, "{report}");
     assert_eq!(holdouts["holdout_catches"], 1, "{report}");

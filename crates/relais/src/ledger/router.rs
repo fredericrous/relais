@@ -1,13 +1,21 @@
 //! The session router's tables (ledger step v20, SPEC §30): what `relais
 //! native router-observe` writes and what `router-state` and `relais
-//! report` read back. Mechanism only: what a record means, and how one
-//! outcome ranks against another, is `crate::router`'s; a task row arrives
-//! here carrying its rank.
+//! report` read back. What a record means, and how one outcome ranks
+//! against another, is `crate::router`'s; a task row arrives here carrying
+//! its rank. The one rule this module owns is the rank-0 merge: between
+//! `answered` and `unknown`, `unknown` wins in either arrival order, and a
+//! task with files is never `answered`.
 
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use super::{Ledger, Result};
+
+/// The `outcome_source` migration v45 marks the rows it backfilled with.
+const BACKFILL_V45_SOURCE: &str = "backfill_v45";
+
+/// The most unmatched check commands a task keeps.
+pub const UNMATCHED_CHECKS_MAX: usize = 5;
 
 /// The classifier's reading of a task, as the plugin sent it.
 #[derive(Debug, Clone, PartialEq)]
@@ -105,6 +113,15 @@ pub struct RouterTaskRow {
     pub outcome_source: Option<String>,
     /// The checks the task ran, with their kinds.
     pub checks: Vec<RouterCheck>,
+    /// The task that spawned this one; none for a main task, an unparented
+    /// spawn, or a row recorded before the plugin sent the link.
+    pub parent_task_id: Option<String>,
+    /// Whether the plugin that wrote the record captured the parent link:
+    /// a missing parent on a `false` row is "not captured", not "no parent".
+    pub parent_link_recorded: bool,
+    /// Build or test commands the task ran that matched no check, as
+    /// `<repository>: <argv prefix>`, at most [`UNMATCHED_CHECKS_MAX`].
+    pub unmatched_checks: Vec<String>,
 }
 
 /// One check a task ran: a command or an amont gate stamp, with its kind
@@ -269,6 +286,100 @@ fn union(mut list: Vec<String>, extra: &[String]) -> Vec<String> {
     list
 }
 
+/// A stored outcome of rank 0, the only ones the merge rewrites. Parsed
+/// once from the `outcome` column; a stronger outcome never reaches the
+/// rank-0 rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RankZeroOutcome {
+    Answered,
+    Unknown,
+}
+
+impl RankZeroOutcome {
+    /// The rank-0 outcome the merge rules cover for `text`, if any.
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        match text {
+            "answered" => Some(Self::Answered),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The outcome after a merge at rank 0: `unknown` wins over `answered` in
+/// either arrival order, and a task with files is never `answered`: the
+/// plugin's rule is monotone within a task, so once a write is seen the
+/// task reports `unknown`.
+fn rank_zero_outcome(
+    picked: RankZeroOutcome,
+    stored: RankZeroOutcome,
+    incoming: RankZeroOutcome,
+    files: &[String],
+) -> RankZeroOutcome {
+    let either_unknown = stored == RankZeroOutcome::Unknown || incoming == RankZeroOutcome::Unknown;
+    let answered_with_files = picked == RankZeroOutcome::Answered && !files.is_empty();
+    if either_unknown || answered_with_files {
+        RankZeroOutcome::Unknown
+    } else {
+        picked
+    }
+}
+
+/// The outcome name after a merge: `picked` run through `rank_zero_outcome`
+/// when all three names are rank-0 outcomes, else (a stronger outcome, or
+/// a name this binary does not know) left as it is.
+fn merged_outcome(picked: &str, stored: &str, incoming: &str, files: &[String]) -> String {
+    match (
+        RankZeroOutcome::parse(picked),
+        RankZeroOutcome::parse(stored),
+        RankZeroOutcome::parse(incoming),
+    ) {
+        (Some(picked), Some(stored), Some(incoming)) => {
+            rank_zero_outcome(picked, stored, incoming, files)
+                .as_str()
+                .to_string()
+        }
+        _ => picked.to_string(),
+    }
+}
+
+/// The first record of a task, stored as it came but for the rank-0 rule:
+/// an `answered` record that carries files is stored `unknown`, end
+/// outcome included, as a merge would store it.
+fn first_task(incoming: &RouterTaskRow) -> RouterTaskRow {
+    let outcome = merged_outcome(
+        &incoming.outcome,
+        &incoming.outcome,
+        &incoming.outcome,
+        &incoming.files,
+    );
+    if outcome == incoming.outcome {
+        return incoming.clone();
+    }
+    let completed_at_end = match incoming
+        .completed_at_end
+        .as_deref()
+        .map(RankZeroOutcome::parse)
+    {
+        Some(Some(RankZeroOutcome::Answered)) => Some(outcome.clone()),
+        Some(Some(RankZeroOutcome::Unknown)) | Some(None) | None => {
+            incoming.completed_at_end.clone()
+        }
+    };
+    RouterTaskRow {
+        outcome,
+        completed_at_end,
+        ..incoming.clone()
+    }
+}
+
 /// `incoming` folded onto `stored`: the outcome moves only up the rank,
 /// counters only up, `exhausted`, the inferred signals and the files only
 /// gain, and the outcome at the end is kept from the first record that
@@ -277,6 +388,33 @@ fn merge_task(stored: RouterTaskRow, incoming: &RouterTaskRow) -> RouterTaskRow 
     let promote = incoming.outcome_rank > stored.outcome_rank;
     let inferred = union(stored.inferred, &incoming.inferred);
     let files = union(stored.files, &incoming.files);
+    let outcome_rank = stored.outcome_rank.max(incoming.outcome_rank);
+    let picked = if promote {
+        &incoming.outcome
+    } else {
+        &stored.outcome
+    };
+    let outcome = merged_outcome(picked, &stored.outcome, &incoming.outcome, &files);
+    let forced_unknown =
+        RankZeroOutcome::parse(&outcome) == Some(RankZeroOutcome::Unknown) && !promote;
+    let completed_at_end = match stored
+        .completed_at_end
+        .or(incoming.completed_at_end.clone())
+    {
+        Some(end)
+            if forced_unknown
+                && RankZeroOutcome::parse(&end) == Some(RankZeroOutcome::Answered) =>
+        {
+            Some(RankZeroOutcome::Unknown.as_str().to_string())
+        }
+        end => end,
+    };
+    let backfilled = stored.outcome_source.as_deref() == Some(BACKFILL_V45_SOURCE);
+    let outcome_source_kept = if promote || (forced_unknown && backfilled) {
+        incoming.outcome_source.clone().or(stored.outcome_source)
+    } else {
+        stored.outcome_source.or(incoming.outcome_source.clone())
+    };
     RouterTaskRow {
         task_id: stored.task_id,
         agent_id: stored.agent_id,
@@ -287,15 +425,9 @@ fn merge_task(stored: RouterTaskRow, incoming: &RouterTaskRow) -> RouterTaskRow 
         },
         ended_at: later(stored.ended_at, incoming.ended_at.clone()),
         class: incoming.class.clone().or(stored.class),
-        outcome: if promote {
-            incoming.outcome.clone()
-        } else {
-            stored.outcome
-        },
-        outcome_rank: stored.outcome_rank.max(incoming.outcome_rank),
-        completed_at_end: stored
-            .completed_at_end
-            .or(incoming.completed_at_end.clone()),
+        outcome,
+        outcome_rank,
+        completed_at_end,
         inferred,
         files,
         escalations: stored.escalations.max(incoming.escalations),
@@ -306,15 +438,18 @@ fn merge_task(stored: RouterTaskRow, incoming: &RouterTaskRow) -> RouterTaskRow 
         } else {
             stored.explicit_quote.or(incoming.explicit_quote.clone())
         },
-        outcome_source: if promote {
-            incoming.outcome_source.clone().or(stored.outcome_source)
-        } else {
-            stored.outcome_source.or(incoming.outcome_source.clone())
-        },
+        outcome_source: outcome_source_kept,
         checks: if incoming.checks.is_empty() {
             stored.checks
         } else {
             incoming.checks.clone()
+        },
+        parent_task_id: stored.parent_task_id.or(incoming.parent_task_id.clone()),
+        parent_link_recorded: stored.parent_link_recorded || incoming.parent_link_recorded,
+        unmatched_checks: {
+            let mut unmatched = union(stored.unmatched_checks, &incoming.unmatched_checks);
+            unmatched.truncate(UNMATCHED_CHECKS_MAX);
+            unmatched
         },
     }
 }
@@ -337,7 +472,8 @@ fn read_class(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Option<
 const TASK_COLUMNS: &str =
     "task_id, agent_id, started_at, ended_at, class_kind, difficulty, scope, \
      uncertainty, verifiable, confidence, outcome, outcome_rank, inferred_json, escalations, \
-     exhausted, turns, explicit_quote, completed_at_end, files_json, outcome_source, checks_json";
+     exhausted, turns, explicit_quote, completed_at_end, files_json, outcome_source, checks_json, \
+     parent_task_id, parent_link_recorded, unmatched_checks_json";
 
 fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterTaskRow> {
     read_task_at(row, 0)
@@ -471,7 +607,7 @@ impl Ledger {
                         .optional()?;
                     let merged = match stored {
                         Some(stored) => merge_task(stored, t),
-                        None => t.clone(),
+                        None => first_task(t),
                     };
                     let (kind, difficulty, scope, uncertainty, verifiable, confidence) =
                         class_columns(&merged.class);
@@ -481,15 +617,18 @@ impl Ledger {
                         serde_json::to_string(&merged.files).expect("a list of strings serializes");
                     let checks =
                         serde_json::to_string(&merged.checks).expect("a list of checks serializes");
+                    let unmatched = serde_json::to_string(&merged.unmatched_checks)
+                        .expect("a list of strings serializes");
                     tx.execute(
                         "INSERT INTO router_tasks
                             (session, task_id, agent_id, started_at, ended_at, class_kind,
                              difficulty, scope, uncertainty, verifiable, confidence, outcome,
                              outcome_rank, inferred_json, escalations, exhausted, turns,
                              explicit_quote, completed_at_end, files_json, recorded_at,
-                             updated_at, outcome_source, checks_json)
+                             updated_at, outcome_source, checks_json, parent_task_id,
+                             parent_link_recorded, unmatched_checks_json)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21, ?22, ?23)
+                                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21, ?22, ?23, ?24, ?25, ?26)
                          ON CONFLICT (session, task_id, agent_id) DO UPDATE SET
                             started_at = excluded.started_at, ended_at = excluded.ended_at,
                             class_kind = excluded.class_kind, difficulty = excluded.difficulty,
@@ -503,7 +642,10 @@ impl Ledger {
                             files_json = excluded.files_json,
                             updated_at = excluded.updated_at,
                             outcome_source = excluded.outcome_source,
-                            checks_json = excluded.checks_json",
+                            checks_json = excluded.checks_json,
+                            parent_task_id = excluded.parent_task_id,
+                            parent_link_recorded = excluded.parent_link_recorded,
+                            unmatched_checks_json = excluded.unmatched_checks_json",
                         params![
                             session,
                             merged.task_id,
@@ -528,6 +670,9 @@ impl Ledger {
                             now,
                             merged.outcome_source.as_deref().unwrap_or("own"),
                             checks,
+                            merged.parent_task_id,
+                            merged.parent_link_recorded,
+                            unmatched,
                         ],
                     )?;
                 }
@@ -566,7 +711,7 @@ impl Ledger {
                             SET outcome = ?1, outcome_rank = ?2, outcome_source = 'parent',
                                 updated_at = ?3
                           WHERE session = ?4 AND task_id = ?5 AND agent_id = ?6
-                            AND outcome = 'unknown' AND outcome_rank < ?2",
+                            AND outcome IN ('unknown', 'answered') AND outcome_rank < ?2",
                         params![
                             o.outcome,
                             o.outcome_rank,
@@ -952,6 +1097,18 @@ fn read_task_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Rout
                 )
             })?,
         },
+        parent_task_id: row.get(offset + 21)?,
+        parent_link_recorded: row.get(offset + 22)?,
+        unmatched_checks: match row.get::<_, Option<String>>(offset + 23)? {
+            None => Vec::new(),
+            Some(text) => serde_json::from_str(&text).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    offset + 23,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?,
+        },
     })
 }
 
@@ -988,6 +1145,9 @@ mod tests {
             explicit_quote: None,
             outcome_source: Some("own".into()),
             checks: vec![],
+            parent_task_id: None,
+            parent_link_recorded: false,
+            unmatched_checks: vec![],
         }
     }
 
@@ -1039,6 +1199,160 @@ mod tests {
         assert_eq!(write("corrected", 2), "corrected");
         assert_eq!(write("completed_verified", 1), "corrected");
         assert_eq!(write("unknown", 0), "corrected");
+    }
+
+    #[test]
+    fn at_rank_zero_unknown_beats_answered_in_either_order() {
+        let answered = || task("answered", 0);
+        let unknown = || task("unknown", 0);
+        assert_eq!(merge_task(answered(), &unknown()).outcome, "unknown");
+        assert_eq!(merge_task(unknown(), &answered()).outcome, "unknown");
+        assert_eq!(merge_task(answered(), &answered()).outcome, "answered");
+    }
+
+    #[test]
+    fn a_merge_keeps_the_stored_parent_ors_the_marker_and_caps_unmatched_checks() {
+        let stored = RouterTaskRow {
+            parent_task_id: Some("first".into()),
+            parent_link_recorded: false,
+            unmatched_checks: vec!["r: make a".into(), "r: make b".into(), "r: make c".into()],
+            ..task("unknown", 0)
+        };
+        let incoming = RouterTaskRow {
+            parent_task_id: Some("second".into()),
+            parent_link_recorded: true,
+            unmatched_checks: vec![
+                "r: make b".into(),
+                "r: make d".into(),
+                "r: make e".into(),
+                "r: make f".into(),
+            ],
+            ..task("unknown", 0)
+        };
+        let merged = merge_task(stored, &incoming);
+        assert_eq!(merged.parent_task_id.as_deref(), Some("first"));
+        assert!(merged.parent_link_recorded);
+        assert_eq!(
+            merged.unmatched_checks,
+            [
+                "r: make a",
+                "r: make b",
+                "r: make c",
+                "r: make d",
+                "r: make e"
+            ]
+        );
+
+        let adopted = merge_task(task("unknown", 0), &incoming);
+        assert_eq!(adopted.parent_task_id.as_deref(), Some("second"));
+        let kept = merge_task(
+            RouterTaskRow {
+                parent_link_recorded: true,
+                ..task("unknown", 0)
+            },
+            &task("unknown", 0),
+        );
+        assert!(kept.parent_link_recorded);
+    }
+
+    #[test]
+    fn the_parent_link_and_unmatched_checks_round_trip_through_the_ledger() {
+        let (ledger, _dir) = ledger();
+        let written = RouterTaskRow {
+            parent_task_id: Some("parent-1".into()),
+            parent_link_recorded: true,
+            unmatched_checks: vec!["repo: cargo nextest".into(), "repo: make check".into()],
+            ..task("unknown", 0)
+        };
+        ledger
+            .record_router_batch("s", &[RouterRecord::Task(written)])
+            .unwrap();
+        let read = ledger.router_task("s", "t1", None).unwrap().unwrap();
+        assert_eq!(read.parent_task_id.as_deref(), Some("parent-1"));
+        assert!(read.parent_link_recorded);
+        assert_eq!(
+            read.unmatched_checks,
+            ["repo: cargo nextest", "repo: make check"]
+        );
+    }
+
+    #[test]
+    fn answered_with_files_is_forced_unknown() {
+        let with_files = RouterTaskRow {
+            files: vec!["abc".into()],
+            ..task("answered", 0)
+        };
+        assert_eq!(
+            merge_task(task("answered", 0), &with_files).outcome,
+            "unknown"
+        );
+        assert_eq!(
+            merge_task(with_files.clone(), &task("answered", 0)).outcome,
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn a_forced_unknown_keeps_the_end_outcome_and_the_source_consistent() {
+        let backfilled = RouterTaskRow {
+            completed_at_end: Some("answered".into()),
+            outcome_source: Some("backfill_v45".into()),
+            ..task("answered", 0)
+        };
+        let incoming = RouterTaskRow {
+            outcome_source: Some("own".into()),
+            ..task("unknown", 0)
+        };
+        let merged = merge_task(backfilled, &incoming);
+        assert_eq!(merged.outcome, "unknown");
+        assert_eq!(merged.completed_at_end.as_deref(), Some("unknown"));
+        assert_eq!(merged.outcome_source.as_deref(), Some("own"));
+        let kept = merge_task(
+            RouterTaskRow {
+                completed_at_end: Some("answered".into()),
+                ..task("answered", 0)
+            },
+            &task("answered", 0),
+        );
+        assert_eq!(kept.completed_at_end.as_deref(), Some("answered"));
+    }
+
+    #[test]
+    fn a_first_answered_record_with_files_is_stored_unknown() {
+        let with_files = RouterTaskRow {
+            files: vec!["abc".into()],
+            completed_at_end: Some("answered".into()),
+            ..task("answered", 0)
+        };
+        let stored = first_task(&with_files);
+        assert_eq!(stored.outcome, "unknown");
+        assert_eq!(stored.completed_at_end.as_deref(), Some("unknown"));
+        assert_eq!(stored.files, vec!["abc".to_string()]);
+        let plain = task("answered", 0);
+        assert_eq!(first_task(&plain), plain);
+        let verified = RouterTaskRow {
+            files: vec!["abc".into()],
+            ..task("completed_verified", 1)
+        };
+        assert_eq!(first_task(&verified), verified);
+    }
+
+    #[test]
+    fn a_strong_outcome_replaces_answered_and_corrected_is_never_replaced() {
+        let verified = merge_task(task("answered", 0), &task("completed_verified", 1));
+        assert_eq!(verified.outcome, "completed_verified");
+        let with_files = RouterTaskRow {
+            files: vec!["abc".into()],
+            ..task("completed_verified", 1)
+        };
+        assert_eq!(
+            merge_task(task("answered", 0), &with_files).outcome,
+            "completed_verified"
+        );
+        let corrected = merge_task(task("corrected", 2), &task("answered", 0));
+        assert_eq!(corrected.outcome, "corrected");
+        let still = merge_task(corrected, &task("completed_verified", 1));
+        assert_eq!(still.outcome, "corrected");
     }
 
     #[test]

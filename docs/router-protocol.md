@@ -61,6 +61,7 @@ exit, or stdout that does not parse, the plugin runs in `shadow`.
 - **`pins`**: subagent types whose definition (user `~/.claude/agents/*.md`, project `.claude/agents/*.md`) names a `model:` in its front matter, plus machine `[session_routing] pinned_agents`. The plugin never overrides a pinned type.
 - **`checks`**: argv prefixes that count as verification. The repository's `relais.toml` profile commands, plus the built-in list: `test` kind: `cargo test`, `cargo nextest`, `npm test`, `pnpm test`, `yarn test`, `bun test`, `pnpm run test`, `npm run test`, `pytest`, `uv run pytest`, `go test`, `make check`, `make test`; `lint` kind: `cargo clippy`, `pnpm run lint`, `npm run lint`, `go vet`, `golangci-lint run`, `ruff check`, `mypy`, `pyright`, `make lint`; `build` kind: `cargo check`, `cargo build`, `pnpm run build`, `pnpm run typecheck`, `npm run build`, `npm run typecheck`, `tsc`, `go build`, `make build`.
 - **`check_kinds`**: the kind of each entry of `checks`, same order and length: `test`, `lint` or `build`. A repository command that is not on the built-in list is `test`. A relais that does not serve it leaves the plugin to read the kind off the argv. The plugin adds the kind `gate` for an amont stamp (below).
+- **`accepts`**: what `router-observe` accepts beyond the v0.35 form: `answered`, `parent_task_id` (with `parent_link_recorded`) and `unmatched_checks`. The plugin sends the three together, and only when all three are listed here, never by comparing version numbers; absent from a relais that predates it.
 - **`adjustments`**: R2's learned rules; empty in R1.
 
 ### Exploration
@@ -102,14 +103,16 @@ Record kinds (field `kind`):
   "files": ["16 hex"], "at": "RFC3339" }
 
 { "kind": "task", "task_id": "s", "agent_id": "s|null", "started_at": "RFC3339", "ended_at": "RFC3339|null",
-  "class": { … }, "outcome": "completed_verified|completed_accepted|corrected|unknown",
-  "completed_at_end": "completed_verified|completed_accepted|corrected|unknown|null",
+  "class": { … }, "outcome": "completed_verified|completed_accepted|corrected|answered|unknown",
+  "completed_at_end": "completed_verified|completed_accepted|corrected|answered|unknown|null",
   "inferred": ["aborted", "no_complaint", "respawned"], "files": ["16 hex"],
   "escalations": 0, "exhausted": false, "turns": 1, "explicit_quote": "s|null",
-  "checks": [{ "name": "go vet ./...", "kind": "test|lint|build|gate", "passed": true }] }
+  "checks": [{ "name": "go vet ./...", "kind": "test|lint|build|gate", "passed": true }],
+  "parent_task_id": "s|null", "parent_link_recorded": true,
+  "unmatched_checks": ["repo: make check"] }
 
 { "kind": "task_outcome", "task_id": "s", "agent_id": "s|null",
-  "outcome": "completed_verified|completed_accepted|corrected|unknown", "at": "RFC3339" }
+  "outcome": "completed_verified|completed_accepted|corrected|answered|unknown", "at": "RFC3339" }
 
 { "kind": "classification", "call_id": "s", "purpose": "prompt|spawn", "model": "full id",
   "prompt_version": "64 lowercase hex: SHA-256 of the classifier's system prompt",
@@ -126,8 +129,10 @@ Record kinds (field `kind`):
 - **`files`** are the first 16 hex digits of the SHA-256 of a repo-relative path (relative to the session's cwd, no leading `./`), lowercase. On a `task`: every file the task edited (Edit, Write, MultiEdit, NotebookEdit successes). On a `reassess` with `event: "revert"`: the files a successful Bash `git revert …` (`[]`: its files are not known here), `git checkout [<ref>] -- <paths>` or `git restore <paths>` (not `--staged` alone) put back; a revert is never escalating. Optional, default `[]`. R2 matches reverts and later corrections to the tasks whose files they touch (plan §5, missed failures).
 - **`table_version`** is the capability table's `version` the decision was made under. Optional, default `null`.
 - **`checks`** are the checks the task ran (its last 20), each with the kind of check it matched (`test`, `lint`, `build`) or `gate` for an amont stamp. `name` is the command, or `amont-gate@<first 7 of the tree>`. Optional, default `[]`; a later record with checks replaces the stored list.
-- **`task_outcome`** amends a subagent's task with its parent's outcome. A subagent's task is sent when the subagent completes, before its parent ends; when the parent ends the plugin sends one `task_outcome` per router-created subagent task it spawned (never one for an `unknown` outcome). relais sets that task's `outcome` and `outcome_source = parent` only when the stored outcome is `unknown`, and does nothing when the task has no record yet. A task's own record sets `outcome_source = own` (every task recorded before ledger step v23 is `own`), and a later own record of a higher rank takes the outcome back.
-- **`completed_at_end`** is the outcome when the task ended (`null` while it is open). relais keeps the first one it receives; a later record never moves it, so a correction that arrives after the end is measured against it. Optional, default `null`.
+- **`parent_task_id`** is the task that spawned a router-created subagent's task (`null` for a main task or a spawn with no active parent); **`parent_link_recorded`** is `true` on every record a plugin that captures the link sends, so a missing parent on a record without it reads "not captured", never "no parent" (a release date is no evidence of capture). Both optional, defaults `null` and `false`. relais keeps the stored `parent_task_id` (a later record fills it only when none is stored) and ORs the marker. Ledger step v45 adds `router_tasks.parent_task_id` and `parent_link_recorded`.
+- **`unmatched_checks`** lists the build or test commands the task ran that matched no entry of `checks` (the program is `make`, `just`, `cargo`, `npm`, `pnpm`, `yarn`, `bun`, `go`, `pytest`, `uv`, `mvn`, `gradle`, `./gradlew`, `deno`, `tox` or `nox`), each as `<repository>: <prefix>`: the repository is the basename of the session's git root, and the prefix is what a person would paste into `checks` and nothing more (leading `VAR=` words and flags skipped, the program, the next word only if it matches `^[a-z][a-z0-9:_-]*$`, and after `run` or `exec` one more such word: `make check`, `cargo nextest`, `npm run test`, `uv run pytest`; `pytest tests/x.py`, `make -C /p check` and `cargo +nightly test` give `pytest`, `make`, `cargo`). At most 5 distinct entries per task; relais refuses an entry of any other shape (exit 2) and merges by union, capped at 5 distinct. Optional, default `[]`; ledger column `router_tasks.unmatched_checks_json` (step v45). The plugin sends `parent_task_id`, `parent_link_recorded` and `unmatched_checks` only to a relais whose router-state lists them in `accepts`, the same gate as `answered`: an older relais refuses unknown fields.
+- **`task_outcome`** amends a subagent's task with its parent's outcome. A subagent's task is sent when the subagent completes, before its parent ends; when the parent ends the plugin sends one `task_outcome` per router-created subagent task it spawned (never one for an `unknown` or `answered` outcome). relais sets that task's `outcome` and `outcome_source = parent` only when the stored outcome is `unknown` or `answered`, and does nothing when the task has no record yet. A task's own record sets `outcome_source = own` (every task recorded before ledger step v23 is `own`), and a later own record of a higher rank takes the outcome back.
+- **`completed_at_end`** is the outcome when the task ended (`null` while it is open). relais keeps the first one it receives; a later record never moves it, so a correction that arrives after the end is measured against it. The one exception: a stored `answered` becomes `unknown` when a later record forces the merged outcome to `unknown`. Optional, default `null`.
 
 Idempotency keys:
 - decision: `(session, task_id, turn_id, agent_id)`;
@@ -137,7 +142,9 @@ Idempotency keys:
 - task_outcome: `(session, task_id, agent_id)` (it updates that task);
 - classification: `(session, call_id)`.
 
-A `task` record may be sent again with a later outcome. Its rank is `corrected` > `completed_verified` = `completed_accepted` > `unknown`. A higher-ranked outcome overwrites a lower one; a lower one never overwrites. `unknown` never overwrites anything. `files` and `inferred` only gain; `completed_at_end` is never overwritten once set.
+A `task` record may be sent again with a later outcome. Its rank is `corrected` > `completed_verified` = `completed_accepted` > `unknown` = `answered` (rank 0, so stored ranks need no rescale). A higher-ranked outcome overwrites a lower one; a lower one never overwrites. At rank 0 `unknown` wins over `answered` in either arrival order, and a merged task with files is never `answered`: the plugin's rule is monotone within a task, so once a write is seen it reports `unknown`. `files` and `inferred` only gain; `completed_at_end` is never overwritten once set, except that `answered` becomes `unknown` when the merged outcome is forced to `unknown`.
+
+**`answered`.** A task ends `answered` when it is not corrected, verified or accepted, has no explicit accept quote, edited no file, did nothing the hook could not see that may write one (a Bash writer such as `sed -i`, a redirection, `tee`, `git apply|checkout|commit|merge|rebase` or a formatter with a write flag; a subagent the router did not create; a relais run or replay), and was not aborted. A question or a review that changed nothing is the typical case. `answered` is neither completed nor a strong outcome: it is reported on its own line, and is never a learning label. The plugin sends `answered` only to a relais whose router-state lists `answered` in `accepts` (a router-state that was not read, or has no `accepts`, counts as older); to an older one it sends `unknown`, the v0.35 form. The relais that adds `accepts` (ledger step v45) backfills `answered` onto ended `unknown` question and review rows with no files and no `aborted` signal, marking them `outcome_source = backfill_v45`; undo with `UPDATE router_tasks SET outcome = 'unknown', outcome_source = 'own', completed_at_end = CASE WHEN completed_at_end = 'answered' THEN 'unknown' ELSE completed_at_end END WHERE outcome_source = 'backfill_v45'` (the backfill also sets `completed_at_end = 'answered'` where it was `unknown`).
 
 ## `relais native router-envelope --by <name> (--epsilon-max <f> | --off) [--source plugin-ask]`
 

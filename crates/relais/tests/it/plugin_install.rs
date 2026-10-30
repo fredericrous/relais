@@ -167,10 +167,10 @@ fn a_first_install_writes_the_marketplace_then_adds_it_and_installs_the_plugin()
         .project
         .join(".claude/skills/relais/SKILL.md")
         .exists());
-    assert!(world
+    assert!(!world
         .project
         .join(".claude/skills/relais-verified-push/SKILL.md")
-        .is_file());
+        .exists());
     assert!(!world
         .project
         .join(".claude/agents/relais-worker-sonnet-medium.md")

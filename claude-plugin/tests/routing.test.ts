@@ -3,7 +3,8 @@
 
 import { expect, test } from 'claude-code/testing'
 import { nativeCalls, settle, spawnLine, startQueued } from './support.ts'
-import { CLASSIFIER_SYSTEM, sha256Hex } from '../hooks/router.ts'
+import { CLASSIFIER_SYSTEM, createRouterMemory, newTask, outcomeOf, sha256Hex, unmatchedChecksOf, withUnmatchedChecks } from '../hooks/router.ts'
+import { noteRelaisLaunch } from '../hooks/routing.ts'
 import {
   answered,
   bash,
@@ -670,17 +671,111 @@ test('a subagent that ended before its parent is amended with the parent’s out
   await endSession($, engine)
   const records = nativeCalls(engine.calls, 'router-observe').flatMap((c: any) => c.payload.records)
   const sub = records.find((r: any) => r.kind === 'task' && r.agent_id === 'agent-1')
-  expect(sub.outcome).toBe('unknown')
+  expect(sub.outcome).toBe('answered')
   const outcomes = records.filter((r: any) => r.kind === 'task_outcome')
   expect(outcomes.map((r: any) => [r.task_id, r.agent_id, r.outcome])).toEqual([[sub.task_id, 'agent-1', 'completed_verified']])
   expect(records.indexOf(outcomes[0])).toBeGreaterThan(records.indexOf(sub))
+})
+
+test('a question task with no edit is recorded answered', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'what does this function do?')
+  await toolCall($, engine, bash('grep -rn foo src'), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  expect(observed(engine, 'task').map((r: any) => r.outcome)).toEqual(['answered'])
+})
+
+test('a sed -i keeps a task with no recorded edit unknown', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'what does this function do?')
+  await toolCall($, engine, bash("sed -i 's/a/b/' src/a.rs"), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  expect(observed(engine, 'task').map((r: any) => r.outcome)).toEqual(['unknown'])
+})
+
+test('a subagent the router did not create keeps the parent task unknown', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'what does this function do?')
+  await $.agent.spawn({ prompt: 'look around', description: 'look', subagentType: 'pinned-agent' })
+  await endSession($, engine)
+  expect(observed(engine, 'task').find((r: any) => r.agent_id === null).outcome).toBe('unknown')
+})
+
+test('a relais run or replay launched from the task keeps it unknown', () => {
+  const store: any = { router: createRouterMemory() }
+  store.router.task = newTask('t', null, 'what is this?', { kind: 'question', difficulty: 1, scope: 'local', uncertainty: 'low', verifiable: false, confidence: 0.9 } as any, 'research', 0)
+  expect(outcomeOf(store.router.task)).toBe('answered')
+  noteRelaisLaunch(store)
+  expect(store.router.task.maybeWrote).toBe(true)
+  expect(outcomeOf(store.router.task)).toBe('unknown')
+})
+
+test('the run tool launched in a routed session ends the task unknown', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'what does this function do?')
+  const reply = await $.tool.call({ tool: 'mcp__relais__run', task: 'fix-it.json', cwd: '/repo' })
+  expect(reply.result).toContain('Started relais run')
+  await startQueued(engine)
+  engine.stream.push('stdout', JSON.stringify({ relais: 'done', run: 'run-1', outcome: 'blocked' }) + '\n')
+  await settle(engine)
+  await engine.clock.advance(100)
+  await personTurn($, engine, 'and this one?')
+  await settle(engine)
+  expect(observed(engine, 'task').map((r: any) => r.outcome)).toEqual(['unknown'])
+})
+
+test('a run call refused for its workspace leaves the task answered', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'what does this function do?')
+  const reply = await $.tool.call({ tool: 'mcp__relais__run', task: 'fix-it.json', cwd: '/repo', workspace: 'everywhere' })
+  expect(reply.deny).toContain('auto, fork, in-place, isolated')
+  await endSession($, engine)
+  expect(observed(engine, 'task').map((r: any) => r.outcome)).toEqual(['answered'])
+})
+
+test('an answered parent sends no task_outcome', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  await $.agent.spawn({ prompt: 'rename in the module', description: 'rename foo', subagentType: 'general-purpose' })
+  await endSession($, engine)
+  expect(observed(engine, 'task').find((r: any) => r.agent_id === null).outcome).toBe('answered')
+  expect(observed(engine, 'task_outcome')).toEqual([])
+})
+
+test('a router-state whose accepts lacks answered gets the v0.35 form: answered is sent as unknown, and no version is asked', async ($: any, on: any) => {
+  const engine = await routedSession($, on, { state: { accepts: [] } })
+  await personTurn($, engine, 'what does this function do?')
+  await personTurn($, engine, 'and this one?')
+  await endSession($, engine)
+  const tasks = observed(engine, 'task')
+  expect(tasks.length).toBeGreaterThan(0)
+  expect(tasks.map((r: any) => r.outcome)).toEqual(tasks.map(() => 'unknown'))
+  expect(tasks.every((r: any) => r.completed_at_end !== 'answered')).toBe(true)
+  const asked = engine.calls.run.filter((c: any) => c.argv?.[1] === '--version')
+  expect(asked.length).toBe(0)
+})
+
+test('a router-state from a relais that predates accepts (0.38.0 and older) gets the v0.35 form', async ($: any, on: any) => {
+  const engine = await routedSession($, on, { state: { accepts: undefined } })
+  await personTurn($, engine, 'what does this function do?')
+  await toolCall($, engine, bash('make check'), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  const tasks = observed(engine, 'task')
+  expect(tasks.length).toBeGreaterThan(0)
+  for (const record of tasks) {
+    expect(record.outcome).not.toBe('answered')
+    expect('parent_task_id' in record).toBe(false)
+    expect('unmatched_checks' in record).toBe(false)
+  }
 })
 
 test('a parent whose outcome is unknown sends no task_outcome', async ($: any, on: any) => {
   const engine = await routedSession($, on)
   await personTurn($, engine, 'rename foo to bar, tests exist')
   await $.agent.spawn({ prompt: 'rename in the module', description: 'rename foo', subagentType: 'general-purpose' })
+  await toolCall($, engine, bash("sed -i 's/foo/bar/' src/a.rs"), { result: {}, text: 'ok' })
   await endSession($, engine)
+  expect(observed(engine, 'task').find((r: any) => r.agent_id === null).outcome).toBe('unknown')
   expect(observed(engine, 'task_outcome')).toEqual([])
 })
 
@@ -718,4 +813,137 @@ test('every decision carries the capability table’s version', async ($: any, o
   const decisions = observed(engine, 'decision')
   expect(decisions.length).toBe(2)
   expect(decisions.map((d: any) => d.table_version)).toEqual([1, 1])
+})
+
+test('a router-created subagent record carries its parent, a main task has none, and every record says the link was captured', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  await $.agent.spawn({ prompt: 'rename in the module', description: 'rename foo', subagentType: 'general-purpose' })
+  await endSession($, engine)
+  const tasks = observed(engine, 'task')
+  const main = tasks.find((r: any) => r.agent_id === null)
+  const sub = tasks.find((r: any) => r.agent_id === 'agent-1')
+  expect(main.parent_task_id).toBeNull()
+  expect(sub.parent_task_id).toBe(main.task_id)
+  expect(tasks.every((r: any) => r.parent_link_recorded === true)).toBe(true)
+})
+
+test('a spawn with no active parent task records a null parent', () => {
+  const task = newTask('t', 'a', 'x', { kind: 'question' } as any, 'research', 0)
+  expect(task.parentTaskId).toBeUndefined()
+  expect(newTask('t', 'a', 'x', { kind: 'question' } as any, 'research', 0, 'p').parentTaskId).toBe('p')
+})
+
+test('unmatched build and test commands keep only the argv prefix a person would paste into checks', () => {
+  const checks = [['cargo', 'test']]
+  const cases: [string, string[]][] = [
+    ['make check', ['make check']],
+    ['cargo nextest run', ['cargo nextest']],
+    ['npm run test', ['npm run test']],
+    ['uv run pytest', ['uv run pytest']],
+    ['pytest tests/x.py', ['pytest']],
+    ['make -C /p check', ['make']],
+    ['cargo +nightly build', ['cargo']],
+    ['cargo +nightly test', ['cargo']],
+    ['FOO=x make', ['make']],
+    ['cargo test --all', []],
+    ['ls -la', []],
+    ['cd /p && make lint; just fmt', ['make lint', 'just fmt']],
+  ]
+  for (const [command, expected] of cases) expect(unmatchedChecksOf(command, checks)).toEqual(expected)
+})
+
+test('a flag from a subdirectory stores one git-root entry, never the subdirectory name', async ($: any, on: any) => {
+  const engine = await routedSession($, on, { cwd: '/repo/packages/app' })
+  const base = engine.script.runResult
+  engine.script.runResult = (argv: string[], init: any) =>
+    argv[0] === 'git' && argv[1] === 'rev-parse' ? { ...succeeded, stdout: '/repo\n' } : base(argv, init)
+  await personTurn($, engine, 'what does this function do?')
+  await toolCall($, engine, bash('make check'), { result: {}, text: 'ok' })
+  await $.command.run({ command: 'relais-flag', args: '', origin: { kind: 'composer' }, presentation: { layout: 'main', columns: 120 } })
+  await endSession($, engine)
+  const entries = observed(engine, 'task').flatMap((record: any) => record.unmatched_checks)
+  expect(entries.length).toBeGreaterThan(0)
+  expect(new Set(entries)).toEqual(new Set(['repo: make check']))
+})
+
+test('a task keeps at most 5 distinct unmatched checks', () => {
+  let task = newTask('t', null, 'x', { kind: 'edit' } as any, 'research', 0)
+  task = withUnmatchedChecks(task, ['make a', 'make a', 'make b', 'make c', 'make d', 'make e', 'make f'])
+  expect(task.unmatchedChecks).toEqual(['make a', 'make b', 'make c', 'make d', 'make e'])
+  expect(withUnmatchedChecks(task, ['make g']).unmatchedChecks.length).toBe(5)
+})
+
+test('the task record names unmatched checks with the repository and nothing else', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  const base = engine.script.runResult
+  engine.script.runResult = (argv: string[], init: any) =>
+    argv[0] === 'git' && argv[1] === 'rev-parse' ? { ...succeeded, stdout: '/repo\n' } : base(argv, init)
+  await personTurn($, engine, 'what does this function do?')
+  await toolCall($, engine, bash('make -C /secret/path check --token abc'), { result: {}, text: 'ok' })
+  await toolCall($, engine, bash('cargo nextest run'), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  const [task] = observed(engine, 'task')
+  expect(task.unmatched_checks).toEqual(['repo: make', 'repo: cargo nextest'])
+})
+
+test('a git root whose name has a space sends no unmatched entry', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  const base = engine.script.runResult
+  engine.script.runResult = (argv: string[], init: any) =>
+    argv[0] === 'git' && argv[1] === 'rev-parse' ? { ...succeeded, stdout: '/my repo\n' } : base(argv, init)
+  await personTurn($, engine, 'what does this function do?')
+  await toolCall($, engine, bash('make check'), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  const tasks = observed(engine, 'task')
+  expect(tasks.length).toBeGreaterThan(0)
+  for (const record of tasks) expect(record.unmatched_checks).toEqual([])
+})
+
+test('a 41-byte script name ends the prefix', () => {
+  const longest = 'a'.repeat(40)
+  expect(unmatchedChecksOf(`npm run ${longest}`, [])).toEqual([`npm run ${longest}`])
+  expect(unmatchedChecksOf(`make ${'a'.repeat(41)}`, [])).toEqual(['make'])
+  expect(unmatchedChecksOf(`npm run ${'a'.repeat(41)}`, [])).toEqual(['npm run'])
+})
+
+test('a failing rev-parse from a subdirectory stores no unmatched entry', async ($: any, on: any) => {
+  const engine = await routedSession($, on, { cwd: '/repo/packages/app' })
+  const base = engine.script.runResult
+  engine.script.runResult = (argv: string[], init: any) =>
+    argv[0] === 'git' && argv[1] === 'rev-parse' ? { ...succeeded, exitCode: 128, stdout: '', stderr: 'fatal' } : base(argv, init)
+  await personTurn($, engine, 'what does this function do?')
+  await toolCall($, engine, bash('make check'), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  const tasks = observed(engine, 'task')
+  expect(tasks.length).toBeGreaterThan(0)
+  for (const record of tasks) expect(record.unmatched_checks).toEqual([])
+})
+
+test('a router-state that accepts answered alone gets the v0.35 form: the three fields go together', async ($: any, on: any) => {
+  const engine = await routedSession($, on, { state: { accepts: ['answered'] } })
+  await personTurn($, engine, 'what does this function do?')
+  await toolCall($, engine, bash('make check'), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  const tasks = observed(engine, 'task')
+  expect(tasks.length).toBeGreaterThan(0)
+  for (const record of tasks) {
+    expect(record.outcome).not.toBe('answered')
+    expect('parent_task_id' in record).toBe(false)
+    expect('unmatched_checks' in record).toBe(false)
+  }
+})
+
+test('a router-state whose accepts lacks answered receives none of the parent or unmatched fields', async ($: any, on: any) => {
+  const engine = await routedSession($, on, { state: { accepts: [] } })
+  await personTurn($, engine, 'what does this function do?')
+  await toolCall($, engine, bash('make check'), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  const tasks = observed(engine, 'task')
+  expect(tasks.length).toBeGreaterThan(0)
+  for (const record of tasks) {
+    expect('parent_task_id' in record).toBe(false)
+    expect('parent_link_recorded' in record).toBe(false)
+    expect('unmatched_checks' in record).toBe(false)
+  }
 })

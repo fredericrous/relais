@@ -22,7 +22,7 @@ export type Reason =
   | 'timeout_kept'
   | 'abstained'
   | 'cache_gate'
-export type Outcome = 'completed_verified' | 'completed_accepted' | 'corrected' | 'unknown'
+export type Outcome = 'completed_verified' | 'completed_accepted' | 'corrected' | 'answered' | 'unknown'
 export type ReassessEvent = 'failed_verification' | 'repair_failed' | 'scope_growth' | 'spawn' | 'correction' | 'flag' | 'revert'
 
 const KINDS: readonly Kind[] = ['question', 'edit', 'debug', 'design', 'review']
@@ -71,6 +71,10 @@ export type RouterState = {
   // The kind of each entry of `checks` (same order): test, lint or build.
   // Empty from a relais that predates it: the kind is then read off the argv.
   check_kinds: string[]
+  // What `router-observe` accepts beyond the v0.35 form (`answered`, the
+  // parent link, unmatched checks). Empty from a relais that predates it, so
+  // records go in the v0.35 form whatever the relais version number.
+  accepts: string[]
 }
 
 // What a check proves. `gate` is an amont stamp, read at task end.
@@ -97,6 +101,17 @@ export type TaskState = {
   escalations: number
   exhausted: boolean
   hasEdit: boolean
+  // Sticky: the task did something that could have written a file the hook
+  // cannot see (a Bash writer, a subagent the router did not create, a
+  // relais run or replay). With it a task with no recorded edit is `unknown`,
+  // never `answered`.
+  maybeWrote: boolean
+  // The task that spawned this one: set for a router-created subagent, absent
+  // for a main task or a spawn with no active parent.
+  parentTaskId?: string
+  // The argv prefixes of build or test commands that matched no check (at
+  // most UNMATCHED_CHECKS_MAX distinct), without the repository.
+  unmatchedChecks: string[]
   // Edits since the last verification, and whether the last verification
   // that counted as escalating evidence failed with no pass since.
   editedSinceCheck: boolean
@@ -326,6 +341,7 @@ export function parseRouterState(text: unknown): RouterState | undefined {
     pins: raw.pins && typeof raw.pins === 'object' ? raw.pins : {},
     excluded_models: Array.isArray(raw.excluded_models) ? raw.excluded_models.filter((m: unknown) => typeof m === 'string') : [],
     ...parseChecks(raw),
+    accepts: Array.isArray(raw.accepts) ? raw.accepts.filter((a: unknown) => typeof a === 'string') : [],
   }
 }
 
@@ -498,13 +514,13 @@ const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value))
 
 // --- tasks ------------------------------------------------------------------
 
-export function newTask(id: string, agentId: string | null, opening: string, c: Class, tier: Tier, now: number): TaskState {
+export function newTask(id: string, agentId: string | null, opening: string, taskClass: Class, tier: Tier, now: number, parentTaskId?: string): TaskState {
   return {
     id,
     agentId,
     opening: clip(opening, OPENING_BYTES),
     startedAt: now,
-    class: c,
+    class: taskClass,
     tier,
     effort: null,
     override: true,
@@ -514,6 +530,9 @@ export function newTask(id: string, agentId: string | null, opening: string, c: 
     escalations: 0,
     exhausted: false,
     hasEdit: false,
+    maybeWrote: false,
+    ...(parentTaskId ? { parentTaskId } : {}),
+    unmatchedChecks: [],
     editedSinceCheck: false,
     lastCountedFailure: false,
     verifications: [],
@@ -756,6 +775,96 @@ export function checkIndex(command: string, checks: string[][]): number | undefi
     if (at >= 0) return at
   }
   return undefined
+}
+
+const UNMATCHED_CHECKS_MAX = 5
+const RUNNER_PROGRAMS = ['make', 'just', 'cargo', 'npm', 'pnpm', 'yarn', 'bun', 'go', 'pytest', 'uv', 'mvn', 'gradle', './gradlew', 'deno', 'tox', 'nox']
+const SUBCOMMAND = /^[a-z][a-z0-9:_-]*$/
+const SUBCOMMAND_MAX_BYTES = 40
+const REPOSITORY_MAX_BYTES = 100
+
+function isSubcommandWord(word: string | undefined): word is string {
+  return word !== undefined && encoder.encode(word).length <= SUBCOMMAND_MAX_BYTES && SUBCOMMAND.test(word)
+}
+
+// The argv prefixes of the build or test runners a command starts that no
+// check covers: what a person would paste into `checks`, and nothing more.
+// Leading assignments and flags are skipped, then the program, the next word
+// when it looks like a subcommand, and after `run` or `exec` one more. No
+// path, flag or value is kept. A command a check covers has none.
+export function unmatchedChecksOf(command: string, checks: string[][]): string[] {
+  if (checkIndex(command, checks) !== undefined) return []
+  const found: string[] = []
+  for (const segment of command.split(/&&|\|\||\||;|\n/)) {
+    const argv = words(segment.trim())
+    while (argv.length > 0 && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[0]) || argv[0].startsWith('-'))) argv.shift()
+    const program = argv[0]
+    if (program === undefined || !RUNNER_PROGRAMS.includes(program)) continue
+    const prefix = [program]
+    if (isSubcommandWord(argv[1])) {
+      prefix.push(argv[1])
+      if ((argv[1] === 'run' || argv[1] === 'exec') && isSubcommandWord(argv[2])) prefix.push(argv[2])
+    }
+    found.push(prefix.join(' '))
+  }
+  return found
+}
+
+// `task` with `prefixes` added to its unmatched checks: distinct, at most
+// UNMATCHED_CHECKS_MAX, the first ones kept.
+export function withUnmatchedChecks(task: TaskState, prefixes: string[]): TaskState {
+  const merged = [...new Set([...task.unmatchedChecks, ...prefixes])].slice(0, UNMATCHED_CHECKS_MAX)
+  return merged.length === task.unmatchedChecks.length ? task : { ...task, unmatchedChecks: merged }
+}
+
+// The last path word of a directory: the repository name when it is the git
+// root.
+export const repositoryName = (directory: string): string => directory.replace(/\/+$/, '').replace(/^.*\//, '')
+
+// Drops, in place, the programs that only run another one (`env`, `xargs`,
+// `npx`, `bunx`, `pnpm exec`, `uv run`) with their flags and assignments, so
+// the program they run is the one judged.
+function stripLauncher(argv: string[]) {
+  for (;;) {
+    const program = (argv[0] ?? '').replace(/^.*\//, '')
+    const runs = program === 'pnpm' ? argv[1] === 'exec' : program === 'uv' ? argv[1] === 'run' : ['env', 'xargs', 'npx', 'bunx'].includes(program)
+    if (!runs) return
+    argv.splice(0, program === 'pnpm' || program === 'uv' ? 2 : 1)
+    while (argv.length > 0 && (argv[0].startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[0]))) argv.shift()
+  }
+}
+
+// Whether a Bash command may write a file: a `sed -i`, a redirection or
+// `tee`, a `git` command that changes the tree, a formatter with a write
+// flag, or a plain file-changing program. A guess toward "yes": a task that
+// might have written is `unknown`, never `answered`.
+export function mayWrite(command: string): boolean {
+  for (const segment of command.split(/&&|\|\||\||;|\n/)) {
+    const text = segment.trim().replace(/\d*>&\d+/g, '').replace(/\d*>>?\s*\/dev\/null/g, '')
+    if (/(^|[^<>=-])>>?(?![>&=])/.test(text)) return true
+    const argv = words(text)
+    while (argv.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[0])) argv.shift()
+    if (argv.length === 0) continue
+    stripLauncher(argv)
+    if (argv.length === 0) continue
+    const program = argv[0].replace(/^.*\//, '')
+    const rest = argv.slice(1)
+    if (['tee', 'mv', 'cp', 'rm', 'touch', 'patch', 'truncate', 'install', 'ln'].includes(program)) return true
+    if (program === 'sed' && rest.some(w => /^-[a-zA-Z]*i/.test(w) || w === '--in-place' || w.startsWith('--in-place='))) return true
+    if (program === 'git' && rest.some(w => ['apply', 'checkout', 'commit', 'merge', 'rebase', 'restore', 'reset', 'stash', 'cherry-pick', 'revert', 'pull', 'switch', 'am', 'rm', 'mv', 'clean'].includes(w))) return true
+    const writeFlag = rest.some(w => w === '--write' || w === '--fix' || w === '--apply' || w === '-w' || w === '-i')
+    const checkFlag = rest.some(w => w === '--check' || w === '--diff' || w === '--dry-run' || w === '-l')
+    if (['prettier', 'biome', 'eslint', 'gofmt', 'goimports', 'rustfmt', 'ruff', 'black', 'isort', 'clang-format'].includes(program)) {
+      if (writeFlag || (['rustfmt', 'black', 'isort'].includes(program) && !checkFlag)) return true
+    }
+    if (program === 'cargo' && (rest[0] === 'fmt' || rest[0] === 'fix') && !checkFlag) return true
+    if (program === 'go' && rest[0] === 'fmt') return true
+    if (program === 'cargo' && rest[0] === 'clippy' && rest.includes('--fix')) return true
+    if (program === 'perl' && rest.some(w => /^-[a-zA-Z]*i/.test(w))) return true
+    if (program === 'relais' && rest[0] === 'run') return true
+    if (program === 'relais' && rest[0] === 'dataset' && rest[1] === 'replay' && !rest.includes('--dry-run')) return true
+  }
+  return false
 }
 
 // What a finished tool call says, or undefined when it is no evidence.
@@ -1067,7 +1176,10 @@ export function outcomeOf(task: TaskState): Outcome {
   const last = task.verifications[task.verifications.length - 1]
   if ((last && last.passed) || task.relaisAccepted) return 'completed_verified'
   if (task.acceptQuote !== null) return 'completed_accepted'
-  return 'unknown'
+  // Nothing was edited and nothing could have been: a question, a review.
+  // An aborted task says nothing about what it would have done.
+  if (task.hasEdit || task.files.length > 0 || task.maybeWrote || task.inferred.includes('aborted')) return 'unknown'
+  return 'answered'
 }
 
 // --- records (docs/router-protocol.md) ---------------------------------------------
@@ -1194,7 +1306,8 @@ export function reassessRecord(task: TaskState, r: ReassessRecord, now: number) 
   return { kind: 'reassess', task_id: task.id, agent_id: task.agentId, ...r, at: iso(now) }
 }
 
-export function taskRecord(task: TaskState, endedAt: number | null, cwd: string | undefined) {
+export function taskRecord(task: TaskState, endedAt: number | null, cwd: string | undefined, repository?: string) {
+  const repositoryOfTask = repository ?? ''
   const outcome = outcomeOf(task)
   return {
     kind: 'task',
@@ -1214,6 +1327,10 @@ export function taskRecord(task: TaskState, endedAt: number | null, cwd: string 
     turns: task.turns,
     explicit_quote: task.explicitQuote,
     checks: task.verifications.map(v => ({ name: v.command, kind: v.kind ?? 'test', passed: v.passed })),
+    parent_task_id: task.parentTaskId ?? null,
+    // Dates are not evidence of capture: a record says it carries the link.
+    parent_link_recorded: true,
+    unmatched_checks: repositoryOfTask === '' || /\s/.test(repositoryOfTask) || encoder.encode(repositoryOfTask).length > REPOSITORY_MAX_BYTES ? [] : task.unmatchedChecks.map(prefix => `${repositoryOfTask}: ${prefix}`),
   }
 }
 
@@ -1292,6 +1409,8 @@ export type RouterMemory = {
   lastContext: number
   queue: { session: string; record: unknown }[]
   status: string | undefined
+  // The git-root name of `cwd` once asked, for the unmatched checks.
+  repository: { cwd: string; name: string } | undefined
 }
 
 export const createRouterMemory = (): RouterMemory => ({
@@ -1312,6 +1431,7 @@ export const createRouterMemory = (): RouterMemory => ({
   lastContext: 0,
   queue: [],
   status: undefined,
+  repository: undefined,
 })
 
 // The status line's routing part.

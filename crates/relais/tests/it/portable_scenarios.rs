@@ -103,6 +103,22 @@ impl World {
         self
     }
 
+    /// A `claude` that answers its two listings from files under
+    /// `tests/fixtures/claude-plugin`.
+    #[cfg(unix)]
+    fn with_listings(mut self, plugins: &str, marketplaces: &str) -> Self {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude-plugin");
+        let claude = self.root.join("claude");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1 $2 $3\" in\n\"plugin list --json\") cat '{}';;\n\"plugin marketplace list\") cat '{}';;\nesac\nexit 0\n",
+            dir.join(plugins).display(),
+            dir.join(marketplaces).display()
+        );
+        fake_bin::install_script(&claude, &script);
+        self.claude = claude;
+        self
+    }
+
     /// The binary, in this world. `RELAIS_CLAUDE_BIN` names a path that
     /// does not exist, so "the harness is missing" is a fact of the
     /// scenario rather than a fact about the machine running it — and
@@ -375,15 +391,14 @@ fn install_is_preview_first_and_uninstall_keeps_foreign_and_modified_files() {
     assert!(text(&preview.stdout).contains("preview only"));
     assert!(!world
         .repo
-        .join(".claude/skills/relais-verified-push/SKILL.md")
+        .join(".claude/agents/relais-research.md")
         .exists());
     std::fs::create_dir_all(world.repo.join(".claude/agents")).expect("mkdir");
     std::fs::write(world.repo.join(".claude/agents/custom.md"), "# mine\n").expect("foreign");
     let write = world.relais(&["install", "--claude", "--write"]);
     assert_eq!(write.status.code(), Some(0), "{}", text(&write.stderr));
-    let skill = world
-        .repo
-        .join(".claude/skills/relais-verified-push/SKILL.md");
+    assert!(!world.repo.join(".claude/skills").exists());
+    let skill = world.repo.join(".claude/agents/relais-implementation.md");
     assert!(skill.exists());
     assert!(world
         .repo
@@ -2138,4 +2153,95 @@ fn a_ledger_holding_headless_era_rows_still_reads() {
     );
     let report = world.relais(&["report"]);
     assert_eq!(report.status.code(), Some(0), "{}", text(&report.stderr));
+}
+
+/// `doctor --json`'s `integration` object and its `plugin` finding, with
+/// the fake `claude` answering in the shapes Claude Code 2.1.312 prints
+/// (`tests/fixtures/claude-plugin`).
+#[cfg(unix)]
+#[test]
+fn doctor_json_describes_the_integration_from_real_listings() {
+    let cases = [
+        (
+            "user",
+            "plugin-list-user.json",
+            "marketplace-list-relais.json",
+            "present",
+            true,
+        ),
+        (
+            "project",
+            "plugin-list-project.json",
+            "marketplace-list-relais.json",
+            "present",
+            true,
+        ),
+        (
+            "plugin-only",
+            "plugin-list-user.json",
+            "marketplace-list-empty.json",
+            "partial",
+            true,
+        ),
+        (
+            "market-only",
+            "plugin-list-empty.json",
+            "marketplace-list-relais.json",
+            "partial",
+            false,
+        ),
+        (
+            "absent",
+            "plugin-list-empty.json",
+            "marketplace-list-empty.json",
+            "absent",
+            false,
+        ),
+    ];
+    for (tag, plugins, marketplaces, state, has_plugin) in cases {
+        let world = World::new(&format!("integ-{tag}")).with_listings(plugins, marketplaces);
+        let out = world.relais(&["doctor", "--json"]);
+        let doc: serde_json::Value =
+            serde_json::from_str(text(&out.stdout).trim()).expect("doctor --json");
+        let integration = &doc["integration"];
+        assert_eq!(integration["state"], state, "{tag}");
+        assert_eq!(
+            integration["plugin_version"],
+            if has_plugin {
+                "0.38.0".into()
+            } else {
+                serde_json::Value::Null
+            },
+            "{tag}"
+        );
+        assert!(integration.get("reason").is_none(), "{tag}: {integration}");
+        let finding = doc["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .find(|f| f["component"] == "plugin")
+            .expect("plugin finding");
+        let finding_detail = finding["detail"].as_str().expect("detail");
+        assert_eq!(
+            finding_detail.contains("not installed") || finding_detail.contains("is not"),
+            !has_plugin,
+            "{tag}: {finding_detail}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_json_says_why_the_integration_is_unknown() {
+    let malformed = World::new("integ-malformed")
+        .with_listings("plugin-list-malformed.txt", "marketplace-list-relais.json");
+    let missing = World::new("integ-missing");
+    for (tag, world) in [("malformed", malformed), ("missing claude", missing)] {
+        let out = world.relais(&["doctor", "--json"]);
+        let doc: serde_json::Value =
+            serde_json::from_str(text(&out.stdout).trim()).expect("doctor --json");
+        assert_eq!(doc["integration"]["state"], "unknown", "{tag}");
+        let reason = doc["integration"]["reason"].as_str().unwrap_or_default();
+        assert!(!reason.is_empty(), "{tag}: {doc}");
+    }
 }

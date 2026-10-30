@@ -212,7 +212,7 @@ pub(super) fn apply_step(conn: &Connection, version: &str, sql: &str, now: &str)
     Ok(())
 }
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 45;
+pub const LEDGER_SCHEMA_VERSION: u64 = 46;
 
 #[cfg(test)]
 mod tests {
@@ -956,8 +956,8 @@ mod tests {
             .expect("a v38 row");
         }
         let ledger = Ledger::open(&path).expect("upgrade to current schema");
-        assert_eq!(ledger.schema_version().expect("version"), 45);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 45);
+        assert_eq!(ledger.schema_version().expect("version"), 46);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 46);
         let tables: Vec<String> = ledger
             .conn
             .prepare(
@@ -1022,8 +1022,8 @@ mod tests {
             .expect("a run written at v40");
         }
         let ledger = Ledger::open(&path).expect("upgrade to v41");
-        assert_eq!(ledger.schema_version().expect("version"), 45);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 45);
+        assert_eq!(ledger.schema_version().expect("version"), 46);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 46);
         let runs: i64 = ledger
             .conn
             .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
@@ -1080,8 +1080,8 @@ mod tests {
             .expect("an intent written at v41");
         }
         let ledger = Ledger::open(&path).expect("upgrade to v42");
-        assert_eq!(ledger.schema_version().expect("version"), 45);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 45);
+        assert_eq!(ledger.schema_version().expect("version"), 46);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 46);
         let runs: i64 = ledger
             .conn
             .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
@@ -1136,7 +1136,7 @@ mod tests {
             .expect("a run written at v42");
         }
         let ledger = Ledger::open(&path).expect("upgrade to v43");
-        assert_eq!(ledger.schema_version().expect("version"), 45);
+        assert_eq!(ledger.schema_version().expect("version"), 46);
         let runs: i64 = ledger
             .conn
             .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
@@ -1184,7 +1184,7 @@ mod tests {
             .expect("a run written at v43");
         }
         let ledger = Ledger::open(&path).expect("upgrade to v44");
-        assert_eq!(ledger.schema_version().expect("version"), 45);
+        assert_eq!(ledger.schema_version().expect("version"), 46);
         let runs: i64 = ledger
             .conn
             .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
@@ -1202,10 +1202,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
     }
 
-    /// v45 adds `source` to the holdout tables: rows written at v44 read
-    /// back as `named`.
+    /// v45 backfills `answered` onto ended, unaborted, file-free question
+    /// and review rows only, and its undo SQL restores them.
     #[test]
-    fn a_v44_ledger_reads_its_holdout_rows_as_named() {
+    fn v45_backfills_only_ended_file_free_question_and_review_rows() {
         let dir = temp_dir("v44-to-v45");
         let path = dir.join("ledger.sqlite");
         {
@@ -1217,7 +1217,153 @@ mod tests {
                 );",
             )
             .expect("migrations table");
-            assert_eq!(MIGRATIONS[43].0, "v44", "pinned to v44");
+            assert_eq!(MIGRATIONS[44].0, "v45", "pinned to v45");
+            for (version, sql) in &MIGRATIONS[..44] {
+                conn.execute_batch(sql).expect("apply step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "then"],
+                )
+                .expect("record step");
+            }
+            let rows: [(&str, Option<&str>, &str, &str, &str); 8] = [
+                (
+                    "question",
+                    Some("2026-10-01T00:00:00Z"),
+                    "[]",
+                    "[]",
+                    "unknown",
+                ),
+                (
+                    "review",
+                    Some("2026-10-01T00:00:00Z"),
+                    "[]",
+                    r#"["respawned"]"#,
+                    "unknown",
+                ),
+                (
+                    "question",
+                    Some("2026-10-01T00:00:00Z"),
+                    "[]",
+                    r#"["aborted"]"#,
+                    "unknown",
+                ),
+                ("question", None, "[]", "[]", "unknown"),
+                ("debug", Some("2026-10-01T00:00:00Z"), "[]", "[]", "unknown"),
+                (
+                    "question",
+                    Some("2026-10-01T00:00:00Z"),
+                    r#"["abc"]"#,
+                    "[]",
+                    "unknown",
+                ),
+                (
+                    "question",
+                    Some("2026-10-01T00:00:00Z"),
+                    "[]",
+                    "[]",
+                    "corrected",
+                ),
+                (
+                    "review",
+                    Some("2026-10-01T00:00:00Z"),
+                    "[]",
+                    r#"["aborted_late"]"#,
+                    "unknown",
+                ),
+            ];
+            for (index, (kind, ended, files, inferred, outcome)) in rows.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO router_tasks (session, task_id, agent_id, started_at, ended_at,
+                        class_kind, outcome, outcome_rank, inferred_json, files_json,
+                        escalations, exhausted, turns, recorded_at, updated_at, outcome_source,
+                        completed_at_end)
+                     VALUES ('s', ?1, '', '2026-10-01T00:00:00Z', ?2, ?3, ?4, 0, ?5, ?6,
+                        0, 0, 1, 'now', 'now', 'own', ?4)",
+                    params![format!("t{index}"), ended, kind, outcome, inferred, files],
+                )
+                .expect("a task written at v44");
+            }
+        }
+        let ledger = Ledger::open(&path).expect("upgrade to v45");
+        assert_eq!(ledger.schema_version().expect("version"), 46);
+        let answered = |ledger: &Ledger| -> Vec<String> {
+            let mut stmt = ledger
+                .conn
+                .prepare(
+                    "SELECT task_id FROM router_tasks WHERE outcome = 'answered' ORDER BY task_id",
+                )
+                .expect("prepare");
+            stmt.query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<std::result::Result<Vec<String>, _>>()
+                .expect("rows")
+        };
+        assert_eq!(answered(&ledger), ["t0", "t1", "t7"]);
+        let marked: i64 = ledger
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM router_tasks WHERE outcome_source = 'backfill_v45'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(marked, 3);
+        let ends = |ledger: &Ledger, wanted: &str| -> Vec<String> {
+            let mut stmt = ledger
+                .conn
+                .prepare(
+                    "SELECT task_id FROM router_tasks WHERE completed_at_end = ?1 ORDER BY task_id",
+                )
+                .expect("prepare");
+            stmt.query_map([wanted], |row| row.get(0))
+                .expect("query")
+                .collect::<std::result::Result<Vec<String>, _>>()
+                .expect("rows")
+        };
+        assert_eq!(ends(&ledger, "answered"), ["t0", "t1", "t7"]);
+        assert_eq!(ends(&ledger, "corrected"), ["t6"]);
+        ledger
+            .conn
+            .execute(
+                "UPDATE router_tasks
+                    SET outcome = 'unknown', outcome_source = 'own',
+                        completed_at_end = CASE WHEN completed_at_end = 'answered'
+                                                THEN 'unknown' ELSE completed_at_end END
+                  WHERE outcome_source = 'backfill_v45'",
+                [],
+            )
+            .expect("undo");
+        assert!(ends(&ledger, "answered").is_empty());
+        assert_eq!(ends(&ledger, "unknown").len(), 7);
+        assert!(answered(&ledger).is_empty());
+        let unknown: i64 = ledger
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM router_tasks WHERE outcome = 'unknown' AND outcome_source = 'own'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(unknown, 7);
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+    }
+
+    /// v45 adds the parent link and unmatched-check columns, and a task
+    /// written at v44 reads back with their defaults.
+    #[test]
+    fn v45_adds_the_parent_and_unmatched_check_columns_with_their_defaults() {
+        let dir = temp_dir("v44-to-v45-columns");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
             for (version, sql) in &MIGRATIONS[..44] {
                 conn.execute_batch(sql).expect("apply step");
                 conn.execute(
@@ -1227,38 +1373,28 @@ mod tests {
                 .expect("record step");
             }
             conn.execute(
-                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
-                 VALUES ('run-old', '/repo', 'accepted', 'now', 'now')",
+                "INSERT INTO router_tasks (session, task_id, agent_id, started_at, ended_at,
+                    class_kind, outcome, outcome_rank, inferred_json, files_json,
+                    escalations, exhausted, turns, recorded_at, updated_at, outcome_source,
+                    completed_at_end)
+                 VALUES ('s', 't0', 'a', '2026-10-01T00:00:00Z', NULL, 'debug', 'unknown', 0,
+                    '[]', '[]', 0, 0, 1, 'now', 'now', 'own', NULL)",
                 [],
             )
-            .expect("a run written at v44");
-            conn.execute(
-                "INSERT INTO holdout_definitions (run_id, name, definition_json, digest)
-                 VALUES ('run-old', 'h', '{}', 'd')",
-                [],
-            )
-            .expect("a definition written at v44");
-            conn.execute(
-                "INSERT INTO holdout_outcomes
-                    (run_id, label_kind, attempt_index, name, outcome, profile_green)
-                 VALUES ('run-old', 'attempt', 1, 'h', 'passed', 1)",
-                [],
-            )
-            .expect("an outcome written at v44");
+            .expect("a task written at v44");
         }
         let ledger = Ledger::open(&path).expect("upgrade to v45");
-        assert_eq!(ledger.schema_version().expect("version"), 45);
-        for table in ["holdout_definitions", "holdout_outcomes"] {
-            let sources: Vec<String> = ledger
-                .conn
-                .prepare(&format!("SELECT source FROM {table}"))
-                .expect("prepare")
-                .query_map([], |row| row.get(0))
-                .expect("query")
-                .collect::<std::result::Result<_, _>>()
-                .expect("rows");
-            assert_eq!(sources, vec!["named".to_string()], "{table}");
-        }
+        assert_eq!(ledger.schema_version().expect("version"), 46);
+        let (parent, recorded, unmatched): (Option<String>, i64, Option<String>) = ledger
+            .conn
+            .query_row(
+                "SELECT parent_task_id, parent_link_recorded, unmatched_checks_json
+                   FROM router_tasks WHERE task_id = 't0'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("the three columns exist");
+        assert_eq!((parent, recorded, unmatched), (None, 0, None));
         std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
     }
 
@@ -1706,5 +1842,65 @@ mod tests {
             .expect("count");
         assert_eq!(applied, 26, "the ledger stays at v26");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v46 adds `source` to the holdout tables: rows written at v45 read
+    /// back as `named`.
+    #[test]
+    fn a_v45_ledger_reads_its_holdout_rows_as_named() {
+        let dir = temp_dir("v45-to-v46");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            assert_eq!(MIGRATIONS[44].0, "v45", "pinned to v45");
+            for (version, sql) in &MIGRATIONS[..45] {
+                conn.execute_batch(sql).expect("apply step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "then"],
+                )
+                .expect("record step");
+            }
+            conn.execute(
+                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES ('run-old', '/repo', 'accepted', 'now', 'now')",
+                [],
+            )
+            .expect("a run written at v45");
+            conn.execute(
+                "INSERT INTO holdout_definitions (run_id, name, definition_json, digest)
+                 VALUES ('run-old', 'h', '{}', 'd')",
+                [],
+            )
+            .expect("a definition written at v45");
+            conn.execute(
+                "INSERT INTO holdout_outcomes
+                    (run_id, label_kind, attempt_index, name, outcome, profile_green)
+                 VALUES ('run-old', 'attempt', 1, 'h', 'passed', 1)",
+                [],
+            )
+            .expect("an outcome written at v45");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade to v46");
+        assert_eq!(ledger.schema_version().expect("version"), 46);
+        for table in ["holdout_definitions", "holdout_outcomes"] {
+            let sources: Vec<String> = ledger
+                .conn
+                .prepare(&format!("SELECT source FROM {table}"))
+                .expect("prepare")
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<std::result::Result<_, _>>()
+                .expect("rows");
+            assert_eq!(sources, vec!["named".to_string()], "{table}");
+        }
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
     }
 }

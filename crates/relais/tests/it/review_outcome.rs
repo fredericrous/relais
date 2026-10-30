@@ -441,6 +441,9 @@ fn seed_router_task(ledger: &Ledger, session: &str, task_id: &str, agent_id: &st
                 explicit_quote: None,
                 outcome_source: Some("own".into()),
                 checks: vec![],
+                parent_task_id: None,
+                parent_link_recorded: false,
+                unmatched_checks: vec![],
             })],
         )
         .expect("router task");

@@ -12,6 +12,7 @@ import {
   fileHash,
   gateChecks,
   matchesCheck,
+  mayWrite,
   modeEffective,
   newTask,
   onEvidence,
@@ -285,11 +286,32 @@ test('reverts: git revert, checkout -- paths and restore are found; a branch swi
 
 test('outcomes: corrected outranks verified; an accept is completed_accepted; inferred signals are no outcome', () => {
   const task = newTask('t', null, 'x', asClass(), 'research', 0)
-  expect(outcomeOf(task)).toBe('unknown')
+  expect(outcomeOf(task)).toBe('answered')
+  expect(outcomeOf({ ...task, inferred: ['no_complaint'] })).toBe('answered')
   expect(outcomeOf({ ...task, inferred: ['aborted', 'no_complaint'] })).toBe('unknown')
   expect(outcomeOf({ ...task, acceptQuote: 'ship it' })).toBe('completed_accepted')
   expect(outcomeOf({ ...task, relaisAccepted: true })).toBe('completed_verified')
   expect(outcomeOf({ ...task, corrected: true, relaisAccepted: true })).toBe('corrected')
+})
+
+test('outcomes: a task that edited or might have written is unknown, never answered', () => {
+  const task = newTask('t', null, 'x', asClass(), 'research', 0)
+  expect(outcomeOf({ ...task, hasEdit: true, files: ['/r/a.rs'] })).toBe('unknown')
+  // An edit with no file (a notebook call without a path) is still an edit.
+  expect(outcomeOf({ ...task, hasEdit: true, files: [] })).toBe('unknown')
+  expect(outcomeOf({ ...task, maybeWrote: true })).toBe('unknown')
+  expect(outcomeOf({ ...task, hasEdit: true, files: ['/r/a.rs'], verifications: [{ command: 'cargo test', passed: true }] })).toBe('completed_verified')
+  expect(outcomeOf({ ...task, maybeWrote: true, acceptQuote: 'ship it' })).toBe('completed_accepted')
+  expect(outcomeOf({ ...task, maybeWrote: true, corrected: true })).toBe('corrected')
+})
+
+test('mayWrite: sed -i, redirections, tee, git writers and formatters write; reads do not', () => {
+  for (const command of ['sed -i s/a/b/ f', "sed -i '' s/a/b/ f", 'echo x > f', 'cat a >> b', 'ls | tee out', 'git apply p.diff', 'git commit -m x', 'git -C r checkout main', 'cargo fmt', 'prettier --write .', 'FOO=1 rm -f x', 'relais run --task t.json', 'relais dataset replay --recipe r', 'git rm f', 'git mv a b', 'git clean -fd', 'env FOO=1 rm x', 'env -i sed -i s/a/b/ f', 'xargs rm', 'npx prettier --write .', 'bunx prettier --write .', 'pnpm exec prettier --write .', 'uv run black .', 'perl -i -pe s/a/b/ f', 'perl -pi -e s/a/b/ f', 'cargo clippy --fix']) {
+    expect(mayWrite(command)).toBe(true)
+  }
+  for (const command of ['sed -n 1,5p f', 'grep -rn foo . 2>/dev/null', 'ls 2>&1', 'git status && git diff', 'git log --oneline', 'cargo fmt --check', 'cat f | head', 'cargo test', 'relais dataset replay --recipe r --dry-run', 'relais --version']) {
+    expect(mayWrite(command)).toBe(false)
+  }
 })
 
 test('a spawn: pins are kept, the person’s model honoured, low confidence abstains, the table routes', () => {
@@ -313,6 +335,13 @@ test('router-state that does not parse, or names no tier models, is none', () =>
   expect(parseRouterState('nope')).toBe(undefined)
   expect(parseRouterState(JSON.stringify({ ...ROUTER_STATE, schema: 2 }))).toBe(undefined)
   expect(parseRouterState(JSON.stringify({ ...ROUTER_STATE, tiers: { research: { model: 'x' } } }))).toBe(undefined)
+})
+
+test('router-state accepts keeps its strings, and is empty from a relais that predates it', () => {
+  expect(state.accepts).toEqual(['answered', 'parent_task_id', 'unmatched_checks'])
+  const { accepts: _, ...older } = ROUTER_STATE
+  expect(parseRouterState(JSON.stringify(older))!.accepts).toEqual([])
+  expect(parseRouterState(JSON.stringify({ ...ROUTER_STATE, accepts: ['answered', 3, null] }))!.accepts).toEqual(['answered'])
 })
 
 // --- exploration (learning-loop Phase 4) ---------------------------------------
