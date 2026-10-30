@@ -331,7 +331,8 @@ fn plan_lists_an_attached_holdout_on_a_reachable_store_in_json_and_human_output(
     );
     let machine = ATTACHED_ESCAPING.replace(
         "store = \"unused\"",
-        &format!("store = \"{}\"\nref = \"HEAD\"", store_dir.display()),
+        // A TOML literal string: a Windows path's backslashes are not escapes.
+        &format!("store = '{}'\nref = \"HEAD\"", store_dir.display()),
     );
     assert_ne!(machine, ATTACHED_ESCAPING);
     let acceptance = serde_json::json!(["src/main.rs no longer exists"]);
