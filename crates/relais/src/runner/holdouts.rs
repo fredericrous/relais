@@ -119,17 +119,8 @@ impl<'a> RunEngine<'a> {
         runs: &[HoldoutRun],
         profile_green: bool,
     ) -> Result<(), String> {
-        let attached = self
-            .config
-            .ledger
-            .attached_holdout_definitions(&self.run_id)
-            .map_err(|e| format!("the ledger refused to list the attached holdouts: {e}"))?;
         for run in runs {
-            let source = if attached.iter().any(|held| held.name == run.name) {
-                holdout::HoldoutSource::Attached
-            } else {
-                holdout::HoldoutSource::Named
-            };
+            let source = run.source.unwrap_or(holdout::HoldoutSource::Named);
             self.config
                 .ledger
                 .record_holdout_outcome(
@@ -280,8 +271,8 @@ impl<'a> RunEngine<'a> {
             .iter()
             .map(|holdout| holdout::fetch(holdout, &root, &|| self.budgets.remaining()))
             .collect();
-        let is_attached =
-            |holdout: &ResolvedHoldout| attached.iter().any(|held| held.name == holdout.name);
+        let is_attached_name = |name: &str| attached.iter().any(|held| held.name == name);
+        let is_attached = |holdout: &ResolvedHoldout| is_attached_name(&holdout.name);
         if let Some(e) = live
             .iter()
             .zip(&fetched)
@@ -391,7 +382,18 @@ impl<'a> RunEngine<'a> {
                 }
             }
         }
-        ran.into_iter().collect()
+        ran.into_iter()
+            .map(|run| {
+                run.map(|run| HoldoutRun {
+                    source: Some(if is_attached_name(&run.name) {
+                        holdout::HoldoutSource::Attached
+                    } else {
+                        holdout::HoldoutSource::Named
+                    }),
+                    ..run
+                })
+            })
+            .collect()
     }
 
     /// Make the holdout's verification copy, set it up and place its

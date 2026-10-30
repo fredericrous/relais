@@ -310,6 +310,7 @@ fn a_passing_holdout_settles_its_criterion_and_is_listed_on_the_receipt() {
         panic!("{:?}", receipt.holdouts);
     };
     assert_eq!(run.name, "escaping");
+    assert_eq!(run.source, Some(crate::holdout::HoldoutSource::Named));
     assert_eq!(run.outcome, crate::verify::HoldoutVerdict::Passed);
     assert_eq!(run.tests.len(), 1);
     assert_eq!(run.tests[0].id, "h::escapes");
@@ -2081,6 +2082,7 @@ fn an_attached_holdout_runs_records_source_attached_and_settles_its_criterion() 
         panic!("{:?}", receipt.holdouts);
     };
     assert_eq!(run.name, "escaping");
+    assert_eq!(run.source, Some(crate::holdout::HoldoutSource::Attached));
     let attached = receipt
         .criteria
         .iter()
