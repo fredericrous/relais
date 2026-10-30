@@ -50,11 +50,30 @@ pub(crate) fn note_held_repair_effort(report: &mut doctor::DoctorReport) {
     }
 }
 
+/// What `relais doctor --json` prints: the findings, and the Claude Code
+/// integration described apart from them.
+#[derive(serde::Serialize)]
+struct DoctorDocument<'a> {
+    #[serde(flatten)]
+    report: &'a doctor::DoctorReport,
+    integration: relais::install::plugin::Integration,
+}
+
 pub(crate) fn doctor_command(json: bool) -> Result<CliOutcome, CliError> {
-    let mut report = doctor::doctor(&project_dir()?);
+    use relais::install::plugin::Claude;
+    let claude = Claude::discover();
+    let listing = claude
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(Claude::installed);
+    let integration = relais::install::plugin::integration(&claude, &listing);
+    let mut report = doctor::doctor(&project_dir()?, listing);
     note_held_repair_effort(&mut report);
     if json {
-        print_document(&report)?;
+        print_document(&DoctorDocument {
+            report: &report,
+            integration,
+        })?;
     } else {
         print!("{}", report.render());
     }

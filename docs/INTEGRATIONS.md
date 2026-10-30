@@ -1,7 +1,6 @@
 # The Claude Code hook integration
 
-`relais install --claude` writes three advisory agent definitions and two
-skills — `/relais-verified-push` and `/relais-architecture-conflict` — and
+`relais install --claude` writes three advisory agent definitions and
 installs the relais Claude Code plugin (`relais@relais-local`), which carries
 the mod, the agent definitions relais dispatches and the `/relais` skill. The
 plugin is embedded in the binary: install writes it as a directory marketplace
@@ -14,7 +13,15 @@ refreshes it. `relais uninstall --claude` runs `claude plugin uninstall` and
 `claude plugin marketplace remove` (each accepted when already gone) and removes
 the directory. `relais doctor` reports a `plugin` finding: ok when it is
 enabled at this relais's version, a warning naming `relais install --claude
---write` otherwise. Install never touches `settings.json`
+--write` otherwise. `relais doctor --json` adds an `integration` object beside
+`findings`, derived from the same one `claude plugin list --json` reading as
+the `plugin` finding (plus `claude plugin marketplace list --json`):
+`state` is `present` (plugin installed at any scope and marketplace registered),
+`partial` (one of the two), `absent` (neither) or `unknown`; `plugin_version` is
+the installed plugin's version or null; `binary` is the absolute path of the
+running relais or null; `reason` appears only when `state` is `unknown` and names
+the cause (no `claude` found, a listing that failed, a listing that was not
+JSON). Install never touches `settings.json`
 (Claude Code's own `claude plugin` commands write the plugin's entries to its
 user settings). `relais install --claude --hooks` is a
 separate, explicit ask on top of that: it wires a live hook into

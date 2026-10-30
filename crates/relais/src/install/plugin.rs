@@ -13,7 +13,7 @@
 //! The plugin carries the mod, the agent definitions and the `/relais`
 //! skill (plan: all-native-mod, Design §1).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -156,6 +156,8 @@ pub enum PluginError {
     },
     /// `claude plugin list --json` answered with something else.
     Unreadable(String),
+    /// `claude plugin marketplace list --json` answered with something else.
+    UnreadableMarketplace(String),
     /// The marketplace directory could not be written or removed.
     Directory { path: PathBuf, detail: String },
 }
@@ -179,6 +181,12 @@ impl std::fmt::Display for PluginError {
                 write!(
                     f,
                     "`claude plugin list --json` printed no plugin list: {detail}"
+                )
+            }
+            PluginError::UnreadableMarketplace(detail) => {
+                write!(
+                    f,
+                    "`claude plugin marketplace list --json` printed no marketplace list: {detail}"
                 )
             }
             PluginError::Directory { path, detail } => {
@@ -225,6 +233,147 @@ pub fn parse_installed(list_json: &str) -> Result<Installed, PluginError> {
     })
 }
 
+/// The Claude Code integration, described for `relais doctor --json`.
+/// Each state carries only the data that state has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Integration {
+    /// The plugin is installed, current or behind, and its marketplace is registered.
+    Present {
+        plugin_version: String,
+        binary: Option<PathBuf>,
+    },
+    /// Neither the plugin nor its marketplace is there.
+    Absent { binary: Option<PathBuf> },
+    /// The marketplace without the plugin, or the plugin without it.
+    Partial {
+        plugin_version: Option<String>,
+        binary: Option<PathBuf>,
+    },
+    /// Claude Code could not be asked, or its listing could not be read.
+    Unknown {
+        reason: String,
+        binary: Option<PathBuf>,
+    },
+}
+
+impl Integration {
+    /// The state's name as `doctor --json` prints it.
+    pub fn state(&self) -> &'static str {
+        match self {
+            Integration::Present { .. } => "present",
+            Integration::Absent { .. } => "absent",
+            Integration::Partial { .. } => "partial",
+            Integration::Unknown { .. } => "unknown",
+        }
+    }
+
+    pub fn plugin_version(&self) -> Option<&str> {
+        match self {
+            Integration::Present { plugin_version, .. } => Some(plugin_version),
+            Integration::Partial { plugin_version, .. } => plugin_version.as_deref(),
+            Integration::Absent { .. } | Integration::Unknown { .. } => None,
+        }
+    }
+
+    pub fn binary(&self) -> Option<&Path> {
+        match self {
+            Integration::Present { binary, .. }
+            | Integration::Absent { binary }
+            | Integration::Partial { binary, .. }
+            | Integration::Unknown { binary, .. } => binary.as_deref(),
+        }
+    }
+
+    /// Why the state is `unknown`; none for any other state.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Integration::Unknown { reason, .. } => Some(reason),
+            Integration::Present { .. }
+            | Integration::Absent { .. }
+            | Integration::Partial { .. } => None,
+        }
+    }
+}
+
+impl Serialize for Integration {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Flat<'a> {
+            state: &'static str,
+            plugin_version: Option<&'a str>,
+            binary: Option<&'a Path>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reason: Option<&'a str>,
+        }
+        Flat {
+            state: self.state(),
+            plugin_version: self.plugin_version(),
+            binary: self.binary(),
+            reason: self.reason(),
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Deserialize)]
+struct ListedMarketplace {
+    name: String,
+}
+
+/// Whether the relais marketplace is registered, from a
+/// `plugin marketplace list --json` document.
+pub fn parse_marketplace_registered(list_json: &str) -> Result<bool, PluginError> {
+    let listed: Vec<ListedMarketplace> = serde_json::from_str(list_json)
+        .map_err(|e| PluginError::UnreadableMarketplace(e.to_string()))?;
+    Ok(listed.iter().any(|entry| entry.name == MARKETPLACE))
+}
+
+/// The integration, given what the plugin listing (the same one the
+/// `plugin` finding reads) and the marketplace listing said, and the path
+/// of the running relais.
+pub fn integration_from(
+    plugin: &Result<Installed, PluginError>,
+    marketplace: Result<bool, PluginError>,
+    binary: Option<PathBuf>,
+) -> Integration {
+    match (plugin, marketplace) {
+        (Err(e), _) => Integration::Unknown {
+            reason: e.to_string(),
+            binary,
+        },
+        (Ok(_), Err(e)) => Integration::Unknown {
+            reason: e.to_string(),
+            binary,
+        },
+        (Ok(Installed::Yes { version, .. }), Ok(true)) => Integration::Present {
+            plugin_version: version.clone(),
+            binary,
+        },
+        (Ok(Installed::Yes { version, .. }), Ok(false)) => Integration::Partial {
+            plugin_version: Some(version.clone()),
+            binary,
+        },
+        (Ok(Installed::No), Ok(true)) => Integration::Partial {
+            plugin_version: None,
+            binary,
+        },
+        (Ok(Installed::No), Ok(false)) => Integration::Absent { binary },
+    }
+}
+
+/// The integration, from the plugin listing already read and, when Claude
+/// Code is there to ask, `plugin marketplace list --json`.
+pub fn integration(
+    claude: &Result<Claude, PluginError>,
+    plugin: &Result<Installed, PluginError>,
+) -> Integration {
+    let marketplace = match (claude, plugin) {
+        (Ok(claude), Ok(_)) => claude.marketplace_registered(),
+        _ => Ok(false),
+    };
+    integration_from(plugin, marketplace, running_binary())
+}
+
 /// The Claude Code binary relais talks to.
 pub struct Claude {
     binary: PathBuf,
@@ -266,6 +415,17 @@ impl Claude {
         parse_installed(&listing)
     }
 
+    /// Whether the relais marketplace is registered.
+    fn marketplace_registered(&self) -> Result<bool, PluginError> {
+        let listing = self.run(&[
+            "plugin".into(),
+            "marketplace".into(),
+            "list".into(),
+            "--json".into(),
+        ])?;
+        parse_marketplace_registered(&listing)
+    }
+
     fn step(&self, step: Step, marketplace: &Path) -> Result<StepEnd, PluginError> {
         match self.run(&step.args(marketplace)) {
             Ok(_) => Ok(StepEnd::Done),
@@ -277,6 +437,13 @@ impl Claude {
             Err(e) => Err(e),
         }
     }
+}
+
+/// The absolute path of the running relais, if the system can say.
+pub fn running_binary() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .filter(|path| path.is_absolute())
 }
 
 /// The steps an install takes: a first one registers and installs, one
@@ -605,5 +772,84 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("marketplace is broken"), "{shown}");
+    }
+
+    fn failure() -> PluginError {
+        PluginError::Unreadable("scratch".to_string())
+    }
+
+    fn yes(version: &str) -> Result<Installed, PluginError> {
+        Ok(Installed::Yes {
+            version: version.to_string(),
+            enabled: true,
+        })
+    }
+
+    #[test]
+    fn the_integration_state_follows_what_the_two_listings_said() {
+        let binary = Some(PathBuf::from("/usr/bin/relais"));
+        let version = || Some("1.2.3".to_string());
+        let cases: Vec<(&str, _, _, &str, Option<String>)> = vec![
+            ("both", yes("1.2.3"), Ok(true), "present", version()),
+            ("plugin only", yes("1.2.3"), Ok(false), "partial", version()),
+            (
+                "marketplace only",
+                Ok(Installed::No),
+                Ok(true),
+                "partial",
+                None,
+            ),
+            ("neither", Ok(Installed::No), Ok(false), "absent", None),
+            (
+                "plugin unreadable",
+                Err(failure()),
+                Ok(true),
+                "unknown",
+                None,
+            ),
+            (
+                "marketplace unreadable",
+                yes("1.2.3"),
+                Err(failure()),
+                "unknown",
+                None,
+            ),
+            (
+                "both unreadable",
+                Err(failure()),
+                Err(failure()),
+                "unknown",
+                None,
+            ),
+        ];
+        for (name, plugin, marketplace, state, plugin_version) in cases {
+            let integration = integration_from(&plugin, marketplace, binary.clone());
+            assert_eq!(integration.state(), state, "{name}");
+            assert_eq!(
+                integration.plugin_version(),
+                plugin_version.as_deref(),
+                "{name}"
+            );
+            assert_eq!(integration.binary(), binary.as_deref(), "{name}");
+            assert_eq!(integration.reason().is_some(), state == "unknown", "{name}");
+        }
+    }
+
+    #[test]
+    fn a_project_scope_install_counts_for_the_finding_and_the_integration_alike() {
+        let listing =
+            r#"[{"id":"relais@relais-local","version":"0.9.0","scope":"project","enabled":true}]"#;
+        let plugin = parse_installed(listing);
+        assert_eq!(plugin, yes("0.9.0"));
+        let integration = integration_from(&plugin, Ok(true), None);
+        assert_eq!(integration.state(), "present");
+        assert_eq!(integration.plugin_version(), Some("0.9.0"));
+    }
+
+    #[test]
+    fn a_bad_marketplace_listing_names_the_marketplace_command() {
+        let integration = integration_from(&yes("1"), parse_marketplace_registered("nope"), None);
+        let reason = integration.reason().expect("unknown has a reason");
+        assert!(reason.contains("marketplace"), "{reason}");
     }
 }
