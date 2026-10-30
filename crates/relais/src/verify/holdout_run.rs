@@ -56,6 +56,9 @@ pub struct HoldoutRun {
     /// The kept copy of the command's log, inside the run's artifacts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<String>,
+    /// Wall-clock milliseconds the holdout took, copy and setup included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_ms: Option<u64>,
 }
 
 impl HoldoutRun {
@@ -70,6 +73,7 @@ impl HoldoutRun {
             tests: Vec::new(),
             report: None,
             log: None,
+            wall_ms: None,
         }
     }
 

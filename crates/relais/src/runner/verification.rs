@@ -798,6 +798,8 @@ impl<'a> RunEngine<'a> {
         // Holdouts run in a second copy made now that the profile's
         // commands have finished (ADR-0045). Their logs are not check logs.
         let holdouts = self.run_holdouts(candidate_sha, authority, label, resolved_holdouts)?;
+        // An attached holdout skipped just now has left the ledger.
+        let acceptance = self.effective_acceptance().map_err(|e| e.to_string())?;
         for entry in &acceptance {
             if let Some(crate::acceptance::Evidence::Holdout { name }) = entry.evidence() {
                 let passed = holdouts

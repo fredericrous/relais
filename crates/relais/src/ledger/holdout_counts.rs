@@ -18,10 +18,12 @@ pub struct HoldoutOutcomeRow<'a> {
     pub label_kind: &'a str,
     pub attempt_index: u32,
     pub name: &'a str,
-    /// `passed`, `failed`, `did_not_build` or `timed_out`.
+    /// `passed`, `failed`, `did_not_build`, `timed_out` or `skipped` (an
+    /// attached holdout whose store could not be fetched).
     pub outcome: &'a str,
     /// Every profile check passed on that candidate (no failed check, no
-    /// profile gap).
+    /// profile gap). Meaningless on a `skipped` row, which is written before
+    /// the profile is known: readers ignore it there.
     pub profile_green: bool,
     /// `named` or `attached`.
     pub source: &'a str,
@@ -100,11 +102,32 @@ impl Ledger {
         Ok(rows)
     }
 
-    /// Whether the run named at least one holdout (it has an outcome row).
+    /// The names of the run's attached holdouts recorded as skipped: their
+    /// definitions stay frozen, but they no longer judge the run.
+    pub fn skipped_attached_holdouts(&self, run_id: &RunId) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT name FROM holdout_outcomes
+              WHERE run_id = ?1 AND outcome = ?2 AND source = ?3 ORDER BY name",
+        )?;
+        let names = statement
+            .query_map(
+                params![
+                    run_id.as_str(),
+                    crate::holdout::SKIPPED_OUTCOME,
+                    crate::holdout::HoldoutSource::Attached.as_str()
+                ],
+                |row| row.get(0),
+            )?
+            .collect::<std::result::Result<Vec<String>, _>>()?;
+        Ok(names)
+    }
+
+    /// Whether the run ran at least one holdout (it has an outcome row that
+    /// was not skipped).
     pub fn run_named_a_holdout(&self, run_id: &RunId) -> Result<bool> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM holdout_outcomes WHERE run_id = ?1",
-            [run_id.as_str()],
+            "SELECT COUNT(*) FROM holdout_outcomes WHERE run_id = ?1 AND outcome <> ?2",
+            params![run_id.as_str(), crate::holdout::SKIPPED_OUTCOME],
             |row| row.get(0),
         )?;
         Ok(count > 0)

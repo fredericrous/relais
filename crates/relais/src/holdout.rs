@@ -34,6 +34,10 @@ pub struct ResolvedHoldout {
     pub digest: String,
 }
 
+/// The outcome a ledger row records for an attached holdout that was skipped
+/// because its store could not be fetched; it is never a catch.
+pub const SKIPPED_OUTCOME: &str = "skipped";
+
 /// Where a run's holdout came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoldoutSource {

@@ -55,7 +55,8 @@ impl Ledger {
     }
 
     /// The criteria that settle the run: the contract's own, then one
-    /// mandatory criterion per attached holdout the ledger holds for the run.
+    /// mandatory criterion per attached holdout the ledger holds for the run
+    /// and has not recorded as skipped.
     /// Every read that settles a criterion goes through here, so what the
     /// machine declaration says now never changes what judges a run.
     pub fn effective_acceptance(
@@ -63,10 +64,12 @@ impl Ledger {
         run_id: &RunId,
         contract: &crate::contract::TaskContract,
     ) -> Result<Vec<AcceptanceEntry>> {
+        let skipped = self.skipped_attached_holdouts(run_id)?;
         let mut entries = contract.acceptance.clone();
         entries.extend(
             self.attached_holdout_definitions(run_id)?
                 .iter()
+                .filter(|holdout| !skipped.contains(&holdout.name))
                 .map(|holdout| crate::holdout::attached_criterion(&holdout.name)),
         );
         Ok(entries)

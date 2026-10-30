@@ -164,7 +164,7 @@ pub struct DiskCheck<'a> {
     pub probe: std::sync::Arc<dyn DiskProbe>,
     /// The places the run writes.
     pub paths: Vec<PathBuf>,
-    pub growth: &'a dyn Growth,
+    pub growth: &'a (dyn Growth + Sync),
 }
 
 impl DiskCheck<'static> {

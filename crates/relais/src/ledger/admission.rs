@@ -18,10 +18,59 @@ pub struct GroupBindingRow {
     pub tokens: u32,
 }
 
-/// The ledger is where a check's measured growth is kept (SPEC §23).
-impl crate::disk::Growth for Ledger {
+/// The run ledger's clock, handed to each connection the growth opens.
+struct SharedClock(std::sync::Arc<dyn super::Clock>);
+
+impl super::Clock for SharedClock {
+    fn now_rfc3339(&self) -> String {
+        self.0.now_rfc3339()
+    }
+}
+
+/// The ledger is where a check's measured growth is kept (SPEC §23). Each
+/// thread that asks opens its own connection once, on the run ledger's
+/// clock, and keeps it for the growth's life. The map's mutex is held for
+/// the whole call, so no two calls overlap: the connections buy no
+/// parallelism, only one open per thread instead of one per call.
+// holds-until: one connection per thread that ever asked, for the growth's
+// life — verifications x holdouts per run, each thread id used once; a
+// connection is dropped when its thread ends once runs hold hundreds of
+// verifications.
+pub struct LedgerGrowth {
+    path: std::path::PathBuf,
+    clock: std::sync::Arc<dyn super::Clock>,
+    connections: std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, Ledger>>,
+}
+
+impl LedgerGrowth {
+    pub fn of(ledger: &Ledger) -> Self {
+        Self {
+            path: ledger.path().to_path_buf(),
+            clock: ledger.clock(),
+            connections: std::sync::Mutex::default(),
+        }
+    }
+
+    /// Run `use_ledger` on this thread's connection, opening it the first time.
+    fn with_connection<T>(&self, use_ledger: impl FnOnce(&Ledger) -> Result<T>) -> Result<T> {
+        let mut connections = self
+            .connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let thread = std::thread::current().id();
+        let ledger = match connections.entry(thread) {
+            std::collections::hash_map::Entry::Occupied(open) => open.into_mut(),
+            std::collections::hash_map::Entry::Vacant(slot) => slot.insert(
+                Ledger::open_with_clock(&self.path, Box::new(SharedClock(self.clock.clone())))?,
+            ),
+        };
+        use_ledger(ledger)
+    }
+}
+
+impl crate::disk::Growth for LedgerGrowth {
     fn last(&self, label: &str) -> Option<u64> {
-        match self.check_disk_growth(label) {
+        match self.with_connection(|ledger| ledger.check_disk_growth(label)) {
             Ok(bytes) => bytes,
             Err(e) => {
                 eprintln!("relais: the disk estimate of `{label}` could not be read: {e}");
@@ -31,7 +80,8 @@ impl crate::disk::Growth for Ledger {
     }
 
     fn record(&self, label: &str, bytes: u64) {
-        if let Err(e) = self.record_check_disk_growth(label, bytes) {
+        let written = self.with_connection(|ledger| ledger.record_check_disk_growth(label, bytes));
+        if let Err(e) = written {
             eprintln!("relais: the disk growth of `{label}` could not be recorded: {e}");
         }
     }

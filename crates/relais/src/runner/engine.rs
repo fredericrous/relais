@@ -6,9 +6,9 @@ use super::{
     setup_failure_detail, state_sibling, verify, verify_root, workspace, worktree_root, Arc,
     AtomicBool, AttemptContext, AttemptKind, BlockCode, Budget, BudgetClock, BudgetLimits, Budgets,
     Candidate, CostKind, Duration, EffectiveAuthority, Event, Events, EvidenceKind, Exhausted,
-    Finish, Instant, Limit, Next, Observation, Ordering, PackageId, PackageRole, PathBuf, Phase,
-    Reason, Refusal, Request, RunConfig, RunEngine, RunError, RunId, RunOutcome, State, Summary,
-    Terminal, Transition, UsagePhase, ADMISSION_POLL,
+    Finish, Gate, Instant, Limit, Next, Observation, Ordering, PackageId, PackageRole, PathBuf,
+    Phase, Reason, Refusal, Request, RunConfig, RunEngine, RunError, RunId, RunOutcome, State,
+    Summary, Terminal, Transition, UsagePhase, ADMISSION_POLL,
 };
 
 impl<'a> RunEngine<'a> {
@@ -59,6 +59,7 @@ impl<'a> RunEngine<'a> {
             cancel_asked: Arc::new(AtomicBool::new(false)),
             budgets: Budgets::unbounded(),
             heavy_tries: verify::Tries::for_epoch(epoch),
+            growth: crate::ledger::LedgerGrowth::of(config.ledger),
             registration: None,
             events,
         })
@@ -105,31 +106,15 @@ impl<'a> RunEngine<'a> {
         &self,
         work: impl FnOnce(Option<&AtomicBool>) -> T,
     ) -> T {
-        let Some(gate) = self.config.gate else {
-            return work(None);
-        };
-        let done = AtomicBool::new(false);
-        let every = self.config.heartbeat_every;
-        let (run_id, asked) = (self.run_id.as_str(), &*self.cancel_asked);
-        std::thread::scope(|scope| {
-            let done = &done;
-            scope.spawn(move || {
-                let mut last: Option<Instant> = None;
-                while !done.load(Ordering::SeqCst) {
-                    if last.is_none_or(|last| last.elapsed() >= every) {
-                        last = Some(Instant::now());
-                        if gate.run_cancelled(run_id).unwrap_or(false) {
-                            asked.store(true, Ordering::SeqCst);
-                            return;
-                        }
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-            });
-            let result = work(Some(asked));
-            done.store(true, Ordering::SeqCst);
-            result
-        })
+        watch_cancel(
+            &CancelWatch {
+                gate: self.config.gate,
+                every: self.config.heartbeat_every,
+                run_id: self.run_id.as_str(),
+                asked: &self.cancel_asked,
+            },
+            work,
+        )
     }
 
     /// Whether the coordinator has cancelled this run: the watcher saw it,
@@ -825,7 +810,7 @@ impl<'a> RunEngine<'a> {
                 floor: self.config.machine.resources.min_free_bytes(),
                 probe: Arc::new(crate::disk::StatvfsProbe),
                 paths: self.disk_paths(),
-                growth: self.config.ledger,
+                growth: &self.growth,
             },
         }
     }
@@ -980,6 +965,51 @@ pub(crate) fn host_slot_dir(setting: Option<&str>) -> Option<PathBuf> {
         Some("off") => None,
         Some(dir) => Some(PathBuf::from(dir)),
     }
+}
+
+/// What a cancel watcher needs of a run, all of it shareable across threads.
+pub(super) struct CancelWatch<'a> {
+    pub(super) gate: Option<&'a (dyn Gate + Sync)>,
+    pub(super) every: Duration,
+    pub(super) run_id: &'a str,
+    pub(super) asked: &'a AtomicBool,
+}
+
+/// [`RunEngine::while_watching_cancel`] without the engine, so work on
+/// another thread can be watched too.
+pub(super) fn watch_cancel<T>(
+    watch: &CancelWatch<'_>,
+    work: impl FnOnce(Option<&AtomicBool>) -> T,
+) -> T {
+    let CancelWatch {
+        gate,
+        every,
+        run_id,
+        asked,
+    } = *watch;
+    let Some(gate) = gate else {
+        return work(None);
+    };
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let done = &done;
+        scope.spawn(move || {
+            let mut last: Option<Instant> = None;
+            while !done.load(Ordering::SeqCst) {
+                if last.is_none_or(|last| last.elapsed() >= every) {
+                    last = Some(Instant::now());
+                    if gate.run_cancelled(run_id).unwrap_or(false) {
+                        asked.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let result = work(Some(asked));
+        done.store(true, Ordering::SeqCst);
+        result
+    })
 }
 
 #[cfg(test)]
