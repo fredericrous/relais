@@ -57,7 +57,12 @@ impl<'a> RunEngine<'a> {
         if let Some(exhausted) = self.review_spend_blocked(spend.total) {
             return Err(exhausted);
         }
-        let statements = self.config.contract.acceptance_statements();
+        let statements = self
+            .effective_acceptance()
+            .map_err(|e| format!("the run's criteria could not be read: {e}"))?
+            .iter()
+            .map(|entry| entry.statement().to_string())
+            .collect::<Vec<_>>();
         let report = candidate.result_text.as_deref().unwrap_or_default();
         let prompt =
             report_review_prompt(&self.config.contract.objective, &statements, report, tree);
@@ -307,8 +312,26 @@ impl<'a> RunEngine<'a> {
             }
         };
         let part_candidates = self.part_candidates(request, &staged.files);
-        let (prompt, reviewer_gap) =
-            self.review_prompt(request, &review_dir, &staged, part, &part_candidates);
+        let statements = match self.effective_acceptance() {
+            Ok(entries) => entries
+                .iter()
+                .map(|entry| entry.statement().to_string())
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                return Reviewed::unavailable(
+                    UnavailableCause::NotRead,
+                    format!("the run's criteria could not be read for the reviewer: {e}"),
+                )
+            }
+        };
+        let (prompt, reviewer_gap) = self.review_prompt(
+            request,
+            &review_dir,
+            &staged,
+            part,
+            &part_candidates,
+            &statements,
+        );
         if let Some(gap) = &reviewer_gap {
             self.emit_guidance_gap(gap);
         }
@@ -465,6 +488,7 @@ impl<'a> RunEngine<'a> {
         staged: &StagedPatch,
         part: Option<PartLabel>,
         candidates: &Result<PartCandidates, GuidanceGap>,
+        statements: &[String],
     ) -> (String, Option<GuidanceGap>) {
         let mut prompt = String::from(
             "You are a semantic reviewer. You cannot edit or waive checks; you report findings only.\n\
@@ -488,10 +512,7 @@ impl<'a> RunEngine<'a> {
         prompt.push_str(DECISION_PRECEDENCE);
         prompt.push('\n');
         prompt.push_str(&data_block("objective", &self.config.contract.objective));
-        prompt.push_str(&data_list_block(
-            "acceptance criteria",
-            &self.config.contract.acceptance_statements(),
-        ));
+        prompt.push_str(&data_list_block("acceptance criteria", statements));
         if !request.manifest.constraints.is_empty() {
             prompt.push_str(&data_list_block(
                 "architectural constraints",

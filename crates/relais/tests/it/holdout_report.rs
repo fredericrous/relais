@@ -35,6 +35,7 @@ fn the_report_json_counts_one_catch_and_one_exposure_under_holdouts() {
                 name: "escaping",
                 outcome: "failed",
                 profile_green: true,
+                source: "named",
             },
         )
         .expect("outcome");
@@ -47,6 +48,7 @@ fn the_report_json_counts_one_catch_and_one_exposure_under_holdouts() {
                 name: "escaping",
                 outcome: "passed",
                 profile_green: true,
+                source: "named",
             },
         )
         .expect("outcome");

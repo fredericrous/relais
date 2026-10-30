@@ -494,12 +494,9 @@ fn record_answer(
                 format!("run {run_id} carries no recorded contract"),
             ));
         };
-        let declared: Vec<String> = contract.acceptance.iter().map(|entry| entry.id()).collect();
-        let Some(entry) = contract
-            .acceptance
-            .iter()
-            .find(|entry| entry.id() == criterion_id)
-        else {
+        let acceptance = operational(ledger.effective_acceptance(&run, &contract), "decide")?;
+        let declared: Vec<String> = acceptance.iter().map(|entry| entry.id()).collect();
+        let Some(entry) = acceptance.iter().find(|entry| entry.id() == criterion_id) else {
             return Ok(refusal(
                 CliOutcome::InvalidInput,
                 format!(

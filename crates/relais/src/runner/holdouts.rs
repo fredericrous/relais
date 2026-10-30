@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use super::config::holdout_root;
 use super::holdout_exposure::{scan_transcript, Markers};
 use super::setup_gate;
-use super::{AttemptLabel, HoldoutStop, RunEngine, VerifyFailure};
+use super::{AttemptLabel, HoldoutStop, RunEngine, RunError, VerifyFailure};
 use crate::holdout::{self, ResolvedHoldout};
 use crate::ledger::HoldoutOutcomeRow;
 use crate::policy::{CommandSpec, EffectiveAuthority};
@@ -38,6 +38,16 @@ impl<'a> RunEngine<'a> {
                 self.holdout_dir().display()
             ),
         }
+    }
+
+    /// The criteria that settle this run: the contract's own plus one per
+    /// attached holdout, read from the ledger the run froze them in.
+    pub(super) fn effective_acceptance(
+        &self,
+    ) -> Result<Vec<crate::acceptance::AcceptanceEntry>, crate::ledger::LedgerError> {
+        self.config
+            .ledger
+            .effective_acceptance(&self.run_id, self.config.contract)
     }
 
     pub(super) fn sweep_ended_holdouts(&self) {
@@ -107,7 +117,17 @@ impl<'a> RunEngine<'a> {
         runs: &[HoldoutRun],
         profile_green: bool,
     ) -> Result<(), String> {
+        let attached = self
+            .config
+            .ledger
+            .attached_holdout_definitions(&self.run_id)
+            .map_err(|e| format!("the ledger refused to list the attached holdouts: {e}"))?;
         for run in runs {
+            let source = if attached.iter().any(|held| held.name == run.name) {
+                holdout::HoldoutSource::Attached
+            } else {
+                holdout::HoldoutSource::Named
+            };
             self.config
                 .ledger
                 .record_holdout_outcome(
@@ -118,6 +138,7 @@ impl<'a> RunEngine<'a> {
                         name: &run.name,
                         outcome: run.outcome.as_str(),
                         profile_green,
+                        source: source.as_str(),
                     },
                 )
                 .map_err(|e| format!("the ledger refused a holdout outcome row: {e}"))?;
@@ -127,25 +148,31 @@ impl<'a> RunEngine<'a> {
 
     /// What a worker is told of a failed holdout: the criterion's statement
     /// and the failing test ids, nothing else.
-    pub(super) fn holdout_failures(&self, gaps: &[HoldoutGap]) -> Vec<String> {
-        gaps.iter()
-            .map(|HoldoutGap { gap, .. }| {
-                let statement = self
-                    .config
-                    .contract
-                    .acceptance
+    pub(super) fn holdout_failures(&self, gaps: &[HoldoutGap]) -> Result<Vec<String>, RunError> {
+        let acceptance = self.effective_acceptance()?;
+        Ok(gaps
+            .iter()
+            .map(|HoldoutGap { name, gap }| {
+                let statement = acceptance
                     .iter()
                     .find(|entry| entry.id() == gap.criterion_id)
                     .map_or("", |entry| entry.statement());
+                if gap.criterion_id == holdout::attached_criterion_id(name) {
+                    return attached_failure_line(statement, &gap.missing);
+                }
                 format!("{} (criterion: {statement})", gap.message())
             })
-            .collect()
+            .collect())
     }
 
     /// What a person is told when the attempts ran out on holdout gaps
     /// alone: each holdout with its commit, the failing test ids and the
     /// kept log and report. Only the person's `relais decide` reads it.
-    pub(super) fn holdout_stop(&self, gaps: &[HoldoutGap], runs: &[HoldoutRun]) -> HoldoutStop {
+    pub(super) fn holdout_stop(
+        &self,
+        gaps: &[HoldoutGap],
+        runs: &[HoldoutRun],
+    ) -> Result<HoldoutStop, RunError> {
         let records = gaps
             .iter()
             .map(|HoldoutGap { name, .. }| {
@@ -159,13 +186,17 @@ impl<'a> RunEngine<'a> {
                 })
             })
             .collect::<Vec<_>>();
-        HoldoutStop {
-            detail: self.holdout_decision_detail(gaps, runs),
+        Ok(HoldoutStop {
+            detail: self.holdout_decision_detail(gaps, runs)?,
             holdouts: serde_json::Value::Array(records),
-        }
+        })
     }
 
-    fn holdout_decision_detail(&self, gaps: &[HoldoutGap], runs: &[HoldoutRun]) -> String {
+    fn holdout_decision_detail(
+        &self,
+        gaps: &[HoldoutGap],
+        runs: &[HoldoutRun],
+    ) -> Result<String, RunError> {
         let named = gaps
             .iter()
             .map(|HoldoutGap { name, gap }| {
@@ -187,12 +218,28 @@ impl<'a> RunEngine<'a> {
             })
             .collect::<Vec<_>>()
             .join("; ");
-        format!(
+        let attached = self
+            .config
+            .ledger
+            .attached_holdout_definitions(&self.run_id)?;
+        let provenance = gaps
+            .iter()
+            .filter_map(|HoldoutGap { name, .. }| {
+                let held = attached.iter().find(|held| held.name == *name)?;
+                Some(format!(
+                    " Holdout `{name}` was attached by machine.toml [holdouts.{}.{name}].attach; \
+                     removing attach stops attachment on future root runs; successors retain \
+                     frozen holdouts.",
+                    held.repo
+                ))
+            })
+            .collect::<String>();
+        Ok(format!(
             "the attempts ran out and the only failures left are holdout gaps: {named}. Answer \
              with `relais decide {} --answer approve|revise|reject`; approve is refused, as for \
-             any gap",
+             any gap.{provenance}",
             self.run_id
-        )
+        ))
     }
 
     /// Fetch and run every resolved holdout, in contract order. A store
@@ -367,6 +414,32 @@ impl<'a> RunEngine<'a> {
         }
         Ok(run)
     }
+}
+
+/// What a worker is told of an attached holdout's failure: the criterion's
+/// statement, the verdict and the failing test names, and nothing of where
+/// the holdout was declared.
+fn attached_failure_line(statement: &str, missing: &verify::MissingEvidence) -> String {
+    let verdict = match missing {
+        verify::MissingEvidence::HoldoutFailed { failing, .. } if !failing.is_empty() => {
+            format!("failed: {}", failing.join(", "))
+        }
+        verify::MissingEvidence::HoldoutFailed { .. } => "failed".to_string(),
+        verify::MissingEvidence::HoldoutDidNotBuild { .. } => {
+            "did not build or wrote no report".to_string()
+        }
+        verify::MissingEvidence::HoldoutTimedOut { .. } => "timed out".to_string(),
+        verify::MissingEvidence::HoldoutNotRun { .. }
+        | verify::MissingEvidence::CheckProducedNothing { .. }
+        | verify::MissingEvidence::CheckUndefined { .. }
+        | verify::MissingEvidence::SignOffUnrecorded
+        | verify::MissingEvidence::GateNotCovered { .. }
+        | verify::MissingEvidence::GateUnavailable { .. }
+        | verify::MissingEvidence::NoPerTestResults { .. }
+        | verify::MissingEvidence::TestNotReported { .. }
+        | verify::MissingEvidence::TestNotPassed { .. } => "unmet".to_string(),
+    };
+    format!("{statement}: {verdict}")
 }
 
 /// A holdout gap a repair can answer, with the holdout it names.

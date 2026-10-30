@@ -42,7 +42,13 @@ pub(crate) fn evidence_attach_command(
             eprintln!("relais evidence attach: run {run_id} carries no recorded contract");
             return Ok(CliOutcome::OperationalFailure);
         };
-        let declared: Vec<String> = contract.acceptance.iter().map(|entry| entry.id()).collect();
+        let declared: Vec<String> = operational(
+            ledger.effective_acceptance(&run, &contract),
+            "evidence attach",
+        )?
+        .iter()
+        .map(|entry| entry.id())
+        .collect();
         if !declared.iter().any(|id| id == criterion_id) {
             eprintln!(
                 "relais evidence attach: run {run_id} names no acceptance criterion \

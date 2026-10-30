@@ -1063,9 +1063,8 @@ pub struct HoldoutDecl {
     /// a run whose contract names this holdout.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<String>,
-    /// Where the holdout attaches to a task that does not name it: parsed
-    /// and validated only, nothing attaches from it yet, and it is not
-    /// part of `holdout::digest_of`.
+    /// Where the holdout attaches to a task that does not name it. It is
+    /// not part of `holdout::digest_of`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attach: Option<HoldoutAttach>,
 }
@@ -1078,6 +1077,27 @@ pub struct HoldoutAttach {
     pub task_types: Vec<crate::contract::TaskType>,
     /// Repo-relative globs.
     pub paths: Vec<String>,
+}
+
+impl HoldoutAttach {
+    /// Both lists are non-empty and no task type is `unclassified`: what
+    /// a declaration read from machine.toml guarantees, re-checked for one
+    /// read back from the ledger.
+    pub fn check(&self) -> Result<(), String> {
+        if self.task_types.is_empty() {
+            return Err("attach.task_types is empty".to_string());
+        }
+        if self.paths.is_empty() {
+            return Err("attach.paths is empty".to_string());
+        }
+        if self
+            .task_types
+            .contains(&crate::contract::TaskType::Unclassified)
+        {
+            return Err("attach.task_types lists `unclassified`".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// A declaration as written, before `attach` is checked against the key
@@ -1995,6 +2015,9 @@ pub enum BlockCode {
     HoldoutBadOverlay,
     /// A holdout's overlay path already exists at the base revision.
     HoldoutOverlayExists,
+    /// A contract criterion's id is the one relais gives the criterion it
+    /// attaches for a declared holdout (`attached:<name>`).
+    HoldoutCriterionCollision,
     /// The holdout store does not resolve its ref to one commit.
     HoldoutUnreadable,
     /// A holdout store could not be fetched at the commit recorded at
@@ -2053,6 +2076,7 @@ impl BlockCode {
             Self::HoldoutNoJunit => "holdout_no_junit",
             Self::HoldoutBadOverlay => "holdout_bad_overlay",
             Self::HoldoutOverlayExists => "holdout_overlay_exists",
+            Self::HoldoutCriterionCollision => "holdout_criterion_collision",
             Self::HoldoutUnreadable => "holdout_unreadable",
             Self::HoldoutUnfetchable => "holdout_unfetchable",
             Self::WorkspaceBusy => "workspace_busy",

@@ -23,6 +23,8 @@ pub struct HoldoutOutcomeRow<'a> {
     /// Every profile check passed on that candidate (no failed check, no
     /// profile gap).
     pub profile_green: bool,
+    /// `named` or `attached`.
+    pub source: &'a str,
 }
 
 impl Ledger {
@@ -35,15 +37,16 @@ impl Ledger {
     ) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO holdout_outcomes
-                (run_id, label_kind, attempt_index, name, outcome, profile_green)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (run_id, label_kind, attempt_index, name, outcome, profile_green, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 run_id.as_str(),
                 row.label_kind,
                 i64::from(row.attempt_index),
                 row.name,
                 row.outcome,
-                i64::from(row.profile_green)
+                i64::from(row.profile_green),
+                row.source
             ],
         )?;
         Ok(())
@@ -78,6 +81,18 @@ impl Ledger {
               WHERE (run_id = ?1 OR run_id IN (SELECT id FROM runs WHERE parent_run = ?1))
                 AND agent_id IS NOT NULL
               ORDER BY created_at, dispatch_id",
+        )?;
+        let rows = statement
+            .query_map([run_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The (holdout name, source) of every outcome row of the run, ordered.
+    pub fn holdout_outcome_sources(&self, run_id: &RunId) -> Result<Vec<(String, String)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT name, source FROM holdout_outcomes WHERE run_id = ?1
+              ORDER BY label_kind, attempt_index, name",
         )?;
         let rows = statement
             .query_map([run_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -148,6 +163,7 @@ mod tests {
                     name: "slow",
                     outcome: "timed_out",
                     profile_green: true,
+                    source: "named",
                 },
             )
             .expect("outcome");

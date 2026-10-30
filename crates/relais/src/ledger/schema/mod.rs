@@ -212,7 +212,7 @@ pub(super) fn apply_step(conn: &Connection, version: &str, sql: &str, now: &str)
     Ok(())
 }
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 44;
+pub const LEDGER_SCHEMA_VERSION: u64 = 45;
 
 #[cfg(test)]
 mod tests {
@@ -956,8 +956,8 @@ mod tests {
             .expect("a v38 row");
         }
         let ledger = Ledger::open(&path).expect("upgrade to current schema");
-        assert_eq!(ledger.schema_version().expect("version"), 44);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 44);
+        assert_eq!(ledger.schema_version().expect("version"), 45);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 45);
         let tables: Vec<String> = ledger
             .conn
             .prepare(
@@ -1022,8 +1022,8 @@ mod tests {
             .expect("a run written at v40");
         }
         let ledger = Ledger::open(&path).expect("upgrade to v41");
-        assert_eq!(ledger.schema_version().expect("version"), 44);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 44);
+        assert_eq!(ledger.schema_version().expect("version"), 45);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 45);
         let runs: i64 = ledger
             .conn
             .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
@@ -1080,8 +1080,8 @@ mod tests {
             .expect("an intent written at v41");
         }
         let ledger = Ledger::open(&path).expect("upgrade to v42");
-        assert_eq!(ledger.schema_version().expect("version"), 44);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 44);
+        assert_eq!(ledger.schema_version().expect("version"), 45);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 45);
         let runs: i64 = ledger
             .conn
             .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
@@ -1136,7 +1136,7 @@ mod tests {
             .expect("a run written at v42");
         }
         let ledger = Ledger::open(&path).expect("upgrade to v43");
-        assert_eq!(ledger.schema_version().expect("version"), 44);
+        assert_eq!(ledger.schema_version().expect("version"), 45);
         let runs: i64 = ledger
             .conn
             .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
@@ -1184,7 +1184,7 @@ mod tests {
             .expect("a run written at v43");
         }
         let ledger = Ledger::open(&path).expect("upgrade to v44");
-        assert_eq!(ledger.schema_version().expect("version"), 44);
+        assert_eq!(ledger.schema_version().expect("version"), 45);
         let runs: i64 = ledger
             .conn
             .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
@@ -1198,6 +1198,66 @@ mod tests {
                 })
                 .expect("the table exists");
             assert_eq!(rows, 0, "{table} starts empty");
+        }
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+    }
+
+    /// v45 adds `source` to the holdout tables: rows written at v44 read
+    /// back as `named`.
+    #[test]
+    fn a_v44_ledger_reads_its_holdout_rows_as_named() {
+        let dir = temp_dir("v44-to-v45");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            assert_eq!(MIGRATIONS[43].0, "v44", "pinned to v44");
+            for (version, sql) in &MIGRATIONS[..44] {
+                conn.execute_batch(sql).expect("apply step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "then"],
+                )
+                .expect("record step");
+            }
+            conn.execute(
+                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES ('run-old', '/repo', 'accepted', 'now', 'now')",
+                [],
+            )
+            .expect("a run written at v44");
+            conn.execute(
+                "INSERT INTO holdout_definitions (run_id, name, definition_json, digest)
+                 VALUES ('run-old', 'h', '{}', 'd')",
+                [],
+            )
+            .expect("a definition written at v44");
+            conn.execute(
+                "INSERT INTO holdout_outcomes
+                    (run_id, label_kind, attempt_index, name, outcome, profile_green)
+                 VALUES ('run-old', 'attempt', 1, 'h', 'passed', 1)",
+                [],
+            )
+            .expect("an outcome written at v44");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade to v45");
+        assert_eq!(ledger.schema_version().expect("version"), 45);
+        for table in ["holdout_definitions", "holdout_outcomes"] {
+            let sources: Vec<String> = ledger
+                .conn
+                .prepare(&format!("SELECT source FROM {table}"))
+                .expect("prepare")
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<std::result::Result<_, _>>()
+                .expect("rows");
+            assert_eq!(sources, vec!["named".to_string()], "{table}");
         }
         std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
     }

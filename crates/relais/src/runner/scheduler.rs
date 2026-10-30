@@ -525,7 +525,7 @@ fn execute_waves(
                 root.base_sha,
                 &assembly.head,
             )?);
-            failures = verify::missing_test_gaps(&contract.acceptance, patch_adds_test);
+            failures = verify::missing_test_gaps(&engine.effective_acceptance()?, patch_adds_test);
         }
         if failures.is_empty() {
             let patch_path = engine.artifacts.join(INTEGRATED_PATCH);
@@ -1235,7 +1235,7 @@ fn integrated_receipt(
         .map(|(criterion_id, _actor)| criterion_id)
         .collect();
     let (criteria, mandatory_evidence_independence) = verify::settle_acceptance(
-        &engine.config.contract.acceptance,
+        &engine.effective_acceptance()?,
         &root.authority.verification_profile,
         &report,
         verify::Attestations {
