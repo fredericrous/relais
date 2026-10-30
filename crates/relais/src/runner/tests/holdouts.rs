@@ -1746,8 +1746,8 @@ fn the_report_json_carries_the_holdout_counts_under_holdouts() {
     let report = crate::report::runs_report(&fixture.ledger, "1970-01-01T00:00:00Z", None)
         .expect("a report");
     let json = serde_json::to_value(&report).expect("json");
-    assert_eq!(json["schema_version"], 14);
-    assert_eq!(crate::report::REPORT_SCHEMA_VERSION, 14);
+    assert_eq!(json["schema_version"], 15);
+    assert_eq!(crate::report::REPORT_SCHEMA_VERSION, 15);
     assert_eq!(json["holdouts"]["holdout_runs"], 1);
     assert_eq!(json["holdouts"]["holdout_catches"], 1);
     assert_eq!(json["holdouts"]["holdout_exposures"]["runs"], 0);
@@ -2100,6 +2100,35 @@ fn an_attached_holdout_runs_records_source_attached_and_settles_its_criterion() 
     );
     let events = events_text(&fixture, &outcome.run_id);
     assert!(events.contains("holdout_attached"), "{events}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn plan_and_preflight_attach_the_same_holdout_names() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let settings = attach_settings(&fixture, &writes(PASSING));
+    let contract = feature_contract(&fixture, bare_acceptance());
+    let planned: Vec<String> = crate::holdout::attachments(
+        &settings,
+        &crate::repo::main_checkout_name(&fixture.repo).unwrap_or_default(),
+        &contract,
+        contract.task_type,
+    )
+    .into_iter()
+    .map(|attachment| attachment.name)
+    .collect();
+    let backend = counting_worker(Arc::default(), Arc::default());
+    let outcome = fixture.execute_with_holdouts(settings, &contract, &repo, &backend);
+    let preflight: Vec<String> = fixture
+        .ledger
+        .attached_holdout_definitions(&outcome.run_id)
+        .expect("definitions")
+        .into_iter()
+        .map(|holdout| holdout.name)
+        .collect();
+    assert_eq!(planned, vec!["escaping".to_string()]);
+    assert_eq!(planned, preflight);
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
 

@@ -83,3 +83,214 @@ fn the_report_json_counts_one_catch_and_one_exposure_under_holdouts() {
         "{report}"
     );
 }
+
+#[test]
+fn the_report_json_splits_holdouts_by_source_and_counts_skipped_attached() {
+    let _permit = common::WorldPermit::acquire(1);
+    let scratch = short_temp_dir("ho-source");
+    let root = scratch.to_path_buf();
+    let state = root.join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let ledger = Ledger::open(&state.join("ledger.sqlite")).expect("ledger");
+    let rows = [
+        ("run-named", "passed", "named"),
+        ("run-attached", "failed", "attached"),
+        ("run-skipped", "skipped", "attached"),
+    ];
+    for (run, outcome, source) in rows {
+        let run = RunId::from_stored(run);
+        ledger
+            .insert_run(
+                &run,
+                "/repo",
+                None,
+                &TaskId::from_stored(run.as_str()),
+                "rk",
+            )
+            .expect("run");
+        ledger
+            .record_holdout_outcome(
+                &run,
+                &HoldoutOutcomeRow {
+                    label_kind: "attempt",
+                    attempt_index: 1,
+                    name: "h",
+                    outcome,
+                    profile_green: true,
+                    source,
+                },
+            )
+            .expect("outcome");
+    }
+    drop(ledger);
+
+    let output = common::relais(BIN)
+        .args(["report", "--no-import", "--json"])
+        .current_dir(&root)
+        .env("RELAIS_STATE_DIR", &state)
+        .env("RELAIS_CONFIG_DIR", root.join("cfg"))
+        .env("HOME", &root)
+        .env("USERPROFILE", &root)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .output()
+        .expect("relais runs");
+    assert_eq!(output.status.code(), Some(0));
+    let report: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(report["schema_version"], 15, "{report}");
+    let holdouts = &report["holdouts"];
+    assert_eq!(holdouts["holdout_runs"], 2, "{report}");
+    assert_eq!(holdouts["holdout_catches"], 1, "{report}");
+    assert_eq!(holdouts["by_source"]["named"]["runs"], 1, "{report}");
+    assert_eq!(holdouts["by_source"]["named"]["catches"], 0, "{report}");
+    assert_eq!(holdouts["by_source"]["attached"]["runs"], 1, "{report}");
+    assert_eq!(holdouts["by_source"]["attached"]["catches"], 1, "{report}");
+    assert_eq!(holdouts["by_source"]["attached"]["skipped"], 1, "{report}");
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git runs");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn plan_lists_an_attached_holdout_in_json_and_in_the_human_output() {
+    let _permit = common::WorldPermit::acquire(1);
+    let scratch = short_temp_dir("ho-plan");
+    let root = scratch.to_path_buf();
+    let repo = root.join("repo");
+    let config = root.join("cfg");
+    let state = root.join("state");
+    for dir in [&repo, &config, &state, &root.join("no-hooks")] {
+        std::fs::create_dir_all(dir).expect("dir");
+    }
+    git(&repo, &["init", "-q"]);
+    git(
+        &repo,
+        &[
+            "config",
+            "core.hooksPath",
+            &root.join("no-hooks").to_string_lossy(),
+        ],
+    );
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::create_dir_all(repo.join("src")).expect("src");
+    std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").expect("write");
+    std::fs::write(
+        repo.join("relais.toml"),
+        r#"schema_version = 1
+
+[models.research]
+id = "haiku"
+
+[models.implementation]
+id = "sonnet"
+
+[models.escalation]
+id = "fable"
+
+[execution]
+max_attempts = 3
+max_repairs_before_escalation = 1
+max_wall_seconds = 120
+
+[integrations]
+aval = "off"
+amont = "off"
+amont_agent = "off"
+
+[verification.profiles.default]
+commands = []
+"#,
+    )
+    .expect("policy");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+    std::fs::write(
+        config.join("machine.toml"),
+        r#"schema_version = 1
+
+[holdouts]
+store = "unused"
+
+[holdouts.repo.escaping]
+path = "repo/escaping.sh"
+overlay = "tests/escaping.sh"
+command = { argv = ["true"], junit = "junit.xml" }
+
+[holdouts.repo.escaping.attach]
+task_types = ["feature"]
+paths = ["src/**"]
+"#,
+    )
+    .expect("machine");
+    let task = root.join("task.json");
+    std::fs::write(
+        &task,
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "change",
+            "task_type": "feature",
+            "objective": "Remove the obsolete entry point",
+            "base_ref": "HEAD",
+            "write_scope": ["src/**"],
+            "acceptance": ["src/main.rs no longer exists"],
+            "verification_profile": "default",
+            "review": "off",
+        })
+        .to_string(),
+    )
+    .expect("task");
+
+    let plan = |extra: &[&str]| {
+        let mut args = vec!["plan", "--task", task.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        common::relais(BIN)
+            .args(args)
+            .current_dir(&repo)
+            .env("RELAIS_STATE_DIR", &state)
+            .env("RELAIS_CONFIG_DIR", &config)
+            .env("RELAIS_CLAUDE_BIN", root.join("no-such-claude"))
+            .env("RELAIS_SESSION_ID", "tab-test")
+            .env("HOME", &root)
+            .env("USERPROFILE", &root)
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .output()
+            .expect("relais runs")
+    };
+    let json = plan(&["--json"]);
+    let report: Value = serde_json::from_slice(&json.stdout).unwrap_or_else(|e| {
+        panic!(
+            "{e}: {}\n{}",
+            String::from_utf8_lossy(&json.stdout),
+            String::from_utf8_lossy(&json.stderr)
+        )
+    });
+    assert_eq!(
+        report["holdouts"]["attached"],
+        serde_json::json!([
+            {"name": "escaping", "task_type": "feature", "path": "src/**"}
+        ]),
+        "{report}"
+    );
+    let human = plan(&[]);
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        stdout.contains("holdout escaping attached: task type feature, path src/**"),
+        "{stdout}"
+    );
+    let _ = common::relais(BIN)
+        .args(["coordinator", "stop"])
+        .env("RELAIS_STATE_DIR", &state)
+        .env("RELAIS_CONFIG_DIR", &config)
+        .env("HOME", &root)
+        .output(); // best-effort: plan may have started a coordinator, stopping is harmless
+}

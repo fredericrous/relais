@@ -87,6 +87,16 @@ pub fn attached_criterion(name: &str) -> AcceptanceEntry {
 pub struct Attachment {
     pub name: String,
     pub rule: String,
+    /// The routing type and declared path that matched; none for a holdout
+    /// carried over from a predecessor, which is not matched again.
+    pub matched: Option<AttachMatch>,
+}
+
+/// What an `attach` declaration matched on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachMatch {
+    pub task_type: String,
+    pub path: String,
 }
 
 /// Whether `decl` attaches to a run of this routing type and contract: the
@@ -96,7 +106,7 @@ pub fn attach_rule(
     decl: &HoldoutDecl,
     task_type: Option<crate::contract::TaskType>,
     contract: &crate::contract::TaskContract,
-) -> Option<String> {
+) -> Option<(String, AttachMatch)> {
     let attach = decl.attach.as_ref()?;
     let task_type = task_type.filter(|kind| *kind != crate::contract::TaskType::Unclassified)?;
     if !attach.task_types.contains(&task_type) {
@@ -106,9 +116,15 @@ pub fn attach_rule(
         .paths
         .iter()
         .find(|path| crate::contract::scope::write_scope_could_touch(contract, path))?;
-    Some(format!(
-        "task type {} listed, write scope could touch {path}",
-        task_type.as_str()
+    Some((
+        format!(
+            "task type {} listed, write scope could touch {path}",
+            task_type.as_str()
+        ),
+        AttachMatch {
+            task_type: task_type.as_str().to_string(),
+            path: path.to_string(),
+        },
     ))
 }
 
@@ -143,8 +159,12 @@ pub fn attachments(
         .filter(|name| !named_mandatory.contains(&name.as_str()))
         .filter_map(|name| {
             let decl = settings.declaration(repo, &name)?;
-            let rule = attach_rule(decl, task_type, contract)?;
-            Some(Attachment { name, rule })
+            let (rule, matched) = attach_rule(decl, task_type, contract)?;
+            Some(Attachment {
+                name,
+                rule,
+                matched: Some(matched),
+            })
         })
         .collect()
 }
@@ -978,6 +998,29 @@ mod tests {
     }
 
     #[test]
+    fn an_attachment_carries_the_type_and_path_that_matched() {
+        let src = contract_of("change", &["src/**"], serde_json::json!(["bare"]));
+        let mut settings = HoldoutSettings::default();
+        settings.repos.entry("r".into()).or_default().insert(
+            "x".into(),
+            attach_decl(&[crate::contract::TaskType::Feature], &["src/**"]),
+        );
+        let found = attachments(
+            &settings,
+            "r",
+            &src,
+            Some(crate::contract::TaskType::Feature),
+        );
+        assert_eq!(
+            found[0].matched,
+            Some(AttachMatch {
+                task_type: "feature".into(),
+                path: "src/**".into()
+            })
+        );
+    }
+
+    #[test]
     fn a_holdout_attaches_by_type_scope_and_mandatory_naming() {
         use crate::contract::TaskType::{Feature, Infra, Unclassified};
         let src = contract_of("change", &["src/**"], serde_json::json!(["bare"]));
@@ -1048,6 +1091,7 @@ mod tests {
         let attached = [Attachment {
             name: "x".into(),
             rule: "r".into(),
+            matched: None,
         }];
         let block = attachment_collision(&contract, &attached).expect("a collision");
         assert_eq!(block.code, BlockCode::HoldoutCriterionCollision);

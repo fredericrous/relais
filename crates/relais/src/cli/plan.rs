@@ -79,8 +79,9 @@ pub(crate) fn plan_json(
     decision: &route::Routed,
     authority: &EffectiveAuthority,
     contract: &TaskContract,
+    attached: &[relais::holdout::Attachment],
 ) -> Result<CliOutcome, CliError> {
-    let (value, outcome) = match decision {
+    let (mut value, outcome) = match decision {
         route::Routed::Route(routed) => (
             serde_json::json!({
                 "contract_hash": contract.hash(),
@@ -109,6 +110,20 @@ pub(crate) fn plan_json(
             CliOutcome::Blocked,
         ),
     };
+    value["holdouts"] = serde_json::json!({
+        "attached": attached
+            .iter()
+            .filter_map(|attachment| {
+                attachment.matched.as_ref().map(|matched| {
+                    serde_json::json!({
+                        "name": attachment.name,
+                        "task_type": matched.task_type,
+                        "path": matched.path,
+                    })
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
     println!(
         "{}",
         serde_json::to_string_pretty(&value).expect("a plan decision serializes")
@@ -225,6 +240,12 @@ pub(crate) fn plan_command(
         (Some(task), None) => operational(open_ledger()?.routing_type(task, None), "plan")?,
         (None, None) => None,
     };
+    let attached = relais::holdout::attachments(
+        &machine.holdouts,
+        &relais::repo::main_checkout_name(&root).unwrap_or_default(),
+        &contract,
+        task_type,
+    );
     let decision = route::route(route::RouteInputs {
         draw_key: None,
         task_type,
@@ -240,13 +261,21 @@ pub(crate) fn plan_command(
         catalogs: &catalogs,
     });
     if let PlanFormat::Json = format {
-        return plan_json(&decision, &authority, &contract);
+        return plan_json(&decision, &authority, &contract, &attached);
     }
     let session = relais::coordinator::resolve_session();
     println!("contract hash: {}", contract.hash());
     println!("policy hash: {}", authority.authority_hash);
     println!("repository: {repo_identity}");
     println!("base: {} ({})", base_sha, contract.base_ref);
+    for attachment in &attached {
+        if let Some(matched) = &attachment.matched {
+            println!(
+                "holdout {} attached: task type {}, path {}",
+                attachment.name, matched.task_type, matched.path
+            );
+        }
+    }
     // Stderr, not stdout: `plan`'s stdout stays what it was (see below),
     // and session attribution is not part of that contract.
     eprintln!("session: {} ({})", session.id, session.source);

@@ -133,6 +133,28 @@ impl Ledger {
         Ok(count > 0)
     }
 
+    /// Whether the run ran (did not skip) a holdout of this `source`.
+    pub fn run_ran_holdout_of_source(&self, run_id: &RunId, source: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM holdout_outcomes
+              WHERE run_id = ?1 AND source = ?2 AND outcome <> ?3",
+            params![run_id.as_str(), source, crate::holdout::SKIPPED_OUTCOME],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Whether a holdout of this `source` failed on green profile checks.
+    pub fn run_holdout_of_source_caught(&self, run_id: &RunId, source: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM holdout_outcomes
+              WHERE run_id = ?1 AND source = ?2 AND profile_green = 1 AND outcome = 'failed'",
+            params![run_id.as_str(), source],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Whether the run has an outcome row that failed (a holdout that did
     /// not build is no catch) while the profile's checks were green on that candidate: the
     /// acceptance on evidence the worker controlled that a holdout stopped.

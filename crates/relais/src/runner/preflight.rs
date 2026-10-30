@@ -584,6 +584,7 @@ impl<'a> RunEngine<'a> {
                 .map(|holdout| crate::holdout::Attachment {
                     name: holdout.name.clone(),
                     rule: "retained from the predecessor".to_string(),
+                    matched: None,
                 })
                 .collect()
         } else if self.parent.is_none() {
