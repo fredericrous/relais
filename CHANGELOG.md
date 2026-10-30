@@ -8,6 +8,14 @@ missing here.
 
 ## Unreleased
 
+## v0.41.0
+
+- A holdout can attach to runs without the contract naming it (ADR-0045 widening). Give its machine.toml declaration `attach = { task_types = [...], paths = [...] }`. A `change` or `verify` run whose routing type is listed and whose write scope could touch one of the paths then gets a mandatory `attached:<name>` criterion, unless a mandatory contract criterion already names the holdout. `unclassified` is refused, and an error names the key path. The attached criterion is rebuilt from the ledger after preflight and inherited by successors. No model sees it in a first prompt; a retry shows only its statement, verdict and failing tests, and `relais decide` adds where it was declared.
+- An attached holdout whose store cannot be read (unreachable, missing, or a ref that does not resolve) is skipped, with a `holdout_attach_skipped` event and a skipped row that is never a catch. A named holdout still refuses the run.
+- A run's holdouts run concurrently, each in its own copy and `CARGO_TARGET_DIR`. The receipt records `wall_ms` and `source` (`named` or `attached`) for each holdout.
+- Ledger schema 46 adds `source` to `holdout_definitions` and `holdout_outcomes`; existing rows read as `named`. `relais report --json` schema 16 adds `holdouts.by_source` (`named` and `attached` runs and catches, and attached `skipped`), with a by-source line in the text view.
+- `relais plan` lists the holdouts that would attach (`holdout <name> attached: task type <t>, path <glob>`), and those it would skip, also under `holdouts.attached` and `holdouts.skipped` in `--json`.
+
 ## v0.40.0
 
 - A routed task that edited no file, launched nothing that could write one (a Bash writer such as `sed -i`, a subagent the router did not create, a relais run or replay) and was not aborted now ends `answered` instead of `unknown` (answered-outcome plan, relais#333). `answered` is reported on its own line, `answered (no file edited, never a label): N`, broken down by task kind, and it is never a completed task, a strong outcome or a learning label. The outcomes line keeps its shape, so `unknown rate` now counts only tasks that edited, or could have edited, something without a recognised check: on one live ledger it went from 50% to 19%.
