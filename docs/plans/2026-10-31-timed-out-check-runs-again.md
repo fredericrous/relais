@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: fix/timed-out-check-runs-again
 repos: [relais]
 adrs: [ADR-0010]
@@ -85,5 +85,12 @@ A timeout can still be the code's fault (a hang the worker introduced), so it mu
 - D3 (2026-10-31, implementation review) Deliberate: `a_baseline_retry_draws_on_the_total_not_on_work` shows that the work budget is not spent by a baseline re-run, not that the total went down by the timed-out limit: `Budgets` is not observable from a run's outcome, and the total's charge for pre-work time is covered by the `policy::budgets` unit tests.
 - D4 (2026-10-31, implementation review) Deliberate: `a_holdout_retry_that_exhausts_the_budget_ends_on_that_budget` cannot show that its holdout ran twice. With a 4 s total, preflight and the baseline often spend more than 2 s on this machine, so the holdout's first attempt is already clipped and is not re-run; an assertion on the kept `log-attempt1.txt` failed for that reason (tried 2026-10-31). The test keeps what it guarantees: the run ends on the total, with no behavioral repair. The re-run of a holdout is shown by `a_holdout_that_times_out_then_passes_is_flaky_and_keeps_both_attempts`.
 - D5 (2026-10-31, implementation review) `a_timeout_relais_sent_is_not_memory` was not changed, against the Verification line that planned to update it: it asserts only that a timed-out check is not classified as memory, which holds whether the check ran once or twice.
+
+## Implementation review
+
+- Verdict: approve on tree d8e4f4f3 (Delta), after approve-with-changes on 887ba339, af420a63 and 157482a7.
+- Fixed: six test cleanups explained; a holdout timed-out-then-passed test with a serde round trip; the production check moved to the answered-outcome plan; a test comment and the SPEC cross-reference corrected.
+- Deliberate: D3 (the total's decrease is not observable from a run), D4 (the budget holdout test cannot show a re-run), D5 (`a_timeout_relais_sent_is_not_memory` needed no change).
+- Open for the person, noted by the reviewer: with `retry = 1`, a check that exits 1 then times out runs a third time; holdouts record the flaky reason on the receipt only, not as an event.
 
 <!-- panel: repos=relais adds= reviewers=backend,codex body-sha=670fecbc6c98 -->
