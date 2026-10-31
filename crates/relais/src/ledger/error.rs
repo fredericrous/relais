@@ -31,6 +31,12 @@ pub enum LedgerError {
         found: u64,
         known: u64,
     },
+    /// Another connection holds the ledger, so a write-ahead-log checkpoint
+    /// could not finish. The file is intact; closing it again once that
+    /// connection ends succeeds.
+    Busy {
+        what: String,
+    },
 }
 
 impl LedgerError {
@@ -62,6 +68,11 @@ impl std::fmt::Display for LedgerError {
                 f,
                 "ledger: {found} applied migration(s), this relais reads {known} — \
                  not read; the next relais that writes it migrates it"
+            ),
+            LedgerError::Busy { what } => write!(
+                f,
+                "ledger: busy: {what}; another connection is using it — \
+                 retry once it has finished"
             ),
         }
     }
