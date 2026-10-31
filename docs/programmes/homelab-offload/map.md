@@ -42,6 +42,14 @@ production.
 
 ## Decisions so far
 
+- [How relais on the laptop reaches the cluster API off-LAN](t12-laptop-cluster-path.md): the VIP 192.168.1.65:6443, off-LAN over the Headscale 192.168.1.0/24 route, as SA `relais/relais-coordinator` with a short bound token in Keychain via an exec plugin; a namespaced Role.
+- [Which denial signals a pod produces, and how they map onto the old denial report](t10-pod-denial-signals.md): Hubble DROPPED flows per run-labelled pod under default-deny egress are the one verified (network) signal; Tetragon is suspected context; no seccomp audit or gVisor; no bwrap in the pod.
+- [What capacity relais gets on the cluster without starving the services or Forgejo runners](t05-cluster-capacity.md): almost none outside wk-3 until wk-4 returns; the binding limit is OSD disk I/O; a `relais` namespace with a 4 CPU / 8Gi / 8-pod quota, `relais-batch` priority -500 non-preempting, emptyDir scratch.
+- [How a worktree gets into a pod and a patch comes back](t04-worktree-transport.md): a git bundle of an immutable snapshot commit plus a manifest; the result is rebound by sha and digest; Forgejo push optional, rsync rejected.
+- [How remote capacity becomes a slot kind](t07-slot-model.md): a `ClusterJob` class in a `Cluster` cap group (`CapGroup::Remote` renamed `ModelApi`), counted by one Kubernetes Lease per slot, about 60 s TTL renewed by the coordinator, reaped on expiry; amont-slots stays host-only.
+- [How a heavy check runs in a pod and returns its outcome and logs](t14-remote-heavy-checks.md): a remote executor replaces only spawn and wait; verdicts bound to tree, image digest and toolchain; same executor for base and candidate; holdouts stay on the host in v1.
+- [Can litellm per-key budgets cap Claude spend, and does Claude Code run through it](t06-litellm-budgets.md): not today; dollar per-day caps per key only, per-run needs an in-cluster minter, and the route lacks `/v1/messages`; live test before t03.
+
 ## Not yet specified
 
 - A Rust build cache for cold pods (sccache, a cargo mirror).
