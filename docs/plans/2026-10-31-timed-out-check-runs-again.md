@@ -64,6 +64,7 @@ A timeout can still be the code's fault (a hang the worker introduced), so it mu
 
 ## Verification record (2026-10-31, before push)
 
+- `make check` on `ad90cb46`, rebased on main `412f5e2d` (v0.43.0; only `CHANGELOG.md` conflicted, both `## Unreleased` entries kept): exit 0. Rust 2118 + 42 + 284 + 1 passed, 0 failed; plugin 355 pass, 0 fail.
 - `make check` on `df05d4fb` (after the implementation-review fixes): exit 0. Rust 2118 + 41 + 284 + 1 passed, 0 failed; plugin 355 pass, 0 fail.
 - `make check` on the applied candidate, committed as `4e9e29e8`: exit 0 in 1435 s at load about 10. Rust 2117 + 41 + 284 + 1 passed, 0 failed; plugin 355 pass, 0 fail.
 - Named tests, all pass: `a_check_that_times_out_then_passes_is_flaky_timed_out_then_passed`, `a_check_that_times_out_twice_runs_exactly_twice`, `a_check_with_retry_one_that_always_times_out_runs_exactly_twice`, `a_clipped_timeout_is_not_run_again`, `a_check_outcome_without_the_new_fields_still_parses`, `a_setup_step_that_times_out_is_not_run_again`, `a_change_whose_only_failure_is_a_first_run_timeout_is_accepted_without_a_repair`, `a_baseline_check_that_times_out_once_then_passes_is_not_unrunnable`, `a_holdout_retry_that_exhausts_the_budget_ends_on_that_budget`, `a_baseline_retry_draws_on_the_total_not_on_work`; the updated `timeouts_kill_the_check_and_count_as_failures` and the unchanged `a_timeout_relais_sent_is_not_memory` and `a_check_without_retry_runs_once` pass (`a_timeout_relais_sent_is_not_memory` needed no change: a timeout, on one run or two, is still never classified as memory).
