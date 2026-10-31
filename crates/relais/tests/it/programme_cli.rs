@@ -183,7 +183,7 @@ fn the_frontier_lists_ready_tickets_and_follows_branches_and_resolutions() {
     let out = world.programme(&["frontier", "--all"]);
     assert_eq!(
         text(&out.stdout),
-        "B\ttask/afk\talpha\tName of B\nD\ttask/afk\talpha\tName of D\tin-flight prog/demo/D\n"
+        "B\ttask/afk\talpha\tName of B\nD\ttask/afk\talpha\tName of D\tin-flight prog/demo/D 0m\n"
     );
 
     git(
@@ -256,7 +256,7 @@ fn show_gives_the_destination_counts_blockers_and_branches() {
         "Destination\nShip the demo.\nThen stop.\n\n\
          open 3 (frontier 1, blocked 1, in flight 1), closed 1, out of scope 1\n\n\
          Blocked\n  Name of C (C): blocked by D\n\n\
-         In flight\n  Name of D (D): prog/demo/D\n"
+         In flight\n  Name of D (D): prog/demo/D 0m\n"
     );
     let out = world.programme(&["show", "--json"]);
     let shown: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
@@ -445,4 +445,106 @@ fn an_unknown_ticket_type_is_reported_and_left_off_the_frontier() {
     let stderr = text(&out.stderr);
     let prefix = format!("{}:2: unknown type", world.dir().join("D.md").display());
     assert!(stderr.contains(&prefix), "{stderr}");
+}
+
+/// Commits on `branch` in `repo` with the committer date `epoch` (Unix seconds).
+fn commit_dated(repo: &Path, branch: &str, epoch: i64) {
+    let date = format!("{epoch} +0000");
+    let out = git_command(repo)
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "work",
+        ])
+        .env("GIT_COMMITTER_DATE", &date)
+        .env("GIT_AUTHOR_DATE", &date)
+        .output()
+        .expect("git runs");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    git(repo, &["branch", "-f", branch, "HEAD"]);
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}
+
+#[test]
+fn an_in_flight_ticket_shows_its_branch_last_commit_age() {
+    let world = World::new("age");
+    let alpha = world.root.join("alpha");
+    commit_dated(&alpha, "prog/demo/D", unix_now() - 3 * 3600);
+
+    let out = world.programme(&["frontier", "--all"]);
+    assert_eq!(
+        text(&out.stdout),
+        "B\ttask/afk\talpha\tName of B\nD\ttask/afk\talpha\tName of D\tin-flight prog/demo/D 3h\n"
+    );
+    let fields: Vec<usize> = text(&out.stdout)
+        .lines()
+        .map(|line| line.split('\t').count())
+        .collect();
+    assert_eq!(fields, [4, 5]);
+    let out = world.programme(&["show"]);
+    assert!(text(&out.stdout).contains("In flight\n  Name of D (D): prog/demo/D 3h\n"));
+
+    let out = world.programme(&["frontier", "--all", "--json"]);
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let age = rows[1]["branch_age_secs"].as_i64().expect("integer");
+    assert!((10_800..=10_860).contains(&age), "{age}");
+    assert!(rows[0]["branch_age_secs"].is_null());
+    let out = world.programme(&["show", "--json"]);
+    let shown: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let age = shown["in_flight"][0]["branch_age_secs"]
+        .as_i64()
+        .expect("integer");
+    assert!((10_800..=10_860).contains(&age), "{age}");
+
+    commit_dated(&alpha, "prog/demo/D", unix_now() + 7200);
+    let out = world.programme(&["frontier", "--all"]);
+    assert!(text(&out.stdout).ends_with("in-flight prog/demo/D 0m\n"));
+    let out = world.programme(&["show", "--json"]);
+    let shown: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(shown["in_flight"][0]["branch_age_secs"], 0);
+}
+
+#[test]
+fn list_names_a_map_once_though_a_linked_worktree_holds_it() {
+    let world = World::new("list-once");
+    let alpha = world.root.join("alpha");
+    git(&alpha, &["add", "."]);
+    git(&alpha, &["commit", "-q", "-m", "programme"]);
+    let linked = world.root.join("alpha-wt-x");
+    git(
+        &alpha,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            linked.to_str().expect("utf8"),
+            "-b",
+            "side",
+        ],
+    );
+    let root = world.root.to_str().expect("utf8");
+    let out = world.relais(&["programme", "list", "--root", root]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout).lines().count(),
+        1,
+        "{}",
+        text(&out.stdout)
+    );
 }

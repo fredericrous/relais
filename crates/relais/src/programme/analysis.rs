@@ -13,8 +13,11 @@ pub enum Standing {
     Frontier,
     /// Open, and these tickets (not closed, or not there) block it.
     Blocked(Vec<String>),
-    /// Open, and this branch works it.
-    InFlight(String),
+    /// Open, and this branch works it; its tip was committed at that Unix time.
+    InFlight {
+        branch: String,
+        last_commit_unix: i64,
+    },
     Closed,
     OutOfScope,
 }
@@ -33,13 +36,20 @@ pub fn branch_name(slug: &str, id: &str) -> String {
     format!("prog/{slug}/{id}")
 }
 
-/// Every ticket's standing. `working` holds the ids that a
-/// `prog/<slug>/<id>` branch works; a branch wins over blockers because it
+/// Seconds since a branch tip was committed, never negative: a committer
+/// date in the future reads as 0.
+pub fn age_secs(now_unix: i64, last_commit_unix: i64) -> u64 {
+    u64::try_from(now_unix.saturating_sub(last_commit_unix)).unwrap_or(0)
+}
+
+/// Every ticket's standing. `working` maps the ids that a
+/// `prog/<slug>/<id>` branch works to the latest committer date (Unix
+/// seconds) among that branch's local and `origin` refs; a branch wins over blockers because it
 /// is the stronger fact about the ticket.
 pub fn standings(
     tickets: &BTreeMap<String, Ticket>,
     slug: &str,
-    working: &BTreeSet<String>,
+    working: &BTreeMap<String, i64>,
 ) -> BTreeMap<String, Standing> {
     tickets
         .values()
@@ -47,9 +57,10 @@ pub fn standings(
             let standing = match ticket.status {
                 Status::Closed => Standing::Closed,
                 Status::OutOfScope => Standing::OutOfScope,
-                Status::Open if working.contains(&ticket.id) => {
-                    Standing::InFlight(branch_name(slug, &ticket.id))
-                }
+                Status::Open if working.contains_key(&ticket.id) => Standing::InFlight {
+                    branch: branch_name(slug, &ticket.id),
+                    last_commit_unix: working[&ticket.id],
+                },
                 Status::Open => {
                     let blockers: Vec<String> = ticket
                         .blocked_by
@@ -75,7 +86,7 @@ pub fn counts(standings: &BTreeMap<String, Standing>) -> Counts {
         match standing {
             Standing::Frontier => counts.frontier += 1,
             Standing::Blocked(_) => counts.blocked += 1,
-            Standing::InFlight(_) => counts.in_flight += 1,
+            Standing::InFlight { .. } => counts.in_flight += 1,
             Standing::Closed => counts.closed += 1,
             Standing::OutOfScope => counts.out_of_scope += 1,
         }
@@ -282,16 +293,28 @@ mod tests {
             ticket("D", Status::Open, &[]),
             ticket("E", Status::OutOfScope, &[]),
         ]);
-        let working = BTreeSet::from(["D".to_string()]);
+        let working = BTreeMap::from([("D".to_string(), 1_000)]);
         let all = standings(&tickets, "demo", &working);
         assert_eq!(all["B"], Standing::Frontier);
         assert_eq!(all["C"], Standing::Blocked(vec!["D".to_string()]));
-        assert_eq!(all["D"], Standing::InFlight("prog/demo/D".to_string()));
+        assert_eq!(
+            all["D"],
+            Standing::InFlight {
+                branch: "prog/demo/D".to_string(),
+                last_commit_unix: 1_000
+            }
+        );
         let total = counts(&all);
         assert_eq!(
             (total.open, total.frontier, total.blocked, total.in_flight),
             (3, 1, 1, 1)
         );
+    }
+
+    #[test]
+    fn an_age_is_clamped_at_zero() {
+        assert_eq!(age_secs(1_000, 400), 600);
+        assert_eq!(age_secs(1_000, 1_500), 0);
     }
 
     #[test]
