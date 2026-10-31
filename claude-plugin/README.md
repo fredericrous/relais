@@ -122,6 +122,10 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
   `mcp__relais__onboard` / `mcp__relais__trust`, a replay with
   `mcp__relais__replay`, progress with `mcp__relais__status` or
   `/relais-status`.
+- `skills/programme/SKILL.md` — the `programme` skill (`/relais:programme` by
+  hand), which the model uses at the start of big work and to resume it: the
+  three-tier triage, charting a map, and working one ticket from
+  `relais programme frontier` (SPEC §31).
 - `tests/*.test.ts`, `tests/views/relais-pane.test.ts`,
   `tests/views/quiet-pane.test.ts`, `tests/views/agent-view.test.ts` — the plugin's tests.
 

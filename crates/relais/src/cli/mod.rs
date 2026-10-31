@@ -11,6 +11,7 @@ pub(crate) mod learn;
 pub(crate) mod native;
 pub(crate) mod outcome;
 pub(crate) mod plan;
+pub(crate) mod programme;
 pub(crate) mod protocol;
 pub(crate) mod recipe;
 pub(crate) mod replay;
@@ -42,6 +43,11 @@ use self::learn::{
 use self::native::native_command;
 use self::outcome::{exit_code, CliError, CliOutcome};
 use self::plan::{plan_command, PlanFormat};
+use self::programme::{
+    check_command as programme_check_command, frontier_command as programme_frontier_command,
+    list_command as programme_list_command, show_command as programme_show_command, Format,
+    Listing,
+};
 use self::protocol::{announce_unstarted, open_protocol};
 use self::recipe::{
     recipe_diff_command, recipe_evaluate_command, recipe_list_command, recipe_promote_command,
@@ -417,6 +423,12 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: EvidenceCommand,
     },
+    /// Read-only queries over programme maps (SPEC §31): which decision
+    /// tickets are ready, what a programme holds, whether its files agree
+    Programme {
+        #[command(subcommand)]
+        cmd: ProgrammeCommand,
+    },
     /// Read one Claude Code hook payload on stdin and answer it (SPEC
     /// §23): silence, or a refusal a person can act on. With `--probe
     /// --record <dir>`, record the payload verbatim instead and decide
@@ -429,6 +441,51 @@ pub(crate) enum Command {
         /// Where `--probe` writes the payload
         #[arg(long = "record")]
         record: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ProgrammeCommand {
+    /// Every programme map under a root, with its destination and counts
+    List {
+        /// Directory holding the repositories (default: the parent of the
+        /// current repository's main checkout, through the git common dir, else
+        /// the current directory)
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open tickets whose blockers are closed and that no `prog/<slug>/<id>`
+    /// branch works, one per line: id, type/mode, repos, name
+    Frontier {
+        /// The programme directory, docs/programmes/<slug>
+        dir: PathBuf,
+        /// Also list the tickets a branch works, labelled `in-flight <branch>`
+        #[arg(long)]
+        all: bool,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// The destination, the counts, each blocked ticket and its blockers,
+    /// each in-flight ticket and its branch
+    Show {
+        /// The programme directory, docs/programmes/<slug>
+        dir: PathBuf,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report every problem in the map and its tickets, as
+    /// `<path>:<line>: <problem>` on stderr; exit 2 when there is one
+    Check {
+        /// The programme directory, docs/programmes/<slug>
+        dir: PathBuf,
+        /// Also print `{problems: [...]}` on stdout
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1309,6 +1366,22 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             json,
             proof_stdin,
         }),
+        Command::Programme { cmd } => match cmd {
+            ProgrammeCommand::List { root, json } => {
+                programme_list_command(root.as_deref(), Format::from_json_flag(json))
+            }
+            ProgrammeCommand::Frontier { dir, all, json } => programme_frontier_command(
+                &dir,
+                Listing::from_all_flag(all),
+                Format::from_json_flag(json),
+            ),
+            ProgrammeCommand::Show { dir, json } => {
+                programme_show_command(&dir, Format::from_json_flag(json))
+            }
+            ProgrammeCommand::Check { dir, json } => {
+                programme_check_command(&dir, Format::from_json_flag(json))
+            }
+        },
         Command::Evidence { cmd } => match cmd {
             EvidenceCommand::Attach {
                 run_id,
