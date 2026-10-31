@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+- `relais programme list|frontier|show|check` read a programme map (`docs/programmes/<slug>/map.md` and one TOML-frontmatter ticket file per decision, ADR-0051) and answer which decision tickets are ready: open, every blocker closed, and no `prog/<slug>/<id>` branch (local or `origin`) working them. `check` reports every problem as `path:line: message` on stderr and exits 2 when there is one. All four are read-only and open no ledger, coordinator or machine config (SPEC §31).
+
 ## v0.42.0
 
 - `relais dataset seed <file|-> [--json]` writes a described set of runs into a new ledger, so `relais report` can be checked against known counts (used by the value-checking holdout). The runs are JSON lines, with an optional first line `{"seed_schema": 1}`. Each line gives a status, `accepted_by`, `created_at`, `cost_micros`, holdouts and exposures, and they go through the same ledger writers as real runs.

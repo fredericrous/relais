@@ -20,6 +20,8 @@ mod no_headless_launch;
 mod plugin_agents;
 mod plugin_install;
 mod portable_scenarios;
+#[cfg(unix)]
+mod programme_cli;
 mod quiet_watch;
 mod release_scenarios;
 mod review_outcome;

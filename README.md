@@ -255,6 +255,20 @@ declares no setup:
 
 relais runs on a machine with none of its sibling tools. Without aval, decision keys it cannot resolve are not looked up: they are listed once as "not checked (reported, not passed)" in the receipt and the run goes on, unless `[integrations] aval = "required"` makes the missing tool block. Without amont, its hook and attestation checks are skipped and the missing tool is reported as a gap, not a pass. Without amont-agent, the guard it would add is absent and that is reported too. A tool that is installed but fails still blocks. `relais init` proposes all three as `"optional"`, and `relais doctor` lists each with its mode and whether it is installed.
 
+### Programme maps
+
+A programme that needs more than one session is a map, `docs/programmes/<slug>/map.md`,
+with one decision ticket per file beside it (SPEC §31). These commands only
+read; they open no ledger and no coordinator.
+
+```sh
+relais programme frontier docs/programmes/<slug>   # open tickets whose blockers are closed and no prog/<slug>/<id> branch works
+relais programme frontier <dir> --all --json       # also the in-flight ones; JSON array
+relais programme show <dir>                        # destination, counts, blocked tickets and their blockers, branches
+relais programme check <dir>                       # every problem as path:line: message on stderr; exit 2 when there is one
+relais programme list [--root <dir>]               # every map under <root>/*/docs/programmes, with counts
+```
+
 ### Session routing
 
 The plugin can also route the model of your own session (SPEC §30): a
