@@ -8,6 +8,13 @@ missing here.
 
 ## Unreleased
 
+### Fixed
+
+- **`relais --bogus --help` prints the help and exits 0**: help wins over an
+  unknown argument (cli.help.help-and-version), at the top level and after a
+  subcommand, which gets its own help. An unknown argument alone is still a
+  usage error with exit 2, and `--help` after `--` is not a request for help.
+
 ## v0.43.0
 
 - `relais programme list|frontier|show|check` read a programme map (`docs/programmes/<slug>/map.md` and one TOML-frontmatter ticket file per decision, ADR-0051) and answer which decision tickets are ready: open, every blocker closed, and no `prog/<slug>/<id>` branch (local or `origin`) working them. `check` reports every problem as `path:line: message` on stderr and exits 2 when there is one. All four are read-only and open no ledger, coordinator or machine config (SPEC §31).

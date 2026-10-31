@@ -1091,8 +1091,57 @@ impl DecideAnswer {
     }
 }
 
+/// The argv that asks clap for the help `args` wanted, when an unknown
+/// argument stopped the parse and `-h` or `--help` stands before any `--`
+/// (cli.help.help-and-version: `relais --bogus --help` is someone asking
+/// how to use us). It keeps the subcommand path the words name and drops
+/// everything else, so clap prints the same help it prints for
+/// `relais <path> --help`. A word that names no subcommand is skipped, which
+/// also skips a flag's value.
+fn help_argv(args: &[std::ffi::OsString]) -> Option<Vec<std::ffi::OsString>> {
+    use clap::CommandFactory;
+    let mut command = Cli::command();
+    let mut argv = vec![args.first()?.clone()];
+    let mut wants_help = false;
+    for arg in args.iter().skip(1) {
+        let Some(word) = arg.to_str() else { continue };
+        match word {
+            "--" => break,
+            "-h" | "--help" => wants_help = true,
+            _ if word.starts_with('-') => {}
+            _ => {
+                if let Some(sub) = command.find_subcommand(word).cloned() {
+                    argv.push(arg.clone());
+                    command = sub;
+                }
+            }
+        }
+    }
+    wants_help.then(|| {
+        argv.push("--help".into());
+        argv
+    })
+}
+
+/// `Cli::parse`, except that help wins over an unknown argument.
+fn parse_cli() -> Cli {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(e) if e.kind() == clap::error::ErrorKind::UnknownArgument => {
+            match help_argv(&args).map(Cli::try_parse_from) {
+                Some(Err(help)) if help.kind() == clap::error::ErrorKind::DisplayHelp => {
+                    help.exit()
+                }
+                _ => e.exit(),
+            }
+        }
+        Err(e) => e.exit(),
+    }
+}
+
 pub(crate) fn main() {
-    let cli = Cli::parse();
+    let cli = parse_cli();
     // Before anything runs, or prints: `--protocol` takes stdout over.
     let channel = match open_protocol(&cli.command) {
         Ok(channel) => channel,
@@ -1415,6 +1464,39 @@ mod tests {
         let dir = relais::test_support::short_temp_dir(&format!("main-{label}"));
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
         (ledger, dir)
+    }
+
+    #[test]
+    fn help_wins_over_an_unknown_argument() {
+        let argv = |words: &[&str]| -> Vec<std::ffi::OsString> {
+            std::iter::once("relais")
+                .chain(words.iter().copied())
+                .map(Into::into)
+                .collect()
+        };
+        let kind = |words: &[&str]| {
+            help_argv(&argv(words)).map(|a| Cli::try_parse_from(a).err().map(|e| e.kind()))
+        };
+        let help = Some(Some(clap::error::ErrorKind::DisplayHelp));
+        assert_eq!(kind(&["--bogus", "--help"]), help);
+        assert_eq!(kind(&["--bogus", "-h"]), help);
+        assert_eq!(
+            help_argv(&argv(&["coordinator", "status", "--bogus", "--help"])),
+            Some(argv(&["coordinator", "status", "--help"]))
+        );
+        assert_eq!(
+            kind(&["run", "--task", "t.json", "--bogus", "--help"]),
+            help
+        );
+        // No help asked, or asked only after `--`: the usage error stands.
+        assert_eq!(help_argv(&argv(&["--bogus-flag-for-probe"])), None);
+        assert_eq!(help_argv(&argv(&["run", "--", "--help"])), None);
+        assert_eq!(
+            Cli::try_parse_from(argv(&["--bogus-flag-for-probe"]))
+                .err()
+                .map(|e| e.exit_code()),
+            Some(2)
+        );
     }
 
     #[test]
