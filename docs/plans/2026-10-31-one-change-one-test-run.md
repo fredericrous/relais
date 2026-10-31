@@ -103,6 +103,8 @@ Measure, don't guess. For one week of ledger data plus `amont slots` samples, re
   - "CI's msrv and audit jobs still run on the PR" → both jobs trigger on `pull_request` with no path filter (`ci.yaml:14`, `:124`, `:180`). Their conclusions are read on the PR by `merge-when-green`.
   - The commit's `pre-commit-cargo-test` was deferred to CI (no host slot freed: a pre-push `cargo-test` from another session had held one for 17 min). That is the waste this plan targets. It is the repository's declared `set onBusy defer` (amont.conf), not a skip: no `hook.skip`, no `--no-verify`.
 
+  - CI's first run failed on all three test legs: `policy::tests::the_authority_hash_survives_effort_becoming_data` pins the hash of relais's own `relais.toml`, and A1 moved it deliberately. The pin now expects `df6b1095…`, the hash `relais plan` printed. Locally, `cargo test -p relais --lib policy::tests::the_authority_hash` → 1 passed. CI's test legs are the full-suite check; `merge-when-green` reads their conclusions.
+
 ## Decision log
 
 - 2026-10-31: A1 was edited directly, not through relais: a relais run would have run the very checks the change removes.
@@ -111,6 +113,7 @@ Measure, don't guess. For one week of ledger data plus `amont slots` samples, re
 
 - A1: approve after a Delta. Round 1 was approve-with-changes (51k tokens, 38 s); the Delta approved (55k tokens, 19 s).
 - Fixed: the record now has all three A1 checks, and the audit comment now says only its findings are advisory.
+- Round 3: the pinned policy hash updated after CI failed; approve (60k tokens, 18 s; advisory, past the two-round contract).
 - Phase A1 is done. Next: A2 in amont, then the Part B programme map.
 
 <!-- panel: repos=relais,amont reviewers=architect,backend,lang:rust,po,tui,unix body-sha=1fbe1abf744f -->
