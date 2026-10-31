@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: docs/homelab-offload-chart
 repos: [relais]
 adrs: [ADR-0001, ADR-0003, ADR-0009, ADR-0010, decisions:ADR-0045, decisions:ADR-0051]
@@ -269,5 +269,13 @@ Verification, observed before the push:
 - t12: off-LAN reach is unproven, because the macOS Tailscale build installs
   no `192.168.1.0/24` route (memory note). The stale memory row on kubectl
   through the public endpoint was corrected.
+
+## Implementation review
+
+- Round 1 returned approve-with-changes: two medium findings and two low.
+  Fixed: the map's t12 line now says the off-LAN path is unproven; the
+  Verification frontier set is updated; a pack-refresh line is in the log.
+- The Delta returned approve, with no new findings.
+- Cost: 55k + 58k tokens, 44 s + 17 s.
 
 <!-- panel: repos=relais reviewers=architect,backend,language,po,tui,unix,codex body-sha=680919108aaa -->
