@@ -67,7 +67,9 @@ A timeout can still be the code's fault (a hang the worker introduced), so it mu
 - `make check` on the applied candidate, committed as `4e9e29e8`: exit 0 in 1435 s at load about 10. Rust 2117 + 41 + 284 + 1 passed, 0 failed; plugin 355 pass, 0 fail.
 - Named tests, all pass: `a_check_that_times_out_then_passes_is_flaky_timed_out_then_passed`, `a_check_that_times_out_twice_runs_exactly_twice`, `a_check_with_retry_one_that_always_times_out_runs_exactly_twice`, `a_clipped_timeout_is_not_run_again`, `a_check_outcome_without_the_new_fields_still_parses`, `a_setup_step_that_times_out_is_not_run_again`, `a_change_whose_only_failure_is_a_first_run_timeout_is_accepted_without_a_repair`, `a_baseline_check_that_times_out_once_then_passes_is_not_unrunnable`, `a_holdout_retry_that_exhausts_the_budget_ends_on_that_budget`, `a_baseline_retry_draws_on_the_total_not_on_work`; the updated `timeouts_kill_the_check_and_count_as_failures`, `a_timeout_relais_sent_is_not_memory` and the unchanged `a_check_without_retry_runs_once` pass.
 - The relais run that wrote it (`run-65f224f342308-1606d`) spent $1.40 on its worker, then waited 3 h for a heavy slot and verified nothing; recorded `salvaged` at `4e9e29e8`.
-- Production check (the resumed Phase 0 replays) runs after the release; its counts are recorded in `2026-10-27-answered-outcome.md`.
+- The production check named in Verification is not part of this branch: it is the next step of `2026-10-27-answered-outcome.md` Phase 0 (the resumed replays), and its counts are recorded there.
+
+- `a_holdout_that_times_out_then_passes_is_flaky_and_keeps_both_attempts` (added after the implementation review): pass, flaky reason, two attempts (the first `TimedOut`, not clipped), the kept `log-attempt1.txt`, a serde round trip of the receipt's `HoldoutRun`.
 
 ## Not in scope
 
@@ -79,6 +81,7 @@ A timeout can still be the code's fault (a hang the worker introduced), so it mu
 
 - D1 (2026-10-31, person) Pause the replays and fix relais first: "Pause, corriger relais d'abord (Recommandé)".
 - D2 (2026-10-31) One re-run, not a contention probe: relais keeps no contention fact, a second run is the cheapest evidence, and a hang still fails twice and gets its repair.
-
+- D3 (2026-10-31, implementation review) Deliberate: `a_baseline_retry_draws_on_the_total_not_on_work` shows that the work budget is not spent by a baseline re-run, not that the total went down by the timed-out limit: `Budgets` is not observable from a run's outcome, and the total's charge for pre-work time is covered by the `policy::budgets` unit tests.
+- D4 (2026-10-31, implementation review) Deliberate: `a_holdout_retry_that_exhausts_the_budget_ends_on_that_budget` cannot show that its holdout ran twice. With a 4 s total, preflight and the baseline often spend more than 2 s on this machine, so the holdout's first attempt is already clipped and is not re-run; an assertion on the kept `log-attempt1.txt` failed for that reason (tried 2026-10-31). The test keeps what it guarantees: the run ends on the total, with no behavioral repair. The re-run of a holdout is shown by `a_holdout_that_times_out_then_passes_is_flaky_and_keeps_both_attempts`.
 
 <!-- panel: repos=relais adds= reviewers=backend,codex body-sha=670fecbc6c98 -->

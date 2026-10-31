@@ -3617,7 +3617,7 @@ mod tests {
             2,
             "a timeout on its own limit runs again"
         );
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
     }
 
     const SLEEPS_ONCE: &str = "if [ -f seen ]; then echo second; else touch seen; sleep 5; fi";
@@ -3662,7 +3662,7 @@ mod tests {
             events.contains("\"reason\":\"timed_out_then_passed\""),
             "{events}"
         );
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
     }
 
     #[test]
@@ -3674,7 +3674,7 @@ mod tests {
         assert!(!outcome.flaky);
         assert_eq!(runs_of(&dir), 2);
         assert_eq!(outcome.attempts.len(), 2);
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
     }
 
     #[test]
@@ -3689,7 +3689,7 @@ mod tests {
         assert!(outcome.failed());
         assert_eq!(runs_of(&dir), 2);
         assert_eq!(outcome.attempts.len(), 2);
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
     }
 
     #[test]
@@ -3712,7 +3712,7 @@ mod tests {
         .expect("runs");
         assert_eq!(outcome.ended, Ended::TimedOut);
         assert_eq!(runs_of(&dir), 1);
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
     }
 
     #[test]
@@ -3743,7 +3743,7 @@ mod tests {
         assert!(outcome.clipped);
         assert_eq!(runs_of(&dir), 1);
         assert!(outcome.attempts.is_empty());
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
     }
 
     #[test]

@@ -2663,3 +2663,53 @@ fn a_holdout_retry_that_exhausts_the_budget_ends_on_that_budget() {
     );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
+
+#[test]
+fn a_holdout_that_times_out_then_passes_is_flaky_and_keeps_both_attempts() {
+    // The first run leaves a marker and hangs past its two seconds; the
+    // re-run finds the marker and writes a passing report.
+    let fixture = Fixture::new();
+    let marker = fixture.dir.join("holdout-ran-once");
+    let script = script_writing(
+        &report_named("h"),
+        &format!(
+            "if [ ! -e '{m}' ]; then touch '{m}'; sleep 30; fi",
+            m = marker.display()
+        ),
+    );
+    let (store, _) = store_with(&fixture, &[(STORE_PATH_IN_STORE, script.as_str())]);
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let mut declared = script_declaration(&["sh", OVERLAY], None);
+    declared.command = serde_json::from_value(
+        serde_json::json!({ "argv": ["sh", OVERLAY], "junit": "j.xml", "timeout_seconds": 2 }),
+    )
+    .expect("a command");
+    let settings = settings_for(&fixture, &store, declared);
+    let contract = holdout_contract(&fixture, true);
+    let backend = counting_worker(Arc::default(), Arc::default());
+    let outcome = fixture.execute_with_holdouts(settings, &contract, &repo, &backend);
+    let Terminal::Accepted(receipt) = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    let [run] = receipt.holdouts.as_slice() else {
+        panic!("{:?}", receipt.holdouts);
+    };
+    assert_eq!(run.outcome, verify::HoldoutVerdict::Passed);
+    assert_eq!(run.flaky_reason.as_deref(), Some("timed_out_then_passed"));
+    let [first, second] = run.attempts.as_slice() else {
+        panic!("{:?}", run.attempts);
+    };
+    assert_eq!(first.ended.recorded(), Some(crate::procs::Ended::TimedOut));
+    assert!(!first.clipped, "{first:?}");
+    assert_eq!(
+        second.ended.recorded(),
+        Some(crate::procs::Ended::Exited(0))
+    );
+    let first_log = first.log.as_deref().expect("the first attempt's kept log");
+    assert!(first_log.ends_with("log-attempt1.txt"), "{first_log}");
+    assert!(std::path::Path::new(first_log).is_file(), "{first_log}");
+    let round_trip: verify::HoldoutRun =
+        serde_json::from_str(&serde_json::to_string(run).expect("serializes")).expect("parses");
+    assert_eq!(&round_trip, run);
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
