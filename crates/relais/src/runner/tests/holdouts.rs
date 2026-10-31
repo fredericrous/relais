@@ -2626,3 +2626,40 @@ fn two_holdouts_overlaying_one_path_each_see_only_their_own_files() {
     assert_eq!(tests_of("second"), vec!["b::t".to_string()]);
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
+
+#[test]
+fn a_holdout_retry_that_exhausts_the_budget_ends_on_that_budget() {
+    // The holdout hangs past its own two seconds; its one extra run is
+    // clipped by the four second total and hangs again. The run ends on the
+    // total, with no behavioral repair for a clock.
+    let fixture = Fixture::new();
+    let (store, _) = store_with(&fixture, &[(STORE_PATH_IN_STORE, "#!/bin/sh\nsleep 30\n")]);
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let mut declared = script_declaration(&["sh", OVERLAY], None);
+    declared.command = serde_json::from_value(
+        serde_json::json!({ "argv": ["sh", OVERLAY], "junit": "j.xml", "timeout_seconds": 2 }),
+    )
+    .expect("a command");
+    let settings = settings_for(&fixture, &store, declared);
+    let mut contract = holdout_contract(&fixture, true);
+    contract.limits.total_seconds = Some(4);
+    let backend = counting_worker(Arc::default(), Arc::default());
+    let outcome = fixture.execute_with_holdouts(settings, &contract, &repo, &backend);
+    assert!(
+        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail } if detail.contains("total")),
+        "{:?}",
+        outcome.terminal
+    );
+    let reasons: Vec<String> = fixture
+        .ledger
+        .transitions(&outcome.run_id)
+        .expect("transitions")
+        .into_iter()
+        .map(|transition| transition.reason)
+        .collect();
+    assert!(
+        !reasons.iter().any(|reason| reason == "behavioral_failure"),
+        "{reasons:?}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}

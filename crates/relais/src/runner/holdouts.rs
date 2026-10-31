@@ -560,6 +560,19 @@ impl Job<'_> {
         std::fs::create_dir_all(&kept).map_err(|e| e.to_string())?;
         let log = kept.join("log.txt");
         std::fs::copy(&check.log_path, &log).map_err(|e| e.to_string())?;
+        // Every earlier attempt keeps its own log beside the last one.
+        let earlier = check.attempts.len().saturating_sub(1);
+        for (number, (attempt, kept_attempt)) in check
+            .attempts
+            .iter()
+            .zip(run.attempts.iter_mut())
+            .enumerate()
+            .take(earlier)
+        {
+            let attempt_log = kept.join(format!("log-attempt{}.txt", number + 1));
+            std::fs::copy(&attempt.log_path, &attempt_log).map_err(|e| e.to_string())?;
+            kept_attempt.log = Some(attempt_log.to_string_lossy().into_owned());
+        }
         if run.outcome == verify::HoldoutVerdict::TimedOut {
             use std::io::Write;
             let mut kept_log = std::fs::OpenOptions::new()

@@ -924,6 +924,9 @@ impl<'a> RunEngine<'a> {
         if checks
             .iter()
             .any(|check| matches!(check.ended.recorded(), Some(Ended::TimedOut)))
+            || holdouts
+                .iter()
+                .any(|holdout| holdout.outcome == verify::HoldoutVerdict::TimedOut)
         {
             if let Some(exhausted) = self.budgets.exhausted() {
                 return Ok(Step::Ended(

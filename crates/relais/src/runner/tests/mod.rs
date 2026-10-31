@@ -8794,6 +8794,7 @@ mod review_repair;
 mod review_retry;
 mod review_stop;
 mod scope_floor;
+mod timeout_rerun;
 // Shells out to `sh` and a fake `claude` script made executable with
 // unix permissions: unix only, like the script it tests.
 #[cfg(unix)]

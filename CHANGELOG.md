@@ -14,6 +14,7 @@ missing here.
   unknown argument (cli.help.help-and-version), at the top level and after a
   subcommand, which gets its own help. An unknown argument alone is still a
   usage error with exit 2, and `--help` after `--` is not a request for help.
+- A check that ends on its own time limit now runs once more (only that check, not the suite, and with no worker) before it is judged (baseline, candidate and holdout checks, not setup steps, and not a check a run budget cut): a pass on that run is marked `flaky` with the reason `timed_out_then_passed` (new `reason` on the `flaky` event), so a contended machine no longer buys a repair or blocks a base; a check that times out twice fails as before (SPEC §9, §29).
 
 ## v0.43.0
 
