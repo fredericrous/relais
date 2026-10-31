@@ -37,7 +37,7 @@ use self::install::{install_command, uninstall_command, Targets};
 use self::learn::{
     dataset_build_command, evaluate_command, export_classifier_command, export_tasks_command,
     import_task_types_command, judge_trial_command, learn_cycle_command, learn_last_command,
-    promote_command, rollback_command, train_command,
+    promote_command, rollback_command, seed_command, train_command, SeedOutput,
 };
 use self::native::native_command;
 use self::outcome::{exit_code, CliError, CliOutcome};
@@ -602,6 +602,21 @@ pub(crate) enum DatasetCommand {
         /// The file of labels
         file: PathBuf,
     },
+    /// Write a described set of runs (JSON lines; an optional first line
+    /// `{"seed_schema": 1}`) into a NEW ledger, so `relais report` can be
+    /// checked against known counts. Refused (exit 2) unless
+    /// `RELAIS_STATE_DIR` names a directory other than the default one with
+    /// no ledger file in it; a bad file is refused whole, each bad line
+    /// printed as `<file>:<line>: <reason>`, and nothing is written. The
+    /// ledger appears complete or not at all
+    #[command(name = "seed")]
+    Seed {
+        /// The seed file, or `-` for stdin
+        file: PathBuf,
+        /// Print `{"seeded": <n>, "ledger": <path>}` on stdout
+        #[arg(long)]
+        json: bool,
+    },
     /// Record a ground-truth verdict on a review-rejected replay trial:
     /// `pass` when the source work has the same defect the review found
     /// (the typed-research gate then counts the trial as accepted), `fail`
@@ -1160,6 +1175,14 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             DatasetCommand::Build => dataset_build_command(),
             DatasetCommand::ExportTasks { out } => export_tasks_command(&out),
             DatasetCommand::ImportTaskTypes { file } => import_task_types_command(&file),
+            DatasetCommand::Seed { file, json } => {
+                let output = if json {
+                    SeedOutput::Json
+                } else {
+                    SeedOutput::Human
+                };
+                seed_command(&file, output)
+            }
             DatasetCommand::JudgeTrial {
                 trial_id,
                 verdict,

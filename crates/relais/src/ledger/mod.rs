@@ -199,6 +199,25 @@ impl Ledger {
         })
     }
 
+    /// Fold the write-ahead log into the database file, truncate it, and
+    /// close the connection. A ledger closed here leaves no `-wal` sidecar
+    /// behind, so the file can be linked or copied on its own. An error
+    /// (a reader holding the log, a failed close) is returned, never
+    /// swallowed: the caller must not treat the file as self-contained.
+    pub fn close(self) -> Result<()> {
+        let still_busy: i64 =
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        if still_busy != 0 {
+            return Err(LedgerError::Corrupt {
+                what: "the write-ahead log".into(),
+                detail: "a checkpoint could not complete because another connection holds the log"
+                    .into(),
+            });
+        }
+        self.conn.close().map_err(|(_, error)| error.into())
+    }
+
     /// Whether SQLite opened this connection read-only. [`Self::open`] on a
     /// file it cannot write (another owner, a read-only mount, an ACL)
     /// falls back to a read-only connection without an error; this is the
