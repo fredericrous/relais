@@ -31,3 +31,4 @@ the dataset seed command, while this branch was open; the board showed its
 ## Implementation review
 
 - Round 1 approve-with-changes (99k tokens, 84 s). Fixed: `make plugin` and the gate recorded; the hand-charted map named as a deviation; the rule's release corrected to 0.43.0 in decisions (#122) and the pack refreshed here; the test helper's reason moved to the `drop` line.
+- Delta approve (107k tokens, 26 s).
