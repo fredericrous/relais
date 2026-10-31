@@ -209,10 +209,8 @@ impl Ledger {
             self.conn
                 .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
         if still_busy != 0 {
-            return Err(LedgerError::Corrupt {
-                what: "the write-ahead log".into(),
-                detail: "a checkpoint could not complete because another connection holds the log"
-                    .into(),
+            return Err(LedgerError::Busy {
+                what: "a checkpoint of the write-ahead log could not complete".into(),
             });
         }
         self.conn.close().map_err(|(_, error)| error.into())
@@ -305,6 +303,34 @@ mod tests {
     use crate::money::{CostCompleteness, MicroUsd};
     use crate::route::RoutedBy;
     use rusqlite::params;
+
+    /// A second connection with an open read transaction keeps the log
+    /// in use: `close` reports the ledger busy, not corrupt.
+    #[test]
+    fn close_reports_busy_when_a_reader_holds_the_log() {
+        let (ledger, _dir) = temp_ledger();
+        ledger
+            .conn
+            .execute_batch("CREATE TABLE busy_probe (x); INSERT INTO busy_probe VALUES (1);")
+            .expect("write");
+        let reader = Connection::open(ledger.path()).expect("reader");
+        reader.execute_batch("BEGIN").expect("begin");
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM busy_probe", [], |row| row.get(0))
+            .expect("read");
+        ledger
+            .conn
+            .execute_batch("INSERT INTO busy_probe VALUES (2);")
+            .expect("write after the reader's snapshot");
+        // No real wait: the reader never moves to the new snapshot, so the
+        // ledger's own busy timeout would only spend its five seconds.
+        ledger
+            .conn
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("no busy wait");
+        let error = ledger.close().expect_err("a reader blocks the checkpoint");
+        assert!(matches!(error, LedgerError::Busy { .. }), "{error:?}");
+    }
 
     /// A read-only open shut out by an exclusive lock gives up after
     /// `READ_ONLY_BUSY_TIMEOUT`, not the writers' five seconds: it sits
