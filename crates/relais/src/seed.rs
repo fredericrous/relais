@@ -1006,10 +1006,10 @@ mod tests {
     fn a_panic_at_run_two_unwinds_through_the_guard() {
         let dir = short_temp_dir("seed-panic");
         hooks::pause_after_first_run(Box::new(|| panic!("injected panic")));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             write_seed(&dir, &three_runs())
         }));
-        assert!(result.is_err(), "the panic propagates");
+        assert!(unwound.is_err(), "the panic propagates");
         assert_eq!(file_names(&dir), Vec::<String>::new());
     }
 

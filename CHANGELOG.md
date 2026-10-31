@@ -8,6 +8,12 @@ missing here.
 
 ## Unreleased
 
+- `relais dataset seed <file|-> [--json]` writes a described set of runs into a new ledger, so `relais report` can be checked against known counts (used by the value-checking holdout). The runs are JSON lines, with an optional first line `{"seed_schema": 1}`. Each line gives a status, `accepted_by`, `created_at`, `cost_micros`, holdouts and exposures, and they go through the same ledger writers as real runs.
+  - It refuses (exit 2) unless `RELAIS_STATE_DIR` names a directory other than the default one, however spelled, with no `ledger.sqlite`, `-wal` or `-shm` in it.
+  - A bad file is refused whole, each bad line printed as `file:line: reason`.
+  - I/O errors exit 1. With `--json`, stdout carries only `{seeded, ledger}`.
+  - The ledger appears complete or not at all: it is staged per invocation and published with `hard_link`.
+
 ## v0.41.0
 
 - A holdout can attach to runs without the contract naming it (ADR-0045 widening). Give its machine.toml declaration `attach = { task_types = [...], paths = [...] }`. A `change` or `verify` run whose routing type is listed and whose write scope could touch one of the paths then gets a mandatory `attached:<name>` criterion, unless a mandatory contract criterion already names the holdout. `unclassified` is refused, and an error names the key path. The attached criterion is rebuilt from the ledger after preflight and inherited by successors. No model sees it in a first prompt; a retry shows only its statement, verdict and failing tests, and `relais decide` adds where it was declared.

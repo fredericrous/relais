@@ -416,6 +416,8 @@ fn an_unwritable_state_dir_exits_1_and_leaves_no_ledger() {
     let probe = world.state.join("probe");
     if std::fs::write(&probe, b"").is_ok() {
         // Skipped for root, which writes through 0o555; owner: relais maintainers.
+        // CI runs it: GitHub's hosted runners run tests as the non-root `runner`
+        // user, so only a local run as root skips it.
         eprintln!("skipped: the effective user ignores directory permissions");
         std::fs::remove_file(&probe).expect("remove probe");
         std::fs::set_permissions(&world.state, std::fs::Permissions::from_mode(0o755))
@@ -448,9 +450,10 @@ fn the_seed_command_is_in_the_dataset_help() {
         .output()
         .expect("relais runs");
     assert_eq!(output.status.code(), Some(0));
+    let help = text(&output.stdout);
     assert!(
-        text(&output.stdout).contains("seed"),
-        "{}",
-        text(&output.stdout)
+        help.lines()
+            .any(|line| line.trim_start().starts_with("seed ") && line.contains("NEW ledger")),
+        "{help}"
     );
 }
