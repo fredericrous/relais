@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.43.0
+
 - `relais programme list|frontier|show|check` read a programme map (`docs/programmes/<slug>/map.md` and one TOML-frontmatter ticket file per decision, ADR-0051) and answer which decision tickets are ready: open, every blocker closed, and no `prog/<slug>/<id>` branch (local or `origin`) working them. `check` reports every problem as `path:line: message` on stderr and exits 2 when there is one. All four are read-only and open no ledger, coordinator or machine config (SPEC §31).
 
 ## v0.42.0
