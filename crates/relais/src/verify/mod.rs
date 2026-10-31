@@ -44,7 +44,7 @@ pub use heavy::{
     overweight, parallelism, Admitted, Ask, HeavyAdmission, Jitter, LeaseStop, SeededJitter,
     Sleeper, ThreadSleeper, Tries, ANNOUNCE_EVERY, HOST_SLOT_ENV, LEASE_HEARTBEAT_EVERY,
 };
-pub use holdout_run::{HoldoutRun, HoldoutTest, HoldoutVerdict};
+pub use holdout_run::{HoldoutAttempt, HoldoutRun, HoldoutTest, HoldoutVerdict};
 pub use junit::{parse_junit, parse_report, JunitArtifact, JunitError, JunitReport, TestOutcome};
 
 /// Why verification could not be carried out as the policy declares it.
@@ -138,6 +138,20 @@ pub struct CheckOutcome {
     /// A check that failed and then passed on a retry: a pass, marked.
     #[serde(default, skip_serializing_if = "is_false")]
     pub flaky: bool,
+    /// Why a flaky pass was marked: `timed_out_then_passed` when the check
+    /// ended on its own time limit and passed on the one extra run. Absent
+    /// for an ordinary declared-retry flake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flaky_reason: Option<String>,
+    /// The time limit this run started with, in milliseconds: the check's
+    /// own, or less when a run budget clipped it. Zero in a receipt written
+    /// before this field existed.
+    #[serde(default)]
+    pub applied_limit_ms: u64,
+    /// The applied limit was below the check's own: a budget cut it, so a
+    /// timeout is the budget's and the check is not run again for it.
+    #[serde(default)]
+    pub clipped: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -151,6 +165,12 @@ pub struct Attempt {
     pub ended: CheckEnd,
     pub log_path: String,
     pub log_sha256: String,
+    /// The limit this attempt started with, in milliseconds.
+    #[serde(default)]
+    pub applied_limit_ms: u64,
+    /// A run budget cut the limit below the check's own.
+    #[serde(default)]
+    pub clipped: bool,
 }
 
 impl CheckOutcome {
@@ -159,6 +179,8 @@ impl CheckOutcome {
             ended: self.ended,
             log_path: self.log_path.clone(),
             log_sha256: self.log_sha256.clone(),
+            applied_limit_ms: self.applied_limit_ms,
+            clipped: self.clipped,
         }
     }
 
@@ -1158,6 +1180,22 @@ pub struct ObservedRun<'a> {
 /// resource exhaustion, and a cancellation, are never retried. A
 /// fail-then-pass is a pass marked `flaky`.
 pub fn run_observed_within(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
+    run_with_retries(run, TimeoutRerun::Once)
+}
+
+/// Whether a check that ends on its own time limit gets one extra run.
+/// A setup step does not: re-running a killed install is not known to be
+/// safe.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TimeoutRerun {
+    Once,
+    Never,
+}
+
+fn run_with_retries(
+    run: ObservedRun<'_>,
+    timeout_rerun: TimeoutRerun,
+) -> Result<CheckOutcome, VerifyError> {
     let ObservedRun {
         spec,
         label,
@@ -1168,10 +1206,25 @@ pub fn run_observed_within(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyE
     } = run;
     let mut outcome = run_attempt(run)?;
     let mut attempts = Vec::new();
-    for number in 1..=spec.retry.unwrap_or(0) {
-        if !retryable(&outcome, admission) {
+    let declared = spec.retry.unwrap_or(0);
+    let mut number = 0;
+    let mut followed_timeout = false;
+    loop {
+        let timed_out_unclipped =
+            matches!(outcome.ended.recorded(), Some(Ended::TimedOut)) && !outcome.clipped;
+        let declared_retry = number < declared && retryable(&outcome, admission);
+        // One extra run for a timeout on the check's own limit, once per
+        // verification, and never after an earlier attempt already followed
+        // a timeout.
+        let extra_run = timeout_rerun == TimeoutRerun::Once
+            && !declared_retry
+            && timed_out_unclipped
+            && !followed_timeout;
+        if !declared_retry && !extra_run {
             break;
         }
+        followed_timeout |= timed_out_unclipped;
+        number += 1;
         attempts.push(outcome.attempt());
         let retry_stem = format!("{log_stem}-retry{number}");
         outcome = run_attempt(ObservedRun {
@@ -1183,15 +1236,23 @@ pub fn run_observed_within(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyE
         attempts.push(outcome.attempt());
         outcome.flaky = !outcome.failed();
         if outcome.flaky {
+            if followed_timeout {
+                outcome.flaky_reason = Some(TIMED_OUT_THEN_PASSED.to_string());
+            }
             events.emit(Event::Flaky {
                 label: label.to_string(),
                 attempts: attempts.len() as u32,
+                reason: outcome.flaky_reason.clone(),
             });
         }
         outcome.attempts = attempts;
     }
     Ok(outcome)
 }
+
+/// The reason a check is marked flaky when it ended on its own time limit
+/// and passed on the extra run.
+pub const TIMED_OUT_THEN_PASSED: &str = "timed_out_then_passed";
 
 /// Does a failed check earn another run? Not a pass, not a cancellation,
 /// and not a failure that shows the machine ran out of a resource.
@@ -1234,6 +1295,7 @@ fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
         Err(stop) => return Err(VerifyError::Lease(stop)),
     };
     let timeout = admission.budgets.clip(own_timeout);
+    let clipped = timeout < own_timeout;
     let heartbeat_every = admission.heartbeat_every;
     // The tree as it is before the check writes to it: what it grew by is
     // the estimate its next lease reserves (SPEC §23).
@@ -1388,6 +1450,9 @@ fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
         junit,
         attempts: Vec::new(),
         flaky: false,
+        flaky_reason: None,
+        applied_limit_ms: timeout.as_millis() as u64,
+        clipped,
     })
 }
 
@@ -1712,16 +1777,19 @@ pub fn run_setup_gated_within(run: SetupRun<'_>) -> Result<Vec<CheckOutcome>, Ve
         }
         let label = setup_label(command);
         let log_stem = format!("{prefix}-setup{index}");
-        let outcome = run_observed_within(ObservedRun {
-            dir,
-            spec: command,
-            logs_dir,
-            label: &label,
-            log_stem: &log_stem,
-            events,
-            cancel,
-            admission,
-        })?;
+        let outcome = run_with_retries(
+            ObservedRun {
+                dir,
+                spec: command,
+                logs_dir,
+                label: &label,
+                log_stem: &log_stem,
+                events,
+                cancel,
+                admission,
+            },
+            TimeoutRerun::Never,
+        )?;
         let failed = outcome.failed();
         gate.ran(index, command, !failed);
         outcomes.push(outcome);
@@ -3544,6 +3612,159 @@ mod tests {
         .expect("run");
         assert_eq!(hung.ended, Ended::TimedOut);
         assert!(hung.failed());
+        assert_eq!(
+            hung.attempts.len(),
+            2,
+            "a timeout on its own limit runs again"
+        );
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+    }
+
+    const SLEEPS_ONCE: &str = "if [ -f seen ]; then echo second; else touch seen; sleep 5; fi";
+
+    fn logged_events(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default()
+    }
+
+    fn observed(dir: &Path, spec: &CommandSpec) -> CheckOutcome {
+        let events = Events::for_run_on("r", dir, crate::protocol::Wire::to(std::io::sink()));
+        run_observed_within(ObservedRun {
+            dir,
+            spec,
+            logs_dir: &dir.join("logs"),
+            label: "c",
+            log_stem: "s",
+            events: &events,
+            cancel: None,
+            admission: &HeavyAdmission::unmanaged(),
+        })
+        .expect("runs")
+    }
+
+    #[test]
+    fn a_check_that_times_out_then_passes_is_flaky_timed_out_then_passed() {
+        let dir = temp_dir("timeout-then-pass");
+        let outcome = observed(&dir, &command(&["sh", "-c", SLEEPS_ONCE], 1));
+        assert!(!outcome.failed());
+        assert!(outcome.flaky);
+        assert_eq!(
+            outcome.flaky_reason.as_deref(),
+            Some("timed_out_then_passed")
+        );
+        assert_eq!(outcome.attempts.len(), 2);
+        assert_eq!(outcome.attempts[0].ended.recorded(), Some(Ended::TimedOut));
+        assert!(!outcome.attempts[0].clipped);
+        assert_eq!(outcome.attempts[0].applied_limit_ms, 1000);
+        assert!(dir.join("logs/s.log").exists());
+        assert!(dir.join("logs/s-retry1.log").exists());
+        let events = logged_events(&dir);
+        assert!(
+            events.contains("\"reason\":\"timed_out_then_passed\""),
+            "{events}"
+        );
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+    }
+
+    #[test]
+    fn a_check_that_times_out_twice_runs_exactly_twice() {
+        let dir = temp_dir("timeout-twice");
+        let script = format!("{COUNTED}sleep 5");
+        let outcome = observed(&dir, &command(&["sh", "-c", &script], 1));
+        assert!(outcome.failed());
+        assert!(!outcome.flaky);
+        assert_eq!(runs_of(&dir), 2);
+        assert_eq!(outcome.attempts.len(), 2);
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+    }
+
+    #[test]
+    fn a_check_with_retry_one_that_always_times_out_runs_exactly_twice() {
+        let dir = temp_dir("timeout-retry-one");
+        let script = format!("{COUNTED}sleep 5");
+        let spec = CommandSpec {
+            retry: Some(1),
+            ..command(&["sh", "-c", &script], 1)
+        };
+        let outcome = observed(&dir, &spec);
+        assert!(outcome.failed());
+        assert_eq!(runs_of(&dir), 2);
+        assert_eq!(outcome.attempts.len(), 2);
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+    }
+
+    #[test]
+    fn a_setup_step_that_times_out_is_not_run_again() {
+        let dir = temp_dir("setup-timeout");
+        let script = format!("{COUNTED}sleep 5");
+        let outcome = run_with_retries(
+            ObservedRun {
+                dir: &dir,
+                spec: &command(&["sh", "-c", &script], 1),
+                logs_dir: &dir.join("logs"),
+                label: "c",
+                log_stem: "s",
+                events: &Events::silent(),
+                cancel: None,
+                admission: &HeavyAdmission::unmanaged(),
+            },
+            TimeoutRerun::Never,
+        )
+        .expect("runs");
+        assert_eq!(outcome.ended, Ended::TimedOut);
+        assert_eq!(runs_of(&dir), 1);
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+    }
+
+    #[test]
+    fn a_clipped_timeout_is_not_run_again() {
+        use crate::policy::{BudgetLimits, Budgets, WallClock};
+        let dir = temp_dir("clipped-no-rerun");
+        let budgets = Budgets::start(
+            std::sync::Arc::new(WallClock),
+            BudgetLimits::resolve(1, 60, 60, Some(600), 0),
+        );
+        budgets.begin_work();
+        let script = format!("{COUNTED}sleep 20");
+        let outcome = run_observed_within(ObservedRun {
+            dir: &dir,
+            spec: &command(&["sh", "-c", &script], 30),
+            logs_dir: &dir.join("logs"),
+            label: "c",
+            log_stem: "s",
+            events: &Events::silent(),
+            cancel: None,
+            admission: &HeavyAdmission {
+                budgets,
+                ..HeavyAdmission::unmanaged()
+            },
+        })
+        .expect("runs");
+        assert_eq!(outcome.ended, Ended::TimedOut);
+        assert!(outcome.clipped);
+        assert_eq!(runs_of(&dir), 1);
+        assert!(outcome.attempts.is_empty());
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+    }
+
+    #[test]
+    fn a_check_outcome_without_the_new_fields_still_parses() {
+        let dir = temp_dir("old-receipt");
+        let ran =
+            run_command(&dir, &command(&["true"], 10), &dir.join("logs"), "c", "s").expect("runs");
+        let mut old = serde_json::to_value(&ran).unwrap();
+        for key in ["applied_limit_ms", "clipped", "flaky_reason"] {
+            old.as_object_mut().unwrap().remove(key);
+        }
+        let outcome: CheckOutcome = serde_json::from_value(old).expect("an old receipt parses");
+        assert_eq!(outcome.applied_limit_ms, 0);
+        assert!(!outcome.clipped);
+        assert_eq!(outcome.flaky_reason, None);
+        let mut old_attempt = serde_json::to_value(ran.attempt()).unwrap();
+        for key in ["applied_limit_ms", "clipped"] {
+            old_attempt.as_object_mut().unwrap().remove(key);
+        }
+        let attempt: Attempt = serde_json::from_value(old_attempt).expect("an old attempt parses");
+        assert!(!attempt.clipped);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3819,6 +4040,9 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            flaky_reason: None,
+            applied_limit_ms: 0,
+            clipped: false,
         }
     }
 
@@ -4773,6 +4997,9 @@ mod tests {
                 junit: None,
                 attempts: Vec::new(),
                 flaky: false,
+                flaky_reason: None,
+                applied_limit_ms: 0,
+                clipped: false,
             }],
             gaps: vec![],
             baseline_failures: vec![],
@@ -4864,6 +5091,9 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            flaky_reason: None,
+            applied_limit_ms: 0,
+            clipped: false,
         }];
         let gaps = acceptance_gaps(
             &entries,
@@ -4929,6 +5159,9 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            flaky_reason: None,
+            applied_limit_ms: 0,
+            clipped: false,
         }];
         let report = VerificationReport {
             candidate_sha: "abc".into(),
@@ -5072,6 +5305,9 @@ mod tests {
             junit,
             attempts: Vec::new(),
             flaky: false,
+            flaky_reason: None,
+            applied_limit_ms: 0,
+            clipped: false,
         }
     }
 
@@ -5411,6 +5647,9 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            flaky_reason: None,
+            applied_limit_ms: 0,
+            clipped: false,
         }];
         let entries = vec![declared(
             "a person signed off on the migration",
@@ -5499,6 +5738,9 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            flaky_reason: None,
+            applied_limit_ms: 0,
+            clipped: false,
         }];
         let entries = vec![declared(
             "a person signed off on the migration",
@@ -5611,6 +5853,9 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            flaky_reason: None,
+            applied_limit_ms: 0,
+            clipped: false,
         }];
         let entries = vec![declared(
             "the pre-push cargo test gate covers this candidate",
@@ -5700,6 +5945,9 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            flaky_reason: None,
+            applied_limit_ms: 0,
+            clipped: false,
         }];
         let entries = vec![declared(
             "the pre-push cargo test gate covers this candidate",
@@ -5901,6 +6149,9 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            flaky_reason: None,
+            applied_limit_ms: 0,
+            clipped: false,
         };
         let entries = vec![
             AcceptanceEntry::Bare("the layout is listed".into()),
@@ -6105,6 +6356,9 @@ mod tests {
             junit: None,
             attempts: Vec::new(),
             flaky: false,
+            flaky_reason: None,
+            applied_limit_ms: 0,
+            clipped: false,
         };
         let report = VerificationReport {
             candidate_sha: "abc".into(),
@@ -6268,6 +6522,9 @@ mod tests {
                 junit: None,
                 attempts: Vec::new(),
                 flaky: false,
+                flaky_reason: None,
+                applied_limit_ms: 0,
+                clipped: false,
             }],
             gaps: Vec::new(),
             gaps_not_judged: Vec::new(),

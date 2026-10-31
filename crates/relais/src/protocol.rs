@@ -197,6 +197,10 @@ pub enum Event {
     Flaky {
         label: String,
         attempts: u32,
+        /// Why the check ran again, when it was not a declared retry:
+        /// `timed_out_then_passed`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// The runner is alive while it waits on a check or a worker: every
     /// [`HEARTBEAT_INTERVAL`]. `alive_at` is when the timer thread spoke;

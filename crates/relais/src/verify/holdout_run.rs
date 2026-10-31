@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{CheckOutcome, JunitReport, TestOutcome};
+use super::{Attempt, CheckEnd, CheckOutcome, JunitReport, TestOutcome};
 use crate::holdout::HoldoutSource;
 use crate::procs::Ended;
 
@@ -40,6 +40,32 @@ pub struct HoldoutTest {
     pub outcome: TestOutcome,
 }
 
+/// One run of a holdout that ran more than once: how it ended, the limit it
+/// started with and whether a budget clipped it, and its kept log. Nothing
+/// of the command or its output beyond that log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldoutAttempt {
+    pub ended: CheckEnd,
+    #[serde(default)]
+    pub applied_limit_ms: u64,
+    #[serde(default)]
+    pub clipped: bool,
+    /// The kept copy of this attempt's log, inside the run's artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<String>,
+}
+
+impl From<&Attempt> for HoldoutAttempt {
+    fn from(attempt: &Attempt) -> Self {
+        Self {
+            ended: attempt.ended,
+            applied_limit_ms: attempt.applied_limit_ms,
+            clipped: attempt.clipped,
+            log: None,
+        }
+    }
+}
+
 /// The receipt's record of one holdout run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HoldoutRun {
@@ -63,6 +89,13 @@ pub struct HoldoutRun {
     /// Wall-clock milliseconds the holdout took, copy and setup included.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wall_ms: Option<u64>,
+    /// Every attempt of a holdout that ran more than once, in order, the
+    /// last one being what the fields above describe.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<HoldoutAttempt>,
+    /// Why a flaky pass was marked (`timed_out_then_passed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flaky_reason: Option<String>,
 }
 
 impl HoldoutRun {
@@ -79,12 +112,22 @@ impl HoldoutRun {
             report: None,
             log: None,
             wall_ms: None,
+            attempts: Vec::new(),
+            flaky_reason: None,
         }
     }
 
     /// Settle a holdout from its command's outcome: the exit status
     /// together with the parsed report, nothing else.
     pub fn settled(name: &str, sha: &str, digest: &str, check: &CheckOutcome) -> Self {
+        Self {
+            attempts: check.attempts.iter().map(HoldoutAttempt::from).collect(),
+            flaky_reason: check.flaky_reason.clone(),
+            ..Self::settled_last(name, sha, digest, check)
+        }
+    }
+
+    fn settled_last(name: &str, sha: &str, digest: &str, check: &CheckOutcome) -> Self {
         if matches!(check.ended.recorded(), Some(Ended::TimedOut)) {
             return Self {
                 outcome: HoldoutVerdict::TimedOut,
@@ -148,6 +191,9 @@ mod tests {
             junit,
             attempts: Vec::new(),
             flaky: false,
+            flaky_reason: None,
+            applied_limit_ms: 0,
+            clipped: false,
         }
     }
 
