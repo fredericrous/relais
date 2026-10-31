@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.42.0
+
 - `relais dataset seed <file|-> [--json]` writes a described set of runs into a new ledger, so `relais report` can be checked against known counts (used by the value-checking holdout). The runs are JSON lines, with an optional first line `{"seed_schema": 1}`. Each line gives a status, `accepted_by`, `created_at`, `cost_micros`, holdouts and exposures, and they go through the same ledger writers as real runs.
   - It refuses (exit 2) unless `RELAIS_STATE_DIR` names a directory other than the default one, however spelled, with no `ledger.sqlite`, `-wal` or `-shm` in it.
   - A bad file is refused whole, each bad line printed as `file:line: reason`.
