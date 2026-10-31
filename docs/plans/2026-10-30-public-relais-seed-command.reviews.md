@@ -52,6 +52,6 @@ All reviewers ran on opus-5-5, except codex (gpt-6-astra). plan-panel computed `
 **Carried into implementation**
 
 - Codex 3: duplicate holdout names within a run, and a synthetic attempt identity.
-- Stale wording: "renamed into place" in the Decision log, "one transaction" in Phase 1, and "exits non-zero".
+- Stale wording: "renamed into place" in the Decision log, "one transaction" in Phase 1, and "exits non-zero" (fixed: exit 2 for refusals, exit 1 for I/O).
 - A `SchemaMismatch` is a refusal (exit 2).
 - Name the test-only hooks.

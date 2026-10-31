@@ -80,14 +80,14 @@ Before publication, a Drop guard attempts cleanup of only this invocation's temp
 
 ## Phases
 
-- [ ] Phase 1 — relais: the `dataset seed` subcommand, the guard, the parser with whole-file refusal, the writer in one transaction, `--json`, SPEC beside `import-task-types` (docs/SPEC.md ~985), `--help`, and the CHANGELOG. Release.
+- [x] Phase 1 — relais: the `dataset seed` subcommand, the guard, the parser with whole-file refusal, the writer into a staging database published by `hard_link`, `--json`, SPEC beside `import-task-types` (docs/SPEC.md ~985), `--help`, and the CHANGELOG. Release.
 - [ ] Phase 2 — the widen plan's Phase 2b resumes with `report-values` built on `relais dataset seed`. That work lives in that plan, not this one.
 
 ## Decision log
 
 - 2026-10-30 — A seed command rather than a protocol-driven run, chosen by the person after the 2a probe: deterministic, no slots, no nested run.
 - 2026-10-30 — The guard requires an explicit `RELAIS_STATE_DIR`, no ledger file at all and a non-default directory (review: seeding over an existing empty WAL ledger was the source of every remaining edge, and a holdout always seeds a fresh directory). Seeding fake runs into a real ledger would corrupt every report and the learning loop, so the default target is impossible by construction, not merely discouraged.
-- 2026-10-30 — Atomicity comes from a temp ledger renamed into place, not from new transaction-taking variants of the ledger writers: the target must be empty anyway, and this leaves the ledger's write functions untouched (review: backend's route over lang:rust's).
+- 2026-10-30 — Atomicity comes from a staging database published by `hard_link` onto the absent target, not from new transaction-taking variants of the ledger writers: the target must not exist anyway, and this leaves the ledger's write functions untouched (review: backend's route over lang:rust's).
 - 2026-10-30 — Rows go through the existing ledger write functions, so the report's counting is exercised as it is for real runs. A seed-specific shortcut would test the shortcut.
 
 ## Verification
@@ -115,8 +115,17 @@ Before publication, a Drop guard attempts cleanup of only this invocation's temp
   - The integration test covers I/O instead: a state directory made read-only after validation exits 1 and leaves no ledger.
   - Sidecars: after a seed, no `-wal` sits beside `ledger.sqlite`, and `PRAGMA integrity_check` returns `ok`.
   - Publication, a unit test on the seed writer (the failpoint is `cfg(test)`, as above): inject failure removing the temporary name after a successful hard link. Assert the writer returns a published outcome carrying a cleanup warning, and a readable destination containing the complete expected counts. A test of the CLI's outcome-to-exit mapping asserts that this outcome gives exit 0, the normal success output and the warning on stderr, and that a destination-exists refusal gives exit 2.
-  - SPEC and `--help` name the command; the `--help` snapshot is updated.
+  - SPEC and `--help` name the command (the repository has no `--help` snapshot file; the test asserts the `seed` subcommand line of `relais dataset --help`).
   - Piloted: the released binary seeds a scratch state, and `report --json` shows the seeded counts. The real ledger's mtime and run count are unchanged.
+
+  - **Observed 2026-10-31,** on `feat/dataset-seed`. Step A (run-65f16342fdc05-c613) and step B (run-65f1b830d7c34-13fb5) were each accepted on green profile checks, with the `report-json` holdout passing 25/25 and a relais review. Step B went through two review-fix successors. Every commit passed the amont gate (31 checks).
+    - The six writer unit tests: close, three runs, `storage_full` at run 2, a panic at run 2, two writers, and a failed cleanup after the link. → passed.
+    - The integration tests: report counts against the file, the month window, every refusal, I/O exit 1, the exit mapping, the `--help` line. → passed.
+    - Piloted with the branch binary on an isolated state. Three seeded runs gave `relais report --json`: accepted 2 (relais 1, person 1), pending_decisions 1, holdout_runs 2, holdout_catches 1, exposures 1 (`store`), by_source named {1, 0} and attached {1, 1, skipped 1}. Each matched the file.
+    - A second seed into the same directory exited 2: the ledger already exists. `$HOME/.local/state/relais/` exited 2: the default directory.
+    - The real ledger's mtime was unchanged, with 970 runs before and after.
+    - The pilot on the released binary follows the release.
+  - **Deliberate:** `Ledger::close` reports a checkpoint blocked by another connection as `LedgerError::Corrupt`. A distinct variant would touch every exhaustive match on `LedgerError` for a path only the seed uses. Its detail says that another connection holds the log.
 
 ## Outcome
 
