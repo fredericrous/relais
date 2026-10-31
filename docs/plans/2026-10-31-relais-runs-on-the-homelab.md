@@ -234,6 +234,9 @@ What each ticket covers:
   `relais programme frontier docs/programmes/homelab-offload --json` lists
   exactly t01, t03, t09 and t13, plus any research ticket left open by a
   failed run. When t13 closes, it lists exactly t01, t03, t09 and t15.
+  (Superseded by the research, see the Decision log: t01, t03, t09, t13, t18
+  and t19 at merge; once t13 closes, t01, t03, t09, t18 and t19, since t15
+  also waits on t19.)
 - `relais programme list` shows the map from `~/Developer/Perso`.
 - The PR is merged, and `origin/main` contains the map.
 
@@ -259,6 +262,8 @@ Verification, observed before the push:
   research. Freeing disk is the person's call.
 - t13 stays open: the sampler spec is in its ticket, and starting the sampler
   is the first step of its next session.
+- The vendored decisions pack was behind (d694a08 → eaacb7d). The
+  worktree-task Start step refreshes it on the branch, in its own commit.
 - New tickets from the research: t18 (who owns the cluster lease protocol) and
   t19 (may relais use wk-3, or wait for wk-4). t15 now waits on t19.
 - t12: off-LAN reach is unproven, because the macOS Tailscale build installs

@@ -42,7 +42,7 @@ production.
 
 ## Decisions so far
 
-- [How relais on the laptop reaches the cluster API off-LAN](t12-laptop-cluster-path.md): the VIP 192.168.1.65:6443, off-LAN over the Headscale 192.168.1.0/24 route, as SA `relais/relais-coordinator` with a short bound token in Keychain via an exec plugin; a namespaced Role.
+- [How relais on the laptop reaches the cluster API off-LAN](t12-laptop-cluster-path.md): the VIP 192.168.1.65:6443 (off-LAN via the Headscale 192.168.1.0/24 route is unproven: the macOS Tailscale build installs no route; live test open for t02/t17), as SA `relais/relais-coordinator` with a short bound token in Keychain via an exec plugin; a namespaced Role.
 - [Which denial signals a pod produces, and how they map onto the old denial report](t10-pod-denial-signals.md): Hubble DROPPED flows per run-labelled pod under default-deny egress are the one verified (network) signal; Tetragon is suspected context; no seccomp audit or gVisor; no bwrap in the pod.
 - [What capacity relais gets on the cluster without starving the services or Forgejo runners](t05-cluster-capacity.md): almost none outside wk-3 until wk-4 returns; the binding limit is OSD disk I/O; a `relais` namespace with a 4 CPU / 8Gi / 8-pod quota, `relais-batch` priority -500 non-preempting, emptyDir scratch.
 - [How a worktree gets into a pod and a patch comes back](t04-worktree-transport.md): a git bundle of an immutable snapshot commit plus a manifest; the result is rebound by sha and digest; Forgejo push optional, rsync rejected.
