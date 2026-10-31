@@ -59,7 +59,7 @@ A timeout can still be the code's fault (a hang the worker introduced), so it mu
   - a check whose timeout was clipped by a spent budget is not re-run and the run ends on the budget (existing budget tests still pass);
   - at runner level, a change run whose only failure is a first-run timeout that passes on the re-run is accepted with no repair dispatched (no second worker in the events);
   - a baseline check that times out once and passes on the re-run is not `baseline_unrunnable`.
-- Production: the resumed Phase 0 replays → expected: each first-run timeout shows a `flaky` event with reason `timed_out_then_passed`, or ends on the budget, and no `repair · behavioral_failure` has a `TimedOut` as its only failure → actual: recorded in the plan.
+- Production: the resumed Phase 0 replays → expected: each first-run timeout shows a `flaky` event with reason `timed_out_then_passed`, or ends on the budget, and no `repair · behavioral_failure` has a `TimedOut` as its only failure → actual: recorded in `2026-10-27-answered-outcome.md` Phase 0 (not part of this branch).
 - The existing `timeouts_kill_the_check_and_count_as_failures` and `a_timeout_relais_sent_is_not_memory` are updated to the new rule (a timeout that also times out on the re-run still fails), not deleted.
 
 ## Verification record (2026-10-31, before push)

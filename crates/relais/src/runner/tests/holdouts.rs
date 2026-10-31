@@ -2629,9 +2629,10 @@ fn two_holdouts_overlaying_one_path_each_see_only_their_own_files() {
 
 #[test]
 fn a_holdout_retry_that_exhausts_the_budget_ends_on_that_budget() {
-    // The holdout hangs past its own two seconds; its one extra run is
-    // clipped by the four second total and hangs again. The run ends on the
-    // total, with no behavioral repair for a clock.
+    // The holdout hangs past its own two seconds or is clipped by the four
+    // second total; either way the run ends on the total, with no behavioral
+    // repair for a clock. Whether it ran twice depends on how much of the
+    // total preflight spent, so this test does not assert it (plan D4).
     let fixture = Fixture::new();
     let (store, _) = store_with(&fixture, &[(STORE_PATH_IN_STORE, "#!/bin/sh\nsleep 30\n")]);
     let repo = fixture.repo_policy(vec![passing_check()], 3);
