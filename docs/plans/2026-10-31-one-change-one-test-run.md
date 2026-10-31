@@ -107,4 +107,10 @@ Measure, don't guess. For one week of ledger data plus `amont slots` samples, re
 
 - 2026-10-31: A1 was edited directly, not through relais: a relais run would have run the very checks the change removes.
 
+## Implementation review
+
+- A1: approve after a Delta. Round 1 was approve-with-changes (51k tokens, 38 s); the Delta approved (55k tokens, 19 s).
+- Fixed: the record now has all three A1 checks, and the audit comment now says only its findings are advisory.
+- Phase A1 is done. Next: A2 in amont, then the Part B programme map.
+
 <!-- panel: repos=relais,amont reviewers=architect,backend,lang:rust,po,tui,unix body-sha=1fbe1abf744f -->
