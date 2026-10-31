@@ -2,7 +2,11 @@ name: CI
 
 # `make check` — toolchain, lint, test, msrv, audit, plugin — on every push to
 # main and every pull request, so a green check on the PR means what a
-# green `make check` means on the workstation. The jobs mirror the
+# green `make check` means on the workstation. One exception, by decision
+# (ADR-0041, `ci.platform-schedule`): a pull request runs `test` on macOS,
+# relais's primary platform, and defers Ubuntu and Windows to the push to
+# main unless it touches platform code or carries `full-ci` (`plan` below);
+# the release waits for all three on main (release.yaml, `platforms`). The jobs mirror the
 # Makefile targets one for one; change a flag in one place, change it in
 # the other. The msrv floor, the audit command and the Claude Code version
 # the plugin job installs are READ from the repository (Cargo.toml, the
@@ -12,6 +16,8 @@ on:
   push:
     branches: ["main"]
   pull_request:
+    # `labeled` too: adding `full-ci` re-plans the run with every platform.
+    types: [opened, synchronize, reopened, labeled]
   # For `audit`: a new advisory against a crate in the tree appears
   # without anybody pushing anything. Monday morning, so it is read at the
   # start of a week.
@@ -62,6 +68,9 @@ jobs:
       - run: python3 scripts/check-child-cycles.py crates/relais/src/runner
       # The deletion check's pure logic, on fixtures (no cargo, no network).
       - run: python3 scripts/test_mutants_check.py
+      # The CI platform scripts (classifier, plan, release guard), on
+      # fixtures and a throwaway history.
+      - run: python3 scripts/test_ci_platform.py
       # general.no-disabled-safety: the clippy settings that refuse a
       # reasonless `#[allow]` are still in Cargo.toml (ADR-0044). The
       # release tarball is pinned by its checksum, so a moved tag fails here.
@@ -87,23 +96,59 @@ jobs:
   # the coordinator's endpoint and process handling are a different
   # implementation there (`ipc`, `procs`); the scenarios are `cfg(unix)`
   # (the fake `claude` is a shell script), the library suite is not.
+  #
+  # Which legs run is `plan`'s answer: macOS always; Ubuntu and Windows on
+  # main, on the schedule, and on a pull request that touches platform code
+  # or carries `full-ci`. A deferred leg is named in the run summary.
+  plan:
+    name: which platforms this run tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run_other: ${{ steps.plan.outputs.run_other }}
+      test_matrix: ${{ steps.plan.outputs.test_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The pull request's base must be reachable to say what it changed.
+          fetch-depth: 0
+      - id: platform
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          out=$(./scripts/ci-platform-touched.sh "$BASE")
+          printf '%s\n' "$out"
+          echo "touched=$(printf '%s\n' "$out" | tail -n 1)" >> "$GITHUB_OUTPUT"
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          PLATFORM_CODE: ${{ steps.platform.outputs.touched || 'true' }}
+          FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+        run: ./scripts/ci-platform-plan.sh
+
   test:
     name: test (${{ matrix.os }})
+    needs: plan
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include: ${{ fromJSON(needs.plan.outputs.test_matrix) }}
     steps:
       - uses: actions/checkout@v4
       # Skips `cargo test` only when a signature by a key in
       # .github/allowed_signers covers this exact tree on this leg's
       # platform; anything else runs it. Not on `schedule`: that run exists
-      # to catch drift no push made, so it must never skip.
+      # to catch drift no push made, so it must never skip. The platform is
+      # named, not left to the runner's default, so the leg and the
+      # attestation it accepts are read in one place (`plan`'s matrix).
       - id: attest
         if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
         uses: fredericrous/attest@v1
+        with:
+          platform: ${{ matrix.platform }}
       - uses: actions/cache@v4
         with:
           path: |
@@ -118,6 +163,11 @@ jobs:
           git config --global user.name "relais ci"
       - if: ${{ !contains(fromJSON(steps.attest.outputs.gates || '[]'), 'pre-push-cargo-test') }}
         run: cargo test
+      # The third state a reader must be able to tell apart from "ran" and
+      # "deferred": already proven by a signature (`ci.a-deferred-job-says-so`).
+      - if: ${{ contains(fromJSON(steps.attest.outputs.gates || '[]'), 'pre-push-cargo-test') }}
+        run: |
+          echo "test (${{ matrix.os }}): skipped, a signature covers this tree on ${{ matrix.platform }}" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # `make msrv`: the floor `rust-version` claims, actually compiled
   # against. Without this, `rust-version` is a string nothing tests.

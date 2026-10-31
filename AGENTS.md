@@ -59,3 +59,13 @@ message it asks for, or change what it asks for — `amont setup`, or
 `amont.commit.*` directly.
 
 <!-- amont:end -->
+
+## Platforms
+
+macOS is relais's primary platform (decisions ADR-0041, `ci.platform-schedule`).
+A pull request tests macOS. It tests Ubuntu and Windows too when it touches
+platform code (`scripts/ci-platform-touched.sh`) or carries the `full-ci`
+label; otherwise those legs are deferred to the push to main, and the release
+waits for all three (`release.yaml`, `platforms`). Add the `full-ci` label to a
+pull request whose change you suspect behaves differently on Linux or Windows
+without the classifier seeing it.
