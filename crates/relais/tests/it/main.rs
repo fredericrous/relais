@@ -2,6 +2,7 @@
 //! one process-wide cap on live worlds.
 
 mod common;
+mod dataset_seed;
 mod decide_actor;
 // The fake worker scripts are Unix shell; every module that uses them is
 // Unix-only too.

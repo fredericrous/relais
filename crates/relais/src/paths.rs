@@ -88,13 +88,36 @@ pub fn machine_settings_path() -> Result<PathBuf, HomeUnset> {
 pub fn state_dir() -> Result<PathBuf, HomeUnset> {
     match dir_override(STATE_DIR_ENV) {
         Some(dir) => Ok(dir),
-        None => Ok(home_dir()?.join(".local").join("state").join("relais")),
+        None => default_state_dir(),
     }
+}
+
+/// The state directory when no override is set, whatever the environment
+/// says now.
+pub fn default_state_dir() -> Result<PathBuf, HomeUnset> {
+    Ok(home_dir()?.join(".local").join("state").join("relais"))
+}
+
+/// The ledger's file name inside the state directory.
+pub const LEDGER_FILE: &str = "ledger.sqlite";
+
+/// The suffix of the write-ahead-log sidecar SQLite puts beside a database.
+pub const WAL_SUFFIX: &str = "-wal";
+/// The suffix of the shared-memory sidecar SQLite puts beside a database.
+pub const SHM_SUFFIX: &str = "-shm";
+
+/// The ledger file and the two sidecars SQLite may put beside it.
+pub fn ledger_file_names() -> [String; 3] {
+    [
+        LEDGER_FILE.to_string(),
+        format!("{LEDGER_FILE}{WAL_SUFFIX}"),
+        format!("{LEDGER_FILE}{SHM_SUFFIX}"),
+    ]
 }
 
 /// The SQLite ledger (SPEC §12).
 pub fn ledger_path() -> Result<PathBuf, HomeUnset> {
-    Ok(state_dir()?.join("ledger.sqlite"))
+    Ok(state_dir()?.join(LEDGER_FILE))
 }
 
 /// The directory marketplace `relais install --claude` writes the

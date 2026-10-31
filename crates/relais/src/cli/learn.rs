@@ -857,6 +857,161 @@ pub(crate) fn import_task_types_command(file: &Path) -> Result<CliOutcome, CliEr
     Ok(CliOutcome::Accepted)
 }
 
+/// How `relais dataset seed` tells its result: chosen once from the flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeedOutput {
+    Human,
+    Json,
+}
+
+const SEED_NEXT_COMMAND: &str = "`RELAIS_STATE_DIR=$(mktemp -d) relais dataset seed <file>`";
+
+/// The text of a guard refusal (reason and next command) and its exit.
+fn guard_failure(error: &relais::seed::GuardError) -> (String, CliOutcome) {
+    use relais::seed::GuardError;
+    match error {
+        GuardError::StateDirNotSet => (
+            format!(
+                "relais dataset seed: refused: {error}; seed writes only into an explicit, \
+                 empty state; run {SEED_NEXT_COMMAND}"
+            ),
+            CliOutcome::InvalidInput,
+        ),
+        GuardError::DefaultStateDir { .. } => (
+            format!(
+                "relais dataset seed: refused: {error}, which holds a person's ledger; run \
+                 {SEED_NEXT_COMMAND}"
+            ),
+            CliOutcome::InvalidInput,
+        ),
+        GuardError::LedgerExists { .. } => (
+            format!(
+                "relais dataset seed: refused: {error}; seed writes only a ledger that does not \
+                 exist yet; use a fresh directory: {SEED_NEXT_COMMAND}"
+            ),
+            CliOutcome::InvalidInput,
+        ),
+        GuardError::Io { .. } => (
+            format!("relais dataset seed: {error}"),
+            CliOutcome::OperationalFailure,
+        ),
+    }
+}
+
+/// `relais dataset seed <file|-> [--json]`. The guard and the whole-file
+/// validation run before any ledger is opened or written.
+pub(crate) fn seed_command(file: &Path, output: SeedOutput) -> Result<CliOutcome, CliError> {
+    use std::io::Read as _;
+    let override_dir = std::env::var_os(paths::STATE_DIR_ENV);
+    let default_dir = paths::default_state_dir().ok();
+    let state_dir =
+        match relais::seed::guard_destination(override_dir.as_deref(), default_dir.as_deref()) {
+            Ok(dir) => dir,
+            Err(error) => {
+                let (text, outcome) = guard_failure(&error);
+                eprintln!("{text}");
+                return Ok(outcome);
+            }
+        };
+    let from_stdin = file == Path::new("-");
+    let label = if from_stdin {
+        "<stdin>".to_string()
+    } else {
+        file.display().to_string()
+    };
+    let mut text = String::new();
+    let read = if from_stdin {
+        std::io::stdin().read_to_string(&mut text).map(|_| ())
+    } else {
+        std::fs::read_to_string(file).map(|read| text = read)
+    };
+    if let Err(error) = read {
+        eprintln!("relais dataset seed: {label}: {error}");
+        return Ok(CliOutcome::OperationalFailure);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let runs = match relais::seed::parse_seed(&text, &now) {
+        Ok(runs) => runs,
+        Err(problems) => {
+            for problem in &problems {
+                eprintln!("{label}:{}: {}", problem.line, problem.reason);
+            }
+            eprintln!(
+                "relais dataset seed: {} bad line(s); nothing was written",
+                problems.len()
+            );
+            return Ok(CliOutcome::InvalidInput);
+        }
+    };
+    let written = relais::seed::write_seed(&state_dir, &runs);
+    Ok(report_seed_result(
+        written,
+        runs.len(),
+        output,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    ))
+}
+
+/// How a seed write is told to the caller and exited: the one mapping from
+/// the writer's outcome to streams and exit status.
+fn report_seed_result(
+    written: Result<relais::seed::SeedOutcome, relais::seed::SeedError>,
+    seeded: usize,
+    output: SeedOutput,
+    stdout: &mut dyn std::io::Write,
+    stderr: &mut dyn std::io::Write,
+) -> CliOutcome {
+    use relais::seed::SeedOutcome;
+    // A closed stderr or stdout cannot be reported anywhere else.
+    let say = |sink: &mut dyn std::io::Write, line: String| {
+        let _ = writeln!(sink, "{line}"); // nowhere left to report a failed write
+    };
+    match written {
+        Ok(SeedOutcome::Published {
+            path,
+            cleanup_warning,
+        }) => {
+            if let Some(warning) = cleanup_warning {
+                say(stderr, format!("relais dataset seed: warning: {warning}"));
+            }
+            match output {
+                SeedOutput::Json => say(
+                    stdout,
+                    serde_json::json!({
+                        "seeded": seeded,
+                        "ledger": path.display().to_string(),
+                    })
+                    .to_string(),
+                ),
+                SeedOutput::Human => say(
+                    stderr,
+                    format!(
+                        "relais dataset seed: seeded {seeded} runs into {}",
+                        path.display()
+                    ),
+                ),
+            }
+            CliOutcome::Accepted
+        }
+        Ok(SeedOutcome::DestinationExists { path }) => {
+            say(
+                stderr,
+                format!(
+                    "relais dataset seed: refused: {} appeared while seeding; nothing of this \
+                     seed was kept; use a fresh directory: {SEED_NEXT_COMMAND}",
+                    path.display()
+                ),
+            );
+            CliOutcome::InvalidInput
+        }
+        Err(error) => {
+            say(stderr, format!("relais dataset seed: {error}"));
+            CliOutcome::OperationalFailure
+        }
+    }
+}
+
 /// `relais dataset judge-trial <TRIAL_ID> --verdict pass|fail --note <TEXT>`.
 pub(crate) fn judge_trial_command(
     trial_id: &str,
@@ -1013,4 +1168,104 @@ pub(crate) fn learning_off_command(
         &serde_json::json!({ "schema": 1, "auto_promote": null, "off": off, "removed": had_grant }),
     )?;
     Ok(CliOutcome::Accepted)
+}
+
+#[cfg(test)]
+mod seed_report_tests {
+    use super::*;
+    use relais::seed::{SeedError, SeedOutcome};
+
+    fn report(
+        written: Result<SeedOutcome, SeedError>,
+        output: SeedOutput,
+    ) -> (CliOutcome, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let outcome = report_seed_result(written, 3, output, &mut out, &mut err);
+        (
+            outcome,
+            String::from_utf8(out).expect("utf8"),
+            String::from_utf8(err).expect("utf8"),
+        )
+    }
+
+    #[test]
+    fn destination_exists_exits_2() {
+        let (outcome, out, err) = report(
+            Ok(SeedOutcome::DestinationExists {
+                path: "/s/ledger.sqlite".into(),
+            }),
+            SeedOutput::Json,
+        );
+        assert_eq!(outcome, CliOutcome::InvalidInput);
+        assert_eq!(super::super::outcome::exit_code(&outcome), 2);
+        assert_eq!(out, "");
+        assert!(err.contains("RELAIS_STATE_DIR=$(mktemp -d)"), "{err}");
+    }
+
+    #[test]
+    fn published_with_a_cleanup_warning_exits_0_and_warns() {
+        let (outcome, out, err) = report(
+            Ok(SeedOutcome::Published {
+                path: "/s/ledger.sqlite".into(),
+                cleanup_warning: Some("could not remove x".into()),
+            }),
+            SeedOutput::Human,
+        );
+        assert_eq!(super::super::outcome::exit_code(&outcome), 0);
+        assert_eq!(out, "");
+        assert!(err.contains("warning: could not remove x"), "{err}");
+        assert!(err.contains("seeded 3 runs into /s/ledger.sqlite"), "{err}");
+    }
+
+    #[test]
+    fn json_prints_only_the_object_on_stdout() {
+        let (outcome, out, _) = report(
+            Ok(SeedOutcome::Published {
+                path: "/s/ledger.sqlite".into(),
+                cleanup_warning: None,
+            }),
+            SeedOutput::Json,
+        );
+        assert_eq!(outcome, CliOutcome::Accepted);
+        let document: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(document["seeded"], 3);
+        assert_eq!(document["ledger"], "/s/ledger.sqlite");
+    }
+
+    #[test]
+    fn an_io_error_exits_1() {
+        let error = SeedError::Io {
+            operation: "publish ledger",
+            path: "/s/ledger.sqlite".into(),
+            source: std::io::Error::other("disk"),
+        };
+        let (outcome, out, err) = report(Err(error), SeedOutput::Json);
+        assert_eq!(super::super::outcome::exit_code(&outcome), 1);
+        assert_eq!(out, "");
+        assert!(err.contains("publish ledger"), "{err}");
+    }
+
+    #[test]
+    fn guard_refusals_exit_2_and_io_failures_exit_1() {
+        use relais::seed::GuardError;
+        let refusals = [
+            GuardError::StateDirNotSet,
+            GuardError::DefaultStateDir { dir: "/d".into() },
+            GuardError::LedgerExists {
+                path: "/d/l".into(),
+            },
+        ];
+        for refusal in refusals {
+            let (text, outcome) = guard_failure(&refusal);
+            assert_eq!(super::super::outcome::exit_code(&outcome), 2, "{text}");
+            assert!(text.contains("mktemp -d"), "{text}");
+        }
+        let io = GuardError::Io {
+            operation: "inspect",
+            path: "/d/l".into(),
+            source: std::io::Error::other("denied"),
+        };
+        let (text, outcome) = guard_failure(&io);
+        assert_eq!(super::super::outcome::exit_code(&outcome), 1, "{text}");
+    }
 }
