@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.44.0
+
 ### Fixed
 
 - **`relais --bogus --help` prints the help and exits 0**: help wins over an
