@@ -148,10 +148,9 @@ impl World {
 
 impl Drop for World {
     fn drop(&mut self) {
-        // Writable again so the scratch directory can be removed; a failure
-        // only leaves the scratch directory behind.
+        // Writable again so the scratch directory can be removed.
         let writable = std::fs::Permissions::from_mode(0o755);
-        drop(std::fs::set_permissions(&self.state, writable));
+        drop(std::fs::set_permissions(&self.state, writable)); // a failure only leaves the scratch directory behind
     }
 }
 
