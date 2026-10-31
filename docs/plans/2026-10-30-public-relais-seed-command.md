@@ -118,9 +118,9 @@ Before publication, a Drop guard attempts cleanup of only this invocation's temp
   - SPEC and `--help` name the command (the repository has no `--help` snapshot file; the test asserts the `seed` subcommand line of `relais dataset --help`).
   - Piloted: the released binary seeds a scratch state, and `report --json` shows the seeded counts. The real ledger's mtime and run count are unchanged.
 
-  - **Observed 2026-10-31,** on `feat/dataset-seed`. Step A (run-65f16342fdc05-c613) and step B (run-65f1b830d7c34-13fb5) were each accepted on green profile checks, with the `report-json` holdout passing 25/25 and a relais review. Step B went through two review-fix successors. Every commit passed the amont gate (31 checks).
-    - The six writer unit tests: close, three runs, `storage_full` at run 2, a panic at run 2, two writers, and a failed cleanup after the link. → passed.
-    - The integration tests: report counts against the file, the month window, every refusal, I/O exit 1, the exit mapping, the `--help` line. → passed.
+  - **Observed 2026-10-31,** on `feat/dataset-seed`. Step A (run-65f16342fdc05-c613) and step B (run-65f1b830d7c34-13fb5) were each accepted on green profile checks, with the `report-json` holdout passing 25/25 and a relais review. Step B went through two review-fix successors. The step A and step B commits passed the amont gate (31 checks). The review-fix commit 5590c55d had clippy and cargo-test deferred to CI for want of a host slot. Clippy and the seed tests passed when run directly, and the PR's CI run settles them.
+    - The six writer unit tests: close, three runs, `storage_full` at run 2, a panic at run 2, two writers, and a failed cleanup after the link. The CLI exit mapping unit tests (`seed_report_tests`, cli/learn.rs). → passed.
+    - The integration tests: report counts against the file, the month window, every refusal, I/O exit 1, the `--help` line. → passed.
     - Piloted with the branch binary on an isolated state. Three seeded runs gave `relais report --json`: accepted 2 (relais 1, person 1), pending_decisions 1, holdout_runs 2, holdout_catches 1, exposures 1 (`store`), by_source named {1, 0} and attached {1, 1, skipped 1}. Each matched the file.
     - A second seed into the same directory exited 2: the ledger already exists. `$HOME/.local/state/relais/` exited 2: the default directory.
     - The real ledger's mtime was unchanged, with 970 runs before and after.
