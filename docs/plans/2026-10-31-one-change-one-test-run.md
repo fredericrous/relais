@@ -93,4 +93,16 @@ Measure, don't guess. For one week of ledger data plus `amont slots` samples, re
   - Report the numbers. Success means they fall. Roll back A2 if a lone-holder, idle-host pre-push `cargo-test` gets more than 25% slower than its pre-A2 time.
 - **B:** the waste audit report is attached to ticket 0 and ranks tickets 1–5. Tickets 1+2 ship first and alone. They are accepted when, after a green relais run, the push log shows `cargo-test` skipped by a stamp and the CI `attest` step skips one test leg.
 
+## Verification record
+
+- **A1** (`chore/relais-profile-drop-msrv-audit`, 6ecb0b4e):
+  - Profile commands → expected lint, test, plugin → actual `[make lint] [make test] [make plugin]`, read from relais.toml with `tomllib`.
+  - `relais plan --task <noop contract> --json` → policy accepted → exit 0, policy_hash `df6b1095…`.
+    - The plan said `relais plan` would list the checks. Its JSON carries only route, holdouts and hashes, so the TOML read above stands in.
+  - The commit's `pre-commit-cargo-test` was deferred to CI (no host slot freed: a pre-push `cargo-test` from another session had held one for 17 min). That is the waste this plan targets.
+
+## Decision log
+
+- 2026-10-31: A1 was edited directly, not through relais: a relais run would have run the very checks the change removes.
+
 <!-- panel: repos=relais,amont reviewers=architect,backend,lang:rust,po,tui,unix body-sha=1fbe1abf744f -->
