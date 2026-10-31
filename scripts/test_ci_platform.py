@@ -166,18 +166,18 @@ class ReleasePlatforms(unittest.TestCase):
         return {"name": f"test ({os_name})", "conclusion": conclusion}
 
     def test_every_leg_passed_releases(self):
-        result = self.run_with([self.leg("macos-latest"), self.leg("ubuntu-latest"),
+        guard = self.run_with([self.leg("macos-latest"), self.leg("ubuntu-latest"),
                                 self.leg("windows-latest"), self.leg("lint", "success")])
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(guard.returncode, 0, guard.stderr)
 
     def test_a_missing_or_failed_leg_blocks_and_is_named(self):
-        result = self.run_with([self.leg("macos-latest"), self.leg("ubuntu-latest"),
+        guard = self.run_with([self.leg("macos-latest"), self.leg("ubuntu-latest"),
                                 self.leg("windows-latest", "failure")])
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("test (windows-latest)", result.stderr)
-        result = self.run_with([self.leg("macos-latest")])
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("test (ubuntu-latest)", result.stderr)
+        self.assertEqual(guard.returncode, 1)
+        self.assertIn("test (windows-latest)", guard.stderr)
+        guard = self.run_with([self.leg("macos-latest")])
+        self.assertEqual(guard.returncode, 1)
+        self.assertIn("test (ubuntu-latest)", guard.stderr)
 
     def test_an_unreadable_answer_blocks(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
@@ -185,11 +185,11 @@ class ReleasePlatforms(unittest.TestCase):
             path = f.name
         try:
             env = dict(os.environ, CHECK_RUNS_JSON=path)
-            result = subprocess.run(["sh", script("ci-release-platforms.sh"), "abc123"],
+            guard = subprocess.run(["sh", script("ci-release-platforms.sh"), "abc123"],
                                     env=env, capture_output=True, text=True)
         finally:
             os.unlink(path)
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(guard.returncode, 1)
 
 
 if __name__ == "__main__":
