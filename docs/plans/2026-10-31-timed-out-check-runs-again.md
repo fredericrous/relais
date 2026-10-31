@@ -62,6 +62,13 @@ A timeout can still be the code's fault (a hang the worker introduced), so it mu
 - Production: the resumed Phase 0 replays → expected: each first-run timeout shows a `flaky` event with reason `timed_out_then_passed`, or ends on the budget, and no `repair · behavioral_failure` has a `TimedOut` as its only failure → actual: recorded in the plan.
 - The existing `timeouts_kill_the_check_and_count_as_failures` and `a_timeout_relais_sent_is_not_memory` are updated to the new rule (a timeout that also times out on the re-run still fails), not deleted.
 
+## Verification record (2026-10-31, before push)
+
+- `make check` on the applied candidate, committed as `4e9e29e8`: exit 0 in 1435 s at load about 10. Rust 2117 + 41 + 284 + 1 passed, 0 failed; plugin 355 pass, 0 fail.
+- Named tests, all pass: `a_check_that_times_out_then_passes_is_flaky_timed_out_then_passed`, `a_check_that_times_out_twice_runs_exactly_twice`, `a_check_with_retry_one_that_always_times_out_runs_exactly_twice`, `a_clipped_timeout_is_not_run_again`, `a_check_outcome_without_the_new_fields_still_parses`, `a_setup_step_that_times_out_is_not_run_again`, `a_change_whose_only_failure_is_a_first_run_timeout_is_accepted_without_a_repair`, `a_baseline_check_that_times_out_once_then_passes_is_not_unrunnable`, `a_holdout_retry_that_exhausts_the_budget_ends_on_that_budget`, `a_baseline_retry_draws_on_the_total_not_on_work`; the updated `timeouts_kill_the_check_and_count_as_failures`, `a_timeout_relais_sent_is_not_memory` and the unchanged `a_check_without_retry_runs_once` pass.
+- The relais run that wrote it (`run-65f224f342308-1606d`) spent $1.40 on its worker, then waited 3 h for a heavy slot and verified nothing; recorded `salvaged` at `4e9e29e8`.
+- Production check (the resumed Phase 0 replays) runs after the release; its counts are recorded in `2026-10-27-answered-outcome.md`.
+
 ## Not in scope
 
 - Recording load or CPU on `CheckOutcome`, or deciding on contention directly.
