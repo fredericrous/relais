@@ -1,0 +1,16 @@
+amont-provenance-v1
+commit 2bb8c18a294e4cb7092202f5835ef1585a119eb1
+tree ff6e3eb3adaa16d1c8a2083ec4677dc456097c14
+canon 34971322fcbcac44f1cce6c092a0195023db4f2a
+patch e2de415f725916495892469e1e46c3c0380f5804
+plan docs/plans/2026-10-31-relais-runs-on-the-homelab.md af43f8385f643af284ced708819a433bf4b525197ea4f93f08df1e5e5c8c27b9
+review reviewed d208bd1160d84e686b1788eadc59ccd6f4b8a9786d7e3bbd76d0be4dbf6bf188
+preview not-required
+producer amont-agent 3.10.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAEAEiFf7syhz7XSQXEq6Pig/xWo5gryTuMbDfpJAt1q41W2Af+
+RHxZ1KoNCftUx0YP40bDZHWwsNujacfN3ZpesP
+-----END SSH SIGNATURE-----
