@@ -49,7 +49,8 @@ amont_agent = "required"
 # second build on the floor toolchain per candidate and per uncached base;
 # a newer std API still fails `make lint` through clippy's
 # `incompatible_msrv`, and newer syntax fails CI's `msrv` job before merge.
-# audit is advisory and never fails, so it said nothing about a candidate.
+# audit's findings are advisory and never fail the target, so it said
+# nothing about a candidate.
 #
 # Timeouts are from measurement rather than taste: each target run once at
 # 172a69c2 (2026-10-20), then three times that, rounded up to a minute,

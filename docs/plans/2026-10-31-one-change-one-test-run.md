@@ -99,7 +99,9 @@ Measure, don't guess. For one week of ledger data plus `amont slots` samples, re
   - Profile commands → expected lint, test, plugin → actual `[make lint] [make test] [make plugin]`, read from relais.toml with `tomllib`.
   - `relais plan --task <noop contract> --json` → policy accepted → exit 0, policy_hash `df6b1095…`.
     - The plan said `relais plan` would list the checks. Its JSON carries only route, holdouts and hashes, so the TOML read above stands in.
-  - The commit's `pre-commit-cargo-test` was deferred to CI (no host slot freed: a pre-push `cargo-test` from another session had held one for 17 min). That is the waste this plan targets.
+  - "A real relais run shows no msrv/audit in its log dir" → replaced by the TOML read above, since no relais run was made (see the Decision log). The first relais run on relais after the merge is the live check.
+  - "CI's msrv and audit jobs still run on the PR" → both jobs trigger on `pull_request` with no path filter (`ci.yaml:14`, `:124`, `:180`). Their conclusions are read on the PR by `merge-when-green`.
+  - The commit's `pre-commit-cargo-test` was deferred to CI (no host slot freed: a pre-push `cargo-test` from another session had held one for 17 min). That is the waste this plan targets. It is the repository's declared `set onBusy defer` (amont.conf), not a skip: no `hook.skip`, no `--no-verify`.
 
 ## Decision log
 
