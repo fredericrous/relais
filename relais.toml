@@ -43,6 +43,15 @@ amont_agent = "required"
 # `make check`'s gates, one check each (plan C3), so a red verdict names
 # the gate, each gate has its own clock, and only `make plugin` retries.
 #
+# Except `make msrv` and `make audit`, which CI runs on every pull request
+# (jobs `msrv` and `audit`) and a candidate does not need again here
+# (docs/plans/2026-10-31-one-change-one-test-run.md, A1). msrv was a whole
+# second build on the floor toolchain per candidate and per uncached base;
+# a newer std API still fails `make lint` through clippy's
+# `incompatible_msrv`, and newer syntax fails CI's `msrv` job before merge.
+# audit's findings are advisory and never fail the target, so it said
+# nothing about a candidate.
+#
 # Timeouts are from measurement rather than taste: each target run once at
 # 172a69c2 (2026-10-20), then three times that, rounded up to a minute,
 # never under 300 s. Three times is the headroom the single `make check`
@@ -73,17 +82,6 @@ argv = ["make", "test"]
 # `baseline_unrunnable`; 1800 s is the single `make check`'s old limit.
 timeout_seconds = 1800
 weight = 2
-
-[[verification.profiles.default.commands]]
-argv = ["make", "msrv"]
-# Measured 152 s (a second build on the declared floor). Raised from 480 s
-# on 2026-10-29, when it timed out at a load average near 470.
-timeout_seconds = 900
-
-[[verification.profiles.default.commands]]
-argv = ["make", "audit"]
-# Measured 3 s; it fetches the advisory database, so the floor applies.
-timeout_seconds = 300
 
 [[verification.profiles.default.commands]]
 argv = ["make", "plugin"]

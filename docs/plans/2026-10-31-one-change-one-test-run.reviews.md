@@ -1,0 +1,45 @@
+# Full reviews: one change, one test run
+
+## Full reviews (reference)
+
+- **architect** (29k tokens, 49 s): approve-with-changes.
+  - [high] relais and amont share one slot queue. Accepted.
+  - [high] Width needs weight, and the formula should be shared code in `amont-slots`. Accepted.
+  - [low] Verification should account for weight. Accepted.
+- **tui** (25k tokens, 45 s): approve-with-changes.
+  - [high] Three checks remain, not four. Accepted.
+  - [medium] `amont slots` should show width. Accepted.
+  - [medium] Width needs weight. Accepted.
+  - [low] Give the concrete number. Accepted.
+  - [low] Say how trust is granted again. Accepted.
+- **unix** (27k tokens, 51 s): approve-with-changes.
+  - [medium] Width needs weight. Accepted.
+  - [medium] `MAKEFLAGS` set without a `-j`. Accepted.
+  - [low] An empty value counts as unset. Accepted.
+  - [low] State the precedence in the docs. Accepted.
+- **po** (29k tokens, 65 s): approve-with-changes.
+  - [high] Measure before and after, with a rollback rule. Accepted.
+  - [high] A lone holder at `-j2` is too narrow. Accepted, via the cost check.
+  - [medium] Three checks remain. Accepted.
+  - [medium] Part B accepted on what the person sees, B1+B2 first, plus a non-goal. Accepted.
+- **backend r1** (41k tokens, 84 s): approve-with-changes.
+  - [high] The shared queue. Accepted.
+  - [high] Weight and the three spawn sites. Accepted; its "set nothing when unqueued" is overridden by rust.
+  - [high] Cost check. Accepted.
+  - [medium] Observability. Accepted.
+  - [medium] Observable verification. Accepted.
+  - [low] Who signs a local stamp. Accepted.
+- **lang:rust** (42k tokens, 75 s): approve-with-changes.
+  - [high] Bound unqueued runs too. Accepted.
+  - [medium] Name the three spawn sites. Accepted.
+  - [medium] Weight and `cap()`. Accepted.
+  - [medium] An integration test on the child env. Accepted.
+  - [medium] The msrv reason was wrong. Accepted.
+  - [low] How a preset key is detected. Accepted.
+- **backend r2** (38k tokens, 57 s): approve-with-changes.
+  - [high] The cost check would always fail; time three widths. Applied.
+  - [medium] Slots off → set nothing. Carried into implementation.
+  - [medium] Optional `jobs`; relais pins `amont-slots` 1.62. Carried into implementation.
+- **backend r2b** (23k tokens, 27 s): approve-with-changes.
+  - [medium] Verification values for both formulas. Carried into implementation.
+- **codex:** not installed.
