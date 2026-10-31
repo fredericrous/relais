@@ -237,4 +237,32 @@ What each ticket covers:
 - `relais programme list` shows the map from `~/Developer/Perso`.
 - The PR is merged, and `origin/main` contains the map.
 
+## Outcome
+
+Verification, observed before the push:
+
+| Check | Expected | Actual |
+|---|---|---|
+| `relais programme check docs/programmes/homelab-offload` | exit 0 | exit 0 |
+| frontier before research | t01, t04, t05, t06, t07, t10, t12, t13, t14 | exactly those 9 |
+| frontier at merge | t01, t03, t09, t13 (+ any failed research) | t01, t03, t09, t13 + t18, t19 (new tickets the research made precise) |
+| `relais programme list` | shows the map | listed: open 12, frontier 6, closed 7 |
+
+## Decision log
+
+- 2026-10-31: relais `inspect` runs were refused twice on contract shape:
+  acceptance must be `{statement, evidence: {kind: "llm_review"}}`, and read
+  hints must be inside the run's own repository (`../homelab` was refused).
+- 2026-10-31: 7 of 8 inspect runs ended `blocked (disk_low)`: 4.3–4.8 GB free
+  against relais's 8 GiB floor. Only t06 ran through relais (¢19). The other
+  research ran as Explore agents, which the programme skill allows for
+  research. Freeing disk is the person's call.
+- t13 stays open: the sampler spec is in its ticket, and starting the sampler
+  is the first step of its next session.
+- New tickets from the research: t18 (who owns the cluster lease protocol) and
+  t19 (may relais use wk-3, or wait for wk-4). t15 now waits on t19.
+- t12: off-LAN reach is unproven, because the macOS Tailscale build installs
+  no `192.168.1.0/24` route (memory note). The stale memory row on kubectl
+  through the public endpoint was corrected.
+
 <!-- panel: repos=relais reviewers=architect,backend,language,po,tui,unix,codex body-sha=680919108aaa -->
