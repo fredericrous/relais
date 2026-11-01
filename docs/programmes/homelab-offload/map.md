@@ -43,6 +43,8 @@ production.
 
 ## Decisions so far
 
+- [Where the pod's attestation signing key lives](t25-pod-signing-key.md): nowhere new; the laptop's amont signs from Kubernetes-recorded facts (exit code, imageID, Job spec), one Job per gate, Job-create fenced to the coordinator.
+- [Which slice ships first and alone](t15-first-slice.md): amont runs `platform=any` gates (lint, types, cycles) on wk-3, one Job per gate, laptop-signed; enabled after the t13 window.
 - [Which tool runs a gate on the cluster](t21-remote-runner-owner.md): amont, behind a `platform=any` gate and a per-repo opt-in; the pod returns a signed attestation; relais keeps calling `amont run --stamp` (architect seat).
 - [Who owns the cluster lease protocol](t18-cluster-lease-owner.md): amont, in a new std-only crate relais links for worker pods.
 - [How amont earns and signs a stamp for a tree a pod verified](t22-stamp-from-remote-run.md): it doesn't stamp (ADR-0015); the pod's signed attestation counts on the laptop only for gates declared `platform=any`; it amends ADR-0015 and adds a decisions ADR beside ADR-0041.
