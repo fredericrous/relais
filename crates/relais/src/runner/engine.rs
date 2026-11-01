@@ -928,9 +928,14 @@ impl<'a> RunEngine<'a> {
             Exhausted::AdmissionWait => {
                 let mut detail = format!(
                     "queued for a lease for {}s, the whole admission wait budget \
-                     (`[resources] admission_wait_seconds`); nothing was launched",
+                     (`[resources] admission_wait_seconds`)",
                     limits.admission_wait.as_secs()
                 );
+                // "Nothing was launched" holds for the lease, not the run: a
+                // worker may already have made the candidate.
+                if candidate.is_none() {
+                    detail.push_str("; nothing was launched");
+                }
                 let mut detail_json = serde_json::json!({ "detail": detail });
                 if let Some(kept) = candidate {
                     detail.push_str(&format!(
