@@ -368,6 +368,11 @@ pub(crate) fn retire_all_command() -> Result<CliOutcome, CliError> {
             }
         }
     }
+    // The checkouts just retired leave their run's `verify/<run>/` empty.
+    relais::runner::sweep_empty_verify_dirs(
+        &relais::runner::verify_root(&state_dir.join(paths::RUNS_DIR)),
+        &ledger,
+    );
     Ok(if failed {
         CliOutcome::OperationalFailure
     } else {
@@ -692,12 +697,109 @@ pub(crate) fn retire_in_place_saying(
     ))
 }
 
-/// Remove the holdout directory of every run the ledger records as ended.
+/// Remove the holdout directory of every run the ledger records as ended,
+/// and the empty verify directory every ended run left.
 fn sweep_ended_holdouts(ledger: &Ledger, state_dir: &Path) {
-    relais::runner::sweep_ended_holdouts(
-        &relais::runner::holdout_root(&state_dir.join(paths::RUNS_DIR)),
-        ledger,
+    let runs = state_dir.join(paths::RUNS_DIR);
+    relais::runner::sweep_ended_holdouts(&relais::runner::holdout_root(&runs), ledger);
+    relais::runner::sweep_empty_verify_dirs(&relais::runner::verify_root(&runs), ledger);
+}
+
+/// `relais resume --prune-runs <days> [--write]`: list the run
+/// directories old enough to go, with the ledger's verdict on each and
+/// the evidence rows deleting it would leave dangling; delete the
+/// prunable ones only with `--write`. A run that has not ended, waits on
+/// a person (needs_review, needs_decision, interrupted: `relais decide`
+/// still reads its artifacts) or has no receipt in the ledger is kept.
+pub(crate) fn prune_runs_command(days: u64, write: bool) -> Result<CliOutcome, CliError> {
+    use relais::prune::{apply_run_prune, plan_run_prune, RunVerdict};
+    let ledger = open_ledger()?;
+    let state_dir = paths::state_dir().map_err(CliError::Home)?;
+    let removed = relais::runner::sweep_empty_verify_dirs(
+        &relais::runner::verify_root(&state_dir.join(paths::RUNS_DIR)),
+        &ledger,
     );
+    if !removed.is_empty() {
+        println!("removed {} empty verify directories", removed.len());
+    }
+    let judge = |run: &str, path: &Path| -> RunVerdict {
+        let id = RunId::from_stored(run);
+        match ledger.run_status(&id) {
+            Ok(None) => return RunVerdict::Kept("not in the ledger".to_string()),
+            Ok(Some(state)) if !state.is_terminal() => {
+                return RunVerdict::Kept(format!("{} (not ended)", state.as_str()))
+            }
+            Ok(Some(state @ (State::NeedsReview | State::NeedsDecision | State::Interrupted))) => {
+                return RunVerdict::Kept(format!("{} (waits on a person)", state.as_str()))
+            }
+            Ok(Some(_)) => {}
+            Err(e) => return RunVerdict::Kept(format!("ledger: {e}")),
+        }
+        match ledger.receipt(&id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return RunVerdict::Kept("no receipt in the ledger".to_string()),
+            Err(e) => return RunVerdict::Kept(format!("ledger: {e}")),
+        }
+        match ledger.evidence_under(path) {
+            Ok(dangling_evidence) => RunVerdict::Prunable { dangling_evidence },
+            Err(e) => RunVerdict::Kept(format!("ledger: {e}")),
+        }
+    };
+    let runs_dir = state_dir.join(paths::RUNS_DIR);
+    let older_than = std::time::Duration::from_secs(days.saturating_mul(86_400));
+    let plan = plan_run_prune(&runs_dir, older_than, std::time::SystemTime::now(), &judge);
+    let mut prunable = 0usize;
+    let mut bytes = 0u64;
+    let mut dangling = 0usize;
+    for dir in &plan {
+        let days_old = dir.age.as_secs() / 86_400;
+        match &dir.verdict {
+            RunVerdict::Prunable { dangling_evidence } => {
+                prunable += 1;
+                bytes += dir.bytes;
+                dangling += dangling_evidence;
+                println!(
+                    "prune  {}  {days_old}d  {}  {dangling_evidence} evidence rows left dangling",
+                    dir.run,
+                    human_bytes(dir.bytes)
+                );
+            }
+            RunVerdict::Kept(why) => println!("keep   {}  {days_old}d  {why}", dir.run),
+        }
+    }
+    println!(
+        "{prunable} of {} run directories older than {days}d are prunable ({}, {dangling} evidence rows)",
+        plan.len(),
+        human_bytes(bytes)
+    );
+    if !write {
+        if prunable > 0 {
+            println!("preview only: add --write to delete them");
+        }
+        return Ok(CliOutcome::Accepted);
+    }
+    let (gone, failed) = apply_run_prune(&plan);
+    println!("deleted {} run directories", gone.len());
+    for (path, e) in &failed {
+        eprintln!(
+            "relais resume: {} could not be deleted: {e}",
+            path.display()
+        );
+    }
+    Ok(if failed.is_empty() {
+        CliOutcome::Accepted
+    } else {
+        CliOutcome::OperationalFailure
+    })
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const MB: u64 = 1024 * 1024;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else {
+        format!("{} KB", bytes.div_ceil(1024))
+    }
 }
 
 /// Retire every worktree one terminal run still holds.

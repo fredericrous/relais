@@ -190,6 +190,20 @@ impl Ledger {
         Ok(())
     }
 
+    /// How many evidence rows, of any run, point at a file under `dir`:
+    /// what deleting `dir` would leave dangling. A cached baseline's
+    /// check logs are recorded again by the run that reused them, so a
+    /// run directory can be cited by runs other than its own.
+    pub fn evidence_under(&self, dir: &std::path::Path) -> Result<usize> {
+        let prefix = format!("{}{}", dir.to_string_lossy(), std::path::MAIN_SEPARATOR);
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM evidence WHERE substr(path, 1, length(?1)) = ?1",
+            [prefix.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
     pub fn evidence(&self, run_id: &RunId) -> Result<Vec<EvidenceRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT kind, path, sha256, tool, external_id, subject, criterion_id

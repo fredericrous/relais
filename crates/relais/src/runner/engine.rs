@@ -3,12 +3,12 @@
 use super::setup_gate;
 use super::{
     admission_block, baseline_summary, decide, exhaustion, fresh_progress, scheduler,
-    setup_failure_detail, state_sibling, verify, verify_root, workspace, worktree_root, Arc,
-    AtomicBool, AttemptContext, AttemptKind, BlockCode, Budget, BudgetClock, BudgetLimits, Budgets,
-    Candidate, CostKind, Duration, EffectiveAuthority, Event, Events, EvidenceKind, Exhausted,
-    Finish, Gate, Instant, Limit, Next, Observation, Ordering, PackageId, PackageRole, PathBuf,
-    Phase, Reason, Refusal, Request, RunConfig, RunEngine, RunError, RunId, RunOutcome, State,
-    Summary, Terminal, Transition, UsagePhase, ADMISSION_POLL,
+    setup_failure_detail, state_sibling, sweep_empty_verify_dirs, verify, verify_root, workspace,
+    worktree_root, Arc, AtomicBool, AttemptContext, AttemptKind, BlockCode, Budget, BudgetClock,
+    BudgetLimits, Budgets, Candidate, CostKind, Duration, EffectiveAuthority, Event, Events,
+    EvidenceKind, Exhausted, Finish, Gate, Instant, Limit, Next, Observation, Ordering, PackageId,
+    PackageRole, PathBuf, Phase, Reason, Refusal, Request, RunConfig, RunEngine, RunError, RunId,
+    RunOutcome, State, Summary, Terminal, Transition, UsagePhase, ADMISSION_POLL,
 };
 
 impl<'a> RunEngine<'a> {
@@ -234,12 +234,22 @@ impl<'a> RunEngine<'a> {
     pub(super) fn run(mut self) -> Result<RunOutcome, RunError> {
         if self.parent.is_none() {
             self.sweep_ended_holdouts();
+            sweep_empty_verify_dirs(&verify_root(&self.config.artifacts_dir), self.config.ledger);
         }
         let finish = self.run_to_outcome();
         self.count_holdout_exposures();
         // A package (child) run has its own run id and so its own holdout
         // directory; it removes it here like a root run does.
         self.remove_holdout_dir();
+        // Each verification worktree removed itself; the run's own
+        // `verify/<run>/` directory is left empty, and goes too. One that
+        // still holds a file (a release that failed) stays visible.
+        if let Err(e) = crate::prune::remove_empty_tree(&self.verify_dir) {
+            eprintln!(
+                "relais: the verify directory {} could not be removed: {e}",
+                self.verify_dir.display()
+            );
+        }
         let outcome = match finish {
             Finish::Own(outcome) => outcome,
             Finish::Exit(error) => return Err(error),

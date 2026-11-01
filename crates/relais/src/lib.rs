@@ -36,6 +36,7 @@ pub mod policy;
 pub mod procs;
 pub mod programme;
 pub mod protocol;
+pub mod prune;
 pub mod quiet;
 pub mod reap;
 pub mod repo;

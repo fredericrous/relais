@@ -3773,6 +3773,62 @@ fn a_leftover_verification_checkout_is_removed_by_resume() {
     assert!(!checkout.exists());
     let listed = git(&world.repo, &["worktree", "list"]);
     assert!(!listed.contains("verify-base"), "{listed}");
+    // The run's own verify directory, now empty, went with it.
+    assert!(
+        !world.state.join("verify").join(&run_id).exists(),
+        "the empty verify/<run>/ directory must go"
+    );
+}
+
+// A finished run leaves no empty `verify/<run>/` directory, and `resume
+// --prune-runs` previews before it deletes: nothing goes without --write,
+// a run younger than the age is not listed, and the evidence rows a
+// deletion would leave dangling are counted.
+#[test]
+fn a_finished_run_leaves_no_empty_verify_dir_and_pruning_previews_first() {
+    let world = World::new("prune");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(5), "{}", text(&run.stderr));
+    let run_id = world.only_run_id();
+    assert!(
+        !world.state.join("verify").join(&run_id).exists(),
+        "a finished run removes its empty verify directory"
+    );
+    let run_dir = world.state.join("runs").join(&run_id);
+    assert!(run_dir.is_dir());
+
+    // Too young for a 30-day prune: not even listed.
+    let young = world.relais(&["resume", "--prune-runs", "30"]);
+    assert_eq!(young.status.code(), Some(0), "{}", text(&young.stderr));
+    assert!(
+        !text(&young.stdout).contains(&run_id),
+        "{}",
+        text(&young.stdout)
+    );
+
+    // Zero days: listed with its verdict; the preview deletes nothing.
+    let preview = world.relais(&["resume", "--prune-runs", "0"]);
+    let out = text(&preview.stdout);
+    assert_eq!(
+        preview.status.code(),
+        Some(0),
+        "{out}\n{}",
+        text(&preview.stderr)
+    );
+    assert!(out.contains(&run_id), "{out}");
+    assert!(run_dir.is_dir(), "a preview deletes nothing");
+
+    // The run ended budget_exhausted with a receipt only if one was
+    // stored; whatever the verdict, --write deletes exactly the prunable.
+    let prunable = out
+        .lines()
+        .any(|line| line.starts_with("prune") && line.contains(&run_id));
+    let applied = world.relais(&["resume", "--prune-runs", "0", "--write"]);
+    assert_eq!(applied.status.code(), Some(0), "{}", text(&applied.stderr));
+    assert_eq!(run_dir.exists(), !prunable, "{out}");
 }
 
 // A decomposed run's package keeps its verification checkout under the

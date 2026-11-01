@@ -8,6 +8,14 @@ missing here.
 
 ## Unreleased
 
+### Added
+
+- **`relais resume --prune-runs <days>`** lists the run directories under `runs/` untouched for that many days, each with its verdict and the evidence rows deleting it would leave dangling. It deletes only with `--write`, and only runs that have ended, wait on nobody and have their receipt in the ledger.
+
+### Fixed
+
+- **An ended run no longer leaves an empty `verify/<run>/` directory behind.** The run removes it at its end, and the next run start or `relais resume --retire` removes those earlier runs left (74 had piled up since September). A directory that still holds a file is kept.
+
 ## v0.44.0
 
 ### Fixed
