@@ -226,9 +226,11 @@ jobs:
   # were published" ever ran `cargo test` against the bytes being shipped
   # (C13). A tag on an unmerged or amended commit published untested code.
   #
-  # One leg, ubuntu, mirroring ci.yaml's `test` job command for command:
-  # the matrix belongs on the pull request, where a broken platform can
-  # still be fixed. Here it is the last gate before something immutable.
+  # One leg, ubuntu, mirroring ci.yaml's `test` job command for command.
+  # The other platforms are not rerun here: `platforms` waits for main's CI
+  # to have tested this exact commit on all three, since a pull request
+  # tests only macOS (ADR-0041). Here it is the last gate before something
+  # immutable.
   test:
     name: the suite passes on the tagged commit
     needs: guard
@@ -249,6 +251,38 @@ jobs:
           git config --global user.email "ci@relais.invalid"
           git config --global user.name "relais ci"
       - run: cargo test
+
+  # Every platform tested this exact commit on main. A pull request tests
+  # macOS, relais's primary platform; Ubuntu and Windows wait for the push
+  # to main (ci.yaml, `plan`; decisions ADR-0041, `ci.platform-schedule`).
+  # Deferring them is safe only because nothing ships until they passed:
+  # this waits for the `test (<os>)` jobs of the PUSH-TO-MAIN runs for the
+  # tagged commit (a pull request's run may have deferred legs, so it does
+  # not count), which the release PR's merge started.
+  # holds-until: relais CI signs attestations (plan C2); then read git-attest, as ci-release-gates.sh does
+  # A dry run reports and does not block.
+  platforms:
+    name: every platform passed on main for this commit
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ needs.guard.outputs.dry_run }}
+        run: |
+          if ./scripts/ci-release-platforms.sh "${{ github.sha }}" --wait 2400; then
+            exit 0
+          fi
+          if [ "$DRY_RUN" = true ]; then
+            echo "::warning::dry run: this commit has not passed test on every platform; a tag here would not publish"
+            exit 0
+          fi
+          exit 1
 
   audit:
     name: no known vulnerabilities ship
@@ -313,7 +347,7 @@ jobs:
   publish:
     name: publish the release
     # `test` as well as `build`: compiling is not passing.
-    needs: [guard, test, build, audit]
+    needs: [guard, test, platforms, build, audit]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

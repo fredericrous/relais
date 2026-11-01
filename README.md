@@ -32,8 +32,15 @@ CI (`.github/workflows/ci.yaml`) runs the same targets on every push and
 pull request: lint (fmt, clippy `-D warnings`, the module-cycle gate) on
 **Ubuntu**; the test suite on **Ubuntu, macOS and Windows** (the
 coordinator's endpoint and process handling are a different
-implementation on Windows, and the product ships to a macOS workstation)
-— including the release scenarios in
+implementation on Windows, and the product ships to a macOS workstation).
+**macOS is relais's primary platform** (decisions ADR-0041,
+`ci.platform-schedule`): a pull request tests macOS, and tests Ubuntu and
+Windows only when it touches platform code (`scripts/ci-platform-touched.sh`:
+the workflows, scripts, manifests, toolchain, Makefile, installers, or a
+source file under `cfg(windows|unix|target_os|target_family)`) or carries
+the `full-ci` label. Otherwise those two legs run on the push to main, the
+run summary says so, and the release waits for all three on the tagged
+commit. The suite includes the release scenarios in
 `crates/relais/tests/it/portable_scenarios.rs`, which drive the real binary
 on all three; the ones in `release_scenarios.rs` need a `sh` fake worker
 and stay unix-only;
