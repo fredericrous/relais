@@ -30,7 +30,7 @@ production.
   sandbox loop, which needs its own record), decisions:ADR-0045 (holdouts the
   writer cannot reach), decisions:ADR-0051 `harness.tool-boundaries` (amont
   owns host slots).
-- Cluster facts: wk-4 down, wk-3 reserved for AI work, Forgejo `ci` pool cut
+- Cluster facts: wk-4 down, wk-3 reserved for AI work (relais may use it under quota, t19), Forgejo `ci` pool cut
   to 2, CephFS slow on small files (use node-local ephemeral storage), no
   gVisor or Kata, Tetragon detect-only, Cilium default-deny egress templates
   in `apps/kubeopencode/`, mirrors for npm, Go and images but none for cargo.

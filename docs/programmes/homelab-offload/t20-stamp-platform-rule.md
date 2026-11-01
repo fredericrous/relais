@@ -24,3 +24,9 @@ and push gate for that tree?
   local.
 
 The rule is written as a decisions ADR amending ADR-0041 when t22 is built.
+
+## Notes
+
+Corrected by t22: amont stamps carry no platform; only attestations do. A pod
+never stamps (amont ADR-0015). "Counts on the laptop" here means the laptop
+honours the pod's signed attestation for a gate declared platform-independent.

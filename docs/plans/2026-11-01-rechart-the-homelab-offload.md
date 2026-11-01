@@ -102,6 +102,7 @@ record. Branch `docs/homelab-offload-rechart`.
 | t22-stamp-from-remote-run | How amont earns and signs a stamp for a tree a pod verified | research / afk | — | amont, decisions |
 | t23-gate-platform-inventory | Which gates in the fleet are platform-independent, and which repos are Linux-primary | research / afk | — | amont, relais, homelab |
 | t24-litellm-live-test | Does the credential path t03 chose work end to end in a pod (token, `/v1/messages`, tool use, caching, spend accounting) | research / hitl | — | homelab, relais |
+| t25-pod-signing-key | Where the pod's attestation signing key lives (added during research, from t22) | grilling / hitl | t22 | amont, homelab |
 
 - **t21** decides who owns the remote runner. ADR-0051 gives amont the
   gates, the stamps and the host slots, so amont is the likely owner, with
@@ -188,6 +189,7 @@ persistent cache answers part of it, and it stays open until t21.
   platform; attestations do.
 - t23: the timing data covers one day only, so the share of laptop load is
   left to t13. Labels in `check_timings` need gate names.
+- t25 came out of t22's open questions (which key signs a pod's attestation, kept from the gate's own code); it is on the frontier now, beside t13, t21 and t24.
 - Carried from review and done: the `t20-stamp-platform-rule` slug, t22
   blocked by t20, and Decisions so far lines for t01, t03, t09, t19 and t20.
 

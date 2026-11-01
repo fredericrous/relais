@@ -22,7 +22,7 @@ this floor, and the automatic loop (t11) may only tighten it:
 - all capabilities dropped;
 - RuntimeDefault seccomp;
 - `automountServiceAccountToken: false`;
-- no secrets mounted;
+- no secrets mounted, with one carve-out: a worker pod (t02) gets its own Claude Code token (t03), mounted read-only and never into a check pod;
 - no hostPath;
 - egress: `world` denied, plus egressDeny to the `vault` namespace and to the
   `kube-apiserver` (the diag-sandbox pattern).

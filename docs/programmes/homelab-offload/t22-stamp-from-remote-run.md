@@ -44,7 +44,7 @@ it only for gates `amont.conf` declares platform-independent.**
     `docs/ci.md:112-180`).
   - **ADR-0015 already decides** "a remote executor must never stamp":
     pre-push would sign its result under the laptop's platform
-    (`adr/0015-a-runner-earns-the-stamp.md:60-65`).
+    (`adr/0015-a-runner-earns-the-stamp.md:67`).
 - **The shape:**
   1. A pod run yields a signed attestation: platform `x86_64-linux`, the
      exact tree, the gate, the image digest and the log sha256.

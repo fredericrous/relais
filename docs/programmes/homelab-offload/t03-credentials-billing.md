@@ -15,7 +15,7 @@ A subscription OAuth token mounted in the pod, or an API key routed through lite
 
 Decided as staff engineer, as delegated on 2026-10-31. **Direction:** a
 long-lived Claude Code OAuth token (`claude setup-token`) stored in Vault and
-mounted only into worker pods, never into check pods.
+mounted only into worker pods, never into check pods. This is the one carve-out from the t09 floor's "no secrets mounted".
 
 - **Spend:** capped by relais's own ledger and cap, not by litellm. t06 found
   no per-key budgets, and no `/v1/messages` route.
