@@ -26,3 +26,10 @@ A tag must not depend on a signature that does not exist yet. Turning the attest
 
 ## Not yet proven (post-merge)
 The real proof is that a push to `main` produces three `ci@relais` blocks: `git notes --ref amont-attest show <main tree>` on origin carries one block per platform for `pre-push-cargo-test`. Until that is seen, `ATTEST_CHECK` stays `0`.
+
+## Implementation review
+- Round 1 on d1b91ac0 (by the parent): approve-with-changes. Fixed:
+  - `release.yaml`'s `platforms` job installs git-attest 1.7.0 checksum-verified and exports `GIT_ATTEST`, as amont does. It is inert while `ATTEST_CHECK` is 0, so turning it on is one token. The verifier's stderr is no longer hidden. The `holds-until:` markers name only the flag flip.
+  - The sign job no longer requires every test leg to pass: each leg's result file decides, so passing legs are signed even when another fails. The comment and message match.
+  - `continue-on-error: true` on the sign job's artifact download, so a missing file takes the no-sign path.
+- After the fixes: 21 script tests OK, both workflows parse, shellcheck clean.

@@ -271,14 +271,13 @@ jobs:
   # Sign the gate the test legs ran, once per platform it ran on, so the next
   # job that checks out this tree can skip it (decisions ADR-0041,
   # `ci.attested-skip`; plan C2). Push to main only: a pull request never holds
-  # the key. A leg whose suite an attestation skipped signs nothing, so only
-  # real runs are signed. Keyed off `needs.test.result` and each leg's own
-  # `suite` step outcome: a leg whose run failed never reaches this job, since
-  # `needs` requires success.
+  # the key. Each leg's own result file decides, as in amont: a leg whose suite
+  # passed is signed even when another leg failed, and a leg whose suite an
+  # attestation skipped, or that failed, signs nothing.
   sign:
     name: sign attestations
     needs: [test, plan]
-    if: ${{ always() && needs.test.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -292,6 +291,7 @@ jobs:
       # Each leg's result, read in place of the matrix outputs: the sign step
       # below runs only when this leg's own file says the suite ran and passed.
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           pattern: sign-result-${{ matrix.os }}
           path: ${{ runner.temp }}/sign-results
@@ -304,7 +304,7 @@ jobs:
             echo "sign=true" >> "$GITHUB_OUTPUT"
           else
             echo "sign=false" >> "$GITHUB_OUTPUT"
-            echo "sign: $OS ran no suite (an attestation covered it, or it failed): nothing to sign"
+            echo "sign: $OS has no passing suite run to sign (skipped by an attestation, failed, or no result file)"
           fi
       - name: sign pre-push-cargo-test for this platform
         if: ${{ steps.ran.outputs.sign == 'true' }}

@@ -259,7 +259,7 @@ jobs:
   # this waits for the `test (<os>)` jobs of the PUSH-TO-MAIN runs for the
   # tagged commit (a pull request's run may have deferred legs, so it does
   # not count), which the release PR's merge started.
-  # holds-until: relais CI signs attestations (plan C2): then set ATTEST_CHECK=1 below so a tag also needs the signatures
+  # holds-until: a signed run is proven on main; then flip ATTEST_CHECK to 1 below
   # A dry run reports and does not block.
   platforms:
     name: every platform passed on main for this commit
@@ -271,12 +271,24 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      # attest's verifier at the version and archive digest its own release
+      # pins for v1.7.0, as amont's release.yaml installs it. Inert while
+      # ATTEST_CHECK is 0; it is here so turning the check on is one token.
+      - name: git-attest 1.7.0
+        run: |
+          set -euo pipefail
+          name=git-attest-1.7.0-x86_64-unknown-linux-musl
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$name.tar.gz" \
+            "https://github.com/fredericrous/attest/releases/download/v1.7.0/$name.tar.gz"
+          echo "6d25cc5320670d7f2bf225bd9a653b5b862be015e17b678e642bedb2e23ba2db  $RUNNER_TEMP/$name.tar.gz" \
+            | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP"
+          echo "GIT_ATTEST=$RUNNER_TEMP/$name/git-attest" >> "$GITHUB_ENV"
       - env:
           GH_TOKEN: ${{ github.token }}
           DRY_RUN: ${{ needs.guard.outputs.dry_run }}
         run: |
-          # ATTEST_CHECK is 0 until the first signed run is proven on main
-          # (plan C2): then the release also needs the signatures.
+          # ATTEST_CHECK: flip to 1 once a signed run is proven on main.
           if ATTEST_CHECK=0 ./scripts/ci-release-platforms.sh "${{ github.sha }}" --wait 2400; then
             exit 0
           fi
