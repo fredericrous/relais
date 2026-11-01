@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: build/ci-sign
 repos: [relais]
 canonical: decisions:docs/plans/2026-11-01-one-verdict-build.md
@@ -33,3 +33,10 @@ The real proof is that a push to `main` produces three `ci@relais` blocks: `git 
   - The sign job no longer requires every test leg to pass: each leg's result file decides, so passing legs are signed even when another fails. The comment and message match.
   - `continue-on-error: true` on the sign job's artifact download, so a missing file takes the no-sign path.
 - After the fixes: 21 script tests OK, both workflows parse, shellcheck clean.
+
+## Implementation review
+
+- Approved after round 1 (on d1b91ac0) and a Delta (on a3678554).
+- Round 1 was approve-with-changes: 1 medium finding (install the verifier now, so the switch is one token) and 2 low (sign each leg, as amont does; `continue-on-error` on the download). All were fixed in 648c1e07.
+- Follow-up, low: add `&& needs.plan.result == 'success'` to the `sign` job's `if`, so a failed `plan` skips the job instead of erroring on an empty matrix.
+- After merge: check that `git notes --ref amont-attest show <main tree>` on origin carries three `ci@relais` blocks. Then do one dry-run release with `ATTEST_CHECK=1` before committing the flip.
