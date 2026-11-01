@@ -10,7 +10,7 @@ missing here.
 
 ### Added
 
-- **`relais resume --prune-runs <days>`** lists the run directories under `runs/` untouched for that many days, each with its verdict and the evidence rows deleting it would leave dangling. It deletes only with `--write`, and only runs that have ended, wait on nobody and have their receipt in the ledger.
+- **`relais resume --prune-runs [<days>]`** (30 days by default) lists the run directories under `runs/` untouched for that long, each with its verdict and the evidence rows deleting it would leave dangling. A preview deletes nothing. `--write` deletes only runs that have ended, wait on nobody, have their receipt in the ledger and are not cited by a baseline-cache entry; it also removes the empty verify directories of ended runs.
 
 ### Fixed
 

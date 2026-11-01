@@ -70,7 +70,7 @@ mod types;
 mod verification;
 mod workspace_ops;
 
-pub use crate::prune::sweep_ended_verify_dirs as sweep_empty_verify_dirs;
+pub use crate::prune::sweep_ended_verify_dirs;
 pub use crate::workspace::OutOfScope;
 use baseline::{baseline_summary, setup_failure_detail};
 pub use config::{holdout_root, verify_root, worktree_root, DesignSource, RunConfig};

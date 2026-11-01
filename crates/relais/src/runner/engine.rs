@@ -3,7 +3,7 @@
 use super::setup_gate;
 use super::{
     admission_block, baseline_summary, decide, exhaustion, fresh_progress, scheduler,
-    setup_failure_detail, state_sibling, sweep_empty_verify_dirs, verify, verify_root, workspace,
+    setup_failure_detail, state_sibling, sweep_ended_verify_dirs, verify, verify_root, workspace,
     worktree_root, Arc, AtomicBool, AttemptContext, AttemptKind, BlockCode, Budget, BudgetClock,
     BudgetLimits, Budgets, Candidate, CostKind, Duration, EffectiveAuthority, Event, Events,
     EvidenceKind, Exhausted, Finish, Gate, Instant, Limit, Next, Observation, Ordering, PackageId,
@@ -234,7 +234,7 @@ impl<'a> RunEngine<'a> {
     pub(super) fn run(mut self) -> Result<RunOutcome, RunError> {
         if self.parent.is_none() {
             self.sweep_ended_holdouts();
-            sweep_empty_verify_dirs(&verify_root(&self.config.artifacts_dir), self.config.ledger);
+            sweep_ended_verify_dirs(&verify_root(&self.config.artifacts_dir), self.config.ledger);
         }
         let finish = self.run_to_outcome();
         self.count_holdout_exposures();

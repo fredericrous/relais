@@ -71,10 +71,28 @@ pub fn sweep_empty_verify_dirs(
     min_age: Duration,
 ) -> Vec<PathBuf> {
     let mut removed = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return removed;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return removed,
+        Err(e) => {
+            eprintln!(
+                "relais: the verify directory {} could not be read, nothing is swept: {e}",
+                root.display()
+            );
+            return removed;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                eprintln!(
+                    "relais: an entry of {} could not be read, it is kept: {e}",
+                    root.display()
+                );
+                continue;
+            }
+        };
         let path = entry.path();
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
@@ -160,17 +178,33 @@ pub struct RunDir {
 /// List every `runs/<run>/` directory under `root` untouched for at least
 /// `older_than`, each with the ledger's verdict. Younger ones are not
 /// listed at all. Sorted oldest first.
+///
+/// A `root` that does not exist is an empty listing; any other read error
+/// is returned, and an entry that cannot be read is named on stderr and
+/// left out (so it is never deleted).
 pub fn plan_run_prune(
     root: &Path,
     older_than: Duration,
     now: SystemTime,
     judge: &dyn Fn(&str, &Path) -> RunVerdict,
-) -> Vec<RunDir> {
+) -> io::Result<Vec<RunDir>> {
     let mut dirs = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return dirs;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(dirs),
+        Err(e) => return Err(e),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                eprintln!(
+                    "relais: an entry of {} could not be read, it is left alone: {e}",
+                    root.display()
+                );
+                continue;
+            }
+        };
         let path = entry.path();
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
@@ -194,7 +228,28 @@ pub fn plan_run_prune(
         });
     }
     dirs.sort_by(|a, b| b.age.cmp(&a.age).then_with(|| a.run.cmp(&b.run)));
-    dirs
+    Ok(dirs)
+}
+
+/// How many `*.json` files directly under `dir` mention `needle`: the
+/// baseline cache cites a cached run's retry logs by absolute path under
+/// `runs/<run>/`, so a cited run directory must stay for later hits.
+pub fn json_files_citing(dir: &Path, needle: &str) -> io::Result<usize> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut citing = 0;
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "json")
+            && std::fs::read_to_string(&path)?.contains(needle)
+        {
+            citing += 1;
+        }
+    }
+    Ok(citing)
 }
 
 /// Delete the prunable directories of a plan. Returns the ones removed
@@ -308,10 +363,12 @@ mod tests {
             },
         };
         // Everything is fresh: nothing is old enough to list.
-        assert!(plan_run_prune(&root, 30 * DAY, SystemTime::now(), &judge).is_empty());
+        assert!(plan_run_prune(&root, 30 * DAY, SystemTime::now(), &judge)
+            .unwrap()
+            .is_empty());
         // 31 days on, all three are listed; the preview deletes nothing.
         let later = SystemTime::now() + 31 * DAY;
-        let plan = plan_run_prune(&root, 30 * DAY, later, &judge);
+        let plan = plan_run_prune(&root, 30 * DAY, later, &judge).unwrap();
         assert_eq!(plan.len(), 3);
         assert!(plan.iter().all(|d| d.bytes == 4));
         for name in ["old-done", "old-live", "young-done"] {
@@ -324,5 +381,16 @@ mod tests {
         assert!(root.join("old-live/artifacts/logs/a.log").exists());
         assert!(!root.join("old-done").exists());
         std::fs::remove_dir_all(&root).ok(); // best-effort scratch cleanup
+    }
+
+    #[test]
+    fn a_cache_entry_citing_a_run_is_counted() {
+        let cache = scratch("cache");
+        std::fs::write(cache.join("a.json"), r#"{"p":"/s/runs/run-1/logs/x.log"}"#).unwrap();
+        std::fs::write(cache.join("b.json"), r#"{"p":"/s/runs/run-2/logs/x.log"}"#).unwrap();
+        std::fs::write(cache.join("c.blob"), "/s/runs/run-1/").unwrap();
+        assert_eq!(json_files_citing(&cache, "/s/runs/run-1/").unwrap(), 1);
+        assert_eq!(json_files_citing(&cache.join("none"), "x").unwrap(), 0);
+        std::fs::remove_dir_all(&cache).ok(); // best-effort scratch cleanup
     }
 }
