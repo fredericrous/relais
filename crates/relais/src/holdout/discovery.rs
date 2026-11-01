@@ -48,6 +48,8 @@ pub struct StoreView {
     pub head: Result<String, String>,
     /// The holdouts the store declares for this repository, by name.
     pub declared: BTreeMap<String, HoldoutDecl>,
+    /// The [`super::fingerprint`] of each declared holdout, by name.
+    pub fingerprints: BTreeMap<String, String>,
     /// Why the store could not be read: its commit could not be had, or its
     /// files could not be fetched within the bound. When set, `head` is an
     /// error too and `declared` is empty.
@@ -59,6 +61,7 @@ impl StoreView {
         Self {
             head,
             declared: BTreeMap::new(),
+            fingerprints: BTreeMap::new(),
             unread,
         }
     }
@@ -103,9 +106,19 @@ pub fn discover(
     };
     prune(cache_root, &sha);
     let declared = read_declarations(&tree, repo)?;
+    let mut fingerprints = BTreeMap::new();
+    for (name, decl) in &declared {
+        let fingerprint =
+            super::fingerprint(decl, &tree).map_err(|refused| DeclarationInvalid {
+                file: format!("{repo}/{name}/holdout.toml"),
+                cause: format!("its supplied contents were refused: {refused}"),
+            })?;
+        fingerprints.insert(name.clone(), fingerprint);
+    }
     Ok(StoreView {
         head,
         declared,
+        fingerprints,
         unread: None,
     })
 }
@@ -183,6 +196,19 @@ fn read_declarations(
     repo: &str,
 ) -> Result<BTreeMap<String, HoldoutDecl>, DeclarationInvalid> {
     let repo_dir = tree.join(repo);
+    if std::fs::symlink_metadata(&repo_dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(DeclarationInvalid {
+            file: repo.to_string(),
+            cause: "the repository directory is a symlink".to_string(),
+        });
+    }
+    let symlinked = symlinked_entries(&repo_dir);
+    if let Some(name) = symlinked.first() {
+        return Err(DeclarationInvalid {
+            file: format!("{repo}/{name}"),
+            cause: "it is a symlink".to_string(),
+        });
+    }
     let mut names: Vec<String> = match std::fs::read_dir(&repo_dir) {
         Ok(entries) => entries
             .filter_map(Result::ok)
@@ -299,4 +325,20 @@ fn read_declaration(
         inputs: raw.inputs,
         attach,
     }))
+}
+
+/// The visible entries of `dir` that are symlinks, by name; an unreadable
+/// directory has none here (the listing that follows reports it).
+fn symlinked_entries(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_symlink()))
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    names.sort();
+    names
 }

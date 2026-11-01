@@ -270,7 +270,14 @@ impl<'a> RunEngine<'a> {
             .collect();
         let fetched: Vec<Result<PathBuf, holdout::Unfetchable>> = live
             .iter()
-            .map(|holdout| holdout::fetch(holdout, &root, &|| self.budgets.remaining()))
+            .map(|holdout| {
+                // The contents are checked against the preflight's
+                // fingerprint before anything is copied or run.
+                holdout::fetch(holdout, &root, &|| self.budgets.remaining()).and_then(|source| {
+                    holdout::verify_supplied(holdout, &source)?;
+                    Ok(source)
+                })
+            })
             .collect();
         let is_attached_name = |name: &str| attached.iter().any(|held| held.name == name);
         let is_attached = |holdout: &ResolvedHoldout| is_attached_name(&holdout.name);

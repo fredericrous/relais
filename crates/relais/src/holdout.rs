@@ -20,7 +20,9 @@ use crate::policy::{BlockCode, DeclSource, HoldoutDecl, HoldoutSettings};
 use crate::workspace::Git;
 
 mod discovery;
+mod fingerprint;
 pub use discovery::{discover, DeclarationInvalid, StoreView};
+pub use fingerprint::{fingerprint, SuppliedRefusal, FINGERPRINT_VERSION};
 
 /// A holdout whose store resolved: everything verification needs to fetch and run it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +39,12 @@ pub struct ResolvedHoldout {
     /// [`LEGACY_DIGEST_VERSION`] and is compared with that formula.
     #[serde(default)]
     pub digest_version: u32,
+    /// The [`fingerprint`] of a store-declared holdout's declaration and
+    /// supplied contents, frozen at preflight; verification refuses to run
+    /// contents that no longer match it. `None` for a machine.toml
+    /// declaration and for a definition frozen before fingerprints existed.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 /// The outcome a ledger row records for an attached holdout that was skipped
@@ -633,7 +641,31 @@ pub fn resolve_at(
         decl: decl.clone(),
         digest,
         digest_version: DIGEST_VERSION,
+        fingerprint: None,
     })
+}
+
+/// Refuse a fetched tree whose supplied contents are not the ones frozen at
+/// preflight, before any command starts. A holdout frozen without a
+/// fingerprint is not checked.
+pub fn verify_supplied(resolved: &ResolvedHoldout, source: &Path) -> Result<(), Unfetchable> {
+    let Some(frozen) = &resolved.fingerprint else {
+        return Ok(());
+    };
+    let refuse = |detail: String| Unfetchable {
+        store: resolved.store.clone(),
+        sha: resolved.sha.clone(),
+        detail,
+    };
+    match fingerprint(&resolved.decl, source) {
+        Ok(now) if now == *frozen => Ok(()),
+        Ok(_) => Err(refuse(
+            "its supplied contents differ from those frozen at preflight".to_string(),
+        )),
+        Err(refused) => Err(refuse(format!(
+            "its supplied contents were refused: {refused}"
+        ))),
+    }
 }
 
 /// A path as the holdout command receives it. On Unix the string is kept
@@ -1097,6 +1129,7 @@ mod tests {
             decl: decl(Some("j.xml"), "tests/holdout"),
             digest: "d".into(),
             digest_version: DIGEST_VERSION,
+            fingerprint: None,
         };
         let hit = |path: &str| overlay_collision(std::slice::from_ref(&resolved), &[path.into()]);
         assert!(hit("tests/holdout").is_some());
@@ -1393,6 +1426,7 @@ mod tests {
             sha: "abc".into(),
             digest: digest_of("r", "x", "s", "abc", &declared, DeclSource::Machine),
             digest_version: DIGEST_VERSION,
+            fingerprint: None,
             decl: declared,
         }];
         let held = HoldoutSettings::default();

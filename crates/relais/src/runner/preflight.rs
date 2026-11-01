@@ -661,6 +661,16 @@ impl<'a> RunEngine<'a> {
         } else {
             changes
         };
+        let mut holdouts = holdouts;
+        if let Ok(head) = &view.head {
+            for holdout in &mut holdouts {
+                let from_store = holdout_settings.source_of(&repo_name, &holdout.name)
+                    == crate::policy::DeclSource::Store;
+                if from_store && holdout.sha == *head && holdout.fingerprint.is_none() {
+                    holdout.fingerprint = view.fingerprints.get(&holdout.name).cloned();
+                }
+            }
+        }
         let sourced: Vec<(
             crate::holdout::ResolvedHoldout,
             crate::holdout::HoldoutSource,
