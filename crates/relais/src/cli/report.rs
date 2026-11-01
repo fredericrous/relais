@@ -49,6 +49,10 @@ pub(crate) fn report_command(
         "the learning section",
     )?);
     report.review_outcomes = Some(report::reviewer_report(&ledger));
+    report.check_timings = Some(operational(
+        ledger.check_timing_stats(&since),
+        "the check-timings section",
+    )?);
     report.orchestration.unattributable = not_imported.unattributable;
     report.orchestration.transcript_missing = not_imported.transcript_missing;
     // Best-effort: a report is still a report with no coordinator

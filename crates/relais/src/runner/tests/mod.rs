@@ -4168,6 +4168,131 @@ fn a_cache_hit_keeps_the_bases_outcomes_for_an_identical_candidate() {
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
+/// Per-check timings reach the ledger from the runner (t09): a run with a
+/// setup step records the setup and the command; the second run reads the
+/// base from the cache and reuses it for its identical candidate, so both
+/// are recorded as reused, not as work. `check_timing_stats` splits rows by
+/// label and by `cached`, so the counts name each write: the first run's
+/// base command (1 run), its reused candidate (cached), and the second
+/// run's cached base and reused candidate (cached): 3 reused, 1 run. The
+/// setup ran once, at the first base.
+#[test]
+fn the_runner_writes_timing_rows_for_runs_and_for_reused_outcomes() {
+    let fixture = Fixture::new();
+    // bash, not sh: the baseline cache keys on each program's version, and
+    // Ubuntu's sh (dash) has no --version, which refuses the cache outright.
+    let versioned = |script: &str| CommandSpec {
+        argv: vec![
+            (if cfg!(windows) { "sh" } else { "bash" }).into(),
+            "-c".into(),
+            script.into(),
+        ],
+        ..sh(script)
+    };
+    let mut repo =
+        fixture.repo_policy_with_setup(vec![versioned("true")], vec![versioned("exit 0")], 3);
+    repo.verification
+        .profiles
+        .get_mut("profile")
+        .expect("profile")
+        .cache_baseline = true;
+    let (backend, _) = inspecting_backend("REPORT: nothing to change", "[1] met: read the code");
+    let contract = TaskContract::from_json_str(
+        &serde_json::json!({
+            "schema_version": 1,
+            "kind": "inspect",
+            "objective": "Say whether anything needs changing",
+            "base_ref": "HEAD",
+            "acceptance": ["evidence that nothing needs changing"],
+            "verification_profile": "profile",
+        })
+        .to_string(),
+    )
+    .expect("contract");
+    let since = "1970-01-01T00:00:00Z";
+
+    let RunOutcome {
+        terminal: Terminal::Accepted(first),
+        ..
+    } = fixture.execute(&contract, &repo, &backend)
+    else {
+        panic!("first run");
+    };
+    assert!(!first.verification.baseline_cached);
+    let after_first = fixture.ledger.check_timing_stats(since).expect("stats");
+    #[derive(Clone, Copy, PartialEq)]
+    enum Step {
+        Setup,
+        Check,
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum Source {
+        Ran,
+        Reused,
+    }
+    let rows = |stats: &[crate::ledger::CheckTimingStats], step: Step, source: Source| {
+        stats
+            .iter()
+            .filter(|s| {
+                let is_setup = s.label.starts_with("setup:");
+                (is_setup == (step == Step::Setup)) && (s.cached == (source == Source::Reused))
+            })
+            .map(|s| s.runs)
+            .sum::<u64>()
+    };
+    assert_eq!(
+        rows(&after_first, Step::Setup, Source::Ran),
+        1,
+        "the setup ran once: {after_first:?}"
+    );
+    assert_eq!(
+        rows(&after_first, Step::Setup, Source::Reused),
+        0,
+        "{after_first:?}"
+    );
+    assert_eq!(
+        rows(&after_first, Step::Check, Source::Ran),
+        1,
+        "the base command ran once: {after_first:?}"
+    );
+    assert_eq!(
+        rows(&after_first, Step::Check, Source::Reused),
+        1,
+        "the identical candidate reused the base's outcome: {after_first:?}"
+    );
+
+    let RunOutcome {
+        terminal: Terminal::Accepted(second),
+        ..
+    } = fixture.execute(&contract, &repo, &backend)
+    else {
+        panic!("second run");
+    };
+    assert!(second.verification.baseline_cached);
+    let after_second = fixture.ledger.check_timing_stats(since).expect("stats");
+    assert_eq!(
+        rows(&after_second, Step::Check, Source::Ran),
+        1,
+        "the cache hit ran nothing new: {after_second:?}"
+    );
+    assert_eq!(
+        rows(&after_second, Step::Check, Source::Reused),
+        3,
+        "the hit's base and its identical candidate are both recorded as reused: {after_second:?}"
+    );
+    assert_eq!(
+        rows(&after_second, Step::Setup, Source::Ran),
+        1,
+        "a cache hit runs no setup: {after_second:?}"
+    );
+    let timing = second.verification.checks[0]
+        .timing
+        .as_ref()
+        .expect("the reused outcome keeps its timing");
+    assert!(timing.cached, "{timing:?}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
 #[test]
 fn an_alias_resolved_to_a_dated_id_is_not_a_substitution() {
     let fixture = Fixture::new();

@@ -624,6 +624,7 @@ impl<'a> RunEngine<'a> {
                 integration_gaps: &preflight.integration_gaps,
                 baseline_cached: baseline.cached,
                 baseline_cache_refused: &baseline.cache_refused,
+                baseline_proven: baseline.proven,
                 logs_dir: &baseline.logs_dir,
                 holdouts: &preflight.holdouts,
             };

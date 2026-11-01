@@ -6,7 +6,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use relais::programme::analysis::{self, Counts, Standing};
+use relais::programme::analysis::{self, age_secs, Counts, Standing};
 use relais::programme::load::{find_programmes, main_checkout, Programme, ProgrammeError};
 use relais::programme::model::Ticket;
 use serde_json::{json, Value};
@@ -120,14 +120,51 @@ fn fit_name(name: &str, prefix_width: usize, width: Option<usize>) -> String {
     format!("{kept}…")
 }
 
-fn ticket_json(programme: &Programme, ticket: &Ticket, branch: Option<&str>) -> Value {
+/// A branch tip as `frontier --all` and `show` print it.
+struct Tip<'a> {
+    branch: &'a str,
+    age_secs: u64,
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+        .unwrap_or(0) // only a clock before 1970 lands here; ages then clamp to 0 rather than fail a read-only listing
+}
+
+fn tip_of(standing: &Standing, now_unix: i64) -> Option<Tip<'_>> {
+    match standing {
+        Standing::InFlight {
+            branch,
+            last_commit_unix,
+        } => Some(Tip {
+            branch,
+            age_secs: age_secs(now_unix, *last_commit_unix),
+        }),
+        Standing::Frontier | Standing::Blocked(_) | Standing::Closed | Standing::OutOfScope => None,
+    }
+}
+
+/// `5m`, `3h` or `2d`: the largest whole unit.
+fn format_age(secs: u64) -> String {
+    match secs {
+        0..=3599 => format!("{}m", secs / 60),
+        3600..=86399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
+}
+
+fn ticket_json(programme: &Programme, ticket: &Ticket, tip: Option<&Tip<'_>>) -> Value {
     json!({
         "id": ticket.id,
         "type": ticket.kind.as_str(),
         "mode": ticket.mode.as_str(),
         "repos": programme.repos_of(ticket),
         "name": ticket.name,
-        "branch": branch,
+        "branch": tip.map(|t| t.branch),
+        "branch_age_secs": tip.map(|t| t.age_secs),
     })
 }
 
@@ -149,15 +186,16 @@ pub(crate) fn frontier_command(
 ) -> Result<CliOutcome, CliError> {
     let programme = Programme::load(dir).map_err(programme_error)?;
     let standings = programme.standings().map_err(programme_error)?;
-    let shown: Vec<(&Ticket, Option<&str>)> = programme
+    let now = now_unix();
+    let shown: Vec<(&Ticket, Option<Tip<'_>>)> = programme
         .tickets
         .values()
         .filter_map(|ticket| match (&standings[&ticket.id], listing) {
             (Standing::Frontier, _) => Some((ticket, None)),
-            (Standing::InFlight(branch), Listing::WithInFlight) => {
-                Some((ticket, Some(branch.as_str())))
+            (standing @ Standing::InFlight { .. }, Listing::WithInFlight) => {
+                Some((ticket, tip_of(standing, now)))
             }
-            (Standing::InFlight(_), Listing::ReadyOnly)
+            (Standing::InFlight { .. }, Listing::ReadyOnly)
             | (
                 Standing::Blocked(_) | Standing::Closed | Standing::OutOfScope,
                 Listing::ReadyOnly | Listing::WithInFlight,
@@ -176,14 +214,14 @@ pub(crate) fn frontier_command(
         Format::Json => {
             let rows: Vec<Value> = shown
                 .iter()
-                .map(|(ticket, branch)| ticket_json(&programme, ticket, *branch))
+                .map(|(ticket, tip)| ticket_json(&programme, ticket, tip.as_ref()))
                 .collect();
             format!("{}\n", Value::Array(rows))
         }
         Format::Text => {
             let width = terminal_width();
             let mut text = String::new();
-            for (ticket, branch) in &shown {
+            for (ticket, tip) in &shown {
                 let prefix = format!(
                     "{}\t{}/{}\t{}\t",
                     ticket.id,
@@ -191,9 +229,15 @@ pub(crate) fn frontier_command(
                     ticket.mode.as_str(),
                     programme.repos_of(ticket).join(",")
                 );
-                let label = branch
-                    .map(|b| format!("\tin-flight {b}"))
-                    .unwrap_or_default();
+                // Under --all every line has five fields: a ready ticket's
+                // fifth is empty, so `cut` and `awk` see one shape.
+                let label = match (tip, listing) {
+                    (Some(t), _) => {
+                        format!("\tin-flight {} {}", t.branch, format_age(t.age_secs))
+                    }
+                    (None, Listing::WithInFlight) => "\t".to_string(),
+                    (None, Listing::ReadyOnly) => String::new(),
+                };
                 let name = fit_name(
                     &ticket.name,
                     display_width(&prefix) + display_width(&label),
@@ -218,20 +262,16 @@ pub(crate) fn show_command(dir: &Path, format: Format) -> Result<CliOutcome, Cli
         .filter_map(|t| match &standings[&t.id] {
             Standing::Blocked(by) => Some((t, by)),
             Standing::Frontier
-            | Standing::InFlight(_)
+            | Standing::InFlight { .. }
             | Standing::Closed
             | Standing::OutOfScope => None,
         })
         .collect();
-    let in_flight: Vec<(&Ticket, &String)> = programme
+    let now = now_unix();
+    let in_flight: Vec<(&Ticket, Tip<'_>)> = programme
         .tickets
         .values()
-        .filter_map(|t| match &standings[&t.id] {
-            Standing::InFlight(branch) => Some((t, branch)),
-            Standing::Frontier | Standing::Blocked(_) | Standing::Closed | Standing::OutOfScope => {
-                None
-            }
-        })
+        .filter_map(|t| tip_of(&standings[&t.id], now).map(|tip| (t, tip)))
         .collect();
     let out = match format {
         Format::Json => format!(
@@ -242,8 +282,9 @@ pub(crate) fn show_command(dir: &Path, format: Format) -> Result<CliOutcome, Cli
                 "blocked": blocked.iter().map(|(t, by)| json!({
                     "id": t.id, "name": t.name, "blocked_by": by,
                 })).collect::<Vec<_>>(),
-                "in_flight": in_flight.iter().map(|(t, branch)| json!({
-                    "id": t.id, "name": t.name, "branch": branch,
+                "in_flight": in_flight.iter().map(|(t, tip)| json!({
+                    "id": t.id, "name": t.name, "branch": tip.branch,
+                    "branch_age_secs": tip.age_secs,
                 })).collect::<Vec<_>>(),
             })
         ),
@@ -271,8 +312,14 @@ pub(crate) fn show_command(dir: &Path, format: Format) -> Result<CliOutcome, Cli
             }
             if !in_flight.is_empty() {
                 text.push_str("\nIn flight\n");
-                for (ticket, branch) in &in_flight {
-                    text.push_str(&format!("  {} ({}): {branch}\n", ticket.name, ticket.id));
+                for (ticket, tip) in &in_flight {
+                    text.push_str(&format!(
+                        "  {} ({}): {} {}\n",
+                        ticket.name,
+                        ticket.id,
+                        tip.branch,
+                        format_age(tip.age_secs)
+                    ));
                 }
             }
             text
@@ -400,6 +447,14 @@ mod tests {
         assert_eq!(fit_name("A long name", 10, Some(21)), "A long name");
         assert_eq!(fit_name("A long name", 10, Some(15)), "A lo…");
         assert_eq!(fit_name("A long name", 30, Some(15)), "…");
+    }
+
+    #[test]
+    fn an_age_is_written_in_its_largest_whole_unit() {
+        assert_eq!(format_age(0), "0m");
+        assert_eq!(format_age(300), "5m");
+        assert_eq!(format_age(10_800), "3h");
+        assert_eq!(format_age(2 * 86_400 + 5), "2d");
     }
 
     #[test]

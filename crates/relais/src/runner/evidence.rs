@@ -65,6 +65,43 @@ impl<'a> RunEngine<'a> {
         Ok(())
     }
 
+    /// Record when each run of each check waited, started and ended: one
+    /// `check_timings` row per run, retries included (t09). A check with no
+    /// timing (an outcome from before timings, or one that never ran) has
+    /// no row. `phase` is the log prefix the checks ran under.
+    pub(crate) fn record_check_timings(
+        &self,
+        phase: &str,
+        outcomes: &[verify::CheckOutcome],
+    ) -> Result<(), LedgerError> {
+        for outcome in outcomes {
+            let runs: Vec<Option<&verify::CheckTiming>> = if outcome.attempts.is_empty() {
+                vec![outcome.timing.as_ref()]
+            } else {
+                outcome.attempts.iter().map(|a| a.timing.as_ref()).collect()
+            };
+            for (index, timing) in runs.into_iter().enumerate() {
+                let Some(timing) = timing else { continue };
+                self.config.ledger.record_check_timing(
+                    &self.run_id,
+                    &crate::ledger::CheckTimingRow {
+                        phase,
+                        label: &outcome.label,
+                        attempt_index: u32::try_from(index).unwrap_or(u32::MAX),
+                        queued_at: &timing.queued_at,
+                        admitted_at: timing.admitted_at.as_deref(),
+                        started_at: timing.started_at.as_deref(),
+                        ended_at: &timing.ended_at,
+                        slot_wait_ms: timing.slot_wait_ms,
+                        run_ms: timing.run_ms,
+                        cached: timing.cached,
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Record the kept copy of a check's JUnit report, when one was read,
     /// under its own kind and with its sha256. A report that was missing
     /// or unparseable left no copy, so it has no row.
@@ -231,6 +268,7 @@ impl<'a> RunEngine<'a> {
             integration_gaps: preflight.integration_gaps.clone(),
             baseline_cached: ctx.baseline.cached,
             baseline_cache_refused: ctx.baseline.cache_refused.clone(),
+            baseline_proven: ctx.baseline.proven,
         };
         let patch_adds_test = self.patch_adds_test(ctx, &candidate.sha)?;
         let (criteria, mandatory_evidence_independence) = self.settle(

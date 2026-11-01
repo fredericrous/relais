@@ -189,7 +189,7 @@ impl Programme {
 
     /// Where each ticket stands, reading the branches from git.
     pub fn standings(&self) -> Result<BTreeMap<String, analysis::Standing>, ProgrammeError> {
-        let working = branch_ids(&self.repo_dir, &self.slug)?;
+        let working = branch_tips(&self.repo_dir, &self.slug)?;
         Ok(analysis::standings(&self.tickets, &self.slug, &working))
     }
 }
@@ -230,25 +230,47 @@ pub fn main_checkout(dir: &Path) -> Result<PathBuf, ProgrammeError> {
 }
 
 /// The ids that a local branch or an `origin` remote-tracking branch named
-/// `prog/<slug>/<id>` works.
-fn branch_ids(repo: &Path, slug: &str) -> Result<BTreeSet<String>, ProgrammeError> {
+/// `prog/<slug>/<id>` works, each with the latest committer date (Unix
+/// seconds) among its refs.
+fn branch_tips(repo: &Path, slug: &str) -> Result<BTreeMap<String, i64>, ProgrammeError> {
     let local = format!("refs/heads/prog/{slug}/");
     let remote = format!("refs/remotes/origin/prog/{slug}/");
     let printed = git_stdout(
         repo,
-        &["for-each-ref", "--format=%(refname)", &local, &remote],
+        &[
+            "for-each-ref",
+            "--format=%(refname)\t%(committerdate:unix)",
+            &local,
+            &remote,
+        ],
     )?;
-    Ok(printed
-        .lines()
-        .filter_map(|name| {
-            name.strip_prefix(&local)
-                .or_else(|| name.strip_prefix(&remote))
-        })
-        .map(str::to_string)
-        .collect())
+    let mut tips: BTreeMap<String, i64> = BTreeMap::new();
+    for line in printed.lines() {
+        let Some((name, date)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(id) = name
+            .strip_prefix(&local)
+            .or_else(|| name.strip_prefix(&remote))
+        else {
+            continue;
+        };
+        let committed = date
+            .trim()
+            .parse::<i64>()
+            .map_err(|e| ProgrammeError::Git {
+                repo: repo.to_path_buf(),
+                detail: format!("committer date of {name}: {e}"),
+            })?;
+        let latest = tips.entry(id.to_string()).or_insert(committed);
+        *latest = (*latest).max(committed);
+    }
+    Ok(tips)
 }
 
 /// Every `<root>/*/docs/programmes/*` directory holding a `map.md`, sorted.
+/// Only primary checkouts (a `.git` directory) are scanned: a linked
+/// worktree holds the same map as its main checkout.
 pub fn find_programmes(root: &Path) -> Result<Vec<PathBuf>, ProgrammeError> {
     let children = |dir: &Path| -> Result<Vec<PathBuf>, ProgrammeError> {
         if !dir.is_dir() {
@@ -263,6 +285,9 @@ pub fn find_programmes(root: &Path) -> Result<Vec<PathBuf>, ProgrammeError> {
     };
     let mut found = Vec::new();
     for repo in children(root)? {
+        if !repo.join(".git").is_dir() {
+            continue;
+        }
         for programme in children(&repo.join("docs").join("programmes"))? {
             if programme.join(MAP_FILE).is_file() {
                 found.push(programme);

@@ -105,6 +105,12 @@ Resolution.
 2. **Start** the `worktree-task` skill on branch `prog/<slug>/<id>` in the
    map's repository. The branch tells every other session that the ticket
    is in flight, and the skill's board check shows who else works nearby.
+   The `prog/<slug>/<id>` branch is created in the map's repository even
+   when the ticket's `repos` name others; work in another repository goes
+   on that repository's own branch, named in the Resolution. To give a
+   ticket up unresolved, delete its `prog/` branch locally and on origin.
+   An in-flight ticket whose branch has not moved for days is worth asking
+   the person about.
 3. **Resolve** the ticket by its type (the table above). Then:
    - write its `## Resolution` and set `status = "closed"`;
    - add its line to Decisions so far;

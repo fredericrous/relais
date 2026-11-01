@@ -65,13 +65,44 @@ argv = ["make", "toolchain"]
 # Measured 0 s: the pinned toolchain was already installed.
 timeout_seconds = 300
 
+# Each gate runs through `amont run --stamp <gate>` (amont 1.66, ADR-0015):
+# amont runs exactly the gate its hooks would, and records the verdict on the
+# candidate's tree, so the person's commit and push of that tree skip the
+# suite instead of running it a third and fourth time (decisions programme
+# "one verdict per tree", S2). A gate whose verdict is not recorded — absent
+# or deferred — is a verification gap, never a pass. `AMONT_ON_BUSY=wait`:
+# relais already holds the host slot (`AMONT_HOST_SLOT=held`), so a nested
+# amont never defers; the setting says so explicitly. The four lint gates
+# are `make lint`'s parts; `cargo-test` is `make test`; `plugin-test` is
+# `make plugin`.
 [[verification.profiles.default.commands]]
-argv = ["make", "lint"]
-# Measured 10 s (fmt, clippy -D warnings, warm build).
+argv = ["amont", "run", "--stamp", "cargo-fmt"]
 timeout_seconds = 300
+env = { AMONT_ON_BUSY = "wait" }
 
 [[verification.profiles.default.commands]]
-argv = ["make", "test"]
+argv = ["amont", "run", "--stamp", "clippy"]
+# `make lint` measured 10 s with fmt and clippy on a warm build.
+timeout_seconds = 300
+env = { AMONT_ON_BUSY = "wait" }
+
+[[verification.profiles.default.commands]]
+argv = ["amont", "run", "--stamp", "module-cycles"]
+timeout_seconds = 300
+env = { AMONT_ON_BUSY = "wait" }
+
+[[verification.profiles.default.commands]]
+argv = ["amont", "run", "--stamp", "child-cycles-ledger"]
+timeout_seconds = 300
+env = { AMONT_ON_BUSY = "wait" }
+
+[[verification.profiles.default.commands]]
+argv = ["amont", "run", "--stamp", "child-cycles-runner"]
+timeout_seconds = 300
+env = { AMONT_ON_BUSY = "wait" }
+
+[[verification.profiles.default.commands]]
+argv = ["amont", "run", "--stamp", "cargo-test"]
 # Measured 367 s on 2026-10-25, after the fork tests stopped waiting, from
 # a fresh worktree with the build included (the library's tests 139 s,
 # release_scenarios 117 s). Weight 2: it is the heaviest command on the machine, so
@@ -82,14 +113,16 @@ argv = ["make", "test"]
 # `baseline_unrunnable`; 1800 s is the single `make check`'s old limit.
 timeout_seconds = 1800
 weight = 2
+env = { AMONT_ON_BUSY = "wait" }
 
 [[verification.profiles.default.commands]]
-argv = ["make", "plugin"]
+argv = ["amont", "run", "--stamp", "plugin-test"]
 # Measured 62 s. The one check that may retry: its suite has known
 # timing-sensitive tests, and under relais (`RELAIS_CHECK`) this retry
 # owns the rerun `scripts/plugin-test.sh` does in CI.
 timeout_seconds = 300
 retry = 1
+env = { AMONT_ON_BUSY = "wait" }
 
 # A candidate that touches what the profile's verdict depends on — build
 # manifests, lockfiles, the test tree, fixtures, or a program the profile
@@ -108,6 +141,9 @@ retry = 1
 # failure is never kept as pre-existing.
 [verification.profiles.default]
 cache_baseline = true
+# The gates the commands run are amont's declarations: a candidate that edits
+# them changes what the verdict means, so it goes to review (SPEC §10).
+inputs = ["amont.conf"]
 
 # Risk floors: writes touching these patterns cannot route below the
 # minimum tier, and the review requirement here is a floor, not a hint.

@@ -1218,4 +1218,30 @@ pub(in crate::ledger) const MIGRATIONS: &[(&str, &str)] = &[
     ALTER TABLE holdout_outcomes ADD COLUMN source TEXT NOT NULL DEFAULT 'named';
     "#,
     ),
+    (
+        // Per-check timings (decisions one-verdict-per-tree, t09): one row
+        // per run of a verification command, retries included, so a saving
+        // from skipping or caching a check can be measured. `phase` is the
+        // log prefix (`base`, `attempt1`, ...), `attempt_index` 0 the first
+        // run and n the n-th retry. Expand-only: a new table nothing older
+        // reads.
+        "v47",
+        r#"
+    CREATE TABLE check_timings (
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        phase TEXT NOT NULL,
+        label TEXT NOT NULL,
+        attempt_index INTEGER NOT NULL,
+        queued_at TEXT NOT NULL,
+        admitted_at TEXT,
+        started_at TEXT,
+        ended_at TEXT NOT NULL,
+        slot_wait_ms INTEGER NOT NULL,
+        run_ms INTEGER NOT NULL,
+        cached INTEGER NOT NULL,
+        PRIMARY KEY (run_id, phase, label, attempt_index)
+    );
+    CREATE INDEX check_timings_label ON check_timings (label);
+    "#,
+    ),
 ];

@@ -8,13 +8,15 @@ missing here.
 
 ## Unreleased
 
-### Added
-
+- **A profile can run its gates through amont, and the push then skips them.** A profile command `amont run --stamp <gate>` (amont 1.66) runs an amont gate and records its verdict on the candidate's tree. After the profile, relais asks `amont stamps --json`: a gate reported `deferred` or `absent`, or no answer (amont missing or older than 1.66), is a verification gap, never a pass. relais's own profile now runs `cargo-fmt`, `clippy`, `module-cycles`, the two child-cycle gates, `cargo-test` and `plugin-test` this way, and `amont.conf` is a verification input.
+- **A base amont already proved is not run again.** When every profile gate is `stamped` or `attested` on the base tree on this platform, and the toolchain is identified, the baseline run is skipped and the receipt says `baseline_proven: true`. A proof writes nothing to the baseline cache.
 - **`relais resume --prune-runs [<days>]`** (30 days by default) lists the run directories under `runs/` untouched for that long, each with its verdict and the evidence rows deleting it would leave dangling. A preview deletes nothing. `--write` deletes only runs that have ended, wait on nobody, have their receipt in the ledger and are not cited by a baseline-cache entry; it also removes the empty verify directories of ended runs.
-
-### Fixed
-
 - **An ended run no longer leaves an empty `verify/<run>/` directory behind.** The run removes it at its end, and the next run start or `relais resume --retire` removes those earlier runs left (74 had piled up since September). A directory that still holds a file is kept.
+
+## v0.45.0
+
+- `relais programme list` names each map once: it scans primary checkouts only, so a linked worktree of a repository no longer repeats its maps.
+- `relais programme frontier --all` and `show` give each in-flight ticket its branch's last-commit age (`5m`, `3h`, `2d`), and their `--json` in-flight entries carry `branch_age_secs`. The `programme` skill now says where the `prog/` branch lives and how to give a ticket up.
 
 ## v0.44.0
 

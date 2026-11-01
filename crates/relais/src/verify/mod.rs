@@ -37,6 +37,7 @@ mod follow;
 mod heavy;
 mod holdout_run;
 mod junit;
+pub mod stamps;
 
 pub use end::CheckEnd;
 pub use heavy::{
@@ -152,6 +153,11 @@ pub struct CheckOutcome {
     /// timeout is the budget's and the check is not run again for it.
     #[serde(default)]
     pub clipped: bool,
+    /// When this run waited, started and ended (the last attempt's, as for
+    /// the fields above). Absent in a receipt written before timings were
+    /// recorded, and for an outcome that never ran here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<CheckTiming>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -171,6 +177,43 @@ pub struct Attempt {
     /// A run budget cut the limit below the check's own.
     #[serde(default)]
     pub clipped: bool,
+    /// This attempt's own timing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<CheckTiming>,
+}
+
+/// When one run of a check waited for admission, started and ended:
+/// wall-clock instants in RFC 3339 UTC, and the two durations a report
+/// aggregates. Without them no saving from skipping or caching a check can
+/// be measured (decisions `one-verdict-per-tree`, t09).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckTiming {
+    /// Just before the run asked for admission (tokens, host slots, disk).
+    pub queued_at: String,
+    /// When admission returned; absent when the run was cancelled queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_at: Option<String>,
+    /// When the command was spawned; absent when it never was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// When the run ended and its tokens went back.
+    pub ended_at: String,
+    /// Milliseconds between `queued_at` and admission.
+    #[serde(default)]
+    pub slot_wait_ms: u64,
+    /// Milliseconds the command itself ran.
+    #[serde(default)]
+    pub run_ms: u64,
+    /// The outcome was reused, not run now (a cached baseline, or the
+    /// base's outcome for a candidate identical to it): the instants are
+    /// the original run's.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cached: bool,
+}
+
+/// Now, as the RFC 3339 UTC instant a [`CheckTiming`] records.
+fn wall_clock() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 impl CheckOutcome {
@@ -181,7 +224,23 @@ impl CheckOutcome {
             log_sha256: self.log_sha256.clone(),
             applied_limit_ms: self.applied_limit_ms,
             clipped: self.clipped,
+            timing: self.timing.clone(),
         }
+    }
+
+    /// The same outcome, reused rather than run now: its timing (and each
+    /// attempt's) is marked `cached`, so a report never counts it as work.
+    pub fn reused(mut self) -> Self {
+        let mark = |timing: &mut Option<CheckTiming>| {
+            if let Some(timing) = timing {
+                timing.cached = true;
+            }
+        };
+        mark(&mut self.timing);
+        for attempt in &mut self.attempts {
+            mark(&mut attempt.timing);
+        }
+        self
     }
 
     pub fn failed(&self) -> bool {
@@ -299,6 +358,11 @@ pub struct VerificationReport {
     /// caching and the toolchain could not be identified (audit V2).
     #[serde(default)]
     pub baseline_cache_refused: Option<CacheRefused>,
+    /// Whether the baseline run was skipped because amont reported every
+    /// profile gate stamped or attested on the base tree (t04): a proven
+    /// base is green, so it has no pre-existing failures.
+    #[serde(default)]
+    pub baseline_proven: bool,
 }
 impl VerificationReport {
     pub fn accepted(&self) -> bool {
@@ -1281,6 +1345,8 @@ fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
     } = run;
     let own_timeout = command_timeout(spec)?;
     std::fs::create_dir_all(logs_dir)?;
+    let queued_at = wall_clock();
+    let queued = std::time::Instant::now();
     // A cancelled queue wait runs nothing; every other refusal is the
     // caller's to end the run on.
     let admitted = match admission.admit(&Ask {
@@ -1294,6 +1360,8 @@ fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
         Err(LeaseStop::Cancelled) => None,
         Err(stop) => return Err(VerifyError::Lease(stop)),
     };
+    let admitted_at = admitted.is_some().then(wall_clock);
+    let slot_wait_ms = queued.elapsed().as_millis() as u64;
     let timeout = admission.budgets.clip(own_timeout);
     let clipped = timeout < own_timeout;
     let heartbeat_every = admission.heartbeat_every;
@@ -1344,6 +1412,7 @@ fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
         label: label.to_string(),
         argv: spec.argv.clone(),
     });
+    let started_at = admitted.is_some().then(wall_clock);
     let started = std::time::Instant::now();
     // Every way out after `check_started` says the check ended: an
     // error is reported with no exit status, never left open.
@@ -1429,6 +1498,19 @@ fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
     // The group is gone (`wait_for_exit` kills it on every path): the
     // tokens and host slots go back now.
     drop(admitted);
+    let timing = CheckTiming {
+        queued_at,
+        admitted_at,
+        run_ms: if started_at.is_some() {
+            started.elapsed().as_millis() as u64
+        } else {
+            0
+        },
+        started_at,
+        ended_at: wall_clock(),
+        slot_wait_ms,
+        cached: false,
+    };
     ended_with(match ended {
         Ended::Exited(code) => Some(code),
         Ended::TimedOut | Ended::Cancelled | Ended::Signalled => None,
@@ -1453,6 +1535,7 @@ fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
         flaky_reason: None,
         applied_limit_ms: timeout.as_millis() as u64,
         clipped,
+        timing: Some(timing),
     })
 }
 
@@ -2208,6 +2291,18 @@ pub trait HookInventory {
     /// `amont_gaps` turns into a gap for every required check, never
     /// into a pass.
     fn list(&self, dir: &Path, stage: Stage) -> Result<AmontInventory, InventoryError>;
+
+    /// What `amont stamps --json` says `tree` (the tree checked out at `dir`
+    /// when `None`) carries a verdict for, for `gates`. The default asks
+    /// nothing: only `AmontCli` spawns amont.
+    fn stamps(
+        &self,
+        _dir: &Path,
+        _tree: Option<&str>,
+        _gates: &[String],
+    ) -> Result<stamps::Answer, stamps::StampsError> {
+        Err(stamps::StampsError::NotAsked)
+    }
 }
 
 /// The `amont` binary on this machine — the one place it is spawned.
@@ -2232,6 +2327,15 @@ impl AmontCli {
 impl HookInventory for AmontCli {
     fn list(&self, dir: &Path, stage: Stage) -> Result<AmontInventory, InventoryError> {
         amont_list(dir, stage, self.cancel.as_deref())
+    }
+
+    fn stamps(
+        &self,
+        dir: &Path,
+        tree: Option<&str>,
+        gates: &[String],
+    ) -> Result<stamps::Answer, stamps::StampsError> {
+        stamps::amont_stamps(dir, tree, gates, self.cancel.as_deref())
     }
 }
 
@@ -3325,6 +3429,10 @@ mod tests {
     /// `run-65c37c19bbf9a-6c72`, verbatim.
     const PRE_FIELD_RECEIPT_5: &str = r#"{"run_id":"run-65c37c19bbf9a-6c72","candidate_sha":"de92ac635059652489d624b90f4dc8d84a26605e","base_sha":"d931ba8f4349d51d96fc9b3984a380a9212e109b","contract_hash":"33758fefa04dd12414def1df5217602247293dc68b831f3e72d1b180211760d9","policy_hash":"5e5e9d7d08e3d279c63891709b2b657211950e5ee4c0647da6ae8c8bc12be398","outcome":"accepted","verification":{"candidate_sha":"de92ac635059652489d624b90f4dc8d84a26605e","base_sha":"d931ba8f4349d51d96fc9b3984a380a9212e109b","contract_hash":"33758fefa04dd12414def1df5217602247293dc68b831f3e72d1b180211760d9","policy_hash":"5e5e9d7d08e3d279c63891709b2b657211950e5ee4c0647da6ae8c8bc12be398","checks":[{"label":"make@c1c4713f","argv":["make","check"],"ended":{"exited":0},"log_path":"/Users/fredericrous/.local/state/relais/runs/run-65c37c19bbf9a-6c72/logs/attempt1-cmd0.log","log_sha256":"b74a0eb6cf67db1a7499901e1aa8a0afd7aa7163dec30e96b21443bf0a1ba9fb"}],"gaps":[],"baseline_failures":[],"amont_bypasses":[],"amont_downgrades":[],"verification_inputs_changed":["crates/relais/tests/release_scenarios.rs"],"integration_gaps":[],"baseline_cached":false,"baseline_cache_refused":null},"models_used":["claude-sonnet-5"],"attempts":1,"cost_completeness":"actual","cost":9924800,"criteria":[{"id":"c-e2744e354c19","statement":"`make check` passes (fmt, clippy -D warnings, tests, msrv, audit, scripts/check-module-cycles.py).","mandatory":true,"met":true},{"id":"amont-gate-is-evidence","statement":"A declared acceptance criterion can name an amont gate as its evidence, alongside the named check, test, review and sign-off it can name today, and `independent()` counts it as independent ground truth because the gate ran outside this run and its attestation is signed.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"asks-amont-not-its-notes","statement":"Whether a gate is covered is asked of amont through its documented interface \u2014 `amont attest covered`, run against the candidate's own tree \u2014 and never by reading `refs/notes/amont-attest`, parsing an attestation format, or invoking a signature verifier here. The gate and its attestation stay amont's to own (SPEC \u00a710, \u00a718), and a test asserts relais runs that command rather than reaching for git notes or ssh-keygen.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"uncovered-gate-is-a-gap","statement":"A mandatory criterion naming a gate that amont does not report as covered becomes a gap in the existing verification report, refused by the mechanism that already refuses gaps \u2014 never a second acceptance path. This is the safe direction even though `amont attest covered` is fail-open by design (it prints nothing and exits 0 on any failure), because a gate whose name does not appear is treated as uncovered whatever the reason.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"gap-says-what-it-cannot-know","statement":"Because that interface cannot distinguish an absent attestation from one whose signature failed to verify, the gap's message says so rather than asserting a cause it does not know, and names `amont attest covered` as the command a person can run to see the same answer.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"coverage-is-recorded-as-evidence","statement":"A gate amont reports as covered records an external attestation evidence row against the run and the criterion it answers, naming amont as the tool and the candidate sha as the subject, so the receipt and `relais explain` show what settled the criterion and where it came from.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"unavailable-amont-is-a-gap","statement":"An amont that is absent, too old to have the subcommand, or fails for any other reason is a gap naming the cause, never a silent pass and never a crash \u2014 relais reports what it could not establish.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"coherent","statement":"The change reads as one idea, and nothing in it lets relais conclude a gate passed on evidence amont did not give it.","mandatory":false,"met":true,"evidence":{"kind":"llm_review"}},{"id":"c-cca6cd9cef5b","statement":"No new `_ =>` arm over an enum this crate owns, no new bool parameter, no new `#[allow]`, and every new silencing of a fallible operation carries a one-line reason at the site.","mandatory":true,"met":true},{"id":"c-f86c85776acf","statement":"The CHANGELOG gains an entry under the unreleased heading, and docs/SPEC.md says the same where it already describes acceptance evidence and amont ownership.","mandatory":true,"met":true}],"mandatory_evidence_independence":"partly_independent"}"#;
 
+    /// A receipt in the shape written once timings were recorded (t09):
+    /// `timing` on the check and on each attempt, one of them `cached`.
+    const TIMED_RECEIPT_6: &str = r#"{"run_id":"run-65c083902dd9a-32f2","candidate_sha":"7b9f24ce9926e47b778a4d540a8ac48219352406","base_sha":"39c47ef1dbe697735bdcab01dfa9152a767c17cc","contract_hash":"ad3f611a09986544da26aa298fc6aedfa620007f690296934331a5a434c12937","policy_hash":"3c3bf4f67d5379c8e3c14e213bee58945a09b49d4ace905db74d3c8167702bce","outcome":"accepted","verification":{"candidate_sha":"7b9f24ce9926e47b778a4d540a8ac48219352406","base_sha":"39c47ef1dbe697735bdcab01dfa9152a767c17cc","contract_hash":"ad3f611a09986544da26aa298fc6aedfa620007f690296934331a5a434c12937","policy_hash":"3c3bf4f67d5379c8e3c14e213bee58945a09b49d4ace905db74d3c8167702bce","checks":[{"label":"make@c1c4713f","argv":["make","check"],"ended":{"exited":0},"log_path":"/Users/fredericrous/.local/state/relais/runs/run-65c083902dd9a-32f2/logs/base-cmd0.log","log_sha256":"2e11fa60569dca14ddc5b04bd11036193f5cdf4d914ce28ef1eb354ed1d6d573","timing":{"queued_at":"2026-11-01T10:00:00.000Z","admitted_at":"2026-11-01T10:00:02.000Z","started_at":"2026-11-01T10:00:02.000Z","ended_at":"2026-11-01T10:05:00.000Z","slot_wait_ms":2000,"run_ms":298000},"attempts":[{"ended":{"exited":0},"log_path":"/Users/fredericrous/.local/state/relais/runs/run-65c083902dd9a-32f2/logs/base-cmd0.log","log_sha256":"2e11fa60569dca14ddc5b04bd11036193f5cdf4d914ce28ef1eb354ed1d6d573","applied_limit_ms":0,"clipped":false,"timing":{"queued_at":"2026-11-01T10:00:00.000Z","admitted_at":"2026-11-01T10:00:02.000Z","started_at":"2026-11-01T10:00:02.000Z","ended_at":"2026-11-01T10:05:00.000Z","slot_wait_ms":2000,"run_ms":298000}},{"ended":{"exited":0},"log_path":"/Users/fredericrous/.local/state/relais/runs/run-65c083902dd9a-32f2/logs/base-cmd0.log","log_sha256":"2e11fa60569dca14ddc5b04bd11036193f5cdf4d914ce28ef1eb354ed1d6d573","applied_limit_ms":0,"clipped":false,"timing":{"queued_at":"2026-11-01T10:00:00.000Z","admitted_at":"2026-11-01T10:00:02.000Z","started_at":"2026-11-01T10:00:02.000Z","ended_at":"2026-11-01T10:05:00.000Z","slot_wait_ms":2000,"run_ms":298000,"cached":true}}]}],"gaps":[],"baseline_failures":[],"amont_bypasses":[],"amont_downgrades":[],"verification_inputs_changed":[],"integration_gaps":[],"baseline_cached":false,"baseline_cache_refused":null},"models_used":["claude-haiku-4-5"],"attempts":1,"cost_completeness":"actual","cost":76325}"#;
+
     /// The receipts actually on this machine's disk, verbatim, all parse.
     ///
     /// The first two predate `CheckOutcome::ended` (#24), which had no
@@ -3340,6 +3448,7 @@ mod tests {
             PRE_FIELD_RECEIPT_3,
             PRE_FIELD_RECEIPT_4,
             PRE_FIELD_RECEIPT_5,
+            TIMED_RECEIPT_6,
         ];
         const UNRECORDED_END: &[&str] = &[PRE_FIELD_RECEIPT_1, PRE_FIELD_RECEIPT_2];
 
@@ -3381,7 +3490,88 @@ mod tests {
                 .expect("the receipt round-trips");
             assert_eq!(again, receipt);
         }
+        for (n, json) in PARSES[..5].iter().enumerate() {
+            let receipt: Receipt = serde_json::from_str(json).expect("parses");
+            for check in &receipt.verification.checks {
+                assert_eq!(check.timing, None, "receipt {n} predates timings");
+            }
+        }
+        let timed: Receipt = serde_json::from_str(TIMED_RECEIPT_6).expect("parses");
+        let check = &timed.verification.checks[0];
+        assert_eq!(check.timing.as_ref().map(|t| t.run_ms), Some(298_000));
+        assert_eq!(check.attempts.len(), 2);
+        assert!(check.attempts[1].timing.as_ref().is_some_and(|t| t.cached));
+        let again: Receipt =
+            serde_json::from_str(&serde_json::to_string(&timed).expect("serializes"))
+                .expect("round-trips");
+        assert_eq!(again, timed);
     }
+
+    /// A receipt written with timings: a check's and each attempt's timing
+    /// round-trip, and the receipt still parses with every older field
+    /// absent. `reused` marks the check and its attempts `cached`.
+    #[test]
+    fn a_receipt_with_check_timings_round_trips() {
+        let mut receipt: Receipt = serde_json::from_str(PRE_FIELD_RECEIPT_3).expect("parses");
+        let timing = |queued: &str| CheckTiming {
+            queued_at: queued.to_string(),
+            admitted_at: Some("2026-11-01T10:00:02.000Z".into()),
+            started_at: Some("2026-11-01T10:00:02.000Z".into()),
+            ended_at: "2026-11-01T10:05:00.000Z".into(),
+            slot_wait_ms: 2000,
+            run_ms: 298_000,
+            cached: false,
+        };
+        let check = &mut receipt.verification.checks[0];
+        check.timing = Some(timing("2026-11-01T10:00:00.000Z"));
+        check.attempts = vec![check.attempt(), check.attempt()];
+        let json = serde_json::to_string(&receipt).expect("serializes");
+        assert!(json.contains("\"slot_wait_ms\":2000"), "{json}");
+        assert!(
+            !json.contains("\"cached\""),
+            "a fresh run writes no cached flag"
+        );
+        let again: Receipt = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(again, receipt);
+
+        let reused = again.verification.checks[0].clone().reused();
+        assert!(reused.timing.as_ref().is_some_and(|t| t.cached));
+        assert!(reused
+            .attempts
+            .iter()
+            .all(|a| a.timing.as_ref().is_some_and(|t| t.cached)));
+        let untimed = CheckOutcome {
+            timing: None,
+            attempts: Vec::new(),
+            ..reused
+        }
+        .reused();
+        assert_eq!(
+            untimed.timing, None,
+            "nothing is invented for an untimed outcome"
+        );
+    }
+
+    /// `baseline_proven` (S2) is newer than every stored receipt: an old one
+    /// reads `false`, a new one reads what it says, and `true` survives a
+    /// round trip.
+    #[test]
+    fn a_receipt_without_baseline_proven_reads_false() {
+        let old: Receipt = serde_json::from_str(PRE_FIELD_RECEIPT_3).expect("old receipt parses");
+        assert!(!old.verification.baseline_proven);
+        let proven = PRE_FIELD_RECEIPT_3.replace(
+            "\"baseline_cache_refused\":null",
+            "\"baseline_cache_refused\":null,\"baseline_proven\":true",
+        );
+        assert_ne!(proven, PRE_FIELD_RECEIPT_3, "the fixture holds the anchor");
+        let new: Receipt = serde_json::from_str(&proven).expect("new receipt parses");
+        assert!(new.verification.baseline_proven);
+        let again: Receipt = serde_json::from_str(&serde_json::to_string(&new).unwrap())
+            .expect("the receipt round-trips");
+        assert!(again.verification.baseline_proven);
+        assert_eq!(again, new);
+    }
+
     use super::*;
 
     #[cfg(unix)]
@@ -3657,6 +3847,22 @@ mod tests {
         assert_eq!(outcome.attempts[0].applied_limit_ms, 1000);
         assert!(dir.join("logs/s.log").exists());
         assert!(dir.join("logs/s-retry1.log").exists());
+        // Each run carries its own timing: the timed-out first run ran about
+        // its 1 s limit, the passing retry started after it ended.
+        let first = outcome.attempts[0]
+            .timing
+            .as_ref()
+            .expect("first run timed");
+        let second = outcome.attempts[1].timing.as_ref().expect("retry timed");
+        assert!(first.admitted_at.is_some() && first.started_at.is_some());
+        assert!(first.run_ms >= 900, "{first:?}");
+        assert!(second.queued_at >= first.ended_at, "{first:?} {second:?}");
+        assert!(!first.cached && !second.cached);
+        assert_eq!(
+            outcome.timing.as_ref(),
+            Some(second),
+            "the last run is the check's"
+        );
         let events = logged_events(&dir);
         assert!(
             events.contains("\"reason\":\"timed_out_then_passed\""),
@@ -4043,6 +4249,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         }
     }
 
@@ -5000,6 +5207,7 @@ mod tests {
                 flaky_reason: None,
                 applied_limit_ms: 0,
                 clipped: false,
+                timing: None,
             }],
             gaps: vec![],
             baseline_failures: vec![],
@@ -5011,6 +5219,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(report.accepted());
         assert!(report.new_failures().is_empty());
@@ -5094,6 +5303,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         }];
         let gaps = acceptance_gaps(
             &entries,
@@ -5129,6 +5339,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(
             !report.accepted(),
@@ -5162,6 +5373,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         }];
         let report = VerificationReport {
             candidate_sha: "abc".into(),
@@ -5179,6 +5391,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(report.accepted());
 
@@ -5308,6 +5521,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         }
     }
 
@@ -5339,6 +5553,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         }
     }
 
@@ -5650,6 +5865,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         }];
         let entries = vec![declared(
             "a person signed off on the migration",
@@ -5689,6 +5905,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(
             !report.accepted(),
@@ -5741,6 +5958,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         }];
         let entries = vec![declared(
             "a person signed off on the migration",
@@ -5775,6 +5993,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(report.accepted());
 
@@ -5856,6 +6075,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         }];
         let entries = vec![declared(
             "the pre-push cargo test gate covers this candidate",
@@ -5897,6 +6117,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         let (criteria, summary) = settle_acceptance(
             &entries,
@@ -5948,6 +6169,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         }];
         let entries = vec![declared(
             "the pre-push cargo test gate covers this candidate",
@@ -5988,6 +6210,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(!report.accepted());
         let (criteria, _) = settle_acceptance(
@@ -6152,6 +6375,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         };
         let entries = vec![
             AcceptanceEntry::Bare("the layout is listed".into()),
@@ -6238,6 +6462,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         let (_, all_independent) = settle_acceptance(
             &[AcceptanceEntry::Bare("it builds".into())],
@@ -6359,6 +6584,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         };
         let report = VerificationReport {
             candidate_sha: "abc".into(),
@@ -6376,6 +6602,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(!report.accepted(), "baseline failures are not auto-waived");
         assert!(
@@ -6428,6 +6655,7 @@ mod tests {
                 integration_gaps: Vec::new(),
                 baseline_cached: false,
                 baseline_cache_refused: None,
+                baseline_proven: false,
             },
             kind: Kind::Change,
             candidate: None,
@@ -6525,6 +6753,7 @@ mod tests {
                 flaky_reason: None,
                 applied_limit_ms: 0,
                 clipped: false,
+                timing: None,
             }],
             gaps: Vec::new(),
             gaps_not_judged: Vec::new(),
@@ -6536,6 +6765,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         let entries = vec![
             declared(

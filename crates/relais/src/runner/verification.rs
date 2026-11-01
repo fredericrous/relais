@@ -581,7 +581,11 @@ impl<'a> RunEngine<'a> {
             // The candidate is the base tree: the baseline's outcomes are
             // its outcomes, by identity — and the base's setup already
             // proved the setup, so it is not spent again either.
-            (Some(outcomes), _) => outcomes.to_vec(),
+            (Some(outcomes), _) => outcomes
+                .iter()
+                .cloned()
+                .map(verify::CheckOutcome::reused)
+                .collect(),
             (None, Some(holder)) => {
                 let setup = self
                     .while_watching_cancel(|cancel| {
@@ -601,9 +605,12 @@ impl<'a> RunEngine<'a> {
                     })
                     .map_err(VerifyFailure::from)?;
                 self.record_logs(None, EvidenceKind::SetupLog, &setup)
+                    .and_then(|()| {
+                        self.record_check_timings(&format!("{}-setup", label.log_prefix()), &setup)
+                    })
                     .map_err(|e| {
                         VerifyFailure::Unavailable(format!(
-                            "the ledger refused a setup-log evidence row: {e}"
+                            "the ledger refused a setup-log or setup-timing row: {e}"
                         ))
                     })?;
                 match verify::setup_failure(&setup) {
@@ -683,6 +690,8 @@ impl<'a> RunEngine<'a> {
                     .map_err(|e| format!("the ledger refused a junit-report evidence row: {e}"))?;
             }
         }
+        self.record_check_timings(&label.log_prefix(), &checks)
+            .map_err(|e| format!("the ledger refused a check-timing row: {e}"))?;
         let inventory = match (amont_on, holder.as_ref()) {
             (true, Some(holder)) => self.config.hooks.list(holder.path(), verify::Stage::Local),
             _ => Err(verify::InventoryError::NotAsked),
@@ -715,6 +724,16 @@ impl<'a> RunEngine<'a> {
             inventory.as_ref(),
             &authority.verification_profile.amont_waivers,
         ));
+        // A profile that runs its gates through `amont run --stamp` relies
+        // on amont recording the verdict on this tree, so the person's
+        // commit and push skip the suite. A gate amont reports deferred or
+        // absent, or no answer at all, is a gap: never a silent pass
+        // (decisions programme "one verdict per tree", t03).
+        let stamp_gates = verify::stamps::profile_gates(&authority.verification_profile);
+        if let (true, false, Some(holder)) = (amont_on, stamp_gates.is_empty(), holder.as_ref()) {
+            let answer = self.config.hooks.stamps(holder.path(), None, &stamp_gates);
+            gaps.extend(verify::stamps::stamp_gaps(&stamp_gates, &answer));
+        }
         // amont was asked and would not answer, and the profile names no
         // check for `amont_gaps` to hang the reason on. Reported anyway:
         // a run must never read "no inventory" as "nothing to enforce"
@@ -887,6 +906,7 @@ pub(super) fn verification_report(
         integration_gaps: preflight.integration_gaps.clone(),
         baseline_cached: ctx.baseline.cached,
         baseline_cache_refused: ctx.baseline.cache_refused.clone(),
+        baseline_proven: ctx.baseline.proven,
     }
 }
 
