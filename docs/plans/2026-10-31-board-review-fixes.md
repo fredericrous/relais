@@ -24,3 +24,4 @@ skill says where the branch lives and how to give a ticket up; released as
 ## Implementation review
 
 - Round 1 approve-with-changes (54k tokens, 45 s). Fixed: one field count under `--all` (the plan's B2); the clock fallback's reason on its line; the `make plugin` attempt recorded.
+- Delta approve (61k tokens, 25 s). B3's `make plugin` alone rests on the gate and on CI's plugin job, read before the merge.
