@@ -66,6 +66,24 @@ The candidate is passed explicitly into `end_on_lease_stop` / `end_on_exhausted`
 
 - 2026-11-01 — Round 1 (backend, lang:rust) asked for rework. Taking the host slot first breaks fairness, and automatic requeue contradicts ADR-0010: both dropped.
 - 2026-11-01 — Round 2 proposed ending `needs_decision`. Codex then found that this needs a new candidate form for verify runs and touches more paths (setup, review admission). A read of `candidate::resolve` and the ledger showed the recovery already works, so the state change was dropped. What is left is the text, the skill line, and closing the attempt.
+- 2026-11-01 — Implementation:
+  - The relais worker ($1.97) made the candidate, then starved in the verification queue: the case this plan addresses. It was applied and checked by hand, with no paid round.
+  - A reviewer's admission expiry ends `needs_review` (review unavailable), not `blocked`, through the existing `review/engine.rs:717-733` path. Behaviour 1's "still ends blocked" holds only for the verification cases. SPEC and the skill line say so.
+  - "Nothing was launched" is dropped from the text when a candidate is kept.
+  - Out of scope, noted: the review-unavailable path records an `admission_wait_exhausted` transition and then ends `needs_review`, a double end that predates this change.
+
+## Implementation review
+
+- Verdict: approve (round 1 approve-with-changes; Delta approve-with-changes; tree bind approve).
+- Fixed:
+  - the wildcard arm on `ResourceClass` (a blocking finding);
+  - the reviewer test now pins `needs_review`;
+  - SPEC and the skill describe the reviewer case.
+- Deliberate:
+  - 2(a) covered by inference plus a live run;
+  - 2(b) inferred from `verify_source`;
+  - no SPEC sentence for other lease stops.
+- Cost: 48k + 56k + 59k tokens, 44 s + 31 s + 9 s.
 
 ## Verification
 
@@ -78,7 +96,16 @@ The candidate is passed explicitly into `end_on_lease_stop` / `end_on_exhausted`
   - `relais status` on the first → the recovery line;
   - the existing `BlockedBy{AdmissionWaitExhausted}` asserts (`tests/budgets.rs`, `tests/mod.rs:4642`) → still pass;
   - `make check` → exit 0.
-- Phase 2: the count above, from the ledger (blocked runs whose detail carries a candidate, and the verify runs naming them).
+- Phase 2: the count above, from the ledger: the `admission_wait_exhausted` transitions whose detail carries a candidate, whatever the terminal state (`needs_review` included), and the verify runs naming them.
+
+Observed (Phase 1, 2026-11-01), input → expected → actual:
+- An attempt's verification expiry → blocked, with candidate {run, index, sha}, and the attempt `blocked` with its sha. Actual: `an_expiry_during_an_attempts_verification_names_the_kept_candidate` passes.
+- A verify run built from the detail → same sha, no worker. Actual: covered by inference, not by a new test. `candidate::resolve` gates only on a terminal state; `verify_kind.rs:119` (a no-worker verify, from an accepted source) and `:307` (a source that has not ended is refused) pass. Seen live: run-65f2b19e46131-cd88 resolved run-65f285d2aff88-fe37/1 (`candidate_resolved`).
+- A verify run's baseline expiry → names the source run. Actual: `an_expiry_in_a_verify_runs_baseline_names_the_resolved_source_run` passes.
+- A change run's baseline, or a worker dispatch's queue → no `candidate`. Actual: `an_expiry_with_no_candidate_under_verification_names_none` passes.
+- A reviewer's admission expiry → names the checked candidate. Actual: the run ends `needs_review` (review unavailable), not `blocked`. Its text carries the recovery, and its `admission_wait_exhausted` transition carries the candidate: `a_reviewers_admission_expiry_names_the_checked_candidate` passes. The verify-run reviewer case is inferred from the shared `verify_source`.
+- `relais status` / the outcome text → the recovery line. Actual: observed live. The plugin's outcome message for run-65f385685d029-11b9f printed the transition detail verbatim.
+- Existing `BlockedBy{AdmissionWaitExhausted}` asserts → pass. Actual: amont's pre-commit gate (27 checks, cargo test included) passed on 6fa0a095. On 7cf92275 clippy was deferred because the host was busy, and clippy had passed on the candidate's tree (stamped `pre-commit-clippy`).
 
 ## Outcome
 
