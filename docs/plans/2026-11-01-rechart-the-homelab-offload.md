@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: docs/homelab-offload-rechart
 repos: [relais]
 adrs: [decisions:ADR-0041, decisions:ADR-0051]
@@ -167,5 +167,28 @@ persistent cache answers part of it, and it stays open until t21.
   hitl and stays open), compared by id.
 - The PR is merged, and `origin/main` holds the map and the abandoned plan
   record.
+
+## Outcome
+
+| Check | Expected | Actual |
+|---|---|---|
+| `relais programme check docs/programmes/homelab-offload` | exit 0 | exit 0, after every edit |
+| frontier at step 3 | exactly t13, t22, t23, t24 | exactly those |
+| frontier after research | t13, t21, t24 | t13, t21, t24 **and t25**, a new ticket the t22 research made precise (where the pod's signing key lives) |
+
+## Decision log
+
+- 2026-11-01: the laptop disk had been freed (42 GB). The t22 relais
+  `inspect` run in amont still ended `baseline_unrunnable`: amont's `make`
+  hit its 3600 s limit under laptop load, which is this programme's own
+  problem. t22 and t23 were researched by Explore agents. t23 spans many
+  repositories, and read hints must stay in one repo.
+- t22 found that amont ADR-0015 already decides "a remote executor must
+  never stamp". The vehicle is a signed attestation. Stamps carry no
+  platform; attestations do.
+- t23: the timing data covers one day only, so the share of laptop load is
+  left to t13. Labels in `check_timings` need gate names.
+- Carried from review and done: the `t20-stamp-platform-rule` slug, t22
+  blocked by t20, and Decisions so far lines for t01, t03, t09, t19 and t20.
 
 <!-- panel: repos=relais reviewers=backend body-sha=12f073381d4c -->

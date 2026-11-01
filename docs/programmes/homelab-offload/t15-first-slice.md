@@ -2,7 +2,7 @@
 type = "grilling"
 mode = "hitl"
 status = "open"
-blocked_by = ["t13-laptop-load-baseline", "t21-remote-runner-owner", "t22-stamp-from-remote-run", "t23-gate-platform-inventory"]
+blocked_by = ["t13-laptop-load-baseline", "t21-remote-runner-owner", "t22-stamp-from-remote-run", "t23-gate-platform-inventory", "t25-pod-signing-key"]
 repos = ["relais"]
 +++
 # Which slice ships first and alone
