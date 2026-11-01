@@ -67,3 +67,18 @@ The ticket stays open until the 7-day window ends.
   read them in place of the `events.jsonl` scan.
 - The laptop disk was freed (42 GB free on 2026-11-01). The sampler can
   start.
+
+## Sampler started 2026-11-01
+
+- **Agent:** launchd `local.laptop-load`
+  (`~/Library/LaunchAgents/local.laptop-load.plist`), running
+  `~/.local/share/laptop-load/sample.py` every 60 s at nice 10.
+- **Output:** `~/.local/state/laptop-load/samples.tsv`, with rows
+  `load <epoch> <ncpu> <l1> <l5> <l15>` and
+  `cpu <epoch> <bucket> <cpu_s>`. The buckets are claude, cargo, node,
+  relais-launched and other.
+- **Window:** it started at epoch 1793571060 and unloads itself after
+  604800 s, around 2026-11-08. The load average at start was about 196–208
+  on 12 CPUs.
+- **Closing:** at the window's end, compute the working-hours median of
+  load15 and the per-bucket CPU-seconds per day, then set the target.
