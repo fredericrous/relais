@@ -277,7 +277,7 @@ jobs:
   sign:
     name: sign attestations
     needs: [test, plan]
-    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    if: ${{ always() && needs.plan.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -290,10 +290,13 @@ jobs:
       - uses: actions/checkout@v4
       # Each leg's result, read in place of the matrix outputs: the sign step
       # below runs only when this leg's own file says the suite ran and passed.
+      # `name:`, not `pattern:`: a pattern download puts each artifact in a
+      # subdirectory named after it, so the file was never where `ran` looks
+      # and every leg read "no result file" (main c27b7956 signed nothing).
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with:
-          pattern: sign-result-${{ matrix.os }}
+          name: sign-result-${{ matrix.os }}
           path: ${{ runner.temp }}/sign-results
       - id: ran
         env:
