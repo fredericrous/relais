@@ -45,3 +45,7 @@ Two decisions made while building:
   - Delta on `80416aca`: approve. Rebind after a rebase and one error-message rewording, on `7ca8aae5`: approve.
 - **Left open on purpose:** the live check (a real relais run, then `relais report --since …`) waits for the relais release. A branch binary would migrate the real ledger to v47 early, which has gone wrong on this machine before. The v47 migration is covered by the schema upgrade tests. After the release the check should show the receipt's `timing`, `-setup` rows, and `(reused)` rows on their own lines.
 - **Status:** phase T1 is built. The relais release comes after S2.
+
+- **Full `make test`** (parent, tree after "reason on the new test's cleanup"): 2116 passed and 8 failed.
+  - All 8 were `runner::tests::holdouts::*`, failing in the fixture's `git commit` with "amont binary not found". The parent had upgraded amont through brew during the run, and the template hook briefly had no binary.
+  - Re-running `runner::tests::holdouts` gave 48 passed, 0 failed.
