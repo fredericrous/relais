@@ -368,6 +368,11 @@ pub(crate) fn retire_all_command() -> Result<CliOutcome, CliError> {
             }
         }
     }
+    // The checkouts just retired leave their run's `verify/<run>/` empty.
+    relais::runner::sweep_ended_verify_dirs(
+        &relais::runner::verify_root(&state_dir.join(paths::RUNS_DIR)),
+        &ledger,
+    );
     Ok(if failed {
         CliOutcome::OperationalFailure
     } else {
@@ -692,12 +697,194 @@ pub(crate) fn retire_in_place_saying(
     ))
 }
 
-/// Remove the holdout directory of every run the ledger records as ended.
+/// Remove the holdout directory of every run the ledger records as ended,
+/// and the empty verify directory every ended run left.
 fn sweep_ended_holdouts(ledger: &Ledger, state_dir: &Path) {
-    relais::runner::sweep_ended_holdouts(
-        &relais::runner::holdout_root(&state_dir.join(paths::RUNS_DIR)),
-        ledger,
+    let runs = state_dir.join(paths::RUNS_DIR);
+    relais::runner::sweep_ended_holdouts(&relais::runner::holdout_root(&runs), ledger);
+    relais::runner::sweep_ended_verify_dirs(&relais::runner::verify_root(&runs), ledger);
+}
+
+/// Whether `--prune-runs` only lists or also deletes. An enum, so the
+/// handler reads as what was asked (the clap edge is where the `bool`
+/// lives), like [`Retire`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Prune {
+    Preview,
+    Write,
+}
+
+impl Prune {
+    pub(crate) fn from_flag(write: bool) -> Self {
+        if write {
+            Self::Write
+        } else {
+            Self::Preview
+        }
+    }
+}
+
+/// `relais resume --prune-runs [<days>] [--write]`: list the run
+/// directories old enough to go (30 days by default), with the ledger's
+/// verdict on each and the evidence rows deleting it would leave
+/// dangling; delete the prunable ones, and the empty verify directories
+/// of ended runs, only with `--write`. A run that has not ended, waits on
+/// a person (needs_review, needs_decision, interrupted: `relais decide`
+/// still reads its artifacts), has no receipt in the ledger, or is cited
+/// by a baseline-cache entry (which names its retry logs by path) is kept.
+/// The listing is stdout; what was done, and every hint, is stderr.
+pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, CliError> {
+    use relais::prune::{apply_run_prune, json_files_citing, plan_run_prune, RunVerdict};
+    let ledger = open_ledger()?;
+    let state_dir = paths::state_dir().map_err(CliError::Home)?;
+    let cache_dir = state_dir.join("baseline-cache");
+    let judge = |run: &str, path: &Path| -> RunVerdict {
+        let id = RunId::from_stored(run);
+        match ledger.run_status(&id) {
+            Ok(None) => return RunVerdict::Kept("not in the ledger".to_string()),
+            Ok(Some(
+                state @ (State::Prepared
+                | State::Running
+                | State::Verifying
+                | State::Repairing
+                | State::Escalating),
+            )) => return RunVerdict::Kept(format!("{} (not ended)", state.as_str())),
+            Ok(Some(state @ (State::NeedsReview | State::NeedsDecision | State::Interrupted))) => {
+                return RunVerdict::Kept(format!("{} (waits on a person)", state.as_str()))
+            }
+            Ok(Some(
+                State::Accepted
+                | State::Blocked
+                | State::Failed
+                | State::BudgetExhausted
+                | State::Cancelled
+                | State::AcceptedByPerson,
+            )) => {}
+            Err(e) => return RunVerdict::Kept(format!("ledger: {e}")),
+        }
+        match ledger.receipt(&id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return RunVerdict::Kept("no receipt in the ledger".to_string()),
+            Err(e) => return RunVerdict::Kept(format!("ledger: {e}")),
+        }
+        // A citation may name the directory as it was spelled when it was
+        // written or through its real path (a symlinked state directory,
+        // `/tmp` against `/private/tmp`): both spellings are looked for.
+        let spellings = spellings_of(path);
+        for spelling in &spellings {
+            let cited = format!(
+                "{}{}",
+                spelling.to_string_lossy(),
+                std::path::MAIN_SEPARATOR
+            );
+            match json_files_citing(&cache_dir, &cited) {
+                Ok(0) => {}
+                Ok(n) => return RunVerdict::Kept(format!("cited by {n} baseline-cache entries")),
+                Err(e) => return RunVerdict::Kept(format!("baseline cache unreadable: {e}")),
+            }
+        }
+        let mut dangling = Vec::new();
+        for spelling in &spellings {
+            match ledger.evidence_under(spelling) {
+                Ok(rows) => {
+                    for row in rows {
+                        if !dangling.contains(&row) {
+                            dangling.push(row);
+                        }
+                    }
+                }
+                Err(e) => return RunVerdict::Kept(format!("ledger: {e}")),
+            }
+        }
+        RunVerdict::Prunable { dangling }
+    };
+    let runs_dir = state_dir.join(paths::RUNS_DIR);
+    let older_than = std::time::Duration::from_secs(days.saturating_mul(86_400));
+    let plan = match plan_run_prune(&runs_dir, older_than, std::time::SystemTime::now(), &judge) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!(
+                "relais resume: {} could not be read: {e}",
+                runs_dir.display()
+            );
+            return Ok(CliOutcome::OperationalFailure);
+        }
+    };
+    let mut prunable = 0usize;
+    let mut bytes = 0u64;
+    let mut dangling_total = 0usize;
+    for dir in &plan {
+        let days_old = dir.age.as_secs() / 86_400;
+        match &dir.verdict {
+            RunVerdict::Prunable { dangling } => {
+                prunable += 1;
+                bytes += dir.bytes;
+                dangling_total += dangling.len();
+                println!(
+                    "prune  {}  {days_old}d  {}  {} evidence rows left dangling",
+                    dir.run,
+                    human_bytes(dir.bytes),
+                    dangling.len()
+                );
+                for (kind, path) in dangling {
+                    println!("         dangling  {kind}  {path}");
+                }
+            }
+            RunVerdict::Kept(why) => println!("keep   {}  {days_old}d  {why}", dir.run),
+        }
+    }
+    println!(
+        "{prunable} of {} run directories older than {days}d are prunable ({}, {dangling_total} evidence rows)",
+        plan.len(),
+        human_bytes(bytes)
     );
+    match prune {
+        Prune::Preview => {
+            if prunable > 0 {
+                eprintln!("preview only: add --write to delete them");
+            }
+            return Ok(CliOutcome::Accepted);
+        }
+        Prune::Write => {}
+    }
+    let removed =
+        relais::runner::sweep_ended_verify_dirs(&relais::runner::verify_root(&runs_dir), &ledger);
+    if !removed.is_empty() {
+        eprintln!("removed {} empty verify directories", removed.len());
+    }
+    let (gone, failed) = apply_run_prune(&plan);
+    eprintln!("deleted {} run directories", gone.len());
+    for (path, e) in &failed {
+        eprintln!(
+            "relais resume: {} could not be deleted: {e}",
+            path.display()
+        );
+    }
+    Ok(if failed.is_empty() {
+        CliOutcome::Accepted
+    } else {
+        CliOutcome::OperationalFailure
+    })
+}
+
+/// `path` as given and, when it differs, as its real path.
+fn spellings_of(path: &Path) -> Vec<PathBuf> {
+    let mut spellings = vec![path.to_path_buf()];
+    if let Ok(real) = std::fs::canonicalize(path) {
+        if real != path {
+            spellings.push(real);
+        }
+    }
+    spellings
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const MB: u64 = 1024 * 1024;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else {
+        format!("{} KB", bytes.div_ceil(1024))
+    }
 }
 
 /// Retire every worktree one terminal run still holds.

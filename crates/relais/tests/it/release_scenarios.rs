@@ -3773,6 +3773,202 @@ fn a_leftover_verification_checkout_is_removed_by_resume() {
     assert!(!checkout.exists());
     let listed = git(&world.repo, &["worktree", "list"]);
     assert!(!listed.contains("verify-base"), "{listed}");
+    // The run's own verify directory, now empty, went with it.
+    assert!(
+        !world.state.join("verify").join(&run_id).exists(),
+        "the empty verify/<run>/ directory must go"
+    );
+}
+
+// A finished run leaves no empty `verify/<run>/` directory, and `resume
+// --prune-runs` previews before it deletes: nothing goes without --write,
+// a run younger than the age is not listed, and the evidence rows a
+// deletion would leave dangling are counted.
+#[test]
+fn a_finished_run_leaves_no_empty_verify_dir_and_pruning_previews_first() {
+    let world = World::new("prune");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(5), "{}", text(&run.stderr));
+    let run_id = world.only_run_id();
+    assert!(
+        !world.state.join("verify").join(&run_id).exists(),
+        "a finished run removes its empty verify directory"
+    );
+    let run_dir = world.state.join("runs").join(&run_id);
+    assert!(run_dir.is_dir());
+
+    // Too young for a 30-day prune: not even listed.
+    let young = world.relais(&["resume", "--prune-runs", "30"]);
+    assert_eq!(young.status.code(), Some(0), "{}", text(&young.stderr));
+    assert!(
+        !text(&young.stdout).contains(&run_id),
+        "{}",
+        text(&young.stdout)
+    );
+
+    // Zero days: listed with its verdict; the preview deletes nothing.
+    let preview = world.relais(&["resume", "--prune-runs", "0"]);
+    let out = text(&preview.stdout);
+    assert_eq!(
+        preview.status.code(),
+        Some(0),
+        "{out}\n{}",
+        text(&preview.stderr)
+    );
+    assert!(out.contains(&run_id), "{out}");
+    assert!(run_dir.is_dir(), "a preview deletes nothing");
+
+    // Without a receipt in the ledger, the ended run is kept and says why;
+    // even --write leaves it.
+    let receipt_less = world.relais(&["resume", "--prune-runs", "0", "--write"]);
+    let out = text(&receipt_less.stdout);
+    assert_eq!(receipt_less.status.code(), Some(0), "{out}");
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("keep") && l.contains(&run_id) && l.contains("no receipt")),
+        "{out}"
+    );
+    assert!(run_dir.is_dir(), "a run without a receipt is never pruned");
+
+    // With its receipt stored, the run is prunable and the evidence rows
+    // pointing into it are counted: one more row citing a file under it
+    // (from another run, as a reused baseline log is) counts one more.
+    let ledger = rusqlite::Connection::open(world.state.join("ledger.sqlite")).expect("open");
+    ledger
+        .execute(
+            "INSERT OR REPLACE INTO receipts (run_id, receipt_json, hash, at) VALUES (?1, '{}', 'h', '2026-01-01T00:00:00Z')",
+            [&run_id],
+        )
+        .expect("store a receipt");
+    let dangling = |world: &World| -> usize {
+        let preview = world.relais(&["resume", "--prune-runs", "0"]);
+        let out = text(&preview.stdout);
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("prune") && l.contains(&run_id))
+            .unwrap_or_else(|| panic!("no prune line: {out}\n{}", text(&preview.stderr)));
+        line.split("  ")
+            .find_map(|part| part.strip_suffix(" evidence rows left dangling"))
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no count in: {line}"))
+    };
+    let before = dangling(&world);
+    let log = run_dir.join("logs/cited.log");
+    ledger
+        .execute(
+            "INSERT INTO evidence (run_id, kind, path, at) VALUES ('another-run', 'check_log', ?1, '2026-01-01T00:00:00Z')",
+            [log.to_string_lossy().as_ref()],
+        )
+        .expect("cite a log");
+    drop(ledger);
+    assert_eq!(dangling(&world), before + 1);
+    assert!(run_dir.is_dir(), "a preview deletes nothing");
+    let applied = world.relais(&["resume", "--prune-runs", "0", "--write"]);
+    assert_eq!(applied.status.code(), Some(0), "{}", text(&applied.stderr));
+    assert!(
+        text(&applied.stderr).contains("deleted 1 run directories"),
+        "{}",
+        text(&applied.stderr)
+    );
+    assert!(!run_dir.exists());
+}
+
+// The live-run guard of `resume --prune-runs`: a run that has not ended
+// (`running`) and one that waits on a person (`needs_review`) are kept even
+// with a receipt and an old run directory, and both survive `--write`. A
+// prunable row lists each evidence row it would leave dangling by kind and
+// path, and `--prune-runs` cannot be combined with `--log`.
+#[test]
+fn pruning_keeps_live_and_waiting_runs_and_names_dangling_rows() {
+    let world = World::new("prunelive");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    // A first run creates the ledger, as in every scenario here.
+    let task = world.write_task("task.json", "off");
+    let first = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(first.status.code(), Some(5), "{}", text(&first.stderr));
+    let ledger = rusqlite::Connection::open(world.state.join("ledger.sqlite")).expect("open");
+    let repo = world.repo.to_string_lossy().into_owned();
+    for (run, status) in [
+        ("run-live", "running"),
+        ("run-review", "needs_review"),
+        ("run-done", "failed"),
+    ] {
+        ledger
+            .execute(
+                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                rusqlite::params![run, repo, status],
+            )
+            .expect("insert a run");
+        ledger
+            .execute(
+                "INSERT INTO receipts (run_id, receipt_json, hash, at) VALUES (?1, '{}', 'h', '2026-01-01T00:00:00Z')",
+                [run],
+            )
+            .expect("store a receipt");
+        let dir = world.state.join("runs").join(run).join("logs");
+        std::fs::create_dir_all(&dir).expect("run dir");
+        std::fs::write(dir.join("check.log"), "x").expect("log");
+    }
+    let cited = world.state.join("runs/run-done/logs/check.log");
+    ledger
+        .execute(
+            "INSERT INTO evidence (run_id, kind, path, at) VALUES ('run-done', 'check_log', ?1, '2026-01-01T00:00:00Z')",
+            [cited.to_string_lossy().as_ref()],
+        )
+        .expect("cite a log");
+    drop(ledger);
+
+    let preview = world.relais(&["resume", "--prune-runs", "0"]);
+    let out = text(&preview.stdout);
+    assert_eq!(
+        preview.status.code(),
+        Some(0),
+        "{out}\n{}",
+        text(&preview.stderr)
+    );
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("keep") && l.contains("run-live") && l.contains("not ended")),
+        "{out}"
+    );
+    assert!(
+        out.lines().any(|l| l.starts_with("keep")
+            && l.contains("run-review")
+            && l.contains("waits on a person")),
+        "{out}"
+    );
+    assert!(
+        out.lines().any(|l| l.contains("dangling  check_log")
+            && l.contains(&cited.to_string_lossy().into_owned())),
+        "the dangling row is named by kind and path: {out}"
+    );
+
+    let applied = world.relais(&["resume", "--prune-runs", "0", "--write"]);
+    assert_eq!(applied.status.code(), Some(0), "{}", text(&applied.stderr));
+    assert!(world.state.join("runs/run-live/logs/check.log").exists());
+    assert!(world.state.join("runs/run-review/logs/check.log").exists());
+    assert!(!world.state.join("runs/run-done").exists());
+
+    let log = world.state.join("prune.log");
+    let combined = world.relais(&[
+        "resume",
+        "--prune-runs",
+        "0",
+        "--log",
+        &log.to_string_lossy(),
+    ]);
+    assert_eq!(
+        combined.status.code(),
+        Some(2),
+        "{}",
+        text(&combined.stderr)
+    );
+    assert!(!log.exists(), "the logged resume never ran");
 }
 
 // A decomposed run's package keeps its verification checkout under the

@@ -55,7 +55,9 @@ use self::recipe::{
 };
 use self::replay::replay_command;
 use self::report::{report_command, usage_import_command};
-use self::resume::{resume_command, resume_logged, retire_all_command, Retire};
+use self::resume::{
+    prune_runs_command, resume_command, resume_logged, retire_all_command, Prune, Retire,
+};
 use self::run::{run_command, RunSource};
 use self::status::{explain_command, status_command};
 use self::trust::trust_command;
@@ -187,8 +189,25 @@ pub(crate) enum Command {
     Resume {
         /// The run to reconcile; omitted with --retire, every terminal
         /// run that still holds a worktree is retired
-        #[arg(required_unless_present = "retire")]
+        #[arg(required_unless_present_any = ["retire", "prune_runs"])]
         run_id: Option<String>,
+        /// List the `runs/<run>/` directories untouched for at least this
+        /// many days (30 when no value is given) whose run has ended,
+        /// waits on nobody and has its receipt in the ledger, with the
+        /// evidence rows deleting each would leave dangling. A preview:
+        /// nothing is deleted without --write, which also removes the
+        /// empty verify directories of ended runs
+        #[arg(
+            long,
+            value_name = "DAYS",
+            num_args = 0..=1,
+            default_missing_value = "30",
+            conflicts_with_all = ["run_id", "retire", "log"]
+        )]
+        prune_runs: Option<u64>,
+        /// With --prune-runs: delete what the preview lists as prunable
+        #[arg(long, requires = "prune_runs")]
+        write: bool,
         /// Retire the worktree(s) of terminal run(s) whose dispatches
         /// are provably dead
         #[arg(long)]
@@ -1260,10 +1279,13 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             retire,
             all: _,
             log,
-        } => match (log, run_id) {
-            (Some(log), _) => resume_logged(&log),
-            (None, Some(run_id)) => resume_command(&run_id, Retire::from_flag(retire)),
-            (None, None) => retire_all_command(),
+            prune_runs,
+            write,
+        } => match (log, prune_runs, run_id) {
+            (Some(log), _, _) => resume_logged(&log),
+            (None, Some(days), _) => prune_runs_command(days, Prune::from_flag(write)),
+            (None, None, Some(run_id)) => resume_command(&run_id, Retire::from_flag(retire)),
+            (None, None, None) => retire_all_command(),
         },
         Command::Report {
             since,
