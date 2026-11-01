@@ -14,38 +14,38 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// Remove `dir` when it holds nothing but (nested) empty directories.
-/// Returns whether `dir` is gone afterwards; a directory that holds any
-/// file, symlink or other entry is left exactly as it was, and so are its
-/// empty subdirectories (nothing is removed unless the whole tree is).
+/// Returns whether `dir` is gone afterwards. Removal is bottom-up with
+/// `remove_dir`, which refuses a directory that is not empty, so a file
+/// that appears between the look and the removal is never deleted: the
+/// directory holding it stays, and so does every directory above it.
 pub fn remove_empty_tree(dir: &Path) -> io::Result<bool> {
-    match only_empty_dirs(dir) {
-        Ok(true) => {}
-        Ok(false) => return Ok(false),
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(true),
         Err(e) => return Err(e),
-    }
-    match std::fs::remove_dir_all(dir) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
-        Err(e) => Err(e),
-    }
-}
-
-/// Whether `dir` is a real directory whose whole tree holds only
-/// directories. A symlink is an entry, not a directory to descend into.
-fn only_empty_dirs(dir: &Path) -> io::Result<bool> {
-    let meta = std::fs::symlink_metadata(dir)?;
+    };
     if !meta.is_dir() {
         return Ok(false);
     }
+    let mut all_gone = true;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        let kind = entry.file_type()?;
-        if !kind.is_dir() || !only_empty_dirs(&entry.path())? {
-            return Ok(false);
+        if entry.file_type()?.is_dir() {
+            all_gone &= remove_empty_tree(&entry.path())?;
+        } else {
+            all_gone = false;
         }
     }
-    Ok(true)
+    if !all_gone {
+        return Ok(false);
+    }
+    match std::fs::remove_dir(dir) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+        // Not empty after all (something arrived): kept, not an error.
+        Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// What the ledger says about the run a directory is named after.
@@ -168,8 +168,9 @@ fn age(path: &Path, now: SystemTime) -> Option<Duration> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunVerdict {
     /// Ended, not waiting on a person, receipt in the ledger: prunable,
-    /// leaving this many evidence rows (of any run) pointing into it.
-    Prunable { dangling_evidence: usize },
+    /// leaving these evidence rows (of any run) pointing into it, as
+    /// `(kind, path)`.
+    Prunable { dangling: Vec<(String, String)> },
     /// Kept, and why.
     Kept(String),
 }
@@ -308,23 +309,26 @@ mod tests {
     const DAY: Duration = Duration::from_secs(86_400);
 
     #[test]
-    fn an_empty_tree_goes_and_a_tree_with_a_file_stays_whole() {
+    fn an_empty_tree_goes_and_a_file_keeps_its_ancestors() {
         let root = scratch("empty");
         let empty = root.join("run-a");
         std::fs::create_dir_all(empty.join("verify-1/target")).unwrap();
         assert!(remove_empty_tree(&empty).unwrap());
         assert!(!empty.exists());
 
+        // Bottom-up: an empty sibling goes, but a file, its directory and
+        // every directory above it stay.
         let full = root.join("run-b");
         std::fs::create_dir_all(full.join("verify-1")).unwrap();
         std::fs::create_dir_all(full.join("verify-base")).unwrap();
         std::fs::write(full.join("verify-1/left.txt"), "x").unwrap();
         assert!(!remove_empty_tree(&full).unwrap());
-        assert!(full.join("verify-1/left.txt").exists());
         assert!(
-            full.join("verify-base").exists(),
-            "nothing partial is removed"
+            full.join("verify-1/left.txt").exists(),
+            "a file is never removed"
         );
+        assert!(full.is_dir());
+        assert!(!full.join("verify-base").exists(), "the empty sibling went");
 
         assert!(remove_empty_tree(&root.join("never-made")).unwrap());
         std::fs::remove_dir_all(&root).ok(); // best-effort scratch cleanup
@@ -368,7 +372,7 @@ mod tests {
         let judge = |run: &str, _: &Path| match run {
             "old-live" => RunVerdict::Kept("running".to_string()),
             _ => RunVerdict::Prunable {
-                dangling_evidence: 2,
+                dangling: Vec::new(),
             },
         };
         // Everything is fresh: nothing is old enough to list.
@@ -402,7 +406,7 @@ mod tests {
         std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
         let later = SystemTime::now() + 31 * DAY;
         let judge = |_: &str, _: &Path| RunVerdict::Prunable {
-            dangling_evidence: 0,
+            dangling: Vec::new(),
         };
         let listed = plan_run_prune(&root, 30 * DAY, later, &judge).unwrap();
         // Probed while still locked: true only when this runs as root,

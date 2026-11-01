@@ -202,7 +202,7 @@ pub(crate) enum Command {
             value_name = "DAYS",
             num_args = 0..=1,
             default_missing_value = "30",
-            conflicts_with_all = ["run_id", "retire"]
+            conflicts_with_all = ["run_id", "retire", "log"]
         )]
         prune_runs: Option<u64>,
         /// With --prune-runs: delete what the preview lists as prunable

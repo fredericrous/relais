@@ -7,55 +7,60 @@ phases: [K1]
 ---
 # One verdict per tree, build: K1 cleanup (pointer)
 
-The canonical plan is decisions `docs/plans/2026-11-01-one-verdict-build.md`. This branch is phase **K1**: relais removes the empty `verify/<run>/` directories it leaves, and `relais resume --prune-runs <days>` prunes old `runs/<run>/` directories, previewing first.
+The canonical plan is decisions `docs/plans/2026-11-01-one-verdict-build.md`. This branch is phase **K1**: relais removes the empty `verify/<run>/` directories it leaves, and `relais resume --prune-runs [<days>]` prunes old `runs/<run>/` directories, previewing first.
 
 ## Verification record (K1)
 
-- **Unit tests** (`prune::`, 4 passed):
-  - an empty tree goes, and a tree holding a file stays whole;
-  - the sweep removes ended runs' directories, and unknown ones only after a day; live, unreadable and non-empty ones stay;
-  - a preview lists and deletes nothing, and applying deletes only the prunable;
-  - a cache citation is counted.
-- **Scenario tests** (`it`, 8 passed, `resume` filter):
-  - `a_leftover_verification_checkout_is_removed_by_resume` now also asserts that the empty `verify/<run>/` goes;
-  - `a_finished_run_leaves_no_empty_verify_dir_and_pruning_previews_first`:
+Every test below is in this branch's diff.
+
+- **Unit tests** in `crates/relais/src/prune.rs` (`prune::`, 5 passed):
+  - `an_empty_tree_goes_and_a_file_keeps_its_ancestors`: removal is bottom-up with `remove_dir`. A file is never removed, and neither are its directory and every directory above it.
+  - `the_sweep_removes_ended_and_old_unknown_empties_only`: ended runs go at once, unknown ones only after a day; live, unreadable and non-empty ones stay.
+  - `a_preview_lists_old_runs_and_deletes_nothing_until_applied`
+  - `a_directory_that_cannot_be_listed_is_never_judged_old`. Mutation-checked as uid 501: with `age()`'s unreadable-listing branch reverted, the test fails; with the fix, it passes.
+  - `a_cache_entry_citing_a_run_is_counted`
+- **Scenario tests** in `crates/relais/tests/it/release_scenarios.rs` (4 passed):
+  - `a_leftover_verification_checkout_is_removed_by_resume` (extended): the emptied `verify/<run>/` goes too.
+  - `a_finished_run_leaves_no_empty_verify_dir_and_pruning_previews_first` (new):
     - a finished run leaves no `verify/<run>/`;
     - `--prune-runs 30` does not list a fresh run;
     - a run without a receipt is kept, even with `--write`;
-    - with a receipt, the run is listed as prunable, and the dangling count rises by exactly 1 per citing row;
-    - the preview deletes nothing, and `--write` deletes it and says so on stderr.
-- **Real state, read-only.** `RELAIS_STATE_DIR` pointed at a scratch dir holding a `.backup` copy of the ledger and a copy of `baseline-cache/`, with `runs/` symlinked. The stored absolute paths were rewritten to the scratch prefix in the copies, in 8,901 evidence rows and in the cache entries, so the prefix checks can match. The branch binary ran `relais resume --prune-runs` (default 30). The first attempt, without the rewrite, could not match any path, so its "0 dangling" was not a measurement and is not recorded here.
+    - with a receipt, the dangling count rises by exactly 1 per citing row;
+    - the preview deletes nothing, and `--write` deletes it.
+  - `pruning_keeps_live_and_waiting_runs_and_names_dangling_rows` (new):
+    - a `running` run and a `needs_review` run, each with a receipt and an old directory, get `keep` lines and survive `--write`;
+    - a prunable run's dangling row is named by kind and path;
+    - `--prune-runs` with `--log` exits 2, and the logged resume never runs.
+  - `a_package_runs_leftover_verification_checkout_is_removed_by_resume` (unchanged): passes.
+- **`make lint`:** fmt, clippy `--all-targets -D warnings` and the module-cycle scripts all pass (CYCLES: none).
+- **Real state, read-only.** `RELAIS_STATE_DIR` was spelled `/tmp/…/k1-state4`, which is a symlink path, since `/tmp` is `/private/tmp`. The directory held a `.backup` copy of the ledger and a copy of `baseline-cache/`, with `runs/` symlinked to the real one. Stored paths were left as they are, real absolute paths, so a citation can match only through canonicalisation. The branch binary ran `relais resume --prune-runs` (default 30).
 
   | Input | Expected | Actual |
   |---|---|---|
-  | preview of 134 directories older than 30 days | some prunable, the rest kept with a reason | 18 prunable (8.1 MB, 128 evidence rows left dangling); kept: 98 no receipt, 10 `needs_review`, 5 `needs_decision`, 3 `interrupted` |
-  | any of the 134 cited by a baseline-cache entry | counted and kept | none: no `cited by` line |
-  | `runs/` afterwards | untouched | 1033 directories before and after |
+  | preview of 134 directories older than 30 days | some prunable, the rest kept with a reason | 18 prunable (8.1 MB); kept: 98 no receipt, 10 `needs_review`, 5 `needs_decision`, 3 `interrupted` |
+  | dangling rows, stored under the real path while the run is seen through the symlinked spelling | found through the canonical path, each named | 128 rows, each printed as `dangling <kind> <path>` (e.g. `context_manifest …/run-65c083902dd9a-32f2/manifest.json`) |
+  | baseline-cache citations of the 134 | counted and kept | none |
+  | files under the real `runs/` written during the preview (`find -newer start ! -newer end`) | none | 0 |
 
   stderr said "preview only: add --write to delete them". Exit 0.
-- **`make lint`:** pass (CYCLES: none). Clippy `--all-targets -D warnings`: clean.
-- **Not done here:** `--write` on the real state is the person's call after the merge. It frees about 8 MB today, because most old runs have no receipt in the ledger.
+  - **Two earlier rehearsals are not counted.**
+    - One left the stored paths unrewritten while `RELAIS_STATE_DIR` named the scratch dir, so no citation could match.
+    - One rewrote them to the scratch prefix while `runs/` resolved through its symlink to the real path, which again gave 0 rows.
+    - Neither wrote under the real `runs/`. Its window showed one directory touched, by a live run's own `attempt1-cmd0.log`.
+- **Not done here:** `--write` on the real state is the person's call after the merge: 18 directories and 8.1 MB are expected.
 
 ## Decision log
 
-- 2026-11-01: implementation review round 1 fixes:
-  - `Prune` enum instead of a bool;
-  - a `runs/` read error exits non-zero, and unreadable entries are named;
-  - talk on stderr;
-  - the 30-day default;
-  - a preview no longer sweeps verify directories;
-  - a deterministic integration test;
-  - the export under its own name.
-- 2026-11-01: a run directory cited by a baseline-cache entry is kept. Cached outcomes name their retry logs by absolute path under `runs/<run>/logs/`; 6 entries do today.
-- 2026-11-01: Delta review: all eight round-1 findings resolved, and the real-state numbers corrected as above.
-  - `if prune == Prune::Preview` stays an equality test: `deliberate:` the enum has two variants, the early return reads as a guard clause, and a third variant would also need its own arm in `apply`.
-  - Whoever runs `--write` on the real state records what it deleted: 18 directories and 8.1 MB are expected.
+- 2026-11-01: a run directory cited by a baseline-cache entry is kept. Cached outcomes name their retry logs by absolute path under `runs/<run>/logs/`; 6 entries did on 11-01.
+- 2026-11-01: a citation is looked for under both the directory's spelling and its canonical path. A symlinked state directory, or `/tmp` against `/private/tmp`, must not hide one.
 
 ## Implementation review
 
-- Approve-with-changes after a Delta. Round 1 (66k tokens, 72 s): 3 blocking, 1 high, 3 medium and 1 low finding, all fixed. Delta (95k tokens, 48 s): all resolved, plus one medium finding (the real-state numbers were not measured) and one low finding.
-- Fixed: the numbers were re-measured with path-matched copies.
-- Deliberate: the equality test on the two-variant `Prune`.
-- Next: PR, merge on green. No release until S2.
-- 2026-11-01: rebased review (tree b9692e68), low finding fixed: `age()` read a hidden entry or listing with `flatten()`, which made a directory look older than it is. An unreadable entry or listing now counts as modified now, and `a_directory_that_cannot_be_listed_is_never_judged_old` covers it. `make lint` clean after the change; `prune::` 5 passed; the scenario test passes.
-- 2026-11-01: final-tree review, high finding fixed: the unlistable-directory test probed after restoring permissions, so it could never fail. The probe now runs while the directory is locked. Mutation check: with `age()`'s unreadable-listing branch reverted, the test fails (panicked at prune.rs:412); with the fix it passes, as uid 501. Then `make lint` clean, `prune::` 5 passed, the scenario tests 3 passed.
+- **Round 1 on tree bb6524bd, by the parent: approve-with-changes.**
+  - Fixed: [blocking] every `State` variant is matched explicitly in the prune judge, with no wildcard; `match prune` has one arm per variant.
+  - Fixed: [high] the preview names each dangling evidence row by kind and path.
+  - Fixed: [high] the live-run guard is tested.
+  - Fixed: [medium] `--prune-runs` conflicts with `--log`.
+  - Fixed: [medium] this record was rewritten.
+  - Fixed: [low] `remove_empty_tree` removes bottom-up with `remove_dir`.
+- The reviews recorded in this file before were run by a fork. A fork's reviews do not count, so none of them is recorded here.

@@ -742,13 +742,24 @@ pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, 
         let id = RunId::from_stored(run);
         match ledger.run_status(&id) {
             Ok(None) => return RunVerdict::Kept("not in the ledger".to_string()),
-            Ok(Some(state)) if !state.is_terminal() => {
-                return RunVerdict::Kept(format!("{} (not ended)", state.as_str()))
-            }
+            Ok(Some(
+                state @ (State::Prepared
+                | State::Running
+                | State::Verifying
+                | State::Repairing
+                | State::Escalating),
+            )) => return RunVerdict::Kept(format!("{} (not ended)", state.as_str())),
             Ok(Some(state @ (State::NeedsReview | State::NeedsDecision | State::Interrupted))) => {
                 return RunVerdict::Kept(format!("{} (waits on a person)", state.as_str()))
             }
-            Ok(Some(_)) => {}
+            Ok(Some(
+                State::Accepted
+                | State::Blocked
+                | State::Failed
+                | State::BudgetExhausted
+                | State::Cancelled
+                | State::AcceptedByPerson,
+            )) => {}
             Err(e) => return RunVerdict::Kept(format!("ledger: {e}")),
         }
         match ledger.receipt(&id) {
@@ -756,16 +767,36 @@ pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, 
             Ok(None) => return RunVerdict::Kept("no receipt in the ledger".to_string()),
             Err(e) => return RunVerdict::Kept(format!("ledger: {e}")),
         }
-        let cited = format!("{}{}", path.to_string_lossy(), std::path::MAIN_SEPARATOR);
-        match json_files_citing(&cache_dir, &cited) {
-            Ok(0) => {}
-            Ok(n) => return RunVerdict::Kept(format!("cited by {n} baseline-cache entries")),
-            Err(e) => return RunVerdict::Kept(format!("baseline cache unreadable: {e}")),
+        // A citation may name the directory as it was spelled when it was
+        // written or through its real path (a symlinked state directory,
+        // `/tmp` against `/private/tmp`): both spellings are looked for.
+        let spellings = spellings_of(path);
+        for spelling in &spellings {
+            let cited = format!(
+                "{}{}",
+                spelling.to_string_lossy(),
+                std::path::MAIN_SEPARATOR
+            );
+            match json_files_citing(&cache_dir, &cited) {
+                Ok(0) => {}
+                Ok(n) => return RunVerdict::Kept(format!("cited by {n} baseline-cache entries")),
+                Err(e) => return RunVerdict::Kept(format!("baseline cache unreadable: {e}")),
+            }
         }
-        match ledger.evidence_under(path) {
-            Ok(dangling_evidence) => RunVerdict::Prunable { dangling_evidence },
-            Err(e) => RunVerdict::Kept(format!("ledger: {e}")),
+        let mut dangling = Vec::new();
+        for spelling in &spellings {
+            match ledger.evidence_under(spelling) {
+                Ok(rows) => {
+                    for row in rows {
+                        if !dangling.contains(&row) {
+                            dangling.push(row);
+                        }
+                    }
+                }
+                Err(e) => return RunVerdict::Kept(format!("ledger: {e}")),
+            }
         }
+        RunVerdict::Prunable { dangling }
     };
     let runs_dir = state_dir.join(paths::RUNS_DIR);
     let older_than = std::time::Duration::from_secs(days.saturating_mul(86_400));
@@ -781,33 +812,40 @@ pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, 
     };
     let mut prunable = 0usize;
     let mut bytes = 0u64;
-    let mut dangling = 0usize;
+    let mut dangling_total = 0usize;
     for dir in &plan {
         let days_old = dir.age.as_secs() / 86_400;
         match &dir.verdict {
-            RunVerdict::Prunable { dangling_evidence } => {
+            RunVerdict::Prunable { dangling } => {
                 prunable += 1;
                 bytes += dir.bytes;
-                dangling += dangling_evidence;
+                dangling_total += dangling.len();
                 println!(
-                    "prune  {}  {days_old}d  {}  {dangling_evidence} evidence rows left dangling",
+                    "prune  {}  {days_old}d  {}  {} evidence rows left dangling",
                     dir.run,
-                    human_bytes(dir.bytes)
+                    human_bytes(dir.bytes),
+                    dangling.len()
                 );
+                for (kind, path) in dangling {
+                    println!("         dangling  {kind}  {path}");
+                }
             }
             RunVerdict::Kept(why) => println!("keep   {}  {days_old}d  {why}", dir.run),
         }
     }
     println!(
-        "{prunable} of {} run directories older than {days}d are prunable ({}, {dangling} evidence rows)",
+        "{prunable} of {} run directories older than {days}d are prunable ({}, {dangling_total} evidence rows)",
         plan.len(),
         human_bytes(bytes)
     );
-    if prune == Prune::Preview {
-        if prunable > 0 {
-            eprintln!("preview only: add --write to delete them");
+    match prune {
+        Prune::Preview => {
+            if prunable > 0 {
+                eprintln!("preview only: add --write to delete them");
+            }
+            return Ok(CliOutcome::Accepted);
         }
-        return Ok(CliOutcome::Accepted);
+        Prune::Write => {}
     }
     let removed =
         relais::runner::sweep_ended_verify_dirs(&relais::runner::verify_root(&runs_dir), &ledger);
@@ -827,6 +865,17 @@ pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, 
     } else {
         CliOutcome::OperationalFailure
     })
+}
+
+/// `path` as given and, when it differs, as its real path.
+fn spellings_of(path: &Path) -> Vec<PathBuf> {
+    let mut spellings = vec![path.to_path_buf()];
+    if let Ok(real) = std::fs::canonicalize(path) {
+        if real != path {
+            spellings.push(real);
+        }
+    }
+    spellings
 }
 
 fn human_bytes(bytes: u64) -> String {

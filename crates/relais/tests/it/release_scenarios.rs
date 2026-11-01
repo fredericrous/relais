@@ -3876,6 +3876,101 @@ fn a_finished_run_leaves_no_empty_verify_dir_and_pruning_previews_first() {
     assert!(!run_dir.exists());
 }
 
+// The live-run guard of `resume --prune-runs`: a run that has not ended
+// (`running`) and one that waits on a person (`needs_review`) are kept even
+// with a receipt and an old run directory, and both survive `--write`. A
+// prunable row lists each evidence row it would leave dangling by kind and
+// path, and `--prune-runs` cannot be combined with `--log`.
+#[test]
+fn pruning_keeps_live_and_waiting_runs_and_names_dangling_rows() {
+    let world = World::new("prunelive");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    // A first run creates the ledger, as in every scenario here.
+    let task = world.write_task("task.json", "off");
+    let first = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(first.status.code(), Some(5), "{}", text(&first.stderr));
+    let ledger = rusqlite::Connection::open(world.state.join("ledger.sqlite")).expect("open");
+    let repo = world.repo.to_string_lossy().into_owned();
+    for (run, status) in [
+        ("run-live", "running"),
+        ("run-review", "needs_review"),
+        ("run-done", "failed"),
+    ] {
+        ledger
+            .execute(
+                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                rusqlite::params![run, repo, status],
+            )
+            .expect("insert a run");
+        ledger
+            .execute(
+                "INSERT INTO receipts (run_id, receipt_json, hash, at) VALUES (?1, '{}', 'h', '2026-01-01T00:00:00Z')",
+                [run],
+            )
+            .expect("store a receipt");
+        let dir = world.state.join("runs").join(run).join("logs");
+        std::fs::create_dir_all(&dir).expect("run dir");
+        std::fs::write(dir.join("check.log"), "x").expect("log");
+    }
+    let cited = world.state.join("runs/run-done/logs/check.log");
+    ledger
+        .execute(
+            "INSERT INTO evidence (run_id, kind, path, at) VALUES ('run-done', 'check_log', ?1, '2026-01-01T00:00:00Z')",
+            [cited.to_string_lossy().as_ref()],
+        )
+        .expect("cite a log");
+    drop(ledger);
+
+    let preview = world.relais(&["resume", "--prune-runs", "0"]);
+    let out = text(&preview.stdout);
+    assert_eq!(
+        preview.status.code(),
+        Some(0),
+        "{out}\n{}",
+        text(&preview.stderr)
+    );
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("keep") && l.contains("run-live") && l.contains("not ended")),
+        "{out}"
+    );
+    assert!(
+        out.lines().any(|l| l.starts_with("keep")
+            && l.contains("run-review")
+            && l.contains("waits on a person")),
+        "{out}"
+    );
+    assert!(
+        out.lines().any(|l| l.contains("dangling  check_log")
+            && l.contains(&cited.to_string_lossy().into_owned())),
+        "the dangling row is named by kind and path: {out}"
+    );
+
+    let applied = world.relais(&["resume", "--prune-runs", "0", "--write"]);
+    assert_eq!(applied.status.code(), Some(0), "{}", text(&applied.stderr));
+    assert!(world.state.join("runs/run-live/logs/check.log").exists());
+    assert!(world.state.join("runs/run-review/logs/check.log").exists());
+    assert!(!world.state.join("runs/run-done").exists());
+
+    let log = world.state.join("prune.log");
+    let combined = world.relais(&[
+        "resume",
+        "--prune-runs",
+        "0",
+        "--log",
+        &log.to_string_lossy(),
+    ]);
+    assert_eq!(
+        combined.status.code(),
+        Some(2),
+        "{}",
+        text(&combined.stderr)
+    );
+    assert!(!log.exists(), "the logged resume never ran");
+}
+
 // A decomposed run's package keeps its verification checkout under the
 // root's artifacts (`runs/<root>/packages/verify/<child>/`): `resume
 // --retire` covers it like a root run's.
