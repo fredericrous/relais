@@ -193,4 +193,15 @@ persistent cache answers part of it, and it stays open until t21.
 - Carried from review and done: the `t20-stamp-platform-rule` slug, t22
   blocked by t20, and Decisions so far lines for t01, t03, t09, t19 and t20.
 
+## Implementation review
+
+- Round 1 returned approve-with-changes: 1 medium finding (t09's floor
+  against t03's worker token) and 3 low (t20 wording, t25 not in the plan,
+  the wk-3 map note). All fixed in "docs: reconcile the t09 floor and t25
+  record".
+- The Delta returned approve, with no new findings.
+- Its hand check for the person: the t09 carve-out (one read-only worker
+  token) was decided under the staff-engineer delegation.
+- Cost: 48k + 53k tokens, 43 s + 13 s.
+
 <!-- panel: repos=relais reviewers=backend body-sha=12f073381d4c -->
