@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/per-check-timings
 repos: [relais]
 canonical: decisions:docs/plans/2026-11-01-one-verdict-build.md
@@ -19,7 +19,7 @@ per-label percentiles. Design: decisions
 | Input | Expected | Actual |
 |---|---|---|
 | `make lint` (fmt, clippy `-D warnings`, cycle scripts) | exit 0 | exit 0 |
-| `make test` (full suite, incl. release scenarios) | exit 0 | exit 0: 2123 + 42 + 284 + 1 passed, 0 failed |
+| `make test` (full suite, incl. release scenarios) | exit 0 | exit 0: 2123 + 42 + 284 + 1 passed, 0 failed (on tree 7ca8aae5, before the runner-level test; CI gives the first full green on 245c39f6) |
 | `policy::tests::the_authority_hash_survives_effort_becoming_data` | pinned hash unchanged | passes (relais.toml untouched) |
 | `receipts_already_on_disk_still_parse` + new fixture test `a_receipt_with_check_timings_round_trips` | old receipts parse with no timing; new round-trips | passes |
 | `timings_aggregate_per_label_and_cached`, `nearest_rank_is_the_ceiling_rank` | per-label, per-cached aggregates; ceiling rank | passes |
@@ -49,3 +49,4 @@ Two decisions made while building:
 - **Full `make test`** (parent, tree after "reason on the new test's cleanup"): 2116 passed and 8 failed.
   - All 8 were `runner::tests::holdouts::*`, failing in the fixture's `git commit` with "amont binary not found". The parent had upgraded amont through brew during the run, and the template hook briefly had no binary.
   - Re-running `runner::tests::holdouts` gave 48 passed, 0 failed.
+- **Implementation review:** approved after round 1 (on 7ca8aae5), a Delta and a re-bind (on 245c39f6). Every finding is fixed, except that the full suite on 245c39f6 is left to CI: the local run was red only from the brew-upgrade window, and the holdouts re-run passed.
