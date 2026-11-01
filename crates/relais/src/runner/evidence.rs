@@ -268,6 +268,7 @@ impl<'a> RunEngine<'a> {
             integration_gaps: preflight.integration_gaps.clone(),
             baseline_cached: ctx.baseline.cached,
             baseline_cache_refused: ctx.baseline.cache_refused.clone(),
+            baseline_proven: ctx.baseline.proven,
         };
         let patch_adds_test = self.patch_adds_test(ctx, &candidate.sha)?;
         let (criteria, mandatory_evidence_independence) = self.settle(

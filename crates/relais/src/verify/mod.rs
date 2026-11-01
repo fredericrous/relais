@@ -37,6 +37,7 @@ mod follow;
 mod heavy;
 mod holdout_run;
 mod junit;
+pub mod stamps;
 
 pub use end::CheckEnd;
 pub use heavy::{
@@ -357,6 +358,11 @@ pub struct VerificationReport {
     /// caching and the toolchain could not be identified (audit V2).
     #[serde(default)]
     pub baseline_cache_refused: Option<CacheRefused>,
+    /// Whether the baseline run was skipped because amont reported every
+    /// profile gate stamped or attested on the base tree (t04): a proven
+    /// base is green, so it has no pre-existing failures.
+    #[serde(default)]
+    pub baseline_proven: bool,
 }
 impl VerificationReport {
     pub fn accepted(&self) -> bool {
@@ -2285,6 +2291,18 @@ pub trait HookInventory {
     /// `amont_gaps` turns into a gap for every required check, never
     /// into a pass.
     fn list(&self, dir: &Path, stage: Stage) -> Result<AmontInventory, InventoryError>;
+
+    /// What `amont stamps --json` says `tree` (the tree checked out at `dir`
+    /// when `None`) carries a verdict for, for `gates`. The default asks
+    /// nothing: only `AmontCli` spawns amont.
+    fn stamps(
+        &self,
+        _dir: &Path,
+        _tree: Option<&str>,
+        _gates: &[String],
+    ) -> Result<stamps::Answer, stamps::StampsError> {
+        Err(stamps::StampsError::NotAsked)
+    }
 }
 
 /// The `amont` binary on this machine — the one place it is spawned.
@@ -2309,6 +2327,15 @@ impl AmontCli {
 impl HookInventory for AmontCli {
     fn list(&self, dir: &Path, stage: Stage) -> Result<AmontInventory, InventoryError> {
         amont_list(dir, stage, self.cancel.as_deref())
+    }
+
+    fn stamps(
+        &self,
+        dir: &Path,
+        tree: Option<&str>,
+        gates: &[String],
+    ) -> Result<stamps::Answer, stamps::StampsError> {
+        stamps::amont_stamps(dir, tree, gates, self.cancel.as_deref())
     }
 }
 
@@ -5171,6 +5198,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(report.accepted());
         assert!(report.new_failures().is_empty());
@@ -5290,6 +5318,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(
             !report.accepted(),
@@ -5341,6 +5370,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(report.accepted());
 
@@ -5502,6 +5532,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         }
     }
 
@@ -5853,6 +5884,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(
             !report.accepted(),
@@ -5940,6 +5972,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(report.accepted());
 
@@ -6063,6 +6096,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         let (criteria, summary) = settle_acceptance(
             &entries,
@@ -6155,6 +6189,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(!report.accepted());
         let (criteria, _) = settle_acceptance(
@@ -6406,6 +6441,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         let (_, all_independent) = settle_acceptance(
             &[AcceptanceEntry::Bare("it builds".into())],
@@ -6545,6 +6581,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(!report.accepted(), "baseline failures are not auto-waived");
         assert!(
@@ -6597,6 +6634,7 @@ mod tests {
                 integration_gaps: Vec::new(),
                 baseline_cached: false,
                 baseline_cache_refused: None,
+                baseline_proven: false,
             },
             kind: Kind::Change,
             candidate: None,
@@ -6706,6 +6744,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         let entries = vec![
             declared(

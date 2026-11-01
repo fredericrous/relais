@@ -171,6 +171,9 @@ pub(super) struct Baseline {
     pub(super) cached: bool,
     /// Why the baseline could not be cached, when it could not (V2).
     pub(super) cache_refused: Option<verify::CacheRefused>,
+    /// amont reported every profile gate stamped or attested on the base
+    /// tree, so the base was not run: it is green by that proof (t04).
+    pub(super) proven: bool,
     /// Where this run's check logs are written.
     pub(super) logs_dir: PathBuf,
 }
