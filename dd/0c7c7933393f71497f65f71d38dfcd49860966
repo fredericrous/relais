@@ -1,0 +1,16 @@
+amont-provenance-v1
+commit e3a224e2cf1ef98b6d2967d5392fbb8be15079a8
+tree dd0c7c7933393f71497f65f71d38dfcd49860966
+canon e38c79d6db2ccdfdbc003f52a097f3bd154eabbc
+patch bdf2cbccd288f285e1614c27304ef776b91247a4
+plan docs/plans/2026-11-01-one-verdict-build-t1.md 52fb16ad1c188fa2483e3bac10c86be28d905b627b112104f3918c9c9525ad52
+review reviewed c09682514f787b4d67a0a107242030a3502b2e74afd4fd409491b742619c0377
+preview not-required
+producer amont-agent 3.11.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAEDog5iBoDxSJzzoKwH5pW5qrbSgx88r9JqmZn2bkdwTqcwVoT
+MWjcmk55065U/yed75zp7amRrPvrzDUrHH6DkF
+-----END SSH SIGNATURE-----
