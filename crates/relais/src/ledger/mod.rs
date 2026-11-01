@@ -15,6 +15,7 @@ use std::path::Path;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 mod admission;
+mod check_timings;
 mod clock;
 mod error;
 mod evidence;
@@ -37,6 +38,7 @@ mod trials;
 mod trust;
 mod usage;
 pub use admission::{GroupBindingRow, LedgerGrowth};
+pub use check_timings::{CheckTimingRow, CheckTimingStats};
 pub use clock::{now_rfc3339, Clock, FixedClock, SystemClock};
 pub use error::LedgerError;
 use error::{parse_state, Result};

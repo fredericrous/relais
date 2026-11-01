@@ -152,6 +152,11 @@ pub struct CheckOutcome {
     /// timeout is the budget's and the check is not run again for it.
     #[serde(default)]
     pub clipped: bool,
+    /// When this run waited, started and ended (the last attempt's, as for
+    /// the fields above). Absent in a receipt written before timings were
+    /// recorded, and for an outcome that never ran here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<CheckTiming>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -171,6 +176,43 @@ pub struct Attempt {
     /// A run budget cut the limit below the check's own.
     #[serde(default)]
     pub clipped: bool,
+    /// This attempt's own timing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<CheckTiming>,
+}
+
+/// When one run of a check waited for admission, started and ended:
+/// wall-clock instants in RFC 3339 UTC, and the two durations a report
+/// aggregates. Without them no saving from skipping or caching a check can
+/// be measured (decisions `one-verdict-per-tree`, t09).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckTiming {
+    /// Just before the run asked for admission (tokens, host slots, disk).
+    pub queued_at: String,
+    /// When admission returned; absent when the run was cancelled queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_at: Option<String>,
+    /// When the command was spawned; absent when it never was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// When the run ended and its tokens went back.
+    pub ended_at: String,
+    /// Milliseconds between `queued_at` and admission.
+    #[serde(default)]
+    pub slot_wait_ms: u64,
+    /// Milliseconds the command itself ran.
+    #[serde(default)]
+    pub run_ms: u64,
+    /// The outcome was reused, not run now (a cached baseline, or the
+    /// base's outcome for a candidate identical to it): the instants are
+    /// the original run's.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cached: bool,
+}
+
+/// Now, as the RFC 3339 UTC instant a [`CheckTiming`] records.
+fn wall_clock() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 impl CheckOutcome {
@@ -181,7 +223,23 @@ impl CheckOutcome {
             log_sha256: self.log_sha256.clone(),
             applied_limit_ms: self.applied_limit_ms,
             clipped: self.clipped,
+            timing: self.timing.clone(),
         }
+    }
+
+    /// The same outcome, reused rather than run now: its timing (and each
+    /// attempt's) is marked `cached`, so a report never counts it as work.
+    pub fn reused(mut self) -> Self {
+        let mark = |timing: &mut Option<CheckTiming>| {
+            if let Some(timing) = timing {
+                timing.cached = true;
+            }
+        };
+        mark(&mut self.timing);
+        for attempt in &mut self.attempts {
+            mark(&mut attempt.timing);
+        }
+        self
     }
 
     pub fn failed(&self) -> bool {
@@ -1281,6 +1339,8 @@ fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
     } = run;
     let own_timeout = command_timeout(spec)?;
     std::fs::create_dir_all(logs_dir)?;
+    let queued_at = wall_clock();
+    let queued = std::time::Instant::now();
     // A cancelled queue wait runs nothing; every other refusal is the
     // caller's to end the run on.
     let admitted = match admission.admit(&Ask {
@@ -1294,6 +1354,8 @@ fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
         Err(LeaseStop::Cancelled) => None,
         Err(stop) => return Err(VerifyError::Lease(stop)),
     };
+    let admitted_at = admitted.is_some().then(wall_clock);
+    let slot_wait_ms = queued.elapsed().as_millis() as u64;
     let timeout = admission.budgets.clip(own_timeout);
     let clipped = timeout < own_timeout;
     let heartbeat_every = admission.heartbeat_every;
@@ -1344,6 +1406,7 @@ fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
         label: label.to_string(),
         argv: spec.argv.clone(),
     });
+    let started_at = admitted.is_some().then(wall_clock);
     let started = std::time::Instant::now();
     // Every way out after `check_started` says the check ended: an
     // error is reported with no exit status, never left open.
@@ -1429,6 +1492,19 @@ fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
     // The group is gone (`wait_for_exit` kills it on every path): the
     // tokens and host slots go back now.
     drop(admitted);
+    let timing = CheckTiming {
+        queued_at,
+        admitted_at,
+        run_ms: if started_at.is_some() {
+            started.elapsed().as_millis() as u64
+        } else {
+            0
+        },
+        started_at,
+        ended_at: wall_clock(),
+        slot_wait_ms,
+        cached: false,
+    };
     ended_with(match ended {
         Ended::Exited(code) => Some(code),
         Ended::TimedOut | Ended::Cancelled | Ended::Signalled => None,
@@ -1453,6 +1529,7 @@ fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
         flaky_reason: None,
         applied_limit_ms: timeout.as_millis() as u64,
         clipped,
+        timing: Some(timing),
     })
 }
 
@@ -3381,6 +3458,57 @@ mod tests {
                 .expect("the receipt round-trips");
             assert_eq!(again, receipt);
         }
+        for (n, json) in PARSES.iter().enumerate() {
+            let receipt: Receipt = serde_json::from_str(json).expect("parses");
+            for check in &receipt.verification.checks {
+                assert_eq!(check.timing, None, "receipt {n} predates timings");
+            }
+        }
+    }
+
+    /// A receipt written with timings: a check's and each attempt's timing
+    /// round-trip, and the receipt still parses with every older field
+    /// absent. `reused` marks the check and its attempts `cached`.
+    #[test]
+    fn a_receipt_with_check_timings_round_trips() {
+        let mut receipt: Receipt = serde_json::from_str(PRE_FIELD_RECEIPT_3).expect("parses");
+        let timing = |queued: &str| CheckTiming {
+            queued_at: queued.to_string(),
+            admitted_at: Some("2026-11-01T10:00:02.000Z".into()),
+            started_at: Some("2026-11-01T10:00:02.000Z".into()),
+            ended_at: "2026-11-01T10:05:00.000Z".into(),
+            slot_wait_ms: 2000,
+            run_ms: 298_000,
+            cached: false,
+        };
+        let check = &mut receipt.verification.checks[0];
+        check.timing = Some(timing("2026-11-01T10:00:00.000Z"));
+        check.attempts = vec![check.attempt(), check.attempt()];
+        let json = serde_json::to_string(&receipt).expect("serializes");
+        assert!(json.contains("\"slot_wait_ms\":2000"), "{json}");
+        assert!(
+            !json.contains("\"cached\""),
+            "a fresh run writes no cached flag"
+        );
+        let again: Receipt = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(again, receipt);
+
+        let reused = again.verification.checks[0].clone().reused();
+        assert!(reused.timing.as_ref().is_some_and(|t| t.cached));
+        assert!(reused
+            .attempts
+            .iter()
+            .all(|a| a.timing.as_ref().is_some_and(|t| t.cached)));
+        let untimed = CheckOutcome {
+            timing: None,
+            attempts: Vec::new(),
+            ..reused
+        }
+        .reused();
+        assert_eq!(
+            untimed.timing, None,
+            "nothing is invented for an untimed outcome"
+        );
     }
     use super::*;
 
@@ -3657,6 +3785,22 @@ mod tests {
         assert_eq!(outcome.attempts[0].applied_limit_ms, 1000);
         assert!(dir.join("logs/s.log").exists());
         assert!(dir.join("logs/s-retry1.log").exists());
+        // Each run carries its own timing: the timed-out first run ran about
+        // its 1 s limit, the passing retry started after it ended.
+        let first = outcome.attempts[0]
+            .timing
+            .as_ref()
+            .expect("first run timed");
+        let second = outcome.attempts[1].timing.as_ref().expect("retry timed");
+        assert!(first.admitted_at.is_some() && first.started_at.is_some());
+        assert!(first.run_ms >= 900, "{first:?}");
+        assert!(second.queued_at >= first.ended_at, "{first:?} {second:?}");
+        assert!(!first.cached && !second.cached);
+        assert_eq!(
+            outcome.timing.as_ref(),
+            Some(second),
+            "the last run is the check's"
+        );
         let events = logged_events(&dir);
         assert!(
             events.contains("\"reason\":\"timed_out_then_passed\""),
@@ -4043,6 +4187,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         }
     }
 
@@ -5000,6 +5145,7 @@ mod tests {
                 flaky_reason: None,
                 applied_limit_ms: 0,
                 clipped: false,
+                timing: None,
             }],
             gaps: vec![],
             baseline_failures: vec![],
@@ -5094,6 +5240,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         }];
         let gaps = acceptance_gaps(
             &entries,
@@ -5162,6 +5309,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         }];
         let report = VerificationReport {
             candidate_sha: "abc".into(),
@@ -5308,6 +5456,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         }
     }
 
@@ -5650,6 +5799,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         }];
         let entries = vec![declared(
             "a person signed off on the migration",
@@ -5741,6 +5891,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         }];
         let entries = vec![declared(
             "a person signed off on the migration",
@@ -5856,6 +6007,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         }];
         let entries = vec![declared(
             "the pre-push cargo test gate covers this candidate",
@@ -5948,6 +6100,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         }];
         let entries = vec![declared(
             "the pre-push cargo test gate covers this candidate",
@@ -6152,6 +6305,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         };
         let entries = vec![
             AcceptanceEntry::Bare("the layout is listed".into()),
@@ -6359,6 +6513,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         };
         let report = VerificationReport {
             candidate_sha: "abc".into(),
@@ -6525,6 +6680,7 @@ mod tests {
                 flaky_reason: None,
                 applied_limit_ms: 0,
                 clipped: false,
+                timing: None,
             }],
             gaps: Vec::new(),
             gaps_not_judged: Vec::new(),

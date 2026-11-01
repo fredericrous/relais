@@ -829,6 +829,10 @@ pub struct Report {
     /// it `None`; `relais report` fills it from the ledger, always: with
     /// nothing ingested it is the empty state.
     pub review_outcomes: Option<ReviewerReport>,
+    /// Per check label, how long it ran and waited for admission, split by
+    /// whether the outcome was reused (t09). `runs_report` leaves it `None`;
+    /// `relais report` fills it from `check_timings`.
+    pub check_timings: Option<Vec<crate::ledger::CheckTimingStats>>,
 }
 
 /// Orchestration spend imported from Claude Code session transcripts
@@ -1298,6 +1302,7 @@ pub fn runs_report(
         session_routing: None,
         learning: None,
         review_outcomes: None,
+        check_timings: None,
         trial_spend,
         observational,
     })
@@ -1629,6 +1634,43 @@ impl Report {
         if let Some(reviewers) = &self.review_outcomes {
             out.push_str(&reviewers.render());
         }
+        if let Some(timings) = &self.check_timings {
+            out.push_str(&render_check_timings(timings));
+        }
+    }
+}
+
+/// The per-check timing section: one line per label (and `cached` split),
+/// run time and admission wait at p50/p90, and the retry count.
+fn render_check_timings(timings: &[crate::ledger::CheckTimingStats]) -> String {
+    let mut out = String::from("\ncheck timings (run p50/p90 · slot wait p50/p90):\n");
+    if timings.is_empty() {
+        out.push_str("  none recorded in the window\n");
+        return out;
+    }
+    for t in timings {
+        out.push_str(&format!(
+            "  {}{}: {} run(s), {} retr{} · run {}/{} · wait {}/{}\n",
+            t.label,
+            if t.cached { " (reused)" } else { "" },
+            t.runs,
+            t.retries,
+            if t.retries == 1 { "y" } else { "ies" },
+            human_ms(t.run_ms_p50),
+            human_ms(t.run_ms_p90),
+            human_ms(t.slot_wait_ms_p50),
+            human_ms(t.slot_wait_ms_p90),
+        ));
+    }
+    out
+}
+
+/// `950ms`, `12.3s` or `4m05s`.
+fn human_ms(ms: u64) -> String {
+    match ms {
+        0..=999 => format!("{ms}ms"),
+        1_000..=59_999 => format!("{:.1}s", ms as f64 / 1000.0),
+        _ => format!("{}m{:02}s", ms / 60_000, (ms % 60_000) / 1000),
     }
 }
 
@@ -1672,6 +1714,30 @@ pub fn completeness_label(completeness: CostCompleteness) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    /// The check-timings section names each label, marks reused outcomes,
+    /// and says so when the window recorded none.
+    #[test]
+    fn the_check_timings_section_reads_per_label() {
+        let stats = crate::ledger::CheckTimingStats {
+            label: "make test".into(),
+            cached: true,
+            runs: 3,
+            retries: 1,
+            run_ms_p50: 950,
+            run_ms_p90: 245_000,
+            slot_wait_ms_p50: 12_300,
+            slot_wait_ms_p90: 61_000,
+        };
+        let text = super::render_check_timings(&[stats]);
+        assert!(
+            text.contains(
+                "make test (reused): 3 run(s), 1 retry · run 950ms/4m05s · wait 12.3s/1m01s"
+            ),
+            "{text}"
+        );
+        assert!(super::render_check_timings(&[]).contains("none recorded"));
+    }
 
     /// The default every `relais report` starts from, and the one that
     /// shipped contradicting itself: with no coordinator reachable the
@@ -2096,6 +2162,7 @@ mod tests {
             session_routing: None,
             learning: None,
             review_outcomes: None,
+            check_timings: None,
         };
         let rendered = report.render();
         assert!(
@@ -2292,6 +2359,7 @@ mod tests {
                 "accepted_tasks_by_person",
                 "accepted_tasks_by_relais",
                 "backfilled_tasks",
+                "check_timings",
                 "cohorts",
                 "cost_completeness",
                 "cost_per_accepted",
