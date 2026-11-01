@@ -8,6 +8,11 @@ missing here.
 
 ## Unreleased
 
+## v0.47.0
+
+- **A run the queue ends names the candidate it keeps.** When `admission_wait` runs out while a candidate is verified, the run still ends `blocked (admission_wait_exhausted)`, and the outcome now says how to verify the candidate again without a worker: a `kind: verify` run naming `candidate {run, index}`. Its transition detail carries `candidate {run, index, sha}`; a `kind: verify` run names its source run. The attempt row is closed `blocked` with its sha, where it used to stay `verifying`. A reviewer whose admission runs out ends `needs_review` (review unavailable) with the same recovery in its text. The text no longer says "nothing was launched" when a worker already made the candidate.
+- **The release signs its attestations.** CI signs the gate attestations on each push to main, and the release requires them signed.
+
 ## v0.46.0
 
 - **Each check records when it queued, started and ended.** Every check outcome and retry, setup steps included, carries `timing` (queued, admitted, started and ended instants, slot wait and run time), stored in a new `check_timings` ledger table. `relais report` prints per-check p50/p90 run and slot-wait times, with reused baseline outcomes apart. The ledger migrates to v47.
