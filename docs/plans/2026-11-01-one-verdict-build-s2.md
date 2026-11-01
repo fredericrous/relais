@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/verify-through-amont
 repos: [relais]
 canonical: decisions:docs/plans/2026-11-01-one-verdict-build.md
@@ -17,7 +17,7 @@ The canonical plan is decisions `docs/plans/2026-11-01-one-verdict-build.md`. Th
 
 - **Seam:** a new `verify::stamps` module holds the types, the parser, the gap and proven rules, and the probe. The existing `HookInventory` port gains a `stamps` method that asks nothing by default; only `AmontCli` spawns `amont stamps --json`. The runner files (`verification.rs`, `baseline.rs`) get one small call site each, so T1's rebase stays small.
 - **Gap rule:** the answer's gates are keyed by check id (`pre-commit-cargo-test`), while the profile names short gates (`cargo-test`), which amont resolves.
-  - Every gate amont reports must be `stamped` or `attested`.
+  - Every gate relais asks about must be in the answer and `stamped` or `attested`; a gate missing from the answer is a gap.
   - An answer naming no gate, a refusal (amont older than 1.66, or an unknown gate) and a probe that did not run are each a gap naming why.
   - Integration off is no gap.
   - A candidate identical to its base, which has no worktree of its own, is not asked.
@@ -49,3 +49,10 @@ The canonical plan is decisions `docs/plans/2026-11-01-one-verdict-build.md`. Th
    - Expected: both say "not repeating it here" for `cargo-test`.
 3. A second run off the same merged base.
    - Expected: the log carries a `baseline_proven` decision, the receipt reads `baseline_proven: true`, and `baseline-cache/` gains no entry.
+
+## Implementation review
+
+- Approved after round 1 (on 16c6946b) and a Delta (on ee15862c, after the rebase onto T1).
+- Round 1 was approve-with-changes, with 3 blocking findings: the receipt fixture, a flag argument, placeholder names. It also had 2 medium (partial answers, the verification record) and 1 low (`holds-until:`). All were fixed in 179b7ac9.
+- The Delta's one low finding, the stale rule on line 20, is fixed here.
+- Follow-up: amend the canonical plan's S2 toolchain clause to match the departure recorded in the decisions above.
