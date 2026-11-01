@@ -323,7 +323,7 @@ fn ended_on(fixture: &Fixture, exhausted: Exhausted) -> RunOutcome {
         escalation_tier: None,
     };
     engine
-        .end_on_exhausted(exhausted, &budget)
+        .end_on_exhausted(exhausted, &budget, None)
         .expect("the run ends")
 }
 

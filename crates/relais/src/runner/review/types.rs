@@ -84,6 +84,9 @@ pub(crate) struct ReviewRequest<'r> {
     /// How each holdout ended on this candidate: the reviewer is given
     /// the name, the outcome and the test ids, nothing else (ADR-0045).
     pub(crate) holdouts: &'r [crate::verify::HoldoutRun],
+    /// The candidate a reviewer admission that expires keeps and names;
+    /// `None` where no candidate is kept (integration).
+    pub(crate) candidate: Option<crate::runner::KeptCandidate>,
 }
 
 impl ReviewRequest<'_> {
@@ -101,6 +104,7 @@ impl ReviewRequest<'_> {
             covering: self.covering.clone(),
             base_sha: self.base_sha,
             holdouts: self.holdouts,
+            candidate: self.candidate.clone(),
         }
     }
 }

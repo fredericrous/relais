@@ -95,7 +95,7 @@ use types::{
     AttemptContext, Attempted, Baseline, Candidate, CandidateConflicts, Dispatched, InPlaceRun,
     PendingEvidence, Preflight, PreparedCandidate, Snapshot, Step, Verified,
 };
-pub(crate) use types::{AttemptLabel, ManagedDispatch, Phase};
+pub(crate) use types::{AttemptLabel, KeptCandidate, ManagedDispatch, Phase};
 
 /// The lifecycle vocabulary lives in `crate::lifecycle`, a leaf module
 /// the ledger, the report and the learning dataset can name without

@@ -92,6 +92,7 @@ impl<'a> RunEngine<'a> {
             reserve_micros,
             budget,
             write_lease,
+            candidate,
             ..
         } = dispatch;
         // The dispatch is `launched` in the ledger BEFORE the process
@@ -171,7 +172,7 @@ impl<'a> RunEngine<'a> {
                             what: "admission_queue_ended".into(),
                             reason: format!("still queued at position {position}"),
                         });
-                        return Ok(Err(self.end_on_exhausted(exhausted, budget)?));
+                        return Ok(Err(self.end_on_exhausted(exhausted, budget, candidate)?));
                     }
                     std::thread::sleep(ADMISSION_POLL);
                 }

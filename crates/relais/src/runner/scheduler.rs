@@ -501,7 +501,9 @@ fn execute_waves(
             &[],
         ) {
             Ok(result) => result,
-            Err(VerifyFailure::Lease(stop)) => return engine.end_on_lease_stop(stop, &budget),
+            Err(VerifyFailure::Lease(stop)) => {
+                return engine.end_on_lease_stop(stop, &budget, None)
+            }
             Err(VerifyFailure::Unavailable(e)) => {
                 return engine.fail_preflight(BlockCode::VerificationUnavailable, e)
             }
@@ -1103,6 +1105,7 @@ fn accept_integrated(
                 covering: root.decision.covering.clone(),
                 base_sha: root.base_sha,
                 holdouts: &[],
+                candidate: None,
             },
             &mut spend,
         );
@@ -1381,6 +1384,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
     // Around the launch, monotonic: the dispatch's own elapsed time.
     let dispatch_start = Instant::now();
     let result = match engine.managed_launch(ManagedDispatch {
+        candidate: None,
         spec,
         attempt: None,
         depth: 0,

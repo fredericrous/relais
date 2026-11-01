@@ -6,9 +6,10 @@ use super::{
     setup_failure_detail, state_sibling, sweep_ended_verify_dirs, verify, verify_root, workspace,
     worktree_root, Arc, AtomicBool, AttemptContext, AttemptKind, BlockCode, Budget, BudgetClock,
     BudgetLimits, Budgets, Candidate, CostKind, Duration, EffectiveAuthority, Event, Events,
-    EvidenceKind, Exhausted, Finish, Gate, Instant, Limit, Next, Observation, Ordering, PackageId,
-    PackageRole, PathBuf, Phase, Reason, Refusal, Request, RunConfig, RunEngine, RunError, RunId,
-    RunOutcome, State, Summary, Terminal, Transition, UsagePhase, ADMISSION_POLL,
+    EvidenceKind, Exhausted, Finish, Gate, Instant, KeptCandidate, Limit, Next, Observation,
+    Ordering, PackageId, PackageRole, PathBuf, Phase, Reason, Refusal, Request, RunConfig,
+    RunEngine, RunError, RunId, RunOutcome, State, Summary, Terminal, Transition, UsagePhase,
+    ADMISSION_POLL,
 };
 
 impl<'a> RunEngine<'a> {
@@ -20,6 +21,37 @@ impl<'a> RunEngine<'a> {
         self.parent
             .as_ref()
             .map_or(UsagePhase::from(kind), |(_, _, role)| role.phase(kind))
+    }
+
+    /// The candidate a `kind: verify` run is verifying, named by the run
+    /// that wrote it; `None` for every other run, whose baseline has no
+    /// candidate under verification.
+    pub(super) fn verify_source(&self, preflight: &super::Preflight) -> Option<KeptCandidate> {
+        if !self.config.contract.is_verify() {
+            return None;
+        }
+        preflight.candidate.as_ref().map(|prepared| KeptCandidate {
+            run: prepared.resolved.source_run.clone(),
+            index: prepared.resolved.index,
+            sha: prepared.resolved.candidate_commit.clone(),
+        })
+    }
+
+    /// The candidate an admission wait that runs out around attempt
+    /// `index`'s verification or review keeps: this run's own attempt, or
+    /// for a `kind: verify` run the source it resolved.
+    pub(super) fn kept_candidate(
+        &self,
+        preflight: &super::Preflight,
+        index: u32,
+        sha: &str,
+    ) -> KeptCandidate {
+        self.verify_source(preflight)
+            .unwrap_or_else(|| KeptCandidate {
+                run: self.run_id.as_str().to_string(),
+                index,
+                sha: sha.to_string(),
+            })
     }
 
     pub(super) fn new(
@@ -597,7 +629,8 @@ impl<'a> RunEngine<'a> {
         self.budgets.begin_work();
         if let Some(exhausted) = self.budgets.exhausted() {
             let nominal = fresh_progress(&preflight).budget;
-            return self.end_on_exhausted(exhausted, &nominal);
+            let kept = self.verify_source(&preflight);
+            return self.end_on_exhausted(exhausted, &nominal, kept.as_ref());
         }
         // The harness identity every dispatch of this run records, probed
         // once (SPEC §16: model/effort/harness identity are features).
@@ -846,11 +879,12 @@ impl<'a> RunEngine<'a> {
         &mut self,
         stop: verify::LeaseStop,
         budget: &Budget,
+        candidate: Option<&KeptCandidate>,
     ) -> Result<RunOutcome, RunError> {
         use verify::LeaseStop;
         let text = stop.to_string();
         match stop {
-            LeaseStop::Exhausted(exhausted) => self.end_on_exhausted(exhausted, budget),
+            LeaseStop::Exhausted(exhausted) => self.end_on_exhausted(exhausted, budget, candidate),
             LeaseStop::Cancelled
             | LeaseStop::Refused {
                 code: Refusal::RunCancelled,
@@ -885,20 +919,33 @@ impl<'a> RunEngine<'a> {
         &mut self,
         exhausted: Exhausted,
         budget: &Budget,
+        candidate: Option<&KeptCandidate>,
     ) -> Result<RunOutcome, RunError> {
         let limits = self.budgets.limits();
         match exhausted {
             Exhausted::Work => self.stop(budget, Observation::LimitReached(Limit::WallClock)),
             Exhausted::Total => self.stop(budget, Observation::LimitReached(Limit::Total)),
             Exhausted::AdmissionWait => {
-                let detail = format!(
+                let mut detail = format!(
                     "queued for a lease for {}s, the whole admission wait budget \
                      (`[resources] admission_wait_seconds`); nothing was launched",
                     limits.admission_wait.as_secs()
                 );
+                let mut detail_json = serde_json::json!({ "detail": detail });
+                if let Some(kept) = candidate {
+                    detail.push_str(&format!(
+                        "; the candidate is kept: verify it again without a worker with a \
+                         `kind: verify` run, `candidate {{run: {}, index: {}}}`",
+                        kept.run, kept.index
+                    ));
+                    detail_json = serde_json::json!({
+                        "detail": detail,
+                        "candidate": { "run": kept.run, "index": kept.index, "sha": kept.sha },
+                    });
+                }
                 self.finish(
                     Reason::AdmissionWaitExhausted,
-                    serde_json::json!({ "detail": detail }),
+                    detail_json,
                     Terminal::BlockedBy {
                         reason: Reason::AdmissionWaitExhausted,
                         detail,

@@ -40,6 +40,15 @@ impl PackageRole {
     }
 }
 
+/// A candidate that is kept when a queue ends the run around it: the run
+/// and attempt index a `kind: verify` run names, and its commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeptCandidate {
+    pub(crate) run: String,
+    pub(crate) index: u32,
+    pub(crate) sha: String,
+}
+
 /// One dispatch as admission and the launch need it: the spec, its place
 /// in the agent tree, what it may spend and how long it has.
 pub(crate) struct ManagedDispatch<'d> {
@@ -58,6 +67,9 @@ pub(crate) struct ManagedDispatch<'d> {
     /// The worktree this dispatch writes, when it writes one. Readers
     /// pass `None` and take no lease.
     pub(crate) write_lease: Option<&'d Path>,
+    /// The candidate an admission wait that runs out is to name: the
+    /// reviewer's; a worker dispatch has none.
+    pub(crate) candidate: Option<&'d KeptCandidate>,
 }
 
 /// An in-place run's hold on the caller's worktree.

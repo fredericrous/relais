@@ -702,6 +702,7 @@ impl<'a> RunEngine<'a> {
         // Around the launch, monotonic: the dispatch's own elapsed time.
         let dispatch_start = Instant::now();
         let result = match self.managed_launch(ManagedDispatch {
+            candidate: request.candidate.as_ref(),
             spec,
             attempt: None,
             depth: 0,

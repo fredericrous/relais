@@ -90,6 +90,7 @@ impl<'a> RunEngine<'a> {
                 covering: preflight.decision.covering.clone(),
                 base_sha: &preflight.base_sha,
                 holdouts: &verified.holdouts,
+                candidate: Some(self.kept_candidate(preflight, candidate.index, &candidate.sha)),
             };
             let review = if in_parts {
                 self.review_candidate_in_parts(&request, &mut progress.spend)
@@ -406,6 +407,7 @@ impl<'a> RunEngine<'a> {
             covering: preflight.decision.covering.clone(),
             base_sha: &preflight.base_sha,
             holdouts: &verified.holdouts,
+            candidate: Some(self.kept_candidate(preflight, candidate.index, &candidate.sha)),
         };
         // Not fatal: without the listing the reviewer works as it did before,
         // and the prompt says so.
