@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/prune-verify-and-runs
 repos: [relais]
 canonical: decisions:docs/plans/2026-11-01-one-verdict-build.md
@@ -28,7 +28,7 @@ Every test below is in this branch's diff.
     - with a receipt, the dangling count rises by exactly 1 per citing row;
     - the preview deletes nothing, and `--write` deletes it.
   - `pruning_keeps_live_and_waiting_runs_and_names_dangling_rows` (new):
-    - a `running` run and a `needs_review` run, each with a receipt and an old directory, get `keep` lines and survive `--write`;
+    - a `running` run and a `needs_review` run, each with a receipt and a directory listed by `--prune-runs 0`, get `keep` lines and survive `--write`;
     - a prunable run's dangling row is named by kind and path;
     - `--prune-runs` with `--log` exits 2, and the logged resume never runs.
   - `a_package_runs_leftover_verification_checkout_is_removed_by_resume` (unchanged): passes.
@@ -64,3 +64,4 @@ Every test below is in this branch's diff.
   - Fixed: [medium] this record was rewritten.
   - Fixed: [low] `remove_empty_tree` removes bottom-up with `remove_dir`.
 - The reviews recorded in this file before were run by a fork. A fork's reviews do not count, so none of them is recorded here.
+- **Delta on 31a1e1eb:** approve. All six round-1 findings are resolved. The one low wording fix (line 31) is applied.
