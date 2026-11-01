@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.45.0
+
 - `relais programme list` names each map once: it scans primary checkouts only, so a linked worktree of a repository no longer repeats its maps.
 - `relais programme frontier --all` and `show` give each in-flight ticket its branch's last-commit age (`5m`, `3h`, `2d`), and their `--json` in-flight entries carry `branch_age_secs`. The `programme` skill now says where the `prog/` branch lives and how to give a ticket up.
 
