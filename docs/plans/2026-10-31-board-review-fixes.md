@@ -10,7 +10,8 @@ Pointer. The plan and its review panel live in decisions. This repository
 carries phase 3 (B1–B3): `relais programme list` names each map once, an
 in-flight ticket shows its branch's last-commit age, and the `programme`
 skill says where the branch lives and how to give a ticket up; released as
-0.44.0.
+0.45.0 (main shipped v0.44.0 from other work while
+this branch was open).
 
 ## Verification
 
@@ -25,3 +26,4 @@ skill says where the branch lives and how to give a ticket up; released as
 
 - Round 1 approve-with-changes (54k tokens, 45 s). Fixed: one field count under `--all` (the plan's B2); the clock fallback's reason on its line; the `make plugin` attempt recorded.
 - Delta approve (61k tokens, 25 s). B3's `make plugin` alone rests on the gate and on CI's plugin job, read before the merge.
+- Rebased onto main after #360–#364 (v0.44.0): round 1 on the new tree approve-with-changes (68k tokens, 33 s). Fixed: the release is 0.45.0 here; decisions' closing PR records it. A push rehearsal on the rebased tree failed one timing test under heavy load (its log went with the rehearsal worktree); the direct `cargo test --workspace` on the same tree passed (rc 0).
