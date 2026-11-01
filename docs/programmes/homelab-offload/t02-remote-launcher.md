@@ -2,7 +2,7 @@
 type = "grilling"
 mode = "hitl"
 status = "open"
-blocked_by = ["t01-native-dispatch-amendment", "t03-credentials-billing", "t04-worktree-transport", "t05-cluster-capacity", "t12-laptop-cluster-path"]
+blocked_by = ["t01-native-dispatch-amendment", "t03-credentials-billing", "t04-worktree-transport", "t05-cluster-capacity", "t12-laptop-cluster-path", "t24-litellm-live-test"]
 repos = ["relais", "homelab"]
 +++
 # What launches a worker in a pod

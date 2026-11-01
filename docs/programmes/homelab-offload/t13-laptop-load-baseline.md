@@ -60,3 +60,10 @@ The ticket stays open until the 7-day window ends.
   - relais-attributed CPU-seconds per day drop by a stated percentage.
   - The median slot wait per run and the number of waiting runs per day both
     fall.
+
+## Update 2026-11-01
+
+- relais#367 now records per-check timings in the ledger. The baseline can
+  read them in place of the `events.jsonl` scan.
+- The laptop disk was freed (42 GB free on 2026-11-01). The sampler can
+  start.
