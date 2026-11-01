@@ -575,8 +575,14 @@ impl<'a> RunEngine<'a> {
             self.events.emit(Event::Decision {
                 what: "holdout_store_unreachable".to_string(),
                 reason: format!(
-                    "the holdout store's files could not be fetched ({cause}); the holdouts it \
-                     declares are not known to this run"
+                    "the holdout store `{}` could not be read ({cause}); the holdouts it \
+                     declares are not known to this run",
+                    self.config
+                        .machine
+                        .holdouts
+                        .store
+                        .as_deref()
+                        .unwrap_or_default()
                 ),
             });
         }
@@ -647,6 +653,13 @@ impl<'a> RunEngine<'a> {
         ) {
             Ok(resolved) => resolved,
             Err(block) => return Ok(Phase::Ended(self.fail_preflight(block.code, block.detail)?)),
+        };
+        // With the store unread, the declarations it holds are unknown: a
+        // frozen name missing from today's settings is not a change.
+        let changes = if view.unread.is_some() {
+            Vec::new()
+        } else {
+            changes
         };
         let sourced: Vec<(
             crate::holdout::ResolvedHoldout,

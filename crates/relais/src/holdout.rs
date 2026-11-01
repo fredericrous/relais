@@ -16,14 +16,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::acceptance::{AcceptanceEntry, Evidence};
 use crate::ids::sha256_hex;
-use crate::policy::{BlockCode, HoldoutDecl, HoldoutSettings};
+use crate::policy::{BlockCode, DeclSource, HoldoutDecl, HoldoutSettings};
 use crate::workspace::Git;
 
 mod discovery;
 pub use discovery::{discover, DeclarationInvalid, StoreView};
-
-/// How long `git ls-remote` may take before the store counts as unreadable.
-const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A holdout whose store resolved: everything verification needs to fetch and run it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +32,11 @@ pub struct ResolvedHoldout {
     pub sha: String,
     pub decl: HoldoutDecl,
     pub digest: String,
+    /// The formula `digest` was computed with ([`DIGEST_VERSION`]). A
+    /// definition frozen before versions existed reads back as
+    /// [`LEGACY_DIGEST_VERSION`] and is compared with that formula.
+    #[serde(default)]
+    pub digest_version: u32,
 }
 
 /// The outcome a ledger row records for an attached holdout that was skipped
@@ -449,7 +451,15 @@ pub fn resolve_inheriting(
             Some(held) => {
                 let current_digest = settings.declaration(repo, name).map(|decl| {
                     let store = settings.store.clone().unwrap_or_default();
-                    digest_of(repo, name, &store, &held.sha, decl)
+                    digest_with(
+                        held.digest_version,
+                        repo,
+                        name,
+                        &store,
+                        &held.sha,
+                        decl,
+                        settings.source_of(repo, name),
+                    )
                 });
                 if current_digest.as_deref() != Some(held.digest.as_str()) {
                     changes.push(DefinitionChange {
@@ -552,11 +562,22 @@ pub fn resolve_at(
     base_sha: &str,
     store_head: Option<&Result<String, String>>,
 ) -> Result<ResolvedHoldout, HoldoutRefusal> {
-    let decl = settings
-        .declaration(repo, name)
-        .ok_or_else(|| HoldoutRefusal::Unknown {
+    let Some(decl) = settings.declaration(repo, name) else {
+        // A store that could not be read declares nothing here, which is not
+        // the same as declaring no such holdout.
+        if let (Some(Err(cause)), Some(store)) = (store_head, settings.store.as_deref()) {
+            if !store.is_empty() {
+                return Err(HoldoutRefusal::Unreadable {
+                    store: store.to_string(),
+                    git_ref: settings.git_ref.clone(),
+                    stderr_last_line: cause.clone(),
+                });
+            }
+        }
+        return Err(HoldoutRefusal::Unknown {
             declared: settings.declared_names(repo),
-        })?;
+        });
+    };
     if decl.command.junit.is_none() {
         return Err(HoldoutRefusal::NoJunit);
     }
@@ -592,10 +613,17 @@ pub fn resolve_at(
     }
     let sha = match store_head {
         Some(answer) => answer.clone(),
-        None => ls_remote(&store, &settings.git_ref),
+        None => ls_remote(&store, &settings.git_ref, settings.discovery_bound),
     }
     .map_err(unreadable)?;
-    let digest = digest_of(repo, name, &store, &sha, decl);
+    let digest = digest_of(
+        repo,
+        name,
+        &store,
+        &sha,
+        decl,
+        settings.source_of(repo, name),
+    );
     Ok(ResolvedHoldout {
         name: name.to_string(),
         repo: repo.to_string(),
@@ -604,6 +632,7 @@ pub fn resolve_at(
         sha,
         decl: decl.clone(),
         digest,
+        digest_version: DIGEST_VERSION,
     })
 }
 
@@ -697,14 +726,38 @@ pub fn clean_relative(path: &str) -> bool {
             .any(|segment| segment.is_empty() || segment == "." || segment == "..")
 }
 
+/// The digest formula of definitions frozen before versions existed: the
+/// declaration's script, overlay, argv, junit and config, and nothing else.
+pub const LEGACY_DIGEST_VERSION: u32 = 0;
+
+/// The current digest formula: the legacy fields plus the declaration's
+/// source, its effective `timeout_seconds`, `inputs` and `attach`.
+pub const DIGEST_VERSION: u32 = 1;
+
+/// The digest of a declaration under the current formula.
 pub(crate) fn digest_of(
     repo: &str,
     name: &str,
     store: &str,
     sha: &str,
     decl: &HoldoutDecl,
+    source: DeclSource,
 ) -> String {
-    let canonical = serde_json::json!({
+    digest_with(DIGEST_VERSION, repo, name, store, sha, decl, source)
+}
+
+/// The digest under the formula `version` names. A version this relais does
+/// not know is computed as the current one.
+pub(crate) fn digest_with(
+    version: u32,
+    repo: &str,
+    name: &str,
+    store: &str,
+    sha: &str,
+    decl: &HoldoutDecl,
+    source: DeclSource,
+) -> String {
+    let mut canonical = serde_json::json!({
         "repo": repo,
         "name": name,
         "store": store,
@@ -715,6 +768,18 @@ pub(crate) fn digest_of(
         "junit": decl.command.junit,
         "config": decl.config,
     });
+    if version != LEGACY_DIGEST_VERSION {
+        if let Some(fields) = canonical.as_object_mut() {
+            fields.insert("digest_version".into(), version.into());
+            fields.insert("source".into(), source.as_str().into());
+            fields.insert(
+                "timeout_seconds".into(),
+                decl.command.timeout_seconds.into(),
+            );
+            fields.insert("inputs".into(), serde_json::json!(decl.inputs));
+            fields.insert("attach".into(), serde_json::json!(decl.attach));
+        }
+    }
     sha256_hex(canonical.to_string().as_bytes())
 }
 
@@ -722,12 +787,12 @@ pub(crate) fn digest_of(
 /// terminal prompt, ssh in batch mode, stdin from /dev/null, bounded by
 /// [`LS_REMOTE_TIMEOUT`]. The one sha the ref names, or the reason it
 /// could not be had.
-fn ls_remote(store: &str, git_ref: &str) -> Result<String, String> {
+fn ls_remote(store: &str, git_ref: &str, bound: Duration) -> Result<String, String> {
     #[cfg(test)]
     crate::test_support::fetch_count::record_ask(store);
     let mut command = unattended_git(Path::new("."));
     command.args(["ls-remote", store, git_ref]);
-    let output = crate::procs::run_with_timeout(command, LS_REMOTE_TIMEOUT, None, None)
+    let output = crate::procs::run_with_timeout(command, bound, None, None)
         .map_err(|e| format!("git ls-remote could not be run: {e}"))?;
     match output.ended {
         crate::procs::Ended::Exited(0) => {}
@@ -737,7 +802,7 @@ fn ls_remote(store: &str, git_ref: &str) -> Result<String, String> {
         crate::procs::Ended::TimedOut | crate::procs::Ended::Cancelled => {
             return Err(format!(
                 "git ls-remote did not answer within {} s",
-                LS_REMOTE_TIMEOUT.as_secs()
+                bound.as_secs()
             ))
         }
     }
@@ -1031,6 +1096,7 @@ mod tests {
             sha: "abc".into(),
             decl: decl(Some("j.xml"), "tests/holdout"),
             digest: "d".into(),
+            digest_version: DIGEST_VERSION,
         };
         let hit = |path: &str| overlay_collision(std::slice::from_ref(&resolved), &[path.into()]);
         assert!(hit("tests/holdout").is_some());
@@ -1054,17 +1120,109 @@ mod tests {
     }
 
     #[test]
-    fn attach_leaves_the_digest_unchanged() {
+    fn the_digest_changes_with_the_source_the_timeout_the_inputs_and_the_attach() {
         let plain = decl(Some("j.xml"), "o");
+        let base = digest_of("r", "n", "s", "sha", &plain, DeclSource::Machine);
+        assert_ne!(
+            base,
+            digest_of("r", "n", "s", "sha", &plain, DeclSource::Store)
+        );
+        let mut slower = plain.clone();
+        slower.command.timeout_seconds += 1;
+        assert_ne!(
+            base,
+            digest_of("r", "n", "s", "sha", &slower, DeclSource::Machine)
+        );
+        let mut with_inputs = plain.clone();
+        with_inputs.inputs = vec!["Cargo.toml".into()];
+        assert_ne!(
+            base,
+            digest_of("r", "n", "s", "sha", &with_inputs, DeclSource::Machine)
+        );
         let mut attached = plain.clone();
         attached.attach = Some(crate::policy::HoldoutAttach {
             task_types: vec![crate::contract::TaskType::Feature],
             paths: vec!["src/**".into()],
         });
-        assert_eq!(
-            digest_of("r", "n", "s", "sha", &plain),
-            digest_of("r", "n", "s", "sha", &attached)
+        assert_ne!(
+            base,
+            digest_of("r", "n", "s", "sha", &attached, DeclSource::Machine)
         );
+    }
+
+    #[test]
+    fn the_legacy_formula_ignores_source_timeout_inputs_and_attach() {
+        let plain = decl(Some("j.xml"), "o");
+        let mut changed = plain.clone();
+        changed.command.timeout_seconds += 1;
+        changed.inputs = vec!["Cargo.toml".into()];
+        changed.attach = Some(crate::policy::HoldoutAttach {
+            task_types: vec![crate::contract::TaskType::Feature],
+            paths: vec!["src/**".into()],
+        });
+        assert_eq!(
+            digest_with(
+                LEGACY_DIGEST_VERSION,
+                "r",
+                "n",
+                "s",
+                "sha",
+                &plain,
+                DeclSource::Machine
+            ),
+            digest_with(
+                LEGACY_DIGEST_VERSION,
+                "r",
+                "n",
+                "s",
+                "sha",
+                &changed,
+                DeclSource::Store
+            )
+        );
+    }
+
+    #[test]
+    fn a_definition_frozen_without_a_digest_version_compares_under_the_old_formula() {
+        let declared = decl(Some("j.xml"), "o");
+        let frozen = serde_json::json!({
+            "name": "x", "repo": "r", "store": "s", "git_ref": "main", "sha": "abc",
+            "decl": declared,
+            "digest": digest_with(
+                LEGACY_DIGEST_VERSION, "r", "x", "s", "abc", &declared, DeclSource::Machine
+            ),
+        });
+        let frozen: ResolvedHoldout = serde_json::from_value(frozen).expect("an old row");
+        assert_eq!(frozen.digest_version, LEGACY_DIGEST_VERSION);
+        let mut settings = HoldoutSettings {
+            store: Some("s".into()),
+            ..HoldoutSettings::default()
+        };
+        settings
+            .repos
+            .entry("r".into())
+            .or_default()
+            .insert("x".into(), declared);
+        let entries = [crate::acceptance::AcceptanceEntry::Declared(
+            crate::acceptance::DeclaredCriterion {
+                statement: "x holds".into(),
+                id: None,
+                mandatory: true,
+                evidence: crate::acceptance::Evidence::Holdout { name: "x".into() },
+            },
+        )];
+        let git = never_exists();
+        let lookup = Lookup {
+            settings: &settings,
+            repo: "r",
+            git: &git,
+            repo_dir: Path::new("."),
+            base_sha: "abc",
+            machine_toml: "machine.toml",
+            store_head: None,
+        };
+        let resolution = resolve_inheriting(&entries, &lookup, &[frozen]).expect("resolved");
+        assert!(resolution.changes.is_empty(), "{:?}", resolution.changes);
     }
 
     fn attach_decl(types: &[crate::contract::TaskType], paths: &[&str]) -> HoldoutDecl {
@@ -1233,7 +1391,8 @@ mod tests {
             store: "s".into(),
             git_ref: "main".into(),
             sha: "abc".into(),
-            digest: digest_of("r", "x", "s", "abc", &declared),
+            digest: digest_of("r", "x", "s", "abc", &declared, DeclSource::Machine),
+            digest_version: DIGEST_VERSION,
             decl: declared,
         }];
         let held = HoldoutSettings::default();

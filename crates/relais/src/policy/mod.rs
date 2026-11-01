@@ -1014,6 +1014,35 @@ pub struct HoldoutSettings {
     /// a holdout the store declares is then not used. Such a table declares
     /// nothing itself, so [`Self::declaration`] never sees these names.
     pub disabled: BTreeMap<String, BTreeSet<String>>,
+    /// Names the store declared that [`Self::with_discovered`] added, by
+    /// repository: a name here has the store as its source, any other
+    /// declaration is machine.toml's. Never read from or written to
+    /// machine.toml.
+    pub from_store: BTreeMap<String, BTreeSet<String>>,
+    /// How long store discovery as a whole, `ls-remote` included, may take
+    /// before the store counts as unreachable. Not a machine.toml key: a
+    /// test injects a shorter one.
+    pub discovery_bound: std::time::Duration,
+}
+
+/// The bound of store discovery: the store is asked for its commit within it
+/// and its files are fetched within what is left.
+pub const DEFAULT_HOLDOUT_DISCOVERY_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Where a holdout's effective declaration comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclSource {
+    Machine,
+    Store,
+}
+
+impl DeclSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Machine => "machine",
+            Self::Store => "store",
+        }
+    }
 }
 
 /// The default `ref` of the holdout store.
@@ -1026,6 +1055,8 @@ impl Default for HoldoutSettings {
             git_ref: DEFAULT_HOLDOUT_REF.to_string(),
             repos: BTreeMap::new(),
             disabled: BTreeMap::new(),
+            from_store: BTreeMap::new(),
+            discovery_bound: DEFAULT_HOLDOUT_DISCOVERY_BOUND,
         }
     }
 }
@@ -1048,7 +1079,14 @@ impl HoldoutSettings {
             if off.is_some_and(|names| names.contains(&name)) {
                 continue;
             }
-            named.entry(name).or_insert(decl);
+            if let std::collections::btree_map::Entry::Vacant(slot) = named.entry(name.clone()) {
+                slot.insert(decl);
+                effective
+                    .from_store
+                    .entry(repo.to_string())
+                    .or_default()
+                    .insert(name);
+            }
         }
         if named.is_empty() {
             effective.repos.remove(repo);
@@ -1064,6 +1102,19 @@ impl HoldoutSettings {
     /// The declaration of holdout `name` for the repository directory `repo`.
     pub fn declaration(&self, repo: &str, name: &str) -> Option<&HoldoutDecl> {
         self.repos.get(repo).and_then(|named| named.get(name))
+    }
+
+    /// Where the declaration of holdout `name` for `repo` comes from.
+    pub fn source_of(&self, repo: &str, name: &str) -> DeclSource {
+        if self
+            .from_store
+            .get(repo)
+            .is_some_and(|names| names.contains(name))
+        {
+            DeclSource::Store
+        } else {
+            DeclSource::Machine
+        }
     }
 
     /// Every holdout name declared for `repo`.
@@ -1094,8 +1145,7 @@ pub struct HoldoutDecl {
     /// a run whose contract names this holdout.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<String>,
-    /// Where the holdout attaches to a task that does not name it. It is
-    /// not part of `holdout::digest_of`.
+    /// Where the holdout attaches to a task that does not name it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attach: Option<HoldoutAttach>,
 }

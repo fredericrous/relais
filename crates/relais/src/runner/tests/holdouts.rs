@@ -1231,8 +1231,14 @@ fn a_successor_is_judged_by_its_predecessors_frozen_holdout_and_resolves_a_new_n
 
     let events = events_text(&fixture, &new_run);
     assert!(events.contains("holdout_definition_changed"), "{events}");
-    let current_digest =
-        crate::holdout::digest_of(&repo_name, "escaping", &store, &sha_a, &edited_declaration);
+    let current_digest = crate::holdout::digest_of(
+        &repo_name,
+        "escaping",
+        &store,
+        &sha_a,
+        &edited_declaration,
+        crate::policy::DeclSource::Machine,
+    );
     assert_ne!(current_digest, frozen.digest);
     assert!(
         events.contains(&format!(
@@ -2534,6 +2540,136 @@ fn a_store_unreachable_at_preflight_skips_an_attached_holdout_and_refuses_a_name
             .expect("sources"),
         vec![("escaping".to_string(), "attached".to_string())]
     );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+/// A run that left its scope, so it waits for a person, with the holdout
+/// `escaping` frozen from `settings`.
+fn decided_with_frozen_holdout(
+    fixture: &Fixture,
+    settings: HoldoutSettings,
+    repo: &RepoPolicy,
+) -> (RunId, crate::holdout::ResolvedHoldout) {
+    let contract = holdout_contract(fixture, true);
+    let leaving = MockBackend::new(|spec| {
+        std::fs::create_dir_all(spec.work_dir.join("docs")).expect("mkdir");
+        std::fs::write(spec.work_dir.join("docs/extra.md"), "one\n").expect("write");
+        std::fs::write(spec.work_dir.join("src/main.rs"), "fn main() {}\n// e\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let decided = fixture
+        .execute_with_holdouts(settings, &contract, repo, &leaving)
+        .run_id;
+    let mut frozen = fixture
+        .ledger
+        .holdout_definitions(&decided)
+        .expect("definitions");
+    assert_eq!(frozen.len(), 1, "{frozen:?}");
+    (decided, frozen.remove(0))
+}
+
+#[test]
+fn an_unreachable_store_ends_discovery_within_the_bound_and_refuses_a_named_holdout_as_unreadable()
+{
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let missing_store = format!("file://{}/no-such-store", fixture.dir.display());
+    // The store would declare `named`; with it unread, machine.toml names nothing.
+    let mut settings = store_settings(&missing_store);
+    let bound = std::time::Duration::from_secs(5);
+    settings.discovery_bound = bound;
+    let mut acceptance = bare_acceptance();
+    acceptance.push(named_criterion("named"));
+    let started = std::time::Instant::now();
+    let outcome = fixture.execute_with_holdouts(
+        settings,
+        &feature_contract(&fixture, acceptance),
+        &repo,
+        &MockBackend::new(|_| MockOutcome::default()),
+    );
+    assert!(started.elapsed() < bound + std::time::Duration::from_secs(25));
+    let run = outcome.run_id.clone();
+    assert_eq!(blocked_code(outcome), BlockCode::HoldoutUnreadable);
+    let events = events_text(&fixture, &run);
+    assert!(events.contains("holdout_store_unreachable"), "{events}");
+    assert!(events.contains("no-such-store"), "{events}");
+    assert!(events.contains("could not be read ("), "{events}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_successor_whose_store_is_unreachable_reports_no_definition_change() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let (store, _) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(PASSING))]);
+    let settings = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
+    let (decided, _) = decided_with_frozen_holdout(&fixture, settings, &repo);
+
+    // The store is gone, and machine.toml no longer declares `escaping`.
+    let missing_store = format!("file://{}/no-such-store", fixture.dir.display());
+    let (new_run, contract) = claimed_successor(&fixture, &decided, None);
+    let _ = fixture.execute_with_holdouts_as(
+        Some(new_run.clone()),
+        store_settings(&missing_store),
+        &contract,
+        &repo,
+        &counting_worker(Arc::default(), Arc::default()),
+    );
+    let events = events_text(&fixture, &new_run);
+    assert!(events.contains("holdout_store_unreachable"), "{events}");
+    assert!(!events.contains("holdout_definition_changed"), "{events}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
+}
+
+#[test]
+fn a_successor_of_a_run_frozen_before_digest_versions_reports_no_definition_change() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let (store, _) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(PASSING))]);
+    let settings = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
+    let (decided, mut frozen) = decided_with_frozen_holdout(&fixture, settings.clone(), &repo);
+
+    // Rewrite the frozen row as the previous release wrote it.
+    frozen.digest = crate::holdout::digest_with(
+        crate::holdout::LEGACY_DIGEST_VERSION,
+        &frozen.repo,
+        &frozen.name,
+        &frozen.store,
+        &frozen.sha,
+        &frozen.decl,
+        crate::policy::DeclSource::Machine,
+    );
+    frozen.digest_version = crate::holdout::LEGACY_DIGEST_VERSION;
+    fixture
+        .ledger
+        .record_holdout_definitions(
+            &decided,
+            &[(frozen.clone(), crate::holdout::HoldoutSource::Named)],
+        )
+        .expect("rewrite");
+
+    let (new_run, contract) = claimed_successor(&fixture, &decided, None);
+    let outcome = fixture.execute_with_holdouts_as(
+        Some(new_run.clone()),
+        settings,
+        &contract,
+        &repo,
+        &counting_worker(Arc::default(), Arc::default()),
+    );
+    let Terminal::Accepted(receipt) = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    assert!(receipt
+        .holdouts
+        .iter()
+        .any(|run| run.digest == frozen.digest));
+    let events = events_text(&fixture, &new_run);
+    assert!(!events.contains("holdout_definition_changed"), "{events}");
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
 }
 

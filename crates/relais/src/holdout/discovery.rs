@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use serde::Deserialize;
 
-use super::{clean_relative, fetch_tree, ls_remote, LS_REMOTE_TIMEOUT};
+use super::{clean_relative, fetch_tree, ls_remote};
 use crate::policy::{
     CommandSpec, HoldoutAttach, HoldoutDecl, HoldoutSettings, DEFAULT_HOLDOUT_TIMEOUT_SECONDS,
 };
@@ -48,7 +48,9 @@ pub struct StoreView {
     pub head: Result<String, String>,
     /// The holdouts the store declares for this repository, by name.
     pub declared: BTreeMap<String, HoldoutDecl>,
-    /// Why the store's files could not be fetched although its commit was had.
+    /// Why the store could not be read: its commit could not be had, or its
+    /// files could not be fetched within the bound. When set, `head` is an
+    /// error too and `declared` is empty.
     pub unread: Option<String>,
 }
 
@@ -64,7 +66,8 @@ impl StoreView {
 
 /// Ask the store for its commit once, fetch it into
 /// `<cache_root>/<sha>` and read the holdouts it declares for `repo`. The
-/// whole of it, `ls-remote` included, is bounded by the `ls-remote` bound.
+/// whole of it, `ls-remote` included, is bounded by the settings'
+/// `discovery_bound` (30 s unless a test injects another).
 /// `run_id` names this fetch's own partial directory. A store that cannot
 /// be asked or fetched declares nothing here; the view says why.
 pub fn discover(
@@ -81,17 +84,22 @@ pub fn discover(
             None,
         ));
     }
-    let head = ls_remote(&store, &settings.git_ref);
+    let bound = settings.discovery_bound;
+    let head = ls_remote(&store, &settings.git_ref, bound);
     let sha = match &head {
         Ok(sha) if !repo.is_empty() => sha.clone(),
-        Ok(_) | Err(_) => return Ok(StoreView::without_files(head, None)),
+        Ok(_) => return Ok(StoreView::without_files(head, None)),
+        Err(cause) => {
+            let unread = Some(cause.clone());
+            return Ok(StoreView::without_files(head, unread));
+        }
     };
-    let left = || LS_REMOTE_TIMEOUT.saturating_sub(started.elapsed());
+    let left = || bound.saturating_sub(started.elapsed());
     let target = cache_root.join(&sha);
     let partial = cache_root.join(format!("{sha}.partial.{run_id}"));
     let tree = match fetch_tree(&store, &settings.git_ref, &sha, &target, &partial, &left) {
         Ok(tree) => tree,
-        Err(cause) => return Ok(StoreView::without_files(head, Some(cause))),
+        Err(cause) => return Ok(StoreView::without_files(Err(cause.clone()), Some(cause))),
     };
     prune(cache_root, &sha);
     let declared = read_declarations(&tree, repo)?;
