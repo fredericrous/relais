@@ -1,8 +1,8 @@
 +++
 type = "grilling"
 mode = "hitl"
-status = "open"
-blocked_by = ["t13-laptop-load-baseline", "t22-stamp-from-remote-run", "t23-gate-platform-inventory", "t25-pod-signing-key"]
+status = "closed"
+blocked_by = ["t22-stamp-from-remote-run", "t23-gate-platform-inventory", "t25-pod-signing-key"]
 repos = ["relais"]
 +++
 # Which slice ships first and alone
@@ -42,3 +42,39 @@ Still valid, whoever runs the gate:
 The slice is now **amont running `platform=any` gates** (lint, types, cycle
 checks) on the wk-3 runner pod, returning signed attestations. It is no
 longer relais heavy checks. relais `cargo-test` stays local.
+
+## Update 2026-11-01 (t25): what in the notes above no longer holds
+
+t25 requires one Job per gate. The verdict is the container's
+Kubernetes-recorded exit status, and the laptop signs. That supersedes:
+- the long-lived runner pod with `kubectl exec`;
+- the `RELAIS-EXIT` trailer as evidence.
+
+Still valid:
+- wk-3 placement and sizing;
+- the local-path cache (one PVC per slot; a Job binds its slot's PVC);
+- the crates and rustup proxy;
+- the egress floor;
+- the ExecCredential kubeconfig;
+- the epoch-fenced Lease;
+- the deadline;
+- OOM and lost-cluster handling, which falls back to local and is never
+  red.
+
+## Resolution
+
+**The first slice: amont runs `platform=any` gates on wk-3, one Job per
+gate, and the laptop signs a `platform x86_64-linux` attestation from the
+Kubernetes-recorded outcome.**
+
+- relais and amont `cargo-test` stay on macOS.
+- The targets are the lint, type and cycle gates: duro typecheck and lint,
+  trade-agents ruff and pyright, relais `module-cycles` and
+  `child-cycles-*` (t23).
+- It ships behind a per-repo opt-in.
+- **It is enabled only after the t13 baseline window closes** (around
+  2026-11-08). That is why t13 is no longer a blocker of this decision.
+  The build can proceed meanwhile.
+
+Decided as staff engineer under the 2026-10-31 delegation, from t21, t22, t23
+and t25.
