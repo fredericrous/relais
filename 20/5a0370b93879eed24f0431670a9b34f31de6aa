@@ -1,0 +1,16 @@
+amont-provenance-v1
+commit 205a0370b93879eed24f0431670a9b34f31de6aa
+tree 5768c1f65c5d585b1cb7f67c0691dfe2d1334d06
+canon 1ee1342467236420aeeb6a2f10e09a5f8555ea0d
+patch 12298eee88cd7881bb9506d45afb1756972e6c0f
+plan docs/plans/2026-11-01-admission-queue-wastes-less.md e0f867fbe8140cf30fdd908db5160e6e2a1ff5205deb51b0d1170157e4c94285
+review reviewed 3304ce7f8cc77bdfae97089c737b1416db2e5cf5d7bbe99a4765c29e7bb8b7da
+preview not-required
+producer amont-agent 3.11.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAEDjTnmYlOU/q2AJB47ZV7tadD4JmuAVJ4m6NixzPjpz+DbPex
+tt9XTmatIguyDUJn3c7o4SpbU5RJLyKJ6WHhQK
+-----END SSH SIGNATURE-----
