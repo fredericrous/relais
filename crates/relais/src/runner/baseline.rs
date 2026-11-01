@@ -43,7 +43,7 @@ impl<'a> RunEngine<'a> {
             )
             .map(|tree| tree.trim().to_string())
             .unwrap_or_else(|_| preflight.base_sha.clone());
-        let toolchain_known = toolchain.is_ok();
+        let toolchain_identified = toolchain.is_ok();
         let baseline_key = match &toolchain {
             Ok(toolchain) => Some(verify::baseline_key(
                 &base_tree,
@@ -73,7 +73,9 @@ impl<'a> RunEngine<'a> {
                     self.config
                         .hooks
                         .stamps(self.config.repo_dir, Some(&base_tree), &gates);
-                if verify::stamps::base_is_proven(&gates, &answer, toolchain_known) {
+                // An identified toolchain, as the cache requires: a stamp
+                // carries none (see `base_is_proven`).
+                if toolchain_identified && verify::stamps::base_is_proven(&gates, &answer) {
                     self.events.emit(Event::Decision {
                         what: "baseline_proven".into(),
                         reason: format!(

@@ -3551,6 +3551,27 @@ mod tests {
             "nothing is invented for an untimed outcome"
         );
     }
+
+    /// `baseline_proven` (S2) is newer than every stored receipt: an old one
+    /// reads `false`, a new one reads what it says, and `true` survives a
+    /// round trip.
+    #[test]
+    fn a_receipt_without_baseline_proven_reads_false() {
+        let old: Receipt = serde_json::from_str(PRE_FIELD_RECEIPT_3).expect("old receipt parses");
+        assert!(!old.verification.baseline_proven);
+        let proven = PRE_FIELD_RECEIPT_3.replace(
+            "\"baseline_cache_refused\":null",
+            "\"baseline_cache_refused\":null,\"baseline_proven\":true",
+        );
+        assert_ne!(proven, PRE_FIELD_RECEIPT_3, "the fixture holds the anchor");
+        let new: Receipt = serde_json::from_str(&proven).expect("new receipt parses");
+        assert!(new.verification.baseline_proven);
+        let again: Receipt = serde_json::from_str(&serde_json::to_string(&new).unwrap())
+            .expect("the receipt round-trips");
+        assert!(again.verification.baseline_proven);
+        assert_eq!(again, new);
+    }
+
     use super::*;
 
     #[cfg(unix)]

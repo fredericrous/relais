@@ -144,10 +144,10 @@ pub fn profile_gates(profile: &VerificationProfile) -> Vec<String> {
 /// relais reads from amont about a tree's verdict.
 pub fn parse(stdout: &str) -> Result<Answer, StampsError> {
     let unreadable = |detail: String| StampsError::Unreadable { detail };
-    let value: serde_json::Value =
+    let document: serde_json::Value =
         serde_json::from_str(stdout.trim()).map_err(|e| unreadable(e.to_string()))?;
     let text = |key: &str| {
-        value
+        document
             .get(key)
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
@@ -155,7 +155,7 @@ pub fn parse(stdout: &str) -> Result<Answer, StampsError> {
     };
     let tree = text("tree")?;
     let platform = text("platform")?;
-    let gates = value
+    let gates = document
         .get("gates")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| unreadable("no `gates` object".into()))?;
@@ -173,9 +173,27 @@ pub fn parse(stdout: &str) -> Result<Answer, StampsError> {
     })
 }
 
-/// Gaps on a candidate whose profile ran stamp commands: every gate amont
-/// reports must be vouched for, and an answer that names no gate at all, or
-/// no answer, is a gap naming why.
+/// The state of every gate id the answer holds for the asked short `name`:
+/// amont resolves `cargo-test` to `pre-commit-cargo-test` and
+/// `pre-push-cargo-test`, and keys its answer by those ids. Empty when the
+/// answer holds nothing for the name.
+fn states_of<'a>(answer: &'a Answer, name: &str) -> Vec<(&'a str, State)> {
+    answer
+        .gates
+        .iter()
+        .filter(|(id, _)| {
+            id.as_str() == name
+                || id.strip_prefix("pre-commit-") == Some(name)
+                || id.strip_prefix("pre-push-") == Some(name)
+        })
+        .map(|(id, state)| (id.as_str(), *state))
+        .collect()
+}
+
+/// Gaps on a candidate whose profile ran stamp commands. Every asked gate
+/// must be answered, and every id the answer holds for it vouched for: a
+/// name the answer says nothing about is a gap, because a partial answer
+/// proves nothing about the gate it left out. No answer is a gap naming why.
 pub fn stamp_gaps(asked: &[String], answer: &Result<Answer, StampsError>) -> Vec<String> {
     if asked.is_empty() {
         return Vec::new();
@@ -183,46 +201,55 @@ pub fn stamp_gaps(asked: &[String], answer: &Result<Answer, StampsError>) -> Vec
     match answer {
         Err(StampsError::NotAsked) => Vec::new(),
         Err(e) => vec![format!("amont stamps: {e}")],
-        Ok(answer) if answer.gates.is_empty() => vec![format!(
-            "amont stamps: no gate reported for {} on tree {}",
-            asked.join(", "),
-            answer.tree
-        )],
-        Ok(answer) => answer
-            .gates
+        Ok(answer) => asked
             .iter()
-            .filter(|(_, state)| !state.vouched())
-            .map(|(gate, state)| {
-                format!(
-                    "amont gate `{gate}` is {} on the verified tree: its verdict was not recorded, \
-                     so the push would run it again",
-                    state.as_str()
-                )
+            .flat_map(|name| {
+                let states = states_of(answer, name);
+                if states.is_empty() {
+                    return vec![format!(
+                        "amont stamps: no answer for gate `{name}` on tree {}",
+                        answer.tree
+                    )];
+                }
+                states
+                    .into_iter()
+                    .filter(|(_, state)| !state.vouched())
+                    .map(|(id, state)| {
+                        format!(
+                            "amont gate `{id}` is {} on the verified tree: its verdict was not \
+                             recorded, so the push would run it again",
+                            state.as_str()
+                        )
+                    })
+                    .collect()
             })
             .collect(),
     }
 }
 
-/// Whether a base can skip its baseline run: every profile gate is vouched
-/// for on this platform AND the toolchain the baseline would run on is
-/// identified (`toolchain_known`). Anything else runs the baseline as before.
+/// Whether the answer proves a base: every asked gate is answered, and every
+/// id the answer holds for it is vouched for on this platform. A name the
+/// answer leaves out proves nothing, so it blocks the proof.
 ///
-/// A stamp carries no toolchain of its own (amont ADR-0015 keys it by tree
-/// and gate identity), so relais cannot prove the stamp was earned on the
-/// toolchain it would use now. It requires what the baseline cache requires
-/// instead: a toolchain it can name. A repository that pins its toolchain in
-/// its tree (`rust-toolchain.toml`) makes the toolchain a function of the
-/// tree; one that does not takes the residual risk the plan names.
-pub fn base_is_proven(
-    gates: &[String],
-    answer: &Result<Answer, StampsError>,
-    toolchain_known: bool,
-) -> bool {
-    if gates.is_empty() || !toolchain_known {
+/// The caller also requires the toolchain to be identified, as the baseline
+/// cache does (`runner/baseline.rs`). A stamp carries no toolchain of its own
+/// (amont ADR-0015 keys it by tree and gate identity), so relais cannot prove
+/// the stamp was earned on the toolchain it would use now.
+// holds-until: a profile that runs `amont run --stamp` is in a repository
+// that does not pin its toolchain in its tree. Today only relais does, and it
+// pins `rust-toolchain.toml`, so the toolchain is a function of the tree and
+// "an identified toolchain" is enough. This departs from the plan's
+// "toolchain matches the baseline key"; the first unpinned repository to adopt
+// stamped profiles must carry the toolchain in the stamp or the key first.
+pub fn base_is_proven(gates: &[String], answer: &Result<Answer, StampsError>) -> bool {
+    if gates.is_empty() {
         return false;
     }
     match answer {
-        Ok(answer) => !answer.gates.is_empty() && answer.gates.values().all(|s| s.vouched()),
+        Ok(answer) => gates.iter().all(|name| {
+            let states = states_of(answer, name);
+            !states.is_empty() && states.iter().all(|(_, state)| state.vouched())
+        }),
         Err(_) => false,
     }
 }
@@ -354,6 +381,38 @@ mod tests {
         assert_eq!(stamp_gaps(&asked, &answer(&[])).len(), 1);
     }
 
+    /// A partial answer proves nothing about the gate it leaves out: every
+    /// asked name must be answered, and a name answered for one stage only
+    /// still counts as answered.
+    #[test]
+    fn a_partial_answer_is_a_gap_for_the_name_it_leaves_out() {
+        let asked = names(&["cargo-test", "clippy"]);
+        let only_one = answer(&[("pre-commit-cargo-test", State::Stamped)]);
+        let gaps = stamp_gaps(&asked, &only_one);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].contains("no answer for gate `clippy`"), "{gaps:?}");
+        assert!(!base_is_proven(&asked, &only_one));
+        // A short name resolves to the commit-time and push ids alike.
+        let both = answer(&[
+            ("pre-commit-cargo-test", State::Stamped),
+            ("pre-push-cargo-test", State::Stamped),
+            ("pre-commit-clippy", State::Stamped),
+        ]);
+        assert!(stamp_gaps(&asked, &both).is_empty());
+        assert!(base_is_proven(&asked, &both));
+        // One id of a name unvouched is enough to block it.
+        let mixed = answer(&[
+            ("pre-commit-cargo-test", State::Stamped),
+            ("pre-push-cargo-test", State::Absent),
+            ("pre-commit-clippy", State::Stamped),
+        ]);
+        assert_eq!(stamp_gaps(&asked, &mixed).len(), 1);
+        assert!(!base_is_proven(&asked, &mixed));
+        // A name is matched whole, never by prefix.
+        let near = answer(&[("pre-commit-cargo-test-extra", State::Stamped)]);
+        assert!(!base_is_proven(&names(&["cargo-test"]), &near));
+    }
+
     /// No answer is a gap naming why; nothing asked is no gap; a profile
     /// with no stamp command asks for nothing.
     #[test]
@@ -369,8 +428,8 @@ mod tests {
         assert!(stamp_gaps(&[], &old).is_empty());
     }
 
-    /// A base is proven only when every gate is vouched for and the
-    /// toolchain is known.
+    /// A base is proven only when every asked gate is answered and vouched
+    /// for. (The toolchain condition is the caller's: `runner/baseline.rs`.)
     #[test]
     fn a_base_is_proven_only_when_every_gate_is_vouched_for() {
         let gates = names(&["cargo-test", "clippy"]);
@@ -378,22 +437,17 @@ mod tests {
             ("pre-commit-cargo-test", State::Stamped),
             ("pre-commit-clippy", State::Attested),
         ]);
-        assert!(base_is_proven(&gates, &all, true));
+        assert!(base_is_proven(&gates, &all));
         let one_absent = answer(&[
             ("pre-commit-cargo-test", State::Stamped),
             ("pre-commit-clippy", State::Absent),
         ]);
-        assert!(!base_is_proven(&gates, &one_absent, true));
-        assert!(
-            !base_is_proven(&gates, &all, false),
-            "unknown toolchain runs it"
-        );
-        assert!(!base_is_proven(&gates, &answer(&[]), true));
-        assert!(!base_is_proven(&[], &all, true));
+        assert!(!base_is_proven(&gates, &one_absent));
+        assert!(!base_is_proven(&gates, &answer(&[])));
+        assert!(!base_is_proven(&[], &all));
         assert!(!base_is_proven(
             &gates,
-            &Err(StampsError::NotRun { detail: "x".into() }),
-            true
+            &Err(StampsError::NotRun { detail: "x".into() })
         ));
     }
 
@@ -424,8 +478,8 @@ mod tests {
             eprintln!("skipped: `amont list --json` did not exit 0 here");
             return;
         }
-        let value: serde_json::Value = serde_json::from_slice(out.1).expect("amont list --json");
-        let names: Vec<String> = value["checks"]
+        let listing: serde_json::Value = serde_json::from_slice(out.1).expect("amont list --json");
+        let names: Vec<String> = listing["checks"]
             .as_array()
             .expect("checks")
             .iter()
@@ -489,8 +543,10 @@ mod tests {
         assert_eq!(args.trim(), "stamps --json --tree t1 cargo-test");
     }
 
-    /// An amont with no `stamps` subcommand exits 2 on usage: refused, which
-    /// is a gap, never a crash or a pass.
+    /// An amont with no `stamps` subcommand, or one asked about a gate it
+    /// does not know, exits 2 on usage (measured on 1.66.1:
+    /// `amont stamps --json zzz-not-a-gate` prints `amont: unknown gate …` and
+    /// exits 2): refused, which is a gap, never a crash or a pass.
     #[cfg(unix)]
     #[test]
     fn an_old_amont_is_refused() {
