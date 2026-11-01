@@ -59,7 +59,7 @@ impl Gate for QueueingGate {
                     return Ok(Decision::Queued { position: 1 });
                 }
             }
-            _ => {}
+            ResourceClass::Indexing | ResourceClass::Training => {}
         }
         self.inner.admit(request)
     }
@@ -253,6 +253,15 @@ fn a_reviewers_admission_expiry_names_the_checked_candidate() {
         &conditional_worker("relais task"),
         &gate,
     );
+    // A required review that cannot be dispatched ends `needs_review`
+    // (review unavailable), and its text carries the recovery.
+    match &outcome.terminal {
+        Terminal::NeedsReview { detail } => assert!(
+            detail.contains("the candidate is kept") && detail.contains("kind: verify"),
+            "{detail}"
+        ),
+        other => panic!("expected needs_review, got {other:?}"),
+    }
     let detail = transition_detail(&fixture, &outcome);
     let rows = attempt_rows(&fixture, &outcome.run_id);
     let sha = rows[0]
