@@ -8,6 +8,9 @@ missing here.
 
 ## Unreleased
 
+- **A profile can run its gates through amont, and the push then skips them.** A profile command `amont run --stamp <gate>` (amont 1.66) runs an amont gate and records its verdict on the candidate's tree. After the profile, relais asks `amont stamps --json`: a gate reported `deferred` or `absent`, or no answer (amont missing or older than 1.66), is a verification gap, never a pass. relais's own profile now runs `cargo-fmt`, `clippy`, `module-cycles`, the two child-cycle gates, `cargo-test` and `plugin-test` this way, and `amont.conf` is a verification input.
+- **A base amont already proved is not run again.** When every profile gate is `stamped` or `attested` on the base tree on this platform, and the toolchain is identified, the baseline run is skipped and the receipt says `baseline_proven: true`. A proof writes nothing to the baseline cache.
+
 ## v0.45.0
 
 - `relais programme list` names each map once: it scans primary checkouts only, so a linked worktree of a repository no longer repeats its maps.

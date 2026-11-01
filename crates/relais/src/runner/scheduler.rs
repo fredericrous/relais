@@ -62,6 +62,8 @@ pub(crate) struct RootContext<'a> {
     pub baseline_cached: bool,
     /// Why the baseline could not be cached, when it could not (V2).
     pub baseline_cache_refused: &'a Option<crate::verify::CacheRefused>,
+    /// The base was proven by amont's stamps and not run (t04).
+    pub baseline_proven: bool,
     pub logs_dir: &'a Path,
     /// The holdouts the root contract names (ADR-0045): their overlay paths
     /// are reserved and their inputs protected on the assembled candidate.
@@ -1223,6 +1225,7 @@ fn integrated_receipt(
         integration_gaps: root.integration_gaps.to_vec(),
         baseline_cached: root.baseline_cached,
         baseline_cache_refused: root.baseline_cache_refused.clone(),
+        baseline_proven: root.baseline_proven,
     };
     // The criteria settled here are the ROOT contract's, not the work
     // plan's `integration_acceptance` — the latter is still bare strings

@@ -261,6 +261,7 @@ mod tests {
                 integration_gaps: Vec::new(),
                 baseline_cached: false,
                 baseline_cache_refused: None,
+                baseline_proven: false,
             },
             kind,
             candidate: None,

@@ -43,6 +43,7 @@ impl<'a> RunEngine<'a> {
             )
             .map(|tree| tree.trim().to_string())
             .unwrap_or_else(|_| preflight.base_sha.clone());
+        let toolchain_identified = toolchain.is_ok();
         let baseline_key = match &toolchain {
             Ok(toolchain) => Some(verify::baseline_key(
                 &base_tree,
@@ -59,6 +60,40 @@ impl<'a> RunEngine<'a> {
             _ => None,
         };
         let was_cached = cached.is_some();
+        // A base amont already proved green on this platform — every gate
+        // the profile runs through `amont run --stamp` is stamped or
+        // attested on the base tree — is not run again (decisions programme
+        // "one verdict per tree", t04). Asked only when there is no cache
+        // hit; a proof writes nothing to the cache, and anything short of a
+        // full proof runs the baseline exactly as before.
+        if !was_cached && self.amont_on() {
+            let gates = verify::stamps::profile_gates(&authority.verification_profile);
+            if !gates.is_empty() {
+                let answer =
+                    self.config
+                        .hooks
+                        .stamps(self.config.repo_dir, Some(&base_tree), &gates);
+                // An identified toolchain, as the cache requires: a stamp
+                // carries none (see `base_is_proven`).
+                if toolchain_identified && verify::stamps::base_is_proven(&gates, &answer) {
+                    self.events.emit(Event::Decision {
+                        what: "baseline_proven".into(),
+                        reason: format!(
+                            "amont reports {} stamped or attested on base tree {base_tree}; the base is green by that proof and was not run",
+                            gates.join(", ")
+                        ),
+                    });
+                    return Ok(Phase::Ready(Baseline {
+                        failures: Vec::new(),
+                        checks: None,
+                        cached: false,
+                        cache_refused,
+                        proven: true,
+                        logs_dir,
+                    }));
+                }
+            }
+        }
         // The baseline's check outcomes are kept: a candidate identical to
         // the base has exactly these results, without re-running them.
         let (failures, checks) = match cached {
@@ -286,8 +321,21 @@ impl<'a> RunEngine<'a> {
             checks,
             cached: was_cached,
             cache_refused,
+            proven: false,
             logs_dir,
         }))
+    }
+
+    /// Whether this run asks amont at all: the integration is on in policy
+    /// and the binary is on this machine.
+    pub(super) fn amont_on(&self) -> bool {
+        self.config
+            .repo_policy
+            .integrations
+            .amont
+            .as_ref()
+            .is_some_and(|dependency| dependency.mode() != crate::policy::DependencyMode::Off)
+            && crate::tooling::integration_available("amont")
     }
 }
 

@@ -724,6 +724,16 @@ impl<'a> RunEngine<'a> {
             inventory.as_ref(),
             &authority.verification_profile.amont_waivers,
         ));
+        // A profile that runs its gates through `amont run --stamp` relies
+        // on amont recording the verdict on this tree, so the person's
+        // commit and push skip the suite. A gate amont reports deferred or
+        // absent, or no answer at all, is a gap: never a silent pass
+        // (decisions programme "one verdict per tree", t03).
+        let stamp_gates = verify::stamps::profile_gates(&authority.verification_profile);
+        if let (true, false, Some(holder)) = (amont_on, stamp_gates.is_empty(), holder.as_ref()) {
+            let answer = self.config.hooks.stamps(holder.path(), None, &stamp_gates);
+            gaps.extend(verify::stamps::stamp_gaps(&stamp_gates, &answer));
+        }
         // amont was asked and would not answer, and the profile names no
         // check for `amont_gaps` to hang the reason on. Reported anyway:
         // a run must never read "no inventory" as "nothing to enforce"
@@ -896,6 +906,7 @@ pub(super) fn verification_report(
         integration_gaps: preflight.integration_gaps.clone(),
         baseline_cached: ctx.baseline.cached,
         baseline_cache_refused: ctx.baseline.cache_refused.clone(),
+        baseline_proven: ctx.baseline.proven,
     }
 }
 

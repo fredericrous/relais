@@ -37,6 +37,7 @@ mod follow;
 mod heavy;
 mod holdout_run;
 mod junit;
+pub mod stamps;
 
 pub use end::CheckEnd;
 pub use heavy::{
@@ -357,6 +358,11 @@ pub struct VerificationReport {
     /// caching and the toolchain could not be identified (audit V2).
     #[serde(default)]
     pub baseline_cache_refused: Option<CacheRefused>,
+    /// Whether the baseline run was skipped because amont reported every
+    /// profile gate stamped or attested on the base tree (t04): a proven
+    /// base is green, so it has no pre-existing failures.
+    #[serde(default)]
+    pub baseline_proven: bool,
 }
 impl VerificationReport {
     pub fn accepted(&self) -> bool {
@@ -2285,6 +2291,18 @@ pub trait HookInventory {
     /// `amont_gaps` turns into a gap for every required check, never
     /// into a pass.
     fn list(&self, dir: &Path, stage: Stage) -> Result<AmontInventory, InventoryError>;
+
+    /// What `amont stamps --json` says `tree` (the tree checked out at `dir`
+    /// when `None`) carries a verdict for, for `gates`. The default asks
+    /// nothing: only `AmontCli` spawns amont.
+    fn stamps(
+        &self,
+        _dir: &Path,
+        _tree: Option<&str>,
+        _gates: &[String],
+    ) -> Result<stamps::Answer, stamps::StampsError> {
+        Err(stamps::StampsError::NotAsked)
+    }
 }
 
 /// The `amont` binary on this machine — the one place it is spawned.
@@ -2309,6 +2327,15 @@ impl AmontCli {
 impl HookInventory for AmontCli {
     fn list(&self, dir: &Path, stage: Stage) -> Result<AmontInventory, InventoryError> {
         amont_list(dir, stage, self.cancel.as_deref())
+    }
+
+    fn stamps(
+        &self,
+        dir: &Path,
+        tree: Option<&str>,
+        gates: &[String],
+    ) -> Result<stamps::Answer, stamps::StampsError> {
+        stamps::amont_stamps(dir, tree, gates, self.cancel.as_deref())
     }
 }
 
@@ -3524,6 +3551,27 @@ mod tests {
             "nothing is invented for an untimed outcome"
         );
     }
+
+    /// `baseline_proven` (S2) is newer than every stored receipt: an old one
+    /// reads `false`, a new one reads what it says, and `true` survives a
+    /// round trip.
+    #[test]
+    fn a_receipt_without_baseline_proven_reads_false() {
+        let old: Receipt = serde_json::from_str(PRE_FIELD_RECEIPT_3).expect("old receipt parses");
+        assert!(!old.verification.baseline_proven);
+        let proven = PRE_FIELD_RECEIPT_3.replace(
+            "\"baseline_cache_refused\":null",
+            "\"baseline_cache_refused\":null,\"baseline_proven\":true",
+        );
+        assert_ne!(proven, PRE_FIELD_RECEIPT_3, "the fixture holds the anchor");
+        let new: Receipt = serde_json::from_str(&proven).expect("new receipt parses");
+        assert!(new.verification.baseline_proven);
+        let again: Receipt = serde_json::from_str(&serde_json::to_string(&new).unwrap())
+            .expect("the receipt round-trips");
+        assert!(again.verification.baseline_proven);
+        assert_eq!(again, new);
+    }
+
     use super::*;
 
     #[cfg(unix)]
@@ -5171,6 +5219,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(report.accepted());
         assert!(report.new_failures().is_empty());
@@ -5290,6 +5339,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(
             !report.accepted(),
@@ -5341,6 +5391,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(report.accepted());
 
@@ -5502,6 +5553,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         }
     }
 
@@ -5853,6 +5905,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(
             !report.accepted(),
@@ -5940,6 +5993,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(report.accepted());
 
@@ -6063,6 +6117,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         let (criteria, summary) = settle_acceptance(
             &entries,
@@ -6155,6 +6210,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(!report.accepted());
         let (criteria, _) = settle_acceptance(
@@ -6406,6 +6462,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         let (_, all_independent) = settle_acceptance(
             &[AcceptanceEntry::Bare("it builds".into())],
@@ -6545,6 +6602,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         assert!(!report.accepted(), "baseline failures are not auto-waived");
         assert!(
@@ -6597,6 +6655,7 @@ mod tests {
                 integration_gaps: Vec::new(),
                 baseline_cached: false,
                 baseline_cache_refused: None,
+                baseline_proven: false,
             },
             kind: Kind::Change,
             candidate: None,
@@ -6706,6 +6765,7 @@ mod tests {
             integration_gaps: Vec::new(),
             baseline_cached: false,
             baseline_cache_refused: None,
+            baseline_proven: false,
         };
         let entries = vec![
             declared(
