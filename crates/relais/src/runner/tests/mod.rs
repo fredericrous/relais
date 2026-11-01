@@ -4179,7 +4179,18 @@ fn a_cache_hit_keeps_the_bases_outcomes_for_an_identical_candidate() {
 #[test]
 fn the_runner_writes_timing_rows_for_runs_and_for_reused_outcomes() {
     let fixture = Fixture::new();
-    let mut repo = fixture.repo_policy_with_setup(vec![sh("true")], vec![sh("exit 0")], 3);
+    // bash, not sh: the baseline cache keys on each program's version, and
+    // Ubuntu's sh (dash) has no --version, which refuses the cache outright.
+    let versioned = |script: &str| CommandSpec {
+        argv: vec![
+            (if cfg!(windows) { "sh" } else { "bash" }).into(),
+            "-c".into(),
+            script.into(),
+        ],
+        ..sh(script)
+    };
+    let mut repo =
+        fixture.repo_policy_with_setup(vec![versioned("true")], vec![versioned("exit 0")], 3);
     repo.verification
         .profiles
         .get_mut("profile")
