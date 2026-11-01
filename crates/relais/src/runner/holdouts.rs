@@ -690,27 +690,6 @@ pub fn sweep_ended_holdouts(root: &Path, ledger: &crate::ledger::Ledger) {
     });
 }
 
-/// Remove every empty `verify/<run>/` directory an earlier run left: its
-/// run has ended, or no run claims it and nobody touched it for a day.
-/// A directory that still holds a file is kept (`prune::remove_empty_tree`).
-pub fn sweep_empty_verify_dirs(root: &Path, ledger: &crate::ledger::Ledger) -> Vec<PathBuf> {
-    use crate::prune::RunRecord;
-    crate::prune::sweep_empty_verify_dirs(
-        root,
-        &|name| {
-            let run = crate::ids::RunId::from_stored(name);
-            match ledger.run_status(&run) {
-                Ok(Some(state)) if state.is_terminal() => Ok(RunRecord::Ended),
-                Ok(Some(_)) => Ok(RunRecord::Live),
-                Ok(None) => Ok(RunRecord::Unknown),
-                Err(e) => Err(e.to_string()),
-            }
-        },
-        std::time::SystemTime::now(),
-        std::time::Duration::from_secs(86_400),
-    )
-}
-
 /// Where one holdout runs: the run's holdout directory, its position, the
 /// verification it belongs to and its fetched store.
 struct HoldoutSite<'h> {

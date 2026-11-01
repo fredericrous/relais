@@ -70,13 +70,14 @@ mod types;
 mod verification;
 mod workspace_ops;
 
+pub use crate::prune::sweep_ended_verify_dirs as sweep_empty_verify_dirs;
 pub use crate::workspace::OutOfScope;
 use baseline::{baseline_summary, setup_failure_detail};
 pub use config::{holdout_root, verify_root, worktree_root, DesignSource, RunConfig};
 use config::{retirement_detail, state_sibling};
 use error::Finish;
 pub use error::RunError;
-pub use holdouts::{sweep_empty_verify_dirs, sweep_ended_holdouts};
+pub use holdouts::sweep_ended_holdouts;
 use launch::admission_block;
 pub use machine::{
     decide, AttemptKind, Budget, HoldoutStop, Limit, Next, Observation, OverBudget, Terminal,

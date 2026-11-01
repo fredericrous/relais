@@ -103,6 +103,26 @@ pub fn sweep_empty_verify_dirs(
     removed
 }
 
+/// [`sweep_empty_verify_dirs`] judged by the ledger: a terminal run has
+/// ended, a non-terminal one is live, a name with no row is unknown (and
+/// goes only after a day untouched).
+pub fn sweep_ended_verify_dirs(root: &Path, ledger: &crate::ledger::Ledger) -> Vec<PathBuf> {
+    sweep_empty_verify_dirs(
+        root,
+        &|name| {
+            let run = crate::ids::RunId::from_stored(name);
+            match ledger.run_status(&run) {
+                Ok(Some(state)) if state.is_terminal() => Ok(RunRecord::Ended),
+                Ok(Some(_)) => Ok(RunRecord::Live),
+                Ok(None) => Ok(RunRecord::Unknown),
+                Err(e) => Err(e.to_string()),
+            }
+        },
+        SystemTime::now(),
+        Duration::from_secs(86_400),
+    )
+}
+
 /// How long ago `path`, or any of its direct entries, was last modified.
 /// `None` when no time can be read (then nothing is old enough).
 fn age(path: &Path, now: SystemTime) -> Option<Duration> {
