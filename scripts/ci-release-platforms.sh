@@ -12,10 +12,10 @@
 # tag's release is already running, so this polls every 60 s, up to --wait
 # (default 0: ask once).
 #
-# holds-until: a signed run is proven on main; then flip ATTEST_CHECK to 1 in release.yaml
-#
-# Until then the evidence is the jobs of the push-to-main workflow runs for
-# the commit: `test (<os>)` with conclusion `success`. A leg whose suite an
+# With ATTEST_CHECK=1 (release.yaml sets it) the signed `pre-push-cargo-test`
+# attestation for the commit's tree must also exist on every platform. The
+# other evidence is the jobs of the push-to-main workflow runs for the
+# commit: `test (<os>)` with conclusion `success`. A leg whose suite an
 # attestation skipped still concludes `success`.
 #
 # JOBS_JSON names a file holding {"jobs": [...]} in place of the API, which

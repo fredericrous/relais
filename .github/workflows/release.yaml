@@ -259,7 +259,9 @@ jobs:
   # this waits for the `test (<os>)` jobs of the PUSH-TO-MAIN runs for the
   # tagged commit (a pull request's run may have deferred legs, so it does
   # not count), which the release PR's merge started.
-  # holds-until: a signed run is proven on main; then flip ATTEST_CHECK to 1 below
+  # It also requires the signed `pre-push-cargo-test` attestation for the
+  # tagged tree on all three platforms (ATTEST_CHECK=1), proven on main
+  # 7a53f9a3 where CI signed linux, windows and aarch64-macos.
   # A dry run reports and does not block.
   platforms:
     name: every platform passed on main for this commit
@@ -272,8 +274,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # attest's verifier at the version and archive digest its own release
-      # pins for v1.7.0, as amont's release.yaml installs it. Inert while
-      # ATTEST_CHECK is 0; it is here so turning the check on is one token.
+      # pins for v1.7.0, as amont's release.yaml installs it.
       - name: git-attest 1.7.0
         run: |
           set -euo pipefail
@@ -288,8 +289,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           DRY_RUN: ${{ needs.guard.outputs.dry_run }}
         run: |
-          # ATTEST_CHECK: flip to 1 once a signed run is proven on main.
-          if ATTEST_CHECK=0 ./scripts/ci-release-platforms.sh "${{ github.sha }}" --wait 2400; then
+          if ATTEST_CHECK=1 ./scripts/ci-release-platforms.sh "${{ github.sha }}" --wait 2400; then
             exit 0
           fi
           if [ "$DRY_RUN" = true ]; then
