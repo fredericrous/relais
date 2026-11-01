@@ -142,15 +142,24 @@ pub fn sweep_ended_verify_dirs(root: &Path, ledger: &crate::ledger::Ledger) -> V
 }
 
 /// How long ago `path`, or any of its direct entries, was last modified.
-/// `None` when no time can be read (then nothing is old enough).
+/// `None` when the path's own time cannot be read (then nothing is old
+/// enough). A listing or an entry that cannot be read counts as modified
+/// now: what cannot be seen may be newer than what can, and a directory
+/// is never judged old on partial evidence.
 fn age(path: &Path, now: SystemTime) -> Option<Duration> {
     let mut newest = std::fs::symlink_metadata(path).ok()?.modified().ok()?;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
-                newest = newest.max(modified);
+    match std::fs::read_dir(path) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry.and_then(|e| e.metadata()).and_then(|m| m.modified()) {
+                    Ok(modified) => newest = newest.max(modified),
+                    Err(_) => return Some(Duration::ZERO), // unreadable entry: fresh
+                }
             }
         }
+        // A plain file has no listing; any other failure hides entries.
+        Err(e) if e.kind() == io::ErrorKind::NotADirectory => {}
+        Err(_) => return Some(Duration::ZERO), // unreadable listing: fresh
     }
     Some(now.duration_since(newest).unwrap_or(Duration::ZERO))
 }
@@ -380,6 +389,26 @@ mod tests {
         assert_eq!(removed.len(), 2);
         assert!(root.join("old-live/artifacts/logs/a.log").exists());
         assert!(!root.join("old-done").exists());
+        std::fs::remove_dir_all(&root).ok(); // best-effort scratch cleanup
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_cannot_be_listed_is_never_judged_old() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("unlistable");
+        let hidden = root.join("run-x");
+        std::fs::create_dir_all(hidden.join("logs")).unwrap();
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let later = SystemTime::now() + 31 * DAY;
+        let judge = |_: &str, _: &Path| RunVerdict::Prunable {
+            dangling_evidence: 0,
+        };
+        let listed = plan_run_prune(&root, 30 * DAY, later, &judge).unwrap();
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Running as root can still list it; then nothing is hidden.
+        let hidden_from_us = std::fs::read_dir(&hidden).is_ok();
+        assert!(hidden_from_us || listed.is_empty(), "{listed:?}");
         std::fs::remove_dir_all(&root).ok(); // best-effort scratch cleanup
     }
 

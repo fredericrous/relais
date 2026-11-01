@@ -57,3 +57,4 @@ The canonical plan is decisions `docs/plans/2026-11-01-one-verdict-build.md`. Th
 - Fixed: the numbers were re-measured with path-matched copies.
 - Deliberate: the equality test on the two-variant `Prune`.
 - Next: PR, merge on green. No release until S2.
+- 2026-11-01: rebased review (tree b9692e68), low finding fixed: `age()` read a hidden entry or listing with `flatten()`, which made a directory look older than it is. An unreadable entry or listing now counts as modified now, and `a_directory_that_cannot_be_listed_is_never_judged_old` covers it. `make lint` clean after the change; `prune::` 5 passed; the scenario test passes.
