@@ -4209,26 +4209,43 @@ fn the_runner_writes_timing_rows_for_runs_and_for_reused_outcomes() {
     };
     assert!(!first.verification.baseline_cached);
     let after_first = fixture.ledger.check_timing_stats(since).expect("stats");
-    let rows = |stats: &[crate::ledger::CheckTimingStats], setup: bool, cached: bool| {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Step {
+        Setup,
+        Check,
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum Source {
+        Ran,
+        Reused,
+    }
+    let rows = |stats: &[crate::ledger::CheckTimingStats], step: Step, source: Source| {
         stats
             .iter()
-            .filter(|s| s.label.starts_with("setup:") == setup && s.cached == cached)
+            .filter(|s| {
+                let is_setup = s.label.starts_with("setup:");
+                (is_setup == (step == Step::Setup)) && (s.cached == (source == Source::Reused))
+            })
             .map(|s| s.runs)
             .sum::<u64>()
     };
     assert_eq!(
-        rows(&after_first, true, false),
+        rows(&after_first, Step::Setup, Source::Ran),
         1,
         "the setup ran once: {after_first:?}"
     );
-    assert_eq!(rows(&after_first, true, true), 0, "{after_first:?}");
     assert_eq!(
-        rows(&after_first, false, false),
+        rows(&after_first, Step::Setup, Source::Reused),
+        0,
+        "{after_first:?}"
+    );
+    assert_eq!(
+        rows(&after_first, Step::Check, Source::Ran),
         1,
         "the base command ran once: {after_first:?}"
     );
     assert_eq!(
-        rows(&after_first, false, true),
+        rows(&after_first, Step::Check, Source::Reused),
         1,
         "the identical candidate reused the base's outcome: {after_first:?}"
     );
@@ -4243,17 +4260,17 @@ fn the_runner_writes_timing_rows_for_runs_and_for_reused_outcomes() {
     assert!(second.verification.baseline_cached);
     let after_second = fixture.ledger.check_timing_stats(since).expect("stats");
     assert_eq!(
-        rows(&after_second, false, false),
+        rows(&after_second, Step::Check, Source::Ran),
         1,
         "the cache hit ran nothing new: {after_second:?}"
     );
     assert_eq!(
-        rows(&after_second, false, true),
+        rows(&after_second, Step::Check, Source::Reused),
         3,
         "the hit's base and its identical candidate are both recorded as reused: {after_second:?}"
     );
     assert_eq!(
-        rows(&after_second, true, false),
+        rows(&after_second, Step::Setup, Source::Ran),
         1,
         "a cache hit runs no setup: {after_second:?}"
     );
@@ -4299,7 +4316,7 @@ fn an_alias_resolved_to_a_dated_id_is_not_a_substitution() {
         vec!["claude-sonnet-5-20261001".to_string()],
         "the effective model is what the receipt records"
     );
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
 // -- managed dispatch (SPEC §23) -------------------------------------
