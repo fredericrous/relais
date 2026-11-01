@@ -4279,7 +4279,7 @@ fn the_runner_writes_timing_rows_for_runs_and_for_reused_outcomes() {
         .as_ref()
         .expect("the reused outcome keeps its timing");
     assert!(timing.cached, "{timing:?}");
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
 #[test]
@@ -4316,7 +4316,7 @@ fn an_alias_resolved_to_a_dated_id_is_not_a_substitution() {
         vec!["claude-sonnet-5-20261001".to_string()],
         "the effective model is what the receipt records"
     );
-    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+    std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
 // -- managed dispatch (SPEC §23) -------------------------------------
