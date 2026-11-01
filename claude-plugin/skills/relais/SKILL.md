@@ -77,6 +77,11 @@ up, and the person answers there.
      applied, and a conflict is the worker's to resolve first. Never
      write "apply this patch" or a patch path into an objective: the
      candidate is named by run, never by path.
+     A run blocked on a budget or a queue with a candidate, or a
+     `needs_review` whose reviewer ran out its queue wait (its text says
+     "the candidate is kept" and names `candidate {run, index}`), is
+     recovered with `"kind": "verify"` naming that candidate, never with
+     a `change` run or `revise`.
    - **A run stopped on `scope_exceeded`.** Answer it with
      `mcp__relais__decide` `answer: "revise"` and `widen_scope: true`
      (or `successor_contract` for a contract you write): relais records

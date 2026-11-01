@@ -139,7 +139,11 @@ impl<'a> RunEngine<'a> {
             ));
         }
         if let Some(exhausted) = self.budgets.exhausted() {
-            return Ok(Some(self.end_on_exhausted(exhausted, &progress.budget)?));
+            return Ok(Some(self.end_on_exhausted(
+                exhausted,
+                &progress.budget,
+                None,
+            )?));
         }
         if let Some(ceiling) = self.config.machine.spending.per_run_micros {
             if progress.spend.total >= ceiling {
@@ -330,6 +334,7 @@ impl<'a> RunEngine<'a> {
         // never derived from the `at` timestamps `record_usage` stamps.
         let dispatch_start = Instant::now();
         let result = match self.managed_launch(ManagedDispatch {
+            candidate: None,
             spec,
             attempt: Some(index),
             depth: 0,
@@ -901,7 +906,23 @@ impl<'a> RunEngine<'a> {
         ) {
             Ok(result) => result,
             Err(VerifyFailure::Lease(stop)) => {
-                return Ok(Step::Ended(self.end_on_lease_stop(stop, &progress.budget)?));
+                let state = if matches!(stop, verify::LeaseStop::Cancelled) {
+                    State::Cancelled
+                } else {
+                    State::Blocked
+                };
+                ledger.finish_attempt(
+                    candidate.attempt_id,
+                    state,
+                    Some(&held_worktree),
+                    Some(&candidate.sha),
+                )?;
+                let kept = self.kept_candidate(ctx.preflight, candidate.index, &candidate.sha);
+                return Ok(Step::Ended(self.end_on_lease_stop(
+                    stop,
+                    &progress.budget,
+                    Some(&kept),
+                )?));
             }
             Err(VerifyFailure::Unavailable(e)) => {
                 return Ok(Step::Ended(
@@ -929,9 +950,18 @@ impl<'a> RunEngine<'a> {
                 .any(|holdout| holdout.outcome == verify::HoldoutVerdict::TimedOut)
         {
             if let Some(exhausted) = self.budgets.exhausted() {
-                return Ok(Step::Ended(
-                    self.end_on_exhausted(exhausted, &progress.budget)?,
-                ));
+                ledger.finish_attempt(
+                    candidate.attempt_id,
+                    State::Blocked,
+                    Some(&held_worktree),
+                    Some(&candidate.sha),
+                )?;
+                let kept = self.kept_candidate(ctx.preflight, candidate.index, &candidate.sha);
+                return Ok(Step::Ended(self.end_on_exhausted(
+                    exhausted,
+                    &progress.budget,
+                    Some(&kept),
+                )?));
             }
         }
         // A failed check that shows a full disk or no memory is evidence

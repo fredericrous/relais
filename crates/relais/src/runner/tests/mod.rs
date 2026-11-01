@@ -7280,6 +7280,7 @@ fn guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_g
         covering: None,
         base_sha: "base",
         holdouts: &[],
+        candidate: None,
     };
     let mut spend = RunSpend::zero();
     let outcome = engine.review_candidate(&request, &mut spend);
@@ -8914,6 +8915,7 @@ mod declared_tests;
 mod exhaustion;
 mod holdouts;
 mod native;
+mod queue_recovery;
 mod review_parts;
 mod review_repair;
 mod review_retry;

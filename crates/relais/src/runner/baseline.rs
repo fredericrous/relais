@@ -144,7 +144,12 @@ impl<'a> RunEngine<'a> {
                                 eprintln!("relais: {e}");
                             }
                             let nominal = fresh_progress(preflight).budget;
-                            return Ok(Phase::Ended(self.end_on_lease_stop(stop, &nominal)?));
+                            let kept = self.verify_source(preflight);
+                            return Ok(Phase::Ended(self.end_on_lease_stop(
+                                stop,
+                                &nominal,
+                                kept.as_ref(),
+                            )?));
                         }
                         Err(e) => return Err(e.into()),
                     };
@@ -189,7 +194,12 @@ impl<'a> RunEngine<'a> {
                                 eprintln!("relais: {e}");
                             }
                             let nominal = fresh_progress(preflight).budget;
-                            return Ok(Phase::Ended(self.end_on_lease_stop(stop, &nominal)?));
+                            let kept = self.verify_source(preflight);
+                            return Ok(Phase::Ended(self.end_on_lease_stop(
+                                stop,
+                                &nominal,
+                                kept.as_ref(),
+                            )?));
                         }
                         Err(e) => return Err(e.into()),
                     };
@@ -234,7 +244,12 @@ impl<'a> RunEngine<'a> {
                             eprintln!("relais: {e}");
                         }
                         let nominal = fresh_progress(preflight).budget;
-                        return Ok(Phase::Ended(self.end_on_exhausted(exhausted, &nominal)?));
+                        let kept = self.verify_source(preflight);
+                        return Ok(Phase::Ended(self.end_on_exhausted(
+                            exhausted,
+                            &nominal,
+                            kept.as_ref(),
+                        )?));
                     }
                     let unrunnable: Vec<&verify::CheckOutcome> = checks
                         .iter()
