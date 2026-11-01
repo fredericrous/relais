@@ -19,6 +19,9 @@ use crate::ids::sha256_hex;
 use crate::policy::{BlockCode, HoldoutDecl, HoldoutSettings};
 use crate::workspace::Git;
 
+mod discovery;
+pub use discovery::{discover, DeclarationInvalid, StoreView};
+
 /// How long `git ls-remote` may take before the store counts as unreadable.
 const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -351,6 +354,10 @@ pub struct Lookup<'a> {
     pub repo_dir: &'a Path,
     pub base_sha: &'a str,
     pub machine_toml: &'a str,
+    /// What the preflight's one `ls_remote` answered, when it made one: every
+    /// holdout of the run is frozen at that commit. `None` asks the store
+    /// again for each holdout.
+    pub store_head: Option<&'a Result<String, String>>,
 }
 
 /// A holdout whose current declaration resolves to another digest than the
@@ -388,6 +395,7 @@ pub fn resolve_all(
         repo_dir,
         base_sha,
         machine_toml,
+        store_head: None,
     };
     resolve_inheriting(entries, &lookup, &[]).map(|resolution| resolution.holdouts)
 }
@@ -412,6 +420,7 @@ pub fn resolve_inheriting(
         repo_dir,
         base_sha,
         machine_toml,
+        store_head,
     } = *lookup;
     let names = holdout_names(entries);
     let fresh: Vec<&String> = names
@@ -452,12 +461,12 @@ pub fn resolve_inheriting(
                 holdouts.push(held.clone());
             }
             None => holdouts.push(
-                resolve(settings, repo, name, git, repo_dir, base_sha).map_err(|refusal| {
-                    HoldoutBlock {
+                resolve_at(settings, repo, name, git, repo_dir, base_sha, store_head).map_err(
+                    |refusal| HoldoutBlock {
                         code: refusal.code(),
                         detail: refusal.describe(name, machine_toml),
-                    }
-                })?,
+                    },
+                )?,
             ),
         }
     }
@@ -529,6 +538,20 @@ pub fn resolve(
     repo_dir: &Path,
     base_sha: &str,
 ) -> Result<ResolvedHoldout, HoldoutRefusal> {
+    resolve_at(settings, repo, name, git, repo_dir, base_sha, None)
+}
+
+/// [`resolve`] with the store's commit already asked for: `store_head` is
+/// the answer of the preflight's one `ls_remote`, or `None` to ask here.
+pub fn resolve_at(
+    settings: &HoldoutSettings,
+    repo: &str,
+    name: &str,
+    git: &dyn Git,
+    repo_dir: &Path,
+    base_sha: &str,
+    store_head: Option<&Result<String, String>>,
+) -> Result<ResolvedHoldout, HoldoutRefusal> {
     let decl = settings
         .declaration(repo, name)
         .ok_or_else(|| HoldoutRefusal::Unknown {
@@ -567,7 +590,11 @@ pub fn resolve(
     if store.is_empty() {
         return Err(unreadable("no `store` is set in [holdouts]".to_string()));
     }
-    let sha = ls_remote(&store, &settings.git_ref).map_err(unreadable)?;
+    let sha = match store_head {
+        Some(answer) => answer.clone(),
+        None => ls_remote(&store, &settings.git_ref),
+    }
+    .map_err(unreadable)?;
     let digest = digest_of(repo, name, &store, &sha, decl);
     Ok(ResolvedHoldout {
         name: name.to_string(),
@@ -696,6 +723,8 @@ pub(crate) fn digest_of(
 /// [`LS_REMOTE_TIMEOUT`]. The one sha the ref names, or the reason it
 /// could not be had.
 fn ls_remote(store: &str, git_ref: &str) -> Result<String, String> {
+    #[cfg(test)]
+    crate::test_support::fetch_count::record_ask(store);
     let mut command = unattended_git(Path::new("."));
     command.args(["ls-remote", store, git_ref]);
     let output = crate::procs::run_with_timeout(command, LS_REMOTE_TIMEOUT, None, None)
@@ -785,25 +814,74 @@ pub fn fetch(
         sha: resolved.sha.clone(),
         detail,
     };
-    let target = dest_root.join("src").join(&resolved.sha);
+    let src = dest_root.join("src");
+    fetch_tree(
+        &resolved.store,
+        &resolved.git_ref,
+        &resolved.sha,
+        &src.join(&resolved.sha),
+        &src.join(format!("{}.partial", resolved.sha)),
+        budget_left,
+    )
+    .map_err(unfetchable)
+}
+
+/// The shallow fetch of `store` at `sha` into `target`, built in `partial`
+/// and renamed into place once complete. An existing `target` is reused, and
+/// so is one that appears while this fetch runs (another process won the
+/// rename): `partial` is then removed and `target` is the answer.
+fn fetch_tree(
+    store: &str,
+    git_ref: &str,
+    sha: &str,
+    target: &Path,
+    partial: &Path,
+    budget_left: &dyn Fn() -> Duration,
+) -> Result<PathBuf, String> {
     if target.is_dir() {
-        return Ok(target);
+        return Ok(target.to_path_buf());
     }
-    let partial = dest_root
-        .join("src")
-        .join(format!("{}.partial", resolved.sha));
-    match std::fs::remove_dir_all(&partial) {
+    match std::fs::remove_dir_all(partial) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(unfetchable(e.to_string())),
+        Err(e) => return Err(e.to_string()),
     }
-    std::fs::create_dir_all(&partial).map_err(|e| unfetchable(e.to_string()))?;
+    if let Some(parent) = partial.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::create_dir_all(partial).map_err(|e| e.to_string())?;
+    #[cfg(test)]
+    crate::test_support::fetch_count::record(target);
+    let built = build_tree(store, git_ref, sha, partial, budget_left);
+    if let Err(detail) = built {
+        let _ = std::fs::remove_dir_all(partial); // the failure reported is the fetch's, not the cleanup's
+        return Err(detail);
+    }
+    match std::fs::rename(partial, target) {
+        Ok(()) => Ok(target.to_path_buf()),
+        Err(_) if target.is_dir() => {
+            // Another process renamed first: a cache hit, and this copy is spare.
+            let _ = std::fs::remove_dir_all(partial); // the spare copy is only disk, the hit stands
+            Ok(target.to_path_buf())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// `git init`, a depth-1 fetch of `sha` and a checkout of it, inside `partial`.
+fn build_tree(
+    store: &str,
+    git_ref: &str,
+    sha: &str,
+    partial: &Path,
+    budget_left: &dyn Fn() -> Duration,
+) -> Result<(), String> {
     let git = |args: &[&str]| -> Result<String, String> {
         let bound = fetch_step_bound(budget_left());
         if bound.is_zero() {
             return Err("the run's time budget is spent".to_string());
         }
-        let mut command = unattended_git(&partial);
+        let mut command = unattended_git(partial);
         command.args(args);
         let output = crate::procs::run_with_timeout(command, bound, None, None)
             .map_err(|e| format!("git could not be run: {e}"))?;
@@ -817,40 +895,21 @@ pub fn fetch(
             }
         }
     };
-    git(&["init", "-q"]).map_err(unfetchable)?;
+    git(&["init", "-q"])?;
     // A server may refuse to serve an unadvertised commit: fall back to
     // the ref and require that it still names the recorded commit.
-    if git(&[
-        "fetch",
-        "-q",
-        "--depth",
-        "1",
-        &resolved.store,
-        &resolved.sha,
-    ])
-    .is_err()
-    {
-        git(&[
-            "fetch",
-            "-q",
-            "--depth",
-            "1",
-            &resolved.store,
-            &resolved.git_ref,
-        ])
-        .map_err(unfetchable)?;
-        let fetched = git(&["rev-parse", "FETCH_HEAD"]).map_err(unfetchable)?;
-        if fetched.trim() != resolved.sha {
-            return Err(unfetchable(format!(
-                "`{}` now names {}, not the recorded commit",
-                resolved.git_ref,
+    if git(&["fetch", "-q", "--depth", "1", store, sha]).is_err() {
+        git(&["fetch", "-q", "--depth", "1", store, git_ref])?;
+        let fetched = git(&["rev-parse", "FETCH_HEAD"])?;
+        if fetched.trim() != sha {
+            return Err(format!(
+                "`{git_ref}` now names {}, not the recorded commit",
                 fetched.trim()
-            )));
+            ));
         }
     }
-    git(&["checkout", "-q", "--detach", &resolved.sha]).map_err(unfetchable)?;
-    std::fs::rename(&partial, &target).map_err(|e| unfetchable(e.to_string()))?;
-    Ok(target)
+    git(&["checkout", "-q", "--detach", sha])?;
+    Ok(())
 }
 
 /// Remove `<root>/<run>/` for every run `has_ended` says is over, so a run
@@ -1186,6 +1245,7 @@ mod tests {
             repo_dir: Path::new("."),
             base_sha: "abc",
             machine_toml: "machine.toml",
+            store_head: None,
         };
         let resolved = resolve_with_attachments(&entries, &["x".to_string()], &lookup, &frozen)
             .expect("resolves");

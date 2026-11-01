@@ -554,13 +554,45 @@ impl<'a> RunEngine<'a> {
         // paid for. The manifest keeps only name, commit and digest.
         let repo_name = crate::repo::main_checkout_name(self.config.repo_dir).unwrap_or_default();
         let machine_toml = crate::holdout::machine_toml_label();
+        // The store is asked once: the commit it names is the one every
+        // holdout of this run is read at and frozen at, and the holdouts it
+        // declares join machine.toml's before anything is looked up.
+        let view = match crate::holdout::discover(
+            &self.config.machine.holdouts,
+            &repo_name,
+            &super::config::holdout_root(&self.config.artifacts_dir).join("cache"),
+            self.run_id.as_str(),
+        ) {
+            Ok(view) => view,
+            Err(invalid) => {
+                return Ok(Phase::Ended(self.fail_preflight(
+                    BlockCode::HoldoutDeclarationInvalid,
+                    invalid.to_string(),
+                )?))
+            }
+        };
+        if let Some(cause) = &view.unread {
+            self.events.emit(Event::Decision {
+                what: "holdout_store_unreachable".to_string(),
+                reason: format!(
+                    "the holdout store's files could not be fetched ({cause}); the holdouts it \
+                     declares are not known to this run"
+                ),
+            });
+        }
+        let holdout_settings = self
+            .config
+            .machine
+            .holdouts
+            .with_discovered(&repo_name, view.declared);
         let lookup = crate::holdout::Lookup {
-            settings: &self.config.machine.holdouts,
+            settings: &holdout_settings,
             repo: &repo_name,
             git: self.config.git,
             repo_dir: self.config.repo_dir,
             base_sha,
             machine_toml: &machine_toml,
+            store_head: Some(&view.head),
         };
         // A successor is judged by the definitions its predecessor froze,
         // attached ones included: they are carried, not matched again.
@@ -589,7 +621,7 @@ impl<'a> RunEngine<'a> {
                 .collect()
         } else if self.parent.is_none() {
             crate::holdout::attachments(
-                &self.config.machine.holdouts,
+                &holdout_settings,
                 &repo_name,
                 self.config.contract,
                 task_type,

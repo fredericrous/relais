@@ -10,7 +10,7 @@
 //! a changed declaration, or the same declaration in another repository,
 //! invalidates them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -1010,6 +1010,10 @@ pub struct HoldoutSettings {
     pub store: Option<String>,
     pub git_ref: String,
     pub repos: BTreeMap<String, BTreeMap<String, HoldoutDecl>>,
+    /// Names a `[holdouts.<repo>.<name>] enabled = false` table turns off:
+    /// a holdout the store declares is then not used. Such a table declares
+    /// nothing itself, so [`Self::declaration`] never sees these names.
+    pub disabled: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// The default `ref` of the holdout store.
@@ -1021,11 +1025,38 @@ impl Default for HoldoutSettings {
             store: None,
             git_ref: DEFAULT_HOLDOUT_REF.to_string(),
             repos: BTreeMap::new(),
+            disabled: BTreeMap::new(),
         }
     }
 }
 
+/// The `timeout_seconds` of a holdout that sets none, in machine.toml or in
+/// the store: a holdout builds the candidate, so the generic 300 s is too
+/// short.
+pub const DEFAULT_HOLDOUT_TIMEOUT_SECONDS: u64 = 1200;
+
 impl HoldoutSettings {
+    /// These settings with the store's declarations for `repo` added: a
+    /// machine.toml table of the same name replaces the store's, and a
+    /// `{ enabled = false }` table drops it. The result is the one set of
+    /// declarations preflight and `relais plan` look holdouts up in.
+    pub fn with_discovered(&self, repo: &str, discovered: BTreeMap<String, HoldoutDecl>) -> Self {
+        let mut effective = self.clone();
+        let off = self.disabled.get(repo);
+        let named = effective.repos.entry(repo.to_string()).or_default();
+        for (name, decl) in discovered {
+            if off.is_some_and(|names| names.contains(&name)) {
+                continue;
+            }
+            named.entry(name).or_insert(decl);
+        }
+        if named.is_empty() {
+            effective.repos.remove(repo);
+        }
+        effective.disabled.clear();
+        effective
+    }
+
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
@@ -1080,6 +1111,32 @@ pub struct HoldoutAttach {
 }
 
 impl HoldoutAttach {
+    /// An `attach` table as written: `key` names it in the message of a
+    /// bad one.
+    pub fn parse(key: &str, task_types: Vec<String>, paths: Vec<String>) -> Result<Self, String> {
+        if task_types.is_empty() {
+            return Err(format!(
+                "{key}.task_types must not be empty; allowed: {}",
+                crate::contract::TaskType::declarable_list()
+            ));
+        }
+        if paths.is_empty() {
+            return Err(format!("{key}.paths must not be empty"));
+        }
+        let task_types = task_types
+            .iter()
+            .map(|text| {
+                crate::contract::TaskType::parse_declared(text).ok_or_else(|| {
+                    format!(
+                        "{key}.task_types: `{text}` is not a task type; allowed: {}",
+                        crate::contract::TaskType::declarable_list()
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { task_types, paths })
+    }
+
     /// Both lists are non-empty and no task type is `unclassified`: what
     /// a declaration read from machine.toml guarantees, re-checked for one
     /// read back from the ledger.
@@ -1100,14 +1157,61 @@ impl HoldoutAttach {
     }
 }
 
+/// `command` of a machine.toml table: a [`CommandSpec`] whose
+/// `timeout_seconds` defaults to [`DEFAULT_HOLDOUT_TIMEOUT_SECONDS`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHoldoutCommand {
+    #[serde(default)]
+    name: Option<String>,
+    argv: Vec<String>,
+    #[serde(default = "default_holdout_timeout")]
+    timeout_seconds: u64,
+    #[serde(default)]
+    junit: Option<String>,
+    #[serde(default)]
+    reuse: Option<ReuseSpec>,
+    #[serde(default)]
+    weight: Option<u32>,
+    #[serde(default)]
+    retry: Option<u32>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+}
+
+fn default_holdout_timeout() -> u64 {
+    DEFAULT_HOLDOUT_TIMEOUT_SECONDS
+}
+
+impl From<RawHoldoutCommand> for CommandSpec {
+    fn from(raw: RawHoldoutCommand) -> Self {
+        Self {
+            name: raw.name,
+            argv: raw.argv,
+            timeout_seconds: raw.timeout_seconds,
+            junit: raw.junit,
+            reuse: raw.reuse,
+            weight: raw.weight,
+            retry: raw.retry,
+            env: raw.env,
+        }
+    }
+}
+
 /// A declaration as written, before `attach` is checked against the key
-/// path it sits under.
+/// path it sits under. With `enabled = false` and nothing else it is an
+/// override that turns a store holdout off.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawHoldoutDecl {
-    path: String,
-    overlay: String,
-    command: CommandSpec,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    overlay: Option<String>,
+    #[serde(default)]
+    command: Option<RawHoldoutCommand>,
     #[serde(default)]
     config: Option<String>,
     #[serde(default)]
@@ -1123,47 +1227,47 @@ struct RawHoldoutAttach {
     paths: Vec<String>,
 }
 
+/// What one `[holdouts.<repo>.<name>]` table is.
+enum HoldoutTable {
+    Declared(Box<HoldoutDecl>),
+    Off,
+}
+
 impl RawHoldoutDecl {
-    fn validate(self, repo: &str, name: &str) -> Result<HoldoutDecl, String> {
-        let key = format!("[holdouts.{repo}.{name}].attach");
+    fn validate(self, repo: &str, name: &str) -> Result<HoldoutTable, String> {
+        let table = format!("[holdouts.{repo}.{name}]");
+        let declares = self.path.is_some()
+            || self.overlay.is_some()
+            || self.command.is_some()
+            || self.config.is_some()
+            || !self.inputs.is_empty()
+            || self.attach.is_some();
+        match (self.enabled, declares) {
+            (Some(false), false) => return Ok(HoldoutTable::Off),
+            (Some(_), _) => {
+                return Err(format!(
+                    "{table}: `enabled` is only accepted as `enabled = false` alone"
+                ))
+            }
+            (None, _) => {}
+        }
+        let missing = |field: &str| format!("{table}: missing field `{field}`");
+        let path = self.path.ok_or_else(|| missing("path"))?;
+        let overlay = self.overlay.ok_or_else(|| missing("overlay"))?;
+        let command = self.command.ok_or_else(|| missing("command"))?;
+        let key = format!("{table}.attach");
         let attach = self
             .attach
-            .map(|raw| {
-                if raw.task_types.is_empty() {
-                    return Err(format!(
-                        "{key}.task_types must not be empty; allowed: {}",
-                        crate::contract::TaskType::declarable_list()
-                    ));
-                }
-                if raw.paths.is_empty() {
-                    return Err(format!("{key}.paths must not be empty"));
-                }
-                let task_types = raw
-                    .task_types
-                    .iter()
-                    .map(|text| {
-                        crate::contract::TaskType::parse_declared(text).ok_or_else(|| {
-                            format!(
-                                "{key}.task_types: `{text}` is not a task type; allowed: {}",
-                                crate::contract::TaskType::declarable_list()
-                            )
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(HoldoutAttach {
-                    task_types,
-                    paths: raw.paths,
-                })
-            })
+            .map(|raw| HoldoutAttach::parse(&key, raw.task_types, raw.paths))
             .transpose()?;
-        Ok(HoldoutDecl {
-            path: self.path,
-            overlay: self.overlay,
-            command: self.command,
+        Ok(HoldoutTable::Declared(Box::new(HoldoutDecl {
+            path,
+            overlay,
+            command: command.into(),
             config: self.config,
             inputs: self.inputs,
             attach,
-        })
+        })))
     }
 }
 
@@ -1189,13 +1293,26 @@ impl<'de> Deserialize<'de> for HoldoutSettings {
                 }
                 (_, HoldoutEntry::Repo(named)) => {
                     let mut declared = BTreeMap::new();
+                    let mut off = BTreeSet::new();
                     for (name, raw) in named {
-                        let decl = raw
+                        match raw
                             .validate(&key, &name)
-                            .map_err(serde::de::Error::custom)?;
-                        declared.insert(name, decl);
+                            .map_err(serde::de::Error::custom)?
+                        {
+                            HoldoutTable::Declared(decl) => {
+                                declared.insert(name, *decl);
+                            }
+                            HoldoutTable::Off => {
+                                off.insert(name);
+                            }
+                        }
                     }
-                    settings.repos.insert(key, declared);
+                    if !off.is_empty() {
+                        settings.disabled.insert(key.clone(), off);
+                    }
+                    if !declared.is_empty() {
+                        settings.repos.insert(key, declared);
+                    }
                 }
                 (_, HoldoutEntry::Text(_)) => {
                     return Err(serde::de::Error::custom(format!(
@@ -1209,6 +1326,14 @@ impl<'de> Deserialize<'de> for HoldoutSettings {
     }
 }
 
+/// A table as written back to machine.toml.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum HoldoutTableRef<'a> {
+    Declared(&'a HoldoutDecl),
+    Off { enabled: bool },
+}
+
 impl Serialize for HoldoutSettings {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
@@ -1217,8 +1342,16 @@ impl Serialize for HoldoutSettings {
             map.serialize_entry("store", store)?;
         }
         map.serialize_entry("ref", &self.git_ref)?;
-        for (repo, named) in &self.repos {
-            map.serialize_entry(repo, named)?;
+        let repo_names: BTreeSet<&String> = self.repos.keys().chain(self.disabled.keys()).collect();
+        for repo in repo_names {
+            let mut tables: BTreeMap<&String, HoldoutTableRef<'_>> = BTreeMap::new();
+            for (name, decl) in self.repos.get(repo).into_iter().flatten() {
+                tables.insert(name, HoldoutTableRef::Declared(decl));
+            }
+            for name in self.disabled.get(repo).into_iter().flatten() {
+                tables.insert(name, HoldoutTableRef::Off { enabled: false });
+            }
+            map.serialize_entry(repo, &tables)?;
         }
         map.end()
     }
@@ -2020,6 +2153,9 @@ pub enum BlockCode {
     HoldoutCriterionCollision,
     /// The holdout store does not resolve its ref to one commit.
     HoldoutUnreadable,
+    /// A `holdout.toml` in the store does not parse, or names a path that is
+    /// not clean or a file the store lacks.
+    HoldoutDeclarationInvalid,
     /// A holdout store could not be fetched at the commit recorded at
     /// preflight, when verification came to run it.
     HoldoutUnfetchable,
@@ -2078,6 +2214,7 @@ impl BlockCode {
             Self::HoldoutOverlayExists => "holdout_overlay_exists",
             Self::HoldoutCriterionCollision => "holdout_criterion_collision",
             Self::HoldoutUnreadable => "holdout_unreadable",
+            Self::HoldoutDeclarationInvalid => "holdout_declaration_invalid",
             Self::HoldoutUnfetchable => "holdout_unfetchable",
             Self::WorkspaceBusy => "workspace_busy",
             Self::WorkspaceHasInterruptedRun => "workspace_has_interrupted_run",
@@ -3812,6 +3949,103 @@ command = { argv = ["cargo", "nextest", "run", "-p", "amont"], junit = "target/n
         assert_eq!(
             MachineSettings::from_toml_str(&written).expect("reads back"),
             machine
+        );
+    }
+
+    const MACHINE_AND_OFF: &str = r#"schema_version = 1
+
+[holdouts]
+store = "s"
+
+[holdouts.r.mine]
+path = "r/mine.sh"
+overlay = "o.sh"
+command = { argv = ["sh", "o.sh"], junit = "j.xml" }
+
+[holdouts.r.theirs]
+enabled = false
+"#;
+
+    fn store_decl(overlay: &str) -> HoldoutDecl {
+        HoldoutDecl {
+            path: "r/x/check.sh".into(),
+            overlay: overlay.into(),
+            command: CommandSpec {
+                name: None,
+                argv: vec!["sh".into(), overlay.into()],
+                timeout_seconds: DEFAULT_HOLDOUT_TIMEOUT_SECONDS,
+                junit: Some("j.xml".into()),
+                reuse: None,
+                weight: None,
+                retry: None,
+                env: BTreeMap::new(),
+            },
+            config: None,
+            inputs: Vec::new(),
+            attach: None,
+        }
+    }
+
+    #[test]
+    fn a_machine_holdout_without_a_timeout_gets_twelve_hundred_seconds() {
+        let machine = MachineSettings::from_toml_str(MACHINE_AND_OFF).expect("parses");
+        let mine = machine.holdouts.declaration("r", "mine").expect("declared");
+        assert_eq!(mine.command.timeout_seconds, 1200);
+        let explicit = MACHINE_AND_OFF.replace(
+            "junit = \"j.xml\"",
+            "junit = \"j.xml\", timeout_seconds = 9",
+        );
+        let machine = MachineSettings::from_toml_str(&explicit).expect("parses");
+        assert_eq!(
+            machine
+                .holdouts
+                .declaration("r", "mine")
+                .expect("declared")
+                .command
+                .timeout_seconds,
+            9
+        );
+    }
+
+    #[test]
+    fn an_enabled_false_table_is_an_override_not_a_declaration() {
+        let machine = MachineSettings::from_toml_str(MACHINE_AND_OFF).expect("parses");
+        assert!(machine.holdouts.declaration("r", "theirs").is_none());
+        assert!(machine.holdouts.disabled["r"].contains("theirs"));
+        let written = toml::to_string(&machine).expect("writes back");
+        assert_eq!(
+            MachineSettings::from_toml_str(&written).expect("reads back"),
+            machine
+        );
+        for bad in [
+            "[holdouts.r.x]\nenabled = true\n",
+            "[holdouts.r.x]\nenabled = false\npath = \"p\"\n",
+        ] {
+            MachineSettings::from_toml_str(&format!(
+                "schema_version = 1\n[holdouts]\nstore = \"s\"\n{bad}"
+            ))
+            .unwrap_err();
+        }
+    }
+
+    #[test]
+    fn a_machine_table_replaces_the_store_declaration_and_enabled_false_removes_it() {
+        let machine = MachineSettings::from_toml_str(MACHINE_AND_OFF).expect("parses");
+        let discovered = BTreeMap::from([
+            ("mine".to_string(), store_decl("from-store.sh")),
+            ("theirs".to_string(), store_decl("theirs.sh")),
+            ("only".to_string(), store_decl("only.sh")),
+        ]);
+        let effective = machine.holdouts.with_discovered("r", discovered);
+        assert_eq!(
+            effective.declaration("r", "mine").expect("kept").overlay,
+            "o.sh",
+            "the machine table wins"
+        );
+        assert!(effective.declaration("r", "theirs").is_none(), "turned off");
+        assert_eq!(
+            effective.declaration("r", "only").expect("added").overlay,
+            "only.sh"
         );
     }
 

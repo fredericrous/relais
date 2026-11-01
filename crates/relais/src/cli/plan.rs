@@ -229,19 +229,36 @@ pub(crate) fn plan_command(
         (None, None) => None,
     };
     let repo_name = relais::repo::main_checkout_name(&root).unwrap_or_default();
+    let view = match relais::holdout::discover(
+        &machine.holdouts,
+        &repo_name,
+        &relais::runner::holdout_root(&paths::runs_dir().map_err(CliError::Home)?).join("cache"),
+        "plan",
+    ) {
+        Ok(view) => view,
+        Err(invalid) => {
+            eprintln!(
+                "relais plan: blocked ({}): {invalid}",
+                relais::policy::BlockCode::HoldoutDeclarationInvalid
+            );
+            return Ok(CliOutcome::Blocked);
+        }
+    };
+    let holdout_settings = machine.holdouts.with_discovered(&repo_name, view.declared);
     let attached =
-        relais::holdout::attachments(&machine.holdouts, &repo_name, &contract, task_type);
+        relais::holdout::attachments(&holdout_settings, &repo_name, &contract, task_type);
     // And the holdouts: `run` refuses a holdout criterion it cannot resolve,
     // with the same codes; an attached one whose store is unreachable is
     // skipped, as `run` skips it.
     let machine_toml = relais::holdout::machine_toml_label();
     let lookup = relais::holdout::Lookup {
-        settings: &machine.holdouts,
+        settings: &holdout_settings,
         repo: &repo_name,
         git: &relais::workspace::SystemGit,
         repo_dir: &root,
         base_sha: &base_sha,
         machine_toml: &machine_toml,
+        store_head: Some(&view.head),
     };
     let attached_names: Vec<String> = attached
         .iter()
