@@ -32,13 +32,16 @@ Two decisions made while building:
 - **Schema:** a new table (`check_timings`, v47), not new columns on the receipt tables. The receipt keeps the per-check timing too, but reports read the table.
 - **Reused outcomes:** a cached baseline or an identical candidate is marked `cached`, with no fresh time claimed. `relais report` shows them as `(reused)`, so they never count as work.
 
+## Decisions
+
+- **Shape of the fields:** the plan words them as flat fields on `CheckOutcome` and `Attempt`. They are nested under one `timing: Option<CheckTiming>` (`#[serde(default, skip_serializing_if = "Option::is_none")]`) on each, so an old receipt reads `None` and writes unchanged. Derived values `slot_wait_ms` and `run_ms` and the `cached` flag live inside `CheckTiming`.
+- **The clock:** `wall_clock()` reads `chrono::Utc::now()` directly. This is deliberate: `run_attempt` is an action, so it owns the clock, and the ledger (which has an injectable clock) is only handed the finished strings.
+
 ## Implementation review
 
-- **Verdict:** approve after one Delta. Round 1 was approve-with-changes (64k tokens, 67 s); the Delta approved (77k tokens, 21 s).
-- **Fixed:**
-  - `nearest_rank` is now read-only (the caller sorts once).
-  - Setup steps record timing rows too (`<prefix>-setup`, `base-setup`).
-  - A kept new-shape receipt fixture, `TIMED_RECEIPT_6`, joins the parse test.
-  - The setup error message now names both writes.
+- **Round 1 on tree `7ca8aae5`, by the parent:** approve-with-changes. Fixed: a runner-level timing test, and the nested-shape note above. The parent runs the Delta and lands.
+- **Reviews this fork ran earlier (not recorded by the push hook, which reads the parent's):**
+  - Round 1 on tree `f2ead769`: approve-with-changes. `nearest_rank` made read-only, setup steps record timing rows, and a kept new-shape receipt fixture `TIMED_RECEIPT_6` was added.
+  - Delta on `80416aca`: approve. Rebind after a rebase and one error-message rewording, on `7ca8aae5`: approve.
 - **Left open on purpose:** the live check (a real relais run, then `relais report --since …`) waits for the relais release. A branch binary would migrate the real ledger to v47 early, which has gone wrong on this machine before. The v47 migration is covered by the schema upgrade tests. After the release the check should show the receipt's `timing`, `-setup` rows, and `(reused)` rows on their own lines.
-- **Status:** phase T1 is built and reviewed. The relais release comes after S2.
+- **Status:** phase T1 is built. The relais release comes after S2.
