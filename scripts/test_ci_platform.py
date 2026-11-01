@@ -236,6 +236,50 @@ class ReleasePlatforms(unittest.TestCase):
         self.assertIn("HTTP 403 rate limited", guard.stderr)
         self.assertIn("test (macos-latest)", guard.stderr)
 
+    def fake_attest(self, directory, covered_by_platform):
+        """A `git-attest` that answers `covered --platform P` from a dict."""
+        cases = "\n".join(
+            f'  {p}) echo "{" ".join(g)}" ;;' for p, g in covered_by_platform.items())
+        path = os.path.join(directory, "git-attest")
+        with open(path, "w") as handle:
+            handle.write("#!/bin/sh\n"
+                         'case "$3" in\n' + cases + "\n  *) : ;;\nesac\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def guard_with_attest(self, covered, attest_check):
+        jobs = [self.leg("macos-latest"), self.leg("ubuntu-latest"), self.leg("windows-latest")]
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, GIT_ATTEST=self.fake_attest(directory, covered),
+                       ATTEST_CHECK=attest_check)
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+                json.dump({"jobs": jobs}, handle)
+                env["JOBS_JSON"] = handle.name
+            try:
+                return subprocess.run(["sh", script("ci-release-platforms.sh"), "abc123"],
+                                      env=env, capture_output=True, text=True)
+            finally:
+                os.unlink(env["JOBS_JSON"])
+
+    def test_attestation_off_ignores_signatures(self):
+        """Until the first signed run exists, a tag needs only the check runs."""
+        guard = self.guard_with_attest({}, "0")
+        self.assertEqual(guard.returncode, 0, guard.stderr)
+
+    def test_attestation_on_requires_a_signature_on_every_platform(self):
+        covered = {"x86_64-linux": ["pre-push-cargo-test"],
+                   "aarch64-macos": ["pre-push-cargo-test"],
+                   "x86_64-windows": []}
+        guard = self.guard_with_attest(covered, "1")
+        self.assertNotEqual(guard.returncode, 0, guard.stdout)
+        self.assertIn("x86_64-windows pre-push-cargo-test (attested)", guard.stderr)
+
+    def test_attestation_on_passes_when_every_platform_is_signed(self):
+        covered = {p: ["pre-push-cargo-test"]
+                   for p in ("x86_64-linux", "aarch64-macos", "x86_64-windows")}
+        guard = self.guard_with_attest(covered, "1")
+        self.assertEqual(guard.returncode, 0, guard.stderr)
+
     def test_only_push_to_main_runs_count(self):
         legs = json.dumps({"jobs": [self.leg("macos-latest"), self.leg("ubuntu-latest"),
                                     self.leg("windows-latest")]})
