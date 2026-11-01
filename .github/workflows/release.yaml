@@ -259,7 +259,7 @@ jobs:
   # this waits for the `test (<os>)` jobs of the PUSH-TO-MAIN runs for the
   # tagged commit (a pull request's run may have deferred legs, so it does
   # not count), which the release PR's merge started.
-  # holds-until: relais CI signs attestations (plan C2); then read git-attest, as ci-release-gates.sh does
+  # holds-until: relais CI signs attestations (plan C2): then set ATTEST_CHECK=1 below so a tag also needs the signatures
   # A dry run reports and does not block.
   platforms:
     name: every platform passed on main for this commit
@@ -275,7 +275,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           DRY_RUN: ${{ needs.guard.outputs.dry_run }}
         run: |
-          if ./scripts/ci-release-platforms.sh "${{ github.sha }}" --wait 2400; then
+          # ATTEST_CHECK is 0 until the first signed run is proven on main
+          # (plan C2): then the release also needs the signatures.
+          if ATTEST_CHECK=0 ./scripts/ci-release-platforms.sh "${{ github.sha }}" --wait 2400; then
             exit 0
           fi
           if [ "$DRY_RUN" = true ]; then

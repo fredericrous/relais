@@ -12,7 +12,7 @@
 # tag's release is already running, so this polls every 60 s, up to --wait
 # (default 0: ask once).
 #
-# holds-until: relais CI signs attestations (plan C2); then read git-attest, as ci-release-gates.sh does
+# holds-until: relais CI signs attestations (plan C2); ATTEST_CHECK=1 then requires them (release.yaml)
 #
 # Until then the evidence is the jobs of the push-to-main workflow runs for
 # the commit: `test (<os>)` with conclusion `success`. A leg whose suite an
@@ -58,6 +58,24 @@ fetch_jobs() {
   done | jq -s '{jobs: (map(.jobs) | add // [])}'
 }
 
+# Attested: for `pre-push-cargo-test` on each platform, a verified signature for
+# this exact tree, read with attest's verifier (the same read amont's
+# ci-release-gates.sh makes). Off until ATTEST_CHECK=1, so this change can land
+# before the first signed run exists; release.yaml turns it on after that proof.
+attested() {
+  [ "${ATTEST_CHECK:-0}" = 1 ] || return 0
+  bin=${GIT_ATTEST:-git-attest}
+  missing_att=
+  for p in x86_64-linux aarch64-macos x86_64-windows; do
+    if ! "$bin" covered --platform "$p" 2> /dev/null | tr ' ' '\n' | grep -qx 'pre-push-cargo-test'; then
+      missing_att="$missing_att
+  $p pre-push-cargo-test (attested)"
+    fi
+  done
+  [ -z "$missing_att" ] || { missing="$missing$missing_att"; return 1; }
+  return 0
+}
+
 check() {
   jobs=$(fetch_jobs)
   if ! have=$(printf '%s' "$jobs" | jq -r '.jobs[]? | select(.conclusion == "success") | .name'); then
@@ -71,6 +89,7 @@ check() {
   done << EOF
 $required
 EOF
+  attested || true
   [ -z "$missing" ]
 }
 

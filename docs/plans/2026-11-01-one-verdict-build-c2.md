@@ -1,0 +1,28 @@
+---
+status: active
+branch: build/ci-sign
+repos: [relais]
+canonical: decisions:docs/plans/2026-11-01-one-verdict-build.md
+phases: [C2]
+adrs: [decisions:ADR-0041, decisions:ADR-0037]
+---
+# Relais CI signs attestations (C2)
+
+Canonical plan: decisions `docs/plans/2026-11-01-one-verdict-build.md`, phase C2. Design: decisions `docs/programmes/one-verdict-per-tree/t10-relais-ci-signs.md`.
+
+## What changed
+- **Signer:** `.github/allowed_signers` gains `ci@relais` (namespaces `amont-attest,amont-provenance`). Its key is the repo secret `ATTEST_SIGNING_KEY`, set by the person.
+- **Sign job** (`ci.yaml`, push to `main` only, after `test`): one leg per matrix platform. Each leg uploads a result file saying whether its own suite ran and passed. The sign job signs `pre-push-cargo-test` on a platform only when that leg's suite ran. A leg whose suite an attestation skipped signs nothing, so only real runs are signed.
+- **Release guard** (`release.yaml`, `ci-release-platforms.sh`): the check-run guard stays and always runs. The attestation read (`git-attest covered --platform`, for `pre-push-cargo-test` on all three platforms) sits beside it, behind `ATTEST_CHECK`, which stays `0` in `release.yaml` until the first signed run is proven on `main`.
+
+## Why the check-run guard stays
+A tag must not depend on a signature that does not exist yet. Turning the attestation check on before main has a signed run would block every release. Once a signed run is proven, `release.yaml` sets `ATTEST_CHECK=1` and a tag needs both.
+
+## Verification (input → expected → actual)
+- **Signers file:** `ci@relais` line parses (principal and namespaces). Expected: a valid entry alongside `zougi.fr@gmail.com`. Actual: both principals present, format matches `ci@amont`.
+- **Workflows:** `ci.yaml` and `release.yaml` parse as YAML. Expected: no parse error. Actual: parse ok; `sign` is a job after `test`.
+- **Guard script:** `sh -n` and shellcheck on `ci-release-platforms.sh`. Expected: clean. Actual: clean.
+- **Guard tests:** `scripts/test_ci_platform.py`, 21 tests including three new attestation cases (off ignores signatures; on requires every platform; on passes when all three are signed). Expected: all pass. Actual: 21 OK.
+
+## Not yet proven (post-merge)
+The real proof is that a push to `main` produces three `ci@relais` blocks: `git notes --ref amont-attest show <main tree>` on origin carries one block per platform for `pre-push-cargo-test`. Until that is seen, `ATTEST_CHECK` stays `0`.

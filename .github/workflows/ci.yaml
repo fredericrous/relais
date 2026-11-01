@@ -161,13 +161,33 @@ jobs:
       - run: |
           git config --global user.email "ci@relais.invalid"
           git config --global user.name "relais ci"
-      - if: ${{ !contains(fromJSON(steps.attest.outputs.gates || '[]'), 'pre-push-cargo-test') }}
+      - id: suite
+        if: ${{ !contains(fromJSON(steps.attest.outputs.gates || '[]'), 'pre-push-cargo-test') }}
         run: cargo test
       # The third state a reader must be able to tell apart from "ran" and
       # "deferred": already proven by a signature (`ci.a-deferred-job-says-so`).
       - if: ${{ contains(fromJSON(steps.attest.outputs.gates || '[]'), 'pre-push-cargo-test') }}
         run: |
           echo "test (${{ matrix.os }}): skipped, a signature covers this tree on ${{ matrix.platform }}" | tee -a "$GITHUB_STEP_SUMMARY"
+      # One result file per leg, uploaded for `sign`: a matrix job's outputs
+      # collapse to one value, so the legs cannot report through `outputs`.
+      # The file says whether THIS leg ran the suite and passed.
+      - name: record the suite result
+        if: ${{ always() }}
+        env:
+          RAN: ${{ steps.suite.outcome == 'success' }}
+          OS: ${{ matrix.os }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/sign-results"
+          jq -n --arg os "$OS" --arg platform "$PLATFORM" --argjson ran "$RAN" \
+            '{os: $os, platform: $platform, ran: $ran}' \
+            > "$RUNNER_TEMP/sign-results/$OS.json"
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: sign-result-${{ matrix.os }}
+          path: ${{ runner.temp }}/sign-results/${{ matrix.os }}.json
 
   # `make msrv`: the floor `rust-version` claims, actually compiled
   # against. Without this, `rust-version` is a string nothing tests.
@@ -247,3 +267,50 @@ jobs:
           if grep -Eq 'RUSTSEC-[0-9]{4}-[0-9]{4}' audit.txt; then
             echo "::warning::cargo audit reported findings (advisory; see the job log)"
           fi
+
+  # Sign the gate the test legs ran, once per platform it ran on, so the next
+  # job that checks out this tree can skip it (decisions ADR-0041,
+  # `ci.attested-skip`; plan C2). Push to main only: a pull request never holds
+  # the key. A leg whose suite an attestation skipped signs nothing, so only
+  # real runs are signed. Keyed off `needs.test.result` and each leg's own
+  # `suite` step outcome: a leg whose run failed never reaches this job, since
+  # `needs` requires success.
+  sign:
+    name: sign attestations
+    needs: [test, plan]
+    if: ${{ always() && needs.test.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.test_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      # Each leg's result, read in place of the matrix outputs: the sign step
+      # below runs only when this leg's own file says the suite ran and passed.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sign-result-${{ matrix.os }}
+          path: ${{ runner.temp }}/sign-results
+      - id: ran
+        env:
+          OS: ${{ matrix.os }}
+        run: |
+          f="$RUNNER_TEMP/sign-results/$OS.json"
+          if [ -f "$f" ] && [ "$(jq -r '.ran' "$f")" = true ]; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+            echo "sign: $OS ran no suite (an attestation covered it, or it failed): nothing to sign"
+          fi
+      - name: sign pre-push-cargo-test for this platform
+        if: ${{ steps.ran.outputs.sign == 'true' }}
+        uses: fredericrous/attest/sign@c5c61817f5a78c3a23d31c903c00ba1eef50cc39 # v1.7.0
+        with:
+          key: ${{ secrets.ATTEST_SIGNING_KEY }}
+          gates: pre-push-cargo-test
+          platform: ${{ matrix.platform }}
+          producer: attest-sign-${{ matrix.os }}
