@@ -2,7 +2,7 @@
 type = "grilling"
 mode = "hitl"
 status = "open"
-blocked_by = ["t13-laptop-load-baseline", "t21-remote-runner-owner", "t22-stamp-from-remote-run", "t23-gate-platform-inventory", "t25-pod-signing-key"]
+blocked_by = ["t13-laptop-load-baseline", "t22-stamp-from-remote-run", "t23-gate-platform-inventory", "t25-pod-signing-key"]
 repos = ["relais"]
 +++
 # Which slice ships first and alone
@@ -36,3 +36,9 @@ Still valid, whoever runs the gate:
 - **Accounting:** one cluster token per check, whatever the weight;
   `PROTOCOL_VERSION` bumped for a new resource class.
 - **Rollback:** ordered, because the config structs deny unknown fields.
+
+## Update 2026-11-01 (t21)
+
+The slice is now **amont running `platform=any` gates** (lint, types, cycle
+checks) on the wk-3 runner pod, returning signed attestations. It is no
+longer relais heavy checks. relais `cargo-test` stays local.

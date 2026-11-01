@@ -2,8 +2,8 @@
 
 ## Destination
 
-relais places each run, a whole worker run or heavy checks, on the laptop or
-the homelab cluster. Cluster runs stay under CPU, RAM, slot and token caps,
+relais places worker runs, and amont places gates (only those declared
+`platform=any`), on the laptop or the homelab cluster. Cluster runs stay under CPU, RAM, slot and token caps,
 and their sandbox adapts automatically above a fixed floor. The laptop's load
 drops by the target the laptop-load baseline sets, and this runs in
 production.
@@ -43,6 +43,8 @@ production.
 
 ## Decisions so far
 
+- [Which tool runs a gate on the cluster](t21-remote-runner-owner.md): amont, behind a `platform=any` gate and a per-repo opt-in; the pod returns a signed attestation; relais keeps calling `amont run --stamp` (architect seat).
+- [Who owns the cluster lease protocol](t18-cluster-lease-owner.md): amont, in a new std-only crate relais links for worker pods.
 - [How amont earns and signs a stamp for a tree a pod verified](t22-stamp-from-remote-run.md): it doesn't stamp (ADR-0015); the pod's signed attestation counts on the laptop only for gates declared `platform=any`; it amends ADR-0015 and adds a decisions ADR beside ADR-0041.
 - [Which gates in the fleet are platform-independent, and which repos are Linux-primary](t23-gate-platform-inventory.md): lint, types and cycle checks (JS/TS, Python, relais scripts) are independent; relais and amont `cargo-test` stay macOS; the share waits for t13 and gate-named timings.
 - [Is "every dispatch native" amended for remote runs](t01-native-dispatch-amendment.md): only when worker pods land (t02), by a relais ADR; a pod worker is relais's own worker.

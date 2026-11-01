@@ -1,7 +1,7 @@
 +++
 type = "grilling"
 mode = "hitl"
-status = "open"
+status = "closed"
 blocked_by = ["t07-slot-model", "t21-remote-runner-owner"]
 repos = ["relais", "amont"]
 +++
@@ -38,3 +38,14 @@ The wire contract it pinned:
 Since then, relais verifies through `amont run --stamp` (relais#370). If t21
 makes amont the remote runner, the runner owns the lease, so this ticket waits
 on t21.
+
+## Resolution
+
+**amont owns the cluster lease protocol**, in a new std-only crate published
+like `amont-slots` (for example `amont-cluster`). relais links it only for
+whole worker pods (t02). This follows from t21: amont runs remote gates.
+
+The architect's earlier "relais owns it" (2026-11-01) assumed relais was the
+runner, so it no longer applies. The person's lean, "relais should hold the
+cluster lease but let the architect decide", is answered by the architect
+seat. The wire contract in the notes above carries over unchanged.
