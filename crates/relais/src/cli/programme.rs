@@ -131,7 +131,7 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
-        .unwrap_or(0)
+        .unwrap_or(0) // only a clock before 1970 lands here; ages then clamp to 0 rather than fail a read-only listing
 }
 
 fn tip_of(standing: &Standing, now_unix: i64) -> Option<Tip<'_>> {
@@ -229,10 +229,15 @@ pub(crate) fn frontier_command(
                     ticket.mode.as_str(),
                     programme.repos_of(ticket).join(",")
                 );
-                let label = tip
-                    .as_ref()
-                    .map(|t| format!("\tin-flight {} {}", t.branch, format_age(t.age_secs)))
-                    .unwrap_or_default();
+                // Under --all every line has five fields: a ready ticket's
+                // fifth is empty, so `cut` and `awk` see one shape.
+                let label = match (tip, listing) {
+                    (Some(t), _) => {
+                        format!("\tin-flight {} {}", t.branch, format_age(t.age_secs))
+                    }
+                    (None, Listing::WithInFlight) => "\t".to_string(),
+                    (None, Listing::ReadyOnly) => String::new(),
+                };
                 let name = fit_name(
                     &ticket.name,
                     display_width(&prefix) + display_width(&label),

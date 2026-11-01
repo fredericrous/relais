@@ -183,7 +183,7 @@ fn the_frontier_lists_ready_tickets_and_follows_branches_and_resolutions() {
     let out = world.programme(&["frontier", "--all"]);
     assert_eq!(
         text(&out.stdout),
-        "B\ttask/afk\talpha\tName of B\nD\ttask/afk\talpha\tName of D\tin-flight prog/demo/D 0m\n"
+        "B\ttask/afk\talpha\tName of B\t\nD\ttask/afk\talpha\tName of D\tin-flight prog/demo/D 0m\n"
     );
 
     git(
@@ -490,13 +490,13 @@ fn an_in_flight_ticket_shows_its_branch_last_commit_age() {
     let out = world.programme(&["frontier", "--all"]);
     assert_eq!(
         text(&out.stdout),
-        "B\ttask/afk\talpha\tName of B\nD\ttask/afk\talpha\tName of D\tin-flight prog/demo/D 3h\n"
+        "B\ttask/afk\talpha\tName of B\t\nD\ttask/afk\talpha\tName of D\tin-flight prog/demo/D 3h\n"
     );
     let fields: Vec<usize> = text(&out.stdout)
         .lines()
         .map(|line| line.split('\t').count())
         .collect();
-    assert_eq!(fields, [4, 5]);
+    assert_eq!(fields, [5, 5]);
     let out = world.programme(&["show"]);
     assert!(text(&out.stdout).contains("In flight\n  Name of D (D): prog/demo/D 3h\n"));
 
