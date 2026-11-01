@@ -131,9 +131,13 @@ fn a_baseline_check_that_times_out_once_then_passes_is_not_unrunnable() {
 
 #[test]
 fn a_baseline_retry_draws_on_the_total_not_on_work() {
-    // The work budget is one second; the baseline spends more than that on
-    // its timed-out run and its re-run. Work has not begun then, so the run
-    // is not cut off by it.
+    // The baseline spends more than the work budget on its timed-out run
+    // (10 s) and its re-run; work has not begun then, so the run is not cut
+    // off by it. The work budget still has to hold the real work after the
+    // baseline (the worker, the candidate's git and verification): one
+    // second did not on a Windows runner, whose git is slow, and failed
+    // there as "the work budget … is exhausted". Six seconds leaves that
+    // room and stays well under the baseline's ten.
     let fixture = Fixture::new();
     let marker = fixture.dir.join("base-ran-once");
     let check = CommandSpec {
@@ -145,12 +149,12 @@ fn a_baseline_retry_draws_on_the_total_not_on_work() {
                 m = marker.display()
             ),
         ],
-        timeout_seconds: 2,
+        timeout_seconds: 10,
         ..passing_check()
     };
     let repo = fixture.repo_policy(vec![check], 3);
     let mut contract = fixture.contract(Review::Off);
-    contract.limits.wall_seconds = Some(1);
+    contract.limits.wall_seconds = Some(6);
     let outcome = fixture.execute(&contract, &repo, &conditional_worker(""));
     assert!(
         !matches!(&outcome.terminal, Terminal::BudgetExhausted { .. }),
