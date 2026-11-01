@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: build/ci-platform-schedule
 repos: [relais]
 canonical: decisions:docs/plans/2026-11-01-one-verdict-build.md
@@ -65,3 +65,8 @@ Design: decisions `docs/programmes/one-verdict-per-tree/t06-relais-ci-platform-s
 - **Shape of the matrix:** one `test` job whose matrix comes from `plan` (macOS always; ubuntu and windows when `run_other`), not separate `test-macos` and `test-other` jobs. The behaviour is equivalent, and the check names stay `test (<os>)`.
 - **Branch protection:** none on relais main (`gh api repos/fredericrous/relais/branches/main/protection` → 404), and squash, rebase and merge are all allowed. So a dropped matrix leg cannot block a PR, and nothing but the release guard stops an untested platform from shipping.
 - **Decision (the person, via the parent):** the macOS leg keeps the exact platform `aarch64-macos`. The laptop's `x86_64-macos` notes do not cover it.
+
+## Implementation review
+
+- Approve after a Delta. Round 1 was approve-with-changes: 2 blocking, 1 high, 2 medium and 1 low finding, all fixed in `63d1681a`. The Delta approved.
+- Follow-up, low: `grep` reads one line at a time, so a `cfg(any(` whose platform keyword is on the next line is not matched. `coordinator/mod.rs` has other matches, so nothing is missed today. Match a bare `cfg(any|all|not)(` at end of line later.
