@@ -405,10 +405,11 @@ mod tests {
             dangling_evidence: 0,
         };
         let listed = plan_run_prune(&root, 30 * DAY, later, &judge).unwrap();
+        // Probed while still locked: true only when this runs as root,
+        // which can list anything. Then the directory is no hidden case.
+        let still_listable = std::fs::read_dir(&hidden).is_ok();
         std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // Running as root can still list it; then nothing is hidden.
-        let hidden_from_us = std::fs::read_dir(&hidden).is_ok();
-        assert!(hidden_from_us || listed.is_empty(), "{listed:?}");
+        assert!(still_listable || listed.is_empty(), "{listed:?}");
         std::fs::remove_dir_all(&root).ok(); // best-effort scratch cleanup
     }
 
