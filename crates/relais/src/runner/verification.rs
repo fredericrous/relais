@@ -610,7 +610,7 @@ impl<'a> RunEngine<'a> {
                     })
                     .map_err(|e| {
                         VerifyFailure::Unavailable(format!(
-                            "the ledger refused a setup-log evidence row: {e}"
+                            "the ledger refused a setup-log or setup-timing row: {e}"
                         ))
                     })?;
                 match verify::setup_failure(&setup) {

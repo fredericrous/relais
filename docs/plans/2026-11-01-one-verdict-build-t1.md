@@ -31,3 +31,14 @@ Two decisions made while building:
 
 - **Schema:** a new table (`check_timings`, v47), not new columns on the receipt tables. The receipt keeps the per-check timing too, but reports read the table.
 - **Reused outcomes:** a cached baseline or an identical candidate is marked `cached`, with no fresh time claimed. `relais report` shows them as `(reused)`, so they never count as work.
+
+## Implementation review
+
+- **Verdict:** approve after one Delta. Round 1 was approve-with-changes (64k tokens, 67 s); the Delta approved (77k tokens, 21 s).
+- **Fixed:**
+  - `nearest_rank` is now read-only (the caller sorts once).
+  - Setup steps record timing rows too (`<prefix>-setup`, `base-setup`).
+  - A kept new-shape receipt fixture, `TIMED_RECEIPT_6`, joins the parse test.
+  - The setup error message now names both writes.
+- **Left open on purpose:** the live check (a real relais run, then `relais report --since …`) waits for the relais release. A branch binary would migrate the real ledger to v47 early, which has gone wrong on this machine before. The v47 migration is covered by the schema upgrade tests. After the release the check should show the receipt's `timing`, `-setup` rows, and `(reused)` rows on their own lines.
+- **Status:** phase T1 is built and reviewed. The relais release comes after S2.
