@@ -65,10 +65,17 @@ impl<'a> RunEngine<'a> {
             // A hit that kept the outcomes has written their logs into this
             // run's `logs/`: they are this run's evidence like any check's.
             Some(hit) => {
-                if let Some(checks) = &hit.checks {
+                let checks = hit.checks.map(|checks| {
+                    checks
+                        .into_iter()
+                        .map(verify::CheckOutcome::reused)
+                        .collect::<Vec<_>>()
+                });
+                if let Some(checks) = &checks {
                     self.record_logs(None, EvidenceKind::CheckLog, checks)?;
+                    self.record_check_timings("base", checks)?;
                 }
-                (hit.failures, hit.checks)
+                (hit.failures, checks)
             }
             None => match verify::verification_worktree(
                 self.config.git,
@@ -107,6 +114,7 @@ impl<'a> RunEngine<'a> {
                         Err(e) => return Err(e.into()),
                     };
                     self.record_logs(None, EvidenceKind::SetupLog, &setup)?;
+                    self.record_check_timings("base-setup", &setup)?;
                     if let Some(outcome) = self.end_if_cancelled()? {
                         if let Err(e) = baseline.release() {
                             eprintln!("relais: {e}");
@@ -151,6 +159,7 @@ impl<'a> RunEngine<'a> {
                         Err(e) => return Err(e.into()),
                     };
                     self.record_logs(None, EvidenceKind::CheckLog, &checks)?;
+                    self.record_check_timings("base", &checks)?;
                     if let Some(outcome) = self.end_if_cancelled()? {
                         if let Err(e) = baseline.release() {
                             eprintln!("relais: {e}");

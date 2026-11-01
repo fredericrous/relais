@@ -581,7 +581,11 @@ impl<'a> RunEngine<'a> {
             // The candidate is the base tree: the baseline's outcomes are
             // its outcomes, by identity — and the base's setup already
             // proved the setup, so it is not spent again either.
-            (Some(outcomes), _) => outcomes.to_vec(),
+            (Some(outcomes), _) => outcomes
+                .iter()
+                .cloned()
+                .map(verify::CheckOutcome::reused)
+                .collect(),
             (None, Some(holder)) => {
                 let setup = self
                     .while_watching_cancel(|cancel| {
@@ -601,9 +605,12 @@ impl<'a> RunEngine<'a> {
                     })
                     .map_err(VerifyFailure::from)?;
                 self.record_logs(None, EvidenceKind::SetupLog, &setup)
+                    .and_then(|()| {
+                        self.record_check_timings(&format!("{}-setup", label.log_prefix()), &setup)
+                    })
                     .map_err(|e| {
                         VerifyFailure::Unavailable(format!(
-                            "the ledger refused a setup-log evidence row: {e}"
+                            "the ledger refused a setup-log or setup-timing row: {e}"
                         ))
                     })?;
                 match verify::setup_failure(&setup) {
@@ -683,6 +690,8 @@ impl<'a> RunEngine<'a> {
                     .map_err(|e| format!("the ledger refused a junit-report evidence row: {e}"))?;
             }
         }
+        self.record_check_timings(&label.log_prefix(), &checks)
+            .map_err(|e| format!("the ledger refused a check-timing row: {e}"))?;
         let inventory = match (amont_on, holder.as_ref()) {
             (true, Some(holder)) => self.config.hooks.list(holder.path(), verify::Stage::Local),
             _ => Err(verify::InventoryError::NotAsked),

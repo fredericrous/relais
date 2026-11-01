@@ -194,6 +194,7 @@ mod tests {
             flaky_reason: None,
             applied_limit_ms: 0,
             clipped: false,
+            timing: None,
         }
     }
 
