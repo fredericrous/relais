@@ -81,6 +81,34 @@ class Touched(unittest.TestCase):
         self.assertEqual(verdict, "true")
         self.assertIn("crates/relais/src/ipc.rs: compiles per platform", reasons)
 
+    def test_every_cfg_form_is_platform_code(self):
+        forms = {
+            "macro": "fn a() -> bool { cfg!(windows) }\n",
+            "any": "#[cfg(any(unix, windows))]\nfn a() {}\n",
+            "all": "#[cfg(all(test, unix))]\nfn a() {}\n",
+            "not": "#[cfg(not(windows))]\nfn a() {}\n",
+            "target_os": "#[cfg(target_os = \"macos\")]\nfn a() {}\n",
+            "attr": "#[cfg_attr(unix, derive(Debug))]\nstruct A;\n",
+        }
+        for name, text in forms.items():
+            with self.subTest(form=name):
+                self.change("crates/relais/src/plain.rs", text)
+                verdict, reasons = self.verdict()
+                self.assertEqual(verdict, "true")
+                self.assertIn("crates/relais/src/plain.rs: compiles per platform", reasons)
+                git(self.repo, "reset", "-q", "--hard", self.base)
+
+    def test_a_cfg_that_names_no_platform_is_not_platform_code(self):
+        self.change("crates/relais/src/plain.rs", "#[cfg(test)]\nfn a() {}\n#[cfg(feature = \"x\")]\nfn b() {}\n")
+        self.assertEqual(self.verdict()[0], "false")
+
+    def test_a_deleted_source_file_cannot_be_inspected_so_it_counts(self):
+        git(self.repo, "rm", "-q", "crates/relais/src/plain.rs")
+        git(self.repo, "commit", "-q", "-m", "delete")
+        verdict, reasons = self.verdict()
+        self.assertEqual(verdict, "true")
+        self.assertIn("crates/relais/src/plain.rs: deleted, cannot inspect", reasons)
+
     def test_a_cfg_gated_test_is_not_platform_code(self):
         self.change("crates/relais/tests/it/x.rs", "#[cfg(unix)]\n#[test]\nfn t() {}\n")
         self.assertEqual(self.verdict()[0], "false")
@@ -149,14 +177,19 @@ class Plan(unittest.TestCase):
 
 
 class ReleasePlatforms(unittest.TestCase):
-    """The release waits for all three `test` legs on the tagged commit."""
+    """The release waits for all three `test` legs, in the push-to-main runs
+    of the tagged commit."""
 
-    def run_with(self, runs):
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-            json.dump({"check_runs": runs}, f)
-            path = f.name
+    def run_with(self, jobs):
+        """The guard over a {"jobs": [...]} fixture, in place of the API."""
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            if isinstance(jobs, str):
+                handle.write(jobs)
+            else:
+                json.dump({"jobs": jobs}, handle)
+            path = handle.name
         try:
-            env = dict(os.environ, CHECK_RUNS_JSON=path)
+            env = dict(os.environ, JOBS_JSON=path)
             return subprocess.run(["sh", script("ci-release-platforms.sh"), "abc123"],
                                   env=env, capture_output=True, text=True)
         finally:
@@ -165,31 +198,62 @@ class ReleasePlatforms(unittest.TestCase):
     def leg(self, os_name, conclusion="success"):
         return {"name": f"test ({os_name})", "conclusion": conclusion}
 
+    def fake_gh(self, directory, body):
+        """A `gh` on PATH that logs its arguments and answers as `body` says."""
+        path = os.path.join(directory, "gh")
+        with open(path, "w") as handle:
+            handle.write("#!/bin/sh\n" + body)
+        os.chmod(path, 0o755)
+        return dict(os.environ, PATH=directory + os.pathsep + os.environ["PATH"],
+                    GITHUB_REPOSITORY="o/r", GH_LOG=os.path.join(directory, "gh.log"))
+
     def test_every_leg_passed_releases(self):
         guard = self.run_with([self.leg("macos-latest"), self.leg("ubuntu-latest"),
-                                self.leg("windows-latest"), self.leg("lint", "success")])
+                               self.leg("windows-latest"), self.leg("lint", "success")])
         self.assertEqual(guard.returncode, 0, guard.stderr)
 
     def test_a_missing_or_failed_leg_blocks_and_is_named(self):
         guard = self.run_with([self.leg("macos-latest"), self.leg("ubuntu-latest"),
-                                self.leg("windows-latest", "failure")])
+                               self.leg("windows-latest", "failure")])
         self.assertEqual(guard.returncode, 1)
         self.assertIn("test (windows-latest)", guard.stderr)
         guard = self.run_with([self.leg("macos-latest")])
         self.assertEqual(guard.returncode, 1)
         self.assertIn("test (ubuntu-latest)", guard.stderr)
 
-    def test_an_unreadable_answer_blocks(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-            f.write("not json")
-            path = f.name
-        try:
-            env = dict(os.environ, CHECK_RUNS_JSON=path)
-            guard = subprocess.run(["sh", script("ci-release-platforms.sh"), "abc123"],
-                                    env=env, capture_output=True, text=True)
-        finally:
-            os.unlink(path)
+    def test_an_unreadable_answer_blocks_and_says_so(self):
+        guard = self.run_with("not json")
         self.assertEqual(guard.returncode, 1)
+        self.assertIn("::warning::check-runs query failed", guard.stderr)
+
+    def test_a_failing_gh_is_reported_with_its_reason_not_swallowed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = self.fake_gh(directory, 'echo "gh: HTTP 403 rate limited" >&2\nexit 1\n')
+            guard = subprocess.run(["sh", script("ci-release-platforms.sh"), "abc123"],
+                                   env=env, capture_output=True, text=True)
+        self.assertEqual(guard.returncode, 1)
+        self.assertIn("::warning::check-runs query failed", guard.stderr)
+        self.assertIn("HTTP 403 rate limited", guard.stderr)
+        self.assertIn("test (macos-latest)", guard.stderr)
+
+    def test_only_push_to_main_runs_count(self):
+        legs = json.dumps({"jobs": [self.leg("macos-latest"), self.leg("ubuntu-latest"),
+                                    self.leg("windows-latest")]})
+        body = (
+            'echo "$@" >> "$GH_LOG"\n'
+            'case "$*" in\n'
+            '  *actions/runs\\?head_sha=*) echo 101 ;;\n'
+            "  *actions/runs/101/jobs*) echo '" + legs + "' ;;\n"
+            "esac\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            env = self.fake_gh(directory, body)
+            guard = subprocess.run(["sh", script("ci-release-platforms.sh"), "abc123"],
+                                   env=env, capture_output=True, text=True)
+            with open(env["GH_LOG"]) as handle:
+                calls = handle.read()
+        self.assertEqual(guard.returncode, 0, guard.stderr)
+        self.assertIn("head_sha=abc123&event=push&branch=main", calls)
 
 
 if __name__ == "__main__":

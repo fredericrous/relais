@@ -256,10 +256,10 @@ jobs:
   # macOS, relais's primary platform; Ubuntu and Windows wait for the push
   # to main (ci.yaml, `plan`; decisions ADR-0041, `ci.platform-schedule`).
   # Deferring them is safe only because nothing ships until they passed:
-  # this waits for main's `test (<os>)` check runs on the tagged commit,
-  # which the release PR's merge started. Until relais's CI signs
-  # attestations (plan phase C2) the check runs are the evidence; C2
-  # switches this to the signatures, as amont's ci-release-gates.sh does.
+  # this waits for the `test (<os>)` jobs of the PUSH-TO-MAIN runs for the
+  # tagged commit (a pull request's run may have deferred legs, so it does
+  # not count), which the release PR's merge started.
+  # holds-until: relais CI signs attestations (plan C2); then read git-attest, as ci-release-gates.sh does
   # A dry run reports and does not block.
   platforms:
     name: every platform passed on main for this commit
@@ -267,7 +267,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
-      checks: read
+      actions: read
       contents: read
     steps:
       - uses: actions/checkout@v4

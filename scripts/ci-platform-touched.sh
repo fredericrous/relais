@@ -16,7 +16,11 @@
 # - what ships per platform: the installers;
 # - a product source file that compiles differently per platform:
 #   `cfg(windows)`, `cfg(unix)`, `cfg(target_os`, `cfg(target_family`, and
-#   their `not(`. This catches `ipc.rs` and `procs.rs`.
+#   their `not(`, `any(` and `all(`, in the attribute form (`#[cfg(...)]`,
+#   `cfg_attr`) and the macro form (`cfg!(windows)`). This catches `ipc.rs`,
+#   `procs.rs` and `tooling.rs`.
+# - a product source file the change deleted: it cannot be inspected, so it
+#   counts (fail-open).
 # A test that is merely `cfg(unix)` (crates/*/tests) does not count: it gates
 # where a test runs, not what the product does.
 #
@@ -32,7 +36,10 @@ if ! changed=$(git diff --name-only "$base"...HEAD 2> /dev/null); then
 fi
 
 touched=false
-cfg='cfg(_attr)?\((not\()?(windows|unix|target_os|target_family)'
+# Any platform keyword inside the parentheses of `cfg(`, `cfg_attr(` or
+# `cfg!(`, however nested (`cfg(all(test, unix))`). A keyword inside a string
+# (`feature = "windows-sys"`) also matches: that errs toward running more.
+cfg='cfg(_attr)?!?\([^)]*(windows|unix|target_os|target_family)'
 for f in $changed; do
   why=
   case $f in
@@ -40,7 +47,11 @@ for f in $changed; do
       | */Cargo.toml | rust-toolchain.toml | .cargo/* | install/*)
       why="builds or ships per platform" ;;
     crates/*/src/*)
-      if [ -f "$f" ] && grep -qE "$cfg" "$f"; then why="compiles per platform"; fi ;;
+      if [ ! -f "$f" ]; then
+        why="deleted, cannot inspect"
+      elif grep -qE "$cfg" "$f"; then
+        why="compiles per platform"
+      fi ;;
   esac
   if [ -n "$why" ]; then
     echo "$f: $why"

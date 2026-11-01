@@ -6,19 +6,23 @@
 # A pull request tests macOS, relais's primary platform. Ubuntu and Windows
 # are tested by the push to main (decisions ADR-0041, `ci.platform-schedule`).
 # So nothing is released until the CI `test` job has passed for this exact
-# commit on all three platforms. The release PR's merge starts main's CI
-# while the tag's release is already running, so this polls every 60 s, up
-# to --wait (default 0: ask once).
+# commit on all three platforms, in a run of the PUSH TO MAIN: a pull
+# request's run of the same commit does not count, because it may have
+# deferred the other legs. The release PR's merge starts main's CI while the
+# tag's release is already running, so this polls every 60 s, up to --wait
+# (default 0: ask once).
 #
-# Until relais's CI signs attestations (plan phase C2), the evidence is the
-# check runs GitHub records for the commit: `test (<os>)` with conclusion
-# `success`. A leg whose suite an attestation skipped still concludes
-# `success`. C2 switches this to the signed attestations, as amont's
-# ci-release-gates.sh asks git-attest.
+# holds-until: relais CI signs attestations (plan C2); then read git-attest, as ci-release-gates.sh does
 #
-# CHECK_RUNS_JSON names a file holding the API's answer, which the tests use
-# in place of `gh api`. Exit 0 when every leg passed; exit 1 naming each one
-# still missing.
+# Until then the evidence is the jobs of the push-to-main workflow runs for
+# the commit: `test (<os>)` with conclusion `success`. A leg whose suite an
+# attestation skipped still concludes `success`.
+#
+# JOBS_JSON names a file holding {"jobs": [...]} in place of the API, which
+# the tests use. A failed `gh` call prints a ::warning:: with its reason and
+# counts as "nothing passed yet", so the wait goes on and the final failure
+# says why. Exit 0 when every leg passed; exit 1 naming each one still
+# missing.
 set -eu
 
 sha=${1:?usage: ci-release-platforms.sh <sha> [--wait SECONDS]}
@@ -35,17 +39,31 @@ required='test (macos-latest)
 test (ubuntu-latest)
 test (windows-latest)'
 
-# The names of the check runs that concluded `success` for the commit.
-passed() {
-  if [ -n "${CHECK_RUNS_JSON:-}" ]; then
-    cat "$CHECK_RUNS_JSON"
-  else
-    gh api --paginate "repos/${GITHUB_REPOSITORY:?}/commits/$sha/check-runs?per_page=100" 2> /dev/null || true
-  fi | jq -r '.check_runs[]? | select(.conclusion == "success") | .name' 2> /dev/null || true
+# The jobs of every push-to-main run for the commit, as one {"jobs": [...]}.
+fetch_jobs() {
+  if [ -n "${JOBS_JSON:-}" ]; then
+    cat "$JOBS_JSON"
+    return
+  fi
+  repo=${GITHUB_REPOSITORY:?}
+  if ! runs=$(gh api "repos/$repo/actions/runs?head_sha=$sha&event=push&branch=main&per_page=100" --jq '.workflow_runs[].id'); then
+    echo "::warning::check-runs query failed: could not list the push-to-main runs for $sha" >&2
+    echo '{"jobs": []}'
+    return
+  fi
+  for run in $runs; do
+    if ! gh api --paginate "repos/$repo/actions/runs/$run/jobs?per_page=100" --jq '{jobs: [.jobs[] | {name, conclusion}]}'; then
+      echo "::warning::check-runs query failed: could not read the jobs of run $run" >&2
+    fi
+  done | jq -s '{jobs: (map(.jobs) | add // [])}'
 }
 
 check() {
-  have=$(passed)
+  jobs=$(fetch_jobs)
+  if ! have=$(printf '%s' "$jobs" | jq -r '.jobs[]? | select(.conclusion == "success") | .name'); then
+    echo "::warning::check-runs query failed: the answer was not readable JSON" >&2
+    have=
+  fi
   missing=
   while IFS= read -r leg; do
     if ! printf '%s\n' "$have" | grep -qxF "$leg"; then missing="$missing
@@ -59,12 +77,12 @@ EOF
 started=$(date +%s)
 while :; do
   if check; then
-    echo "ci-release-platforms: $sha passed test on macOS, Ubuntu and Windows"
+    echo "ci-release-platforms: $sha passed test on macOS, Ubuntu and Windows on main"
     exit 0
   fi
   elapsed=$(( $(date +%s) - started ))
   if [ "$elapsed" -ge "$wait" ]; then
-    echo "ci-release-platforms: $sha has not passed, after ${elapsed}s:$missing" >&2
+    echo "ci-release-platforms: $sha has not passed on main, after ${elapsed}s:$missing" >&2
     echo "ci-release-platforms: let main's CI finish on this commit (or re-run it), then re-run this release" >&2
     exit 1
   fi
