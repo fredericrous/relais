@@ -105,30 +105,30 @@ impl Ledger {
             .map(|((label, cached), items)| {
                 let mut run: Vec<u64> = items.iter().map(|i| i.1).collect();
                 let mut wait: Vec<u64> = items.iter().map(|i| i.2).collect();
+                run.sort_unstable();
+                wait.sort_unstable();
                 CheckTimingStats {
                     label,
                     cached,
                     runs: items.len() as u64,
                     retries: items.iter().filter(|i| i.0 > 0).count() as u64,
-                    run_ms_p50: nearest_rank(&mut run, 50),
-                    run_ms_p90: nearest_rank(&mut run, 90),
-                    slot_wait_ms_p50: nearest_rank(&mut wait, 50),
-                    slot_wait_ms_p90: nearest_rank(&mut wait, 90),
+                    run_ms_p50: nearest_rank(&run, 50),
+                    run_ms_p90: nearest_rank(&run, 90),
+                    slot_wait_ms_p50: nearest_rank(&wait, 50),
+                    slot_wait_ms_p90: nearest_rank(&wait, 90),
                 }
             })
             .collect())
     }
 }
 
-/// The nearest-rank percentile `p` of `values` (sorted in place); 0 for
-/// none.
-fn nearest_rank(values: &mut [u64], p: usize) -> u64 {
-    if values.is_empty() {
+/// The nearest-rank percentile `p` of `sorted` (ascending); 0 for none.
+fn nearest_rank(sorted: &[u64], p: usize) -> u64 {
+    if sorted.is_empty() {
         return 0;
     }
-    values.sort_unstable();
-    let rank = (p * values.len()).div_ceil(100).max(1);
-    values[rank - 1]
+    let rank = (p * sorted.len()).div_ceil(100).max(1);
+    sorted[rank - 1]
 }
 
 #[cfg(test)]
@@ -210,9 +210,9 @@ mod tests {
 
     #[test]
     fn nearest_rank_is_the_ceiling_rank() {
-        assert_eq!(nearest_rank(&mut [], 50), 0);
-        assert_eq!(nearest_rank(&mut [7], 90), 7);
-        assert_eq!(nearest_rank(&mut [1, 2, 3, 4], 50), 2);
-        assert_eq!(nearest_rank(&mut [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 90), 9);
+        assert_eq!(nearest_rank(&[], 50), 0);
+        assert_eq!(nearest_rank(&[7], 90), 7);
+        assert_eq!(nearest_rank(&[1, 2, 3, 4], 50), 2);
+        assert_eq!(nearest_rank(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 90), 9);
     }
 }

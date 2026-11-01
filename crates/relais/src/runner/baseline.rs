@@ -114,6 +114,7 @@ impl<'a> RunEngine<'a> {
                         Err(e) => return Err(e.into()),
                     };
                     self.record_logs(None, EvidenceKind::SetupLog, &setup)?;
+                    self.record_check_timings("base-setup", &setup)?;
                     if let Some(outcome) = self.end_if_cancelled()? {
                         if let Err(e) = baseline.release() {
                             eprintln!("relais: {e}");

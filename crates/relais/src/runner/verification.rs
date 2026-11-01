@@ -605,6 +605,9 @@ impl<'a> RunEngine<'a> {
                     })
                     .map_err(VerifyFailure::from)?;
                 self.record_logs(None, EvidenceKind::SetupLog, &setup)
+                    .and_then(|()| {
+                        self.record_check_timings(&format!("{}-setup", label.log_prefix()), &setup)
+                    })
                     .map_err(|e| {
                         VerifyFailure::Unavailable(format!(
                             "the ledger refused a setup-log evidence row: {e}"
