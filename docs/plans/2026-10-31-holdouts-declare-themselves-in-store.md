@@ -148,6 +148,7 @@ inputs = ["Cargo.toml", "crates/relais/Cargo.toml"]
 - 2026-11-02 — Implementation review, round 1, found two trust holes, both fixed:
   - The plugin dialog cut a review at 40 lines but still offered Confirm. A review too long for the dialog now offers only Not now and sends the person to `relais trust holdouts` in a terminal.
   - The model could confirm a holdout itself in Bash. The plugin guard now refuses `relais trust holdouts --accept`, and `holdout_confirmations.confirmed_via` records `plugin` or `cli` (ledger v48 is unreleased, so the column is part of its migration).
+- 2026-11-02 — The Delta found that the first fix moved long reviews to the terminal, which printed store text unescaped. An escape sequence or `\r` in a script could redraw lines the person reads before accepting. `relais trust holdouts` now renders each review through `trust::holdout_review_lines`, which escapes every store-supplied line with `escape_display`, the escaping the plugin dialog uses. Test: `a_review_escapes_control_characters_in_store_text`. The renderer lives in `trust`, not in `holdout`: `holdout` calling `trust` closes a module cycle.
 - 2026-11-02 — "A successor of such a run skips definition-change detection" was built as: a successor whose own store is unreachable skips the comparison (`a_successor_whose_store_is_unreachable_reports_no_definition_change`). The opposite case (a predecessor whose store was unreachable) freezes no store holdout, so there is nothing to compare.
 
 ## Verification
