@@ -211,7 +211,7 @@ inputs = ["Cargo.toml", "crates/relais/Cargo.toml"]
 
 ## Implementation review
 
-- **Verdict:** approve, after round 1 (approve-with-changes), a Delta (approve-with-changes with one new blocker) and a tree bind (approve).
+- **Verdict:** approve. The rounds were: round 1 (approve-with-changes); a Delta (approve-with-changes with one new blocker); a tree bind (approve); and a second bind (approve) after Windows CI showed a test writing a path into a TOML basic string, now a literal string.
 - **Fixed:**
   - Three trust holes: a dialog that cut the review short while still offering Confirm; the model able to confirm through Bash; store text printed unescaped in the terminal.
   - Five code-rule violations: a flag argument, a done-line on stdout, two out-parameters, and weak names.
@@ -220,7 +220,7 @@ inputs = ["Cargo.toml", "crates/relais/Cargo.toml"]
   - The candidate prints of the review and listings go to stdout, because they are the data the caller asked for.
   - Test-only statics and panics.
   - Std `Option`/`Result` wildcard arms.
-- **Cost:** 131k + 147k + 154k tokens, 152 s + 49 s + 26 s.
+- **Cost:** 131k + 147k + 154k + 157k tokens, 152 s + 49 s + 26 s + 16 s.
 
 ## Outcome
 
