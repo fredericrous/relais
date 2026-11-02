@@ -1,0 +1,13 @@
+amont-attest-v2
+tree ae5eb5921ade83367db8b6daa3b6ca438c44322d
+gates pre-push-cargo-test
+platform x86_64-windows
+canon c74eacc24dd8ac7c46f00f6d8e07b03bdf00de75
+amont attest-sign-windows-latest
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgwe+FHUie+0YKuEzx3YjiV6jyIC
+F0veynb1B9mEPADfwAAAAMYW1vbnQtYXR0ZXN0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3Nz
+aC1lZDI1NTE5AAAAQOzo5zOWuF2fE3LQUwhIgO5FEtQWt+Hafg/t3YU8yAkXS3DKoZCTfT
+jT/F+sURCvwi2aYb85lw5O8WiFLllqLw4=
+-----END SSH SIGNATURE-----
