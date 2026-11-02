@@ -282,37 +282,11 @@ fn trust_holdouts(
         println!("trust holdouts: the store declares no holdout for {repo}");
     }
     for review in &reviews {
-        println!("holdout {}: {}", review.name, review.state.as_str());
-        if let (Some(sha), Some(fingerprint)) = (&review.store_sha, &review.fingerprint) {
-            println!("  store sha:   {sha}");
-            println!("  fingerprint: {fingerprint}");
-        }
-        if let Some(declaration) = &review.declaration {
-            let text = operational(
-                serde_json::to_string_pretty(declaration),
-                "rendering the declaration",
-            )?;
-            println!("  declaration:");
-            for line in text.lines() {
-                println!("    {line}");
-            }
-        }
-        for diff in &review.diffs {
-            println!("  {} {}:", diff.change, diff.path);
-            for line in diff.text.lines() {
-                println!("    {line}");
-            }
-        }
-        if matches!(
-            review.state,
-            relais::holdout::ConfirmationState::New | relais::holdout::ConfirmationState::Changed
-        ) {
-            println!(
-                "  accept: relais trust holdouts --accept {} --sha {} --fingerprint {}",
-                review.name,
-                review.store_sha.as_deref().unwrap_or_default(),
-                review.fingerprint.as_deref().unwrap_or_default()
-            );
+        for line in operational(
+            relais::trust::holdout_review_lines(review),
+            "rendering the review",
+        )? {
+            println!("{line}");
         }
     }
     Ok(CliOutcome::Accepted)
