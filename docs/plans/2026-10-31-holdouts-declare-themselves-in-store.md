@@ -119,7 +119,7 @@ inputs = ["Cargo.toml", "crates/relais/Cargo.toml"]
 
 ## Phases
 
-- [ ] Phase 1 — relais:
+- [ ] Phase 1 — relais (built and reviewed 2026-11-02; only the release is left):
   - store discovery at preflight: one sha, the cached shallow fetch, the 30 s bound;
   - `holdout.toml` with the defaults above, and `RELAIS_HOLDOUT_JUNIT`;
   - machine.toml override and `enabled = false`;
@@ -145,6 +145,9 @@ inputs = ["Cargo.toml", "crates/relais/Cargo.toml"]
   - B1 (verification gap): one clippy `type_complexity` fix in a test.
   - B2 and C (scope_exceeded): the overflows were the `HoldoutUnconfirmed` BlockCode in `policy/mod.rs` (4 lines) and `UNCONFIRMED_OUTCOME` in `preflight.rs` (1 line). Both are required by this plan; the contracts left those files out.
 - 2026-11-02 — On the rebase onto main, A1's store fetch at preflight turned a 4 s total-budget test into `holdout_unfetchable`. A fetch cut short by a spent budget now ends on that budget (`runner/holdouts.rs`, ADR-0010).
+- 2026-11-02 — Implementation review, round 1, found two trust holes, both fixed:
+  - The plugin dialog cut a review at 40 lines but still offered Confirm. A review too long for the dialog now offers only Not now and sends the person to `relais trust holdouts` in a terminal.
+  - The model could confirm a holdout itself in Bash. The plugin guard now refuses `relais trust holdouts --accept`, and `holdout_confirmations.confirmed_via` records `plugin` or `cli` (ledger v48 is unreleased, so the column is part of its migration).
 - 2026-11-02 — "A successor of such a run skips definition-change detection" was built as: a successor whose own store is unreachable skips the comparison (`a_successor_whose_store_is_unreachable_reports_no_definition_change`). The opposite case (a predecessor whose store was unreachable) freezes no store holdout, so there is nothing to compare.
 
 ## Verification
@@ -176,7 +179,25 @@ inputs = ["Cargo.toml", "crates/relais/Cargo.toml"]
   - `relais doctor` on an isolated config with a local store lists the discovered holdouts with their source and confirmation state.
   - The run on this change records `holdout_settled` for `report-json` with exit 0, and a JUnit file with 0 failures.
 - Phase 1, observed on 2026-11-02 (input → expected → actual):
-  - Unit and runner tests for every item above: they pass in `cargo test -p relais` (full suite, 450 s on C's tree). The named tests are in `holdout/fingerprint.rs`, `holdout/confirmation.rs`, `runner/tests/holdouts.rs`, `tests/it/holdout_visibility.rs` and `tests/it/holdout_report.rs`.
+  - Each item above was run by name on the tree being pushed, the rebased branch with the review fixes. Every one prints `... ok`. The full suite also passes: 2510 passed, 0 failed.
+    - Defaults: `a_store_holdout_without_a_toml_takes_every_default`.
+    - A toml with every key: `a_store_holdout_toml_with_every_key_is_read`.
+    - A toml with none: `a_store_holdout_toml_with_no_key_is_all_defaults`.
+    - An unclean path: `a_store_path_that_is_not_clean_is_refused_naming_the_file`.
+    - An invalid toml: `an_invalid_store_holdout_toml_refuses_the_run_naming_the_file`.
+    - The machine.toml override and `enabled = false`: `a_machine_table_replaces_the_store_declaration_and_enabled_false_removes_it`.
+    - The digest: `the_digest_changes_with_the_source_the_timeout_the_inputs_and_the_attach`, `the_legacy_formula_ignores_source_timeout_inputs_and_attach`, `a_definition_frozen_without_a_digest_version_compares_under_the_old_formula`.
+    - A store-only holdout attaches and writes its JUnit: `a_holdout_only_the_store_declares_attaches_runs_and_writes_to_the_given_report_path`.
+    - One store sha per preflight: `one_preflight_asks_the_store_once_and_freezes_every_holdout_at_that_commit`.
+    - The fetch count and concurrency: `preflights_at_one_commit_fetch_the_store_once_and_concurrent_ones_leave_one_tree`.
+    - An unreachable store: `an_unreachable_store_ends_discovery_within_the_bound_and_refuses_a_named_holdout_as_unreadable`.
+    - Successors: `a_successor_of_a_run_frozen_before_digest_versions_reports_no_definition_change`, `a_successor_whose_store_is_unreachable_reports_no_definition_change`.
+    - Confirmation: `a_new_store_holdout_is_skipped_when_attached_refused_when_named_and_runs_once_confirmed`, `any_change_to_a_confirmed_store_holdout_asks_again_before_it_can_execute`, `a_store_commit_between_display_and_acceptance_is_refused_as_stale_and_the_new_version_cannot_run`, `a_confirmed_snapshot_survives_cache_eviction_and_the_review_still_diffs_against_it`.
+    - Overlays and supplied contents: `a_directory_overlay_hashes_nested_bytes_and_modes_in_path_order`, `supplied_contents_altered_after_preflight_refuse_execution_before_the_command_starts`.
+    - Symlinks: `a_store_symlink_anywhere_in_a_holdout_is_refused_at_discovery_unread`, `a_symlink_anywhere_in_the_supplied_contents_is_refused_unread`.
+    - Keys and shadowing: `a_confirmation_is_keyed_by_store_repository_and_name`, `the_review_lists_a_store_holdout_a_machine_table_shadows_as_shadowed`.
+    - Listings: `doctor_lists_each_discovered_holdout_with_its_source_and_confirmation_state`, `plan_json_marks_an_attached_store_holdout_that_is_not_confirmed`, `the_report_counts_an_unconfirmed_skip_apart_from_other_skips`.
+    - Review fixes: the consent tests `a review too long for the dialog offers no confirmation` and `the guard keeps the model from confirming a store holdout itself`, both passing under `make plugin`; and `a_confirmation_records_who_asked_the_person`.
   - Pilot of the branch binary, with isolated `HOME`/`RELAIS_CONFIG_DIR`/`RELAIS_STATE_DIR` and a local store declaring `demo/report-json` (holdout.toml with attach):
     - `relais trust holdouts` → `new`, with sha, fingerprint, declaration and diff. Actual: as expected.
     - `--accept` with a wrong fingerprint → refused as stale, exit 3. Actual: as expected.
