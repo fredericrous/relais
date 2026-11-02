@@ -49,3 +49,9 @@ The architect's earlier "relais owns it" (2026-11-01) assumed relais was the
 runner, so it no longer applies. The person's lean, "relais should hold the
 cluster lease but let the architect decide", is answered by the architect
 seat. The wire contract in the notes above carries over unchanged.
+
+**Superseded for the first slice** (2026-11-02): amont ADR-0016 ("a gate may
+run on the cluster", amont#397) uses no Lease and no `amont-cluster` crate. A
+slot is a fixed Job name, `amont-gate-slot-<k>`; the Job is the lock and its
+UID is the fence. Worker pods (t02) revisit it, and
+[t26](t26-execution-service.md) may replace the mechanism.
