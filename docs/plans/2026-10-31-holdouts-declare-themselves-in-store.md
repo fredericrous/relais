@@ -209,6 +209,19 @@ inputs = ["Cargo.toml", "crates/relais/Cargo.toml"]
   - "The run on this change records `holdout_settled` for `report-json`": not met by a relais run. A2 skipped both attached holdouts because its budget was spent, and B2 and C stopped on scope before verification. Instead, both store holdouts were run by hand on the rebased branch tree: `report-json` passed 25/25, `report-values` 19/19, exit 0.
 - Phase 3: the person's machine.toml has no per-holdout table. After the person confirms both holdouts once, `relais plan --json` on a `feature` contract touching `crates/relais/src/report/` shows `report-json` and `report-values` under `holdouts.attached`, and `relais doctor` lists both with source `store`, confirmed.
 
+## Implementation review
+
+- **Verdict:** approve, after round 1 (approve-with-changes), a Delta (approve-with-changes with one new blocker) and a tree bind (approve).
+- **Fixed:**
+  - Three trust holes: a dialog that cut the review short while still offering Confirm; the model able to confirm through Bash; store text printed unescaped in the terminal.
+  - Five code-rule violations: a flag argument, a done-line on stdout, two out-parameters, and weak names.
+  - The verification record, now per test on the pushed tree.
+- **Deliberate:**
+  - The candidate prints of the review and listings go to stdout, because they are the data the caller asked for.
+  - Test-only statics and panics.
+  - Std `Option`/`Result` wildcard arms.
+- **Cost:** 131k + 147k + 154k tokens, 152 s + 49 s + 26 s.
+
 ## Outcome
 
 (Filled when the plan closes.)
