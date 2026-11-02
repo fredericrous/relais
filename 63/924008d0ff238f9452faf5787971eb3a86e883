@@ -1,0 +1,16 @@
+amont-provenance-v1
+commit 63924008d0ff238f9452faf5787971eb3a86e883
+tree d9afe09b7c7efe21cff333449406fab97c22c026
+canon 6b51f4e29b1b992c562a48d45314de0eb3d7fcb9
+patch 3e12dd52ad7c76202e27f9296740a010607c6559
+plan docs/plans/2026-10-31-holdouts-declare-themselves-in-store.md c4fc14d16a905e159c5bc674f03e0420c611e547ca8d664a6124a9121b3955ab
+review reviewed cec8b2a511529f1ba5ce644feb122401a148c4c01bec55febd9aefaf8cc182b6
+preview not-required
+producer amont-agent 3.13.1
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAECJHpB5xRUbWTTePbIGBfq1tl4iMgHRN4sbtZNY2UXyFq9xw5
+FlF0UrGIlBL2kKHkq7NsQ5fVjSRBNJj8s+04oL
+-----END SSH SIGNATURE-----
