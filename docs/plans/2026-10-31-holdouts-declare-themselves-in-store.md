@@ -139,6 +139,13 @@ inputs = ["Cargo.toml", "crates/relais/Cargo.toml"]
 - 2026-10-31 — Declarations move into the store, not into a second machine-wide file, because the script and its declaration change together and belong in one commit. The person: "the less we have to declare in machine.toml the better devx".
 - 2026-10-31 — Trust is confirm on change, not warn: the person asked, "when we hit that case (I mean toml changes coz of someone else) we get ask for confirmation otherwise it is automatic?" Any change asks, because git cannot tell who pushed. A changed command never runs before it is confirmed.
 - 2026-10-31 — machine.toml tables keep precedence, so nothing breaks before Phase 3, and a person can still override a store holdout locally.
+- 2026-11-01/02 — Phase 1 was built in five relais runs (A1, A2, B1, B2, C). Each candidate was finished by hand, with no paid second round (the cost-saving rule):
+  - A1 (budget_exhausted → verify starved): clippy `large_enum_variant` (boxed `HoldoutTable::Declared`); the test-only `fetch_count` moved to `test_support`, because `check-module-cycles` allows one trailing `mod tests`; the store fixture sets `core.hooksPath`, because the machine's shellcheck hook judged the fixture's scripts.
+  - A2 (budget_exhausted): applied as-is.
+  - B1 (verification gap): one clippy `type_complexity` fix in a test.
+  - B2 and C (scope_exceeded): the overflows were the `HoldoutUnconfirmed` BlockCode in `policy/mod.rs` (4 lines) and `UNCONFIRMED_OUTCOME` in `preflight.rs` (1 line). Both are required by this plan; the contracts left those files out.
+- 2026-11-02 — On the rebase onto main, A1's store fetch at preflight turned a 4 s total-budget test into `holdout_unfetchable`. A fetch cut short by a spent budget now ends on that budget (`runner/holdouts.rs`, ADR-0010).
+- 2026-11-02 — "A successor of such a run skips definition-change detection" was built as: a successor whose own store is unreachable skips the comparison (`a_successor_whose_store_is_unreachable_reports_no_definition_change`). The opposite case (a predecessor whose store was unreachable) freezes no store holdout, so there is nothing to compare.
 
 ## Verification
 
@@ -168,6 +175,16 @@ inputs = ["Cargo.toml", "crates/relais/Cargo.toml"]
     - symlinks: a store whose `&lt;repo&gt;/&lt;name&gt;` directory, `holdout.toml`, `check.sh`, config, an intermediate path component, or a nested overlay file is a symlink (external target, and a cycle) is refused at discovery and at verification, with no read of the target.
   - `relais doctor` on an isolated config with a local store lists the discovered holdouts with their source and confirmation state.
   - The run on this change records `holdout_settled` for `report-json` with exit 0, and a JUnit file with 0 failures.
+- Phase 1, observed on 2026-11-02 (input → expected → actual):
+  - Unit and runner tests for every item above: they pass in `cargo test -p relais` (full suite, 450 s on C's tree). The named tests are in `holdout/fingerprint.rs`, `holdout/confirmation.rs`, `runner/tests/holdouts.rs`, `tests/it/holdout_visibility.rs` and `tests/it/holdout_report.rs`.
+  - Pilot of the branch binary, with isolated `HOME`/`RELAIS_CONFIG_DIR`/`RELAIS_STATE_DIR` and a local store declaring `demo/report-json` (holdout.toml with attach):
+    - `relais trust holdouts` → `new`, with sha, fingerprint, declaration and diff. Actual: as expected.
+    - `--accept` with a wrong fingerprint → refused as stale, exit 3. Actual: as expected.
+    - `--accept` with the printed sha and fingerprint → `confirmed at <sha>`. Actual: as expected.
+    - `relais doctor` → `holdouts report-json source store confirmed`. Actual: as expected.
+    - The store script changed → `changed`, in the review and in doctor. Actual: as expected.
+    - `relais plan --json` on a feature contract touching `src/**` → attached with `"unconfirmed": true, "confirmation": "changed"`, and the text says it is skipped until accepted. Actual: as expected.
+  - "The run on this change records `holdout_settled` for `report-json`": not met by a relais run. A2 skipped both attached holdouts because its budget was spent, and B2 and C stopped on scope before verification. Instead, both store holdouts were run by hand on the rebased branch tree: `report-json` passed 25/25, `report-values` 19/19, exit 0.
 - Phase 3: the person's machine.toml has no per-holdout table. After the person confirms both holdouts once, `relais plan --json` on a `feature` contract touching `crates/relais/src/report/` shows `report-json` and `report-values` under `holdouts.attached`, and `relais doctor` lists both with source `store`, confirmed.
 
 ## Outcome
