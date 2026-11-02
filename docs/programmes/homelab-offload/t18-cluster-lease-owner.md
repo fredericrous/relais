@@ -54,4 +54,4 @@ seat. The wire contract in the notes above carries over unchanged.
 run on the cluster", amont#397) uses no Lease and no `amont-cluster` crate. A
 slot is a fixed Job name, `amont-gate-slot-<k>`; the Job is the lock and its
 UID is the fence. Worker pods (t02) revisit it, and
-[t26](t26-execution-service.md) may replace the mechanism.
+[t26](t26-execution-service.md) asks how handed-over work outlives the laptop.
