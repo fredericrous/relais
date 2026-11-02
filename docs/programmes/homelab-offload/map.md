@@ -43,6 +43,7 @@ production.
 
 ## Decisions so far
 
+- [How work handed to the cluster outlives the laptop](t26-execution-service.md): two lanes; commit-blocking gates keep the kubectl executor, everything else becomes an Argo Workflow (already installed) fed by a Forgejo snapshot (real parent) or a pull-mirror; Argo holds slots, cancel and 7-day results; the laptop stays the only signer and collects on wake (t25 reopens with worker pods); next: a build plan.
 - [Where the pod's attestation signing key lives](t25-pod-signing-key.md): nowhere new; the laptop's amont signs from Kubernetes-recorded facts (exit code, imageID, Job spec), one Job per gate, Job-create fenced to the coordinator.
 - [Which slice ships first and alone](t15-first-slice.md): amont runs `platform=any` gates (lint, types, cycles) on wk-3, one Job per gate, laptop-signed; enabled after the t13 window.
 - [Which tool runs a gate on the cluster](t21-remote-runner-owner.md): amont, behind a `platform=any` gate and a per-repo opt-in; the pod returns a signed attestation; relais keeps calling `amont run --stamp` (architect seat).
