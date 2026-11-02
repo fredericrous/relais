@@ -3359,6 +3359,7 @@ fn record_confirmation(
             fingerprint: &snapshot.fingerprint,
             store_sha: &snapshot.store_sha,
             snapshot_json: &snapshot_json,
+            confirmed_via: "cli",
         })
         .expect("recorded");
 }

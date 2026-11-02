@@ -153,6 +153,7 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
             accept,
             sha,
             fingerprint,
+            source,
             json,
         } => trust_holdouts(
             &root,
@@ -161,7 +162,8 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                 .as_deref()
                 .zip(sha.as_deref())
                 .zip(fingerprint.as_deref()),
-            json,
+            source,
+            super::programme::Format::from_json_flag(json),
         ),
     }
 }
@@ -172,8 +174,10 @@ fn trust_holdouts(
     root: &std::path::Path,
     machine: &relais::policy::MachineSettings,
     accept: Option<((&str, &str), &str)>,
-    json: bool,
+    source: super::GrantSource,
+    format: super::programme::Format,
 ) -> Result<CliOutcome, CliError> {
+    let json = format == super::programme::Format::Json;
     let repo = relais::repo::main_checkout_name(root).unwrap_or_default();
     let cache =
         relais::runner::holdout_root(&paths::runs_dir().map_err(CliError::Home)?).join("cache");
@@ -235,6 +239,7 @@ fn trust_holdouts(
                 fingerprint: &snapshot.fingerprint,
                 store_sha: &snapshot.store_sha,
                 snapshot_json: &snapshot_json,
+                confirmed_via: source.as_str(),
             }),
             "recording the confirmation",
         )?;
@@ -246,7 +251,7 @@ fn trust_holdouts(
                 "fingerprint": snapshot.fingerprint,
             }))?;
         } else {
-            println!(
+            eprintln!(
                 "trust holdouts: `{name}` confirmed at {} ({})",
                 snapshot.store_sha, snapshot.fingerprint
             );

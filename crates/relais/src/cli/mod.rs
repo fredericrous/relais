@@ -769,6 +769,9 @@ pub(crate) enum TrustCommand {
         /// The fingerprint the review printed
         #[arg(long, requires = "accept")]
         fingerprint: Option<String>,
+        /// Who asked the person: `cli` (typed in a shell) or `plugin`
+        #[arg(long, value_enum, default_value_t = GrantSource::Cli)]
+        source: GrantSource,
         /// Machine-readable output
         #[arg(long)]
         json: bool,
@@ -782,7 +785,7 @@ pub(crate) enum GrantSource {
 }
 
 impl GrantSource {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             GrantSource::Cli => "cli",
             GrantSource::Plugin => "plugin",

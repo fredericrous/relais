@@ -161,7 +161,7 @@ fn supplied_files(tree: &Path, relative: &str) -> Result<Vec<Entry>, SuppliedRef
     let meta = std::fs::symlink_metadata(&top).map_err(|e| unreadable(relative, &e))?;
     let mut files = Vec::new();
     if meta.is_dir() {
-        collect(&top, "", relative, &mut files)?;
+        files = collect(&top, "", relative)?;
     } else if meta.is_file() {
         files.push((String::new(), mode_of(&meta), hash_of(&top, relative)?));
     } else {
@@ -174,12 +174,10 @@ fn supplied_files(tree: &Path, relative: &str) -> Result<Vec<Entry>, SuppliedRef
     Ok(files)
 }
 
-fn collect(
-    dir: &Path,
-    inside: &str,
-    shown: &str,
-    files: &mut Vec<Entry>,
-) -> Result<(), SuppliedRefusal> {
+/// Every file below `dir`, recursively; `inside` is `dir`'s path within the
+/// supplied directory and `shown` its path as a refusal names it.
+fn collect(dir: &Path, inside: &str, shown: &str) -> Result<Vec<Entry>, SuppliedRefusal> {
+    let mut files = Vec::new();
     let entries = std::fs::read_dir(dir).map_err(|e| unreadable(shown, &e))?;
     for entry in entries {
         let entry = entry.map_err(|e| unreadable(shown, &e))?;
@@ -199,7 +197,7 @@ fn collect(
         if kind.is_symlink() {
             return Err(symlink(&shown_here));
         } else if kind.is_dir() {
-            collect(&entry.path(), &here, &shown_here, files)?;
+            files.extend(collect(&entry.path(), &here, &shown_here)?);
         } else if kind.is_file() {
             files.push((here, mode_of(&meta), hash_of(&entry.path(), &shown_here)?));
         } else {
@@ -209,7 +207,7 @@ fn collect(
             });
         }
     }
-    Ok(())
+    Ok(files)
 }
 
 fn hash_of(path: &Path, shown: &str) -> Result<String, SuppliedRefusal> {

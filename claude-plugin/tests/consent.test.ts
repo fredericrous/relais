@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import { allowLabel, escapeDisplay, withRoutingSection, NOT_NOW, onboardTool, onPersonPrompt, question2, trustHoldoutsTool, trustTool, USE_CHECKS, type Shown } from '../hooks/consent.ts'
-import { machineSettingsGuard, MACHINE_SETTINGS_MESSAGE } from '../hooks/guards.ts'
+import { HOLDOUT_CONFIRM_MESSAGE, machineSettingsGuard, MACHINE_SETTINGS_MESSAGE } from '../hooks/guards.ts'
 import { createStore } from '../hooks/store.ts'
 import { pump } from '../hooks/runs.ts'
 
@@ -314,6 +314,15 @@ test('the guard keeps the model off machine.toml', async () => {
   expect(machineSettingsGuard('Write', { file_path: '/repo/relais.toml' }, env)).toBe(undefined)
 })
 
+test('the guard keeps the model from confirming a store holdout itself', async () => {
+  const env = { home: '/home/p' }
+  const accept = 'relais trust holdouts --accept report-json --sha abc --fingerprint v1:x'
+  expect(machineSettingsGuard('Bash', { command: accept }, env)).toBe(HOLDOUT_CONFIRM_MESSAGE)
+  expect(machineSettingsGuard('Bash', { command: `cd /repo && ${accept} --json` }, env)).toBe(HOLDOUT_CONFIRM_MESSAGE)
+  expect(machineSettingsGuard('Bash', { command: 'relais trust holdouts' }, env)).toBe(undefined)
+  expect(machineSettingsGuard('Bash', { command: 'relais trust holdouts --json' }, env)).toBe(undefined)
+})
+
 test('a Not now holds until the person asks for relais again, then they are asked again', async () => {
   const w = world()
   w.state.policy = true
@@ -429,7 +438,7 @@ test('a request that only mentions a negation elsewhere still lifts a Not now', 
 })
 
 test('trust_holdouts: the dialog offers the confirmation and acceptance passes the displayed sha and fingerprint', async () => {
-  const w = world()
+  const holdoutWorld = world()
   const accepts: string[][] = []
   const review = [
     {
@@ -442,8 +451,8 @@ test('trust_holdouts: the dialog offers the confirmation and acceptance passes t
     },
     { name: 'settled', state: 'confirmed', store_sha: 'b'.repeat(40), fingerprint: 'fp-2', declaration: {}, diffs: [] },
   ]
-  const inner = w.fx.process.run
-  w.fx.process.run = async (argv: string[], init: any) => {
+  const inner = holdoutWorld.fx.process.run
+  holdoutWorld.fx.process.run = async (argv: string[], init: any) => {
     const line = argv.slice(1).join(' ')
     if (argv[0] === 'relais' && line === 'trust holdouts --json') return { exitCode: 0, stdout: JSON.stringify(review), stderr: '' }
     if (argv[0] === 'relais' && line.startsWith('trust holdouts --accept')) {
@@ -452,21 +461,54 @@ test('trust_holdouts: the dialog offers the confirmation and acceptance passes t
     }
     return inner(argv, init)
   }
-  w.answers.push('Confirm report-json')
-  const result = await trustHoldoutsTool(w.fx, w.store, '/repo')
-  expect(w.asks.length).toBe(1)
-  expect(w.asks[0].options).toEqual([NOT_NOW, 'Confirm report-json'])
-  expect(w.asks[0].question).toContain('a'.repeat(40))
-  expect(w.asks[0].question).toContain('fp-1')
+  holdoutWorld.answers.push('Confirm report-json')
+  const reply = await trustHoldoutsTool(holdoutWorld.fx, holdoutWorld.store, '/repo')
+  expect(holdoutWorld.asks.length).toBe(1)
+  expect(holdoutWorld.asks[0].options).toEqual([NOT_NOW, 'Confirm report-json'])
+  expect(holdoutWorld.asks[0].question).toContain('a'.repeat(40))
+  expect(holdoutWorld.asks[0].question).toContain('fp-1')
   expect(accepts).toEqual([
-    ['trust', 'holdouts', '--accept', 'report-json', '--sha', 'a'.repeat(40), '--fingerprint', 'fp-1', '--json'],
+    ['trust', 'holdouts', '--accept', 'report-json', '--sha', 'a'.repeat(40), '--fingerprint', 'fp-1', '--source', 'plugin', '--json'],
   ])
-  expect(result).toContain('confirmed: report-json')
+  expect(reply).toContain('confirmed: report-json')
 
   const declinedRun = world()
-  declinedRun.fx.process.run = w.fx.process.run
+  declinedRun.fx.process.run = holdoutWorld.fx.process.run
   declinedRun.answers.push(NOT_NOW)
   accepts.length = 0
   expect(await trustHoldoutsTool(declinedRun.fx, declinedRun.store, '/repo')).toContain('not confirmed')
   expect(accepts).toEqual([])
+})
+
+test('trust_holdouts: a review too long for the dialog offers no confirmation', async () => {
+  const longWorld = world()
+  const accepts: string[][] = []
+  const script = Array.from({ length: 60 }, (_, i) => `+echo ${i}`).join('\n')
+  const review = [
+    {
+      name: 'long',
+      state: 'new',
+      store_sha: 'c'.repeat(40),
+      fingerprint: 'fp-long',
+      declaration: { path: 'check.sh' },
+      diffs: [{ path: 'check.sh', change: 'added', text: script }],
+    },
+  ]
+  const inner = longWorld.fx.process.run
+  longWorld.fx.process.run = async (argv: string[], init: any) => {
+    const line = argv.slice(1).join(' ')
+    if (argv[0] === 'relais' && line === 'trust holdouts --json') return { exitCode: 0, stdout: JSON.stringify(review), stderr: '' }
+    if (argv[0] === 'relais' && line.startsWith('trust holdouts --accept')) {
+      accepts.push(argv.slice(1))
+      return { exitCode: 0, stdout: '{"code":"confirmed"}', stderr: '' }
+    }
+    return inner(argv, init)
+  }
+  longWorld.answers.push('Confirm long')
+  const reply = await trustHoldoutsTool(longWorld.fx, longWorld.store, '/repo')
+  expect(longWorld.asks.length).toBe(1)
+  expect(longWorld.asks[0].options).toEqual([NOT_NOW])
+  expect(longWorld.asks[0].question).toContain('too long to confirm here')
+  expect(accepts).toEqual([])
+  expect(reply).toContain('not confirmed')
 })

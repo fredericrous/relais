@@ -55,6 +55,9 @@ export function routerEnvelopeGuard(tool: string, input: Record<string, unknown>
   return undefined
 }
 
+export const HOLDOUT_CONFIRM_MESSAGE =
+  'Confirming a store holdout is the person\'s decision: what it runs is text from the store. Call mcp__relais__trust_holdouts with the repository\'s cwd: it shows the person each review and asks. The model does not run `relais trust holdouts --accept`.'
+
 // Why the model's Write, Edit or Bash call may not touch the grants, or
 // undefined. Write and Edit are matched on the exact path. Bash is a shell
 // string, so its match is a reminder for the model, not a boundary: SPEC §5
@@ -69,6 +72,7 @@ export function machineSettingsGuard(
     (path !== undefined && text.includes(path)) || text.includes('.config/relais/machine.toml')
   if (tool === 'Bash') {
     const command = String(input.command ?? '')
+    if (/\brelais\s+trust\s+holdouts\b[^\n;&|]*--accept\b/.test(command)) return HOLDOUT_CONFIRM_MESSAGE
     return /\brelais\s+trust\s+grant\b/.test(command) || named(command) ? MACHINE_SETTINGS_MESSAGE : undefined
   }
   const file = String(input.file_path ?? '')

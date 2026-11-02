@@ -274,24 +274,30 @@ export const confirmLabel = (name: string) => `Confirm ${name}`
 // What the person reads before confirming one store holdout: the effective
 // declaration and the lines that changed since the last confirmation. The
 // exact store sha and fingerprint are shown, and are the ones passed back.
-export function holdoutQuestion(review: HoldoutReview, repo: string): { text: string; yes: string } {
+// A review too long for the dialog offers no confirmation at all: a
+// confirmation covers every line, so it may only follow a review that showed
+// every line (`yes` is null, and the person confirms in a terminal).
+export function holdoutQuestion(review: HoldoutReview, repo: string): { text: string; yes: string | null } {
   const body: string[] = []
   const declaration = JSON.stringify(review.declaration, null, 2) ?? ''
   body.push('declaration:', ...declaration.split('\n').map(line => `  ${line}`))
   for (const diff of review.diffs) {
     body.push(`${diff.change} ${diff.path}:`, ...diff.text.split('\n').filter(Boolean).map(line => `  ${line}`))
   }
+  const fits = body.length <= REVIEW_LINES
   const shown = body.slice(0, REVIEW_LINES).map(escapeDisplay)
-  if (body.length > REVIEW_LINES) shown.push(`  +${body.length - REVIEW_LINES} more lines (relais trust holdouts shows all)`)
+  if (!fits) shown.push(`  +${body.length - REVIEW_LINES} more lines`)
   return {
     text: [
       `relais · Run the ${review.state} holdout ${escapeDisplay(review.name)} for ${escapeDisplay(repo)}?`,
       `store sha ${review.store_sha ?? ''}`,
       `fingerprint ${review.fingerprint ?? ''}`,
       ...shown,
-      'Confirming covers exactly this version; any later change asks again.',
+      fits
+        ? 'Confirming covers exactly this version; any later change asks again.'
+        : 'This review is too long to confirm here. Read it whole with `relais trust holdouts` in a terminal, then confirm it there with the --accept line it prints.',
     ].join('\n'),
-    yes: confirmLabel(review.name),
+    yes: fits ? confirmLabel(review.name) : null,
   }
 }
 
@@ -314,15 +320,15 @@ async function askHoldouts(fx: Fx, repo: Repo): Promise<string> {
   const confirmed: string[] = []
   const left: string[] = []
   for (const holdout of open) {
-    const q = holdoutQuestion(holdout, repo.name)
-    const answer = await ask(fx, q.text, [NOT_NOW, q.yes])
-    if (answer !== q.yes) {
+    const question = holdoutQuestion(holdout, repo.name)
+    const answer = await ask(fx, question.text, question.yes ? [NOT_NOW, question.yes] : [NOT_NOW])
+    if (question.yes === null || answer !== question.yes) {
       left.push(holdout.name)
       continue
     }
     const accepted = await run(
       fx,
-      ['relais', 'trust', 'holdouts', '--accept', holdout.name, '--sha', holdout.store_sha!, '--fingerprint', holdout.fingerprint!, '--json'],
+      ['relais', 'trust', 'holdouts', '--accept', holdout.name, '--sha', holdout.store_sha!, '--fingerprint', holdout.fingerprint!, '--source', 'plugin', '--json'],
       repo.root,
     )
     if (accepted.exitCode !== 0) return `not confirmed: relais trust holdouts --accept ${holdout.name} failed: ${err(accepted)}`

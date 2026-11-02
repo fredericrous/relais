@@ -1261,6 +1261,7 @@ pub(in crate::ledger) const MIGRATIONS: &[(&str, &str)] = &[
         store_sha TEXT NOT NULL,
         snapshot_json TEXT NOT NULL,
         confirmed_at TEXT NOT NULL,
+        confirmed_via TEXT NOT NULL,
         PRIMARY KEY (store, repo, name)
     );
     "#,

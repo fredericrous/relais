@@ -50,19 +50,19 @@ pub(crate) fn note_held_repair_effort(report: &mut doctor::DoctorReport) {
     }
 }
 
-/// Add the `holdouts` finding: every holdout discovered for the current
+/// The `holdouts` finding: every holdout discovered for the current
 /// repository with its source, attach rule and confirmation state, and the
 /// store's unreachability when it cannot be read. Nothing when no store is
 /// configured and machine.toml declares none for this repository. A
 /// repository or machine.toml that cannot be read says nothing here: doctor
 /// reports those on findings of their own.
-pub(crate) fn note_holdouts(report: &mut doctor::DoctorReport) {
+pub(crate) fn holdouts_finding() -> Option<doctor::Finding> {
     let (Ok(root), Ok(machine)) = (project_dir(), load_machine()) else {
-        return;
+        return None;
     };
     let repo = relais::repo::main_checkout_name(&root).unwrap_or_default();
     let Ok(runs) = paths::runs_dir() else {
-        return;
+        return None;
     };
     let configured = machine.holdouts.store.is_some()
         || machine
@@ -71,7 +71,7 @@ pub(crate) fn note_holdouts(report: &mut doctor::DoctorReport) {
             .get(&repo)
             .is_some_and(|named| !named.is_empty());
     if !configured {
-        return;
+        return None;
     }
     let view = match relais::holdout::discover(
         &machine.holdouts,
@@ -81,12 +81,11 @@ pub(crate) fn note_holdouts(report: &mut doctor::DoctorReport) {
     ) {
         Ok(view) => view,
         Err(invalid) => {
-            report.findings.push(doctor::Finding {
+            return Some(doctor::Finding {
                 component: "holdouts",
                 level: doctor::Level::Fail,
                 detail: format!("holdout_declaration_invalid: {invalid}"),
             });
-            return;
         }
     };
     let store = machine.holdouts.store.clone().unwrap_or_default();
@@ -130,11 +129,11 @@ pub(crate) fn note_holdouts(report: &mut doctor::DoctorReport) {
         ));
         lines.push(format!("  attach: {}", holdout.attach));
     }
-    report.findings.push(doctor::Finding {
+    Some(doctor::Finding {
         component: "holdouts",
         level,
         detail: lines.join("\n"),
-    });
+    })
 }
 
 /// What `relais doctor --json` prints: the findings, and the Claude Code
@@ -156,7 +155,7 @@ pub(crate) fn doctor_command(json: bool) -> Result<CliOutcome, CliError> {
     let integration = relais::install::plugin::integration(&claude, &listing);
     let mut report = doctor::doctor(&project_dir()?, listing);
     note_held_repair_effort(&mut report);
-    note_holdouts(&mut report);
+    report.findings.extend(holdouts_finding());
     if json {
         print_document(&DoctorDocument {
             report: &report,

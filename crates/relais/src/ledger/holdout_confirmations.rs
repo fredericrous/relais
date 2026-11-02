@@ -19,6 +19,8 @@ pub struct ConfirmationRecord<'a> {
     pub fingerprint: &'a str,
     pub store_sha: &'a str,
     pub snapshot_json: &'a str,
+    /// Who asked the person: `cli` or `plugin`.
+    pub confirmed_via: &'a str,
 }
 
 impl Ledger {
@@ -28,8 +30,9 @@ impl Ledger {
     pub fn confirm_holdout(&self, record: &ConfirmationRecord<'_>) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO holdout_confirmations
-                (store, repo, name, fingerprint, store_sha, snapshot_json, confirmed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (store, repo, name, fingerprint, store_sha, snapshot_json, confirmed_at,
+                 confirmed_via)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 record.store,
                 record.repo,
@@ -37,7 +40,8 @@ impl Ledger {
                 record.fingerprint,
                 record.store_sha,
                 record.snapshot_json,
-                self.now()
+                self.now(),
+                record.confirmed_via
             ],
         )?;
         Ok(())
@@ -87,6 +91,7 @@ mod tests {
             fingerprint: fp,
             store_sha: "abc",
             snapshot_json: "{}",
+            confirmed_via: "cli",
         }
     }
 
@@ -130,5 +135,26 @@ mod tests {
         };
         assert_eq!(fingerprint("alpha"), "v1:ccc");
         assert_eq!(fingerprint("beta"), "v1:bbb");
+    }
+
+    #[test]
+    fn a_confirmation_records_who_asked_the_person() {
+        let dir = crate::test_support::short_temp_dir("ho-via");
+        let ledger = Ledger::open(&dir.to_path_buf().join("ledger.sqlite")).expect("ledger");
+        ledger
+            .confirm_holdout(&ConfirmationRecord {
+                confirmed_via: "plugin",
+                ..record("ssh://store-a", "alpha", "report", "v1:aaa")
+            })
+            .expect("confirm");
+        let via: String = ledger
+            .conn
+            .query_row(
+                "SELECT confirmed_via FROM holdout_confirmations WHERE name = 'report'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read");
+        assert_eq!(via, "plugin");
     }
 }
