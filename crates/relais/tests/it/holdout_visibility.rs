@@ -76,7 +76,9 @@ impl World {
         std::fs::write(
             world.config.join("machine.toml"),
             format!(
-                "schema_version = 1\n\n[holdouts]\nstore = \"file://{}\"\nref = \"main\"\n",
+                // A literal string: a Windows path's `\U` would be a
+                // unicode escape in a basic one.
+                "schema_version = 1\n\n[holdouts]\nstore = 'file://{}'\nref = \"main\"\n",
                 store.display()
             ),
         )
