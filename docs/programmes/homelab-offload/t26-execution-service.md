@@ -1,7 +1,7 @@
 +++
 type = "grilling"
 mode = "hitl"
-status = "open"
+status = "closed"
 blocked_by = []
 repos = ["amont", "homelab", "relais"]
 +++
@@ -69,3 +69,114 @@ Decide with:
 - whether t02 worker pods are scheduled.
 
 ## Resolution
+
+Decided by the architect and staff-engineer seats on the person's delegation
+(2026-11-02): "take the best decisions as a software architect and staff
+engineer. goal is autonomy, reduce load, get our coding sessions completed
+faster. solution can be hybrid. sometimes stream from the laptop sometimes
+clone directly the project. i can provide a service account/creds".
+
+**Two lanes, one cluster.**
+- **Synchronous lane** (a gate a commit or push is waiting on): the ADR-0016
+  `kubectl` executor stays as it is, with the bundle streamed through `exec`.
+  The laptop is awake by definition, and a closed lid falls back locally on
+  wake. Phase 4's overhead numbers decide whether this lane later moves onto
+  the detached lane's template. The criterion is Job overhead at p90 no worse
+  than a WorkflowTemplate run. Until then there are two executors, on purpose.
+- **Detached lane** (work nobody is blocked on):
+  - `amont rehearse`;
+  - `platform=any` pre-push gates;
+  - relais heavy checks (through `amont run --stamp`);
+  - later, relais whole-worker runs (t02).
+
+  Each becomes an **Argo Workflow**, already installed on the homelab
+  (`controllers/argo-workflows`, used by trade-agents). Nothing new to run.
+
+**Detached lane design:**
+1. **Submission is a Forgejo snapshot first, a direct clone second.**
+   - At submit time, a detached run's commit is usually not on any remote: a
+     pre-push, a rehearsal, a relais candidate. So the laptop pushes a
+     snapshot commit to a per-project Forgejo repo (`amont-snapshots/<repo>`,
+     ref `refs/snapshots/<run>`) and reads it back with `ls-remote`, because
+     Forgejo has lost accepted pushes.
+   - The snapshot keeps its **real parent**, so a push sends only the delta,
+     not the whole tree. The parentless form is ADR-0016's, for the bundle.
+   - A commit already reachable from a Forgejo pull-mirror of the project
+     (origin/main baselines) is fetched from the mirror and nothing is
+     pushed. A mirror that lags falls back to the snapshot.
+   - GitHub repositories get Forgejo **pull-mirrors**, so pods only ever
+     fetch from Forgejo in the cluster. No GitHub token sits in a gate
+     namespace, and the sandbox keeps denying world egress.
+   - Snapshots are garbage-collected after 7 days by a CronWorkflow.
+2. **Argo owns the lifecycle.**
+   - A WorkflowTemplate `gate-run` in `amont-gates`, pinned by image digest.
+   - Slots are Argo semaphores (a ConfigMap), not 409s. Cancel is
+     `argo stop` by label, through the Kubernetes API.
+   - The controller watches `amont-gates`; add it to `workflowNamespaces`.
+   - Each Workflow sets its own `ttlStrategy` (7 days), `serviceAccountName`
+     and deadline, not the chart's 1-day / 7200 s / `argo-workflow`
+     defaults.
+   - The laptop submits a `Workflow` through the Kubernetes API as
+     `amont-gate-runner` (its Role gains workflow verbs). Argo Server stays
+     ClusterIP-only: it runs `authModes: server`, which is unauthenticated.
+   - Only our template runs: check `templateReferencing: Strict`, which is
+     controller-wide, against trade-agents' inline workflows before turning
+     it on.
+3. **The sandbox floor changes, deliberately (amends t09).**
+   - Argo's executor reports results through the apiserver, which the
+     `amont-gates` CNP denies, and a network policy is per pod. Detached-lane
+     pods therefore get the apiserver in their CNP. Their token is mounted
+     only into the executor's containers (`automountServiceAccountToken:
+     false` on the pod, plus the executor's own service account limited to
+     `workflowtaskresults`).
+   - Gate code can reach the apiserver over the network, with no token.
+   - The fetch runs as its own step, reaching only Forgejo.
+4. **Results are durable.** The Workflow's node status, recorded by the
+   Argo controller, carries:
+   - the exit codes, the observed tree and the workflow UID;
+   - the template's pinned image digest, which replaces the pod's
+     `imageID` that pod GC removes.
+
+   It is kept 7 days. Logs go to the Ceph RGW artifact store, which already
+   exists. A record lost to TTL means the run is redone, never trusted.
+5. **Trust: the laptop stays the only signer, by decision (t25 kept).**
+   - The laptop collects finished Workflows: amont at every hook start, as
+     one cheap list call, and the relais coordinator for its runs. It turns a
+     pass into the same cluster token and `x86_64-linux` attestation as ADR-0016.
+   - **What this slice does not deliver:** while the lid is closed, nothing
+     acts on a result. CI runs anyway, and the result only speeds up the
+     laptop's next commit, push or relais step. relais's repair and review
+     loop stalls once the leaf step running at the time finishes.
+   - **t25 reopens when relais worker pods land (t02).** The likely answer
+     is an in-cluster signer limited to `platform=any` gates, with its own
+     allowed-signers entry, so a closed lid no longer stalls the
+     coordinator.
+6. **Placement is by load.**
+   - amont sends a `platform=any` gate to a lane when the host slots are
+     busy or the laptop's load is over the threshold t13 sets. That replaces
+     "defer to CI" when the cluster is reachable.
+   - relais places whole runs by t08.
+7. **What a closed lid does, per consumer:**
+   - a commit gate falls back locally on wake (unchanged);
+   - a detached pre-push gate lets the push go ahead, like a deferral to CI.
+     Its result becomes an attestation when collected, and a CI leg that
+     runs first simply runs;
+   - a rehearsal returns at once, and the next push collects it;
+   - a relais run shows "running remotely" and resumes on wake.
+8. **Credentials, the minimum:**
+   - a Forgejo bot account with read on the mirror and snapshot repos (the
+     pods) and push on `amont-snapshots/*` (the laptop, through the person's
+     existing token);
+   - the pull-mirrors' own GitHub read token, if any repository is private;
+   - later, the Claude credential for worker pods (t24).
+
+   Vault is down (2026-11-01), so secrets use the breakglass
+   `ssa: IfNotPresent` pattern, keeping each value out of every transcript:
+   `! read -s T && kubectl … create secret generic … --from-literal=token="$T"`.
+
+**Next:** a build plan, "detached cluster runs", through plan mode and the
+review panel. It spans amont (the lane, the collector, an ADR beside
+ADR-0016), homelab (pull-mirrors, the snapshot org, Argo namespace and
+template, CNP, RBAC) and relais (collect, a remote run state). Its first
+slice is `amont rehearse --cluster` end to end.
+
