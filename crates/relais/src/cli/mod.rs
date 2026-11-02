@@ -754,6 +754,25 @@ pub(crate) enum TrustCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Review the holdouts the store declares for this repository, with
+    /// their confirmation state (new, changed, confirmed or shadowed), the
+    /// complete declaration and the diffs against the confirmed snapshot.
+    /// With --accept, confirm one holdout, only at the exact --sha and
+    /// --fingerprint the review printed; a store that moved since is refused.
+    Holdouts {
+        /// The holdout to confirm
+        #[arg(long, requires_all = ["sha", "fingerprint"])]
+        accept: Option<String>,
+        /// The store commit the review printed
+        #[arg(long, requires = "accept")]
+        sha: Option<String>,
+        /// The fingerprint the review printed
+        #[arg(long, requires = "accept")]
+        fingerprint: Option<String>,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]

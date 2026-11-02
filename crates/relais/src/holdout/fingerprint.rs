@@ -62,6 +62,63 @@ pub fn fingerprint(decl: &HoldoutDecl, tree: &Path) -> Result<String, SuppliedRe
     ))
 }
 
+/// One supplied file with its bytes, for the snapshot a confirmation retains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuppliedFile {
+    /// `path` or `config`: which declaration field supplied it.
+    pub role: &'static str,
+    /// The field's value: the file or directory inside the store.
+    pub root: String,
+    /// The file below `root`; empty when `root` is itself the file.
+    pub relative: String,
+    pub mode: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// Every file `decl` supplies, with its bytes, under the same refusals as
+/// [`fingerprint`]. A file whose bytes changed between listing and reading
+/// is refused, so the contents returned are the ones fingerprinted.
+pub fn supplied_contents(
+    decl: &HoldoutDecl,
+    tree: &Path,
+) -> Result<Vec<SuppliedFile>, SuppliedRefusal> {
+    let roles = [
+        ("path", Some(decl.path.as_str())),
+        ("config", decl.config.as_deref()),
+    ];
+    let mut contents = Vec::new();
+    for (role, root) in roles {
+        let Some(root) = root else { continue };
+        for (relative, mode, hash) in supplied_files(tree, root)? {
+            let file = if relative.is_empty() {
+                tree.join(root)
+            } else {
+                tree.join(root).join(&relative)
+            };
+            let shown = if relative.is_empty() {
+                root.to_string()
+            } else {
+                format!("{root}/{relative}")
+            };
+            let bytes = std::fs::read(&file).map_err(|e| unreadable(&shown, &e))?;
+            if sha256_hex(&bytes) != hash {
+                return Err(SuppliedRefusal {
+                    path: shown,
+                    cause: "changed while it was being read".to_string(),
+                });
+            }
+            contents.push(SuppliedFile {
+                role,
+                root: root.to_string(),
+                relative,
+                mode,
+                bytes,
+            });
+        }
+    }
+    Ok(contents)
+}
+
 /// Refuse a symlink at any component of `relative` under `root`.
 pub fn reject_symlinks_along(root: &Path, relative: &str) -> Result<(), SuppliedRefusal> {
     let mut current = root.to_path_buf();

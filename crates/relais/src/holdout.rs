@@ -19,10 +19,17 @@ use crate::ids::sha256_hex;
 use crate::policy::{BlockCode, DeclSource, HoldoutDecl, HoldoutSettings};
 use crate::workspace::Git;
 
+mod confirmation;
 mod discovery;
 mod fingerprint;
+pub use confirmation::{
+    accept, is_confirmed, review, AcceptRefusal, ConfirmationState, FileDiff, HoldoutConfirmation,
+    HoldoutReview, ReviewFailed, Snapshot, SnapshotFile,
+};
 pub use discovery::{discover, DeclarationInvalid, StoreView};
-pub use fingerprint::{fingerprint, SuppliedRefusal, FINGERPRINT_VERSION};
+pub use fingerprint::{
+    fingerprint, supplied_contents, SuppliedFile, SuppliedRefusal, FINGERPRINT_VERSION,
+};
 
 /// A holdout whose store resolved: everything verification needs to fetch and run it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

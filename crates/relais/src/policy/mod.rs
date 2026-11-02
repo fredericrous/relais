@@ -2206,6 +2206,9 @@ pub enum BlockCode {
     /// A `holdout.toml` in the store does not parse, or names a path that is
     /// not clean or a file the store lacks.
     HoldoutDeclarationInvalid,
+    /// A contract names a store holdout whose fingerprint the person has not
+    /// confirmed (`relais trust holdouts`).
+    HoldoutUnconfirmed,
     /// A holdout store could not be fetched at the commit recorded at
     /// preflight, when verification came to run it.
     HoldoutUnfetchable,
@@ -2265,6 +2268,7 @@ impl BlockCode {
             Self::HoldoutCriterionCollision => "holdout_criterion_collision",
             Self::HoldoutUnreadable => "holdout_unreadable",
             Self::HoldoutDeclarationInvalid => "holdout_declaration_invalid",
+            Self::HoldoutUnconfirmed => "holdout_unconfirmed",
             Self::HoldoutUnfetchable => "holdout_unfetchable",
             Self::WorkspaceBusy => "workspace_busy",
             Self::WorkspaceHasInterruptedRun => "workspace_has_interrupted_run",

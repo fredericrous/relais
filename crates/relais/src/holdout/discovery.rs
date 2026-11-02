@@ -54,6 +54,9 @@ pub struct StoreView {
     /// files could not be fetched within the bound. When set, `head` is an
     /// error too and `declared` is empty.
     pub unread: Option<String>,
+    /// The fetched tree at `head` that `declared` and `fingerprints` were
+    /// read from; `None` when nothing was fetched.
+    pub tree: Option<PathBuf>,
 }
 
 impl StoreView {
@@ -63,6 +66,7 @@ impl StoreView {
             declared: BTreeMap::new(),
             fingerprints: BTreeMap::new(),
             unread,
+            tree: None,
         }
     }
 }
@@ -120,6 +124,7 @@ pub fn discover(
         declared,
         fingerprints,
         unread: None,
+        tree: Some(tree),
     })
 }
 

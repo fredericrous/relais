@@ -671,6 +671,76 @@ impl<'a> RunEngine<'a> {
                 }
             }
         }
+        // A store holdout runs only on the fingerprint the person confirmed
+        // (SPEC §4). An attached one that is not is skipped; a named one
+        // refuses the run. Neither runs.
+        let named_in_contract = crate::holdout::holdout_names(&self.config.contract.acceptance);
+        let mut unconfirmed = Vec::new();
+        let mut confirmed_holdouts = Vec::with_capacity(holdouts.len());
+        for holdout in holdouts {
+            let from_store = holdout_settings.source_of(&repo_name, &holdout.name)
+                == crate::policy::DeclSource::Store
+                || holdout.fingerprint.is_some();
+            let confirmation = if from_store {
+                self.config.ledger.holdout_confirmation(
+                    &holdout.store,
+                    &holdout.repo,
+                    &holdout.name,
+                )?
+            } else {
+                None
+            };
+            if !from_store
+                || crate::holdout::is_confirmed(
+                    confirmation.as_ref(),
+                    holdout.fingerprint.as_deref(),
+                )
+            {
+                confirmed_holdouts.push(holdout);
+            } else {
+                unconfirmed.push((holdout, confirmation.is_some()));
+            }
+        }
+        let holdouts = confirmed_holdouts;
+        let mut unconfirmed_skipped = Vec::new();
+        let mut unconfirmed_named = Vec::new();
+        for (holdout, was_confirmed) in &unconfirmed {
+            let attached_only = attached_names.contains(&holdout.name)
+                && !named_in_contract.contains(&holdout.name);
+            self.events.emit(Event::Decision {
+                what: "holdout_unconfirmed".to_string(),
+                reason: format!(
+                    "holdout `{}` is {} in the store and the person has not confirmed it; it                      does not run until `relais trust holdouts` accepts it{}",
+                    holdout.name,
+                    if *was_confirmed { "changed" } else { "new" },
+                    if attached_only {
+                        "; the run settles without it"
+                    } else {
+                        ""
+                    }
+                ),
+            });
+            if attached_only {
+                unconfirmed_skipped.push(holdout.name.clone());
+            } else {
+                unconfirmed_named.push(holdout.name.clone());
+            }
+        }
+        if !unconfirmed_named.is_empty() {
+            return Ok(Phase::Ended(self.fail_preflight(
+                BlockCode::HoldoutUnconfirmed,
+                format!(
+                    "the holdout{} {} {} not confirmed; review with `relais trust holdouts`",
+                    if unconfirmed_named.len() == 1 { "" } else { "s" },
+                    unconfirmed_named
+                        .iter()
+                        .map(|name| format!("`{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if unconfirmed_named.len() == 1 { "is" } else { "are" },
+                ),
+            )?));
+        }
         let sourced: Vec<(
             crate::holdout::ResolvedHoldout,
             crate::holdout::HoldoutSource,
@@ -694,6 +764,7 @@ impl<'a> RunEngine<'a> {
         for attachment in attached
             .iter()
             .filter(|attachment| !skipped.iter().any(|gone| gone.name == attachment.name))
+            .filter(|attachment| !unconfirmed_skipped.contains(&attachment.name))
         {
             self.events.emit(Event::Decision {
                 what: "holdout_attached".to_string(),
@@ -716,6 +787,19 @@ impl<'a> RunEngine<'a> {
                 what: "holdout_attach_skipped".to_string(),
                 reason: format!("{}; the run settles without it", gone.detail),
             });
+        }
+        for name in &unconfirmed_skipped {
+            self.config.ledger.record_holdout_outcome(
+                &self.run_id,
+                &crate::ledger::HoldoutOutcomeRow {
+                    label_kind: "attempt",
+                    attempt_index: 0,
+                    name,
+                    outcome: crate::holdout::SKIPPED_OUTCOME,
+                    profile_green: false,
+                    source: crate::holdout::HoldoutSource::Attached.as_str(),
+                },
+            )?;
         }
         for change in &changes {
             let current = change.current_digest.as_deref().unwrap_or("undeclared");
