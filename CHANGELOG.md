@@ -8,6 +8,14 @@ missing here.
 
 ## Unreleased
 
+## v0.48.0
+
+- **A holdout store declares its own holdouts.** At preflight relais reads `<repo>/<name>/holdout.toml` and `check.sh` from the store `[holdouts] store` names, at one commit per run, through a shared cache of shallow fetches. A machine.toml table of the same name still wins, and `{ enabled = false }` turns a store holdout off. A `holdout.toml` that does not parse refuses the run (`holdout_declaration_invalid`). An unreachable store refuses a named holdout as `holdout_unreadable` and records `holdout_store_unreachable`.
+- **A store holdout runs only at a fingerprint the person confirmed.** The fingerprint covers the whole effective declaration and the files it supplies. Any change asks again, and a symlink anywhere in a holdout is refused without being read. `relais trust holdouts` shows each new or changed holdout's declaration and diffs, and `--accept <name> --sha <sha> --fingerprint <fp>` confirms exactly that version; a store that moved meanwhile is refused as stale. Confirmations live in the new ledger table `holdout_confirmations`, and the ledger migrates to v48. Until a holdout is confirmed, it is skipped when attached and refuses the run when named (`holdout_unconfirmed`).
+- **The plugin asks.** `mcp__relais__trust_holdouts` puts each review in Claude Code's dialog. A review too long to show whole is confirmed in a terminal instead. The model is refused a `relais trust holdouts --accept` in Bash.
+- **You can see them.** `relais doctor` lists each holdout with its source (store or machine) and confirmation state. `relais plan` marks an attached holdout that is not confirmed. `relais report` counts unconfirmed skips separately.
+- The holdout definition digest now covers the declaration's source, timeout, inputs and attach rule. Definitions frozen before this release still compare under the old formula, so the upgrade reports no spurious changes.
+
 ## v0.47.0
 
 - **A run the queue ends names the candidate it keeps.** When `admission_wait` runs out while a candidate is verified, the run still ends `blocked (admission_wait_exhausted)`, and the outcome now says how to verify the candidate again without a worker: a `kind: verify` run naming `candidate {run, index}`. Its transition detail carries `candidate {run, index, sha}`; a `kind: verify` run names its source run. The attempt row is closed `blocked` with its sha, where it used to stay `verifying`. A reviewer whose admission runs out ends `needs_review` (review unavailable) with the same recovery in its text. The text no longer says "nothing was launched" when a worker already made the candidate.
