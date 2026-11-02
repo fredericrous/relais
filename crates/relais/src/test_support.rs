@@ -191,6 +191,61 @@ pub fn stays(window: std::time::Duration, mut holds: impl FnMut() -> bool) -> bo
 /// the wait and nothing more.
 const POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
+/// How many times a tree was really fetched, per target, and how many times
+/// a store was asked for its commit, so a test can tell a cache hit from a
+/// fetch and count the questions a preflight puts to the store.
+pub mod fetch_count {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    fn counts() -> &'static Mutex<HashMap<PathBuf, usize>> {
+        static COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+        COUNTS.get_or_init(Mutex::default)
+    }
+
+    fn asked() -> &'static Mutex<HashMap<String, usize>> {
+        static ASKED: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+        ASKED.get_or_init(Mutex::default)
+    }
+
+    pub fn record_ask(store: &str) {
+        *asked()
+            .lock()
+            .expect("ls-remote counts")
+            .entry(store.to_string())
+            .or_default() += 1;
+    }
+
+    /// `ls-remote` calls made against `store` so far.
+    pub fn asks_of(store: &str) -> usize {
+        asked()
+            .lock()
+            .expect("ls-remote counts")
+            .get(store)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn record(target: &Path) {
+        *counts()
+            .lock()
+            .expect("fetch counts")
+            .entry(target.to_path_buf())
+            .or_default() += 1;
+    }
+
+    /// Fetches made into `target` so far.
+    pub fn of(target: &Path) -> usize {
+        counts()
+            .lock()
+            .expect("fetch counts")
+            .get(target)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

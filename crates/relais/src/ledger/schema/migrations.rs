@@ -1244,4 +1244,26 @@ pub(in crate::ledger) const MIGRATIONS: &[(&str, &str)] = &[
     CREATE INDEX check_timings_label ON check_timings (label);
     "#,
     ),
+    (
+        // The store holdouts the person confirmed (SPEC §4): one row per
+        // (store, repository, holdout name) holding the confirmed
+        // fingerprint, the store commit it was reviewed at and a retained
+        // snapshot of the reviewed declaration and supplied contents, so a
+        // later review diffs against it whatever the fetch cache evicted.
+        // Expand-only: a new table nothing older reads.
+        "v48",
+        r#"
+    CREATE TABLE holdout_confirmations (
+        store TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        name TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        store_sha TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL,
+        confirmed_at TEXT NOT NULL,
+        confirmed_via TEXT NOT NULL,
+        PRIMARY KEY (store, repo, name)
+    );
+    "#,
+    ),
 ];

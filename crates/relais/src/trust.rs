@@ -699,9 +699,75 @@ fn add_grant_to(
     Ok(doc.to_string())
 }
 
+/// What `relais trust holdouts` prints for one review, line by line. Every
+/// line that carries store text is escaped ([`escape_display`]): a long
+/// review is confirmed in a terminal, so a control character or an escape
+/// sequence in a store script must not erase or redraw a line the person is
+/// reading before they accept its fingerprint.
+pub fn holdout_review_lines(
+    review: &crate::holdout::HoldoutReview,
+) -> Result<Vec<String>, serde_json::Error> {
+    let shown = escape_display;
+    let mut lines = vec![format!(
+        "holdout {}: {}",
+        shown(&review.name),
+        review.state.as_str()
+    )];
+    if let (Some(sha), Some(fingerprint)) = (&review.store_sha, &review.fingerprint) {
+        lines.push(format!("  store sha:   {}", shown(sha)));
+        lines.push(format!("  fingerprint: {}", shown(fingerprint)));
+    }
+    if let Some(declaration) = &review.declaration {
+        lines.push("  declaration:".to_string());
+        let text = serde_json::to_string_pretty(declaration)?;
+        lines.extend(text.lines().map(|line| format!("    {}", shown(line))));
+    }
+    for diff in &review.diffs {
+        lines.push(format!("  {} {}:", diff.change, shown(&diff.path)));
+        lines.extend(diff.text.lines().map(|line| format!("    {}", shown(line))));
+    }
+    if matches!(
+        review.state,
+        crate::holdout::ConfirmationState::New | crate::holdout::ConfirmationState::Changed
+    ) {
+        lines.push(format!(
+            "  accept: relais trust holdouts --accept {} --sha {} --fingerprint {}",
+            shown(&review.name),
+            shown(review.store_sha.as_deref().unwrap_or_default()),
+            shown(review.fingerprint.as_deref().unwrap_or_default())
+        ));
+    }
+    Ok(lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_review_escapes_control_characters_in_store_text() {
+        let review = crate::holdout::HoldoutReview {
+            name: "report\x1b[2K".to_string(),
+            state: crate::holdout::ConfirmationState::New,
+            store_sha: Some("abc".to_string()),
+            fingerprint: Some("v1:f".to_string()),
+            declaration: None,
+            diffs: vec![crate::holdout::FileDiff {
+                path: "check.sh\r".to_string(),
+                change: "added",
+                text: "+echo ok\x1b[1A\x1b[2K\r+rm -rf hidden\n".to_string(),
+            }],
+        };
+        let lines = holdout_review_lines(&review).expect("rendered");
+        let all = lines.join("\n");
+        assert!(!all.contains('\x1b') && !all.contains('\r'), "{all:?}");
+        assert!(all.contains("report\\x1b[2K"), "{all}");
+        assert!(all.contains("check.sh\\r"), "{all}");
+        assert!(
+            all.contains("+echo ok\\x1b[1A\\x1b[2K\\r+rm -rf hidden"),
+            "{all}"
+        );
+    }
 
     fn record() -> TrustGrant {
         TrustGrant {

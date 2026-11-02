@@ -270,7 +270,14 @@ impl<'a> RunEngine<'a> {
             .collect();
         let fetched: Vec<Result<PathBuf, holdout::Unfetchable>> = live
             .iter()
-            .map(|holdout| holdout::fetch(holdout, &root, &|| self.budgets.remaining()))
+            .map(|holdout| {
+                // The contents are checked against the preflight's
+                // fingerprint before anything is copied or run.
+                holdout::fetch(holdout, &root, &|| self.budgets.remaining()).and_then(|source| {
+                    holdout::verify_supplied(holdout, &source)?;
+                    Ok(source)
+                })
+            })
             .collect();
         let is_attached_name = |name: &str| attached.iter().any(|held| held.name == name);
         let is_attached = |holdout: &ResolvedHoldout| is_attached_name(&holdout.name);
@@ -282,6 +289,13 @@ impl<'a> RunEngine<'a> {
                 _ => None,
             })
         {
+            // A fetch cut short because a budget ran out says nothing about
+            // the store: the run ends on that budget (ADR-0010).
+            if let Some(exhausted) = self.budgets.exhausted() {
+                return Err(VerifyFailure::Lease(verify::LeaseStop::Exhausted(
+                    exhausted,
+                )));
+            }
             return Err(VerifyFailure::HoldoutUnfetchable(e.to_string()));
         }
         let running_together = fetched.iter().filter(|fetch| fetch.is_ok()).count();
@@ -491,6 +505,30 @@ impl<'a> RunEngine<'a> {
                 holdout.name
             );
             return ready(Some(copy), Ok(did_not_build()));
+        }
+        // The report's place is handed to the command, so a script writes it
+        // without knowing where the declaration put it; its directory exists
+        // before the command starts.
+        if let Some(junit) = spec
+            .junit
+            .clone()
+            .filter(|junit| holdout::clean_relative(junit))
+        {
+            let report = copy.path().join(junit);
+            if let Some(parent) = report.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!(
+                        "relais: holdout `{}`: the directory of its JUnit report could not be \
+                         made: {e}",
+                        holdout.name
+                    );
+                    return ready(Some(copy), Ok(did_not_build()));
+                }
+            }
+            spec.env.insert(
+                "RELAIS_HOLDOUT_JUNIT".to_string(),
+                report.to_string_lossy().into_owned(),
+            );
         }
         let job = Job {
             holdout,

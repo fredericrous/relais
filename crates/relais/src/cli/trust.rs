@@ -149,7 +149,147 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
             }
             Ok(CliOutcome::Accepted)
         }
+        TrustCommand::Holdouts {
+            accept,
+            sha,
+            fingerprint,
+            source,
+            json,
+        } => trust_holdouts(
+            &root,
+            &machine,
+            accept
+                .as_deref()
+                .zip(sha.as_deref())
+                .zip(fingerprint.as_deref()),
+            source,
+            super::programme::Format::from_json_flag(json),
+        ),
     }
+}
+
+/// `relais trust holdouts`: review every holdout the store declares for this
+/// repository, or confirm one at the exact commit and fingerprint reviewed.
+fn trust_holdouts(
+    root: &std::path::Path,
+    machine: &relais::policy::MachineSettings,
+    accept: Option<((&str, &str), &str)>,
+    source: super::GrantSource,
+    format: super::programme::Format,
+) -> Result<CliOutcome, CliError> {
+    let json = format == super::programme::Format::Json;
+    let repo = relais::repo::main_checkout_name(root).unwrap_or_default();
+    let cache =
+        relais::runner::holdout_root(&paths::runs_dir().map_err(CliError::Home)?).join("cache");
+    let view = match relais::holdout::discover(
+        &machine.holdouts,
+        &repo,
+        &cache,
+        &format!("trust-{}", std::process::id()),
+    ) {
+        Ok(view) => view,
+        Err(invalid) => {
+            eprintln!("relais trust holdouts: {invalid}");
+            return Ok(CliOutcome::Blocked);
+        }
+    };
+    if let Some(cause) = &view.unread {
+        eprintln!("relais trust holdouts: the holdout store could not be read: {cause}");
+        return Ok(CliOutcome::OperationalFailure);
+    }
+    let store = machine.holdouts.store.clone().unwrap_or_default();
+    let ledger = open_ledger()?;
+    let mut shadowed: std::collections::BTreeSet<String> = machine
+        .holdouts
+        .repos
+        .get(&repo)
+        .map(|named| named.keys().cloned().collect())
+        .unwrap_or_default();
+    if let Some(off) = machine.holdouts.disabled.get(&repo) {
+        shadowed.extend(off.iter().cloned());
+    }
+    if let Some(((name, sha), fingerprint)) = accept {
+        if shadowed.contains(name) {
+            eprintln!(
+                "relais trust holdouts: `{name}` is shadowed by a machine.toml table; the store's \
+                 declaration does not run, so there is nothing to confirm"
+            );
+            return Ok(CliOutcome::Blocked);
+        }
+        let snapshot = match relais::holdout::accept(&view, name, sha, fingerprint) {
+            Ok(snapshot) => snapshot,
+            Err(refusal) => {
+                if json {
+                    print_document(&serde_json::json!({
+                        "code": "stale_holdout_review",
+                        "detail": refusal.to_string(),
+                    }))?;
+                }
+                eprintln!("relais trust holdouts: refused: {refusal}");
+                return Ok(CliOutcome::Blocked);
+            }
+        };
+        let snapshot_json =
+            operational(serde_json::to_string(&snapshot), "rendering the snapshot")?;
+        operational(
+            ledger.confirm_holdout(&relais::ledger::ConfirmationRecord {
+                store: &store,
+                repo: &repo,
+                name,
+                fingerprint: &snapshot.fingerprint,
+                store_sha: &snapshot.store_sha,
+                snapshot_json: &snapshot_json,
+                confirmed_via: source.as_str(),
+            }),
+            "recording the confirmation",
+        )?;
+        if json {
+            print_document(&serde_json::json!({
+                "code": "confirmed",
+                "name": name,
+                "store_sha": snapshot.store_sha,
+                "fingerprint": snapshot.fingerprint,
+            }))?;
+        } else {
+            eprintln!(
+                "trust holdouts: `{name}` confirmed at {} ({})",
+                snapshot.store_sha, snapshot.fingerprint
+            );
+        }
+        return Ok(CliOutcome::Accepted);
+    }
+    let mut confirmed = std::collections::BTreeMap::new();
+    for name in view.declared.keys() {
+        if let Some(held) = operational(
+            ledger.holdout_confirmation(&store, &repo, name),
+            "reading the confirmations",
+        )? {
+            confirmed.insert(name.clone(), held);
+        }
+    }
+    let reviews = match relais::holdout::review(&view, &shadowed, &confirmed) {
+        Ok(reviews) => reviews,
+        Err(failed) => {
+            eprintln!("relais trust holdouts: {failed}");
+            return Ok(CliOutcome::Blocked);
+        }
+    };
+    if json {
+        print_document(&reviews)?;
+        return Ok(CliOutcome::Accepted);
+    }
+    if reviews.is_empty() {
+        println!("trust holdouts: the store declares no holdout for {repo}");
+    }
+    for review in &reviews {
+        for line in operational(
+            relais::trust::holdout_review_lines(review),
+            "rendering the review",
+        )? {
+            println!("{line}");
+        }
+    }
+    Ok(CliOutcome::Accepted)
 }
 
 /// The steps the latest recorded grant for this repository authorized,

@@ -46,6 +46,8 @@ pub struct AttachedCounts {
     pub runs: usize,
     pub catches: usize,
     pub skipped: usize,
+    /// Runs whose attached store holdout was left out as unconfirmed.
+    pub unconfirmed: usize,
 }
 
 /// Runs with at least one exposure, and how many runs hit each marker.
@@ -64,6 +66,9 @@ pub fn holdouts_report(
     for (run, _) in window {
         if !ledger.skipped_attached_holdouts(run)?.is_empty() {
             report.by_source.attached.skipped += 1;
+        }
+        if !ledger.unconfirmed_attached_holdouts(run)?.is_empty() {
+            report.by_source.attached.unconfirmed += 1;
         }
         let named = crate::holdout::HoldoutSource::Named.as_str();
         let attached = crate::holdout::HoldoutSource::Attached.as_str();
@@ -112,12 +117,13 @@ impl HoldoutsReport {
         ));
         let by_source = &self.by_source;
         out.push_str(&format!(
-            "  by source: named {}/{}, attached {}/{}, skipped {}\n",
+            "  by source: named {}/{}, attached {}/{}, skipped {}, unconfirmed {}\n",
             by_source.named.runs,
             by_source.named.catches,
             by_source.attached.runs,
             by_source.attached.catches,
-            by_source.attached.skipped
+            by_source.attached.skipped,
+            by_source.attached.unconfirmed
         ));
         out.push_str(&format!(
             "  holdout_catches: {} (failed while the profile checks passed)\n",
@@ -164,7 +170,7 @@ mod tests {
         assert!(text.contains("holdout_catches: 3"), "{text}");
         assert!(text.contains("(runs with a holdout)"), "{text}");
         assert!(
-            text.contains("by source: named 0/0, attached 0/0, skipped 0"),
+            text.contains("by source: named 0/0, attached 0/0, skipped 0, unconfirmed 0"),
             "{text}"
         );
         assert!(text.contains("machine_toml 1, overlay 1"), "{text}");

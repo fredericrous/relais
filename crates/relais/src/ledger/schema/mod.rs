@@ -212,7 +212,7 @@ pub(super) fn apply_step(conn: &Connection, version: &str, sql: &str, now: &str)
     Ok(())
 }
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 47;
+pub const LEDGER_SCHEMA_VERSION: u64 = 48;
 
 #[cfg(test)]
 mod tests {
@@ -956,8 +956,8 @@ mod tests {
             .expect("a v38 row");
         }
         let ledger = Ledger::open(&path).expect("upgrade to current schema");
-        assert_eq!(ledger.schema_version().expect("version"), 47);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 47);
+        assert_eq!(ledger.schema_version().expect("version"), 48);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 48);
         let tables: Vec<String> = ledger
             .conn
             .prepare(
@@ -1022,8 +1022,8 @@ mod tests {
             .expect("a run written at v40");
         }
         let ledger = Ledger::open(&path).expect("upgrade to v41");
-        assert_eq!(ledger.schema_version().expect("version"), 47);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 47);
+        assert_eq!(ledger.schema_version().expect("version"), 48);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 48);
         let runs: i64 = ledger
             .conn
             .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
@@ -1080,8 +1080,8 @@ mod tests {
             .expect("an intent written at v41");
         }
         let ledger = Ledger::open(&path).expect("upgrade to v42");
-        assert_eq!(ledger.schema_version().expect("version"), 47);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 47);
+        assert_eq!(ledger.schema_version().expect("version"), 48);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 48);
         let runs: i64 = ledger
             .conn
             .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
@@ -1136,7 +1136,7 @@ mod tests {
             .expect("a run written at v42");
         }
         let ledger = Ledger::open(&path).expect("upgrade to v43");
-        assert_eq!(ledger.schema_version().expect("version"), 47);
+        assert_eq!(ledger.schema_version().expect("version"), 48);
         let runs: i64 = ledger
             .conn
             .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
@@ -1184,7 +1184,7 @@ mod tests {
             .expect("a run written at v43");
         }
         let ledger = Ledger::open(&path).expect("upgrade to v44");
-        assert_eq!(ledger.schema_version().expect("version"), 47);
+        assert_eq!(ledger.schema_version().expect("version"), 48);
         let runs: i64 = ledger
             .conn
             .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
@@ -1286,7 +1286,7 @@ mod tests {
             }
         }
         let ledger = Ledger::open(&path).expect("upgrade to v45");
-        assert_eq!(ledger.schema_version().expect("version"), 47);
+        assert_eq!(ledger.schema_version().expect("version"), 48);
         let answered = |ledger: &Ledger| -> Vec<String> {
             let mut stmt = ledger
                 .conn
@@ -1384,7 +1384,7 @@ mod tests {
             .expect("a task written at v44");
         }
         let ledger = Ledger::open(&path).expect("upgrade to v45");
-        assert_eq!(ledger.schema_version().expect("version"), 47);
+        assert_eq!(ledger.schema_version().expect("version"), 48);
         let (parent, recorded, unmatched): (Option<String>, i64, Option<String>) = ledger
             .conn
             .query_row(
@@ -1889,7 +1889,7 @@ mod tests {
             .expect("an outcome written at v45");
         }
         let ledger = Ledger::open(&path).expect("upgrade to v46");
-        assert_eq!(ledger.schema_version().expect("version"), 47);
+        assert_eq!(ledger.schema_version().expect("version"), 48);
         for table in ["holdout_definitions", "holdout_outcomes"] {
             let sources: Vec<String> = ledger
                 .conn

@@ -19,7 +19,7 @@ import {
 } from './decide.ts'
 import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses } from './guards.ts'
 import { cancelRun, childOf, contractPath, onChunk, pump, reconcileIntents, reloadTimeline, startReplay, startRun, statusOf, workspaceOf } from './runs.ts'
-import { onboardTool, onPersonPrompt, trustTool, withRoutingSection } from './consent.ts'
+import { onboardTool, onPersonPrompt, trustHoldoutsTool, trustTool, withRoutingSection } from './consent.ts'
 import { decideGuard, learningEnvelopeGuard, machineSettingsGuard, routerEnvelopeGuard } from './guards.ts'
 import { ensureWatcher } from './quiet-watch.ts'
 import { learningCommand, noteLastCycle, startCycle, startResumeSweep } from './learning.ts'
@@ -46,6 +46,7 @@ const STATUS_TOOL = 'mcp__relais__status'
 const CANCEL_TOOL = 'mcp__relais__cancel'
 const ONBOARD_TOOL = 'mcp__relais__onboard'
 const TRUST_TOOL = 'mcp__relais__trust'
+const TRUST_HOLDOUTS_TOOL = 'mcp__relais__trust_holdouts'
 const DECIDE_TOOL = 'mcp__relais__decide'
 const FEEDBACK_TOOL = 'mcp__relais__feedback'
 const CONSENT_FAILED = 'declined: relais could not ask the person (internal error). Nothing was written or allowed.'
@@ -173,6 +174,16 @@ export function register(on: any) {
       name: 'trust',
       description:
         "Ask the person to allow the commands of a repository's relais.toml (a run reported missing_trust_grant). The person sees the exact commands. Returns ready or declined.",
+      inputSchema: {
+        type: 'object',
+        properties: { cwd: { type: 'string', description: 'The repository (absolute path).' } },
+        required: ['cwd'],
+      },
+    })
+    await $.tool.register({
+      name: 'trust_holdouts',
+      description:
+        "Ask the person to confirm the new or changed holdouts the holdout store declares for a repository (a run reported holdout_unconfirmed). The person sees each declaration and what changed; the sha and fingerprint shown are the ones confirmed. Returns the names confirmed.",
       inputSchema: {
         type: 'object',
         properties: { cwd: { type: 'string', description: 'The repository (absolute path).' } },
@@ -319,6 +330,12 @@ export function register(on: any) {
     if (typeof e.cwd !== 'string') return { deny: 'relais trust needs a cwd (absolute path).' }
     const fx = effects($)
     return { result: await trustTool(fx, store, e.cwd, await fx.session.id()) }
+  }).catch(() => ({ result: CONSENT_FAILED }))
+
+  on('tool.call', { tool: TRUST_HOLDOUTS_TOOL }, async ($: any, e: any) => {
+    if (typeof e.cwd !== 'string') return { deny: 'relais trust_holdouts needs a cwd (absolute path).' }
+    const fx = effects($)
+    return { result: await trustHoldoutsTool(fx, store, e.cwd) }
   }).catch(() => ({ result: CONSENT_FAILED }))
 
   // machine.toml holds the grants: the model does not write it, and is

@@ -107,6 +107,9 @@ up, and the person answers there.
      use them and to allow relais to run them, and commits `relais.toml`.
    - `blocked (missing_trust_grant)`: call `mcp__relais__trust` with the
      `cwd`. It shows the person the exact commands and asks.
+   - `blocked (holdout_unconfirmed)`: call `mcp__relais__trust_holdouts` with
+     the `cwd`. It shows the person each new or changed store holdout and
+     asks; an attached one that is not confirmed is skipped, not blocked.
    - Both ask the person themselves, in Claude Code's own dialog. Do not
      ask the same question first, and do not answer it for them.
    - `ready`: call `mcp__relais__run` again.

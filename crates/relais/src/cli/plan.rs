@@ -24,6 +24,7 @@ use relais::policy::RepoPolicy;
 use relais::route;
 use relais::runner::live_trial;
 use relais::workspace;
+use std::collections::BTreeMap;
 use std::path::Path;
 /// A change to the repository's commands that no `relais run` has said
 /// yet, read without consuming it (`plan`, `trust show`): from the ledger
@@ -81,6 +82,7 @@ pub(crate) fn plan_json(
     contract: &TaskContract,
     attached: &[relais::holdout::Attachment],
     skipped: &[relais::holdout::SkippedAttachment],
+    confirmations: &BTreeMap<String, relais::holdout::ConfirmationState>,
 ) -> Result<CliOutcome, CliError> {
     let (mut value, outcome) = match decision {
         route::Routed::Route(routed) => (
@@ -120,11 +122,17 @@ pub(crate) fn plan_json(
             .iter()
             .filter_map(|attachment| {
                 attachment.matched.as_ref().map(|matched| {
-                    serde_json::json!({
+                    let mut entry = serde_json::json!({
                         "name": attachment.name,
                         "task_type": matched.task_type,
                         "path": matched.path,
-                    })
+                    });
+                    if let Some(state) = confirmations.get(&attachment.name) {
+                        entry["unconfirmed"] =
+                            (*state != relais::holdout::ConfirmationState::Confirmed).into();
+                        entry["confirmation"] = state.as_str().into();
+                    }
+                    entry
                 })
             })
             .collect::<Vec<_>>(),
@@ -229,19 +237,38 @@ pub(crate) fn plan_command(
         (None, None) => None,
     };
     let repo_name = relais::repo::main_checkout_name(&root).unwrap_or_default();
+    let view = match relais::holdout::discover(
+        &machine.holdouts,
+        &repo_name,
+        &relais::runner::holdout_root(&paths::runs_dir().map_err(CliError::Home)?).join("cache"),
+        "plan",
+    ) {
+        Ok(view) => view,
+        Err(invalid) => {
+            eprintln!(
+                "relais plan: blocked ({}): {invalid}",
+                relais::policy::BlockCode::HoldoutDeclarationInvalid
+            );
+            return Ok(CliOutcome::Blocked);
+        }
+    };
+    let holdout_settings = machine
+        .holdouts
+        .with_discovered(&repo_name, view.declared.clone());
     let attached =
-        relais::holdout::attachments(&machine.holdouts, &repo_name, &contract, task_type);
+        relais::holdout::attachments(&holdout_settings, &repo_name, &contract, task_type);
     // And the holdouts: `run` refuses a holdout criterion it cannot resolve,
     // with the same codes; an attached one whose store is unreachable is
     // skipped, as `run` skips it.
     let machine_toml = relais::holdout::machine_toml_label();
     let lookup = relais::holdout::Lookup {
-        settings: &machine.holdouts,
+        settings: &holdout_settings,
         repo: &repo_name,
         git: &relais::workspace::SystemGit,
         repo_dir: &root,
         base_sha: &base_sha,
         machine_toml: &machine_toml,
+        store_head: Some(&view.head),
     };
     let attached_names: Vec<String> = attached
         .iter()
@@ -266,6 +293,8 @@ pub(crate) fn plan_command(
         .into_iter()
         .filter(|attachment| !skipped.iter().any(|gone| gone.name == attachment.name))
         .collect();
+    let confirmations =
+        store_confirmations(&machine, &repo_name, &view, &holdout_settings, &attached);
     for gone in &skipped {
         eprintln!(
             "relais plan: holdout_attach_skipped: {}; the run settles without it",
@@ -287,7 +316,14 @@ pub(crate) fn plan_command(
         catalogs: &catalogs,
     });
     if let PlanFormat::Json = format {
-        return plan_json(&decision, &authority, &contract, &attached, &skipped);
+        return plan_json(
+            &decision,
+            &authority,
+            &contract,
+            &attached,
+            &skipped,
+            &confirmations,
+        );
     }
     let session = relais::coordinator::resolve_session();
     println!("contract hash: {}", contract.hash());
@@ -303,6 +339,16 @@ pub(crate) fn plan_command(
                 "holdout {} attached: task type {}, path {}",
                 attachment.name, matched.task_type, matched.path
             );
+            if let Some(state) = confirmations
+                .get(&attachment.name)
+                .filter(|state| **state != relais::holdout::ConfirmationState::Confirmed)
+            {
+                println!(
+                    "holdout {} unconfirmed ({}): skipped until `relais trust holdouts` accepts it",
+                    attachment.name,
+                    state.as_str()
+                );
+            }
         }
     }
     // Stderr, not stdout: `plan`'s stdout stays what it was (see below),
@@ -375,6 +421,42 @@ pub(crate) fn plan_command(
             Ok(CliOutcome::Blocked)
         }
     }
+}
+
+/// The confirmation state of each attached holdout that comes from the
+/// store; `run` skips the ones not `confirmed` (SPEC §4). Read-only:
+/// with no ledger on disk nothing is confirmed, and none is created.
+fn store_confirmations(
+    machine: &MachineSettings,
+    repo_name: &str,
+    view: &relais::holdout::StoreView,
+    effective: &relais::policy::HoldoutSettings,
+    attached: &[relais::holdout::Attachment],
+) -> BTreeMap<String, relais::holdout::ConfirmationState> {
+    let store = machine.holdouts.store.clone().unwrap_or_default();
+    let ledger = paths::ledger_path()
+        .ok()
+        .filter(|path| path.exists())
+        .and_then(|path| Ledger::open(&path).ok());
+    attached
+        .iter()
+        .filter(|attachment| {
+            effective.source_of(repo_name, &attachment.name) == relais::policy::DeclSource::Store
+        })
+        .map(|attachment| {
+            let held = ledger.as_ref().and_then(|ledger| {
+                ledger
+                    .holdout_confirmation(&store, repo_name, &attachment.name)
+                    .ok()
+                    .flatten()
+            });
+            let state = relais::holdout::state_of(
+                held.as_ref(),
+                view.fingerprints.get(&attachment.name).map(String::as_str),
+            );
+            (attachment.name.clone(), state)
+        })
+        .collect()
 }
 
 /// The task identity a run of this contract will have: the one already

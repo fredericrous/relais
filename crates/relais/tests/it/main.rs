@@ -10,6 +10,7 @@ mod decide_actor;
 mod fake_bin;
 mod feedback_cli;
 mod holdout_report;
+mod holdout_visibility;
 mod hook_event_fixtures;
 mod hook_respond;
 mod learning_cycle;
