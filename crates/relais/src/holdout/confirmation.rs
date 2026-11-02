@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::fingerprint::{fingerprint, supplied_contents, SuppliedFile, SuppliedRefusal};
 use super::StoreView;
 use crate::ids::to_hex;
-use crate::policy::HoldoutDecl;
+use crate::policy::{DeclSource, HoldoutDecl, HoldoutSettings};
 
 /// The more lines a diff would compare (old times new), the less it is worth
 /// aligning them: past this the whole file is shown replaced.
@@ -103,6 +103,19 @@ impl ConfirmationState {
     }
 }
 
+/// Where a store holdout stands: never confirmed, confirmed at another
+/// fingerprint, or confirmed at `current`.
+pub fn state_of(
+    confirmation: Option<&HoldoutConfirmation>,
+    current: Option<&str>,
+) -> ConfirmationState {
+    match confirmation {
+        None => ConfirmationState::New,
+        Some(_) if is_confirmed(confirmation, current) => ConfirmationState::Confirmed,
+        Some(_) => ConfirmationState::Changed,
+    }
+}
+
 /// Whether `fingerprint` is the one the person confirmed. A holdout frozen
 /// without a fingerprint was never fingerprinted, so it is not confirmed.
 pub fn is_confirmed(confirmation: Option<&HoldoutConfirmation>, fingerprint: Option<&str>) -> bool {
@@ -110,6 +123,85 @@ pub fn is_confirmed(confirmation: Option<&HoldoutConfirmation>, fingerprint: Opt
         (Some(confirmed), Some(current)) => confirmed.fingerprint == current,
         _ => false,
     }
+}
+
+/// One holdout discovered for the repository, as `relais doctor` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ListedHoldout {
+    pub name: String,
+    /// `store` or `machine`: whose declaration is in force.
+    pub source: &'static str,
+    /// Where it attaches to a task that does not name it.
+    pub attach: String,
+    pub state: ConfirmationState,
+}
+
+/// The attach rule of a declaration, in words.
+pub fn attach_text(decl: &HoldoutDecl) -> String {
+    match &decl.attach {
+        None => "none (named by a contract only)".to_string(),
+        Some(attach) => format!(
+            "task types {}; paths {}",
+            attach
+                .task_types
+                .iter()
+                .map(|kind| kind.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            attach.paths.join(", ")
+        ),
+    }
+}
+
+/// Every holdout discovered for `repo`: the effective declarations (store and
+/// machine.toml merged as `HoldoutSettings::with_discovered` does), then the
+/// store's declarations a machine.toml table turned off. `machine` is the
+/// settings before the merge, `confirmed` the confirmations by name.
+pub fn listing(
+    machine: &HoldoutSettings,
+    repo: &str,
+    view: &StoreView,
+    confirmed: &BTreeMap<String, HoldoutConfirmation>,
+) -> Vec<ListedHoldout> {
+    let effective = machine.with_discovered(repo, view.declared.clone());
+    let mut listed: BTreeMap<String, ListedHoldout> = BTreeMap::new();
+    for name in effective.declared_names(repo) {
+        let Some(decl) = effective.declaration(repo, &name) else {
+            continue;
+        };
+        let (source, state) = match effective.source_of(repo, &name) {
+            DeclSource::Store => (
+                "store",
+                state_of(
+                    confirmed.get(&name),
+                    view.fingerprints.get(&name).map(String::as_str),
+                ),
+            ),
+            DeclSource::Machine if view.declared.contains_key(&name) => {
+                ("machine", ConfirmationState::Shadowed)
+            }
+            // The person's own text needs no confirmation (SPEC §4).
+            DeclSource::Machine => ("machine", ConfirmationState::Confirmed),
+        };
+        listed.insert(
+            name.clone(),
+            ListedHoldout {
+                name,
+                source,
+                attach: attach_text(decl),
+                state,
+            },
+        );
+    }
+    for (name, decl) in &view.declared {
+        listed.entry(name.clone()).or_insert_with(|| ListedHoldout {
+            name: name.clone(),
+            source: "store",
+            attach: attach_text(decl),
+            state: ConfirmationState::Shadowed,
+        });
+    }
+    listed.into_values().collect()
 }
 
 /// How one supplied file, or the declaration itself, differs from the
@@ -183,11 +275,7 @@ pub fn review(
         };
         let current = view.fingerprints.get(name).cloned();
         let previous = confirmed.get(name);
-        let state = match previous {
-            None => ConfirmationState::New,
-            Some(_) if is_confirmed(previous, current.as_deref()) => ConfirmationState::Confirmed,
-            Some(_) => ConfirmationState::Changed,
-        };
+        let state = state_of(previous, current.as_deref());
         let diffs = match (&view.tree, state) {
             (_, ConfirmationState::Confirmed) => Vec::new(),
             (Some(tree), _) => {

@@ -795,7 +795,7 @@ impl<'a> RunEngine<'a> {
                     label_kind: "attempt",
                     attempt_index: 0,
                     name,
-                    outcome: crate::holdout::SKIPPED_OUTCOME,
+                    outcome: crate::holdout::UNCONFIRMED_OUTCOME,
                     profile_green: false,
                     source: crate::holdout::HoldoutSource::Attached.as_str(),
                 },

@@ -258,6 +258,85 @@ async function askTrust(fx: Fx, store: Store, repo: Repo, session: string): Prom
   return `ready: the person allowed ${shown.declaration.steps.length} command(s) in ${repo.name}. Call mcp__relais__run again.`
 }
 
+export type HoldoutReview = {
+  name: string
+  state: 'new' | 'changed' | 'confirmed' | 'shadowed'
+  store_sha: string | null
+  fingerprint: string | null
+  declaration: unknown
+  diffs: { path: string; change: string; text: string }[]
+}
+
+const REVIEW_LINES = 40
+
+export const confirmLabel = (name: string) => `Confirm ${name}`
+
+// What the person reads before confirming one store holdout: the effective
+// declaration and the lines that changed since the last confirmation. The
+// exact store sha and fingerprint are shown, and are the ones passed back.
+export function holdoutQuestion(review: HoldoutReview, repo: string): { text: string; yes: string } {
+  const body: string[] = []
+  const declaration = JSON.stringify(review.declaration, null, 2) ?? ''
+  body.push('declaration:', ...declaration.split('\n').map(line => `  ${line}`))
+  for (const diff of review.diffs) {
+    body.push(`${diff.change} ${diff.path}:`, ...diff.text.split('\n').filter(Boolean).map(line => `  ${line}`))
+  }
+  const shown = body.slice(0, REVIEW_LINES).map(escapeDisplay)
+  if (body.length > REVIEW_LINES) shown.push(`  +${body.length - REVIEW_LINES} more lines (relais trust holdouts shows all)`)
+  return {
+    text: [
+      `relais · Run the ${review.state} holdout ${escapeDisplay(review.name)} for ${escapeDisplay(repo)}?`,
+      `store sha ${review.store_sha ?? ''}`,
+      `fingerprint ${review.fingerprint ?? ''}`,
+      ...shown,
+      'Confirming covers exactly this version; any later change asks again.',
+    ].join('\n'),
+    yes: confirmLabel(review.name),
+  }
+}
+
+// `relais trust holdouts` through the dialog: one question per new or
+// changed store holdout, and the displayed sha and fingerprint go back on
+// acceptance, so a store that moved meanwhile is refused as stale.
+export async function trustHoldoutsTool(fx: Fx, store: Store, cwd: string): Promise<string> {
+  const repo = await repoOf(fx, cwd)
+  if (typeof repo === 'string') return repo
+  return serialized(store, `${repo.root}\0holdouts`, () => askHoldouts(fx, repo))
+}
+
+async function askHoldouts(fx: Fx, repo: Repo): Promise<string> {
+  const review = await run(fx, ['relais', 'trust', 'holdouts', '--json'], repo.root)
+  if (review.exitCode !== 0) return `not confirmed: relais trust holdouts failed: ${err(review)}`
+  const reviews = parsed<HoldoutReview[]>(review)
+  if (!reviews) return `not confirmed: relais trust holdouts printed no JSON: ${out(review).slice(0, 400)}`
+  const open = reviews.filter(r => (r.state === 'new' || r.state === 'changed') && r.store_sha && r.fingerprint)
+  if (open.length === 0) return `ready: no holdout of ${repo.name} waits for confirmation.`
+  const confirmed: string[] = []
+  const left: string[] = []
+  for (const holdout of open) {
+    const q = holdoutQuestion(holdout, repo.name)
+    const answer = await ask(fx, q.text, [NOT_NOW, q.yes])
+    if (answer !== q.yes) {
+      left.push(holdout.name)
+      continue
+    }
+    const accepted = await run(
+      fx,
+      ['relais', 'trust', 'holdouts', '--accept', holdout.name, '--sha', holdout.store_sha!, '--fingerprint', holdout.fingerprint!, '--json'],
+      repo.root,
+    )
+    if (accepted.exitCode !== 0) return `not confirmed: relais trust holdouts --accept ${holdout.name} failed: ${err(accepted)}`
+    confirmed.push(holdout.name)
+  }
+  if (confirmed.length > 0) fx.ui.toast(`relais · ${confirmed.length} holdout${confirmed.length === 1 ? '' : 's'} confirmed in ${repo.name}`)
+  return [
+    confirmed.length > 0 ? `confirmed: ${confirmed.join(', ')}.` : 'confirmed: none.',
+    left.length > 0 ? `not confirmed (the person declined or dismissed): ${left.join(', ')}; they do not run.` : '',
+  ]
+    .filter(Boolean)
+    .join(' ')
+}
+
 // Trusts the repository once: no key, so nothing the repository changes while
 // the person is being asked can make the grant stale.
 async function grant(fx: Fx, repo: Repo, session: string): Promise<'ok' | string> {

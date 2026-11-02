@@ -23,8 +23,9 @@ mod confirmation;
 mod discovery;
 mod fingerprint;
 pub use confirmation::{
-    accept, is_confirmed, review, AcceptRefusal, ConfirmationState, FileDiff, HoldoutConfirmation,
-    HoldoutReview, ReviewFailed, Snapshot, SnapshotFile,
+    accept, attach_text, is_confirmed, listing, review, state_of, AcceptRefusal, ConfirmationState,
+    FileDiff, HoldoutConfirmation, HoldoutReview, ListedHoldout, ReviewFailed, Snapshot,
+    SnapshotFile,
 };
 pub use discovery::{discover, DeclarationInvalid, StoreView};
 pub use fingerprint::{
@@ -57,6 +58,11 @@ pub struct ResolvedHoldout {
 /// The outcome a ledger row records for an attached holdout that was skipped
 /// because its store could not be fetched; it is never a catch.
 pub const SKIPPED_OUTCOME: &str = "skipped";
+
+/// The outcome a ledger row records for an attached store holdout that was
+/// not run because the person has not confirmed it (SPEC §4); counted apart
+/// from other skips, and never a catch.
+pub const UNCONFIRMED_OUTCOME: &str = "unconfirmed";
 
 /// Where a run's holdout came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

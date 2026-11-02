@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { allowLabel, escapeDisplay, withRoutingSection, NOT_NOW, onboardTool, onPersonPrompt, question2, trustTool, USE_CHECKS, type Shown } from '../hooks/consent.ts'
+import { allowLabel, escapeDisplay, withRoutingSection, NOT_NOW, onboardTool, onPersonPrompt, question2, trustHoldoutsTool, trustTool, USE_CHECKS, type Shown } from '../hooks/consent.ts'
 import { machineSettingsGuard, MACHINE_SETTINGS_MESSAGE } from '../hooks/guards.ts'
 import { createStore } from '../hooks/store.ts'
 import { pump } from '../hooks/runs.ts'
@@ -426,4 +426,47 @@ test('a request that only mentions a negation elsewhere still lifts a Not now', 
   store.declined.add('/repo')
   onPersonPrompt(store, 'no relais for this one')
   expect(store.declined.size).toBe(1)
+})
+
+test('trust_holdouts: the dialog offers the confirmation and acceptance passes the displayed sha and fingerprint', async () => {
+  const w = world()
+  const accepts: string[][] = []
+  const review = [
+    {
+      name: 'report-json',
+      state: 'new',
+      store_sha: 'a'.repeat(40),
+      fingerprint: 'fp-1',
+      declaration: { path: 'check.sh', overlay: '.relais-holdout/report-json.sh' },
+      diffs: [{ path: 'holdout declaration', change: 'added', text: '+{}\n' }],
+    },
+    { name: 'settled', state: 'confirmed', store_sha: 'b'.repeat(40), fingerprint: 'fp-2', declaration: {}, diffs: [] },
+  ]
+  const inner = w.fx.process.run
+  w.fx.process.run = async (argv: string[], init: any) => {
+    const line = argv.slice(1).join(' ')
+    if (argv[0] === 'relais' && line === 'trust holdouts --json') return { exitCode: 0, stdout: JSON.stringify(review), stderr: '' }
+    if (argv[0] === 'relais' && line.startsWith('trust holdouts --accept')) {
+      accepts.push(argv.slice(1))
+      return { exitCode: 0, stdout: '{"code":"confirmed"}', stderr: '' }
+    }
+    return inner(argv, init)
+  }
+  w.answers.push('Confirm report-json')
+  const result = await trustHoldoutsTool(w.fx, w.store, '/repo')
+  expect(w.asks.length).toBe(1)
+  expect(w.asks[0].options).toEqual([NOT_NOW, 'Confirm report-json'])
+  expect(w.asks[0].question).toContain('a'.repeat(40))
+  expect(w.asks[0].question).toContain('fp-1')
+  expect(accepts).toEqual([
+    ['trust', 'holdouts', '--accept', 'report-json', '--sha', 'a'.repeat(40), '--fingerprint', 'fp-1', '--json'],
+  ])
+  expect(result).toContain('confirmed: report-json')
+
+  const declinedRun = world()
+  declinedRun.fx.process.run = w.fx.process.run
+  declinedRun.answers.push(NOT_NOW)
+  accepts.length = 0
+  expect(await trustHoldoutsTool(declinedRun.fx, declinedRun.store, '/repo')).toContain('not confirmed')
+  expect(accepts).toEqual([])
 })

@@ -50,6 +50,93 @@ pub(crate) fn note_held_repair_effort(report: &mut doctor::DoctorReport) {
     }
 }
 
+/// Add the `holdouts` finding: every holdout discovered for the current
+/// repository with its source, attach rule and confirmation state, and the
+/// store's unreachability when it cannot be read. Nothing when no store is
+/// configured and machine.toml declares none for this repository. A
+/// repository or machine.toml that cannot be read says nothing here: doctor
+/// reports those on findings of their own.
+pub(crate) fn note_holdouts(report: &mut doctor::DoctorReport) {
+    let (Ok(root), Ok(machine)) = (project_dir(), load_machine()) else {
+        return;
+    };
+    let repo = relais::repo::main_checkout_name(&root).unwrap_or_default();
+    let Ok(runs) = paths::runs_dir() else {
+        return;
+    };
+    let configured = machine.holdouts.store.is_some()
+        || machine
+            .holdouts
+            .repos
+            .get(&repo)
+            .is_some_and(|named| !named.is_empty());
+    if !configured {
+        return;
+    }
+    let view = match relais::holdout::discover(
+        &machine.holdouts,
+        &repo,
+        &relais::runner::holdout_root(&runs).join("cache"),
+        &format!("doctor-{}", std::process::id()),
+    ) {
+        Ok(view) => view,
+        Err(invalid) => {
+            report.findings.push(doctor::Finding {
+                component: "holdouts",
+                level: doctor::Level::Fail,
+                detail: format!("holdout_declaration_invalid: {invalid}"),
+            });
+            return;
+        }
+    };
+    let store = machine.holdouts.store.clone().unwrap_or_default();
+    let ledger = paths::ledger_path()
+        .ok()
+        .filter(|path| path.exists())
+        .and_then(|path| relais::ledger::Ledger::open(&path).ok());
+    let mut confirmed = std::collections::BTreeMap::new();
+    if let Some(ledger) = &ledger {
+        for name in view.declared.keys() {
+            if let Ok(Some(held)) = ledger.holdout_confirmation(&store, &repo, name) {
+                confirmed.insert(name.clone(), held);
+            }
+        }
+    }
+    let listed = relais::holdout::listing(&machine.holdouts, &repo, &view, &confirmed);
+    let mut lines = Vec::new();
+    let mut level = doctor::Level::Ok;
+    if let Some(cause) = &view.unread {
+        level = doctor::Level::Warn;
+        lines.push(format!(
+            "holdout_store_unreachable: {store} ({cause}); the holdouts it declares are unknown"
+        ));
+    }
+    if listed.is_empty() && view.unread.is_none() {
+        lines.push(format!("no holdout is declared for {repo}"));
+    }
+    for holdout in &listed {
+        if matches!(
+            holdout.state,
+            relais::holdout::ConfirmationState::New | relais::holdout::ConfirmationState::Changed
+        ) && level == doctor::Level::Ok
+        {
+            level = doctor::Level::Warn;
+        }
+        lines.push(format!(
+            "{}  source {}  {}",
+            holdout.name,
+            holdout.source,
+            holdout.state.as_str()
+        ));
+        lines.push(format!("  attach: {}", holdout.attach));
+    }
+    report.findings.push(doctor::Finding {
+        component: "holdouts",
+        level,
+        detail: lines.join("\n"),
+    });
+}
+
 /// What `relais doctor --json` prints: the findings, and the Claude Code
 /// integration described apart from them.
 #[derive(serde::Serialize)]
@@ -69,6 +156,7 @@ pub(crate) fn doctor_command(json: bool) -> Result<CliOutcome, CliError> {
     let integration = relais::install::plugin::integration(&claude, &listing);
     let mut report = doctor::doctor(&project_dir()?, listing);
     note_held_repair_effort(&mut report);
+    note_holdouts(&mut report);
     if json {
         print_document(&DoctorDocument {
             report: &report,

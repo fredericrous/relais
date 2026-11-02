@@ -67,6 +67,8 @@ const NEXT_STEP: Record<string, string> = {
     'This repository has no relais.toml yet. Call mcp__relais__onboard with this cwd: it asks the person which checks to use and whether relais may run them, then call mcp__relais__run again.',
   missing_trust_grant:
     "The person has not allowed this repository's commands yet. Call mcp__relais__trust with this cwd: it shows them the exact commands and asks; then call mcp__relais__run again.",
+  holdout_unconfirmed:
+    'A holdout the contract names is new or changed in the holdout store and the person has not confirmed it. Call mcp__relais__trust_holdouts with this cwd: it shows them the declaration and what changed and asks; then call mcp__relais__run again.',
 }
 
 // One tick of the session's timer: sends the verdicts waiting, then writes

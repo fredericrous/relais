@@ -122,12 +122,36 @@ impl Ledger {
         Ok(names)
     }
 
+    /// The names of the run's attached store holdouts left out because the
+    /// person had not confirmed them.
+    pub fn unconfirmed_attached_holdouts(&self, run_id: &RunId) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT name FROM holdout_outcomes
+              WHERE run_id = ?1 AND outcome = ?2 AND source = ?3 ORDER BY name",
+        )?;
+        let names = statement
+            .query_map(
+                params![
+                    run_id.as_str(),
+                    crate::holdout::UNCONFIRMED_OUTCOME,
+                    crate::holdout::HoldoutSource::Attached.as_str()
+                ],
+                |row| row.get(0),
+            )?
+            .collect::<std::result::Result<Vec<String>, _>>()?;
+        Ok(names)
+    }
+
     /// Whether the run ran at least one holdout (it has an outcome row that
-    /// was not skipped).
+    /// was neither skipped nor unconfirmed).
     pub fn run_named_a_holdout(&self, run_id: &RunId) -> Result<bool> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM holdout_outcomes WHERE run_id = ?1 AND outcome <> ?2",
-            params![run_id.as_str(), crate::holdout::SKIPPED_OUTCOME],
+            "SELECT COUNT(*) FROM holdout_outcomes WHERE run_id = ?1 AND outcome <> ?2 AND outcome <> ?3",
+            params![
+                run_id.as_str(),
+                crate::holdout::SKIPPED_OUTCOME,
+                crate::holdout::UNCONFIRMED_OUTCOME
+            ],
             |row| row.get(0),
         )?;
         Ok(count > 0)
@@ -137,8 +161,13 @@ impl Ledger {
     pub fn run_ran_holdout_of_source(&self, run_id: &RunId, source: &str) -> Result<bool> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM holdout_outcomes
-              WHERE run_id = ?1 AND source = ?2 AND outcome <> ?3",
-            params![run_id.as_str(), source, crate::holdout::SKIPPED_OUTCOME],
+              WHERE run_id = ?1 AND source = ?2 AND outcome <> ?3 AND outcome <> ?4",
+            params![
+                run_id.as_str(),
+                source,
+                crate::holdout::SKIPPED_OUTCOME,
+                crate::holdout::UNCONFIRMED_OUTCOME
+            ],
             |row| row.get(0),
         )?;
         Ok(count > 0)

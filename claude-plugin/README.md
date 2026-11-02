@@ -119,7 +119,7 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
 - `skills/relais/SKILL.md` — the `relais` skill (`/relais:relais` by hand),
   which the model uses on its own for bounded tasks: the contract from the
   plan or the request, a run with `mcp__relais__run`, setup with
-  `mcp__relais__onboard` / `mcp__relais__trust`, a replay with
+  `mcp__relais__onboard` / `mcp__relais__trust` (and `mcp__relais__trust_holdouts` for new or changed store holdouts), a replay with
   `mcp__relais__replay`, progress with `mcp__relais__status` or
   `/relais-status`.
 - `skills/programme/SKILL.md` — the `programme` skill (`/relais:programme` by

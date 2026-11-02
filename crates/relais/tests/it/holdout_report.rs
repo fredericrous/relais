@@ -378,3 +378,65 @@ fn plan_refuses_a_named_holdout_on_an_unreachable_store() {
     let stderr = String::from_utf8_lossy(&named.stderr);
     assert!(stderr.contains("blocked (holdout_unreadable)"), "{stderr}");
 }
+
+#[test]
+fn the_report_counts_an_unconfirmed_skip_apart_from_other_skips() {
+    let _permit = common::WorldPermit::acquire(1);
+    let scratch = short_temp_dir("ho-unconf");
+    let root = scratch.to_path_buf();
+    let state = root.join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let ledger = Ledger::open(&state.join("ledger.sqlite")).expect("ledger");
+    for (run, outcome) in [
+        ("run-unconfirmed", "unconfirmed"),
+        ("run-skipped", "skipped"),
+    ] {
+        let run = RunId::from_stored(run);
+        ledger
+            .insert_run(
+                &run,
+                "/repo",
+                None,
+                &TaskId::from_stored(run.as_str()),
+                "rk",
+            )
+            .expect("run");
+        ledger
+            .record_holdout_outcome(
+                &run,
+                &HoldoutOutcomeRow {
+                    label_kind: "attempt",
+                    attempt_index: 0,
+                    name: "attached-one",
+                    outcome,
+                    profile_green: false,
+                    source: "attached",
+                },
+            )
+            .expect("outcome");
+    }
+    drop(ledger);
+
+    let output = common::relais(BIN)
+        .args(["report", "--no-import", "--json"])
+        .current_dir(&root)
+        .env("RELAIS_STATE_DIR", &state)
+        .env("RELAIS_CONFIG_DIR", root.join("cfg"))
+        .env("HOME", &root)
+        .env("USERPROFILE", &root)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .output()
+        .expect("relais runs");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("json");
+    let attached = &report["holdouts"]["by_source"]["attached"];
+    assert_eq!(attached["unconfirmed"], 1, "{report}");
+    assert_eq!(attached["skipped"], 1, "{report}");
+    assert_eq!(attached["runs"], 0, "{report}");
+    assert_eq!(report["holdouts"]["holdout_runs"], 0, "{report}");
+}

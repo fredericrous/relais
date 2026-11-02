@@ -3414,10 +3414,15 @@ fn assert_skipped_unconfirmed(fixture: &Fixture, outcome: &RunOutcome, marker: &
     assert_eq!(
         fixture
             .ledger
-            .skipped_attached_holdouts(&outcome.run_id)
-            .expect("skipped"),
+            .unconfirmed_attached_holdouts(&outcome.run_id)
+            .expect("unconfirmed"),
         vec!["report".to_string()]
     );
+    assert!(fixture
+        .ledger
+        .skipped_attached_holdouts(&outcome.run_id)
+        .expect("skipped")
+        .is_empty());
 }
 
 #[test]
