@@ -3,6 +3,9 @@
 use super::ctx::load_contract;
 use super::ctx::refusal;
 use super::ctx::Refusal;
+use super::decision_record::read_decide_proof;
+use super::decision_record::Decided;
+use super::decision_record::Decision;
 use super::evidence::authorship_label;
 use super::evidence::reseal_receipt_with_signoff;
 use super::feedback::open_verification_gaps;
@@ -40,22 +43,6 @@ pub(crate) struct DecideRequest<'a> {
     pub(crate) json: bool,
     pub(crate) proof_stdin: bool,
 }
-
-/// What a recorded decision reports, for both the sentence and `--json`.
-pub(crate) struct Decided {
-    pub(crate) run: String,
-    pub(crate) resolution: Reason,
-    pub(crate) actor: relais::ledger::Actor,
-    pub(crate) from_state: State,
-    pub(crate) to_state: State,
-    pub(crate) advice: serde_json::Value,
-    pub(crate) sentence: String,
-    /// The successor intent a `revise --widen-scope` or `--successor-
-    /// contract` answer wrote (or, repeated, found).
-    pub(crate) successor_intent: Option<serde_json::Value>,
-}
-
-pub(crate) type Decision = Result<Decided, Refusal>;
 
 pub(crate) fn decide_command(request: DecideRequest<'_>) -> Result<CliOutcome, CliError> {
     let json = request.json;
@@ -115,32 +102,6 @@ pub(crate) const UNPROVED_SIGNOFF: &str =
     "`--criterion` is refused for `--actor person-via-orchestrator` \
      without the plugin's proof: only an answer recorded through the decide tool counts as the \
      person's sign-off";
-
-/// The plugin's proof on stdin (`--proof-stdin`).
-#[derive(serde::Deserialize)]
-pub(crate) struct DecideProof {
-    pub(crate) session: String,
-    pub(crate) nonce: String,
-}
-
-/// Read the `--proof-stdin` frame. A malformed frame is a refusal, never a
-/// silent `cli`: the plugin wrote it, so a bad one is a bug to see.
-pub(crate) fn read_decide_proof() -> Result<DecideProof, Refusal> {
-    use std::io::Read;
-    let mut text = String::new();
-    if let Err(e) = std::io::stdin().take(64 * 1024).read_to_string(&mut text) {
-        return refusal(
-            CliOutcome::InvalidInput,
-            format!("`--proof-stdin`: could not read stdin: {e}"),
-        );
-    }
-    serde_json::from_str(text.trim()).or_else(|e| {
-        refusal(
-            CliOutcome::InvalidInput,
-            format!("`--proof-stdin` expects {{\"session\", \"nonce\"}} on stdin: {e}"),
-        )
-    })
-}
 
 /// The checks that need only the arguments, run before the ledger is
 /// opened so a refused invocation touches nothing.

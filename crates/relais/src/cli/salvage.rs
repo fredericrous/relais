@@ -1,8 +1,8 @@
 //! `relais decide --answer salvaged`.
 
 use super::ctx::refusal;
-use super::decide::Decided;
-use super::decide::Decision;
+use super::decision_record::Decided;
+use super::decision_record::Decision;
 use super::outcome::operational;
 use super::outcome::CliError;
 use super::outcome::CliOutcome;

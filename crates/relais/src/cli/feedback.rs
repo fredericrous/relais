@@ -3,7 +3,7 @@
 use super::ctx::open_ledger;
 use super::ctx::refusal;
 use super::ctx::Refusal;
-use super::decide::read_decide_proof;
+use super::decision_record::read_decide_proof;
 use super::outcome::exit_code;
 use super::outcome::operational;
 use super::outcome::CliError;
