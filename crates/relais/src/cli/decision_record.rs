@@ -1,7 +1,8 @@
-//! What a recorded `relais decide` answer reports, and the plugin's proof
-//! that the answer came through its decide tool. `decide`, `feedback` and
-//! `salvage` all read these; keeping them out of `decide` keeps the three
-//! acyclic (`scripts/check-child-cycles.py crates/relais/src/cli`).
+//! A recorded `relais decide` answer, and the plugin's proof that the answer
+//! came through its decide tool. It stands apart from `decide` because the
+//! modules `decide` calls also read it: kept inside `decide`, each of them
+//! would import `decide` back, an import cycle
+//! (`scripts/check-child-cycles.py crates/relais/src/cli`).
 
 use super::ctx::refusal;
 use super::ctx::Refusal;

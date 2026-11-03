@@ -3689,12 +3689,12 @@ timeout_seconds = 60
             .expect("this repository's own relais.toml parses");
         assert_eq!(
             own.authority_hash(),
-            "ae37a83891228ef444fc61be594945a91a973f2b31b1933bad685d367779b0b9",
-            "the hash of this repository's own policy must not move (it moved deliberately six \
+            "fa2eec0f145dc2c100d5f87f510ba71485b6ef07fa8572affdd7c402d2fbb1b1",
+            "the hash of this repository's own policy must not move (it moved deliberately seven \
 times: when the per-type recipes were seeded, when `cache_baseline` was turned on, when \
 `make check` was split into one check per gate, when the `make test` and `make msrv` \
-limits were raised, when `make msrv` and `make audit` were left to CI, and sixth: \
-commands run through amont gates)"
+limits were raised, when `make msrv` and `make audit` were left to CI, sixth: commands \
+run through amont gates, and seventh: the `cli` child-cycle gate joined them)"
         );
         let tiered = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
         assert_eq!(
