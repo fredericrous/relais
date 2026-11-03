@@ -3,6 +3,7 @@
 pub(crate) mod coordinator;
 pub(crate) mod ctx;
 pub(crate) mod decide;
+pub(crate) mod decision_record;
 pub(crate) mod doctor;
 pub(crate) mod evidence;
 pub(crate) mod feedback;

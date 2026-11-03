@@ -66,6 +66,7 @@ jobs:
       # the top-level module).
       - run: python3 scripts/check-child-cycles.py crates/relais/src/ledger
       - run: python3 scripts/check-child-cycles.py crates/relais/src/runner
+      - run: python3 scripts/check-child-cycles.py crates/relais/src/cli
       # The deletion check's pure logic, on fixtures (no cargo, no network).
       - run: python3 scripts/test_mutants_check.py
       # The CI platform scripts (classifier, plan, release guard), on
@@ -78,8 +79,8 @@ jobs:
       # build relais, and the commit gate's clippy already refuses an `#[allow]`.
       - name: adr-lint sync --check
         env:
-          ADR_LINT: "0.8.0"
-          ADR_LINT_SHA256: 4298718e843d5253ed84a64a4b7ed98ee5bab5bd3dc0d0bd1aeb59920d92be03
+          ADR_LINT: "0.15.0"
+          ADR_LINT_SHA256: 257da35a72c0f3a157f84526b25ba94c71a69381d92be7e2caa7dd3e2b0e8b36
         run: |
           name="adr-lint-$ADR_LINT-x86_64-unknown-linux-gnu"
           curl -fsSL --max-time 60 -o "$RUNNER_TEMP/$name.tar.gz" \

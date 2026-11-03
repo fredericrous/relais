@@ -30,6 +30,7 @@ lint:
 	python3 scripts/check-module-cycles.py
 	python3 scripts/check-child-cycles.py crates/relais/src/ledger
 	python3 scripts/check-child-cycles.py crates/relais/src/runner
+	python3 scripts/check-child-cycles.py crates/relais/src/cli
 
 test:
 	$(CARGO) test
