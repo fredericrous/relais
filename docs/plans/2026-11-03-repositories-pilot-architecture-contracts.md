@@ -27,4 +27,11 @@ its reviews and its decision log live in the canonical file above.
 | a real commit staging only a comment in `adr-lint.toml` | `adr-lint-check` runs | `amont list --stage pre-commit` with only `adr-lint.toml` staged: `● adr-lint-check (declared)`; the commit passed its 28 checks (probe commit then dropped) |
 | `child-cycles-cli` gate | blocks at commit, runs in relais verification | amont.conf `pre-commit child-cycles-cli … block`; relais.toml `amont run --stamp child-cycles-cli`; `amont trust` re-granted (a1c73977…) |
 
-Note: the own-policy authority hash moved, so the person's trust grant for relais runs in this repository must be renewed after merge.
+Note: the own-policy authority hash moved. Under ADR-0007 relais reports the policy change once at the next run here; the first run after merge confirms the grant still admits it and records a `child-cycles-cli` stamp.
+
+## Implementation review
+
+approve (round 1 approve-with-changes: 1 high, 2 medium; delta: all resolved), plus code review backend, lang:rust, architect and platform, all approve after their delta.
+Fixed: the `child-cycles-cli` gate and verification command, the comment counts, the record of `make lint`, `make check` and the `adr-lint.toml` trigger, the module doc.
+deliberate: relais.toml:75 still says "five lint gates" where the profile lists six (platform, low; the count was already one short); fixed in the ports-plan branch, which edits relais.toml again. decision_record's two concerns (architect, low) are noted for the ports plan's exploration.
+Tokens and time: implementation 62k + 68k; backend 49k + 52k; lang:rust 49k + 52k; architect 50k + 53k; platform 70k + 74k.
