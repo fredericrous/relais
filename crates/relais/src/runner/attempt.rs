@@ -511,7 +511,7 @@ impl<'a> RunEngine<'a> {
                 &progress.budget,
                 Observation::Cancelled(
                     "the dispatch was cancelled through the coordinator; what the worker wrote \
-                     is kept as a named candidate"
+                     is archived partial work, not a registered candidate"
                         .into(),
                 ),
             )?));
