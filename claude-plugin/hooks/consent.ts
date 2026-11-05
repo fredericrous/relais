@@ -190,6 +190,8 @@ export const ROUTING_SECTION = 'relais-routing'
 // line as a developer instruction that the person cannot lift: on
 // 2026-11-04 one refused to edit directly after "don't use relais". A model
 // that is unknown (no name, or the read failed) keeps the rule, as before.
+// holds-until: a proxy reports a Claude alias for a non-Claude model; then
+// detect the proxy, not the name.
 export function isClaudeModel(model: unknown): boolean {
   if (typeof model !== 'string' || model.trim() === '') return true
   return /claude|opus|sonnet|haiku|fable/i.test(model)

@@ -20,23 +20,27 @@ person said "don't use relais", and stayed blocked. relais routes for Claude
 sessions; its router and run ladder are Claude's.
 
 ## Approach
-`prompt.compose` reads the session model (`$.session.model()`) and adds the
-`relais-routing` section only when the model is a Claude model or is unknown.
-A model name that holds none of `claude`, `opus`, `sonnet`, `haiku`, `fable`
-is not Claude. An unknown model keeps today's behaviour: the line is added.
+`prompt.compose` adds the `relais-routing` section only when the model the
+prompt is composed for (`e.promptModel`, a field the engine always sets) is a
+Claude model. A model name that holds none of `claude`, `opus`, `sonnet`,
+`haiku`, `fable` is not Claude. No name keeps today's behaviour: the line is
+added. Reading the event, not `$.session.model()`, avoids an effect call
+inside the hook and its failure modes.
 
 - `hooks/consent.ts`: `isClaudeModel(model)` and an optional `model` argument
   on `withRoutingSection`; a non-Claude model returns the composed prompt
   unchanged.
-- `hooks/register.ts`: the compose hook reads the model, and a failed read is
-  an unknown model.
-- Tests: Claude ids and aliases get the section; a proxy id (`gpt-5`,
-  `qwen`) does not; unknown and failed reads keep it; once-only still holds.
+- `hooks/register.ts`: the compose hook passes `e.promptModel`.
+- Tests: helper cases in `consent.test.ts`; the hook itself, run by the
+  engine, in `compose.test.ts`.
 
 ## Non-goals
 No change to the routing tools, the skill text, the router, or the person's
 own `~/.claude/CLAUDE.md`, which carries its own relais line.
 
 ## Verification
-- `claude-plugin/tests/consent.test.ts` covers each case above.
-- `make plugin` passes.
+Observed (359 + 2 tests, `claude plugin validate claude-plugin` passed):
+- `consent.test.ts`: `claude-opus-5-5`, `opus`, `Haiku`, `fable-5-1` → section added; `gpt-5`, `qwen`, `gemini-3-pro`, `o4-mini` → prompt returned unchanged; no name, `''`, `'  '`, `42` → section added.
+- `compose.test.ts`, through the engine: `promptModel: 'claude-sonnet-5-5'` → `relais-routing` present; `promptModel: 'gpt-5'` → absent.
+- Not run: a live non-Claude session through a proxy. `holds-until:` the next session on a proxy model shows no `# relais` section; the person's own `~/.claude/CLAUDE.md` line is not touched here.
+- `make plugin`, CI conclusion and the merged SHA: pending, next phase (land).

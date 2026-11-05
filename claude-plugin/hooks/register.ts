@@ -557,12 +557,10 @@ export function register(on: any) {
 
   // The routing rule as a section of the system prompt: a note attached to
   // the person's prompt reaches the model but is read as a hook's aside.
-  // Only for a Claude session: another model's session cannot lift it.
-  on('prompt.compose', async ($: any, e: any, next: any) => {
-    const composed = await next(e)
-    const model = await Promise.resolve($.session.model()).catch(() => undefined)
-    return withRoutingSection(composed, model)
-  })
+  // Only for a Claude model: another model's session cannot lift the rule.
+  // The event names the model the prompt is composed for; none named is an
+  // unknown model, which keeps the rule.
+  on('prompt.compose', async (_$: any, e: any, next: any) => withRoutingSection(await next(e), e?.promptModel))
 
   on('command.run', { command: 'relais-routing' }, async ($: any, e: any) => ({
     text: await routingCommand(effects($), store, typeof e?.args === 'string' ? e.args : ''),
