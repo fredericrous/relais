@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { allowLabel, escapeDisplay, withRoutingSection, NOT_NOW, onboardTool, onPersonPrompt, question2, trustHoldoutsTool, trustTool, USE_CHECKS, type Shown } from '../hooks/consent.ts'
+import { allowLabel, escapeDisplay, isClaudeModel, withRoutingSection, NOT_NOW, onboardTool, onPersonPrompt, question2, trustHoldoutsTool, trustTool, USE_CHECKS, type Shown } from '../hooks/consent.ts'
 import { HOLDOUT_CONFIRM_MESSAGE, machineSettingsGuard, MACHINE_SETTINGS_MESSAGE } from '../hooks/guards.ts'
 import { createStore } from '../hooks/store.ts'
 import { pump } from '../hooks/runs.ts'
@@ -374,6 +374,22 @@ test('the system prompt gains the routing rule as one section, once', async () =
   expect(composed.sections[1].scope).toBe('global')
   expect(withRoutingSection(composed)).toBe(composed)
   expect(withRoutingSection(undefined)).toBe(undefined)
+})
+
+test('the routing rule is for Claude sessions: a proxy model does not get it', async () => {
+  const base = { sections: [{ id: 'base', text: 'You are an agent.', scope: 'global' }] }
+  for (const model of ['claude-opus-5-5', 'claude-sonnet-5-5', 'opus', 'Haiku', 'fable-5-1']) {
+    expect(withRoutingSection(base, model).sections.map((s: any) => s.id)).toEqual(['base', 'relais-routing'])
+  }
+  for (const model of ['gpt-5', 'qwen', 'gemini-3-pro', 'o4-mini']) {
+    expect(withRoutingSection(base, model)).toBe(base)
+  }
+  // An unknown model keeps the rule, as before.
+  for (const model of [undefined, null, '', '  ', 42]) {
+    expect(withRoutingSection(base, model).sections.length).toBe(2)
+  }
+  expect(isClaudeModel('claude-opus-5-5')).toBe(true)
+  expect(isClaudeModel('gpt-5')).toBe(false)
 })
 
 test('the outcome message the pump submits does not lift a Not now when it comes back through prompt.submit', async () => {
