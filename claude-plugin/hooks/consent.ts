@@ -185,10 +185,23 @@ export const ROUTING_CONTEXT =
 
 export const ROUTING_SECTION = 'relais-routing'
 
+// relais routes by Claude's tiers, and its rule is for a Claude session. A
+// session on another model, reached through a proxy, reads a system-prompt
+// line as a developer instruction that the person cannot lift: on
+// 2026-11-04 one refused to edit directly after "don't use relais". A model
+// that is unknown (the event names none) keeps the rule, as before.
+// holds-until: a proxy reports a Claude alias for a non-Claude model; then
+// detect the proxy, not the name.
+export function isClaudeModel(model: unknown): boolean {
+  if (typeof model !== 'string' || model.trim() === '') return true
+  return /claude|opus|sonnet|haiku|fable/i.test(model)
+}
+
 // The composed system prompt with the routing rule as one more section,
-// in the scope of the last one; unchanged when it holds no sections or
-// already has this one.
-export function withRoutingSection(composed: any): any {
+// in the scope of the last one; unchanged when it holds no sections, already
+// has this one, or the session model is not Claude.
+export function withRoutingSection(composed: any, model?: unknown): any {
+  if (!isClaudeModel(model)) return composed
   const sections = composed?.sections
   if (!Array.isArray(sections) || sections.some((s: any) => s?.id === ROUTING_SECTION)) return composed
   const scope = sections[sections.length - 1]?.scope
