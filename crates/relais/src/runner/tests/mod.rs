@@ -4684,7 +4684,18 @@ fn cancellation_through_the_gate_stops_the_worker_and_preserves_the_worktree() {
     else {
         panic!("expected cancellation, got {outcome:?}");
     };
-    assert!(detail.contains("named candidate"), "{detail}");
+    assert!(
+        fixture
+            .ledger
+            .candidate_attempts(&run_id)
+            .expect("candidates")
+            .is_empty(),
+        "no candidate was registered, so none can be resumed"
+    );
+    assert!(
+        !detail.contains("named candidate") && detail.contains("archived partial work"),
+        "{detail}"
+    );
     // Nothing was snapshotted before the cancellation, so the
     // half-done tree is what the retirement keeps: under `final`,
     // in a patch, and the directory goes.

@@ -2361,6 +2361,73 @@ fn a_tests_only_overflow_prints_the_successor_intent_and_the_command_to_run_it()
     );
 }
 
+// The cancelled footer follows the candidate resolver's view of the ledger:
+// a run that registered a candidate says so, and the ledger agrees.
+#[test]
+fn a_cancelled_run_with_a_registered_candidate_names_it_in_the_footer() {
+    let world = World::new("cancelfooter");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    let path = world.write_task_scoped("widen", "tests-only-please", "off", &["docs/**"]);
+    let run = world.relais(&["run", "--task", path.to_str().unwrap()]);
+    let stderr = text(&run.stderr);
+    assert_eq!(run.status.code(), Some(7), "{stderr}");
+    let ledger = relais::ledger::Ledger::open(&world.state.join("ledger.sqlite")).expect("ledger");
+    let registered = ledger
+        .candidate_attempts(&relais::ids::RunId::from_stored(world.only_run_id()))
+        .expect("candidates");
+    assert!(!registered.is_empty(), "{stderr}");
+    assert!(
+        stderr.contains("the preserved candidate and evidence are under"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("archived partial work"), "{stderr}");
+}
+
+// A run cancelled through the coordinator while its worker is dispatched
+// registers no candidate, so its last line must not claim a preserved one.
+#[test]
+fn a_cancelled_run_with_no_registered_candidate_gives_a_generic_footer() {
+    let world = World::new("cancelnocand");
+    let hash = world.write_policy_with_wall(3, 120);
+    world.write_machine(&hash, "");
+    let task = world.write_task_for(
+        "task.json",
+        "Remove the obsolete entry point (sleep-please)",
+        "off",
+    );
+    let run = std::thread::scope(|scope| {
+        let driver = scope.spawn(|| world.relais(&["run", "--task", task.to_str().unwrap()]));
+        assert!(
+            World::poll_until(|| world.worker_launches() >= 1, 60),
+            "the worker was never dispatched"
+        );
+        let run_id = world.only_run_id();
+        let cancel = world.relais(&["coordinator", "cancel", "--run", &run_id]);
+        assert_eq!(
+            cancel.status.code(),
+            Some(0),
+            "{}\n{}",
+            text(&cancel.stdout),
+            text(&cancel.stderr)
+        );
+        driver.join().expect("the run ends")
+    });
+    let stderr = text(&run.stderr);
+    assert_eq!(run.status.code(), Some(7), "{stderr}");
+    let ledger = relais::ledger::Ledger::open(&world.state.join("ledger.sqlite")).expect("ledger");
+    let registered = ledger
+        .candidate_attempts(&relais::ids::RunId::from_stored(world.only_run_id()))
+        .expect("candidates");
+    assert!(registered.is_empty(), "{registered:?}\n{stderr}");
+    assert!(
+        stderr.contains("archived partial work and evidence are under"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("preserved candidate"), "{stderr}");
+    world.stop_coordinator();
+}
+
 // The decision spine (SPEC-new): a run that reaches `needs_decision` opens
 // a decision record nobody has answered, `report` lists it, `relais
 // decide` answers it by name, and `report` no longer lists it — the

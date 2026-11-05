@@ -630,10 +630,15 @@ pub(crate) fn run_command(
                     );
                 }
             }
-            eprintln!(
-                "the preserved candidate and evidence are under {}",
-                run_dir.display()
-            );
+            let kept = match ledger.candidate_attempts(&outcome.run_id) {
+                Ok(attempts) if !attempts.is_empty() => "the preserved candidate",
+                Ok(_) => "archived partial work",
+                Err(e) => {
+                    eprintln!("could not read the run's candidates: {e}");
+                    "archived partial work"
+                }
+            };
+            eprintln!("{kept} and evidence are under {}", run_dir.display());
             Ok(CliOutcome::Cancelled)
         }
     };

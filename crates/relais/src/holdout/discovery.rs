@@ -154,7 +154,7 @@ fn prune(cache_root: &Path, keep: &str) {
             Some((written, entry.path()))
         })
         .collect();
-    others.sort_by(|a, b| b.0.cmp(&a.0));
+    others.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     for (_, path) in others.into_iter().skip(KEPT_COMMITS - 1) {
         if let Err(e) = std::fs::remove_dir_all(&path) {
             eprintln!(
