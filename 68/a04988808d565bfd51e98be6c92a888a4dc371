@@ -1,0 +1,16 @@
+amont-provenance-v1
+commit 68a04988808d565bfd51e98be6c92a888a4dc371
+tree a4164ffc0957aa14a99b2af74622e4c16d922f96
+canon aec9b6cd132643b2423358cc94bd97512a21bc1e
+patch 4d53668d7b913630a466651d1bb323f1588ee804
+plan docs/plans/2026-11-05-routing-rule-claude-sessions-only.md 86b2a4d80c79f57c4af71a168036a262a43d5acf68135517bba7527e29c031a9
+review reviewed cb6656135bbca6e3e7faf151a77ed6a54dde4ade1210787326de353ab0da7f82
+preview not-required
+producer amont-agent 3.16.1
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAEDMrqeyCl4XzflCjQDApzuo+W3WzGEObh8h+/zkCfl3/RyDHA
+s718HJTjWNB5+G9jRPzrxalYInG4PiSXAa7N0F
+-----END SSH SIGNATURE-----
