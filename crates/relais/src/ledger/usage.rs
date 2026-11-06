@@ -219,6 +219,53 @@ fn fold_phase_cost(
     }
 }
 
+/// What one dispatch or one attempt spent, from its own usage rows only
+/// (no child run, no other phase): the figure the harness report puts
+/// beside what a step caught.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnitUsage {
+    /// The sum of the reported costs; `None` when no row reported one.
+    pub cost: Option<MicroUsd>,
+    /// Input, output and cache tokens of every row.
+    pub tokens: u64,
+    /// The worst completeness of the rows. No row at all, or a row that
+    /// reported no cost, is `Unknown`: it spent something, never a true zero.
+    pub completeness: CostCompleteness,
+}
+
+fn fold_unit_usage(rows: Vec<(Option<i64>, i64, String)>) -> UnitUsage {
+    let mut cost: Option<i64> = None;
+    let mut tokens: i64 = 0;
+    let mut parts = Vec::new();
+    for (cost_micros, row_tokens, completeness) in &rows {
+        if let Some(micros) = cost_micros {
+            cost = Some(cost.unwrap_or(0).saturating_add(*micros));
+        }
+        tokens = tokens.saturating_add(*row_tokens);
+        parts.push(if cost_micros.is_none() {
+            CostCompleteness::Unknown
+        } else {
+            // A completeness this binary cannot read is unknown, the
+            // widest answer.
+            serde_json::from_str(completeness).unwrap_or(CostCompleteness::Unknown)
+        });
+    }
+    UnitUsage {
+        cost: cost.map(MicroUsd::from_micros),
+        tokens: tokens.max(0) as u64,
+        completeness: if rows.is_empty() {
+            CostCompleteness::Unknown
+        } else {
+            CostCompleteness::worst(parts)
+        },
+    }
+}
+
+const UNIT_USAGE_COLUMNS: &str = "cost_micros,
+    COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
+        + COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0),
+    completeness";
+
 /// A dispatch that claimed to launch and never recorded a terminal
 /// state: what reconciliation looks at after a crash or restart.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,22 +303,40 @@ pub struct LiveDispatch {
 }
 
 impl Ledger {
-    /// What one attempt cost, from the usage rows that name it and whose
-    /// cost was reported. `None` is unknown — no such row — and never
-    /// `$0.00`: an attempt that died before it could report cost something.
-    /// An inclusive parent's covered children are not added again.
-    pub fn attempt_cost(&self, attempt_id: i64) -> Result<Option<MicroUsd>> {
-        let (reported, micros): (i64, i64) = self.conn.query_row(
-            &format!(
-                "{COVERED_BY_AN_INCLUSIVE_PARENT}
-                 SELECT COUNT(cost_micros), COALESCE(SUM(cost_micros), 0) FROM usage_events
-                  WHERE attempt_id = ?1
-                    AND event_id NOT IN (SELECT event_id FROM covered)"
-            ),
-            [attempt_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        Ok((reported > 0).then(|| MicroUsd::from_micros(micros)))
+    /// What one dispatch spent in `phase`: the usage rows keyed by its id
+    /// (the id itself or its `<id>#…` range), an inclusive parent's covered
+    /// children left out. Counts this dispatch alone, never a child run's.
+    pub fn dispatch_usage(&self, dispatch_id: &str, phase: UsagePhase) -> Result<UnitUsage> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{COVERED_BY_AN_INCLUSIVE_PARENT}
+             SELECT {UNIT_USAGE_COLUMNS} FROM usage_events
+              WHERE phase = ?2
+                AND (event_id = ?1
+                     OR (event_id >= ?1 || '#' AND event_id < ?1 || '$'))
+                AND event_id NOT IN (SELECT event_id FROM covered)"
+        ))?;
+        let rows = stmt.query_map(params![dispatch_id, phase.as_str()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        Ok(fold_unit_usage(
+            rows.collect::<std::result::Result<Vec<_>, _>>()?,
+        ))
+    }
+
+    /// What one attempt spent, from the usage rows that name it.
+    pub fn attempt_usage(&self, attempt_id: i64) -> Result<UnitUsage> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{COVERED_BY_AN_INCLUSIVE_PARENT}
+             SELECT {UNIT_USAGE_COLUMNS} FROM usage_events
+              WHERE attempt_id = ?1
+                AND event_id NOT IN (SELECT event_id FROM covered)"
+        ))?;
+        let rows = stmt.query_map([attempt_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        Ok(fold_unit_usage(
+            rows.collect::<std::result::Result<Vec<_>, _>>()?,
+        ))
     }
 
     pub fn record_usage(&self, event: &UsageEvent) -> Result<bool> {

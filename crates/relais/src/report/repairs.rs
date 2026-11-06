@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::ids::RunId;
-use crate::ledger::{Ledger, LedgerError, Transition};
+use crate::ledger::{Ledger, LedgerError, Transition, UnitUsage};
 use crate::lifecycle::{Reason, State, UsagePhase};
 use crate::money::MicroUsd;
 
@@ -107,7 +107,10 @@ pub(super) struct Repair {
     /// The model that ran the repair; `None` when no usage row named one.
     pub(super) model: Option<String>,
     verdict: Verdict,
-    cost: Option<MicroUsd>,
+    /// What the attempt's own usage rows add up to: the one source of its
+    /// cost (`usage.cost` is `None` when no row reported one) for both the
+    /// repair section and the harness section.
+    pub(super) usage: UnitUsage,
 }
 
 impl Repair {
@@ -160,7 +163,7 @@ fn repairs_of_run(ledger: &Ledger, run_id: &RunId) -> Result<Vec<Repair>, Ledger
             model: ledger.attempt_model(attempt.id)?,
             effort: ledger.requested_effort(attempt.id)?,
             verdict,
-            cost: ledger.attempt_cost(attempt.id)?,
+            usage: ledger.attempt_usage(attempt.id)?,
         });
     }
     Ok(repairs)
@@ -232,7 +235,7 @@ impl Tally {
                 *self.no_verdict_kinds.entry(kind.label()).or_default() += 1;
             }
         }
-        match repair.cost {
+        match repair.usage.cost {
             Some(cost) => self.costs.push(cost),
             None => self.unknown_cost += 1,
         }

@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+- **`relais report` shows what each harness step costs beside what it caught.** Every `harness.steps[].models[]` row gains `cost_micros`, `tokens`, `cost_completeness`, `cost_per_caught_micros` and `tokens_per_caught`; the last two are `null` when nothing was caught. The text line ends `, $X.XX total, $Y.YY/catch`, with `(partial)` after the total when some usage was not reported. A step whose usage rows reported no cost at all shows `cost_micros: null` and `, cost unknown`, never `$0.00`. The report schema goes from 16 to 17.
+
 ## v0.48.2
 
 - **A check can no longer be stopped by the terminal.** Setup steps and checks now start with stdin at end of file and, on unix, in their own session with no controlling terminal. A check that asked a question on `/dev/tty` (amont's install journey did) used to be stopped by SIGTTIN and sit there until its timeout when relais ran from a terminal; it now gets an error at once and the check ends on its own. A check that needs an answer must take it from its arguments or environment.
