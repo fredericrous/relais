@@ -20,6 +20,12 @@
 //! * repair: each counted repair's own cost; a `review_repair` attempt is
 //!   not a counted repair.
 //!
+//! Each row also carries what the step cost: every dispatch's or attempt's own
+//! usage rows, credited to the model that ran it, whether or not it ended in a
+//! verdict (a repair with no verdict spent its money too). A model that ran only
+//! an earlier dispatch of a run, whose verdict went to the last one, therefore
+//! has a row of zero counts and a cost.
+//!
 //! `unknown` is the model of a step no usage row named a model for.
 
 use std::collections::BTreeMap;
@@ -99,7 +105,8 @@ struct ModelTally {
     no_verdict: usize,
     cost_micros: Option<i64>,
     tokens: u64,
-    completeness: Vec<CostCompleteness>,
+    /// The worst completeness so far; `None` before any usage was added.
+    completeness: Option<CostCompleteness>,
 }
 
 impl ModelTally {
@@ -112,14 +119,19 @@ impl ModelTally {
             );
         }
         self.tokens = self.tokens.saturating_add(usage.tokens);
-        self.completeness.push(usage.completeness);
+        self.completeness = Some(
+            self.completeness
+                .map_or(usage.completeness, |worst| worst.max(usage.completeness)),
+        );
     }
 }
 
 type Tally = BTreeMap<String, ModelTally>;
 
 fn per_catch(total: u64, caught: usize) -> Option<u64> {
-    (caught > 0).then(|| (total as f64 / caught as f64).round() as u64)
+    let caught = caught as u64;
+    // Rounded to the nearest unit with integers: money stays integer micros.
+    (caught > 0).then(|| (total + caught / 2) / caught)
 }
 
 fn step(step: Step, tally: Tally) -> HarnessStep {
@@ -135,11 +147,7 @@ fn step(step: Step, tally: Tally) -> HarnessStep {
                 cost_micros: row.cost_micros,
                 tokens: row.tokens,
                 // Nothing counted is nothing known, not a true zero.
-                cost_completeness: if row.completeness.is_empty() {
-                    CostCompleteness::Unknown
-                } else {
-                    CostCompleteness::worst(row.completeness)
-                },
+                cost_completeness: row.completeness.unwrap_or(CostCompleteness::Unknown),
                 cost_per_caught_micros: row.cost_micros.and_then(|micros| {
                     per_catch(micros.max(0) as u64, row.caught).map(|per| per as i64)
                 }),
@@ -240,9 +248,14 @@ pub fn harness_report(
     })
 }
 
-/// Micro-dollars as `$X.XX`.
+/// Micro-dollars as `$X.XX`; a known cost under half a cent is `<$0.01`,
+/// never `$0.00` (which reads as free).
 fn dollars(micros: i64) -> String {
-    format!("${:.2}", micros as f64 / 1_000_000.0)
+    if micros > 0 && micros < 5_000 {
+        return "<$0.01".to_string();
+    }
+    let cents = (micros.max(0) + 5_000) / 10_000;
+    format!("${}.{:02}", cents / 100, cents % 100)
 }
 
 impl HarnessReport {
@@ -258,32 +271,45 @@ impl HarnessReport {
                 out.push_str(&format!("  {name}: none in this window\n"));
             }
             for row in &step.models {
-                out.push_str(&format!(
-                    "  {name} [{}]: {} of {} {noun} {caught}",
-                    row.model, row.caught, row.ran
-                ));
-                if row.no_verdict > 0 {
-                    out.push_str(&format!(", {} with no verdict", row.no_verdict));
+                // A model that ran only an earlier dispatch of a run has no
+                // verdict of its own: its row carries the cost alone.
+                let cost_only = row.ran == 0 && row.no_verdict == 0;
+                if cost_only {
+                    out.push_str(&format!(
+                        "  {name} [{}]: earlier dispatches only\n",
+                        row.model
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  {name} [{}]: {} of {} {noun} {caught}",
+                        row.model, row.caught, row.ran
+                    ));
+                    if row.no_verdict > 0 {
+                        out.push_str(&format!(", {} with no verdict", row.no_verdict));
+                    }
+                    out.push('\n');
                 }
                 // The figure's own kind, so a priced-from-tokens total is not
                 // called partial: every real row is estimated.
-                let partial = match row.cost_completeness {
+                let kind = match row.cost_completeness {
                     CostCompleteness::Actual => "",
                     CostCompleteness::Estimated => " (est.)",
                     CostCompleteness::IncompleteLowerBound => " (lower bound)",
                     CostCompleteness::Unknown => " (partial)",
                 };
-                let per_catch = row
-                    .cost_per_caught_micros
-                    .map_or_else(|| "-".to_string(), dollars);
                 match row.cost_micros {
-                    Some(micros) => out.push_str(&format!(
-                        ", {} total{partial}, {per_catch}/catch",
-                        dollars(micros)
-                    )),
-                    None => out.push_str(", cost unknown"),
+                    Some(micros) => {
+                        out.push_str(&format!("    cost: {} total{kind}", dollars(micros)));
+                        if !cost_only {
+                            let per_catch = row
+                                .cost_per_caught_micros
+                                .map_or_else(|| "-".to_string(), dollars);
+                            out.push_str(&format!(", {per_catch}/catch"));
+                        }
+                        out.push('\n');
+                    }
+                    None => out.push_str("    cost unknown\n"),
                 }
-                out.push('\n');
             }
         }
         let any_unknown = self
@@ -491,7 +517,7 @@ mod tests {
             }])
         );
         let text = report.render();
-        let line = "review [opus]: 1 of 1 reviews led to revise, 1 with no verdict, $1.55 total, $1.55/catch\n";
+        let line = "review [opus]: 1 of 1 reviews led to revise, 1 with no verdict\n    cost: $1.55 total, $1.55/catch\n";
         assert!(text.contains(line), "{line} missing from {text}");
     }
 
@@ -622,17 +648,15 @@ mod tests {
         );
         let text = report.render();
         for line in [
-            "review [haiku]: 1 of 1 reviews led to revise, $1.50 total (lower bound), $1.50/catch\n",
-            "review [opus]: 0 of 1 reviews led to revise, $2.00 total (partial), -/catch\n",
-            "review [sonnet]: 0 of 1 reviews led to revise, cost unknown\n",
-            "review [unknown]: 0 of 1 reviews led to revise, cost unknown\n",
+            "review [haiku]: 1 of 1 reviews led to revise\n    cost: $1.50 total (lower bound), $1.50/catch\n",
+            "review [opus]: 0 of 1 reviews led to revise\n    cost: $2.00 total (partial), -/catch\n",
+            "review [sonnet]: 0 of 1 reviews led to revise\n    cost unknown\n",
+            "review [unknown]: 0 of 1 reviews led to revise\n    cost unknown\n",
         ] {
             assert!(text.contains(line), "{line} missing from {text}");
         }
     }
 
-    /// A run's first review dispatch ran on opus and its last on sonnet:
-    /// each dispatch's cost goes to its own model, the verdict to the last.
     /// Every real row is priced from tokens, so it is estimated: the text
     /// says so instead of calling it partial.
     #[test]
@@ -649,10 +673,96 @@ mod tests {
         finish_review_caught(&ledger, &run);
         let report = harness_report(&ledger, &[(run, State::Accepted)]).expect("report");
         let text = report.render();
-        let line = "review [opus]: 1 of 1 reviews led to revise, $1.00 total (est.), $1.00/catch\n";
+        let line = "review [opus]: 1 of 1 reviews led to revise\n    cost: $1.00 total (est.), $1.00/catch\n";
         assert!(text.contains(line), "{line} missing from {text}");
     }
 
+    /// Usage booked the way the review engine books it (a turn row, then
+    /// the final row, both keyed by the dispatch id) is read back whole.
+    #[test]
+    fn usage_booked_through_record_usage_delta_is_read_back_whole() {
+        use crate::ledger::Booking;
+        let (ledger, _dir) = open("harness-cost-booked");
+        let run = new_run(&ledger, "run-b");
+        review_dispatch(&ledger, &run, "d-b");
+        let cumulative = |input: i64, cost: i64| UsageEvent {
+            event_id: "d-b".into(),
+            run_id: run.clone(),
+            attempt_id: None,
+            parent_event_id: None,
+            model: Some("opus".into()),
+            input_tokens: Some(input),
+            output_tokens: Some(0),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost: Some(MicroUsd::from_micros(cost)),
+            cost_kind: CostKind::ApiSpend,
+            completeness: CostCompleteness::Actual,
+            inclusive: false,
+            at: now_rfc3339(),
+            phase: Some(UsagePhase::Review),
+            duration_ms: None,
+            requested_model: None,
+            requested_effort: None,
+            harness: None,
+        };
+        ledger
+            .record_usage_delta(&cumulative(10, 300_000), &[], Booking::Turn)
+            .expect("turn");
+        ledger
+            .record_usage_delta(&cumulative(25, 1_000_000), &[], Booking::Final)
+            .expect("final");
+        finish_review_caught(&ledger, &run);
+        let report = harness_report(&ledger, &[(run, State::Accepted)]).expect("report");
+        assert_eq!(
+            models_of(&report, Step::Review),
+            json!([{
+                "model": "opus", "ran": 1, "caught": 1, "no_verdict": 0,
+                "cost_micros": 1_000_000, "tokens": 25, "cost_completeness": "actual",
+                "cost_per_caught_micros": 1_000_000, "tokens_per_caught": 25,
+            }])
+        );
+    }
+
+    /// A model that ran only an earlier dispatch reads as a cost-only row,
+    /// and a known cost under half a cent is never shown as `$0.00`.
+    #[test]
+    fn a_cost_only_row_and_a_tiny_cost_read_plainly() {
+        let row = |model: &str, ran: usize, micros: i64| StepModel {
+            model: model.into(),
+            ran,
+            caught: 0,
+            no_verdict: 0,
+            cost_micros: Some(micros),
+            tokens: 1,
+            cost_completeness: CostCompleteness::Estimated,
+            cost_per_caught_micros: None,
+            tokens_per_caught: None,
+        };
+        let report = HarnessReport {
+            steps: vec![
+                HarnessStep {
+                    step: Step::Review,
+                    models: vec![row("sonnet", 0, 200_000), row("haiku", 1, 4_000)],
+                },
+                HarnessStep {
+                    step: Step::Repair,
+                    models: vec![],
+                },
+            ],
+        };
+        let text = report.render();
+        for line in [
+            "review [sonnet]: earlier dispatches only\n    cost: $0.20 total (est.)\n",
+            "review [haiku]: 0 of 1 reviews led to revise\n    cost: <$0.01 total (est.), -/catch\n",
+            "repair: none in this window\n",
+        ] {
+            assert!(text.contains(line), "{line} missing from {text}");
+        }
+    }
+
+    /// A run's first review dispatch ran on opus and its last on sonnet:
+    /// each dispatch's cost goes to its own model, the verdict to the last.
     #[test]
     fn a_review_dispatch_cost_goes_to_its_own_model_not_the_last_ones() {
         let (ledger, _dir) = open("harness-cost-own-model");

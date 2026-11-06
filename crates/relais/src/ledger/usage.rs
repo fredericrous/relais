@@ -230,6 +230,13 @@ pub struct UnitUsage {
     pub tokens: u64,
     /// The worst completeness of the rows. No row at all, or a row that
     /// reported no cost, is `Unknown`: it spent something, never a true zero.
+    /// A stored value this binary cannot read counts as `Unknown` too (the
+    /// widest answer), so an unreadable row is never read as complete.
+    ///
+    /// Judged row by row: a turn row without cost beside a priced final row
+    /// reads `Unknown` (5 of 1,166 turn rows on the 2026-11-06 ledger).
+    /// holds-until: that share passes about 1%; then the final row's
+    /// completeness should decide.
     pub completeness: CostCompleteness,
 }
 
@@ -306,6 +313,9 @@ impl Ledger {
     /// What one dispatch spent in `phase`: the usage rows keyed by its id
     /// (the id itself or its `<id>#…` range), an inclusive parent's covered
     /// children left out. Counts this dispatch alone, never a child run's.
+    /// The `'#'..'$'` byte range is the one [`Self::record_usage_delta`] and
+    /// `run_dispatch_report_counts` use; a change to the suffix scheme changes
+    /// all of them.
     pub fn dispatch_usage(&self, dispatch_id: &str, phase: UsagePhase) -> Result<UnitUsage> {
         let mut stmt = self.conn.prepare(&format!(
             "{COVERED_BY_AN_INCLUSIVE_PARENT}

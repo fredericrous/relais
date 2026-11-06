@@ -8,7 +8,7 @@ missing here.
 
 ## Unreleased
 
-- **`relais report` shows what each harness step costs beside what it caught.** Every `harness.steps[].models[]` row gains `cost_micros`, `tokens`, `cost_completeness`, `cost_per_caught_micros` and `tokens_per_caught`; the last two are `null` when nothing was caught. The text line ends `, $X.XX total, $Y.YY/catch`, with `(est.)` after the total when the cost is priced from tokens, `(lower bound)` when some usage was cut short and `(partial)` when some dispatch or attempt reported no cost. A step whose usage rows reported no cost at all shows `cost_micros: null` and `, cost unknown`, never `$0.00`. The report schema goes from 16 to 17.
+- **`relais report` shows what each harness step costs beside what it caught.** Every `harness.steps[].models[]` row gains `cost_micros`, `tokens`, `cost_completeness`, `cost_per_caught_micros` and `tokens_per_caught`; the last two are `null` when nothing was caught. The text report puts the cost on its own line under each row, `cost: $X.XX total, $Y.YY/catch` (`<$0.01` for a known cost under half a cent), with `(est.)` after the total when the cost is priced from tokens, `(lower bound)` when some usage was cut short and `(partial)` when some dispatch or attempt reported no cost. A step whose usage rows reported no cost at all shows `cost_micros: null` and `, cost unknown`, never `$0.00`. A model that ran only an earlier dispatch of a run appears with `ran`, `caught` and `no_verdict` all 0, carrying its cost alone, and the text says `earlier dispatches only`. The report schema goes from 16 to 17.
 
 ## v0.48.2
 
