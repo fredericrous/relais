@@ -74,8 +74,8 @@ fn accepted_by_person(
 /// status` prints, so its JSON agrees with the sentence a person sees),
 /// so a downstream parser can tell an old shape from a new one instead of
 /// guessing from key presence. 9: `never_shipped_tasks`. 10:
-/// `repair_outcomes`. 11: `advisor_data`. 12: `advisor_data` becomes `decision_labels`. 13: `harness`. 14: `holdouts`. 15: `answered`, the unknown subagents by parent and the unmatched check commands in session routing. 16: `holdouts.by_source`.
-pub const REPORT_SCHEMA_VERSION: u32 = 16;
+/// `repair_outcomes`. 11: `advisor_data`. 12: `advisor_data` becomes `decision_labels`. 13: `harness`. 14: `holdouts`. 15: `answered`, the unknown subagents by parent and the unmatched check commands in session routing. 16: `holdouts.by_source`. 17: `harness.steps[].models[]` gains cost and tokens.
+pub const REPORT_SCHEMA_VERSION: u32 = 17;
 
 /// A dimension `relais report --by` groups the window's tasks over (SPEC
 /// §11: "compare like task classes and policy versions"). Total over the
@@ -4386,15 +4386,25 @@ mod tests {
         }
     }
 
+    /// The step's rows with only the catch counts: the cost fields are
+    /// asserted by the tests in `report::harness`.
     fn harness_step(report: &Report, step: &str) -> serde_json::Value {
         let json = serde_json::to_value(report).expect("json");
-        json["harness"]["steps"]
+        let mut found = json["harness"]["steps"]
             .as_array()
             .expect("steps")
             .iter()
             .find(|s| s["step"] == step)
             .cloned()
-            .unwrap_or(serde_json::Value::Null)
+            .unwrap_or(serde_json::Value::Null);
+        for model in found["models"].as_array_mut().into_iter().flatten() {
+            if let Some(row) = model.as_object_mut() {
+                row.retain(|key, _| {
+                    ["model", "ran", "caught", "no_verdict"].contains(&key.as_str())
+                });
+            }
+        }
+        found
     }
 
     /// A revise that answers a decision raised for another reason than review
@@ -4483,7 +4493,12 @@ mod tests {
         let report = runs_report(&ledger, SINCE, None).expect("report");
         assert_eq!(
             harness_step(&report, "review")["models"],
-            serde_json::json!([{ "model": "opus", "ran": 1, "caught": 1, "no_verdict": 0 }])
+            // The first dispatch ran on sonnet: its cost is sonnet's, the
+            // review's verdict is the last dispatch's.
+            serde_json::json!([
+                { "model": "opus", "ran": 1, "caught": 1, "no_verdict": 0 },
+                { "model": "sonnet", "ran": 0, "caught": 0, "no_verdict": 0 },
+            ])
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4693,12 +4708,12 @@ mod tests {
             json["harness"],
             serde_json::json!({ "steps": [
                 { "step": "review", "models": [
-                    { "model": "opus", "ran": 3, "caught": 2, "no_verdict": 0 },
-                    { "model": "sonnet", "ran": 2, "caught": 1, "no_verdict": 0 },
+                    { "model": "opus", "ran": 3, "caught": 2, "no_verdict": 0, "cost_micros": null, "tokens": 6, "cost_completeness": "unknown", "cost_per_caught_micros": null, "tokens_per_caught": 3 },
+                    { "model": "sonnet", "ran": 2, "caught": 1, "no_verdict": 0, "cost_micros": null, "tokens": 4, "cost_completeness": "unknown", "cost_per_caught_micros": null, "tokens_per_caught": 4 },
                 ]},
                 { "step": "repair", "models": [
-                    { "model": "opus", "ran": 2, "caught": 1, "no_verdict": 0 },
-                    { "model": "sonnet", "ran": 2, "caught": 1, "no_verdict": 0 },
+                    { "model": "opus", "ran": 2, "caught": 1, "no_verdict": 0, "cost_micros": null, "tokens": 4, "cost_completeness": "unknown", "cost_per_caught_micros": null, "tokens_per_caught": 4 },
+                    { "model": "sonnet", "ran": 2, "caught": 1, "no_verdict": 0, "cost_micros": null, "tokens": 4, "cost_completeness": "unknown", "cost_per_caught_micros": null, "tokens_per_caught": 4 },
                 ]},
             ]})
         );
