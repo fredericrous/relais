@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+- **Escalation and review default to Opus, not Fable.** `relais init` writes `[models.escalation] id = "opus"`, and the `relais-review` advisory agent that `relais install` writes runs on `opus`. Fable cost too much for the escalation rung, which also reviews every Sonnet-written candidate. An existing `relais.toml` keeps its own model; edit its `[models.escalation]` to switch.
+
 ## v0.48.0
 
 - **A holdout store declares its own holdouts.** At preflight relais reads `<repo>/<name>/holdout.toml` and `check.sh` from the store `[holdouts] store` names, at one commit per run, through a shared cache of shallow fetches. A machine.toml table of the same name still wins, and `{ enabled = false }` turns a store holdout off. A `holdout.toml` that does not parse refuses the run (`holdout_declaration_invalid`). An unreachable store refuses a named holdout as `holdout_unreadable` and records `holdout_store_unreachable`.
