@@ -12,6 +12,9 @@ Approved 2026-11-06; proposal-time body wording is preserved to retain the revie
 📍 relais, amont-agent · active · next: current-source reproduction. Panel: backend (Opus), TypeScript (Opus).
 **Changed by review:** bounded metadata; terminal denial state; golden notification tests.
 **Verdicts:** two approve-with-changes; high findings resolved; seven implementation carries in the sidecar.
+🔁 **Execution changed 2026-11-06 (person's request):** implemented directly in the task worktrees, not through relais, after its runs and this session's large reference loads, repeated post-compaction material and review cycles filled context. Discipline: narrow reads, quiet-wrapped commands, no full skill/schema loads, no extra panels; declared code-review seats only, told when a language is absent.
+Phase 1 evidence: PTY regression red (both checks `TimedOut`) before, green after; amont f9ba814c install journey (binary sha256 6e073eb4…) 3/3 green under a terminal; no survivors; scratch checkout removed.
+
 📄 Full reviews: [review evidence and implementation carries](2026-11-06-reliable-verification-and-deliberate-output.reviews.md).
 
 ## Context

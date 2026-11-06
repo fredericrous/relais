@@ -38,6 +38,8 @@ mod heavy;
 mod holdout_run;
 mod junit;
 pub mod stamps;
+#[cfg(all(test, unix))]
+mod terminal_tests;
 
 pub use end::CheckEnd;
 pub use heavy::{
@@ -1393,10 +1395,14 @@ fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
     command
         .args(&spec.argv[1..])
         .current_dir(dir)
+        .stdin(std::process::Stdio::null())
         .stdout(log_file.try_clone()?)
         .stderr(log_file)
         .env("RELAIS_CHECK", "1");
-    crate::procs::own_process_group(&mut command);
+    // A check never reads a terminal: no stdin, no controlling terminal
+    // (relais#383). A new session also makes it its own process group, so
+    // the group kill and CPU sampling below are unchanged.
+    crate::procs::own_session(&mut command);
     if let Some(admitted) = &admitted {
         // The runner holds the host slots (`admitted`), never the check:
         // their descriptors are close-on-exec, so nothing the check leaves
