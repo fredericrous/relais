@@ -313,6 +313,9 @@ impl Ledger {
     /// What one dispatch spent in `phase`: the usage rows keyed by its id
     /// (the id itself or its `<id>#…` range), an inclusive parent's covered
     /// children left out. Counts this dispatch alone, never a child run's.
+    /// An advisor call made during the dispatch is keyed `advisor:<message id>`
+    /// and is not counted here: 5 of 798 review-phase rows, about 0.7% of
+    /// their cost, on the 2026-11-06 ledger. holds-until: that share passes 5%.
     /// The `'#'..'$'` byte range is the one [`Self::record_usage_delta`] and
     /// `run_dispatch_report_counts` use; a change to the suffix scheme changes
     /// all of them.
