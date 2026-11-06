@@ -265,10 +265,13 @@ impl HarnessReport {
                 if row.no_verdict > 0 {
                     out.push_str(&format!(", {} with no verdict", row.no_verdict));
                 }
-                let partial = if row.cost_completeness == CostCompleteness::Actual {
-                    ""
-                } else {
-                    " (partial)"
+                // The figure's own kind, so a priced-from-tokens total is not
+                // called partial: every real row is estimated.
+                let partial = match row.cost_completeness {
+                    CostCompleteness::Actual => "",
+                    CostCompleteness::Estimated => " (est.)",
+                    CostCompleteness::IncompleteLowerBound => " (lower bound)",
+                    CostCompleteness::Unknown => " (partial)",
                 };
                 let per_catch = row
                     .cost_per_caught_micros
@@ -347,14 +350,18 @@ mod tests {
             .expect("dispatch");
     }
 
-    /// A review that ended clean, or was answered by a review repair
-    /// (caught by review).
-    fn finish_review(ledger: &Ledger, run: &RunId, caught: bool) {
+    /// A review that ended clean: nothing caught.
+    fn finish_review_clean(ledger: &Ledger, run: &RunId) {
         go(ledger, run, State::Verifying, "verification_started");
-        if caught {
-            go(ledger, run, State::Repairing, "review_repair");
-            go(ledger, run, State::Verifying, "verification_started");
-        }
+        go(ledger, run, State::Accepted, "checks_and_review_passed");
+    }
+
+    /// A review whose findings sent the worker back to a review repair
+    /// before the run passed (caught by review).
+    fn finish_review_caught(ledger: &Ledger, run: &RunId) {
+        go(ledger, run, State::Verifying, "verification_started");
+        go(ledger, run, State::Repairing, "review_repair");
+        go(ledger, run, State::Verifying, "verification_started");
         go(ledger, run, State::Accepted, "checks_and_review_passed");
     }
 
@@ -429,7 +436,7 @@ mod tests {
     /// inclusive total counts.
     #[test]
     fn a_parent_and_its_child_run_are_summed_once_with_the_hash_range_matched() {
-        let (ledger, dir) = open("harness-cost-tree");
+        let (ledger, _dir) = open("harness-cost-tree");
         let parent = new_run(&ledger, "run-p");
         review_dispatch(&ledger, &parent, "d-p");
         let rows = [
@@ -451,7 +458,7 @@ mod tests {
         covered.tokens = 999;
         covered.parent = Some("d-p#1");
         record(&ledger, &parent, covered);
-        finish_review(&ledger, &parent, true);
+        finish_review_caught(&ledger, &parent);
 
         let child = RunId::from_stored("run-c");
         ledger
@@ -486,14 +493,13 @@ mod tests {
         let text = report.render();
         let line = "review [opus]: 1 of 1 reviews led to revise, 1 with no verdict, $1.55 total, $1.55/catch\n";
         assert!(text.contains(line), "{line} missing from {text}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A check repair and a `review_repair` attempt in one run: only the
     /// check repair's cost lands in the repair step.
     #[test]
     fn only_the_check_repair_cost_lands_in_the_repair_step() {
-        let (ledger, dir) = open("harness-cost-repair");
+        let (ledger, _dir) = open("harness-cost-repair");
         let run = new_run(&ledger, "run-r");
         let mut attempts = Vec::new();
         for (index, phase) in [
@@ -541,7 +547,6 @@ mod tests {
                 "cost_per_caught_micros": 2_000_000, "tokens_per_caught": 30,
             }])
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Mixed completeness inside a dispatch, a silent dispatch among
@@ -549,7 +554,7 @@ mod tests {
     /// zero.
     #[test]
     fn mixed_and_silent_usage_is_partial_or_unknown_never_complete_or_zero() {
-        let (ledger, dir) = open("harness-cost-mixed");
+        let (ledger, _dir) = open("harness-cost-mixed");
         let haiku = new_run(&ledger, "run-haiku");
         review_dispatch(&ledger, &haiku, "d-haiku");
         for (id, cost, completeness) in [
@@ -563,7 +568,7 @@ mod tests {
             row.completeness = completeness;
             record(&ledger, &haiku, row);
         }
-        finish_review(&ledger, &haiku, true);
+        finish_review_caught(&ledger, &haiku);
         let opus = new_run(&ledger, "run-opus");
         review_dispatch(&ledger, &opus, "d-opus-1");
         review_dispatch(&ledger, &opus, "d-opus-2");
@@ -577,7 +582,7 @@ mod tests {
         silent.tokens = 3;
         silent.completeness = CostCompleteness::Unknown;
         record(&ledger, &opus, silent);
-        finish_review(&ledger, &opus, false);
+        finish_review_clean(&ledger, &opus);
         let sonnet = new_run(&ledger, "run-sonnet");
         review_dispatch(&ledger, &sonnet, "d-sonnet");
         let mut row = Row::new("d-sonnet", UsagePhase::Review);
@@ -585,10 +590,10 @@ mod tests {
         row.tokens = 2;
         row.completeness = CostCompleteness::Unknown;
         record(&ledger, &sonnet, row);
-        finish_review(&ledger, &sonnet, false);
+        finish_review_clean(&ledger, &sonnet);
         let none = new_run(&ledger, "run-none");
         review_dispatch(&ledger, &none, "d-none");
-        finish_review(&ledger, &none, false);
+        finish_review_clean(&ledger, &none);
 
         let window = [
             (haiku, State::Accepted),
@@ -617,21 +622,40 @@ mod tests {
         );
         let text = report.render();
         for line in [
-            "review [haiku]: 1 of 1 reviews led to revise, $1.50 total (partial), $1.50/catch\n",
+            "review [haiku]: 1 of 1 reviews led to revise, $1.50 total (lower bound), $1.50/catch\n",
             "review [opus]: 0 of 1 reviews led to revise, $2.00 total (partial), -/catch\n",
             "review [sonnet]: 0 of 1 reviews led to revise, cost unknown\n",
             "review [unknown]: 0 of 1 reviews led to revise, cost unknown\n",
         ] {
             assert!(text.contains(line), "{line} missing from {text}");
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A run's first review dispatch ran on opus and its last on sonnet:
     /// each dispatch's cost goes to its own model, the verdict to the last.
+    /// Every real row is priced from tokens, so it is estimated: the text
+    /// says so instead of calling it partial.
+    #[test]
+    fn an_estimated_cost_is_marked_estimated_not_partial() {
+        let (ledger, _dir) = open("harness-cost-estimated");
+        let run = new_run(&ledger, "run-est");
+        review_dispatch(&ledger, &run, "d-est");
+        let mut row = Row::new("d-est", UsagePhase::Review);
+        row.model = Some("opus");
+        row.cost = Some(1_000_000);
+        row.tokens = 4;
+        row.completeness = CostCompleteness::Estimated;
+        record(&ledger, &run, row);
+        finish_review_caught(&ledger, &run);
+        let report = harness_report(&ledger, &[(run, State::Accepted)]).expect("report");
+        let text = report.render();
+        let line = "review [opus]: 1 of 1 reviews led to revise, $1.00 total (est.), $1.00/catch\n";
+        assert!(text.contains(line), "{line} missing from {text}");
+    }
+
     #[test]
     fn a_review_dispatch_cost_goes_to_its_own_model_not_the_last_ones() {
-        let (ledger, dir) = open("harness-cost-own-model");
+        let (ledger, _dir) = open("harness-cost-own-model");
         let run = new_run(&ledger, "run-m");
         review_dispatch(&ledger, &run, "d-1");
         review_dispatch(&ledger, &run, "d-2");
@@ -644,7 +668,7 @@ mod tests {
             row.tokens = tokens;
             record(&ledger, &run, row);
         }
-        finish_review(&ledger, &run, false);
+        finish_review_clean(&ledger, &run);
         let report = harness_report(&ledger, &[(run, State::Accepted)]).expect("report");
         assert_eq!(
             models_of(&report, Step::Review),
@@ -657,7 +681,6 @@ mod tests {
                   "cost_per_caught_micros": null, "tokens_per_caught": null },
             ])
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A run that was sent back to its worker on a review's findings and
