@@ -8,7 +8,11 @@ missing here.
 
 ## Unreleased
 
+## v0.48.1
+
 - **Escalation and review default to Opus, not Fable.** `relais init` writes `[models.escalation] id = "opus"`, and the `relais-review` advisory agent that `relais install` writes runs on `opus`. Fable cost too much for the escalation rung, which also reviews every Sonnet-written candidate. An existing `relais.toml` keeps its own model; edit its `[models.escalation]` to switch.
+- Also in this release: the session routing rule applies only to Claude sessions (#390), and a cancelled run reports its artifacts accurately (#391).
+
 
 ## v0.48.0
 
