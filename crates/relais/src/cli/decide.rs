@@ -192,7 +192,7 @@ pub(crate) fn decide_in(
         if frees_in_place && done.from_state == State::Interrupted {
             // The answer is already recorded: whatever goes wrong freeing
             // the worktree is reported inside the answer, never as an error.
-            let report = match free_after_answer(locate, done) {
+            let report = match free_after_answer(locate, done, request.answer) {
                 Ok(report) => report,
                 Err(e) => Some(format!(
                     "the in-place worktree could not be freed ({e}); finish it with \
@@ -211,22 +211,25 @@ pub(crate) fn decide_in(
 fn free_after_answer(
     locate: &dyn Fn() -> Result<StateLocations, CliError>,
     done: &Decided,
+    answer: DecideAnswer,
 ) -> Result<Option<String>, CliError> {
     let locations = locate()?;
     let ledger = operational(Ledger::open(&locations.ledger), "the ledger is unavailable")?;
     let run = RunId::from_stored(&done.run);
-    free_kept_in_place(&ledger, &run, done.to_state, &locations.runs)
+    free_kept_in_place(&ledger, &run, answer, done.to_state, &locations.runs)
 }
 
 /// What answering an interrupted in-place run does to its worktree marker.
-/// Only a moved HEAD means the tree and branch are the person's, so only
-/// then is the marker retired (the code `relais resume --retire` runs);
-/// otherwise it stays and the command that retires it is named. Only a
+/// A moved HEAD means the tree and branch are the person's, so the marker
+/// is retired (the code `relais resume --retire` runs); so it is for an
+/// abandon whose HEAD did not move and whose working tree equals the start
+/// snapshot, since nothing is kept to lose. Otherwise it stays and the command that retires it is named. Only a
 /// missing marker means there is nothing to free; every other failure is
 /// named in the returned report.
 fn free_kept_in_place(
     ledger: &Ledger,
     run: &RunId,
+    answer: DecideAnswer,
     state: State,
     runs_dir: &Path,
 ) -> Result<Option<String>, CliError> {
@@ -273,7 +276,10 @@ fn free_kept_in_place(
             )))
         }
     };
-    if !head_moved {
+    let nothing_kept = !head_moved
+        && answer == DecideAnswer::Abandon
+        && tree_equals_start(&workspace.repo_path, &git_dir, run, &marker.start);
+    if !head_moved && !nothing_kept {
         return Ok(Some(format!(
             "the in-place worktree {} still holds a marker for it; HEAD did not move, so \
              finish it with `relais resume --retire {run}`",
@@ -293,6 +299,23 @@ fn free_kept_in_place(
         },
     )?;
     Ok(Some(lines.join("; ")))
+}
+
+/// Whether the working tree (untracked non-ignored files included) is the
+/// start snapshot's tree. Any failure to tell answers no: the marker stays.
+fn tree_equals_start(root: &Path, git_dir: &Path, run: &RunId, start: &str) -> bool {
+    use relais::workspace::inplace;
+    let index = git_dir.join(format!("relais-decide-{run}.index"));
+    let now = inplace::working_tree(root, &index);
+    let _ = std::fs::remove_file(&index); // scratch index; `working_tree` deletes a stale one before it rebuilds
+    let Ok(now) = now else { return false };
+    let start_tree = relais::workspace::git_command(root)
+        .args(["rev-parse", &format!("{start}^{{tree}}")])
+        .output();
+    match start_tree {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim() == now,
+        Ok(_) | Err(_) => false,
+    }
 }
 
 fn record_answer(
@@ -1218,6 +1241,42 @@ mod tests {
             decided
                 .sentence
                 .contains("relais resume --retire run-still"),
+            "{}",
+            decided.sentence
+        );
+    }
+
+    #[test]
+    fn abandoning_an_unmoved_clean_run_retires_the_marker() {
+        let dir = relais::test_support::short_temp_dir("decide-inplace-clean");
+        let (_ledger, worktree) = interrupted_in_place(&dir, "run-clean");
+        answer_with(&dir, "run-clean", DecideAnswer::Abandon);
+        assert!(!marker_exists(&worktree, "run-clean"));
+    }
+
+    #[test]
+    fn abandoning_an_unmoved_run_with_a_tracked_edit_keeps_the_marker() {
+        let dir = relais::test_support::short_temp_dir("decide-inplace-edit");
+        let (_ledger, worktree) = interrupted_in_place(&dir, "run-edit");
+        std::fs::write(worktree.join("a.txt"), "edited\n").expect("edit");
+        let decided = answer_with(&dir, "run-edit", DecideAnswer::Abandon);
+        assert!(marker_exists(&worktree, "run-edit"));
+        assert!(
+            decided.sentence.contains("relais resume --retire run-edit"),
+            "{}",
+            decided.sentence
+        );
+    }
+
+    #[test]
+    fn abandoning_an_unmoved_run_with_an_untracked_file_keeps_the_marker() {
+        let dir = relais::test_support::short_temp_dir("decide-inplace-untracked");
+        let (_ledger, worktree) = interrupted_in_place(&dir, "run-new");
+        std::fs::write(worktree.join("new.txt"), "x\n").expect("new");
+        let decided = answer_with(&dir, "run-new", DecideAnswer::Abandon);
+        assert!(marker_exists(&worktree, "run-new"));
+        assert!(
+            decided.sentence.contains("relais resume --retire run-new"),
             "{}",
             decided.sentence
         );

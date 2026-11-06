@@ -9,6 +9,7 @@ missing here.
 ## Unreleased
 
 - **A misshapen acceptance entry says what is wrong.** A contract whose acceptance entry was neither a string nor a valid declared criterion was refused with "data did not match any variant of untagged enum AcceptanceEntry", which named nothing. That message was most of the ~9% of runs refused in the last two weeks. The refusal now names the entry (`acceptance[1]`), the fault (``unknown field `criterion` ``, ``unknown variant `report` ``, ``missing field `evidence` ``) and the shape that parses, with every evidence kind. Valid JSON with the wrong shape now reads "contract does not match the schema", not "contract is not valid JSON", which is kept for real syntax errors. An unknown field nested inside the contract (an entry, `limits`, `candidate`) keeps its full message instead of being reported as an unknown field of the contract itself. The `/relais` skill now shows a declared criterion in full: the field is `statement`.
+- **A setup queue that runs out ends blocked, and abandoning an untouched run frees its worktree (#382).** A lease stop while the task worktree's setup queued for a host slot now ends the run `blocked (admission_wait_exhausted)`, exit 3, as the baseline's does, instead of `interrupted`. `relais decide abandon` of an interrupted in-place run whose `HEAD` did not move and whose working tree equals its start snapshot now retires the worktree marker; with edits the marker stays and the answer still names `relais resume --retire <run>`.
 
 ## v0.49.0
 
