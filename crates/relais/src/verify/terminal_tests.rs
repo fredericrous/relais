@@ -10,7 +10,6 @@
 //! ([`run_observed`]). A machine with no pseudo-terminal fails the test; it
 //! never skips.
 
-use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -31,6 +30,11 @@ const CHECK_TIMEOUT_SECONDS: u64 = 5;
 /// the helper fails.
 fn run_under_a_terminal(case: &str) {
     let (master, slave) = crate::procs::open_test_pty();
+    // Files, not pipes: a helper that writes more than a pipe holds would
+    // block on it and read as a hang.
+    let dir = crate::test_support::temp_dir(&format!("verify-terminal-outer-{case}"));
+    let out_path = dir.join("helper.out");
+    let err_path = dir.join("helper.err");
     let mut helper = Command::new(std::env::current_exe().expect("test binary"));
     helper
         .args([
@@ -42,39 +46,32 @@ fn run_under_a_terminal(case: &str) {
         ])
         .env(CASE_ENV, case)
         .stdin(Stdio::from(slave))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    crate::procs::take_terminal_on_spawn(&mut helper);
+        .stdout(std::fs::File::create(&out_path).expect("helper stdout file"))
+        .stderr(std::fs::File::create(&err_path).expect("helper stderr file"));
+    let mut helper = crate::procs::take_terminal_on_spawn(helper);
     let mut child = helper.spawn().expect("spawn the helper");
+    // The check's own timeout (run_observed) ends and kills the check's
+    // group long before this deadline; reaching it means the helper hung.
     let deadline = Instant::now() + Duration::from_secs(120);
     let status = loop {
         if let Some(status) = child.try_wait().expect("wait") {
             break status;
         }
         if Instant::now() > deadline {
-            let _ = child.kill();
-            panic!("the helper for {case} did not end within 120 s");
+            let killed = child.kill().and_then(|()| child.wait());
+            panic!("the helper for {case} did not end within 120 s (kill: {killed:?})");
         }
         std::thread::sleep(Duration::from_millis(50));
     };
     drop(master);
-    let mut out = String::new();
-    let mut err = String::new();
-    child
-        .stdout
-        .take()
-        .expect("stdout")
-        .read_to_string(&mut out)
-        .ok();
-    child
-        .stderr
-        .take()
-        .expect("stderr")
-        .read_to_string(&mut err)
-        .ok();
+    let read = |p: &std::path::Path| {
+        std::fs::read_to_string(p).unwrap_or_else(|e| format!("<unreadable: {e}>"))
+    };
     assert!(
         status.success(),
-        "helper {case} failed ({status}):\n{out}\n{err}"
+        "helper {case} failed ({status}):\n{}\n{}",
+        read(&out_path),
+        read(&err_path)
     );
 }
 
@@ -99,6 +96,7 @@ fn a_check_reads_end_of_file_on_stdin() {
 #[ignore = "needs RELAIS_TERMINAL_TEST_COMMAND"]
 fn a_real_command_passes_under_a_terminal() {
     if std::env::var_os(COMMAND_ENV).is_none() {
+        eprintln!("not run: {COMMAND_ENV} is not set");
         return;
     }
     run_under_a_terminal("command");
@@ -113,10 +111,10 @@ fn helper_runs_a_check() {
     let Ok(case) = std::env::var(CASE_ENV) else {
         return;
     };
-    // Its own group: `pgid == pid`. Its own session: `sid == pid`.
+    // Its own group: `pgid == pid`. No controlling terminal is what the
+    // `tty` case proves.
     let identity = "pid=$$; pgid=$(ps -o pgid= -p $$ | tr -d ' '); \
-                    sid=$(ps -o sess= -p $$ | tr -d ' '); echo pid=$pid pgid=$pgid sid=$sid; \
-                    [ \"$pgid\" = \"$pid\" ] && echo own-group";
+                    echo pid=$pid pgid=$pgid; [ \"$pgid\" = \"$pid\" ] && echo own-group";
     let body = match case.as_str() {
         "tty" => "cat /dev/tty; echo rc=$?",
         "stdin" => "read line; echo rc=$?",
@@ -149,18 +147,20 @@ fn helper_runs_a_check() {
     .expect("the check runs");
     let elapsed = started.elapsed();
     let log = std::fs::read_to_string(&outcome.log_path).expect("the check's log");
-    let ended = format!("{:?}", outcome.ended);
+    // The script ends with `echo`, so it passes unless it was stopped
+    // (a timeout) or killed.
     assert!(
-        !ended.contains("TimedOut") && elapsed < Duration::from_secs(CHECK_TIMEOUT_SECONDS),
-        "the {case} check was stopped until its timeout ({ended}, {elapsed:?}):\n{log}"
+        outcome.ended.succeeded() && elapsed < Duration::from_secs(CHECK_TIMEOUT_SECONDS),
+        "the {case} check was stopped until its timeout ({:?}, {elapsed:?}):\n{log}",
+        outcome.ended
     );
     assert!(
         log.contains("own-group"),
         "the check is its own group:\n{log}"
     );
     assert!(
-        log.lines().any(|l| l.starts_with("rc=") && l != "rc=0"),
-        "the {case} check read nothing and said so:\n{log}"
+        log.lines().any(|l| l == "rc=1"),
+        "the {case} check got end of file or an error, at once (rc=1):\n{log}"
     );
 }
 
@@ -192,7 +192,7 @@ fn run_a_real_command(identity: &str) {
     )
     .expect("the command runs");
     let log = std::fs::read_to_string(&outcome.log_path).expect("the command's log");
-    println!("{:?} in {:?}", outcome.ended, started.elapsed());
+    eprintln!("{:?} in {:?}", outcome.ended, started.elapsed());
     assert!(
         outcome.ended.succeeded(),
         "the command failed ({:?}):\n{log}",

@@ -1402,7 +1402,7 @@ fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
     // A check never reads a terminal: no stdin, no controlling terminal
     // (relais#383). A new session also makes it its own process group, so
     // the group kill and CPU sampling below are unchanged.
-    crate::procs::own_session(&mut command);
+    let mut command = crate::procs::own_session(command);
     if let Some(admitted) = &admitted {
         // The runner holds the host slots (`admitted`), never the check:
         // their descriptors are close-on-exec, so nothing the check leaves

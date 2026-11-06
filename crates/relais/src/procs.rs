@@ -295,8 +295,8 @@ pub fn own_process_group(command: &mut Command) {
 /// question gets an error at once instead of a SIGTTIN that stops it until
 /// its timeout (relais#383). Never combined with `process_group(0)`: a
 /// group leader cannot call `setsid`. Pair it with a null stdin.
-pub fn own_session(command: &mut Command) {
-    imp::own_session(command);
+pub fn own_session(command: Command) -> Command {
+    imp::own_session(command)
 }
 
 /// A fresh pseudo-terminal for the verification terminal tests: its master
@@ -305,8 +305,12 @@ pub fn own_session(command: &mut Command) {
 #[cfg(all(test, unix))]
 pub(crate) fn open_test_pty() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // ptsname returns a static buffer shared by every thread, and tests run
+    // in parallel: one call at a time.
+    static PTSNAME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = PTSNAME.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: plain libc calls on descriptors this function owns; ptsname's
-    // static buffer is copied before any other call can reuse it.
+    // buffer is copied while the lock is held.
     unsafe {
         let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
         assert!(master >= 0, "posix_openpt: {}", io::Error::last_os_error());
@@ -327,7 +331,7 @@ pub(crate) fn open_test_pty() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
 /// terminal, the way an interactive shell holds one; its group is then the
 /// terminal's foreground group.
 #[cfg(all(test, unix))]
-pub(crate) fn take_terminal_on_spawn(command: &mut Command) {
+pub(crate) fn take_terminal_on_spawn(mut command: Command) -> Command {
     use std::os::unix::process::CommandExt;
     // SAFETY: setsid and ioctl are async-signal-safe; stdin is already the
     // slave when this runs.
@@ -342,6 +346,7 @@ pub(crate) fn take_terminal_on_spawn(command: &mut Command) {
             Ok(())
         });
     }
+    command
 }
 
 /// The CPU time the live processes of group `pgid` have used so far, from
@@ -1365,7 +1370,7 @@ mod imp {
         command.process_group(0);
     }
 
-    pub fn own_session(command: &mut Command) {
+    pub fn own_session(mut command: Command) -> Command {
         // SAFETY: setsid is async-signal-safe and touches no memory; it is
         // the only call made between fork and exec. It fails only for a
         // process group leader, which the forked child never is.
@@ -1377,6 +1382,7 @@ mod imp {
                 Ok(())
             });
         }
+        command
     }
 
     pub fn group_alive(pgid: u32) -> bool {
@@ -1591,10 +1597,11 @@ mod imp {
         command.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
 
-    pub fn own_session(command: &mut Command) {
+    pub fn own_session(mut command: Command) -> Command {
         // Windows has no controlling terminal to leave; the check's stdin
         // is null all the same.
-        own_process_group(command);
+        own_process_group(&mut command);
+        command
     }
 
     pub fn group_alive(pgid: u32) -> bool {
