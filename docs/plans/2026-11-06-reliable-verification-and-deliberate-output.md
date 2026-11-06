@@ -121,4 +121,24 @@ Omissions: architect at code close — ownership and interfaces are reviewed in 
 - No active background agents or waiting relais runs at the start of this update (`waiting: 0`). Historical notifications were reconciled, not relaunched.
 - Approval would authorize the above PR/release/local activation sequence and owned fixtures, not new trust grants, global permissions, unrelated cleanup or resumed suppression fleet publication.
 
+## Implementation review
+
+Phase 1 (relais#383), tree 63885f34. Round 1 then Delta, all Opus.
+- implementation-review: approve-with-changes → approve. Fixed discards, stdout timing line, `&mut Command` params, rc=1 pin. Deliberate: unset real-command case returns green with a stderr "not run" line (78k, 74 s + 20 s).
+- backend / lang:rust / unix: approve-with-changes → approve. Fixed pipe-fill, Debug-string match, ptsname race, unreaped helper, sid claim. Deliberate: amont probes unchanged (step 4); check-group kill left to run_observed's own timeout (47k/58k/51k round 1).
+- lang:typescript, tui: approve (no TypeScript in the diff; optional "asked for a terminal" hint deferred).
+
+## Phase 1 verification (observed)
+
+| Input | Expected | Actual |
+|---|---|---|
+| Current amont f9ba814c install journey, old launcher shape under PTY | SIGTTIN | 3/3 SIGTTIN; controls 2/2 pass (relais run-65f97bc0db008-118a6 artifacts) |
+| PTY regression, launcher reverted | red | both cases TimedOut (~10 s) |
+| PTY regression, fixed launcher | green | 2/2 pass, 0.2 s |
+| amont install journey (it binary sha256 6e073eb4…) through fixed launcher under PTY | 3/3 green | 3/3 pass, ~8.5 s each |
+| Survivors / scratch | none | no processes; scratch worktree removed, logs kept |
+| Default gate | green | 30/30 checks at b055a6e6 and 92aef136 |
+
+Remaining Phase 1 steps: release/install, then amont's unchanged `make check` through native relais once; seven-day receipt observation from that date.
+
 <!-- panel: repos=relais,amont-agent adds=lang:typescript reviewers=backend,lang:typescript body-sha=745e5882e9b0 -->
