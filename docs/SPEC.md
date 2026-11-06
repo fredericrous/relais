@@ -189,7 +189,7 @@ id = "sonnet"
 effort = "medium"
 
 [models.escalation]
-id = "fable"
+id = "opus"
 effort = "medium"
 
 [execution]
