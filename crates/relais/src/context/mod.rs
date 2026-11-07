@@ -1633,6 +1633,9 @@ mod tests {
         let script = "#!/bin/sh\nif [ -f .adr.yaml ] && grep -q decisions.pack .adr.yaml && [ -s decisions.pack ]; then\n  printf '%s' '{\"rules\":[{\"active\":true,\"adopts\":\"ADR-0011\",\"body\":\"B\",\"file\":\"aval.pack\",\"governs\":\"code\",\"id\":\"names.reveal-intent\",\"level\":\"constraint\",\"pack\":\"decisions\",\"source\":\"x\",\"statement\":\"S\"}]}'\nelse\n  exit 3\nfi\n";
         std::fs::write(&fake, script).expect("fake aval");
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        // Its first exec on macOS is assessed, past the 5 s guidance
+        // timeout under load: run it once before anything is timed.
+        crate::test_support::prime_script(&fake);
         let mut cli = AvalCli::new(repository)
             .with_bin(fake.to_str())
             .with_fleet_cache(cache.clone());
