@@ -7292,6 +7292,8 @@ fn guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_g
         base_sha: "base",
         holdouts: &[],
         candidate: None,
+        basis: PatchBasis::Base,
+        inherited_files: &[],
     };
     let mut spend = RunSpend::zero();
     let outcome = engine.review_candidate(&request, &mut spend);

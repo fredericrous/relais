@@ -20,8 +20,8 @@ use super::candidates::{
 };
 use super::{
     merge_reviewer_gaps, patch_section, report_review_prompt, review_verdict, reviewer_decisions,
-    reviewer_tier, stage_patch, ReviewOutcome, ReviewPurpose, ReviewRequest, ReviewSeat,
-    StagedPatch, UnavailableCause, REVIEW_CONSTRAINTS_BUDGET_BYTES, REVIEW_MIN_WALL,
+    reviewer_tier, stage_patch, PatchBasis, ReviewOutcome, ReviewPurpose, ReviewRequest,
+    ReviewSeat, StagedPatch, UnavailableCause, REVIEW_CONSTRAINTS_BUDGET_BYTES, REVIEW_MIN_WALL,
     REVIEW_PART_TIMEOUT,
 };
 use crate::runner::prompt::DECISION_PRECEDENCE;
@@ -176,9 +176,12 @@ impl<'a> RunEngine<'a> {
             .artifacts
             .join(format!("review-{}.txt", request.candidate_sha));
         let first = self.review_unit(request, spend, None, &artifact, None);
-        let ReviewOutcome::Unavailable(detail) = first.outcome else {
+        self.record_basis(request, &first);
+        let ReviewOutcome::Unavailable(detail) = &first.outcome else {
+            self.record_clearance(request, &first);
             return first.outcome;
         };
+        let detail = detail.clone();
         // The retry reads the cause, never the sentence: only a reviewer
         // that ended with no result is worth asking again. A refusal, a
         // cancellation or an exhausted resource would end the same way.
@@ -198,14 +201,73 @@ impl<'a> RunEngine<'a> {
                 UnavailableCause::TerminalMissing.as_str()
             ),
         });
-        match self
-            .review_unit(request, spend, None, &artifact, Some(wall))
-            .outcome
-        {
+        let second = self.review_unit(request, spend, None, &artifact, Some(wall));
+        match second.outcome {
             ReviewOutcome::Unavailable(second) => ReviewOutcome::Unavailable(format!(
                 "{second}; the first dispatch had also failed: {detail}"
             )),
-            decided => decided,
+            decided => {
+                let reviewed = Reviewed {
+                    outcome: decided,
+                    ..second
+                };
+                self.record_basis(request, &reviewed);
+                self.record_clearance(request, &reviewed);
+                reviewed.outcome
+            }
+        }
+    }
+
+    /// Remember on the review's dispatch what its patch was measured from,
+    /// so the receipt never reads a kept full patch as reviewed in full when
+    /// only the successor's own changes were read, nor the reverse. Only a
+    /// candidate that continues a run has a basis worth naming.
+    pub(super) fn record_basis(&self, request: &ReviewRequest<'_>, reviewed: &Reviewed) {
+        let Some(dispatch_id) = &reviewed.dispatch_id else {
+            return;
+        };
+        let basis = match &request.basis {
+            PatchBasis::Base => return,
+            PatchBasis::InheritedBase => crate::ledger::ReviewBasis::AgainstBase,
+            PatchBasis::Predecessor { cleared_by } => crate::ledger::ReviewBasis::SuccessorOnly {
+                cleared_by: cleared_by.clone(),
+            },
+        };
+        if let Err(e) = self.config.ledger.record_review_basis(dispatch_id, &basis) {
+            self.events.emit(Event::EnvironmentWarning {
+                what: "review_basis_not_recorded".to_string(),
+                detail: format!("the review's basis could not be recorded: {e}"),
+            });
+        }
+    }
+
+    /// Remember on the review's dispatch that it found nothing in the whole
+    /// tree of the candidate under the rules it was given, so a successor
+    /// that inherits exactly this tree may be reviewed on its own changes.
+    /// Not recording it only costs a successor a full review.
+    fn record_clearance(&self, request: &ReviewRequest<'_>, reviewed: &Reviewed) {
+        let (ReviewOutcome::NoFindings, Some(dispatch_id)) =
+            (&reviewed.outcome, &reviewed.dispatch_id)
+        else {
+            return;
+        };
+        let recorded = crate::workspace::tree_of(self.config.repo_dir, request.candidate_sha)
+            .map_err(|e| e.to_string())
+            .and_then(|tree| {
+                self.config
+                    .ledger
+                    .record_review_clearance(
+                        dispatch_id,
+                        &tree,
+                        &super::rules_sha256(&request.manifest.guidance),
+                    )
+                    .map_err(|e| e.to_string())
+            });
+        if let Err(e) = recorded {
+            self.events.emit(Event::EnvironmentWarning {
+                what: "review_clearance_not_recorded".to_string(),
+                detail: format!("the review's clearance could not be recorded: {e}"),
+            });
         }
     }
 
@@ -597,6 +659,7 @@ impl<'a> RunEngine<'a> {
                  and report findings about them.\n"
             ));
         }
+        prompt.push_str(&inherited_block(request));
         prompt.push_str(&patch_section(staged));
         prompt.push_str(&format!("source to inspect: {}\n", review_dir.display()));
         prompt.push('\n');
@@ -880,4 +943,34 @@ impl Reviewed {
     pub(in crate::runner) fn unavailable(cause: UnavailableCause, detail: String) -> Self {
         Self::failed(ReviewFailure::new(cause, detail))
     }
+}
+
+/// What the reviewer is told of the files a predecessor run changed: they
+/// are inherited, and the patch below either holds them (measured from the
+/// base) or leaves them to the predecessor's own review.
+fn inherited_block(request: &ReviewRequest<'_>) -> String {
+    if request.inherited_files.is_empty() {
+        return String::new();
+    }
+    let mut block = data_list_block(
+        "files the predecessor run changed (inherited)",
+        request.inherited_files,
+    );
+    block.push_str(match request.basis {
+        PatchBasis::Base | PatchBasis::InheritedBase => {
+            "this candidate continues the predecessor run, and no successful review of the \
+             predecessor's tree is on record: the patch below is measured from the base and holds \
+             the inherited changes too. Review all of it, and judge the write scope and `Nothing \
+             else changes` against what the predecessor changed.\n"
+        }
+        PatchBasis::Predecessor { .. } => {
+            "this candidate continues the predecessor run, whose tree a successful review \
+             covers: the patch below holds only this candidate's own changes on top of it. Judge \
+             the write scope and `Nothing else changes` against what the predecessor changed, \
+             and report a change to an inherited file only where the patch touches it. Candidate \
+             lines listed below may lie on inherited lines the patch does not hold: rule only on \
+             those the patch shows.\n"
+        }
+    });
+    block
 }

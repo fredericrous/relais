@@ -309,6 +309,36 @@ pub struct LiveDispatch {
     pub depth: Option<i64>,
 }
 
+/// What the patch a review dispatch read was measured from, as the ledger
+/// stores it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewBasis {
+    /// The full patch against the run's base.
+    AgainstBase,
+    /// Only the successor's own changes; the dispatch `cleared_by` cleared
+    /// the predecessor's tree.
+    SuccessorOnly { cleared_by: String },
+}
+
+impl TryFrom<(String, Option<String>)> for ReviewBasis {
+    type Error = LedgerError;
+
+    fn try_from((kind, cleared_by): (String, Option<String>)) -> Result<Self> {
+        match (kind.as_str(), cleared_by) {
+            ("against_base", _) => Ok(Self::AgainstBase),
+            ("successor_only", Some(cleared_by)) => Ok(Self::SuccessorOnly { cleared_by }),
+            ("successor_only", None) => Err(LedgerError::Corrupt {
+                what: "the stored basis of a review".to_string(),
+                detail: "successor_only names no cleared_by".to_string(),
+            }),
+            (unknown, _) => Err(LedgerError::Corrupt {
+                what: "the stored basis of a review".to_string(),
+                detail: format!("unknown basis kind {unknown:?}"),
+            }),
+        }
+    }
+}
+
 impl Ledger {
     /// What one dispatch spent in `phase`: the usage rows keyed by its id
     /// (the id itself or its `<id>#…` range), an inclusive parent's covered
@@ -1054,6 +1084,87 @@ impl Ledger {
         Ok(())
     }
 
+    /// Note on a review dispatch that its reviewer found nothing in the whole
+    /// of `tree` under the rules hashed `rules_sha256`. Kept in the
+    /// dispatch's intent so no schema step is needed.
+    pub fn record_review_clearance(
+        &self,
+        dispatch_id: &str,
+        tree: &str,
+        rules_sha256: &str,
+    ) -> Result<()> {
+        let cleared = serde_json::json!({ "tree": tree, "rules_sha256": rules_sha256 });
+        self.conn.execute(
+            "UPDATE dispatches
+                SET intent_json = json_set(intent_json, '$.cleared', json(?2)), updated_at = ?3
+              WHERE dispatch_id = ?1 AND json_extract(intent_json, '$.kind') = 'review'",
+            params![dispatch_id, cleared.to_string(), self.now()],
+        )?;
+        Ok(())
+    }
+
+    /// The review dispatch of `run_id` that found nothing in exactly `tree`
+    /// under the rules hashed `rules_sha256`, if there is one.
+    pub fn review_cleared(
+        &self,
+        run_id: &RunId,
+        tree: &str,
+        rules_sha256: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT dispatch_id FROM dispatches
+                  WHERE run_id = ?1
+                    AND json_extract(intent_json, '$.kind') = 'review'
+                    AND json_extract(intent_json, '$.cleared.tree') = ?2
+                    AND json_extract(intent_json, '$.cleared.rules_sha256') = ?3
+                  LIMIT 1",
+                params![run_id.as_str(), tree, rules_sha256],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Note on a review dispatch what its patch was measured from.
+    pub fn record_review_basis(&self, dispatch_id: &str, basis: &ReviewBasis) -> Result<()> {
+        let (kind, cleared_by) = match basis {
+            ReviewBasis::AgainstBase => ("against_base", None),
+            ReviewBasis::SuccessorOnly { cleared_by } => {
+                ("successor_only", Some(cleared_by.as_str()))
+            }
+        };
+        let basis = serde_json::json!({ "kind": kind, "cleared_by": cleared_by });
+        self.conn.execute(
+            "UPDATE dispatches
+                SET intent_json = json_set(intent_json, '$.basis', json(?2)), updated_at = ?3
+              WHERE dispatch_id = ?1 AND json_extract(intent_json, '$.kind') = 'review'",
+            params![dispatch_id, basis.to_string(), self.now()],
+        )?;
+        Ok(())
+    }
+
+    /// The basis the latest review dispatch of `run_id` that recorded one
+    /// read its patch from. A stored kind this build does not know, or
+    /// `successor_only` without `cleared_by`, is an error.
+    pub fn review_basis(&self, run_id: &RunId) -> Result<Option<ReviewBasis>> {
+        let stored: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT json_extract(intent_json, '$.basis.kind'),
+                        json_extract(intent_json, '$.basis.cleared_by')
+                   FROM dispatches
+                  WHERE run_id = ?1
+                    AND json_extract(intent_json, '$.kind') = 'review'
+                    AND json_extract(intent_json, '$.basis.kind') IS NOT NULL
+                  ORDER BY rowid DESC LIMIT 1",
+                params![run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        stored.map(ReviewBasis::try_from).transpose()
+    }
+
     pub fn finish_dispatch(&self, dispatch_id: &DispatchId, state: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE dispatches SET state = ?2, updated_at = ?3 WHERE dispatch_id = ?1",
@@ -1068,6 +1179,42 @@ mod tests {
     use super::super::test_support::{dispatch, event, package, run, task, temp_ledger, usage_row};
     use super::super::{ChildOf, OrchestrationUsageRow};
     use super::*;
+
+    fn review_dispatch_with_basis(ledger: &Ledger, basis: &str) {
+        ledger
+            .insert_run(&run("run-b"), "/r", None, &task("run-b"), "rk")
+            .expect("run");
+        ledger
+            .conn
+            .execute(
+                "INSERT INTO dispatches (dispatch_id, run_id, state, intent_json, created_at, updated_at)
+                 VALUES ('disp-b', 'run-b', 'finished', ?1, 't', 't')",
+                params![format!(r#"{{"kind":"review","basis":{basis}}}"#)],
+            )
+            .expect("dispatch");
+    }
+
+    #[test]
+    fn review_basis_errors_on_an_unknown_kind() {
+        let (ledger, dir) = temp_ledger();
+        review_dispatch_with_basis(&ledger, r#"{"kind":"sideways"}"#);
+        assert!(matches!(
+            ledger.review_basis(&RunId::from_stored("run-b".to_string())),
+            Err(LedgerError::Corrupt { .. })
+        ));
+        drop(dir);
+    }
+
+    #[test]
+    fn review_basis_errors_on_successor_only_without_cleared_by() {
+        let (ledger, dir) = temp_ledger();
+        review_dispatch_with_basis(&ledger, r#"{"kind":"successor_only","cleared_by":null}"#);
+        assert!(matches!(
+            ledger.review_basis(&RunId::from_stored("run-b".to_string())),
+            Err(LedgerError::Corrupt { .. })
+        ));
+        drop(dir);
+    }
 
     #[test]
     fn unknown_usage_is_null_left_out_of_the_sum_and_poisons_completeness() {

@@ -15,7 +15,7 @@ mod parts;
 pub(in crate::runner) use candidates::CandidatesRun;
 pub(in crate::runner) use parts::write_immutable;
 mod types;
-pub(crate) use types::{ReviewOutcome, ReviewRequest};
+pub(crate) use types::{PatchBasis, ReviewOutcome, ReviewRequest};
 pub(in crate::runner) use types::{ReviewPurpose, ReviewSeat, UnavailableCause};
 
 /// The verdict, read from the LAST non-empty line of a reviewer's
@@ -406,6 +406,23 @@ pub(in crate::runner) fn tracked_tree_section(tree: Option<&workspace::TrackedTr
     section
 }
 
+/// The hash of the rules a review is given: every rule's id, level and
+/// statement and every code rule's body hash. A review holds for another
+/// tree only under the same rules.
+pub(in crate::runner) fn rules_sha256(guidance: &Guidance) -> String {
+    let mut text = String::new();
+    for rule in &guidance.rules {
+        text.push_str(&format!(
+            "{}\0{}\0{}\n",
+            rule.id, rule.level, rule.statement
+        ));
+    }
+    for rule in &guidance.code_rules {
+        text.push_str(&format!("code\0{}\0{}\n", rule.id, rule.body_sha256));
+    }
+    crate::ids::sha256_hex(text.as_bytes())
+}
+
 /// The review record a receipt carries, read from the ledger that
 /// recorded the review: none ran, it ran from another model, or the model
 /// that wrote the candidate reviewed it (`Reason::ReviewerSameModel`).
@@ -438,10 +455,18 @@ pub(crate) fn review_record_of(
                 .collect(),
         });
     }
-    Ok(if same_model {
-        verify::ReviewRecord::SameModel
-    } else {
-        verify::ReviewRecord::Independent
+    Ok(match ledger.review_basis(run_id)? {
+        Some(crate::ledger::ReviewBasis::SuccessorOnly { cleared_by }) => {
+            verify::ReviewRecord::SuccessorOnly {
+                same_model,
+                cleared_by,
+            }
+        }
+        Some(crate::ledger::ReviewBasis::AgainstBase) => {
+            verify::ReviewRecord::AgainstBase { same_model }
+        }
+        None if same_model => verify::ReviewRecord::SameModel,
+        None => verify::ReviewRecord::Independent,
     })
 }
 

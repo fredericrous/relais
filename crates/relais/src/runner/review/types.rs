@@ -87,6 +87,26 @@ pub(crate) struct ReviewRequest<'r> {
     /// The candidate a reviewer admission that expires keeps and names;
     /// `None` where no candidate is kept (integration).
     pub(crate) candidate: Option<crate::runner::KeptCandidate>,
+    /// What `patch_path` is measured from.
+    pub(crate) basis: PatchBasis,
+    /// The files a predecessor run changed and this candidate inherits
+    /// (`from_candidate`); empty for a candidate that continues no run. The
+    /// reviewer is told which of the patch's files are inherited.
+    pub(crate) inherited_files: &'r [String],
+}
+
+/// What the patch a reviewer reads is measured from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PatchBasis {
+    /// The run's base: everything the candidate holds.
+    Base,
+    /// The run's base for a candidate that continues a predecessor run:
+    /// the patch holds the inherited changes too, because no review of the
+    /// predecessor's tree could be relied on.
+    InheritedBase,
+    /// The predecessor's tree, which the review dispatch `cleared_by`
+    /// already covers: the candidate's own changes only.
+    Predecessor { cleared_by: String },
 }
 
 impl ReviewRequest<'_> {
@@ -105,6 +125,8 @@ impl ReviewRequest<'_> {
             base_sha: self.base_sha,
             holdouts: self.holdouts,
             candidate: self.candidate.clone(),
+            basis: self.basis.clone(),
+            inherited_files: self.inherited_files,
         }
     }
 }
