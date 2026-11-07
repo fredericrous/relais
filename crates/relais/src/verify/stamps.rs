@@ -123,21 +123,45 @@ impl std::fmt::Display for StampsError {
 pub fn profile_gates(profile: &VerificationProfile) -> Vec<String> {
     let mut gates: Vec<String> = Vec::new();
     for command in &profile.commands {
-        let argv = &command.argv;
-        if argv.len() > STAMP_PREFIX.len()
-            && argv
-                .iter()
-                .zip(STAMP_PREFIX)
-                .all(|(word, want)| word == want)
-        {
-            for gate in &argv[STAMP_PREFIX.len()..] {
-                if !gates.contains(gate) {
-                    gates.push(gate.clone());
-                }
+        for gate in stamped_by(&command.argv) {
+            if !gates.contains(gate) {
+                gates.push(gate.clone());
             }
         }
     }
     gates
+}
+
+/// The gates one command stamps: its operands when it is an
+/// `amont run --stamp` line, else none.
+fn stamped_by(argv: &[String]) -> &[String] {
+    let is_stamp = argv.len() > STAMP_PREFIX.len()
+        && argv
+            .iter()
+            .zip(STAMP_PREFIX)
+            .all(|(word, want)| word == want);
+    if is_stamp {
+        &argv[STAMP_PREFIX.len()..]
+    } else {
+        &[]
+    }
+}
+
+/// The stamp gates whose verdict amont is to be asked about: `gates` less
+/// those named by a check that did not pass (#397). A failed `amont run
+/// --stamp` is a failed check, repaired like any other; amont records no
+/// verdict for it, and asking would add a gap that stops the run before
+/// the repair. The gap stays for a gate whose command passed and whose
+/// verdict amont did not record.
+pub fn gates_to_ask(gates: Vec<String>, checks: &[super::CheckOutcome]) -> Vec<String> {
+    gates
+        .into_iter()
+        .filter(|gate| {
+            !checks
+                .iter()
+                .any(|check| !check.ended.succeeded() && stamped_by(&check.argv).contains(gate))
+        })
+        .collect()
 }
 
 /// Parse `amont stamps --json`. Pure, and tested: it is the whole of what
@@ -307,6 +331,55 @@ mod tests {
 
     fn names(gates: &[&str]) -> Vec<String> {
         gates.iter().map(|g| (*g).to_string()).collect()
+    }
+
+    fn stamp_check(gate: &str, ended: Ended) -> super::super::CheckOutcome {
+        super::super::CheckOutcome {
+            label: format!("amont@{gate}"),
+            argv: names(&["amont", "run", "--stamp", gate]),
+            ended: super::super::CheckEnd::new(ended),
+            log_path: "log".into(),
+            log_sha256: String::new(),
+            junit: None,
+            attempts: Vec::new(),
+            flaky: false,
+            flaky_reason: None,
+            applied_limit_ms: 0,
+            clipped: false,
+            timing: None,
+        }
+    }
+
+    /// #397: a stamp gate whose command failed is not asked about, so its
+    /// missing verdict is never a gap and the failure goes to repair; one
+    /// whose command passed is still asked, so an unrecorded verdict still
+    /// is a gap.
+    #[test]
+    fn a_stamp_gate_whose_check_failed_is_not_asked_about() {
+        let checks = [
+            stamp_check("cargo-fmt", Ended::Exited(1)),
+            stamp_check("clippy", Ended::Exited(0)),
+            stamp_check("plugin-test", Ended::TimedOut),
+        ];
+        assert_eq!(
+            gates_to_ask(names(&["cargo-fmt", "clippy", "plugin-test"]), &checks),
+            names(&["clippy"])
+        );
+        // A non-stamp check that failed names no gate.
+        let other = super::super::CheckOutcome {
+            argv: names(&["make", "lint"]),
+            ..stamp_check("x", Ended::Exited(1))
+        };
+        assert_eq!(
+            gates_to_ask(names(&["clippy"]), &[other]),
+            names(&["clippy"])
+        );
+        // The passing gate with no recorded verdict is still a gap.
+        let asked = gates_to_ask(names(&["clippy"]), &checks);
+        assert_eq!(
+            stamp_gaps(&asked, &answer(&[("pre-commit-clippy", State::Absent)])).len(),
+            1
+        );
     }
 
     /// amont's documented shape parses, and a state it never prints is

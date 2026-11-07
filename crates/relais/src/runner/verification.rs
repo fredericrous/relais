@@ -868,7 +868,12 @@ impl<'a> RunEngine<'a> {
         // commit and push skip the suite. A gate amont reports deferred or
         // absent, or no answer at all, is a gap: never a silent pass
         // (decisions programme "one verdict per tree", t03).
-        let stamp_gates = verify::stamps::profile_gates(&authority.verification_profile);
+        // Only gates whose command passed: a failed one is a failed check,
+        // repaired like any other, not a gap (#397).
+        let stamp_gates = verify::stamps::gates_to_ask(
+            verify::stamps::profile_gates(&authority.verification_profile),
+            &checks,
+        );
         if let (true, false, Some(holder)) = (amont_on, stamp_gates.is_empty(), holder.as_ref()) {
             let answer = self.config.hooks.stamps(holder.path(), None, &stamp_gates);
             gaps.extend(verify::stamps::stamp_gaps(&stamp_gates, &answer));

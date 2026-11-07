@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+- **A failed stamped check is repaired, not reported as a gap (#397).** When a profile command `amont run --stamp <gate>` failed (unformatted code, a clippy warning, a failing test), relais still asked amont for the gate's verdict, found none recorded, and stopped the run `needs_decision (verification_gap)` before the repair the failure called for. relais now asks amont only about gates whose command passed: a failed one goes to repair like any failing check, and a passing gate whose verdict amont did not record is still a gap.
+
 ## v0.50.0
 
 - **A misshapen acceptance entry says what is wrong.** A contract whose acceptance entry was neither a string nor a valid declared criterion was refused with "data did not match any variant of untagged enum AcceptanceEntry", which named nothing. That message was most of the ~9% of runs refused in the last two weeks. The refusal now names the entry (`acceptance[1]`), the fault (``unknown field `criterion` ``, ``unknown variant `report` ``, ``missing field `evidence` ``) and the shape that parses, with every evidence kind. Valid JSON with the wrong shape now reads "contract does not match the schema", not "contract is not valid JSON", which is kept for real syntax errors. An unknown field nested inside the contract (an entry, `limits`, `candidate`) keeps its full message instead of being reported as an unknown field of the contract itself. The `/relais` skill now shows a declared criterion in full: the field is `statement`.
