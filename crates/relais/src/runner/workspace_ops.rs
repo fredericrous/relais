@@ -132,7 +132,6 @@ impl<'a> RunEngine<'a> {
             session_id: session.clone(),
             agent_id: agent.map(str::to_string),
             marker: lease.marker_file(),
-            stop_seen: false,
         };
         let what = match gate.report_orphan(&report) {
             Ok(OrphanRegistration::Held) => "held until its stop is seen".to_string(),

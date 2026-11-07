@@ -1255,7 +1255,6 @@ mod tests {
             session_id: "s1".into(),
             agent_id: None,
             marker: marker.clone(),
-            stop_seen: false,
         };
         assert_eq!(state.report_orphan(report), OrphanRegistration::Held);
         state
@@ -1291,7 +1290,6 @@ mod tests {
                 session_id: "s1".into(),
                 agent_id: Some("a1".into()),
                 marker: named,
-                stop_seen: false,
             });
             assert!(
                 matches!(outcome, OrphanRegistration::Refused { .. }),
@@ -1325,7 +1323,6 @@ mod tests {
             session_id: "s1".into(),
             agent_id: None,
             marker: marker.clone(),
-            stop_seen: false,
         };
         assert_eq!(
             gate.report_orphan(&report).expect("report"),
@@ -1540,7 +1537,6 @@ mod tests {
                 session_id: "s1".into(),
                 agent_id: agent.map(str::to_string),
                 marker: marker.to_path_buf(),
-                stop_seen: false,
             }
         }
 

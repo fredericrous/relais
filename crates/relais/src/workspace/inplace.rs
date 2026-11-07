@@ -322,9 +322,12 @@ const ORPHAN_UPDATE_ATTEMPTS: usize = 5;
 /// which returns whether it changed anything. `Ok(false)` when there is
 /// nothing to change: no marker, no orphan, an orphan of another dispatch,
 /// or a `change` that had nothing to do. After writing, the marker is read
-/// again; if another process changed it in the meantime the change is
-/// applied to what that process left, so a later writer never erases an
-/// earlier one.
+/// again, and the change is reapplied if another process wrote between our
+/// write and that read. This is not a lock: a process that read before our
+/// write and writes after our re-read can still erase it. Inside one
+/// process `marker_writes` serialises the writers; across processes both
+/// writers only ever set `stopped`, and a confirmation that is lost is
+/// owed again by the coordinator's next sweep.
 fn update_orphan(
     path: &Path,
     dispatch: &str,

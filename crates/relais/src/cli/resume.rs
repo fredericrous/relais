@@ -1161,11 +1161,9 @@ mod tests {
     fn repo_with_lost_worker(
         dir: &std::path::Path,
         run: &str,
-        stopped: bool,
+        stopped: Option<relais::workspace::inplace::StopConfirmation>,
     ) -> std::path::PathBuf {
-        use relais::workspace::inplace::{
-            self, Lease, Marker, OrphanedWorker, Stage, StopConfirmation, StoppedBy,
-        };
+        use relais::workspace::inplace::{self, Lease, Marker, OrphanedWorker, Stage};
         let repo = dir.join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir");
         let init = std::process::Command::new("git")
@@ -1182,12 +1180,7 @@ mod tests {
             "2026-01-01T10:00:00+00:00",
         )
         .expect("an RFC 3339 time");
-        if stopped {
-            orphan.stopped = Some(StopConfirmation {
-                by: StoppedBy::Person,
-                at: "2026-01-01T11:00:00+00:00".into(),
-            });
-        }
+        orphan.stopped = stopped;
         lease
             .write_marker(&Marker {
                 run: run.into(),
@@ -1209,7 +1202,7 @@ mod tests {
     #[test]
     fn retiring_a_run_whose_lost_worker_may_still_write_is_refused_live() {
         let (ledger, dir) = temp_ledger("resume-fenced");
-        let repo = repo_with_lost_worker(&dir, "run-fenced", false);
+        let repo = repo_with_lost_worker(&dir, "run-fenced", None);
         let run = RunId::from_stored("run-fenced");
         let task = relais::ids::TaskId::from_stored("task-fenced");
         ledger
@@ -1247,7 +1240,14 @@ mod tests {
     #[test]
     fn worker_stopped_on_an_already_confirmed_orphan_goes_on_with_the_retire() {
         let (ledger, dir) = temp_ledger("resume-confirmed");
-        let repo = repo_with_lost_worker(&dir, "run-done", true);
+        let repo = repo_with_lost_worker(
+            &dir,
+            "run-done",
+            Some(relais::workspace::inplace::StopConfirmation {
+                by: relais::workspace::inplace::StoppedBy::Person,
+                at: "2026-01-01T11:00:00+00:00".into(),
+            }),
+        );
         let run = RunId::from_stored("run-done");
         let task = relais::ids::TaskId::from_stored("task-done");
         ledger

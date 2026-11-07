@@ -116,6 +116,8 @@ export type Shown = {
 // The commands changed since the grant, one row per change line
 // (`+ added check make test [default]`): the mark and the label come from
 // the line, the rest of it is one displayed field. Nothing when none is pending.
+// holds-until: `trust show --json` carries the change lines only as display
+// text; parse structured entries once it emits them.
 const CHANGE_LINE = /^([+~-]) (added|removed|changed) (.*)$/s
 
 export function changedCommands(shown: Shown): string[] {
@@ -137,7 +139,11 @@ async function reportChanges(fx: Fx, repo: Repo, shown: Shown): Promise<string[]
   // What was recorded as reported is what the person is told. A failed mark
   // only means the change is listed once more, from the read before it.
   if (marked.exitCode !== 0) return [...seen, `(could not record this as reported: ${escapeDisplay(err(marked))})`]
-  return changedCommands({ ...shown, pending_change: parsed<Shown>(marked)?.pending_change })
+  const recorded = parsed<Shown>(marked)
+  // Recorded but unreadable: the read before it is all there is to show,
+  // and the person must still be told, since relais will not say it again.
+  if (!recorded) return [...seen, '(relais recorded the change but printed no JSON; listed from the read before it)']
+  return changedCommands({ ...shown, pending_change: recorded.pending_change })
 }
 
 const MARK = { same: ' ', new: '+', changed: '~' } as const
@@ -442,8 +448,9 @@ async function onboard(fx: Fx, store: Store, repo: Repo, session: string): Promi
     if (answer !== USE_CHECKS) return refuse(fx, store, repo, answer === NOT_NOW ? 'not_now' : 'dismissed')
   } else {
     const typed = await askCommand(fx, repo)
-    if (typeof typed === 'string') return typed
     switch (typed.kind) {
+      case 'failed':
+        return typed.message
       case 'not_now':
         return refuse(fx, store, repo, 'not_now')
       case 'dismissed':
@@ -504,12 +511,14 @@ export type TypedCommand =
   | { kind: 'not_now' }
   | { kind: 'dismissed' }
   | { kind: 'refused'; reason: string }
+  | { kind: 'failed'; message: string }
 
 // The typed command for a repository where nothing was detected: relais
 // parses it; a refusal (exit 2, the command is not acceptable) is explained
 // and asked once more. Any other failure of relais is not the person's
-// command being refused: it comes back as the "not set up" text to return.
-async function askCommand(fx: Fx, repo: Repo): Promise<TypedCommand | string> {
+// command being refused: it comes back as `failed`, with the "not set up"
+// text to return.
+async function askCommand(fx: Fx, repo: Repo): Promise<TypedCommand> {
   let refusal: string | undefined
   for (let tries = 0; tries < 2; tries++) {
     const answer = await ask(fx, question1Nothing(repo.name, repo.branch, refusal), [NO_COMMAND])
@@ -522,7 +531,7 @@ async function askCommand(fx: Fx, repo: Repo): Promise<TypedCommand | string> {
     }
     const check = await run(fx, ['relais', 'init', '--detect', '--json', '--command', text], repo.root)
     if (check.exitCode === 0) return { kind: 'command', text }
-    if (check.exitCode !== 2) return `not set up: relais init --detect --command failed: ${err(check)}`
+    if (check.exitCode !== 2) return { kind: 'failed', message: `not set up: relais init --detect --command failed: ${err(check)}` }
     refusal = err(check).replace(/^relais[^:]*:\s*/, '')
   }
   return { kind: 'refused', reason: refusal ?? 'refused' }

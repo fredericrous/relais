@@ -30,8 +30,8 @@ pub use native::{
     StoppedReport, WorktreeOutcome,
 };
 pub use orphan::{
-    read_journal as read_orphan_journal, released_dispatches as released_orphans, NoFence,
-    OrphanEffects, OrphanFence, OrphanRegistration, OrphanReport,
+    read_journal as read_orphan_journal, released_dispatches as released_orphans, HeldOrphan,
+    NoFence, OrphanEffects, OrphanFence, OrphanRegistration, OrphanReport,
 };
 
 /// Poll period while waiting on the coordinator: queued for admission, or
@@ -1255,8 +1255,8 @@ impl AdmissionState {
 
     /// Journal held orphans to `path`, and take back those a previous
     /// coordinator left there.
-    pub fn adopt_orphans(&mut self, path: std::path::PathBuf, reports: Vec<OrphanReport>) {
-        self.orphans.adopt(reports);
+    pub fn adopt_orphans(&mut self, path: std::path::PathBuf, held: Vec<HeldOrphan>) {
+        self.orphans.adopt(held);
         self.orphan_journal = Some(path);
     }
 
@@ -1292,14 +1292,23 @@ impl AdmissionState {
     /// confirmation is queued at once. Call before the dispatch settles,
     /// while its native record still exists.
     pub fn report_orphan(&mut self, mut report: OrphanReport) -> OrphanRegistration {
-        let owned = self
-            .dispatches
-            .get(&report.dispatch_id)
-            .is_some_and(|dispatch| {
-                self.orphan_fence
-                    .owns_marker(&report.marker, &dispatch.run_id)
-            });
-        if !owned {
+        // Two different refusals: a dispatch this coordinator never knew (a
+        // restart mid-run) is not a wrong marker, and saying so would send
+        // the operator to the wrong place.
+        let Some(dispatch) = self.dispatches.get(&report.dispatch_id) else {
+            return OrphanRegistration::Refused {
+                reason: format!(
+                    "dispatch {} is unknown to this coordinator; the marker {} still fences \
+                     the tree",
+                    report.dispatch_id,
+                    report.marker.display()
+                ),
+            };
+        };
+        if !self
+            .orphan_fence
+            .owns_marker(&report.marker, &dispatch.run_id)
+        {
             return OrphanRegistration::Refused {
                 reason: format!(
                     "{} is not the in-place marker of the run of dispatch {}",

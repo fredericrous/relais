@@ -915,7 +915,7 @@ impl Coordinator {
             let fence = crate::workspace::inplace::MarkerFence;
             let standing = read_orphan_journal(&path)
                 .into_iter()
-                .filter(|report| crate::admission::OrphanFence::still_standing(&fence, report))
+                .filter(|held| crate::admission::OrphanFence::still_standing(&fence, &held.report))
                 .collect();
             state.adopt_orphans(path, standing);
         }
@@ -3949,7 +3949,6 @@ mod tests {
             session_id: "sess-1".into(),
             agent_id: Some("a1".into()),
             marker: marker_path.clone(),
-            stop_seen: false,
         };
         let elsewhere = OrphanReport {
             marker: dir.join("run-1.json"),

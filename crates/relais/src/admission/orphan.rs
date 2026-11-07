@@ -68,9 +68,16 @@ pub struct OrphanReport {
     pub agent_id: Option<String>,
     /// The in-place marker the confirmation is written into.
     pub marker: PathBuf,
-    /// The worker's stop was seen and its confirmation is owed to the
-    /// marker. Set by the coordinator, never by the runner; journalled, so a
-    /// restart still owes it.
+}
+
+/// A lost worker as the coordinator holds and journals it: the runner's
+/// report, and whether its stop was seen (a confirmation is owed to its
+/// marker). The flag is the coordinator's own and never travels from the
+/// runner; it is journalled, so a restart still owes the confirmation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldOrphan {
+    #[serde(flatten)]
+    pub report: OrphanReport,
     #[serde(default)]
     pub stop_seen: bool,
 }
@@ -103,7 +110,7 @@ pub struct OrphanEffects {
 #[derive(Debug)]
 struct JournalSnapshot {
     path: PathBuf,
-    held: Vec<OrphanReport>,
+    held: Vec<HeldOrphan>,
     generation: u64,
     newest_written: Arc<Mutex<u64>>,
 }
@@ -180,7 +187,7 @@ impl OrphanEffects {
 /// cannot be read is said and treated as empty: the markers still fence. One
 /// that cannot be parsed is renamed to `<name>.corrupt` first, so the next
 /// journal write does not destroy it.
-pub fn read_journal(path: &Path) -> Vec<OrphanReport> {
+pub fn read_journal(path: &Path) -> Vec<HeldOrphan> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
@@ -228,7 +235,7 @@ pub(super) struct OrphanTable {
     marker_writes: Arc<Mutex<()>>,
     /// Held orphans by dispatch. One whose stop was seen stays here, flagged,
     /// until its marker says it is confirmed.
-    held: BTreeMap<String, OrphanReport>,
+    held: BTreeMap<String, HeldOrphan>,
     /// Confirmations owed to markers, to be written by the next effects.
     confirmed: Vec<OrphanReport>,
     journal_dirty: bool,
@@ -246,9 +253,9 @@ pub(super) enum PriorStop {
 
 impl OrphanTable {
     /// Take back the orphans a previous coordinator journalled.
-    pub(super) fn adopt(&mut self, reports: Vec<OrphanReport>) {
-        for report in reports {
-            self.held.insert(report.dispatch_id.clone(), report);
+    pub(super) fn adopt(&mut self, held: Vec<HeldOrphan>) {
+        for orphan in held {
+            self.held.insert(orphan.report.dispatch_id.clone(), orphan);
         }
     }
 
@@ -269,9 +276,9 @@ impl OrphanTable {
                     && !self
                         .confirmed
                         .iter()
-                        .any(|pending| pending.dispatch_id == held.dispatch_id)
+                        .any(|pending| pending.dispatch_id == held.report.dispatch_id)
             })
-            .cloned()
+            .map(|held| held.report.clone())
             .collect();
         self.confirmed.extend(owed);
     }
@@ -283,19 +290,19 @@ impl OrphanTable {
     }
 
     pub(super) fn held(&self) -> impl Iterator<Item = &OrphanReport> {
-        self.held.values()
+        self.held.values().map(|held| &held.report)
     }
 
     /// `agent` of `session` stopped: every held orphan of that agent is owed
     /// its confirmation.
     pub(super) fn note_stop(&mut self, session_id: &str, agent_id: &str) {
         for held in self.held.values_mut() {
-            if held.session_id == session_id
-                && held.agent_id.as_deref() == Some(agent_id)
+            if held.report.session_id == session_id
+                && held.report.agent_id.as_deref() == Some(agent_id)
                 && !held.stop_seen
             {
                 held.stop_seen = true;
-                self.confirmed.push(held.clone());
+                self.confirmed.push(held.report.clone());
                 self.journal_dirty = true;
             }
         }
@@ -306,17 +313,18 @@ impl OrphanTable {
     /// the dispatch's native state already `Stopped`.
     pub(super) fn register(
         &mut self,
-        mut report: OrphanReport,
+        report: OrphanReport,
         prior_stop: PriorStop,
     ) -> OrphanRegistration {
-        report.stop_seen = prior_stop == PriorStop::Seen;
-        let registration = if report.stop_seen {
+        let stop_seen = prior_stop == PriorStop::Seen;
+        let registration = if stop_seen {
             self.confirmed.push(report.clone());
             OrphanRegistration::Confirmed
         } else {
             OrphanRegistration::Held
         };
-        self.held.insert(report.dispatch_id.clone(), report);
+        self.held
+            .insert(report.dispatch_id.clone(), HeldOrphan { report, stop_seen });
         self.journal_dirty = true;
         registration
     }
@@ -357,13 +365,14 @@ mod tests {
             session_id: "sess".into(),
             agent_id: agent.map(str::to_string),
             marker: PathBuf::from("/nonexistent/marker.json"),
-            stop_seen: false,
         }
     }
 
-    fn stopped(mut report: OrphanReport) -> OrphanReport {
-        report.stop_seen = true;
-        report
+    fn stopped(report: OrphanReport) -> HeldOrphan {
+        HeldOrphan {
+            report,
+            stop_seen: true,
+        }
     }
 
     fn fence() -> Arc<dyn OrphanFence> {
@@ -381,9 +390,9 @@ mod tests {
         assert!(table.take_effects(None, &fence()).confirmed.is_empty());
         table.note_stop("sess", "a1");
         let effects = table.take_effects(None, &fence());
-        assert_eq!(effects.confirmed, vec![stopped(report("d1", Some("a1")))]);
+        assert_eq!(effects.confirmed, vec![report("d1", Some("a1"))]);
         assert_eq!(
-            table.held().cloned().collect::<Vec<_>>(),
+            table.held.values().cloned().collect::<Vec<_>>(),
             vec![stopped(report("d1", Some("a1")))],
             "held until the marker says it is confirmed"
         );
@@ -400,7 +409,7 @@ mod tests {
         table.release(&[]);
         assert_eq!(
             table.take_effects(None, &fence()).confirmed,
-            vec![stopped(report("d1", Some("a1")))]
+            vec![report("d1", Some("a1"))]
         );
         table.release(&["d1".to_string()]);
         assert_eq!(table.held().count(), 0);
@@ -438,7 +447,13 @@ mod tests {
             .journal
             .expect("journal");
         assert_eq!(snapshot.path, path);
-        assert_eq!(snapshot.held, vec![report("d1", Some("a1"))]);
+        assert_eq!(
+            snapshot.held,
+            vec![HeldOrphan {
+                report: report("d1", Some("a1")),
+                stop_seen: false,
+            }]
+        );
         assert!(table.take_effects(Some(path), &fence()).journal.is_none());
     }
 

@@ -22,6 +22,7 @@ function world(options: { detected?: string[][] | null; changes?: Shown['changes
     typedCommand: undefined as string[] | undefined,
     marks: 0,
     markFails: false,
+    markSilent: false,
     pendingChange: options.pendingChange,
     markedChange: undefined as Shown['pending_change'],
   }
@@ -97,6 +98,11 @@ function world(options: { detected?: string[][] | null; changes?: Shown['changes
       }
       if (line === 'trust show --json --mark-reported') {
         if (state.markFails) return fail(1, 'relais trust show --mark-reported: the ledger could not be opened')
+        if (state.markSilent) {
+          state.marks += 1
+          state.pendingChange = undefined
+          return ok('')
+        }
         const reply = ok(JSON.stringify({ ...shown(), ...(state.markedChange ? { pending_change: state.markedChange } : {}) }))
         state.marks += 1
         state.pendingChange = undefined
@@ -593,11 +599,22 @@ test('trust: a mark that fails is said in the reply, which still lists the chang
   expect(reply).toContain('could not record this as reported')
 })
 
+test('trust: a mark that records but prints no JSON still lists the change, and says why', async () => {
+  const w = world({ pendingChange: { since: '2026-11-01', lines: ['~ changed check make test [default]'] } })
+  w.state.policy = true
+  w.state.preGranted = true
+  w.state.markSilent = true
+  const reply = await trustTool(w.fx, w.store, '/repo', 's')
+  expect(reply).toContain('~ changed check make test [default]')
+  expect(reply).toContain('printed no JSON')
+  expect(w.state.marks).toBe(1)
+})
+
 test('onboard: typing the words Not now is a command, not the button', async () => {
   const w = world({ detected: null })
   w.answers.push('Not now', allowLabel(2))
-  const result = await onboardTool(w.fx, w.store, '/repo', 's')
-  expect(result).toContain('ready')
+  const reply = await onboardTool(w.fx, w.store, '/repo', 's')
+  expect(reply).toContain('ready')
   expect(w.state.typedCommand).toEqual(['Not', 'now'])
   expect(w.store.declined.size).toBe(0)
 })
@@ -605,9 +622,9 @@ test('onboard: typing the words Not now is a command, not the button', async () 
 test('onboard: a failure of relais that is not a refusal is not-set-up, not the person\'s command refused', async () => {
   const w = world({ detected: null })
   w.answers.push('boom')
-  const result = await onboardTool(w.fx, w.store, '/repo', 's')
-  expect(result).toMatch(/^not set up: relais init --detect --command failed: .*the ledger exploded/)
-  expect(result).not.toContain('declined')
+  const reply = await onboardTool(w.fx, w.store, '/repo', 's')
+  expect(reply).toMatch(/^not set up: relais init --detect --command failed: .*the ledger exploded/)
+  expect(reply).not.toContain('declined')
   expect(w.asks.length).toBe(1)
   expect(w.state.policy).toBe(false)
 })
