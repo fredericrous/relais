@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.50.1
+
 - **A failed stamped check is repaired, not reported as a gap (#397).** When a profile command `amont run --stamp <gate>` failed (unformatted code, a clippy warning, a failing test), relais still asked amont for the gate's verdict, found none recorded, and stopped the run `needs_decision (verification_gap)` before the repair the failure called for. relais now asks amont only about gates whose command passed: a failed one goes to repair like any failing check, and a passing gate whose verdict amont did not record is still a gap.
 
 ## v0.50.0
