@@ -8,7 +8,7 @@ missing here.
 
 ## Unreleased
 
-- **A misshapen acceptance entry says what is wrong.** A contract whose acceptance entry was neither a string nor a valid declared criterion was refused with "data did not match any variant of untagged enum AcceptanceEntry", which named nothing. About 9% of runs in the last two weeks were refused that way. The refusal now names the entry (`acceptance[1]`), the fault (``unknown field `criterion` ``, ``unknown variant `report` ``, ``missing field `evidence` ``) and the shape that parses, with every evidence kind. An unknown field inside an entry is no longer reported as an unknown field of the contract itself. The `/relais` skill now shows a declared criterion in full: the field is `statement`.
+- **A misshapen acceptance entry says what is wrong.** A contract whose acceptance entry was neither a string nor a valid declared criterion was refused with "data did not match any variant of untagged enum AcceptanceEntry", which named nothing. That message was most of the ~9% of runs refused in the last two weeks. The refusal now names the entry (`acceptance[1]`), the fault (``unknown field `criterion` ``, ``unknown variant `report` ``, ``missing field `evidence` ``) and the shape that parses, with every evidence kind. Valid JSON with the wrong shape now reads "contract does not match the schema", not "contract is not valid JSON", which is kept for real syntax errors. An unknown field nested inside the contract (an entry, `limits`, `candidate`) keeps its full message instead of being reported as an unknown field of the contract itself. The `/relais` skill now shows a declared criterion in full: the field is `statement`.
 
 ## v0.49.0
 

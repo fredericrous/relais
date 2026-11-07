@@ -67,13 +67,13 @@ up, and the person answers there.
    `statement`; `criterion`, `text` and `description` are refused:
 
 ```json
-"acceptance": [
+{"acceptance": [
   "the crate builds",
   {"statement": "a regression test covers the empty input",
    "evidence": {"kind": "test", "authorship": "model_added"}},
   {"statement": "clippy is clean",
    "evidence": {"kind": "check", "name": "<check name in the profile>"}}
-]
+]}
 ```
 
    Evidence kinds: `check` {`name`}, `test` {`authorship`:

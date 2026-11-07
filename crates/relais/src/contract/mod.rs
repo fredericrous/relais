@@ -902,6 +902,11 @@ pub enum ContractError {
     EmptyBaseRef,
     EmptyVerificationProfile,
     MalformedJson(String),
+    /// Valid JSON that is not a task contract: a wrong type, a missing
+    /// field, a misshapen acceptance entry. Kept apart from
+    /// [`Self::MalformedJson`] so its author fixes the field it names
+    /// instead of hunting for a syntax error.
+    Misshapen(String),
     DecompositionOnInspect,
     PlanTooSmall(usize),
     PlanTooLarge(usize, u32),
@@ -973,6 +978,7 @@ impl std::fmt::Display for ContractError {
             Self::EmptyBaseRef => write!(f, "base_ref is empty"),
             Self::EmptyVerificationProfile => write!(f, "verification_profile is empty"),
             Self::MalformedJson(detail) => write!(f, "contract is not valid JSON: {detail}"),
+            Self::Misshapen(detail) => write!(f, "contract does not match the schema: {detail}"),
             Self::DecompositionOnInspect => {
                 write!(f, "kind=inspect cannot be decomposed into work packages")
             }
@@ -1054,7 +1060,7 @@ impl TaskContract {
             {
                 return ContractError::UnknownField(field.to_string());
             }
-            ContractError::MalformedJson(msg)
+            ContractError::Misshapen(msg)
         })?;
         TaskContract::try_from(wire)
     }
@@ -1494,8 +1500,8 @@ mod tests {
         for (index, (acceptance, fault)) in cases.into_iter().enumerate() {
             let error = TaskContract::from_json_str(&contract_with_acceptance(acceptance))
                 .expect_err("refused");
-            let ContractError::MalformedJson(msg) = &error else {
-                panic!("case {index}: expected MalformedJson, got {error:?}");
+            let ContractError::Misshapen(msg) = &error else {
+                panic!("case {index}: expected Misshapen, got {error:?}");
             };
             assert!(msg.contains(fault), "case {index}: {msg}");
             assert!(
