@@ -824,7 +824,7 @@ mod tests {
     use std::time::Duration;
 
     fn state() -> AdmissionState {
-        AdmissionState::new(ConcurrencyLimits {
+        let mut state = AdmissionState::new(ConcurrencyLimits {
             max_active_agents: None,
             max_active_agents_per_session: None,
             max_heavy_commands: None,
@@ -832,7 +832,18 @@ mod tests {
             max_agent_depth: None,
             max_agents_per_run: None,
             training_when_idle: true,
-        })
+        });
+        state.set_orphan_fence(std::sync::Arc::new(crate::workspace::inplace::MarkerFence));
+        state
+    }
+
+    /// A git directory under `dir` and the path its in-place marker for the
+    /// run `admitted` registers lives at.
+    fn marker_path_in(dir: &std::path::Path) -> std::path::PathBuf {
+        let git_dir = dir.join("git");
+        std::fs::create_dir_all(git_dir.join("relais-inplace")).expect("markers dir");
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+        git_dir.join("relais-inplace").join("run.json")
     }
 
     fn admitted(state: &mut AdmissionState, dispatch: &str, session: &str, now: Instant) {
@@ -1206,9 +1217,9 @@ mod tests {
 
     fn orphan_marker(dir: &std::path::Path) -> std::path::PathBuf {
         use crate::workspace::inplace::{Marker, OrphanedWorker, Stage};
-        let path = dir.join("run-1.json");
+        let path = marker_path_in(dir);
         let marker = Marker {
-            run: "run-1".into(),
+            run: "run".into(),
             stage: Stage::Running,
             head_symbolic: None,
             head_sha: "0".repeat(40),
@@ -1244,6 +1255,7 @@ mod tests {
             session_id: "s1".into(),
             agent_id: None,
             marker: marker.clone(),
+            stop_seen: false,
         };
         assert_eq!(state.report_orphan(report), OrphanRegistration::Held);
         state
@@ -1262,13 +1274,43 @@ mod tests {
     }
 
     #[test]
+    fn a_report_naming_a_marker_outside_the_runs_marker_path_is_refused() {
+        let now = Instant::now();
+        let dir = crate::test_support::temp_dir("orphan-foreign-marker");
+        let marker = orphan_marker(&dir);
+        let foreign = dir.join("elsewhere.json");
+        std::fs::copy(&marker, &foreign).expect("copy");
+        let mut state = state();
+        admitted(&mut state, "d1", "s1", now);
+        for named in [
+            foreign,
+            dir.join("git").join("relais-inplace").join("other.json"),
+        ] {
+            let outcome = state.report_orphan(OrphanReport {
+                dispatch_id: "d1".into(),
+                session_id: "s1".into(),
+                agent_id: Some("a1".into()),
+                marker: named,
+                stop_seen: false,
+            });
+            assert!(
+                matches!(outcome, OrphanRegistration::Refused { .. }),
+                "{outcome:?}"
+            );
+        }
+        assert!(state.held_orphans().is_empty());
+        assert!(state.take_orphan_effects().is_empty());
+    }
+
+    #[test]
     fn a_confirmed_marker_drops_the_held_orphan_from_the_table_and_journal() {
         use crate::admission::{Gate, LocalGate};
         let now = Instant::now();
         let dir = crate::test_support::temp_dir("orphan-release");
         let marker = orphan_marker(&dir);
         let journal = dir.join("inplace-orphans.json");
-        let gate = LocalGate::new(ConcurrencyLimits::default(), crate::ledger::now_rfc3339);
+        let gate = LocalGate::new(ConcurrencyLimits::default(), crate::ledger::now_rfc3339)
+            .with_orphan_fence(std::sync::Arc::new(crate::workspace::inplace::MarkerFence));
         {
             let mut state = gate.admission();
             state.adopt_orphans(journal.clone(), Vec::new());
@@ -1283,6 +1325,7 @@ mod tests {
             session_id: "s1".into(),
             agent_id: None,
             marker: marker.clone(),
+            stop_seen: false,
         };
         assert_eq!(
             gate.report_orphan(&report).expect("report"),
@@ -1469,7 +1512,7 @@ mod tests {
             let orphan = OrphanedWorker::lost_at("d1", "s1", agent, "2026-11-07T10:00:00+00:00")
                 .expect("an RFC 3339 time");
             let marker = Marker {
-                run: "run-1".into(),
+                run: "run".into(),
                 stage: Stage::Running,
                 head_symbolic: None,
                 head_sha: "0".repeat(40),
@@ -1479,7 +1522,7 @@ mod tests {
                 exported: None,
                 orphan: Some(orphan),
             };
-            let path = dir.join("run-1.json");
+            let path = marker_path_in(dir);
             std::fs::write(&path, serde_json::to_string_pretty(&marker).expect("json"))
                 .expect("marker");
             path
@@ -1497,6 +1540,7 @@ mod tests {
                 session_id: "s1".into(),
                 agent_id: agent.map(str::to_string),
                 marker: marker.to_path_buf(),
+                stop_seen: false,
             }
         }
 
@@ -1573,6 +1617,7 @@ mod tests {
             let marker = marker_with_orphan(&dir, Some("a1"));
             let now = Instant::now();
             let mut state = state();
+            bound_native(&mut state, now);
             state.report_orphan(report(&marker, Some("a1")));
             state.settle_by_agent("s1", "a2", None, now);
             state.settle_by_agent("s2", "a1", None, now);
@@ -1586,6 +1631,7 @@ mod tests {
             let marker = marker_with_orphan(&dir, Some("a1"));
             let now = Instant::now();
             let mut state = state();
+            admitted(&mut state, "d1", "s1", now);
             state.settle_by_agent("s1", "a1", None, now);
             assert_eq!(
                 state.report_orphan(report(&marker, Some("a1"))),
@@ -1623,6 +1669,7 @@ mod tests {
             let journal = dir.join("inplace-orphans.json");
             let now = Instant::now();
             let mut first = state();
+            admitted(&mut first, "d1", "s1", now);
             first.adopt_orphans(journal.clone(), Vec::new());
             first.report_orphan(report(&marker, Some("a1")));
             flush(&mut first);
@@ -1634,7 +1681,117 @@ mod tests {
             second.settle_by_agent("s1", "a1", None, now);
             flush(&mut second);
             assert!(!standing(&marker));
+            sweep(&mut second);
+            flush(&mut second);
             assert_eq!(read_orphan_journal(&journal), Vec::new());
+        }
+
+        /// What the coordinator does before a request that can free a tree:
+        /// drop the held orphans whose markers are confirmed.
+        fn sweep(state: &mut AdmissionState) {
+            let (held, fence) = state.orphan_sweep_input();
+            let released = crate::admission::released_orphans(&held, fence.as_ref());
+            state.release_orphans(&released);
+        }
+
+        /// A fence whose first confirmation write fails, as a full disk would.
+        #[derive(Debug, Default)]
+        struct FlakyFence {
+            failed_once: std::sync::atomic::AtomicBool,
+        }
+
+        impl crate::admission::OrphanFence for FlakyFence {
+            fn still_standing(&self, report: &OrphanReport) -> bool {
+                crate::admission::OrphanFence::still_standing(
+                    &crate::workspace::inplace::MarkerFence,
+                    report,
+                )
+            }
+
+            fn confirm_stopped(&self, report: &OrphanReport, at: &str) -> std::io::Result<bool> {
+                if !self
+                    .failed_once
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(std::io::Error::other("the disk is full"));
+                }
+                crate::admission::OrphanFence::confirm_stopped(
+                    &crate::workspace::inplace::MarkerFence,
+                    report,
+                    at,
+                )
+            }
+
+            fn name_agent(&self, report: &OrphanReport, agent: &str) -> std::io::Result<bool> {
+                crate::admission::OrphanFence::name_agent(
+                    &crate::workspace::inplace::MarkerFence,
+                    report,
+                    agent,
+                )
+            }
+
+            fn owns_marker(&self, marker: &std::path::Path, run: &str) -> bool {
+                crate::workspace::inplace::names_marker_of(marker, run)
+            }
+        }
+
+        /// The stop was seen but the write to the marker failed: the orphan
+        /// stays held and the next sweep owes the write again.
+        #[test]
+        fn a_confirmation_that_could_not_be_written_is_retried_by_the_next_sweep() {
+            let dir = crate::test_support::short_temp_dir("orphan-retry");
+            let marker = marker_with_orphan(&dir, Some("a1"));
+            let now = Instant::now();
+            let mut state = state();
+            state.set_orphan_fence(std::sync::Arc::new(FlakyFence::default()));
+            bound_native(&mut state, now);
+            state.report_orphan(report(&marker, Some("a1")));
+            flush(&mut state);
+            state.settle_by_agent("s1", "a1", None, now);
+            flush(&mut state);
+            assert!(standing(&marker), "the first write failed");
+            assert_eq!(state.held_orphans().len(), 1, "still held");
+            sweep(&mut state);
+            assert_eq!(state.held_orphans().len(), 1, "the marker still fences");
+            flush(&mut state);
+            assert!(!standing(&marker), "the retry wrote the confirmation");
+            sweep(&mut state);
+            assert!(state.held_orphans().is_empty());
+        }
+
+        /// The journal remembers that a stop was seen, so a restarted
+        /// coordinator still owes the marker its confirmation.
+        #[test]
+        fn a_stop_seen_before_a_restart_is_still_owed_after_it() {
+            let dir = crate::test_support::short_temp_dir("orphan-restart-owed");
+            let marker = marker_with_orphan(&dir, Some("a1"));
+            let journal = dir.join("inplace-orphans.json");
+            let now = Instant::now();
+            let mut first = state();
+            bound_native(&mut first, now);
+            first.adopt_orphans(journal.clone(), Vec::new());
+            first.report_orphan(report(&marker, Some("a1")));
+            first.settle_by_agent("s1", "a1", None, now);
+            first
+                .take_orphan_effects()
+                .apply("2026-11-07T10:05:00+00:00");
+            drop(first);
+            // The confirmation never reached the marker.
+            let mut reset = Marker::clone(&read_marker(&marker));
+            reset.orphan =
+                OrphanedWorker::lost_at("d1", "s1", Some("a1"), "2026-11-07T10:00:00+00:00");
+            std::fs::write(&marker, serde_json::to_string(&reset).expect("json")).expect("marker");
+            assert!(standing(&marker));
+
+            let mut second = state();
+            second.adopt_orphans(journal.clone(), read_orphan_journal(&journal));
+            sweep(&mut second);
+            flush(&mut second);
+            assert!(!standing(&marker));
+        }
+
+        fn read_marker(path: &std::path::Path) -> Marker {
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read")).expect("json")
         }
 
         /// No agent id, so no SubagentStop can name the worker: only the
@@ -1645,6 +1802,7 @@ mod tests {
             let marker = marker_with_orphan(&dir, None);
             let now = Instant::now();
             let mut state = state();
+            admitted(&mut state, "d1", "s1", now);
             assert_eq!(
                 state.report_orphan(report(&marker, None)),
                 OrphanRegistration::Held

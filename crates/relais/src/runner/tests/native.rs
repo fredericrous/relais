@@ -1045,6 +1045,7 @@ fn an_attempt_with_no_booked_record_has_no_unpriced_model() {
         failure_detail: None,
         booked_message_ids: Vec::new(),
         unpriced: Vec::new(),
+        lost_worker: None,
     };
     assert_eq!(
         unpriced_native_model(&result),

@@ -33,7 +33,7 @@ impl<'a> RunEngine<'a> {
                 ),
             ),
             LeaseRefusal::WorkerMayRun { run, orphan } => (
-                BlockCode::WorkspaceHasInterruptedRun,
+                BlockCode::InplaceWorkerMayRun,
                 orphan.fence_text(&run, &self.config.ledger.now()),
             ),
             LeaseRefusal::UnreadableMarker { path, why } => (
@@ -99,19 +99,15 @@ impl<'a> RunEngine<'a> {
     ) {
         use crate::admission::{OrphanRegistration, OrphanReport};
         use crate::workspace::inplace::OrphanedWorker;
-        let lost = !launched.ended.succeeded()
-            && launched
-                .failure_detail
-                .as_deref()
-                .is_some_and(|detail| detail.starts_with(crate::adapter::native::MOD_GONE));
+        let lost = launched.lost_worker.as_ref();
         let Some(lease) = self.inplace.as_ref().and_then(|state| state.lease.as_ref()) else {
             return;
         };
-        if !lost {
+        let Some(lost) = lost else {
             return;
-        }
+        };
         let session = &self.config.session_id;
-        let agent = launched.session_id.as_deref();
+        let agent = lost.agent.as_deref();
         let Some(orphan) =
             OrphanedWorker::lost_at(dispatch_id, session, agent, &self.config.ledger.now())
         else {
@@ -136,10 +132,16 @@ impl<'a> RunEngine<'a> {
             session_id: session.clone(),
             agent_id: agent.map(str::to_string),
             marker: lease.marker_file(),
+            stop_seen: false,
         };
         let what = match gate.report_orphan(&report) {
             Ok(OrphanRegistration::Held) => "held until its stop is seen".to_string(),
             Ok(OrphanRegistration::Confirmed) => "its stop was already seen".to_string(),
+            Ok(OrphanRegistration::Refused { reason }) => format!(
+                "the coordinator refused the report ({reason}); `relais resume --retire {} \
+                 --worker-stopped` frees the tree once its session is closed",
+                self.run_id
+            ),
             Err(e) => format!(
                 "the coordinator could not be told ({e}); `relais resume --retire {} \
                  --worker-stopped` frees the tree once its session is closed",

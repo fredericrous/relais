@@ -30,8 +30,8 @@ pub use native::{
     StoppedReport, WorktreeOutcome,
 };
 pub use orphan::{
-    read_journal as read_orphan_journal, released_dispatches as released_orphans,
-    still_standing as orphan_still_standing, OrphanEffects, OrphanRegistration, OrphanReport,
+    read_journal as read_orphan_journal, released_dispatches as released_orphans, NoFence,
+    OrphanEffects, OrphanFence, OrphanRegistration, OrphanReport,
 };
 
 /// Poll period while waiting on the coordinator: queued for admission, or
@@ -1195,6 +1195,8 @@ pub struct AdmissionState {
     disk_measured: BTreeMap<String, (Option<crate::disk::Volume>, Instant)>,
     /// In-place workers a run lost: held until their stop is seen.
     orphans: orphan::OrphanTable,
+    /// How the markers those orphans fence are read and written.
+    orphan_fence: std::sync::Arc<dyn OrphanFence>,
     /// Where held orphans are journalled so a restart keeps them; `None`
     /// keeps them in memory only.
     orphan_journal: Option<std::path::PathBuf>,
@@ -1246,6 +1248,7 @@ impl AdmissionState {
             disk_probe: std::sync::Arc::new(crate::disk::StatvfsProbe),
             disk_measured: BTreeMap::new(),
             orphans: orphan::OrphanTable::default(),
+            orphan_fence: std::sync::Arc::new(NoFence),
             orphan_journal: None,
         }
     }
@@ -1257,9 +1260,24 @@ impl AdmissionState {
         self.orphan_journal = Some(path);
     }
 
+    /// Read and write in-place markers through `fence`. A state built
+    /// without one knows no marker and refuses every orphan report.
+    pub fn set_orphan_fence(&mut self, fence: std::sync::Arc<dyn OrphanFence>) {
+        self.orphan_fence = fence;
+    }
+
     /// The in-place workers the coordinator holds a fence for.
     pub fn held_orphans(&self) -> Vec<OrphanReport> {
         self.orphans.held().cloned().collect()
+    }
+
+    /// The held orphans and the fence to read their markers with, for a
+    /// sweep that reads files with no lock held.
+    pub fn orphan_sweep_input(&self) -> (Vec<OrphanReport>, std::sync::Arc<dyn OrphanFence>) {
+        (
+            self.held_orphans(),
+            std::sync::Arc::clone(&self.orphan_fence),
+        )
     }
 
     /// Drop the held orphans whose markers are confirmed. `dispatches` comes
@@ -1274,6 +1292,22 @@ impl AdmissionState {
     /// confirmation is queued at once. Call before the dispatch settles,
     /// while its native record still exists.
     pub fn report_orphan(&mut self, mut report: OrphanReport) -> OrphanRegistration {
+        let owned = self
+            .dispatches
+            .get(&report.dispatch_id)
+            .is_some_and(|dispatch| {
+                self.orphan_fence
+                    .owns_marker(&report.marker, &dispatch.run_id)
+            });
+        if !owned {
+            return OrphanRegistration::Refused {
+                reason: format!(
+                    "{} is not the in-place marker of the run of dispatch {}",
+                    report.marker.display(),
+                    report.dispatch_id
+                ),
+            };
+        }
         let (agent, stopped) = self.native_agent_of(&report.dispatch_id);
         if report.agent_id.is_none() && agent.is_some() {
             report.agent_id = agent;
@@ -1294,7 +1328,8 @@ impl AdmissionState {
     /// The files the orphan table asks to be written. Applied by the caller
     /// once the admission lock is released.
     pub fn take_orphan_effects(&mut self) -> OrphanEffects {
-        self.orphans.take_effects(self.orphan_journal.as_deref())
+        self.orphans
+            .take_effects(self.orphan_journal.as_deref(), &self.orphan_fence)
     }
 
     /// Hold heavy leases that ask about the disk to `floor` bytes available
@@ -3635,8 +3670,8 @@ pub fn lock_releasing_orphans(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     };
-    let held = lock().held_orphans();
-    let released = released_orphans(&held);
+    let (held, fence) = lock().orphan_sweep_input();
+    let released = released_orphans(&held, fence.as_ref());
     let mut guard = lock();
     guard.release_orphans(&released);
     guard
@@ -3655,6 +3690,12 @@ impl LocalGate {
     /// with `probe` (SPEC §23).
     pub fn with_disk(self, floor: u64, probe: std::sync::Arc<dyn crate::disk::DiskProbe>) -> Self {
         self.admission().set_disk(floor, probe);
+        self
+    }
+
+    /// Read and write in-place markers through `fence`.
+    pub fn with_orphan_fence(self, fence: std::sync::Arc<dyn OrphanFence>) -> Self {
+        self.admission().set_orphan_fence(fence);
         self
     }
 
@@ -3680,6 +3721,13 @@ impl LocalGate {
 
     /// Write what the orphan table asked for, with the lock released.
     fn apply_orphan_effects(&self, at: &str) {
+        let effects = self.admission().take_orphan_effects();
+        effects.apply(at);
+    }
+
+    /// The same, after dropping the held orphans whose markers are
+    /// confirmed and owing the confirmation again to those still fenced.
+    fn sweep_and_apply_orphan_effects(&self, at: &str) {
         let effects = lock_releasing_orphans(&self.state).take_orphan_effects();
         effects.apply(at);
     }
@@ -3790,13 +3838,13 @@ impl Gate for LocalGate {
         let outcome =
             self.admission()
                 .settle_by_agent(session_id, agent_id, spent_micros, Instant::now());
-        self.apply_orphan_effects(&(self.now_rfc3339)());
+        self.sweep_and_apply_orphan_effects(&(self.now_rfc3339)());
         Ok(outcome)
     }
 
     fn report_orphan(&self, report: &OrphanReport) -> Result<OrphanRegistration, GateError> {
         let outcome = self.admission().report_orphan(report.clone());
-        self.apply_orphan_effects(&(self.now_rfc3339)());
+        self.sweep_and_apply_orphan_effects(&(self.now_rfc3339)());
         Ok(outcome)
     }
 

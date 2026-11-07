@@ -514,7 +514,11 @@ pub fn check_command_program(
     let Some(program) = argv.first() else {
         return Err(CommandTextError::Empty);
     };
-    if argv.len() == 1 && ACKNOWLEDGEMENTS.contains(&program.to_lowercase().as_str()) {
+    if argv.len() == 1
+        && ACKNOWLEDGEMENTS
+            .iter()
+            .any(|word| word.eq_ignore_ascii_case(program))
+    {
         return Err(CommandTextError::Acknowledgement(program.clone()));
     }
     if exists(program) {

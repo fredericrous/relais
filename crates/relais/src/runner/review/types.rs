@@ -87,12 +87,8 @@ pub(crate) struct ReviewRequest<'r> {
     /// The candidate a reviewer admission that expires keeps and names;
     /// `None` where no candidate is kept (integration).
     pub(crate) candidate: Option<crate::runner::KeptCandidate>,
-    /// What `patch_path` is measured from.
+    /// What `patch_path` is measured from, and the files it inherits.
     pub(crate) basis: PatchBasis,
-    /// The files a predecessor run changed and this candidate inherits
-    /// (`from_candidate`); empty for a candidate that continues no run. The
-    /// reviewer is told which of the patch's files are inherited.
-    pub(crate) inherited_files: &'r [String],
 }
 
 /// What the patch a reviewer reads is measured from.
@@ -103,10 +99,30 @@ pub(crate) enum PatchBasis {
     /// The run's base for a candidate that continues a predecessor run:
     /// the patch holds the inherited changes too, because no review of the
     /// predecessor's tree could be relied on.
-    InheritedBase,
+    /// `inherited_files` are the files the predecessor changed.
+    InheritedBase { inherited_files: Vec<String> },
     /// The predecessor's tree, which the review dispatch `cleared_by`
-    /// already covers: the candidate's own changes only.
-    Predecessor { cleared_by: String },
+    /// already covers: the candidate's own changes only. `inherited_files`
+    /// are the files the predecessor changed, which the patch leaves out.
+    Predecessor {
+        cleared_by: String,
+        inherited_files: Vec<String>,
+    },
+}
+
+impl PatchBasis {
+    /// The files a predecessor run changed and this candidate inherits
+    /// (`from_candidate`); empty for a candidate that continues no run. The
+    /// reviewer is told which of the patch's files are inherited.
+    pub(crate) fn inherited_files(&self) -> &[String] {
+        match self {
+            Self::Base => &[],
+            Self::InheritedBase { inherited_files }
+            | Self::Predecessor {
+                inherited_files, ..
+            } => inherited_files,
+        }
+    }
 }
 
 impl ReviewRequest<'_> {
@@ -126,7 +142,6 @@ impl ReviewRequest<'_> {
             holdouts: self.holdouts,
             candidate: self.candidate.clone(),
             basis: self.basis.clone(),
-            inherited_files: self.inherited_files,
         }
     }
 }

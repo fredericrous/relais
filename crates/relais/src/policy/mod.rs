@@ -2217,6 +2217,10 @@ pub enum BlockCode {
     /// A run was interrupted in the caller's worktree and has not been
     /// retired; its partial edits are still there.
     WorkspaceHasInterruptedRun,
+    /// A run lost its worker in the caller's worktree and nothing proves it
+    /// stopped: the tree stays fenced until its stop is seen or the person
+    /// vouches (ADR-0008).
+    InplaceWorkerMayRun,
     /// `HEAD` moved during an in-place run: a worker committed on the
     /// person's branch. The tree and the branch were left as they are.
     InPlaceHeadMoved,
@@ -2272,6 +2276,7 @@ impl BlockCode {
             Self::HoldoutUnfetchable => "holdout_unfetchable",
             Self::WorkspaceBusy => "workspace_busy",
             Self::WorkspaceHasInterruptedRun => "workspace_has_interrupted_run",
+            Self::InplaceWorkerMayRun => "inplace_worker_may_run",
             Self::InPlaceHeadMoved => "inplace_head_moved",
             Self::RestoreBlockedIgnoredCollision => "restore_blocked_ignored_collision",
         }

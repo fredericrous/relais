@@ -314,52 +314,131 @@ pub fn marker_file(git_dir: &Path, run: &str) -> PathBuf {
     marker_path(git_dir, run)
 }
 
+/// How many times [`update_orphan`] re-applies its change when the marker
+/// moved under it before giving up.
+const ORPHAN_UPDATE_ATTEMPTS: usize = 5;
+
+/// Change the orphan of `dispatch` in the marker at `path` with `change`,
+/// which returns whether it changed anything. `Ok(false)` when there is
+/// nothing to change: no marker, no orphan, an orphan of another dispatch,
+/// or a `change` that had nothing to do. After writing, the marker is read
+/// again; if another process changed it in the meantime the change is
+/// applied to what that process left, so a later writer never erases an
+/// earlier one.
+fn update_orphan(
+    path: &Path,
+    dispatch: &str,
+    change: impl Fn(&mut OrphanedWorker) -> bool,
+) -> io::Result<bool> {
+    for _ in 0..ORPHAN_UPDATE_ATTEMPTS {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let mut marker: Marker = serde_json::from_str(&text).map_err(io_other)?;
+        let Some(orphan) = marker.orphan.as_mut() else {
+            return Ok(false);
+        };
+        if orphan.dispatch != dispatch || !change(orphan) {
+            return Ok(false);
+        }
+        let rewritten = serde_json::to_string_pretty(&marker).map_err(io_other)?;
+        crate::fsutil::write_atomic(path, &rewritten)?;
+        let reread = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Marker>(&text).ok());
+        if reread.as_ref() == Some(&marker) {
+            return Ok(true);
+        }
+    }
+    Err(io::Error::other(format!(
+        "{} kept changing while the orphan of dispatch {dispatch} was being updated",
+        path.display()
+    )))
+}
+
 /// Record on the marker at `path` that the worker of `dispatch` stopped.
 /// `Ok(false)` when there is nothing to record: no marker, no orphan, an
 /// orphan of another dispatch, or one already confirmed. Idempotent, so a
 /// stop seen twice and a person's word after the coordinator's agree.
 pub fn confirm_stopped(path: &Path, dispatch: &str, by: StoppedBy, at: &str) -> io::Result<bool> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
-    };
-    let mut marker: Marker = serde_json::from_str(&text).map_err(io_other)?;
-    let Some(orphan) = marker.orphan.as_mut() else {
-        return Ok(false);
-    };
-    if orphan.dispatch != dispatch || orphan.stopped.is_some() {
-        return Ok(false);
-    }
-    orphan.stopped = Some(StopConfirmation {
-        by,
-        at: at.to_string(),
-    });
-    let rewritten = serde_json::to_string_pretty(&marker).map_err(io_other)?;
-    crate::fsutil::write_atomic(path, &rewritten)?;
-    Ok(true)
+    update_orphan(path, dispatch, |orphan| {
+        if orphan.stopped.is_some() {
+            return false;
+        }
+        orphan.stopped = Some(StopConfirmation {
+            by,
+            at: at.to_string(),
+        });
+        true
+    })
 }
 
 /// Record on the marker at `path` the agent the coordinator knows for the
 /// orphan of `dispatch`, when the marker names none. `Ok(false)` when there is
 /// nothing to change: no marker, no such orphan, or an agent already named.
 pub fn set_orphan_agent(path: &Path, dispatch: &str, agent_id: &str) -> io::Result<bool> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
-    };
-    let mut marker: Marker = serde_json::from_str(&text).map_err(io_other)?;
-    let Some(orphan) = marker.orphan.as_mut() else {
-        return Ok(false);
-    };
-    if orphan.dispatch != dispatch || orphan.agent_id.is_some() {
-        return Ok(false);
+    update_orphan(path, dispatch, |orphan| {
+        if orphan.agent_id.is_some() {
+            return false;
+        }
+        orphan.agent_id = Some(agent_id.to_string());
+        true
+    })
+}
+
+/// Whether `marker` is where `run`'s in-place marker lives:
+/// `<git-dir>/relais-inplace/<run>.json`, in a directory that is a git
+/// directory. Nothing else is a marker the coordinator may write to.
+pub fn names_marker_of(marker: &Path, run: &str) -> bool {
+    let in_markers_dir = marker.parent().filter(|dir| {
+        dir.file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new(MARKERS_DIR))
+    });
+    marker
+        .file_name()
+        .is_some_and(|name| name == std::ffi::OsStr::new(&format!("{run}.json")))
+        && in_markers_dir
+            .and_then(Path::parent)
+            .is_some_and(|git_dir| git_dir.join("HEAD").is_file())
+}
+
+/// The admission fence over in-place markers (ADR-0008): admission declares
+/// what it needs of a marker and this is the answer, so admission imports
+/// nothing of the workspace.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MarkerFence;
+
+impl crate::admission::OrphanFence for MarkerFence {
+    fn still_standing(&self, report: &crate::admission::OrphanReport) -> bool {
+        match std::fs::read_to_string(&report.marker) {
+            Ok(text) => serde_json::from_str::<Marker>(&text)
+                .ok()
+                .is_none_or(|marker| {
+                    marker.orphan.is_some_and(|orphan| {
+                        orphan.dispatch == report.dispatch_id && orphan.standing()
+                    })
+                }),
+            Err(e) => e.kind() != io::ErrorKind::NotFound,
+        }
     }
-    orphan.agent_id = Some(agent_id.to_string());
-    let rewritten = serde_json::to_string_pretty(&marker).map_err(io_other)?;
-    crate::fsutil::write_atomic(path, &rewritten)?;
-    Ok(true)
+
+    fn confirm_stopped(
+        &self,
+        report: &crate::admission::OrphanReport,
+        at: &str,
+    ) -> io::Result<bool> {
+        confirm_stopped(&report.marker, &report.dispatch_id, StoppedBy::Subagent, at)
+    }
+
+    fn name_agent(&self, report: &crate::admission::OrphanReport, agent: &str) -> io::Result<bool> {
+        set_orphan_agent(&report.marker, &report.dispatch_id, agent)
+    }
+
+    fn owns_marker(&self, marker: &Path, run: &str) -> bool {
+        names_marker_of(marker, run)
+    }
 }
 
 /// Markers left in `git_dir` by runs that are not running.

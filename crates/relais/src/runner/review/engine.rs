@@ -228,10 +228,12 @@ impl<'a> RunEngine<'a> {
         };
         let basis = match &request.basis {
             PatchBasis::Base => return,
-            PatchBasis::InheritedBase => crate::ledger::ReviewBasis::AgainstBase,
-            PatchBasis::Predecessor { cleared_by } => crate::ledger::ReviewBasis::SuccessorOnly {
-                cleared_by: cleared_by.clone(),
-            },
+            PatchBasis::InheritedBase { .. } => crate::ledger::ReviewBasis::AgainstBase,
+            PatchBasis::Predecessor { cleared_by, .. } => {
+                crate::ledger::ReviewBasis::SuccessorOnly {
+                    cleared_by: cleared_by.clone(),
+                }
+            }
         };
         if let Err(e) = self.config.ledger.record_review_basis(dispatch_id, &basis) {
             self.events.emit(Event::EnvironmentWarning {
@@ -949,15 +951,16 @@ impl Reviewed {
 /// are inherited, and the patch below either holds them (measured from the
 /// base) or leaves them to the predecessor's own review.
 fn inherited_block(request: &ReviewRequest<'_>) -> String {
-    if request.inherited_files.is_empty() {
+    let inherited_files = request.basis.inherited_files();
+    if inherited_files.is_empty() {
         return String::new();
     }
     let mut block = data_list_block(
         "files the predecessor run changed (inherited)",
-        request.inherited_files,
+        inherited_files,
     );
     block.push_str(match request.basis {
-        PatchBasis::Base | PatchBasis::InheritedBase => {
+        PatchBasis::Base | PatchBasis::InheritedBase { .. } => {
             "this candidate continues the predecessor run, and no successful review of the \
              predecessor's tree is on record: the patch below is measured from the base and holds \
              the inherited changes too. Review all of it, and judge the write scope and `Nothing \

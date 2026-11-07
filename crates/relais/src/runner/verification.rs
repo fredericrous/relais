@@ -28,11 +28,10 @@ struct CandidateReceiptInput<'a> {
 }
 
 /// The patch a review reads, how it is measured and the files inherited
-/// from a predecessor run.
+/// from a predecessor run (carried by the basis).
 struct ReviewedPatch {
     path: std::path::PathBuf,
     basis: PatchBasis,
-    inherited_files: Vec<String>,
 }
 
 impl<'a> RunEngine<'a> {
@@ -65,12 +64,12 @@ impl<'a> RunEngine<'a> {
             let reviewed = self.patch_for_review(ctx, candidate, shape)?;
             match &reviewed.basis {
                 PatchBasis::Base => {}
-                PatchBasis::InheritedBase => self.step(
+                PatchBasis::InheritedBase { .. } => self.step(
                     "review_basis",
                     "the full patch against the base is reviewed, inherited changes included"
                         .to_string(),
                 ),
-                PatchBasis::Predecessor { cleared_by } => self.step(
+                PatchBasis::Predecessor { cleared_by, .. } => self.step(
                     "review_basis",
                     format!(
                         "only the successor's own changes are reviewed; the predecessor's \
@@ -119,7 +118,6 @@ impl<'a> RunEngine<'a> {
                 holdouts: &verified.holdouts,
                 candidate: Some(self.kept_candidate(preflight, candidate.index, &candidate.sha)),
                 basis: reviewed.basis,
-                inherited_files: &reviewed.inherited_files,
             };
             let review = if in_parts {
                 self.review_candidate_in_parts(&request, &mut progress.spend)
@@ -304,25 +302,25 @@ impl<'a> RunEngine<'a> {
         candidate: &Candidate,
         shape: ReviewShape,
     ) -> Result<ReviewedPatch, RunError> {
-        let whole = |inherited_files| ReviewedPatch {
+        let whole = || ReviewedPatch {
             path: candidate.latest_patch.clone(),
             basis: PatchBasis::Base,
-            inherited_files,
         };
         let preflight = attempt.preflight;
         let Some(prepared) = preflight.candidate.as_ref() else {
-            return Ok(whole(Vec::new()));
+            return Ok(whole());
         };
         if self.config.contract.from_candidate().is_none() {
-            return Ok(whole(Vec::new()));
+            return Ok(whole());
         }
         let inherited_files = attempt
             .worktree
             .changed_paths_from(&preflight.base_sha, &prepared.tree)?;
         let inherited = |files: Vec<String>| ReviewedPatch {
             path: candidate.latest_patch.clone(),
-            basis: PatchBasis::InheritedBase,
-            inherited_files: files,
+            basis: PatchBasis::InheritedBase {
+                inherited_files: files,
+            },
         };
         // A review in parts reads the full patch against the base: its
         // parts are cut from one patch, and the receipt names their hashes.
@@ -333,9 +331,12 @@ impl<'a> RunEngine<'a> {
             return Ok(inherited(inherited_files));
         }
         match self.successor_patch(attempt, candidate, prepared) {
-            Ok(Some(reviewed)) => Ok(ReviewedPatch {
-                inherited_files,
-                ..reviewed
+            Ok(Some((path, cleared_by))) => Ok(ReviewedPatch {
+                path,
+                basis: PatchBasis::Predecessor {
+                    cleared_by,
+                    inherited_files,
+                },
             }),
             Ok(None) => Ok(inherited(inherited_files)),
             Err(e) => {
@@ -354,13 +355,14 @@ impl<'a> RunEngine<'a> {
 
     /// The successor's own changes on top of a predecessor tree that a
     /// review already cleared, or `None` when no such review is on record
-    /// or the successor changed nothing of its own.
+    /// or the successor changed nothing of its own. Otherwise the path of
+    /// the successor's patch and the review dispatch that cleared the tree.
     fn successor_patch(
         &self,
         attempt: &AttemptContext<'_>,
         candidate: &Candidate,
         prepared: &super::types::PreparedCandidate,
-    ) -> Result<Option<ReviewedPatch>, RunError> {
+    ) -> Result<Option<(std::path::PathBuf, String)>, RunError> {
         let preflight = attempt.preflight;
         let Ok(tree) =
             crate::workspace::tree_of(self.config.repo_dir, &prepared.resolved.candidate_commit)
@@ -388,11 +390,7 @@ impl<'a> RunEngine<'a> {
             .artifacts
             .join(format!("candidate-{}.successor.patch", candidate.index));
         std::fs::write(&path, own.as_bytes())?;
-        Ok(Some(ReviewedPatch {
-            path,
-            basis: PatchBasis::Predecessor { cleared_by },
-            inherited_files: Vec::new(),
-        }))
+        Ok(Some((path, cleared_by)))
     }
 
     /// Save the snapshot a receipt would be sealed from, then stop the run
@@ -547,7 +545,6 @@ impl<'a> RunEngine<'a> {
             holdouts: &verified.holdouts,
             candidate: Some(self.kept_candidate(preflight, candidate.index, &candidate.sha)),
             basis: PatchBasis::Base,
-            inherited_files: &[],
         };
         // Not fatal: without the listing the reviewer works as it did before,
         // and the prompt says so.

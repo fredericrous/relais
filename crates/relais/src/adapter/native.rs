@@ -614,6 +614,7 @@ fn ended_result(spec: &LaunchSpec, ended: Ended, detail: String) -> LaunchResult
         failure_detail: Some(detail),
         booked_message_ids: Vec::new(),
         unpriced: Vec::new(),
+        lost_worker: None,
     }
 }
 
@@ -995,6 +996,7 @@ impl<'a> NativeBackend<'a> {
             booked_message_ids: self.rollback_ids(&agent_id),
             session_id: Some(agent_id),
             unpriced: booked.unpriced,
+            lost_worker: None,
         }
     }
 
@@ -1040,7 +1042,7 @@ impl<'a> NativeBackend<'a> {
             Awaited::Ended { ended, detail } => Ok(ended_result(spec, ended, detail)),
             Awaited::Lost { agent, detail } => {
                 let mut lost = ended_result(spec, Ended::Exited(1), detail);
-                lost.session_id = agent;
+                lost.lost_worker = Some(crate::backend::LostWorker { agent });
                 Ok(lost)
             }
         }

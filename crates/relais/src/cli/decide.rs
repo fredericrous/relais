@@ -185,7 +185,7 @@ pub(crate) fn decide_in(
 ) -> Result<Decision, CliError> {
     if request.answer == DecideAnswer::Abandon {
         if let Some(fence) = standing_worker_fence(locate, request.run_id)? {
-            return Ok(refusal(CliOutcome::Blocked, fence));
+            return Ok(refusal(CliOutcome::ResumeRefusedLive, fence));
         }
     }
     let mut decision = record_answer(request, locate)?;
@@ -1293,7 +1293,7 @@ mod tests {
         let Err(refused) = try_answer(&dir, "run-lost", DecideAnswer::Abandon) else {
             panic!("the abandon is refused");
         };
-        assert!(matches!(refused.outcome, CliOutcome::Blocked));
+        assert!(matches!(refused.outcome, CliOutcome::ResumeRefusedLive));
         assert!(
             refused
                 .message

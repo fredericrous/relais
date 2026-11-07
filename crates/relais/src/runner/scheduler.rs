@@ -1107,7 +1107,6 @@ fn accept_integrated(
                 holdouts: &[],
                 candidate: None,
                 basis: crate::runner::PatchBasis::Base,
-                inherited_files: &[],
             },
             &mut spend,
         );

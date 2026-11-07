@@ -72,11 +72,9 @@ pub use trials::{
     LIVE_WORKTREE,
 };
 pub use trust::{StoredDeclaration, TrustGrantRecord};
-pub use usage::{
-    Booking, DispatchBooking, LiveDispatch, PhaseCost, ReviewBasis, UnitUsage, UsageEvent,
-};
+pub use usage::{Booking, DispatchBooking, LiveDispatch, PhaseCost, UnitUsage, UsageEvent};
 mod task_types;
-pub use review::{MergeTotals, ReviewClassTotals, ReviewOutcomeRow};
+pub use review::{MergeTotals, ReviewBasis, ReviewClassTotals, ReviewOutcomeRow};
 pub use review_parts::{PartResult, PartStatus, PlannedPart, ReviewPartRow};
 pub use router::{
     ExplorationTask, RouterCheck, RouterClass, RouterClassificationRow, RouterDecisionRow,

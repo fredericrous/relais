@@ -815,6 +815,7 @@ impl Coordinator {
             .unwrap_or_else(|| Path::new("."))
             .join("coordinator.lock");
         let mut state = AdmissionState::new(limits);
+        state.set_orphan_fence(Arc::new(crate::workspace::inplace::MarkerFence));
         // The machine's `binding_lease_secs` governs the lease a
         // hook-admitted agent is held on (SPEC §23): read here, at the
         // one place an `AdmissionState` is constructed for real, rather
@@ -911,9 +912,10 @@ impl Coordinator {
         // whose marker still says nobody confirmed them stopped.
         if let Some(ledger) = ledger {
             let path = orphan_journal_path(ledger.path());
+            let fence = crate::workspace::inplace::MarkerFence;
             let standing = read_orphan_journal(&path)
                 .into_iter()
-                .filter(crate::admission::orphan_still_standing)
+                .filter(|report| crate::admission::OrphanFence::still_standing(&fence, report))
                 .collect();
             state.adopt_orphans(path, standing);
         }
@@ -1088,6 +1090,8 @@ fn reconcile_loop(
     while wait_for_tick(shutdown) {
         // Ledger and file I/O happen here, before the admission lock.
         sweep_tick(ledger_path, &mut ledger);
+        let orphan_effects = crate::admission::lock_releasing_orphans(state).take_orphan_effects();
+        orphan_effects.apply(&crate::ledger::now_rfc3339());
         let now = Instant::now();
         let report = {
             let mut state = lock_state(state);
@@ -1552,7 +1556,16 @@ fn handle_connection(
             Ok(request) => {
                 served.kind = request.method();
                 let waiting = Instant::now();
-                let mut guard = crate::admission::lock_releasing_orphans(state);
+                // Markers are read only for the requests that can change
+                // what is held, and on the reconcile tick.
+                let mut guard = if matches!(
+                    request,
+                    Request::ReportOrphan { .. } | Request::SettleByAgent { .. }
+                ) {
+                    crate::admission::lock_releasing_orphans(state)
+                } else {
+                    lock_state(state)
+                };
                 served.timings.admission_wait = waiting.elapsed();
                 let handling = Instant::now();
                 let before = guard.group_journal_end();
@@ -3888,7 +3901,10 @@ mod tests {
     fn a_lost_worker_reported_before_a_restart_is_freed_by_a_stop_after_it() {
         use crate::workspace::inplace::{Marker, OrphanedWorker, Stage};
         let dir = crate::test_support::short_temp_dir("orphan-restart-wire");
-        let marker_path = dir.join("run-1.json");
+        let git_dir = dir.join("git");
+        std::fs::create_dir_all(git_dir.join("relais-inplace")).expect("markers dir");
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+        let marker_path = git_dir.join("relais-inplace").join("run-1.json");
         let marker = Marker {
             run: "run-1".into(),
             stage: Stage::Running,
@@ -3924,14 +3940,27 @@ mod tests {
         .expect("start");
         let server = std::thread::spawn(move || coordinator.serve(listener));
         let gate = RemoteGate::new(socket.clone());
+        gate.register_run(&registration("run-1", "sess-1"))
+            .expect("register");
+        gate.admit(&request("d-1", "run-1", "sess-1"))
+            .expect("admit");
+        let report = OrphanReport {
+            dispatch_id: "d-1".into(),
+            session_id: "sess-1".into(),
+            agent_id: Some("a1".into()),
+            marker: marker_path.clone(),
+            stop_seen: false,
+        };
+        let elsewhere = OrphanReport {
+            marker: dir.join("run-1.json"),
+            ..report.clone()
+        };
+        assert!(matches!(
+            gate.report_orphan(&elsewhere).expect("refused"),
+            OrphanRegistration::Refused { .. }
+        ));
         assert_eq!(
-            gate.report_orphan(&OrphanReport {
-                dispatch_id: "d-1".into(),
-                session_id: "sess-1".into(),
-                agent_id: Some("a1".into()),
-                marker: marker_path.clone(),
-            })
-            .expect("report"),
+            gate.report_orphan(&report).expect("report"),
             OrphanRegistration::Held
         );
         Client::new(socket.clone()).request(&Request::Shutdown).ok(); // the coordinator may close before replying

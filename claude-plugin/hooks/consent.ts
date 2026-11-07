@@ -21,6 +21,9 @@ const COMMIT_SUBJECT = 'chore(relais): add relais.toml'
 
 export const USE_CHECKS = 'Use these checks'
 export const NOT_NOW = 'Not now'
+// The button of the typed-command question. It differs from the text a person
+// may type there: an answer equal to it is the button, any other is a command.
+export const NO_COMMAND = 'Not now (type nothing)'
 export const allowLabel = (count: number) => `Allow ${count} command${count === 1 ? '' : 's'}`
 
 // What a repository wrote, made safe to show: a newline or another control
@@ -89,7 +92,7 @@ export function question1Nothing(repo: string, branch: string, refusal?: string)
   return [
     `relais 1 of 2 · No command here proves a change works in ${escapeDisplay(repo)}.`,
     ...(refusal ? [`That one was refused: ${escapeDisplay(refusal)}`] : []),
-    'Type one below (for example: make test), or choose Not now.',
+    `Type one below (for example: make test), or choose "${NO_COMMAND}".`,
     `It goes into relais.toml, committed alone on ${escapeDisplay(branch)}, after step 2.`,
   ].join('\n')
 }
@@ -117,7 +120,7 @@ const CHANGE_LINE = /^([+~-]) (added|removed|changed) (.*)$/s
 
 export function changedCommands(shown: Shown): string[] {
   const change = shown.pending_change
-  if (!change || change.lines.length === 0) return []
+  if (!change || !Array.isArray(change.lines) || change.lines.length === 0) return []
   const listed = change.lines.map(line => {
     const parts = CHANGE_LINE.exec(line)
     return parts ? `${parts[1]} ${parts[2].padEnd(7)} ${escapeDisplay(parts[3])}` : `  ${escapeDisplay(line)}`
@@ -128,11 +131,13 @@ export function changedCommands(shown: Shown): string[] {
 // The rows a reply lists, after recording them as reported so the next
 // `trust show` does not return them (the person is never asked again, ADR-0007).
 async function reportChanges(fx: Fx, repo: Repo, shown: Shown): Promise<string[]> {
-  const listed = changedCommands(shown)
-  if (listed.length === 0) return listed
+  const seen = changedCommands(shown)
+  if (seen.length === 0) return seen
   const marked = await run(fx, ['relais', 'trust', 'show', '--json', '--mark-reported'], repo.root)
-  // A failed mark only means the change is listed once more.
-  return marked.exitCode === 0 ? listed : [...listed, `(could not record this as reported: ${escapeDisplay(err(marked))})`]
+  // What was recorded as reported is what the person is told. A failed mark
+  // only means the change is listed once more, from the read before it.
+  if (marked.exitCode !== 0) return [...seen, `(could not record this as reported: ${escapeDisplay(err(marked))})`]
+  return changedCommands({ ...shown, pending_change: parsed<Shown>(marked)?.pending_change })
 }
 
 const MARK = { same: ' ', new: '+', changed: '~' } as const
@@ -437,13 +442,23 @@ async function onboard(fx: Fx, store: Store, repo: Repo, session: string): Promi
     if (answer !== USE_CHECKS) return refuse(fx, store, repo, answer === NOT_NOW ? 'not_now' : 'dismissed')
   } else {
     const typed = await askCommand(fx, repo)
-    if (typed === NOT_NOW) return refuse(fx, store, repo, 'not_now')
-    if (typed === undefined) return refuse(fx, store, repo, 'dismissed')
-    if (typeof typed !== 'string') {
-      fx.ui.toast(`relais · not set up in ${repo.name} · ask Claude to set up relais to be asked again`)
-      return `declined (command_refused): the command the person typed was refused twice. Nothing was written in ${repo.name}. Tell them why: ${escapeDisplay(typed.refused)}`
+    if (typeof typed === 'string') return typed
+    switch (typed.kind) {
+      case 'not_now':
+        return refuse(fx, store, repo, 'not_now')
+      case 'dismissed':
+        return refuse(fx, store, repo, 'dismissed')
+      case 'refused':
+        fx.ui.toast(`relais · not set up in ${repo.name} · ask Claude to set up relais to be asked again`)
+        return `declined (command_refused): the command the person typed was refused twice. Nothing was written in ${repo.name}. Tell them why: ${escapeDisplay(typed.reason)}`
+      case 'command':
+        command = typed.text
+        break
+      default: {
+        const unreachable: never = typed
+        return unreachable
+      }
     }
-    command = typed
   }
 
   const write = await run(
@@ -484,23 +499,33 @@ async function onboard(fx: Fx, store: Store, repo: Repo, session: string): Promi
   ].join('\n')
 }
 
+export type TypedCommand =
+  | { kind: 'command'; text: string }
+  | { kind: 'not_now' }
+  | { kind: 'dismissed' }
+  | { kind: 'refused'; reason: string }
+
 // The typed command for a repository where nothing was detected: relais
-// parses it; a refusal is explained and asked once more.
-async function askCommand(fx: Fx, repo: Repo): Promise<string | undefined | { refused: string }> {
+// parses it; a refusal (exit 2, the command is not acceptable) is explained
+// and asked once more. Any other failure of relais is not the person's
+// command being refused: it comes back as the "not set up" text to return.
+async function askCommand(fx: Fx, repo: Repo): Promise<TypedCommand | string> {
   let refusal: string | undefined
   for (let tries = 0; tries < 2; tries++) {
-    const answer = await ask(fx, question1Nothing(repo.name, repo.branch, refusal), [NOT_NOW])
-    if (answer === undefined || answer === NOT_NOW) return answer
+    const answer = await ask(fx, question1Nothing(repo.name, repo.branch, refusal), [NO_COMMAND])
+    if (answer === undefined) return { kind: 'dismissed' }
+    if (answer === NO_COMMAND) return { kind: 'not_now' }
     const text = answer.trim()
     if (text === '' || text.includes('\n')) {
       refusal = 'type one command on one line'
       continue
     }
     const check = await run(fx, ['relais', 'init', '--detect', '--json', '--command', text], repo.root)
-    if (check.exitCode === 0) return text
+    if (check.exitCode === 0) return { kind: 'command', text }
+    if (check.exitCode !== 2) return `not set up: relais init --detect --command failed: ${err(check)}`
     refusal = err(check).replace(/^relais[^:]*:\s*/, '')
   }
-  return { refused: refusal ?? 'refused' }
+  return { kind: 'refused', reason: refusal ?? 'refused' }
 }
 
 async function operationInProgress(fx: Fx, root: string): Promise<string | undefined> {

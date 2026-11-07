@@ -733,7 +733,8 @@ pub(crate) enum JudgeVerdict {
 #[derive(Subcommand)]
 pub(crate) enum TrustCommand {
     /// The grant key, the repository, where machine.toml is, and every
-    /// command a grant would authorize. Writes nothing.
+    /// command a grant would authorize. Writes nothing unless
+    /// --mark-reported is given.
     Show {
         /// Machine-readable output
         #[arg(long)]

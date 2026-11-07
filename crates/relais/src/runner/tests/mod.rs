@@ -5661,12 +5661,15 @@ impl Backend for LostWorker {
         (self.before_return)();
         lost.ended = crate::procs::Ended::Exited(1);
         lost.result_text = None;
+        // Worded unlike the adapter's text: the fence follows the typed
+        // `lost_worker`, never the message.
         lost.failure_detail = Some(format!(
-            "{}: the relais plugin said no hello while dispatch {} ran",
-            crate::adapter::native::MOD_GONE,
+            "the worker's session went silent while dispatch {} ran",
             spec.dispatch_id
         ));
-        lost.session_id = self.agent.map(str::to_string);
+        lost.lost_worker = Some(crate::backend::LostWorker {
+            agent: self.agent.map(str::to_string),
+        });
         Ok(lost)
     }
 }
@@ -5701,7 +5704,8 @@ fn a_lost_in_place_worker_fences_the_tree_until_its_stop_is_seen() {
     let gate = LocalGate::new(
         crate::policy::ConcurrencyLimits::default(),
         crate::ledger::now_rfc3339,
-    );
+    )
+    .with_orphan_fence(Arc::new(crate::workspace::inplace::MarkerFence));
     let backend = lost_worker(Some("agent-9"), || {});
     let contract = fixture.contract(Review::Off);
     let RunOutcome {
@@ -5711,7 +5715,7 @@ fn a_lost_in_place_worker_fences_the_tree_until_its_stop_is_seen() {
     else {
         panic!("a lost worker ends the run interrupted");
     };
-    assert!(detail.contains("mod_gone"), "{detail}");
+    assert!(detail.contains("went silent"), "{detail}");
 
     let orphan = marker_of(&fixture, &run_id)
         .orphan
@@ -5755,7 +5759,7 @@ fn a_lost_in_place_worker_fences_the_tree_until_its_stop_is_seen() {
     else {
         panic!("a second in-place run is refused");
     };
-    assert_eq!(code, BlockCode::WorkspaceHasInterruptedRun);
+    assert_eq!(code, BlockCode::InplaceWorkerMayRun);
     assert!(detail.starts_with(WORKER_MAY_RUN), "{detail}");
     assert!(detail.contains(&orphan.dispatch), "{detail}");
     assert!(detail.contains("--worker-stopped"), "{detail}");
@@ -5787,10 +5791,13 @@ fn a_stop_seen_before_the_orphan_is_reported_frees_the_tree_at_once() {
     let mut fixture = fixture_in_a_linked_worktree();
     fixture.workspace = crate::workspace::reuse::Workspace::InPlace;
     let (repo, machine) = in_place_policy(&fixture);
-    let gate = Arc::new(LocalGate::new(
-        crate::policy::ConcurrencyLimits::default(),
-        crate::ledger::now_rfc3339,
-    ));
+    let gate = Arc::new(
+        LocalGate::new(
+            crate::policy::ConcurrencyLimits::default(),
+            crate::ledger::now_rfc3339,
+        )
+        .with_orphan_fence(Arc::new(crate::workspace::inplace::MarkerFence)),
+    );
     let early = Arc::clone(&gate);
     let backend = lost_worker(Some("agent-9"), move || {
         early
@@ -7484,7 +7491,6 @@ fn guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_g
         holdouts: &[],
         candidate: None,
         basis: PatchBasis::Base,
-        inherited_files: &[],
     };
     let mut spend = RunSpend::zero();
     let outcome = engine.review_candidate(&request, &mut spend);
