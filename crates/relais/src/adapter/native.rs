@@ -43,7 +43,10 @@ const SPAWN_MISSING: &str = "native_spawn_missing";
 const WORKER_MISSING: &str = "native_worker_missing";
 
 /// The label an attempt ends with when the session's plugin stopped saying hello.
-const MOD_GONE: &str = "mod_gone";
+/// A result with this label leads its `failure_detail` and carries the agent
+/// that was bound, if one was, in `session_id`: the worker was never told to
+/// stop and may still be writing.
+pub const MOD_GONE: &str = "mod_gone";
 
 /// A pass of the wait loop that took this much longer than its sleep means
 /// the host was suspended in between (a laptop lid, deep sleep): a process
@@ -242,6 +245,13 @@ enum Awaited {
     /// Anything but a stop: the attempt has no result.
     Ended {
         ended: Ended,
+        detail: String,
+    },
+    /// The session's plugin went silent while the worker ran. Nothing asked
+    /// the worker to stop, so it may still be writing; `agent` is the one
+    /// that bound, if any did.
+    Lost {
+        agent: Option<String>,
         detail: String,
     },
 }
@@ -736,8 +746,8 @@ impl<'a> NativeBackend<'a> {
                     let alive = hello_age.is_some_and(|age| age < self.waits.hello_lapse)
                         || woke_until.is_some_and(|until| Instant::now() < until);
                     if !alive {
-                        return Awaited::Ended {
-                            ended: Ended::Exited(1),
+                        return Awaited::Lost {
+                            agent: running.clone(),
                             detail: format!(
                                 "{MOD_GONE}: the relais plugin of session {} said no hello for \
                                  {}s while dispatch {} ran",
@@ -1028,6 +1038,11 @@ impl<'a> NativeBackend<'a> {
                 Ok(self.stopped_result(spec, report, notes))
             }
             Awaited::Ended { ended, detail } => Ok(ended_result(spec, ended, detail)),
+            Awaited::Lost { agent, detail } => {
+                let mut lost = ended_result(spec, Ended::Exited(1), detail);
+                lost.session_id = agent;
+                Ok(lost)
+            }
         }
     }
 }
@@ -1436,7 +1451,10 @@ mod tests {
     #[test]
     fn the_agent_keeps_its_spawn_effort_across_continuations() {
         let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
-        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let gate = crate::admission::LocalGate::new(
+            crate::policy::ConcurrencyLimits::default(),
+            crate::ledger::now_rfc3339,
+        );
         let backend = backend_in(&harness, &gate, None);
         let stop = |asked: &str| {
             backend.stopped_result(
@@ -1468,7 +1486,10 @@ mod tests {
     #[test]
     fn a_failed_or_killed_agent_has_no_result_and_is_not_continued() {
         let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
-        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let gate = crate::admission::LocalGate::new(
+            crate::policy::ConcurrencyLimits::default(),
+            crate::ledger::now_rfc3339,
+        );
         let backend = backend_in(&harness, &gate, None);
         for (status, word) in [
             (AgentStatus::Failed, "failed"),
@@ -1498,7 +1519,10 @@ mod tests {
     #[test]
     fn a_stopped_agent_is_not_continued() {
         let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
-        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let gate = crate::admission::LocalGate::new(
+            crate::policy::ConcurrencyLimits::default(),
+            crate::ledger::now_rfc3339,
+        );
         let backend = backend_in(&harness, &gate, None);
         let worker = spec("sonnet", None);
         backend.stopped_result(
@@ -1521,7 +1545,10 @@ mod tests {
     #[test]
     fn an_agents_transcript_gives_its_message_ids() {
         let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
-        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let gate = crate::admission::LocalGate::new(
+            crate::policy::ConcurrencyLimits::default(),
+            crate::ledger::now_rfc3339,
+        );
         let dir = crate::test_support::short_temp_dir("native-ids");
         let subagents = dir.join("-slug").join("s1").join("subagents");
         std::fs::create_dir_all(&subagents).expect("dirs");
@@ -1633,7 +1660,10 @@ mod tests {
             Some(&format!("{WORKER_LINE}\n{WORKER_LINE}\n")),
         );
         let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
-        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let gate = crate::admission::LocalGate::new(
+            crate::policy::ConcurrencyLimits::default(),
+            crate::ledger::now_rfc3339,
+        );
         let mut backend = backend_in(&harness, &gate, projects).with_advisor_ledger(db.clone());
         backend.prices = Some(advisor_prices());
         let worker = spec("sonnet-x", None);
@@ -1739,7 +1769,10 @@ mod tests {
             )
             .expect("second dispatch");
         let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
-        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let gate = crate::admission::LocalGate::new(
+            crate::policy::ConcurrencyLimits::default(),
+            crate::ledger::now_rfc3339,
+        );
         let mut backend = backend_in(&harness, &gate, projects).with_advisor_ledger(db.clone());
         backend.prices = Some(advisor_prices());
         let notes = backend.book_advisors("d1", "a1").expect("booked");
@@ -1756,7 +1789,10 @@ mod tests {
     fn an_unpriced_advisor_call_is_booked_unknown_and_noted() {
         let (_dir, _ledger, db, projects) = advisor_world("native-adv3", Some(WORKER_LINE));
         let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
-        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let gate = crate::admission::LocalGate::new(
+            crate::policy::ConcurrencyLimits::default(),
+            crate::ledger::now_rfc3339,
+        );
         let mut backend = backend_in(&harness, &gate, projects).with_advisor_ledger(db.clone());
         backend.prices = Some(table());
         let notes = backend.book_advisors("d1", "a1").expect("booked");
@@ -1768,7 +1804,10 @@ mod tests {
     fn an_advisor_call_that_cannot_be_booked_is_an_error_not_a_pricing_note() {
         let (_dir, _ledger, db, projects) = advisor_world("native-adv4", Some(WORKER_LINE));
         let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
-        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let gate = crate::admission::LocalGate::new(
+            crate::policy::ConcurrencyLimits::default(),
+            crate::ledger::now_rfc3339,
+        );
         let mut backend = backend_in(&harness, &gate, projects).with_advisor_ledger(db.clone());
         backend.prices = Some(advisor_prices());
         let booked = backend.book_advisors("no-such-dispatch", "a1");
@@ -1783,7 +1822,10 @@ mod tests {
     fn a_missing_transcript_books_executor_usage_as_before() {
         let (_dir, _ledger, db, projects) = advisor_world("native-adv4", None);
         let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
-        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let gate = crate::admission::LocalGate::new(
+            crate::policy::ConcurrencyLimits::default(),
+            crate::ledger::now_rfc3339,
+        );
         let mut backend = backend_in(&harness, &gate, projects).with_advisor_ledger(db.clone());
         backend.prices = Some(advisor_prices());
         let result = backend.stopped_result(

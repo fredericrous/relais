@@ -183,6 +183,11 @@ pub(crate) fn decide_in(
     request: &DecideRequest<'_>,
     locate: &dyn Fn() -> Result<StateLocations, CliError>,
 ) -> Result<Decision, CliError> {
+    if request.answer == DecideAnswer::Abandon {
+        if let Some(fence) = standing_worker_fence(locate, request.run_id)? {
+            return Ok(refusal(CliOutcome::Blocked, fence));
+        }
+    }
     let mut decision = record_answer(request, locate)?;
     if let Ok(done) = &mut decision {
         let frees_in_place = matches!(
@@ -206,6 +211,30 @@ pub(crate) fn decide_in(
         }
     }
     Ok(decision)
+}
+
+/// The refusal text when `run` is an in-place run that lost a worker nothing
+/// proves stopped: abandoning it would hand the tree to the person while the
+/// worker may still write it. `None` when the run holds no such fence, or
+/// when its marker cannot be read (that is reported when the tree is freed).
+fn standing_worker_fence(
+    locate: &dyn Fn() -> Result<StateLocations, CliError>,
+    run_id: &str,
+) -> Result<Option<String>, CliError> {
+    use relais::workspace::inplace;
+    let locations = locate()?;
+    let ledger = operational(Ledger::open(&locations.ledger), "the ledger is unavailable")?;
+    let run = RunId::from_stored(run_id);
+    let Some(workspace) = operational(ledger.run_workspace(&run), "decide")? else {
+        return Ok(None);
+    };
+    let marker = inplace::git_dir(&workspace.repo_path)
+        .and_then(|git_dir| inplace::read_marker(&git_dir, run.as_str()));
+    Ok(marker
+        .ok()
+        .and_then(|marker| marker.orphan)
+        .filter(|orphan| orphan.standing())
+        .map(|orphan| orphan.fence_text(run.as_str(), &relais::ledger::now_rfc3339())))
 }
 
 fn free_after_answer(
@@ -1149,6 +1178,7 @@ mod tests {
                 index_listing: start.index_listing.clone(),
                 target: None,
                 exported: None,
+                orphan: None,
             })
             .expect("marker");
         drop(lease);
@@ -1205,6 +1235,129 @@ mod tests {
     fn move_head(worktree: &Path) {
         std::fs::write(worktree.join("a.txt"), "moved\n").expect("edit");
         git(worktree, &["commit", "-q", "-am", "worker"]);
+    }
+
+    /// The marker of `run` in `worktree` says its worker was lost on 2026-01-01,
+    /// well past the escalation point, and nobody has confirmed it stopped.
+    fn lose_worker(worktree: &Path, run: &str) {
+        use relais::workspace::inplace::{self, OrphanedWorker};
+        let git_dir = inplace::git_dir(worktree).expect("git dir");
+        let mut marker = inplace::read_marker(&git_dir, run).expect("marker");
+        marker.orphan = OrphanedWorker::lost_at(
+            "dispatch-7",
+            "sess",
+            Some("agent-7"),
+            "2026-01-01T10:00:00+00:00",
+        );
+        std::fs::write(
+            inplace::marker_file(&git_dir, run),
+            serde_json::to_string_pretty(&marker).expect("json"),
+        )
+        .expect("marker");
+    }
+
+    fn try_answer(dir: &Path, run_id: &str, answer: DecideAnswer) -> Decision {
+        let locations = || {
+            Ok(StateLocations {
+                ledger: dir.join("ledger.sqlite"),
+                runs: dir.join("runs"),
+            })
+        };
+        decide_in(
+            &DecideRequest {
+                run_id,
+                answer,
+                actor: "orchestrator",
+                person_quote: None,
+                note: None,
+                successor: None,
+                criterion: None,
+                candidate: None,
+                widen_scope: false,
+                rerun_verify: false,
+                successor_contract: None,
+                json: false,
+                proof_stdin: false,
+            },
+            &locations,
+        )
+        .expect("decide runs")
+    }
+
+    #[test]
+    fn abandoning_a_run_whose_lost_worker_may_still_write_is_refused() {
+        let dir = relais::test_support::short_temp_dir("decide-inplace-orphan-abandon");
+        let (ledger, worktree) = interrupted_in_place(&dir, "run-lost");
+        lose_worker(&worktree, "run-lost");
+        move_head(&worktree);
+        let Err(refused) = try_answer(&dir, "run-lost", DecideAnswer::Abandon) else {
+            panic!("the abandon is refused");
+        };
+        assert!(matches!(refused.outcome, CliOutcome::Blocked));
+        assert!(
+            refused
+                .message
+                .starts_with(relais::workspace::inplace::WORKER_MAY_RUN),
+            "{}",
+            refused.message
+        );
+        assert!(
+            refused.message.contains("dispatch-7"),
+            "{}",
+            refused.message
+        );
+        assert!(
+            refused.message.contains("--worker-stopped"),
+            "{}",
+            refused.message
+        );
+        assert!(
+            refused.message.contains("escalation point has passed"),
+            "a stale fence says a stop or --worker-stopped is still required: {}",
+            refused.message
+        );
+        assert!(marker_exists(&worktree, "run-lost"));
+        assert_eq!(
+            ledger
+                .run_status(&RunId::from_stored("run-lost"))
+                .expect("status"),
+            Some(State::Interrupted),
+            "nothing was recorded"
+        );
+    }
+
+    #[test]
+    fn salvaging_a_run_whose_lost_worker_may_still_write_keeps_the_marker_and_says_why() {
+        let dir = relais::test_support::short_temp_dir("decide-inplace-orphan-salvage");
+        let (_ledger, worktree) = interrupted_in_place(&dir, "run-lost");
+        lose_worker(&worktree, "run-lost");
+        move_head(&worktree);
+        let decided = answer_with(&dir, "run-lost", DecideAnswer::Salvaged);
+        assert!(
+            decided.sentence.contains("inplace_worker_may_run"),
+            "{}",
+            decided.sentence
+        );
+        assert!(marker_exists(&worktree, "run-lost"));
+    }
+
+    #[test]
+    fn the_persons_word_frees_a_lost_worker_and_the_abandon_goes_through() {
+        use relais::workspace::inplace::{self, StoppedBy};
+        let dir = relais::test_support::short_temp_dir("decide-inplace-orphan-word");
+        let (_ledger, worktree) = interrupted_in_place(&dir, "run-lost");
+        lose_worker(&worktree, "run-lost");
+        move_head(&worktree);
+        let git_dir = inplace::git_dir(&worktree).expect("git dir");
+        assert!(inplace::confirm_stopped(
+            &inplace::marker_file(&git_dir, "run-lost"),
+            "dispatch-7",
+            StoppedBy::Person,
+            "2026-11-07T11:00:00+00:00",
+        )
+        .expect("confirm"));
+        answer_with(&dir, "run-lost", DecideAnswer::Abandon);
+        assert!(!marker_exists(&worktree, "run-lost"));
     }
 
     #[test]

@@ -32,7 +32,10 @@ struct QueueingGate {
 impl QueueingGate {
     fn new(heavy: Heavy, model_work_allowed: usize) -> Self {
         Self {
-            inner: crate::admission::LocalGate::new(ConcurrencyLimits::default()),
+            inner: crate::admission::LocalGate::new(
+                ConcurrencyLimits::default(),
+                crate::ledger::now_rfc3339,
+            ),
             heavy,
             model_work_allowed,
             model_work_granted: AtomicUsize::new(0),

@@ -552,7 +552,7 @@ mod tests {
     /// coordinator that was never told about the session beforehand.
     #[test]
     fn a_spawn_in_an_unheard_of_session_registers_its_run_and_is_admitted_silently() {
-        let gate = LocalGate::new(ConcurrencyLimits::default());
+        let gate = LocalGate::new(ConcurrencyLimits::default(), crate::ledger::now_rfc3339);
         let payload = spawn_payload("session-unknown", "tool-1");
         let handled = handle(&payload, &settings(), &gate);
         assert_eq!(handled.answer, HookAnswer::Silent);
@@ -650,7 +650,7 @@ mod tests {
             }
         }
         let gate = AlwaysUnknownRun {
-            inner: LocalGate::new(ConcurrencyLimits::default()),
+            inner: LocalGate::new(ConcurrencyLimits::default(), crate::ledger::now_rfc3339),
             registrations: std::sync::atomic::AtomicUsize::new(0),
         };
         let payload = spawn_payload("session-stubborn", "tool-1");
@@ -832,7 +832,7 @@ mod tests {
     /// rather than coming back to life on the next spawn's retry.
     #[test]
     fn a_cancelled_run_stays_refused_after_a_registration() {
-        let gate = LocalGate::new(ConcurrencyLimits::default());
+        let gate = LocalGate::new(ConcurrencyLimits::default(), crate::ledger::now_rfc3339);
         let session = SessionId::new("session-cancelled");
         let run_id = ids::derive_run_id(&session);
         gate.register_run(&RunRegistration {
@@ -951,7 +951,7 @@ mod tests {
             max_active_agents_per_session: Some(2),
             ..ConcurrencyLimits::default()
         };
-        let gate = LocalGate::new(limits);
+        let gate = LocalGate::new(limits, crate::ledger::now_rfc3339);
         let session = "session-capped";
         for tool_use in ["tool-1", "tool-2"] {
             let payload = spawn_payload(session, tool_use);
@@ -992,7 +992,7 @@ mod tests {
             max_active_agents_per_session: Some(2),
             ..ConcurrencyLimits::default()
         };
-        let gate = LocalGate::new(limits);
+        let gate = LocalGate::new(limits, crate::ledger::now_rfc3339);
         let session = "session-freed";
         for (tool_use, agent) in [("tool-1", "agent-1"), ("tool-2", "agent-2")] {
             assert_eq!(
@@ -1047,7 +1047,7 @@ mod tests {
             max_active_agents_per_session: Some(1),
             ..ConcurrencyLimits::default()
         };
-        let gate = LocalGate::new(limits);
+        let gate = LocalGate::new(limits, crate::ledger::now_rfc3339);
         let session = "session-sync";
         assert_eq!(
             handle(&spawn_payload(session, "tool-1"), &settings(), &gate).answer,
@@ -1149,7 +1149,7 @@ mod tests {
             }
         }
         let gate = CapturingGate {
-            inner: LocalGate::new(ConcurrencyLimits::default()),
+            inner: LocalGate::new(ConcurrencyLimits::default(), crate::ledger::now_rfc3339),
             last_caller_agent_id: std::sync::Mutex::new(None),
         };
         handle(&spawn_payload("session-a", "tool-top"), &settings(), &gate);
@@ -1180,7 +1180,7 @@ mod tests {
             max_active_agents_per_session: Some(1),
             ..ConcurrencyLimits::default()
         };
-        let gate = LocalGate::new(limits);
+        let gate = LocalGate::new(limits, crate::ledger::now_rfc3339);
         let session = "session-failed";
         assert_eq!(
             handle(&spawn_payload(session, "tool-1"), &settings(), &gate).answer,
@@ -1208,7 +1208,7 @@ mod tests {
     /// silence: no stdout payload at all.
     #[test]
     fn a_registered_run_with_room_is_silent() {
-        let gate = LocalGate::new(ConcurrencyLimits::default());
+        let gate = LocalGate::new(ConcurrencyLimits::default(), crate::ledger::now_rfc3339);
         let session = SessionId::new("session-granted");
         let run_id = ids::derive_run_id(&session);
         gate.register_run(&RunRegistration {
@@ -1309,7 +1309,7 @@ mod tests {
             }
         }
         let gate = CountingWithdraw {
-            inner: LocalGate::new(ConcurrencyLimits::default()),
+            inner: LocalGate::new(ConcurrencyLimits::default(), crate::ledger::now_rfc3339),
             withdrawals: std::sync::atomic::AtomicUsize::new(0),
         };
         // Registered, then cancelled: the auto-registration this module
@@ -1712,7 +1712,7 @@ mod tests {
             max_active_agents_per_session: Some(1),
             ..ConcurrencyLimits::default()
         };
-        let gate = std::sync::Arc::new(LocalGate::new(limits));
+        let gate = std::sync::Arc::new(LocalGate::new(limits, crate::ledger::now_rfc3339));
         let session = "session-waits";
 
         let first = handle(
@@ -1779,7 +1779,7 @@ mod tests {
             max_active_agents_per_session: Some(1),
             ..ConcurrencyLimits::default()
         };
-        let gate = LocalGate::new(limits);
+        let gate = LocalGate::new(limits, crate::ledger::now_rfc3339);
         let session = "session-gives-up";
         let first = handle(&spawn_payload(session, "tool-1"), &settings(), &gate);
         assert_eq!(first.answer, HookAnswer::Silent);
@@ -1824,7 +1824,7 @@ mod tests {
             max_active_agents_per_session: Some(1),
             ..ConcurrencyLimits::default()
         };
-        let gate = LocalGate::new(limits);
+        let gate = LocalGate::new(limits, crate::ledger::now_rfc3339);
         let session = "session-refuses-at-once";
         let first = handle(&spawn_payload(session, "tool-1"), &settings(), &gate);
         assert_eq!(first.answer, HookAnswer::Silent);

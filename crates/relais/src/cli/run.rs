@@ -778,7 +778,8 @@ mod tests {
     #[test]
     fn a_run_is_refused_without_a_recent_hello_or_on_a_claude_code_outside_the_range() {
         use relais::adapter::claude::ProbeFailure;
-        let gate = relais::admission::LocalGate::new(Default::default());
+        let gate =
+            relais::admission::LocalGate::new(Default::default(), relais::ledger::now_rfc3339);
         let supported = Some("2.1.291 (Claude Code)");
         let silent = run_refusal("relais run", &gate, "s1", supported, None)
             .expect("answers")
@@ -821,7 +822,8 @@ mod tests {
 
     #[test]
     fn a_timed_out_probe_continues_on_a_fresh_hello_and_is_refused_on_a_stale_one() {
-        let gate = relais::admission::LocalGate::new(Default::default());
+        let gate =
+            relais::admission::LocalGate::new(Default::default(), relais::ledger::now_rfc3339);
         let late = relais::adapter::claude::ProbeFailure::TimedOut {
             args: "--version".into(),
             after: std::time::Duration::from_secs(30),

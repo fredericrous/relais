@@ -424,7 +424,10 @@ fn run_native_contract(
     let mut repo = fixture.repo_policy(vec![main_gone_check()], attempts);
     configure(&mut repo);
     let machine = fixture.machine_for(&repo);
-    let gate = Arc::new(LocalGate::new(ConcurrencyLimits::default()));
+    let gate = Arc::new(LocalGate::new(
+        ConcurrencyLimits::default(),
+        crate::ledger::now_rfc3339,
+    ));
     gate.native_hello(SESSION).expect("hello");
     let harness = MockBackend::new(|_| MockOutcome::default());
     let (wire, rx) = LineSink::wire();
@@ -1078,7 +1081,7 @@ fn no_bind_within_the_wait_ends_the_attempt_interrupted_and_the_run_stops() {
     let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
     repo.execution.max_wall_seconds = 60;
     let machine = fixture.machine_for(&repo);
-    let gate = LocalGate::new(ConcurrencyLimits::default());
+    let gate = LocalGate::new(ConcurrencyLimits::default(), crate::ledger::now_rfc3339);
     gate.native_hello(SESSION).expect("hello");
     let harness = MockBackend::new(|_| MockOutcome::default());
     let (wire, rx) = LineSink::wire();
@@ -1127,7 +1130,7 @@ fn a_model_without_a_shipped_definition_ends_interrupted_before_any_spawn_line()
         .expect("an implementation tier")
         .id = "claude-sonnet-5-5".into();
     let machine = fixture.machine_for(&repo);
-    let gate = LocalGate::new(ConcurrencyLimits::default());
+    let gate = LocalGate::new(ConcurrencyLimits::default(), crate::ledger::now_rfc3339);
     gate.native_hello(SESSION).expect("hello");
     let harness = MockBackend::new(|_| MockOutcome::default());
     let (wire, rx) = LineSink::wire();
@@ -1177,7 +1180,7 @@ fn a_native_launch_that_fails_keeps_its_row_native() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
     let machine = fixture.machine_for(&repo);
-    let gate = LocalGate::new(ConcurrencyLimits::default());
+    let gate = LocalGate::new(ConcurrencyLimits::default(), crate::ledger::now_rfc3339);
     gate.native_hello(SESSION).expect("hello");
     let harness = MockBackend::new(|_| MockOutcome::default());
     let backend = NativeBackend::new(
@@ -1331,7 +1334,7 @@ fn a_run_on_the_mock_backend_books_native_rows_and_estimated_usage() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
     let machine = fixture.machine_for(&repo);
-    let gate = LocalGate::new(ConcurrencyLimits::default());
+    let gate = LocalGate::new(ConcurrencyLimits::default(), crate::ledger::now_rfc3339);
     let backend = MockBackend::new(move |spec| {
         // The reviewer's tree has no such file to remove.
         std::fs::remove_file(spec.work_dir.join("src/main.rs")).ok();

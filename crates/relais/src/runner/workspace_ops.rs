@@ -32,6 +32,10 @@ impl<'a> RunEngine<'a> {
                     "run {run} was interrupted here with edits applied; run: relais resume --retire {run}"
                 ),
             ),
+            LeaseRefusal::WorkerMayRun { run, orphan } => (
+                BlockCode::WorkspaceHasInterruptedRun,
+                orphan.fence_text(&run, &self.config.ledger.now()),
+            ),
             LeaseRefusal::UnreadableMarker { path, why } => (
                 BlockCode::WorkspaceHasInterruptedRun,
                 format!(
@@ -80,6 +84,77 @@ impl<'a> RunEngine<'a> {
         Ok(sha)
     }
 
+    /// An in-place attempt ended with its worker lost (`mod_gone`): nothing
+    /// asked it to stop, so it may still be writing the person's tree. The
+    /// orphan goes into the marker first, so the fence outlives this process
+    /// and the coordinator, and is then reported to the coordinator, which
+    /// writes the stop confirmation into the marker when the agent's stop
+    /// arrives. Call before the dispatch settles: the coordinator checks the
+    /// dispatch's native record, which settling drops.
+    pub(super) fn fence_lost_worker(
+        &self,
+        gate: &(dyn crate::admission::Gate + Sync),
+        dispatch_id: &str,
+        launched: &crate::backend::LaunchResult,
+    ) {
+        use crate::admission::{OrphanRegistration, OrphanReport};
+        use crate::workspace::inplace::OrphanedWorker;
+        let lost = !launched.ended.succeeded()
+            && launched
+                .failure_detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with(crate::adapter::native::MOD_GONE));
+        let Some(lease) = self.inplace.as_ref().and_then(|state| state.lease.as_ref()) else {
+            return;
+        };
+        if !lost {
+            return;
+        }
+        let session = &self.config.session_id;
+        let agent = launched.session_id.as_deref();
+        let Some(orphan) =
+            OrphanedWorker::lost_at(dispatch_id, session, agent, &self.config.ledger.now())
+        else {
+            self.events.emit(Event::Stderr {
+                text: "the clock gave no RFC 3339 time, so the lost worker could not be fenced"
+                    .into(),
+            });
+            return;
+        };
+        if let Err(e) = lease.record_orphan(orphan) {
+            self.events.emit(Event::Stderr {
+                text: format!(
+                    "the lost worker of dispatch {dispatch_id} could not be written to the \
+                     in-place marker ({e}); do not edit {} until you have stopped its session",
+                    self.config.repo_dir.display()
+                ),
+            });
+            return;
+        }
+        let report = OrphanReport {
+            dispatch_id: dispatch_id.to_string(),
+            session_id: session.clone(),
+            agent_id: agent.map(str::to_string),
+            marker: lease.marker_file(),
+        };
+        let what = match gate.report_orphan(&report) {
+            Ok(OrphanRegistration::Held) => "held until its stop is seen".to_string(),
+            Ok(OrphanRegistration::Confirmed) => "its stop was already seen".to_string(),
+            Err(e) => format!(
+                "the coordinator could not be told ({e}); `relais resume --retire {} \
+                 --worker-stopped` frees the tree once its session is closed",
+                self.run_id
+            ),
+        };
+        self.events.emit(Event::Decision {
+            what: "inplace_worker_orphaned".into(),
+            reason: format!(
+                "the worker of dispatch {dispatch_id} was lost and may still write {}: {what}",
+                self.config.repo_dir.display()
+            ),
+        });
+    }
+
     /// The run's worker tree when it works in place: the caller's own
     /// worktree, against a private index. The marker is written here,
     /// before anything can edit the tree, so a run that dies from now on
@@ -98,6 +173,7 @@ impl<'a> RunEngine<'a> {
             index_listing: start.index_listing.clone(),
             target: None,
             exported: None,
+            orphan: None,
         };
         Some(
             lease

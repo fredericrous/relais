@@ -10,10 +10,13 @@ use super::*;
 
 /// A gate whose only agent seat another tab holds, so this run queues.
 fn gate_with_the_seat_taken() -> crate::admission::LocalGate {
-    let gate = crate::admission::LocalGate::new(ConcurrencyLimits {
-        max_active_agents: Some(1),
-        ..ConcurrencyLimits::default()
-    });
+    let gate = crate::admission::LocalGate::new(
+        ConcurrencyLimits {
+            max_active_agents: Some(1),
+            ..ConcurrencyLimits::default()
+        },
+        crate::ledger::now_rfc3339,
+    );
     gate.register_run(&RunRegistration {
         run_id: "other-run".into(),
         session_id: "other-tab".into(),
@@ -94,10 +97,13 @@ fn a_queue_that_outlasts_the_admission_wait_blocks_with_its_own_name() {
 /// A gate whose only heavy-command token another run holds, so this run's
 /// first check queues.
 fn gate_with_the_heavy_token_taken() -> crate::admission::LocalGate {
-    let gate = crate::admission::LocalGate::new(ConcurrencyLimits {
-        max_heavy_commands: Some(1),
-        ..ConcurrencyLimits::default()
-    });
+    let gate = crate::admission::LocalGate::new(
+        ConcurrencyLimits {
+            max_heavy_commands: Some(1),
+            ..ConcurrencyLimits::default()
+        },
+        crate::ledger::now_rfc3339,
+    );
     gate.register_run(&RunRegistration {
         run_id: "other-run".into(),
         session_id: "other-tab".into(),

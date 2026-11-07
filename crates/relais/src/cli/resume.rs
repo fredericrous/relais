@@ -79,10 +79,90 @@ impl Retire {
     }
 }
 
-pub(crate) fn resume_command(run_id: &str, retire: Retire) -> Result<CliOutcome, CliError> {
+/// Whether the person vouches that the worker an in-place run lost has
+/// stopped (`--worker-stopped`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerStopped {
+    Unattested,
+    Attested,
+}
+
+impl WorkerStopped {
+    pub(crate) fn from_flag(attested: bool) -> Self {
+        if attested {
+            Self::Attested
+        } else {
+            Self::Unattested
+        }
+    }
+}
+
+/// Record the person's word that the orphaned worker of `run` has stopped:
+/// on the marker, which frees the tree, and on the run. `Some(outcome)` when
+/// there was nothing to attest, which ends the command.
+fn attest_worker_stopped(ledger: &Ledger, run: &RunId) -> Result<Option<CliOutcome>, CliError> {
+    use relais::workspace::inplace::{self, StoppedBy};
+    let nothing = |why: &str| {
+        eprintln!("relais resume: {run}: --worker-stopped has nothing to confirm: {why}");
+        Ok(Some(CliOutcome::InvalidInput))
+    };
+    let Some(workspace) = operational(ledger.run_workspace(run), "resume")? else {
+        return nothing("the run has no recorded worktree");
+    };
+    let Ok(git_dir) = inplace::git_dir(&workspace.repo_path) else {
+        return nothing("its worktree's git directory cannot be read");
+    };
+    let Ok(marker) = inplace::read_marker(&git_dir, run.as_str()) else {
+        return nothing("the run holds no in-place marker");
+    };
+    let Some(orphan) = marker.orphan.filter(|orphan| orphan.standing()) else {
+        return nothing("the run lost no worker that is still unconfirmed");
+    };
+    let now = relais::ledger::now_rfc3339();
+    let path = inplace::marker_file(&git_dir, run.as_str());
+    operational(
+        inplace::confirm_stopped(&path, &orphan.dispatch, StoppedBy::Person, &now),
+        "resume",
+    )?;
+    let state = operational(ledger.run_status(run), "resume")?.unwrap_or(State::Interrupted);
+    operational(
+        ledger.record_transition(&relais::ledger::Transition {
+            run_id: run.clone(),
+            attempt_id: None,
+            from_state: Some(state),
+            to_state: state,
+            reason: Reason::WorktreeNotReleased.as_str().to_string(),
+            detail: Some(serde_json::json!({
+                "code": "worker_stopped_attested",
+                "dispatch": orphan.dispatch,
+                "session": orphan.session,
+                "agent_id": orphan.agent_id,
+                "detail": "the person attested that the lost worker has stopped (--worker-stopped)",
+            })),
+            at: now,
+        }),
+        "resume",
+    )?;
+    println!(
+        "{run}: recorded your word that the worker of dispatch {} has stopped",
+        orphan.dispatch
+    );
+    Ok(None)
+}
+
+pub(crate) fn resume_command(
+    run_id: &str,
+    retire: Retire,
+    worker: WorkerStopped,
+) -> Result<CliOutcome, CliError> {
     let ledger = open_ledger()?;
     print_pending_intents(&ledger);
     let run = RunId::from_stored(run_id);
+    if worker == WorkerStopped::Attested {
+        if let Some(outcome) = attest_worker_stopped(&ledger, &run)? {
+            return Ok(outcome);
+        }
+    }
     let Some(state) = operational(ledger.run_status(&run), "resume")? else {
         eprintln!("relais resume: unknown run {run_id}");
         return Ok(CliOutcome::UnknownRun);
@@ -594,6 +674,16 @@ pub(crate) fn retire_in_place_saying(
     let Ok(marker) = inplace::read_marker(&git_dir, run.as_str()) else {
         return Ok(None);
     };
+    // The dispatch is closed in the ledger, so the reconciliation below
+    // reads it as dead; only the marker knows the worker was lost, not
+    // stopped.
+    if let Some(orphan) = marker.orphan.as_ref().filter(|orphan| orphan.standing()) {
+        say(format!(
+            "{run}: kept, {}",
+            orphan.fence_text(run.as_str(), &relais::ledger::now_rfc3339())
+        ));
+        return Ok(Some(CliOutcome::Blocked));
+    }
     if !reconciliation.all_provably_dead() {
         say(format!(
             "{run}: kept, a dispatch may still write {} ({})",
@@ -612,9 +702,11 @@ pub(crate) fn retire_in_place_saying(
             ));
             return Ok(Some(CliOutcome::OperationalFailure));
         }
-        Err(LeaseRefusal::Interrupted { .. } | LeaseRefusal::UnreadableMarker { .. }) => {
-            return Ok(None)
-        }
+        Err(
+            LeaseRefusal::Interrupted { .. }
+            | LeaseRefusal::WorkerMayRun { .. }
+            | LeaseRefusal::UnreadableMarker { .. },
+        ) => return Ok(None),
         Err(LeaseRefusal::Io(e)) => {
             say(format!(
                 "{run}: kept, {} could not be taken: {e}",

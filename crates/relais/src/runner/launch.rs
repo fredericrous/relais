@@ -331,6 +331,11 @@ impl<'a> RunEngine<'a> {
                 )?));
             }
         };
+        // A lost in-place worker fences the tree before the dispatch
+        // settles and its native record goes.
+        if lease_key.is_some() {
+            self.fence_lost_worker(gate, &spec.dispatch_id, &result);
+        }
         // Bind, free the seat, settle the reservation: unknown usage
         // settles as unknown, never zero (SPEC §23). Failures here are
         // the coordinator's to reconcile; the work already happened and

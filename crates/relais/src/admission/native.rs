@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::{AdmissionState, BindOutcome, Provenance};
+use super::{AdmissionState, BindOutcome, OrphanRegistration, Provenance};
 
 /// What relais asked the parent session to run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,6 +274,10 @@ pub enum NativeAnswer {
     HelloAge {
         age_ms: Option<u64>,
     },
+    /// What the coordinator did with a lost in-place worker.
+    Orphan {
+        outcome: OrphanRegistration,
+    },
 }
 
 /// One reader per answer, so a caller names the answer it expects and
@@ -345,6 +349,14 @@ impl NativeAnswer {
 
     pub fn stopped_agent(self) -> Option<StoppedOutcome> {
         if let Self::StoppedAgent { outcome } = self {
+            Some(outcome)
+        } else {
+            None
+        }
+    }
+
+    pub fn orphan(self) -> Option<OrphanRegistration> {
+        if let Self::Orphan { outcome } = self {
             Some(outcome)
         } else {
             None
@@ -600,8 +612,10 @@ impl AdmissionState {
             .find(|(_, record)| bound_to_agent(record))
             .map(|(dispatch_id, _)| dispatch_id.clone());
         let Some(dispatch_id) = found else {
+            self.orphans.note_stop(session_id, agent_id);
             return StopNativeOutcome::NotNative;
         };
+        self.orphans.note_stop(session_id, agent_id);
         // The hook knows nothing of what the agent spent: the plugin's
         // `stopped` report carries that, and this path is not the new flow.
         let stopped = NativeState::Stopped {
@@ -708,8 +722,35 @@ impl AdmissionState {
             usage: report.usage.clone(),
             answer: report.answer.clone(),
         };
+        let session_id = record.session_id.clone();
         self.set_native(dispatch_id, stopped, None);
+        self.orphans.note_stop(&session_id, &report.agent_id);
         StoppedOutcome::Recorded
+    }
+
+    /// The agent a native dispatch ran as, and whether it ended, as the
+    /// coordinator's own record has it.
+    pub(super) fn native_agent_of(&self, dispatch_id: &str) -> (Option<String>, bool) {
+        let from_dispatch = self
+            .dispatches
+            .get(dispatch_id)
+            .and_then(|dispatch| dispatch.agent_id.clone());
+        match self
+            .native
+            .records
+            .get(dispatch_id)
+            .map(|record| &record.state)
+        {
+            Some(NativeState::Stopped { agent_id, .. }) => (Some(agent_id.clone()), true),
+            Some(NativeState::Bound { agent_id }) => (Some(agent_id.clone()), false),
+            Some(
+                NativeState::Requested { .. }
+                | NativeState::Claimed
+                | NativeState::TreeGiven { .. }
+                | NativeState::Failed { .. },
+            )
+            | None => (from_dispatch, false),
+        }
     }
 
     /// Is the agent bound, or was it, to a native dispatch still on
@@ -778,6 +819,7 @@ mod tests {
         AgentSettleOutcome, Decision, DispatchRequest, DispatchSource, ResourceClass,
         RunRegistration,
     };
+    use crate::admission::{OrphanRegistration, OrphanReport};
     use crate::policy::ConcurrencyLimits;
     use std::time::Duration;
 
@@ -1162,6 +1204,104 @@ mod tests {
         );
     }
 
+    fn orphan_marker(dir: &std::path::Path) -> std::path::PathBuf {
+        use crate::workspace::inplace::{Marker, OrphanedWorker, Stage};
+        let path = dir.join("run-1.json");
+        let marker = Marker {
+            run: "run-1".into(),
+            stage: Stage::Running,
+            head_symbolic: None,
+            head_sha: "0".repeat(40),
+            start: "0".repeat(40),
+            index_listing: String::new(),
+            target: None,
+            exported: None,
+            orphan: OrphanedWorker::lost_at("d1", "s1", None, "2026-11-07T10:00:00+00:00"),
+        };
+        std::fs::write(&path, serde_json::to_string(&marker).expect("json")).expect("marker");
+        path
+    }
+
+    fn read_orphan(path: &std::path::Path) -> crate::workspace::inplace::OrphanedWorker {
+        let text = std::fs::read_to_string(path).expect("marker");
+        let marker: crate::workspace::inplace::Marker = serde_json::from_str(&text).expect("json");
+        marker.orphan.expect("orphan")
+    }
+
+    #[test]
+    fn an_agent_the_coordinator_supplies_is_written_to_the_marker_and_its_stop_frees_it() {
+        let now = Instant::now();
+        let dir = crate::test_support::temp_dir("orphan-agent-fill");
+        let marker = orphan_marker(&dir);
+        let mut state = state();
+        admitted(&mut state, "d1", "s1", now);
+        state.register_native("s1", "d1", &spawn_ask("d1"));
+        state.claim_native("s1", "d1", None, now);
+        state.native_worktree("s1", "agent-a1");
+        state.bind_native("s1", "d1", "a1", now);
+        let report = OrphanReport {
+            dispatch_id: "d1".into(),
+            session_id: "s1".into(),
+            agent_id: None,
+            marker: marker.clone(),
+        };
+        assert_eq!(state.report_orphan(report), OrphanRegistration::Held);
+        state
+            .take_orphan_effects()
+            .apply("2026-11-07T10:01:00+00:00");
+        let orphan = read_orphan(&marker);
+        assert_eq!(orphan.agent_id.as_deref(), Some("a1"));
+        let text = orphan.fence_text("run-1", "2026-11-07T10:02:00+00:00");
+        assert!(text.contains("agent a1 stopped"), "{text}");
+        assert!(orphan.standing());
+        state.settle_by_agent("s1", "a1", None, now);
+        state
+            .take_orphan_effects()
+            .apply("2026-11-07T10:03:00+00:00");
+        assert!(!read_orphan(&marker).standing());
+    }
+
+    #[test]
+    fn a_confirmed_marker_drops_the_held_orphan_from_the_table_and_journal() {
+        use crate::admission::{Gate, LocalGate};
+        let now = Instant::now();
+        let dir = crate::test_support::temp_dir("orphan-release");
+        let marker = orphan_marker(&dir);
+        let journal = dir.join("inplace-orphans.json");
+        let gate = LocalGate::new(ConcurrencyLimits::default(), crate::ledger::now_rfc3339);
+        {
+            let mut state = gate.admission();
+            state.adopt_orphans(journal.clone(), Vec::new());
+            admitted(&mut state, "d1", "s1", now);
+            state.register_native("s1", "d1", &spawn_ask("d1"));
+            state.claim_native("s1", "d1", None, now);
+            state.native_worktree("s1", "agent-a1");
+            state.bind_native("s1", "d1", "a1", now);
+        }
+        let report = OrphanReport {
+            dispatch_id: "d1".into(),
+            session_id: "s1".into(),
+            agent_id: None,
+            marker: marker.clone(),
+        };
+        assert_eq!(
+            gate.report_orphan(&report).expect("report"),
+            OrphanRegistration::Held
+        );
+        assert_eq!(crate::admission::read_orphan_journal(&journal).len(), 1);
+        let confirmed = crate::workspace::inplace::confirm_stopped(
+            &marker,
+            "d1",
+            crate::workspace::inplace::StoppedBy::Person,
+            "2026-11-07T10:02:00+00:00",
+        );
+        assert!(confirmed.expect("confirm"));
+        gate.settle_by_agent("s1", "unrelated", None)
+            .expect("touch");
+        assert!(gate.admission().held_orphans().is_empty());
+        assert!(crate::admission::read_orphan_journal(&journal).is_empty());
+    }
+
     fn report(agent: &str, answer: &str) -> StoppedReport {
         StoppedReport {
             agent_id: agent.into(),
@@ -1317,5 +1457,240 @@ mod tests {
             Some(Duration::from_secs(5))
         );
         assert_eq!(state.native_hello_age("s2", t0), None);
+    }
+
+    /// The lost in-place workers the coordinator fences (ADR-0008).
+    mod orphans {
+        use super::*;
+        use crate::admission::{read_orphan_journal, OrphanRegistration, OrphanReport};
+        use crate::workspace::inplace::{Marker, OrphanedWorker, Stage, StoppedBy, WORKER_MAY_RUN};
+
+        fn marker_with_orphan(dir: &std::path::Path, agent: Option<&str>) -> PathBuf {
+            let orphan = OrphanedWorker::lost_at("d1", "s1", agent, "2026-11-07T10:00:00+00:00")
+                .expect("an RFC 3339 time");
+            let marker = Marker {
+                run: "run-1".into(),
+                stage: Stage::Running,
+                head_symbolic: None,
+                head_sha: "0".repeat(40),
+                start: "0".repeat(40),
+                index_listing: String::new(),
+                target: None,
+                exported: None,
+                orphan: Some(orphan),
+            };
+            let path = dir.join("run-1.json");
+            std::fs::write(&path, serde_json::to_string_pretty(&marker).expect("json"))
+                .expect("marker");
+            path
+        }
+
+        fn standing(path: &std::path::Path) -> bool {
+            let marker: Marker =
+                serde_json::from_str(&std::fs::read_to_string(path).expect("read")).expect("json");
+            marker.orphan.expect("orphan").standing()
+        }
+
+        fn report(marker: &std::path::Path, agent: Option<&str>) -> OrphanReport {
+            OrphanReport {
+                dispatch_id: "d1".into(),
+                session_id: "s1".into(),
+                agent_id: agent.map(str::to_string),
+                marker: marker.to_path_buf(),
+            }
+        }
+
+        fn flush(state: &mut AdmissionState) {
+            state
+                .take_orphan_effects()
+                .apply("2026-11-07T10:05:00+00:00");
+        }
+
+        fn bound_native(state: &mut AdmissionState, now: Instant) {
+            admitted(state, "d1", "s1", now);
+            state.register_native("s1", "d1", &spawn_ask("d1"));
+            state.claim_native("s1", "d1", None, now);
+            state.native_worktree("s1", "agent-a1");
+            assert_eq!(
+                state.bind_native("s1", "d1", "a1", now),
+                BindNativeOutcome::Bound
+            );
+        }
+
+        /// A SubagentStop that reaches the coordinator while the dispatch is
+        /// still bound answers `Native` and settles nothing; it still frees
+        /// the tree.
+        #[test]
+        fn a_stop_before_the_settle_frees_the_tree() {
+            let dir = crate::test_support::short_temp_dir("orphan-native");
+            let marker = marker_with_orphan(&dir, Some("a1"));
+            let now = Instant::now();
+            let mut state = state();
+            bound_native(&mut state, now);
+            assert_eq!(
+                state.report_orphan(report(&marker, Some("a1"))),
+                OrphanRegistration::Held
+            );
+            flush(&mut state);
+            assert!(standing(&marker));
+            assert_eq!(
+                state.settle_by_agent("s1", "a1", None, now),
+                AgentSettleOutcome::Native {
+                    dispatch_id: "d1".into()
+                }
+            );
+            flush(&mut state);
+            assert!(!standing(&marker));
+        }
+
+        /// The runner settles the lost dispatch right after reporting it, and
+        /// the stop that follows finds nothing bound: it frees the tree all
+        /// the same.
+        #[test]
+        fn a_stop_after_the_settle_frees_the_tree() {
+            let dir = crate::test_support::short_temp_dir("orphan-settled");
+            let marker = marker_with_orphan(&dir, Some("a1"));
+            let now = Instant::now();
+            let mut state = state();
+            bound_native(&mut state, now);
+            state.report_orphan(report(&marker, Some("a1")));
+            state.settle("d1", None, now);
+            state.release("d1", now);
+            assert!(standing(&marker));
+            assert_eq!(
+                state.settle_by_agent("s1", "a1", None, now),
+                AgentSettleOutcome::NothingBound
+            );
+            flush(&mut state);
+            let marker_text = std::fs::read_to_string(&marker).expect("read");
+            assert!(marker_text.contains("subagent"), "{marker_text}");
+            assert!(!standing(&marker));
+        }
+
+        #[test]
+        fn a_stop_for_another_agent_frees_nothing() {
+            let dir = crate::test_support::short_temp_dir("orphan-other");
+            let marker = marker_with_orphan(&dir, Some("a1"));
+            let now = Instant::now();
+            let mut state = state();
+            state.report_orphan(report(&marker, Some("a1")));
+            state.settle_by_agent("s1", "a2", None, now);
+            state.settle_by_agent("s2", "a1", None, now);
+            flush(&mut state);
+            assert!(standing(&marker));
+        }
+
+        #[test]
+        fn a_stop_remembered_at_registration_frees_the_tree_at_once() {
+            let dir = crate::test_support::short_temp_dir("orphan-remembered");
+            let marker = marker_with_orphan(&dir, Some("a1"));
+            let now = Instant::now();
+            let mut state = state();
+            state.settle_by_agent("s1", "a1", None, now);
+            assert_eq!(
+                state.report_orphan(report(&marker, Some("a1"))),
+                OrphanRegistration::Confirmed
+            );
+            flush(&mut state);
+            assert!(!standing(&marker));
+        }
+
+        #[test]
+        fn a_dispatch_already_stopped_natively_frees_the_tree_at_registration() {
+            let dir = crate::test_support::short_temp_dir("orphan-native-stopped");
+            let marker = marker_with_orphan(&dir, None);
+            let now = Instant::now();
+            let mut state = state();
+            bound_native(&mut state, now);
+            state.stopped_native("d1", &report_of("a1", "done"));
+            // The runner knew no agent; the coordinator's own record names it.
+            assert_eq!(
+                state.report_orphan(report(&marker, None)),
+                OrphanRegistration::Confirmed
+            );
+            flush(&mut state);
+            assert!(!standing(&marker));
+        }
+
+        fn report_of(agent: &str, answer: &str) -> StoppedReport {
+            super::report(agent, answer)
+        }
+
+        #[test]
+        fn a_journalled_orphan_survives_a_coordinator_restart() {
+            let dir = crate::test_support::short_temp_dir("orphan-restart");
+            let marker = marker_with_orphan(&dir, Some("a1"));
+            let journal = dir.join("inplace-orphans.json");
+            let now = Instant::now();
+            let mut first = state();
+            first.adopt_orphans(journal.clone(), Vec::new());
+            first.report_orphan(report(&marker, Some("a1")));
+            flush(&mut first);
+            drop(first);
+
+            let mut second = state();
+            second.adopt_orphans(journal.clone(), read_orphan_journal(&journal));
+            assert_eq!(second.held_orphans(), vec![report(&marker, Some("a1"))]);
+            second.settle_by_agent("s1", "a1", None, now);
+            flush(&mut second);
+            assert!(!standing(&marker));
+            assert_eq!(read_orphan_journal(&journal), Vec::new());
+        }
+
+        /// No agent id, so no SubagentStop can name the worker: only the
+        /// person's word frees it.
+        #[test]
+        fn an_orphan_with_no_agent_is_freed_only_by_the_persons_word() {
+            let dir = crate::test_support::short_temp_dir("orphan-no-agent");
+            let marker = marker_with_orphan(&dir, None);
+            let now = Instant::now();
+            let mut state = state();
+            assert_eq!(
+                state.report_orphan(report(&marker, None)),
+                OrphanRegistration::Held
+            );
+            state.settle_by_agent("s1", "a1", None, now);
+            state.stop_native("s1", "a1", None);
+            flush(&mut state);
+            assert!(standing(&marker));
+            assert!(crate::workspace::inplace::confirm_stopped(
+                &marker,
+                "d1",
+                StoppedBy::Person,
+                "2026-11-07T11:00:00+00:00"
+            )
+            .expect("confirm"));
+            assert!(!standing(&marker));
+            // A second word changes nothing.
+            assert!(!crate::workspace::inplace::confirm_stopped(
+                &marker,
+                "d1",
+                StoppedBy::Subagent,
+                "2026-11-07T11:00:01+00:00"
+            )
+            .expect("confirm again"));
+        }
+
+        /// Time never frees the tree: past the escalation point the fence
+        /// stands and its text says what is still required.
+        #[test]
+        fn past_the_escalation_point_the_fence_stands_and_says_what_frees_it() {
+            let dir = crate::test_support::short_temp_dir("orphan-escalate");
+            let marker = marker_with_orphan(&dir, Some("a1"));
+            let marker_value: Marker =
+                serde_json::from_str(&std::fs::read_to_string(&marker).expect("read"))
+                    .expect("json");
+            let orphan = marker_value.orphan.expect("orphan");
+            assert_eq!(orphan.escalate_at, "2026-11-07T12:00:00+00:00");
+            let early = orphan.fence_text("run-1", "2026-11-07T10:30:00+00:00");
+            assert!(early.starts_with(WORKER_MAY_RUN), "{early}");
+            assert!(early.contains("dispatch d1"), "{early}");
+            assert!(early.contains("0h30m"), "{early}");
+            assert!(!early.contains("escalation"), "{early}");
+            let late = orphan.fence_text("run-1", "2026-11-09T10:00:00+00:00");
+            assert!(late.contains("escalation point has passed"), "{late}");
+            assert!(late.contains("--worker-stopped"), "{late}");
+            assert!(orphan.standing(), "no amount of time clears it");
+        }
     }
 }
