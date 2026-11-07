@@ -39,10 +39,14 @@ production.
   `prog/<slug>/<id>`, but amont's push gate rejects a `prog/` prefix
   (`amont-runtime/src/vocabulary.rs:81`). Until that is reconciled, ticket
   sessions use `docs/homelab-offload-<id>`.
+- The person, 2026-11-07: worker pods reach Claude, Codex and Qwen through a CLIProxyAPI and its management center (router-for-me/CLIProxyAPI, Cli-Proxy-API-Management-Center) run on the homelab, as the Mac does today on 127.0.0.1:8317; t03 is amended.
 - Plan that charted this map: `docs/plans/2026-10-31-relais-runs-on-the-homelab.md`.
 
 ## Decisions so far
 
+- [How the CLIProxyAPI auth volume is backed up and restored](t29-cliproxy-auth-backup.md): the existing Velero daily/weekly/monthly schedules with `cliproxy` added; a restore assumes fresh sign-ins because refresh tokens rotate; off-site data copy and a drill go to the deploy plan.
+- [Which proxy owns each OAuth account once the homelab runs one](t28-oauth-account-owner.md): the homelab proxy holds every account and the Mac points at it, its own proxy stopped (the person, 2026-11-07); cutover never runs both; the off-LAN path is t30.
+- [How CLIProxyAPI and its management center run on the homelab](t27-cliproxy-on-homelab.md): upstream `eceasy/cli-proxy-api` by digest, one replica on an RWO PVC (refresh rewrites the OAuth files), per-consumer access keys from Vault, the bundled panel with management not routed, `cliproxy` namespace egress to Anthropic/OpenAI/the LiteLLM gateway; next: a deploy plan after t28.
 - [How work handed to the cluster outlives the laptop](t26-execution-service.md): two lanes; commit-blocking gates keep the kubectl executor, everything else becomes an Argo Workflow (already installed) fed by a Forgejo snapshot (real parent) or a pull-mirror; Argo holds slots, cancel and 7-day results; the laptop stays the only signer and collects on wake (t25 reopens with worker pods); next: a build plan.
 - [Where the pod's attestation signing key lives](t25-pod-signing-key.md): nowhere new; the laptop's amont signs from Kubernetes-recorded facts (exit code, imageID, Job spec), one Job per gate, Job-create fenced to the coordinator.
 - [Which slice ships first and alone](t15-first-slice.md): amont runs `platform=any` gates (lint, types, cycles) on wk-3, one Job per gate, laptop-signed; enabled after the t13 window.
@@ -51,7 +55,7 @@ production.
 - [How amont earns and signs a stamp for a tree a pod verified](t22-stamp-from-remote-run.md): it doesn't stamp (ADR-0015); the pod's signed attestation counts on the laptop only for gates declared `platform=any`; it amends ADR-0015 and adds a decisions ADR beside ADR-0041.
 - [Which gates in the fleet are platform-independent, and which repos are Linux-primary](t23-gate-platform-inventory.md): lint, types and cycle checks (JS/TS, Python, relais scripts) are independent; relais and amont `cargo-test` stay macOS; the share waits for t13 and gate-named timings.
 - [Is "every dispatch native" amended for remote runs](t01-native-dispatch-amendment.md): only when worker pods land (t02), by a relais ADR; a pod worker is relais's own worker.
-- [Which credential a pod uses, and where the token budget is enforced](t03-credentials-billing.md): a long-lived `claude setup-token` in Vault, worker pods only; spend capped by relais's ledger; gated on t24.
+- [Which credential a pod uses, and where the token budget is enforced](t03-credentials-billing.md): *(amended 2026-11-07 by the person)* worker pods call a homelab CLIProxyAPI with a proxy access key; the OAuth tokens stay in the proxy; spend capped by relais's ledger; gated on t27, t28, then t24.
 - [What the automatic loop may never widen](t09-sandbox-floor.md): PSA restricted, non-root, no token automount, no secrets or hostPath, world, vault and the apiserver denied; the loop only tightens.
 - [May relais pods run on wk-3, or does offload wait for wk-4](t19-wk3-for-relais.md): yes, under quota and `relais-batch` priority (the person, 2026-10-31).
 - [May a stamp earned in a Linux pod satisfy the laptop's gate](t20-stamp-platform-rule.md): per gate; platform-independent gates only (the person, 2026-11-01).
