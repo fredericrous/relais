@@ -69,6 +69,7 @@ production.
 
 ## Not yet specified
 
-- A Rust build cache for cold pods (sccache, a cargo mirror).
+- Nothing for now: the Rust build cache for cold pods is
+  [t31](t31-rust-build-cache.md).
 
 ## Out of scope
