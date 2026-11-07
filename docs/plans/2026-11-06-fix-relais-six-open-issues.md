@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: fix/open-issues-2026-11
 repos: [relais]
 adrs: [ADR-0007, ADR-0009, decisions:ADR-0043]
@@ -147,8 +147,8 @@ minor: #369 and #347 change behaviour).
 
 ## Phases
 - [x] Phase 1: six relais `change` runs, one per issue, in place in the task worktree. Each accepted candidate is committed as its own commit, subject ≤ 50 chars.
-- [ ] Phase 2: implementation review (the Code review profiles above) on the branch diff, fixes, then push, one PR, merge-when-green with a merge commit.
-- [ ] Phase 3: release v0.50.0 (v0.49.0 was released meanwhile by another session), tag, verify the artefacts, install relais and reinstall the plugin (the person's step), then the live checks.
+- [x] Phase 2: implementation review (the Code review profiles above) on the branch diff, fixes, then push, one PR, merge-when-green with a merge commit.
+- [x] Phase 3: release v0.50.0 (v0.49.0 was released meanwhile by another session), tag, verify the artefacts, install relais, and the `Yes` live check. Open: the person's plugin reinstall, and the forced `mod_gone` live check, run when no other session's run shares the coordinator (the plugin heartbeat must be cut under it).
 
 ## Rollback
 Revert the merge commit and release a patch. Each issue is one commit, so
@@ -173,8 +173,8 @@ one fix can be reverted alone.
 - #352: a `from_candidate` fixture with successful review evidence for the exact inherited tree asserts successor-only review and inherited-file context. Missing or failed predecessor review and changed merged trees assert full-patch review. Include an inherited violation to prove that unreviewed code cannot escape review → 31 successor tests pass, the in-parts one included (commit cc391674).
 - #351: with no repository corpus, preflight still resolves the fleet code rules. Assert identical complete active rule texts in worker and reviewer prompts. A worker change that creates a new adr-lint match must produce that match after candidate creation, and its rule text must already have appeared in the worker's prompt → the guidance and candidate tests pass (commit 91d828b1; the fake-aval fleet test runs on Unix only, 804a7d28, since its fake is a `sh` script); measured: the embedded pack alone and relais's own config both give 55 `governs: code` rules, 47,174 text bytes.
 - #347: `relais init --detect --json --command Yes` exits non-zero identifying an acknowledgement, without writing configuration, even when executable lookup would succeed; cover macOS's case-insensitive lookup and lowercase `yes` on Linux; (the Rust test is the proof of the rule) `consent.test.ts` onboard flow, with the fake refusing `Yes` with the CLI's exact message, asserts that message reaches the second question and nothing is written; a `Yes`,`Yes` decline names the refusal reason and not shell operators; the `already allowed` answer lists changed commands on the first trustTool call and not on the second → the Rust and plugin tests pass in the full suites of the commit gate (bcc704b1: cargo-test and plugin-test, 33 checks).
-- Each relais run's own verification (the default profile: the repository's checks) passes; the branch passes `make check` and CI on every platform → each run's own verification passed, or its failure was fixed by hand and checked again; the full Rust and plugin suites, clippy, fmt and module-cycles passed in the commit gate of bcc704b1. CI on every platform is the pull request's checks.
-- Live, after install: `relais init --detect --json --command Yes` is refused; an in-place run after a forced `mod_gone` (plugin hello stopped) refuses a second run in that tree until the agent stops → Phase 3, after install.
+- Each relais run's own verification (the default profile: the repository's checks) passes; the branch passes `make check` and CI on every platform → each run's own verification passed, or its failure was fixed by hand and checked again; the full Rust and plugin suites, clippy, fmt and module-cycles passed in the commit gate of bcc704b1. CI: PR #400's checks passed on every platform (after the Windows `#[cfg(unix)]` fix), and release run 42373690063 concluded success on every platform.
+- Live, after install: `relais init --detect --json --command Yes` is refused; an in-place run after a forced `mod_gone` (plugin hello stopped) refuses a second run in that tree until the agent stops → with relais 0.50.0 installed: `Yes`, `yes` and `ok` exit 2 as acknowledgements, `nosuchprogram-xyz` exits 2 as not found, `make` exits 0, and nothing is written. The forced `mod_gone` was not run live: it needs the plugin's heartbeat cut under the coordinator other sessions share; the fence is covered by the runner, admission and coordinator tests.
 
 ## Implementation review
 - implementation-review: approve-with-changes → approve on bcc704b1, and again on 804a7d28 (a Windows CI fix: `#[cfg(unix)]` on one test); BlockCode, plan record and flag/`result` names fixed; the unwritable orphan is deliberate (431k tokens over three rounds).
@@ -184,5 +184,7 @@ one fix can be reverted alone.
 - architect: approve-with-changes; its last item is the embedded-pack Decision-log line above; OrphanFence, marker ownership, one stop store and ledger/review.rs fixed (286k).
 
 ## Outcome
+Shipped in relais v0.50.0 (tag on e1bd6315, release run 42373690063: every platform, the Homebrew tap and the brew install test green). PR #400 merged with a merge commit, one commit per issue; #382, #377, #369, #352, #351 and #347 closed. Found on the way and filed: #397 (a failed stamped gate stops as verification_gap instead of a repair), which made several runs land by hand.
+
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,lang:typescript,codex body-sha=4a722c605b6c -->
