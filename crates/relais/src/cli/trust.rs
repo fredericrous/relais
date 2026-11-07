@@ -7,7 +7,8 @@ use super::ctx::print_document;
 use super::outcome::operational;
 use super::outcome::CliError;
 use super::outcome::CliOutcome;
-use super::plan::pending_command_change;
+use super::plan::command_change;
+use super::plan::Seeing;
 use super::GrantScope;
 use super::GrantSource;
 use super::TrustCommand;
@@ -22,9 +23,13 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
     let identity = relais::repo::identity(&root);
     let repo_key = relais::policy::repo_key(&identity);
     match cmd {
-        TrustCommand::Show { json } => {
-            // Read-only: the ledger is consulted only if it already
-            // exists, so `show` never creates the state directory.
+        TrustCommand::Show {
+            json,
+            mark_reported,
+        } => {
+            // Without `--mark-reported` this is read-only: the ledger is
+            // consulted only if it already exists, so `show` never creates
+            // the state directory.
             let previous = previous_grant_steps(&repo_key);
             let mut shown = relais::trust::show(
                 &policy,
@@ -33,7 +38,23 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                 machine_path,
                 previous.as_deref(),
             );
-            shown.pending_change = pending_command_change("trust show", &repo_key, &policy);
+            // Only the caller that tells the person records the change as said.
+            let seeing = if mark_reported {
+                Seeing::Reporting
+            } else {
+                Seeing::Reading
+            };
+            shown.pending_change = match (command_change(&repo_key, &policy, seeing), seeing) {
+                (Ok(change), _) => change,
+                (Err(unreported), Seeing::Reading) => {
+                    eprintln!("relais trust show: warning: {unreported}");
+                    None
+                }
+                (Err(unreported), Seeing::Reporting) => {
+                    eprintln!("relais trust show --mark-reported: {unreported}");
+                    return Ok(CliOutcome::OperationalFailure);
+                }
+            };
             if json {
                 print_document(&shown)?;
             } else {

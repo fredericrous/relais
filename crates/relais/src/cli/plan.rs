@@ -36,35 +36,56 @@ pub(crate) fn pending_command_change(
     repo_key: &str,
     policy: &RepoPolicy,
 ) -> Option<relais::trust::CommandsChanged> {
-    let ledger = match paths::ledger_path()
+    command_change(repo_key, policy, Seeing::Reading).unwrap_or_else(|unreported| {
+        eprintln!("relais {command}: warning: {unreported}");
+        None
+    })
+}
+
+/// Whether looking at a pending change leaves it pending or reports it.
+#[derive(Clone, Copy)]
+pub(crate) enum Seeing {
+    /// `plan`, `trust show`: nothing is recorded.
+    Reading,
+    /// `trust show --mark-reported`: the change is recorded as said.
+    Reporting,
+}
+
+/// The pending change, read through a store that only reads or, under
+/// [`Seeing::Reporting`], through one that records it so it is not returned
+/// again. The `Err` says why the ledger could not be used; the caller
+/// decides whether that costs a warning or the command.
+pub(crate) fn command_change(
+    repo_key: &str,
+    policy: &RepoPolicy,
+    seeing: Seeing,
+) -> Result<Option<relais::trust::CommandsChanged>, String> {
+    let ledger = paths::ledger_path()
         .ok()
         .filter(|path| path.exists())
         .map(|path| Ledger::open(&path))
         .transpose()
-    {
-        Ok(ledger) => ledger,
-        Err(e) => {
-            eprintln!(
-                "relais {command}: warning: the ledger could not be opened ({e}); a pending \
-                 change to the commands is not reported"
-            );
-            return None;
+        .map_err(|e| {
+            format!(
+                "the ledger could not be opened ({e}); a pending change to the commands is not \
+                 reported"
+            )
+        })?;
+    match (&ledger, seeing) {
+        (Some(ledger), Seeing::Reading) => {
+            relais::trust::observe(&relais::trust::Reader(ledger), repo_key, policy)
         }
-    };
-    let seen = match &ledger {
-        Some(ledger) => relais::trust::observe(&relais::trust::Reader(ledger), repo_key, policy),
-        None => relais::trust::observe(&relais::trust::NoHistory, repo_key, policy),
-    };
-    match seen {
-        Ok(change) => change,
-        Err(e) => {
-            eprintln!(
-                "relais {command}: warning: the commands this repository last ran under could \
-                 not be read ({e}); a pending change to them is not reported"
-            );
-            None
+        (Some(ledger), Seeing::Reporting) => {
+            relais::trust::observe(&relais::trust::Recorder(ledger), repo_key, policy)
         }
+        (None, _) => relais::trust::observe(&relais::trust::NoHistory, repo_key, policy),
     }
+    .map_err(|e| {
+        format!(
+            "the commands this repository last ran under could not be read or recorded ({e}); \
+             a pending change to them is not reported"
+        )
+    })
 }
 
 /// How `plan` prints its decision.

@@ -106,6 +106,33 @@ export type Shown = {
     integrations: { name: string; mode: string }[]
   }
   changes?: ('same' | 'new' | 'changed')[]
+  // The commands changed since the grant, reported by `trust show` once.
+  pending_change?: { since: string; lines: string[] }
+}
+
+// The commands changed since the grant, one row per change line
+// (`+ added check make test [default]`): the mark and the label come from
+// the line, the rest of it is one displayed field. Nothing when none is pending.
+const CHANGE_LINE = /^([+~-]) (added|removed|changed) (.*)$/s
+
+export function changedCommands(shown: Shown): string[] {
+  const change = shown.pending_change
+  if (!change || change.lines.length === 0) return []
+  const listed = change.lines.map(line => {
+    const parts = CHANGE_LINE.exec(line)
+    return parts ? `${parts[1]} ${parts[2].padEnd(7)} ${escapeDisplay(parts[3])}` : `  ${escapeDisplay(line)}`
+  })
+  return [`Commands changed in relais.toml since ${escapeDisplay(change.since)}:`, ...listed]
+}
+
+// The rows a reply lists, after recording them as reported so the next
+// `trust show` does not return them (the person is never asked again, ADR-0007).
+async function reportChanges(fx: Fx, repo: Repo, shown: Shown): Promise<string[]> {
+  const listed = changedCommands(shown)
+  if (listed.length === 0) return listed
+  const marked = await run(fx, ['relais', 'trust', 'show', '--json', '--mark-reported'], repo.root)
+  // A failed mark only means the change is listed once more.
+  return marked.exitCode === 0 ? listed : [...listed, `(could not record this as reported: ${escapeDisplay(err(marked))})`]
 }
 
 const MARK = { same: ' ', new: '+', changed: '~' } as const
@@ -261,7 +288,9 @@ async function askTrust(fx: Fx, store: Store, repo: Repo, session: string): Prom
   if (show.exitCode !== 0) return `not set up: relais trust show failed: ${err(show)}`
   const shown = parsed<Shown>(show)
   if (!shown) return `not set up: relais trust show printed no JSON: ${out(show).slice(0, 400)}`
-  if (shown.granted) return `ready: ${repo.name} is already allowed. Call mcp__relais__run.`
+  if (shown.granted) {
+    return [`ready: ${repo.name} is already allowed. Call mcp__relais__run.`, ...(await reportChanges(fx, repo, shown))].join('\n')
+  }
   const q = question2(shown, repo.name)
   const answer = await ask(fx, q.text, [NOT_NOW, q.yes])
   if (answer !== q.yes) return refuse(fx, store, repo, answer === NOT_NOW ? 'not_now' : 'dismissed')
@@ -412,7 +441,7 @@ async function onboard(fx: Fx, store: Store, repo: Repo, session: string): Promi
     if (typed === undefined) return refuse(fx, store, repo, 'dismissed')
     if (typeof typed !== 'string') {
       fx.ui.toast(`relais · not set up in ${repo.name} · ask Claude to set up relais to be asked again`)
-      return `declined (command_refused): the command the person typed was refused twice (${typed.refused}). Nothing was written in ${repo.name}. Tell them relais runs one plain command, without shell operators.`
+      return `declined (command_refused): the command the person typed was refused twice. Nothing was written in ${repo.name}. Tell them why: ${escapeDisplay(typed.refused)}`
     }
     command = typed
   }
@@ -449,7 +478,10 @@ async function onboard(fx: Fx, store: Store, repo: Repo, session: string): Promi
   const granted = shown.granted ? 'ok' : await grant(fx, repo, session)
   if (granted !== 'ok') return granted
   fx.ui.toast(`relais · set up: relais.toml ${sha} on ${repo.branch}, grant saved · starting run`)
-  return `ready: relais.toml committed as ${sha} on ${repo.branch}, and the person allowed its ${shown.declaration.steps.length} command(s). Call mcp__relais__run again.`
+  return [
+    `ready: relais.toml committed as ${sha} on ${repo.branch}, and the person allowed its ${shown.declaration.steps.length} command(s). Call mcp__relais__run again.`,
+    ...(shown.granted ? await reportChanges(fx, repo, shown) : []),
+  ].join('\n')
 }
 
 // The typed command for a repository where nothing was detected: relais

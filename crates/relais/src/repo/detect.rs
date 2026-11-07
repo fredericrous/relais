@@ -461,6 +461,11 @@ pub enum CommandTextError {
     /// A shell operator, named. Relais runs argv, never a shell line.
     ShellCharacter(char),
     UnclosedQuote(char),
+    /// A bare "yes", "ok", "no": an answer to a question, not a command.
+    Acknowledgement(String),
+    /// The program is not a file in the repository, not under
+    /// `node_modules/.bin` and not on this machine's `PATH`.
+    ProgramNotFound(String),
 }
 
 impl std::fmt::Display for CommandTextError {
@@ -480,11 +485,44 @@ impl std::fmt::Display for CommandTextError {
                 "`{c}` is not allowed: relais runs argv, not a shell line (SPEC §6)"
             ),
             Self::UnclosedQuote(q) => write!(f, "unclosed {q} quote"),
+            Self::Acknowledgement(word) => write!(
+                f,
+                "`{word}` is an acknowledgement, not a command: type the command that verifies this repository"
+            ),
+            Self::ProgramNotFound(program) => write!(
+                f,
+                "`{program}` is not a file in the repository, not in node_modules/.bin and not on this machine's PATH (this check is local: an offloaded run's container may differ); name an existing program or an explicit path"
+            ),
         }
     }
 }
 
 impl std::error::Error for CommandTextError {}
+
+/// Words that answer a question rather than name a program.
+const ACKNOWLEDGEMENTS: &[&str] = &["yes", "y", "ok", "okay", "no", "n"];
+
+/// Refuse an argv that names nothing runnable: first a bare
+/// acknowledgement (so `Yes` is refused even where `/usr/bin/Yes` resolves
+/// on a case-insensitive filesystem), then a program that `exists` does not
+/// find. The lookup (repository files, `node_modules/.bin`, the local
+/// `PATH`) is the caller's, so this check reads nothing.
+pub fn check_command_program(
+    argv: &[String],
+    exists: impl Fn(&str) -> bool,
+) -> Result<(), CommandTextError> {
+    let Some(program) = argv.first() else {
+        return Err(CommandTextError::Empty);
+    };
+    if argv.len() == 1 && ACKNOWLEDGEMENTS.contains(&program.to_lowercase().as_str()) {
+        return Err(CommandTextError::Acknowledgement(program.clone()));
+    }
+    if exists(program) {
+        Ok(())
+    } else {
+        Err(CommandTextError::ProgramNotFound(program.clone()))
+    }
+}
 
 /// The characters a shell would treat as an operator or an expansion.
 const SHELL_CHARACTERS: &[char] = &['|', '&', ';', '<', '>', '$', '`', '(', ')', '\n', '\r'];
@@ -920,6 +958,32 @@ mod tests {
             parse_command_text("a 'b"),
             Err(CommandTextError::UnclosedQuote('\''))
         );
+    }
+
+    #[test]
+    fn acknowledgements_are_refused_before_any_lookup() {
+        for word in ["Yes", "yes", "Y", "ok", "OKAY", "no", "N"] {
+            let refused = check_command_program(&[word.to_string()], |_| true).expect_err(word);
+            assert!(
+                matches!(refused, CommandTextError::Acknowledgement(_)),
+                "{word}"
+            );
+            assert!(refused.to_string().contains("acknowledgement"), "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_program_the_lookup_does_not_find_is_refused() {
+        let argv = |text: &str| parse_command_text(text).expect("plain");
+        let known = |program: &str| program == "vitest";
+        assert_eq!(check_command_program(&argv("vitest run"), known), Ok(()));
+        let missing =
+            check_command_program(&argv("no-such-program-xyz test"), known).expect_err("missing");
+        assert_eq!(
+            missing,
+            CommandTextError::ProgramNotFound("no-such-program-xyz".into())
+        );
+        assert!(missing.to_string().contains("local"), "{missing}");
     }
 
     #[test]

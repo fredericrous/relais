@@ -731,6 +731,11 @@ pub(crate) enum TrustCommand {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
+        /// Record a pending change to the commands as reported, so the
+        /// next `trust show` no longer returns it; for the caller that
+        /// tells the person
+        #[arg(long = "mark-reported")]
+        mark_reported: bool,
     },
     /// Trust this repository once, in machine.toml (`[trust_repos]`): every
     /// policy of it is then admitted, a change to its commands warns. With

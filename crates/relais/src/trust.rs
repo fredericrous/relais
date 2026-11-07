@@ -252,8 +252,9 @@ pub struct Seen {
 /// Where the declaration each repository last ran under is kept. A
 /// caller picks the store whose behaviour it needs: [`Recorder`] (what
 /// `relais run` passes) records what it sees, [`Reader`] and
-/// [`NoHistory`] (what `plan`, `doctor` and `trust show` pass) record
-/// nothing, so looking at a pending change never consumes it. A replay
+/// [`NoHistory`] (what `plan`, `doctor` and a plain `trust show` pass) record
+/// nothing, so looking at a pending change never consumes it; `trust show
+/// --mark-reported` passes [`Recorder`] to consume it on purpose. A replay
 /// passes [`NoHistory`] and never asks: it neither says nor records one.
 pub trait DeclarationStore {
     fn last_seen(&self, repo_key: &str) -> Result<Option<Seen>, String>;
