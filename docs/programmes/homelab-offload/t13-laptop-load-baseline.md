@@ -11,6 +11,36 @@ repos = ["relais"]
 
 Measure the 1/5/15-minute load average and CPU-seconds per day, split between heavy checks and Claude Code processes, over 7 days and before anything moves; record heavy-slot occupancy. The first run records what already exists (ledger timings, heavy-slot waits) and writes the sampler spec here: command, output path, stop condition. Starting the sampler is the first step of this ticket's next session; the ticket closes when the window ends, with the target the Destination uses.
 
+## Look at
+
+- `~/.local/state/laptop-load/samples.tsv`: the sampler's rows,
+  `load <epoch> <ncpu> <l1> <l5> <l15>` and `cpu <epoch> <bucket> <cpu_s>`.
+  The window is epoch 1793571060 to 1794175860.
+- `~/.local/share/laptop-load/sample.py` and
+  `~/Library/LaunchAgents/local.laptop-load.plist`: how a sample is taken.
+- `~/.local/state/relais/ledger.sqlite`, table `check_timings` (relais#367):
+  per-check wall time within the window.
+- `waiting_for_slot` events in
+  `~/.local/state/relais/runs/<run>/events.jsonl`: slot waits, maximum per
+  run, as in the 7-day table below.
+- This ticket's Findings so far: the 10-25 to 10-31 table and the candidate
+  target.
+
+## Answer looks like
+
+- **Coverage:** minutes sampled out of the window's 10,080, because sleep
+  leaves gaps.
+- **Per day, in a table:**
+  - the working-hours median and p90 of load15 (09:00–20:00 local);
+  - CPU-seconds for each bucket (claude, cargo, node, relais-launched,
+    other);
+  - check wall-seconds;
+  - runs that waited on a slot, and the median wait per run.
+- **The target:** one sentence the Destination quotes. For example,
+  "working-hours median load15 below N on 12 CPUs, and relais-launched plus
+  cargo CPU-seconds per day down X% from this baseline", with N and X taken
+  from the table.
+
 ## Findings so far
 
 Explore research, 2026-10-31 (the relais inspect run was blocked by low disk).
