@@ -1,0 +1,15 @@
+amont-provenance-v1
+commit c64d9c92bc097239550cc8bb2407c8628db0ef3d
+tree f1a9bd669b69b812308f534621db0076d3545152
+canon 51978a25ef7b2ba85ae0c505c75dc76c3e9aea13
+plan docs/plans/2026-11-06-fix-relais-six-open-issues.md a562f6b0a7ed62451b6362c7a2cf74918bf69f655aebe08998573f79bcd7a1f8
+review reviewed 260c12a835ae01f32345559efd7e02f2ef75bd1a3bc2332ccc0687d533c46e4e
+preview not-required
+producer amont-agent 3.20.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAECQyDvFO/fCLdA6/xMKmmamtzJMZ3PvZpojXpeQ/WBPNfJRhC
+YqJG36QwW2LSBc3JIMXbtwekX86RoubMAUyNUC
+-----END SSH SIGNATURE-----
