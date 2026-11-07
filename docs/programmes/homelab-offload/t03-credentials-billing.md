@@ -21,3 +21,11 @@ mounted only into worker pods, never into check pods. This is the one carve-out 
   no per-key budgets, and no `/v1/messages` route.
 - **Gate:** the direction holds only after the end-to-end test in
   t24-litellm-live-test, which blocks t02.
+
+## Amended 2026-11-07 (the person)
+
+The person changed the direction. The person already sends Claude, Codex and Qwen requests through a CLIProxyAPI on the Mac (`ANTHROPIC_BASE_URL=http://127.0.0.1:8317`). Worker pods will reach models through a CLIProxyAPI, plus its management center, running on the homelab, not through a `claude setup-token` in Vault.
+
+- **The floor:** the OAuth tokens stay inside the proxy. A worker pod holds only a proxy access key, which narrows the carve-out from t09's floor.
+- **Spend:** still capped by relais's ledger; t27 checks what the proxy itself reports.
+- **Tickets:** t27 (how the proxy runs on the homelab) and t28 (which proxy owns each OAuth account) come first; then t24 tests the path end to end.

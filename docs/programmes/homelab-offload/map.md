@@ -39,6 +39,7 @@ production.
   `prog/<slug>/<id>`, but amont's push gate rejects a `prog/` prefix
   (`amont-runtime/src/vocabulary.rs:81`). Until that is reconciled, ticket
   sessions use `docs/homelab-offload-<id>`.
+- The person, 2026-11-07: worker pods reach Claude, Codex and Qwen through a CLIProxyAPI and its management center (router-for-me/CLIProxyAPI, Cli-Proxy-API-Management-Center) run on the homelab, as the Mac does today on 127.0.0.1:8317; t03 is amended.
 - Plan that charted this map: `docs/plans/2026-10-31-relais-runs-on-the-homelab.md`.
 
 ## Decisions so far
@@ -51,7 +52,7 @@ production.
 - [How amont earns and signs a stamp for a tree a pod verified](t22-stamp-from-remote-run.md): it doesn't stamp (ADR-0015); the pod's signed attestation counts on the laptop only for gates declared `platform=any`; it amends ADR-0015 and adds a decisions ADR beside ADR-0041.
 - [Which gates in the fleet are platform-independent, and which repos are Linux-primary](t23-gate-platform-inventory.md): lint, types and cycle checks (JS/TS, Python, relais scripts) are independent; relais and amont `cargo-test` stay macOS; the share waits for t13 and gate-named timings.
 - [Is "every dispatch native" amended for remote runs](t01-native-dispatch-amendment.md): only when worker pods land (t02), by a relais ADR; a pod worker is relais's own worker.
-- [Which credential a pod uses, and where the token budget is enforced](t03-credentials-billing.md): a long-lived `claude setup-token` in Vault, worker pods only; spend capped by relais's ledger; gated on t24.
+- [Which credential a pod uses, and where the token budget is enforced](t03-credentials-billing.md): *(amended 2026-11-07 by the person)* worker pods call a homelab CLIProxyAPI with a proxy access key; the OAuth tokens stay in the proxy; spend capped by relais's ledger; gated on t27, t28, then t24.
 - [What the automatic loop may never widen](t09-sandbox-floor.md): PSA restricted, non-root, no token automount, no secrets or hostPath, world, vault and the apiserver denied; the loop only tightens.
 - [May relais pods run on wk-3, or does offload wait for wk-4](t19-wk3-for-relais.md): yes, under quota and `relais-batch` priority (the person, 2026-10-31).
 - [May a stamp earned in a Linux pod satisfy the laptop's gate](t20-stamp-platform-rule.md): per gate; platform-independent gates only (the person, 2026-11-01).
