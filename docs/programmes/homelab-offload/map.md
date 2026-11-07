@@ -44,6 +44,9 @@ production.
 
 ## Decisions so far
 
+- [How the CLIProxyAPI auth volume is backed up and restored](t29-cliproxy-auth-backup.md): the existing Velero daily/weekly/monthly schedules with `cliproxy` added; a restore assumes fresh sign-ins because refresh tokens rotate; off-site data copy and a drill go to the deploy plan.
+- [Which proxy owns each OAuth account once the homelab runs one](t28-oauth-account-owner.md): the homelab proxy holds every account and the Mac points at it, its own proxy stopped (the person, 2026-11-07); cutover never runs both; the off-LAN path is t30.
+- [How CLIProxyAPI and its management center run on the homelab](t27-cliproxy-on-homelab.md): upstream `eceasy/cli-proxy-api` by digest, one replica on an RWO PVC (refresh rewrites the OAuth files), per-consumer access keys from Vault, the bundled panel with management not routed, `cliproxy` namespace egress to Anthropic/OpenAI/the LiteLLM gateway; next: a deploy plan after t28.
 - [How work handed to the cluster outlives the laptop](t26-execution-service.md): two lanes; commit-blocking gates keep the kubectl executor, everything else becomes an Argo Workflow (already installed) fed by a Forgejo snapshot (real parent) or a pull-mirror; Argo holds slots, cancel and 7-day results; the laptop stays the only signer and collects on wake (t25 reopens with worker pods); next: a build plan.
 - [Where the pod's attestation signing key lives](t25-pod-signing-key.md): nowhere new; the laptop's amont signs from Kubernetes-recorded facts (exit code, imageID, Job spec), one Job per gate, Job-create fenced to the coordinator.
 - [Which slice ships first and alone](t15-first-slice.md): amont runs `platform=any` gates (lint, types, cycles) on wk-3, one Job per gate, laptop-signed; enabled after the t13 window.
