@@ -353,6 +353,17 @@ pub struct LaunchResult {
     /// booked message priced.
     #[serde(default)]
     pub unpriced: Vec<String>,
+    /// Set when the worker was lost without being told to stop (the plugin
+    /// went silent): it may still be writing the tree it ran in.
+    #[serde(default)]
+    pub lost_worker: Option<LostWorker>,
+}
+
+/// A worker whose session vanished while it ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LostWorker {
+    /// The agent the worker ran as; `None` when none had bound.
+    pub agent: Option<String>,
 }
 
 impl LaunchResult {
@@ -576,6 +587,7 @@ mod tests {
             failure_detail: None,
             booked_message_ids: Vec::new(),
             unpriced: Vec::new(),
+            lost_worker: None,
         };
         assert!(result.terminal_result_missing());
         let completed = LaunchResult {
@@ -624,6 +636,7 @@ mod tests {
             failure_detail: None,
             booked_message_ids: vec!["m1".into()],
             unpriced: Vec::new(),
+            lost_worker: None,
         })
         .expect("serializes");
         stored

@@ -721,7 +721,18 @@ impl<'a> RunEngine<'a> {
                 "task",
                 cancel,
             )
-        })?;
+        });
+        let setup = match setup {
+            Ok(setup) => setup,
+            Err(verify::VerifyError::Lease(stop)) => {
+                let nominal = fresh_progress(&preflight).budget;
+                let kept = self.verify_source(&preflight);
+                let outcome = self.end_on_lease_stop(stop, &nominal, kept.as_ref())?;
+                self.retire_worktree(&worktree, &outcome)?;
+                return Ok(outcome);
+            }
+            Err(e) => return Err(e.into()),
+        };
         self.record_logs(None, EvidenceKind::SetupLog, &setup)?;
         if let Some(outcome) = self.end_if_cancelled()? {
             self.retire_worktree(&worktree, &outcome)?;

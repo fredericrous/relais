@@ -554,3 +554,143 @@ fn sample_receipt() -> crate::verify::Receipt {
         holdouts: Vec::new(),
     }
 }
+
+const FLEET_RULES_JSON: &str = r#"{"rules":[{"active":true,"adopts":"ADR-0011","body":"BODY-OF-NAMES-REVEAL-INTENT","file":"aval.pack","governs":"code","id":"names.reveal-intent","level":"constraint","pack":"decisions","source":"x","statement":"STATEMENT-OF-NAMES-REVEAL-INTENT"}]}"#;
+
+/// A repository with no decisions corpus (aval exits 3 there) whose code
+/// rules come from the fleet decisions directory, and whose adr-lint lists
+/// a candidate; every call is logged in order.
+struct NoCorpus {
+    log: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl crate::context::DecisionResolver for NoCorpus {
+    fn resolve(&self, _key: &str, _scope: Option<&str>) -> AvalVerdict {
+        AvalVerdict::Unknown
+    }
+
+    fn constraint_rules(&self) -> Result<crate::context::Rules, GuidanceGap> {
+        let in_repository = |_: &[String]| {
+            Err(GuidanceGap::new(
+                crate::context::GuidanceSource::Index,
+                crate::context::guidance::GapCause::Exited(3),
+                "aval exit 3",
+            ))
+        };
+        let in_fleet = |_: &[String]| Ok(FLEET_RULES_JSON.to_string());
+        crate::context::guidance::fetch_rules_or_fleet(&in_repository, Some(&in_fleet))
+    }
+
+    fn candidates_for(&self, _base: &str, _head: &str) -> Result<CandidateList, GuidanceGap> {
+        self.log.lock().expect("log").push("candidates");
+        Ok(CandidateList {
+            candidates: vec![candidate_on("src/main.rs", 'a')],
+            overflow: std::collections::BTreeMap::new(),
+        })
+    }
+}
+
+/// Runs a reviewed task in a repository with no corpus; returns the log and the
+/// reviewer prompts.
+fn no_corpus_run() -> (Vec<&'static str>, Vec<String>) {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let resolver = NoCorpus {
+        log: Arc::clone(&log),
+    };
+    let worker_log = Arc::clone(&log);
+    let (backend, reviewer_prompts) = ruling_backend(
+        {
+            let inner = conditional_worker("relais task");
+            MockBackend::new(move |spec| {
+                if spec.prompt.contains("BODY-OF-NAMES-REVEAL-INTENT") {
+                    worker_log.lock().expect("log").push("worker");
+                }
+                (inner.behavior)(spec)
+            })
+        },
+        |_| String::new(),
+    );
+    let outcome = fixture.execute_as_resolving(
+        &resolver,
+        None,
+        &fixture.contract(Review::Required),
+        &repo,
+        &backend,
+    );
+    assert!(
+        matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    let reviewer = reviewer_prompts.lock().expect("prompts").clone();
+    let events = log.lock().expect("log").clone();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch directory
+    (events, reviewer)
+}
+
+#[test]
+fn a_repository_without_a_corpus_gives_worker_and_reviewer_the_same_fleet_rules() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let resolver = NoCorpus { log };
+    let worker_prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let kept = Arc::clone(&worker_prompts);
+    let inner = conditional_worker("relais task");
+    let (backend, reviewer_prompts) = ruling_backend(
+        MockBackend::new(move |spec| {
+            kept.lock()
+                .expect("worker prompts")
+                .push(spec.prompt.clone());
+            (inner.behavior)(spec)
+        }),
+        |_| String::new(),
+    );
+    accepted(fixture.execute_as_resolving(
+        &resolver,
+        None,
+        &fixture.contract(Review::Required),
+        &repo,
+        &backend,
+    ));
+    let worker = worker_prompts.lock().expect("worker prompts");
+    let reviewer = reviewer_prompts.lock().expect("reviewer prompts");
+    let worker_rules = fenced(
+        worker.first().expect("a worker prompt"),
+        "code rules in force",
+    )
+    .expect("the worker's code rules");
+    let reviewer_rules = fenced(
+        reviewer.first().expect("a reviewer prompt"),
+        "code rules in force",
+    )
+    .expect("the reviewer's code rules");
+    assert!(
+        worker_rules.contains("BODY-OF-NAMES-REVEAL-INTENT"),
+        "{worker_rules}"
+    );
+    assert!(
+        worker_rules.contains("STATEMENT-OF-NAMES-REVEAL-INTENT"),
+        "{worker_rules}"
+    );
+    assert_eq!(worker_rules, reviewer_rules);
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch directory
+}
+
+#[test]
+fn a_match_made_by_the_candidate_follows_a_worker_prompt_that_already_had_the_rule() {
+    let (events, reviewer) = no_corpus_run();
+    assert_eq!(events, ["worker", "candidates"]);
+    let prompt = reviewer.first().expect("a reviewer prompt");
+    assert!(prompt.contains("<<<CANDIDATES sha="), "{prompt}");
+    let start = prompt
+        .find("<<<CANDIDATES sha=")
+        .expect("a CANDIDATES block");
+    let block = &prompt[start..];
+    let block = &block[..block.find("<<<END CANDIDATES>>>").expect("a closing fence")];
+    assert!(
+        block.contains("names.reveal-intent/rust-weak-name src/main.rs:2"),
+        "{block:?}"
+    );
+}

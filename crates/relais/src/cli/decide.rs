@@ -183,6 +183,11 @@ pub(crate) fn decide_in(
     request: &DecideRequest<'_>,
     locate: &dyn Fn() -> Result<StateLocations, CliError>,
 ) -> Result<Decision, CliError> {
+    if request.answer == DecideAnswer::Abandon {
+        if let Some(fence) = standing_worker_fence(locate, request.run_id)? {
+            return Ok(refusal(CliOutcome::ResumeRefusedLive, fence));
+        }
+    }
     let mut decision = record_answer(request, locate)?;
     if let Ok(done) = &mut decision {
         let frees_in_place = matches!(
@@ -192,7 +197,7 @@ pub(crate) fn decide_in(
         if frees_in_place && done.from_state == State::Interrupted {
             // The answer is already recorded: whatever goes wrong freeing
             // the worktree is reported inside the answer, never as an error.
-            let report = match free_after_answer(locate, done) {
+            let report = match free_after_answer(locate, done, request.answer) {
                 Ok(report) => report,
                 Err(e) => Some(format!(
                     "the in-place worktree could not be freed ({e}); finish it with \
@@ -208,25 +213,52 @@ pub(crate) fn decide_in(
     Ok(decision)
 }
 
+/// The refusal text when `run` is an in-place run that lost a worker nothing
+/// proves stopped: abandoning it would hand the tree to the person while the
+/// worker may still write it. `None` when the run holds no such fence, or
+/// when its marker cannot be read (that is reported when the tree is freed).
+fn standing_worker_fence(
+    locate: &dyn Fn() -> Result<StateLocations, CliError>,
+    run_id: &str,
+) -> Result<Option<String>, CliError> {
+    use relais::workspace::inplace;
+    let locations = locate()?;
+    let ledger = operational(Ledger::open(&locations.ledger), "the ledger is unavailable")?;
+    let run = RunId::from_stored(run_id);
+    let Some(workspace) = operational(ledger.run_workspace(&run), "decide")? else {
+        return Ok(None);
+    };
+    let marker = inplace::git_dir(&workspace.repo_path)
+        .and_then(|git_dir| inplace::read_marker(&git_dir, run.as_str()));
+    Ok(marker
+        .ok()
+        .and_then(|marker| marker.orphan)
+        .filter(|orphan| orphan.standing())
+        .map(|orphan| orphan.fence_text(run.as_str(), &relais::ledger::now_rfc3339())))
+}
+
 fn free_after_answer(
     locate: &dyn Fn() -> Result<StateLocations, CliError>,
     done: &Decided,
+    answer: DecideAnswer,
 ) -> Result<Option<String>, CliError> {
     let locations = locate()?;
     let ledger = operational(Ledger::open(&locations.ledger), "the ledger is unavailable")?;
     let run = RunId::from_stored(&done.run);
-    free_kept_in_place(&ledger, &run, done.to_state, &locations.runs)
+    free_kept_in_place(&ledger, &run, answer, done.to_state, &locations.runs)
 }
 
 /// What answering an interrupted in-place run does to its worktree marker.
-/// Only a moved HEAD means the tree and branch are the person's, so only
-/// then is the marker retired (the code `relais resume --retire` runs);
-/// otherwise it stays and the command that retires it is named. Only a
+/// A moved HEAD means the tree and branch are the person's, so the marker
+/// is retired (the code `relais resume --retire` runs); so it is for an
+/// abandon whose HEAD did not move and whose working tree equals the start
+/// snapshot, since nothing is kept to lose. Otherwise it stays and the command that retires it is named. Only a
 /// missing marker means there is nothing to free; every other failure is
 /// named in the returned report.
 fn free_kept_in_place(
     ledger: &Ledger,
     run: &RunId,
+    answer: DecideAnswer,
     state: State,
     runs_dir: &Path,
 ) -> Result<Option<String>, CliError> {
@@ -273,7 +305,10 @@ fn free_kept_in_place(
             )))
         }
     };
-    if !head_moved {
+    let nothing_kept = !head_moved
+        && answer == DecideAnswer::Abandon
+        && tree_equals_start(&workspace.repo_path, &git_dir, run, &marker.start);
+    if !head_moved && !nothing_kept {
         return Ok(Some(format!(
             "the in-place worktree {} still holds a marker for it; HEAD did not move, so \
              finish it with `relais resume --retire {run}`",
@@ -293,6 +328,23 @@ fn free_kept_in_place(
         },
     )?;
     Ok(Some(lines.join("; ")))
+}
+
+/// Whether the working tree (untracked non-ignored files included) is the
+/// start snapshot's tree. Any failure to tell answers no: the marker stays.
+fn tree_equals_start(root: &Path, git_dir: &Path, run: &RunId, start: &str) -> bool {
+    use relais::workspace::inplace;
+    let index = git_dir.join(format!("relais-decide-{run}.index"));
+    let now = inplace::working_tree(root, &index);
+    let _ = std::fs::remove_file(&index); // scratch index; `working_tree` deletes a stale one before it rebuilds
+    let Ok(now) = now else { return false };
+    let start_tree = relais::workspace::git_command(root)
+        .args(["rev-parse", &format!("{start}^{{tree}}")])
+        .output();
+    match start_tree {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim() == now,
+        Ok(_) | Err(_) => false,
+    }
 }
 
 fn record_answer(
@@ -1126,6 +1178,7 @@ mod tests {
                 index_listing: start.index_listing.clone(),
                 target: None,
                 exported: None,
+                orphan: None,
             })
             .expect("marker");
         drop(lease);
@@ -1184,6 +1237,129 @@ mod tests {
         git(worktree, &["commit", "-q", "-am", "worker"]);
     }
 
+    /// The marker of `run` in `worktree` says its worker was lost on 2026-01-01,
+    /// well past the escalation point, and nobody has confirmed it stopped.
+    fn lose_worker(worktree: &Path, run: &str) {
+        use relais::workspace::inplace::{self, OrphanedWorker};
+        let git_dir = inplace::git_dir(worktree).expect("git dir");
+        let mut marker = inplace::read_marker(&git_dir, run).expect("marker");
+        marker.orphan = OrphanedWorker::lost_at(
+            "dispatch-7",
+            "sess",
+            Some("agent-7"),
+            "2026-01-01T10:00:00+00:00",
+        );
+        std::fs::write(
+            inplace::marker_file(&git_dir, run),
+            serde_json::to_string_pretty(&marker).expect("json"),
+        )
+        .expect("marker");
+    }
+
+    fn try_answer(dir: &Path, run_id: &str, answer: DecideAnswer) -> Decision {
+        let locations = || {
+            Ok(StateLocations {
+                ledger: dir.join("ledger.sqlite"),
+                runs: dir.join("runs"),
+            })
+        };
+        decide_in(
+            &DecideRequest {
+                run_id,
+                answer,
+                actor: "orchestrator",
+                person_quote: None,
+                note: None,
+                successor: None,
+                criterion: None,
+                candidate: None,
+                widen_scope: false,
+                rerun_verify: false,
+                successor_contract: None,
+                json: false,
+                proof_stdin: false,
+            },
+            &locations,
+        )
+        .expect("decide runs")
+    }
+
+    #[test]
+    fn abandoning_a_run_whose_lost_worker_may_still_write_is_refused() {
+        let dir = relais::test_support::short_temp_dir("decide-inplace-orphan-abandon");
+        let (ledger, worktree) = interrupted_in_place(&dir, "run-lost");
+        lose_worker(&worktree, "run-lost");
+        move_head(&worktree);
+        let Err(refused) = try_answer(&dir, "run-lost", DecideAnswer::Abandon) else {
+            panic!("the abandon is refused");
+        };
+        assert!(matches!(refused.outcome, CliOutcome::ResumeRefusedLive));
+        assert!(
+            refused
+                .message
+                .starts_with(relais::workspace::inplace::WORKER_MAY_RUN),
+            "{}",
+            refused.message
+        );
+        assert!(
+            refused.message.contains("dispatch-7"),
+            "{}",
+            refused.message
+        );
+        assert!(
+            refused.message.contains("--worker-stopped"),
+            "{}",
+            refused.message
+        );
+        assert!(
+            refused.message.contains("escalation point has passed"),
+            "a stale fence says a stop or --worker-stopped is still required: {}",
+            refused.message
+        );
+        assert!(marker_exists(&worktree, "run-lost"));
+        assert_eq!(
+            ledger
+                .run_status(&RunId::from_stored("run-lost"))
+                .expect("status"),
+            Some(State::Interrupted),
+            "nothing was recorded"
+        );
+    }
+
+    #[test]
+    fn salvaging_a_run_whose_lost_worker_may_still_write_keeps_the_marker_and_says_why() {
+        let dir = relais::test_support::short_temp_dir("decide-inplace-orphan-salvage");
+        let (_ledger, worktree) = interrupted_in_place(&dir, "run-lost");
+        lose_worker(&worktree, "run-lost");
+        move_head(&worktree);
+        let decided = answer_with(&dir, "run-lost", DecideAnswer::Salvaged);
+        assert!(
+            decided.sentence.contains("inplace_worker_may_run"),
+            "{}",
+            decided.sentence
+        );
+        assert!(marker_exists(&worktree, "run-lost"));
+    }
+
+    #[test]
+    fn the_persons_word_frees_a_lost_worker_and_the_abandon_goes_through() {
+        use relais::workspace::inplace::{self, StoppedBy};
+        let dir = relais::test_support::short_temp_dir("decide-inplace-orphan-word");
+        let (_ledger, worktree) = interrupted_in_place(&dir, "run-lost");
+        lose_worker(&worktree, "run-lost");
+        move_head(&worktree);
+        let git_dir = inplace::git_dir(&worktree).expect("git dir");
+        assert!(inplace::confirm_stopped(
+            &inplace::marker_file(&git_dir, "run-lost"),
+            "dispatch-7",
+            StoppedBy::Person,
+            "2026-11-07T11:00:00+00:00",
+        )
+        .expect("confirm"));
+        answer_with(&dir, "run-lost", DecideAnswer::Abandon);
+        assert!(!marker_exists(&worktree, "run-lost"));
+    }
+
     #[test]
     fn salvaging_an_interrupted_run_whose_head_moved_frees_its_worktree() {
         let dir = relais::test_support::short_temp_dir("decide-inplace-salvage");
@@ -1218,6 +1394,42 @@ mod tests {
             decided
                 .sentence
                 .contains("relais resume --retire run-still"),
+            "{}",
+            decided.sentence
+        );
+    }
+
+    #[test]
+    fn abandoning_an_unmoved_clean_run_retires_the_marker() {
+        let dir = relais::test_support::short_temp_dir("decide-inplace-clean");
+        let (_ledger, worktree) = interrupted_in_place(&dir, "run-clean");
+        answer_with(&dir, "run-clean", DecideAnswer::Abandon);
+        assert!(!marker_exists(&worktree, "run-clean"));
+    }
+
+    #[test]
+    fn abandoning_an_unmoved_run_with_a_tracked_edit_keeps_the_marker() {
+        let dir = relais::test_support::short_temp_dir("decide-inplace-edit");
+        let (_ledger, worktree) = interrupted_in_place(&dir, "run-edit");
+        std::fs::write(worktree.join("a.txt"), "edited\n").expect("edit");
+        let decided = answer_with(&dir, "run-edit", DecideAnswer::Abandon);
+        assert!(marker_exists(&worktree, "run-edit"));
+        assert!(
+            decided.sentence.contains("relais resume --retire run-edit"),
+            "{}",
+            decided.sentence
+        );
+    }
+
+    #[test]
+    fn abandoning_an_unmoved_run_with_an_untracked_file_keeps_the_marker() {
+        let dir = relais::test_support::short_temp_dir("decide-inplace-untracked");
+        let (_ledger, worktree) = interrupted_in_place(&dir, "run-new");
+        std::fs::write(worktree.join("new.txt"), "x\n").expect("new");
+        let decided = answer_with(&dir, "run-new", DecideAnswer::Abandon);
+        assert!(marker_exists(&worktree, "run-new"));
+        assert!(
+            decided.sentence.contains("relais resume --retire run-new"),
             "{}",
             decided.sentence
         );

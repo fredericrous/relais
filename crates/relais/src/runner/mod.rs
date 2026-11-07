@@ -86,7 +86,7 @@ pub use machine::{
 use prompt::{build_prompt, build_review_repair_prompt, conflict_block, RepairFailure};
 pub(crate) use prompt::{data_block, data_list_block, relevant_block};
 use review::reviewer_guidance;
-pub(crate) use review::{review_record_of, ReviewOutcome, ReviewRequest};
+pub(crate) use review::{review_record_of, PatchBasis, ReviewOutcome, ReviewRequest};
 pub(crate) use spend::{effort_str, spend_limit, utc_day_start, Ceiling, RunSpend};
 use spend::{fresh_progress, Progress};
 pub use types::PackageRole;

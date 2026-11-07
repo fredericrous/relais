@@ -23,10 +23,15 @@ use serde::{Deserialize, Serialize};
 use crate::policy::ConcurrencyLimits;
 
 mod native;
+mod orphan;
 pub use native::{
     AgentStatus, AgentUsage, BindNativeOutcome, BoundOutcome, ClaimOutcome, NativeAnswer,
     NativeAsk, NativeProgress, NativeState, RegisterOutcome, StopNativeOutcome, StoppedOutcome,
     StoppedReport, WorktreeOutcome,
+};
+pub use orphan::{
+    read_journal as read_orphan_journal, released_dispatches as released_orphans, HeldOrphan,
+    NoFence, OrphanEffects, OrphanFence, OrphanRegistration, OrphanReport,
 };
 
 /// Poll period while waiting on the coordinator: queued for admission, or
@@ -1188,6 +1193,13 @@ pub struct AdmissionState {
     /// measured) and when it was taken, so the queue is not re-measured
     /// on every poll. See `volumes_for`.
     disk_measured: BTreeMap<String, (Option<crate::disk::Volume>, Instant)>,
+    /// In-place workers a run lost: held until their stop is seen.
+    orphans: orphan::OrphanTable,
+    /// How the markers those orphans fence are read and written.
+    orphan_fence: std::sync::Arc<dyn OrphanFence>,
+    /// Where held orphans are journalled so a restart keeps them; `None`
+    /// keeps them in memory only.
+    orphan_journal: Option<std::path::PathBuf>,
 }
 
 /// How long a measurement of a path's volume is reused before the disk is
@@ -1235,7 +1247,98 @@ impl AdmissionState {
             disk_floor: 0,
             disk_probe: std::sync::Arc::new(crate::disk::StatvfsProbe),
             disk_measured: BTreeMap::new(),
+            orphans: orphan::OrphanTable::default(),
+            orphan_fence: std::sync::Arc::new(NoFence),
+            orphan_journal: None,
         }
+    }
+
+    /// Journal held orphans to `path`, and take back those a previous
+    /// coordinator left there.
+    pub fn adopt_orphans(&mut self, path: std::path::PathBuf, held: Vec<HeldOrphan>) {
+        self.orphans.adopt(held);
+        self.orphan_journal = Some(path);
+    }
+
+    /// Read and write in-place markers through `fence`. A state built
+    /// without one knows no marker and refuses every orphan report.
+    pub fn set_orphan_fence(&mut self, fence: std::sync::Arc<dyn OrphanFence>) {
+        self.orphan_fence = fence;
+    }
+
+    /// The in-place workers the coordinator holds a fence for.
+    pub fn held_orphans(&self) -> Vec<OrphanReport> {
+        self.orphans.held().cloned().collect()
+    }
+
+    /// The held orphans and the fence to read their markers with, for a
+    /// sweep that reads files with no lock held.
+    pub fn orphan_sweep_input(&self) -> (Vec<OrphanReport>, std::sync::Arc<dyn OrphanFence>) {
+        (
+            self.held_orphans(),
+            std::sync::Arc::clone(&self.orphan_fence),
+        )
+    }
+
+    /// Drop the held orphans whose markers are confirmed. `dispatches` comes
+    /// from [`released_orphans`], read with no lock held.
+    pub fn release_orphans(&mut self, dispatches: &[String]) {
+        self.orphans.release(dispatches);
+    }
+
+    /// A run lost the worker of an in-place dispatch: hold it until its
+    /// agent's stop is seen. The stop may already have been (remembered for
+    /// the agent, or recorded on the dispatch's native state), and then the
+    /// confirmation is queued at once. Call before the dispatch settles,
+    /// while its native record still exists.
+    pub fn report_orphan(&mut self, mut report: OrphanReport) -> OrphanRegistration {
+        // Two different refusals: a dispatch this coordinator never knew (a
+        // restart mid-run) is not a wrong marker, and saying so would send
+        // the operator to the wrong place.
+        let Some(dispatch) = self.dispatches.get(&report.dispatch_id) else {
+            return OrphanRegistration::Refused {
+                reason: format!(
+                    "dispatch {} is unknown to this coordinator; the marker {} still fences \
+                     the tree",
+                    report.dispatch_id,
+                    report.marker.display()
+                ),
+            };
+        };
+        if !self
+            .orphan_fence
+            .owns_marker(&report.marker, &dispatch.run_id)
+        {
+            return OrphanRegistration::Refused {
+                reason: format!(
+                    "{} is not the in-place marker of the run of dispatch {}",
+                    report.marker.display(),
+                    report.dispatch_id
+                ),
+            };
+        }
+        let (agent, stopped) = self.native_agent_of(&report.dispatch_id);
+        if report.agent_id.is_none() && agent.is_some() {
+            report.agent_id = agent;
+            self.orphans.note_named(report.clone());
+        }
+        let remembered = report.agent_id.as_deref().is_some_and(|agent| {
+            self.stopped
+                .contains(&(report.session_id.clone(), agent.to_string()))
+        });
+        let prior_stop = if stopped || remembered {
+            orphan::PriorStop::Seen
+        } else {
+            orphan::PriorStop::Unseen
+        };
+        self.orphans.register(report, prior_stop)
+    }
+
+    /// The files the orphan table asks to be written. Applied by the caller
+    /// once the admission lock is released.
+    pub fn take_orphan_effects(&mut self) -> OrphanEffects {
+        self.orphans
+            .take_effects(self.orphan_journal.as_deref(), &self.orphan_fence)
     }
 
     /// Hold heavy leases that ask about the disk to `floor` bytes available
@@ -2169,6 +2272,7 @@ impl AdmissionState {
         spent_micros: Option<i64>,
         now: Instant,
     ) -> AgentSettleOutcome {
+        self.orphans.note_stop(session_id, agent_id);
         let bound = self
             .dispatches
             .iter()
@@ -3333,6 +3437,12 @@ pub trait Gate {
     ) -> Result<AgentSettleOutcome, GateError> {
         Ok(AgentSettleOutcome::NothingBound)
     }
+    /// A run lost the worker of an in-place dispatch (see
+    /// `AdmissionState::report_orphan`). The default holds nothing, so a gate
+    /// that tracks no agents leaves the marker's fence to the person.
+    fn report_orphan(&self, _report: &OrphanReport) -> Result<OrphanRegistration, GateError> {
+        Ok(OrphanRegistration::Held)
+    }
     /// Record what relais asked the parent session to run for an
     /// admitted dispatch (see `AdmissionState::register_native`). The
     /// native calls below default to a gate that holds no native
@@ -3553,12 +3663,35 @@ impl std::error::Error for GateError {
 /// scheduling that does not need cross-tab coordination.
 pub struct LocalGate {
     state: std::sync::Mutex<AdmissionState>,
+    /// The clock, RFC 3339, that stamps stop confirmations.
+    now_rfc3339: fn() -> String,
+}
+
+/// Lock the admission state after dropping the held orphans whose markers
+/// no longer fence their trees. The markers are read with no lock held; the
+/// returned guard is the one the caller goes on to use. Every holder of an
+/// admission state releases orphans through this one sequence.
+pub fn lock_releasing_orphans(
+    state: &std::sync::Mutex<AdmissionState>,
+) -> std::sync::MutexGuard<'_, AdmissionState> {
+    let lock = || {
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    };
+    let (held, fence) = lock().orphan_sweep_input();
+    let released = released_orphans(&held, fence.as_ref());
+    let mut guard = lock();
+    guard.release_orphans(&released);
+    guard
 }
 
 impl LocalGate {
-    pub fn new(limits: ConcurrencyLimits) -> Self {
+    /// `now_rfc3339` stamps stop confirmations.
+    pub fn new(limits: ConcurrencyLimits, now_rfc3339: fn() -> String) -> Self {
         Self {
             state: std::sync::Mutex::new(AdmissionState::new(limits)),
+            now_rfc3339,
         }
     }
 
@@ -3566,6 +3699,12 @@ impl LocalGate {
     /// with `probe` (SPEC §23).
     pub fn with_disk(self, floor: u64, probe: std::sync::Arc<dyn crate::disk::DiskProbe>) -> Self {
         self.admission().set_disk(floor, probe);
+        self
+    }
+
+    /// Read and write in-place markers through `fence`.
+    pub fn with_orphan_fence(self, fence: std::sync::Arc<dyn OrphanFence>) -> Self {
+        self.admission().set_orphan_fence(fence);
         self
     }
 
@@ -3587,6 +3726,19 @@ impl LocalGate {
 
     pub fn cancel_run(&self, run_id: &str) {
         self.admission().cancel_run(run_id, Instant::now());
+    }
+
+    /// Write what the orphan table asked for, with the lock released.
+    fn apply_orphan_effects(&self, at: &str) {
+        let effects = self.admission().take_orphan_effects();
+        effects.apply(at);
+    }
+
+    /// The same, after dropping the held orphans whose markers are
+    /// confirmed and owing the confirmation again to those still fenced.
+    fn sweep_and_apply_orphan_effects(&self, at: &str) {
+        let effects = lock_releasing_orphans(&self.state).take_orphan_effects();
+        effects.apply(at);
     }
 }
 
@@ -3692,9 +3844,17 @@ impl Gate for LocalGate {
         agent_id: &str,
         spent_micros: Option<i64>,
     ) -> Result<AgentSettleOutcome, GateError> {
-        Ok(self
-            .admission()
-            .settle_by_agent(session_id, agent_id, spent_micros, Instant::now()))
+        let outcome =
+            self.admission()
+                .settle_by_agent(session_id, agent_id, spent_micros, Instant::now());
+        self.sweep_and_apply_orphan_effects(&(self.now_rfc3339)());
+        Ok(outcome)
+    }
+
+    fn report_orphan(&self, report: &OrphanReport) -> Result<OrphanRegistration, GateError> {
+        let outcome = self.admission().report_orphan(report.clone());
+        self.sweep_and_apply_orphan_effects(&(self.now_rfc3339)());
+        Ok(outcome)
     }
 
     fn register_native(
@@ -3740,11 +3900,13 @@ impl Gate for LocalGate {
         agent_id: &str,
         last_assistant_message: Option<&str>,
     ) -> Result<StopNativeOutcome, GateError> {
-        Ok(self.admission().stop_native(
+        let outcome = self.admission().stop_native(
             session_id,
             agent_id,
             last_assistant_message.map(str::to_string),
-        ))
+        );
+        self.apply_orphan_effects(&(self.now_rfc3339)());
+        Ok(outcome)
     }
 
     fn native_hello(&self, session_id: &str) -> Result<(), GateError> {
@@ -5941,7 +6103,7 @@ mod tests {
 
     #[test]
     fn local_gate_round_trips_through_the_trait() {
-        let gate = LocalGate::new(limits());
+        let gate = LocalGate::new(limits(), crate::ledger::now_rfc3339);
         gate.register_run(&RunRegistration {
             run_id: "run-a".into(),
             session_id: "tab-a".into(),

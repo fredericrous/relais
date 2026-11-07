@@ -14,6 +14,9 @@ enum Heavy {
     Never,
     /// Once a worker or reviewer has been granted: verification queues.
     AfterModelWork,
+    /// After this many heavy grants (the baseline's): the task tree's setup
+    /// queues.
+    AfterHeavyGrants(usize),
 }
 
 /// A gate that answers like a `LocalGate` until the scripted moment, then
@@ -23,15 +26,20 @@ struct QueueingGate {
     heavy: Heavy,
     model_work_allowed: usize,
     model_work_granted: AtomicUsize,
+    heavy_granted: AtomicUsize,
 }
 
 impl QueueingGate {
     fn new(heavy: Heavy, model_work_allowed: usize) -> Self {
         Self {
-            inner: crate::admission::LocalGate::new(ConcurrencyLimits::default()),
+            inner: crate::admission::LocalGate::new(
+                ConcurrencyLimits::default(),
+                crate::ledger::now_rfc3339,
+            ),
             heavy,
             model_work_allowed,
             model_work_granted: AtomicUsize::new(0),
+            heavy_granted: AtomicUsize::new(0),
         }
     }
 }
@@ -54,10 +62,14 @@ impl Gate for QueueingGate {
                     Heavy::Free => false,
                     Heavy::Never => true,
                     Heavy::AfterModelWork => granted > 0,
+                    Heavy::AfterHeavyGrants(allowed) => {
+                        self.heavy_granted.load(Ordering::SeqCst) >= allowed
+                    }
                 };
                 if queued {
                     return Ok(Decision::Queued { position: 1 });
                 }
+                self.heavy_granted.fetch_add(1, Ordering::SeqCst);
             }
             ResourceClass::Indexing | ResourceClass::Training => {}
         }
@@ -300,4 +312,55 @@ fn an_expiry_with_no_candidate_under_verification_names_none() {
     assert!(blocked_detail(&fixture, &worker_queue)
         .get("candidate")
         .is_none());
+}
+
+/// The heavy grants a baseline takes with one setup step: the step, then the checks.
+const HEAVY_GRANTS_OF_A_BASELINE: usize = 2;
+
+#[test]
+fn an_expiry_while_the_task_trees_setup_queues_ends_blocked() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy_with_setup(vec![sh("true")], vec![main_gone_check()], 3);
+    let machine = queued_machine(&fixture, &repo);
+    let gate = QueueingGate::new(
+        Heavy::AfterHeavyGrants(HEAVY_GRANTS_OF_A_BASELINE),
+        usize::MAX,
+    );
+    let outcome = fixture.execute_managed(
+        &fixture.contract(Review::Off),
+        &repo,
+        &machine,
+        &conditional_worker("relais task"),
+        &gate,
+    );
+    // `blocked_detail` pins `Terminal::BlockedBy`; `cli/run.rs` maps every
+    // `BlockedBy` to `CliOutcome::Blocked`, which `cli/outcome.rs::exit_code`
+    // maps to 3. The binary-only `cli` module is out of reach of this test.
+    let detail = blocked_detail(&fixture, &outcome);
+    // The baseline finished first: its check ran and left its log. A stop
+    // during the baseline (`baseline.rs` handles that path already) ends
+    // with the same reason and no attempt, and would leave no such log.
+    let base_log = fixture
+        .artifacts
+        .join(outcome.run_id.as_str())
+        .join("logs")
+        .join("base-cmd0.log");
+    assert!(
+        base_log.exists(),
+        "the baseline's check ran before the stop: {}",
+        base_log.display()
+    );
+    // The stop came while the setup queued: no worker was dispatched, so no
+    // attempt exists, and the detail names no candidate and says nothing was
+    // launched. A stop during candidate verification would leave an attempt
+    // row with a candidate and a detail naming it.
+    let rows = attempt_rows(&fixture, &outcome.run_id);
+    assert!(rows.is_empty(), "{rows:?}");
+    assert!(detail.get("candidate").is_none(), "{detail}");
+    assert!(
+        detail["detail"]
+            .as_str()
+            .is_some_and(|text| text.ends_with("; nothing was launched")),
+        "{detail}"
+    );
 }

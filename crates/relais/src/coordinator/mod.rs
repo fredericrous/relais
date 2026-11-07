@@ -21,14 +21,15 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::admission::read_orphan_journal;
 use crate::admission::{
     AdmissionState, AgentSettleOutcome, Attribution, BindNativeOutcome, BindOutcome, BoundOutcome,
     ClaimOutcome, Decision, DispatchRequest, DispatchSource, Enforcement, Gate, GateError,
     GroupBinding, GroupChange, HeartbeatStatus, LifecycleOutcome, NativeAnswer, NativeAsk,
-    NativeProgress, PendingSignal, Provenance, RegisterOutcome, ReleaseWriteOutcome, ResourceClass,
-    ResumeOutcome, RunRegistration, Signal, StatusSnapshot, StopNativeOutcome, StoppedOutcome,
-    StoppedReport, TrainingDecision, WaitOutcome, WithdrawOutcome, WorktreeOutcome,
-    WriteLeaseOutcome, GROUP_KILL_AFTER,
+    NativeProgress, OrphanEffects, OrphanRegistration, OrphanReport, PendingSignal, Provenance,
+    RegisterOutcome, ReleaseWriteOutcome, ResourceClass, ResumeOutcome, RunRegistration, Signal,
+    StatusSnapshot, StopNativeOutcome, StoppedOutcome, StoppedReport, TrainingDecision,
+    WaitOutcome, WithdrawOutcome, WorktreeOutcome, WriteLeaseOutcome, GROUP_KILL_AFTER,
 };
 use crate::ipc::{Listener, Stream};
 use crate::ledger::{GroupBindingRow, Ledger};
@@ -204,7 +205,10 @@ const DESCRIPTOR_RETRIES: u32 = 20;
 /// v6 added the Training lease (`acquire_training`, `end_training`) and
 /// its `training` reply: a v5 daemon would refuse both, and a learning
 /// cycle that cannot ask for the lease must not run without one.
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// v7 added `report_orphan`: a run reports the in-place worker it lost, and
+/// a v6 daemon would refuse the call and leave the fence to the marker alone.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Why a coordinator call, election or startup failed. Every variant
 /// names the operation and the entity it was about, so a caller can tell
@@ -429,6 +433,11 @@ pub enum Request {
         session_id: String,
         agent_id: String,
     },
+    /// A run lost the worker of an in-place dispatch: hold the fence until
+    /// its agent's stop is seen.
+    ReportOrphan {
+        report: OrphanReport,
+    },
     /// Where a native dispatch is.
     NativeStatus {
         dispatch_id: String,
@@ -513,6 +522,7 @@ impl Request {
             Request::NativeBound { .. } => "native_bound",
             Request::NativeStopped { .. } => "native_stopped",
             Request::IsNativeAgent { .. } => "is_native_agent",
+            Request::ReportOrphan { .. } => "report_orphan",
             Request::NativeStatus { .. } => "native_status",
             Request::FinishRun { .. } => "finish_run",
             Request::AcquireWrite { .. } => "acquire_write",
@@ -739,6 +749,12 @@ pub fn elect(socket_path: &Path) -> Result<(Listener, LockFile), CoordinatorErro
     finish_election(socket_path).map(|listener| (listener, lock))
 }
 
+/// Where a coordinator journals the in-place workers it holds a fence for:
+/// beside the ledger it serves.
+fn orphan_journal_path(ledger: &Path) -> PathBuf {
+    ledger.with_file_name("inplace-orphans.json")
+}
+
 fn finish_election(socket_path: &Path) -> Result<Listener, CoordinatorError> {
     if socket_path.exists() {
         // A leftover endpoint from a crashed coordinator: prove it is dead
@@ -799,6 +815,7 @@ impl Coordinator {
             .unwrap_or_else(|| Path::new("."))
             .join("coordinator.lock");
         let mut state = AdmissionState::new(limits);
+        state.set_orphan_fence(Arc::new(crate::workspace::inplace::MarkerFence));
         // The machine's `binding_lease_secs` governs the lease a
         // hook-admitted agent is held on (SPEC §23): read here, at the
         // one place an `AdmissionState` is constructed for real, rather
@@ -890,6 +907,17 @@ impl Coordinator {
                     now,
                 );
             }
+        }
+        // The in-place workers the last coordinator held a fence for: those
+        // whose marker still says nobody confirmed them stopped.
+        if let Some(ledger) = ledger {
+            let path = orphan_journal_path(ledger.path());
+            let fence = crate::workspace::inplace::MarkerFence;
+            let standing = read_orphan_journal(&path)
+                .into_iter()
+                .filter(|held| crate::admission::OrphanFence::still_standing(&fence, &held.report))
+                .collect();
+            state.adopt_orphans(path, standing);
         }
         Ok((
             Self {
@@ -1062,6 +1090,8 @@ fn reconcile_loop(
     while wait_for_tick(shutdown) {
         // Ledger and file I/O happen here, before the admission lock.
         sweep_tick(ledger_path, &mut ledger);
+        let orphan_effects = crate::admission::lock_releasing_orphans(state).take_orphan_effects();
+        orphan_effects.apply(&crate::ledger::now_rfc3339());
         let now = Instant::now();
         let report = {
             let mut state = lock_state(state);
@@ -1500,6 +1530,7 @@ fn handle_connection(
     let oversized = read as u64 == cap && !line.ends_with('\n');
     let mut signals = Vec::new();
     let mut journaled = None;
+    let mut orphan_effects = OrphanEffects::default();
     // The kind of the request served, from its typed value; a line that
     // was refused before it became one is named for why.
     served.kind = "oversized";
@@ -1525,12 +1556,22 @@ fn handle_connection(
             Ok(request) => {
                 served.kind = request.method();
                 let waiting = Instant::now();
-                let mut guard = lock_state(state);
+                // Markers are read only for the requests that can change
+                // what is held, and on the reconcile tick.
+                let mut guard = if matches!(
+                    request,
+                    Request::ReportOrphan { .. } | Request::SettleByAgent { .. }
+                ) {
+                    crate::admission::lock_releasing_orphans(state)
+                } else {
+                    lock_state(state)
+                };
                 served.timings.admission_wait = waiting.elapsed();
                 let handling = Instant::now();
                 let before = guard.group_journal_end();
                 let (response, pending) = handle(request, &mut guard, Instant::now());
                 let after = guard.group_journal_end();
+                orphan_effects = guard.take_orphan_effects();
                 drop(guard);
                 served.timings.handling = handling.elapsed();
                 journaled = (after > before).then_some(after);
@@ -1556,6 +1597,11 @@ fn handle_connection(
     let phase = Instant::now();
     if let Some(end) = journaled {
         store.flush_through(state, end);
+    }
+    // A lost worker's stop confirmation is on its marker before the caller
+    // hears of it, written with the admission lock released.
+    if !orphan_effects.is_empty() {
+        orphan_effects.apply(&crate::ledger::now_rfc3339());
     }
     served.timings.flush = phase.elapsed();
     let payload = serde_json::to_string(&response).map_err(|e| CoordinatorError::Protocol {
@@ -1913,6 +1959,11 @@ pub fn handle(
         } => Response::Native {
             answer: NativeAnswer::Agent {
                 native: state.is_native_agent(&session_id, &agent_id),
+            },
+        },
+        Request::ReportOrphan { report } => Response::Native {
+            answer: NativeAnswer::Orphan {
+                outcome: state.report_orphan(report),
             },
         },
         Request::NativeStatus { dispatch_id } => Response::Native {
@@ -2657,6 +2708,16 @@ impl Gate for RemoteGate {
         )
     }
 
+    fn report_orphan(&self, report: &OrphanReport) -> Result<OrphanRegistration, GateError> {
+        self.native_call(
+            "report_orphan",
+            Request::ReportOrphan {
+                report: report.clone(),
+            },
+            NativeAnswer::orphan,
+        )
+    }
+
     fn native_status(&self, dispatch_id: &str) -> Result<NativeProgress, GateError> {
         self.native_call(
             "native_status",
@@ -3389,7 +3450,7 @@ mod tests {
         );
         check.kill().ok();
         check.wait().ok();
-        Client::new(socket).request(&Request::Shutdown).ok();
+        Client::new(socket).request(&Request::Shutdown).ok(); // the coordinator may close before replying
         server.join().expect("server").expect("served");
     }
 
@@ -3831,6 +3892,96 @@ mod tests {
         ));
         let _ = Client::new(socket.clone()).ping();
         server.join().expect("server thread").expect("serve");
+    }
+
+    /// A lost in-place worker reported to one coordinator is still fenced
+    /// by the next: the journal beside the ledger carries it, and the stop
+    /// that arrives after the restart writes its confirmation.
+    #[test]
+    fn a_lost_worker_reported_before_a_restart_is_freed_by_a_stop_after_it() {
+        use crate::workspace::inplace::{Marker, OrphanedWorker, Stage};
+        let dir = crate::test_support::short_temp_dir("orphan-restart-wire");
+        let git_dir = dir.join("git");
+        std::fs::create_dir_all(git_dir.join("relais-inplace")).expect("markers dir");
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+        let marker_path = git_dir.join("relais-inplace").join("run-1.json");
+        let marker = Marker {
+            run: "run-1".into(),
+            stage: Stage::Running,
+            head_symbolic: None,
+            head_sha: "0".repeat(40),
+            start: "0".repeat(40),
+            index_listing: String::new(),
+            target: None,
+            exported: None,
+            orphan: OrphanedWorker::lost_at(
+                "d-1",
+                "sess-1",
+                Some("a1"),
+                "2026-11-07T10:00:00+00:00",
+            ),
+        };
+        std::fs::write(&marker_path, serde_json::to_string(&marker).expect("json"))
+            .expect("marker");
+        let ledger = Ledger::open(&dir.join("ledger.db")).expect("ledger");
+        let standing = |path: &Path| {
+            let text = std::fs::read_to_string(path).expect("marker");
+            let marker: Marker = serde_json::from_str(&text).expect("json");
+            marker.orphan.expect("orphan").standing()
+        };
+
+        let socket = dir.join("relais.sock");
+        let (coordinator, listener) = Coordinator::start(
+            &socket,
+            limits(),
+            Some(&ledger),
+            crate::admission::DEFAULT_AGENT_LEASE_TTL,
+        )
+        .expect("start");
+        let server = std::thread::spawn(move || coordinator.serve(listener));
+        let gate = RemoteGate::new(socket.clone());
+        gate.register_run(&registration("run-1", "sess-1"))
+            .expect("register");
+        gate.admit(&request("d-1", "run-1", "sess-1"))
+            .expect("admit");
+        let report = OrphanReport {
+            dispatch_id: "d-1".into(),
+            session_id: "sess-1".into(),
+            agent_id: Some("a1".into()),
+            marker: marker_path.clone(),
+        };
+        let elsewhere = OrphanReport {
+            marker: dir.join("run-1.json"),
+            ..report.clone()
+        };
+        assert!(matches!(
+            gate.report_orphan(&elsewhere).expect("refused"),
+            OrphanRegistration::Refused { .. }
+        ));
+        assert_eq!(
+            gate.report_orphan(&report).expect("report"),
+            OrphanRegistration::Held
+        );
+        Client::new(socket.clone()).request(&Request::Shutdown).ok(); // the coordinator may close before replying
+        server.join().expect("server").expect("served");
+        assert!(standing(&marker_path), "a restart alone frees nothing");
+
+        let (coordinator, listener) = Coordinator::start(
+            &socket,
+            limits(),
+            Some(&ledger),
+            crate::admission::DEFAULT_AGENT_LEASE_TTL,
+        )
+        .expect("restart");
+        let server = std::thread::spawn(move || coordinator.serve(listener));
+        let gate = RemoteGate::new(socket.clone());
+        gate.settle_by_agent("sess-1", "a1", None).expect("stop");
+        assert!(
+            !standing(&marker_path),
+            "the stop after the restart frees the tree"
+        );
+        Client::new(socket).request(&Request::Shutdown).ok(); // the coordinator may close before replying
+        server.join().expect("server").expect("served");
     }
 
     // The native-dispatch calls over a real socket: each request reaches

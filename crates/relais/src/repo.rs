@@ -12,8 +12,8 @@ use crate::policy::{RepoIdentity, INIT_TEMPLATE};
 mod detect;
 
 pub use detect::{
-    detect_policy, escape_control, parse_command_text, CommandTextError, Proposal, ProposedCommand,
-    ProposedIntegrations, Skipped, DETECTED_PROFILE,
+    check_command_program, detect_policy, escape_control, parse_command_text, CommandTextError,
+    Proposal, ProposedCommand, ProposedIntegrations, Skipped, DETECTED_PROFILE,
 };
 
 /// Why no policy was found upward from a directory.

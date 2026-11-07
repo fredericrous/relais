@@ -5581,6 +5581,23 @@ fn a_repository_is_trusted_once_and_a_command_change_warns_once() {
     let plan = world.relais(&["plan", "--task", task.to_str().unwrap()]);
     assert!(!text(&plan.stderr).contains("commands changed"));
 
+    // A caller that tells the person records the change itself: the
+    // mark-reported call returns it, the next `trust show` does not.
+    world.write_policy_verifying(3, 120, &format!("{DEFAULT_CHECK}{RECIPE}"));
+    let pending = world.relais(&["trust", "show", "--json"]);
+    let pending: serde_json::Value = serde_json::from_slice(&pending.stdout).expect("show json");
+    assert!(
+        pending["pending_change"]["lines"][0].is_string(),
+        "{pending}"
+    );
+    let marked = world.relais(&["trust", "show", "--json", "--mark-reported"]);
+    let marked: serde_json::Value = serde_json::from_slice(&marked.stdout).expect("marked json");
+    assert!(marked["pending_change"]["lines"][0]
+        .as_str()
+        .is_some_and(|line| line.starts_with("~ changed check")));
+    let after = world.relais(&["trust", "show", "--json"]);
+    let after: serde_json::Value = serde_json::from_slice(&after.stdout).expect("show json");
+    assert!(after.get("pending_change").is_none(), "{after}");
     // Another repository stays blocked: the grant is this repository's.
     let other = World::with_permit("trust-once-other", permit.clone());
     other.write_policy(3);

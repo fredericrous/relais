@@ -3230,8 +3230,23 @@ pub enum ReviewRecord {
     Unavailable {
         detail: String,
     },
+    /// The review read only this candidate's own changes, because the
+    /// predecessor run's dispatch `cleared_by` found nothing in the
+    /// inherited tree. The kept patch is the full one; this review did not
+    /// read all of it.
+    SuccessorOnly {
+        same_model: bool,
+        cleared_by: String,
+    },
+    /// The candidate continues a predecessor run, and this review read the
+    /// full patch against the base, inherited changes included.
+    AgainstBase {
+        same_model: bool,
+    },
     /// The patch was reviewed in parts (`review-parts`, SPEC §10): every
-    /// part, in order, with its hashes and verdict. `same_model` is true when
+    /// part, in order, with its hashes and verdict. Parts are always cut from
+    /// the full patch against the base, never from a successor-only patch
+    /// (`patch_for_review`), so a `Parts` record covers the whole kept patch. `same_model` is true when
     /// the reviewer's model is the one that wrote the candidate.
     Parts {
         same_model: bool,

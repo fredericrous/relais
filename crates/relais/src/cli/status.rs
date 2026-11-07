@@ -67,6 +67,44 @@ pub(crate) fn print_pending_intents(ledger: &Ledger) {
     }
 }
 
+/// The fence an in-place run's lost worker puts on its tree, as the refusal
+/// text says it: `None` when the run holds none, or its marker cannot be read.
+fn worker_fence_of_run(ledger: &Ledger, run: &RunId) -> Option<String> {
+    use relais::workspace::inplace;
+    let workspace = ledger.run_workspace(run).ok().flatten()?;
+    let git_dir = inplace::git_dir(&workspace.repo_path).ok()?;
+    let marker = inplace::read_marker(&git_dir, run.as_str()).ok()?;
+    marker
+        .orphan
+        .filter(inplace::OrphanedWorker::standing)
+        .map(|orphan| orphan.fence_text(run.as_str(), &relais::ledger::now_rfc3339()))
+}
+
+/// The fences standing in the worktrees of the repository `status` runs from.
+fn worker_fences_here() -> Vec<String> {
+    use relais::workspace::inplace;
+    let Ok(here) = super::ctx::project_dir() else {
+        return Vec::new();
+    };
+    let Ok(worktrees) = relais::workspace::worktree_paths(&here) else {
+        return Vec::new();
+    };
+    let now = relais::ledger::now_rfc3339();
+    worktrees
+        .iter()
+        .filter_map(|path| inplace::git_dir(path).ok())
+        .filter_map(|git_dir| inplace::leftover_markers(&git_dir).ok())
+        .flat_map(|left| left.markers)
+        .filter_map(|marker| {
+            let run = marker.run.clone();
+            marker
+                .orphan
+                .filter(inplace::OrphanedWorker::standing)
+                .map(|orphan| orphan.fence_text(&run, &now))
+        })
+        .collect()
+}
+
 pub(crate) fn status_command(run_id: Option<&str>) -> Result<CliOutcome, CliError> {
     let ledger = open_ledger()?;
     let run_id = run_id.map(RunId::from_stored);
@@ -77,6 +115,9 @@ pub(crate) fn status_command(run_id: Option<&str>) -> Result<CliOutcome, CliErro
                 "status",
             )?;
             print!("{}", report.render());
+            for fence in worker_fences_here() {
+                println!("{fence}");
+            }
             print_pending_intents(&ledger);
             Ok(CliOutcome::Accepted)
         }
@@ -88,6 +129,9 @@ pub(crate) fn status_command(run_id: Option<&str>) -> Result<CliOutcome, CliErro
             let cost = operational(ledger.run_cost(&run_id), "status")?;
             let attempts = operational(ledger.attempt_count(&run_id), "status")?;
             println!("{run_id}: {state} (attempts: {attempts}, cost: {cost})");
+            if let Some(fence) = worker_fence_of_run(&ledger, &run_id) {
+                println!("{fence}");
+            }
             print_pending_intents(&ledger);
             Ok(CliOutcome::Accepted)
         }

@@ -488,6 +488,26 @@ pub fn parse_rules_output(stdout: &str) -> Result<Rules, GuidanceGap> {
     })
 }
 
+/// One spawn of `aval` with the given argv.
+pub(super) type AvalRun<'a> = &'a dyn Fn(&[String]) -> Result<String, GuidanceGap>;
+
+/// [`fetch_rules`] in the repository, and when the repository has no
+/// decisions corpus of its own (aval exit 3) the same fetch in the fleet
+/// decisions directory, when one is known. The fleet's answer replaces the
+/// gap only when it carries rules; otherwise the repository's own gap stays.
+pub fn fetch_rules_or_fleet(
+    repository: AvalRun<'_>,
+    fleet: Option<AvalRun<'_>>,
+) -> Result<Rules, GuidanceGap> {
+    match fetch_rules(repository) {
+        Err(gap) if gap.cause == GapCause::Exited(3) => match fleet.map(fetch_rules) {
+            Some(Ok(rules)) if !rules.code_rules.is_empty() => Ok(rules),
+            _ => Err(gap),
+        },
+        answer => answer,
+    }
+}
+
 /// Fetch the constraints with `run` (one spawn of the given argv). An aval
 /// that exits 2 on the new argv is too old for it: the previous argv is
 /// tried, and the gap naming the fix is kept only when that succeeds. Rules
@@ -886,6 +906,22 @@ printf '%s' '{"rules":[{"id":"errors.typed-values","level":"constraint","stateme
             fetch_rules(&slow).expect_err("timeout").cause,
             GapCause::NoAnswer
         );
+    }
+
+    #[test]
+    fn a_repository_without_a_corpus_takes_the_fleet_code_rules() {
+        let none = fake_aval("exit 3");
+        let fleet = |_: &[String]| Ok(FULL_RULES_JSON.to_string());
+        let rules = fetch_rules_or_fleet(&none, Some(&fleet)).expect("the fleet's rules");
+        assert_eq!(rules.code_rules.len(), 2);
+        let gap = fetch_rules_or_fleet(&none, None).expect_err("no fleet directory");
+        assert_eq!(gap.cause, GapCause::Exited(3));
+        let empty = |_: &[String]| Ok(r#"{"rules":[]}"#.to_string());
+        let gap = fetch_rules_or_fleet(&none, Some(&empty)).expect_err("the fleet has none");
+        assert_eq!(gap.cause, GapCause::Exited(3));
+        let other = fake_aval("exit 1");
+        let gap = fetch_rules_or_fleet(&other, Some(&fleet)).expect_err("only exit 3 falls back");
+        assert_eq!(gap.cause, GapCause::Exited(1));
     }
 
     #[test]

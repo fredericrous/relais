@@ -1106,6 +1106,7 @@ fn accept_integrated(
                 base_sha: root.base_sha,
                 holdouts: &[],
                 candidate: None,
+                basis: crate::runner::PatchBasis::Base,
             },
             &mut spend,
         );

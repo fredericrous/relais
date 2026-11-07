@@ -79,10 +79,96 @@ impl Retire {
     }
 }
 
-pub(crate) fn resume_command(run_id: &str, retire: Retire) -> Result<CliOutcome, CliError> {
+/// Whether the person vouches that the worker an in-place run lost has
+/// stopped (`--worker-stopped`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerStopped {
+    Unattested,
+    Attested,
+}
+
+impl WorkerStopped {
+    pub(crate) fn from_flag(attested: bool) -> Self {
+        if attested {
+            Self::Attested
+        } else {
+            Self::Unattested
+        }
+    }
+}
+
+/// Record the person's word that the orphaned worker of `run` has stopped:
+/// on the marker, which frees the tree, and on the run. `Some(outcome)` when
+/// the run is unknown, which ends the command. A run with no standing
+/// orphan (already confirmed, or none lost) is said on stderr and the
+/// command goes on with the retire.
+fn attest_worker_stopped(ledger: &Ledger, run: &RunId) -> Result<Option<CliOutcome>, CliError> {
+    use relais::workspace::inplace::{self, StoppedBy};
+    if operational(ledger.run_status(run), "resume")?.is_none() {
+        eprintln!("relais resume: unknown run {run}");
+        return Ok(Some(CliOutcome::UnknownRun));
+    }
+    let nothing = |why: &str| {
+        eprintln!("relais resume: {run}: --worker-stopped has nothing to confirm: {why}");
+        Ok(None)
+    };
+    let Some(workspace) = operational(ledger.run_workspace(run), "resume")? else {
+        return nothing("the run has no recorded worktree");
+    };
+    let Ok(git_dir) = inplace::git_dir(&workspace.repo_path) else {
+        return nothing("its worktree's git directory cannot be read");
+    };
+    let Ok(marker) = inplace::read_marker(&git_dir, run.as_str()) else {
+        return nothing("the run holds no in-place marker");
+    };
+    let Some(orphan) = marker.orphan.filter(|orphan| orphan.standing()) else {
+        return nothing("the run lost no worker that is still unconfirmed");
+    };
+    let now = relais::ledger::now_rfc3339();
+    let path = inplace::marker_file(&git_dir, run.as_str());
+    operational(
+        inplace::confirm_stopped(&path, &orphan.dispatch, StoppedBy::Person, &now),
+        "resume",
+    )?;
+    let state = operational(ledger.run_status(run), "resume")?.unwrap_or(State::Interrupted);
+    operational(
+        ledger.record_transition(&relais::ledger::Transition {
+            run_id: run.clone(),
+            attempt_id: None,
+            from_state: Some(state),
+            to_state: state,
+            reason: Reason::WorktreeNotReleased.as_str().to_string(),
+            detail: Some(serde_json::json!({
+                "code": "worker_stopped_attested",
+                "dispatch": orphan.dispatch,
+                "session": orphan.session,
+                "agent_id": orphan.agent_id,
+                "detail": "the person attested that the lost worker has stopped (--worker-stopped)",
+            })),
+            at: now,
+        }),
+        "resume",
+    )?;
+    println!(
+        "{run}: recorded your word that the worker of dispatch {} has stopped",
+        orphan.dispatch
+    );
+    Ok(None)
+}
+
+pub(crate) fn resume_command(
+    run_id: &str,
+    retire: Retire,
+    worker: WorkerStopped,
+) -> Result<CliOutcome, CliError> {
     let ledger = open_ledger()?;
     print_pending_intents(&ledger);
     let run = RunId::from_stored(run_id);
+    if worker == WorkerStopped::Attested {
+        if let Some(outcome) = attest_worker_stopped(&ledger, &run)? {
+            return Ok(outcome);
+        }
+    }
     let Some(state) = operational(ledger.run_status(&run), "resume")? else {
         eprintln!("relais resume: unknown run {run_id}");
         return Ok(CliOutcome::UnknownRun);
@@ -594,6 +680,16 @@ pub(crate) fn retire_in_place_saying(
     let Ok(marker) = inplace::read_marker(&git_dir, run.as_str()) else {
         return Ok(None);
     };
+    // The dispatch is closed in the ledger, so the reconciliation below
+    // reads it as dead; only the marker knows the worker was lost, not
+    // stopped.
+    if let Some(orphan) = marker.orphan.as_ref().filter(|orphan| orphan.standing()) {
+        say(format!(
+            "{run}: kept, {}",
+            orphan.fence_text(run.as_str(), &relais::ledger::now_rfc3339())
+        ));
+        return Ok(Some(CliOutcome::ResumeRefusedLive));
+    }
     if !reconciliation.all_provably_dead() {
         say(format!(
             "{run}: kept, a dispatch may still write {} ({})",
@@ -612,9 +708,11 @@ pub(crate) fn retire_in_place_saying(
             ));
             return Ok(Some(CliOutcome::OperationalFailure));
         }
-        Err(LeaseRefusal::Interrupted { .. } | LeaseRefusal::UnreadableMarker { .. }) => {
-            return Ok(None)
-        }
+        Err(
+            LeaseRefusal::Interrupted { .. }
+            | LeaseRefusal::WorkerMayRun { .. }
+            | LeaseRefusal::UnreadableMarker { .. },
+        ) => return Ok(None),
         Err(LeaseRefusal::Io(e)) => {
             say(format!(
                 "{run}: kept, {} could not be taken: {e}",
@@ -1056,5 +1154,106 @@ mod tests {
         );
         assert!(since.is_some(), "driver_since");
         drop(dir);
+    }
+
+    /// A git repository in `dir` whose in-place marker for `run` names a lost
+    /// worker, confirmed stopped when `stopped` says so.
+    fn repo_with_lost_worker(
+        dir: &std::path::Path,
+        run: &str,
+        stopped: Option<relais::workspace::inplace::StopConfirmation>,
+    ) -> std::path::PathBuf {
+        use relais::workspace::inplace::{self, Lease, Marker, OrphanedWorker, Stage};
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo)
+            .status()
+            .expect("git init");
+        assert!(init.success());
+        let lease = Lease::acquire(&repo, run).expect("lease");
+        let mut orphan = OrphanedWorker::lost_at(
+            "dispatch-7",
+            "sess",
+            Some("agent-7"),
+            "2026-01-01T10:00:00+00:00",
+        )
+        .expect("an RFC 3339 time");
+        orphan.stopped = stopped;
+        lease
+            .write_marker(&Marker {
+                run: run.into(),
+                stage: Stage::Running,
+                head_symbolic: None,
+                head_sha: "0".repeat(40),
+                start: "0".repeat(40),
+                index_listing: String::new(),
+                target: None,
+                exported: None,
+                orphan: Some(orphan),
+            })
+            .expect("marker");
+        drop(lease);
+        assert!(inplace::git_dir(&repo).is_ok());
+        repo
+    }
+
+    #[test]
+    fn retiring_a_run_whose_lost_worker_may_still_write_is_refused_live() {
+        let (ledger, dir) = temp_ledger("resume-fenced");
+        let repo = repo_with_lost_worker(&dir, "run-fenced", None);
+        let run = RunId::from_stored("run-fenced");
+        let task = relais::ids::TaskId::from_stored("task-fenced");
+        ledger
+            .insert_run(&run, &repo.to_string_lossy(), None, &task, "rk")
+            .expect("run");
+        let mut said = Vec::new();
+        let outcome = retire_in_place_saying(
+            &ledger,
+            &run,
+            State::Interrupted,
+            &resume::Reconciliation {
+                verdicts: Vec::new(),
+            },
+            &dir.join("runs"),
+            &mut |line| said.push(line),
+        )
+        .unwrap_or_else(|_| panic!("retire"));
+        assert_eq!(outcome, Some(CliOutcome::ResumeRefusedLive), "{said:?}");
+        assert_eq!(
+            outcome.as_ref().map(crate::cli::outcome::exit_code),
+            Some(11)
+        );
+    }
+
+    #[test]
+    fn worker_stopped_on_an_unknown_run_is_unknown_run() {
+        let (ledger, dir) = temp_ledger("resume-unknown");
+        let outcome = attest_worker_stopped(&ledger, &RunId::from_stored("run-none"))
+            .unwrap_or_else(|_| panic!("attest"));
+        assert_eq!(outcome, Some(CliOutcome::UnknownRun));
+        assert_eq!(crate::cli::outcome::exit_code(&CliOutcome::UnknownRun), 10);
+        drop(dir);
+    }
+
+    #[test]
+    fn worker_stopped_on_an_already_confirmed_orphan_goes_on_with_the_retire() {
+        let (ledger, dir) = temp_ledger("resume-confirmed");
+        let repo = repo_with_lost_worker(
+            &dir,
+            "run-done",
+            Some(relais::workspace::inplace::StopConfirmation {
+                by: relais::workspace::inplace::StoppedBy::Person,
+                at: "2026-01-01T11:00:00+00:00".into(),
+            }),
+        );
+        let run = RunId::from_stored("run-done");
+        let task = relais::ids::TaskId::from_stored("task-done");
+        ledger
+            .insert_run(&run, &repo.to_string_lossy(), None, &task, "rk")
+            .expect("run");
+        let outcome = attest_worker_stopped(&ledger, &run).unwrap_or_else(|_| panic!("attest"));
+        assert_eq!(outcome, None, "nothing to confirm is a note, not an exit");
     }
 }

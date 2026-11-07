@@ -90,10 +90,19 @@ fn sh(script: &str) -> CommandSpec {
 }
 
 fn gate_with(heavy: u32) -> LocalGate {
-    LocalGate::new(ConcurrencyLimits {
-        max_heavy_commands: Some(heavy),
-        ..ConcurrencyLimits::default()
-    })
+    LocalGate::new(
+        ConcurrencyLimits {
+            max_heavy_commands: Some(heavy),
+            ..ConcurrencyLimits::default()
+        },
+        fixed_clock,
+    )
+}
+
+/// These tests confirm no orphan, so the gate's clock is never read; a
+/// fixed one keeps `verify` from importing `ledger` (module-cycles).
+fn fixed_clock() -> String {
+    "2026-11-07T00:00:00+00:00".to_string()
 }
 
 fn register(gate: &LocalGate, run: &str) {

@@ -39,6 +39,19 @@ pub fn install_script(dest: &Path, script: &str) {
     }
 }
 
+/// Makes `aside` the shared copy by hard link, then removes `aside`. A link
+/// never replaces: a process that finds `shared` already there keeps the
+/// first process's inode, which may be warmed or running, where a rename
+/// would swap it for a cold one.
+fn publish(aside: &Path, shared: &Path) {
+    match std::fs::hard_link(aside, shared) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => panic!("publish shared script {}: {error}", shared.display()),
+    }
+    std::fs::remove_file(aside).expect("remove aside script");
+}
+
 /// Writes `shared` if no test process has yet, then runs it once per test
 /// process, all under one lock, so the tests of a process never race on
 /// the file and a test that links it later never pays the first-exec check
@@ -54,8 +67,9 @@ fn publish_and_warm_once(shared: &Path, dir: &Path, script: &str) {
         return;
     }
     if !shared.exists() {
-        // Written aside and renamed, so another test process never runs a
-        // half-written copy; the pid keeps processes' aside files apart.
+        // Written aside and published by hard link, so another test process
+        // never runs a half-written copy nor has its inode replaced; the pid
+        // keeps processes' aside files apart.
         let aside = dir.join(format!(
             "{}.{}.tmp",
             shared.file_name().unwrap_or_default().to_string_lossy(),
@@ -64,7 +78,7 @@ fn publish_and_warm_once(shared: &Path, dir: &Path, script: &str) {
         std::fs::write(&aside, script).expect("write shared script");
         std::fs::set_permissions(&aside, std::fs::Permissions::from_mode(0o755))
             .expect("chmod shared script");
-        std::fs::rename(&aside, shared).expect("publish shared script");
+        publish(&aside, shared);
     }
     let mut child = Command::new(shared)
         .arg("--version")
@@ -84,4 +98,33 @@ fn publish_and_warm_once(shared: &Path, dir: &Path, script: &str) {
         std::thread::sleep(Duration::from_millis(50));
     }
     warmed.push(shared.to_path_buf());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::publish;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn publish_keeps_an_existing_shared_inode_and_removes_the_aside_file() {
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("publish-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let shared = dir.join("shared");
+        let aside = dir.join("shared.aside.tmp");
+        std::fs::write(&shared, "first").expect("write shared");
+        std::fs::write(&aside, "second").expect("write aside");
+        let inode_before = std::fs::metadata(&shared).expect("shared metadata").ino();
+
+        publish(&aside, &shared);
+
+        let inode_after = std::fs::metadata(&shared).expect("shared metadata").ino();
+        assert_eq!(inode_before, inode_after);
+        assert_eq!(
+            std::fs::read_to_string(&shared).expect("read shared"),
+            "first"
+        );
+        assert!(!aside.exists());
+        std::fs::remove_dir_all(&dir).expect("remove test dir");
+    }
 }

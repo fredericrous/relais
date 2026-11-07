@@ -306,7 +306,11 @@ pub(crate) fn init_detect_command(
         );
     }
     if let Some(text) = command {
-        match relais::repo::parse_command_text(text) {
+        let checked = relais::repo::parse_command_text(text).and_then(|argv| {
+            relais::repo::check_command_program(&argv, |program| program_exists(&root, program))
+                .map(|()| argv)
+        });
+        match checked {
             Ok(argv) => proposal = proposal.with_command(argv, "--command"),
             Err(e) => {
                 eprintln!("relais init --command: {e}");
@@ -402,4 +406,20 @@ pub(crate) fn skipped_lines(proposal: &relais::repo::Proposal) -> Vec<String> {
             )
         })
         .collect()
+}
+
+/// Whether `program` is a file in the repository, `node_modules/.bin/<name>`
+/// or on this machine's `PATH`; an explicit path is looked up as given
+/// (relative ones from the repository root).
+fn program_exists(root: &std::path::Path, program: &str) -> bool {
+    let path = std::path::Path::new(program);
+    if path.is_absolute() {
+        path.is_file()
+    } else if path.components().count() > 1 {
+        root.join(path).is_file()
+    } else {
+        root.join(path).is_file()
+            || root.join("node_modules/.bin").join(path).is_file()
+            || relais::tooling::which(program).is_some()
+    }
 }

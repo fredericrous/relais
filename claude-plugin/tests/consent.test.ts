@@ -1,12 +1,12 @@
 import { expect, test } from 'claude-code/testing'
-import { allowLabel, escapeDisplay, isClaudeModel, withRoutingSection, NOT_NOW, onboardTool, onPersonPrompt, question2, trustHoldoutsTool, trustTool, USE_CHECKS, type Shown } from '../hooks/consent.ts'
+import { allowLabel, escapeDisplay, isClaudeModel, withRoutingSection, NOT_NOW, NO_COMMAND, onboardTool, onPersonPrompt, question2, trustHoldoutsTool, trustTool, USE_CHECKS, type Shown } from '../hooks/consent.ts'
 import { HOLDOUT_CONFIRM_MESSAGE, machineSettingsGuard, MACHINE_SETTINGS_MESSAGE } from '../hooks/guards.ts'
 import { createStore } from '../hooks/store.ts'
 import { pump } from '../hooks/runs.ts'
 
 // A repository and a relais, scripted: what `git` and `relais` answer, and
 // what was asked, toasted and granted.
-function world(options: { detected?: string[][] | null; changes?: Shown['changes']; argvFrom?: string } = {}) {
+function world(options: { detected?: string[][] | null; changes?: Shown['changes']; argvFrom?: string; pendingChange?: Shown['pending_change'] } = {}) {
   const state = {
     policy: false,
     staged: [] as string[],
@@ -20,6 +20,11 @@ function world(options: { detected?: string[][] | null; changes?: Shown['changes
     rmFails: false,
     detected: options.detected === undefined ? [['make', 'check']] : options.detected,
     typedCommand: undefined as string[] | undefined,
+    marks: 0,
+    markFails: false,
+    markSilent: false,
+    pendingChange: options.pendingChange,
+    markedChange: undefined as Shown['pending_change'],
   }
   const asks: { question: string; options: string[] }[] = []
   const toasts: string[] = []
@@ -43,6 +48,8 @@ function world(options: { detected?: string[][] | null; changes?: Shown['changes
       integrations: [{ name: 'amont', mode: 'required' }],
     },
     ...(options.changes ? { changes: options.changes } : {}),
+    // `trust show` reports a change once, then the ledger has it.
+    ...(state.pendingChange ? { pending_change: state.pendingChange } : {}),
   })
   const ok = (stdout = '') => ({ exitCode: 0, stdout, stderr: '' })
   const fail = (exitCode: number, stderr: string) => ({ exitCode, stdout: '', stderr })
@@ -73,6 +80,8 @@ function world(options: { detected?: string[][] | null; changes?: Shown['changes
     if (cmd === 'relais') {
       if (line.startsWith('init --detect --json --command')) {
         const text = rest[rest.length - 1]
+        if (text === 'Yes') return fail(2, 'relais init --command: `Yes` is an acknowledgement, not a command: type the command that verifies this repository')
+        if (text === 'boom') return fail(3, 'relais: the ledger exploded')
         return text.includes('|') ? fail(2, 'relais init --command: `|` is not allowed: relais runs argv, not a shell line (SPEC §6)') : ok('{}')
       }
       if (line === 'init --detect --json') {
@@ -86,6 +95,18 @@ function world(options: { detected?: string[][] | null; changes?: Shown['changes
         if (i >= 0) state.typedCommand = rest[i + 1].split(' ')
         state.policy = true
         return ok()
+      }
+      if (line === 'trust show --json --mark-reported') {
+        if (state.markFails) return fail(1, 'relais trust show --mark-reported: the ledger could not be opened')
+        if (state.markSilent) {
+          state.marks += 1
+          state.pendingChange = undefined
+          return ok('')
+        }
+        const reply = ok(JSON.stringify({ ...shown(), ...(state.markedChange ? { pending_change: state.markedChange } : {}) }))
+        state.marks += 1
+        state.pendingChange = undefined
+        return reply
       }
       if (line === 'trust show --json') {
         if (state.showFails) throw new Error('relais is not installed')
@@ -281,7 +302,7 @@ test('onboard: with nothing detected the typed command is proposed and shown in 
   w.answers.push('make test', allowLabel(2))
   const result = await onboardTool(w.fx, w.store, '/repo', 's')
   expect(result).toContain('ready')
-  expect(w.asks[0].options).toEqual([NOT_NOW])
+  expect(w.asks[0].options).toEqual([NO_COMMAND])
   expect(w.asks[1].question).toContain('  check  make test')
 })
 
@@ -297,7 +318,7 @@ test('onboard: a shell line is explained and asked once more, then declined', as
 
 test('onboard: Not now on the typed-command question is a decline, not a command', async () => {
   const w = world({ detected: null })
-  w.answers.push(NOT_NOW)
+  w.answers.push(NO_COMMAND)
   expect(await onboardTool(w.fx, w.store, '/repo', 's')).toContain('declined (not_now)')
   expect(w.state.policy).toBe(false)
 })
@@ -527,4 +548,103 @@ test('trust_holdouts: a review too long for the dialog offers no confirmation', 
   expect(longWorld.asks[0].question).toContain('too long to confirm here')
   expect(accepts).toEqual([])
   expect(reply).toContain('not confirmed')
+})
+
+test('onboard: a refused acknowledgement reaches the second question and writes nothing', async () => {
+  const w = world({ detected: null })
+  w.answers.push('Yes', NO_COMMAND)
+  const reply = await onboardTool(w.fx, w.store, '/repo', 's')
+  expect(w.asks[1].question).toContain('`Yes` is an acknowledgement, not a command')
+  expect(reply).toContain('declined (not_now)')
+  expect(w.state.policy).toBe(false)
+})
+
+test('onboard: Yes, Yes declines with the refusal reason, not shell operators', async () => {
+  const w = world({ detected: null })
+  w.answers.push('Yes', 'Yes')
+  const reply = await onboardTool(w.fx, w.store, '/repo', 's')
+  expect(reply).toContain('declined (command_refused)')
+  expect(reply).toContain('is an acknowledgement')
+  expect(reply).not.toContain('shell operators')
+  expect(reply.split('is an acknowledgement').length - 1).toBe(1)
+  expect(w.state.policy).toBe(false)
+})
+
+test('trust: a change since the grant is listed, marked reported, and not listed again', async () => {
+  const w = world({ pendingChange: { since: '2026-11-01', lines: ['~ changed check make test [default]', '- removed check make lint [default]', '+ added check make \u0001x [default]'] } })
+  w.state.policy = true
+  w.state.preGranted = true
+  const first = await trustTool(w.fx, w.store, '/repo', 's')
+  expect(first).toContain('ready: repo is already allowed')
+  expect(first).toContain('Commands changed in relais.toml since 2026-11-01:')
+  expect(first.split('\n').slice(1)).toEqual([
+    'Commands changed in relais.toml since 2026-11-01:',
+    '~ changed check make test [default]',
+    '- removed check make lint [default]',
+    '+ added   check make \\x01x [default]',
+  ])
+  expect(w.state.marks).toBe(1)
+  const second = await trustTool(w.fx, w.store, '/repo', 's')
+  expect(second).not.toContain('Commands changed')
+  expect(w.state.marks).toBe(1)
+})
+
+test('trust: a mark that fails is said in the reply, which still lists the change', async () => {
+  const w = world({ pendingChange: { since: '2026-11-01', lines: ['~ changed check make test [default]'] } })
+  w.state.policy = true
+  w.state.preGranted = true
+  w.state.markFails = true
+  const reply = await trustTool(w.fx, w.store, '/repo', 's')
+  expect(reply).toContain('~ changed check make test [default]')
+  expect(reply).toContain('could not record this as reported')
+})
+
+test('trust: a mark that records but prints no JSON still lists the change, and says why', async () => {
+  const w = world({ pendingChange: { since: '2026-11-01', lines: ['~ changed check make test [default]'] } })
+  w.state.policy = true
+  w.state.preGranted = true
+  w.state.markSilent = true
+  const reply = await trustTool(w.fx, w.store, '/repo', 's')
+  expect(reply).toContain('~ changed check make test [default]')
+  expect(reply).toContain('printed no JSON')
+  expect(w.state.marks).toBe(1)
+})
+
+test('onboard: typing the words Not now is a command, not the button', async () => {
+  const w = world({ detected: null })
+  w.answers.push('Not now', allowLabel(2))
+  const reply = await onboardTool(w.fx, w.store, '/repo', 's')
+  expect(reply).toContain('ready')
+  expect(w.state.typedCommand).toEqual(['Not', 'now'])
+  expect(w.store.declined.size).toBe(0)
+})
+
+test('onboard: a failure of relais that is not a refusal is not-set-up, not the person\'s command refused', async () => {
+  const w = world({ detected: null })
+  w.answers.push('boom')
+  const reply = await onboardTool(w.fx, w.store, '/repo', 's')
+  expect(reply).toMatch(/^not set up: relais init --detect --command failed: .*the ledger exploded/)
+  expect(reply).not.toContain('declined')
+  expect(w.asks.length).toBe(1)
+  expect(w.state.policy).toBe(false)
+})
+
+test('trust: the change that is listed is the one the mark recorded', async () => {
+  const w = world({ pendingChange: { since: '2026-11-01', lines: ['~ changed check make test [default]'] } })
+  w.state.markedChange = { since: '2026-11-02', lines: ['+ added check make lint [default]'] }
+  w.state.policy = true
+  w.state.preGranted = true
+  const reply = await trustTool(w.fx, w.store, '/repo', 's')
+  expect(reply).toContain('since 2026-11-02')
+  expect(reply).toContain('+ added   check make lint [default]')
+  expect(reply).not.toContain('make test')
+})
+
+test('trust: a pending change without lines is not listed and does not throw', async () => {
+  const w = world({ pendingChange: { since: '2026-11-01' } as any })
+  w.state.policy = true
+  w.state.preGranted = true
+  const reply = await trustTool(w.fx, w.store, '/repo', 's')
+  expect(reply).toContain('ready: repo is already allowed')
+  expect(reply).not.toContain('Commands changed')
 })

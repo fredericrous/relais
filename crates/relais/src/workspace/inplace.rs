@@ -105,6 +105,121 @@ pub struct Marker {
     pub target: Option<Target>,
     /// The ref the unkept work was exported to, once it was.
     pub exported: Option<String>,
+    /// A worker the run lost and cannot prove stopped. While it stands, the
+    /// tree is fenced. A relais that predates the field ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan: Option<OrphanedWorker>,
+}
+
+/// The code a refusal carries while an orphaned worker may still write.
+pub const WORKER_MAY_RUN: &str = "inplace_worker_may_run";
+
+/// How long after a worker is lost the fence says that a person has to act.
+/// An escalation point only: no amount of elapsed time proves a
+/// disconnected native worker has stopped.
+const ESCALATE_AFTER_HOURS: i64 = 2;
+
+/// Who proved the orphaned worker stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoppedBy {
+    /// The coordinator saw the plugin's `SubagentStop` for the agent.
+    Subagent,
+    /// The person, with `relais resume --retire <run> --worker-stopped`.
+    Person,
+}
+
+/// The proof that frees an orphaned worker's tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopConfirmation {
+    pub by: StoppedBy,
+    pub at: String,
+}
+
+/// A native worker whose session went silent mid-attempt: it was never told
+/// to stop and may still be writing the tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrphanedWorker {
+    pub dispatch: String,
+    pub session: String,
+    /// The agent the worker ran as, when one had bound.
+    pub agent_id: Option<String>,
+    /// RFC 3339: when the worker was lost.
+    pub since: String,
+    /// RFC 3339: `since` plus two hours.
+    pub escalate_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<StopConfirmation>,
+}
+
+impl OrphanedWorker {
+    /// An orphan lost at `since`; `None` when `since` is not RFC 3339.
+    pub fn lost_at(
+        dispatch: &str,
+        session: &str,
+        agent_id: Option<&str>,
+        since: &str,
+    ) -> Option<Self> {
+        let lost = chrono::DateTime::parse_from_rfc3339(since).ok()?;
+        let escalate_at = lost + chrono::Duration::hours(ESCALATE_AFTER_HOURS);
+        Some(Self {
+            dispatch: dispatch.to_string(),
+            session: session.to_string(),
+            agent_id: agent_id.map(str::to_string),
+            since: since.to_string(),
+            escalate_at: escalate_at.to_rfc3339(),
+            stopped: None,
+        })
+    }
+
+    /// Whether the worker may still be writing: nobody has confirmed it
+    /// stopped.
+    pub fn standing(&self) -> bool {
+        self.stopped.is_none()
+    }
+
+    /// The refusal text for `run`'s tree at `now` (RFC 3339): the dispatch,
+    /// its age and what frees it. Pure in `now`, so a test advances time.
+    pub fn fence_text(&self, run: &str, now: &str) -> String {
+        let parse = |text: &str| chrono::DateTime::parse_from_rfc3339(text).ok();
+        let age = match (parse(now), parse(&self.since)) {
+            (Some(now), Some(since)) => human_age(now - since),
+            _ => "an unknown time".to_string(),
+        };
+        let past_escalation = matches!(
+            (parse(now), parse(&self.escalate_at)),
+            (Some(now), Some(escalate)) if now >= escalate
+        );
+        let frees = match &self.agent_id {
+            Some(agent) => format!(
+                "the coordinator's confirmation that agent {agent} stopped, or \
+                 `relais resume --retire {run} --worker-stopped` once you have closed \
+                 session {}",
+                self.session
+            ),
+            None => format!(
+                "`relais resume --retire {run} --worker-stopped` once you have closed \
+                 session {} (no agent id is known, so nothing else can confirm it)",
+                self.session
+            ),
+        };
+        let escalation = if past_escalation {
+            "; the two-hour escalation point has passed, and elapsed time never frees the \
+             tree: a stop confirmation or --worker-stopped is still required"
+        } else {
+            ""
+        };
+        format!(
+            "{WORKER_MAY_RUN}: dispatch {} of run {run} was lost {age} ago and its worker may \
+             still be writing this worktree; it is freed by {frees}{escalation}",
+            self.dispatch
+        )
+    }
+}
+
+fn human_age(age: chrono::Duration) -> String {
+    let minutes = age.num_minutes().max(0);
+    format!("{}h{:02}m", minutes / 60, minutes % 60)
 }
 
 #[derive(Debug)]
@@ -116,6 +231,12 @@ pub enum LeaseRefusal {
     /// A run was interrupted here and has not been retired.
     Interrupted {
         run: String,
+    },
+    /// A run lost its worker here and nothing proves it stopped: the tree
+    /// stays fenced until it does.
+    WorkerMayRun {
+        run: String,
+        orphan: Box<OrphanedWorker>,
     },
     /// A marker is in the git directory that relais cannot read, so what
     /// run left it, and what it decided, is unknown. Nothing may start on
@@ -177,6 +298,152 @@ impl Leftovers {
     }
 }
 
+/// The first leftover run whose lost worker nobody has confirmed stopped.
+pub fn standing_orphan(left: &Leftovers) -> Option<(String, OrphanedWorker)> {
+    left.markers.iter().find_map(|marker| {
+        marker
+            .orphan
+            .as_ref()
+            .filter(|orphan| orphan.standing())
+            .map(|orphan| (marker.run.clone(), orphan.clone()))
+    })
+}
+
+/// Where `run`'s marker lives in `git_dir`.
+pub fn marker_file(git_dir: &Path, run: &str) -> PathBuf {
+    marker_path(git_dir, run)
+}
+
+/// How many times [`update_orphan`] re-applies its change when the marker
+/// moved under it before giving up.
+const ORPHAN_UPDATE_ATTEMPTS: usize = 5;
+
+/// Change the orphan of `dispatch` in the marker at `path` with `change`,
+/// which returns whether it changed anything. `Ok(false)` when there is
+/// nothing to change: no marker, no orphan, an orphan of another dispatch,
+/// or a `change` that had nothing to do. After writing, the marker is read
+/// again, and the change is reapplied if another process wrote between our
+/// write and that read. This is not a lock: a process that read before our
+/// write and writes after our re-read can still erase it. Inside one
+/// process `marker_writes` serialises the writers; across processes both
+/// writers only ever set `stopped`, and a confirmation that is lost is
+/// owed again by the coordinator's next sweep.
+fn update_orphan(
+    path: &Path,
+    dispatch: &str,
+    change: impl Fn(&mut OrphanedWorker) -> bool,
+) -> io::Result<bool> {
+    for _ in 0..ORPHAN_UPDATE_ATTEMPTS {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let mut marker: Marker = serde_json::from_str(&text).map_err(io_other)?;
+        let Some(orphan) = marker.orphan.as_mut() else {
+            return Ok(false);
+        };
+        if orphan.dispatch != dispatch || !change(orphan) {
+            return Ok(false);
+        }
+        let rewritten = serde_json::to_string_pretty(&marker).map_err(io_other)?;
+        crate::fsutil::write_atomic(path, &rewritten)?;
+        let reread = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Marker>(&text).ok());
+        if reread.as_ref() == Some(&marker) {
+            return Ok(true);
+        }
+    }
+    Err(io::Error::other(format!(
+        "{} kept changing while the orphan of dispatch {dispatch} was being updated",
+        path.display()
+    )))
+}
+
+/// Record on the marker at `path` that the worker of `dispatch` stopped.
+/// `Ok(false)` when there is nothing to record: no marker, no orphan, an
+/// orphan of another dispatch, or one already confirmed. Idempotent, so a
+/// stop seen twice and a person's word after the coordinator's agree.
+pub fn confirm_stopped(path: &Path, dispatch: &str, by: StoppedBy, at: &str) -> io::Result<bool> {
+    update_orphan(path, dispatch, |orphan| {
+        if orphan.stopped.is_some() {
+            return false;
+        }
+        orphan.stopped = Some(StopConfirmation {
+            by,
+            at: at.to_string(),
+        });
+        true
+    })
+}
+
+/// Record on the marker at `path` the agent the coordinator knows for the
+/// orphan of `dispatch`, when the marker names none. `Ok(false)` when there is
+/// nothing to change: no marker, no such orphan, or an agent already named.
+pub fn set_orphan_agent(path: &Path, dispatch: &str, agent_id: &str) -> io::Result<bool> {
+    update_orphan(path, dispatch, |orphan| {
+        if orphan.agent_id.is_some() {
+            return false;
+        }
+        orphan.agent_id = Some(agent_id.to_string());
+        true
+    })
+}
+
+/// Whether `marker` is where `run`'s in-place marker lives:
+/// `<git-dir>/relais-inplace/<run>.json`, in a directory that is a git
+/// directory. Nothing else is a marker the coordinator may write to.
+pub fn names_marker_of(marker: &Path, run: &str) -> bool {
+    let in_markers_dir = marker.parent().filter(|dir| {
+        dir.file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new(MARKERS_DIR))
+    });
+    marker
+        .file_name()
+        .is_some_and(|name| name == std::ffi::OsStr::new(&format!("{run}.json")))
+        && in_markers_dir
+            .and_then(Path::parent)
+            .is_some_and(|git_dir| git_dir.join("HEAD").is_file())
+}
+
+/// The admission fence over in-place markers (ADR-0008): admission declares
+/// what it needs of a marker and this is the answer, so admission imports
+/// nothing of the workspace.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MarkerFence;
+
+impl crate::admission::OrphanFence for MarkerFence {
+    fn still_standing(&self, report: &crate::admission::OrphanReport) -> bool {
+        match std::fs::read_to_string(&report.marker) {
+            Ok(text) => serde_json::from_str::<Marker>(&text)
+                .ok()
+                .is_none_or(|marker| {
+                    marker.orphan.is_some_and(|orphan| {
+                        orphan.dispatch == report.dispatch_id && orphan.standing()
+                    })
+                }),
+            Err(e) => e.kind() != io::ErrorKind::NotFound,
+        }
+    }
+
+    fn confirm_stopped(
+        &self,
+        report: &crate::admission::OrphanReport,
+        at: &str,
+    ) -> io::Result<bool> {
+        confirm_stopped(&report.marker, &report.dispatch_id, StoppedBy::Subagent, at)
+    }
+
+    fn name_agent(&self, report: &crate::admission::OrphanReport, agent: &str) -> io::Result<bool> {
+        set_orphan_agent(&report.marker, &report.dispatch_id, agent)
+    }
+
+    fn owns_marker(&self, marker: &Path, run: &str) -> bool {
+        names_marker_of(marker, run)
+    }
+}
+
 /// Markers left in `git_dir` by runs that are not running.
 pub fn leftover_markers(git_dir: &Path) -> io::Result<Leftovers> {
     let dir = markers_dir(git_dir);
@@ -218,6 +485,12 @@ impl Lease {
             return Err(LeaseRefusal::Busy { holder });
         };
         let left = leftover_markers(&git_dir)?;
+        if let Some((run, orphan)) = standing_orphan(&left) {
+            return Err(LeaseRefusal::WorkerMayRun {
+                run,
+                orphan: Box::new(orphan),
+            });
+        }
         if let Some(marker) = left.markers.into_iter().next() {
             return Err(LeaseRefusal::Interrupted { run: marker.run });
         }
@@ -278,6 +551,19 @@ impl Lease {
 
     pub fn read_marker(&self) -> io::Result<Marker> {
         read_marker(&self.dir, &self.run)
+    }
+
+    /// Write `orphan` into the run's marker: the attempt ended with a worker
+    /// that may still be writing, so the tree stays fenced.
+    pub fn record_orphan(&self, orphan: OrphanedWorker) -> io::Result<()> {
+        let mut marker = self.read_marker()?;
+        marker.orphan = Some(orphan);
+        self.write_marker(&marker)
+    }
+
+    /// The path of the run's marker.
+    pub fn marker_file(&self) -> PathBuf {
+        marker_path(&self.dir, &self.run)
     }
 
     /// The end of a clean run: the marker and the run's private files go,
@@ -903,6 +1189,7 @@ mod tests {
                 index_listing: String::new(),
                 target: None,
                 exported: None,
+                orphan: None,
             })
             .expect("marker");
         drop(first);
@@ -1068,6 +1355,7 @@ mod tests {
             index_listing: start.index_listing.clone(),
             target: None,
             exported: None,
+            orphan: None,
         }
     }
 

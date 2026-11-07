@@ -97,6 +97,7 @@ impl<'a> RunEngine<'a> {
                 &result_stem,
                 None,
             );
+            self.record_basis(&part_request, &reviewed);
             let (status, detail) = match &reviewed.outcome {
                 ReviewOutcome::NoFindings => (PartStatus::Passed, None),
                 ReviewOutcome::Findings(_) => (PartStatus::Findings, None),

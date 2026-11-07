@@ -128,6 +128,7 @@ impl Backend for MockBackend {
             failure_detail: None,
             booked_message_ids: Vec::new(),
             unpriced: Vec::new(),
+            lost_worker: None,
         })
     }
 }

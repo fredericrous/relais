@@ -370,6 +370,30 @@ fn init_detect_on_an_empty_repository_exits_19_and_writes_nothing() {
         text(&refused.stderr)
     );
 
+    for word in ["Yes", "yes"] {
+        let ack = world.relais(&["init", "--detect", "--json", "--write", "--command", word]);
+        assert_ne!(ack.status.code(), Some(0), "{word}");
+        assert!(
+            text(&ack.stderr).contains("acknowledgement"),
+            "{}",
+            text(&ack.stderr)
+        );
+    }
+    let missing = world.relais(&[
+        "init",
+        "--detect",
+        "--write",
+        "--command",
+        "no-such-program-xyz test",
+    ]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(
+        text(&missing.stderr).contains("local"),
+        "{}",
+        text(&missing.stderr)
+    );
+    assert!(!world.repo.join("relais.toml").exists());
+
     let typed = world.relais(&["init", "--detect", "--write", "--command", "make test"]);
     assert_eq!(typed.status.code(), Some(0), "{}", text(&typed.stderr));
     let policy = std::fs::read_to_string(world.repo.join("relais.toml")).expect("policy");

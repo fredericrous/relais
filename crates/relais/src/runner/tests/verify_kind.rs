@@ -1579,3 +1579,340 @@ fn a_persons_non_test_widen_gets_a_block_that_does_not_call_it_a_test() {
     assert!(!block.contains("tests"), "{block}");
     assert!(crate::runner::review::widened_scope_block(&[]).is_empty());
 }
+
+// #352: a successor is reviewed on its own changes
+
+/// One backend for a source run and its successor: the worker writes
+/// `file` (so each run's patch differs), a reviewer answers `answer` and
+/// every reviewer prompt is kept.
+fn reviewing_backend(
+    prompts: &Arc<Mutex<Vec<String>>>,
+    file: &'static str,
+    answer: &'static str,
+) -> MockBackend {
+    let prompts = Arc::clone(prompts);
+    MockBackend::new(move |spec| {
+        let text = if spec.prompt.contains("semantic reviewer") {
+            prompts.lock().expect("lock").push(spec.prompt.clone());
+            answer
+        } else {
+            std::fs::write(spec.work_dir.join(file), "pub fn added() {}\n").expect("write");
+            "DONE"
+        };
+        MockOutcome {
+            result_text: Some(text.into()),
+            exit_code: Some(0),
+            usage: Some(usage(10)),
+            ..Default::default()
+        }
+    })
+}
+
+fn review_contract(from: Option<&RunId>, review: &str) -> TaskContract {
+    let mut contract = serde_json::json!({
+        "schema_version": 1,
+        "kind": "change",
+        "objective": "Add a file",
+        "base_ref": "HEAD",
+        "write_scope": ["src/**"],
+        "acceptance": ["the profile's checks pass"],
+        "verification_profile": "profile",
+        "review": review,
+    });
+    if let Some(source) = from {
+        contract["from_candidate"] = serde_json::json!({ "run": source.as_str() });
+    }
+    TaskContract::from_json_str(&contract.to_string()).expect("a review contract")
+}
+
+/// What a reviewed successor run left behind: the reviewer prompts, the
+/// receipt's review record, the successor's events and the dispatch that
+/// reviewed its source.
+struct SuccessorRun {
+    prompts: Vec<String>,
+    review: verify::ReviewRecord,
+    events: String,
+    source_review_dispatch: Option<String>,
+}
+
+/// Run a reviewed source, then a reviewed successor whose backend
+/// `child_backend` builds. `between` runs after the source, before the
+/// successor.
+fn successor_run(
+    source_review: &str,
+    source_answer: &'static str,
+    between: impl FnOnce(&Fixture),
+    child_backend: impl FnOnce(&Fixture, &Arc<Mutex<Vec<String>>>) -> MockBackend,
+) -> SuccessorRun {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 1);
+    let source_prompts = Arc::default();
+    let source = fixture.execute(
+        &review_contract(None, source_review),
+        &repo,
+        &reviewing_backend(&source_prompts, "src/parent.rs", source_answer),
+    );
+    between(&fixture);
+    let prompts = Arc::default();
+    let child = fixture.execute(
+        &review_contract(Some(&source.run_id), "required"),
+        &repo,
+        &child_backend(&fixture, &prompts),
+    );
+    let source_review_dispatch = fixture
+        .ledger
+        .review_cleared(
+            &source.run_id,
+            &crate::workspace::tree_of(
+                &fixture.repo,
+                &crate::workspace::candidate_ref(source.run_id.as_str(), 1),
+            )
+            .expect("the source candidate's tree"),
+            &crate::ids::sha256_hex(b""),
+        )
+        .ok()
+        .flatten();
+    let run = SuccessorRun {
+        prompts: prompts.lock().expect("lock").clone(),
+        review: review_record_of(&fixture.ledger, &child.run_id).expect("review record"),
+        events: std::fs::read_to_string(
+            fixture
+                .artifacts
+                .join(child.run_id.as_str())
+                .join("events.jsonl"),
+        )
+        .expect("events.jsonl"),
+        source_review_dispatch,
+    };
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a test temp dir
+    run
+}
+
+fn child_reviewer(_: &Fixture, prompts: &Arc<Mutex<Vec<String>>>) -> MockBackend {
+    reviewing_backend(prompts, "src/child.rs", "FINDINGS: none")
+}
+
+fn assert_fell_back_to_base(run: &SuccessorRun) {
+    assert!(
+        matches!(run.review, verify::ReviewRecord::AgainstBase { .. }),
+        "{:?}",
+        run.review
+    );
+    assert!(run.events.contains("review_basis"), "{}", run.events);
+}
+
+const INHERITED: &str = "files the predecessor run changed (inherited)";
+const SUCCESSOR_ONLY: &str = "holds only this candidate's own changes";
+const FULL_PATCH: &str = "no successful review of the predecessor's tree is on record";
+
+#[test]
+fn a_successor_of_a_reviewed_predecessor_is_reviewed_on_its_own_changes() {
+    let run = successor_run("required", "FINDINGS: none", |_| {}, child_reviewer);
+    let prompts = &run.prompts;
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    let prompt = &prompts[0];
+    let cleared_by = run
+        .source_review_dispatch
+        .clone()
+        .expect("the predecessor's review dispatch");
+    assert!(
+        matches!(
+            &run.review,
+            verify::ReviewRecord::SuccessorOnly { cleared_by: recorded, .. }
+                if *recorded == cleared_by
+        ),
+        "{:?}",
+        run.review
+    );
+    assert!(
+        run.events.contains("review_basis") && run.events.contains(&cleared_by),
+        "{}",
+        run.events
+    );
+    assert!(
+        prompt.contains(INHERITED) && prompt.contains("src/parent.rs"),
+        "{prompt}"
+    );
+    assert!(prompt.contains(SUCCESSOR_ONLY), "{prompt}");
+    assert!(prompt.contains("src/child.rs"), "{prompt}");
+    let changed = prompt
+        .split("the candidate patch is the file")
+        .nth(1)
+        .expect("changed files block");
+    assert!(
+        changed.contains("src/child.rs") && !changed.contains("src/parent.rs"),
+        "the patch holds the successor's changes only: {changed}"
+    );
+}
+
+#[test]
+fn a_successor_only_review_names_the_predecessors_dispatch_in_the_run_events() {
+    let run = successor_run("required", "FINDINGS: none", |_| {}, child_reviewer);
+    let cleared_by = run
+        .source_review_dispatch
+        .as_deref()
+        .expect("the predecessor's review dispatch");
+    assert!(
+        run.events.contains("review_basis") && run.events.contains(cleared_by),
+        "{}",
+        run.events
+    );
+}
+
+#[test]
+fn a_successor_of_an_unreviewed_predecessor_is_reviewed_on_the_full_patch() {
+    let run = successor_run(
+        "required",
+        "FINDINGS:\n1. [high] src/parent.rs:1 bad. Fix.\n",
+        |_| {},
+        child_reviewer,
+    );
+    assert_fell_back_to_base(&run);
+    let prompts = &run.prompts;
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    let prompt = &prompts[0];
+    assert!(
+        prompt.contains(INHERITED) && prompt.contains(FULL_PATCH),
+        "{prompt}"
+    );
+    let changed = prompt
+        .split("the candidate patch is the file")
+        .nth(1)
+        .expect("changed files block");
+    assert!(
+        changed.contains("src/parent.rs") && changed.contains("src/child.rs"),
+        "an inherited violation still reaches the reviewer: {changed}"
+    );
+}
+
+#[test]
+fn a_merge_that_changed_the_inherited_tree_is_reviewed_on_the_full_patch() {
+    let run = successor_run(
+        "required",
+        "FINDINGS: none",
+        |fixture| {
+            commit_file(fixture, "README.md", "the target moved on\n");
+        },
+        child_reviewer,
+    );
+    assert_fell_back_to_base(&run);
+    let prompts = &run.prompts;
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    let prompt = &prompts[0];
+    assert!(
+        prompt.contains(FULL_PATCH) && !prompt.contains(SUCCESSOR_ONLY),
+        "{prompt}"
+    );
+    let changed = prompt
+        .split("the candidate patch is the file")
+        .nth(1)
+        .expect("changed files block");
+    assert!(changed.contains("src/parent.rs"), "{changed}");
+}
+
+#[test]
+fn a_successor_of_a_predecessor_that_was_never_reviewed_is_reviewed_on_the_full_patch() {
+    let run = successor_run("off", "FINDINGS: none", |_| {}, child_reviewer);
+    assert_fell_back_to_base(&run);
+    let prompts = &run.prompts;
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    let prompt = &prompts[0];
+    assert!(
+        prompt.contains(INHERITED) && prompt.contains(FULL_PATCH),
+        "{prompt}"
+    );
+    let changed = prompt
+        .split("the candidate patch is the file")
+        .nth(1)
+        .expect("patch block");
+    assert!(
+        changed.contains("src/parent.rs") && changed.contains("src/child.rs"),
+        "{changed}"
+    );
+}
+
+#[test]
+fn a_cleared_successor_reviewed_in_parts_reads_the_full_patch_against_the_base() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 1);
+    let source = fixture.execute(
+        &review_contract(None, "required"),
+        &repo,
+        &reviewing_backend(&Arc::default(), "src/parent.rs", "FINDINGS: none"),
+    );
+    // The successor's reviewer is refused once, so the run stops needs_review
+    // and a `review-parts` answer asks for the review again, in parts.
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let prompts: Arc<Mutex<Vec<String>>> = Arc::default();
+    let backend = {
+        let (refuse, prompts) = (Arc::clone(&refuse), Arc::clone(&prompts));
+        MockBackend::new(move |spec| {
+            if spec.prompt.contains("semantic reviewer") {
+                if refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                    return MockOutcome {
+                        exit_code: Some(1),
+                        ..Default::default()
+                    };
+                }
+                prompts.lock().expect("lock").push(spec.prompt.clone());
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    usage: Some(usage(10)),
+                    ..Default::default()
+                };
+            }
+            std::fs::write(spec.work_dir.join("src/child.rs"), "pub fn added() {}\n")
+                .expect("write");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(10)),
+                ..Default::default()
+            }
+        })
+    };
+    let stopped = fixture.execute(
+        &review_contract(Some(&source.run_id), "required"),
+        &repo,
+        &backend,
+    );
+    assert!(
+        matches!(stopped.terminal, Terminal::NeedsReview { .. }),
+        "{stopped:?}"
+    );
+    refuse.store(false, std::sync::atomic::Ordering::SeqCst);
+    // The answer records the `review: parts` intent on the new run; the run
+    // itself is the cleared successor of `source`, a change with its own work.
+    let (_, new_run) =
+        super::review_parts::answer_review_parts(&fixture, &stopped.run_id, State::NeedsReview);
+    let contract = review_contract(Some(&source.run_id), "required");
+    let outcome = fixture.execute_as(Some(new_run.clone()), &contract, &repo, &backend);
+    assert!(
+        matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    let prompts = prompts.lock().expect("lock").clone();
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert!(
+        prompts[0].contains("src/parent.rs") && prompts[0].contains("src/child.rs"),
+        "{}",
+        prompts[0]
+    );
+    assert!(!prompts[0].contains(SUCCESSOR_ONLY), "{}", prompts[0]);
+    // The part's own patch section, not the inherited-files block (which
+    // lists src/parent.rs whatever the basis): the full patch reached it.
+    let part = prompts[0]
+        .split("the candidate patch is the file")
+        .nth(1)
+        .expect("the part's patch section");
+    assert!(
+        part.contains("src/parent.rs") && part.contains("src/child.rs"),
+        "{part}"
+    );
+    assert_eq!(
+        fixture.ledger.review_basis(&new_run).expect("basis"),
+        Some(crate::ledger::ReviewBasis::AgainstBase)
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a test temp dir
+}

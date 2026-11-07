@@ -967,7 +967,7 @@ pub fn retire(worktree: &TaskWorktree, run_id: &str, artifacts_dir: &Path) -> Re
 }
 
 /// The tree object a commit carries.
-fn tree_of(dir: &Path, commit: &str) -> Result<String> {
+pub fn tree_of(dir: &Path, commit: &str) -> Result<String> {
     git(dir, &["rev-parse", &format!("{commit}^{{tree}}")])
 }
 

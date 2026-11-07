@@ -58,6 +58,7 @@ use self::replay::replay_command;
 use self::report::{report_command, usage_import_command};
 use self::resume::{
     prune_runs_command, resume_command, resume_logged, retire_all_command, Prune, Retire,
+    WorkerStopped,
 };
 use self::run::{run_command, RunSource};
 use self::status::{explain_command, status_command};
@@ -213,6 +214,12 @@ pub(crate) enum Command {
         /// are provably dead
         #[arg(long)]
         retire: bool,
+        /// With --retire and a run: vouch that the worker an in-place run
+        /// lost (`inplace_worker_may_run`) has stopped, after closing its
+        /// Claude Code session. The only way to free a tree whose lost
+        /// worker has no agent id, and the way out when no stop was seen
+        #[arg(long, requires_all = ["retire", "run_id"])]
+        worker_stopped: bool,
         /// Every run rather than one: the default when no run is named
         #[arg(long, requires = "retire", conflicts_with = "run_id")]
         all: bool,
@@ -726,11 +733,17 @@ pub(crate) enum JudgeVerdict {
 #[derive(Subcommand)]
 pub(crate) enum TrustCommand {
     /// The grant key, the repository, where machine.toml is, and every
-    /// command a grant would authorize. Writes nothing.
+    /// command a grant would authorize. Writes nothing unless
+    /// --mark-reported is given.
     Show {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
+        /// Record a pending change to the commands as reported, so the
+        /// next `trust show` no longer returns it; for the caller that
+        /// tells the person
+        #[arg(long = "mark-reported")]
+        mark_reported: bool,
     },
     /// Trust this repository once, in machine.toml (`[trust_repos]`): every
     /// policy of it is then admitted, a change to its commands warns. With
@@ -1300,6 +1313,7 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
         Command::Resume {
             run_id,
             retire,
+            worker_stopped,
             all: _,
             log,
             prune_runs,
@@ -1307,7 +1321,11 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
         } => match (log, prune_runs, run_id) {
             (Some(log), _, _) => resume_logged(&log),
             (None, Some(days), _) => prune_runs_command(days, Prune::from_flag(write)),
-            (None, None, Some(run_id)) => resume_command(&run_id, Retire::from_flag(retire)),
+            (None, None, Some(run_id)) => resume_command(
+                &run_id,
+                Retire::from_flag(retire),
+                WorkerStopped::from_flag(worker_stopped),
+            ),
             (None, None, None) => retire_all_command(),
         },
         Command::Report {

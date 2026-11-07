@@ -237,6 +237,12 @@ pub struct AvalCli {
     rules: OnceLock<Result<Rules, GuidanceGap>>,
     /// The adr-lint program: `RELAIS_ADR_LINT`, else `adr-lint` from PATH.
     adr_lint: String,
+    /// The fleet decisions directory a repository without a corpus of its
+    /// own takes its code rules from: `RELAIS_FLEET_DECISIONS`, if set.
+    /// Unset, the decisions pack embedded in this binary is the source.
+    fleet_decisions: Option<PathBuf>,
+    /// Where the embedded pack is materialised, keyed by its content hash.
+    fleet_cache: Option<PathBuf>,
 }
 
 impl AvalCli {
@@ -248,6 +254,8 @@ impl AvalCli {
             cancel: None,
             rules: OnceLock::new(),
             adr_lint: adr_lint_program(),
+            fleet_decisions: fleet_decisions_dir(),
+            fleet_cache: default_fleet_cache(),
         }
     }
 
@@ -260,6 +268,8 @@ impl AvalCli {
             cancel: Some(cancel),
             rules: OnceLock::new(),
             adr_lint: adr_lint_program(),
+            fleet_decisions: fleet_decisions_dir(),
+            fleet_cache: default_fleet_cache(),
         }
     }
 
@@ -270,10 +280,78 @@ impl AvalCli {
         self
     }
 
+    /// The same, materialising the embedded fleet pack under `dir`.
+    pub fn with_fleet_cache(mut self, dir: PathBuf) -> Self {
+        self.fleet_cache = Some(dir);
+        self
+    }
+
     /// The same, spawning `program` for adr-lint.
     pub fn with_adr_lint(mut self, program: impl Into<String>) -> Self {
         self.adr_lint = program.into();
         self
+    }
+}
+
+/// The fleet decisions directory: the one place the environment is read
+/// for it.
+fn fleet_decisions_dir() -> Option<PathBuf> {
+    std::env::var_os(FLEET_DECISIONS_ENV)
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Names the directory of the fleet decisions corpus; an explicit override
+/// of the embedded pack.
+pub const FLEET_DECISIONS_ENV: &str = "RELAIS_FLEET_DECISIONS";
+
+/// The fleet decisions pack this repository vendors, embedded at build time.
+const EMBEDDED_FLEET_PACK: &[u8] = include_bytes!("../../../../.adr/packs/decisions.pack");
+
+const FLEET_PACK_FILE: &str = "decisions.pack";
+
+fn default_fleet_cache() -> Option<PathBuf> {
+    crate::paths::state_dir()
+        .ok()
+        .map(|state| state.join("fleet-decisions"))
+}
+
+/// Write `pack` and a minimal `.adr.yaml` naming it into
+/// `<cache>/<sha256 of pack>/` once, and return that directory. An existing
+/// complete directory is reused; a half-written one is never visible,
+/// because the directory is built aside and renamed into place.
+fn materialise_fleet_pack(cache: &Path, pack: &[u8]) -> std::io::Result<PathBuf> {
+    let key = sha256_hex(pack)[..16].to_string();
+    let target = cache.join(&key);
+    if target.join(".adr.yaml").is_file() {
+        return Ok(target);
+    }
+    static ASIDE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = ASIDE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let aside = cache.join(format!("{key}.tmp-{}-{sequence}", std::process::id()));
+    let written = std::fs::create_dir_all(&aside)
+        .and_then(|()| std::fs::write(aside.join(FLEET_PACK_FILE), pack))
+        .and_then(|()| {
+            std::fs::write(
+                aside.join(".adr.yaml"),
+                format!("packs:\n  - {FLEET_PACK_FILE}\nkeys:\n"),
+            )
+        });
+    if let Err(error) = written {
+        // The half-written aside directory is this call's own: dropped so
+        // the cache never keeps one. Its removal failing changes nothing the
+        // caller can act on; the write error is what it is told.
+        let _ = std::fs::remove_dir_all(&aside); // best-effort: the write error is the one reported
+        return Err(error);
+    }
+    match std::fs::rename(&aside, &target) {
+        Ok(()) => Ok(target),
+        Err(_) if target.join(".adr.yaml").is_file() => match std::fs::remove_dir_all(&aside) {
+            Ok(()) => Ok(target),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(target),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
     }
 }
 
@@ -300,15 +378,50 @@ impl DecisionResolver for AvalCli {
     fn constraint_rules(&self) -> Result<Rules, GuidanceGap> {
         self.rules
             .get_or_init(|| {
-                guidance::fetch_rules(&|args| {
-                    guidance::run_aval(
-                        "aval",
-                        args,
-                        &self.root,
-                        GuidanceSource::Index,
-                        crate::tooling::GUIDANCE_TIMEOUT,
-                        self.cancel.as_deref(),
-                    )
+                let program = self.bin.clone().unwrap_or_else(|| "aval".to_string());
+                let ask_in = |dir: &Path| {
+                    let dir = dir.to_path_buf();
+                    let program = program.clone();
+                    move |args: &[String]| {
+                        guidance::run_aval(
+                            &program,
+                            args,
+                            &dir,
+                            GuidanceSource::Index,
+                            crate::tooling::GUIDANCE_TIMEOUT,
+                            self.cancel.as_deref(),
+                        )
+                    }
+                };
+                let in_repository = ask_in(&self.root);
+                let mut cache_failure = None;
+                let fleet_dir = self.fleet_decisions.clone().or_else(|| {
+                    let cache = self.fleet_cache.as_deref()?;
+                    match materialise_fleet_pack(cache, EMBEDDED_FLEET_PACK) {
+                        Ok(dir) => Some(dir),
+                        Err(error) => {
+                            cache_failure = Some(format!(
+                                "the embedded fleet pack could not be written under {}: {error}",
+                                cache.display()
+                            ));
+                            None
+                        }
+                    }
+                });
+                let in_fleet = fleet_dir.as_deref().map(ask_in);
+                guidance::fetch_rules_or_fleet(
+                    &in_repository,
+                    in_fleet.as_ref().map(|ask| ask as guidance::AvalRun<'_>),
+                )
+                .map_err(|gap| match cache_failure {
+                    Some(failure) if gap.cause == guidance::GapCause::Exited(3) => {
+                        GuidanceGap::new(
+                            gap.source,
+                            gap.cause,
+                            format!("{}; {failure}", gap.detail),
+                        )
+                    }
+                    _ => gap,
                 })
             })
             .clone()
@@ -316,7 +429,7 @@ impl DecisionResolver for AvalCli {
 
     fn relevant(&self, query: &RelevantQuery) -> Result<Relevant, GuidanceGap> {
         guidance::run_aval(
-            "aval",
+            self.bin.as_deref().unwrap_or("aval"),
             &guidance::relevant_args(query),
             &self.root,
             GuidanceSource::Relevant,
@@ -330,7 +443,7 @@ impl DecisionResolver for AvalCli {
         guidance::fetch_decisions(
             &|args| {
                 guidance::run_aval(
-                    "aval",
+                    self.bin.as_deref().unwrap_or("aval"),
                     args,
                     &self.root,
                     GuidanceSource::Decisions,
@@ -1505,6 +1618,70 @@ mod tests {
             resolve_with_path(&dir, None, &dir),
             AvalVerdict::NotInstalled
         );
+    }
+
+    // Unix only: the fake aval is a `sh` script made executable by mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_repository_without_a_corpus_takes_the_embedded_fleet_pack_by_default() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::temp_dir("aval-fleet");
+        let repository = dir.join("repository");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&repository).expect("repository");
+        let fake = dir.join("fake-aval");
+        let script = "#!/bin/sh\nif [ -f .adr.yaml ] && grep -q decisions.pack .adr.yaml && [ -s decisions.pack ]; then\n  printf '%s' '{\"rules\":[{\"active\":true,\"adopts\":\"ADR-0011\",\"body\":\"B\",\"file\":\"aval.pack\",\"governs\":\"code\",\"id\":\"names.reveal-intent\",\"level\":\"constraint\",\"pack\":\"decisions\",\"source\":\"x\",\"statement\":\"S\"}]}'\nelse\n  exit 3\nfi\n";
+        std::fs::write(&fake, script).expect("fake aval");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let mut cli = AvalCli::new(repository)
+            .with_bin(fake.to_str())
+            .with_fleet_cache(cache.clone());
+        cli.fleet_decisions = None;
+        let rules = cli.constraint_rules().expect("the fleet's rules");
+        assert_eq!(rules.code_rules.len(), 1);
+        assert_eq!(rules.code_rules[0].id, "names.reveal-intent");
+        let materialised: Vec<_> = std::fs::read_dir(&cache).expect("cache").collect();
+        assert_eq!(materialised.len(), 1);
+    }
+
+    #[test]
+    fn two_first_writers_of_the_fleet_cache_both_get_the_directory() {
+        let dir = crate::test_support::temp_dir("fleet-race");
+        let cache = dir.join("cache");
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = cache.clone();
+                std::thread::spawn(move || materialise_fleet_pack(&cache, EMBEDDED_FLEET_PACK))
+            })
+            .collect();
+        for writer in writers {
+            let materialised = writer.join().expect("writer").expect("the directory");
+            assert!(materialised.join(".adr.yaml").is_file());
+        }
+    }
+
+    #[test]
+    fn a_real_aval_reads_the_materialised_fleet_pack() {
+        let dir = crate::test_support::temp_dir("fleet-real-aval");
+        let materialised =
+            materialise_fleet_pack(&dir.join("cache"), EMBEDDED_FLEET_PACK).expect("materialised");
+        let output = match std::process::Command::new("aval")
+            .args(["rules", "--level", "constraint", "--full", "--json"])
+            .current_dir(&materialised)
+            .output()
+        {
+            Ok(output) => output,
+            // no aval installed here: the fake-aval tests still cover the wiring
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipped: no aval on PATH; the fake-aval tests cover the wiring");
+                return;
+            }
+            Err(error) => panic!("aval did not run: {error}"),
+        };
+        assert!(output.status.success(), "{output:?}");
+        let rules = guidance::parse_rules_output(&String::from_utf8_lossy(&output.stdout))
+            .expect("aval's rules");
+        assert!(!rules.code_rules.is_empty());
     }
 
     #[test]
