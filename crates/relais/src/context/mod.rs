@@ -1620,6 +1620,8 @@ mod tests {
         );
     }
 
+    // Unix only: the fake aval is a `sh` script made executable by mode.
+    #[cfg(unix)]
     #[test]
     fn a_repository_without_a_corpus_takes_the_embedded_fleet_pack_by_default() {
         use std::os::unix::fs::PermissionsExt;
