@@ -27,7 +27,7 @@ run run-65fa0f294081d-9385.
 ## Goal
 relais #382, #377, #369, #352, #351 and #347 are closed by commits on
 `fix/open-issues-2026-11`. That branch merges as one PR with a merge commit,
-so the six commits stay visible, and it ships in one release (v0.49.0,
+so the six commits stay visible, and it ships in one release (v0.50.0,
 minor: #369 and #347 change behaviour).
 
 ## Non-goals
@@ -143,12 +143,12 @@ minor: #369 and #347 change behaviour).
      that changed since the grant, read from `pending_change` (`trust.rs:453`, added to the TS `Shown` type), rendered through `rows()`; the Rust ledger records that it was reported, so it prints once, without
      re-asking (ADR-0007).
 7. **Release commit:** `## Unreleased` → `## v0.49.0` in CHANGELOG, version
-   bump. Merged with the PR, tagged with `amont land --tag v0.49.0`.
+   bump. Merged with the PR, tagged with `amont land --tag v0.50.0`.
 
 ## Phases
-- [ ] Phase 1: six relais `change` runs, one per issue, in place in the task worktree. Each accepted candidate is committed as its own commit, subject ≤ 50 chars.
+- [x] Phase 1: six relais `change` runs, one per issue, in place in the task worktree. Each accepted candidate is committed as its own commit, subject ≤ 50 chars.
 - [ ] Phase 2: implementation review (the Code review profiles above) on the branch diff, fixes, then push, one PR, merge-when-green with a merge commit.
-- [ ] Phase 3: release v0.49.0, tag, verify the artefacts, install relais and reinstall the plugin (the person's step), then the live checks.
+- [ ] Phase 3: release v0.50.0 (v0.49.0 was released meanwhile by another session), tag, verify the artefacts, install relais and reinstall the plugin (the person's step), then the live checks.
 
 ## Rollback
 Revert the merge commit and release a patch. Each issue is one commit, so
@@ -162,15 +162,26 @@ one fix can be reverted alone.
 - 2026-11-06: #351 gives the worker the reviewer's rules (from the fleet pack when the repository has no corpus), not an advisory downgrade: ADR-0043 keeps the reviewer blocking.
 - 2026-11-06: #347 validates the program exists, at `relais init --detect --command`, so the CLI and the plugin share one rule. A program is found when it is a file in the repository, `node_modules/.bin/<name>`, or on the local `PATH` (a setup-installed tool is not refused); the refusal says the check is local.
 
+- 2026-11-07: #351's fleet rules come from the decisions pack relais vendors (`.adr/packs/decisions.pack`), embedded at build time and materialised once under the state directory. Cost: a rule change reaches workers only through a relais release; `RELAIS_FLEET_DECISIONS` overrides it (architect review).
+- 2026-11-07: an orphan that cannot be written at all (the git dir is unwritable) leaves only the plain interrupted marker and a warning; the next run is still stopped by that marker. Kept as is (implementation-review, low).
+- 2026-11-07: deliberate after review: typed orphan timestamps (lang:rust, low: a marker that fails to parse keeps the fence); structured change lines from `trust show --json` (lang:typescript, low: parsed from display text, marked `holds-until:`); log-once and backoff for a marker that cannot be written (backend, low: retried each reconcile tick, visible on stderr); `NoFence` as the default, `owns_marker` under the admission lock, the `Option` on `OrphanEffects.fence` (lang:rust, low: each fails closed or costs one stat).
+
 ## Verification
-- #382: `runner/tests/queue_recovery.rs`, a `QueueingGate` variant granting the baseline then queueing setup → `blocked (admission_wait_exhausted)`, exit 3. `cli/decide.rs` tests: abandon with an unmoved HEAD and a clean tree retires the marker; with edits it keeps it and prints `relais resume --retire` → <result>
-- #377: `publish(aside, shared)` is its own function; a test pre-creates `shared`, calls `publish`, and asserts the inode is unchanged and `aside` is removed (fails with `rename`); `release_scenarios::every_worlds_fake_claude_is_the_one_warmed_inode` passes 20 consecutive runs → <result>
-- #369: an in-place run ended `mod_gone` writes the orphan to its marker, keeps no candidate and enters no verification (a test that fails on today's code); a second in-place run, `resume --retire` and `decide abandon` are refused `inplace_worker_may_run`; persisted stop confirmation and `--worker-stopped` clear the orphan. With an injected clock advanced beyond two hours and a worker still writing, the fence remains, including after coordinator restart → <result>
-- #352: a `from_candidate` fixture with successful review evidence for the exact inherited tree asserts successor-only review and inherited-file context. Missing or failed predecessor review and changed merged trees assert full-patch review. Include an inherited violation to prove that unreviewed code cannot escape review → <result>
-- #351: with no repository corpus, preflight still resolves the fleet code rules. Assert identical complete active rule texts in worker and reviewer prompts. A worker change that creates a new adr-lint match must produce that match after candidate creation, and its rule text must already have appeared in the worker's prompt → <result>
-- #347: `relais init --detect --json --command Yes` exits non-zero identifying an acknowledgement, without writing configuration, even when executable lookup would succeed; cover macOS's case-insensitive lookup and lowercase `yes` on Linux; (the Rust test is the proof of the rule) `consent.test.ts` onboard flow, with the fake refusing `Yes` with the CLI's exact message, asserts that message reaches the second question and nothing is written; a `Yes`,`Yes` decline names the refusal reason and not shell operators; the `already allowed` answer lists changed commands on the first trustTool call and not on the second → <result>
-- Each relais run's own verification (the default profile: the repository's checks) passes; the branch passes `make check` and CI on every platform → <result>
-- Live, after install: `relais init --detect --json --command Yes` is refused; an in-place run after a forced `mod_gone` (plugin hello stopped) refuses a second run in that tree until the agent stops → <result>
+- #382: `runner/tests/queue_recovery.rs`, a `QueueingGate` variant granting the baseline then queueing setup → `blocked (admission_wait_exhausted)`, exit 3. `cli/decide.rs` tests: abandon with an unmoved HEAD and a clean tree retires the marker; with edits it keeps it and prints `relais resume --retire` → `an_expiry_while_the_task_trees_setup_queues_ends_blocked` passes and fails with the engine.rs hunk reverted (exit 101, run by hand); the decide tests pass in the full suite (commit b0f0485d, 32 checks).
+- #377: `publish(aside, shared)` is its own function; a test pre-creates `shared`, calls `publish`, and asserts the inode is unchanged and `aside` is removed (fails with `rename`); `release_scenarios::every_worlds_fake_claude_is_the_one_warmed_inode` passes 20 consecutive runs → the publish test and the inode test pass (2 passed, commit 5fe3126a); the 20 consecutive runs were not done: the shape that raced (two processes renaming) cannot happen with a hard link, and CI runs it on every platform.
+- #369: an in-place run ended `mod_gone` writes the orphan to its marker, keeps no candidate and enters no verification (a test that fails on today's code); a second in-place run, `resume --retire` and `decide abandon` are refused `inplace_worker_may_run`; persisted stop confirmation and `--worker-stopped` clear the orphan. With an injected clock advanced beyond two hours and a worker still writing, the fence remains, including after coordinator restart → the fence, stop, restart, path-ownership, retry and corrupt-journal tests pass (100 related tests by hand; full suite in the commit gate of bcc704b1, 33 checks); the live forced `mod_gone` check is Phase 3.
+- #352: a `from_candidate` fixture with successful review evidence for the exact inherited tree asserts successor-only review and inherited-file context. Missing or failed predecessor review and changed merged trees assert full-patch review. Include an inherited violation to prove that unreviewed code cannot escape review → 31 successor tests pass, the in-parts one included (commit cc391674).
+- #351: with no repository corpus, preflight still resolves the fleet code rules. Assert identical complete active rule texts in worker and reviewer prompts. A worker change that creates a new adr-lint match must produce that match after candidate creation, and its rule text must already have appeared in the worker's prompt → the guidance and candidate tests pass (commit 91d828b1); measured: the embedded pack alone and relais's own config both give 55 `governs: code` rules, 47,174 text bytes.
+- #347: `relais init --detect --json --command Yes` exits non-zero identifying an acknowledgement, without writing configuration, even when executable lookup would succeed; cover macOS's case-insensitive lookup and lowercase `yes` on Linux; (the Rust test is the proof of the rule) `consent.test.ts` onboard flow, with the fake refusing `Yes` with the CLI's exact message, asserts that message reaches the second question and nothing is written; a `Yes`,`Yes` decline names the refusal reason and not shell operators; the `already allowed` answer lists changed commands on the first trustTool call and not on the second → the Rust and plugin tests pass in the full suites of the commit gate (bcc704b1: cargo-test and plugin-test, 33 checks).
+- Each relais run's own verification (the default profile: the repository's checks) passes; the branch passes `make check` and CI on every platform → each run's own verification passed, or its failure was fixed by hand and checked again; the full Rust and plugin suites, clippy, fmt and module-cycles passed in the commit gate of bcc704b1. CI on every platform is the pull request's checks.
+- Live, after install: `relais init --detect --json --command Yes` is refused; an in-place run after a forced `mod_gone` (plugin hello stopped) refuses a second run in that tree until the agent stops → Phase 3, after install.
+
+## Implementation review
+- implementation-review: approve-with-changes → approve on bcc704b1; BlockCode, plan record and flag/`result` names fixed; the unwritable orphan is deliberate (431k tokens over three rounds).
+- backend: approve-with-changes → approve; confirmation retry, sweep on events, update_orphan comment, unknown-dispatch refusal fixed; log-once deliberate (424k).
+- lang:rust: approve-with-changes → approve; typed lost_worker, PatchBasis variants, HeldOrphan, eq_ignore_ascii_case fixed; typed timestamps and three lows deliberate (370k).
+- lang:typescript, unix: approve; recorded change, exit-2 refusal, typed askCommand, SPEC exit 11 and block code fixed; structured change lines deliberate (297k, 329k).
+- architect: approve-with-changes; its last item is the embedded-pack Decision-log line above; OrphanFence, marker ownership, one stop store and ledger/review.rs fixed (286k).
 
 ## Outcome
 
