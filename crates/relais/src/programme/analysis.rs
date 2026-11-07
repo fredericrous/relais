@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::model::{MapDoc, Problem, Status, Ticket, MAP_FILE};
+use super::model::{MapDoc, Mode, Problem, Status, Ticket, MAP_FILE};
 
 /// Where a ticket stands against the others and the branches.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +187,31 @@ pub fn check(
     problems
 }
 
+/// What is worth fixing but does not fail `check`: each open afk ticket
+/// without a `## Look at` or a `## Answer looks like` section, on its
+/// heading line.
+pub fn warnings(tickets: &BTreeMap<String, Ticket>) -> Vec<Problem> {
+    let mut found = Vec::new();
+    for ticket in tickets.values() {
+        if ticket.status != Status::Open || ticket.mode != Mode::Afk {
+            continue;
+        }
+        for (present, title) in [
+            (ticket.has_look_at, "## Look at"),
+            (ticket.has_answer_looks_like, "## Answer looks like"),
+        ] {
+            if !present {
+                found.push(problem(
+                    ticket,
+                    ticket.heading_line,
+                    format!("open afk ticket has no `{title}` section"),
+                ));
+            }
+        }
+    }
+    found
+}
+
 /// One problem per cycle, on its smallest ticket id, naming the path round.
 // holds-until: ~1000 tickets in one programme — one reachability walk per
 // ticket is quadratic; a strongly-connected-components pass after
@@ -272,6 +297,8 @@ mod tests {
             blocked_by: blocked_by.iter().map(|b| b.to_string()).collect(),
             repos: None,
             has_question: true,
+            has_look_at: false,
+            has_answer_looks_like: false,
             has_resolution: status == Status::Closed,
             status_line: 4,
             blocked_by_line: 5,
@@ -308,6 +335,44 @@ mod tests {
         assert_eq!(
             (total.open, total.frontier, total.blocked, total.in_flight),
             (3, 1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn only_open_afk_tickets_lacking_a_section_are_warned_about() {
+        let mut complete = ticket("A", Status::Open, &[]);
+        complete.has_look_at = true;
+        complete.has_answer_looks_like = true;
+        let mut half = ticket("B", Status::Open, &[]);
+        half.has_look_at = true;
+        let mut hitl = ticket("C", Status::Open, &[]);
+        hitl.mode = Mode::Hitl;
+        let tickets = set(vec![
+            complete,
+            half,
+            hitl,
+            ticket("D", Status::Closed, &[]),
+            ticket("E", Status::OutOfScope, &[]),
+            ticket("F", Status::Open, &[]),
+        ]);
+        let found: Vec<(String, String)> = warnings(&tickets)
+            .into_iter()
+            .map(|w| (w.file, w.message))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    "B.md",
+                    "open afk ticket has no `## Answer looks like` section"
+                ),
+                ("F.md", "open afk ticket has no `## Look at` section"),
+                (
+                    "F.md",
+                    "open afk ticket has no `## Answer looks like` section"
+                ),
+            ]
+            .map(|(f, m)| (f.to_string(), m.to_string()))
         );
     }
 

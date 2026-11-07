@@ -166,6 +166,8 @@ pub fn parse_ticket(id: &str, text: &str) -> (Option<Ticket>, Vec<Problem>) {
     let has_section = |title: &str| body.iter().any(|(_, l)| l.trim_end() == title);
     let has_question = has_section("## Question");
     let has_resolution = has_section("## Resolution");
+    let has_look_at = has_section("## Look at");
+    let has_answer_looks_like = has_section("## Answer looks like");
     if !has_question {
         problems.push(problem(
             &file,
@@ -186,6 +188,8 @@ pub fn parse_ticket(id: &str, text: &str) -> (Option<Ticket>, Vec<Problem>) {
         blocked_by: blocked_by.unwrap_or_default(),
         repos,
         has_question,
+        has_look_at,
+        has_answer_looks_like,
         has_resolution,
         status_line: key_line("status"),
         blocked_by_line: key_line("blocked_by"),
@@ -272,6 +276,19 @@ mod tests {
         assert_eq!(ticket.repos, None);
         assert_eq!(ticket.blocked_by_line, 5);
         assert!(ticket.has_question && !ticket.has_resolution);
+        assert!(!ticket.has_look_at && !ticket.has_answer_looks_like);
+    }
+
+    #[test]
+    fn the_afk_sections_are_read() {
+        let text = TICKET.replace(
+            "Which?\n",
+            "Which?\n\n## Look at\n\nx\n\n## Answer looks like\n\ny\n",
+        );
+        let (ticket, problems) = parse_ticket("B", &text);
+        assert_eq!(problems, []);
+        let ticket = ticket.expect("ticket");
+        assert!(ticket.has_look_at && ticket.has_answer_looks_like);
     }
 
     #[test]

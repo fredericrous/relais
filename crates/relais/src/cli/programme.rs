@@ -343,18 +343,32 @@ pub(crate) fn check_command(dir: &Path, format: Format) -> Result<CliOutcome, Cl
     if !problems.is_empty() {
         eprintln!("{} problems", problems.len());
     }
+    let warnings = analysis::warnings(&programme.tickets);
+    for warning in &warnings {
+        eprintln!(
+            "{}:{}: warning: {}",
+            dir.join(&warning.file).display(),
+            warning.line,
+            warning.message
+        );
+    }
     if format == Format::Json {
-        let rows: Vec<Value> = problems
-            .iter()
-            .map(|p| {
-                json!({
-                    "path": dir.join(&p.file).display().to_string(),
-                    "line": p.line,
-                    "message": p.message,
+        let rows = |found: &[relais::programme::model::Problem]| -> Vec<Value> {
+            found
+                .iter()
+                .map(|p| {
+                    json!({
+                        "path": dir.join(&p.file).display().to_string(),
+                        "line": p.line,
+                        "message": p.message,
+                    })
                 })
-            })
-            .collect();
-        print_stdout(&format!("{}\n", json!({ "problems": rows })))?;
+                .collect()
+        };
+        print_stdout(&format!(
+            "{}\n",
+            json!({ "problems": rows(&problems), "warnings": rows(&warnings) })
+        ))?;
     }
     Ok(if problems.is_empty() {
         CliOutcome::Accepted

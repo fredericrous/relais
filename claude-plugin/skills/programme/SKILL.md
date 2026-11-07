@@ -50,6 +50,10 @@ repos = ["relais", "amont"]   # the repositories it touches; default: the map's
 # Which object store holds the lake
 ## Question
 <the decision this ticket resolves>
+## Look at
+<afk: the files, runs or pages to read first>
+## Answer looks like
+<afk: the shape of a finished answer, so a run knows when it is done>
 ## Resolution
 <when closed: the answer, and links to assets, ADRs, PRs and runs>
 ```
@@ -81,7 +85,9 @@ Resolution.
    Multi-session work with every decision clear still gets a map. Done when
    each decision is a ticket or a line under Not yet specified.
 3. **Write the files.** Make a question a ticket when you can state it
-   precisely now, even if it is blocked; otherwise it is fog. Done when
+   precisely now, even if it is blocked; otherwise it is fog. An afk
+   ticket requires `## Look at` and `## Answer looks like`; `check` warns
+   on an open afk ticket without them. Done when
    `relais programme check docs/programmes/<slug>` exits 0 and
    `relais programme frontier docs/programmes/<slug>` lists at least one
    ticket.
