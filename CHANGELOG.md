@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+- **A misshapen acceptance entry says what is wrong.** A contract whose acceptance entry was neither a string nor a valid declared criterion was refused with "data did not match any variant of untagged enum AcceptanceEntry", which named nothing. About 9% of runs in the last two weeks were refused that way. The refusal now names the entry (`acceptance[1]`), the fault (``unknown field `criterion` ``, ``unknown variant `report` ``, ``missing field `evidence` ``) and the shape that parses, with every evidence kind. An unknown field inside an entry is no longer reported as an unknown field of the contract itself. The `/relais` skill now shows a declared criterion in full: the field is `statement`.
+
 ## v0.49.0
 
 - **`relais report` shows what each harness step costs beside what it caught.** Every `harness.steps[].models[]` row gains `cost_micros`, `tokens`, `cost_completeness`, `cost_per_caught_micros` and `tokens_per_caught`; the last two are `null` when nothing was caught. The text report puts the cost on its own line under each row, `cost: $X.XX total, $Y.YY/catch` (`<$0.01` for a known cost under half a cent), with `(est.)` after the total when the cost is priced from tokens, `(lower bound)` when some usage was cut short and `(partial)` when some dispatch or attempt reported no cost. A step whose usage rows reported no cost at all shows `cost_micros: null` and a `cost unknown` line, never `$0.00`. A model that ran only an earlier dispatch of a run appears with `ran`, `caught` and `no_verdict` all 0, carrying its cost alone, and the text says `earlier dispatches only`. The report schema goes from 16 to 17.
