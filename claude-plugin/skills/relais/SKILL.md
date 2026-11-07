@@ -62,10 +62,26 @@ up, and the person answers there.
 }
 ```
 
-   A criterion that asks for new tests is declared as an object with
-   `"evidence": {"kind": "test", "authorship": "model_added"}`: relais
-   then meets it only when the checks pass AND the patch adds at least
-   one test (a bare string criterion is settled by the checks alone).
+   A bare string criterion is settled by the checks alone. To name what
+   settles a criterion, declare it as an object. The field is
+   `statement`; `criterion`, `text` and `description` are refused:
+
+```json
+{"acceptance": [
+  "the crate builds",
+  {"statement": "a regression test covers the empty input",
+   "evidence": {"kind": "test", "authorship": "model_added"}},
+  {"statement": "clippy is clean",
+   "evidence": {"kind": "check", "name": "<check name in the profile>"}}
+]}
+```
+
+   Evidence kinds: `check` {`name`}, `test` {`authorship`:
+   `pre_existing`|`human_added`|`model_added`, optional `name` of one
+   JUnit test}, `llm_review`, `human_sign_off`, `amont_gate` {`gate`},
+   `holdout` {`name`}. There is no `report` kind. Optional fields: `id`
+   and `mandatory` (default true). A `model_added` test criterion is met
+   only when the checks pass AND the patch adds at least one test.
 
    Use `"kind": "inspect"` with evidence criteria for investigations
    that must not edit files.

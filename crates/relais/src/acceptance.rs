@@ -14,7 +14,13 @@ use crate::ids::sha256_hex;
 /// string, exactly as every contract has always written one, or a
 /// declared criterion naming its own evidence. Untagged so a contract
 /// written entirely in bare strings is unchanged, byte for byte.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Deserialized by hand rather than by `#[serde(untagged)]`: an untagged
+/// enum answers every mistake with "data did not match any variant",
+/// which names neither the field nor the fix, and authors (models above
+/// all) then retry blind. An object is parsed as a [`DeclaredCriterion`]
+/// and its own error is kept, with the shape that would have parsed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum AcceptanceEntry {
     Bare(String),
@@ -154,6 +160,66 @@ impl AcceptanceEntry {
                 .unwrap_or_else(|| derive_id(&criterion.statement)),
         }
     }
+}
+
+/// The two shapes an entry may take, quoted in every parse error.
+pub const ENTRY_SHAPES: &str = "an acceptance entry is a string, or an object \
+{\"statement\": \"...\", \"evidence\": {\"kind\": ...}} with optional \"id\" and \"mandatory\"; \
+evidence kinds: check {name}, test {authorship: pre_existing|human_added|model_added, name?}, \
+llm_review, human_sign_off, amont_gate {gate}, holdout {name}";
+
+impl AcceptanceEntry {
+    /// Parse one entry from a JSON value, keeping the declared
+    /// criterion's own error (unknown field, missing field, unknown
+    /// evidence kind) instead of the untagged "matched no variant".
+    pub fn from_value(value: serde_json::Value) -> Result<Self, String> {
+        match value {
+            serde_json::Value::String(statement) => Ok(Self::Bare(statement)),
+            object @ serde_json::Value::Object(_) => serde_json::from_value(object)
+                .map(Self::Declared)
+                .map_err(|e| format!("{e} ({ENTRY_SHAPES})")),
+            other => Err(format!(
+                "expected a string or an object, got {} ({ENTRY_SHAPES})",
+                json_kind(&other)
+            )),
+        }
+    }
+}
+
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+impl<'de> Deserialize<'de> for AcceptanceEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Self::from_value(value)
+            .map_err(|e| serde::de::Error::custom(format!("acceptance entry: {e}")))
+    }
+}
+
+/// `deserialize_with` for a contract's `acceptance` list: as the entry's
+/// own `Deserialize`, plus the index of the entry that failed, so a
+/// ten-criterion contract says which one to fix.
+pub fn deserialize_entries<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<AcceptanceEntry>, D::Error> {
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            AcceptanceEntry::from_value(value)
+                .map_err(|e| serde::de::Error::custom(format!("acceptance[{index}]: {e}")))
+        })
+        .collect()
 }
 
 impl From<String> for AcceptanceEntry {

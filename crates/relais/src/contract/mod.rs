@@ -487,6 +487,7 @@ struct ContractWire {
     from_candidate: Option<CandidateRef>,
     #[serde(default)]
     read_hints: Vec<String>,
+    #[serde(deserialize_with = "crate::acceptance::deserialize_entries")]
     acceptance: Vec<crate::acceptance::AcceptanceEntry>,
     verification_profile: String,
     #[serde(default)]
@@ -901,6 +902,11 @@ pub enum ContractError {
     EmptyBaseRef,
     EmptyVerificationProfile,
     MalformedJson(String),
+    /// Valid JSON that is not a task contract: a wrong type, a missing
+    /// field, a misshapen acceptance entry. Kept apart from
+    /// [`Self::MalformedJson`] so its author fixes the field it names
+    /// instead of hunting for a syntax error.
+    Misshapen(String),
     DecompositionOnInspect,
     PlanTooSmall(usize),
     PlanTooLarge(usize, u32),
@@ -972,6 +978,7 @@ impl std::fmt::Display for ContractError {
             Self::EmptyBaseRef => write!(f, "base_ref is empty"),
             Self::EmptyVerificationProfile => write!(f, "verification_profile is empty"),
             Self::MalformedJson(detail) => write!(f, "contract is not valid JSON: {detail}"),
+            Self::Misshapen(detail) => write!(f, "contract does not match the schema: {detail}"),
             Self::DecompositionOnInspect => {
                 write!(f, "kind=inspect cannot be decomposed into work packages")
             }
@@ -1044,14 +1051,16 @@ impl TaskContract {
         // `ContractError` that names it instead of a serde message.
         let wire: ContractWire = serde_json::from_value(value).map_err(|e| {
             let msg = e.to_string();
+            // Only the contract's own unknown field: a nested one (an
+            // acceptance entry's `criterion`) keeps its full message,
+            // which names the entry and the shape that would parse.
             if let Some(field) = msg
-                .split("unknown field `")
-                .nth(1)
+                .strip_prefix("unknown field `")
                 .and_then(|rest| rest.split('`').next())
             {
                 return ContractError::UnknownField(field.to_string());
             }
-            ContractError::MalformedJson(msg)
+            ContractError::Misshapen(msg)
         })?;
         TaskContract::try_from(wire)
     }
@@ -1458,6 +1467,54 @@ mod tests {
                 name: "make check".into()
             })
         );
+    }
+
+    fn contract_with_acceptance(acceptance: &str) -> String {
+        format!(
+            r#"{{"schema_version": 1, "kind": "change", "objective": "o",
+                "base_ref": "HEAD", "write_scope": ["src/**"],
+                "acceptance": {acceptance}, "verification_profile": "p"}}"#
+        )
+    }
+
+    /// The shapes orchestrating sessions actually sent (transcripts,
+    /// 2026-10/11): each used to come back as "data did not match any
+    /// variant of untagged enum AcceptanceEntry", naming nothing. Each
+    /// now names the entry, the field or kind at fault, and the shape
+    /// that parses — and a nested unknown field is never reported as the
+    /// contract's own.
+    #[test]
+    fn a_misshapen_acceptance_entry_names_the_entry_the_fault_and_the_shape() {
+        let cases = [
+            (
+                r#"["it builds", {"criterion": "x", "evidence": {"kind": "check", "name": "c"}}]"#,
+                "unknown field `criterion`",
+            ),
+            (
+                r#"[{"statement": "x", "evidence": {"kind": "report"}}]"#,
+                "unknown variant `report`",
+            ),
+            (r#"[{"statement": "x"}]"#, "missing field `evidence`"),
+            (r#"[42]"#, "got a number"),
+        ];
+        for (index, (acceptance, fault)) in cases.into_iter().enumerate() {
+            let error = TaskContract::from_json_str(&contract_with_acceptance(acceptance))
+                .expect_err("refused");
+            let ContractError::Misshapen(msg) = &error else {
+                panic!("case {index}: expected Misshapen, got {error:?}");
+            };
+            assert!(msg.contains(fault), "case {index}: {msg}");
+            assert!(
+                msg.contains("\"statement\""),
+                "case {index} names the shape: {msg}"
+            );
+            assert!(!msg.contains("untagged enum"), "case {index}: {msg}");
+        }
+        let error = TaskContract::from_json_str(&contract_with_acceptance(
+            r#"["a", {"criterion": "x", "evidence": {"kind": "check", "name": "c"}}]"#,
+        ))
+        .expect_err("refused");
+        assert!(error.to_string().contains("acceptance[1]"), "{error}");
     }
 
     /// P5: a scope is untrusted input. A pattern that cannot bound
