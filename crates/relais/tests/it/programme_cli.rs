@@ -50,7 +50,7 @@ fn ticket(
     let resolution =
         resolution.map_or(String::new(), |text| format!("\n## Resolution\n\n{text}\n"));
     format!(
-        "+++\ntype = \"task\"\nmode = \"afk\"\nstatus = \"{status}\"\nblocked_by = {blocked_by}\n{repos}+++\n# {name}\n\n## Question\n\nWhich one?\n{resolution}"
+        "+++\ntype = \"task\"\nmode = \"afk\"\nstatus = \"{status}\"\nblocked_by = {blocked_by}\n{repos}+++\n# {name}\n\n## Question\n\nWhich one?\n\n## Look at\n\nThe code.\n\n## Answer looks like\n\nA name.\n{resolution}"
     )
 }
 
@@ -273,7 +273,7 @@ fn check_accepts_the_valid_fixture_silently() {
     assert_eq!(text(&out.stdout), "");
     assert_eq!(text(&out.stderr), "");
     let out = world.programme(&["check", "--json"]);
-    assert_eq!(text(&out.stdout), "{\"problems\":[]}\n");
+    assert_eq!(text(&out.stdout), "{\"problems\":[],\"warnings\":[]}\n");
 }
 
 #[test]
@@ -331,6 +331,45 @@ fn check_reports_each_problem_with_path_and_line_and_nothing_on_stdout() {
             "{tag}"
         );
     }
+}
+
+#[test]
+fn check_warns_without_failing_on_an_open_afk_ticket_missing_a_section() {
+    for section in ["## Look at", "## Answer looks like"] {
+        let world = World::new("warn");
+        let full = ticket("open", "[]", None, "Name of D", None);
+        let start = full.find(section).expect("section");
+        let end = full[start + 2..]
+            .find("\n## ")
+            .map_or(full.len(), |n| start + 2 + n + 1);
+        let trimmed = format!("{}{}", &full[..start], &full[end..]);
+        assert!(!trimmed.contains(section));
+        world.write("D.md", &trimmed);
+        let out = world.programme(&["check"]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert_eq!(text(&out.stdout), "");
+        assert_eq!(
+            text(&out.stderr),
+            format!(
+                "{}:7: warning: open afk ticket has no `{section}` section\n",
+                world.dir().join("D.md").display()
+            )
+        );
+        let out = world.programme(&["check", "--json"]);
+        let found: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+        assert_eq!(found["problems"], serde_json::json!([]));
+        assert_eq!(found["warnings"].as_array().map(Vec::len), Some(1));
+        assert_eq!(found["warnings"][0]["line"], 7);
+    }
+}
+
+#[test]
+fn check_does_not_warn_about_hitl_tickets() {
+    let world = World::new("nowarn");
+    let bare = "+++\ntype = \"task\"\nmode = \"hitl\"\nstatus = \"open\"\nblocked_by = []\n+++\n# Name of D\n\n## Question\n\nWhich?\n";
+    world.write("D.md", bare);
+    let out = world.programme(&["check"]);
+    assert_eq!(text(&out.stderr), "");
 }
 
 #[test]

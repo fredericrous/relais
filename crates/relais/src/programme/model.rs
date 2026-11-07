@@ -93,6 +93,8 @@ pub struct Ticket {
     /// `None` when the file does not say: the map's own repository.
     pub repos: Option<Vec<String>>,
     pub has_question: bool,
+    pub has_look_at: bool,
+    pub has_answer_looks_like: bool,
     pub has_resolution: bool,
     pub status_line: usize,
     pub blocked_by_line: usize,
