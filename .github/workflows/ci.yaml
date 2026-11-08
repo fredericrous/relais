@@ -77,14 +77,18 @@ jobs:
       # release tarball is pinned by its checksum, so a moved tag fails here.
       # CI only, not `make lint`: a contributor need not install adr-lint to
       # build relais, and the commit gate's clippy already refuses an `#[allow]`.
+      # Fetched through the API (`gh release download`), not the public
+      # download URL: that CDN path returned 504 for this asset for hours on
+      # 2026-11-08 while the API served it.
       - name: adr-lint sync --check
         env:
           ADR_LINT: "0.15.0"
           ADR_LINT_SHA256: 257da35a72c0f3a157f84526b25ba94c71a69381d92be7e2caa7dd3e2b0e8b36
+          GH_TOKEN: ${{ github.token }}
         run: |
           name="adr-lint-$ADR_LINT-x86_64-unknown-linux-gnu"
-          curl -fsSL --max-time 60 -o "$RUNNER_TEMP/$name.tar.gz" \
-            "https://github.com/fredericrous/adr-lint/releases/download/v$ADR_LINT/$name.tar.gz"
+          gh release download "v$ADR_LINT" --repo fredericrous/adr-lint \
+            --pattern "$name.tar.gz" --dir "$RUNNER_TEMP"
           echo "$ADR_LINT_SHA256  $RUNNER_TEMP/$name.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP"
           "$RUNNER_TEMP/$name/adr-lint" sync --check
