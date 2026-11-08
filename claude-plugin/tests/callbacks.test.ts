@@ -125,3 +125,15 @@ test('hello runs from HOME, so a removed session directory does not stop it', SL
   expect(hellos.length).toBe(2)
   for (const hello of hellos) expect(hello.init.cwd).toBe('/Users/p')
 })
+
+// A dispatch-only stop (relais#408) for an agent that already ended has
+// nothing to stop: no TaskStop, and no "TaskStop failed" note in the timeline.
+test('a stop that names only an ended dispatch makes no TaskStop', SLOW, async ($: any, on: any) => {
+  const engine = await endedDispatch($, on)
+  engine.script.runResult = () => acknowledged
+  await advance(engine, 2000) // the poll sees the end: the dispatch is stopped
+  expect(nativeCalls(engine.calls, 'stopped').length).toBe(1)
+  engine.stream.push('stdout', JSON.stringify({ relais: 'stop', dispatch: 'd1' }) + '\n')
+  await settle(engine)
+  expect(engine.calls.tool.filter((t: any) => t.tool === 'TaskStop').length).toBe(0)
+})

@@ -61,16 +61,8 @@ export async function handleSpawn(fx: Fx, store: Store, child: Child, line: any)
     store.pending.delete(dispatch)
   }
   const agent: string | undefined = spawned?.deny ? undefined : spawned?.agentId ?? (await agentOf(fx, dispatch))
-  const stopAsked = store.stopOnSpawn.delete(dispatch)
   if (!agent) {
     failDispatch(fx, store, child, dispatch, '', spawned?.deny ?? 'the agent did not start')
-    return
-  }
-  // relais gave the attempt up while this spawn ran: the agent is stopped
-  // before it can edit the worktree, and never bound.
-  if (stopAsked) {
-    await stopAgent(fx, store, text(line.run), agent)
-    failDispatch(fx, store, child, dispatch, agent, 'relais stopped the dispatch before its agent was bound')
     return
   }
   open(store, child, { ...openDispatch(dispatch, agent), isBound: true })
@@ -131,8 +123,8 @@ export async function handleContinue(fx: Fx, store: Store, child: Child, line: a
 
 // relais names the agent when it saw it bound; otherwise only the dispatch,
 // and the agent is the one this plugin spawned for it (relais#408: a lost
-// plugin's `bound` call is what failed). A spawn still in flight is stopped
-// when it returns.
+// plugin's `bound` call is what failed). A child's lines are handled in
+// order, so the stop comes after its dispatch's spawn has been handled.
 export async function handleStop(fx: Fx, store: Store, line: any) {
   const dispatch = text(line.dispatch)
   const named = text(line.agent) ?? text(line.agent_id)
@@ -140,10 +132,7 @@ export async function handleStop(fx: Fx, store: Store, line: any) {
   // A dispatch-only stop for an agent that already ended has nothing to stop.
   if (!named && known?.isStopped) return
   const agent = named ?? (known?.agent || undefined)
-  if (!agent) {
-    if (dispatch && store.pending.has(dispatch)) store.stopOnSpawn.add(dispatch)
-    return
-  }
+  if (!agent) return
   await stopAgent(fx, store, text(line.run), agent)
 }
 

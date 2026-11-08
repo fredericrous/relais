@@ -85,6 +85,8 @@ export function scriptedEngine(
     stepUsage: (e: any): any => ({ ...zeroUsage, input_tokens: 10, output_tokens: 5, model: e.model }),
     // Whether `agent.spawn` names the started agent (a workflow's remote one does not).
     spawnHasAgentId: true,
+    // Holds `agent.spawn` until it settles, so a test can act mid-spawn. Null answers at once.
+    spawnHold: null as Promise<void> | null,
     // The detached learning cycle cannot be spawned.
     learnSpawnFails: false,
     // `$.ui.ask`'s answer; a throw is a dismissal.
@@ -179,8 +181,9 @@ export function scriptedEngine(
   on('agent.list', () => ({ value: agents.map(a => ({ type: RELAIS_AGENT_TYPE, description: '', ...a })) }))
   // `agent.spawn` hooks decide the model and the directory; the agent then
   // shows in `$.agent.list()` as running.
-  on('agent.spawn', (_$: any, e: any) => {
+  on('agent.spawn', async (_$: any, e: any) => {
     calls.spawned.push(e)
+    if (script.spawnHold) await script.spawnHold
     const id = `agent-${nextAgent++}`
     agents.push({
       id,

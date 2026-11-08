@@ -92,6 +92,23 @@ test('a stop line that names only the dispatch stops the agent spawned for it', 
   expect(stops[0].task_id).toBe('agent-1')
 })
 
+test('a stop queued behind its spawn stops the agent once the spawn returns', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  let release = () => {}
+  engine.script.spawnHold = new Promise<void>(resolve => (release = resolve))
+  engine.stream.push('stdout', spawnLine('d1'))
+  await settle(engine)
+  engine.stream.push('stdout', JSON.stringify({ relais: 'stop', dispatch: 'd1' }) + '\n')
+  await settle(engine)
+  // A child's lines are handled in order: the stop waits for the spawn.
+  expect(engine.calls.tool.filter((t: any) => t.tool === 'TaskStop').length).toBe(0)
+  release()
+  await settle(engine)
+  const stops = engine.calls.tool.filter((t: any) => t.tool === 'TaskStop')
+  expect(stops.length).toBe(1)
+  expect(stops[0].task_id).toBe('agent-1')
+})
+
 test('a TaskStop that fails is said in the run\'s timeline, not dropped', async ($: any, on: any) => {
   const engine = await startedRun($, on)
   engine.stream.push('stdout', event('run-1', 0, { kind: 'phase', state: 'running', reason: 'ok', detail: {} }) + spawnLine('d1'))

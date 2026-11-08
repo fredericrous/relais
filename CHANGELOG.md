@@ -8,7 +8,7 @@ missing here.
 
 ## Unreleased
 
-- **A worker relais gives up on is told to stop, even before it is bound (#408).** When a session's plugin stopped saying hello, relais ended the attempt `mod_gone` but left its agent running, and that agent went on editing the in-place worktree. relais now sends the plugin a stop for the dispatch, as it already did on a cancel or a timeout. When it never saw the agent bound (the `bound` call is what failed), the stop names only the dispatch, and the plugin stops the agent it spawned for it, or stops it as soon as a spawn still in flight returns. Timeouts and cancels before an agent was bound now send that stop too.
+- **A worker relais gives up on is told to stop, even before it is bound (#408).** When a session's plugin stopped saying hello, relais ended the attempt `mod_gone` but left its agent running, and that agent went on editing the in-place worktree. relais now sends the plugin a stop for the dispatch, as it already did on a cancel or a timeout. When it never saw the agent bound (the `bound` call is what failed), the stop names only the dispatch, and the plugin stops the agent it spawned for it. A repair names the agent it continues from the start, so a stopped one is never continued. Timeouts and cancels before an agent was bound now send that stop too.
 
 ## v0.50.2
 

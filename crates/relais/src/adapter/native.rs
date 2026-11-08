@@ -685,8 +685,13 @@ impl<'a> NativeBackend<'a> {
         let mut failures = 0u32;
         // The agent the last poll found the dispatch bound to: once the run
         // is cancelled the coordinator settles the dispatch, and its record
-        // no longer names the agent.
-        let mut running: Option<String> = None;
+        // no longer names the agent. A continue names its agent from the
+        // start, so a stop before the first `Bound` poll still names it and
+        // drops it from what may be continued.
+        let mut running: Option<String> = match route {
+            Route::Continue { agent_id, .. } => Some(agent_id.clone()),
+            Route::Spawn => None,
+        };
         loop {
             let now = Instant::now();
             if let Some(slept) = watch.pass(SystemTime::now(), now) {
@@ -764,8 +769,9 @@ impl<'a> NativeBackend<'a> {
         }
     }
 
-    /// The attempt's end when its run has been cancelled: the agent, if one
-    /// was bound, is asked to stop. `None` while the run goes on.
+    /// The attempt's end when its run has been cancelled: the plugin is asked
+    /// to stop the agent, named when relais knows it, else by the dispatch.
+    /// `None` while the run goes on.
     fn cancelled(&self, spec: &LaunchSpec, running: Option<&str>) -> Option<Awaited> {
         let is_cancelled = spec
             .cancel

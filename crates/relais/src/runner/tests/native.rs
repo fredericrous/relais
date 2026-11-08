@@ -1304,11 +1304,20 @@ fn a_session_whose_hello_lapses_ends_the_attempt_mod_gone() {
     // relais#408: a lost worker may keep editing the worktree. The plugin may
     // still be reading the wire while its own calls fail, so relais asks it
     // to stop the dispatch's agent, as it does on a cancel or a timeout.
+    let spawned: Vec<&String> = run
+        .seen()
+        .iter()
+        .filter_map(|seen| match seen {
+            Seen::Spawn { dispatch_id, .. } => Some(dispatch_id),
+            _ => None,
+        })
+        .collect();
     assert!(
-        run.seen()
-            .iter()
-            .any(|seen| matches!(seen, Seen::Stop { .. })),
-        "a stop line when the hello lapses: {:?}",
+        run.seen().iter().any(|seen| matches!(
+            seen,
+            Seen::Stop { dispatch_id, .. } if spawned.contains(&dispatch_id)
+        )),
+        "a stop line for the spawned dispatch when the hello lapses: {:?}",
         run.seen()
     );
     std::fs::remove_dir_all(&fixture.dir).ok();

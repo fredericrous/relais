@@ -84,8 +84,9 @@ impl<'a> RunEngine<'a> {
         Ok(sha)
     }
 
-    /// An in-place attempt ended with its worker lost (`mod_gone`): nothing
-    /// asked it to stop, so it may still be writing the person's tree. The
+    /// An in-place attempt ended with its worker lost (`mod_gone`): relais
+    /// asked the plugin to stop it, but a plugin that is really gone never
+    /// hears that, so it may still be writing the person's tree. The
     /// orphan goes into the marker first, so the fence outlives this process
     /// and the coordinator, and is then reported to the coordinator, which
     /// writes the stop confirmation into the marker when the agent's stop
