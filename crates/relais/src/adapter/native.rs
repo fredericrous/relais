@@ -685,8 +685,13 @@ impl<'a> NativeBackend<'a> {
         let mut failures = 0u32;
         // The agent the last poll found the dispatch bound to: once the run
         // is cancelled the coordinator settles the dispatch, and its record
-        // no longer names the agent.
-        let mut running: Option<String> = None;
+        // no longer names the agent. A continue names its agent from the
+        // start, so a stop before the first `Bound` poll still names it and
+        // drops it from what may be continued.
+        let mut running: Option<String> = match route {
+            Route::Continue { agent_id, .. } => Some(agent_id.clone()),
+            Route::Spawn => None,
+        };
         loop {
             let now = Instant::now();
             if let Some(slept) = watch.pass(SystemTime::now(), now) {
@@ -700,9 +705,7 @@ impl<'a> NativeBackend<'a> {
             if started.elapsed() >= spec.wall_timeout {
                 // The attempt is over; an agent left running would go on
                 // editing its worktree and spending what nothing books.
-                if let Some(agent) = &running {
-                    self.stop_agent(spec, agent);
-                }
+                self.stop_agent(spec, running.as_deref());
                 return Awaited::Ended {
                     ended: Ended::TimedOut,
                     detail: "the native worker did not stop within the attempt's wall time".into(),
@@ -712,9 +715,7 @@ impl<'a> NativeBackend<'a> {
                 Err(e) => {
                     failures += 1;
                     if failures >= STATUS_FAILURES_ALLOWED {
-                        if let Some(agent) = &running {
-                            self.stop_agent(spec, agent);
-                        }
+                        self.stop_agent(spec, running.as_deref());
                         return Awaited::Ended {
                             ended: Ended::Exited(1),
                             detail: format!(
@@ -747,6 +748,10 @@ impl<'a> NativeBackend<'a> {
                     let alive = hello_age.is_some_and(|age| age < self.waits.hello_lapse)
                         || woke_until.is_some_and(|until| Instant::now() < until);
                     if !alive {
+                        // The plugin may still read the wire while its own
+                        // calls fail (relais#408: a removed session cwd), and
+                        // the worker would go on editing the worktree.
+                        self.stop_agent(spec, running.as_deref());
                         return Awaited::Lost {
                             agent: running.clone(),
                             detail: format!(
@@ -764,8 +769,9 @@ impl<'a> NativeBackend<'a> {
         }
     }
 
-    /// The attempt's end when its run has been cancelled: the agent, if one
-    /// was bound, is asked to stop. `None` while the run goes on.
+    /// The attempt's end when its run has been cancelled: the plugin is asked
+    /// to stop the agent, named when relais knows it, else by the dispatch.
+    /// `None` while the run goes on.
     fn cancelled(&self, spec: &LaunchSpec, running: Option<&str>) -> Option<Awaited> {
         let is_cancelled = spec
             .cancel
@@ -774,9 +780,7 @@ impl<'a> NativeBackend<'a> {
         if !is_cancelled {
             return None;
         }
-        if let Some(agent) = running {
-            self.stop_agent(spec, agent);
-        }
+        self.stop_agent(spec, running);
         Some(Awaited::Ended {
             ended: Ended::Cancelled,
             detail: "the dispatch was cancelled while the native worker ran".into(),
@@ -792,13 +796,16 @@ impl<'a> NativeBackend<'a> {
     }
 
     /// Ask the plugin to stop the agent of an attempt that is over
-    /// (cancelled, timed out, or no longer followed).
-    fn stop_agent(&self, spec: &LaunchSpec, agent: &str) {
+    /// (cancelled, timed out, or no longer followed). With no agent bound,
+    /// the stop names the dispatch alone and the plugin finds the agent.
+    fn stop_agent(&self, spec: &LaunchSpec, agent: Option<&str>) {
         // A stopped agent is never continued: its late, empty last turn
         // would land on the repair and read as that repair's end.
-        self.memory()
-            .agents
-            .retain(|_, known| known.agent_id != agent);
+        if let Some(agent) = agent {
+            self.memory()
+                .agents
+                .retain(|_, known| known.agent_id != agent);
+        }
         let stop = Request::Stop {
             run: &self.link.run_id,
             dispatch: &spec.dispatch_id,
@@ -808,7 +815,8 @@ impl<'a> NativeBackend<'a> {
         // stderr (the run's events), so the person can stop the agent.
         if let Err(e) = self.publish(&stop) {
             eprintln!(
-                "relais: could not ask the plugin to stop agent {agent} of dispatch {}: {e}",
+                "relais: could not ask the plugin to stop agent {} of dispatch {}: {e}",
+                agent.unwrap_or("(not bound)"),
                 spec.dispatch_id
             );
         }
@@ -1537,7 +1545,7 @@ mod tests {
             route_for(known.as_ref(), &worker),
             Route::Continue { .. }
         ));
-        backend.stop_agent(&worker, "a1");
+        backend.stop_agent(&worker, Some("a1"));
         let known = backend.memory().agents.get(&worker.work_dir).cloned();
         assert_eq!(route_for(known.as_ref(), &worker), Route::Spawn);
     }

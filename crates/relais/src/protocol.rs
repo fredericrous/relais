@@ -284,11 +284,14 @@ pub enum Request<'a> {
         agent: &'a str,
         message: &'a str,
     },
-    /// The attempt was cancelled while its agent runs.
+    /// The attempt is over while its agent may run: cancelled, timed out,
+    /// or its plugin said no hello. `agent` is absent when relais never saw
+    /// one bound, and the plugin stops the agent it spawned for `dispatch`.
     Stop {
         run: &'a str,
         dispatch: &'a str,
-        agent: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent: Option<&'a str>,
     },
     /// The run ended — or, with `run: None`, it never started: the
     /// policy, the machine settings, the contract or admission refused it
@@ -1324,7 +1327,7 @@ mod tests {
         wire.send(&Request::Stop {
             run: "r",
             dispatch: "d",
-            agent: "a",
+            agent: Some("a"),
         })
         .expect("sent");
         wire.send(&Request::Done {

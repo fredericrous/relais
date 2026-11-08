@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+- **A worker relais gives up on is told to stop, even before it is bound (#408).** When a session's plugin stopped saying hello, relais ended the attempt `mod_gone` but left its agent running, and that agent went on editing the in-place worktree. relais now sends the plugin a stop for the dispatch, as it already did on a cancel or a timeout. When it never saw the agent bound (the `bound` call is what failed), the stop names only the dispatch, and the plugin stops the agent it spawned for it. A repair names the agent it continues from the start, so a stopped one is never continued. Timeouts and cancels before an agent was bound now send that stop too.
+
 ## v0.50.2
 
 - **Removing the session's working directory no longer loses a run (#408).** The plugin started every `relais native` call in the session's working directory. Once that directory was removed (a worktree torn down while a run was live), each spawn failed with ENOENT before relais ran. The hello stopped, and relais marked the in-place worker lost while it kept writing. Calls that name a session or run and read no repository (hello, status, cancel, the dispatch callbacks) now run from HOME. Calls that need the repository (router state, router observations, `relais learn`) keep its directory and run again from HOME only when it is gone.
