@@ -1,0 +1,13 @@
+amont-attest-v2
+tree 63c3bb612abde1ec07d1b2ce8b24d8da0019edaf
+gates pre-push-cargo-test
+platform aarch64-macos
+canon ec72f9879d744d5304a56881dc9f02d0fef20b4a
+amont attest-sign-macos-latest
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgwe+FHUie+0YKuEzx3YjiV6jyIC
+F0veynb1B9mEPADfwAAAAMYW1vbnQtYXR0ZXN0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3Nz
+aC1lZDI1NTE5AAAAQJr5JmXaVqvP7CjPtnKtlXINOaKaAPK/o+Wh75EL2hQK2r7yTmA93L
+4VIkFxv4rSkbAfT1mGuZg2t1PNWOUlCAo=
+-----END SSH SIGNATURE-----
