@@ -68,7 +68,8 @@ enum Seen {
     },
     Stop {
         dispatch_id: String,
-        agent_id: String,
+        /// `None` when relais stops a dispatch whose agent it never saw bound.
+        agent_id: Option<String>,
     },
 }
 
@@ -196,7 +197,7 @@ fn run_plugin(
             "stop" => {
                 script.seen.push(Seen::Stop {
                     dispatch_id: text("dispatch").expect("dispatch"),
-                    agent_id: text("agent").expect("agent"),
+                    agent_id: text("agent"),
                 });
                 continue;
             }
@@ -759,7 +760,9 @@ fn a_repair_continues_the_same_agent_and_an_escalation_spawns_on_the_next_model(
                 ..
             } => format!("spawn {subagent_type} {agent_id}"),
             Seen::Continue { agent_id, .. } => format!("continue {agent_id}"),
-            Seen::Stop { agent_id, .. } => format!("stop {agent_id}"),
+            Seen::Stop { agent_id, .. } => {
+                format!("stop {}", agent_id.as_deref().unwrap_or("(dispatch only)"))
+            }
         })
         .collect();
     assert_eq!(
@@ -1298,6 +1301,16 @@ fn a_session_whose_hello_lapses_ends_the_attempt_mod_gone() {
     );
     let detail = interrupted_detail(&run.outcome);
     assert!(detail.contains("mod_gone"), "{detail}");
+    // relais#408: a lost worker may keep editing the worktree. The plugin may
+    // still be reading the wire while its own calls fail, so relais asks it
+    // to stop the dispatch's agent, as it does on a cancel or a timeout.
+    assert!(
+        run.seen()
+            .iter()
+            .any(|seen| matches!(seen, Seen::Stop { .. })),
+        "a stop line when the hello lapses: {:?}",
+        run.seen()
+    );
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
@@ -1319,9 +1332,9 @@ fn a_run_cancelled_while_its_agent_runs_asks_the_plugin_to_stop_it() {
         run.outcome
     );
     assert!(
-        run.seen()
-            .iter()
-            .any(|seen| matches!(seen, Seen::Stop { agent_id, .. } if agent_id == "ag1")),
+        run.seen().iter().any(
+            |seen| matches!(seen, Seen::Stop { agent_id: Some(agent_id), .. } if agent_id == "ag1")
+        ),
         "the agent was asked to stop: {:?}",
         run.seen()
     );

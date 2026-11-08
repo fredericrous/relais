@@ -61,8 +61,16 @@ export async function handleSpawn(fx: Fx, store: Store, child: Child, line: any)
     store.pending.delete(dispatch)
   }
   const agent: string | undefined = spawned?.deny ? undefined : spawned?.agentId ?? (await agentOf(fx, dispatch))
+  const stopAsked = store.stopOnSpawn.delete(dispatch)
   if (!agent) {
     failDispatch(fx, store, child, dispatch, '', spawned?.deny ?? 'the agent did not start')
+    return
+  }
+  // relais gave the attempt up while this spawn ran: the agent is stopped
+  // before it can edit the worktree, and never bound.
+  if (stopAsked) {
+    await stopAgent(fx, store, text(line.run), agent)
+    failDispatch(fx, store, child, dispatch, agent, 'relais stopped the dispatch before its agent was bound')
     return
   }
   open(store, child, { ...openDispatch(dispatch, agent), isBound: true })
@@ -121,9 +129,25 @@ export async function handleContinue(fx: Fx, store: Store, child: Child, line: a
   startPoll(fx, store)
 }
 
+// relais names the agent when it saw it bound; otherwise only the dispatch,
+// and the agent is the one this plugin spawned for it (relais#408: a lost
+// plugin's `bound` call is what failed). A spawn still in flight is stopped
+// when it returns.
 export async function handleStop(fx: Fx, store: Store, line: any) {
-  const agent = text(line.agent) ?? text(line.agent_id)
-  if (!agent) return
+  const dispatch = text(line.dispatch)
+  const named = text(line.agent) ?? text(line.agent_id)
+  const known = dispatch ? store.dispatches.get(dispatch) : undefined
+  // A dispatch-only stop for an agent that already ended has nothing to stop.
+  if (!named && known?.isStopped) return
+  const agent = named ?? (known?.agent || undefined)
+  if (!agent) {
+    if (dispatch && store.pending.has(dispatch)) store.stopOnSpawn.add(dispatch)
+    return
+  }
+  await stopAgent(fx, store, text(line.run), agent)
+}
+
+async function stopAgent(fx: Fx, store: Store, run: string | undefined, agent: string) {
   let why: string | undefined
   try {
     why = refusal(await fx.tool.call({ tool: 'TaskStop', task_id: agent }))
@@ -132,7 +156,7 @@ export async function handleStop(fx: Fx, store: Store, line: any) {
   }
   // Said in the run's timeline: an agent relais asked to stop may still be
   // running, and the person is the one who can stop it.
-  if (why !== undefined) await note(fx, store, text(line.run), `TaskStop of agent ${agent} failed: ${why}`)
+  if (why !== undefined) await note(fx, store, run, `TaskStop of agent ${agent} failed: ${why}`)
 }
 
 // A failure the plugin met, as a `stderr` entry of the run it names, else

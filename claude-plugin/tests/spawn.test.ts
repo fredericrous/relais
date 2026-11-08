@@ -77,6 +77,21 @@ test('a stop line stops the agent through TaskStop', async ($: any, on: any) => 
   expect(stops[0].task_id).toBe('agent-1')
 })
 
+// relais#408: a dispatch relais reads as lost (its plugin said no hello) may
+// have no agent bound on relais's side, because the `bound` call was what
+// failed. relais then names only the dispatch, and the plugin stops the agent
+// it spawned for it.
+test('a stop line that names only the dispatch stops the agent spawned for it', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stdout', spawnLine('d1'))
+  await settle(engine)
+  engine.stream.push('stdout', JSON.stringify({ relais: 'stop', dispatch: 'd1' }) + '\n')
+  await settle(engine)
+  const stops = engine.calls.tool.filter((t: any) => t.tool === 'TaskStop')
+  expect(stops.length).toBe(1)
+  expect(stops[0].task_id).toBe('agent-1')
+})
+
 test('a TaskStop that fails is said in the run\'s timeline, not dropped', async ($: any, on: any) => {
   const engine = await startedRun($, on)
   engine.stream.push('stdout', event('run-1', 0, { kind: 'phase', state: 'running', reason: 'ok', detail: {} }) + spawnLine('d1'))

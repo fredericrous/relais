@@ -68,6 +68,9 @@ export type Store = {
   agentDispatch: Map<string, string>
   // dispatch id -> the cwd its spawn must run in
   pending: Map<string, { cwd: string }>
+  // Dispatches relais asked to stop while their spawn was still in flight:
+  // the agent is stopped as soon as the spawn names it (relais#408).
+  stopOnSpawn: Set<string>
   // Set around the module's own SendMessage, so its `agent.offer` hook lets
   // a relais type through (Claude Code refuses to resume a hidden one).
   resuming: number
@@ -168,6 +171,7 @@ export const createStore = (): Store => ({
   dispatchChild: new Map(),
   agentDispatch: new Map(),
   pending: new Map(),
+  stopOnSpawn: new Set(),
   resuming: 0,
   sessions: new Set(),
   isDirty: false,
