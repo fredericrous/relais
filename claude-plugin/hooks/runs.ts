@@ -34,6 +34,7 @@ import {
   toastDecision,
   toastOutcome,
 } from './ui.ts'
+import { homeCwd } from './home-cwd.ts'
 
 const STATUS_TIMEOUT_MS = 10_000
 // A reconciling status of one live run: short, because the next poll asks again.
@@ -146,6 +147,7 @@ async function freshen(fx: Fx, store: Store, text: string): Promise<string> {
   let current: any
   try {
     const result = await fx.process.run(['relais', 'native', 'status', '--run', pending.run], {
+      ...(await homeCwd(fx)),
       timeoutMs: FRESHEN_TIMEOUT_MS,
     })
     if (result.exitCode !== 0) {
@@ -290,6 +292,7 @@ export async function reconcileIntents(fx: Fx, store: Store): Promise<Reconciled
   try {
     const session = await fx.session.id()
     const result = await fx.process.run(['relais', 'native', 'status', '--session', session], {
+      ...(await homeCwd(fx)),
       timeoutMs: STATUS_TIMEOUT_MS,
     })
     if (result.exitCode !== 0) {
@@ -599,7 +602,7 @@ export async function reloadTimeline(fx: Fx, store: Store, run?: string) {
   const session = await fx.session.id()
   const argv = ['relais', 'native', 'status', ...(run ? ['--run', run] : ['--session', session])]
   try {
-    const result = await fx.process.run(argv, { timeoutMs: STATUS_TIMEOUT_MS })
+    const result = await fx.process.run(argv, { ...(await homeCwd(fx)), timeoutMs: STATUS_TIMEOUT_MS })
     if (result.exitCode !== 0) {
       store.statusFailure = `relais native status exited ${result.exitCode}: ${String(result.stderr ?? '').trim().slice(0, 400)}`
       return undefined
@@ -641,7 +644,10 @@ export function refreshRun(fx: Fx, store: Store, run: string): Promise<void> {
 
 async function readRun(fx: Fx, store: Store, run: string) {
   try {
-    const result = await fx.process.run(['relais', 'native', 'status', '--run', run], { timeoutMs: RECONCILE_TIMEOUT_MS })
+    const result = await fx.process.run(['relais', 'native', 'status', '--run', run], {
+      ...(await homeCwd(fx)),
+      timeoutMs: RECONCILE_TIMEOUT_MS,
+    })
     if (result.exitCode !== 0) {
       store.statusFailure = `relais native status --run ${run} exited ${result.exitCode}: ${String(result.stderr ?? '').trim().slice(0, 400)}`
       return
@@ -729,6 +735,7 @@ export async function cancelRun(fx: Fx, store: Store, run: string): Promise<stri
   let result: { exitCode: number; stdout?: string; stderr?: string }
   try {
     result = await fx.process.run(['relais', 'native', 'cancel', '--run', run, '--session', session], {
+      ...(await homeCwd(fx)),
       timeoutMs: CANCEL_TIMEOUT_MS,
     })
   } catch (reason) {

@@ -107,3 +107,21 @@ test('after the module unloads there is no hello', SLOW, async ($: any, on: any)
   await advance(engine, 120000)
   expect(nativeCalls(engine.calls, 'hello').length).toBe(before)
 })
+
+// relais#408: the session's working directory can be removed while a run is
+// live (a worktree torn down), and a spawn whose cwd is gone fails with ENOENT
+// before relais starts. The hello names its session and reads no repository,
+// so it runs from HOME and keeps going.
+test('hello runs from HOME, so a removed session directory does not stop it', SLOW, async ($: any, on: any) => {
+  const engine = scriptedEngine(on)
+  engine.script.runResult = (argv: string[], init: any) => {
+    if (argv[2] === 'hello' && init?.cwd !== '/Users/p') throw new Error('spawn relais ENOENT')
+    return acknowledged
+  }
+  await $.session.start({ cwd: '/Users/p/gone-worktree', surface: 'terminal', isInteractive: true })
+  await settle(engine)
+  await advance(engine, 30000)
+  const hellos = nativeCalls(engine.calls, 'hello')
+  expect(hellos.length).toBe(2)
+  for (const hello of hellos) expect(hello.init.cwd).toBe('/Users/p')
+})
