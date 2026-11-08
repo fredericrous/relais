@@ -276,11 +276,23 @@ jobs:
       # attest's verifier at the version and archive digest its own release
       # pins for v1.7.0, as amont's release.yaml installs it.
       - name: git-attest 1.7.0
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           name=git-attest-1.7.0-x86_64-unknown-linux-musl
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$name.tar.gz" \
-            "https://github.com/fredericrous/attest/releases/download/v1.7.0/$name.tar.gz"
+          # Through the API, not the web route, which throttles anonymous downloads (504s on 2026-11-08).
+          for attempt in 1 2 3; do
+            rc=0
+            timeout 120 gh release download "v1.7.0" --repo fredericrous/attest \
+              --pattern "$name.tar.gz" -O "$RUNNER_TEMP/$name.tar.gz" --clobber || rc=$?
+            [ "$rc" = 0 ] && break
+            if [ "$attempt" = 3 ]; then
+              echo "::error::could not download $name.tar.gz from fredericrous/attest v1.7.0 (exit $rc; 124 = timed out after 120 s)"
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
           echo "6d25cc5320670d7f2bf225bd9a653b5b862be015e17b678e642bedb2e23ba2db  $RUNNER_TEMP/$name.tar.gz" \
             | sha256sum -c -
           tar xzf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP"
