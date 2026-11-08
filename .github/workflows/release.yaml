@@ -276,6 +276,8 @@ jobs:
       # attest's verifier at the version and archive digest its own release
       # pins for v1.7.0, as amont's release.yaml installs it.
       - name: git-attest 1.7.0
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           name=git-attest-1.7.0-x86_64-unknown-linux-musl
