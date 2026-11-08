@@ -5,6 +5,7 @@
 
 import type { Fx } from './fx.ts'
 import { after, detach, type Child, type Store } from './store.ts'
+import { homeCwd } from './home-cwd.ts'
 
 const CALL_TIMEOUT_MS = 20_000
 // Backoff in ms; the last step repeats.
@@ -18,6 +19,7 @@ async function callOnce(fx: Fx, argv: string[], payload: unknown): Promise<boole
   try {
     const stdin = payload === undefined ? undefined : JSON.stringify(payload)
     const result = await fx.process.run(['relais', 'native', ...argv], {
+      ...(await homeCwd(fx)),
       stdin,
       timeoutMs: CALL_TIMEOUT_MS,
     })

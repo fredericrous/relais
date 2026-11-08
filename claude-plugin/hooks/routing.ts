@@ -53,6 +53,7 @@ import {
 } from './router.ts'
 import { after, detach, type Store } from './store.ts'
 import { markDirty } from './ui.ts'
+import { runFallingBackHome } from './home-cwd.ts'
 
 const STATE_TIMEOUT_MS = 10_000
 const OBSERVE_TIMEOUT_MS = 20_000
@@ -111,7 +112,7 @@ export async function loadRouterState(fx: Fx, store: Store) {
   try {
     const session = r.session ?? (await fx.session.id())
     r.session = session
-    const result = await fx.process.run(['relais', 'native', 'router-state', '--session', session], {
+    const result = await runFallingBackHome(fx, ['relais', 'native', 'router-state', '--session', session], {
       ...(r.cwd ? { cwd: r.cwd } : {}),
       timeoutMs: STATE_TIMEOUT_MS,
     })
@@ -733,7 +734,7 @@ async function observe(fx: Fx, store: Store, payload: unknown, attempt: number, 
   let code: number | undefined
   let stderr = ''
   try {
-    const result = await fx.process.run(['relais', 'native', 'router-observe'], {
+    const result = await runFallingBackHome(fx, ['relais', 'native', 'router-observe'], {
       stdin: JSON.stringify(payload),
       timeoutMs: OBSERVE_TIMEOUT_MS,
       ...(store.router.cwd ? { cwd: store.router.cwd } : {}),

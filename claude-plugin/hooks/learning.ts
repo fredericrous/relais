@@ -8,6 +8,7 @@ import { note } from './agents.ts'
 import { NOT_NOW } from './consent.ts'
 import type { Fx } from './fx.ts'
 import type { Store } from './store.ts'
+import { runFallingBackHome } from './home-cwd.ts'
 
 const LAST_TIMEOUT_MS = 5_000
 const COMMAND_TIMEOUT_MS = 10_000
@@ -98,7 +99,7 @@ const SAYS: Record<string, string> = {
 // error this plugin has not noted yet. Fails open.
 export async function noteLastCycle(fx: Fx, store: Store): Promise<void> {
   try {
-    const result = await fx.process.run(['relais', 'learn', 'last', '--json'], {
+    const result = await runFallingBackHome(fx, ['relais', 'learn', 'last', '--json'], {
       ...(store.router.cwd ? { cwd: store.router.cwd } : {}),
       timeoutMs: LAST_TIMEOUT_MS,
     })
@@ -133,7 +134,7 @@ export async function learningCommand(fx: Fx, store: Store, args = ''): Promise<
   const session = await fx.session.id()
   const by = `the person in Claude Code session ${session}`
   const run = (argv: string[]) =>
-    fx.process.run(argv, { ...(store.router.cwd ? { cwd: store.router.cwd } : {}), timeoutMs: COMMAND_TIMEOUT_MS })
+    runFallingBackHome(fx, argv, { ...(store.router.cwd ? { cwd: store.router.cwd } : {}), timeoutMs: COMMAND_TIMEOUT_MS })
   const failed = (result: any) => String(result?.stderr ?? '').trim().slice(0, 600)
   const arg = args.trim()
   if (arg === 'off') {
