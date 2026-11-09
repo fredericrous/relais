@@ -144,7 +144,7 @@ ADR-0066 (decisions#179) merged first; relais pack refreshed on this branch. Rou
 |---|---|---|
 | This repository's aval corpus (55 code rules, 11 tool-checked; 37 process rules), `prompt_rule_bytes_before_and_after_on_this_repository` | reviewer rules ≈ −17 KB, worker ≈ −8 KB | reviewer rule block 65.5 KB → 49.7 KB (−24%), worker code rules 49.3 KB → 43.3 KB (−12%); whole prompts ≈ 72 → 56 KB and 68 → 62 KB |
 | Every real `Checked by` paragraph (decisions c9898d0) | parsed as labelled | 55 of 55 (44 judge, 11 tool) |
-| A release-scenario run | a `guidance_index` event naming the worker's lines; nothing on stderr | event present with `tests.no-real-waits`; stderr unchanged |
+| A release-scenario run | a `guidance_index` event naming the worker's lines where `aval` runs; nothing on stderr | with aval: event present with `tests.no-real-waits`; without aval on PATH (as on CI, which failed the first push): no event, test passes; stderr unchanged |
 | Isolated-path golden | unchanged | unchanged (index records filtered as measurements) |
 | Plugin timeline, `make plugin` | `guidance_index` not shown, other decisions shown | 378 pass, 0 fail |
 | Reviewer fetching an indexed rule | — | observed after release, Phase 5 (needs the released plugin's reviewer agents) |
