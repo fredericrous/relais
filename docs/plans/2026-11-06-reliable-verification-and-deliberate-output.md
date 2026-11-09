@@ -8,18 +8,15 @@ adrs: [decisions:ADR-0039, decisions:ADR-0042, decisions:ADR-0050, decisions:ADR
 
 ## Review panel
 
-Approved 2026-11-06; proposal-time body wording is preserved to retain the review binding.
-📍 relais, amont-agent · active · next: current-source reproduction. Panel: backend (Opus), TypeScript (Opus).
-**Changed by review:** bounded metadata; terminal denial state; golden notification tests.
-**Verdicts:** two approve-with-changes; high findings resolved; seven implementation carries in the sidecar.
-🔁 **Execution changed 2026-11-06 (person's request):** implemented directly in the task worktrees, not through relais, after its runs and this session's large reference loads, repeated post-compaction material and review cycles filled context. Discipline: narrow reads, quiet-wrapped commands, no full skill/schema loads, no extra panels; declared code-review seats only, told when a language is absent.
-Phase 1 evidence: PTY regression red (both checks `TimedOut`) before, green after; amont f9ba814c install journey (binary sha256 6e073eb4…) 3/3 green under a terminal; no survivors; scratch checkout removed.
-
+👉 **Decide:** none — approve if Phase 3 should be the no-prompt version: refuse a large whole-file read once per agent with feedback, allow the retry.
+📍 relais, amont-agent · Phases 1–2 done (Phase 2 tool pushed, PR next) · next: Phase 3 in amont-agent. Delta panel: backend (opus).
+**Changed by review:** reach measured per agent (1,706 of 1,711 large reads are an agent's first); once-per-key record is `first_telling`; `head` dropped; replay must show 0 false interventions before activation.
+**Verdicts:** backend approve-with-changes → approve. Carried into implementation: prefix the once-per-key with the rule id; the sentence "1,637 whole reads repeated…" in Phase 3 is superseded by the per-agent breakdown below it (770 repeats).
 📄 Full reviews: [review evidence and implementation carries](2026-11-06-reliable-verification-and-deliberate-output.reviews.md).
 
 ## Context
 
-The person prioritized amont checks stopping under relais and reducing unnecessary Claude context/quota use. They then challenged the exclusion of automatic output mediation, requested consent before loading successful CI output, and proposed an agent self-review opportunity before interrupting them.
+The person prioritized amont checks stopping under relais and reducing unnecessary Claude context/quota use. They then challenged the exclusion of automatic output mediation, requested consent before loading successful CI output, and proposed an agent self-review opportunity before interrupting them. On 2026-11-09, shown the Phase 2 baseline, they chose no prompts at all: Phase 3 became autonomous limits on the largest outputs, with feedback to the agent only.
 
 Accepted inspection `run-65f95f0243fa2-c037` reproduced SIGTTIN in the real amont install journey: `offer_agents_md -> trust::confirm -> read(/dev/tty)`. Three background-PTY runs stopped; two no-controlling-terminal controls passed. It used an older binary: current amont must be rebuilt and reproduced before a fix. The historical cancelled run's signal remains unknown.
 
@@ -56,40 +53,30 @@ Critical files: `relais/crates/relais/src/verify/mod.rs` (sole production seam: 
 
 Use a small owned-fixture experiment before broad implementation. Reuse existing hook/quiet tests and protocol handling; no extra summarizer or nested agent fan-out.
 
-1. **Consent:** verify actual native `Ask` behavior under the current host/permission mode. An unapproved successful-job output read must not execute. Test approve, deny, cancellation and non-interactive/unavailable consent. Separately prove a non-executing, explicitly machine-generated self-review feedback path that is distinguishable from a person's permission refusal. It must never teach retrying a human denial or rephrasing to bypass a guard. If that distinction is unsupported, report self-review unsupported and use native Ask directly; if Ask cannot be enforced, stop the consent slice. Never substitute automatic Allow or widen permissions.
+1. **Consent (done 2026-11-08, real-host fixture; kept as the record of what the host does, no longer a Phase 3 dependency):** verify actual native `Ask` behavior under the current host/permission mode. An unapproved successful-job output read must not execute. Test approve, deny, cancellation and non-interactive/unavailable consent. Separately prove a non-executing, explicitly machine-generated self-review feedback path that is distinguishable from a person's permission refusal. It must never teach retrying a human denial or rephrasing to bypass a guard. If that distinction is unsupported, report self-review unsupported and use native Ask directly; if Ask cannot be enforced, stop the consent slice. Never substitute automatic Allow or widen permissions.
 2. **Mediation:** verify whether the real pre-tool interface supports invocation updates and how authorization evaluates the original and transformed commands. Test allowed and denied commands; never attach an Allow decision merely to make rewriting work. If safety cannot be demonstrated, do not enable automatic rewriting; retain explicit quiet recipes without claiming transparent interception.
 3. Start with actual Bash and Read hook paths. Inventory CLI/API, wrappers, saved artifacts and MCP coverage. Unknown tools are explicit gaps, not claimed protection. No guarantee for arbitrary MCP results without a verified pre-execution adapter.
 4. Produce a reproducible aggregate of the last 14 days: exact UTC window, session/call counts, deduplication, byte definition, category/coverage gaps. Include direct output, CI/log/receipt reads, agent launches and reported token/cache/model/duration data where available. Separate bytes, reported usage and inferred context duplication; none is automatically billed tokens or quota percentage.
-5. Keep measurement in existing Rust tooling with already-declared JSON facilities and std counting; add synthetic tests. Print aggregates and bounded redacted examples only. Do not copy transcripts/secrets into git. Rank further optimization slices by observed avoidable volume; the explicitly requested CI-consent policy is not vetoed by an arbitrary byte-share cutoff.
+5. Keep measurement in existing Rust tooling with already-declared JSON facilities and std counting; add synthetic tests. Print aggregates and bounded redacted examples only. Do not copy transcripts/secrets into git. Rank further optimization slices by observed avoidable volume; the person re-targeted Phase 3 on 2026-11-09 from these numbers.
 
 Critical files: amont-agent's existing decision/payload/hook protocol, quiet integration fixtures, transcript-reading/measurement facilities and tests; `docs/quiet.md`. Exact contract paths are narrowed after inspecting these existing entry points, before launching each worker.
 
-## Phase 3 — Self-review first, then consent for successful CI output
+## Phase 3 — Autonomous limits where the bytes are (re-targeted 2026-11-09)
 
-This is one targeted pre-tool policy, not a blanket block on CI information.
+The Phase 2 baseline moved the target. Over [2026-10-23T10:03:38Z, 2026-11-06T10:03:38Z): main-conversation tool output 27.4 MB, subagent output 121.9 MB. CI logs are 0.5% of main output (plus 0.6% failed-job logs). Subagents' whole-file Reads over 8 KiB are 1,711 calls and 40.4 MB, about 27% of all tool output; 1,637 whole reads repeated a file already read whole in the same session. Measured reach, keyed per agent as below: of the 1,711, 941 calls (26.0 MB) are an agent's first whole read of that file, 765 (14.4 MB) a sibling subagent's first read of a file another agent read, and 5 (0.1 MB) the same agent again (left to `file-reread`). So refuse-once reaches 1,706 calls and 40.3 MB of would-refuse reads; what an agent then reads by window is the unknown Phase 5 measures. Main shell output is many small results (about 1 KB each), so capping it saves little. The person chose no prompts: every limit below is feedback to the agent, never a question to the person, and CI logs get no special path.
 
-| Retrieval | Policy |
-|---|---|
-| Status, conclusion, SHA and compact list of all job outcomes | Allow |
-| Failed-job diagnostics | Allow with existing bounded-output guidance |
-| Successful-job logs or verbose successful-step payloads | Self-review challenge, then native consent on retry |
-| Whole-run output including successful jobs | Same challenge/consent; suggest failed-job-only retrieval |
-| Verbose CI retrieval with unknown outcome | Compact metadata lookup first; if still unknown, challenge/consent |
+1. **Refuse once, then allow.** Add one shared behaviour to the existing rules: the first matching call in a session is refused before it runs, with factual machine feedback (proven on the real host 2026-11-08: the agent sees `PreToolUse:… hook error: <reason>` and continues); the same call repeated afterwards is allowed and journalled `allowed-after-feedback`. Key: session, agent (main or the subagent's id when the payload carries one), tool, normalised path and file size. Reuse the hook's `first_telling`/`lsp::told` once-per-key record (unrecorded answers first), not the `session_state.rs` read log; expiry or a lost record returns to "refuse once", never to a silent allow on an unseen file. No second model, no prompt.
+2. **`read-unbounded-large`**: lower `LARGE` from 16 KiB to 8 KiB, keep its exemptions (plans read whole by reviewers) and its stat-only check, and graduate it from `advise` to refuse-once. Feedback names the file's size and line count and the cheaper call: a window (`offset`/`limit`) or LSP `documentSymbol`.
+3. **`whole-file-dump`**: graduate to refuse-once for a `cat` or address-less `sed` of a whole regular file over 8 KiB; feedback names the Read window.
+4. **`file-reread`**: stays `advise`; its rate is measured in Phase 5 before any change.
+5. No change to `persisted-output-dump`, CI rules, permissions or Claude Code settings. Lowering `bashOutputMaxChars` is the person's setting and out of scope.
 
-1. Resolve job identity/outcome **without fetching the verbose output**. Use existing bounded process helpers for at most one compact metadata query per evaluation, only after matching a CI-retrieval command, with a 1.5-second deadline (timeout stays unknown). Measure unmatched-call hook p95 against the baseline and require no regression beyond baseline noise; cache only narrowly identified outcomes. Auth/network/parse failure stays unknown. Start with verified GitHub `gh` CLI/API patterns; enumerate unsupported Forgejo/raw HTTP/MCP paths explicitly rather than claiming universal coverage.
-2. **Fresh episode:** refuse execution once with a short, factual self-review message: the job succeeded, the compact result is available, do you actually need its full output? Suggest the compact alternative. This is feedback to the existing agent, **not a separate LLM call**.
-3. **Retry after challenge:** if the agent still requests that retrieval, emit native `Ask`, identifying the job/attempt, outcome, scope and the agent's supplied purpose when available. The agent can explain the reason in its next message/tool description; no second model judges whether the reason is good. The person decides.
-4. **Consent boundary:** a retry is not approval. Native approval authorizes the single requested tool call; no persistent allowlist, self-approved token or blanket CI waiver. Denied, cancelled or unavailable consent does not run the retrieval and closes the episode until expiry: matching requests, including equivalent forms, do not prompt again. A recorded human denial is labeled as such; unavailable consent is labeled unavailable, never falsely attributed to the person. Expiry never grants consent or authorizes an agent to retry a human refusal; a new explicit human request can begin a new episode. There is at most one machine self-review challenge before Ask for an episode—not an endless deny/retry loop.
-5. Keep bounded session state keyed by repository/host, run/job identity, attempt and retrieval scope—not exact shell spelling. Changing `gh` to a known equivalent API path or wrapping in quiet/redirection must not reset or bypass the challenge. Whole-run permission is not inferred from one job's permission. Eviction/expiry returns to the conservative initial state, never Allow.
-6. Gate **before fetching/downloading or opening known saved successful-CI output**. Quiet capture is not consent. Saved-log coverage requires known provenance; ordinary source files must not become CI logs by filename resemblance. No private sibling-path or product-specific filename classifier.
-7. Keep consent output concise and journal only safe identities/decisions, not tokens, full URLs with secrets or logs. Existing pipeline/queue rules keep their own purpose; compose decisions deterministically without losing their protections or emitting duplicate warnings. Document precedence and test combined cases.
-
-Critical files: `amont-agent/crates/amont-agent-guard/src/decision.rs`, existing session-state/payload/rule infrastructure, a focused CI-output rule, registry, `src/hook.rs`, existing rule corpus/`tests/hook.rs`, owner docs. No new CLI is required just to carry a justification.
+Critical files: amont-agent `crates/amont-agent-guard/src/rules/read_unbounded_large.rs`, `whole_file_dump.rs`, `session_state.rs`, the hook's Read/Bash paths in `src/hook.rs`, `tests/hook.rs`, the rule corpus, `docs/`.
 
 ## Phase 4 — Capture automatically and reduce producer noise
 
 1. If Phase 2 proves safe invocation updates, automatically route a **small explicit set of non-interactive checks** through existing quiet capture. Prefer existing declared `amont run` when applicable; otherwise reuse `amont-agent quiet`. Preserve host-slot scheduling through its published interface; scheduling alone is not capture.
-2. Do not rewrite mutations, pushes, `amont land --json`, interactive/stdin-consuming calls, opaque shell parses or already captured output. Unsupported syntax stays unchanged with a documented gap. Never use quiet routing to bypass Phase 3's CI consent policy.
+2. Do not rewrite mutations, pushes, `amont land --json`, interactive/stdin-consuming calls, opaque shell parses or already captured output. Unsupported syntax stays unchanged with a documented gap. Never use quiet routing to get around a Phase 3 refusal.
 3. Preserve one-line success, exact exit/signal/cancel behavior, actionable failure excerpts and full raw-log retrieval/permissions. Keep CI full-failure behavior unchanged. Do not fork quiet's excerpt engine or indiscriminately tail failures.
 4. Tighten **relais-owned** completion/status formatting at existing public adapters: compact current outcome, actionable failure/decision, changed-file count and receipt/evidence path. Keep full criteria/reports/logs behind published detail paths rather than repeating complete contracts inside notifications. Add golden-text regression tests in `outcome.test.ts` for accepted, failed, blocked, cancelled and answered outcomes, using oversized-summary fixtures: fixture-specific byte ceilings must fail before compaction and pass after it; assert the receipt path when present, DECIDE_STEP when awaiting, FEEDBACK_STEP for accepted non-trials, and applicable NEXT_STEP[code] guidance. Ceilings are test assertions, never runtime truncation that could cut an instruction. Preserve decision, trust and feedback instructions when applicable, delivery/dedup semantics, and truthful current-state information. Do not suppress an unresolved decision as stale.
 5. Publish compact receipt projections in `relais/docs/SPEC.md`, including candidate identity, criteria, check exits and **all** gaps/bypasses/downgrades. Never interpret absent/null/pending as green. Do not teach amont-agent relais's field schema. Publish the recipe before another tool points at it; until then use the bounded generic fallback.
@@ -99,25 +86,24 @@ Critical files: existing amont-agent hook/payload/decision and shell-analysis/qu
 
 ## Phase 5 — Verify, land, activate and observe
 
-- Replay the fixed baseline window through the proposed CI classifier. Review all flagged cases up to 50, otherwise a reproducible sample of 50 plus every distinct form. Record actual coverage and false interventions; zero sampled cases is not proof of accuracy. Run the complete negative corpus.
-- Exercise the real host against owned fixtures: self-review abandonment, retry -> Ask, denied consent -> no fetch/read, approved call -> one retrieval, two jobs, rerun attempts, equivalent command forms, redirected/quiet-wrapped downloads, known saved logs, unknown metadata, stale/expired state and unsupported MCP paths.
-- Test automatic routing using deterministic noisy pass/fail fixtures: record whole-episode bytes, including guard feedback/retries; pass <=200 B excluding the existing delayed notice; raw log intact; exit 3, signals, missing executable, cancellation and grandchild cleanup retained. Required diagnostics may exceed a cosmetic byte budget.
-- Test compact successful/failed/blocked/cancelled/answered relais notifications. Preserve current action/state and every verification gap, avoid repeated full-contract text, and keep complete evidence retrievable. Do not change accepted/failed semantics to reduce bytes.
-- Run project default checks and declared implementation reviews, then PR/CI/release/install through each owner workflow. No tool downgrades, review bypasses or manual trust edits. No retry of dismissed aval trust. Person-only plugin refresh remains a reported boundary.
-- **Conditional local activation:** consent policy activates only after the real Ask/no-execution tests and negative corpus pass. Automatic routing activates only for proven safe forms. Approval of this plan does not itself approve reading any successful CI log. Any false intervention or authorization regression disables only the affected new behavior, preserving prior protections; fix before re-enabling.
-- Observe seven days after actual activation; record the exact due date then. Count self-review challenges with/without retries (no mind-reading claim), consent prompts/outcomes, false interventions, routed calls, whole-episode bytes and available agent usage. Include challenge/metadata/retry overhead. Target >=50% fewer avoidable bytes for optimized fixture episodes with no lost evidence; poor real-world benefit holds expansion or disables the affected optimization, **not** the explicitly requested consent policy merely for low traffic.
-- Report before/after workload and data limitations. No quota-saving percentage without actual evidence. Retain mandatory reviews while using concise shared briefs and no redundant exploration, repair runs or raw successful output dumps.
+- Replay the fixed baseline window through the Phase 3 matchers: count would-refuse calls by rule and context (main, subagent), review a reproducible sample of 50 plus every exempt-path near miss, and record false interventions. Run the rules' negative corpus.
+- Hook tests: first whole Read over 8 KiB refused with size and window advice; the identical retry allowed and journalled; a different file refused once on its own; a ranged Read and an exempt plan path never refused; a subagent's call keyed apart from the main session's; expired or missing state refuses once again. The same for `whole-file-dump`.
+- Automatic routing (Phase 4): deterministic noisy pass/fail fixtures; passing output <=200 B excluding the delayed notice; raw log intact; exit codes, signals, missing executable, cancellation and grandchild cleanup retained. The real-host proof (2026-11-08) showed the rewritten command is what is shown and run, so routing only ever makes output quieter, never changes the effect.
+- Compact relais notifications: successful, failed, blocked, cancelled and answered fixtures; current action/state and every verification gap kept; complete evidence retrievable.
+- Project default checks, declared implementation reviews (deltas via `review-brief --interdiff`), PR/CI/release/install through each owner workflow. No tool downgrades, review bypasses or manual trust edits.
+- **Activation:** graduating the two rules to refuse-once is authorised by this plan once the replay sample shows 0 false interventions; any false intervention returns only that rule to `advise` until fixed.
+- **Observe seven days** after activation (date recorded then): run `amont-agent output-audit` over those seven days and compare with the baseline's per-day rates. Target: subagent whole-Read bytes over 8 KiB down by half, with no rise in failed tasks or repair rounds in relais receipts. Report `allowed-after-feedback` counts (feedback ignored) honestly; no quota percentage without measured evidence.
 
 ## Code review
 
 - relais: backend, lang:rust, lang:typescript, unix, tui
 - amont-agent: backend, lang:rust, unix, tui
 
-Omissions: architect at code close — ownership and interfaces are reviewed in this plan; changes stay localized to existing process/policy/formatting seams. No React/UI profiles: native permission prompts, not a new web UI. Language profiles cover only the named repository's languages; amont-agent has no TypeScript implementation work.
+Omissions: architect at code close — ownership and interfaces are reviewed in this plan; changes stay localized to existing process/policy/formatting seams. No React/UI profiles: hook feedback to the agent only, no prompt and no web UI. Language profiles cover only the named repository's languages; amont-agent has no TypeScript implementation work.
 
 ## Approval scope and current state
 
-- This is the full updated proposal, **not implemented or approved**. Automatic capture and Ask behavior are explicitly unproven until Phase 2; no promise of arbitrary MCP interception.
+- This is the full updated proposal, **not implemented or approved**. Ask enforcement and safe command rewriting were proven on the real host on 2026-11-08; Phase 3 uses no prompt. No promise of arbitrary MCP interception.
 - No active background agents or waiting relais runs at the start of this update (`waiting: 0`). Historical notifications were reconciled, not relaunched.
 - Approval would authorize the above PR/release/local activation sequence and owned fixtures, not new trust grants, global permissions, unrelated cleanup or resumed suppression fleet publication.
 
@@ -141,4 +127,4 @@ Phase 1 (relais#383), tree 63885f34. Round 1 then Delta, all Opus.
 
 Remaining Phase 1 steps: release/install, then amont's unchanged `make check` through native relais once; seven-day receipt observation from that date.
 
-<!-- panel: repos=relais,amont-agent adds=lang:typescript reviewers=backend,lang:typescript body-sha=745e5882e9b0 -->
+<!-- panel: repos=relais,amont-agent adds=lang:typescript reviewers=backend body-sha=10e3bac11bf2 -->
