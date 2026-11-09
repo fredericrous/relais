@@ -130,3 +130,21 @@ Phase 1 (relais#383), tree 63885f34. Round 1 then Delta, all Opus.
 Remaining Phase 1 steps: release/install, then amont's unchanged `make check` through native relais once; seven-day receipt observation from that date.
 
 <!-- panel: repos=relais,amont-agent,decisions adds=lang:typescript reviewers=backend body-sha=a7be636bc98a -->
+
+## Phase 4 implementation review
+
+ADR-0066 (decisions#179) merged first; relais pack refreshed on this branch. Round 1 on tree 9cb2267d, two deltas (resumed seats), final tree 04b13545, all Opus; all six approve.
+- implementation-review: approve-with-changes → approve → approve. Fixed: this verification table (blocking), the 120-character cut tested, the reviewer instruction recorded below.
+- backend / lang:rust / unix / tui / lang:typescript: approve, approve-with-changes, approve, approve, approve. Fixed: index records get their own `what: guidance_index` (one event per prompt, readers count distinct ids, the golden drops them), `IndexedFor` / `CandidateNames` / `ReviewerGuidance` in place of strings, `None` and a tuple, no unused `in_full`. Deliberate: `CodeRule::checker` parses on each call (a few lines, cheaper than storing a field the manifest would have to skip). Second delta: the plugin timeline skips `guidance_index` (it would have shown a dozen rule ids per attempt), tested; the reviewer's fallback sentence asserted. Deliberate: test-only clones of a candidate set (Rust, cosmetic).
+- Decision: the reviewer's fetch instruction names only `aval_rule` (with `repo:` when known) and asks it to say in its report which rule it could not read when the tool is missing; it names no CLI, since reviewer agents have no shell. Item 2's "reused, not re-worded" holds for the worker only.
+
+## Phase 4 verification (observed)
+
+| Input | Expected | Actual |
+|---|---|---|
+| This repository's aval corpus (55 code rules, 11 tool-checked; 37 process rules), `prompt_rule_bytes_before_and_after_on_this_repository` | reviewer rules ≈ −17 KB, worker ≈ −8 KB | reviewer rule block 65.5 KB → 49.7 KB (−24%), worker code rules 49.3 KB → 43.3 KB (−12%); whole prompts ≈ 72 → 56 KB and 68 → 62 KB |
+| Every real `Checked by` paragraph (decisions c9898d0) | parsed as labelled | 55 of 55 (44 judge, 11 tool) |
+| A release-scenario run | a `guidance_index` event naming the worker's lines; nothing on stderr | event present with `tests.no-real-waits`; stderr unchanged |
+| Isolated-path golden | unchanged | unchanged (index records filtered as measurements) |
+| Plugin timeline, `make plugin` | `guidance_index` not shown, other decisions shown | 378 pass, 0 fail |
+| Reviewer fetching an indexed rule | — | observed after release, Phase 5 (needs the released plugin's reviewer agents) |
