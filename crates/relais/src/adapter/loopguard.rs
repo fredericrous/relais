@@ -558,10 +558,8 @@ fn subcommand<'a>(args: &[&'a str], with_value: &[&str]) -> Option<&'a str> {
     None
 }
 
-// holds-until: progress is judged from the worktree and not from the
-// transcript. Only the commands listed here count as changing files, so a
-// script that writes files, or a command missing from the list, leaves the
-// counts standing and the guard can fire although the worker made progress.
+// Only the commands listed here count as changing files, so a script that writes files, or a command missing from the list, leaves the counts standing and the guard can fire although the worker made progress.
+// holds-until: progress is read from this fixed list; a worktree diff replaces it if the shadow events show misses.
 fn segment_mutates(words: &[&str]) -> bool {
     let Some((&name, args)) = words.split_first() else {
         return false;

@@ -122,7 +122,7 @@ impl<'a> RunEngine<'a> {
     /// kept, and the machine picks the next rung.
     fn end_looped_attempt(
         &mut self,
-        ctx: &AttemptContext<'_>,
+        context: &AttemptContext<'_>,
         progress: &mut Progress,
         dispatched: Dispatched,
     ) -> Result<Step, RunError> {
@@ -134,7 +134,7 @@ impl<'a> RunEngine<'a> {
                 "an attempt was ended as looped without a looped worker".into(),
             ));
         };
-        let held_worktree = ctx.worktree_path.to_string_lossy().into_owned();
+        let held_worktree = context.worktree_path.to_string_lossy().into_owned();
         self.config
             .ledger
             .finish_attempt(attempt_id, State::Failed, Some(&held_worktree), None)?;
@@ -158,7 +158,7 @@ impl<'a> RunEngine<'a> {
             Observation::WorkerLooped { command, count },
         )?;
         let rung = match &next {
-            Next::Attempt { rung, .. } => ctx
+            Next::Attempt { rung, .. } => context
                 .preflight
                 .decision
                 .ladder
@@ -170,7 +170,7 @@ impl<'a> RunEngine<'a> {
             "relais: attempt {attempt} stopped: worker repeated {shown} failing {count} times \
              with no edit; next: {rung}"
         );
-        self.proceed(ctx, progress, next)
+        self.proceed(context, progress, next)
     }
 
     /// Budget ceilings are checked BEFORE admitting more work (SPEC §9,
