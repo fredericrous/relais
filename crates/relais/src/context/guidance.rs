@@ -185,6 +185,65 @@ impl CodeRule {
             body_sha256,
         }
     }
+
+    /// How this rule is checked, read from its body's `**Checked by:**`
+    /// paragraph (ADR-0066). A body with no such paragraph — or none at all,
+    /// as in a manifest read back from disk — is [`Checker::Judge`], so a
+    /// rule nobody can classify stays in full.
+    pub fn checker(&self) -> Checker {
+        checker_of(&self.body)
+    }
+}
+
+/// Who checks a code rule (ADR-0066): a reviewer's judgement, at least in
+/// part, or only a tool — the adr-lint candidate pass or an exact check (a
+/// compiler, a formatter, a lint). A tool-only rule can be an index line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checker {
+    Judge,
+    Tool,
+}
+
+/// The [`Checker`] a rule body states. The paragraph after `**Checked by:**`
+/// (to a blank line or the next `**` field) lists the checkers separated by
+/// commas, each perhaps followed by a parenthesised note that can itself hold
+/// commas and wrap lines; notes are dropped before the list is split. Only a
+/// list made wholly of `candidate` and `exact` is [`Checker::Tool`]; any
+/// other word, or no list, is [`Checker::Judge`].
+pub fn checker_of(body: &str) -> Checker {
+    let mut lines = body.lines().map(str::trim);
+    let Some(first) = lines.find_map(|line| line.strip_prefix("**Checked by:**")) else {
+        return Checker::Judge;
+    };
+    let mut paragraph = first.to_string();
+    for line in lines.take_while(|line| !line.is_empty() && !line.starts_with("**")) {
+        paragraph.push(' ');
+        paragraph.push_str(line);
+    }
+    let mut depth = 0usize;
+    let mut flat = String::new();
+    for c in paragraph.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => flat.push(c),
+            _ => {}
+        }
+    }
+    let kinds: Vec<&str> = flat
+        .split(',')
+        .map(|kind| kind.trim().trim_end_matches('.').trim())
+        .filter(|kind| !kind.is_empty())
+        .collect();
+    let tool_only = !kinds.is_empty()
+        && kinds
+            .iter()
+            .all(|kind| matches!(*kind, "candidate" | "exact"));
+    if tool_only {
+        Checker::Tool
+    } else {
+        Checker::Judge
+    }
 }
 
 /// The active constraint rules of the repository.
@@ -751,6 +810,64 @@ pub fn run_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every real `Checked by` paragraph is read as its fixture says: the
+    /// tool-only rules, and every rule with a judge part (ADR-0066).
+    #[test]
+    fn every_real_checked_by_paragraph_is_classified() {
+        let fixture = include_str!("../../tests/fixtures/guidance/checked-by.txt");
+        let mut seen = 0;
+        for line in fixture
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            let (want, paragraph) = line.split_once('\t').expect("label, tab, paragraph");
+            let body = format!(
+                "Some rule text.\n\n**Checked by:** {paragraph}\n\n**Reviewed by:** backend."
+            );
+            let got = match checker_of(&body) {
+                Checker::Judge => "judge",
+                Checker::Tool => "tool",
+            };
+            assert_eq!(got, want, "{paragraph}");
+            seen += 1;
+        }
+        assert_eq!(seen, 55, "every paragraph of the fixture");
+    }
+
+    #[test]
+    fn a_rule_nobody_can_classify_stays_judged() {
+        assert_eq!(checker_of(""), Checker::Judge, "no body");
+        assert_eq!(
+            checker_of("text\n**Reviewed by:** backend."),
+            Checker::Judge
+        );
+        assert_eq!(
+            checker_of("**Checked by:** a person, someday."),
+            Checker::Judge
+        );
+        assert_eq!(
+            checker_of("**Checked by:**\n\nlater"),
+            Checker::Judge,
+            "empty list"
+        );
+        assert_eq!(
+            checker_of("**Checked by:** candidate (one,\ntwo), exact (a (nested) note)."),
+            Checker::Tool,
+            "notes with commas, wrapped and nested"
+        );
+        assert_eq!(
+            checker_of("**Checked by:** exact (fmt),\njudge (the rest)."),
+            Checker::Judge,
+            "a wrapped judge part"
+        );
+        let rule = CodeRule::new(
+            "a.b".into(),
+            "s".into(),
+            "**Checked by:** candidate (x).".into(),
+        );
+        assert_eq!(rule.checker(), Checker::Tool);
+    }
 
     /// Captured from aval 1.9.0 (`aval rules --level constraint --json`),
     /// shortened to three rules; one is inactive.

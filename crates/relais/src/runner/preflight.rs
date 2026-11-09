@@ -903,6 +903,19 @@ impl<'a> RunEngine<'a> {
         });
     }
 
+    /// The rules a prompt gave as one line each (ADR-0066), as a run event
+    /// in `events.jsonl`, so a fetch or a later violation of one can be
+    /// counted. `who` is the agent the prompt is for. Nothing when none was.
+    pub(in crate::runner) fn emit_index_lines(&self, who: &str, ids: &[&str]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.events.emit(Event::Decision {
+            what: "guidance".to_string(),
+            reason: format!("{who} index lines: {}", ids.join(" ")),
+        });
+    }
+
     /// The receipt's guidance note: one line, and only when guidance had
     /// a gap, the reviewer's included.
     pub(in crate::runner) fn guidance_note(&self, manifest: &ContextManifest) -> Option<String> {

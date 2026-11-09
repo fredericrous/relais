@@ -51,7 +51,7 @@ fn tools_of(kind: AgentKind) -> &'static [&'static str] {
             "mcp__aval__aval_resolve",
             "mcp__aval__aval_relevant",
         ],
-        AgentKind::Reviewer => &["Read", "Grep", "Glob", "LSP"],
+        AgentKind::Reviewer => &["Read", "Grep", "Glob", "LSP", "mcp__aval__aval_rule"],
         AgentKind::Planner => &["Read", "Grep", "Glob", "LSP", "Bash"],
     }
 }

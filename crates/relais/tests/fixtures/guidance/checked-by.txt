@@ -1,0 +1,59 @@
+# Every `**Checked by:**` paragraph in decisions@c9898d0 docs/principles/*.md,
+# one per line (wrapped lines joined), with the checker it states:
+# `tool` when its list, notes removed, is only candidate/exact; else `judge`.
+
+judge	candidate (a new manifest entry), judge (whether ownership is argued).
+judge	judge.
+judge	judge.
+judge	judge.
+judge	judge.
+judge	exact (the Go compiler, Cargo between crates, and `adr-lint check` between sibling modules in a repository that declares an `[architecture]` contract in `adr-lint.toml`, for Rust, TypeScript and Python), judge (a cycle in a repository with no contract).
+judge	exact (`adr-lint check`, in a repository that declares an `[architecture]` contract in `adr-lint.toml`: an import into a later layer, in Rust, TypeScript, Python and Go), judge (a repository with no contract, a file in no layer, and a coupling that is not an import).
+judge	judge.
+judge	exact (an `I` prefix on a TS interface, a `Trait` suffix, an `m_` prefix), candidate (single letters outside a loop index or a closure over a named collection, the placeholders and abbreviations listed above), judge (whether a name is clear in its context).
+tool	candidate (a boolean parameter, a string or integer selector compared against literals).
+tool	candidate (a `&mut` parameter other than `self` outside a trait impl, a Go pointer out-parameter).
+judge	candidate (commented-out code, a banner, `@author`), judge (whether a comment is accurate).
+tool	exact (cargo-fmt, gofmt, the repository's Prettier or Biome config, ruff format).
+judge	judge (a row type outside the adapter, and the mapping step: the `only_in` lists of an `adr-lint.toml` contract keep the database driver in the adapters, but a row handed out of the adapter is a value, not an import, so no import check sees it).
+judge	judge.
+judge	exact (a TypeScript `catch` with no statement and no comment, and an Effect `catchAll` to void without a same-line reason), candidate (a Rust `let _ =` or `.ok();` statement, a Go `_ =` and a Python `except …: pass`, each with no same-line comment), judge (whether a stated reason is genuine; a Go call that drops its error result without `_`, which needs types to see). The linters that flag the discard itself are not used: clippy `let_underscore_must_use`, errcheck with check-blank and ruff `S110` do not read the comment this rule allows, so each would refuse code the rule permits.
+judge	judge.
+judge	exact (`adr-lint check`, in a repository that declares an `[architecture]` contract: an import of a package its `only_in` lists keep to named paths or modules, made anywhere else), judge (whether the interface is the application's own, and a third-party API no `only_in` names).
+judge	exact (ast-grep for an `#[ignore]`, `t.Skip()` or `it.skip` that carries no reason), judge (the owner, and independence, repeatability and speed).
+judge	judge.
+judge	judge.
+judge	exact (ban-ts-comment, eslint-comments, ruff PGH003/PGH004/RUF100, clippy allow_attributes_without_reason, nolintlint, `adr-lint sync --check` for a loosened config; `amont-agent suppressions --staged` at commit, for an added bare or blanket marker and a loosened configuration), judge (a test skipped or an assertion weakened to get a green run).
+tool	candidate (a print to stdout outside the output module).
+judge	exact (`adr-lint cli-probe`: an unknown flag exits 2), judge (the other codes).
+judge	exact (`adr-lint cli-probe`: `-h`, `--help`, `--bogus --help` and `--version` exit 0), judge (help on stdout, `-v`, subcommand help and `tool help sub`).
+judge	judge.
+judge	judge.
+judge	judge.
+judge	judge.
+judge	judge.
+judge	judge.
+judge	judge.
+judge	judge.
+judge	judge.
+judge	judge.
+judge	judge.
+judge	judge.
+judge	judge.
+judge	exact (`@effect/tsgo` in customer-vision: its ambient rules at error in typecheck and CI; exempt are the config, telemetry, runtime, id and worker-entry modules, the build configs, and test files), candidate (adr-lint's ambient-read patterns for Rust, Python and Go, outside a repository's declared `[architecture.ambient]`, ADR-0056), judge (TypeScript in other repositories; customer-vision's test files, which the person exempted; a clock passed by reference rather than called; configuration and global-state reads; and any read in a repository with no `[architecture.ambient]`).
+tool	candidate (a new global or singleton).
+tool	candidate (a Go slice or map argument that is mutated, a TS write to a parameter).
+judge	judge.
+tool	exact (switch-exhaustiveness-check, golangci exhaustive, the Rust compiler), candidate (`_ =>` on the crate's own enum).
+tool	candidate (`unwrap`, `expect`, `panic!`, Go `panic`, a TS throw that is not an Error).
+judge	exact (`adr-lint check`, in a repository that declares an `[architecture]` contract: the domain layer importing a later layer, or a package its `only_in` lists keep to the adapters, reported as an `architecture.dependency-rule` or `boundaries.own-the-interface` finding, ADR-0056), judge (a repository with no contract, an infrastructure package no `only_in` names, and a coupling that is not an import).
+judge	judge.
+judge	judge.
+tool	candidate (an HTTP client without a timeout, `fetch` without `signal`).
+tool	candidate (a retry without a bound).
+judge	judge.
+judge	judge.
+judge	judge.
+judge	judge.
+judge	judge.
+tool	candidate (a sleep in a test file).

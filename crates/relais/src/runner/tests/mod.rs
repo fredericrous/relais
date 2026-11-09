@@ -7309,18 +7309,21 @@ fn the_planner_gets_the_relevant_block_and_never_the_index() {
     assert!(!block.contains("constraint index") && !block.contains("aval rule"));
 }
 
+/// ADR-0066: the reviewer reads process rules as one line each and is told
+/// to fetch one with `aval_rule`, naming the corpus.
 #[test]
-fn the_reviewer_reads_full_statements_and_never_aval_rule() {
+fn the_reviewer_reads_process_rules_as_lines_and_fetches_with_aval_rule() {
     let manifest = guided_manifest(
         &["errors.never-swallowed", "errors.typed-values"],
         &[("k.k", "choice")],
     );
-    let (text, gap) = reviewer_guidance(&manifest.guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES);
+    let (text, gap, _) =
+        reviewer_guidance(&manifest.guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES, None);
     assert_eq!(gap, None);
-    let block = fenced(&text, "constraints in force").expect("statements");
+    let block = fenced(&text, "process rules in force").expect("process lines");
     assert!(block.contains("`errors.never-swallowed`: the statement of errors.never-swallowed"));
     assert!(block.contains("`errors.typed-values`: the statement of errors.typed-values"));
-    assert!(!text.contains("aval rule"), "{text}");
+    assert!(text.contains("the `aval_rule` tool"), "{text}");
     assert!(!text.contains("constraint index"), "{text}");
     assert!(text.contains("--- begin relevant guidance ("));
 }
@@ -7331,8 +7334,8 @@ fn a_reviewer_budget_that_fits_n_of_m_gives_n_whole_statements_and_a_gap() {
     let rules = &manifest.guidance.rules;
     let line = |rule: &RuleRef| format!("`{}`: {}", rule.id, rule.statement).len() + 1;
     let budget = line(&rules[0]) + line(&rules[1]);
-    let (text, gap) = reviewer_guidance(&manifest.guidance, budget);
-    let block = fenced(&text, "constraints in force").expect("statements");
+    let (text, gap, _) = reviewer_guidance(&manifest.guidance, budget, None);
+    let block = fenced(&text, "process rules in force").expect("process lines");
     assert!(block.contains("`a.one`: the statement of a.one"));
     assert!(block.contains("`a.two`: the statement of a.two"));
     assert!(!block.contains("a.three"), "no part of the third: {block}");
@@ -7352,13 +7355,12 @@ fn a_reviewer_budget_that_fits_n_of_m_gives_n_whole_statements_and_a_gap() {
         .find(|line| line.starts_with("only 2 of 3 could be shown"))
         .expect("the reviewer is told how many could be shown");
     assert!(shown_line.contains("omitted: a.three"), "{shown_line}");
-    assert!(!text.contains("aval rule"), "{text}");
     assert!(context::guidance::gap_line(&[gap])
         .expect("a line")
         .contains("omitted: a.three"));
 
-    let (none, gap) = reviewer_guidance(&manifest.guidance, 0);
-    assert!(!none.contains("constraints in force"), "{none}");
+    let (none, gap, _) = reviewer_guidance(&manifest.guidance, 0, None);
+    assert!(!none.contains("process rules in force"), "{none}");
     assert!(gap.expect("gap").detail.contains("0 of 3"));
 }
 
@@ -7377,7 +7379,7 @@ fn the_reviewer_does_not_read_a_rule_twice() {
             statement: "other".into(),
         },
     ];
-    let (text, _) = reviewer_guidance(&manifest.guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES);
+    let (text, _, _) = reviewer_guidance(&manifest.guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES, None);
     assert_eq!(text.matches("the statement of a.one").count(), 1, "{text}");
     let relevant = fenced(&text, "relevant guidance").expect("relevant");
     assert!(relevant.contains("rule `z.other`") && !relevant.contains("a.one"));
@@ -8750,8 +8752,10 @@ fn a_constraints_overflow_and_a_decisions_failure_keep_both_labels_and_causes() 
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
     let backend = conditional_worker("relais task");
+    // Each process rule is one line of at most 120 characters (ADR-0066),
+    // so a thousand of them overflow the 96 KiB constraints budget.
     let rules = OverflowingRulesFailingDecisions(StatedRules(
-        (0..40)
+        (0..1000)
             .map(|number| crate::context::RuleRef {
                 id: format!("r.{number:04}"),
                 level: "constraint".into(),
@@ -8953,7 +8957,8 @@ fn the_constraints_budget_fits_a_stated_number_of_statements() {
     let ids: Vec<String> = (0..4000).map(|index| format!("r.{index:04}")).collect();
     let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
     let manifest = guided_manifest(&refs, &[]);
-    let (text, gap) = reviewer_guidance(&manifest.guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES);
+    let (text, gap, _) =
+        reviewer_guidance(&manifest.guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES, None);
     // 8 + 2 + 23 + 1 = 34 bytes a statement; 98304 / 34 = 2891.
     assert_eq!(REVIEW_CONSTRAINTS_BUDGET_BYTES, 96 * 1024);
     assert_eq!(text.matches("the statement of r.").count(), 2891, "{text}");
@@ -9267,12 +9272,95 @@ fn the_reviewer_reads_code_rules_in_full_and_other_constraints_as_statements() {
         statement: "the statement of names.reveal-intent".into(),
     });
     manifest.guidance.code_rules = vec![code_rule("names.reveal-intent", "BODY-TEXT-OF-THE-RULE")];
-    let (text, gap) = reviewer_guidance(&manifest.guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES);
+    let (text, gap, _) =
+        reviewer_guidance(&manifest.guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES, None);
     assert!(gap.is_none());
     let code = fenced(&text, "code rules in force").expect("code rules");
     assert!(code.contains("BODY-TEXT-OF-THE-RULE"));
-    let others = fenced(&text, "constraints in force").expect("statements");
+    let others = fenced(&text, "process rules in force").expect("process lines");
     assert!(others.contains("a.process") && !others.contains("names.reveal-intent"));
+}
+
+/// ADR-0066: a code rule a tool alone checks is one line for the reviewer
+/// unless a candidate of this diff names it, and in full when the
+/// candidates are unavailable; a rule with a judge part is always in full.
+#[test]
+fn the_reviewer_reads_a_tool_checked_rule_in_full_only_when_its_candidate_fires() {
+    let mut manifest = guided_manifest(&[], &[]);
+    manifest.guidance.code_rules = vec![
+        code_rule("a.judged", "JUDGED-BODY\n\n**Checked by:** judge."),
+        code_rule(
+            "b.tooled",
+            "TOOLED-BODY\n\n**Checked by:** candidate (a sleep in a test).",
+        ),
+    ];
+    let budget = REVIEW_CONSTRAINTS_BUDGET_BYTES;
+    let quiet = std::collections::BTreeSet::new();
+    let (text, _, indexed) = reviewer_guidance(&manifest.guidance, budget, Some(&quiet));
+    let full = fenced(&text, "code rules in force").expect("code rules");
+    assert!(
+        full.contains("JUDGED-BODY") && !full.contains("TOOLED-BODY"),
+        "{full}"
+    );
+    let lines = fenced(&text, "code rules a tool checks").expect("tool lines");
+    assert!(
+        lines.contains("`b.tooled`: the statement of b.tooled"),
+        "{lines}"
+    );
+    assert!(text.contains("the `aval_rule` tool"), "{text}");
+    assert_eq!(indexed, vec!["b.tooled".to_string()]);
+
+    let named = std::collections::BTreeSet::from(["b.tooled".to_string()]);
+    let (text, _, indexed) = reviewer_guidance(&manifest.guidance, budget, Some(&named));
+    let full = fenced(&text, "code rules in force").expect("code rules");
+    assert!(full.contains("TOOLED-BODY"), "its candidate fired: {full}");
+    assert!(
+        fenced(&text, "code rules a tool checks").is_none(),
+        "{text}"
+    );
+    assert!(indexed.is_empty(), "{indexed:?}");
+
+    let (text, _, _) = reviewer_guidance(&manifest.guidance, budget, None);
+    let full = fenced(&text, "code rules in force").expect("code rules");
+    assert!(
+        full.contains("TOOLED-BODY"),
+        "candidates unavailable: {full}"
+    );
+}
+
+/// ADR-0066: the worker reads a rule with a judge part in full, and a rule a
+/// tool alone checks as one line with how to fetch it.
+#[test]
+fn the_worker_reads_judged_rules_in_full_and_tool_checked_rules_as_lines() {
+    let mut guidance = guided_manifest(&[], &[]).guidance;
+    guidance.repo_name = Some("relais".into());
+    guidance.code_rules = vec![
+        code_rule(
+            "a.judged",
+            "JUDGED-BODY\n\n**Checked by:** exact (fmt), judge (the rest).",
+        ),
+        code_rule(
+            "b.tooled",
+            "TOOLED-BODY\n\n**Checked by:** exact (cargo-fmt).",
+        ),
+    ];
+    let (text, gap) = prompt::worker_code_rules_block(&guidance, 64 * 1024);
+    assert_eq!(gap, None);
+    let full = fenced(&text, "code rules in force").expect("code rules");
+    assert!(
+        full.contains("JUDGED-BODY") && !full.contains("TOOLED-BODY"),
+        "{full}"
+    );
+    let lines = fenced(&text, "code rules a tool checks").expect("tool lines");
+    assert!(
+        lines.contains("`b.tooled`: the statement of b.tooled"),
+        "{lines}"
+    );
+    assert!(text.contains("passing `repo: \"relais\"`"), "{text}");
+    assert_eq!(
+        prompt::tool_checked_ids(&guidance, &std::collections::BTreeSet::new()),
+        vec!["b.tooled"]
+    );
 }
 
 /// A resolver whose `governs: code` rules are the ones given.
@@ -9397,7 +9485,7 @@ fn code_rules_without_text_tell_the_reviewer_the_text_is_unavailable() {
         }],
         ..Guidance::default()
     };
-    let (_, gap) = reviewer_guidance(&guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES);
+    let (_, gap, _) = reviewer_guidance(&guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES, None);
     let gap = gap.expect("a gap");
     assert!(gap.detail.contains("full text"), "{}", gap.detail);
     assert!(gap.detail.contains("unavailable"), "{}", gap.detail);
@@ -9422,15 +9510,15 @@ fn merged_reviewer_gaps_agree_on_one_budget_and_name_every_omitted_rule() {
         .filter_map(prompt::RenderedRule::full_text_of)
         .map(|rule| rule.bytes())
         .sum();
-    let statement_one = prompt::RenderedRule::statement_of(&manifest.guidance.rules[0]).bytes();
+    let statement_one = prompt::RenderedRule::index_line_of(&manifest.guidance.rules[0]).bytes();
     let statement_all: usize = manifest
         .guidance
         .rules
         .iter()
-        .map(|rule| prompt::RenderedRule::statement_of(rule).bytes())
+        .map(|rule| prompt::RenderedRule::index_line_of(rule).bytes())
         .sum();
     let budget = code_one + statement_one;
-    let (_, gap) = reviewer_guidance(&manifest.guidance, budget);
+    let (_, gap, _) = reviewer_guidance(&manifest.guidance, budget, None);
     let gap = gap.expect("a merged gap");
     assert_eq!(
         gap.cause,

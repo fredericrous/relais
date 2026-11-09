@@ -284,7 +284,7 @@ fn agent_review() -> String {
     let body = r#"---
 name: relais-review
 description: Semantic reviewer (relais advisory default). Reports findings; cannot edit or waive anything.
-tools: Read, Grep, Glob, LSP
+tools: Read, Grep, Glob, LSP, mcp__aval__aval_rule
 model: opus
 ---
 

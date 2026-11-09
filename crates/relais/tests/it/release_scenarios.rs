@@ -1595,6 +1595,20 @@ fn budget_exhaustion_preserves_evidence_and_stops_dispatch() {
         !runs[0].join("candidate-3.patch").exists(),
         "no third dispatch"
     );
+    // ADR-0066: the code rules a tool checks were given as lines, and the
+    // run's events say which, never its stderr.
+    let journalled = events_jsonl(&runs[0]).into_iter().any(|event| {
+        event["event"]["kind"] == "decision"
+            && event["event"]["what"] == "guidance"
+            && event["event"]["reason"].as_str().is_some_and(|r| {
+                r.starts_with("worker index lines: ") && r.contains("tests.no-real-waits")
+            })
+    });
+    assert!(
+        journalled,
+        "a guidance event names the worker's index lines"
+    );
+    assert!(!stderr.contains("index lines"), "{stderr}");
     let report: serde_json::Value = serde_json::from_str(&text(
         &world
             .relais(&["report", "--since", "2026-01-01", "--json"])

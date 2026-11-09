@@ -1,10 +1,13 @@
 //! Reading a reviewer's answer and building its prompts.
 
+use std::collections::BTreeSet;
+
 use super::prompt::{fit_statements, relevant_block, RenderedRule, RuleKind};
 use super::{
     context, data_block, data_list_block, verify, workspace, Duration, EffectiveAuthority,
     Guidance, GuidanceGap, GuidanceSource, Path, PathBuf, Reason, RunId, Tier,
 };
+use crate::context::guidance::{Checker, CodeRule};
 
 pub use super::machine::Severity;
 pub(in crate::runner) use super::machine::REVIEW_MAX_PARTS;
@@ -522,26 +525,88 @@ pub(in crate::runner) fn widened_scope_block(paths: &[String]) -> String {
     block
 }
 
-/// What the reviewer reads of aval: the full text of every active code
-/// rule, then the statement of every other active constraint (it cannot
-/// run `aval rule`, so never the bare index and never that instruction),
-/// then the relevant block without the rules already stated above it.
-/// `budget` is the constraints budget; rules that do not fit whole are left
-/// out and named in the returned gap.
+/// The rule ids the candidates of this diff name, or `None` when the
+/// candidates are unavailable: then every tool-checked rule stays in full.
+pub(in crate::runner) fn candidate_rules(
+    candidates: &Result<candidates::PartCandidates, GuidanceGap>,
+) -> Option<BTreeSet<String>> {
+    candidates
+        .as_ref()
+        .ok()
+        .map(|part| part.items.iter().map(|item| item.rule.clone()).collect())
+}
+
+/// The code rules the reviewer gets in full (ADR-0066): every rule with a
+/// judge part, and a rule a tool alone checks when a candidate of this diff
+/// names it or when the candidates are unavailable (`named` is `None`).
+fn reviewer_full_code_rules<'a>(
+    guidance: &'a Guidance,
+    named: Option<&BTreeSet<String>>,
+) -> Vec<&'a CodeRule> {
+    guidance
+        .code_rules
+        .iter()
+        .filter(|rule| {
+            rule.checker() == Checker::Judge || named.is_none_or(|ids| ids.contains(&rule.id))
+        })
+        .collect()
+}
+
+/// How the reviewer reads one rule in full: the `aval_rule` tool, with the
+/// repository's corpus named when it is known. Unlike the worker's, it
+/// names no CLI: a reviewer has no shell.
+fn reviewer_fetch_instruction(guidance: &Guidance) -> String {
+    match &guidance.repo_name {
+        Some(name) => format!(
+            "read one rule in full with the `aval_rule` tool, passing `repo: \"{name}\"`, when your review needs it."
+        ),
+        None => "read one rule in full with the `aval_rule` tool when your review needs it."
+            .to_string(),
+    }
+}
+
+/// What the reviewer reads of aval (ADR-0066): in full, the code rules with
+/// a judge part and the tool-checked ones a candidate of this diff names;
+/// one line each for the other tool-checked code rules and for the process
+/// rules, with how to read one through `aval_rule`; then the relevant block
+/// without the rules already given above it. `named` is
+/// [`candidate_rules`]. `budget` is the constraints budget; rules that do
+/// not fit whole are left out and named in the returned gap. The ids
+/// returned last are the rules given as index lines, which relais journals.
 pub(in crate::runner) fn reviewer_guidance(
     guidance: &Guidance,
     budget: usize,
-) -> (String, Option<GuidanceGap>) {
-    let code: Vec<RenderedRule> = guidance
+    named: Option<&BTreeSet<String>>,
+) -> (String, Option<GuidanceGap>, Vec<String>) {
+    let full_rules = reviewer_full_code_rules(guidance, named);
+    let code: Vec<RenderedRule> = full_rules
+        .iter()
+        .copied()
+        .filter_map(RenderedRule::full_text_of)
+        .collect();
+    let full_ids: BTreeSet<String> = full_rules.iter().map(|rule| rule.id.clone()).collect();
+    let tool_rules: Vec<&CodeRule> = guidance
         .code_rules
         .iter()
-        .filter_map(RenderedRule::full_text_of)
+        .filter(|rule| rule.checker() == Checker::Tool && !full_ids.contains(&rule.id))
+        .collect();
+    let tool_ids: Vec<String> = tool_rules.iter().map(|rule| rule.id.clone()).collect();
+    let tool_lines: Vec<String> = tool_rules
+        .iter()
+        .map(|rule| format!("`{}`: {}", rule.id, rule.statement))
+        .collect();
+    // A code rule is either in full or one tool line above; one whose text
+    // is unavailable (a manifest read back from disk) stays a process line.
+    let given: BTreeSet<&str> = code
+        .iter()
+        .map(|rule| rule.id.as_str())
+        .chain(tool_ids.iter().map(String::as_str))
         .collect();
     let others: Vec<RenderedRule> = guidance
         .rules
         .iter()
-        .filter(|rule| !code.iter().any(|full| full.id == rule.id))
-        .map(RenderedRule::statement_of)
+        .filter(|rule| !given.contains(rule.id.as_str()))
+        .map(RenderedRule::index_line_of)
         .collect();
     let unreadable: Vec<&str> = guidance
         .code_rules
@@ -595,17 +660,27 @@ pub(in crate::runner) fn reviewer_guidance(
         let full: Vec<&str> = code_shown.iter().map(|rule| rule.text.as_str()).collect();
         text.push_str(&data_block("code rules in force", &full.join("\n\n")));
     }
+    let fetch = reviewer_fetch_instruction(guidance);
+    text.push_str(&super::prompt::tool_checked_block(&tool_lines, &fetch));
     if !shown.is_empty() {
-        let statements: Vec<String> = shown.iter().map(|rule| rule.text.clone()).collect();
-        text.push_str(&data_list_block("constraints in force", &statements));
+        let lines: Vec<String> = shown.iter().map(|rule| rule.text.clone()).collect();
+        text.push_str(&format!(
+            "the process rules below are in force, one line each. {fetch}\n"
+        ));
+        text.push_str(&data_list_block("process rules in force", &lines));
     }
     let stated: Vec<&str> = code_shown
         .iter()
         .chain(shown.iter())
         .map(|rule| rule.id.as_str())
+        .chain(tool_ids.iter().map(String::as_str))
         .collect();
     text.push_str(&relevant_block(guidance, &stated));
-    (text, gap)
+    let indexed = tool_ids
+        .into_iter()
+        .chain(shown.iter().map(|rule| rule.id.clone()))
+        .collect();
+    (text, gap, indexed)
 }
 
 /// The decisions that apply to the files a candidate patch changes, as a

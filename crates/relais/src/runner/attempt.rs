@@ -296,6 +296,13 @@ impl<'a> RunEngine<'a> {
         if let Some(gap) = &code_rules_gap {
             self.emit_guidance_gap(gap);
         }
+        // The run's record of the code rules the worker got as one line
+        // each (ADR-0066).
+        let indexed = super::prompt::tool_checked_ids(
+            &ctx.preflight.manifest.guidance,
+            &std::collections::BTreeSet::new(),
+        );
+        self.emit_index_lines("worker", &indexed);
         // Like `reviewer_gap`, this gap lives outside the manifest: the
         // manifest is built before the prompt, so the receipt reads it from here.
         self.worker_code_rules_gap = code_rules_gap;
