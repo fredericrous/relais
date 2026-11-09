@@ -392,7 +392,7 @@ An evidence reference names what kind of evidence it is, from a closed set rathe
 | Behavioral failure with a localized correction | repairing, if repair allowance remains |
 | Repair fails or diagnosis remains ambiguous | escalating, if authorized and budget permits |
 | Same failure and unchanged candidate recur | escalate or fail immediately |
-| A native worker repeats one failing command `loop_threshold` times with no edit between (`[execution] loop_threshold`, §5) | the worker is stopped and the next rung runs, as for a failed verification: repairing, or escalating when authorized; `failed (worker_looped)` when neither remains (exit code 4, as for any `failed` run) |
+| A native worker repeats one failing command `loop_threshold` times with no edit between (`[execution] loop_threshold`, §5) | the worker is stopped and the next rung runs, as for a failed verification: repairing, or escalating when authorized; `failed (worker_looped)` when neither remains (exit code 4, as for any `failed` run); a stop nobody acknowledges within the attempt's remaining wall time ends `interrupted` with the detail `stop_unacknowledged: …` and the tree fenced (the detail names the last failed status poll), and a transcript that is never found prints `relais: loop guard off for attempt <n>: transcript not found` once on stderr |
 | Missing dependency/service/permission | blocked; do not buy a stronger model |
 | Required architectural choice unresolved | needs_decision |
 | Diff exceeds contract or changes protected verification | needs_decision |
