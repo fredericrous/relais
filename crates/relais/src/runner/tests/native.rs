@@ -104,6 +104,9 @@ enum Plugin {
     /// Like `LoopsAndIgnoresStop`, and the run is cancelled as the stop
     /// arrives.
     LoopsAndCancelsOnStop,
+    /// The first agent repeats one failing command, and reports stopped once
+    /// the backend has said its shadow line: no wall clock decides the test.
+    LoopsUntilShadowThenStops,
     /// Like `LoopsUntilStopped`, with a bearer token in the command.
     LoopsOnASecret,
     /// Like `LoopsUntilStopped`; when the second agent is asked to spawn,
@@ -277,6 +280,7 @@ fn wait_for(ready: impl Fn() -> bool) {
 struct Observed {
     offsets: Arc<std::sync::Mutex<BTreeMap<PathBuf, u64>>>,
     guard_off_lines: Arc<std::sync::Mutex<Vec<String>>>,
+    shadow_lines: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 fn run_plugin(
@@ -441,6 +445,7 @@ fn run_plugin(
                     | Plugin::WritesAfterItsStop
                     | Plugin::LoopsAndIgnoresStop
                     | Plugin::LoopsAndCancelsOnStop
+                    | Plugin::LoopsUntilShadowThenStops
                     | Plugin::OlderLoopThenOneMoreFailure
             )
         {
@@ -481,6 +486,22 @@ fn run_plugin(
             }
             Plugin::LoopsAndIgnoresStop | Plugin::LoopsAndCancelsOnStop => {
                 record_bound(&mut script, &gate, &dispatch_id, &agent_id);
+            }
+            Plugin::LoopsUntilShadowThenStops => {
+                record_bound(&mut script, &gate, &dispatch_id, &agent_id);
+                wait_for(|| {
+                    !observed
+                        .shadow_lines
+                        .lock()
+                        .expect("shadow lines lock")
+                        .is_empty()
+                });
+                record_stop(
+                    &mut script,
+                    &gate,
+                    &dispatch_id,
+                    &report(1, AgentStatus::Completed),
+                );
             }
             Plugin::OlderLoopThenOneMoreFailure if !fresh => {
                 record_bound(&mut script, &gate, &dispatch_id, &agent_id);
@@ -777,6 +798,7 @@ fn run_native_launching(
     let observed = Observed {
         offsets: Arc::clone(&backend.followed_offsets),
         guard_off_lines: Arc::clone(&backend.guard_off_lines),
+        shadow_lines: Arc::clone(&backend.shadow_lines),
     };
     let session = std::thread::spawn(move || {
         run_plugin(parent_gate, rx, projects, cast.plugin, cast.work, observed)
@@ -1880,7 +1902,9 @@ fn with_the_threshold_unset_a_looping_transcript_runs_to_the_wall_timeout() {
         Plugin::LoopsAndIgnoresStop,
         fixes_on_repair,
         Some(prices()),
-        |repo| repo.execution.max_wall_seconds = 1,
+        // The first transcript lookup is about 1 s in (4 polls of 250 ms);
+        // the run must still be live then, on a loaded runner too.
+        |repo| repo.execution.max_wall_seconds = 5,
     );
     let detail = interrupted_detail(&run.outcome);
     assert!(detail.contains("wall time"), "{detail}");
@@ -2038,7 +2062,7 @@ fn a_shadow_line_names_the_runners_attempt_after_a_dispatch_that_never_waited() 
         &contract,
         3,
         Cast {
-            plugin: Plugin::LoopsAndIgnoresStop,
+            plugin: Plugin::LoopsUntilShadowThenStops,
             work: fixes_on_repair,
         },
         Some(prices()),
@@ -2046,7 +2070,9 @@ fn a_shadow_line_names_the_runners_attempt_after_a_dispatch_that_never_waited() 
             waits: waits(Duration::from_secs(60)),
             refusal: Refusal::TheFirstDispatch,
         },
-        |repo| repo.execution.max_wall_seconds = 1,
+        // A ceiling only: the plugin reports stopped once the shadow line
+        // is said, so the run ends well before it.
+        |repo| repo.execution.max_wall_seconds = 15,
     );
     assert_eq!(run.shadow.len(), 1, "{:?} {:?}", run.shadow, run.outcome);
     assert!(
