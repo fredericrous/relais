@@ -524,7 +524,7 @@ function whyText(outcome: string, code: string | null, detail: string | null, st
     // A progress bar redraws with \r: only its last frame is the message.
     .map(entry => entry.replace(/\r+$/, ''))
     .map(entry => cleanLine(entry.slice(entry.lastIndexOf('\r') + 1)).replace(/\s+/g, ' ').trim())
-    // Empty and repeated lines go first, so the last WHY_LINES that remain are the ones quoted.
+    // Empty lines and lines already in `detail` go first, so the last WHY_LINES that remain are the ones quoted.
     .filter(entry => entry !== '' && !(detail && detail.includes(entry)))
     .slice(-WHY_LINES)
     .map(entry => cutLineTo(entry, WHY_LINE_CHARS))
