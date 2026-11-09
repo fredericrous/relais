@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { formatCost, rebuildRuns, applyEvent, applyLine, reconcileStatus, emptyRun, outcomeText, statusReply } from '../hooks/timeline.ts'
+import { appendOutput, latestOutput, MAX_OUTPUT_LINES, formatCost, rebuildRuns, applyEvent, applyLine, reconcileStatus, emptyRun, outcomeText, statusReply } from '../hooks/timeline.ts'
 import { wrapWords } from '../hooks/pane.ts'
 import sevenTimeline from './fixtures/status-seven-phases.timeline.ts'
 import sevenFrozen from './fixtures/status-seven-phases.frozen.ts'
@@ -390,4 +390,84 @@ test('a phase is one string with empty parts dropped', () => {
   const [model] = Object.values(rebuildRuns(sevenTimeline as any, FROZEN_NOW))
   const { phases } = statusReply(model, FROZEN_NOW)
   expect(phases[0]).toBe('preflight · done · contract valid, base 3f9a2c1 · 30s')
+})
+
+// Failure-first output.
+
+const freshCheck = () => ({
+  label: 'tests',
+  argv: [] as string[],
+  running: true,
+  exit: undefined,
+  durationMs: undefined,
+  output: [] as string[],
+  isOpen: false,
+  elidedBytes: 0,
+  lastOutputAt: undefined,
+  failures: [],
+  trailing: 0,
+  lineCount: 0,
+  pendingCr: false,
+})
+
+const outputOf = (chunks: string[]) => {
+  const check = chunks.reduce((c, chunk) => appendOutput(c, chunk), freshCheck() as any)
+  const model: any = {
+    steps: [{ checks: [check], activity: [] }],
+  }
+  return latestOutput(model, MAX_OUTPUT_LINES)
+}
+
+const noise = (count: number, prefix = 'ok line') => Array.from({ length: count }, (_, i) => `${prefix} ${i}`)
+const plainTail = (lines: string[]) => lines.slice(-MAX_OUTPUT_LINES)
+
+const failureTable: Array<[string, string[], string]> = [
+  ['pytest', [...noise(5), 'FAILED tests/test_x.py::test_a - assert 1 == 2', ...noise(80)], 'FAILED tests/test_x.py::test_a - assert 1 == 2'],
+  ['pytest assertion', [...noise(5), 'E   assert 1 == 2', ...noise(80)], 'E   assert 1 == 2'],
+  ['cargo', [...noise(5), "thread 'a' panicked at src/lib.rs:3:1:", ...noise(120)], "thread 'a' panicked at src/lib.rs:3:1:"],
+  ['cargo error', ['Building [' + '='.repeat(300) + ']\rerror[E0308]: mismatched types', ...noise(80)], 'error[E0308]: mismatched types'],
+  ['vitest', [...noise(5), ' \u00d7 adds numbers', ...noise(80)], ' \u00d7 adds numbers'],
+]
+
+for (const [name, lines, failure] of failureTable) {
+  test(`latestOutput keeps the ${name} failure that scrolled out of the tail`, () => {
+    const out = outputOf([lines.join('\n') + '\n'])
+    expect(out).toContain(failure)
+    expect(out.length).toBeLessThanOrEqual(MAX_OUTPUT_LINES)
+    expect(out[out.length - 1]).toBe(lines[lines.length - 1])
+  })
+}
+
+test('latestOutput returns the plain tail for XFAIL, indented error: and fail_* names', () => {
+  for (const marker of ['tests/a.py::t XFAIL', '  error: none', 'PASSED tests/a.py::fail_one']) {
+    const lines = [...noise(5), marker, ...noise(80)]
+    expect(outputOf([lines.join('\n') + '\n'])).toEqual(plainTail(lines))
+  }
+})
+
+test('a CRLF pytest line is matched', () => {
+  const lines = [...noise(5), 'FAILED x', ...noise(80)]
+  expect(outputOf([lines.join('\r\n') + '\r\n'])).toContain('FAILED x')
+})
+
+test('a \\r in the second chunk of one line leaves the text after it', () => {
+  const out = outputOf(['progress 50%', '\rFAILED x\n', ...noise(80).map(l => l + '\n')])
+  expect(out).toContain('FAILED x')
+})
+
+test('a match split across chunks at every byte offset gives the one-chunk result', () => {
+  const text = [...noise(3), 'noise', 'FAILED x\r', 'after one', 'after two', 'after three', ...noise(80)].join('\n') + '\n'
+  const whole = outputOf([text])
+  for (const kept of ['FAILED x', 'after one', 'after two']) expect(whole).toContain(kept)
+  expect(whole).not.toContain('after three')
+  for (let at = 1; at < text.length; at++) {
+    expect(outputOf([text.slice(0, at), text.slice(at)])).toEqual(whole)
+  }
+})
+
+test('100 noise lines matching error: do not push out the real failure', () => {
+  const lines = [...Array.from({ length: 100 }, (_, i) => `error: noise ${i}`), 'FAILED real', ...noise(50)]
+  const out = outputOf([lines.join('\n') + '\n'])
+  expect(out).toContain('FAILED real')
+  expect(out.length).toBeLessThanOrEqual(MAX_OUTPUT_LINES)
 })
