@@ -1,0 +1,19 @@
+amont-provenance-v1
+commit 4ab419006b7f96ff338809c339b76a7067e963b4
+tree 036b842d072002a253b4c963fe6d2896a56b30f1
+canon 13cfc9ef9dc43cabf8200ee03a611ab362e39354
+patch 9a4a5403579a3d2d5bcc004e05a70d83c74cfe9b
+plan docs/plans/2026-11-08-loop-breaker-native-workers.md ed3c6c1e1d7b0aad2588136dce2470665b4310c489dae1af61504de429761cc7
+review reviewed 774fa6e1b084ad5be4887d74c748aed7b5cd1b29a5a2a2c52a1bd9cabcaccad6
+code-review backend reviewed 774fa6e1b084ad5be4887d74c748aed7b5cd1b29a5a2a2c52a1bd9cabcaccad6
+code-review lang:rust reviewed 774fa6e1b084ad5be4887d74c748aed7b5cd1b29a5a2a2c52a1bd9cabcaccad6
+code-review unix carried c818f5daa5fb3da91b0cc8cf3beafe01b9704d4975aec9545ff1f48da20806cf
+preview not-required
+producer amont-agent 3.24.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAECpM2xzvWhojO9MkkpS7G+X5JxjezzwZUr5YTd6Jj3Zb8tBjZ
+Wx8GKCfYI6BIyoWmhkcrrlak30NtZc4TgLOS0B
+-----END SSH SIGNATURE-----
