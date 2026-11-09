@@ -107,6 +107,7 @@ reinstall.
 - Phase 2: the line reads `Last runner stderr (quoted): "…"`, not `Why (runner stderr, quoted)`, because the code quotes the last lines and does not know they are the cause. It keeps only the last `\r` frame and compares with `detail` before cutting. `cutLine` stays one-argument (`.map(cutLine)` passes an index); `cutLineTo(line, width)` is the new function.
 - Phase 4: the reply carries at most 30 failure lines, a third from the earliest matches, so at least 10 tail lines remain; storage keeps 20 + 20 as written. Empty chunks do not close the open line; OSC sequences are stripped by `cutLineTo`.
 - Phase 2: the last two lines are taken after empty lines, escape-only lines and lines already in `detail` are dropped, so none of them uses up a slot.
+- Phase 1: the skill keeps the sentence "Do not end your turn before it arrives" verbatim: a Rust test (`install::tests::the_plugin_skill_starts_runs_through_the_tools_and_names_no_hook_marker`) pins it, and CI caught the first rewrite. The plan's exploration had only searched the plugin tests; the Rust crate pins the skill text too.
 - Deliberate: `onDone` does not pass the outcome `reason` into the live model (the `rebuildOne` path does). It predates this plan; the outcome message itself now carries the reason. Carried to a later change.
 
 ## Verification record
@@ -114,6 +115,7 @@ reinstall.
 - Frozen pre-change fixtures (`claude-plugin/tests/fixtures/*.frozen.ts`) → expected compact reply at most 90% → observed: both fixtures pass the 90% assertion in `status.test.ts`.
 - Failure-first output → expected the root-cause line survives a 120-line tail for pytest, cargo and vitest, CRLF, split chunks and 100 noise lines → observed: table tests in `status.test.ts` pass.
 - Outcome message → expected `Last runner stderr (quoted)` only on an unaccepted outcome without detail (or `review_unavailable`), absent from an answered rewrite → observed: `outcome.test.ts` pass.
+- `cargo test` (whole suite) → expected pass → observed pass after the skill-wording fix (CI's macOS job had failed the skill-text test on the first push).
 - Not observed here: the live `needs_review` run and the week-later transcript count; both wait for the release and the person's plugin reinstall.
 
 ## Implementation review
