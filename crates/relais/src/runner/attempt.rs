@@ -11,7 +11,7 @@ use super::{
     RunEngine, RunError, RunOutcome, Snapshot, State, Step, Terminal, UsageEvent, Verified,
     VerifyFailure, WorkspaceError,
 };
-use crate::backend::LoopedWorker;
+use crate::backend::{LoopedWorker, Repeated};
 
 impl<'a> RunEngine<'a> {
     /// The bounded sequence of attempts the runner — not a model — owns
@@ -141,10 +141,10 @@ impl<'a> RunEngine<'a> {
             .ledger
             .finish_attempt(attempt_id, State::Failed, Some(&held_worktree), None)?;
         let command = loop_text::redacted_one_line(&looped.command);
-        let error_line = looped
-            .error_line
-            .as_deref()
-            .map(loop_text::redacted_one_line);
+        let error_line = match &looped.evidence {
+            Repeated::ErrorLine(line) => Some(loop_text::redacted_one_line(line)),
+            Repeated::SameOutput => None,
+        };
         // The loop replaces the failures of any earlier attempt: the next
         // prompt must not claim a candidate failed checks it never reached.
         progress.last_failures = Some(vec![RepairFailure::Loop {
@@ -168,10 +168,9 @@ impl<'a> RunEngine<'a> {
                 .map_or_else(|| format!("rung {}", rung.get()), |at| at.model.clone()),
             Next::Accept | Next::Stop(_) => "none (run failed: worker_looped)".to_string(),
         };
-        let phrase = if looped.error_line.is_some() {
-            loop_text::failing_phrase(&shown, count)
-        } else {
-            loop_text::same_output_phrase(&shown, count)
+        let phrase = match looped.evidence {
+            Repeated::ErrorLine(_) => loop_text::failing_phrase(&shown, count),
+            Repeated::SameOutput => loop_text::same_output_phrase(&shown, count),
         };
         eprintln!("relais: attempt {attempt} stopped: worker {phrase}; next: {rung}");
         self.proceed(context, progress, next)

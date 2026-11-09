@@ -102,12 +102,17 @@ pub struct Waits {
     /// A session whose plugin said no hello for this long ends the attempt
     /// `mod_gone`.
     pub hello_lapse: Duration,
+    /// How many transcript lookups a tail makes before it gives up: the
+    /// file is created a moment after the agent binds, but a directory read
+    /// is not made on every poll.
+    pub transcript_lookups: u32,
 }
 
 impl Waits {
     pub const DEFAULT: Self = Self {
         spawn: Duration::from_secs(120),
         hello_lapse: HELLO_FRESH,
+        transcript_lookups: 20,
     };
 }
 
@@ -270,16 +275,10 @@ enum Awaited {
     Looped {
         agent: String,
         command: String,
-        error_line: Option<String>,
+        evidence: crate::backend::Repeated,
         count: u32,
     },
 }
-
-/// How many transcript lookups a tail makes before it gives up: the file is
-/// created a moment after the agent binds, but a directory read is not made
-/// on every poll. Scaled in test builds, so that a transcript that never
-/// appears does not cost a test the whole search.
-const TRANSCRIPT_LOOKUPS_ALLOWED: u32 = if cfg!(test) { 3 } else { 20 };
 
 /// Polls between two transcript lookups.
 const POLLS_BETWEEN_LOOKUPS: u32 = 4;
@@ -306,7 +305,12 @@ impl TranscriptTail {
     /// Follows `path` from its start, or from its current end when earlier
     /// turns of the same agent must not seed a streak. `None` when the
     /// file cannot be opened or the threshold is not a valid one.
-    fn open(path: &Path, threshold: u32, start: TranscriptStart) -> Option<Self> {
+    fn open(
+        path: &Path,
+        threshold: u32,
+        start: TranscriptStart,
+        #[cfg(test)] offsets: &tests::FollowedOffsets,
+    ) -> Option<Self> {
         let guard = LoopGuard::new(threshold).ok()?;
         let file = File::open(path).ok()?;
         let offset = match start {
@@ -315,7 +319,7 @@ impl TranscriptTail {
         };
         let tail = Self {
             #[cfg(test)]
-            registration: tests::Registration::new(path),
+            registration: tests::Registration::new(path, offsets),
             file,
             offset,
             threshold,
@@ -399,12 +403,18 @@ impl TailState {
                 return None;
             }
             *lookups += 1;
-            let found = backend
-                .transcript_path(agent_id)
-                .and_then(|path| TranscriptTail::open(&path, threshold, start));
+            let found = backend.transcript_path(agent_id).and_then(|path| {
+                TranscriptTail::open(
+                    &path,
+                    threshold,
+                    start,
+                    #[cfg(test)]
+                    &backend.followed_offsets,
+                )
+            });
             *self = match found {
                 Some(following) => Self::Following(following),
-                None if *lookups >= TRANSCRIPT_LOOKUPS_ALLOWED => {
+                None if *lookups >= backend.waits.transcript_lookups => {
                     backend.say_guard_off(&format!(
                         "relais: loop guard off for attempt {attempt}: transcript not found"
                     ));
@@ -800,7 +810,11 @@ pub struct NativeBackend<'a> {
     pub(crate) shadow_lines: Mutex<Vec<String>>,
     /// The `loop guard off` lines this backend said, for the tests to read.
     #[cfg(test)]
-    pub(crate) guard_off_lines: Mutex<Vec<String>>,
+    pub(crate) guard_off_lines: std::sync::Arc<Mutex<Vec<String>>>,
+    /// The offset each open tail has read to, by transcript path, for a
+    /// scripted plugin to synchronise on without sleeping.
+    #[cfg(test)]
+    pub(crate) followed_offsets: tests::FollowedOffsets,
 }
 
 impl<'a> NativeBackend<'a> {
@@ -822,7 +836,9 @@ impl<'a> NativeBackend<'a> {
             #[cfg(test)]
             shadow_lines: Mutex::new(Vec::new()),
             #[cfg(test)]
-            guard_off_lines: Mutex::new(Vec::new()),
+            guard_off_lines: std::sync::Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            followed_offsets: tests::FollowedOffsets::default(),
         }
     }
 
@@ -991,14 +1007,18 @@ impl<'a> NativeBackend<'a> {
                                 let polls_failed =
                                     match self.stop_and_confirm(spec, &agent, attempt_end) {
                                         StopAck::Confirmed => {
-                                            let error_line = match fired.evidence {
-                                                Evidence::ErrorLine(line) => Some(line),
-                                                Evidence::OutputHash(_) => None,
+                                            let evidence = match fired.evidence {
+                                                Evidence::ErrorLine(line) => {
+                                                    crate::backend::Repeated::ErrorLine(line)
+                                                }
+                                                Evidence::OutputHash(_) => {
+                                                    crate::backend::Repeated::SameOutput
+                                                }
                                             };
                                             return Awaited::Looped {
                                                 agent,
                                                 command: fired.command,
-                                                error_line,
+                                                evidence,
                                                 count: fired.count,
                                             };
                                         }
@@ -1461,13 +1481,13 @@ impl<'a> NativeBackend<'a> {
             Awaited::Looped {
                 agent,
                 command,
-                error_line,
+                evidence,
                 count,
             } => {
                 let looped = crate::backend::LoopedWorker {
                     agent,
                     command,
-                    error_line,
+                    evidence,
                     count,
                 };
                 Ok(self.looped_result(spec, looped, booking_from))
@@ -1502,53 +1522,34 @@ impl Backend for NativeBackend<'_> {
     }
 }
 
-impl NativeBackend<'_> {
-    /// How far the open tail of `transcript` has read; `None` while no tail
-    /// follows it. Lets a scripted plugin synchronise without sleeping.
-    #[cfg(test)]
-    pub(crate) fn followed_offset(transcript: &Path) -> Option<u64> {
-        tests::followed_offset(transcript)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{SuspendWatch, ADMISSION_POLL, SUSPEND_GAP};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime};
 
-    /// The offset each open tail has read to, by transcript path.
-    fn followed_offsets() -> &'static Mutex<BTreeMap<PathBuf, u64>> {
-        static OFFSETS: OnceLock<Mutex<BTreeMap<PathBuf, u64>>> = OnceLock::new();
-        OFFSETS.get_or_init(Default::default)
-    }
+    /// How far the open tail of a transcript has read, by transcript path.
+    pub(super) type FollowedOffsets = Arc<Mutex<BTreeMap<PathBuf, u64>>>;
 
-    /// How far the open tail of `transcript` has read; `None` while no tail
-    /// follows it.
-    pub(super) fn followed_offset(transcript: &Path) -> Option<u64> {
-        followed_offsets()
-            .lock()
-            .expect("offsets lock")
-            .get(transcript)
-            .copied()
-    }
-
-    /// A tail's entry in the offset registry, removed when the tail drops.
+    /// A tail's entry in its backend's offset registry, removed when the
+    /// tail drops.
     pub(super) struct Registration {
         path: PathBuf,
+        offsets: FollowedOffsets,
     }
 
     impl Registration {
-        pub(super) fn new(path: &Path) -> Self {
+        pub(super) fn new(path: &Path, offsets: &FollowedOffsets) -> Self {
             Self {
                 path: path.to_path_buf(),
+                offsets: Arc::clone(offsets),
             }
         }
 
         pub(super) fn publish(&self, offset: u64) {
-            followed_offsets()
+            self.offsets
                 .lock()
                 .expect("offsets lock")
                 .insert(self.path.clone(), offset);
@@ -1557,7 +1558,7 @@ mod tests {
 
     impl Drop for Registration {
         fn drop(&mut self) {
-            followed_offsets()
+            self.offsets
                 .lock()
                 .expect("offsets lock")
                 .remove(&self.path);

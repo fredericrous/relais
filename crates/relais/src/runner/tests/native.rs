@@ -273,13 +273,28 @@ fn wait_for(ready: impl Fn() -> bool) {
     }
 }
 
+/// What the backend under test shows a scripted plugin of its own state.
+struct Observed {
+    offsets: Arc<std::sync::Mutex<BTreeMap<PathBuf, u64>>>,
+    guard_off_lines: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
 fn run_plugin(
     gate: Arc<LocalGate>,
     lines: mpsc::Receiver<String>,
     projects: PathBuf,
     plugin: Plugin,
     work: Work,
+    observed: Observed,
 ) -> Scripted {
+    let followed_offsets = |transcript: &Path| {
+        observed
+            .offsets
+            .lock()
+            .expect("offsets lock")
+            .get(transcript)
+            .copied()
+    };
     let mut script = Scripted::default();
     let mut agents: BTreeMap<String, Agent> = BTreeMap::new();
     let mut spawned = 0;
@@ -461,7 +476,7 @@ fn run_plugin(
             }
             Plugin::ContinuationLoops if first_agent && !fresh => {
                 record_bound(&mut script, &gate, &dispatch_id, &agent_id);
-                wait_for(|| NativeBackend::followed_offset(&transcript).is_some());
+                wait_for(|| followed_offsets(&transcript).is_some());
                 append_failing_runs(&transcript, "again", 3);
             }
             Plugin::LoopsAndIgnoresStop | Plugin::LoopsAndCancelsOnStop => {
@@ -475,11 +490,25 @@ fn run_plugin(
                 // backend would stop it. For that to be observable the new
                 // failure must land while the tail is open and be read
                 // before the stop is reported.
-                wait_for(|| NativeBackend::followed_offset(&transcript).is_some());
+                wait_for(|| followed_offsets(&transcript).is_some());
                 append_failing_runs(&transcript, "new", 1);
                 let written = std::fs::metadata(&transcript).expect("transcript").len();
+                wait_for(|| followed_offsets(&transcript).is_some_and(|read| read >= written));
+                record_stop(
+                    &mut script,
+                    &gate,
+                    &dispatch_id,
+                    &report(1, AgentStatus::Completed),
+                );
+            }
+            Plugin::NeverStopsWithoutTranscript => {
+                record_bound(&mut script, &gate, &dispatch_id, &agent_id);
                 wait_for(|| {
-                    NativeBackend::followed_offset(&transcript).is_some_and(|read| read >= written)
+                    !observed
+                        .guard_off_lines
+                        .lock()
+                        .expect("guard-off lines lock")
+                        .is_empty()
                 });
                 record_stop(
                     &mut script,
@@ -488,9 +517,7 @@ fn run_plugin(
                     &report(1, AgentStatus::Completed),
                 );
             }
-            Plugin::NeverStops
-            | Plugin::NeverStopsWithoutTranscript
-            | Plugin::CancelsAfterBound => {
+            Plugin::NeverStops | Plugin::CancelsAfterBound => {
                 record_bound(&mut script, &gate, &dispatch_id, &agent_id);
                 if plugin == Plugin::CancelsAfterBound {
                     // Long enough for the backend's poll to see the bind.
@@ -582,6 +609,7 @@ fn waits(hello_lapse: Duration) -> Waits {
     Waits {
         spawn: Duration::from_secs(5),
         hello_lapse,
+        transcript_lookups: 3,
     }
 }
 
@@ -746,8 +774,13 @@ fn run_native_launching(
         prices,
     );
     let parent_gate = Arc::clone(&gate);
-    let session =
-        std::thread::spawn(move || run_plugin(parent_gate, rx, projects, cast.plugin, cast.work));
+    let observed = Observed {
+        offsets: Arc::clone(&backend.followed_offsets),
+        guard_off_lines: Arc::clone(&backend.guard_off_lines),
+    };
+    let session = std::thread::spawn(move || {
+        run_plugin(parent_gate, rx, projects, cast.plugin, cast.work, observed)
+    });
     let refusing = RefusesTheFirst {
         inner: &backend,
         refusal: launching.refusal,
@@ -1422,6 +1455,7 @@ fn no_bind_within_the_wait_ends_the_attempt_interrupted_and_the_run_stops() {
         Waits {
             spawn: Duration::from_millis(600),
             hello_lapse: Duration::from_secs(60),
+            transcript_lookups: 3,
         },
         Some(prices()),
     );
@@ -1781,6 +1815,7 @@ fn a_stop_that_is_never_acknowledged_ends_lost_with_no_second_attempt() {
         Waits {
             spawn: Duration::from_secs(1),
             hello_lapse: Duration::from_secs(60),
+            transcript_lookups: 3,
         },
         |repo| {
             repo.execution.loop_threshold = Some(3);
@@ -2063,6 +2098,7 @@ fn a_run_cancelled_while_a_stop_is_pending_ends_cancelled_before_the_spawn_wait(
         Waits {
             spawn: Duration::from_secs(60),
             hello_lapse: Duration::from_secs(120),
+            transcript_lookups: 3,
         },
         |repo| {
             repo.execution.loop_threshold = Some(3);
@@ -2097,6 +2133,7 @@ fn a_stop_never_acknowledged_ends_at_the_wall_time_not_the_spawn_wait() {
         Waits {
             spawn: Duration::from_secs(60),
             hello_lapse: Duration::from_secs(120),
+            transcript_lookups: 3,
         },
         |repo| {
             repo.execution.loop_threshold = Some(3);
@@ -2148,15 +2185,21 @@ fn a_contract_threshold_of_zero_turns_the_guard_off_with_no_stop_and_no_shadow_l
 #[test]
 fn a_transcript_that_is_never_found_says_the_guard_is_off_once() {
     let fixture = Fixture::new();
-    let run = run_native(
+    let run = run_native_waiting(
         &fixture,
         Review::Optional,
         1,
-        Plugin::NeverStopsWithoutTranscript,
-        fixes_on_repair,
+        Cast {
+            plugin: Plugin::NeverStopsWithoutTranscript,
+            work: fixes_on_repair,
+        },
         Some(prices()),
-        // The three test-build lookups end after about 3 s; the rest is margin
-        // for a loaded runner. The run ends at this wall time.
+        Waits {
+            transcript_lookups: 2,
+            ..waits(Duration::from_secs(60))
+        },
+        // The plugin reports the agent stopped as soon as the guard-off line
+        // is said, so the run ends then; this wall time is only a ceiling.
         |repo| repo.execution.max_wall_seconds = 15,
     );
     assert_eq!(

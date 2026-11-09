@@ -373,11 +373,17 @@ pub struct LaunchResult {
 pub struct LoopedWorker {
     pub agent: String,
     pub command: String,
-    /// The error line that repeated; `None` when the repeat was fingerprinted
-    /// by the hash of its output.
-    #[serde(default)]
-    pub error_line: Option<String>,
+    pub evidence: Repeated,
     pub count: u32,
+}
+
+/// What the repeated command was fingerprinted by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Repeated {
+    /// The error line that repeated.
+    ErrorLine(String),
+    /// The command printed the same output each time.
+    SameOutput,
 }
 
 /// A worker whose session vanished while it ran.
