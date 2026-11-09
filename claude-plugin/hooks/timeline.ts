@@ -149,20 +149,25 @@ export const awaitsState = (state: string) => AWAITS_STATES.has(state)
 export const awaitsAPerson = (m: RunModel) => m.outcome !== undefined && awaitsState(m.outcome.state)
 
 // An OSC sequence (a terminal hyperlink or title): ESC ] ... BEL, or ending in ESC \.
-// Built from character codes so the pattern holds no control character.
+// Built from character codes so the source holds no control-character literal.
 const ESC = String.fromCharCode(27)
 const BEL = String.fromCharCode(7)
 const OSC_SEQUENCE = new RegExp(`${ESC}\\][^${BEL}${ESC}]*(?:${BEL}|${ESC}\\\\)`, 'g')
 
-// Control characters out, the line cut: a stored line is never wider than `width`.
-export function cutLineTo(line: string, width: number): string {
-  const clean = line
+// Escape sequences and control characters out; tabs become two spaces.
+export function cleanLine(line: string): string {
+  return line
     .replace(OSC_SEQUENCE, '')
     // eslint-disable-next-line no-control-regex
     .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
     // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '')
     .replace(/\t/g, '  ')
+}
+
+// Cleaned and cut: a stored line is never wider than `width`.
+export function cutLineTo(line: string, width: number): string {
+  const clean = cleanLine(line)
   return clean.length > width ? clean.slice(0, width - 1) + '…' : clean
 }
 

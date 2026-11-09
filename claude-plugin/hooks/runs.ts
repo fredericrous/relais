@@ -13,6 +13,7 @@ import {
   awaitsState,
   changedText,
   cutLine,
+  cleanLine,
   cutLineTo,
   emptyRun,
   isLive,
@@ -523,7 +524,7 @@ function whyText(outcome: string, code: string | null, detail: string | null, st
     .slice(-WHY_LINES)
     // A progress bar redraws with \r: only its last frame is the message.
     .map(entry => entry.replace(/\r+$/, ''))
-    .map(entry => entry.slice(entry.lastIndexOf('\r') + 1).replace(/\s+/g, ' ').trim())
+    .map(entry => cleanLine(entry.slice(entry.lastIndexOf('\r') + 1)).replace(/\s+/g, ' ').trim())
     .filter(entry => entry !== '' && !(detail && detail.includes(entry)))
     .map(entry => cutLineTo(entry, WHY_LINE_CHARS))
     .map(entry => JSON.stringify(entry))

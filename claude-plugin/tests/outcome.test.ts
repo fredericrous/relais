@@ -536,12 +536,17 @@ test('the quoted stderr line keeps only the last frame of a \\r progress bar', a
   expect(text.split('\n')[1]).toBe('Last runner stderr (quoted): "error: boom"')
 })
 
+test('a stderr line made only of escape codes is not quoted, and does not take a slot', async ($: any, on: any) => {
+  const text = await whyRun($, on, 'needs_review', {}, 'real\n\u001b[0m\n')
+  expect(text.split('\n')[1]).toBe('Last runner stderr (quoted): "real"')
+})
+
 test('no Why line on an accepted outcome', async ($: any, on: any) => {
-  expect(await whyRun($, on, 'accepted', {}, 'boom\n')).not.toContain('Why (')
+  expect(await whyRun($, on, 'accepted', {}, 'boom\n')).not.toContain('Last runner stderr')
 })
 
 test('no Why line when detail is set', async ($: any, on: any) => {
-  expect(await whyRun($, on, 'blocked', { code: 'no_policy', detail: 'no policy' }, 'boom\n')).not.toContain('Why (')
+  expect(await whyRun($, on, 'blocked', { code: 'no_policy', detail: 'no policy' }, 'boom\n')).not.toContain('Last runner stderr')
 })
 
 test('review_unavailable keeps its detail and still gets a Why line', async ($: any, on: any) => {
@@ -579,7 +584,7 @@ test('an answered run\'s rewrite carries no Why line', async ($: any, on: any) =
   await tick(engine)
   expect(engine.calls.prompts.length).toBe(1)
   expect(engine.calls.prompts[0].text).toContain('Since then: decision_approved')
-  expect(engine.calls.prompts[0].text).not.toContain('Why (')
+  expect(engine.calls.prompts[0].text).not.toContain('Last runner stderr')
 })
 
 test('a stderr line over 160 characters is quoted cut to 160, ending in an ellipsis', async ($: any, on: any) => {
