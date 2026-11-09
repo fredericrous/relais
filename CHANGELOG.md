@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+- **`status` and the outcome message cost the session fewer tokens.** The `status` tool with a run id returns each phase as one line and `elapsed_s` instead of milliseconds. `output: true` returns the failing lines of a check before its tail, so a failure above the last 40 lines is no longer missed. The outcome message of a run that stopped without a reason of its own quotes the runner's last two stderr lines, and the relais skill now says to wait for the outcome instead of polling `status`.
+
 ## v0.52.1
 
 - The same code as v0.52.0, whose release run was created without its macOS, aarch64 Linux, guard and publish jobs and could not be retried, so v0.52.0 was never published.
