@@ -537,8 +537,8 @@ test('the quoted stderr line keeps only the last frame of a \\r progress bar', a
 })
 
 test('a stderr line made only of escape codes is not quoted, and does not take a slot', async ($: any, on: any) => {
-  const text = await whyRun($, on, 'needs_review', {}, 'real\n\u001b[0m\n')
-  expect(text.split('\n')[1]).toBe('Last runner stderr (quoted): "real"')
+  const text = await whyRun($, on, 'needs_review', {}, 'a\nreal\n\u001b[0m\n')
+  expect(text.split('\n')[1]).toBe('Last runner stderr (quoted): "a" "real"')
 })
 
 test('no Why line on an accepted outcome', async ($: any, on: any) => {
