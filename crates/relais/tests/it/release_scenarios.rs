@@ -1605,8 +1605,14 @@ fn budget_exhaustion_preserves_evidence_and_stops_dispatch() {
                     && r.contains("tests.no-real-waits")
             })
     });
+    // The rules come from the machine's `aval`: with none (a CI runner),
+    // there are no code rules to give as lines, and nothing to journal.
+    let aval_runs = std::process::Command::new("aval")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success());
     assert!(
-        journalled,
+        journalled || !aval_runs,
         "a guidance event names the worker's index lines"
     );
     assert!(!stderr.contains("one line each"), "{stderr}");
