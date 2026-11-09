@@ -1,0 +1,21 @@
+amont-provenance-v1
+commit a3396bb3ffae837b55b945b60c1a52e722121257
+tree a34085e6dedfb62ea9fa4374cad84d3bbf8450ba
+canon 39ffe59ec2792a0c68c8bdda3d46b6e3a93d05b7
+patch 264121e99dcf713871f9a14ce459c9834e2b416d
+plan docs/plans/2026-11-06-reliable-verification-and-deliberate-output.md 24c766e509fcbe4e7460bd99c21b07992cd0f33b19b21881592feac45de506b9
+review reviewed 04b13545a2bfef574582efddf497d77b91e7c1e2e84736a568471e97a02d119a
+code-review backend reviewed 04b13545a2bfef574582efddf497d77b91e7c1e2e84736a568471e97a02d119a
+code-review lang:rust reviewed 04b13545a2bfef574582efddf497d77b91e7c1e2e84736a568471e97a02d119a
+code-review lang:typescript reviewed 04b13545a2bfef574582efddf497d77b91e7c1e2e84736a568471e97a02d119a
+code-review unix reviewed 04b13545a2bfef574582efddf497d77b91e7c1e2e84736a568471e97a02d119a
+code-review tui reviewed 04b13545a2bfef574582efddf497d77b91e7c1e2e84736a568471e97a02d119a
+preview not-required
+producer amont-agent 3.26.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAEBLbv6jlgURwDQOY9vCvKGH75GfiPVD8c78enEN+zE2JQxGVk
+ua3YK9YwfwZ7qtF/6n6es7aeS/7EZbN29F584M
+-----END SSH SIGNATURE-----
