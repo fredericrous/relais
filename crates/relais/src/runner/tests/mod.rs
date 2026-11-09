@@ -9557,6 +9557,41 @@ fn a_worker_code_rule_over_budget_is_a_run_event_and_a_receipt_guidance_line() {
     assert!(note.contains("b.huge"), "{note}");
 }
 
+/// ADR-0066: a run journals the code rules its worker got as one line each
+/// as a `guidance_index` decision event, naming the tool-checked rule and not
+/// the judged one, with the rules supplied by the test, not the machine.
+#[test]
+fn a_run_journals_the_rules_its_worker_got_as_lines() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let backend = conditional_worker("relais task");
+    let resolver = StatedCodeRules(vec![
+        code_rule("a.judged", "**Checked by:** judge."),
+        code_rule("b.tooled", "**Checked by:** candidate (a sleep in a test)."),
+    ]);
+    let outcome =
+        fixture.execute_resolving(&resolver, &fixture.contract(Review::Off), &repo, &backend);
+    let events = std::fs::read_to_string(
+        fixture
+            .artifacts
+            .join(outcome.run_id.as_str())
+            .join("events.jsonl"),
+    )
+    .expect("events.jsonl");
+    let index: Vec<&str> = events
+        .lines()
+        .filter(|line| line.contains("\"guidance_index\""))
+        .collect();
+    assert!(!index.is_empty(), "a guidance_index event: {events}");
+    for line in &index {
+        assert!(
+            line.contains("rules given to the worker as one line each: b.tooled")
+                && !line.contains("a.judged"),
+            "{line}"
+        );
+    }
+}
+
 #[test]
 fn code_rules_without_text_tell_the_reviewer_the_text_is_unavailable() {
     let guidance = Guidance {

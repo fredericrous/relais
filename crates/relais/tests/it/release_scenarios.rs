@@ -1595,26 +1595,8 @@ fn budget_exhaustion_preserves_evidence_and_stops_dispatch() {
         !runs[0].join("candidate-3.patch").exists(),
         "no third dispatch"
     );
-    // ADR-0066: the code rules a tool checks were given as lines, and the
-    // run's events say which, never its stderr.
-    let journalled = events_jsonl(&runs[0]).into_iter().any(|event| {
-        event["event"]["kind"] == "decision"
-            && event["event"]["what"] == "guidance_index"
-            && event["event"]["reason"].as_str().is_some_and(|r| {
-                r.starts_with("rules given to the worker as one line each: ")
-                    && r.contains("tests.no-real-waits")
-            })
-    });
-    // The rules come from the machine's `aval`: with none (a CI runner),
-    // there are no code rules to give as lines, and nothing to journal.
-    let aval_runs = std::process::Command::new("aval")
-        .arg("--version")
-        .output()
-        .is_ok_and(|out| out.status.success());
-    assert!(
-        journalled || !aval_runs,
-        "a guidance event names the worker's index lines"
-    );
+    // ADR-0066: the rules given as lines are journalled in the run's events
+    // (`a_run_journals_the_rules_its_worker_got_as_lines`), never on stderr.
     assert!(!stderr.contains("one line each"), "{stderr}");
     let report: serde_json::Value = serde_json::from_str(&text(
         &world
