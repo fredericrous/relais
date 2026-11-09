@@ -614,14 +614,12 @@ export function statusReply(m: RunModel, now: number, opts: { output?: boolean }
     run: m.run,
     phase: m.phase,
     attempt: m.attempt,
-    maxAttempts: m.maxAttempts ?? null,
-    elapsedMs: elapsedOf(m, now),
-    phases: m.steps.map(s => ({
-      title: s.title,
-      state: s.state,
-      detail: s.detail,
-      durationMs: s.endedAt ? s.endedAt - s.startedAt : null,
-    })),
+    ...(m.maxAttempts != null ? { maxAttempts: m.maxAttempts } : {}),
+    elapsed_s: Math.round(elapsedOf(m, now) / 1000),
+    // "<title> · <state> · <detail> · <secs>s", empty parts dropped.
+    phases: m.steps.map(s =>
+      [s.title, s.state, s.detail, s.endedAt ? `${Math.round((s.endedAt - s.startedAt) / 1000)}s` : ''].filter(Boolean).join(' · '),
+    ),
     decisions: m.decisions.map(d => d.text),
     cost: formatCost(m.cost),
     outcome: m.outcome ?? null,

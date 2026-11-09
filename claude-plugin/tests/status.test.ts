@@ -1,6 +1,10 @@
 import { expect, test } from 'claude-code/testing'
 import { formatCost, rebuildRuns, applyEvent, applyLine, reconcileStatus, emptyRun, outcomeText, statusReply } from '../hooks/timeline.ts'
 import { wrapWords } from '../hooks/pane.ts'
+import sevenTimeline from './fixtures/status-seven-phases.timeline.ts'
+import sevenFrozen from './fixtures/status-seven-phases.frozen.ts'
+import capturedTimeline from './fixtures/status-captured-run.timeline.ts'
+import capturedFrozen from './fixtures/status-captured-run.frozen.ts'
 import { nativeCalls, scriptedEngine, settle, spawnLine, startedRun, turn } from './support.ts'
 
 const result = (stdout: string, exitCode = 0) => ({ exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
@@ -352,4 +356,38 @@ test('status with run still carries phases, decisions, stderr and outcome', asyn
   expect(Array.isArray(reply.decisions)).toBe(true)
   expect(Array.isArray(reply.stderr)).toBe(true)
   expect(reply.outcome.state).toBe('accepted')
+})
+
+const FROZEN_NOW = Date.parse('2026-11-09T18:00:00Z')
+
+for (const [name, timeline, frozen] of [
+  ['the fixture run (7 phases, 4 decisions, 2 stderr lines)', sevenTimeline, sevenFrozen],
+  ['a captured real run', capturedTimeline, capturedFrozen],
+] as const) {
+  test(`the compact status reply for ${name} is at most 90% of the frozen pre-change reply`, () => {
+    const [model] = Object.values(rebuildRuns(timeline as any, FROZEN_NOW))
+    const compact = JSON.stringify([statusReply(model, FROZEN_NOW)])
+    expect(compact.length).toBeLessThanOrEqual(frozen.length * 0.9)
+    const [reply] = JSON.parse(compact)
+    expect(reply.phases.length).toBe(model.steps.length)
+    for (const phase of reply.phases) {
+      expect(typeof phase).toBe('string')
+      expect(phase.includes(' ·  · ')).toBe(false)
+    }
+    expect('elapsedMs' in reply).toBe(false)
+    expect(typeof reply.elapsed_s).toBe('number')
+    expect(reply.maxAttempts).toBe(3)
+  })
+}
+
+test('maxAttempts is left out when the run has none', () => {
+  const [model] = Object.values(rebuildRuns(sevenTimeline as any, FROZEN_NOW))
+  const reply = statusReply({ ...model, maxAttempts: undefined } as any, FROZEN_NOW)
+  expect('maxAttempts' in reply).toBe(false)
+})
+
+test('a phase is one string with empty parts dropped', () => {
+  const [model] = Object.values(rebuildRuns(sevenTimeline as any, FROZEN_NOW))
+  const { phases } = statusReply(model, FROZEN_NOW)
+  expect(phases[0]).toBe('preflight · done · contract valid, base 3f9a2c1 · 30s')
 })
