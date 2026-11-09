@@ -2,6 +2,8 @@
 
 use std::borrow::Cow;
 
+use crate::context::guidance::Checker;
+
 use super::{
     context, AttemptKind, ContextManifest, Guidance, GuidanceGap, GuidanceSource, RuleRef,
     TaskContract,
@@ -267,11 +269,18 @@ pub(crate) struct RenderedRule {
 }
 
 impl RenderedRule {
-    /// A constraint shown as its statement alone.
-    pub(in crate::runner) fn statement_of(rule: &RuleRef) -> Self {
+    /// A process rule as the reviewer's index line (ADR-0066): its id and
+    /// statement, the statement cut at 120 characters.
+    pub(in crate::runner) fn index_line_of(rule: &RuleRef) -> Self {
+        let statement: String = rule.statement.chars().take(120).collect();
+        let cut = if statement.len() < rule.statement.len() {
+            "…"
+        } else {
+            ""
+        };
         Self {
             id: rule.id.clone(),
-            text: format!("`{}`: {}", rule.id, rule.statement),
+            text: format!("`{}`: {statement}{cut}", rule.id),
         }
     }
 
@@ -390,9 +399,16 @@ pub(super) fn worker_code_rules_block(
     let rendered: Vec<RenderedRule> = guidance
         .code_rules
         .iter()
+        .filter(|rule| rule.checker() == Checker::Judge)
         .filter_map(RenderedRule::full_text_of)
         .collect();
-    if rendered.is_empty() {
+    let indexed: Vec<String> = guidance
+        .code_rules
+        .iter()
+        .filter(|rule| rule.checker() == Checker::Tool)
+        .map(tool_checked_line)
+        .collect();
+    if rendered.is_empty() && indexed.is_empty() {
         let gap = GuidanceGap::new(
             GuidanceSource::CodeRules,
             context::guidance::GapCause::TextUnavailable,
@@ -407,15 +423,73 @@ pub(super) fn worker_code_rules_block(
         GuidanceSource::CodeRules,
         RuleKind::CodeRules,
     );
-    if shown.is_empty() {
-        return (String::new(), gap);
+    let mut text = String::new();
+    if !shown.is_empty() {
+        let texts: Vec<&str> = shown.iter().map(|rule| rule.text.as_str()).collect();
+        text.push_str("the code rules below are in force, in full; review blocks on them.\n");
+        text.push_str(&data_block("code rules in force", &texts.join("\n\n")));
     }
-    let texts: Vec<&str> = shown.iter().map(|rule| rule.text.as_str()).collect();
-    let text = format!(
-        "the code rules below are in force, in full; review blocks on them.\n{}",
-        data_block("code rules in force", &texts.join("\n\n"))
-    );
+    let instruction = aval_rule_instruction(guidance, "before you write code it governs");
+    text.push_str(&tool_checked_block(&indexed, &instruction));
     (text, gap)
+}
+
+/// The agent a prompt with index lines is for (ADR-0066), as the run's
+/// `guidance_index` event names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runner) enum IndexedFor {
+    Worker,
+    Reviewer,
+}
+
+impl IndexedFor {
+    pub(in crate::runner) fn as_str(self) -> &'static str {
+        match self {
+            IndexedFor::Worker => "worker",
+            IndexedFor::Reviewer => "reviewer",
+        }
+    }
+}
+
+/// The ids of the code rules a tool alone checks (ADR-0066): what the
+/// worker gets as index lines, and what relais journals for the run.
+pub(in crate::runner) fn tool_checked_ids(guidance: &Guidance) -> Vec<&str> {
+    guidance
+        .code_rules
+        .iter()
+        .filter(|rule| rule.checker() == Checker::Tool)
+        .map(|rule| rule.id.as_str())
+        .collect()
+}
+
+/// A code rule as one index line: `` `id`: statement ``.
+pub(in crate::runner) fn tool_checked_line(rule: &context::guidance::CodeRule) -> String {
+    format!("`{}`: {}", rule.id, rule.statement)
+}
+
+/// The code rules a tool alone checks, one line each, and `instruction`:
+/// how this agent reads one in full. Nothing when there is none.
+pub(in crate::runner) fn tool_checked_block(lines: &[String], instruction: &str) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "the code rules below are in force too; a tool checks them (the candidate pass, a \
+         compiler or a lint), so each is one line here. {}\n{}",
+        instruction,
+        data_list_block("code rules a tool checks", lines)
+    )
+}
+
+/// How an agent reads one rule's full text: the `aval_rule` tool with the
+/// repository's corpus named, else the CLI. `purpose` ends the sentence.
+pub(in crate::runner) fn aval_rule_instruction(guidance: &Guidance, purpose: &str) -> String {
+    match &guidance.repo_name {
+        Some(name) => format!(
+            "read one rule with the `aval_rule` tool, passing `repo: \"{name}\"`, or run `aval rule <id>` in the working directory when that tool is not available or answers with an error, {purpose}."
+        ),
+        None => format!("run `aval rule <id>` in the working directory to read one rule {purpose}."),
+    }
 }
 
 /// The worker's constraint index: full ids grouped by prefix, and the
@@ -426,12 +500,7 @@ pub(super) fn constraint_index_block(guidance: &Guidance) -> String {
     if lines.is_empty() {
         return String::new();
     }
-    let instruction = match &guidance.repo_name {
-        Some(name) => format!(
-            "read one rule with the `aval_rule` tool, passing `repo: \"{name}\"`, or run `aval rule <id>` in the working directory when that tool is not available or answers with an error, before you write code it governs."
-        ),
-        None => "run `aval rule <id>` in the working directory to read one rule before you write code it governs.".to_string(),
-    };
+    let instruction = aval_rule_instruction(guidance, "before you write code it governs");
     format!(
         "the constraint rules below are in force; review blocks on them.\n{instruction}\n{}",
         data_block("constraint index", &lines.join("\n"))

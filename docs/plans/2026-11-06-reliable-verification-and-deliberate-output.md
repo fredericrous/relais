@@ -2,16 +2,16 @@
 status: active
 branch: fix/verification-terminal-isolation
 repos: [relais, amont-agent, decisions]
-adrs: [decisions:ADR-0039, decisions:ADR-0042, decisions:ADR-0043, decisions:ADR-0050, decisions:ADR-0053, decisions:ADR-0061]
+adrs: [decisions:ADR-0039, decisions:ADR-0042, decisions:ADR-0043, decisions:ADR-0050, decisions:ADR-0053, decisions:ADR-0061, decisions:ADR-0065, decisions:ADR-0066]
 ---
 # Reliable verification and deliberate output
 
 ## Review panel
 
-👉 **Decide:** none — approve if Phase 3 should ship the reviewer-exempt Read rule and slim profile briefs under a new ADR replacing ADR-0043 for profile seats.
-📍 relais, amont-agent, decisions · Phase 3 rule committed (unpushed) · next: the ADR in decisions, then the amont-agent brief change. Delta panel: backend (opus).
-**Changed by review:** reach corrected by replay (272 calls / 5.5 MB with reviewers exempt); profile index is ids and titles only; RULES hash binds through implementation-review; ADR lands before the code.
-**Verdicts:** backend approve-with-changes → approve-with-changes (round 2, mediums carried). Carried: read item 6's `&amp;lt;id&amp;gt;` and `&amp;lt;&amp;lt;&amp;lt;RULES sha=` as `<id>` and `<<<RULES sha=` (a `plan-apply` escaping bug, to fix); the sizes are about 58 KB per profile brief and 370 KB per round, not 55 and 360.
+👉 **Decide:** none — approve if relais prompts may index the rules a tool checks (candidate/exact-only) and the reviewer's process rules, fetched through the aval MCP and measured.
+📍 relais, decisions · Phase 3 shipped (amont-agent 3.24–3.26, both rules at deny 11-09) · next: ADR-0066, then the relais Phase 4 PR. Delta panel: backend (opus).
+**Changed by review:** reviewer reuses the worker's `aval_rule` instruction with `repo:`; relais journals index ids, `output-audit` counts fetches (no SPEC change); targets from the arithmetic (24%/12%); a stated rollback threshold.
+**Verdicts:** backend approve-with-changes → approve-with-changes (a blocker its own patch caused, fixed) → approve. Nothing carried.
 📄 Full reviews: [review evidence and implementation carries](2026-11-06-reliable-verification-and-deliberate-output.reviews.md).
 
 ## Context
@@ -74,27 +74,26 @@ The Phase 2 baseline moved the target. Over [2026-10-23T10:03:38Z, 2026-11-06T10
 
 Critical files: amont-agent `crates/amont-agent-guard/src/rules/read_unbounded_large.rs`, `whole_file_dump.rs`, the hook's Read/Bash paths in `src/hook.rs`, `crates/amont-agent-process/src/review_brief.rs`, `tests/hook.rs`, `tests/review_brief.rs`, `docs/`; decisions: a new ADR replacing ADR-0043 for `guidance.code-rules-in-dispatch`, `HEADS.md`, `aval.pack`.
 
-## Phase 4 — Capture automatically and reduce producer noise
+## Phase 4 — relais prompts carry the rules each agent judges (re-targeted 2026-11-09)
 
-1. If Phase 2 proves safe invocation updates, automatically route a **small explicit set of non-interactive checks** through existing quiet capture. Prefer existing declared `amont run` when applicable; otherwise reuse `amont-agent quiet`. Preserve host-slot scheduling through its published interface; scheduling alone is not capture.
-2. Do not rewrite mutations, pushes, `amont land --json`, interactive/stdin-consuming calls, opaque shell parses or already captured output. Unsupported syntax stays unchanged with a documented gap. Never use quiet routing to get around a Phase 3 refusal.
-3. Preserve one-line success, exact exit/signal/cancel behavior, actionable failure excerpts and full raw-log retrieval/permissions. Keep CI full-failure behavior unchanged. Do not fork quiet's excerpt engine or indiscriminately tail failures.
-4. Tighten **relais-owned** completion/status formatting at existing public adapters: compact current outcome, actionable failure/decision, changed-file count and receipt/evidence path. Keep full criteria/reports/logs behind published detail paths rather than repeating complete contracts inside notifications. Add golden-text regression tests in `outcome.test.ts` for accepted, failed, blocked, cancelled and answered outcomes, using oversized-summary fixtures: fixture-specific byte ceilings must fail before compaction and pass after it; assert the receipt path when present, DECIDE_STEP when awaiting, FEEDBACK_STEP for accepted non-trials, and applicable NEXT_STEP[code] guidance. Ceilings are test assertions, never runtime truncation that could cut an instruction. Preserve decision, trust and feedback instructions when applicable, delivery/dedup semantics, and truthful current-state information. Do not suppress an unresolved decision as stale.
-5. Publish compact receipt projections in `relais/docs/SPEC.md`, including candidate identity, criteria, check exits and **all** gaps/bypasses/downgrades. Never interpret absent/null/pending as green. Do not teach amont-agent relais's field schema. Publish the recipe before another tool points at it; until then use the bounded generic fallback.
-6. Source-owned short recipes cover explicit quiet fallback, compact CI queries, targeted log retrieval and narrow LSP navigation. No new long always-on prompt, blanket 8 KiB rule or hand-edited installed skill. Extend generic artifact guards only if a measured, independently scoped need remains; that extension is not implicitly authorized here.
+Measured over the Phase 2 window (2026-10-23..11-06): automatic quiet capture of checks would save at most 2.3 MB (check output is 3% of tool output) and relais plugin notifications total 1.0 MB, so the earlier Phase 4 (quiet routing, notification golden tests, receipt projections) is dropped as not worth its review cost. The largest remaining bytes are relais's own prompts: 248 semantic-reviewer prompts at 72 KB (17.8 MB) and 138 worker prompts at 68 KB (8.0 MB, coordinator messages included). A reviewer prompt holds 41 KB of code rules in full and 13.8 KB of statements of 34 process rules (`ci.*`, `work.*`, `toolchain.*`, `guidance.*`, `prose.*`); a worker prompt 41 KB of code rules and 11.5 KB of ranked guidance. Each code rule's body says how it is checked (`**Checked by:**`): judge-only 18 KB, mixed with a judge part about 14 KB, candidate-only about 9 KB, exact-only 0.4 KB. ADR-0043 put code rules in full in every dispatch because on-demand fetch through the `aval rule` CLI failed (0 of 194 workers); the aval MCP tool now exists and is called (since 2026-10-04: 54 `aval_rule` calls from main sessions, 30 from subagents), but no prompt has yet relied on it, so this phase measures whether it is used (item 4). The person chose this re-target, both halves, on 2026-11-09.
 
-Critical files: existing amont-agent hook/payload/decision and shell-analysis/quiet integration tests; `docs/quiet.md`. Relais's `claude-plugin/hooks/runs.ts`, relevant public status adapter if needed, `claude-plugin/tests/outcome.test.ts`/`status.test.ts`, `docs/SPEC.md` and changelog. Use the already-existing TypeScript plugin; no new language is introduced.
+1. **A new decision first** (decisions repo, before the relais PR): it amends ADR-0043's `guidance.code-rules-in-dispatch` for relais dispatch as ADR-0065 did for profile seats. A code rule with a judge part in its `Checked by` line, or with no readable `Checked by` line, stays in full for writers and reviewers; a rule checked only by `candidate` or `exact` is one index line (id and statement) for the worker, and for the reviewer is given in full only when a candidate in this diff names it. Process rules are an id-and-statement index for the reviewer too, fetched with `mcp__aval__aval_rule`. Two or more later-found violations of an indexed rule in the seven days, against the baseline window's count, return that slice to full text.
+2. **Reviewer** (`runner/review/mod.rs` `reviewer_guidance`, `engine.rs`): code rules split by checker as above, the candidate ids of this diff passed in from the candidates list (`PartCandidates`, already fetched before the prompt is built; when candidates are unavailable every candidate-only rule stays in full); process rules rendered as `- <id>: <statement cut at 120 chars>` under the instruction `constraint_index_block` already gives workers (`aval_rule` with `repo: "<guidance.repo_name>"`, else `aval rule <id>`), reused, not re-worded. The reviewer agent definitions (the 19 hand-kept `claude-plugin/agents/relais-reviewer-*.md`, `tools_of(AgentKind::Reviewer)` in `tests/it/plugin_agents.rs`, and the advisory `relais-review` in `install/mod.rs`) gain `mcp__aval__aval_rule`. Expected: 72 − (13.8 − 34 × ~155 B ≈ 5.3) − (9.4 − ~1) ≈ 55 KB per review (about 24%).
+3. **Worker** (`runner/prompt.rs` `worker_code_rules_block`): judge rules in full, candidate- and exact-only rules as an index line each with the instruction to fetch with `aval_rule` (workers already have the tool). The ranked-guidance trim is the separate active plan `2026-10-27-guidance-budget-and-wait-row` and is not touched. Expected: 68 − (9.4 − ~1) ≈ 60 KB per worker prompt (about 12%).
+4. **Measure it**: the relais journal (not the receipt, so no SPEC contract change) records, per run, the rule ids given as index lines; `amont-agent output-audit` counts the `aval_rule` calls of relais `agent_type`s from transcripts; the parse of `Checked by` is a pure function run while the rule body is present (a manifest read back from disk has none: today's gap stands), unit-tested over a fixture of every real `Checked by` line copied with its source sha; unknown wording defaults to full text.
+
+Non-goals: no change to the binding key set, the RULES hash, the candidate checker, the guidance budget plan, or what a reviewer blocks on.
 
 ## Phase 5 — Verify, land, activate and observe
 
 - Replay the fixed baseline window through the Phase 3 matchers: count would-refuse calls by rule and context (main, subagent), review a reproducible sample of 50 plus every exempt-path near miss, and record false interventions. Run the rules' negative corpus.
 - Hook tests: first whole Read over 8 KiB refused with size and window advice; the identical retry allowed and journalled; a different file refused once on its own; a ranged Read and an exempt plan path never refused; a subagent's call keyed apart from the main session's; expired or missing state refuses once again. The same for `whole-file-dump`.
-- Automatic routing (Phase 4): deterministic noisy pass/fail fixtures; passing output <=200 B excluding the delayed notice; raw log intact; exit codes, signals, missing executable, cancellation and grandchild cleanup retained. The real-host proof (2026-11-08) showed the rewritten command is what is shown and run, so routing only ever makes output quieter, never changes the effect.
+- relais prompts (Phase 4): a fixture corpus with judge-only, mixed, candidate-only, exact-only and unparseable rules → the reviewer prompt shows the judge rules in full, a candidate-only rule in full only when a listed candidate names it, the rest and the process rules as index lines; the worker prompt the same without the candidate case; every real rule file's `Checked by` line parses; prompt sizes recorded before and after on one real run.
 - Profile brief: `review-brief --profile backend` on a fixture corpus → its own judge rules in full, no `# Code rules (in full)`, an id index, the RULES line present, the size recorded; the same for `--interdiff`; the implementation-review brief byte-identical to before.
-- Compact relais notifications: successful, failed, blocked, cancelled and answered fixtures; current action/state and every verification gap kept; complete evidence retrievable.
 - Project default checks, declared implementation reviews (deltas via `review-brief --interdiff`), PR/CI/release/install through each owner workflow. No tool downgrades, review bypasses or manual trust edits.
 - **Activation:** graduating the two rules to refuse-once is authorised by this plan once the replay sample shows 0 false interventions; any false intervention returns only that rule to `advise` until fixed.
-- **Observe seven days** after activation (date recorded then): run `amont-agent output-audit` over those seven days and compare with the baseline's per-day rates. Targets: subagent whole-Read bytes over 8 KiB outside reviewer agents down by half (reach 5.5 MB in the baseline), and review-brief bytes per round down by about half (measured on the next five review rounds against the 137 KB per seat above), with no rise in failed tasks, repair rounds or reviewer-missed rule violations found later. Report `allowed-after-feedback` counts (feedback ignored) honestly; no quota percentage without measured evidence.
+- **Observe seven days** after activation (date recorded then): run `amont-agent output-audit` over those seven days and compare with the baseline's per-day rates. Targets: subagent whole-Read bytes over 8 KiB outside reviewer agents down by half (reach 5.5 MB in the baseline), and review-brief bytes per round down by about half (measured on the next five review rounds against the 137 KB per seat above), with no rise in failed tasks, repair rounds or reviewer-missed rule violations found later. For Phase 4, over the seven days after its release: relais reviewer prompt bytes down by about 24% and worker prompt bytes by about 12% against the 72 KB and 68 KB above; the `aval_rule` calls per run with an indexed rule; and review findings or later fixes citing an indexed rule, compared with the baseline window. The Phase 4 item 1 threshold (two or more later-found violations of an indexed rule) returns that slice to full text. Report `allowed-after-feedback` counts (feedback ignored) honestly; no quota percentage without measured evidence.
 
 ## Code review
 
@@ -102,7 +101,7 @@ Critical files: existing amont-agent hook/payload/decision and shell-analysis/qu
 - amont-agent: backend, lang:rust, unix, tui
 - decisions: none — ADR text only, reviewed by this panel and aval's lint
 
-Omissions: architect at code close — ownership and interfaces are reviewed in this plan; changes stay localized to existing process/policy/formatting seams. No React/UI profiles: hook feedback to the agent only, no prompt and no web UI. Language profiles cover only the named repository's languages; amont-agent has no TypeScript implementation work.
+Omissions: architect at code close — ownership and interfaces are reviewed in this plan; changes stay localized to existing process/policy/formatting seams. No React/UI profiles: hook feedback to the agent only, no prompt and no web UI. Language profiles cover only the named repository's languages; amont-agent has no TypeScript implementation work. relais keeps lang:typescript because Phase 1's diff was reviewed with it; Phase 4 has no TypeScript.
 
 ## Approval scope and current state
 
@@ -130,4 +129,22 @@ Phase 1 (relais#383), tree 63885f34. Round 1 then Delta, all Opus.
 
 Remaining Phase 1 steps: release/install, then amont's unchanged `make check` through native relais once; seven-day receipt observation from that date.
 
-<!-- panel: repos=relais,amont-agent,decisions adds=lang:typescript reviewers=backend body-sha=8d8066826a6c -->
+<!-- panel: repos=relais,amont-agent,decisions adds=lang:typescript reviewers=backend body-sha=a7be636bc98a -->
+
+## Phase 4 implementation review
+
+ADR-0066 (decisions#179) merged first; relais pack refreshed on this branch. Round 1 on tree 9cb2267d, two deltas (resumed seats), final tree 04b13545, all Opus; all six approve.
+- implementation-review: approve-with-changes → approve → approve. Fixed: this verification table (blocking), the 120-character cut tested, the reviewer instruction recorded below.
+- backend / lang:rust / unix / tui / lang:typescript: approve, approve-with-changes, approve, approve, approve. Fixed: index records get their own `what: guidance_index` (one event per prompt, readers count distinct ids, the golden drops them), `IndexedFor` / `CandidateNames` / `ReviewerGuidance` in place of strings, `None` and a tuple, no unused `in_full`. Deliberate: `CodeRule::checker` parses on each call (a few lines, cheaper than storing a field the manifest would have to skip). Second delta: the plugin timeline skips `guidance_index` (it would have shown a dozen rule ids per attempt), tested; the reviewer's fallback sentence asserted. Deliberate: test-only clones of a candidate set (Rust, cosmetic).
+- Decision: the reviewer's fetch instruction names only `aval_rule` (with `repo:` when known) and asks it to say in its report which rule it could not read when the tool is missing; it names no CLI, since reviewer agents have no shell. Item 2's "reused, not re-worded" holds for the worker only.
+
+## Phase 4 verification (observed)
+
+| Input | Expected | Actual |
+|---|---|---|
+| This repository's aval corpus (55 code rules, 11 tool-checked; 37 process rules), `prompt_rule_bytes_before_and_after_on_this_repository` | reviewer rules ≈ −17 KB, worker ≈ −8 KB | reviewer rule block 65.5 KB → 49.7 KB (−24%), worker code rules 49.3 KB → 43.3 KB (−12%); whole prompts ≈ 72 → 56 KB and 68 → 62 KB |
+| Every real `Checked by` paragraph (decisions c9898d0) | parsed as labelled | 55 of 55 (44 judge, 11 tool) |
+| A run whose resolver gives one judged and one tool-checked rule (`a_run_journals_the_rules_its_worker_got_as_lines`, any machine) | a `guidance_index` event naming only the tool-checked rule; nothing on stderr (release scenario) | as expected; the first push's scenario assertion depended on the machine's `aval` and failed on CI, replaced by this test |
+| Isolated-path golden | unchanged | unchanged (index records filtered as measurements) |
+| Plugin timeline, `make plugin` | `guidance_index` not shown, other decisions shown | 378 pass, 0 fail |
+| Reviewer fetching an indexed rule | — | observed after release, Phase 5 (needs the released plugin's reviewer agents) |

@@ -26,8 +26,8 @@ use super::{
 };
 use crate::runner::prompt::DECISION_PRECEDENCE;
 use crate::runner::{
-    data_block, data_list_block, effort_str, reviewer_guidance, utc_day_start, Budget, Candidate,
-    Ceiling, ManagedDispatch, Reason, RunEngine, RunError, RunSpend, State,
+    candidate_rules, data_block, data_list_block, effort_str, reviewer_guidance, utc_day_start,
+    Budget, Candidate, Ceiling, ManagedDispatch, Reason, RunEngine, RunError, RunSpend, State,
 };
 
 impl<'a> RunEngine<'a> {
@@ -388,7 +388,7 @@ impl<'a> RunEngine<'a> {
                 )
             }
         };
-        let (prompt, reviewer_gap) = self.review_prompt(
+        let (prompt, reviewer_gap, indexed) = self.review_prompt(
             request,
             &review_dir,
             &staged,
@@ -399,6 +399,9 @@ impl<'a> RunEngine<'a> {
         if let Some(gap) = &reviewer_gap {
             self.emit_guidance_gap(gap);
         }
+        // The run's record of what the reviewer got as one line each (ADR-0066).
+        let indexed: Vec<&str> = indexed.iter().map(String::as_str).collect();
+        self.emit_index_lines(super::super::prompt::IndexedFor::Reviewer, &indexed);
         self.reviewer_gap = reviewer_gap;
         let seat = ReviewSeat {
             profile: &profile,
@@ -553,7 +556,7 @@ impl<'a> RunEngine<'a> {
         part: Option<PartLabel>,
         candidates: &Result<PartCandidates, GuidanceGap>,
         statements: &[String],
-    ) -> (String, Option<GuidanceGap>) {
+    ) -> (String, Option<GuidanceGap>, Vec<String>) {
         let mut prompt = String::from(
             "You are a semantic reviewer. You cannot edit or waive checks; you report findings only.\n\
              Report each finding with file/range, the violated acceptance criterion or code rule id, evidence, and suggested verification.\n\
@@ -590,14 +593,19 @@ impl<'a> RunEngine<'a> {
         }
         // The patch is not in the prompt, so the constraints have a
         // budget of their own.
-        let (guidance_text, reviewer_gap) =
-            reviewer_guidance(&request.manifest.guidance, REVIEW_CONSTRAINTS_BUDGET_BYTES);
-        prompt.push_str(&guidance_text);
+        let guidance = reviewer_guidance(
+            &request.manifest.guidance,
+            REVIEW_CONSTRAINTS_BUDGET_BYTES,
+            &candidate_rules(candidates),
+        );
+        prompt.push_str(&guidance.text);
+        let guidance_text_len = guidance.text.len();
+        let (reviewer_gap, indexed) = (guidance.gap, guidance.indexed);
         let (decisions_text, decisions_gap) = reviewer_decisions(
             self.config.aval_resolver,
             &staged.files,
             REVIEW_CONSTRAINTS_BUDGET_BYTES,
-            guidance_text.len(),
+            guidance_text_len,
         );
         prompt.push_str(&decisions_text);
         match candidates {
@@ -671,7 +679,7 @@ impl<'a> RunEngine<'a> {
              `FINDINGS: none` when there are no findings, or the line `FINDINGS:` followed by \
              the list of findings.\n",
         );
-        (prompt, reviewer_gap)
+        (prompt, reviewer_gap, indexed)
     }
 
     /// The review as a managed dispatch with its own seat, and the

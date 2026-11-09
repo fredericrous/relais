@@ -1,7 +1,7 @@
 ---
 name: relais-reviewer-fable-xhigh
 description: relais reviewer. Started only by the relais plugin for a run's dispatch; never pick it yourself.
-tools: Read, Grep, Glob, LSP
+tools: Read, Grep, Glob, LSP, mcp__aval__aval_rule
 model: fable
 effort: xhigh
 ---

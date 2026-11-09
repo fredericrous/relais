@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+- **Prompts give a code rule in full only when a reviewer judges it (ADR-0066).** A rule its `**Checked by:**` line leaves to a tool (the adr-lint candidate pass, a compiler, a formatter, a lint) is one line in the worker's prompt, and in the reviewer's unless a candidate of the patch names it; a rule with a judge part, or no readable line, stays in full. The reviewer gets the process rules as one line each instead of their statements, and the reviewer agents gain `mcp__aval__aval_rule` to read one in full. Each run journals the rule ids it gave as lines, as a `guidance_index` decision event in its `events.jsonl` (a new `what`: readers that list decisions see one more kind). Measured over two weeks: reviewer prompts 72 KB, worker prompts 68 KB; expected about 55 KB and 60 KB.
+
 ## v0.51.0
 
 - **The bundled SQLite moves past RUSTSEC-2026-0459.** `rusqlite` is now 0.41 (libsqlite3-sys 0.39), and the minimum supported Rust version becomes 1.89.

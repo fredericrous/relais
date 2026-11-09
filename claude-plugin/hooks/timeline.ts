@@ -383,6 +383,10 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
       return withEntry(m, at, 'check', `${failed ? 'FAIL ' : ''}${event.label} · exit ${event.exit ?? 'none'}`)
     }
     case 'decision': {
+      // The rules a prompt gave as one line each (ADR-0066) are a record for
+      // the audit, not news: a dozen rule ids on every attempt would bury the
+      // decisions a person reads the timeline for.
+      if (event.what === 'guidance_index') return m
       const entry = { at, kind: 'decision', text: `${event.what} · ${event.reason}` }
       return withEntry({ ...m, decisions: pushEntry(m.decisions, entry) }, at, 'decision', entry.text)
     }

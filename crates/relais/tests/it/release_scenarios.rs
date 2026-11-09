@@ -1595,6 +1595,9 @@ fn budget_exhaustion_preserves_evidence_and_stops_dispatch() {
         !runs[0].join("candidate-3.patch").exists(),
         "no third dispatch"
     );
+    // ADR-0066: the rules given as lines are journalled in the run's events
+    // (`a_run_journals_the_rules_its_worker_got_as_lines`), never on stderr.
+    assert!(!stderr.contains("one line each"), "{stderr}");
     let report: serde_json::Value = serde_json::from_str(&text(
         &world
             .relais(&["report", "--since", "2026-01-01", "--json"])
@@ -5741,7 +5744,12 @@ fn golden_document(world: &World, run_id: &str, label: &str) -> serde_json::Valu
             serde_json::Value::Object(kept)
         })
         .collect();
-    let mut events = events;
+    // A `guidance_index` decision (ADR-0066) lists the rule ids the
+    // machine's corpus gives as lines: a measurement, not the path's shape.
+    let mut events: Vec<serde_json::Value> = events
+        .into_iter()
+        .filter(|event| !(event["kind"] == "decision" && event["what"] == "guidance_index"))
+        .collect();
     events.dedup_by(|later, earlier| {
         later == earlier && later["what"] == "guidance" && later["kind"] == "decision"
     });
