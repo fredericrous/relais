@@ -66,9 +66,9 @@ pub(crate) fn loop_threshold_finding() -> Option<doctor::Finding> {
 fn loop_threshold_text(threshold: Option<u32>) -> String {
     match threshold {
         Some(repeats) => format!(
-            "loop_threshold: {repeats} (a native worker repeating one failing command {repeats} times with no edit is stopped)"
+            "loop_threshold: {repeats} (a native worker repeating one failing command {repeats} times with no edit is stopped; a contract's limits.loop_threshold = 0 turns the guard off for its run)"
         ),
-        None => "loop_threshold: unset (loop detection is off; it only records what it would have stopped (shadow))".to_string(),
+        None => "loop_threshold: unset (no worker is stopped; the guard only records what it would have stopped (shadow), and a contract's limits.loop_threshold = 0 turns even that off for its run)".to_string(),
     }
 }
 

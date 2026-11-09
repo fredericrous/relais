@@ -1372,7 +1372,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         wall_timeout: engine.budgets.remaining().max(Duration::from_secs(1)),
         cancel: None,
         agent: AgentKind::Planner,
-        loop_threshold: None,
+        loop_guard: crate::policy::LoopGuardMode::Off,
         attempt: 0,
     };
     let budget = Budget {
@@ -1554,7 +1554,7 @@ mod tests {
             allow_nested_agents: false,
             max_agent_depth: 1,
             max_agents_total: 24,
-            loop_threshold: None,
+            loop_guard: crate::policy::LoopGuardMode::Shadow,
             verification_profile: crate::policy::VerificationProfile::default(),
             review_floor: Review::Off,
             disallowed_tools: Vec::new(),

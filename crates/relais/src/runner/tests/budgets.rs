@@ -407,7 +407,7 @@ fn the_limits_of_a_run_come_from_the_repository_the_machine_and_the_contract() {
         allow_nested_agents: false,
         max_agent_depth: 1,
         max_agents_total: 24,
-        loop_threshold: None,
+        loop_guard: crate::policy::LoopGuardMode::Shadow,
         verification_profile: VerificationProfile::default(),
         review_floor: Review::Off,
         disallowed_tools: Vec::new(),

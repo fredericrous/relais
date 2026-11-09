@@ -7470,7 +7470,7 @@ fn guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_g
         allow_nested_agents: false,
         max_agent_depth: 1,
         max_agents_total: 1,
-        loop_threshold: None,
+        loop_guard: crate::policy::LoopGuardMode::Shadow,
         verification_profile: crate::policy::VerificationProfile::default(),
         review_floor: Review::Off,
         disallowed_tools: Vec::new(),

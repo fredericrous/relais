@@ -106,14 +106,26 @@ enum Plugin {
     LoopsAndCancelsOnStop,
     /// Like `LoopsUntilStopped`, with a bearer token in the command.
     LoopsOnASecret,
+    /// Like `LoopsUntilStopped`; when the second agent is asked to spawn,
+    /// the first one, long since reported stopped, writes one more
+    /// transcript message and a file in its tree.
+    WritesAfterItsStop,
+    /// Binds and never stops, and writes no transcript at all.
+    NeverStopsWithoutTranscript,
 }
 
 impl Plugin {
     /// The first agent loops from its spawn and reports stopped when asked.
     fn loops_until_stopped(self) -> bool {
-        matches!(self, Self::LoopsUntilStopped | Self::LoopsOnASecret)
+        matches!(
+            self,
+            Self::LoopsUntilStopped | Self::LoopsOnASecret | Self::WritesAfterItsStop
+        )
     }
 }
+
+/// The input tokens of the message the first agent writes after its stop.
+const LATE_INPUT_TOKENS: u64 = 7777;
 
 const SECRET_COMMAND: &str =
     "curl -H 'Authorization: Bearer s3cretToken9z' https://example.test/build";
@@ -361,6 +373,26 @@ fn run_plugin(
             other => panic!("an unknown request {other}"),
         };
         script.prompts.push(prompt.clone());
+        if plugin == Plugin::WritesAfterItsStop && agent_id == "ag2" {
+            let first = agents.get("ag1").expect("the first agent");
+            let first_transcript = projects
+                .join("-slug")
+                .join(SESSION)
+                .join("subagents")
+                .join("agent-ag1.jsonl");
+            let mut out = std::fs::OpenOptions::new()
+                .append(true)
+                .open(first_transcript)
+                .expect("the first transcript opens");
+            writeln!(
+                out,
+                r#"{{"type":"assistant","timestamp":"2026-10-06T00:00:00Z","message":{{"id":"ag1-late","model":"{}","usage":{{"input_tokens":{LATE_INPUT_TOKENS},"output_tokens":3333,"cache_read_input_tokens":0}}}}}}"#,
+                first.model
+            )
+            .expect("the late transcript line");
+            std::fs::write(first.tree.join("late.txt"), "written after the stop\n")
+                .expect("the late file");
+        }
         let agent = agents.get_mut(&agent_id).expect("a known agent");
         // Only a worker changes its tree; a reviewer and a planner read.
         if agent.kind == "worker" {
@@ -376,7 +408,10 @@ fn run_plugin(
             .join(SESSION)
             .join("subagents")
             .join(format!("agent-{agent_id}.jsonl"));
-        if plugin == Plugin::LeavesNoTranscript {
+        if matches!(
+            plugin,
+            Plugin::LeavesNoTranscript | Plugin::NeverStopsWithoutTranscript
+        ) {
             agent.messages += count;
         } else {
             append_messages(&transcript, &agent_id, agent, count);
@@ -388,6 +423,7 @@ fn run_plugin(
                 plugin,
                 Plugin::LoopsUntilStopped
                     | Plugin::LoopsOnASecret
+                    | Plugin::WritesAfterItsStop
                     | Plugin::LoopsAndIgnoresStop
                     | Plugin::LoopsAndCancelsOnStop
                     | Plugin::OlderLoopThenOneMoreFailure
@@ -418,7 +454,9 @@ fn run_plugin(
                 record_stop(&mut script, &gate, &dispatch_id, &stopped);
                 record_bound(&mut script, &gate, &dispatch_id, &agent_id);
             }
-            Plugin::LoopsUntilStopped | Plugin::LoopsOnASecret if first_agent => {
+            Plugin::LoopsUntilStopped | Plugin::LoopsOnASecret | Plugin::WritesAfterItsStop
+                if first_agent =>
+            {
                 record_bound(&mut script, &gate, &dispatch_id, &agent_id);
             }
             Plugin::ContinuationLoops if first_agent && !fresh => {
@@ -450,7 +488,9 @@ fn run_plugin(
                     &report(1, AgentStatus::Completed),
                 );
             }
-            Plugin::NeverStops | Plugin::CancelsAfterBound => {
+            Plugin::NeverStops
+            | Plugin::NeverStopsWithoutTranscript
+            | Plugin::CancelsAfterBound => {
                 record_bound(&mut script, &gate, &dispatch_id, &agent_id);
                 if plugin == Plugin::CancelsAfterBound {
                     // Long enough for the backend's poll to see the bind.
@@ -464,6 +504,7 @@ fn run_plugin(
             Plugin::Obeys
             | Plugin::LoopsUntilStopped
             | Plugin::LoopsOnASecret
+            | Plugin::WritesAfterItsStop
             | Plugin::ContinuationLoops
             | Plugin::OlderLoopThenOneMoreFailure
             | Plugin::AgentFails
@@ -527,6 +568,8 @@ struct Native {
     script: Scripted,
     /// The `relais: shadow:` lines the backend said.
     shadow: Vec<String>,
+    /// The `relais: loop guard off` lines the backend said.
+    guard_off: Vec<String>,
 }
 
 impl Native {
@@ -723,6 +766,11 @@ fn run_native_launching(
         .lock()
         .expect("the shadow lines")
         .clone();
+    let guard_off = backend
+        .guard_off_lines
+        .lock()
+        .expect("the guard-off lines")
+        .clone();
     // Every holder of the wire gone ends the plugin's loop.
     drop(backend);
     drop(wire);
@@ -731,6 +779,7 @@ fn run_native_launching(
         outcome,
         script,
         shadow,
+        guard_off,
     }
 }
 
@@ -1738,7 +1787,8 @@ fn a_stop_that_is_never_acknowledged_ends_lost_with_no_second_attempt() {
         },
     );
     let detail = interrupted_detail(&run.outcome);
-    assert!(detail.contains("mod_gone"), "{detail}");
+    assert!(detail.contains("stop_unacknowledged"), "{detail}");
+    assert!(!detail.contains("mod_gone"), "{detail}");
     let spawns = run
         .seen()
         .iter()
@@ -2059,6 +2109,92 @@ fn a_stop_never_acknowledged_ends_at_the_wall_time_not_the_spawn_wait() {
         began.elapsed()
     );
     let detail = interrupted_detail(&run.outcome);
-    assert!(detail.contains("mod_gone"), "{detail}");
+    assert!(detail.contains("stop_unacknowledged"), "{detail}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn a_contract_threshold_of_zero_turns_the_guard_off_with_no_stop_and_no_shadow_line() {
+    let fixture = Fixture::new();
+    let mut contract = fixture.contract(Review::Optional);
+    contract.limits.loop_threshold = Some(0);
+    let run = run_native_contract(
+        &fixture,
+        &contract,
+        3,
+        Cast {
+            plugin: Plugin::LoopsAndIgnoresStop,
+            work: fixes_on_repair,
+        },
+        Some(prices()),
+        waits(Duration::from_secs(60)),
+        |repo| {
+            repo.execution.loop_threshold = Some(3);
+            repo.execution.max_wall_seconds = 1;
+        },
+    );
+    let detail = interrupted_detail(&run.outcome);
+    assert!(detail.contains("wall time"), "{detail}");
+    assert!(run.shadow.is_empty(), "{:?}", run.shadow);
+    assert!(run.guard_off.is_empty(), "{:?}", run.guard_off);
+    assert!(
+        !transitions_reasons(&fixture, &run).contains(&"worker_looped".to_string()),
+        "{:?}",
+        transitions_reasons(&fixture, &run)
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn a_transcript_that_is_never_found_says_the_guard_is_off_once() {
+    let fixture = Fixture::new();
+    let run = run_native(
+        &fixture,
+        Review::Optional,
+        1,
+        Plugin::NeverStopsWithoutTranscript,
+        fixes_on_repair,
+        Some(prices()),
+        // The three test-build lookups end after about 3 s; the rest is margin
+        // for a loaded runner. The run ends at this wall time.
+        |repo| repo.execution.max_wall_seconds = 15,
+    );
+    assert_eq!(
+        run.guard_off,
+        vec!["relais: loop guard off for attempt 1: transcript not found".to_string()],
+        "{:?}",
+        run.outcome
+    );
+    assert!(run.shadow.is_empty(), "{:?}", run.shadow);
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn what_a_stopped_agent_writes_later_is_not_booked_to_the_next_attempt() {
+    let fixture = Fixture::new();
+    let run = run_native(
+        &fixture,
+        Review::Optional,
+        3,
+        Plugin::WritesAfterItsStop,
+        fixes_for_the_second_agent,
+        Some(prices()),
+        |repo| {
+            repo.execution.loop_threshold = Some(3);
+        },
+    );
+    assert!(
+        transitions_reasons(&fixture, &run).contains(&"worker_looped".to_string()),
+        "{:?}",
+        transitions_reasons(&fixture, &run)
+    );
+    let rows = native_usage(&fixture, &run.outcome.run_id);
+    let booked_input: i64 = rows.iter().map(|row| row.0.unwrap_or(0)).sum();
+    let (written_input, _) = transcript_usage(&fixture);
+    let late = i64::try_from(LATE_INPUT_TOKENS).expect("fits");
+    assert_eq!(booked_input, written_input - late, "{rows:?}");
+    // holds-until: the scripted plugin shares one path between both attempts' trees, so the
+    // late file cannot be told from the second attempt's own; a harness with separate trees
+    // asserts its absence from the second attempt's snapshot.
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
 }

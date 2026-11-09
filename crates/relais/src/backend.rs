@@ -240,9 +240,8 @@ pub struct LaunchSpec {
     /// What kind of agent this dispatch is: the native agent definition it
     /// runs as, and the kind its run events name.
     pub agent: crate::protocol::AgentKind,
-    /// How many identical failing results with no edit between stop a
-    /// native worker; `None` runs no loop detection.
-    pub loop_threshold: Option<u32>,
+    /// What the loop guard does for this dispatch.
+    pub loop_guard: crate::policy::LoopGuardMode,
     /// The run's attempt number this dispatch belongs to, from the runner's
     /// budget; 0 for a dispatch that is not a worker attempt.
     pub attempt: u32,

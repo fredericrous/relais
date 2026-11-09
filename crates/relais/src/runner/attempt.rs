@@ -11,6 +11,7 @@ use super::{
     RunEngine, RunError, RunOutcome, Snapshot, State, Step, Terminal, UsageEvent, Verified,
     VerifyFailure, WorkspaceError,
 };
+use crate::backend::LoopedWorker;
 
 impl<'a> RunEngine<'a> {
     /// The bounded sequence of attempts the runner — not a model — owns
@@ -29,14 +30,20 @@ impl<'a> RunEngine<'a> {
             if let Some(outcome) = self.ceiling_reached(&progress)? {
                 return Ok(outcome);
             }
-            let dispatched = match self.dispatch_attempt(ctx, &mut progress)? {
+            let mut dispatched = match self.dispatch_attempt(ctx, &mut progress)? {
                 Phase::Ended(outcome) => return Ok(outcome),
                 Phase::Ready(dispatched) => dispatched,
             };
-            let judged =
-                if dispatched.result.lost_worker.is_none() && dispatched.result.looped.is_some() {
-                    self.end_looped_attempt(ctx, &mut progress, dispatched)?
-                } else {
+            // A lost worker wins over a loop: its tree is fenced and goes
+            // through the snapshot, which reports it.
+            let judged = match (
+                &dispatched.result.lost_worker,
+                dispatched.result.looped.take(),
+            ) {
+                (None, Some(looped)) => {
+                    self.end_looped_attempt(ctx, &mut progress, dispatched, looped)?
+                }
+                (Some(_), _) | (None, None) => {
                     match self.snapshot_attempt(ctx, &progress, dispatched)? {
                         Snapshot::Ended(outcome) => return Ok(outcome),
                         Snapshot::Ready(candidate) => {
@@ -46,7 +53,8 @@ impl<'a> RunEngine<'a> {
                             self.fail_unresolved(ctx, &mut progress, attempt_id, &paths)?
                         }
                     }
-                };
+                }
+            };
             match judged {
                 Step::Ended(outcome) => return Ok(outcome),
                 // The attempt is booked and judged; only a further dispatch
@@ -125,15 +133,9 @@ impl<'a> RunEngine<'a> {
         context: &AttemptContext<'_>,
         progress: &mut Progress,
         dispatched: Dispatched,
+        looped: LoopedWorker,
     ) -> Result<Step, RunError> {
-        let Dispatched {
-            attempt_id, result, ..
-        } = dispatched;
-        let Some(looped) = result.looped else {
-            return Err(RunError::Other(
-                "an attempt was ended as looped without a looped worker".into(),
-            ));
-        };
+        let attempt_id = dispatched.attempt_id;
         let held_worktree = context.worktree_path.to_string_lossy().into_owned();
         self.config
             .ledger
@@ -166,10 +168,12 @@ impl<'a> RunEngine<'a> {
                 .map_or_else(|| format!("rung {}", rung.get()), |at| at.model.clone()),
             Next::Accept | Next::Stop(_) => "none (run failed: worker_looped)".to_string(),
         };
-        eprintln!(
-            "relais: attempt {attempt} stopped: worker repeated {shown} failing {count} times \
-             with no edit; next: {rung}"
-        );
+        let phrase = if looped.error_line.is_some() {
+            loop_text::failing_phrase(&shown, count)
+        } else {
+            loop_text::same_output_phrase(&shown, count)
+        };
+        eprintln!("relais: attempt {attempt} stopped: worker {phrase}; next: {rung}");
         self.proceed(context, progress, next)
     }
 
@@ -388,7 +392,7 @@ impl<'a> RunEngine<'a> {
             wall_timeout: remaining_wall,
             cancel: None,
             agent: AgentKind::Worker,
-            loop_threshold: authority.loop_threshold,
+            loop_guard: authority.loop_guard,
             attempt: index,
         };
 

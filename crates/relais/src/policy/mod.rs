@@ -472,6 +472,19 @@ pub struct ExecutionPolicy {
     pub loop_threshold: Option<u32>,
 }
 
+/// What the loop guard does for one native worker: the three states that a
+/// bare `Option<u32>` threshold would fold into two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopGuardMode {
+    /// The repository never set the key: the guard only records what it
+    /// would have stopped.
+    Shadow,
+    /// A contract turned the guard off with `limits.loop_threshold = 0`.
+    Off,
+    /// Stop a worker after this many identical failing results.
+    Stop(u32),
+}
+
 /// The smallest `[execution] loop_threshold`: one failure is not a loop.
 pub const MIN_LOOP_THRESHOLD: u32 = 2;
 
@@ -2336,12 +2349,12 @@ pub struct EffectiveAuthority {
     pub allow_nested_agents: bool,
     pub max_agent_depth: u32,
     pub max_agents_total: u32,
-    /// Repeats of one failing command that stop a native worker; `None`
-    /// leaves the guard off. The repository's value is the floor: the
-    /// contract may raise it, or turn the guard off with an explicit 0,
-    /// but never lower it, and it cannot turn the guard on where the
-    /// repository left it unset (SPEC §5). There is no machine-level key.
-    pub loop_threshold: Option<u32>,
+    /// What the loop guard does for a native worker. The repository's value
+    /// is the floor: the contract may raise it, or turn the guard off with
+    /// an explicit 0, but never lower it, and it cannot turn the guard on
+    /// where the repository left it unset (SPEC §5). There is no
+    /// machine-level key.
+    pub loop_guard: LoopGuardMode,
     pub verification_profile: VerificationProfile,
     pub review_floor: Review,
     pub disallowed_tools: Vec<String>,
@@ -2540,14 +2553,15 @@ pub fn effective_authority(
             cap.min(repo.execution.max_agents_total)
         });
 
-    let loop_threshold =
-        repo.execution
-            .loop_threshold
-            .and_then(|repository| match contract.limits.loop_threshold {
-                None => Some(repository),
-                Some(0) => None,
-                Some(asked) => Some(repository.max(asked)),
-            });
+    let loop_guard = match (
+        repo.execution.loop_threshold,
+        contract.limits.loop_threshold,
+    ) {
+        (_, Some(0)) => LoopGuardMode::Off,
+        (None, _) => LoopGuardMode::Shadow,
+        (Some(repository), None) => LoopGuardMode::Stop(repository),
+        (Some(repository), Some(asked)) => LoopGuardMode::Stop(repository.max(asked)),
+    };
 
     EffectiveAuthority {
         models,
@@ -2557,7 +2571,7 @@ pub fn effective_authority(
         allow_nested_agents: repo.execution.allow_nested_agents,
         max_agent_depth,
         max_agents_total,
-        loop_threshold,
+        loop_guard,
         verification_profile: profile,
         review_floor,
         disallowed_tools: effective_disallowed_tools(&machine.permissions),
@@ -3738,35 +3752,51 @@ timeout_seconds = 60
     fn loop_threshold_authority(
         repository: Option<u32>,
         contract_value: Option<u32>,
-    ) -> Option<u32> {
+    ) -> LoopGuardMode {
         let mut repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
         repo.execution.loop_threshold = repository;
         let machine = MachineSettings::from_toml_str(&machine_toml("")).expect("machine parses");
         let mut task = contract();
         task.limits.loop_threshold = contract_value;
-        effective_authority(&repo, &machine, &task, &identity()).loop_threshold
+        effective_authority(&repo, &machine, &task, &identity()).loop_guard
     }
 
     #[test]
     fn a_contract_loop_threshold_may_raise_the_repository_value() {
-        assert_eq!(loop_threshold_authority(Some(3), Some(5)), Some(5));
-        assert_eq!(loop_threshold_authority(Some(3), None), Some(3));
+        assert_eq!(
+            loop_threshold_authority(Some(3), Some(5)),
+            LoopGuardMode::Stop(5)
+        );
+        assert_eq!(
+            loop_threshold_authority(Some(3), None),
+            LoopGuardMode::Stop(3)
+        );
     }
 
     #[test]
     fn a_contract_loop_threshold_of_zero_turns_the_guard_off() {
-        assert_eq!(loop_threshold_authority(Some(3), Some(0)), None);
+        assert_eq!(
+            loop_threshold_authority(Some(3), Some(0)),
+            LoopGuardMode::Off
+        );
     }
 
     #[test]
     fn a_contract_loop_threshold_below_the_repository_value_is_clamped() {
-        assert_eq!(loop_threshold_authority(Some(5), Some(2)), Some(5));
+        assert_eq!(
+            loop_threshold_authority(Some(5), Some(2)),
+            LoopGuardMode::Stop(5)
+        );
     }
 
     #[test]
     fn a_contract_cannot_turn_the_loop_guard_on() {
-        assert_eq!(loop_threshold_authority(None, Some(3)), None);
-        assert_eq!(loop_threshold_authority(None, None), None);
+        assert_eq!(
+            loop_threshold_authority(None, Some(3)),
+            LoopGuardMode::Shadow
+        );
+        assert_eq!(loop_threshold_authority(None, None), LoopGuardMode::Shadow);
+        assert_eq!(loop_threshold_authority(None, Some(0)), LoopGuardMode::Off);
     }
 
     #[test]

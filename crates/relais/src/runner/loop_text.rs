@@ -2,7 +2,9 @@
 //! rules live beside the guard, so the adapter's shadow line and the
 //! runner's stop line cannot drift apart.
 
-pub(super) use crate::adapter::loopguard::{redacted_one_line, shown};
+pub(super) use crate::adapter::loopguard::{
+    failing_phrase, redacted_one_line, same_output_phrase, shown,
+};
 
 #[cfg(test)]
 mod tests {

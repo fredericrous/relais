@@ -19,7 +19,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::adapter::loopguard::{
-    redacted_one_line, shown, Evidence, LoopFired, LoopGuard, DEFAULT_LOOP_THRESHOLD,
+    redacted_one_line, same_output_phrase, shown, Evidence, LoopFired, LoopGuard,
+    DEFAULT_LOOP_THRESHOLD,
 };
 use crate::admission::{
     AgentStatus, AgentUsage, Gate, GateError, NativeAsk, NativeProgress, NativeState,
@@ -36,7 +37,7 @@ use crate::orchestration::{
     parse_transcript, price, unpriced_reason, CacheWrites, PriceTable, Speed, UsageRecord,
     UsageSource,
 };
-use crate::policy::EffortId;
+use crate::policy::{EffortId, LoopGuardMode};
 use crate::procs::Ended;
 use crate::protocol::{AgentKind, Request, Wire};
 
@@ -53,6 +54,10 @@ const WORKER_MISSING: &str = "native_worker_missing";
 /// that was bound, if one was, in `session_id`: the worker was never told to
 /// stop and may still be writing.
 pub const MOD_GONE: &str = "mod_gone";
+
+/// The prefix of a stop the coordinator never acknowledged: the plugin may be
+/// fine, the worker is what did not answer.
+pub const STOP_UNACKNOWLEDGED: &str = "stop_unacknowledged";
 
 /// A pass of the wait loop that took this much longer than its sleep means
 /// the host was suspended in between (a laptop lid, deep sleep): a process
@@ -272,8 +277,9 @@ enum Awaited {
 
 /// How many transcript lookups a tail makes before it gives up: the file is
 /// created a moment after the agent binds, but a directory read is not made
-/// on every poll.
-const TRANSCRIPT_LOOKUPS_ALLOWED: u32 = 20;
+/// on every poll. Scaled in test builds, so that a transcript that never
+/// appears does not cost a test the whole search.
+const TRANSCRIPT_LOOKUPS_ALLOWED: u32 = if cfg!(test) { 3 } else { 20 };
 
 /// Polls between two transcript lookups.
 const POLLS_BETWEEN_LOOKUPS: u32 = 4;
@@ -347,6 +353,24 @@ impl TranscriptTail {
     }
 }
 
+/// How a request to stop a worker ended.
+enum StopAck {
+    /// The coordinator reported the dispatch stopped or failed.
+    Confirmed,
+    /// The run was cancelled during the wait.
+    Cancelled,
+    /// Neither happened before the deadline; carries the status polls that
+    /// failed meanwhile.
+    Unconfirmed(PollErrors),
+}
+
+/// The status polls that failed while a stop was awaited.
+#[derive(Default)]
+struct PollErrors {
+    count: u32,
+    last: Option<String>,
+}
+
 /// Where the transcript of an agent is looked for while the wait goes on.
 enum TailState {
     /// Not found yet; `lookups` made so far.
@@ -368,6 +392,7 @@ impl TailState {
         threshold: u32,
         start: TranscriptStart,
         polls: u32,
+        attempt: u32,
     ) -> Option<LoopFired> {
         if let Self::Searching { lookups } = self {
             if *lookups > 0 && !polls.is_multiple_of(POLLS_BETWEEN_LOOKUPS) {
@@ -379,7 +404,12 @@ impl TailState {
                 .and_then(|path| TranscriptTail::open(&path, threshold, start));
             *self = match found {
                 Some(following) => Self::Following(following),
-                None if *lookups >= TRANSCRIPT_LOOKUPS_ALLOWED => Self::Absent,
+                None if *lookups >= TRANSCRIPT_LOOKUPS_ALLOWED => {
+                    backend.say_guard_off(&format!(
+                        "relais: loop guard off for attempt {attempt}: transcript not found"
+                    ));
+                    Self::Absent
+                }
                 None => return None,
             };
         }
@@ -768,6 +798,9 @@ pub struct NativeBackend<'a> {
     /// The shadow lines this backend said, for the tests to read.
     #[cfg(test)]
     pub(crate) shadow_lines: Mutex<Vec<String>>,
+    /// The `loop guard off` lines this backend said, for the tests to read.
+    #[cfg(test)]
+    pub(crate) guard_off_lines: Mutex<Vec<String>>,
 }
 
 impl<'a> NativeBackend<'a> {
@@ -788,6 +821,8 @@ impl<'a> NativeBackend<'a> {
             advisor_ledger: None,
             #[cfg(test)]
             shadow_lines: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            guard_off_lines: Mutex::new(Vec::new()),
         }
     }
 
@@ -840,12 +875,12 @@ impl<'a> NativeBackend<'a> {
         let attempt = spec.attempt;
         // With the key unset a worker's transcript is still followed, with the
         // default threshold, only to record what the guard would have stopped.
-        let shadow_threshold = if is_worker && spec.loop_threshold.is_none() {
-            Some(DEFAULT_LOOP_THRESHOLD)
-        } else {
-            None
+        let (watched_threshold, stops) = match spec.loop_guard {
+            LoopGuardMode::Shadow if is_worker => (Some(DEFAULT_LOOP_THRESHOLD), false),
+            LoopGuardMode::Shadow | LoopGuardMode::Off => (None, false),
+            LoopGuardMode::Stop(threshold) => (Some(threshold), true),
         };
-        let mut tail = if spec.loop_threshold.is_some() || shadow_threshold.is_some() {
+        let mut tail = if watched_threshold.is_some() {
             TailState::Searching { lookups: 0 }
         } else {
             TailState::Absent
@@ -924,56 +959,93 @@ impl<'a> NativeBackend<'a> {
                             ),
                         };
                     }
-                    if let (Some(threshold), Some(agent)) = (shadow_threshold, running.as_deref()) {
-                        if let Some(fired) = tail.watch(self, agent, threshold, start, polls) {
-                            let key = (fired.command.clone(), fired.evidence.clone());
-                            if !shadowed.contains(&key) {
-                                shadowed.push(key);
-                                self.say_shadow(&format!(
-                                    "relais: shadow: would stop attempt {attempt}: {} x{}",
-                                    shown(&redacted_one_line(&fired.command)),
-                                    fired.count
-                                ));
-                            }
-                        }
-                    }
-                    if let (Some(threshold), Some(agent)) =
-                        (spec.loop_threshold, running.as_deref())
+                    if let (Some(threshold), Some(agent)) = (watched_threshold, running.as_deref())
                     {
-                        if let Some(fired) = tail.watch(self, agent, threshold, start, polls) {
-                            let agent = agent.to_string();
-                            let attempt_end = started + spec.wall_timeout;
-                            if self.stop_and_confirm(spec, &agent, attempt_end) {
-                                let error_line = match fired.evidence {
-                                    Evidence::ErrorLine(line) => Some(line),
-                                    Evidence::OutputHash(_) => None,
+                        if let Some(fired) =
+                            tail.watch(self, agent, threshold, start, polls, attempt)
+                        {
+                            if !stops {
+                                let key = (fired.command.clone(), fired.evidence.clone());
+                                if !shadowed.contains(&key) {
+                                    shadowed.push(key);
+                                    let shown_command = shown(&redacted_one_line(&fired.command));
+                                    let line = match fired.evidence {
+                                        Evidence::ErrorLine(_) => format!(
+                                            "relais: shadow: would stop attempt {attempt}: {shown_command} x{}",
+                                            fired.count
+                                        ),
+                                        Evidence::OutputHash(_) => format!(
+                                            "relais: shadow: would stop attempt {attempt}: {}",
+                                            same_output_phrase(&shown_command, fired.count)
+                                        ),
+                                    };
+                                    self.say_shadow(&line);
+                                }
+                            } else {
+                                let agent = agent.to_string();
+                                let attempt_end = started + spec.wall_timeout;
+                                let repeated = match fired.evidence {
+                                    Evidence::ErrorLine(_) => "a failing command",
+                                    Evidence::OutputHash(_) => "a command with the same output",
                                 };
-                                return Awaited::Looped {
-                                    agent,
-                                    command: fired.command,
-                                    error_line,
-                                    count: fired.count,
+                                let polls_failed =
+                                    match self.stop_and_confirm(spec, &agent, attempt_end) {
+                                        StopAck::Confirmed => {
+                                            let error_line = match fired.evidence {
+                                                Evidence::ErrorLine(line) => Some(line),
+                                                Evidence::OutputHash(_) => None,
+                                            };
+                                            return Awaited::Looped {
+                                                agent,
+                                                command: fired.command,
+                                                error_line,
+                                                count: fired.count,
+                                            };
+                                        }
+                                        StopAck::Cancelled => {
+                                            if let Some(cancelled) =
+                                                self.cancelled(spec, Some(&agent))
+                                            {
+                                                return cancelled;
+                                            }
+                                            PollErrors::default()
+                                        }
+                                        StopAck::Unconfirmed(errors) => errors,
+                                    };
+                                let polls_said = match &polls_failed.last {
+                                    Some(last) => format!(
+                                        "; {} status polls failed during the wait, the last: {last}",
+                                        polls_failed.count
+                                    ),
+                                    None => String::new(),
+                                };
+                                return Awaited::Lost {
+                                    agent: Some(agent),
+                                    detail: format!(
+                                        "{STOP_UNACKNOWLEDGED}: the worker of dispatch {} repeated \
+                                         {repeated} and did not stop within {}s of the request \
+                                         or the attempt's wall time{polls_said}",
+                                        spec.dispatch_id,
+                                        self.waits.spawn.as_secs()
+                                    ),
                                 };
                             }
-                            if let Some(cancelled) = self.cancelled(spec, Some(&agent)) {
-                                return cancelled;
-                            }
-                            return Awaited::Lost {
-                                agent: Some(agent),
-                                detail: format!(
-                                    "{MOD_GONE}: the worker of dispatch {} repeated a failing \
-                                     command and did not stop within {}s of the request or the \
-                                     attempt's wall time",
-                                    spec.dispatch_id,
-                                    self.waits.spawn.as_secs()
-                                ),
-                            };
                         }
                     }
                 }
             }
             std::thread::sleep(ADMISSION_POLL);
         }
+    }
+
+    /// Says on stderr (the run's events) that the guard gave up on an attempt.
+    fn say_guard_off(&self, line: &str) {
+        eprintln!("{line}");
+        #[cfg(test)]
+        self.guard_off_lines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(line.to_string());
     }
 
     /// Says on stderr (the run's events) what the guard would have stopped.
@@ -1129,24 +1201,31 @@ impl<'a> NativeBackend<'a> {
 
     /// Asks the agent to stop and waits until the coordinator reports the
     /// dispatch stopped or failed, for at most the spawn wait and never past
-    /// `attempt_end`, the end of the attempt's wall time. `false` when it did
-    /// not, or when the run was cancelled meanwhile.
-    fn stop_and_confirm(&self, spec: &LaunchSpec, agent: &str, attempt_end: Instant) -> bool {
+    /// `attempt_end`, the end of the attempt's wall time.
+    fn stop_and_confirm(&self, spec: &LaunchSpec, agent: &str, attempt_end: Instant) -> StopAck {
         self.stop_agent(spec, Some(agent));
         let deadline = (Instant::now() + self.waits.spawn).min(attempt_end);
+        let mut errors = PollErrors::default();
         loop {
-            if let Ok(NativeProgress::Known {
-                state: NativeState::Stopped { .. } | NativeState::Failed { .. },
-            }) = self.gate.native_status(&spec.dispatch_id)
-            {
-                return true;
+            match self.gate.native_status(&spec.dispatch_id) {
+                Ok(NativeProgress::Known {
+                    state: NativeState::Stopped { .. } | NativeState::Failed { .. },
+                }) => return StopAck::Confirmed,
+                Ok(_) => {}
+                Err(e) => {
+                    errors.count += 1;
+                    errors.last = Some(e.to_string());
+                }
             }
             let is_cancelled = spec
                 .cancel
                 .as_ref()
                 .is_some_and(|flag| flag.load(Ordering::SeqCst));
-            if is_cancelled || Instant::now() >= deadline {
-                return false;
+            if is_cancelled {
+                return StopAck::Cancelled;
+            }
+            if Instant::now() >= deadline {
+                return StopAck::Unconfirmed(errors);
             }
             std::thread::sleep(ADMISSION_POLL);
         }
@@ -1545,7 +1624,7 @@ mod tests {
             wall_timeout: Duration::from_secs(60),
             cancel: None,
             agent: AgentKind::Worker,
-            loop_threshold: None,
+            loop_guard: crate::policy::LoopGuardMode::Shadow,
             attempt: 1,
         }
     }

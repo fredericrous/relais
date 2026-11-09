@@ -62,6 +62,17 @@ pub fn redacted_one_line(text: &str) -> String {
     line
 }
 
+/// How a loop of repeated error lines is named in the stop and shadow lines.
+pub fn failing_phrase(shown_command: &str, count: u32) -> String {
+    format!("repeated {shown_command} failing {count} times with no edit")
+}
+
+/// How a loop fingerprinted by the hash of its output is named: the command
+/// may not have failed.
+pub fn same_output_phrase(shown_command: &str, count: u32) -> String {
+    format!("repeated {shown_command} {count} times with the same output and no edit")
+}
+
 /// `line` cut to `SHOWN_COMMAND_CHARS` characters (Unicode scalar values),
 /// the last one `…`, when it is longer.
 pub fn shown(line: &str) -> String {
@@ -654,6 +665,18 @@ mod tests {
 
     fn guard() -> LoopGuard {
         LoopGuard::with_default_threshold()
+    }
+
+    #[test]
+    fn a_loop_fingerprinted_by_output_is_not_called_failing() {
+        assert_eq!(
+            failing_phrase("make test", 3),
+            "repeated make test failing 3 times with no edit"
+        );
+        assert_eq!(
+            same_output_phrase("make test", 3),
+            "repeated make test 3 times with the same output and no edit"
+        );
     }
 
     #[test]
