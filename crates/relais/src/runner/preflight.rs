@@ -904,15 +904,26 @@ impl<'a> RunEngine<'a> {
     }
 
     /// The rules a prompt gave as one line each (ADR-0066), as a run event
-    /// in `events.jsonl`, so a fetch or a later violation of one can be
-    /// counted. `who` is the agent the prompt is for. Nothing when none was.
-    pub(in crate::runner) fn emit_index_lines(&self, who: &str, ids: &[&str]) {
+    /// in `events.jsonl` with `what: "guidance_index"` (apart from the
+    /// `guidance` gaps), so a fetch or a later violation of one can be
+    /// counted. One event per prompt built: a run with repairs or a review in
+    /// parts writes the same ids again, and a reader counts distinct ids.
+    /// Nothing when no rule was given as a line.
+    pub(in crate::runner) fn emit_index_lines(
+        &self,
+        given_to: super::prompt::IndexedFor,
+        ids: &[&str],
+    ) {
         if ids.is_empty() {
             return;
         }
         self.events.emit(Event::Decision {
-            what: "guidance".to_string(),
-            reason: format!("{who} index lines: {}", ids.join(" ")),
+            what: "guidance_index".to_string(),
+            reason: format!(
+                "rules given to the {} as one line each: {}",
+                given_to.as_str(),
+                ids.join(" ")
+            ),
         });
     }
 

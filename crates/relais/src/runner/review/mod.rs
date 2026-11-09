@@ -525,44 +525,74 @@ pub(in crate::runner) fn widened_scope_block(paths: &[String]) -> String {
     block
 }
 
-/// The rule ids the candidates of this diff name, or `None` when the
-/// candidates are unavailable: then every tool-checked rule stays in full.
+/// What the reviewer knows of the rules this diff's candidates name
+/// (ADR-0066).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::runner) enum CandidateNames {
+    /// The candidates could not be listed (their gap is recorded where they
+    /// were fetched): every tool-checked rule stays in full.
+    Unavailable,
+    /// The rule ids the candidates name; empty when there is none.
+    Named(BTreeSet<String>),
+}
+
+impl CandidateNames {
+    fn keeps_in_full(&self, rule: &CodeRule) -> bool {
+        match self {
+            CandidateNames::Unavailable => true,
+            CandidateNames::Named(ids) => ids.contains(&rule.id),
+        }
+    }
+}
+
+/// The [`CandidateNames`] of this diff's candidates.
 pub(in crate::runner) fn candidate_rules(
     candidates: &Result<candidates::PartCandidates, GuidanceGap>,
-) -> Option<BTreeSet<String>> {
-    candidates
-        .as_ref()
-        .ok()
-        .map(|part| part.items.iter().map(|item| item.rule.clone()).collect())
+) -> CandidateNames {
+    match candidates {
+        Ok(part) => {
+            CandidateNames::Named(part.items.iter().map(|item| item.rule.clone()).collect())
+        }
+        Err(_) => CandidateNames::Unavailable,
+    }
+}
+
+/// What the reviewer reads of aval, and the rules it got as index lines,
+/// which relais journals.
+pub(in crate::runner) struct ReviewerGuidance {
+    pub(in crate::runner) text: String,
+    pub(in crate::runner) gap: Option<GuidanceGap>,
+    pub(in crate::runner) indexed: Vec<String>,
 }
 
 /// The code rules the reviewer gets in full (ADR-0066): every rule with a
 /// judge part, and a rule a tool alone checks when a candidate of this diff
-/// names it or when the candidates are unavailable (`named` is `None`).
+/// names it or when the candidates are unavailable.
 fn reviewer_full_code_rules<'a>(
     guidance: &'a Guidance,
-    named: Option<&BTreeSet<String>>,
+    named: &CandidateNames,
 ) -> Vec<&'a CodeRule> {
     guidance
         .code_rules
         .iter()
-        .filter(|rule| {
-            rule.checker() == Checker::Judge || named.is_none_or(|ids| ids.contains(&rule.id))
-        })
+        .filter(|rule| rule.checker() == Checker::Judge || named.keeps_in_full(rule))
         .collect()
 }
 
 /// How the reviewer reads one rule in full: the `aval_rule` tool, with the
-/// repository's corpus named when it is known. Unlike the worker's, it
-/// names no CLI: a reviewer has no shell.
+/// repository's corpus named when it is known, and what to say when that
+/// tool is missing. Unlike the worker's, it names no CLI: a reviewer has no
+/// shell.
 fn reviewer_fetch_instruction(guidance: &Guidance) -> String {
-    match &guidance.repo_name {
-        Some(name) => format!(
-            "read one rule in full with the `aval_rule` tool, passing `repo: \"{name}\"`, when your review needs it."
-        ),
-        None => "read one rule in full with the `aval_rule` tool when your review needs it."
-            .to_string(),
-    }
+    let corpus = match &guidance.repo_name {
+        Some(name) => format!(", passing `repo: \"{name}\"`"),
+        None => String::new(),
+    };
+    format!(
+        "read one rule in full with the `aval_rule` tool{corpus} when your review needs it; if \
+         that tool is not available or answers with an error, say so in your report, naming the \
+         rule you could not read."
+    )
 }
 
 /// What the reviewer reads of aval (ADR-0066): in full, the code rules with
@@ -571,13 +601,12 @@ fn reviewer_fetch_instruction(guidance: &Guidance) -> String {
 /// rules, with how to read one through `aval_rule`; then the relevant block
 /// without the rules already given above it. `named` is
 /// [`candidate_rules`]. `budget` is the constraints budget; rules that do
-/// not fit whole are left out and named in the returned gap. The ids
-/// returned last are the rules given as index lines, which relais journals.
+/// not fit whole are left out and named in the returned gap.
 pub(in crate::runner) fn reviewer_guidance(
     guidance: &Guidance,
     budget: usize,
-    named: Option<&BTreeSet<String>>,
-) -> (String, Option<GuidanceGap>, Vec<String>) {
+    named: &CandidateNames,
+) -> ReviewerGuidance {
     let full_rules = reviewer_full_code_rules(guidance, named);
     let code: Vec<RenderedRule> = full_rules
         .iter()
@@ -593,7 +622,8 @@ pub(in crate::runner) fn reviewer_guidance(
     let tool_ids: Vec<String> = tool_rules.iter().map(|rule| rule.id.clone()).collect();
     let tool_lines: Vec<String> = tool_rules
         .iter()
-        .map(|rule| format!("`{}`: {}", rule.id, rule.statement))
+        .copied()
+        .map(super::prompt::tool_checked_line)
         .collect();
     // A code rule is either in full or one tool line above; one whose text
     // is unavailable (a manifest read back from disk) stays a process line.
@@ -680,7 +710,7 @@ pub(in crate::runner) fn reviewer_guidance(
         .into_iter()
         .chain(shown.iter().map(|rule| rule.id.clone()))
         .collect();
-    (text, gap, indexed)
+    ReviewerGuidance { text, gap, indexed }
 }
 
 /// The decisions that apply to the files a candidate patch changes, as a

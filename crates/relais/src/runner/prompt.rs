@@ -1,7 +1,6 @@
 //! The worker's prompt and the quoted-data blocks it is built from.
 
 use std::borrow::Cow;
-use std::collections::BTreeSet;
 
 use crate::context::guidance::Checker;
 
@@ -403,7 +402,12 @@ pub(super) fn worker_code_rules_block(
         .filter(|rule| rule.checker() == Checker::Judge)
         .filter_map(RenderedRule::full_text_of)
         .collect();
-    let indexed = tool_checked_lines(guidance, &BTreeSet::new());
+    let indexed: Vec<String> = guidance
+        .code_rules
+        .iter()
+        .filter(|rule| rule.checker() == Checker::Tool)
+        .map(tool_checked_line)
+        .collect();
     if rendered.is_empty() && indexed.is_empty() {
         let gap = GuidanceGap::new(
             GuidanceSource::CodeRules,
@@ -430,31 +434,37 @@ pub(super) fn worker_code_rules_block(
     (text, gap)
 }
 
-/// The ids of the code rules a tool alone checks (ADR-0066) that are not
-/// among `in_full`: what a prompt gives as index lines, and what relais
-/// journals for the run so a later fetch or violation can be counted.
-pub(in crate::runner) fn tool_checked_ids<'a>(
-    guidance: &'a Guidance,
-    in_full: &BTreeSet<String>,
-) -> Vec<&'a str> {
+/// The agent a prompt with index lines is for (ADR-0066), as the run's
+/// `guidance_index` event names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runner) enum IndexedFor {
+    Worker,
+    Reviewer,
+}
+
+impl IndexedFor {
+    pub(in crate::runner) fn as_str(self) -> &'static str {
+        match self {
+            IndexedFor::Worker => "worker",
+            IndexedFor::Reviewer => "reviewer",
+        }
+    }
+}
+
+/// The ids of the code rules a tool alone checks (ADR-0066): what the
+/// worker gets as index lines, and what relais journals for the run.
+pub(in crate::runner) fn tool_checked_ids(guidance: &Guidance) -> Vec<&str> {
     guidance
         .code_rules
         .iter()
-        .filter(|rule| rule.checker() == Checker::Tool && !in_full.contains(&rule.id))
+        .filter(|rule| rule.checker() == Checker::Tool)
         .map(|rule| rule.id.as_str())
         .collect()
 }
 
-/// One `` `id`: statement `` line per code rule a tool alone checks and
-/// that is not given in full.
-fn tool_checked_lines(guidance: &Guidance, in_full: &BTreeSet<String>) -> Vec<String> {
-    let ids = tool_checked_ids(guidance, in_full);
-    guidance
-        .code_rules
-        .iter()
-        .filter(|rule| ids.contains(&rule.id.as_str()))
-        .map(|rule| format!("`{}`: {}", rule.id, rule.statement))
-        .collect()
+/// A code rule as one index line: `` `id`: statement ``.
+pub(in crate::runner) fn tool_checked_line(rule: &context::guidance::CodeRule) -> String {
+    format!("`{}`: {}", rule.id, rule.statement)
 }
 
 /// The code rules a tool alone checks, one line each, and `instruction`:

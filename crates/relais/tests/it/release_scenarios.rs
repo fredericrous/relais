@@ -1599,16 +1599,17 @@ fn budget_exhaustion_preserves_evidence_and_stops_dispatch() {
     // run's events say which, never its stderr.
     let journalled = events_jsonl(&runs[0]).into_iter().any(|event| {
         event["event"]["kind"] == "decision"
-            && event["event"]["what"] == "guidance"
+            && event["event"]["what"] == "guidance_index"
             && event["event"]["reason"].as_str().is_some_and(|r| {
-                r.starts_with("worker index lines: ") && r.contains("tests.no-real-waits")
+                r.starts_with("rules given to the worker as one line each: ")
+                    && r.contains("tests.no-real-waits")
             })
     });
     assert!(
         journalled,
         "a guidance event names the worker's index lines"
     );
-    assert!(!stderr.contains("index lines"), "{stderr}");
+    assert!(!stderr.contains("one line each"), "{stderr}");
     let report: serde_json::Value = serde_json::from_str(&text(
         &world
             .relais(&["report", "--since", "2026-01-01", "--json"])
@@ -5755,7 +5756,12 @@ fn golden_document(world: &World, run_id: &str, label: &str) -> serde_json::Valu
             serde_json::Value::Object(kept)
         })
         .collect();
-    let mut events = events;
+    // A `guidance_index` decision (ADR-0066) lists the rule ids the
+    // machine's corpus gives as lines: a measurement, not the path's shape.
+    let mut events: Vec<serde_json::Value> = events
+        .into_iter()
+        .filter(|event| !(event["kind"] == "decision" && event["what"] == "guidance_index"))
+        .collect();
     events.dedup_by(|later, earlier| {
         later == earlier && later["what"] == "guidance" && later["kind"] == "decision"
     });

@@ -401,7 +401,7 @@ impl<'a> RunEngine<'a> {
         }
         // The run's record of what the reviewer got as one line each (ADR-0066).
         let indexed: Vec<&str> = indexed.iter().map(String::as_str).collect();
-        self.emit_index_lines("reviewer", &indexed);
+        self.emit_index_lines(super::super::prompt::IndexedFor::Reviewer, &indexed);
         self.reviewer_gap = reviewer_gap;
         let seat = ReviewSeat {
             profile: &profile,
@@ -593,18 +593,19 @@ impl<'a> RunEngine<'a> {
         }
         // The patch is not in the prompt, so the constraints have a
         // budget of their own.
-        let named = candidate_rules(candidates);
-        let (guidance_text, reviewer_gap, indexed) = reviewer_guidance(
+        let guidance = reviewer_guidance(
             &request.manifest.guidance,
             REVIEW_CONSTRAINTS_BUDGET_BYTES,
-            named.as_ref(),
+            &candidate_rules(candidates),
         );
-        prompt.push_str(&guidance_text);
+        prompt.push_str(&guidance.text);
+        let guidance_text_len = guidance.text.len();
+        let (reviewer_gap, indexed) = (guidance.gap, guidance.indexed);
         let (decisions_text, decisions_gap) = reviewer_decisions(
             self.config.aval_resolver,
             &staged.files,
             REVIEW_CONSTRAINTS_BUDGET_BYTES,
-            guidance_text.len(),
+            guidance_text_len,
         );
         prompt.push_str(&decisions_text);
         match candidates {

@@ -59,11 +59,6 @@
         "label": "setup:sh@0500b2cc"
       },
       {
-        "kind": "decision",
-        "reason": "<what the machine has>",
-        "what": "guidance"
-      },
-      {
         "kind": "phase",
         "reason": "worker_dispatched",
         "state": "running"
@@ -118,11 +113,6 @@
         "state": "repairing"
       },
       {
-        "kind": "decision",
-        "reason": "<what the machine has>",
-        "what": "guidance"
-      },
-      {
         "kind": "phase",
         "reason": "worker_dispatched",
         "state": "running"
@@ -175,11 +165,6 @@
         "kind": "phase",
         "reason": "repair_exhausted",
         "state": "escalating"
-      },
-      {
-        "kind": "decision",
-        "reason": "<what the machine has>",
-        "what": "guidance"
       },
       {
         "kind": "phase",
