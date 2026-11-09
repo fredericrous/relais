@@ -1,5 +1,7 @@
 //! The worker's prompt and the quoted-data blocks it is built from.
 
+use std::borrow::Cow;
+
 use super::{
     context, AttemptKind, ContextManifest, Guidance, GuidanceGap, GuidanceSource, RuleRef,
     TaskContract,
@@ -14,26 +16,41 @@ scoped decision, then a default-scope decision, then an adopted rule: an applica
 outranks an adopted rule, and a code-rule violation is not reported where a listed decision \
 decides otherwise; missing decision evidence is reported as uncertainty, not as permission.\n";
 
-/// Why a repair is needed: a profile check that failed, or a holdout gap.
-/// The kind decides what the worker is shown beside the line: a check's log
-/// is the worker's to read, a holdout's never is.
+/// Why a repair is needed: a profile check that failed, a holdout gap, or a
+/// worker stopped for repeating one failing command. The kind decides what
+/// the worker is shown beside the line: a check's log is the worker's to
+/// read, a holdout's never is. `command` and `error_line` are already
+/// redacted and on one line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::runner) enum RepairFailure {
     Check(String),
     Holdout(String),
+    Loop {
+        command: String,
+        error_line: Option<String>,
+        count: u32,
+    },
 }
 
 impl RepairFailure {
-    pub(in crate::runner) fn text(&self) -> &str {
+    pub(in crate::runner) fn text(&self) -> Cow<'_, str> {
         match self {
-            Self::Check(text) | Self::Holdout(text) => text,
+            Self::Check(text) | Self::Holdout(text) => Cow::Borrowed(text),
+            Self::Loop {
+                command,
+                error_line,
+                count,
+            } => Cow::Owned(match error_line {
+                Some(line) => format!("repeated `{command}` {count} times, failing with: {line}"),
+                None => format!("repeated `{command}` {count} times, failing the same way"),
+            }),
         }
     }
 
     pub(in crate::runner) fn texts(failures: &[RepairFailure]) -> Vec<String> {
         failures
             .iter()
-            .map(|failure| failure.text().to_string())
+            .map(|failure| failure.text().into_owned())
             .collect()
     }
 
@@ -41,8 +58,15 @@ impl RepairFailure {
         match self {
             Self::Check(text) => format!("  - {text} (log under logs/)\n"),
             Self::Holdout(text) => format!("  - {text}\n"),
+            Self::Loop { .. } => format!("  - {}\n", self.text()),
         }
     }
+}
+
+fn is_loop(failures: &[RepairFailure]) -> bool {
+    failures
+        .iter()
+        .any(|failure| matches!(failure, RepairFailure::Loop { .. }))
 }
 
 pub(super) fn build_prompt(
@@ -143,18 +167,37 @@ pub(super) fn build_prompt(
             }
             AttemptKind::Repair => {
                 prompt.push_str("\n[repair addendum]\n");
-                prompt.push_str("the previous candidate failed verification on these checks:\n");
+                if is_loop(failures) {
+                    prompt.push_str(
+                        "the previous attempt was stopped before it produced a candidate: \
+                         your predecessor repeated one failing command with no edit between:\n",
+                    );
+                } else {
+                    prompt
+                        .push_str("the previous candidate failed verification on these checks:\n");
+                }
                 for failure in failures {
                     prompt.push_str(&failure.repair_line());
                 }
-                prompt.push_str("fix only the failures; do not rewrite unrelated work.\n");
+                if is_loop(failures) {
+                    prompt.push_str(
+                        "do not run that command again unchanged: change what it depends on \
+                         first, or take another approach; the tree is as it was left.\n",
+                    );
+                } else {
+                    prompt.push_str("fix only the failures; do not rewrite unrelated work.\n");
+                }
             }
             AttemptKind::Escalation => {
                 prompt.push_str("\n[escalation addendum]\n");
                 prompt.push_str(
-                    "a previous attempt exists. Its claims are UNVERIFIED evidence, not facts.\n\
-                     the same checks failed:\n",
+                    "a previous attempt exists. Its claims are UNVERIFIED evidence, not facts.\n",
                 );
+                prompt.push_str(if is_loop(failures) {
+                    "it was stopped for repeating one failing command with no edit between:\n"
+                } else {
+                    "the same checks failed:\n"
+                });
                 for failure in failures {
                     prompt.push_str(&format!("  - {}\n", failure.text()));
                 }

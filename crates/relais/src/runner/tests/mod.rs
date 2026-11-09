@@ -7522,6 +7522,39 @@ fn every_attempt_kind_carries_the_native_rules() {
 }
 
 #[test]
+fn a_repair_after_a_loop_carries_the_command_and_its_error_line() {
+    let fixture = Fixture::new();
+    let contract = fixture.contract(Review::Off);
+    let failures = vec![RepairFailure::Loop {
+        command: "make test".into(),
+        error_line: Some("boom".into()),
+        count: 3,
+    }];
+    for kind in [AttemptKind::Repair, AttemptKind::Escalation] {
+        let prompt = build_prompt(
+            &contract,
+            &manifest_with(Vec::new()),
+            1,
+            Some(failures.as_slice()),
+            kind,
+        )
+        .0;
+        assert!(prompt.contains("repeat"), "{kind:?}: {prompt}");
+        assert!(prompt.contains("`make test` 3 times"), "{kind:?}: {prompt}");
+        assert!(prompt.contains("boom"), "{kind:?}: {prompt}");
+        assert!(
+            !prompt.contains("failed verification"),
+            "{kind:?}: {prompt}"
+        );
+        assert!(
+            !prompt.contains("the same checks failed"),
+            "{kind:?}: {prompt}"
+        );
+    }
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+#[test]
 fn the_objective_and_criteria_are_quoted_as_data() {
     let fixture = Fixture::new();
     let mut contract = fixture.contract(Review::Off);

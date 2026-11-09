@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::adapter::loopguard::{LoopFired, LoopGuard};
+use crate::adapter::loopguard::{Evidence, LoopFired, LoopGuard};
 use crate::admission::{
     AgentStatus, AgentUsage, Gate, GateError, NativeAsk, NativeProgress, NativeState,
     RegisterOutcome, StoppedReport, ADMISSION_POLL,
@@ -263,6 +263,7 @@ enum Awaited {
     Looped {
         agent: String,
         command: String,
+        error_line: Option<String>,
         count: u32,
     },
 }
@@ -910,18 +911,28 @@ impl<'a> NativeBackend<'a> {
                     {
                         if let Some(fired) = tail.watch(self, agent, threshold, start, polls) {
                             let agent = agent.to_string();
-                            if self.stop_and_confirm(spec, &agent) {
+                            let attempt_end = started + spec.wall_timeout;
+                            if self.stop_and_confirm(spec, &agent, attempt_end) {
+                                let error_line = match fired.evidence {
+                                    Evidence::ErrorLine(line) => Some(line),
+                                    Evidence::OutputHash(_) => None,
+                                };
                                 return Awaited::Looped {
                                     agent,
                                     command: fired.command,
+                                    error_line,
                                     count: fired.count,
                                 };
+                            }
+                            if let Some(cancelled) = self.cancelled(spec, Some(&agent)) {
+                                return cancelled;
                             }
                             return Awaited::Lost {
                                 agent: Some(agent),
                                 detail: format!(
                                     "{MOD_GONE}: the worker of dispatch {} repeated a failing \
-                                     command and did not stop within {}s of the request",
+                                     command and did not stop within {}s of the request or the \
+                                     attempt's wall time",
                                     spec.dispatch_id,
                                     self.waits.spawn.as_secs()
                                 ),
@@ -1075,11 +1086,13 @@ impl<'a> NativeBackend<'a> {
         })
     }
 
-    /// Asks the agent to stop and waits, for at most the spawn wait, until
-    /// the coordinator reports the dispatch stopped or failed.
-    fn stop_and_confirm(&self, spec: &LaunchSpec, agent: &str) -> bool {
+    /// Asks the agent to stop and waits until the coordinator reports the
+    /// dispatch stopped or failed, for at most the spawn wait and never past
+    /// `attempt_end`, the end of the attempt's wall time. `false` when it did
+    /// not, or when the run was cancelled meanwhile.
+    fn stop_and_confirm(&self, spec: &LaunchSpec, agent: &str, attempt_end: Instant) -> bool {
         self.stop_agent(spec, Some(agent));
-        let deadline = Instant::now() + self.waits.spawn;
+        let deadline = (Instant::now() + self.waits.spawn).min(attempt_end);
         loop {
             if let Ok(NativeProgress::Known {
                 state: NativeState::Stopped { .. } | NativeState::Failed { .. },
@@ -1087,7 +1100,11 @@ impl<'a> NativeBackend<'a> {
             {
                 return true;
             }
-            if Instant::now() >= deadline {
+            let is_cancelled = spec
+                .cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::SeqCst));
+            if is_cancelled || Instant::now() >= deadline {
                 return false;
             }
             std::thread::sleep(ADMISSION_POLL);
@@ -1099,12 +1116,12 @@ impl<'a> NativeBackend<'a> {
     fn looped_result(
         &self,
         spec: &LaunchSpec,
-        agent: String,
-        command: String,
-        count: u32,
+        looped: crate::backend::LoopedWorker,
+        booking_from: u64,
     ) -> LaunchResult {
+        let agent = looped.agent.clone();
         let records: Vec<UsageRecord> = self
-            .read_transcript(&agent)
+            .read_transcript_from(&agent, booking_from)
             .map(|content| parse_transcript(&content))
             .unwrap_or_default();
         let executor: Vec<UsageRecord> = records
@@ -1135,13 +1152,24 @@ impl<'a> NativeBackend<'a> {
             .into_iter()
             .map(|record| record.message_id)
             .collect();
-        looped_launch.session_id = Some(agent.clone());
-        looped_launch.looped = Some(crate::backend::LoopedWorker {
-            agent,
-            command,
-            count,
-        });
+        looped_launch.session_id = Some(agent);
+        looped_launch.looped = Some(looped);
         looped_launch
+    }
+
+    /// The transcript's length in bytes now: 0 when there is none.
+    fn transcript_len(&self, agent_id: &str) -> u64 {
+        self.transcript_path(agent_id)
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map_or(0, |meta| meta.len())
+    }
+
+    /// The transcript from byte `from` on. `None` when it is missing or
+    /// shorter than `from` (it was rewritten), which books nothing.
+    fn read_transcript_from(&self, agent_id: &str, from: u64) -> Option<String> {
+        let bytes = std::fs::read(self.transcript_path(agent_id)?).ok()?;
+        let tail = bytes.get(usize::try_from(from).ok()?..)?;
+        Some(String::from_utf8_lossy(tail).into_owned())
     }
 
     /// The message ids of an agent's transcript. They are read for nothing
@@ -1266,6 +1294,12 @@ impl<'a> NativeBackend<'a> {
             return Ok(ended_result(spec, Ended::Exited(1), refusal));
         }
         let ask = ask_for(&route, spec);
+        // What a continued agent's transcript already held belongs to its
+        // earlier attempts, whose usage is booked.
+        let booking_from = match &route {
+            Route::Continue { agent_id, .. } => self.transcript_len(agent_id),
+            Route::Spawn => 0,
+        };
         match self
             .gate
             .register_native(&self.link.session_id, &spec.dispatch_id, &ask)
@@ -1307,8 +1341,17 @@ impl<'a> NativeBackend<'a> {
             Awaited::Looped {
                 agent,
                 command,
+                error_line,
                 count,
-            } => Ok(self.looped_result(spec, agent, command, count)),
+            } => {
+                let looped = crate::backend::LoopedWorker {
+                    agent,
+                    command,
+                    error_line,
+                    count,
+                };
+                Ok(self.looped_result(spec, looped, booking_from))
+            }
         }
     }
 }

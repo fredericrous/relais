@@ -1,6 +1,7 @@
 //! The attempt loop: dispatch, snapshot, verify and judge each attempt.
 
 use super::holdouts::split_holdout_gaps;
+use super::loop_text;
 use super::{
     build_prompt, build_review_repair_prompt, conflict_block, effort_str, fresh_progress,
     spend_limit, split_profile_gaps, unpriced_native_model, verify, workspace, AgentKind,
@@ -137,14 +138,39 @@ impl<'a> RunEngine<'a> {
         self.config
             .ledger
             .finish_attempt(attempt_id, State::Failed, Some(&held_worktree), None)?;
-        self.follow(
-            ctx,
-            progress,
-            Observation::WorkerLooped {
-                command: looped.command,
-                count: looped.count,
-            },
-        )
+        let command = loop_text::redacted_one_line(&looped.command);
+        let error_line = looped
+            .error_line
+            .as_deref()
+            .map(loop_text::redacted_one_line);
+        // The loop replaces the failures of any earlier attempt: the next
+        // prompt must not claim a candidate failed checks it never reached.
+        progress.last_failures = Some(vec![RepairFailure::Loop {
+            command: command.clone(),
+            error_line,
+            count: looped.count,
+        }]);
+        let attempt = progress.budget.attempts_used;
+        let count = looped.count;
+        let shown = loop_text::shown(&command);
+        let next = self.decide(
+            &progress.budget,
+            Observation::WorkerLooped { command, count },
+        )?;
+        let rung = match &next {
+            Next::Attempt { rung, .. } => ctx
+                .preflight
+                .decision
+                .ladder
+                .rung(*rung)
+                .map_or_else(|| format!("rung {}", rung.get()), |at| at.model.clone()),
+            Next::Accept | Next::Stop(_) => "none (run failed: worker_looped)".to_string(),
+        };
+        eprintln!(
+            "relais: attempt {attempt} stopped: worker repeated {shown} failing {count} times \
+             with no edit; next: {rung}"
+        );
+        self.proceed(ctx, progress, next)
     }
 
     /// Budget ceilings are checked BEFORE admitting more work (SPEC §9,

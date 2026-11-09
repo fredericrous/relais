@@ -371,6 +371,10 @@ pub struct LaunchResult {
 pub struct LoopedWorker {
     pub agent: String,
     pub command: String,
+    /// The error line that repeated; `None` when the repeat was fingerprinted
+    /// by the hash of its output.
+    #[serde(default)]
+    pub error_line: Option<String>,
     pub count: u32,
 }
 

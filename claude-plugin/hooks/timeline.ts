@@ -256,6 +256,19 @@ const maxAttemptsOf = (detail: any): number | undefined => {
 const agentStatusOf = (outcome: string) =>
   outcome === 'completed' || outcome === 'ok' || outcome === 'exit 0' ? 'completed' : outcome
 
+export const MAX_DETAIL_CHARS = 60
+
+// A detail as the pane shows it: one line, control characters escaped, cut to
+// 60 code points with the last one `…`.
+export function shownDetail(detail: string): string {
+  const oneLine = detail
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[\u0000-\u001f\u007f]/g, c => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`)
+  const points = [...oneLine]
+  return points.length <= MAX_DETAIL_CHARS ? oneLine : `${points.slice(0, MAX_DETAIL_CHARS - 1).join('')}…`
+}
+
 // One event line (`{relais:'event', run, at, event}`) folded into the model.
 export function applyEvent(model: RunModel, event: any, at: number): RunModel {
   let m = model
@@ -281,11 +294,11 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
       const current = lastStep(m)
       m = { ...m, maxAttempts: typeof event.max_attempts === 'number' ? event.max_attempts : m.maxAttempts }
       if (current && current.state === 'active' && current.title === event.name) {
-        m = mapLast(m, s => ({ ...s, detail: event.detail || s.detail }))
+        m = mapLast(m, s => ({ ...s, detail: event.detail ? shownDetail(String(event.detail)) : s.detail }))
       } else {
         m = closeStep(m, at, 'done')
         m = openStep(m, event.name, m.phase, at)
-        m = mapLast(m, s => ({ ...s, detail: event.detail ?? '' }))
+        m = mapLast(m, s => ({ ...s, detail: shownDetail(String(event.detail ?? '')) }))
       }
       return withEntry(m, at, 'step', `${event.name}${event.detail ? ` · ${event.detail}` : ''}`)
     }

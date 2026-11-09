@@ -98,11 +98,30 @@ enum Plugin {
     /// The first agent fails the same command three times and stops; the
     /// continuation adds one more failure of it while it runs.
     OlderLoopThenOneMoreFailure,
+    /// The first agent completes its first turn; asked to continue, it
+    /// repeats one failing command and stops only when relais asks.
+    ContinuationLoops,
+    /// Like `LoopsUntilStopped`, with a bearer token in the command.
+    LoopsOnASecret,
 }
+
+impl Plugin {
+    /// The first agent loops from its spawn and reports stopped when asked.
+    fn loops_until_stopped(self) -> bool {
+        matches!(self, Self::LoopsUntilStopped | Self::LoopsOnASecret)
+    }
+}
+
+const SECRET_COMMAND: &str =
+    "curl -H 'Authorization: Bearer s3cretToken9z' https://example.test/build";
 
 /// Failing runs of one Bash command appended to a transcript, the way
 /// Claude Code writes them: a `tool_use` line, then its `tool_result`.
 fn append_failing_runs(file: &Path, label: &str, runs: u32) {
+    append_failing_command(file, label, "make test", runs);
+}
+
+fn append_failing_command(file: &Path, label: &str, command: &str, runs: u32) {
     std::fs::create_dir_all(file.parent().expect("a parent")).expect("mkdir");
     let mut out = std::fs::OpenOptions::new()
         .create(true)
@@ -115,7 +134,7 @@ fn append_failing_runs(file: &Path, label: &str, runs: u32) {
             out,
             "{}",
             serde_json::json!({"type":"assistant","message":{"content":[
-                {"type":"tool_use","id":id,"name":"Bash","input":{"command":"make test"}}
+                {"type":"tool_use","id":id,"name":"Bash","input":{"command":command}}
             ]}})
         )
         .expect("tool use line");
@@ -211,6 +230,8 @@ struct Scripted {
     lines: Vec<serde_json::Value>,
     bound: Vec<BoundOutcome>,
     stopped: Vec<StoppedOutcome>,
+    /// The prompt of every spawn and continue, in order.
+    prompts: Vec<String>,
 }
 
 fn record_bound(script: &mut Scripted, gate: &LocalGate, dispatch: &str, agent: &str) {
@@ -269,7 +290,10 @@ fn run_plugin(
                     dispatch_id: dispatch.clone(),
                     agent_id: stopped_agent.clone(),
                 });
-                if let (Plugin::LoopsUntilStopped, Some(agent_id)) = (plugin, stopped_agent) {
+                if let (true, Some(agent_id)) = (
+                    plugin.loops_until_stopped() || plugin == Plugin::ContinuationLoops,
+                    stopped_agent,
+                ) {
                     let killed = StoppedReport {
                         agent_id,
                         status: AgentStatus::Killed,
@@ -327,6 +351,7 @@ fn run_plugin(
             }
             other => panic!("an unknown request {other}"),
         };
+        script.prompts.push(prompt.clone());
         let agent = agents.get_mut(&agent_id).expect("a known agent");
         // Only a worker changes its tree; a reviewer and a planner read.
         if agent.kind == "worker" {
@@ -353,11 +378,17 @@ fn run_plugin(
             && matches!(
                 plugin,
                 Plugin::LoopsUntilStopped
+                    | Plugin::LoopsOnASecret
                     | Plugin::LoopsAndIgnoresStop
                     | Plugin::OlderLoopThenOneMoreFailure
             )
         {
-            append_failing_runs(&transcript, "old", 3);
+            let command = if plugin == Plugin::LoopsOnASecret {
+                SECRET_COMMAND
+            } else {
+                "make test"
+            };
+            append_failing_command(&transcript, "old", command, 3);
         }
         let report = |factor: u64, status: AgentStatus| StoppedReport {
             agent_id: agent_id.clone(),
@@ -377,8 +408,13 @@ fn run_plugin(
                 record_stop(&mut script, &gate, &dispatch_id, &stopped);
                 record_bound(&mut script, &gate, &dispatch_id, &agent_id);
             }
-            Plugin::LoopsUntilStopped if first_agent => {
+            Plugin::LoopsUntilStopped | Plugin::LoopsOnASecret if first_agent => {
                 record_bound(&mut script, &gate, &dispatch_id, &agent_id);
+            }
+            Plugin::ContinuationLoops if first_agent && !fresh => {
+                record_bound(&mut script, &gate, &dispatch_id, &agent_id);
+                wait_for(|| NativeBackend::followed_offset(&transcript).is_some());
+                append_failing_runs(&transcript, "again", 3);
             }
             Plugin::LoopsAndIgnoresStop => {
                 record_bound(&mut script, &gate, &dispatch_id, &agent_id);
@@ -417,6 +453,8 @@ fn run_plugin(
             }
             Plugin::Obeys
             | Plugin::LoopsUntilStopped
+            | Plugin::LoopsOnASecret
+            | Plugin::ContinuationLoops
             | Plugin::OlderLoopThenOneMoreFailure
             | Plugin::AgentFails
             | Plugin::StopsTwice
@@ -1653,5 +1691,168 @@ fn with_the_threshold_unset_a_looping_transcript_runs_to_the_wall_timeout() {
         "{:?}",
         transitions_reasons(&fixture, &run)
     );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+/// Fixes the tree once the prompt says the previous worker repeated itself.
+fn fixes_after_a_loop(tree: &Path, prompt: &str) {
+    if prompt.contains("repeat") {
+        std::fs::remove_file(tree.join("src/main.rs")).expect("fix");
+    }
+}
+
+/// The usage of every transcript under the projects directory, each message
+/// counted once at its last (largest) write: input and output tokens.
+fn transcript_usage(fixture: &Fixture) -> (i64, i64) {
+    let subagents = fixture
+        .dir
+        .join("projects")
+        .join("-slug")
+        .join(SESSION)
+        .join("subagents");
+    let mut last: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    for entry in std::fs::read_dir(subagents).expect("subagents").flatten() {
+        let content = std::fs::read_to_string(entry.path()).expect("transcript");
+        for line in content.lines() {
+            let record: serde_json::Value = serde_json::from_str(line).expect("json");
+            let usage = &record["message"]["usage"];
+            if let Some(id) = record["message"]["id"].as_str() {
+                last.insert(
+                    id.to_string(),
+                    (
+                        usage["input_tokens"].as_i64().unwrap_or(0),
+                        usage["output_tokens"].as_i64().unwrap_or(0),
+                    ),
+                );
+            }
+        }
+    }
+    last.values()
+        .fold((0, 0), |(input, output), (input_tokens, output_tokens)| {
+            (input + input_tokens, output + output_tokens)
+        })
+}
+
+#[test]
+fn a_continued_repair_that_loops_books_the_transcript_usage_once() {
+    let fixture = Fixture::new();
+    let run = run_native(
+        &fixture,
+        Review::Off,
+        3,
+        Plugin::ContinuationLoops,
+        fixes_after_a_loop,
+        Some(prices()),
+        |repo| {
+            repo.execution.loop_threshold = Some(3);
+        },
+    );
+    assert!(
+        run.seen()
+            .iter()
+            .any(|entry| matches!(entry, Seen::Continue { agent_id, .. } if agent_id == "ag1")),
+        "the repair continued the first agent: {:?}",
+        run.seen()
+    );
+    assert!(
+        transitions_reasons(&fixture, &run).contains(&"worker_looped".to_string()),
+        "{:?}",
+        transitions_reasons(&fixture, &run)
+    );
+    let rows = native_usage(&fixture, &run.outcome.run_id);
+    let booked = rows.iter().fold((0, 0), |(input, output), row| {
+        (input + row.0.unwrap_or(0), output + row.1.unwrap_or(0))
+    });
+    assert_eq!(booked, transcript_usage(&fixture), "{rows:?}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn a_loop_after_a_failed_verification_replaces_its_failures_in_the_next_prompt() {
+    let fixture = Fixture::new();
+    let run = run_native(
+        &fixture,
+        Review::Off,
+        3,
+        Plugin::ContinuationLoops,
+        fixes_after_a_loop,
+        Some(prices()),
+        |repo| {
+            repo.execution.loop_threshold = Some(3);
+        },
+    );
+    assert!(
+        matches!(run.outcome.terminal, Terminal::Accepted(_)),
+        "{:?}",
+        run.outcome
+    );
+    let prompts = &run.script.prompts;
+    assert_eq!(prompts.len(), 3, "{prompts:?}");
+    assert!(prompts[1].contains("failed verification"), "{}", prompts[1]);
+    let third = &prompts[2];
+    assert!(third.contains("`make test`"), "{third}");
+    assert!(!third.contains("failed verification"), "{third}");
+    assert!(!third.contains("the same checks failed"), "{third}");
+    assert!(!third.contains("mod_gone"), "{third}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn a_secret_in_a_looping_command_is_not_stored_in_the_transition() {
+    let fixture = Fixture::new();
+    let run = run_native(
+        &fixture,
+        Review::Off,
+        3,
+        Plugin::LoopsOnASecret,
+        fixes_after_a_loop,
+        Some(prices()),
+        |repo| {
+            repo.execution.loop_threshold = Some(3);
+        },
+    );
+    let transitions = fixture
+        .ledger
+        .transitions(&run.outcome.run_id)
+        .expect("history");
+    let looped = transitions
+        .iter()
+        .find(|transition| transition.reason == "worker_looped")
+        .expect("a worker_looped transition");
+    let stored = format!("{:?}", looped.detail);
+    assert!(stored.contains("curl"), "{stored}");
+    assert!(!stored.contains("s3cretToken9z"), "{stored}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn a_stop_never_acknowledged_ends_at_the_wall_time_not_the_spawn_wait() {
+    let fixture = Fixture::new();
+    let began = std::time::Instant::now();
+    let run = run_native_waiting(
+        &fixture,
+        Review::Off,
+        3,
+        Cast {
+            plugin: Plugin::LoopsAndIgnoresStop,
+            work: fixes_on_repair,
+        },
+        Some(prices()),
+        Waits {
+            spawn: Duration::from_secs(60),
+            hello_lapse: Duration::from_secs(120),
+        },
+        |repo| {
+            repo.execution.loop_threshold = Some(3);
+            repo.execution.max_wall_seconds = 2;
+        },
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        began.elapsed()
+    );
+    let detail = interrupted_detail(&run.outcome);
+    assert!(detail.contains("mod_gone"), "{detail}");
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
 }
