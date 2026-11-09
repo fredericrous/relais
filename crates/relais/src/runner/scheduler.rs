@@ -749,6 +749,7 @@ fn run_package(
             wall_seconds: Some(remaining_wall.as_secs().max(1)),
             // The root run's total is the run's, not a package's.
             total_seconds: None,
+            loop_threshold: contract.limits.loop_threshold,
         },
         // The root's review setting, as written: a package is reviewed
         // exactly as the contract asks the run to be.
@@ -1371,6 +1372,8 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         wall_timeout: engine.budgets.remaining().max(Duration::from_secs(1)),
         cancel: None,
         agent: AgentKind::Planner,
+        loop_guard: crate::policy::LoopGuardMode::Off,
+        attempt: 0,
     };
     let budget = Budget {
         attempts_used: 0,
@@ -1551,6 +1554,7 @@ mod tests {
             allow_nested_agents: false,
             max_agent_depth: 1,
             max_agents_total: 24,
+            loop_guard: crate::policy::LoopGuardMode::Shadow,
             verification_profile: crate::policy::VerificationProfile::default(),
             review_floor: Review::Off,
             disallowed_tools: Vec::new(),

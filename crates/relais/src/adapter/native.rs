@@ -11,11 +11,17 @@
 //! `claude` process of its own but the probes of the harness.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::adapter::loopguard::{
+    redacted_one_line, same_output_phrase, shown, Evidence, LoopFired, LoopGuard,
+    DEFAULT_LOOP_THRESHOLD,
+};
 use crate::admission::{
     AgentStatus, AgentUsage, Gate, GateError, NativeAsk, NativeProgress, NativeState,
     RegisterOutcome, StoppedReport, ADMISSION_POLL,
@@ -26,11 +32,12 @@ use crate::backend::{
 };
 use crate::money::MicroUsd;
 use crate::native::{agent_type, has_definition, kind_word, plugin_agent_type, HELLO_FRESH};
+use crate::orchestration::transcript::parse_tool_events;
 use crate::orchestration::{
     parse_transcript, price, unpriced_reason, CacheWrites, PriceTable, Speed, UsageRecord,
     UsageSource,
 };
-use crate::policy::EffortId;
+use crate::policy::{EffortId, LoopGuardMode};
 use crate::procs::Ended;
 use crate::protocol::{AgentKind, Request, Wire};
 
@@ -47,6 +54,10 @@ const WORKER_MISSING: &str = "native_worker_missing";
 /// that was bound, if one was, in `session_id`: the worker was never told to
 /// stop and may still be writing.
 pub const MOD_GONE: &str = "mod_gone";
+
+/// The prefix of a stop the coordinator never acknowledged: the plugin may be
+/// fine, the worker is what did not answer.
+pub const STOP_UNACKNOWLEDGED: &str = "stop_unacknowledged";
 
 /// A pass of the wait loop that took this much longer than its sleep means
 /// the host was suspended in between (a laptop lid, deep sleep): a process
@@ -91,12 +102,17 @@ pub struct Waits {
     /// A session whose plugin said no hello for this long ends the attempt
     /// `mod_gone`.
     pub hello_lapse: Duration,
+    /// How many transcript lookups a tail makes before it gives up: the
+    /// file is created a moment after the agent binds, but a directory read
+    /// is not made on every poll.
+    pub transcript_lookups: u32,
 }
 
 impl Waits {
     pub const DEFAULT: Self = Self {
         spawn: Duration::from_secs(120),
         hello_lapse: HELLO_FRESH,
+        transcript_lookups: 20,
     };
 }
 
@@ -254,6 +270,164 @@ enum Awaited {
         agent: Option<String>,
         detail: String,
     },
+    /// The worker repeated one failing command with no edit between, was
+    /// asked to stop, and the coordinator reported it stopped (or failed).
+    Looped {
+        agent: String,
+        command: String,
+        evidence: crate::backend::Repeated,
+        count: u32,
+    },
+}
+
+/// Polls between two transcript lookups.
+const POLLS_BETWEEN_LOOKUPS: u32 = 4;
+
+/// Where a transcript is followed from.
+#[derive(Clone, Copy)]
+enum TranscriptStart {
+    Beginning,
+    /// Earlier turns of the same agent must not seed a streak.
+    End,
+}
+
+/// An agent's transcript, followed as it grows and fed to a loop guard.
+struct TranscriptTail {
+    #[cfg(test)]
+    registration: tests::Registration,
+    file: File,
+    offset: u64,
+    threshold: u32,
+    guard: LoopGuard,
+}
+
+impl TranscriptTail {
+    /// Follows `path` from its start, or from its current end when earlier
+    /// turns of the same agent must not seed a streak. `None` when the
+    /// file cannot be opened or the threshold is not a valid one.
+    fn open(
+        path: &Path,
+        threshold: u32,
+        start: TranscriptStart,
+        #[cfg(test)] offsets: &tests::FollowedOffsets,
+    ) -> Option<Self> {
+        let guard = LoopGuard::new(threshold).ok()?;
+        let file = File::open(path).ok()?;
+        let offset = match start {
+            TranscriptStart::End => file.metadata().ok()?.len(),
+            TranscriptStart::Beginning => 0,
+        };
+        let tail = Self {
+            #[cfg(test)]
+            registration: tests::Registration::new(path, offsets),
+            file,
+            offset,
+            threshold,
+            guard,
+        };
+        #[cfg(test)]
+        tail.registration.publish(tail.offset);
+        Some(tail)
+    }
+
+    /// Reads what was appended since the last call, whole lines only, and
+    /// returns the loop it shows, if any. An unreadable file shows nothing.
+    fn poll(&mut self) -> Option<LoopFired> {
+        let len = self.file.metadata().ok()?.len();
+        if len < self.offset {
+            // The file was rewritten: what was counted no longer stands.
+            self.offset = 0;
+            self.guard = LoopGuard::new(self.threshold).ok()?;
+        }
+        if len == self.offset {
+            return None;
+        }
+        self.file.seek(SeekFrom::Start(self.offset)).ok()?;
+        let mut appended = Vec::new();
+        (&mut self.file)
+            .take(len - self.offset)
+            .read_to_end(&mut appended)
+            .ok()?;
+        let complete = appended.iter().rposition(|byte| *byte == b'\n')? + 1;
+        self.offset += complete as u64;
+        #[cfg(test)]
+        self.registration.publish(self.offset);
+        let text = String::from_utf8_lossy(&appended[..complete]);
+        self.guard.observe(parse_tool_events(&text))
+    }
+}
+
+/// How a request to stop a worker ended.
+enum StopAck {
+    /// The coordinator reported the dispatch stopped or failed.
+    Confirmed,
+    /// The run was cancelled during the wait.
+    Cancelled,
+    /// Neither happened before the deadline; carries the status polls that
+    /// failed meanwhile.
+    Unconfirmed(PollErrors),
+}
+
+/// The status polls that failed while a stop was awaited.
+#[derive(Default)]
+struct PollErrors {
+    count: u32,
+    last: Option<String>,
+}
+
+/// Where the transcript of an agent is looked for while the wait goes on.
+enum TailState {
+    /// Not found yet; `lookups` made so far.
+    Searching {
+        lookups: u32,
+    },
+    Following(TranscriptTail),
+    /// Never found, or the guard is off: no detection, no error.
+    Absent,
+}
+
+impl TailState {
+    /// One look at the transcript for the loop guard. Looks the file up
+    /// every few polls, a bounded number of times, then follows it.
+    fn watch(
+        &mut self,
+        backend: &NativeBackend<'_>,
+        agent_id: &str,
+        threshold: u32,
+        start: TranscriptStart,
+        polls: u32,
+        attempt: u32,
+    ) -> Option<LoopFired> {
+        if let Self::Searching { lookups } = self {
+            if *lookups > 0 && !polls.is_multiple_of(POLLS_BETWEEN_LOOKUPS) {
+                return None;
+            }
+            *lookups += 1;
+            let found = backend.transcript_path(agent_id).and_then(|path| {
+                TranscriptTail::open(
+                    &path,
+                    threshold,
+                    start,
+                    #[cfg(test)]
+                    &backend.followed_offsets,
+                )
+            });
+            *self = match found {
+                Some(following) => Self::Following(following),
+                None if *lookups >= backend.waits.transcript_lookups => {
+                    backend.say_guard_off(&format!(
+                        "relais: loop guard off for attempt {attempt}: transcript not found"
+                    ));
+                    Self::Absent
+                }
+                None => return None,
+            };
+        }
+        match self {
+            Self::Following(following) => following.poll(),
+            Self::Searching { .. } | Self::Absent => None,
+        }
+    }
 }
 
 /// What a dispatch's reported usage adds up to.
@@ -615,6 +789,7 @@ fn ended_result(spec: &LaunchSpec, ended: Ended, detail: String) -> LaunchResult
         booked_message_ids: Vec::new(),
         unpriced: Vec::new(),
         lost_worker: None,
+        looped: None,
     }
 }
 
@@ -630,6 +805,16 @@ pub struct NativeBackend<'a> {
     /// The ledger the advisor calls found in an agent's transcript are
     /// booked into; `None` books none.
     advisor_ledger: Option<PathBuf>,
+    /// The shadow lines this backend said, for the tests to read.
+    #[cfg(test)]
+    pub(crate) shadow_lines: Mutex<Vec<String>>,
+    /// The `loop guard off` lines this backend said, for the tests to read.
+    #[cfg(test)]
+    pub(crate) guard_off_lines: std::sync::Arc<Mutex<Vec<String>>>,
+    /// The offset each open tail has read to, by transcript path, for a
+    /// scripted plugin to synchronise on without sleeping.
+    #[cfg(test)]
+    pub(crate) followed_offsets: tests::FollowedOffsets,
 }
 
 impl<'a> NativeBackend<'a> {
@@ -648,6 +833,12 @@ impl<'a> NativeBackend<'a> {
             prices,
             memory: Mutex::new(Memory::default()),
             advisor_ledger: None,
+            #[cfg(test)]
+            shadow_lines: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            guard_off_lines: std::sync::Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            followed_offsets: tests::FollowedOffsets::default(),
         }
     }
 
@@ -692,7 +883,28 @@ impl<'a> NativeBackend<'a> {
             Route::Continue { agent_id, .. } => Some(agent_id.clone()),
             Route::Spawn => None,
         };
+        let start = match route {
+            Route::Continue { .. } => TranscriptStart::End,
+            Route::Spawn => TranscriptStart::Beginning,
+        };
+        let is_worker = matches!(spec.agent, crate::protocol::AgentKind::Worker);
+        let attempt = spec.attempt;
+        // With the key unset a worker's transcript is still followed, with the
+        // default threshold, only to record what the guard would have stopped.
+        let (watched_threshold, stops) = match spec.loop_guard {
+            LoopGuardMode::Shadow if is_worker => (Some(DEFAULT_LOOP_THRESHOLD), false),
+            LoopGuardMode::Shadow | LoopGuardMode::Off => (None, false),
+            LoopGuardMode::Stop(threshold) => (Some(threshold), true),
+        };
+        let mut tail = if watched_threshold.is_some() {
+            TailState::Searching { lookups: 0 }
+        } else {
+            TailState::Absent
+        };
+        let mut shadowed: Vec<(String, Evidence)> = Vec::new();
+        let mut polls = 0u32;
         loop {
+            polls = polls.wrapping_add(1);
             let now = Instant::now();
             if let Some(slept) = watch.pass(SystemTime::now(), now) {
                 // Time the machine spent asleep is not time the attempt used.
@@ -763,10 +975,107 @@ impl<'a> NativeBackend<'a> {
                             ),
                         };
                     }
+                    if let (Some(threshold), Some(agent)) = (watched_threshold, running.as_deref())
+                    {
+                        if let Some(fired) =
+                            tail.watch(self, agent, threshold, start, polls, attempt)
+                        {
+                            if !stops {
+                                let key = (fired.command.clone(), fired.evidence.clone());
+                                if !shadowed.contains(&key) {
+                                    shadowed.push(key);
+                                    let shown_command = shown(&redacted_one_line(&fired.command));
+                                    let line = match fired.evidence {
+                                        Evidence::ErrorLine(_) => format!(
+                                            "relais: shadow: would stop attempt {attempt}: {shown_command} x{}",
+                                            fired.count
+                                        ),
+                                        Evidence::OutputHash(_) => format!(
+                                            "relais: shadow: would stop attempt {attempt}: {}",
+                                            same_output_phrase(&shown_command, fired.count)
+                                        ),
+                                    };
+                                    self.say_shadow(&line);
+                                }
+                            } else {
+                                let agent = agent.to_string();
+                                let attempt_end = started + spec.wall_timeout;
+                                let repeated = match fired.evidence {
+                                    Evidence::ErrorLine(_) => "a failing command",
+                                    Evidence::OutputHash(_) => "a command with the same output",
+                                };
+                                let polls_failed =
+                                    match self.stop_and_confirm(spec, &agent, attempt_end) {
+                                        StopAck::Confirmed => {
+                                            let evidence = match fired.evidence {
+                                                Evidence::ErrorLine(line) => {
+                                                    crate::backend::Repeated::ErrorLine(line)
+                                                }
+                                                Evidence::OutputHash(_) => {
+                                                    crate::backend::Repeated::SameOutput
+                                                }
+                                            };
+                                            return Awaited::Looped {
+                                                agent,
+                                                command: fired.command,
+                                                evidence,
+                                                count: fired.count,
+                                            };
+                                        }
+                                        StopAck::Cancelled => {
+                                            if let Some(cancelled) =
+                                                self.cancelled(spec, Some(&agent))
+                                            {
+                                                return cancelled;
+                                            }
+                                            PollErrors::default()
+                                        }
+                                        StopAck::Unconfirmed(errors) => errors,
+                                    };
+                                let polls_said = match &polls_failed.last {
+                                    Some(last) => format!(
+                                        "; {} status polls failed during the wait, the last: {last}",
+                                        polls_failed.count
+                                    ),
+                                    None => String::new(),
+                                };
+                                return Awaited::Lost {
+                                    agent: Some(agent),
+                                    detail: format!(
+                                        "{STOP_UNACKNOWLEDGED}: the worker of dispatch {} repeated \
+                                         {repeated} and did not stop within {}s of the request \
+                                         or the attempt's wall time{polls_said}",
+                                        spec.dispatch_id,
+                                        self.waits.spawn.as_secs()
+                                    ),
+                                };
+                            }
+                        }
+                    }
                 }
             }
             std::thread::sleep(ADMISSION_POLL);
         }
+    }
+
+    /// Says on stderr (the run's events) that the guard gave up on an attempt.
+    fn say_guard_off(&self, line: &str) {
+        eprintln!("{line}");
+        #[cfg(test)]
+        self.guard_off_lines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(line.to_string());
+    }
+
+    /// Says on stderr (the run's events) what the guard would have stopped.
+    fn say_shadow(&self, line: &str) {
+        eprintln!("{line}");
+        #[cfg(test)]
+        self.shadow_lines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(line.to_string());
     }
 
     /// The attempt's end when its run has been cancelled: the plugin is asked
@@ -894,6 +1203,115 @@ impl<'a> NativeBackend<'a> {
         })
     }
 
+    /// The path of an agent's transcript, found as `read_transcript` finds
+    /// it. `None` while the file does not exist.
+    fn transcript_path(&self, agent_id: &str) -> Option<PathBuf> {
+        let projects = self.link.projects_dir.as_ref()?;
+        let slugs = std::fs::read_dir(projects).ok()?;
+        let file = format!("agent-{agent_id}.jsonl");
+        slugs.flatten().find_map(|slug| {
+            let path = slug
+                .path()
+                .join(&self.link.session_id)
+                .join("subagents")
+                .join(&file);
+            path.is_file().then_some(path)
+        })
+    }
+
+    /// Asks the agent to stop and waits until the coordinator reports the
+    /// dispatch stopped or failed, for at most the spawn wait and never past
+    /// `attempt_end`, the end of the attempt's wall time.
+    fn stop_and_confirm(&self, spec: &LaunchSpec, agent: &str, attempt_end: Instant) -> StopAck {
+        self.stop_agent(spec, Some(agent));
+        let deadline = (Instant::now() + self.waits.spawn).min(attempt_end);
+        let mut errors = PollErrors::default();
+        loop {
+            match self.gate.native_status(&spec.dispatch_id) {
+                Ok(NativeProgress::Known {
+                    state: NativeState::Stopped { .. } | NativeState::Failed { .. },
+                }) => return StopAck::Confirmed,
+                Ok(_) => {}
+                Err(e) => {
+                    errors.count += 1;
+                    errors.last = Some(e.to_string());
+                }
+            }
+            let is_cancelled = spec
+                .cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::SeqCst));
+            if is_cancelled {
+                return StopAck::Cancelled;
+            }
+            if Instant::now() >= deadline {
+                return StopAck::Unconfirmed(errors);
+            }
+            std::thread::sleep(ADMISSION_POLL);
+        }
+    }
+
+    /// The result of a worker stopped for repeating a failing command: its
+    /// usage is read from the transcript, since the stop sent no report.
+    fn looped_result(
+        &self,
+        spec: &LaunchSpec,
+        looped: crate::backend::LoopedWorker,
+        booking_from: u64,
+    ) -> LaunchResult {
+        let agent = looped.agent.clone();
+        let records: Vec<UsageRecord> = self
+            .read_transcript_from(&agent, booking_from)
+            .map(|content| parse_transcript(&content))
+            .unwrap_or_default();
+        let executor: Vec<UsageRecord> = records
+            .iter()
+            .filter(|record| record.source != UsageSource::Advisor)
+            .cloned()
+            .collect();
+        let mut booked = usage_of(&executor, self.prices.as_ref());
+        let advisor_failure = match self.book_advisors(&spec.dispatch_id, &agent) {
+            Ok(unpriced) => {
+                booked.unpriced.extend(unpriced);
+                None
+            }
+            Err(e) => Some(format!(
+                "the advisor usage of agent {agent} could not be booked: {e}"
+            )),
+        };
+        let mut looped_launch = ended_result(
+            spec,
+            Ended::Exited(1),
+            format!("the native agent {agent} was stopped for repeating one failing command"),
+        );
+        looped_launch.stderr = advisor_failure.unwrap_or_default();
+        looped_launch.effective_model = booked.effective_model;
+        looped_launch.usage = booked.usage;
+        looped_launch.unpriced = booked.unpriced;
+        looped_launch.booked_message_ids = records
+            .into_iter()
+            .map(|record| record.message_id)
+            .collect();
+        looped_launch.session_id = Some(agent);
+        looped_launch.looped = Some(looped);
+        looped_launch
+    }
+
+    /// The transcript's length in bytes now: 0 when there is none.
+    fn transcript_len(&self, agent_id: &str) -> u64 {
+        self.transcript_path(agent_id)
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map_or(0, |meta| meta.len())
+    }
+
+    /// The transcript from byte `from` on. `None` when it is missing or
+    /// shorter than `from` (it was rewritten), which books nothing.
+    fn read_transcript_from(&self, agent_id: &str, from: u64) -> Option<String> {
+        let bytes = std::fs::read(self.transcript_path(agent_id)?).ok()?;
+        let tail = bytes.get(usize::try_from(from).ok()?..)?;
+        Some(String::from_utf8_lossy(tail).into_owned())
+    }
+
     /// The message ids of an agent's transcript. They are read for nothing
     /// else: an older relais's usage import skips what is recorded here, so
     /// the agent's usage is not booked twice after a revert. Empty when the
@@ -1005,6 +1423,7 @@ impl<'a> NativeBackend<'a> {
             session_id: Some(agent_id),
             unpriced: booked.unpriced,
             lost_worker: None,
+            looped: None,
         }
     }
 
@@ -1015,6 +1434,12 @@ impl<'a> NativeBackend<'a> {
             return Ok(ended_result(spec, Ended::Exited(1), refusal));
         }
         let ask = ask_for(&route, spec);
+        // What a continued agent's transcript already held belongs to its
+        // earlier attempts, whose usage is booked.
+        let booking_from = match &route {
+            Route::Continue { agent_id, .. } => self.transcript_len(agent_id),
+            Route::Spawn => 0,
+        };
         match self
             .gate
             .register_native(&self.link.session_id, &spec.dispatch_id, &ask)
@@ -1053,6 +1478,20 @@ impl<'a> NativeBackend<'a> {
                 lost.lost_worker = Some(crate::backend::LostWorker { agent });
                 Ok(lost)
             }
+            Awaited::Looped {
+                agent,
+                command,
+                evidence,
+                count,
+            } => {
+                let looped = crate::backend::LoopedWorker {
+                    agent,
+                    command,
+                    evidence,
+                    count,
+                };
+                Ok(self.looped_result(spec, looped, booking_from))
+            }
         }
     }
 }
@@ -1086,7 +1525,45 @@ impl Backend for NativeBackend<'_> {
 #[cfg(test)]
 mod tests {
     use super::{SuspendWatch, ADMISSION_POLL, SUSPEND_GAP};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime};
+
+    /// How far the open tail of a transcript has read, by transcript path.
+    pub(super) type FollowedOffsets = Arc<Mutex<BTreeMap<PathBuf, u64>>>;
+
+    /// A tail's entry in its backend's offset registry, removed when the
+    /// tail drops.
+    pub(super) struct Registration {
+        path: PathBuf,
+        offsets: FollowedOffsets,
+    }
+
+    impl Registration {
+        pub(super) fn new(path: &Path, offsets: &FollowedOffsets) -> Self {
+            Self {
+                path: path.to_path_buf(),
+                offsets: Arc::clone(offsets),
+            }
+        }
+
+        pub(super) fn publish(&self, offset: u64) {
+            self.offsets
+                .lock()
+                .expect("offsets lock")
+                .insert(self.path.clone(), offset);
+        }
+    }
+
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            self.offsets
+                .lock()
+                .expect("offsets lock")
+                .remove(&self.path);
+        }
+    }
 
     #[test]
     fn a_pass_after_the_usual_sleep_reports_no_suspend() {
@@ -1148,6 +1625,8 @@ mod tests {
             wall_timeout: Duration::from_secs(60),
             cancel: None,
             agent: AgentKind::Worker,
+            loop_guard: crate::policy::LoopGuardMode::Shadow,
+            attempt: 1,
         }
     }
 

@@ -1,6 +1,7 @@
 //! The attempt loop: dispatch, snapshot, verify and judge each attempt.
 
 use super::holdouts::split_holdout_gaps;
+use super::loop_text;
 use super::{
     build_prompt, build_review_repair_prompt, conflict_block, effort_str, fresh_progress,
     spend_limit, split_profile_gaps, unpriced_native_model, verify, workspace, AgentKind,
@@ -10,6 +11,7 @@ use super::{
     RunEngine, RunError, RunOutcome, Snapshot, State, Step, Terminal, UsageEvent, Verified,
     VerifyFailure, WorkspaceError,
 };
+use crate::backend::{LoopedWorker, Repeated};
 
 impl<'a> RunEngine<'a> {
     /// The bounded sequence of attempts the runner — not a model — owns
@@ -28,17 +30,29 @@ impl<'a> RunEngine<'a> {
             if let Some(outcome) = self.ceiling_reached(&progress)? {
                 return Ok(outcome);
             }
-            let dispatched = match self.dispatch_attempt(ctx, &mut progress)? {
+            let mut dispatched = match self.dispatch_attempt(ctx, &mut progress)? {
                 Phase::Ended(outcome) => return Ok(outcome),
                 Phase::Ready(dispatched) => dispatched,
             };
-            let judged = match self.snapshot_attempt(ctx, &progress, dispatched)? {
-                Snapshot::Ended(outcome) => return Ok(outcome),
-                Snapshot::Ready(candidate) => {
-                    self.judge_candidate(ctx, &mut progress, candidate)?
+            // A lost worker wins over a loop: its tree is fenced and goes
+            // through the snapshot, which reports it.
+            let judged = match (
+                &dispatched.result.lost_worker,
+                dispatched.result.looped.take(),
+            ) {
+                (None, Some(looped)) => {
+                    self.end_looped_attempt(ctx, &mut progress, dispatched, looped)?
                 }
-                Snapshot::Unresolved { attempt_id, paths } => {
-                    self.fail_unresolved(ctx, &mut progress, attempt_id, &paths)?
+                (Some(_), _) | (None, None) => {
+                    match self.snapshot_attempt(ctx, &progress, dispatched)? {
+                        Snapshot::Ended(outcome) => return Ok(outcome),
+                        Snapshot::Ready(candidate) => {
+                            self.judge_candidate(ctx, &mut progress, candidate)?
+                        }
+                        Snapshot::Unresolved { attempt_id, paths } => {
+                            self.fail_unresolved(ctx, &mut progress, attempt_id, &paths)?
+                        }
+                    }
                 }
             };
             match judged {
@@ -109,6 +123,57 @@ impl<'a> RunEngine<'a> {
                 "a verify run was offered another attempt: it has no worker to repair with".into(),
             )),
         }
+    }
+
+    /// An attempt whose worker was stopped for repeating one failing
+    /// command has no candidate: verification is skipped, the worktree is
+    /// kept, and the machine picks the next rung.
+    fn end_looped_attempt(
+        &mut self,
+        context: &AttemptContext<'_>,
+        progress: &mut Progress,
+        dispatched: Dispatched,
+        looped: LoopedWorker,
+    ) -> Result<Step, RunError> {
+        let attempt_id = dispatched.attempt_id;
+        let held_worktree = context.worktree_path.to_string_lossy().into_owned();
+        self.config
+            .ledger
+            .finish_attempt(attempt_id, State::Failed, Some(&held_worktree), None)?;
+        let command = loop_text::redacted_one_line(&looped.command);
+        let error_line = match &looped.evidence {
+            Repeated::ErrorLine(line) => Some(loop_text::redacted_one_line(line)),
+            Repeated::SameOutput => None,
+        };
+        // The loop replaces the failures of any earlier attempt: the next
+        // prompt must not claim a candidate failed checks it never reached.
+        progress.last_failures = Some(vec![RepairFailure::Loop {
+            command: command.clone(),
+            error_line,
+            count: looped.count,
+        }]);
+        let attempt = progress.budget.attempts_used;
+        let count = looped.count;
+        let shown = loop_text::shown(&command);
+        let next = self.decide(
+            &progress.budget,
+            Observation::WorkerLooped { command, count },
+        )?;
+        let rung = match &next {
+            Next::Attempt { rung, .. } => context
+                .preflight
+                .decision
+                .ladder
+                .rung(*rung)
+                .map_or_else(|| format!("rung {}", rung.get()), |at| at.model.clone()),
+            Next::Accept | Next::Stop(_) => "none (run failed: worker_looped)".to_string(),
+        };
+        let phrase = match looped.evidence {
+            Repeated::ErrorLine(_) => loop_text::failing_phrase(&shown, count),
+            Repeated::SameOutput => loop_text::same_output_phrase(&shown, count),
+        };
+        eprintln!("relais: attempt {attempt} stopped: worker {phrase}; next: {rung}");
+        self.proceed(context, progress, next)
     }
 
     /// Budget ceilings are checked BEFORE admitting more work (SPEC §9,
@@ -326,6 +391,8 @@ impl<'a> RunEngine<'a> {
             wall_timeout: remaining_wall,
             cancel: None,
             agent: AgentKind::Worker,
+            loop_guard: authority.loop_guard,
+            attempt: index,
         };
 
         let requested_model = model_profile.id.clone();

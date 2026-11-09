@@ -10,6 +10,7 @@
 //! guarantees its backend cannot enforce.
 
 pub mod claude;
+pub mod loopguard;
 pub mod mock;
 pub mod native;
 

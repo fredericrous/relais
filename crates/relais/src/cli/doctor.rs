@@ -37,16 +37,38 @@ pub(crate) fn note_held_repair_effort(report: &mut doctor::DoctorReport) {
         repo.models.values().map(|profile| profile.id.as_str()),
     );
     let held = route::held_repair_models(&repo.models, &catalogs, repo.execution.repair_effort);
-    if held.is_empty() {
-        return;
-    }
-    if let Some(finding) = report
+    let Some(finding) = report
         .findings
         .iter_mut()
         .find(|finding| finding.component == "effort")
-    {
+    else {
+        return;
+    };
+    if !held.is_empty() {
         finding.detail.push('\n');
         finding.detail.push_str(&route::held_would_text(&held));
+    }
+}
+
+/// The `loop_threshold` finding: always present when the repository policy
+/// reads, whether or not an effort finding exists. An unreadable policy is
+/// reported on findings of its own.
+pub(crate) fn loop_threshold_finding() -> Option<doctor::Finding> {
+    let (_, repo) = load_repo_policy().ok()?;
+    Some(doctor::Finding {
+        component: "loop_threshold",
+        level: doctor::Level::Ok,
+        detail: loop_threshold_text(repo.execution.loop_threshold),
+    })
+}
+
+/// The `[execution] loop_threshold` line doctor prints.
+fn loop_threshold_text(threshold: Option<u32>) -> String {
+    match threshold {
+        Some(repeats) => format!(
+            "loop_threshold: {repeats} (a native worker repeating one failing command {repeats} times with no edit is stopped; a contract's limits.loop_threshold = 0 turns the guard off for its run)"
+        ),
+        None => "loop_threshold: unset (no worker is stopped; the guard only records what it would have stopped (shadow), and a contract's limits.loop_threshold = 0 turns even that off for its run)".to_string(),
     }
 }
 
@@ -155,6 +177,7 @@ pub(crate) fn doctor_command(json: bool) -> Result<CliOutcome, CliError> {
     let integration = relais::install::plugin::integration(&claude, &listing);
     let mut report = doctor::doctor(&project_dir()?, listing);
     note_held_repair_effort(&mut report);
+    report.findings.extend(loop_threshold_finding());
     report.findings.extend(holdouts_finding());
     if json {
         print_document(&DoctorDocument {

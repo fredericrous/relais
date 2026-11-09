@@ -387,3 +387,15 @@ test('a Button is still drawn after a second run finishes and folds the first', 
   expect(left[0].props.key).toBe('agent:agent-2')
   expect(after.rows.filter((r: any) => r.props.autoFocus !== undefined).length).toBe(0)
 })
+
+test('a long multi-line detail is drawn as one line of at most 60 characters ending in an ellipsis', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  const detail = 'abcdefghi\n'.repeat(20)
+  expect([...detail].length).toBe(200)
+  const { texts } = await drawn($, engine, [phase(0, 'running'), step(1, 'looped', detail)])
+  const row = texts[indexOf(texts, 'looped')]
+  const collapsed = 'abcdefghi '.repeat(20).trim()
+  expect(row).toContain(`${collapsed.slice(0, 59)}…`)
+  expect(row).not.toContain(collapsed.slice(0, 61))
+  expect(row).not.toContain('\n')
+})

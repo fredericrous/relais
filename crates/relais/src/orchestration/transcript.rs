@@ -294,6 +294,120 @@ pub fn parse_transcript(content: &str) -> Vec<UsageRecord> {
     records
 }
 
+/// The tools whose use is a change to the tree.
+const EDIT_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// One tool call or result of a transcript, in the order it was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolEvent {
+    /// A `Bash` tool call.
+    BashUse { id: String, command: String },
+    /// The result of a tool call, paired with its use by `tool_use_id`.
+    ToolResult {
+        tool_use_id: String,
+        outcome: ToolOutcome,
+        output: String,
+    },
+    /// A use of `Edit`, `Write`, `MultiEdit` or `NotebookEdit`.
+    EditUse { tool: String },
+}
+
+/// Whether a tool call succeeded. A failure carries the first non-empty line
+/// of its output, or `None` when the output has no such line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolOutcome {
+    Succeeded,
+    Failed { first_line: Option<String> },
+}
+
+/// The text of a `tool_result` `content`: a string, or blocks of `text`.
+fn result_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn tool_event_of(block: &serde_json::Value) -> Option<ToolEvent> {
+    match block.get("type").and_then(serde_json::Value::as_str)? {
+        "tool_use" => {
+            let name = block.get("name").and_then(serde_json::Value::as_str)?;
+            if EDIT_TOOLS.contains(&name) {
+                return Some(ToolEvent::EditUse {
+                    tool: name.to_string(),
+                });
+            }
+            if name != "Bash" {
+                return None;
+            }
+            let id = block.get("id").and_then(serde_json::Value::as_str)?;
+            let command = block
+                .get("input")
+                .and_then(|input| input.get("command"))
+                .and_then(serde_json::Value::as_str)?;
+            Some(ToolEvent::BashUse {
+                id: id.to_string(),
+                command: command.to_string(),
+            })
+        }
+        "tool_result" => {
+            let tool_use_id = block
+                .get("tool_use_id")
+                .and_then(serde_json::Value::as_str)?;
+            let is_error = block
+                .get("is_error")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let output = result_text(block.get("content"));
+            let outcome = if is_error {
+                ToolOutcome::Failed {
+                    first_line: output
+                        .lines()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty())
+                        .map(str::to_string),
+                }
+            } else {
+                ToolOutcome::Succeeded
+            };
+            Some(ToolEvent::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                outcome,
+                output,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Parse one transcript's content into its tool events: Bash calls, the
+/// results of tool calls, and uses of the edit family. A line this cannot
+/// make sense of is skipped, as in [`parse_transcript`].
+pub fn parse_tool_events(content: &str) -> Vec<ToolEvent> {
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .filter(|line| {
+            matches!(
+                line.get("type").and_then(serde_json::Value::as_str),
+                Some("assistant" | "user")
+            )
+        })
+        .flat_map(|line| {
+            line.get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(serde_json::Value::as_array)
+                .map(|blocks| blocks.iter().filter_map(tool_event_of).collect::<Vec<_>>())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,5 +600,59 @@ mod tests {
     fn a_malformed_line_is_skipped_not_an_error() {
         let content = "not json at all\n";
         assert!(parse_transcript(content).is_empty());
+    }
+
+    #[test]
+    fn tool_events_are_read_from_a_realistic_transcript() {
+        let lines = [
+            serde_json::json!({"type":"user","message":{"role":"user","content":"fix the build"}}),
+            serde_json::json!({"type":"assistant","message":{"id":"msg_1","model":"claude-opus-5","content":[
+                {"type":"text","text":"Running the tests."},
+                {"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test 2>&1 | tail -40","description":"run"}},
+                {"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"/x"}}
+            ]}}),
+            serde_json::json!({"type":"user","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"\n  Exit code 101\nerror[E0425]: cannot find value"},
+                {"type":"tool_result","tool_use_id":"toolu_2","content":[{"type":"text","text":"file body"}]}
+            ]}}),
+            serde_json::json!({"type":"assistant","message":{"id":"msg_2","content":[
+                {"type":"tool_use","id":"toolu_3","name":"Edit","input":{"file_path":"/x","old_string":"a","new_string":"b"}}
+            ]}}),
+        ];
+        let content = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            parse_tool_events(&content),
+            vec![
+                ToolEvent::BashUse {
+                    id: "toolu_1".into(),
+                    command: "cargo test 2>&1 | tail -40".into()
+                },
+                ToolEvent::ToolResult {
+                    tool_use_id: "toolu_1".into(),
+                    outcome: ToolOutcome::Failed {
+                        first_line: Some("Exit code 101".into())
+                    },
+                    output: "\n  Exit code 101\nerror[E0425]: cannot find value".into()
+                },
+                ToolEvent::ToolResult {
+                    tool_use_id: "toolu_2".into(),
+                    outcome: ToolOutcome::Succeeded,
+                    output: "file body".into()
+                },
+                ToolEvent::EditUse {
+                    tool: "Edit".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_tool_event_lines_are_skipped() {
+        let content = "not json\n{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\"}]}}\n";
+        assert!(parse_tool_events(content).is_empty());
     }
 }

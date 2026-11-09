@@ -181,6 +181,7 @@ impl Fixture {
                 max_agents_total: 24,
                 repair_effort: Default::default(),
                 widen_scope_for_tests: true,
+                loop_threshold: None,
             },
             integrations: Default::default(),
             verification: VerificationPolicy {
@@ -7469,6 +7470,7 @@ fn guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_g
         allow_nested_agents: false,
         max_agent_depth: 1,
         max_agents_total: 1,
+        loop_guard: crate::policy::LoopGuardMode::Shadow,
         verification_profile: crate::policy::VerificationProfile::default(),
         review_floor: Review::Off,
         disallowed_tools: Vec::new(),
@@ -7515,6 +7517,39 @@ fn every_attempt_kind_carries_the_native_rules() {
             "{kind:?}: {prompt}"
         );
         assert!(prompt.contains("you cannot spawn agents"), "{kind:?}");
+    }
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+#[test]
+fn a_repair_after_a_loop_carries_the_command_and_its_error_line() {
+    let fixture = Fixture::new();
+    let contract = fixture.contract(Review::Off);
+    let failures = vec![RepairFailure::Loop {
+        command: "make test".into(),
+        error_line: Some("boom".into()),
+        count: 3,
+    }];
+    for kind in [AttemptKind::Repair, AttemptKind::Escalation] {
+        let prompt = build_prompt(
+            &contract,
+            &manifest_with(Vec::new()),
+            1,
+            Some(failures.as_slice()),
+            kind,
+        )
+        .0;
+        assert!(prompt.contains("repeat"), "{kind:?}: {prompt}");
+        assert!(prompt.contains("`make test` 3 times"), "{kind:?}: {prompt}");
+        assert!(prompt.contains("boom"), "{kind:?}: {prompt}");
+        assert!(
+            !prompt.contains("failed verification"),
+            "{kind:?}: {prompt}"
+        );
+        assert!(
+            !prompt.contains("the same checks failed"),
+            "{kind:?}: {prompt}"
+        );
     }
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }

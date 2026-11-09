@@ -58,6 +58,7 @@ mod holdout_exposure;
 mod holdouts;
 mod launch;
 pub mod live_trial;
+mod loop_text;
 pub mod machine;
 mod preflight;
 mod prompt;

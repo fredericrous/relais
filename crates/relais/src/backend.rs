@@ -240,6 +240,11 @@ pub struct LaunchSpec {
     /// What kind of agent this dispatch is: the native agent definition it
     /// runs as, and the kind its run events name.
     pub agent: crate::protocol::AgentKind,
+    /// What the loop guard does for this dispatch.
+    pub loop_guard: crate::policy::LoopGuardMode,
+    /// The run's attempt number this dispatch belongs to, from the runner's
+    /// budget; 0 for a dispatch that is not a worker attempt.
+    pub attempt: u32,
 }
 
 /// What the harness said one dispatch cost. `inclusive` describes a
@@ -357,6 +362,28 @@ pub struct LaunchResult {
     /// went silent): it may still be writing the tree it ran in.
     #[serde(default)]
     pub lost_worker: Option<LostWorker>,
+    /// Set when a worker was stopped, and acknowledged stopped, for
+    /// repeating one failing command: the attempt has no result to verify.
+    #[serde(default)]
+    pub looped: Option<LoopedWorker>,
+}
+
+/// A worker that was stopped for repeating one failing command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopedWorker {
+    pub agent: String,
+    pub command: String,
+    pub evidence: Repeated,
+    pub count: u32,
+}
+
+/// What the repeated command was fingerprinted by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Repeated {
+    /// The error line that repeated.
+    ErrorLine(String),
+    /// The command printed the same output each time.
+    SameOutput,
 }
 
 /// A worker whose session vanished while it ran.
@@ -588,6 +615,7 @@ mod tests {
             booked_message_ids: Vec::new(),
             unpriced: Vec::new(),
             lost_worker: None,
+            looped: None,
         };
         assert!(result.terminal_result_missing());
         let completed = LaunchResult {
@@ -637,6 +665,7 @@ mod tests {
             booked_message_ids: vec!["m1".into()],
             unpriced: Vec::new(),
             lost_worker: None,
+            looped: None,
         })
         .expect("serializes");
         stored
