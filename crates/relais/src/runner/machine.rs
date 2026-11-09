@@ -314,6 +314,9 @@ pub enum Observation {
     /// The worker process ended without a terminal result: killed,
     /// non-zero exit, or output the adapter could not read.
     TerminalResultMissing { timed_out: bool, detail: String },
+    /// The worker was stopped for repeating one failing command with no
+    /// edit between: its attempt has no candidate to verify.
+    WorkerLooped { command: String, count: u32 },
     /// The dispatch was cancelled through the coordinator.
     Cancelled(String),
     /// The provider ran a model other than the one requested.
@@ -508,6 +511,58 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
             );
             let (state, reason, terminal) = ended(Reason::RepairExhausted, detail);
             Decision::stop(state, reason, recorded(&failures), terminal)
+        }
+
+        // A stopped worker is not a repair of its own: the next rung takes
+        // over by the rule a failed verification follows, the stronger
+        // model being the stated exception to SPEC §9's "changed nothing".
+        Observation::WorkerLooped { command, count } => {
+            let looped = format!("worker_looped: {command} x{count}");
+            let detail = serde_json::json!({
+                "looped": looped,
+                "command": command,
+                "count": count,
+                "attempt": budget.attempts_used,
+            });
+            if budget.repairs_used < budget.max_repairs {
+                return Decision {
+                    state: State::Repairing,
+                    reason: Reason::WorkerLooped,
+                    detail,
+                    next: Next::Attempt {
+                        kind: AttemptKind::Repair,
+                        rung: budget.rung.next(),
+                    },
+                };
+            }
+            if let Some(stronger) = budget
+                .escalation_tier
+                .filter(|_| budget.escalation_authorized())
+            {
+                return Decision {
+                    state: State::Escalating,
+                    reason: Reason::WorkerLooped,
+                    detail: serde_json::json!({
+                        "looped": looped,
+                        "command": command,
+                        "count": count,
+                        "attempt": budget.attempts_used,
+                        "to_tier": stronger.as_str(),
+                    }),
+                    next: Next::Attempt {
+                        kind: AttemptKind::Escalation,
+                        rung: budget.rung.next(),
+                    },
+                };
+            }
+            Decision::stop(
+                State::Failed,
+                Reason::WorkerLooped,
+                detail,
+                Terminal::Failed {
+                    detail: format!("no repair or escalation remains after {looped}"),
+                },
+            )
         }
 
         Observation::HoldoutsOutOfAttempts { failures, holdout } => holdout.decision(&failures),
@@ -1036,6 +1091,37 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_looped_worker_follows_the_shape_of_a_failed_verification() {
+        let looped = || Observation::WorkerLooped {
+            command: "make test".into(),
+            count: 3,
+        };
+        let repair = decide(&budget(0, Some(Tier::Escalation)), looped());
+        assert_eq!(repair.state, State::Repairing);
+        assert_eq!(repair.reason, Reason::WorkerLooped);
+        assert!(matches!(
+            repair.next,
+            Next::Attempt {
+                kind: AttemptKind::Repair,
+                ..
+            }
+        ));
+        let escalation = decide(&budget(1, Some(Tier::Escalation)), looped());
+        assert_eq!(escalation.state, State::Escalating);
+        assert!(matches!(
+            escalation.next,
+            Next::Attempt {
+                kind: AttemptKind::Escalation,
+                ..
+            }
+        ));
+        let ended = decide(&budget(1, None), looped());
+        assert_eq!(ended.state, State::Failed);
+        assert_eq!(ended.reason, Reason::WorkerLooped);
+        assert!(matches!(ended.next, Next::Stop(Terminal::Failed { .. })));
     }
 
     #[test]

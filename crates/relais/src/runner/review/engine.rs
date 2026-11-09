@@ -722,6 +722,7 @@ impl<'a> RunEngine<'a> {
             wall_timeout: wall.unwrap_or_else(|| self.budgets.remaining().max(REVIEW_MIN_WALL)),
             cancel: None,
             agent: AgentKind::Reviewer,
+            loop_threshold: None,
         };
         let recorded = self.config.ledger.record_dispatch_intent(
             &dispatch_id,

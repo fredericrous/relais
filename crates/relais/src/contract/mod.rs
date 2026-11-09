@@ -865,6 +865,13 @@ pub struct Limits {
     /// timeouts, the work budget and both wait budgets (ADR-0010).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_seconds: Option<u64>,
+    /// The repository's `[execution] loop_threshold` is the floor: a value
+    /// of 2 or more may raise it, 0 turns the guard off for this run, and
+    /// any other lower value is clamped to the repository's. It cannot
+    /// turn the guard on where the repository left it unset; 1 is refused
+    /// (SPEC §5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_threshold: Option<u32>,
 }
 
 /// Why a contract is rejected. Errors are hard validation failures at
@@ -899,6 +906,8 @@ pub enum ContractError {
     BadAttempts(u32),
     BadWallSeconds(u64),
     BadTotalSeconds(u64),
+    /// `limits.loop_threshold` of 1: one failure is not a loop.
+    BadLoopThreshold(u32),
     EmptyBaseRef,
     EmptyVerificationProfile,
     MalformedJson(String),
@@ -975,6 +984,10 @@ impl std::fmt::Display for ContractError {
             Self::BadAttempts(n) => write!(f, "limits.attempts must be >= 1, got {n}"),
             Self::BadWallSeconds(n) => write!(f, "limits.wall_seconds must be >= 1, got {n}"),
             Self::BadTotalSeconds(n) => write!(f, "limits.total_seconds must be >= 1, got {n}"),
+            Self::BadLoopThreshold(n) => write!(
+                f,
+                "limits.loop_threshold must be 0 (off) or >= 2, got {n}"
+            ),
             Self::EmptyBaseRef => write!(f, "base_ref is empty"),
             Self::EmptyVerificationProfile => write!(f, "verification_profile is empty"),
             Self::MalformedJson(detail) => write!(f, "contract is not valid JSON: {detail}"),
@@ -1142,6 +1155,9 @@ impl TaskContract {
             if total_seconds < 1 {
                 return Err(ContractError::BadTotalSeconds(total_seconds));
             }
+        }
+        if self.limits.loop_threshold == Some(1) {
+            return Err(ContractError::BadLoopThreshold(1));
         }
         let mut seen = std::collections::BTreeSet::new();
         for criterion in &self.acceptance {

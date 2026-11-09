@@ -1190,6 +1190,7 @@ mod tests {
                 max_agents_total: 24,
                 repair_effort: Default::default(),
                 widen_scope_for_tests: true,
+                loop_threshold: None,
             },
             integrations: Default::default(),
             verification: VerificationPolicy {

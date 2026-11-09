@@ -90,6 +90,62 @@ enum Plugin {
     StopsTwice,
     /// The agent leaves no transcript behind.
     LeavesNoTranscript,
+    /// The first agent repeats one failing command and never stops by
+    /// itself; it reports stopped once relais asks it to. Later agents obey.
+    LoopsUntilStopped,
+    /// The first agent repeats one failing command and ignores every stop.
+    LoopsAndIgnoresStop,
+    /// The first agent fails the same command three times and stops; the
+    /// continuation adds one more failure of it while it runs.
+    OlderLoopThenOneMoreFailure,
+}
+
+/// Failing runs of one Bash command appended to a transcript, the way
+/// Claude Code writes them: a `tool_use` line, then its `tool_result`.
+fn append_failing_runs(file: &Path, label: &str, runs: u32) {
+    std::fs::create_dir_all(file.parent().expect("a parent")).expect("mkdir");
+    let mut out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file)
+        .expect("transcript opens");
+    for run in 0..runs {
+        let id = format!("{label}-{run}");
+        writeln!(
+            out,
+            "{}",
+            serde_json::json!({"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":id,"name":"Bash","input":{"command":"make test"}}
+            ]}})
+        )
+        .expect("tool use line");
+        writeln!(
+            out,
+            "{}",
+            serde_json::json!({"type":"user","message":{"content":[
+                {"type":"tool_result","tool_use_id":id,"is_error":true,"content":"boom"}
+            ]}})
+        )
+        .expect("tool result line");
+    }
+}
+
+/// Nothing on the first attempt, the fix on a repair.
+fn fixes_on_repair(tree: &Path, prompt: &str) {
+    if prompt.contains("repair addendum") {
+        std::fs::remove_file(tree.join("src/main.rs")).expect("fix");
+    }
+}
+
+/// Nothing for the first agent of a tree, the fix for the next one: a
+/// stopped worker leaves no failure for a repair addendum to carry.
+fn fixes_for_the_second_agent(tree: &Path, _prompt: &str) {
+    let seen = tree.with_extension("first-agent-seen");
+    if seen.exists() {
+        std::fs::remove_file(tree.join("src/main.rs")).expect("fix");
+    } else {
+        std::fs::write(seen, "").expect("mark");
+    }
 }
 
 /// The agent's work on its tree, given the prompt it was sent: the task
@@ -169,6 +225,18 @@ fn record_stop(script: &mut Scripted, gate: &LocalGate, dispatch: &str, report: 
         .push(gate.native_stopped(dispatch, report).expect("stopped"));
 }
 
+/// Waits for `ready`, polling, up to a deadline.
+fn wait_for(ready: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the backend did not reach the awaited state in time"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn run_plugin(
     gate: Arc<LocalGate>,
     lines: mpsc::Receiver<String>,
@@ -195,10 +263,21 @@ fn run_plugin(
                 continue;
             }
             "stop" => {
+                let dispatch = text("dispatch").expect("dispatch");
+                let stopped_agent = text("agent");
                 script.seen.push(Seen::Stop {
-                    dispatch_id: text("dispatch").expect("dispatch"),
-                    agent_id: text("agent"),
+                    dispatch_id: dispatch.clone(),
+                    agent_id: stopped_agent.clone(),
                 });
+                if let (Plugin::LoopsUntilStopped, Some(agent_id)) = (plugin, stopped_agent) {
+                    let killed = StoppedReport {
+                        agent_id,
+                        status: AgentStatus::Killed,
+                        usage: None,
+                        answer: None,
+                    };
+                    record_stop(&mut script, &gate, &dispatch, &killed);
+                }
                 continue;
             }
             "spawn" => {
@@ -258,15 +337,27 @@ fn run_plugin(
         } else {
             CONTINUE_MESSAGES
         };
+        let transcript = projects
+            .join("-slug")
+            .join(SESSION)
+            .join("subagents")
+            .join(format!("agent-{agent_id}.jsonl"));
         if plugin == Plugin::LeavesNoTranscript {
             agent.messages += count;
         } else {
-            let transcript = projects
-                .join("-slug")
-                .join(SESSION)
-                .join("subagents")
-                .join(format!("agent-{agent_id}.jsonl"));
             append_messages(&transcript, &agent_id, agent, count);
+        }
+        let first_agent = agent_id == "ag1";
+        if first_agent
+            && fresh
+            && matches!(
+                plugin,
+                Plugin::LoopsUntilStopped
+                    | Plugin::LoopsAndIgnoresStop
+                    | Plugin::OlderLoopThenOneMoreFailure
+            )
+        {
+            append_failing_runs(&transcript, "old", 3);
         }
         let report = |factor: u64, status: AgentStatus| StoppedReport {
             agent_id: agent_id.clone(),
@@ -286,6 +377,33 @@ fn run_plugin(
                 record_stop(&mut script, &gate, &dispatch_id, &stopped);
                 record_bound(&mut script, &gate, &dispatch_id, &agent_id);
             }
+            Plugin::LoopsUntilStopped if first_agent => {
+                record_bound(&mut script, &gate, &dispatch_id, &agent_id);
+            }
+            Plugin::LoopsAndIgnoresStop => {
+                record_bound(&mut script, &gate, &dispatch_id, &agent_id);
+            }
+            Plugin::OlderLoopThenOneMoreFailure if !fresh => {
+                record_bound(&mut script, &gate, &dispatch_id, &agent_id);
+                // The backend follows the transcript from its end, so the
+                // three older failures are never counted. Counted from the
+                // start they would meet the new one and make four, and the
+                // backend would stop it. For that to be observable the new
+                // failure must land while the tail is open and be read
+                // before the stop is reported.
+                wait_for(|| NativeBackend::followed_offset(&transcript).is_some());
+                append_failing_runs(&transcript, "new", 1);
+                let written = std::fs::metadata(&transcript).expect("transcript").len();
+                wait_for(|| {
+                    NativeBackend::followed_offset(&transcript).is_some_and(|read| read >= written)
+                });
+                record_stop(
+                    &mut script,
+                    &gate,
+                    &dispatch_id,
+                    &report(1, AgentStatus::Completed),
+                );
+            }
             Plugin::NeverStops | Plugin::CancelsAfterBound => {
                 record_bound(&mut script, &gate, &dispatch_id, &agent_id);
                 if plugin == Plugin::CancelsAfterBound {
@@ -298,6 +416,8 @@ fn run_plugin(
                 }
             }
             Plugin::Obeys
+            | Plugin::LoopsUntilStopped
+            | Plugin::OlderLoopThenOneMoreFailure
             | Plugin::AgentFails
             | Plugin::StopsTwice
             | Plugin::LeavesNoTranscript => {
@@ -1049,6 +1169,7 @@ fn an_attempt_with_no_booked_record_has_no_unpriced_model() {
         booked_message_ids: Vec::new(),
         unpriced: Vec::new(),
         lost_worker: None,
+        looped: None,
     };
     assert_eq!(
         unpriced_native_model(&result),
@@ -1394,4 +1515,143 @@ fn a_run_on_the_mock_backend_books_native_rows_and_estimated_usage() {
     assert_eq!(kinds.len(), 1, "{kinds:?}");
     assert!(kinds[0].contains("EstimatedApiEquivalent"), "{kinds:?}");
     std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+fn transitions_reasons(fixture: &Fixture, run: &Native) -> Vec<String> {
+    fixture
+        .ledger
+        .transitions(&run.outcome.run_id)
+        .expect("history")
+        .iter()
+        .map(|transition| transition.reason.as_str().to_string())
+        .collect()
+}
+
+#[test]
+fn a_looping_worker_is_stopped_and_the_next_attempt_runs() {
+    let fixture = Fixture::new();
+    let run = run_native(
+        &fixture,
+        Review::Optional,
+        3,
+        Plugin::LoopsUntilStopped,
+        fixes_for_the_second_agent,
+        Some(prices()),
+        |repo| {
+            repo.execution.loop_threshold = Some(3);
+        },
+    );
+    let seen = run.seen();
+    let stop_at = seen
+        .iter()
+        .position(
+            |entry| matches!(entry, Seen::Stop { agent_id: Some(agent), .. } if agent == "ag1"),
+        )
+        .unwrap_or_else(|| panic!("the looping agent was asked to stop: {seen:?}"));
+    let second_spawn = seen
+        .iter()
+        .position(|entry| matches!(entry, Seen::Spawn { agent_id, .. } if agent_id == "ag2"))
+        .unwrap_or_else(|| panic!("a second attempt spawned: {seen:?}"));
+    assert!(stop_at < second_spawn, "{seen:?}");
+    assert!(
+        matches!(run.outcome.terminal, Terminal::Accepted(_)),
+        "{:?}",
+        run.outcome
+    );
+    assert!(
+        transitions_reasons(&fixture, &run).contains(&"worker_looped".to_string()),
+        "{:?}",
+        transitions_reasons(&fixture, &run)
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn a_stop_that_is_never_acknowledged_ends_lost_with_no_second_attempt() {
+    let fixture = Fixture::new();
+    let run = run_native_waiting(
+        &fixture,
+        Review::Optional,
+        3,
+        Cast {
+            plugin: Plugin::LoopsAndIgnoresStop,
+            work: fixes_on_repair,
+        },
+        Some(prices()),
+        Waits {
+            spawn: Duration::from_secs(1),
+            hello_lapse: Duration::from_secs(60),
+        },
+        |repo| {
+            repo.execution.loop_threshold = Some(3);
+        },
+    );
+    let detail = interrupted_detail(&run.outcome);
+    assert!(detail.contains("mod_gone"), "{detail}");
+    let spawns = run
+        .seen()
+        .iter()
+        .filter(|entry| matches!(entry, Seen::Spawn { .. }))
+        .count();
+    assert_eq!(spawns, 1, "{:?}", run.seen());
+    assert!(
+        !transitions_reasons(&fixture, &run).contains(&"worker_looped".to_string()),
+        "{:?}",
+        transitions_reasons(&fixture, &run)
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn a_continuation_does_not_inherit_the_loop_of_an_earlier_attempt() {
+    let fixture = Fixture::new();
+    let run = run_native(
+        &fixture,
+        Review::Optional,
+        3,
+        Plugin::OlderLoopThenOneMoreFailure,
+        fixes_on_repair,
+        Some(prices()),
+        |repo| {
+            repo.execution.loop_threshold = Some(4);
+        },
+    );
+    assert!(
+        run.seen()
+            .iter()
+            .any(|entry| matches!(entry, Seen::Continue { .. })),
+        "the repair continued the agent: {:?}",
+        run.seen()
+    );
+    assert!(
+        !run.seen()
+            .iter()
+            .any(|entry| matches!(entry, Seen::Stop { .. })),
+        "{:?}",
+        run.seen()
+    );
+    assert!(matches!(run.outcome.terminal, Terminal::Accepted(_)));
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn with_the_threshold_unset_a_looping_transcript_runs_to_the_wall_timeout() {
+    let fixture = Fixture::new();
+    let run = run_native(
+        &fixture,
+        Review::Optional,
+        3,
+        Plugin::LoopsAndIgnoresStop,
+        fixes_on_repair,
+        Some(prices()),
+        |repo| repo.execution.max_wall_seconds = 1,
+    );
+    let detail = interrupted_detail(&run.outcome);
+    assert!(detail.contains("wall time"), "{detail}");
+    assert!(
+        !transitions_reasons(&fixture, &run).contains(&"worker_looped".to_string()),
+        "{:?}",
+        transitions_reasons(&fixture, &run)
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
 }

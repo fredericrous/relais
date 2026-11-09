@@ -32,15 +32,20 @@ impl<'a> RunEngine<'a> {
                 Phase::Ended(outcome) => return Ok(outcome),
                 Phase::Ready(dispatched) => dispatched,
             };
-            let judged = match self.snapshot_attempt(ctx, &progress, dispatched)? {
-                Snapshot::Ended(outcome) => return Ok(outcome),
-                Snapshot::Ready(candidate) => {
-                    self.judge_candidate(ctx, &mut progress, candidate)?
-                }
-                Snapshot::Unresolved { attempt_id, paths } => {
-                    self.fail_unresolved(ctx, &mut progress, attempt_id, &paths)?
-                }
-            };
+            let judged =
+                if dispatched.result.lost_worker.is_none() && dispatched.result.looped.is_some() {
+                    self.end_looped_attempt(ctx, &mut progress, dispatched)?
+                } else {
+                    match self.snapshot_attempt(ctx, &progress, dispatched)? {
+                        Snapshot::Ended(outcome) => return Ok(outcome),
+                        Snapshot::Ready(candidate) => {
+                            self.judge_candidate(ctx, &mut progress, candidate)?
+                        }
+                        Snapshot::Unresolved { attempt_id, paths } => {
+                            self.fail_unresolved(ctx, &mut progress, attempt_id, &paths)?
+                        }
+                    }
+                };
             match judged {
                 Step::Ended(outcome) => return Ok(outcome),
                 // The attempt is booked and judged; only a further dispatch
@@ -109,6 +114,37 @@ impl<'a> RunEngine<'a> {
                 "a verify run was offered another attempt: it has no worker to repair with".into(),
             )),
         }
+    }
+
+    /// An attempt whose worker was stopped for repeating one failing
+    /// command has no candidate: verification is skipped, the worktree is
+    /// kept, and the machine picks the next rung.
+    fn end_looped_attempt(
+        &mut self,
+        ctx: &AttemptContext<'_>,
+        progress: &mut Progress,
+        dispatched: Dispatched,
+    ) -> Result<Step, RunError> {
+        let Dispatched {
+            attempt_id, result, ..
+        } = dispatched;
+        let Some(looped) = result.looped else {
+            return Err(RunError::Other(
+                "an attempt was ended as looped without a looped worker".into(),
+            ));
+        };
+        let held_worktree = ctx.worktree_path.to_string_lossy().into_owned();
+        self.config
+            .ledger
+            .finish_attempt(attempt_id, State::Failed, Some(&held_worktree), None)?;
+        self.follow(
+            ctx,
+            progress,
+            Observation::WorkerLooped {
+                command: looped.command,
+                count: looped.count,
+            },
+        )
     }
 
     /// Budget ceilings are checked BEFORE admitting more work (SPEC §9,
@@ -326,6 +362,7 @@ impl<'a> RunEngine<'a> {
             wall_timeout: remaining_wall,
             cancel: None,
             agent: AgentKind::Worker,
+            loop_threshold: authority.loop_threshold,
         };
 
         let requested_model = model_profile.id.clone();

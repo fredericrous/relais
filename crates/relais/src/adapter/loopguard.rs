@@ -13,7 +13,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use crate::orchestration::transcript::{parse_tool_events, ToolEvent, ToolOutcome};
 
 pub const DEFAULT_LOOP_THRESHOLD: u32 = 3;
-pub const MIN_LOOP_THRESHOLD: u32 = 2;
+pub const MIN_LOOP_THRESHOLD: u32 = crate::policy::MIN_LOOP_THRESHOLD;
 
 /// A threshold below [`MIN_LOOP_THRESHOLD`] was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

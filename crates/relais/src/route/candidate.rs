@@ -759,6 +759,7 @@ fn validate_new_recipe(
             max_agents_total,
             repair_effort,
             widen_scope_for_tests,
+            loop_threshold,
         } = execution;
         // NOT a knob. Raising effort on repair is spend, and a learner
         // does not choose its own.
@@ -773,6 +774,13 @@ fn validate_new_recipe(
             return Err(CandidateRejection::FixedRecipeFieldChanged {
                 name: new_name.clone(),
                 field: "execution.widen_scope_for_tests",
+            });
+        }
+        // NOT a knob either: it decides when a worker is stopped.
+        if *loop_threshold != incumbent.execution.loop_threshold {
+            return Err(CandidateRejection::FixedRecipeFieldChanged {
+                name: new_name.clone(),
+                field: "execution.loop_threshold",
             });
         }
         check_cap(

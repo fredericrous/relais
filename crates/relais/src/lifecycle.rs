@@ -46,6 +46,8 @@ pub enum Reason {
     CriteriaUnmet,
     AmbiguousDiagnosis,
     SameFailureRecurrence,
+    /// A native worker was stopped for repeating one failing command.
+    WorkerLooped,
     EnvMissing,
     ArchitectureUnresolved,
     ScopeExceeded,
@@ -207,13 +209,14 @@ impl Reason {
     ///
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it.
-    pub const ALL: [Self; 68] = [
+    pub const ALL: [Self; 69] = [
         Self::ChecksAndReviewPassed,
         Self::BehavioralFailure,
         Self::RepairExhausted,
         Self::CriteriaUnmet,
         Self::AmbiguousDiagnosis,
         Self::SameFailureRecurrence,
+        Self::WorkerLooped,
         Self::EnvMissing,
         Self::ArchitectureUnresolved,
         Self::ScopeExceeded,
@@ -286,6 +289,7 @@ impl Reason {
             Self::CriteriaUnmet => "criteria_unmet",
             Self::AmbiguousDiagnosis => "ambiguous_diagnosis",
             Self::SameFailureRecurrence => "same_failure_recurrence",
+            Self::WorkerLooped => "worker_looped",
             Self::EnvMissing => "env_missing",
             Self::ArchitectureUnresolved => "architecture_unresolved",
             Self::ScopeExceeded => "scope_exceeded",
@@ -665,6 +669,7 @@ mod tests {
         for reason in [
             Reason::ChecksAndReviewPassed,
             Reason::SameFailureRecurrence,
+            Reason::WorkerLooped,
             Reason::VerificationInputsChanged,
             Reason::RunnerFailure,
         ] {

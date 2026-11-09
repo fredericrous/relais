@@ -240,6 +240,9 @@ pub struct LaunchSpec {
     /// What kind of agent this dispatch is: the native agent definition it
     /// runs as, and the kind its run events name.
     pub agent: crate::protocol::AgentKind,
+    /// How many identical failing results with no edit between stop a
+    /// native worker; `None` runs no loop detection.
+    pub loop_threshold: Option<u32>,
 }
 
 /// What the harness said one dispatch cost. `inclusive` describes a
@@ -357,6 +360,18 @@ pub struct LaunchResult {
     /// went silent): it may still be writing the tree it ran in.
     #[serde(default)]
     pub lost_worker: Option<LostWorker>,
+    /// Set when a worker was stopped, and acknowledged stopped, for
+    /// repeating one failing command: the attempt has no result to verify.
+    #[serde(default)]
+    pub looped: Option<LoopedWorker>,
+}
+
+/// A worker that was stopped for repeating one failing command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopedWorker {
+    pub agent: String,
+    pub command: String,
+    pub count: u32,
 }
 
 /// A worker whose session vanished while it ran.
@@ -588,6 +603,7 @@ mod tests {
             booked_message_ids: Vec::new(),
             unpriced: Vec::new(),
             lost_worker: None,
+            looped: None,
         };
         assert!(result.terminal_result_missing());
         let completed = LaunchResult {
@@ -637,6 +653,7 @@ mod tests {
             booked_message_ids: vec!["m1".into()],
             unpriced: Vec::new(),
             lost_worker: None,
+            looped: None,
         })
         .expect("serializes");
         stored
