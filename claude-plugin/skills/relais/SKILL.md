@@ -182,6 +182,10 @@ up, and the person answers there.
 - If the run needs a decision, make it explicitly — do not let a model
   invent it. A decision is not made until it is recorded with
   `mcp__relais__decide`.
+- After upgrading relais, and before touching a worktree a run works in
+  place, read [operating.md](operating.md): the plugin and the coordinator
+  are not upgraded with the CLI, and an in-place run writes its result over
+  the worktree.
 
 ## Done when
 
