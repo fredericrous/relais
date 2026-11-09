@@ -141,10 +141,10 @@ up, and the person answers there.
 
 4. Follow it and read the outcome.
    - Wait. The outcome arrives as a message when the run ends, with the
-     run id, the stop reason and what changed. Do not poll
+     run id, the stop reason and what changed. Do not end your turn before
+     it arrives: a run whose session ends goes with it. Do not poll
      `mcp__relais__status` while a run goes, and never call it just to
-     learn a run id. Do not end your turn before the outcome arrives: a
-     run whose session ends goes with it.
+     learn a run id.
    - Call `mcp__relais__status` with `run` only when the person asks for
      progress, or the pane shows the run stalled (phases, decisions, cost
      and outcome, one line per phase). Add `output: true` only after a
