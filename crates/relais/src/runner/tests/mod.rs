@@ -7331,6 +7331,16 @@ fn the_reviewer_reads_process_rules_as_lines_and_fetches_with_aval_rule() {
     assert!(block.contains("`errors.never-swallowed`: the statement of errors.never-swallowed"));
     assert!(block.contains("`errors.typed-values`: the statement of errors.typed-values"));
     assert!(text.contains("the `aval_rule` tool"), "{text}");
+    assert!(
+        text.contains(
+            "if that tool is not available or answers with an error, say so in your report"
+        ),
+        "the reviewer says which rule it could not read: {text}"
+    );
+    assert!(
+        !text.contains("aval rule <id>"),
+        "a reviewer has no shell: {text}"
+    );
     assert!(!text.contains("constraint index"), "{text}");
     assert!(text.contains("--- begin relevant guidance ("));
 }

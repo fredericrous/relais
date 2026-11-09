@@ -57,3 +57,15 @@ test('flaky and resource_exhausted are rows of text, and a check ending clears t
   const waiting = fold({ kind: 'waiting_for_slot', class: 'host_slot', position: 0, waited_s: 30 })
   expect(applyEvent(waiting, { kind: 'check_started', label: 'x', argv: [] }, T0).wait).toBeUndefined()
 })
+
+test('a guidance_index record stays out of the timeline; other decisions show', () => {
+  const index = fold({
+    kind: 'decision',
+    what: 'guidance_index',
+    reason: 'rules given to the worker as one line each: a.b c.d',
+  })
+  expect(index.decisions).toEqual([])
+  expect(timelineText(index, T0).join('\n')).not.toContain('a.b c.d')
+  const repair = fold({ kind: 'decision', what: 'repair', reason: 'checks_failed' })
+  expect(timelineText(repair, T0)).toContain('decision · repair · checks_failed')
+})
