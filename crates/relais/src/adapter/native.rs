@@ -807,7 +807,7 @@ pub struct NativeBackend<'a> {
     advisor_ledger: Option<PathBuf>,
     /// The shadow lines this backend said, for the tests to read.
     #[cfg(test)]
-    pub(crate) shadow_lines: Mutex<Vec<String>>,
+    pub(crate) shadow_lines: std::sync::Arc<Mutex<Vec<String>>>,
     /// The `loop guard off` lines this backend said, for the tests to read.
     #[cfg(test)]
     pub(crate) guard_off_lines: std::sync::Arc<Mutex<Vec<String>>>,
@@ -834,7 +834,7 @@ impl<'a> NativeBackend<'a> {
             memory: Mutex::new(Memory::default()),
             advisor_ledger: None,
             #[cfg(test)]
-            shadow_lines: Mutex::new(Vec::new()),
+            shadow_lines: std::sync::Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             guard_off_lines: std::sync::Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
