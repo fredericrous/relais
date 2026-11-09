@@ -1,17 +1,17 @@
 ---
 status: active
 branch: fix/verification-terminal-isolation
-repos: [relais, amont-agent]
-adrs: [decisions:ADR-0039, decisions:ADR-0042, decisions:ADR-0050, decisions:ADR-0053]
+repos: [relais, amont-agent, decisions]
+adrs: [decisions:ADR-0039, decisions:ADR-0042, decisions:ADR-0043, decisions:ADR-0050, decisions:ADR-0053, decisions:ADR-0061]
 ---
 # Reliable verification and deliberate output
 
 ## Review panel
 
-👉 **Decide:** none — approve if Phase 3 should be the no-prompt version: refuse a large whole-file read once per agent with feedback, allow the retry.
-📍 relais, amont-agent · Phases 1–2 done (Phase 2 tool pushed, PR next) · next: Phase 3 in amont-agent. Delta panel: backend (opus).
-**Changed by review:** reach measured per agent (1,706 of 1,711 large reads are an agent's first); once-per-key record is `first_telling`; `head` dropped; replay must show 0 false interventions before activation.
-**Verdicts:** backend approve-with-changes → approve. Carried into implementation: prefix the once-per-key with the rule id; the sentence "1,637 whole reads repeated…" in Phase 3 is superseded by the per-agent breakdown below it (770 repeats).
+👉 **Decide:** none — approve if Phase 3 should ship the reviewer-exempt Read rule and slim profile briefs under a new ADR replacing ADR-0043 for profile seats.
+📍 relais, amont-agent, decisions · Phase 3 rule committed (unpushed) · next: the ADR in decisions, then the amont-agent brief change. Delta panel: backend (opus).
+**Changed by review:** reach corrected by replay (272 calls / 5.5 MB with reviewers exempt); profile index is ids and titles only; RULES hash binds through implementation-review; ADR lands before the code.
+**Verdicts:** backend approve-with-changes → approve-with-changes (round 2, mediums carried). Carried: read item 6's `&amp;lt;id&amp;gt;` and `&amp;lt;&amp;lt;&amp;lt;RULES sha=` as `<id>` and `<<<RULES sha=` (a `plan-apply` escaping bug, to fix); the sizes are about 58 KB per profile brief and 370 KB per round, not 55 and 360.
 📄 Full reviews: [review evidence and implementation carries](2026-11-06-reliable-verification-and-deliberate-output.reviews.md).
 
 ## Context
@@ -63,15 +63,16 @@ Critical files: amont-agent's existing decision/payload/hook protocol, quiet int
 
 ## Phase 3 — Autonomous limits where the bytes are (re-targeted 2026-11-09)
 
-The Phase 2 baseline moved the target. Over [2026-10-23T10:03:38Z, 2026-11-06T10:03:38Z): main-conversation tool output 27.4 MB, subagent output 121.9 MB. CI logs are 0.5% of main output (plus 0.6% failed-job logs). Subagents' whole-file Reads over 8 KiB are 1,711 calls and 40.4 MB, about 27% of all tool output; 1,637 whole reads repeated a file already read whole in the same session. Measured reach, keyed per agent as below: of the 1,711, 941 calls (26.0 MB) are an agent's first whole read of that file, 765 (14.4 MB) a sibling subagent's first read of a file another agent read, and 5 (0.1 MB) the same agent again (left to `file-reread`). So refuse-once reaches 1,706 calls and 40.3 MB of would-refuse reads; what an agent then reads by window is the unknown Phase 5 measures. Main shell output is many small results (about 1 KB each), so capping it saves little. The person chose no prompts: every limit below is feedback to the agent, never a question to the person, and CI logs get no special path.
+The Phase 2 baseline moved the target. Over [2026-10-23T10:03:38Z, 2026-11-06T10:03:38Z): main-conversation tool output 27.4 MB, subagent output 121.9 MB. CI logs are 0.5% of main output (plus 0.6% failed-job logs). Subagents' whole-file Reads over 8 KiB are 1,711 calls and 40.4 MB, about 27% of all tool output; 1,637 whole reads repeated a file already read whole in the same session. Measured reach, keyed per agent as below: of the 1,711, 941 calls (26.0 MB) are an agent's first whole read of that file, 765 (14.4 MB) a sibling subagent's first read of a file another agent read, and 5 (0.1 MB) the same agent again (left to `file-reread`). Replayed through the rule as built (2026-11-09), its exemptions cut that: 775 calls / 23 MB, of which 332 / 15.1 MB were review briefs that reviewers are told to read whole, false interventions. With reviewer agents exempt (below) the rule reaches 272 calls / 5.5 MB, about 4% of tool output, mostly workers reading source files. The large remaining bucket is the briefs themselves: about 137 KB per seat (code rules in full 50 KB, constraint index 34 KB, diff 33 KB, path decisions 17 KB), read whole by every seat of every round. Item 6 shrinks them. Main shell output is many small results (about 1 KB each), so capping it saves little. The person chose no prompts: every limit below is feedback to the agent, never a question to the person, and CI logs get no special path.
 
 1. **Refuse once, then allow.** Add one shared behaviour to the existing rules: the first matching call in a session is refused before it runs, with factual machine feedback (proven on the real host 2026-11-08: the agent sees `PreToolUse:… hook error: <reason>` and continues); the same call repeated afterwards is allowed and journalled `allowed-after-feedback`. Key: session, agent (main or the subagent's id when the payload carries one), tool, normalised path and file size. Reuse the hook's `first_telling`/`lsp::told` once-per-key record (unrecorded answers first), not the `session_state.rs` read log; expiry or a lost record returns to "refuse once", never to a silent allow on an unseen file. No second model, no prompt.
-2. **`read-unbounded-large`**: lower `LARGE` from 16 KiB to 8 KiB, keep its exemptions (plans read whole by reviewers) and its stat-only check, and graduate it from `advise` to refuse-once. Feedback names the file's size and line count and the cheaper call: a window (`offset`/`limit`) or LSP `documentSymbol`.
+2. **`read-unbounded-large`**: lower `LARGE` from 16 KiB to 8 KiB, keep its exemptions (plans read whole by reviewers), add one: an agent whose `agent_type` is a reviewer (`implementation-review`, `code-review-*`, `plan-review-*`, `interface-review`, relais reviewers) is handed its brief to read whole. Keep the stat-only check, and graduate it from `advise` to refuse-once. Feedback names the file's size and line count and the cheaper call: a window (`offset`/`limit`) or LSP `documentSymbol`.
 3. **`whole-file-dump`**: graduate to refuse-once for a `cat` or address-less `sed` of a whole regular file over 8 KiB; feedback names the Read window.
 4. **`file-reread`**: stays `advise`; its rate is measured in Phase 5 before any change.
 5. No change to `persisted-output-dump`, CI rules, permissions or Claude Code settings. Lowering `bashOutputMaxChars` is the person's setting and out of scope.
+6. **Profile briefs carry their own rules, not all of them** (the person's choice, 2026-11-09). A new decision replaces ADR-0043's `guidance.code-rules-in-dispatch` for code-review profile seats: implementation-review keeps every code rule in full, the decisions on the touched paths and the candidates (it already rules on every rule's candidates, so no rule loses its reader); a profile seat's brief carries the judge rules it owns in full, the decisions on the touched paths, and an id index of the other constraints (one line per id and title, replacing the 34 KB `aval rules --level constraint` text; size measured before release), fetched with `aval_rule`, or `aval rule &lt;id&gt;` where the MCP tool is absent, when its review needs one. The `&lt;&lt;&lt;RULES sha=` line stays the full code-rules hash; the new ADR states that a profile seat binds to it through implementation-review, and `interdiff_brief` and `code_review.rs` change to match. The ADR merges and `aval.pack` is refreshed before the amont-agent PR. `amont-agent review-brief --profile` changes to match. Expected, with the index ids and titles only (about 3 KB): a profile brief from about 137 KB to about 55 KB (137 − 50 code rules − 34 constraint text + 2 judge rules + 3 index); per round of one implementation review and four profiles, about 685 KB to about 360 KB. ADR-0061's per-profile diff slice is unchanged and not built here.
 
-Critical files: amont-agent `crates/amont-agent-guard/src/rules/read_unbounded_large.rs`, `whole_file_dump.rs`, `session_state.rs`, the hook's Read/Bash paths in `src/hook.rs`, `tests/hook.rs`, the rule corpus, `docs/`.
+Critical files: amont-agent `crates/amont-agent-guard/src/rules/read_unbounded_large.rs`, `whole_file_dump.rs`, the hook's Read/Bash paths in `src/hook.rs`, `crates/amont-agent-process/src/review_brief.rs`, `tests/hook.rs`, `tests/review_brief.rs`, `docs/`; decisions: a new ADR replacing ADR-0043 for `guidance.code-rules-in-dispatch`, `HEADS.md`, `aval.pack`.
 
 ## Phase 4 — Capture automatically and reduce producer noise
 
@@ -89,15 +90,17 @@ Critical files: existing amont-agent hook/payload/decision and shell-analysis/qu
 - Replay the fixed baseline window through the Phase 3 matchers: count would-refuse calls by rule and context (main, subagent), review a reproducible sample of 50 plus every exempt-path near miss, and record false interventions. Run the rules' negative corpus.
 - Hook tests: first whole Read over 8 KiB refused with size and window advice; the identical retry allowed and journalled; a different file refused once on its own; a ranged Read and an exempt plan path never refused; a subagent's call keyed apart from the main session's; expired or missing state refuses once again. The same for `whole-file-dump`.
 - Automatic routing (Phase 4): deterministic noisy pass/fail fixtures; passing output <=200 B excluding the delayed notice; raw log intact; exit codes, signals, missing executable, cancellation and grandchild cleanup retained. The real-host proof (2026-11-08) showed the rewritten command is what is shown and run, so routing only ever makes output quieter, never changes the effect.
+- Profile brief: `review-brief --profile backend` on a fixture corpus → its own judge rules in full, no `# Code rules (in full)`, an id index, the RULES line present, the size recorded; the same for `--interdiff`; the implementation-review brief byte-identical to before.
 - Compact relais notifications: successful, failed, blocked, cancelled and answered fixtures; current action/state and every verification gap kept; complete evidence retrievable.
 - Project default checks, declared implementation reviews (deltas via `review-brief --interdiff`), PR/CI/release/install through each owner workflow. No tool downgrades, review bypasses or manual trust edits.
 - **Activation:** graduating the two rules to refuse-once is authorised by this plan once the replay sample shows 0 false interventions; any false intervention returns only that rule to `advise` until fixed.
-- **Observe seven days** after activation (date recorded then): run `amont-agent output-audit` over those seven days and compare with the baseline's per-day rates. Target: subagent whole-Read bytes over 8 KiB down by half, with no rise in failed tasks or repair rounds in relais receipts. Report `allowed-after-feedback` counts (feedback ignored) honestly; no quota percentage without measured evidence.
+- **Observe seven days** after activation (date recorded then): run `amont-agent output-audit` over those seven days and compare with the baseline's per-day rates. Targets: subagent whole-Read bytes over 8 KiB outside reviewer agents down by half (reach 5.5 MB in the baseline), and review-brief bytes per round down by about half (measured on the next five review rounds against the 137 KB per seat above), with no rise in failed tasks, repair rounds or reviewer-missed rule violations found later. Report `allowed-after-feedback` counts (feedback ignored) honestly; no quota percentage without measured evidence.
 
 ## Code review
 
 - relais: backend, lang:rust, lang:typescript, unix, tui
 - amont-agent: backend, lang:rust, unix, tui
+- decisions: none — ADR text only, reviewed by this panel and aval's lint
 
 Omissions: architect at code close — ownership and interfaces are reviewed in this plan; changes stay localized to existing process/policy/formatting seams. No React/UI profiles: hook feedback to the agent only, no prompt and no web UI. Language profiles cover only the named repository's languages; amont-agent has no TypeScript implementation work.
 
@@ -127,4 +130,4 @@ Phase 1 (relais#383), tree 63885f34. Round 1 then Delta, all Opus.
 
 Remaining Phase 1 steps: release/install, then amont's unchanged `make check` through native relais once; seven-day receipt observation from that date.
 
-<!-- panel: repos=relais,amont-agent adds=lang:typescript reviewers=backend body-sha=10e3bac11bf2 -->
+<!-- panel: repos=relais,amont-agent,decisions adds=lang:typescript reviewers=backend body-sha=8d8066826a6c -->
