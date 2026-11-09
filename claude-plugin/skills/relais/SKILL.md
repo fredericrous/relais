@@ -140,13 +140,18 @@ up, and the person answers there.
      both.
 
 4. Follow it and read the outcome.
-   - Progress: call `mcp__relais__status` with `run` (phases, decisions,
-     cost and outcome; add `output: true` only when the last lines of a
-     check's output are what you need). Without `run` it lists a short
-     page of this session's runs (10 at most, `offset` for the next page).
+   - Wait. The outcome arrives as a message when the run ends, with the
+     run id, the stop reason and what changed. Do not end your turn before
+     it arrives: a run whose session ends goes with it. Do not poll
+     `mcp__relais__status` while a run goes, and never call it just to
+     learn a run id.
+   - Call `mcp__relais__status` with `run` only when the person asks for
+     progress, or the pane shows the run stalled (phases, decisions, cost
+     and outcome, one line per phase). Add `output: true` only after a
+     failure whose message does not say why: it returns the failing lines
+     first, then the tail. Without `run` it lists a short page of this
+     session's runs (10 at most, `offset` for the next page).
      The person can follow the same runs in `/relais-status`.
-   - The outcome arrives as a message when the run ends. Do not end your
-     turn before it arrives: a run whose session ends goes with it.
    - Read the outcome: accepted (receipt + patch), needs_decision,
      needs_review, blocked, failed, budget_exhausted or interrupted. The
      artifacts path is on every terminal state. A run refused before it

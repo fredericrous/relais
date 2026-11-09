@@ -204,7 +204,10 @@ test('after /clear the timeline is reloaded from relais native status', async ($
   const [run] = JSON.parse(reply.result)
   expect(run.run).toBe('run-old')
   expect(run.decisions).toEqual(['repair · checks_failed'])
-  expect(run.phases.map((p: any) => p.title)).toEqual(['preflight', 'attempt 1 · worker'])
+  expect(run.phases.length).toBe(2)
+  expect(/^[a-z_]+: preflight/.test(run.phases[0])).toBe(true)
+  expect(/^[a-z_]+: attempt 1 · worker/.test(run.phases[1])).toBe(true)
+  expect(run.phases.every((phase: string) => typeof phase === 'string' && !phase.includes(' ·  · '))).toBe(true)
   expect(run.maxAttempts).toBe(3)
   expect(engine.calls.run.some((c: any) => c.argv.join(' ') === 'relais native status --session session-1')).toBe(true)
 })
@@ -508,4 +511,93 @@ test('a retried outcome is checked again, and the retry carries the fresh text',
   expect(engine.calls.prompts[0].text).toContain('Since then: decision_approved')
   expect(engine.calls.prompts[0].text).not.toContain('yours to decide')
   expect(statusCalls(engine).length).toBe(2)
+})
+
+const whyRun = async ($: any, on: any, outcome: string, extra: Record<string, unknown>, stderr: string) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stderr', stderr)
+  engine.stream.push('stdout', phase(0, 'running') + done(outcome, extra))
+  await settle(engine)
+  await tick(engine)
+  return engine.calls.prompts[0].text as string
+}
+
+test('an unaccepted outcome without detail quotes the last two runner stderr lines right after the headline', async ($: any, on: any) => {
+  const text = await whyRun($, on, 'needs_review', {}, 'old\nfirst \u001b[31mred\u001b[0m\r\nsecond\tline\r\n')
+  const lines = text.split('\n')
+  expect(lines[1]).toBe('Last runner stderr (quoted): "first red" "second line"')
+  expect(text).not.toContain('"old"')
+  expect(text).not.toContain('\u001b')
+  expect(text).not.toContain('\r')
+})
+
+test('the quoted stderr line keeps only the last frame of a \\r progress bar', async ($: any, on: any) => {
+  const text = await whyRun($, on, 'needs_review', {}, 'downloading 10%\rdownloading 90%\rerror: boom\r\n')
+  expect(text.split('\n')[1]).toBe('Last runner stderr (quoted): "error: boom"')
+})
+
+test('a stderr line made only of escape codes is not quoted, and does not take a slot', async ($: any, on: any) => {
+  const text = await whyRun($, on, 'needs_review', {}, 'a\nreal\n\u001b[0m\n')
+  expect(text.split('\n')[1]).toBe('Last runner stderr (quoted): "a" "real"')
+})
+
+test('no Why line on an accepted outcome', async ($: any, on: any) => {
+  expect(await whyRun($, on, 'accepted', {}, 'boom\n')).not.toContain('Last runner stderr')
+})
+
+test('no Why line when detail is set', async ($: any, on: any) => {
+  expect(await whyRun($, on, 'blocked', { code: 'no_policy', detail: 'no policy' }, 'boom\n')).not.toContain('Last runner stderr')
+})
+
+test('review_unavailable keeps its detail and still gets a Why line', async ($: any, on: any) => {
+  const text = await whyRun($, on, 'needs_review', { code: 'review_unavailable', detail: 'reviewer gone' }, 'quota exhausted\n')
+  expect(text).toContain('Last runner stderr (quoted): "quota exhausted"')
+})
+
+test('a stderr line contained in detail is skipped', async ($: any, on: any) => {
+  const text = await whyRun($, on, 'needs_review', { code: 'review_unavailable', detail: 'reviewer gone: quota exhausted' }, 'quota exhausted\nother\n')
+  expect(text).toContain('Last runner stderr (quoted): "other"')
+  expect(text).not.toContain('"quota exhausted"')
+})
+
+test('a run: null refusal carries the Why line', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stderr', 'config exploded\n')
+  engine.stream.push('stdout', line({ relais: 'done', run: null, outcome: 'blocked', receipt: null, summary: null }))
+  engine.stream.end(2)
+  await settle(engine)
+  await tick(engine)
+  expect(engine.calls.prompts[0].text.split('\n')[1]).toBe('Last runner stderr (quoted): "config exploded"')
+})
+
+test('an answered run\'s rewrite carries no Why line', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  let current: unknown = stillOpen
+  engine.script.runResult = (argv: string[]) => (argv[2] === 'status' ? statusWith(argv[4], current) : ok())
+  engine.script.submitFailures = 1
+  engine.stream.push('stderr', 'stale reason\n')
+  engine.stream.push('stdout', phase(0, 'running') + done('needs_decision', { code: 'verification_inputs_changed' }))
+  await settle(engine)
+  await tick(engine, 100)
+  expect(engine.calls.prompts.length).toBe(0)
+  current = answered
+  await tick(engine)
+  expect(engine.calls.prompts.length).toBe(1)
+  expect(engine.calls.prompts[0].text).toContain('Since then: decision_approved')
+  expect(engine.calls.prompts[0].text).not.toContain('Last runner stderr')
+})
+
+test('a stderr line over 160 characters is quoted cut to 160, ending in an ellipsis', async ($: any, on: any) => {
+  const text = await whyRun($, on, 'needs_review', {}, `${'x'.repeat(300)}\n`)
+  expect(text.split('\n')[1]).toBe(`Last runner stderr (quoted): ${JSON.stringify(`${'x'.repeat(159)}…`)}`)
+})
+
+test('an open needs_decision outcome without detail carries the Why line it later loses on rewrite', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.script.runResult = (argv: string[]) => (argv[2] === 'status' ? statusWith(argv[4], stillOpen) : ok())
+  engine.stream.push('stderr', 'stale reason\n')
+  engine.stream.push('stdout', phase(0, 'running') + done('needs_decision', { code: 'verification_inputs_changed' }))
+  await settle(engine)
+  await tick(engine)
+  expect(engine.calls.prompts[0].text.split('\n')[1]).toBe('Last runner stderr (quoted): "stale reason"')
 })

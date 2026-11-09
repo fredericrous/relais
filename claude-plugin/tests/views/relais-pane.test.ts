@@ -329,7 +329,7 @@ test('the status tool returns phases, decisions and cost, and at most 40 output 
   expect(brief.phase).toBe('verifying')
   expect(brief.decisions).toEqual(['repair · checks_failed'])
   expect('output' in brief).toBe(false)
-  expect(brief.phases.map((p: any) => p.title)).toContain('preflight')
+  expect(brief.phases.some((phase: string) => /^[a-z_]+: preflight/.test(phase))).toBe(true)
   // Asked for, they are the last 40.
   const [run] = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status', run: RUN, output: true })).result)
   expect(run.output.length).toBe(40)

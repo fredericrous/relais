@@ -9,6 +9,14 @@ export const MAX_STDERR_LINES = 10
 export const MAX_ACTIVITY_LINES = 40
 // A line is cut to this before it is stored, whatever width the pane gets.
 export const MAX_LINE = 240
+export const MAX_FAILURE_WINDOWS = 40
+const FAILURE_CONTEXT_LINES = 2
+// Failure lines a status reply carries ahead of the tail.
+const MAX_FAILURE_OUTPUT_LINES = 30
+// When failure lines are trimmed to fit, this share goes to the earliest ones
+// (the root cause) and the rest to the latest (the summary).
+const ROOT_CAUSE_SHARE = 1 / 3
+const FAILURE_LINE = /\bFAIL(ED)?\b|^E\s|^error(\[E\d+\])?:|panicked at|^\s*[×✗]\s/
 
 export type Check = {
   label: string
@@ -22,7 +30,19 @@ export type Check = {
   elidedBytes: number
   // When the check's last output event arrived; undefined before the first.
   lastOutputAt: number | undefined
+  // Windows around the lines that look like a failure (first and most recent
+  // MAX_FAILURE_WINDOWS/2 kept), so a root cause survives the tail.
+  failures: FailureWindow[]
+  // Context lines still to attach after the latest failure line.
+  trailing: number
+  // Lines started so far; the open line, if any, is number `lineCount`.
+  lineCount: number
+  // Whether the open line's text so far ended in a bare carriage return.
+  pendingCr: boolean
 }
+
+export type NumberedLine = { no: number; text: string }
+export type FailureWindow = NumberedLine[]
 
 export type Step = {
   title: string
@@ -128,33 +148,86 @@ const AWAITS_STATES = new Set(['needs_decision', 'needs_review', 'interrupted'])
 export const awaitsState = (state: string) => AWAITS_STATES.has(state)
 export const awaitsAPerson = (m: RunModel) => m.outcome !== undefined && awaitsState(m.outcome.state)
 
-// Control characters out, the line cut: a stored line is never wider than MAX_LINE.
-export function cutLine(line: string): string {
-  const clean = line
+// An OSC sequence (a terminal hyperlink or title): ESC ] ... BEL, or ending in ESC \.
+// Built from character codes so the source holds no control-character literal.
+const ESC = String.fromCharCode(27)
+const BEL = String.fromCharCode(7)
+const OSC_SEQUENCE = new RegExp(`${ESC}\\][^${BEL}${ESC}]*(?:${BEL}|${ESC}\\\\)`, 'g')
+
+// Escape sequences and control characters out; tabs become two spaces.
+export function cleanLine(line: string): string {
+  return line
+    .replace(OSC_SEQUENCE, '')
     // eslint-disable-next-line no-control-regex
     .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
     // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '')
     .replace(/\t/g, '  ')
-  return clean.length > MAX_LINE ? clean.slice(0, MAX_LINE - 1) + '…' : clean
+}
+
+// Cleaned and cut: a stored line is never wider than `width`.
+export function cutLineTo(line: string, width: number): string {
+  const clean = cleanLine(line)
+  return clean.length > width ? clean.slice(0, width - 1) + '…' : clean
+}
+
+// Cut at MAX_LINE. One argument on purpose: callers pass it to `.map`, which would hand it an index.
+export function cutLine(line: string): string {
+  return cutLineTo(line, MAX_LINE)
+}
+
+// Records a finished line (number `no`, stored text `text`) in the failure
+// windows: a matching line opens a window with its leading context, a line
+// within the trailing count joins the latest window.
+function recordLine(check: Check, no: number, text: string): Check {
+  if (FAILURE_LINE.test(text)) {
+    const before = check.output
+      .slice(0, Math.max(0, check.output.length - 1))
+      .map((previous, i, earlier) => ({ no: no - (earlier.length - i), text: previous }))
+      .slice(-FAILURE_CONTEXT_LINES)
+    const failures = [...check.failures, [...before, { no, text }]]
+    if (failures.length > MAX_FAILURE_WINDOWS) failures.splice(MAX_FAILURE_WINDOWS / 2, 1)
+    return { ...check, failures, trailing: FAILURE_CONTEXT_LINES }
+  }
+  if (check.trailing > 0 && check.failures.length > 0) {
+    const failures = [...check.failures]
+    failures[failures.length - 1] = [...failures[failures.length - 1], { no, text }]
+    return { ...check, failures, trailing: check.trailing - 1 }
+  }
+  return check
 }
 
 // The output lines of `text` appended to a check's tail, which keeps only
-// the last MAX_OUTPUT_LINES.
+// the last MAX_OUTPUT_LINES, and to its failure windows.
 export function appendOutput(check: Check, text: string): Check {
+  // An empty chunk is no output: it must not close the line still being written.
+  if (text === '') return check
   const pieces = text.split('\n')
   const endsLine = pieces[pieces.length - 1] === ''
   if (endsLine) pieces.pop()
-  const lines = [...check.output]
+  let state: Check = { ...check, output: [...check.output] }
   pieces.forEach((piece, i) => {
-    if (i === 0 && check.isOpen && lines.length > 0) {
-      lines[lines.length - 1] = cutLine(lines[lines.length - 1] + piece)
-    } else {
-      lines.push(cutLine(piece))
+    const terminated = i < pieces.length - 1 || endsLine
+    const continues = i === 0 && state.isOpen && state.output.length > 0
+    let raw = continues
+      ? state.output[state.output.length - 1] + (state.pendingCr ? '\r' : '') + piece
+      : piece
+    if (!continues) state = { ...state, lineCount: state.lineCount + 1 }
+    let pendingCr = false
+    if (raw.endsWith('\r')) {
+      raw = raw.slice(0, -1)
+      pendingCr = !terminated
     }
+    const stored = cutLine(raw.slice(raw.lastIndexOf('\r') + 1))
+    if (continues) state.output[state.output.length - 1] = stored
+    else state.output.push(stored)
+    state = { ...state, pendingCr, isOpen: !terminated }
+    if (terminated) state = recordLine(state, state.lineCount, stored)
   })
-  const isOpen = pieces.length > 0 ? !endsLine : check.isOpen && !endsLine
-  return { ...check, output: lines.slice(-MAX_OUTPUT_LINES), isOpen }
+  if (pieces.length === 0 && endsLine && state.isOpen) {
+    state = recordLine({ ...state, isOpen: false }, state.lineCount, state.output[state.output.length - 1])
+  }
+  return { ...state, output: state.output.slice(-MAX_OUTPUT_LINES) }
 }
 
 // A heartbeat whose progress is older than this reads as "no progress".
@@ -358,6 +431,10 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
         isOpen: false,
         elidedBytes: 0,
         lastOutputAt: undefined,
+        failures: [],
+        trailing: 0,
+        lineCount: 0,
+        pendingCr: false,
       }
       m = { ...m, wait: undefined }
       m = mapLast(m, s => ({ ...s, checks: [...s.checks, check], detail: (event.argv ?? []).join(' ') }))
@@ -540,10 +617,55 @@ export function attemptText(m: RunModel): string {
 // running or last check, else what its agent did; else an earlier step's.
 export function latestOutput(m: RunModel, limit: number): string[] {
   for (let i = m.steps.length - 1; i >= 0; i--) {
-    const lines = stepOutput(m.steps[i])
-    if (lines.length > 0) return lines.slice(-limit)
+    const step = m.steps[i]
+    const lines = stepOutput(step)
+    if (lines.length === 0) continue
+    const check = step.checks.length > 0 ? step.checks[step.checks.length - 1] : undefined
+    return check ? failureFirst(check, limit) : lines.slice(-limit)
   }
   return []
+}
+
+const ELLIPSIS = '…'
+
+// Numbered lines in order, an ellipsis wherever numbers skip.
+function renderWindows(lines: NumberedLine[]): string[] {
+  const rendered: string[] = []
+  lines.forEach((line, i) => {
+    if (i > 0 && line.no !== lines[i - 1].no + 1) rendered.push(ELLIPSIS)
+    rendered.push(line.text)
+  })
+  return rendered
+}
+
+// The failure lines (at most MAX_FAILURE_OUTPUT_LINES, first and most recent
+// kept) followed by the tail, `limit` lines in all; the plain tail when the
+// check has no failure lines.
+function failureFirst(check: Check, limit: number): string[] {
+  const tail = check.output
+  const settled = check.isOpen && tail.length > 0
+    ? recordLine({ ...check, isOpen: false }, check.lineCount, tail[tail.length - 1])
+    : check
+  const byNumber = new Map<number, NumberedLine>()
+  for (const window of settled.failures) for (const line of window) byNumber.set(line.no, line)
+  const all = [...byNumber.values()].sort((a, b) => a.no - b.no)
+  if (all.length === 0) return tail.slice(-limit)
+  let failures = all
+  const failureCap = Math.min(MAX_FAILURE_OUTPUT_LINES, limit)
+  for (let keep = failures.length; keep > 0 && renderWindows(failures).length > failureCap; keep--) {
+    const head = Math.floor(keep * ROOT_CAUSE_SHARE)
+    failures = all.slice(0, head).concat(all.slice(all.length - (keep - head)))
+  }
+  const failureNumbers = new Set(failures.map(line => line.no))
+  const tailLines = tail.map((text, i) => ({ no: check.lineCount - (tail.length - 1 - i), text }))
+  let chosen = failures
+  for (let i = tailLines.length - 1; i >= 0; i--) {
+    if (failureNumbers.has(tailLines[i].no)) continue
+    const candidate = [...chosen, tailLines[i]].sort((a, b) => a.no - b.no)
+    if (renderWindows(candidate).length > limit) break
+    chosen = candidate
+  }
+  return renderWindows(chosen)
 }
 
 // A step's own lines: its last check's output, else its agent's activity.
@@ -614,14 +736,13 @@ export function statusReply(m: RunModel, now: number, opts: { output?: boolean }
     run: m.run,
     phase: m.phase,
     attempt: m.attempt,
-    maxAttempts: m.maxAttempts ?? null,
-    elapsedMs: elapsedOf(m, now),
-    phases: m.steps.map(s => ({
-      title: s.title,
-      state: s.state,
-      detail: s.detail,
-      durationMs: s.endedAt ? s.endedAt - s.startedAt : null,
-    })),
+    ...(m.maxAttempts != null ? { maxAttempts: m.maxAttempts } : {}),
+    elapsed_s: Math.round(elapsedOf(m, now) / 1000),
+    // "<state>: <title> · <detail> · <secs>s", empty parts dropped. The state leads, because
+    // titles and details already contain ' · ' and could not be told from it.
+    phases: m.steps.map(s =>
+      `${s.state}: ${[s.title, s.detail, s.endedAt ? `${Math.round((s.endedAt - s.startedAt) / 1000)}s` : ''].filter(Boolean).join(' · ')}`,
+    ),
     decisions: m.decisions.map(d => d.text),
     cost: formatCost(m.cost),
     outcome: m.outcome ?? null,
