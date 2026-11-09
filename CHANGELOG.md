@@ -8,6 +8,7 @@ missing here.
 
 ## Unreleased
 
+- **The bundled SQLite moves past RUSTSEC-2026-0459.** `rusqlite` is now 0.41 (libsqlite3-sys 0.39), and the minimum supported Rust version becomes 1.89.
 - **A native worker that loops can be stopped (`[execution] loop_threshold`).** A worker that repeated one failing Bash command with no edit between kept running until `max_wall_seconds`, and the ladder never moved. relais now reads the worker's transcript while it runs. With `loop_threshold = N` (minimum 2), the Nth identical failure stops the agent, waits for the stop to be acknowledged (fencing the tree if it is not), and runs the next rung: a repair at higher effort, then the escalation model, with the looped command and its error line in the next prompt. A looping run that runs out of attempts ends `failed (worker_looped)`, exit code 4 where it used to end `interrupted` at the wall clock. The key is unset by default, and the detector then runs in shadow at N=3: it prints `relais: shadow: would stop attempt <n>: …` and stops nothing. A contract may raise the threshold or turn the guard off with `limits.loop_threshold = 0`. An older relais calls a stored `worker_looped` reason corrupt when it salvages the run, so roll back by unsetting the key, not by installing an older binary.
 
 ## v0.50.3

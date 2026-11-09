@@ -225,7 +225,7 @@ impl Ledger {
     /// falls back to a read-only connection without an error; this is the
     /// one answer that covers every such cause.
     pub fn is_read_only(&self) -> Result<bool> {
-        Ok(self.conn.is_readonly(rusqlite::DatabaseName::Main)?)
+        Ok(self.conn.is_readonly(rusqlite::MAIN_DB)?)
     }
 
     /// The ledger for reading only, when there is one this binary can read.

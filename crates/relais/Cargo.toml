@@ -36,7 +36,7 @@ globset = "0.4"
 # Machine-local ledger (SPEC §12). Bundled: hermetic, no system SQLite to
 # drift against. rusqlite is the maintained standard; a ledger is the one
 # place a dependency is clearly cheaper than hand-rolling.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 # Timestamps and report windows; stored as RFC3339 strings / unix seconds.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Per-test results from a verification command's JUnit XML report (SPEC
