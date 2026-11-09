@@ -106,17 +106,18 @@ reinstall.
 - Phase 3: the phase string is `<state>: <title> · <detail> · <secs>s`, not `<title> · <state> · …` (implementation review: titles and details contain ` · `, so the state could not be told apart).
 - Phase 2: the line reads `Last runner stderr (quoted): "…"`, not `Why (runner stderr, quoted)`, because the code quotes the last lines and does not know they are the cause. It keeps only the last `\r` frame and compares with `detail` before cutting. `cutLine` stays one-argument (`.map(cutLine)` passes an index); `cutLineTo(line, width)` is the new function.
 - Phase 4: the reply carries at most 30 failure lines, a third from the earliest matches, so at least 10 tail lines remain; storage keeps 20 + 20 as written. Empty chunks do not close the open line; OSC sequences are stripped by `cutLineTo`.
+- Phase 2: the last two lines are taken after empty lines, escape-only lines and lines already in `detail` are dropped, so none of them uses up a slot.
 - Deliberate: `onDone` does not pass the outcome `reason` into the live model (the `rebuildOne` path does). It predates this plan; the outcome message itself now carries the reason. Carried to a later change.
 
 ## Verification record
-- `make plugin` (validate + 405 plugin tests) → expected 0 failures → observed 405 pass, 0 fail, on the tree before the closing commit.
+- `make plugin` (validate + 405 plugin tests) → expected 0 failures → observed 405 pass, 0 fail, run again after the last behaviour change (stderr lines filtered before the last two are taken); the later commit changes one comment, and its pre-commit plugin-test passed.
 - Frozen pre-change fixtures (`claude-plugin/tests/fixtures/*.frozen.ts`) → expected compact reply at most 90% → observed: both fixtures pass the 90% assertion in `status.test.ts`.
 - Failure-first output → expected the root-cause line survives a 120-line tail for pytest, cargo and vitest, CRLF, split chunks and 100 noise lines → observed: table tests in `status.test.ts` pass.
 - Outcome message → expected `Last runner stderr (quoted)` only on an unaccepted outcome without detail (or `review_unavailable`), absent from an answered rewrite → observed: `outcome.test.ts` pass.
 - Not observed here: the live `needs_review` run and the week-later transcript count; both wait for the release and the person's plugin reinstall.
 
 ## Implementation review
-- implementation-review (opus): round 1 approve-with-changes (plan text out of step with the 30-line cap); delta approve-with-changes (tests that could no longer fail, fixed). 70k + 28k tokens.
+- implementation-review (opus): round 1 approve-with-changes (plan text out of step with the 30-line cap); deltas fixed tests that could no longer fail, a test title, and the plan record; last delta approve-with-changes (record only), fixed here.
 - backend (opus): round 1 empty chunk closed an open line, fixed; delta ANSI-only lines filtered too late, fixed.
 - lang:typescript (opus): round 1 live model drops the outcome reason, `deliberate` (existing, Decision log); delta two low points fixed.
 - unix (opus): round 1 `\r` frames, OSC sequences, reinstall note, all fixed; delta approve.
