@@ -13,6 +13,7 @@ import {
   awaitsState,
   changedText,
   cutLine,
+  cutLineTo,
   emptyRun,
   isLive,
   rebuildRuns,
@@ -500,7 +501,7 @@ async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number
   const facts = [receipt ? `Receipt: ${receipt}` : '', summaryText(line.summary), successor ? widenedText(successor) : '', trial ? `Replay trial: ${trial}` : '', commandsChangedText(model)].filter(Boolean)
   // A widened run was answered by relais itself: its successor is launched, no decision waits.
   const awaits = awaitsState(outcome) && typeof line.run === 'string' && !successor
-  const text = [headline, ...facts, code ? NEXT_STEP[code] ?? '' : '', awaits ? DECIDE_STEP : '', outcome === 'accepted' && typeof line.run === 'string' && !trial ? FEEDBACK_STEP : ''].filter(Boolean).join('\n')
+  const text = [headline, whyText(outcome, code, detail, child.stderrTail), ...facts, code ? NEXT_STEP[code] ?? '' : '', awaits ? DECIDE_STEP : '', outcome === 'accepted' && typeof line.run === 'string' && !trial ? FEEDBACK_STEP : ''].filter(Boolean).join('\n')
   // The stream hook descends from the `run` tool call, and a prompt cannot
   // be submitted from under a tool or command hook: the session's timer
   // (`pump`) sends it.
@@ -508,6 +509,22 @@ async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number
   if (awaits) {
     store.pendingOutcomes.set(text, { run, outcome, code, kind: trial ? 'replay' : 'run', facts, noted: new Set() })
   }
+}
+
+const WHY_LINES = 2
+const WHY_LINE_CHARS = 160
+
+// The runner's last stderr lines, quoted, when the outcome carries no reason of its
+// own. Kept out of `facts`: an answered run's rewrite must not carry a stale reason.
+function whyText(outcome: string, code: string | null, detail: string | null, stderrTail: string[] | undefined): string {
+  if (outcome === 'accepted') return ''
+  if (detail && code !== 'review_unavailable') return ''
+  const quoted = (stderrTail ?? [])
+    .slice(-WHY_LINES)
+    .map(entry => cutLineTo(entry.replace(/\s+/g, ' ').trim(), WHY_LINE_CHARS))
+    .filter(entry => entry !== '' && !(detail && detail.includes(entry)))
+    .map(entry => JSON.stringify(entry))
+  return quoted.length ? `Why (runner stderr, quoted): ${quoted.join(' ')}` : ''
 }
 
 export type Successor = { intent_id: string; repo: string; widened_paths: string[] }

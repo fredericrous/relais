@@ -148,15 +148,20 @@ const AWAITS_STATES = new Set(['needs_decision', 'needs_review', 'interrupted'])
 export const awaitsState = (state: string) => AWAITS_STATES.has(state)
 export const awaitsAPerson = (m: RunModel) => m.outcome !== undefined && awaitsState(m.outcome.state)
 
-// Control characters out, the line cut: a stored line is never wider than MAX_LINE.
-export function cutLine(line: string): string {
+// Control characters out, the line cut: a stored line is never wider than `width`.
+export function cutLineTo(line: string, width: number): string {
   const clean = line
     // eslint-disable-next-line no-control-regex
     .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
     // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '')
     .replace(/\t/g, '  ')
-  return clean.length > MAX_LINE ? clean.slice(0, MAX_LINE - 1) + '…' : clean
+  return clean.length > width ? clean.slice(0, width - 1) + '…' : clean
+}
+
+// Cut at MAX_LINE. One argument on purpose: callers pass it to `.map`, which would hand it an index.
+export function cutLine(line: string): string {
+  return cutLineTo(line, MAX_LINE)
 }
 
 // Records a finished line (number `no`, stored text `text`) in the failure
