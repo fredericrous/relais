@@ -21,6 +21,9 @@ effort = "medium"
 [execution]
 max_attempts = 3
 max_repairs_before_escalation = 1
+# loop_threshold is left unset on purpose until the shadow detector has recorded
+# enough events (docs/plans/2026-11-08-loop-breaker-native-workers.md, Rollout):
+# `grep -h 'relais: shadow:' <runs-dir>/*/events.jsonl | wc -l`.
 # 45 minutes, from measurement rather than taste: a package that adds a
 # ledger migration and changes a signature across five modules took 18:00
 # of a 20:00 budget on one attempt (run-65c118139b020-1000173c4) and hit

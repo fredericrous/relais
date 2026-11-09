@@ -196,6 +196,7 @@ effort = "medium"
 max_attempts = 3
 max_repairs_before_escalation = 1
 max_wall_seconds = 1200
+# loop_threshold = 3   # unset: a native worker is never stopped for looping
 allow_nested_agents = true
 max_agent_depth = 3
 max_agents_total = 24
@@ -224,6 +225,12 @@ review = "required"
 ```
 
 These patterns are examples, not verified mappings of the three repositories. Explicit IDs are recommended for reproducible policies; aliases are permitted for convenience and the effective model must be recorded. A profile can omit effort for models without that capability.
+
+### Loop threshold
+
+`[execution] loop_threshold` counts identical failing Bash results with no edit between them, in one native worker's transcript. When a command fails that many times (and the worker has made no file change since the first: no Edit, Write, MultiEdit or NotebookEdit, and no mutating shell command), relais stops the worker and the attempt ends as a loop (§9). The minimum is 2; a value below 2 is refused when `relais.toml` is read, with the key named. The key is unset by default and is then left out of the authority hash. A contract may raise the repository's value (stop later) or turn the guard off with `limits.loop_threshold = 0`; it cannot lower the value or turn the guard on where the repository left it unset. A contract value of 1 is refused. Nothing at machine level sets it.
+
+While the key is unset the detector still runs in shadow, at the default threshold of 3: when it would have stopped a worker it prints one `relais: shadow: would stop attempt <n>: <command> x<count>` line (the command redacted, collapsed to one line and cut to 60 characters), which reaches the run's `events.jsonl`, and it changes nothing else. `relais doctor` says which of the two modes a repository is in.
 
 ### Effort is data
 
@@ -385,6 +392,7 @@ An evidence reference names what kind of evidence it is, from a closed set rathe
 | Behavioral failure with a localized correction | repairing, if repair allowance remains |
 | Repair fails or diagnosis remains ambiguous | escalating, if authorized and budget permits |
 | Same failure and unchanged candidate recur | escalate or fail immediately |
+| A native worker repeats one failing command `loop_threshold` times with no edit between (`[execution] loop_threshold`, §5) | the worker is stopped and the next rung runs, as for a failed verification: repairing, or escalating when authorized; `failed (worker_looped)` when neither remains (exit code 4, as for any `failed` run) |
 | Missing dependency/service/permission | blocked; do not buy a stronger model |
 | Required architectural choice unresolved | needs_decision |
 | Diff exceeds contract or changes protected verification | needs_decision |
@@ -841,6 +849,8 @@ Adding the two calls changed the wire protocol: `coordinator::PROTOCOL_VERSION` 
 ### Native dispatches
 
 A native dispatch is a worker relais asks the parent session to run as a subagent, so Claude Code renders it as its own. It is an ordinary dispatch the runner already admitted under its run (a `DispatchRequest` the runner sent, `ManagedRun`), plus one record in the coordinator's native registry (`admission::native`), keyed by dispatch id. A record moves `Requested { ask }` → `Claimed` → (for a spawn) `TreeGiven { name }` → `Bound { agent_id }` → `Stopped { agent_id, status, usage, answer }`, or ends `Failed { reason }`. `ask` is `Spawn { subagent_type, model, prompt, worktree }` or `Continue { agent_id, message }`: registration (`RegisterNative`) is refused for a dispatch that is not admitted, is finished, belongs to another session, or already has a record. The plugin's flow (below) registers a request, binds its agent and reports its stop; `Claimed` and `TreeGiven` belong to the retired hook-side path (#171), which nothing drives any more: `relais hook` neither claims a call nor answers `WorktreeCreate`, and no marker travels in a prompt. The record is dropped when its dispatch reaches a terminal state, and `NativeStatus` then answers that the dispatch finished, as `finished` does for admission. A cancelled dispatch, or run, is still on record until the cancellation is acknowledged, and `RegisterNative` refuses it in that window (`cancelled`), as ordinary admission refuses a cancelled run (`RunCancelled`).
+
+A native worker that loops is the one case in which relais buys a stronger rung for a worker that changed nothing. The §9 rule against it rests on a worker that produced a candidate and failed the same way again; a looping worker never produced one, and it would otherwise run until its wall clock. The stop waits, within the attempt's remaining wall time and honouring a cancellation, until the coordinator reports the agent stopped; if it does not, the dispatch is treated as a lost worker and the tree is fenced before any next attempt starts. The next attempt's prompt names the looped command and its error line, because the fresh agent has no memory of the stopped one. The stored transition detail is `worker_looped: <redacted command> x<count>`; an older relais calls a stored `worker_looped` reason corrupt when it salvages such a run, so a downgrade is not a rollback: unset the key instead.
 
 ### The native presentation (`relais run`, from the relais plugin)
 
