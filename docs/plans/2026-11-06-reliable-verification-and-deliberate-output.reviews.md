@@ -38,3 +38,7 @@ Implementation verification checklist (carried finding 3):
 ## Delta 2026-11-09: Phase 3 re-targeted (no prompts)
 
 The person, shown the Phase 2 baseline: "Re-target, no prompts". Body 10e3bac11bf2. backend (opus), Delta: approve-with-changes, 5 findings (1 high: reach not shown; answered by measuring per agent, 941 first + 765 sibling-first + 5 same-agent of the 1,711 large subagent whole reads; 4 medium applied by plan-apply: `first_telling` record, no `head`, 0-false-intervention bar, consent wording), 44,439 tokens, 60.7 s. Round 2: approve, 50,428 tokens, 15.9 s. Carried into implementation: prefix the once-per-key with the rule id; the "1,637 whole reads repeated" sentence is superseded by the per-agent breakdown (770 repeats).
+
+## Delta 2026-11-09 (2): reviewer exemption and profile briefs
+
+The pre-activation replay showed the Read rule reaching 272 calls / 5.5 MB once reviewer agents are exempt (332 / 15.1 MB of would-refuse reads were review briefs). The person chose: ship the rule with the reviewer exemption, and slim profile briefs by replacing ADR-0043 for profile seats. Body 8d8066826a6c. backend (opus), Delta: approve-with-changes, 6 findings (2 high: brief-size arithmetic assumed an id-only index; profile seats still carry the full-rules hash), applied; 41,270 tokens, 74.9 s. Round 2: approve-with-changes, 44,655 tokens, 14.9 s. Carried: `plan-apply` HTML-escaped `<` and `>` in item 6 (read `&amp;lt;id&amp;gt;` as `<id>`); sizes are about 58 KB per profile brief and 370 KB per round.
