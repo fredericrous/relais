@@ -42,3 +42,11 @@ The person, shown the Phase 2 baseline: "Re-target, no prompts". Body 10e3bac11b
 ## Delta 2026-11-09 (2): reviewer exemption and profile briefs
 
 The pre-activation replay showed the Read rule reaching 272 calls / 5.5 MB once reviewer agents are exempt (332 / 15.1 MB of would-refuse reads were review briefs). The person chose: ship the rule with the reviewer exemption, and slim profile briefs by replacing ADR-0043 for profile seats. Body 8d8066826a6c. backend (opus), Delta: approve-with-changes, 6 findings (2 high: brief-size arithmetic assumed an id-only index; profile seats still carry the full-rules hash), applied; 41,270 tokens, 74.9 s. Round 2: approve-with-changes, 44,655 tokens, 14.9 s. Carried: `plan-apply` HTML-escaped `<` and `>` in item 6 (read `&amp;lt;id&amp;gt;` as `<id>`); sizes are about 58 KB per profile brief and 370 KB per round.
+
+## Phase 4 re-target delta (2026-11-09, body a7be636bc98a)
+
+The person chose to re-target Phase 4 at relais's own prompts (reviewer 72 KB × 248, worker 68 KB × 138 over the baseline window) after quiet capture (≤ 2.3 MB) and notifications (1.0 MB) measured small, both halves, with the MCP fetch measured.
+
+- backend (opus), round 1: approve-with-changes, 47k tokens, 76 s. High: the reviewer's `aval_rule` instruction must name the corpus (reuse `constraint_index_block`); item 4 had no owner (relais journals index ids, `output-audit` counts fetches, no SPEC change). Medium: classify while the body is present, fixture with source sha; targets from the arithmetic (24%/12%); a rollback threshold; the 19 hand-kept reviewer agent files. Low: TypeScript seat reason; ADR-0065 in `adrs:`. All accepted.
+- backend, round 2: approve-with-changes, 53k, 115 s. Its own round-1 patch put prose on the `## Code review` line (unbinds profiles): moved to Omissions; Phase 5 rollback wording aligned to item 1.
+- backend, round 2 final bind: approve, 56k, 153 s. Nothing carried.
