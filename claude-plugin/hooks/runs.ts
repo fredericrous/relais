@@ -521,10 +521,13 @@ function whyText(outcome: string, code: string | null, detail: string | null, st
   if (detail && code !== 'review_unavailable') return ''
   const quoted = (stderrTail ?? [])
     .slice(-WHY_LINES)
-    .map(entry => cutLineTo(entry.replace(/\s+/g, ' ').trim(), WHY_LINE_CHARS))
+    // A progress bar redraws with \r: only its last frame is the message.
+    .map(entry => entry.replace(/\r+$/, ''))
+    .map(entry => entry.slice(entry.lastIndexOf('\r') + 1).replace(/\s+/g, ' ').trim())
     .filter(entry => entry !== '' && !(detail && detail.includes(entry)))
+    .map(entry => cutLineTo(entry, WHY_LINE_CHARS))
     .map(entry => JSON.stringify(entry))
-  return quoted.length ? `Why (runner stderr, quoted): ${quoted.join(' ')}` : ''
+  return quoted.length ? `Last runner stderr (quoted): ${quoted.join(' ')}` : ''
 }
 
 export type Successor = { intent_id: string; repo: string; widened_paths: string[] }

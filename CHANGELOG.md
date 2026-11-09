@@ -8,7 +8,7 @@ missing here.
 
 ## Unreleased
 
-- **`status` and the outcome message cost the session fewer tokens.** The `status` tool with a run id returns each phase as one line and `elapsed_s` instead of milliseconds. `output: true` returns the failing lines of a check before its tail, so a failure above the last 40 lines is no longer missed. The outcome message of a run that stopped without a reason of its own quotes the runner's last two stderr lines, and the relais skill now says to wait for the outcome instead of polling `status`.
+- **`status` and the outcome message cost the session fewer tokens.** The `status` tool with a run id returns each phase as one line and `elapsed_s` instead of milliseconds. `output: true` returns the failing lines of a check before its tail, so a failure above the last 40 lines is no longer missed. The outcome message of a run that stopped without a reason of its own quotes the runner's last two stderr lines, and the relais skill now says to wait for the outcome instead of polling `status`. The shape of the `status` reply with a run id changed, so reinstall the plugin after upgrading.
 
 ## v0.52.1
 

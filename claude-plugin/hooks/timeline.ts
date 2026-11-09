@@ -148,9 +148,16 @@ const AWAITS_STATES = new Set(['needs_decision', 'needs_review', 'interrupted'])
 export const awaitsState = (state: string) => AWAITS_STATES.has(state)
 export const awaitsAPerson = (m: RunModel) => m.outcome !== undefined && awaitsState(m.outcome.state)
 
+// An OSC sequence (a terminal hyperlink or title): ESC ] ... BEL, or ending in ESC \.
+// Built from character codes so the pattern holds no control character.
+const ESC = String.fromCharCode(27)
+const BEL = String.fromCharCode(7)
+const OSC_SEQUENCE = new RegExp(`${ESC}\\][^${BEL}${ESC}]*(?:${BEL}|${ESC}\\\\)`, 'g')
+
 // Control characters out, the line cut: a stored line is never wider than `width`.
 export function cutLineTo(line: string, width: number): string {
   const clean = line
+    .replace(OSC_SEQUENCE, '')
     // eslint-disable-next-line no-control-regex
     .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
     // eslint-disable-next-line no-control-regex
@@ -188,6 +195,8 @@ function recordLine(check: Check, no: number, text: string): Check {
 // The output lines of `text` appended to a check's tail, which keeps only
 // the last MAX_OUTPUT_LINES, and to its failure windows.
 export function appendOutput(check: Check, text: string): Check {
+  // An empty chunk is no output: it must not close the line still being written.
+  if (text === '') return check
   const pieces = text.split('\n')
   const endsLine = pieces[pieces.length - 1] === ''
   if (endsLine) pieces.pop()
@@ -724,9 +733,10 @@ export function statusReply(m: RunModel, now: number, opts: { output?: boolean }
     attempt: m.attempt,
     ...(m.maxAttempts != null ? { maxAttempts: m.maxAttempts } : {}),
     elapsed_s: Math.round(elapsedOf(m, now) / 1000),
-    // "<title> · <state> · <detail> · <secs>s", empty parts dropped.
+    // "<state>: <title> · <detail> · <secs>s", empty parts dropped. The state leads, because
+    // titles and details already contain ' · ' and could not be told from it.
     phases: m.steps.map(s =>
-      [s.title, s.state, s.detail, s.endedAt ? `${Math.round((s.endedAt - s.startedAt) / 1000)}s` : ''].filter(Boolean).join(' · '),
+      `${s.state}: ${[s.title, s.detail, s.endedAt ? `${Math.round((s.endedAt - s.startedAt) / 1000)}s` : ''].filter(Boolean).join(' · ')}`,
     ),
     decisions: m.decisions.map(d => d.text),
     cost: formatCost(m.cost),

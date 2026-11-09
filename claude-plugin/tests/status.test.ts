@@ -389,7 +389,7 @@ test('maxAttempts is left out when the run has none', () => {
 test('a phase is one string with empty parts dropped', () => {
   const [model] = Object.values(rebuildRuns(sevenTimeline as any, FROZEN_NOW))
   const { phases } = statusReply(model, FROZEN_NOW)
-  expect(phases[0]).toBe('preflight · done · contract valid, base 3f9a2c1 · 30s')
+  expect(phases[0]).toBe('done: preflight · contract valid, base 3f9a2c1 · 30s')
 })
 
 // Failure-first output.
@@ -463,6 +463,19 @@ test('a match split across chunks at every byte offset gives the one-chunk resul
   for (let at = 1; at < text.length; at++) {
     expect(outputOf([text.slice(0, at), text.slice(at)])).toEqual(whole)
   }
+})
+
+test('an empty chunk does not close the line being written', () => {
+  const rest = noise(70).join('\n') + '\n'
+  const whole = outputOf(['FAILED half a line\n' + rest])
+  expect(whole).toContain('FAILED half a line')
+  expect(outputOf(['FAILED half', '', ' a line\n' + rest])).toEqual(whole)
+})
+
+test('terminal hyperlinks (OSC) are removed from stored lines', () => {
+  const link = '\u001b]8;;https://example.com/x\u0007FAILED link\u001b]8;;\u0007\n'
+  expect(outputOf([link])).toContain('FAILED link')
+  expect(outputOf([link]).join('\n')).not.toContain('example.com')
 })
 
 test('100 noise lines matching error: do not push out the real failure', () => {

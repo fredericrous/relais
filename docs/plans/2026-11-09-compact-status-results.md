@@ -102,4 +102,10 @@ Check `amont-agent board --repo relais` first; work in a worktree from `origin/m
 green (`merge-when-green`). Release is separate: a plugin change needs the person's plugin
 reinstall.
 
+## Decision log
+- Phase 3: the phase string is `<state>: <title> · <detail> · <secs>s`, not `<title> · <state> · …` (implementation review: titles and details contain ` · `, so the state could not be told apart).
+- Phase 2: the line reads `Last runner stderr (quoted): "…"`, not `Why (runner stderr, quoted)`, because the code quotes the last lines and does not know they are the cause. It keeps only the last `\r` frame and compares with `detail` before cutting. `cutLine` stays one-argument (`.map(cutLine)` passes an index); `cutLineTo(line, width)` is the new function.
+- Phase 4: the reply carries at most 30 failure lines, a third from the earliest matches, so at least 10 tail lines remain; storage keeps 20 + 20 as written. Empty chunks do not close the open line; OSC sequences are stripped by `cutLineTo`.
+- Deliberate: `onDone` does not pass the outcome `reason` into the live model (the `rebuildOne` path does). It predates this plan; the outcome message itself now carries the reason. Carried to a later change.
+
 <!-- panel: repos=relais reviewers=backend,lang:typescript,tui,unix body-sha=880cdbf7e3d9 -->
