@@ -389,6 +389,7 @@ impl<'a> RunEngine<'a> {
             cancel: None,
             agent: AgentKind::Worker,
             loop_threshold: authority.loop_threshold,
+            attempt: index,
         };
 
         let requested_model = model_profile.id.clone();

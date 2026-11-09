@@ -101,6 +101,9 @@ enum Plugin {
     /// The first agent completes its first turn; asked to continue, it
     /// repeats one failing command and stops only when relais asks.
     ContinuationLoops,
+    /// Like `LoopsAndIgnoresStop`, and the run is cancelled as the stop
+    /// arrives.
+    LoopsAndCancelsOnStop,
     /// Like `LoopsUntilStopped`, with a bearer token in the command.
     LoopsOnASecret,
 }
@@ -302,6 +305,12 @@ fn run_plugin(
                     };
                     record_stop(&mut script, &gate, &dispatch, &killed);
                 }
+                if plugin == Plugin::LoopsAndCancelsOnStop {
+                    let runs: Vec<String> = gate.status().runs.keys().cloned().collect();
+                    for run in runs {
+                        gate.cancel_run(&run);
+                    }
+                }
                 continue;
             }
             "spawn" => {
@@ -380,6 +389,7 @@ fn run_plugin(
                 Plugin::LoopsUntilStopped
                     | Plugin::LoopsOnASecret
                     | Plugin::LoopsAndIgnoresStop
+                    | Plugin::LoopsAndCancelsOnStop
                     | Plugin::OlderLoopThenOneMoreFailure
             )
         {
@@ -416,7 +426,7 @@ fn run_plugin(
                 wait_for(|| NativeBackend::followed_offset(&transcript).is_some());
                 append_failing_runs(&transcript, "again", 3);
             }
-            Plugin::LoopsAndIgnoresStop => {
+            Plugin::LoopsAndIgnoresStop | Plugin::LoopsAndCancelsOnStop => {
                 record_bound(&mut script, &gate, &dispatch_id, &agent_id);
             }
             Plugin::OlderLoopThenOneMoreFailure if !fresh => {
@@ -515,6 +525,8 @@ struct Cast {
 struct Native {
     outcome: RunOutcome,
     script: Scripted,
+    /// The `relais: shadow:` lines the backend said.
+    shadow: Vec<String>,
 }
 
 impl Native {
@@ -580,6 +592,93 @@ fn run_native_contract(
     waits: Waits,
     configure: impl FnOnce(&mut RepoPolicy),
 ) -> Native {
+    run_native_launching(
+        fixture,
+        contract,
+        attempts,
+        cast,
+        prices,
+        Launching {
+            waits,
+            refusal: Refusal::Never,
+        },
+        configure,
+    )
+}
+
+/// How a run waits on the session, and whether its first dispatch ends early.
+struct Launching {
+    waits: Waits,
+    refusal: Refusal,
+}
+
+/// Whether the first dispatch ends before the backend waits on the session.
+#[derive(Clone, Copy, PartialEq)]
+enum Refusal {
+    Never,
+    TheFirstDispatch,
+}
+
+/// Ends the first launch the way a dispatch does that never reaches the
+/// session (a refused registration), reporting a finished worker that
+/// changed nothing, and hands every later one to the native backend.
+struct RefusesTheFirst<'a> {
+    inner: &'a NativeBackend<'a>,
+    refusal: Refusal,
+    refused: std::sync::atomic::AtomicBool,
+}
+
+impl crate::backend::Harness for RefusesTheFirst<'_> {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn probe(&self) -> Option<crate::backend::Capabilities> {
+        self.inner.probe()
+    }
+}
+
+impl Backend for RefusesTheFirst<'_> {
+    fn launch(
+        &self,
+        spec: &crate::backend::LaunchSpec,
+    ) -> Result<crate::backend::LaunchResult, crate::backend::BackendError> {
+        let first = !self.refused.swap(true, std::sync::atomic::Ordering::SeqCst);
+        if first && self.refusal == Refusal::TheFirstDispatch {
+            return Ok(crate::backend::LaunchResult {
+                dispatch_id: spec.dispatch_id.clone(),
+                ended: crate::procs::Ended::Exited(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                result_text: Some("done".into()),
+                session_id: None,
+                effective_model: Some(spec.model.clone()),
+                usage: crate::backend::UsageReport::unknown(),
+                worker_claims_blockage: false,
+                failure_detail: None,
+                booked_message_ids: Vec::new(),
+                unpriced: Vec::new(),
+                lost_worker: None,
+                looped: None,
+            });
+        }
+        self.inner.launch(spec)
+    }
+
+    fn transcript_of(&self, agent_id: &str) -> Option<String> {
+        self.inner.transcript_of(agent_id)
+    }
+}
+
+fn run_native_launching(
+    fixture: &Fixture,
+    contract: &TaskContract,
+    attempts: u32,
+    cast: Cast,
+    prices: Option<PriceTable>,
+    launching: Launching,
+    configure: impl FnOnce(&mut RepoPolicy),
+) -> Native {
     let mut repo = fixture.repo_policy(vec![main_gone_check()], attempts);
     configure(&mut repo);
     let machine = fixture.machine_for(&repo);
@@ -600,25 +699,39 @@ fn run_native_contract(
             wire: wire.clone(),
             projects_dir: Some(projects.clone()),
         },
-        waits,
+        launching.waits,
         prices,
     );
     let parent_gate = Arc::clone(&gate);
     let session =
         std::thread::spawn(move || run_plugin(parent_gate, rx, projects, cast.plugin, cast.work));
+    let refusing = RefusesTheFirst {
+        inner: &backend,
+        refusal: launching.refusal,
+        refused: std::sync::atomic::AtomicBool::new(false),
+    };
     let outcome = fixture.execute_presented(
         contract,
         &repo,
         &machine,
-        &backend,
+        &refusing,
         gate.as_ref(),
         Presented { wire: wire.clone() },
     );
+    let shadow = backend
+        .shadow_lines
+        .lock()
+        .expect("the shadow lines")
+        .clone();
     // Every holder of the wire gone ends the plugin's loop.
     drop(backend);
     drop(wire);
     let script = session.join().expect("the scripted plugin");
-    Native { outcome, script }
+    Native {
+        outcome,
+        script,
+        shadow,
+    }
 }
 
 fn ledger_of(fixture: &Fixture) -> rusqlite::Connection {
@@ -1686,6 +1799,12 @@ fn with_the_threshold_unset_a_looping_transcript_runs_to_the_wall_timeout() {
     );
     let detail = interrupted_detail(&run.outcome);
     assert!(detail.contains("wall time"), "{detail}");
+    assert_eq!(run.shadow.len(), 1, "{:?}", run.shadow);
+    assert!(
+        run.shadow[0].starts_with("relais: shadow: would stop attempt 1: make test x3"),
+        "{:?}",
+        run.shadow
+    );
     assert!(
         !transitions_reasons(&fixture, &run).contains(&"worker_looped".to_string()),
         "{:?}",
@@ -1822,6 +1941,93 @@ fn a_secret_in_a_looping_command_is_not_stored_in_the_transition() {
     let stored = format!("{:?}", looped.detail);
     assert!(stored.contains("curl"), "{stored}");
     assert!(!stored.contains("s3cretToken9z"), "{stored}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn a_shadow_line_names_the_runners_attempt_after_a_dispatch_that_never_waited() {
+    let fixture = Fixture::new();
+    let contract = fixture.contract(Review::Optional);
+    let run = run_native_launching(
+        &fixture,
+        &contract,
+        3,
+        Cast {
+            plugin: Plugin::LoopsAndIgnoresStop,
+            work: fixes_on_repair,
+        },
+        Some(prices()),
+        Launching {
+            waits: waits(Duration::from_secs(60)),
+            refusal: Refusal::TheFirstDispatch,
+        },
+        |repo| repo.execution.max_wall_seconds = 1,
+    );
+    assert_eq!(run.shadow.len(), 1, "{:?} {:?}", run.shadow, run.outcome);
+    assert!(
+        run.shadow[0].starts_with("relais: shadow: would stop attempt 2: make test x3"),
+        "{:?}",
+        run.shadow
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn with_the_threshold_set_a_looping_worker_is_stopped_without_a_shadow_line() {
+    let fixture = Fixture::new();
+    let run = run_native(
+        &fixture,
+        Review::Optional,
+        3,
+        Plugin::LoopsUntilStopped,
+        fixes_for_the_second_agent,
+        Some(prices()),
+        |repo| {
+            repo.execution.loop_threshold = Some(3);
+        },
+    );
+    assert!(
+        run.seen().iter().any(
+            |entry| matches!(entry, Seen::Stop { agent_id: Some(agent), .. } if agent == "ag1")
+        ),
+        "{:?}",
+        run.seen()
+    );
+    assert!(run.shadow.is_empty(), "{:?}", run.shadow);
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn a_run_cancelled_while_a_stop_is_pending_ends_cancelled_before_the_spawn_wait() {
+    let fixture = Fixture::new();
+    let began = std::time::Instant::now();
+    let run = run_native_waiting(
+        &fixture,
+        Review::Off,
+        3,
+        Cast {
+            plugin: Plugin::LoopsAndCancelsOnStop,
+            work: fixes_on_repair,
+        },
+        Some(prices()),
+        Waits {
+            spawn: Duration::from_secs(60),
+            hello_lapse: Duration::from_secs(120),
+        },
+        |repo| {
+            repo.execution.loop_threshold = Some(3);
+        },
+    );
+    assert!(
+        matches!(run.outcome.terminal, Terminal::Cancelled { .. }),
+        "{:?}",
+        run.outcome
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(30),
+        "the cancelled stop waited out the spawn wait: {:?}",
+        began.elapsed()
+    );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
 }
 

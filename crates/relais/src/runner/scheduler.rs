@@ -1373,6 +1373,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         cancel: None,
         agent: AgentKind::Planner,
         loop_threshold: None,
+        attempt: 0,
     };
     let budget = Budget {
         attempts_used: 0,

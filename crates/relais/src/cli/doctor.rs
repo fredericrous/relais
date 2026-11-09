@@ -68,7 +68,7 @@ fn loop_threshold_text(threshold: Option<u32>) -> String {
         Some(repeats) => format!(
             "loop_threshold: {repeats} (a native worker repeating one failing command {repeats} times with no edit is stopped)"
         ),
-        None => "loop_threshold: unset (loop detection is off)".to_string(),
+        None => "loop_threshold: unset (loop detection is off; it only records what it would have stopped (shadow))".to_string(),
     }
 }
 

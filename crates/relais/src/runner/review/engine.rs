@@ -723,6 +723,7 @@ impl<'a> RunEngine<'a> {
             cancel: None,
             agent: AgentKind::Reviewer,
             loop_threshold: None,
+            attempt: 0,
         };
         let recorded = self.config.ledger.record_dispatch_intent(
             &dispatch_id,

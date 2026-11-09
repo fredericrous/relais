@@ -18,7 +18,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::adapter::loopguard::{Evidence, LoopFired, LoopGuard};
+use crate::adapter::loopguard::{
+    redacted_one_line, shown, Evidence, LoopFired, LoopGuard, DEFAULT_LOOP_THRESHOLD,
+};
 use crate::admission::{
     AgentStatus, AgentUsage, Gate, GateError, NativeAsk, NativeProgress, NativeState,
     RegisterOutcome, StoppedReport, ADMISSION_POLL,
@@ -763,6 +765,9 @@ pub struct NativeBackend<'a> {
     /// The ledger the advisor calls found in an agent's transcript are
     /// booked into; `None` books none.
     advisor_ledger: Option<PathBuf>,
+    /// The shadow lines this backend said, for the tests to read.
+    #[cfg(test)]
+    pub(crate) shadow_lines: Mutex<Vec<String>>,
 }
 
 impl<'a> NativeBackend<'a> {
@@ -781,6 +786,8 @@ impl<'a> NativeBackend<'a> {
             prices,
             memory: Mutex::new(Memory::default()),
             advisor_ledger: None,
+            #[cfg(test)]
+            shadow_lines: Mutex::new(Vec::new()),
         }
     }
 
@@ -829,10 +836,21 @@ impl<'a> NativeBackend<'a> {
             Route::Continue { .. } => TranscriptStart::End,
             Route::Spawn => TranscriptStart::Beginning,
         };
-        let mut tail = match spec.loop_threshold {
-            Some(_) => TailState::Searching { lookups: 0 },
-            None => TailState::Absent,
+        let is_worker = matches!(spec.agent, crate::protocol::AgentKind::Worker);
+        let attempt = spec.attempt;
+        // With the key unset a worker's transcript is still followed, with the
+        // default threshold, only to record what the guard would have stopped.
+        let shadow_threshold = if is_worker && spec.loop_threshold.is_none() {
+            Some(DEFAULT_LOOP_THRESHOLD)
+        } else {
+            None
         };
+        let mut tail = if spec.loop_threshold.is_some() || shadow_threshold.is_some() {
+            TailState::Searching { lookups: 0 }
+        } else {
+            TailState::Absent
+        };
+        let mut shadowed: Vec<(String, Evidence)> = Vec::new();
         let mut polls = 0u32;
         loop {
             polls = polls.wrapping_add(1);
@@ -906,6 +924,19 @@ impl<'a> NativeBackend<'a> {
                             ),
                         };
                     }
+                    if let (Some(threshold), Some(agent)) = (shadow_threshold, running.as_deref()) {
+                        if let Some(fired) = tail.watch(self, agent, threshold, start, polls) {
+                            let key = (fired.command.clone(), fired.evidence.clone());
+                            if !shadowed.contains(&key) {
+                                shadowed.push(key);
+                                self.say_shadow(&format!(
+                                    "relais: shadow: would stop attempt {attempt}: {} x{}",
+                                    shown(&redacted_one_line(&fired.command)),
+                                    fired.count
+                                ));
+                            }
+                        }
+                    }
                     if let (Some(threshold), Some(agent)) =
                         (spec.loop_threshold, running.as_deref())
                     {
@@ -943,6 +974,16 @@ impl<'a> NativeBackend<'a> {
             }
             std::thread::sleep(ADMISSION_POLL);
         }
+    }
+
+    /// Says on stderr (the run's events) what the guard would have stopped.
+    fn say_shadow(&self, line: &str) {
+        eprintln!("{line}");
+        #[cfg(test)]
+        self.shadow_lines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(line.to_string());
     }
 
     /// The attempt's end when its run has been cancelled: the plugin is asked
@@ -1505,6 +1546,7 @@ mod tests {
             cancel: None,
             agent: AgentKind::Worker,
             loop_threshold: None,
+            attempt: 1,
         }
     }
 

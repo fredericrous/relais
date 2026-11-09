@@ -243,6 +243,9 @@ pub struct LaunchSpec {
     /// How many identical failing results with no edit between stop a
     /// native worker; `None` runs no loop detection.
     pub loop_threshold: Option<u32>,
+    /// The run's attempt number this dispatch belongs to, from the runner's
+    /// budget; 0 for a dispatch that is not a worker attempt.
+    pub attempt: u32,
 }
 
 /// What the harness said one dispatch cost. `inclusive` describes a
