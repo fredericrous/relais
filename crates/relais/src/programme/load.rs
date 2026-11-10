@@ -93,10 +93,7 @@ impl Programme {
 
         let map_path = canonical.join(MAP_FILE);
         let map_text = std::fs::read_to_string(&map_path).map_err(read_error(&map_path))?;
-        let (map, mut file_problems) = parse_map(&map_text);
 
-        let mut tickets = BTreeMap::new();
-        let mut unreadable = BTreeSet::new();
         let mut files: Vec<PathBuf> = Vec::new();
         for entry in std::fs::read_dir(&canonical).map_err(read_error(&canonical))? {
             let path = entry.map_err(read_error(&canonical))?.path();
@@ -108,11 +105,68 @@ impl Programme {
             }
         }
         files.sort();
+        let mut ticket_texts = Vec::new();
         for path in files {
             let Some(id) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
                 continue;
             };
             let text = std::fs::read_to_string(&path).map_err(read_error(&path))?;
+            ticket_texts.push((id, text));
+        }
+        let repo_dir = main_checkout(repo_dir)?;
+        Ok(Self::assemble(
+            dir.to_path_buf(),
+            slug,
+            repo_dir,
+            &map_text,
+            ticket_texts,
+        ))
+    }
+
+    /// The programme `<repo>/docs/programmes/<slug>` as the commit `rev`
+    /// holds it, read through git rather than from the working tree. `repo`
+    /// is a main checkout; `dir` is still the working-tree path, for messages.
+    pub fn load_at(repo: &Path, slug: &str, rev: &str) -> Result<Self, ProgrammeError> {
+        let prefix = format!("docs/programmes/{slug}/");
+        let names = git_stdout(repo, &["ls-tree", "-z", "--name-only", rev, "--", &prefix])?;
+        let mut ids: Vec<String> = names
+            .split('\0')
+            .filter_map(|path| path.strip_prefix(&prefix))
+            .filter(|name| *name != MAP_FILE)
+            .filter_map(|name| name.strip_suffix(".md"))
+            .filter(|id| !id.is_empty() && !id.contains('/'))
+            .map(str::to_string)
+            .collect();
+        ids.sort();
+        let show = |file: &str| git_stdout(repo, &["show", &format!("{rev}:{prefix}{file}")]);
+        let map_text = show(MAP_FILE)?;
+        let mut ticket_texts = Vec::new();
+        for id in ids {
+            let text = show(&format!("{id}.md"))?;
+            ticket_texts.push((id, text));
+        }
+        let repo_dir = main_checkout(repo)?;
+        Ok(Self::assemble(
+            repo.join("docs").join("programmes").join(slug),
+            slug.to_string(),
+            repo_dir,
+            &map_text,
+            ticket_texts,
+        ))
+    }
+
+    /// Parses a map and its tickets, given as `(id, text)` sorted by id.
+    fn assemble(
+        dir: PathBuf,
+        slug: String,
+        repo_dir: PathBuf,
+        map_text: &str,
+        ticket_texts: Vec<(String, String)>,
+    ) -> Self {
+        let (map, mut file_problems) = parse_map(map_text);
+        let mut tickets = BTreeMap::new();
+        let mut unreadable = BTreeSet::new();
+        for (id, text) in ticket_texts {
             let (ticket, problems) = parse_ticket(&id, &text);
             file_problems.extend(problems);
             match ticket {
@@ -124,10 +178,9 @@ impl Programme {
                 }
             }
         }
-        let repo_dir = main_checkout(repo_dir)?;
         let root = repo_dir.parent().unwrap_or(&repo_dir).to_path_buf();
-        Ok(Self {
-            dir: dir.to_path_buf(),
+        Self {
+            dir,
             slug,
             repo_dir,
             root,
@@ -135,7 +188,7 @@ impl Programme {
             tickets,
             unreadable,
             file_problems,
-        })
+        }
     }
 
     /// The name of the repository that holds the map: a ticket's repos
@@ -268,10 +321,95 @@ fn branch_tips(repo: &Path, slug: &str) -> Result<BTreeMap<String, i64>, Program
     Ok(tips)
 }
 
-/// Every `<root>/*/docs/programmes/*` directory holding a `map.md`, sorted.
-/// Only primary checkouts (a `.git` directory) are scanned: a linked
-/// worktree holds the same map as its main checkout.
-pub fn find_programmes(root: &Path) -> Result<Vec<PathBuf>, ProgrammeError> {
+/// Where a found programme is read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// The checkout's files: the repository has no `origin` default branch.
+    WorkingTree,
+    /// A remote-tracking ref, such as `origin/main`.
+    Ref(String),
+}
+
+/// A programme `find_programmes` found.
+#[derive(Debug)]
+pub struct Found {
+    /// The main checkout that holds it.
+    pub repo: PathBuf,
+    pub slug: String,
+    pub source: Source,
+}
+
+impl Found {
+    /// The working-tree path of its directory, for messages.
+    pub fn dir(&self) -> PathBuf {
+        self.repo.join("docs").join("programmes").join(&self.slug)
+    }
+
+    pub fn load(&self) -> Result<Programme, ProgrammeError> {
+        match &self.source {
+            Source::WorkingTree => Programme::load(&self.dir()),
+            Source::Ref(rev) => Programme::load_at(&self.repo, &self.slug, rev),
+        }
+    }
+}
+
+/// The remote-tracking ref of `origin`'s default branch: what
+/// `origin/HEAD` points at, else `origin/main` when it exists.
+fn origin_default(repo: &Path) -> Option<String> {
+    let head = git_stdout(
+        repo,
+        &["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .ok() // a missing origin/HEAD exits 1; fall back to origin/main
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty());
+    head.or_else(|| {
+        git_stdout(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "-q",
+                "refs/remotes/origin/main^{commit}",
+            ],
+        )
+        .ok() // no origin/main: the working tree is read instead
+        .map(|_| "origin/main".to_string())
+    })
+}
+
+/// The slugs of `docs/programmes/*/map.md` in the commit `rev`, sorted.
+fn programmes_at(repo: &Path, rev: &str) -> Result<Vec<String>, ProgrammeError> {
+    let names = git_stdout(
+        repo,
+        &[
+            "ls-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            rev,
+            "--",
+            "docs/programmes/",
+        ],
+    )?;
+    let suffix = format!("/{MAP_FILE}");
+    let slugs: BTreeSet<String> = names
+        .split('\0')
+        .filter_map(|path| path.strip_prefix("docs/programmes/"))
+        .filter_map(|rest| rest.strip_suffix(&suffix))
+        .filter(|slug| !slug.is_empty() && !slug.contains('/'))
+        .map(str::to_string)
+        .collect();
+    Ok(slugs.into_iter().collect())
+}
+
+/// Every programme under `<root>/*/docs/programmes/*` that holds a `map.md`,
+/// sorted. Only primary checkouts (a `.git` directory) are scanned: a linked
+/// worktree holds the same map as its main checkout. A repository with an
+/// `origin` default branch is read from that ref, so maps and ticket
+/// closures merged upstream show before the checkout pulls them; one
+/// without is read from its files.
+pub fn find_programmes(root: &Path) -> Result<Vec<Found>, ProgrammeError> {
     let children = |dir: &Path| -> Result<Vec<PathBuf>, ProgrammeError> {
         if !dir.is_dir() {
             return Ok(Vec::new());
@@ -288,9 +426,26 @@ pub fn find_programmes(root: &Path) -> Result<Vec<PathBuf>, ProgrammeError> {
         if !repo.join(".git").is_dir() {
             continue;
         }
+        if let Some(rev) = origin_default(&repo) {
+            for slug in programmes_at(&repo, &rev)? {
+                found.push(Found {
+                    repo: repo.clone(),
+                    slug,
+                    source: Source::Ref(rev.clone()),
+                });
+            }
+            continue;
+        }
         for programme in children(&repo.join("docs").join("programmes"))? {
-            if programme.join(MAP_FILE).is_file() {
-                found.push(programme);
+            let slug = programme
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned());
+            if let (true, Some(slug)) = (programme.join(MAP_FILE).is_file(), slug) {
+                found.push(Found {
+                    repo: repo.clone(),
+                    slug,
+                    source: Source::WorkingTree,
+                });
             }
         }
     }

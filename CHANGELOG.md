@@ -9,6 +9,7 @@ missing here.
 ## Unreleased
 
 - **`status` and the outcome message cost the session fewer tokens.** The `status` tool with a run id returns each phase as one line and `elapsed_s` instead of milliseconds. `output: true` returns the failing lines of a check before its tail, so a failure above the last 40 lines is no longer missed. The outcome message of a run that stopped without a reason of its own quotes the runner's last two stderr lines, and the relais skill now says to wait for the outcome instead of polling `status`. The shape of the `status` reply with a run id changed, so reinstall the plugin after upgrading.
+- **`relais programme list` reads each map from `origin`'s default branch.** A repository with `origin/HEAD` (else `origin/main`) is read from that ref through git, so a programme charted, or a ticket closed, upstream shows before the checkout pulls it; a repository with no such ref is read from its files as before. Read from the last fetch: `list` does not fetch. A programme that exists only in the checkout, not yet pushed, is not listed for a repository that has an `origin`. `--json` rows gain `source`: the ref read (`origin/main`) or `working-tree`.
 
 ## v0.52.1
 
