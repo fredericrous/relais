@@ -24,6 +24,8 @@ pub struct MockOutcome {
     pub effective_model: Option<String>,
     pub usage: Option<UsageReport>,
     pub session_id: Option<String>,
+    /// Set with `timed_out` when the scripted worker's stop was confirmed.
+    pub timed_out_stop: Option<crate::backend::TimedOutStop>,
 }
 
 pub struct MockBackend {
@@ -130,6 +132,7 @@ impl Backend for MockBackend {
             unpriced: Vec::new(),
             lost_worker: None,
             looped: None,
+            timed_out_stop: outcome.timed_out_stop.filter(|_| outcome.timed_out),
         })
     }
 }

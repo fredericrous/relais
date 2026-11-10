@@ -782,6 +782,17 @@ pub struct ProcessEnd {
     pub captured: Captured,
 }
 
+impl ProcessEnd {
+    /// Did a worker that ran to its wall time leave nothing running: the
+    /// whole group found empty or killed. Never on Windows, where
+    /// re-parented descendants survive `taskkill /T`. Only a worker's launch
+    /// asks; a verification command that times out is never asked.
+    pub fn stop_confirmed(&self) -> bool {
+        let group_gone = matches!(self.group, GroupKill::NothingLeft | GroupKill::Killed);
+        cfg!(unix) && self.ended == Ended::TimedOut && group_gone
+    }
+}
+
 /// How long a pipe may keep being drained after the child ended and its
 /// process group was killed. Readers stop at end of file, which normally
 /// arrives the instant the last writer goes; a descendant that survived
@@ -1937,6 +1948,32 @@ mod tests {
         assert_eq!(end.ended, Ended::Exited(0));
         assert_eq!(end.group, GroupKill::NothingLeft);
         assert!(end.group.describe().contains("nothing left"));
+    }
+
+    /// A worker that edits and runs past its wall time with its whole group
+    /// gone has a confirmed stop; a refused group kill, or an exit on its
+    /// own, has none.
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_subprocess_with_its_group_gone_is_a_confirmed_stop() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & sleep 30"]);
+        let end = run_with_timeout(command, Duration::from_millis(300), None, None).expect("runs");
+        assert_eq!(end.ended, Ended::TimedOut);
+        assert!(end.stop_confirmed(), "{:?}", end.group);
+
+        let refused = ProcessEnd {
+            group: GroupKill::Refused {
+                detail: "denied".into(),
+            },
+            ..end.clone()
+        };
+        assert!(!refused.stop_confirmed());
+        let on_its_own = ProcessEnd {
+            ended: Ended::Exited(0),
+            ..end
+        };
+        assert!(!on_its_own.stop_confirmed());
     }
 
     /// V12: the prompt is the task. A process that ends before reading it

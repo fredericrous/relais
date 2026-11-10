@@ -590,12 +590,39 @@ impl<'a> RunEngine<'a> {
 
         // Missing terminal result = interrupted, not failed (SPEC §9).
         if result.terminal_result_missing() {
-            ledger.finish_attempt(attempt_id, State::Interrupted, Some(&held_worktree), None)?;
+            let mut detail = result.failure_detail.clone().unwrap_or_default();
+            let timed_out = result.ended == Ended::TimedOut;
+            let candidate = if timed_out && result.timed_out_stop.is_some() {
+                match self.snapshot_timed_out(ctx, attempt_id, index)? {
+                    TimedOutTree::Candidate(sha) => Some(sha),
+                    TimedOutTree::NoCandidate(note) => {
+                        if let Some(note) = note {
+                            if detail.is_empty() {
+                                detail = note;
+                            } else {
+                                detail = format!("{detail}; {note}");
+                            }
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if candidate.is_none() {
+                ledger.finish_attempt(
+                    attempt_id,
+                    State::Interrupted,
+                    Some(&held_worktree),
+                    None,
+                )?;
+            }
             return Ok(Snapshot::Ended(self.stop(
                 &progress.budget,
                 Observation::TerminalResultMissing {
-                    timed_out: result.ended == Ended::TimedOut,
-                    detail: result.failure_detail.clone().unwrap_or_default(),
+                    timed_out,
+                    detail,
+                    candidate,
                 },
             )?));
         }
@@ -649,6 +676,143 @@ impl<'a> RunEngine<'a> {
         )
     }
 
+    /// The tree a worker left after its wall time, once its stop is
+    /// confirmed: published as the interrupted attempt's candidate when it
+    /// differs from its floor and nothing else holds it. It runs no scope
+    /// check, holdout collision or verification: the verify successor does,
+    /// from the base. A full disk propagates; a held tree, an unresolved conflict,
+    /// an unchanged tree and any other failure end with no candidate, and the
+    /// failures say why.
+    fn snapshot_timed_out(
+        &mut self,
+        ctx: &AttemptContext<'_>,
+        attempt_id: i64,
+        index: u32,
+    ) -> Result<TimedOutTree, RunError> {
+        let worktree_path = ctx.worktree_path;
+        if self.wait_for_writers(worktree_path)?.is_some() {
+            return Ok(TimedOutTree::NoCandidate(None));
+        }
+        let sha = match ctx.worktree.snapshot_resolved(
+            &format!("run {} attempt {index}", self.run_id),
+            ctx.preflight.conflicted_paths(),
+        ) {
+            Ok(sha) => sha,
+            Err(WorkspaceError::UnresolvedConflict(_)) => {
+                return Ok(TimedOutTree::NoCandidate(None));
+            }
+            Err(e) if e.is_storage_full() => return Err(e.into()),
+            Err(e) => {
+                return Ok(TimedOutTree::NoCandidate(Some(format!(
+                    "the tree could not be snapshotted ({e})"
+                ))));
+            }
+        };
+        let floor = workspace::ScopeFloor::of_run(
+            ctx.preflight
+                .candidate
+                .as_ref()
+                .map(|prepared| prepared.tree.as_str()),
+            self.config.contract,
+        );
+        match ctx
+            .worktree
+            .changed_paths_from(floor.revision(ctx.worktree), &sha)
+        {
+            Ok(changed) if changed.is_empty() => return Ok(TimedOutTree::NoCandidate(None)),
+            Ok(_) => {}
+            Err(e) if e.is_storage_full() => return Err(e.into()),
+            Err(e) => {
+                return Ok(TimedOutTree::NoCandidate(Some(format!(
+                    "the tree could not be compared with its floor ({e})"
+                ))));
+            }
+        }
+        match self.publish_snapshot(ctx, attempt_id, index, State::Interrupted, &sha) {
+            Ok(_) => Ok(TimedOutTree::Candidate(sha)),
+            Err(e) if e.is_storage_full() => Err(e),
+            // The ledger already holds the candidate when only the latest
+            // patch could not be written: the detail must say so too.
+            Err(_) if self.last_snapshot.as_ref() == Some(&(index, sha.clone())) => {
+                Ok(TimedOutTree::Candidate(sha))
+            }
+            Err(e) => Ok(TimedOutTree::NoCandidate(Some(format!(
+                "the candidate could not be published ({e})"
+            )))),
+        }
+    }
+
+    /// Names the snapshot, writes its artifact files whole, and only then
+    /// publishes it: the attempt's end state, its `candidate_sha` and the
+    /// patch evidence in one ledger transaction, and the run's
+    /// `last_snapshot`; `candidate-latest.patch` follows. A failure before the
+    /// publication leaves nothing selectable. Returns the path of `candidate-latest.patch`.
+    fn publish_snapshot(
+        &mut self,
+        ctx: &AttemptContext<'_>,
+        attempt_id: i64,
+        index: u32,
+        end: State,
+        sha: &str,
+    ) -> Result<PathBuf, RunError> {
+        // `commit-tree` leaves a dangling object: the candidate the
+        // receipt names, the patch's other side and the worktree's
+        // history would all go in the next `git gc`. A ref under
+        // `refs/relais/candidates/` keeps it reachable without
+        // putting a branch in the user's namespace (audit B15).
+        // Best effort: a ref that could not be written is not fatal —
+        // the object exists and this run verifies it from the object —
+        // and the retirement at the run's end names the tree `…/final`
+        // itself when no ref holds it, so nothing is lost either way.
+        // A full disk is the one failure of it that is not shrugged off:
+        // relais's own write failing stops the run (SPEC §10).
+        let named = crate::storage_full::at(crate::storage_full::Site::Ref)
+            .map_err(WorkspaceError::Io)
+            .and_then(|()| {
+                workspace::name_candidate(self.config.repo_dir, self.run_id.as_str(), index, sha)
+            });
+        if let Err(e) = named {
+            if e.is_storage_full() {
+                // Before any artifact file: the storage-full handler gives
+                // the ref the snapshot could not get from this one.
+                self.last_snapshot = Some((index, sha.to_string()));
+                return Err(e.into());
+            }
+        }
+        crate::storage_full::at(crate::storage_full::Site::Snapshot)?;
+        write_whole(
+            &self.artifacts.join(format!("candidate-{index}.sha")),
+            sha.as_bytes(),
+        )?;
+        let patch_path = self.artifacts.join(format!("candidate-{index}.patch"));
+        let partial = patch_path.with_extension("patch.partial");
+        ctx.worktree.export_patch(sha, &partial)?;
+        let patch = std::fs::read(&partial)?;
+        std::fs::File::open(&partial)?.sync_all()?;
+        std::fs::rename(&partial, &patch_path)?;
+        let held_worktree = ctx.worktree_path.to_string_lossy().into_owned();
+        self.config
+            .ledger
+            .publish_candidate(&crate::ledger::CandidatePublication {
+                run_id: &self.run_id,
+                attempt_id,
+                state: end,
+                worktree: Some(&held_worktree),
+                candidate_sha: sha,
+                patch_path: &patch_path,
+                patch_sha256: &workspace::sha256_file(&patch_path)?,
+            })?;
+        self.last_snapshot = Some((index, sha.to_string()));
+        // The reviewer's prompt names `candidate-latest.patch`, so the
+        // copy is part of producing the candidate, not a convenience:
+        // a failure here stops the run instead of handing a reviewer a
+        // path that is not there (R4). It follows the publication so a
+        // failed one leaves the earlier attempt's latest patch in place.
+        let latest_patch = self.artifacts.join("candidate-latest.patch");
+        write_whole(&latest_patch, &patch)?;
+        Ok(latest_patch)
+    }
+
     /// Snapshot the worktree as attempt `index`'s candidate, name it,
     /// export its patch and judge its scope. Shared by a worker's attempt
     /// and a verify run's applied tree: both go through the same
@@ -667,8 +831,6 @@ impl<'a> RunEngine<'a> {
             tier,
             model,
         } = attempted;
-        let worktree_path = ctx.worktree_path;
-        let held_worktree = worktree_path.to_string_lossy().into_owned();
         // The candidate snapshot is recorded outside model control,
         // added files included (SPEC §8).
         let sha = match ctx.worktree.snapshot_resolved(
@@ -686,51 +848,7 @@ impl<'a> RunEngine<'a> {
                 ));
             }
         };
-        self.last_snapshot = Some((index, sha.clone()));
-        // `commit-tree` leaves a dangling object: the candidate the
-        // receipt names, the patch's other side and the worktree's
-        // history would all go in the next `git gc`. A ref under
-        // `refs/relais/candidates/` keeps it reachable without
-        // putting a branch in the user's namespace (audit B15).
-        // Best effort: a ref that could not be written is not fatal —
-        // the object exists and this run verifies it from the object —
-        // and the retirement at the run's end names the tree `…/final`
-        // itself when no ref holds it, so nothing is lost either way.
-        // A full disk is the one failure of it that is not shrugged off:
-        // relais's own write failing stops the run (SPEC §10).
-        let named = crate::storage_full::at(crate::storage_full::Site::Ref)
-            .map_err(WorkspaceError::Io)
-            .and_then(|()| {
-                workspace::name_candidate(self.config.repo_dir, self.run_id.as_str(), index, &sha)
-            });
-        if let Err(e) = named {
-            if e.is_storage_full() {
-                return Err(e.into());
-            }
-        }
-        ledger.finish_attempt(
-            attempt_id,
-            State::Verifying,
-            Some(&held_worktree),
-            Some(&sha),
-        )?;
-        crate::storage_full::at(crate::storage_full::Site::Snapshot)?;
-        std::fs::write(self.artifacts.join(format!("candidate-{index}.sha")), &sha)?;
-        let patch_path = self.artifacts.join(format!("candidate-{index}.patch"));
-        ctx.worktree.export_patch(&sha, &patch_path)?;
-        // The reviewer's prompt names `candidate-latest.patch`, so the
-        // copy is part of producing the candidate, not a convenience:
-        // a failure here stops the run instead of handing a reviewer a
-        // path that is not there (R4).
-        let latest_patch = self.artifacts.join("candidate-latest.patch");
-        std::fs::copy(&patch_path, &latest_patch)?;
-        ledger.record_evidence(
-            &self.run_id,
-            Some(attempt_id),
-            EvidenceKind::CandidatePatch,
-            &patch_path,
-            Some(&workspace::sha256_file(&patch_path)?),
-        )?;
+        let latest_patch = self.publish_snapshot(ctx, attempt_id, index, State::Verifying, &sha)?;
 
         // Write scope is checked on the actual diff; a violation can
         // never be accepted (SPEC §8, §9).
@@ -1288,4 +1406,24 @@ impl<'a> RunEngine<'a> {
             })),
         }
     }
+}
+
+/// What a timed-out worker's tree came to.
+enum TimedOutTree {
+    Candidate(String),
+    /// No candidate; the note says why when it is not the ordinary case.
+    NoCandidate(Option<String>),
+}
+
+/// Writes `bytes` to a temporary file beside `path`, makes them durable,
+/// and renames it over `path`: a reader finds the old file or the whole
+/// new one, never a truncated one.
+fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let partial = path.with_extension("partial");
+    let mut file = std::fs::File::create(&partial)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&partial, path)
 }

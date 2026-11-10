@@ -263,6 +263,13 @@ enum Awaited {
         ended: Ended,
         detail: String,
     },
+    /// The wall time ran out and the worker was asked to stop: `stop` says
+    /// whether the coordinator confirmed it, and `agent` is the one asked.
+    TimedOut {
+        agent: Option<String>,
+        detail: String,
+        stop: StopAck,
+    },
     /// The session's plugin went silent while the worker ran. Nothing asked
     /// the worker to stop, so it may still be writing; `agent` is the one
     /// that bound, if any did.
@@ -358,6 +365,7 @@ impl TranscriptTail {
 }
 
 /// How a request to stop a worker ended.
+#[derive(Debug)]
 enum StopAck {
     /// The coordinator reported the dispatch stopped or failed.
     Confirmed,
@@ -369,7 +377,7 @@ enum StopAck {
 }
 
 /// The status polls that failed while a stop was awaited.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct PollErrors {
     count: u32,
     last: Option<String>,
@@ -790,6 +798,7 @@ fn ended_result(spec: &LaunchSpec, ended: Ended, detail: String) -> LaunchResult
         unpriced: Vec::new(),
         lost_worker: None,
         looped: None,
+        timed_out_stop: None,
     }
 }
 
@@ -917,10 +926,27 @@ impl<'a> NativeBackend<'a> {
             if started.elapsed() >= spec.wall_timeout {
                 // The attempt is over; an agent left running would go on
                 // editing its worktree and spending what nothing books.
-                self.stop_agent(spec, running.as_deref());
-                return Awaited::Ended {
-                    ended: Ended::TimedOut,
-                    detail: "the native worker did not stop within the attempt's wall time".into(),
+                let detail = "the native worker did not stop within the attempt's wall time";
+                let Some(agent) = running.clone() else {
+                    self.stop_agent(spec, None);
+                    return Awaited::TimedOut {
+                        agent: None,
+                        detail: detail.into(),
+                        stop: StopAck::Unconfirmed(PollErrors::default()),
+                    };
+                };
+                // The attempt's own time is spent: the stop gets the spawn
+                // wait as its own grace.
+                let stop = self.stop_and_confirm(spec, &agent, Instant::now() + self.waits.spawn);
+                if matches!(stop, StopAck::Cancelled) {
+                    if let Some(cancelled) = self.cancelled(spec, Some(&agent)) {
+                        return cancelled;
+                    }
+                }
+                return Awaited::TimedOut {
+                    agent: Some(agent),
+                    detail: detail.into(),
+                    stop,
                 };
             }
             match self.poll(spec) {
@@ -1424,6 +1450,7 @@ impl<'a> NativeBackend<'a> {
             unpriced: booked.unpriced,
             lost_worker: None,
             looped: None,
+            timed_out_stop: None,
         }
     }
 
@@ -1473,6 +1500,18 @@ impl<'a> NativeBackend<'a> {
                 Ok(self.stopped_result(spec, report, notes))
             }
             Awaited::Ended { ended, detail } => Ok(ended_result(spec, ended, detail)),
+            Awaited::TimedOut {
+                agent,
+                detail,
+                stop,
+            } => {
+                let mut timed_out = ended_result(spec, Ended::TimedOut, detail);
+                if let (Some(agent), StopAck::Confirmed) = (agent, stop) {
+                    timed_out.timed_out_stop =
+                        Some(crate::backend::TimedOutStop { agent: Some(agent) });
+                }
+                Ok(timed_out)
+            }
             Awaited::Lost { agent, detail } => {
                 let mut lost = ended_result(spec, Ended::Exited(1), detail);
                 lost.lost_worker = Some(crate::backend::LostWorker { agent });

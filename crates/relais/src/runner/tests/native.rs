@@ -113,6 +113,8 @@ enum Plugin {
     /// the first one, long since reported stopped, writes one more
     /// transcript message and a file in its tree.
     WritesAfterItsStop,
+    /// Binds and never stops by itself; it reports stopped when asked.
+    NeverStopsAcksStop,
     /// Binds and never stops, and writes no transcript at all.
     NeverStopsWithoutTranscript,
 }
@@ -325,7 +327,11 @@ fn run_plugin(
                     agent_id: stopped_agent.clone(),
                 });
                 if let (true, Some(agent_id)) = (
-                    plugin.loops_until_stopped() || plugin == Plugin::ContinuationLoops,
+                    plugin.loops_until_stopped()
+                        || matches!(
+                            plugin,
+                            Plugin::ContinuationLoops | Plugin::NeverStopsAcksStop
+                        ),
                     stopped_agent,
                 ) {
                     let killed = StoppedReport {
@@ -538,7 +544,7 @@ fn run_plugin(
                     &report(1, AgentStatus::Completed),
                 );
             }
-            Plugin::NeverStops | Plugin::CancelsAfterBound => {
+            Plugin::NeverStops | Plugin::NeverStopsAcksStop | Plugin::CancelsAfterBound => {
                 record_bound(&mut script, &gate, &dispatch_id, &agent_id);
                 if plugin == Plugin::CancelsAfterBound {
                     // Long enough for the backend's poll to see the bind.
@@ -752,6 +758,7 @@ impl Backend for RefusesTheFirst<'_> {
                 unpriced: Vec::new(),
                 lost_worker: None,
                 looped: None,
+                timed_out_stop: None,
             });
         }
         self.inner.launch(spec)
@@ -1425,6 +1432,7 @@ fn an_attempt_with_no_booked_record_has_no_unpriced_model() {
         unpriced: Vec::new(),
         lost_worker: None,
         looped: None,
+        timed_out_stop: None,
     };
     assert_eq!(
         unpriced_native_model(&result),
@@ -2265,5 +2273,346 @@ fn what_a_stopped_agent_writes_later_is_not_booked_to_the_next_attempt() {
     // holds-until: the scripted plugin shares one path between both attempts' trees, so the
     // late file cannot be told from the second attempt's own; a harness with separate trees
     // asserts its absence from the second attempt's snapshot.
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+fn leaves_the_tree_alone(_tree: &Path, _prompt: &str) {}
+
+fn timed_out_run(plugin: Plugin, work: Work, fixture: &Fixture) -> Native {
+    run_native_waiting(
+        fixture,
+        Review::Off,
+        3,
+        Cast { plugin, work },
+        Some(prices()),
+        Waits {
+            spawn: Duration::from_secs(2),
+            hello_lapse: Duration::from_secs(120),
+            transcript_lookups: 3,
+        },
+        |repo| repo.execution.max_wall_seconds = 3,
+    )
+}
+
+fn process_crash_detail(fixture: &Fixture, run: &Native) -> serde_json::Value {
+    fixture
+        .ledger
+        .transitions(&run.outcome.run_id)
+        .expect("history")
+        .into_iter()
+        .find(|transition| transition.reason == "process_crash")
+        .and_then(|transition| transition.detail)
+        .expect("a process_crash transition with a detail")
+}
+
+#[test]
+fn a_worker_that_edits_then_outlives_its_wall_time_and_acks_the_stop_leaves_a_candidate() {
+    let fixture = Fixture::new();
+    let run = timed_out_run(Plugin::NeverStopsAcksStop, fixes_at_once, &fixture);
+    interrupted_detail(&run.outcome);
+    let candidates = fixture
+        .ledger
+        .candidate_attempts(&run.outcome.run_id)
+        .expect("candidates");
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+    let (index, sha) = &candidates[0];
+    let artifacts = fixture.artifacts.join(run.outcome.run_id.as_str());
+    assert!(artifacts.join(format!("candidate-{index}.patch")).is_file());
+    assert!(artifacts.join("candidate-latest.patch").is_file());
+    assert_eq!(
+        std::fs::read_to_string(artifacts.join(format!("candidate-{index}.sha"))).expect("sha"),
+        *sha
+    );
+    let detail = process_crash_detail(&fixture, &run);
+    assert_eq!(detail["timed_out"], true, "{detail}");
+    assert_eq!(detail["candidate"], serde_json::json!(sha), "{detail}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn a_timed_out_worker_that_never_acks_the_stop_leaves_no_candidate() {
+    let fixture = Fixture::new();
+    let run = timed_out_run(Plugin::NeverStops, fixes_at_once, &fixture);
+    interrupted_detail(&run.outcome);
+    assert!(fixture
+        .ledger
+        .candidate_attempts(&run.outcome.run_id)
+        .expect("candidates")
+        .is_empty());
+    let detail = process_crash_detail(&fixture, &run);
+    assert_eq!(detail["timed_out"], true, "{detail}");
+    assert!(detail.get("candidate").is_none(), "{detail}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn a_timed_out_worker_that_changed_nothing_leaves_no_candidate() {
+    let fixture = Fixture::new();
+    let run = timed_out_run(Plugin::NeverStopsAcksStop, leaves_the_tree_alone, &fixture);
+    interrupted_detail(&run.outcome);
+    assert!(fixture
+        .ledger
+        .candidate_attempts(&run.outcome.run_id)
+        .expect("candidates")
+        .is_empty());
+    let detail = process_crash_detail(&fixture, &run);
+    assert!(detail.get("candidate").is_none(), "{detail}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn a_run_cancelled_during_the_timed_out_stop_wait_ends_cancelled_with_no_candidate() {
+    let fixture = Fixture::new();
+    let run = timed_out_run(Plugin::LoopsAndCancelsOnStop, fixes_at_once, &fixture);
+    assert!(
+        matches!(run.outcome.terminal, Terminal::Cancelled { .. }),
+        "{:?}",
+        run.outcome
+    );
+    assert!(fixture
+        .ledger
+        .candidate_attempts(&run.outcome.run_id)
+        .expect("candidates")
+        .is_empty());
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+fn storage_full_script(
+    after: Option<crate::storage_full::Site>,
+    site: crate::storage_full::Site,
+    ballast: &Path,
+) -> crate::storage_full::failpoint::Script {
+    use crate::storage_full::failpoint::{BallastProbe, Fire, Script};
+    Script {
+        fires: vec![Fire { site, after }],
+        probe: Some(Arc::new(BallastProbe {
+            ballast: ballast.to_path_buf(),
+            low: 1 << 30,
+            high: 50 << 30,
+            keeps_blocks: false,
+        })),
+        ..Script::default()
+    }
+}
+
+#[test]
+fn a_failure_before_the_publication_leaves_no_selectable_candidate_on_either_path() {
+    use crate::storage_full::Site;
+    for (plugin, label) in [
+        (Plugin::NeverStopsAcksStop, "timed out"),
+        (Plugin::Obeys, "verifying"),
+    ] {
+        for site in [Site::Snapshot, Site::Patch, Site::Ledger] {
+            let fixture = Fixture::new();
+            let ballast = fixture.dir.join(crate::storage_full::BALLAST_FILE);
+            std::fs::write(&ballast, vec![0u8; 4096]).expect("ballast");
+            let after = (site == Site::Ledger).then_some(Site::Snapshot);
+            let _armed =
+                crate::storage_full::failpoint::arm(storage_full_script(after, site, &ballast));
+            let run = if plugin == Plugin::Obeys {
+                run_native(
+                    &fixture,
+                    Review::Off,
+                    3,
+                    plugin,
+                    fixes_at_once,
+                    Some(prices()),
+                    |_| {},
+                )
+            } else {
+                timed_out_run(plugin, fixes_at_once, &fixture)
+            };
+            assert!(
+                matches!(
+                    &run.outcome.terminal,
+                    Terminal::BlockedBy {
+                        reason: Reason::RelaisStorageFull,
+                        ..
+                    }
+                ),
+                "{label} {site:?}: a full disk still stops the run: {:?}",
+                run.outcome.terminal
+            );
+            assert!(
+                fixture
+                    .ledger
+                    .candidate_attempts(&run.outcome.run_id)
+                    .expect("candidates")
+                    .is_empty(),
+                "{label} {site:?}: no selectable candidate"
+            );
+            if site == Site::Ledger {
+                let written = fixture.artifacts.join(run.outcome.run_id.as_str());
+                assert!(
+                    written.join("candidate-1.patch").is_file()
+                        && written.join("candidate-1.sha").is_file(),
+                    "{label}: the failure lands after the artifact files"
+                );
+            }
+            {
+                let full = fixture
+                    .ledger
+                    .transitions(&run.outcome.run_id)
+                    .expect("history")
+                    .into_iter()
+                    .find(|transition| transition.reason == "relais_storage_full")
+                    .and_then(|transition| transition.detail)
+                    .expect("the storage-full transition");
+                assert!(
+                    full["candidate"].is_null(),
+                    "{label} {site:?}: last_snapshot is unchanged: {full}"
+                );
+            }
+            std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+        }
+    }
+}
+
+/// What the scripted mock worker's second launch does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SecondAttempt {
+    TimesOut,
+    Completes,
+}
+
+fn timed_out_mock(
+    second_attempt: SecondAttempt,
+    work: impl Fn(&std::path::Path, usize) + Send + Sync + 'static,
+) -> MockBackend {
+    let launches = std::sync::atomic::AtomicUsize::new(0);
+    MockBackend::new(move |spec| {
+        let attempt = launches.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        work(&spec.work_dir, attempt);
+        let timed_out = second_attempt == SecondAttempt::TimesOut && attempt >= 2;
+        MockOutcome {
+            result_text: (!timed_out).then(|| "DONE".to_string()),
+            exit_code: Some(0),
+            timed_out,
+            timed_out_stop: timed_out.then_some(crate::backend::TimedOutStop { agent: None }),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    })
+}
+
+#[test]
+fn a_candidate_that_cannot_be_published_leaves_the_earlier_one_selectable() {
+    let fixture = Fixture::new();
+    let run_id = fixture.ids.run_id().expect("run id");
+    let artifacts = fixture.artifacts.join(run_id.as_str());
+    let blocked = artifacts.join("candidate-2.patch");
+    std::fs::create_dir_all(blocked.join("in-the-way")).expect("a directory where the patch goes");
+    let backend = timed_out_mock(SecondAttempt::TimesOut, |tree, attempt| {
+        std::fs::write(
+            tree.join("src").join(format!("tick-{attempt}.txt")),
+            "edit\n",
+        )
+        .expect("edit");
+    });
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let outcome = fixture.execute_as(
+        Some(run_id.clone()),
+        &fixture.contract(Review::Off),
+        &repo,
+        &backend,
+    );
+    interrupted_detail(&outcome);
+    let candidates = fixture
+        .ledger
+        .candidate_attempts(&run_id)
+        .expect("candidates");
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+    assert_eq!(candidates[0].0, 1);
+    assert_eq!(
+        std::fs::read(artifacts.join("candidate-latest.patch")).expect("latest"),
+        std::fs::read(artifacts.join("candidate-1.patch")).expect("first patch"),
+        "the latest patch still names the selectable candidate"
+    );
+    let crash = fixture
+        .ledger
+        .transitions(&run_id)
+        .expect("history")
+        .into_iter()
+        .find(|transition| transition.reason == "process_crash")
+        .and_then(|transition| transition.detail)
+        .expect("a process_crash detail");
+    assert_eq!(crash["timed_out"], true, "{crash}");
+    assert!(crash.get("candidate").is_none(), "{crash}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[cfg(unix)]
+#[test]
+fn a_subprocess_worker_that_edits_and_times_out_with_its_group_gone_leaves_a_candidate() {
+    let fixture = Fixture::new();
+    let backend = MockBackend::new(|spec| {
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", "rm src/main.rs; sleep 30"])
+            .current_dir(&spec.work_dir);
+        let end = crate::procs::run_with_timeout(command, Duration::from_secs(3), None, None)
+            .expect("the worker runs");
+        MockOutcome {
+            exit_code: Some(0),
+            timed_out: end.ended == crate::procs::Ended::TimedOut,
+            timed_out_stop: crate::backend::TimedOutStop::of_process(&end),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+    interrupted_detail(&outcome);
+    let candidates = fixture
+        .ledger
+        .candidate_attempts(&outcome.run_id)
+        .expect("candidates");
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+    let artifacts = fixture.artifacts.join(outcome.run_id.as_str());
+    assert!(artifacts.join("candidate-latest.patch").is_file());
+    assert!(artifacts.join("candidate-1.patch").is_file());
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn a_normal_candidate_that_cannot_be_published_leaves_the_earlier_one_selectable() {
+    let fixture = Fixture::new();
+    let run_id = fixture.ids.run_id().expect("run id");
+    let artifacts = fixture.artifacts.join(run_id.as_str());
+    std::fs::create_dir_all(artifacts.join("candidate-2.patch").join("in-the-way"))
+        .expect("a directory where the patch goes");
+    let backend = timed_out_mock(SecondAttempt::Completes, |tree, attempt| {
+        std::fs::write(
+            tree.join("src").join(format!("tick-{attempt}.txt")),
+            "edit\n",
+        )
+        .expect("edit");
+    });
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    // The fixture expects an outcome; an unpublishable candidate is an error.
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture.execute_as(
+            Some(run_id.clone()),
+            &fixture.contract(Review::Off),
+            &repo,
+            &backend,
+        )
+    }));
+    if let Ok(outcome) = &ran {
+        assert!(
+            !matches!(outcome.terminal, Terminal::Accepted(_)),
+            "{outcome:?}"
+        );
+    }
+    let candidates = fixture
+        .ledger
+        .candidate_attempts(&run_id)
+        .expect("candidates");
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+    assert_eq!(candidates[0].0, 1);
+    assert_eq!(
+        std::fs::read(artifacts.join("candidate-latest.patch")).expect("latest"),
+        std::fs::read(artifacts.join("candidate-1.patch")).expect("first patch"),
+    );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
 }

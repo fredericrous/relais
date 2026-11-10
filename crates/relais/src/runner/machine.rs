@@ -313,7 +313,13 @@ pub enum Observation {
     ReviewOverBudget(OverBudget),
     /// The worker process ended without a terminal result: killed,
     /// non-zero exit, or output the adapter could not read.
-    TerminalResultMissing { timed_out: bool, detail: String },
+    TerminalResultMissing {
+        timed_out: bool,
+        detail: String,
+        /// The tree a confirmed-stopped worker left, published as the
+        /// interrupted attempt's candidate.
+        candidate: Option<String>,
+    },
     /// The worker was stopped for repeating one failing command with no
     /// edit between: its attempt has no candidate to verify.
     WorkerLooped { command: String, count: u32 },
@@ -756,10 +762,19 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
             )
         }
 
-        Observation::TerminalResultMissing { timed_out, detail } => Decision::stop(
+        Observation::TerminalResultMissing {
+            timed_out,
+            detail,
+            candidate,
+        } => Decision::stop(
             State::Interrupted,
             Reason::ProcessCrash,
-            serde_json::json!({ "timed_out": timed_out, "detail": detail }),
+            match candidate {
+                Some(candidate) => serde_json::json!({
+                    "timed_out": timed_out, "detail": detail, "candidate": candidate
+                }),
+                None => serde_json::json!({ "timed_out": timed_out, "detail": detail }),
+            },
             Terminal::Interrupted {
                 detail: if detail.is_empty() {
                     "the worker process ended without a terminal result; state is \
@@ -1148,7 +1163,8 @@ mod tests {
                 &b,
                 Observation::TerminalResultMissing {
                     timed_out: true,
-                    detail: String::new()
+                    detail: String::new(),
+                    candidate: None,
                 }
             )
             .state,

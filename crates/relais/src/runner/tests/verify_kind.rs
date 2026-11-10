@@ -593,6 +593,46 @@ fn a_conflicting_from_candidate_hands_the_merge_to_the_worker_and_refuses_the_sn
         receipt.candidate.as_ref().map(|c| c.source_run.as_str()),
         Some(source.as_str())
     );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn a_timed_out_worker_that_leaves_a_conflict_unresolved_leaves_no_candidate() {
+    let fixture = Fixture::new();
+    let source = rewriting_source(&fixture);
+    commit_file(
+        &fixture,
+        "src/main.rs",
+        "fn main() { println!(\"target\"); }\n",
+    );
+    let backend = MockBackend::new(|_| MockOutcome {
+        exit_code: Some(0),
+        timed_out: true,
+        timed_out_stop: Some(crate::backend::TimedOutStop { agent: None }),
+        usage: Some(usage(100)),
+        ..Default::default()
+    });
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let outcome = fixture.execute(&continue_contract(&source), &repo, &backend);
+    assert!(
+        matches!(outcome.terminal, Terminal::Interrupted { .. }),
+        "{:?}",
+        outcome.terminal
+    );
+    assert!(fixture
+        .ledger
+        .candidate_attempts(&outcome.run_id)
+        .expect("candidates")
+        .is_empty());
+    let crash = fixture
+        .ledger
+        .transitions(&outcome.run_id)
+        .expect("history")
+        .into_iter()
+        .find(|transition| transition.reason == "process_crash")
+        .and_then(|transition| transition.detail)
+        .expect("a process_crash detail");
+    assert!(crash.get("candidate").is_none(), "{crash}");
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
