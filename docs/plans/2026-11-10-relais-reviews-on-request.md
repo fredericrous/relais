@@ -168,7 +168,7 @@ only on the red checks.
 
 ## Phases
 
-- [ ] Phase 1 — the reviewer only under `review: required`:
+- [x] Phase 1 — the reviewer only under `review: required`:
   `crates/relais/src/runner/attempt.rs`, `crates/relais/src/runner/scheduler.rs`,
   `crates/relais/src/runner/verification.rs`, `crates/relais/src/verify/mod.rs`,
   `crates/relais/src/runner/approval.rs`, `crates/relais/src/cli/evidence.rs`,
@@ -185,7 +185,7 @@ only on the red checks.
     review dispatch; one under `required` is reviewed; an unrequired
     inspection's criteria are `report_exists`; an unrequired empty report
     still fails.
-- [ ] Phase 2 — proof, else lazy: `crates/relais/src/runner/baseline.rs`,
+- [x] Phase 2 — proof, else lazy: `crates/relais/src/runner/baseline.rs`,
   `crates/relais/src/runner/types.rs`, `crates/relais/src/runner/engine.rs`,
   `crates/relais/src/runner/attempt.rs`, `crates/relais/src/runner/verification.rs`,
   `crates/relais/src/runner/evidence.rs`, `crates/relais/src/runner/scheduler.rs`,
@@ -240,6 +240,26 @@ only on the red checks.
 - 2026-11-10 — The baseline is lazy with no policy switch back to up-front.
   ADR-0013 decided it for every repository, and a switch would change the
   policy hash of every `relais.toml`.
+- 2026-11-10 — Built with these deviations:
+  - The receipt gains `review_level`, because no receipt recorded the routed
+    level and the "tests edited" line names it. Report schema 19, since
+    relais#431 took 18.
+  - `relais run` prints that line on stderr.
+  - `relais resume` refuses terminal runs, so a blocked on-demand base
+    writes `<run>/verify-candidate-<n>.json` (a `kind: verify` contract) and
+    names `relais run --task <path>`.
+  - `kind: verify` changes never run the base on demand: a red check fails
+    them outright.
+  - An in-place run's base is never seeded from the worker-edited tree.
+  - Non-lease base errors end `blocked (baseline_verification_failed)`, with
+    the candidate kept.
+  - A base timeout ends the run only when the total is spent.
+  - The cache is read-only for lazy runs. Old cache entries still serve.
+  - The step detail reads `deferred · checked if a check fails`.
+- 2026-11-10 — The rebase over relais#431 dropped my pack-refresh commit,
+  because main already had the refreshed pack. The `report/mod.rs`,
+  `engine.rs` and `runner/mod.rs` conflicts were resolved by keeping both
+  sides.
 
 ## Verification
 
@@ -268,6 +288,65 @@ only on the red checks.
   - The policy-hash test in `policy::tests`, if `relais/relais.toml` changes.
     It shouldn't.
 
+Observed before the push, at d0c57a55, rebased on 4bdca927:
+
+- **Phase 1:**
+  - The scripted change that edits tests under `optional` makes one launch,
+    is accepted, has the paths on its receipt, prints the exact line, and
+    records no `VerificationInputsChanged` transition. Under `required` it is
+    reviewed. Tested by `changing_verification_inputs_is_reviewed_only_under_required`.
+  - An unrequired inspection launches no reviewer, settles as `report_exists`
+    with `NoneIndependent`, and writes no `report-review-1.txt`. Tested by
+    `an_inspection_without_required_settles_by_its_report`.
+  - `relais report --json` parses as one value and carries no line. A
+    pre-change receipt still renders.
+- **Phase 2:**
+  - A green candidate on an unproven base runs no base command and records
+    `baseline_deferred: true`.
+  - A red candidate runs only its red labels, logged under `base-cmd` with
+    the original index, and a pre-existing failure ends
+    `baseline_failure_not_waived`.
+  - A second red attempt reuses the memo.
+  - An identical-tree inspection on a red base is accepted with no base run.
+  - A base run longer than the work left does not end the run `Work`.
+  - A JUnit pre-existing failure ends `PreexistingTestFailures` on attempt 1.
+  - The base endings keep the candidate, with `finish_attempt` `Blocked`, and
+    name `relais run --task <path>`. No `verify-base` worktree is left
+    behind.
+- **Suites:** `cargo test -p relais` gives lib 2312, bin 54, integration 300
+  and doc 1, with 0 failed. Clippy `-D warnings`, fmt and `--lib install::`
+  are clean. `relais/relais.toml` is unchanged.
+- **Not run:**
+  - The real `relais run` checks: the inspect on this repository, and grh
+    with no base phase. They need the installed release and become
+    post-release observations.
+  - No counter for `blocked (baseline_*)` after a worker was paid is built;
+    the endings tests assert the message instead.
+  - The 0.74 comparison is the after-measure on 11-18 (`open_checks_due`).
+
+## Implementation review
+
+- implementation-review (opus): approve-with-changes, then the Delta. Its
+  findings were plan bookkeeping, done in this commit, and all 13 candidates
+  were fine. 50k + 55k tokens, 28 s + 17 s.
+- backend (opus): approve-with-changes, then approve. Fixed: in-place seeding,
+  errors routed to the kept-candidate ending, timeout only on Total.
+  deliberate: weak in-place test assertion; follow-up branch. 74k + 102k.
+- lang:rust (opus): approve-with-changes, twice. Fixed: the `BaseSource` and
+  `Draws` enums, the drop guard, the release event, `Review::is_required`.
+  deliberate: stale doc link, `#[must_use]` on `BaseRun`, and
+  `verify_command`'s swallowed error; follow-up branch, since there is no
+  third pass. 75k + 109k.
+- unix (opus): approve-with-changes, then approve. Fixed: the line on stderr
+  and a pasteable command. deliberate: `report_exists` refused by older relais
+  (Decision log), stated in the CHANGELOG as an upgrade requirement. 55k + 82k.
+- tui (opus): approve-with-changes, then approve. Fixed: the command,
+  separate sentences, a clearer deferred label. 49k + 72k.
+
 ## Outcome
+
+Phases 1 and 2 are built and reviewed on `feat/review-opt-in-lazy-baseline`.
+Next: Phase 3, the release (v0.53.0), then the follow-up branch for the
+deliberate lows.
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix body-sha=8e960c48cbd2 -->
