@@ -252,6 +252,7 @@ impl<'a> RunEngine<'a> {
             verdict,
         } = pending;
         let preflight = ctx.preflight;
+        let flags = ctx.baseline.flags();
         let report = VerificationReport {
             candidate_sha: candidate.sha.clone(),
             base_sha: preflight.base_sha.clone(),
@@ -266,10 +267,10 @@ impl<'a> RunEngine<'a> {
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
             integration_gaps: preflight.integration_gaps.clone(),
-            baseline_cached: ctx.baseline.cached,
+            baseline_cached: flags.cached,
             baseline_cache_refused: ctx.baseline.cache_refused.clone(),
-            baseline_proven: ctx.baseline.proven,
-            baseline_deferred: ctx.baseline.deferred,
+            baseline_proven: flags.proven,
+            baseline_deferred: flags.deferred,
         };
         let patch_adds_test = self.patch_adds_test(ctx, &candidate.sha)?;
         let (criteria, mandatory_evidence_independence) = self.settle(

@@ -571,7 +571,9 @@ pub(crate) fn run_command(
                 receipt.review.reviewed(),
                 receipt.review_level,
             ) {
-                println!("{line}");
+                // A note, not the run's result: stdout keeps the lines a
+                // script reads.
+                eprintln!("{line}");
             }
             Ok(CliOutcome::Accepted)
         }

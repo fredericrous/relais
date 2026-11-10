@@ -3317,14 +3317,7 @@ pub fn unreviewed_test_edits_line(
         return None;
     }
     Some(match level {
-        Some(level) => {
-            let word = match level {
-                crate::contract::Review::Off => "off",
-                crate::contract::Review::Optional => "optional",
-                crate::contract::Review::Required => "required",
-            };
-            format!("tests edited; not reviewed (review: {word})")
-        }
+        Some(level) => format!("tests edited; not reviewed (review: {level})"),
         None => "tests edited; not reviewed".to_string(),
     })
 }

@@ -4,13 +4,14 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::setup_gate;
+use super::workspace_ops::SetupWithin;
 use super::{
     review_record_of, AttemptContext, AttemptLabel, Budget, Candidate, Next, Observation,
     PatchBasis, PendingEvidence, Progress, Reason, RepairFailure, ReviewOutcome, ReviewRequest,
     RunEngine, RunError, RunOutcome, State, Step, Terminal, Verified, VerifyFailure,
 };
 use crate::acceptance::Evidence;
-use crate::contract::{Kind, Review};
+use crate::contract::Kind;
 use crate::ledger::{EvidenceKind, EvidenceOrigin, IntentReview, VerificationSnapshot};
 use crate::policy::EffectiveAuthority;
 use crate::route::Recipe;
@@ -469,8 +470,7 @@ impl<'a> RunEngine<'a> {
             .map(|(criterion_id, _actor)| criterion_id)
             .collect();
         let kind = self.config.contract.kind();
-        let judgment = if kind == Kind::Inspect && ctx.preflight.decision.review < Review::Required
-        {
+        let judgment = if kind == Kind::Inspect && !ctx.preflight.decision.review.is_required() {
             verify::ReportJudgment::Exists
         } else {
             verify::ReportJudgment::from(verdict)
@@ -543,7 +543,7 @@ impl<'a> RunEngine<'a> {
         mut verified: Verified,
     ) -> Result<Step, RunError> {
         let preflight = ctx.preflight;
-        let verdict = if preflight.decision.review >= Review::Required {
+        let verdict = if preflight.decision.review.is_required() {
             match self.report_verdict(ctx, progress, candidate, &verified)? {
                 Ok(verdict) => Some(verdict),
                 Err(ended) => return Ok(Step::Ended(ended)),
@@ -781,7 +781,10 @@ impl<'a> RunEngine<'a> {
                             &authority.verification_profile,
                             logs_dir,
                             &label.log_prefix(),
-                            cancel,
+                            SetupWithin {
+                                cancel,
+                                budgets: &self.budgets,
+                            },
                         )
                     })
                     .map_err(VerifyFailure::from)?;
@@ -1079,6 +1082,7 @@ pub(super) fn verification_report(
     baseline_failures: Vec<String>,
 ) -> VerificationReport {
     let preflight = ctx.preflight;
+    let flags = ctx.baseline.flags();
     VerificationReport {
         candidate_sha: candidate.sha.clone(),
         base_sha: preflight.base_sha.clone(),
@@ -1093,10 +1097,10 @@ pub(super) fn verification_report(
         amont_downgrades: verified.amont_downgrades.clone(),
         verification_inputs_changed: verified.verification_inputs_changed.clone(),
         integration_gaps: preflight.integration_gaps.clone(),
-        baseline_cached: ctx.baseline.cached,
+        baseline_cached: flags.cached,
         baseline_cache_refused: ctx.baseline.cache_refused.clone(),
-        baseline_proven: ctx.baseline.proven,
-        baseline_deferred: ctx.baseline.deferred,
+        baseline_proven: flags.proven,
+        baseline_deferred: flags.deferred,
     }
 }
 

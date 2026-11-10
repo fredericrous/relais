@@ -3,6 +3,7 @@ use super::review::{CandidateNames, ReviewerGuidance, REVIEW_CONSTRAINTS_BUDGET_
 use super::*;
 use crate::adapter::{MockBackend, MockOutcome};
 use crate::context::AvalVerdict;
+use crate::contract::Review;
 use crate::ids::derive_task_id;
 use crate::policy::repo_key;
 use crate::policy::{
@@ -5434,14 +5435,33 @@ fn assert_kept_after_base(fixture: &Fixture, run_id: &RunId, state: State, detai
         Some(sha.clone())
     );
     if state == State::Blocked {
+        // The message ends in the one command that verifies the kept
+        // candidate, and that command's contract is on disk.
+        let contract = fixture
+            .artifacts
+            .join(run_id.as_str())
+            .join("verify-candidate-1.json");
         assert!(
-            detail.contains(&format!(
-                "the candidate is kept: verify it again without a worker with a `kind: verify` \
-                 run, `candidate {{run: {}, index: 1}}`",
-                run_id.as_str()
+            detail.contains(
+                "The base was checked after attempt 1 failed, so a worker was already paid."
+            ),
+            "{detail}"
+        );
+        assert!(
+            detail.ends_with(&format!(
+                "verify the kept candidate: `relais run --task {}`.",
+                contract.display()
             )),
             "{detail}"
         );
+        let written = TaskContract::from_json_str(
+            &std::fs::read_to_string(&contract).expect("the verify contract is written"),
+        )
+        .expect("a valid contract");
+        assert!(written.is_verify());
+        let value = written.canonical_value();
+        assert_eq!(value["candidate"]["run"], run_id.as_str());
+        assert_eq!(value["candidate"]["index"], 1);
     }
     assert!(
         !fixture.verify_dir(run_id).join("verify-base").exists(),
@@ -5817,6 +5837,47 @@ fn a_red_candidate_runs_only_its_red_checks_on_the_base() {
     assert!(events.contains("1 check · 1 red on base"), "{events}");
     assert!(!fixture.verify_dir(&run_id).join("verify-base").exists());
     assert_eq!(cache_entries(&fixture), 0, "a partial base is never cached");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+/// A base that relais itself cannot check (here its log path is taken
+/// by a directory, so the log cannot be written) still ends through the
+/// paid-worker path: blocked `baseline_verification_failed`, the attempt
+/// closed with its candidate kept, never a runner error.
+#[test]
+fn a_base_relais_cannot_check_blocks_with_the_candidate_kept() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![sh("exit 1")], 3);
+    let artifacts = fixture.artifacts.clone();
+    let backend = MockBackend::new(move |spec| {
+        let run_id = spec
+            .work_dir
+            .parent()
+            .and_then(Path::file_name)
+            .expect("worktrees/<run-id>/task")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::create_dir_all(artifacts.join(run_id).join("logs").join("base-cmd0.log"))
+            .expect("a directory where the base's log goes");
+        std::fs::write(spec.work_dir.join("src/change.txt"), "change\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+    let RunOutcome {
+        run_id,
+        terminal: Terminal::Blocked { code, detail },
+    } = outcome
+    else {
+        panic!("expected blocked, got {outcome:?}");
+    };
+    assert_eq!(code, BlockCode::BaselineVerificationFailed, "{detail}");
+    assert!(detail.contains("the base could not be checked"), "{detail}");
+    assert_kept_after_base(&fixture, &run_id, State::Blocked, &detail);
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
@@ -10300,29 +10361,65 @@ fn a_fork_seeds_its_verification_tree_from_a_fresh_task_tree_without_waiting() {
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover only costs disk
 }
 
-/// An in-place run's base seed still takes the caller's window (the
-/// source is already quiet, so it seeds at once); only the verification
-/// seed from the run's own tree is unwaited.
+/// An in-place run's checkout is the tree its worker edits, so the base,
+/// checked on demand after a red candidate (ADR-0013), is never seeded
+/// from it: a lockfile and dependencies the candidate changed must not
+/// become the base's. Only the verification seed from the run's own tree
+/// happens, unwaited.
 #[test]
-fn an_in_place_runs_base_seed_keeps_the_callers_window() {
+fn an_in_place_runs_base_is_never_seeded_from_the_edited_tree() {
     use crate::workspace::reuse::Workspace;
     let fixture = fixture_in_a_linked_worktree();
     std::fs::write(fixture.repo.join(".gitignore"), "node_modules/\n").expect("ignore");
+    std::fs::write(fixture.repo.join("package-lock.json"), "{\"base\": true}\n").expect("lock");
+    git(&fixture.repo, &["add", ".gitignore", "package-lock.json"]);
+    git(&fixture.repo, &["commit", "-q", "-m", "lockfile"]);
     std::fs::create_dir_all(fixture.repo.join("node_modules/dep")).expect("mkdir");
     std::fs::write(fixture.repo.join("node_modules/dep/index.js"), "ok").expect("dep");
     let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
     backdate(&fixture.repo.join("node_modules/dep/index.js"), long_ago);
     backdate(&fixture.repo.join("node_modules/dep"), long_ago);
-    // A check red everywhere: the candidate goes red, so the deferred
-    // base is checked on demand and seeded (ADR-0013).
-    let repo = fixture.repo_policy_with_setup(Vec::new(), vec![sh("exit 1")], 1);
+    // What the base's setup finds in its own tree, written outside it.
+    let seen = fixture.dir.join("base-saw");
+    let seen_sh = seen.display().to_string().replace('\\', "/");
+    let setup = sh(&format!(
+        "case \"$(pwd -P)\" in */verify-base) \
+         if [ -d node_modules ]; then echo dependencies >> '{seen_sh}'; fi; \
+         cat package-lock.json >> '{seen_sh}';; esac"
+    ));
+    let repo = fixture.repo_policy_with_setup(vec![setup], vec![sh("exit 1")], 1);
     let machine = fixture.machine_for(&repo);
+    // The worker changes the dependencies in place, and a source file so
+    // its candidate is not the base. (Editing the lockfile itself is a
+    // profile input: that run ends `verification_inputs_changed` before
+    // any check, and the base's checkout holds its own tracked lockfile.)
+    let backend = MockBackend::new(|spec| {
+        std::fs::write(spec.work_dir.join("node_modules/dep/index.js"), "changed").expect("dep");
+        std::fs::write(spec.work_dir.join("src/change.txt"), "change\n").expect("src");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
     let outcome = fixture.execute_in(
         Workspace::InPlace,
         &fixture.contract(Review::Off),
         &repo,
         &machine,
-        &changing_worker(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+        &backend,
+    );
+    let saw = std::fs::read_to_string(&seen)
+        .unwrap_or_else(|e| panic!("the base was set up on demand ({e}): {outcome:?}"));
+    assert!(
+        saw.contains("\"base\""),
+        "the base has its own lockfile: {saw}"
+    );
+    assert!(!saw.contains("candidate"), "{saw}");
+    assert!(
+        !saw.contains("dependencies"),
+        "the base was not seeded from the edited tree: {saw}"
     );
     let decisions = decisions_of(&fixture, &outcome.run_id);
     assert_eq!(
@@ -10330,12 +10427,6 @@ fn an_in_place_runs_base_seed_keeps_the_callers_window() {
         1,
         "{decisions:?}"
     );
-    if cow_here(&fixture) {
-        assert!(
-            count_of(&decisions, "workspace_seeded") >= 2,
-            "the base seed and the verification seed both clone: {decisions:?}"
-        );
-    }
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover only costs disk
 }
 

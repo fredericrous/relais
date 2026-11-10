@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 
 use crate::backend::LaunchSpec;
 use crate::context::ContextManifest;
+use crate::contract::WorkPackage;
 use crate::contract::{Decomposition, DecompositionMode, Kind, TaskContract, WorkPlan};
-use crate::contract::{Review, WorkPackage};
 use crate::ledger::UsageEvent;
 use crate::lifecycle::UsagePhase;
 use crate::money::MicroUsd;
@@ -1062,7 +1062,7 @@ fn accept_integrated(
     let verification_inputs_changed = assembled.touched_inputs.tests.clone();
     // Edited tests are recorded, not reviewed, unless the routed level
     // asks for a review (ADR-0013).
-    let review_required = root.decision.review >= Review::Required;
+    let review_required = root.decision.review.is_required();
     if review_required {
         // A patch one reviewer cannot be given to read dispatches no
         // reviewer: the run asks a person (SPEC §10).
@@ -1484,6 +1484,7 @@ pub fn package_dir(root_artifacts: &Path, package_id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::Review;
 
     #[test]
     fn coverage_is_prefix_based_and_conservative() {

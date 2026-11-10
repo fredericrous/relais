@@ -7,6 +7,13 @@ use super::{
 };
 use crate::{verify, workspace};
 
+/// What a tree's setup runs under: the run's cancel flag, and the budgets
+/// its steps draw on (an on-demand base's draw on the total only).
+pub(super) struct SetupWithin<'w> {
+    pub(super) cancel: Option<&'w AtomicBool>,
+    pub(super) budgets: &'w crate::policy::Budgets,
+}
+
 impl<'a> RunEngine<'a> {
     /// Take the caller's worktree for this run and snapshot it (ADR-0008).
     /// The snapshot, not `HEAD`, becomes the base of every diff, scope
@@ -381,8 +388,9 @@ impl<'a> RunEngine<'a> {
         profile: &crate::policy::VerificationProfile,
         logs_dir: &Path,
         prefix: &str,
-        cancel: Option<&AtomicBool>,
+        within: SetupWithin<'_>,
     ) -> Result<Vec<verify::CheckOutcome>, verify::VerifyError> {
+        let SetupWithin { cancel, budgets } = within;
         use crate::workspace::reuse::{StampStore, Workspace};
         if self.config.workspace == Workspace::Isolated {
             return verify::run_setup_gated_within(verify::SetupRun {
@@ -393,7 +401,7 @@ impl<'a> RunEngine<'a> {
                 events: &self.events,
                 cancel,
                 gate: &mut verify::RunEveryStep,
-                admission: &self.heavy(),
+                admission: &self.heavy_with(budgets),
             });
         }
         let seed_from = seed_from.filter(|seed| seed.path != dir);
@@ -425,7 +433,7 @@ impl<'a> RunEngine<'a> {
             events: &self.events,
             cancel,
             gate: &mut gate,
-            admission: &self.heavy(),
+            admission: &self.heavy_with(budgets),
         })
     }
 

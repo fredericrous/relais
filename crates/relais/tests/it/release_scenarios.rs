@@ -2116,10 +2116,14 @@ fn an_unrunnable_baseline_and_a_failed_base_setup_block_at_the_first_red_candida
     assert!(stderr.contains("baseline_unrunnable"), "{stderr}");
     assert!(stderr.contains("exited 127"), "{stderr}");
     assert!(
+        stderr.contains("verify the kept candidate: `relais run --task "),
+        "{stderr}"
+    );
+    assert!(
         stderr.contains("[[verification.profiles.default.setup]]"),
         "the block to declare is named: {stderr}"
     );
-    assert!(stderr.contains("the candidate is kept"), "{stderr}");
+    assert!(stderr.contains("verify the kept candidate"), "{stderr}");
     assert_eq!(world.worker_launches(), 1, "one worker, then the base");
     let run_id = world.only_run_id();
     assert!(
@@ -2151,7 +2155,7 @@ fn an_unrunnable_baseline_and_a_failed_base_setup_block_at_the_first_red_candida
     let stderr = text(&run.stderr);
     assert!(stderr.contains("verification_setup_failed"), "{stderr}");
     assert!(stderr.contains("the base revision"), "{stderr}");
-    assert!(stderr.contains("the candidate is kept"), "{stderr}");
+    assert!(stderr.contains("verify the kept candidate"), "{stderr}");
     assert_eq!(world.worker_launches(), 2, "one worker more, then the base");
 }
 

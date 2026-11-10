@@ -7,9 +7,9 @@ use super::{
     spend_limit, split_profile_gaps, unpriced_native_model, verify, workspace, AgentKind,
     AttemptContext, AttemptKind, AttemptLabel, Attempted, BlockCode, Candidate, Ceiling,
     Dispatched, Duration, Ended, EvidenceKind, Instant, LaunchSpec, Limit, ManagedDispatch, Next,
-    Observation, PathBuf, PendingEvidence, Phase, Progress, Reason, RepairFailure, Review,
-    RunEngine, RunError, RunOutcome, Snapshot, State, Step, Terminal, UsageEvent, Verified,
-    VerifyFailure, WorkspaceError,
+    Observation, PathBuf, PendingEvidence, Phase, Progress, Reason, RepairFailure, RunEngine,
+    RunError, RunOutcome, Snapshot, State, Step, Terminal, UsageEvent, Verified, VerifyFailure,
+    WorkspaceError,
 };
 use crate::backend::{LoopedWorker, Repeated};
 
@@ -1039,7 +1039,7 @@ impl<'a> RunEngine<'a> {
         // Editing the test tree no longer forces a review (ADR-0013): the
         // paths ride on the receipt, and the reviewer's prompt names them
         // when the routed level asks for one.
-        let review_required = ctx.preflight.decision.review >= Review::Required;
+        let review_required = ctx.preflight.decision.review.is_required();
 
         // A candidate that carries the base tree has the baseline's
         // results by identity: the commands are not spent again, and
@@ -1085,7 +1085,7 @@ impl<'a> RunEngine<'a> {
                 Reason::CandidateIdenticalToBase,
                 serde_json::json!({ "candidate": candidate.sha }),
             )?;
-            ctx.baseline.checks.as_deref()
+            ctx.baseline.checks()
         } else {
             None
         };
@@ -1242,7 +1242,7 @@ impl<'a> RunEngine<'a> {
             .map(|check| check.label.clone())
             .collect();
         let base_decides = inspecting || !self.config.contract.is_verify();
-        if ctx.baseline.deferred && !red.is_empty() && base_decides {
+        if ctx.baseline.is_deferred() && !red.is_empty() && base_decides {
             if identical {
                 self.base_is_candidate(&checks);
             } else if let Some(outcome) =

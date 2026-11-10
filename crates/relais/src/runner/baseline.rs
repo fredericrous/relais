@@ -8,18 +8,20 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use super::setup_gate;
+use super::workspace_ops::SetupWithin;
 use super::{
-    AttemptContext, Baseline, BlockCode, Budget, Candidate, Ended, Event, EvidenceKind, Exhausted,
-    KeptCandidate, Path, Phase, Preflight, Reason, RunEngine, RunError, RunOutcome, State,
-    Terminal, VerificationProfile,
+    AttemptContext, BaseSource, Baseline, BlockCode, Budget, Candidate, Ended, Event, EvidenceKind,
+    Exhausted, KeptCandidate, Path, Phase, Preflight, Reason, RunEngine, RunError, RunOutcome,
+    State, Terminal, VerificationProfile,
 };
+use crate::policy::Budgets;
 use crate::verify;
 
 /// What the base checked on demand has established in this run
 /// (ADR-0013). One per engine: the engine is borrowed mutably for the
-/// whole run, so two red candidates never run the base at once, and
-/// `running` refuses a re-entry. A decomposed run's packages each have
-/// their own engine and their own `verify/<run>/verify-base`.
+/// whole run, so two red candidates never run the base at once. A
+/// decomposed run's packages each have their own engine and their own
+/// `verify/<run>/verify-base`.
 #[derive(Default)]
 pub(crate) struct BaseMemo<'a> {
     /// The throwaway `verify-base` tree, kept for the run once made, and
@@ -34,8 +36,6 @@ pub(crate) struct BaseMemo<'a> {
     checks: Vec<verify::CheckOutcome>,
     /// The labels among `checks` that failed at the base.
     failures: Vec<String>,
-    /// A base run is under way.
-    running: bool,
 }
 
 /// How an on-demand base run ended when it gave no verdict.
@@ -44,8 +44,8 @@ enum BaseEnding {
     Lease(verify::LeaseStop),
     /// The run was cancelled between commands.
     Cancelled,
-    /// A budget ran out under a base check (#329).
-    Budget(Exhausted),
+    /// The total ran out under a base check (#329).
+    Total,
     /// A failed base check or setup step showed exhaustion.
     Exhaustion(
         String,
@@ -60,6 +60,21 @@ enum BaseEnding {
 enum BaseRan {
     Checks(Vec<verify::CheckOutcome>),
     Ended(BaseEnding),
+}
+
+/// The base could not be checked for a reason of relais's own (a log it
+/// could not write, a profile it could not carry out): blocked with the
+/// candidate kept, like every other ending after a paid worker. A full
+/// disk is not this: it is the run's to end on (SPEC §10), so it stays an
+/// error.
+fn base_not_checked(e: RunError) -> Result<BaseRan, RunError> {
+    if e.is_storage_full() {
+        return Err(e);
+    }
+    Ok(BaseRan::Ended(BaseEnding::Blocked(
+        BlockCode::BaselineVerificationFailed,
+        format!("the base could not be checked: {e}"),
+    )))
 }
 
 impl<'a> RunEngine<'a> {
@@ -130,12 +145,11 @@ impl<'a> RunEngine<'a> {
                 self.record_check_timings("base", checks)?;
             }
             return Ok(Phase::Ready(Baseline {
-                failures: hit.failures,
-                checks,
-                cached: true,
+                source: BaseSource::Cached {
+                    failures: hit.failures,
+                    checks,
+                },
                 cache_refused,
-                proven: false,
-                deferred: false,
                 logs_dir,
             }));
         }
@@ -162,12 +176,8 @@ impl<'a> RunEngine<'a> {
                         ),
                     });
                     return Ok(Phase::Ready(Baseline {
-                        failures: Vec::new(),
-                        checks: None,
-                        cached: false,
+                        source: BaseSource::Proven,
                         cache_refused,
-                        proven: true,
-                        deferred: false,
                         logs_dir,
                     }));
                 }
@@ -183,12 +193,8 @@ impl<'a> RunEngine<'a> {
             ),
         });
         Ok(Phase::Ready(Baseline {
-            failures: Vec::new(),
-            checks: None,
-            cached: false,
+            source: BaseSource::Deferred,
             cache_refused,
-            proven: false,
-            deferred: true,
             logs_dir,
         }))
     }
@@ -197,7 +203,7 @@ impl<'a> RunEngine<'a> {
     /// base checked on demand found so far. The one view every consumer
     /// reads (ADR-0013).
     pub(super) fn base_failures(&self, baseline: &Baseline) -> Vec<String> {
-        let mut all = baseline.failures.clone();
+        let mut all = baseline.failures().to_vec();
         for label in &self.base_memo.failures {
             if !all.contains(label) {
                 all.push(label.clone());
@@ -206,13 +212,13 @@ impl<'a> RunEngine<'a> {
         all
     }
 
-    /// The base's outcomes, with their JUnit: the baseline's when its
-    /// commands ran or a hit kept them, else those checked on demand.
+    /// The base's outcomes, with their JUnit: those a cache hit kept,
+    /// else those checked on demand.
     pub(super) fn base_checks<'s>(
         &'s self,
         baseline: &'s Baseline,
     ) -> Option<&'s [verify::CheckOutcome]> {
-        match &baseline.checks {
+        match baseline.checks() {
             Some(checks) => Some(checks),
             None if !self.base_memo.checks.is_empty() => Some(&self.base_memo.checks),
             None => None,
@@ -220,12 +226,25 @@ impl<'a> RunEngine<'a> {
     }
 
     /// Remove the `verify-base` tree an on-demand run made: at the run's
-    /// end, whatever the ending.
+    /// end, whatever the ending. A release that fails leaves a directory
+    /// and a registration behind, so it goes on the run's record, not
+    /// only to stderr.
     pub(super) fn release_base_tree(&mut self) {
-        if let Some(mut tree) = self.base_memo.tree.take() {
-            if let Err(e) = tree.release() {
-                eprintln!("relais: {e}");
-            }
+        let Some(mut tree) = self.base_memo.tree.take() else {
+            return;
+        };
+        if let Err(e) = tree.release() {
+            let reason = format!(
+                "the base's verification worktree {} could not be released: {e}; `relais resume \
+                 --retire {}` removes it",
+                tree.path().display(),
+                self.run_id
+            );
+            eprintln!("relais: {reason}");
+            self.events.emit(Event::Decision {
+                what: "verify_base_not_released".into(),
+                reason,
+            });
         }
     }
 
@@ -275,11 +294,6 @@ impl<'a> RunEngine<'a> {
         if wanted.is_empty() {
             return Ok(None);
         }
-        if self.base_memo.running {
-            return Err(RunError::Other(
-                "the base was asked to run on demand while it was already running".into(),
-            ));
-        }
         let profile = &ctx.preflight.authority.verification_profile;
         // A red label with no command on the base profile is new: nothing
         // at the base can have failed it.
@@ -296,14 +310,17 @@ impl<'a> RunEngine<'a> {
                 if count == 1 { "" } else { "s" }
             ),
         );
-        self.base_memo.running = true;
-        let normal = self.budgets.clone();
-        let mark = normal.base_mark();
-        self.budgets = normal.for_base();
-        let ran = self.run_base(ctx.preflight, profile, &selected, &ctx.baseline.logs_dir);
-        self.budgets = normal;
-        self.budgets.charge_base(mark);
-        self.base_memo.running = false;
+        // The guard's budgets draw on the total only; dropping it takes the
+        // base's time out of work.
+        let base_run = self.budgets.base_run();
+        let ran = self.run_base(
+            ctx.preflight,
+            profile,
+            &selected,
+            &ctx.baseline.logs_dir,
+            base_run.budgets(),
+        );
+        drop(base_run);
         let checks = match ran? {
             BaseRan::Checks(checks) => checks,
             BaseRan::Ended(ending) => {
@@ -315,14 +332,13 @@ impl<'a> RunEngine<'a> {
         // A base check's timeout is clipped to what is left of the total:
         // when the total ran out, it was the run's own budget that ended
         // it, not the check's limit, and the run ends on that budget
-        // (#329). Read on the run's own budgets, now the base's time is
-        // out of work.
+        // (#329). Any other timeout is a base with no verdict, below.
         let timed_out = checks
             .iter()
             .any(|check| check.ended.recorded() == Some(Ended::TimedOut));
-        if let Some(exhausted) = timed_out.then(|| self.budgets.exhausted()).flatten() {
+        if timed_out && self.budgets.exhausted() == Some(Exhausted::Total) {
             return self
-                .end_base_on_demand(ctx, candidate, budget, BaseEnding::Budget(exhausted))
+                .end_base_on_demand(ctx, candidate, budget, BaseEnding::Total)
                 .map(Some);
         }
         // A check that gave no verdict at the base leaves nothing to tell
@@ -365,13 +381,17 @@ impl<'a> RunEngine<'a> {
         Ok(None)
     }
 
-    /// The base's tree, its setup once, then the chosen commands.
+    /// The base's tree, its setup once, then the chosen commands, all
+    /// drawing on `budgets`. Every way it can stop short of a verdict is a
+    /// [`BaseEnding`], so the caller closes the paid attempt; only a full
+    /// disk is an error.
     fn run_base(
         &mut self,
         preflight: &Preflight,
         profile: &VerificationProfile,
         selected: &[(usize, &crate::policy::CommandSpec)],
         logs_dir: &Path,
+        budgets: &Budgets,
     ) -> Result<BaseRan, RunError> {
         if self.base_memo.tree.is_none() {
             match verify::verification_worktree(
@@ -381,33 +401,33 @@ impl<'a> RunEngine<'a> {
                 &self.verify_dir.join("verify-base"),
             ) {
                 Ok(tree) => self.base_memo.tree = Some(tree),
-                Err(e) => {
-                    return Ok(BaseRan::Ended(BaseEnding::Blocked(
-                        BlockCode::BaselineVerificationFailed,
-                        e.to_string(),
-                    )))
-                }
+                Err(e) => return base_not_checked(e.into()),
             }
         }
         let path: PathBuf = match &self.base_memo.tree {
             Some(tree) => tree.path().to_path_buf(),
-            None => return Err(RunError::Other("the base tree vanished".into())),
+            None => return base_not_checked(RunError::Other("the base tree vanished".into())),
         };
         if !self.base_memo.set_up {
             // The declared setup first, in the base's own copy: its logs
             // are evidence whatever happens next, and a setup that did not
-            // succeed leaves nothing for the commands to run against.
+            // succeed leaves nothing for the commands to run against. An
+            // in-place run's checkout is the tree the worker edited, so the
+            // base is never seeded from it: its dependencies would be the
+            // candidate's, not the base's.
+            let seed = (self.config.workspace != crate::workspace::reuse::Workspace::InPlace)
+                .then_some(setup_gate::SeedSource {
+                    path: self.config.repo_dir,
+                    wait: setup_gate::SeedWait::QuietFor(setup_gate::Quiet::CALLER),
+                });
             let setup = self.while_watching_cancel(|cancel| {
                 self.setup_tree(
                     &path,
-                    Some(setup_gate::SeedSource {
-                        path: self.config.repo_dir,
-                        wait: setup_gate::SeedWait::QuietFor(setup_gate::Quiet::CALLER),
-                    }),
+                    seed,
                     profile,
                     logs_dir,
                     "base",
-                    cancel,
+                    SetupWithin { cancel, budgets },
                 )
             });
             let setup = match setup {
@@ -415,10 +435,14 @@ impl<'a> RunEngine<'a> {
                 Err(verify::VerifyError::Lease(stop)) => {
                     return Ok(BaseRan::Ended(BaseEnding::Lease(stop)))
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return base_not_checked(e.into()),
             };
-            self.record_logs(None, EvidenceKind::SetupLog, &setup)?;
-            self.record_check_timings("base-setup", &setup)?;
+            if let Err(e) = self
+                .record_logs(None, EvidenceKind::SetupLog, &setup)
+                .and_then(|()| self.record_check_timings("base-setup", &setup))
+            {
+                return base_not_checked(e.into());
+            }
             if self.cancel_requested() {
                 return Ok(BaseRan::Ended(BaseEnding::Cancelled));
             }
@@ -443,7 +467,7 @@ impl<'a> RunEngine<'a> {
                 "base",
                 &self.events,
                 cancel,
-                &self.heavy(),
+                &self.heavy_with(budgets),
             )
         });
         let checks = match checks {
@@ -451,10 +475,14 @@ impl<'a> RunEngine<'a> {
             Err(verify::VerifyError::Lease(stop)) => {
                 return Ok(BaseRan::Ended(BaseEnding::Lease(stop)))
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return base_not_checked(e.into()),
         };
-        self.record_logs(None, EvidenceKind::CheckLog, &checks)?;
-        self.record_check_timings("base", &checks)?;
+        if let Err(e) = self
+            .record_logs(None, EvidenceKind::CheckLog, &checks)
+            .and_then(|()| self.record_check_timings("base", &checks))
+        {
+            return base_not_checked(e.into());
+        }
         if self.cancel_requested() {
             return Ok(BaseRan::Ended(BaseEnding::Cancelled));
         }
@@ -468,9 +496,36 @@ impl<'a> RunEngine<'a> {
         Ok(BaseRan::Checks(checks))
     }
 
+    /// A `kind: verify` contract for the kept candidate, written beside the
+    /// run's evidence, and the command that runs it: the run's own
+    /// contract, verifying `candidate {run, index}` without a worker. `None`
+    /// when it cannot be written or does not validate.
+    fn verify_command(&self, kept: &KeptCandidate) -> Option<String> {
+        let mut value = self.config.contract.canonical_value();
+        let fields = value.as_object_mut()?;
+        fields.insert("kind".into(), "verify".into());
+        fields.insert(
+            "candidate".into(),
+            serde_json::json!({ "run": kept.run, "index": kept.index }),
+        );
+        fields.remove("from_candidate");
+        fields.remove("decomposition");
+        let text = serde_json::to_string_pretty(&value).ok()?;
+        crate::contract::TaskContract::from_json_str(&text).ok()?;
+        let path = self
+            .artifacts
+            .join(format!("verify-candidate-{}.json", kept.index));
+        crate::fsutil::write_atomic(&path, &text).ok()?;
+        Some(format!(
+            "relais run --task {}",
+            shell_word(&path.to_string_lossy())
+        ))
+    }
+
     /// End the run on an on-demand base run that gave no verdict. A worker
-    /// was paid by now: the attempt is closed with its candidate, which the
-    /// message says is kept and how to verify it again.
+    /// was paid by now: the attempt is closed with its candidate, and the
+    /// message says the candidate is kept and gives the command that
+    /// verifies it again.
     fn end_base_on_demand(
         &mut self,
         ctx: &AttemptContext<'_>,
@@ -494,16 +549,19 @@ impl<'a> RunEngine<'a> {
             Some(&candidate.sha),
         )?;
         let kept = self.kept_candidate(ctx.preflight, candidate.index, &candidate.sha);
-        let after = format!(
-            "; the base was checked on demand after attempt {} went red, so a worker was paid: {}",
-            candidate.index,
-            kept_sentence(&kept)
-        );
         let kept_json =
             serde_json::json!({ "run": kept.run, "index": kept.index, "sha": kept.sha });
+        let paid = format!(
+            "The base was checked after attempt {} failed, so a worker was already paid.",
+            candidate.index
+        );
+        let verify = match self.verify_command(&kept) {
+            Some(command) => format!("verify the kept candidate: `{command}`."),
+            None => format!("{}.", kept_sentence(&kept)),
+        };
         match ending {
             BaseEnding::Lease(stop) => self.end_on_lease_stop(stop, budget, Some(&kept)),
-            BaseEnding::Budget(exhausted) => self.end_on_exhausted(exhausted, budget, Some(&kept)),
+            BaseEnding::Total => self.end_on_exhausted(Exhausted::Total, budget, Some(&kept)),
             BaseEnding::Cancelled => match self.end_if_cancelled()? {
                 Some(outcome) => Ok(outcome),
                 None => Err(RunError::Other(
@@ -512,7 +570,7 @@ impl<'a> RunEngine<'a> {
             },
             BaseEnding::Exhaustion(label, found, measured) => {
                 let detail = format!(
-                    "{}{after}",
+                    "{} {paid} Free the resource, then {verify}",
                     crate::exhaustion::baseline_on_demand_text(&label, &found, &measured)
                 );
                 let mut json =
@@ -528,7 +586,15 @@ impl<'a> RunEngine<'a> {
                 )
             }
             BaseEnding::Blocked(code, detail) => {
-                let detail = format!("{detail}{after}");
+                let detail = format!(
+                    "{}{} {paid} Once that is fixed, {verify}",
+                    detail.trim_end(),
+                    if detail.trim_end().ends_with('.') {
+                        ""
+                    } else {
+                        "."
+                    }
+                );
                 self.finish(
                     Reason::BlockedPreflight,
                     serde_json::json!({ "code": code, "detail": detail, "candidate": kept_json }),
@@ -552,16 +618,26 @@ impl<'a> RunEngine<'a> {
 }
 
 pub(super) fn baseline_summary(baseline: &Baseline) -> String {
-    if baseline.deferred {
-        return "deferred".to_string();
+    match &baseline.source {
+        BaseSource::Deferred => "deferred · checked if a check fails".to_string(),
+        BaseSource::Proven => checks_summary(None, 0),
+        BaseSource::Cached { failures, .. } => {
+            format!("cached · {}", checks_summary(None, failures.len()))
+        }
     }
-    let checks = baseline.checks.as_ref().map(Vec::len);
-    let summary = checks_summary(checks, baseline.failures.len());
-    if baseline.cached {
-        let red = checks_summary(None, baseline.failures.len());
-        return format!("cached · {red}");
+}
+
+/// A path as one shell word: bare when it holds nothing a shell reads,
+/// else single-quoted.
+fn shell_word(text: &str) -> String {
+    let plain = text
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,=".contains(c));
+    if plain && !text.is_empty() {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
     }
-    summary
 }
 
 /// `N checks · M red on base`, or the red part alone with no count.

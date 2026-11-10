@@ -30,7 +30,7 @@ use crate::admission::{
 };
 use crate::backend::{Backend, LaunchResult, LaunchSpec};
 use crate::context::{self, ContextManifest, Guidance, GuidanceGap, GuidanceSource, RuleRef};
-use crate::contract::{Review, TaskContract};
+use crate::contract::TaskContract;
 use crate::exhaustion;
 use crate::ids::{DispatchId, PackageId, RunId};
 use crate::ledger::{EvidenceKind, Ledger, LedgerError, Transition, UsageEvent};
@@ -93,8 +93,8 @@ use spend::{fresh_progress, Progress};
 pub use types::PackageRole;
 use types::{
     cost_booked, dispatch_ended, harness_reading, split_profile_gaps, unpriced_native_model,
-    AttemptContext, Attempted, Baseline, Candidate, CandidateConflicts, Dispatched, InPlaceRun,
-    PendingEvidence, Preflight, PreparedCandidate, Snapshot, Step, Verified,
+    AttemptContext, Attempted, BaseSource, Baseline, Candidate, CandidateConflicts, Dispatched,
+    InPlaceRun, PendingEvidence, Preflight, PreparedCandidate, Snapshot, Step, Verified,
 };
 pub(crate) use types::{AttemptLabel, KeptCandidate, ManagedDispatch, Phase};
 

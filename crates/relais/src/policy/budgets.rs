@@ -119,11 +119,14 @@ struct Spent {
     base_in_work: i64,
 }
 
-/// Where an on-demand base run began, for [`Budgets::charge_base`].
-#[derive(Debug, Clone, Copy)]
-pub struct BaseMark {
-    at: i64,
-    waited_in_work: i64,
+/// Which budgets a command draws on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Draws {
+    /// Before work begins the total alone; after, work and the total.
+    WorkAndTotal,
+    /// The total alone, whenever it runs: an on-demand base run
+    /// (ADR-0010, ADR-0013).
+    TotalOnly,
 }
 
 /// One run's budgets, shared by everything that spends them. Cloning
@@ -133,9 +136,9 @@ pub struct Budgets {
     clock: Arc<dyn BudgetClock>,
     limits: BudgetLimits,
     spent: Arc<Mutex<Spent>>,
-    /// This view clips by the total only and never names `work` spent:
-    /// the on-demand base run draws on the total (ADR-0010, ADR-0013).
-    base: bool,
+    /// What this view's commands draw on: a [`Draws::TotalOnly`] view
+    /// clips by the total and never names `work` spent.
+    draws: Draws,
 }
 
 impl std::fmt::Debug for Budgets {
@@ -164,7 +167,7 @@ impl Budgets {
                 waited_in_work: 0,
                 base_in_work: 0,
             })),
-            base: false,
+            draws: Draws::WorkAndTotal,
         }
     }
 
@@ -256,40 +259,22 @@ impl Budgets {
         }
     }
 
-    /// The same account, seen by an on-demand base run: its commands are
-    /// clipped by what is left of the total only, and `work` is never the
-    /// budget it names spent (ADR-0010, ADR-0013). Its elapsed time is
-    /// taken out of work afterwards with [`Budgets::charge_base`].
-    pub fn for_base(&self) -> Self {
-        Self {
-            base: true,
-            ..self.clone()
-        }
-    }
-
-    /// Mark the start of an on-demand base run.
-    pub fn base_mark(&self) -> BaseMark {
+    /// Start an on-demand base run (ADR-0013): the guard's view of the
+    /// same account clips its commands by what is left of the total only,
+    /// and never names `work` spent (ADR-0010). When the guard drops, the
+    /// run's elapsed time, less the queue waits already charged within it,
+    /// is taken out of work; the total is charged by the clock, as for a
+    /// wait, and the admission budget is not charged again.
+    pub fn base_run(&self) -> BaseRun {
         let at = self.now();
-        BaseMark {
+        BaseRun {
+            view: Self {
+                draws: Draws::TotalOnly,
+                ..self.clone()
+            },
             at,
             waited_in_work: self.lock().waited_in_work,
         }
-    }
-
-    /// Take the base run that began at `mark` out of the work budget: its
-    /// elapsed time, less the queue waits already charged within it, joins
-    /// `waited_in_work`. The total is charged by the clock, as for a wait;
-    /// the admission budget is not charged (the base did not queue).
-    pub fn charge_base(&self, mark: BaseMark) {
-        let now = self.now();
-        let mut spent = self.lock();
-        if spent.work_started.is_none() {
-            return;
-        }
-        let waited_within = spent.waited_in_work - mark.waited_in_work;
-        let ran = ((now - mark.at) - waited_within).max(0);
-        spent.waited_in_work += ran;
-        spent.base_in_work += ran;
     }
 
     /// Time on-demand base runs took after work began, excluded from work.
@@ -302,7 +287,7 @@ impl Budgets {
     /// for an on-demand base run's ([`Budgets::for_base`]).
     pub fn remaining(&self) -> Duration {
         let total = self.total_remaining();
-        if self.base {
+        if self.draws == Draws::TotalOnly {
             return total;
         }
         if self.lock().work_started.is_some() {
@@ -324,7 +309,7 @@ impl Budgets {
             return Some(Exhausted::Total);
         }
         let started = self.lock().work_started.is_some();
-        if started && !self.base && self.work_remaining().is_zero() {
+        if started && self.draws == Draws::WorkAndTotal && self.work_remaining().is_zero() {
             return Some(Exhausted::Work);
         }
         let spent = self.lock();
@@ -368,6 +353,35 @@ impl Budgets {
         spent.work_started.map_or(Duration::ZERO, |started| {
             from_millis(now - started - spent.waited_in_work)
         })
+    }
+}
+
+/// An on-demand base run being timed. Created by [`Budgets::base_run`];
+/// dropping it takes the run's time out of work.
+pub struct BaseRun {
+    view: Budgets,
+    at: i64,
+    waited_in_work: i64,
+}
+
+impl BaseRun {
+    /// The budgets the base run's commands draw on: the total only.
+    pub fn budgets(&self) -> &Budgets {
+        &self.view
+    }
+}
+
+impl Drop for BaseRun {
+    fn drop(&mut self) {
+        let now = self.view.now();
+        let mut spent = self.view.lock();
+        if spent.work_started.is_none() {
+            return;
+        }
+        let waited_within = spent.waited_in_work - self.waited_in_work;
+        let ran = ((now - self.at) - waited_within).max(0);
+        spent.waited_in_work += ran;
+        spent.base_in_work += ran;
     }
 }
 
@@ -505,13 +519,13 @@ mod tests {
         let budgets = Budgets::start(clock.clone(), limits(100, 50, 50, 500));
         budgets.begin_work();
         clock.advance(80);
-        let base = budgets.for_base();
+        let run = budgets.base_run();
+        let base = run.budgets().clone();
         assert_eq!(
             base.clip(Duration::from_secs(1000)),
             Duration::from_secs(420),
             "the base is clipped by the total, not by the 20 s of work left"
         );
-        let mark = budgets.base_mark();
         {
             // A queue wait inside the base run is charged once, as a wait.
             let mut wait = base.wait(WaitKind::Admission);
@@ -524,7 +538,7 @@ mod tests {
             None,
             "the base view never names work spent"
         );
-        budgets.charge_base(mark);
+        drop(run);
         assert_eq!(budgets.base_in_work(), Duration::from_secs(60));
         assert_eq!(budgets.waited(WaitKind::Admission), Duration::from_secs(10));
         assert_eq!(budgets.work_remaining(), Duration::from_secs(20));

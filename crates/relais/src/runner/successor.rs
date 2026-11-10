@@ -358,7 +358,7 @@ pub fn settled_contract(
     paths: &[String],
 ) -> Result<TaskContract, ContractError> {
     let widened = widened_contract(contract, run, paths)?;
-    if widened.review >= Review::Required {
+    if widened.review.is_required() {
         return Ok(widened);
     }
     let mut reviewed_contract = widened.canonical_value();

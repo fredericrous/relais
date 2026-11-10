@@ -1,6 +1,7 @@
 //! The run engine: its state, constructor, core and run driver.
 
 use super::setup_gate;
+use super::workspace_ops::SetupWithin;
 use super::{
     admission_block, baseline_summary, decide, exhaustion, fresh_progress, kept_sentence,
     scheduler, setup_failure_detail, state_sibling, sweep_ended_verify_dirs, verify, verify_root,
@@ -698,18 +699,19 @@ impl<'a> RunEngine<'a> {
         // may answer "single worker", in which case the ordinary path
         // continues below.
         if let Some(decomposition) = &self.config.contract.decomposition {
+            let flags = baseline.flags();
             let root = scheduler::RootContext {
                 authority: &preflight.authority,
                 base_sha: &preflight.base_sha,
                 contract_hash: &preflight.contract_hash,
                 manifest: &preflight.manifest,
                 decision: &preflight.decision,
-                baseline_failures: &baseline.failures,
+                baseline_failures: baseline.failures(),
                 integration_gaps: &preflight.integration_gaps,
-                baseline_cached: baseline.cached,
+                baseline_cached: flags.cached,
                 baseline_cache_refused: &baseline.cache_refused,
-                baseline_proven: baseline.proven,
-                baseline_deferred: baseline.deferred,
+                baseline_proven: flags.proven,
+                baseline_deferred: flags.deferred,
                 logs_dir: &baseline.logs_dir,
                 holdouts: &preflight.holdouts,
             };
@@ -771,7 +773,10 @@ impl<'a> RunEngine<'a> {
                 &preflight.authority.verification_profile,
                 &baseline.logs_dir,
                 "task",
-                cancel,
+                SetupWithin {
+                    cancel,
+                    budgets: &self.budgets,
+                },
             )
         });
         let setup = match setup {
@@ -962,12 +967,18 @@ impl<'a> RunEngine<'a> {
     /// block, because the machine, not the work, was what ran short.
     /// The heavy-command admission of this run (SPEC §23, ADR-0010).
     pub(crate) fn heavy(&self) -> verify::HeavyAdmission<'_> {
+        self.heavy_with(&self.budgets)
+    }
+
+    /// [`RunEngine::heavy`] drawing on `budgets`: an on-demand base run's
+    /// commands draw on the total only (ADR-0013).
+    pub(crate) fn heavy_with(&self, budgets: &Budgets) -> verify::HeavyAdmission<'_> {
         let cores = verify::cores();
         verify::HeavyAdmission {
             gate: self.config.gate,
             run_id: self.run_id.as_str().to_string(),
             session_id: self.config.session_id.clone(),
-            budgets: self.budgets.clone(),
+            budgets: budgets.clone(),
             events: self.events.clone(),
             cap: verify::heavy_cap(self.config.machine.concurrency.max_heavy_commands, cores),
             cores,
