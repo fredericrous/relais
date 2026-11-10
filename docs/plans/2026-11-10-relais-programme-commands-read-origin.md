@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/programme-sources
 repos: [relais]
 adrs: []
@@ -252,7 +252,9 @@ Integration tests, each with a bare `upstream.git` as `origin`, as in
 
 | Check | Input | Expected | Actual |
 | --- | --- | --- | --- |
-| `cargo test --test it programme_cli` | 13 new tests + 15 existing | all pass | 28 passed |
+| `cargo test --test it programme_cli` | 15 new tests + 15 existing | all pass | 30 passed |
+| `cargo test --lib programme::` | 3 new unit tests (backstop, telling line, cat-file batch) | all pass | 13 passed |
+| set-aside note | stale local edit (`touch -t 2020…`), newer origin | stderr names it | named (integration test) |
 | mutation | tree-history test disabled | squash-merged test red | red (`working-tree` ≠ `origin/main`), reverted |
 | `cargo test --lib install::` | SKILL.md edited | the pin passes | passed |
 | clippy `-D warnings` | all targets | clean | clean |
@@ -261,5 +263,15 @@ Integration tests, each with a bare `upstream.git` as `origin`, as in
 | live `frontier` | primary path and stale worktree path | 4 = `list` frontier | 4 and 4 |
 | live `check` | `relais/docs/programmes/homelab-offload` | exit 0 | exit 0 |
 | Ctrl-C during fetch | hanging upload-pack, SIGINT to the group | no process, no lock | passed (integration test) |
+| backstop | hanging upload-pack, 1 s backstop | `timed out after 1 s`, < 5 s, no new lock | passed (unit test); git's `sh -c 'sleep 60; …'` child is left to end on its own |
+| full suite at pre-commit | 2291 tests | pass | passed; one run had 5 load flakes in `verify`/`runner` timeout tests (load avg ~19), which passed alone, and the retried commit passed |
+
+## Implementation review
+
+- implementation-review: approve (round 3). Fixed: flag args → `Fetch`/`Origin` enums, `result` → `mapped`, the notes out-parameter. 175k, 62 s.
+- backend: approve (round 3). Fixed: set-aside note, skipped-worktree notes, backstop unit test, try_wait reap, new-locks-only, holds-until, SPEC wording. 291k, 104 s.
+- lang:rust: approve (round 2). Fixed: `Origin` enum, typed `FetchFailure` + `source()`, unborn-HEAD check, batch count check, exhaustive `Fetch` match. 170k, 71 s.
+- unix: approve (round 2). Fixed: SIGINT exit-status assert, pid-only signal limit documented, `credential.interactive=never`. 151k, 78 s.
+- tui: approve (round 3). Fixed: `show` source line, `frontier` TTY source line, lock hint, set-aside next step, SPEC order. deliberate: full repo path in fetch lines, `working-tree` token kept. 222k, 77 s. deliberate (backend hand-check): the backstop test leaves git's local-transport `sleep 60` child to end on its own; SPEC §31 documents the limit.
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:rust,tui,unix body-sha=7ec1aa7ec5a4 -->
