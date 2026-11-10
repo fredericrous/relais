@@ -818,10 +818,36 @@ pub enum SettledVia {
     ProfileChecks,
     /// An inspection's report review: model judgment of the report.
     ReportReview,
+    /// An inspection run without `review: required`: the report exists
+    /// and is not empty, and nothing judged it (ADR-0013).
+    ReportExists,
     /// The evidence the contract declared, read as it always was.
     DeclaredEvidence,
     /// A person's recorded sign-off.
     HumanSignOff,
+}
+
+/// What settles an inspection's report criteria (SPEC §10).
+#[derive(Debug, Clone, Copy)]
+pub enum ReportJudgment<'a> {
+    /// The report review answered: each criterion is its verdict.
+    Reviewed(&'a ReportVerdict),
+    /// A review was owed and there is no verdict: nothing is settled.
+    /// A change, which has no report review, passes this too.
+    Missing,
+    /// No review was asked for (`review` below `required`, ADR-0013):
+    /// the report existing meets them. An empty report never reaches
+    /// settlement, the `empty_report` failure stops it first.
+    Exists,
+}
+
+impl<'a> From<Option<&'a ReportVerdict>> for ReportJudgment<'a> {
+    fn from(verdict: Option<&'a ReportVerdict>) -> Self {
+        match verdict {
+            Some(verdict) => Self::Reviewed(verdict),
+            None => Self::Missing,
+        }
+    }
 }
 
 /// One criterion's answer from the report review.
@@ -1043,14 +1069,16 @@ pub fn settle_acceptance(
     attestations: Attestations<'_>,
     kind: Kind,
     patch_adds_test: PatchAddsTest,
-    review: Option<&ReportVerdict>,
+    review: ReportJudgment<'_>,
 ) -> (Vec<CriterionOutcome>, Option<IndependenceSummary>) {
     let accepted = report.accepted_for(kind);
     // An inspection has no patch: what the checks cannot say about its
-    // report, the report review does. A missing review settles nothing.
+    // report, the report review does when one was asked for. A missing
+    // review settles nothing; an unasked one leaves the report itself.
     let by_report = |at: usize| match review {
-        Some(verdict) => verdict.of(at).is_met(),
-        None => false,
+        ReportJudgment::Reviewed(verdict) => (verdict.of(at).is_met(), SettledVia::ReportReview),
+        ReportJudgment::Missing => (false, SettledVia::ReportReview),
+        ReportJudgment::Exists => (true, SettledVia::ReportExists),
     };
     let criteria: Vec<CriterionOutcome> = entries
         .iter()
@@ -1087,7 +1115,7 @@ pub fn settle_acceptance(
                 (
                     Some(Evidence::Test { name: None, .. } | Evidence::LlmReview) | None,
                     Kind::Inspect,
-                ) => (by_report(at), SettledVia::ReportReview),
+                ) => by_report(at),
                 (Some(Evidence::Test { name: None, .. }), Kind::Change) => (
                     accepted && patch_adds_test != PatchAddsTest::Absent,
                     SettledVia::DeclaredEvidence,
@@ -1141,8 +1169,9 @@ pub fn independence_summary(criteria: &[CriterionOutcome]) -> Option<Independenc
         .filter(|criterion| criterion.mandatory)
         .map(
             |criterion| match (criterion.settled_via, &criterion.evidence) {
-                // Model judgment of the report, whatever evidence is declared.
-                (Some(SettledVia::ReportReview), _) => false,
+                // Model judgment of the report, or no judgment at all,
+                // whatever evidence is declared.
+                (Some(SettledVia::ReportReview | SettledVia::ReportExists), _) => false,
                 (Some(SettledVia::ProfileChecks), _) => true,
                 (
                     Some(SettledVia::DeclaredEvidence | SettledVia::HumanSignOff) | None,
@@ -3138,6 +3167,11 @@ pub struct Receipt {
     /// the `serde(default)` for receipts written before this existed.
     #[serde(default)]
     pub review: ReviewRecord,
+    /// The review level the route settled on (`preflight.decision.review`):
+    /// what decided whether a reviewer ran (ADR-0013). Absent on a receipt
+    /// written before it existed, which still parses and re-seals as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_level: Option<crate::contract::Review>,
     /// The rungs that actually ran under this receipt (SPEC §6): tier,
     /// model and effort, initial first. `NotRecorded` on a receipt written
     /// before the ladder existed, which still parses.
@@ -3207,6 +3241,48 @@ impl LadderRecord {
     fn is_not_recorded(&self) -> bool {
         matches!(self, Self::NotRecorded)
     }
+}
+
+impl ReviewRecord {
+    /// Whether a reviewer read the candidate: `None` on a receipt from
+    /// before the record existed, which says nothing either way.
+    pub fn reviewed(&self) -> Option<bool> {
+        match self {
+            Self::NotRecorded => None,
+            Self::NoReview | Self::NotRun(_) | Self::Unavailable { .. } => Some(false),
+            Self::Independent
+            | Self::SameModel
+            | Self::SuccessorOnly { .. }
+            | Self::AgainstBase { .. }
+            | Self::Parts { .. } => Some(true),
+        }
+    }
+}
+
+/// The one plain line `relais run` and `relais report` print for a
+/// candidate that edited test or verification inputs no reviewer read
+/// (ADR-0013): `tests edited; not reviewed (review: optional)`, the level
+/// being the routed one. `None` when nothing was edited, a reviewer read
+/// it, or the receipt does not say.
+pub fn unreviewed_test_edits_line(
+    verification_inputs_changed: &[String],
+    reviewed: Option<bool>,
+    level: Option<crate::contract::Review>,
+) -> Option<String> {
+    if verification_inputs_changed.is_empty() || reviewed != Some(false) {
+        return None;
+    }
+    Some(match level {
+        Some(level) => {
+            let word = match level {
+                crate::contract::Review::Off => "off",
+                crate::contract::Review::Optional => "optional",
+                crate::contract::Review::Required => "required",
+            };
+            format!("tests edited; not reviewed (review: {word})")
+        }
+        None => "tests edited; not reviewed".to_string(),
+    })
 }
 
 /// What a receipt records about the review of its candidate. A receipt from
@@ -3496,6 +3572,30 @@ mod tests {
                     .get("efforts_used")
                     .is_none(),
                 "an empty `efforts_used` is not written back"
+            );
+            // Older than ADR-0013: no `review_level`, no `report_exists`,
+            // and nothing said of the review, so no unreviewed-tests line.
+            assert_eq!(receipt.review_level, None, "receipt {n}");
+            assert!(
+                serde_json::to_value(&receipt)
+                    .expect("receipt serializes")
+                    .get("review_level")
+                    .is_none(),
+                "an absent `review_level` is not written back"
+            );
+            assert_eq!(receipt.review.reviewed(), None, "receipt {n}");
+            assert_eq!(
+                unreviewed_test_edits_line(
+                    &receipt.verification.verification_inputs_changed,
+                    receipt.review.reviewed(),
+                    receipt.review_level,
+                ),
+                None
+            );
+            assert_eq!(
+                independence_summary(&receipt.criteria),
+                receipt.mandatory_evidence_independence,
+                "receipt {n} re-seals as it was"
             );
         }
 
@@ -5440,7 +5540,7 @@ mod tests {
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
-            None,
+            ReportJudgment::Missing,
         );
         assert!(
             criteria.iter().all(|c| c.met),
@@ -5614,7 +5714,7 @@ mod tests {
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
-            None,
+            ReportJudgment::Missing,
         );
         (criteria.remove(0), gaps)
     }
@@ -5944,7 +6044,7 @@ mod tests {
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
-            None,
+            ReportJudgment::Missing,
         );
         assert!(
             !criteria[0].met,
@@ -6029,7 +6129,7 @@ mod tests {
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
-            None,
+            ReportJudgment::Missing,
         );
         assert!(criteria[0].met, "a recorded sign-off is met: {criteria:?}");
         assert_eq!(
@@ -6151,7 +6251,7 @@ mod tests {
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
-            None,
+            ReportJudgment::Missing,
         );
         assert!(criteria[0].met, "a covered gate is met: {criteria:?}");
         assert_eq!(
@@ -6245,7 +6345,7 @@ mod tests {
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
-            None,
+            ReportJudgment::Missing,
         );
         assert!(
             !criteria[0].met,
@@ -6334,7 +6434,7 @@ mod tests {
             },
             Kind::Inspect,
             PatchAddsTest::NotJudged,
-            Some(verdict),
+            ReportJudgment::Reviewed(verdict),
         )
     }
 
@@ -6366,7 +6466,7 @@ mod tests {
             },
             Kind::Inspect,
             PatchAddsTest::NotJudged,
-            None,
+            ReportJudgment::Missing,
         );
         assert!(
             without.iter().all(|criterion| !criterion.met),
@@ -6496,7 +6596,7 @@ mod tests {
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
-            None,
+            ReportJudgment::Missing,
         );
         assert_eq!(all_independent, Some(IndependenceSummary::AllIndependent));
 
@@ -6518,7 +6618,7 @@ mod tests {
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
-            None,
+            ReportJudgment::Missing,
         );
         assert_eq!(partly, Some(IndependenceSummary::PartlyIndependent));
 
@@ -6538,7 +6638,7 @@ mod tests {
             },
             Kind::Change,
             PatchAddsTest::NotJudged,
-            None,
+            ReportJudgment::Missing,
         );
         assert_eq!(none_mandatory, None);
     }
@@ -6689,6 +6789,7 @@ mod tests {
             mandatory_evidence_independence: None,
             recipe: crate::policy::RecipeRecord::NotRecorded,
             verification_profile_hash: "vph".into(),
+            review_level: None,
             review: ReviewRecord::NotRecorded,
             ladder: LadderRecord::NotRecorded,
             efforts_used: Vec::new(),
@@ -6811,7 +6912,7 @@ mod tests {
                 },
                 Kind::Change,
                 adds,
-                None,
+                ReportJudgment::Missing,
             )
             .0
         };

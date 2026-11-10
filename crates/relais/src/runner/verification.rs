@@ -47,7 +47,9 @@ impl<'a> RunEngine<'a> {
     ) -> Result<Step, RunError> {
         let preflight = ctx.preflight;
         // An inspection has no patch to review: its report review has
-        // already run (`judge_inspection`).
+        // already run when one was asked for (`judge_inspection`), and
+        // nothing, not even a `review-parts` answer, reviews its tree.
+        let inspecting = self.config.contract.kind() == Kind::Inspect;
         // A `review-parts` answer asked for this review: the successor
         // reviews in parts whatever the contract's own review says.
         let in_parts = self
@@ -60,7 +62,7 @@ impl<'a> RunEngine<'a> {
         } else {
             ReviewShape::Whole
         };
-        if (verified.review_required || in_parts) && verdict.is_none() {
+        if (verified.review_required || in_parts) && verdict.is_none() && !inspecting {
             let reviewed = self.patch_for_review(ctx, candidate, shape)?;
             match &reviewed.basis {
                 PatchBasis::Base => {}
@@ -277,6 +279,7 @@ impl<'a> RunEngine<'a> {
             ),
             verification_profile_hash: preflight.authority.verification_profile.hash(),
             review,
+            review_level: Some(preflight.decision.review),
             ladder: verify::LadderRecord::Single(preflight.decision.ladder.rungs().to_vec()),
             efforts_used: self.config.ledger.efforts_used(&self.run_id)?,
             candidates: self.candidates_record(&candidate.sha),
@@ -435,7 +438,9 @@ impl<'a> RunEngine<'a> {
 
     /// Settle the contract's criteria against a report, reading the
     /// sign-offs the ledger holds. `verdict` is an inspection's report
-    /// review; a change has none.
+    /// review; a change has none. An inspection routed below `review:
+    /// required` has no report review either: its report criteria are
+    /// met by the report existing (ADR-0013).
     pub(super) fn settle(
         &self,
         ctx: &AttemptContext<'_>,
@@ -458,6 +463,13 @@ impl<'a> RunEngine<'a> {
             .into_iter()
             .map(|(criterion_id, _actor)| criterion_id)
             .collect();
+        let kind = self.config.contract.kind();
+        let judgment = if kind == Kind::Inspect && ctx.preflight.decision.review < Review::Required
+        {
+            verify::ReportJudgment::Exists
+        } else {
+            verify::ReportJudgment::from(verdict)
+        };
         Ok(verify::settle_acceptance(
             &self.effective_acceptance()?,
             &ctx.preflight.authority.verification_profile,
@@ -467,9 +479,9 @@ impl<'a> RunEngine<'a> {
                 gate_coverage,
                 holdouts,
             },
-            self.config.contract.kind(),
+            kind,
             patch_adds_test,
-            verdict,
+            judgment,
         ))
     }
 
@@ -511,8 +523,10 @@ impl<'a> RunEngine<'a> {
     }
 
     /// An inspection is judged by its report (SPEC §10): the checks and
-    /// their gaps were already read as information, and one read-only
-    /// review of the report settles the criteria no check names. In
+    /// their gaps were already read as information. Under `review:
+    /// required` one read-only review of the report settles the criteria
+    /// no check names; below it no review runs, and the report existing
+    /// meets them (ADR-0013). In
     /// order, the first that holds decides: a red check criterion fails
     /// the run, an unmet report criterion is repaired once, a pending
     /// sign-off is a person's, and anything else is accepted.
@@ -524,59 +538,18 @@ impl<'a> RunEngine<'a> {
         mut verified: Verified,
     ) -> Result<Step, RunError> {
         let preflight = ctx.preflight;
-        if self.config.contract.review == Review::Off {
+        let verdict = if preflight.decision.review >= Review::Required {
+            match self.report_verdict(ctx, progress, candidate, &verified)? {
+                Ok(verdict) => Some(verdict),
+                Err(ended) => return Ok(Step::Ended(ended)),
+            }
+        } else {
             verified.notes.push(
-                "the contract says `review: off`, which governs the patch review only: an \
-                 inspection has no patch, and its report review ran"
+                "no review was asked for (`review` below `required`): no report review ran, \
+                 and the criteria no check names are met by the report existing"
                     .into(),
             );
-        }
-        let request = ReviewRequest {
-            manifest: &preflight.manifest,
-            authority: &preflight.authority,
-            candidate_sha: &candidate.sha,
-            candidate_tier: candidate.tier,
-            candidate_model: &candidate.model,
-            verification_inputs_changed: &[],
-            patch_path: candidate.latest_patch.clone(),
-            routed_by: preflight.decision.routed_by,
-            covering: preflight.decision.covering.clone(),
-            base_sha: &preflight.base_sha,
-            holdouts: &verified.holdouts,
-            candidate: Some(self.kept_candidate(preflight, candidate.index, &candidate.sha)),
-            basis: PatchBasis::Base,
-        };
-        // Not fatal: without the listing the reviewer works as it did before,
-        // and the prompt says so.
-        let tree = ctx.worktree.tracked_tree_in(&candidate.sha).ok();
-        let verdict = match self.review_report(
-            &request,
-            candidate,
-            ctx.worktree_path,
-            tree.as_ref(),
-            &mut progress.spend,
-        ) {
-            Ok(verdict) => verdict,
-            Err(detail) => {
-                return Ok(Step::Ended(self.stop_for_review(
-                    &progress.budget,
-                    &|engine| {
-                        engine.candidate_receipt(CandidateReceiptInput {
-                            attempt: ctx,
-                            progress,
-                            candidate,
-                            verified: &verified,
-                            verdict: None,
-                            outcome: State::NeedsDecision,
-                            review: verify::ReviewRecord::Unavailable {
-                                detail: detail.clone(),
-                            },
-                        })
-                    },
-                    Reason::ReviewUnavailable,
-                    Observation::ReviewUnavailable(detail.clone()),
-                )?));
-            }
+            None
         };
         let report = verification_report(ctx, candidate, &verified);
         let (criteria, _) = self.settle(
@@ -585,7 +558,7 @@ impl<'a> RunEngine<'a> {
             &verified.gate_coverage,
             &verified.holdouts,
             verify::PatchAddsTest::NotJudged,
-            Some(&verdict),
+            verdict.as_ref(),
         )?;
         let unmet: Vec<(usize, &verify::CriterionOutcome)> = criteria
             .iter()
@@ -598,7 +571,11 @@ impl<'a> RunEngine<'a> {
                 Some(verify::SettledVia::ProfileChecks | verify::SettledVia::DeclaredEvidence) => {
                     true
                 }
-                Some(verify::SettledVia::ReportReview | verify::SettledVia::HumanSignOff)
+                Some(
+                    verify::SettledVia::ReportReview
+                    | verify::SettledVia::ReportExists
+                    | verify::SettledVia::HumanSignOff,
+                )
                 | None => false,
             })
             .map(|(_, criterion)| {
@@ -612,18 +589,19 @@ impl<'a> RunEngine<'a> {
         if !by_checks.is_empty() {
             return self.follow(ctx, progress, Observation::CheckCriteriaUnmet(by_checks));
         }
+        // Only a report review leaves a report criterion unmet: one met by
+        // the report existing is met.
         let by_report: Vec<String> = unmet
             .iter()
             .filter(|(_, criterion)| {
                 criterion.settled_via == Some(verify::SettledVia::ReportReview)
             })
             .map(|(at, criterion)| {
-                format!(
-                    "[{}] {}: {}",
-                    at + 1,
-                    criterion.statement,
-                    verdict.of(*at).reason()
-                )
+                let why = verdict.as_ref().map_or_else(
+                    || "no report review answered".to_string(),
+                    |verdict| verdict.of(*at).reason().to_string(),
+                );
+                format!("[{}] {}: {why}", at + 1, criterion.statement)
             })
             .collect();
         if !by_report.is_empty() {
@@ -651,7 +629,7 @@ impl<'a> RunEngine<'a> {
                     notes: verified.notes,
                     gate_coverage: verified.gate_coverage,
                     holdouts: verified.holdouts,
-                    verdict: Some(verdict),
+                    verdict,
                 },
             )?;
             return Ok(Step::Ended(self.stop(
@@ -659,7 +637,65 @@ impl<'a> RunEngine<'a> {
                 Observation::VerificationGap(verified.gaps),
             )?));
         }
-        self.accept_candidate(ctx, progress, candidate, verified, Some(&verdict))
+        self.accept_candidate(ctx, progress, candidate, verified, verdict.as_ref())
+    }
+
+    /// The report review of an inspection run under `review: required`:
+    /// its verdict, or the run ended `needs_decision` with the snapshot
+    /// kept when no review could be had.
+    fn report_verdict(
+        &mut self,
+        ctx: &AttemptContext<'_>,
+        progress: &mut Progress,
+        candidate: &Candidate,
+        verified: &Verified,
+    ) -> Result<Result<verify::ReportVerdict, RunOutcome>, RunError> {
+        let preflight = ctx.preflight;
+        let request = ReviewRequest {
+            manifest: &preflight.manifest,
+            authority: &preflight.authority,
+            candidate_sha: &candidate.sha,
+            candidate_tier: candidate.tier,
+            candidate_model: &candidate.model,
+            verification_inputs_changed: &[],
+            patch_path: candidate.latest_patch.clone(),
+            routed_by: preflight.decision.routed_by,
+            covering: preflight.decision.covering.clone(),
+            base_sha: &preflight.base_sha,
+            holdouts: &verified.holdouts,
+            candidate: Some(self.kept_candidate(preflight, candidate.index, &candidate.sha)),
+            basis: PatchBasis::Base,
+        };
+        // Not fatal: without the listing the reviewer works as it did before,
+        // and the prompt says so.
+        let tree = ctx.worktree.tracked_tree_in(&candidate.sha).ok();
+        match self.review_report(
+            &request,
+            candidate,
+            ctx.worktree_path,
+            tree.as_ref(),
+            &mut progress.spend,
+        ) {
+            Ok(verdict) => Ok(Ok(verdict)),
+            Err(detail) => Ok(Err(self.stop_for_review(
+                &progress.budget,
+                &|engine| {
+                    engine.candidate_receipt(CandidateReceiptInput {
+                        attempt: ctx,
+                        progress,
+                        candidate,
+                        verified,
+                        verdict: None,
+                        outcome: State::NeedsDecision,
+                        review: verify::ReviewRecord::Unavailable {
+                            detail: detail.clone(),
+                        },
+                    })
+                },
+                Reason::ReviewUnavailable,
+                Observation::ReviewUnavailable(detail.clone()),
+            )?)),
+        }
     }
 
     /// Verify the immutable candidate copy: a throwaway worktree at the

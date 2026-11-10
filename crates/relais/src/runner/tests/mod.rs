@@ -2977,7 +2977,7 @@ fn an_inspection_on_a_red_base_is_accepted_without_a_repair() {
         "DONE: src/main.rs exists, so the check fails",
         "[1] met: src/main.rs is there",
     );
-    let outcome = fixture.execute(&inspect_contract(), &repo, &backend);
+    let outcome = fixture.execute(&required(inspect_contract()), &repo, &backend);
     let RunOutcome {
         terminal: Terminal::Accepted(receipt),
         ..
@@ -3002,6 +3002,13 @@ fn an_inspection_on_a_red_base_is_accepted_without_a_repair() {
         Some(verify::IndependenceSummary::NoneIndependent)
     );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+/// `contract` routed to `review: required`: an inspection that keeps its
+/// report review (ADR-0013).
+fn required(mut contract: TaskContract) -> TaskContract {
+    contract.review = Review::Required;
+    contract
 }
 
 fn inspect_contract_accepting(acceptance: serde_json::Value) -> TaskContract {
@@ -3163,7 +3170,7 @@ fn an_unmet_report_is_repaired_once_at_the_same_tier_then_fails_without_escalati
         "DONE: the layout is src/ and tests/",
         "[1] not_met: no tests/ directory exists",
     );
-    let outcome = fixture.execute(&inspect_contract(), &repo, &backend);
+    let outcome = fixture.execute(&required(inspect_contract()), &repo, &backend);
     let RunOutcome {
         run_id,
         terminal: Terminal::Failed { detail },
@@ -3223,7 +3230,7 @@ fn an_accepted_inspection_is_not_counted_as_a_patch_review() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![passing_check()], 3);
     let (backend, _) = inspecting_backend("DONE: the report", "[1] met: read it");
-    let outcome = fixture.execute(&inspect_contract(), &repo, &backend);
+    let outcome = fixture.execute(&required(inspect_contract()), &repo, &backend);
     let RunOutcome {
         run_id,
         terminal: Terminal::Accepted(_),
@@ -3256,10 +3263,10 @@ fn the_report_review_reads_the_worktree_with_three_tools_and_sees_the_report_as_
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
     let (backend, launches) = inspecting_backend("DONE: src/main.rs exists", "[1] met: ls");
-    let contract = inspect_contract_accepting(serde_json::json!([
+    let contract = required(inspect_contract_accepting(serde_json::json!([
         "the entry point is described",
         "nothing else is claimed"
-    ]));
+    ])));
     let outcome = fixture.execute(&contract, &repo, &backend);
     assert!(
         matches!(outcome.terminal, Terminal::Failed { .. }),
@@ -3322,7 +3329,7 @@ fn a_review_that_is_missing_unparseable_duplicated_or_omits_a_criterion_meets_no
         let fixture = Fixture::new();
         let repo = fixture.repo_policy(vec![passing_check()], 3);
         let (backend, _) = inspecting_backend("DONE: the report", answer);
-        let outcome = fixture.execute(&inspect_contract(), &repo, &backend);
+        let outcome = fixture.execute(&required(inspect_contract()), &repo, &backend);
         assert!(
             matches!(outcome.terminal, Terminal::Failed { .. }),
             "`{answer}` settles the criterion not met: {outcome:?}"
@@ -3346,7 +3353,7 @@ fn a_report_review_that_cannot_be_dispatched_is_needs_review() {
             ..Default::default()
         }
     });
-    let outcome = fixture.execute(&inspect_contract(), &repo, &backend);
+    let outcome = fixture.execute(&required(inspect_contract()), &repo, &backend);
     let RunOutcome {
         run_id,
         terminal: Terminal::NeedsReview { .. },
@@ -3365,11 +3372,11 @@ fn a_report_review_that_cannot_be_dispatched_is_needs_review() {
 fn a_red_check_criterion_fails_the_inspection_without_a_repair_even_beside_an_unmet_report() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![named_main_gone_check()], 4);
-    let contract = inspect_contract_accepting(serde_json::json!([
+    let contract = required(inspect_contract_accepting(serde_json::json!([
         {"statement": "the gate is green", "id": "gate-green",
          "evidence": {"kind": "check", "name": "gate"}},
         "the layout is listed",
-    ]));
+    ])));
     let (backend, launches) =
         inspecting_backend("DONE: the layout", "[1] met: ok\n[2] not_met: made up");
     let outcome = fixture.execute(&contract, &repo, &backend);
@@ -3400,11 +3407,11 @@ fn an_inspection_waiting_on_a_sign_off_keeps_the_verdict_and_lists_only_that_gap
         .get_mut("profile")
         .expect("profile")
         .amont_checks = vec!["inventory-check".into()];
-    let contract = inspect_contract_accepting(serde_json::json!([
+    let contract = required(inspect_contract_accepting(serde_json::json!([
         "the layout is listed",
         {"statement": "a person read the report", "id": "read",
          "evidence": {"kind": "human_sign_off"}},
-    ]));
+    ])));
     let (backend, launches) = inspecting_backend("DONE: the layout", "[1] met: listed src/");
     let outcome = fixture.execute(&contract, &repo, &backend);
     let RunOutcome {
@@ -3442,50 +3449,86 @@ fn an_inspection_waiting_on_a_sign_off_keeps_the_verdict_and_lists_only_that_gap
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
+/// An inspection routed below `review: required` dispatches no report
+/// review (ADR-0013): its report criteria are met by the report existing,
+/// settled `report_exists` and not independent, and no report review is
+/// kept. `off` and `optional` alike.
 #[test]
-fn a_review_off_inspection_still_runs_its_report_review_and_says_so() {
-    let fixture = Fixture::new();
-    let repo = fixture.repo_policy(vec![passing_check()], 3);
-    let contract = TaskContract::from_json_str(
-        &serde_json::json!({
-            "schema_version": 1,
-            "kind": "inspect",
-            "objective": "Investigate why a check is inactive",
-            "base_ref": "HEAD",
-            "acceptance": ["evidence of why the check is inert"],
-            "verification_profile": "profile",
-            "review": "off",
-        })
-        .to_string(),
-    )
-    .expect("a stored review: off inspect contract still loads");
-    let (backend, launches) = inspecting_backend("DONE: the report", "[1] met: read it");
-    let outcome = fixture.execute(&contract, &repo, &backend);
-    let RunOutcome {
-        terminal: Terminal::Accepted(receipt),
-        ..
-    } = outcome
-    else {
-        panic!("expected acceptance, got {outcome:?}");
-    };
-    assert_eq!(launches.lock().expect("launches").len(), 2);
-    assert!(
-        receipt
-            .verification
-            .notes
+fn an_inspection_without_required_settles_by_its_report() {
+    for review in ["off", "optional"] {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let contract = TaskContract::from_json_str(
+            &serde_json::json!({
+                "schema_version": 1,
+                "kind": "inspect",
+                "objective": "Investigate why a check is inactive",
+                "base_ref": "HEAD",
+                "acceptance": [
+                    "evidence of why the check is inert",
+                    { "statement": "the reviewer reads it", "evidence": { "kind": "llm_review" } },
+                ],
+                "verification_profile": "profile",
+                "review": review,
+            })
+            .to_string(),
+        )
+        .expect("an inspect contract");
+        let (backend, launches) = inspecting_backend("DONE: the report", "[1] not_met: unread");
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(receipt),
+        } = outcome
+        else {
+            panic!("expected acceptance under `review: {review}`, got {outcome:?}");
+        };
+        let launches = launches.lock().expect("launches");
+        assert_eq!(
+            launches.len(),
+            1,
+            "the worker alone, under `review: {review}`"
+        );
+        assert!(launches
             .iter()
-            .any(|note| note.contains("review: off")),
-        "{:?}",
-        receipt.verification.notes
-    );
-    assert!(
-        receipt.verification.gaps_not_judged.is_empty(),
-        "{:?}",
-        receipt.verification.gaps_not_judged
-    );
-    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+            .all(|spec| spec.agent != AgentKind::Reviewer));
+        assert_eq!(receipt.criteria.len(), 2);
+        assert!(receipt.criteria.iter().all(|criterion| criterion.met
+            && criterion.settled_via == Some(verify::SettledVia::ReportExists)));
+        assert_eq!(
+            receipt.mandatory_evidence_independence,
+            Some(verify::IndependenceSummary::NoneIndependent)
+        );
+        assert!(
+            !fixture
+                .artifacts
+                .join(run_id.as_str())
+                .join("report-review-1.txt")
+                .exists(),
+            "no report review is kept"
+        );
+        assert!(
+            receipt
+                .verification
+                .notes
+                .iter()
+                .any(|note| note.contains("no report review ran")),
+            "{:?}",
+            receipt.verification.notes
+        );
+        assert!(
+            receipt.verification.gaps_not_judged.is_empty(),
+            "{:?}",
+            receipt.verification.gaps_not_judged
+        );
+        let json = serde_json::to_value(&receipt).expect("receipt serializes");
+        assert_eq!(json["criteria"][0]["settled_via"], "report_exists");
+        std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+    }
 }
 
+/// No review is asked for here: the report existing is what settles an
+/// unrequired inspection, so an empty one still fails (ADR-0013).
 #[test]
 fn an_empty_inspect_report_is_repaired_once_then_fails() {
     let fixture = Fixture::new();
@@ -4810,16 +4853,11 @@ fn queued_admission_counts_against_the_admission_wait_budget() {
 
 // -- enforcement the spec promises (SPEC §5, §7, §10, §18) ---------------
 
-/// A worker that edits the test tree gets explicit review even when the
-/// route said none: verification inputs cannot be weakened silently.
-#[test]
-fn changing_verification_inputs_forces_review() {
-    let fixture = Fixture::new();
-    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
-    let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counter = Arc::clone(&launches);
-    let backend = MockBackend::new(move |spec| {
-        counter.fetch_add(1, Ordering::SeqCst);
+/// A worker that edits the test tree, under `review`; every launch counted
+/// and the reviewer told what changed (ADR-0013).
+fn test_tree_editing_backend(launches: Arc<std::sync::atomic::AtomicUsize>) -> MockBackend {
+    MockBackend::new(move |spec| {
+        launches.fetch_add(1, Ordering::SeqCst);
         if spec.prompt.contains("semantic reviewer") {
             assert!(
                 spec.prompt.contains("CHANGES THE TEST TREE")
@@ -4846,25 +4884,44 @@ fn changing_verification_inputs_forces_review() {
             usage: Some(usage(100)),
             ..Default::default()
         }
-    });
+    })
+}
+
+/// A worker that edits the test tree is reviewed only under `review:
+/// required` (ADR-0013): below it the candidate is accepted on its checks,
+/// no reviewer is dispatched, and the edited paths ride on the receipt,
+/// which says in one line that no one reviewed them.
+#[test]
+fn changing_verification_inputs_is_reviewed_only_under_required() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let backend = test_tree_editing_backend(Arc::clone(&launches));
     let mut contract = fixture.contract_with_scope(&["src/**", "tests/**"]);
-    contract.review = Review::Off;
+    contract.review = Review::Optional;
     let outcome = fixture.execute(&contract, &repo, &backend);
     let RunOutcome {
         run_id,
         terminal: Terminal::Accepted(receipt),
     } = outcome
     else {
-        panic!("expected acceptance after review, got {outcome:?}");
+        panic!("expected acceptance without review, got {outcome:?}");
     };
-    assert_eq!(
-        launches.load(Ordering::SeqCst),
-        2,
-        "worker, then the forced review"
-    );
+    assert_eq!(launches.load(Ordering::SeqCst), 1, "the worker alone");
     assert_eq!(
         receipt.verification.verification_inputs_changed,
         vec!["tests/regression.rs".to_string()]
+    );
+    assert_eq!(receipt.review.reviewed(), Some(false));
+    assert_eq!(receipt.review_level, Some(Review::Optional));
+    assert_eq!(
+        verify::unreviewed_test_edits_line(
+            &receipt.verification.verification_inputs_changed,
+            receipt.review.reviewed(),
+            receipt.review_level,
+        )
+        .as_deref(),
+        Some("tests edited; not reviewed (review: optional)")
     );
     let reasons: Vec<String> = fixture
         .ledger
@@ -4873,7 +4930,55 @@ fn changing_verification_inputs_forces_review() {
         .into_iter()
         .map(|t| t.reason)
         .collect();
-    assert!(reasons.contains(&Reason::VerificationInputsChanged.as_str().to_string()));
+    assert!(
+        !reasons.contains(&Reason::VerificationInputsChanged.as_str().to_string()),
+        "no transition explains a forced review: {reasons:?}"
+    );
+    // The report reads the same facts off the stored receipt.
+    let report = crate::report::runs_report(&fixture.ledger, "1970-01-01T00:00:00Z", None)
+        .expect("a report");
+    assert!(
+        report
+            .render()
+            .contains("    tests edited; not reviewed (review: optional)\n"),
+        "{}",
+        report.render()
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let backend = test_tree_editing_backend(Arc::clone(&launches));
+    let mut contract = fixture.contract_with_scope(&["src/**", "tests/**"]);
+    contract.review = Review::Required;
+    let outcome = fixture.execute(&contract, &repo, &backend);
+    let RunOutcome {
+        terminal: Terminal::Accepted(receipt),
+        ..
+    } = outcome
+    else {
+        panic!("expected acceptance after review, got {outcome:?}");
+    };
+    assert_eq!(
+        launches.load(Ordering::SeqCst),
+        2,
+        "worker, then the required review"
+    );
+    assert_eq!(
+        receipt.verification.verification_inputs_changed,
+        vec!["tests/regression.rs".to_string()]
+    );
+    assert_eq!(receipt.review.reviewed(), Some(true));
+    assert_eq!(
+        verify::unreviewed_test_edits_line(
+            &receipt.verification.verification_inputs_changed,
+            receipt.review.reviewed(),
+            receipt.review_level,
+        ),
+        None
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
 #[test]

@@ -284,6 +284,7 @@ mod tests {
             ),
             recipe: relais::policy::RecipeRecord::NotRecorded,
             verification_profile_hash: "vph".into(),
+            review_level: None,
             review: relais::verify::ReviewRecord::NoReview,
             ladder: relais::verify::LadderRecord::NotRecorded,
             efforts_used: Vec::new(),

@@ -308,6 +308,7 @@ impl<'a> RunEngine<'a> {
             ),
             verification_profile_hash: preflight.authority.verification_profile.hash(),
             review: review_record_of(self.config.ledger, &self.run_id)?,
+            review_level: Some(preflight.decision.review),
             ladder: verify::LadderRecord::Single(preflight.decision.ladder.rungs().to_vec()),
             efforts_used: self.config.ledger.efforts_used(&self.run_id)?,
             candidates: self.candidates_record(&candidate.sha),

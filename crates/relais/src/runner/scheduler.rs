@@ -1057,8 +1057,9 @@ fn accept_integrated(
         completeness: ledger.run_cost_completeness(&engine.run_id)?,
     };
     let verification_inputs_changed = assembled.touched_inputs.tests.clone();
-    let review_required =
-        root.decision.review >= Review::Required || !verification_inputs_changed.is_empty();
+    // Edited tests are recorded, not reviewed, unless the routed level
+    // asks for a review (ADR-0013).
+    let review_required = root.decision.review >= Review::Required;
     if review_required {
         // A patch one reviewer cannot be given to read dispatches no
         // reviewer: the run asks a person (SPEC §10).
@@ -1253,7 +1254,7 @@ fn integrated_receipt(
         },
         engine.config.contract.kind(),
         assembled.patch_adds_test,
-        None,
+        verify::ReportJudgment::Missing,
     );
     Ok(Receipt {
         run_id: engine.run_id.as_str().to_string(),
@@ -1280,6 +1281,7 @@ fn integrated_receipt(
         ),
         verification_profile_hash: root.authority.verification_profile.hash(),
         review,
+        review_level: Some(root.decision.review),
         ladder: verify::LadderRecord::PerPackage(assembly.ladders.clone()),
         efforts_used: assembly.efforts_used.clone(),
         candidates: engine.candidates_record(&assembly.head),

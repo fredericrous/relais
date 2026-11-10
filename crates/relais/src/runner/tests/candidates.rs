@@ -547,6 +547,7 @@ fn sample_receipt() -> crate::verify::Receipt {
         mandatory_evidence_independence: None,
         recipe: crate::policy::RecipeRecord::NotRecorded,
         verification_profile_hash: "vph".into(),
+        review_level: None,
         review: ReviewRecord::NotRecorded,
         ladder: LadderRecord::NotRecorded,
         efforts_used: Vec::new(),

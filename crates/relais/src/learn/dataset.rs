@@ -1214,6 +1214,7 @@ mod tests {
             mandatory_evidence_independence: None,
             recipe: crate::policy::RecipeRecord::NotRecorded,
             verification_profile_hash: "vph".into(),
+            review_level: None,
             review: ReviewRecord::NotRun(ReviewNotRun::OverBudget {
                 patch_bytes: 1,
                 budget_bytes: 1,

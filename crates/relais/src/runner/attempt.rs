@@ -1001,9 +1001,9 @@ impl<'a> RunEngine<'a> {
         // verification": §9's table sends that to the user as
         // `needs_decision`, because no reviewer can decide on the
         // user's behalf that a loosened build is what was wanted.
-        // Editing the TEST TREE is work §10 explicitly invites, so
-        // it stays what it was: explicit review, whatever the route
-        // said (audit B8).
+        // Editing the TEST TREE is work §10 explicitly invites: it is
+        // recorded, and reviewed only under `review: required`
+        // (ADR-0013).
         let touched_inputs = verify::classify_with_holdout_inputs(
             &authority.verification_profile,
             &crate::holdout::protected_inputs(&ctx.preflight.holdouts),
@@ -1036,8 +1036,10 @@ impl<'a> RunEngine<'a> {
             )?));
         }
         let verification_inputs_changed = touched_inputs.tests;
-        let review_required = ctx.preflight.decision.review >= Review::Required
-            || !verification_inputs_changed.is_empty();
+        // Editing the test tree no longer forces a review (ADR-0013): the
+        // paths ride on the receipt, and the reviewer's prompt names them
+        // when the routed level asks for one.
+        let review_required = ctx.preflight.decision.review >= Review::Required;
 
         // A candidate that carries the base tree has the baseline's
         // results by identity: the commands are not spent again, and
@@ -1067,17 +1069,6 @@ impl<'a> RunEngine<'a> {
                 .result_text
                 .as_deref()
                 .is_none_or(|text| text.trim().is_empty());
-        // Entered only once the candidate is to be verified.
-        if !verification_inputs_changed.is_empty()
-            && ctx.preflight.decision.review < Review::Required
-        {
-            self.transition(
-                State::Verifying,
-                Reason::VerificationInputsChanged,
-                serde_json::json!({ "paths": verification_inputs_changed }),
-            )?;
-        }
-
         // Verification against an immutable copy of the candidate
         // (SPEC §10). Entering `verifying` is a transition like every
         // other: assigned straight to the field, the ledger never
