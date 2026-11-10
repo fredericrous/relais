@@ -73,7 +73,7 @@ mod workspace_ops;
 
 pub use crate::prune::sweep_ended_verify_dirs;
 pub use crate::workspace::OutOfScope;
-use baseline::{baseline_summary, setup_failure_detail};
+use baseline::{baseline_summary, kept_sentence, setup_failure_detail, BaseMemo};
 pub use config::{holdout_root, verify_root, worktree_root, DesignSource, RunConfig};
 use config::{retirement_detail, state_sibling};
 use error::Finish;
@@ -278,6 +278,8 @@ pub(crate) struct RunEngine<'a> {
     /// The answer relais gave this run's wall-time stop, written before its
     /// worktree was retired; the run's end reads it for its outcome.
     pub(in crate::runner) timed_out_settled: Option<successor::Settled>,
+    /// What the base checked on demand established so far (ADR-0013).
+    pub(in crate::runner) base_memo: BaseMemo<'a>,
 }
 
 #[cfg(test)]

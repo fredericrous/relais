@@ -1230,16 +1230,34 @@ impl<'a> RunEngine<'a> {
                 self.stop(&progress.budget, Observation::VerificationGap(gaps))?,
             ));
         }
+        // Proof, else lazy (ADR-0013): a base that was neither cached nor
+        // proven is checked now, on this candidate's red checks only. A
+        // candidate carrying the base tree is the base: its own red checks
+        // are the base's failures, and nothing runs again. A `kind: verify`
+        // change fails on any red check whatever the base says, so the
+        // base is not run for it.
+        let red: Vec<String> = checks
+            .iter()
+            .filter(|check| check.failed())
+            .map(|check| check.label.clone())
+            .collect();
+        let base_decides = inspecting || !self.config.contract.is_verify();
+        if ctx.baseline.deferred && !red.is_empty() && base_decides {
+            if identical {
+                self.base_is_candidate(&checks);
+            } else if let Some(outcome) =
+                self.base_on_demand(ctx, &candidate, &red, &progress.budget)?
+            {
+                return Ok(Step::Ended(outcome));
+            }
+        }
+        let base_failures = self.base_failures(ctx.baseline);
         // An inspection changes nothing, so a check already failing at
         // the base is not its to repair (SPEC §10).
         let mut failures: Vec<String> = if inspecting {
-            verify::new_failure_labels(&checks, &ctx.baseline.failures)
+            verify::new_failure_labels(&checks, &base_failures)
         } else {
-            checks
-                .iter()
-                .filter(|check| check.failed())
-                .map(|check| check.label.clone())
-                .collect()
+            red
         };
         let check_count = failures.len();
         let acceptance = self.effective_acceptance()?;
@@ -1291,9 +1309,7 @@ impl<'a> RunEngine<'a> {
             let same_failures =
                 progress.last_failures.as_deref() == Some(repair_failures.as_slice());
             progress.last_candidate = Some(candidate.sha.clone());
-            let all_preexisting = failures
-                .iter()
-                .all(|label| ctx.baseline.failures.contains(label));
+            let all_preexisting = failures.iter().all(|label| base_failures.contains(label));
             progress.last_failures = Some(repair_failures);
             // Plan C1: complete JUnit on both sides says every failing
             // test already fails at the base and nothing targets it. A
@@ -1305,10 +1321,8 @@ impl<'a> RunEngine<'a> {
                     None
                 };
             progress.holdout_stop = holdout_only.clone();
-            if let Some(tests) = ctx
-                .baseline
-                .checks
-                .as_deref()
+            if let Some(tests) = self
+                .base_checks(ctx.baseline)
                 .filter(|_| holdout_failures.is_empty())
                 .and_then(|base| {
                     verify::guarded_preexisting(

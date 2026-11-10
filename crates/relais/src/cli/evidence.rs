@@ -262,6 +262,7 @@ mod tests {
                 baseline_cached: false,
                 baseline_cache_refused: None,
                 baseline_proven: false,
+                baseline_deferred: false,
             },
             kind,
             candidate: None,

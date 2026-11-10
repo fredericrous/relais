@@ -69,6 +69,21 @@ impl Ledger {
         Ok(())
     }
 
+    /// The `(phase, label)` of every timing row of one run: what a test of
+    /// which checks ran where reads.
+    #[cfg(test)]
+    pub(crate) fn check_timing_phases(&self, run_id: &RunId) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT phase, label FROM check_timings WHERE run_id = ?1 ORDER BY phase, label",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Per-label, per-`cached` aggregates of every row whose run ended at or
     /// after `since` (RFC 3339), sorted by label then cached. Percentiles are
     /// nearest-rank over the rows of the group.

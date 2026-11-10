@@ -535,6 +535,7 @@ fn sample_receipt() -> crate::verify::Receipt {
             baseline_cached: false,
             baseline_cache_refused: None,
             baseline_proven: false,
+            baseline_deferred: false,
         },
         kind: crate::contract::Kind::Change,
         candidate: None,

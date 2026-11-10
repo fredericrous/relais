@@ -244,6 +244,17 @@ pub fn baseline_text(check: &str, found: &Exhaustion, measured: &Measured) -> St
     )
 }
 
+/// The same block when the base was checked on demand, after a candidate
+/// went red (ADR-0013): its red checks cannot be told new from
+/// pre-existing. The caller adds where the candidate is kept.
+pub fn baseline_on_demand_text(check: &str, found: &Exhaustion, measured: &Measured) -> String {
+    format!(
+        "the base revision's {}. The base is not red: exhaustion gives no verdict, so the \
+         candidate's failed checks could not be told new from pre-existing. Free the resource",
+        observed(check, found, measured)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

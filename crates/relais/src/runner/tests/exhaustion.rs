@@ -272,6 +272,8 @@ fn a_passing_check_that_prints_a_signature_is_still_a_pass() {
     );
 }
 
+/// The base is checked on demand at the first red candidate (ADR-0013):
+/// exhaustion there blocks the run with the candidate kept.
 #[test]
 fn a_classified_failure_on_the_base_blocks_the_run_and_never_reddens_the_base() {
     let _space = plenty();
@@ -281,7 +283,9 @@ fn a_classified_failure_on_the_base_blocks_the_run_and_never_reddens_the_base() 
             argv: vec![
                 "sh".into(),
                 "-c".into(),
-                "echo 'No space left on device'; exit 1".into(),
+                "case \"$(pwd -P)\" in */verify-base) echo 'No space left on device';; esac; \
+                 exit 1"
+                    .into(),
             ],
             ..passing_check()
         }],
@@ -310,7 +314,17 @@ fn a_classified_failure_on_the_base_blocks_the_run_and_never_reddens_the_base() 
         Some("baseline_resource_exhausted")
     );
     assert!(outcome.terminal.detail().contains("not red"));
-    assert_eq!(launched.load(Ordering::SeqCst), 0, "no worker was launched");
+    assert_eq!(
+        launched.load(Ordering::SeqCst),
+        1,
+        "one worker, then the base"
+    );
+    assert_kept_after_base(
+        &fixture,
+        &outcome.run_id,
+        State::Blocked,
+        outcome.terminal.detail(),
+    );
 }
 
 // -- relais's own storage (SPEC §10) -------------------------------------------

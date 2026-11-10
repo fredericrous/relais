@@ -365,6 +365,12 @@ pub struct VerificationReport {
     /// base is green, so it has no pre-existing failures.
     #[serde(default)]
     pub baseline_proven: bool,
+    /// Whether no base run happened up front (ADR-0013): the base was
+    /// neither cached nor proven, so it was checked only on a red
+    /// candidate, and only on its red checks. `baseline_failures` holds
+    /// what that on-demand run found.
+    #[serde(default)]
+    pub baseline_deferred: bool,
 }
 impl VerificationReport {
     pub fn accepted(&self) -> bool {
@@ -1767,8 +1773,46 @@ pub fn run_profile_within(
     cancel: Option<&AtomicBool>,
     admission: &HeavyAdmission<'_>,
 ) -> Result<Vec<CheckOutcome>, VerifyError> {
+    run_indexed_within(
+        dir,
+        profile.commands.iter().enumerate(),
+        logs_dir,
+        prefix,
+        events,
+        cancel,
+        admission,
+    )
+}
+
+/// The profile's commands whose labels are among `labels`, each with its
+/// index in the profile: an on-demand base run checks only a candidate's
+/// red checks, and `<prefix>-cmd{index}` still names profile command
+/// `index` (ADR-0013).
+pub fn commands_labelled<'p>(
+    profile: &'p VerificationProfile,
+    labels: &[String],
+) -> Vec<(usize, &'p CommandSpec)> {
+    profile
+        .commands
+        .iter()
+        .enumerate()
+        .filter(|(_, command)| labels.contains(&check_label(command)))
+        .collect()
+}
+
+/// [`run_profile_within`] over chosen commands, each logged under its own
+/// profile index rather than its place in the selection.
+pub fn run_indexed_within<'p>(
+    dir: &Path,
+    commands: impl IntoIterator<Item = (usize, &'p CommandSpec)>,
+    logs_dir: &Path,
+    prefix: &str,
+    events: &Events,
+    cancel: Option<&AtomicBool>,
+    admission: &HeavyAdmission<'_>,
+) -> Result<Vec<CheckOutcome>, VerifyError> {
     let mut outcomes = Vec::new();
-    for (index, command) in profile.commands.iter().enumerate() {
+    for (index, command) in commands {
         let label = check_label(command);
         let log_stem = format!("{prefix}-cmd{index}");
         outcomes.push(run_observed_within(ObservedRun {
@@ -3693,6 +3737,27 @@ mod tests {
         assert_eq!(again, new);
     }
 
+    /// `baseline_deferred` (ADR-0013) is newer than every stored receipt:
+    /// an old one reads `false`, and `true` survives a round trip.
+    #[test]
+    fn a_receipt_without_baseline_deferred_reads_false() {
+        let old: Receipt = serde_json::from_str(PRE_FIELD_RECEIPT_3).expect("old receipt parses");
+        assert!(!old.verification.baseline_deferred);
+        let deferred = PRE_FIELD_RECEIPT_3.replace(
+            "\"baseline_cache_refused\":null",
+            "\"baseline_cache_refused\":null,\"baseline_deferred\":true",
+        );
+        assert_ne!(
+            deferred, PRE_FIELD_RECEIPT_3,
+            "the fixture holds the anchor"
+        );
+        let new: Receipt = serde_json::from_str(&deferred).expect("new receipt parses");
+        assert!(new.verification.baseline_deferred);
+        let again: Receipt = serde_json::from_str(&serde_json::to_string(&new).unwrap())
+            .expect("the receipt round-trips");
+        assert_eq!(again, new);
+    }
+
     use super::*;
 
     #[cfg(unix)]
@@ -5341,6 +5406,7 @@ mod tests {
             baseline_cached: false,
             baseline_cache_refused: None,
             baseline_proven: false,
+            baseline_deferred: false,
         };
         assert!(report.accepted());
         assert!(report.new_failures().is_empty());
@@ -5461,6 +5527,7 @@ mod tests {
             baseline_cached: false,
             baseline_cache_refused: None,
             baseline_proven: false,
+            baseline_deferred: false,
         };
         assert!(
             !report.accepted(),
@@ -5513,6 +5580,7 @@ mod tests {
             baseline_cached: false,
             baseline_cache_refused: None,
             baseline_proven: false,
+            baseline_deferred: false,
         };
         assert!(report.accepted());
 
@@ -5675,6 +5743,7 @@ mod tests {
             baseline_cached: false,
             baseline_cache_refused: None,
             baseline_proven: false,
+            baseline_deferred: false,
         }
     }
 
@@ -6027,6 +6096,7 @@ mod tests {
             baseline_cached: false,
             baseline_cache_refused: None,
             baseline_proven: false,
+            baseline_deferred: false,
         };
         assert!(
             !report.accepted(),
@@ -6115,6 +6185,7 @@ mod tests {
             baseline_cached: false,
             baseline_cache_refused: None,
             baseline_proven: false,
+            baseline_deferred: false,
         };
         assert!(report.accepted());
 
@@ -6239,6 +6310,7 @@ mod tests {
             baseline_cached: false,
             baseline_cache_refused: None,
             baseline_proven: false,
+            baseline_deferred: false,
         };
         let (criteria, summary) = settle_acceptance(
             &entries,
@@ -6332,6 +6404,7 @@ mod tests {
             baseline_cached: false,
             baseline_cache_refused: None,
             baseline_proven: false,
+            baseline_deferred: false,
         };
         assert!(!report.accepted());
         let (criteria, _) = settle_acceptance(
@@ -6584,6 +6657,7 @@ mod tests {
             baseline_cached: false,
             baseline_cache_refused: None,
             baseline_proven: false,
+            baseline_deferred: false,
         };
         let (_, all_independent) = settle_acceptance(
             &[AcceptanceEntry::Bare("it builds".into())],
@@ -6724,6 +6798,7 @@ mod tests {
             baseline_cached: false,
             baseline_cache_refused: None,
             baseline_proven: false,
+            baseline_deferred: false,
         };
         assert!(!report.accepted(), "baseline failures are not auto-waived");
         assert!(
@@ -6777,6 +6852,7 @@ mod tests {
                 baseline_cached: false,
                 baseline_cache_refused: None,
                 baseline_proven: false,
+                baseline_deferred: false,
             },
             kind: Kind::Change,
             candidate: None,
@@ -6888,6 +6964,7 @@ mod tests {
             baseline_cached: false,
             baseline_cache_refused: None,
             baseline_proven: false,
+            baseline_deferred: false,
         };
         let entries = vec![
             declared(

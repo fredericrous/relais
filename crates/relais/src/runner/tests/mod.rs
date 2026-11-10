@@ -3596,8 +3596,11 @@ fn an_inspection_that_meets_a_new_failure_is_not_accepted_and_fails_on_its_repea
     let first = fixture.execute_with_machine(&inspect_contract(), &repo, &machine, &backend);
     assert!(
         matches!(first.terminal, Terminal::Accepted(_)),
-        "a green base fills the cache: {first:?}"
+        "a green base: {first:?}"
     );
+    // A lazy run writes no cache entry (ADR-0013): seed the legacy one
+    // an older relais would have left for this green base.
+    seed_baseline_cache(&fixture, &repo, &first.run_id, &[]);
     std::fs::write(&flag, "red").expect("flag");
     // A cache hit now keeps the base's outcomes, and an identical
     // candidate reuses them instead of re-running (ADR-0009). The
@@ -4074,7 +4077,7 @@ fn an_empty_candidate_on_a_change_is_a_failure_the_worker_may_repair_once() {
 }
 
 #[test]
-fn an_inspect_answer_is_kept_and_its_identical_tree_reuses_the_baseline() {
+fn an_inspect_answer_is_kept_and_its_identical_tree_runs_no_base() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![passing_check()], 3);
     let (backend, _) = inspecting_backend(
@@ -4105,12 +4108,18 @@ fn an_inspect_answer_is_kept_and_its_identical_tree_reuses_the_baseline() {
     let answer = std::fs::read_to_string(run_dir.join("attempt-1-result.txt"))
         .expect("the worker's answer is the deliverable and is kept");
     assert!(answer.contains("trust entry is stale"));
-    assert!(
-        !fixture.verify_dir(&run_id).join("verify-1").exists(),
-        "the candidate is the base tree; its results are the baseline's"
-    );
+    // The base is deferred (ADR-0013): the identical candidate is checked
+    // once, as itself, and nothing runs on the base.
     assert_eq!(receipt.verification.checks.len(), 1);
-    assert!(receipt.verification.checks[0].log_path.contains("base-"));
+    assert!(
+        receipt.verification.checks[0]
+            .log_path
+            .contains("attempt1-"),
+        "{:?}",
+        receipt.verification.checks
+    );
+    assert!(receipt.verification.baseline_deferred);
+    assert!(!run_dir.join("logs").join("base-cmd0.log").exists());
     let transitions = fixture.ledger.transitions(&run_id).expect("history");
     assert!(
         transitions
@@ -4175,10 +4184,8 @@ fn a_cache_hit_keeps_the_bases_outcomes_for_an_identical_candidate() {
     else {
         panic!("first run");
     };
-    assert!(
-        !first.verification.baseline_cached,
-        "the first run fills the cache"
-    );
+    assert!(!first.verification.baseline_cached);
+    seed_baseline_cache(&fixture, &repo, &first_id, &first.verification.checks);
 
     let RunOutcome {
         run_id: second_id,
@@ -4223,13 +4230,14 @@ fn a_cache_hit_keeps_the_bases_outcomes_for_an_identical_candidate() {
 }
 
 /// Per-check timings reach the ledger from the runner (t09): a run with a
-/// setup step records the setup and the command; the second run reads the
-/// base from the cache and reuses it for its identical candidate, so both
-/// are recorded as reused, not as work. `check_timing_stats` splits rows by
-/// label and by `cached`, so the counts name each write: the first run's
-/// base command (1 run), its reused candidate (cached), and the second
-/// run's cached base and reused candidate (cached): 3 reused, 1 run. The
-/// setup ran once, at the first base.
+/// setup step records the setup and the command; the base is deferred
+/// (ADR-0013), so the first run's identical candidate runs them itself.
+/// The second run reads the base from a legacy cache entry and reuses it
+/// for its identical candidate, so both are recorded as reused, not as
+/// work. `check_timing_stats` splits rows by label and by `cached`, so the
+/// counts name each write: the first run's candidate command (1 run), and
+/// the second run's cached base and reused candidate (cached): 2 reused,
+/// 1 run. The setup ran once, at the first candidate.
 #[test]
 fn the_runner_writes_timing_rows_for_runs_and_for_reused_outcomes() {
     let fixture = Fixture::new();
@@ -4266,8 +4274,8 @@ fn the_runner_writes_timing_rows_for_runs_and_for_reused_outcomes() {
     let since = "1970-01-01T00:00:00Z";
 
     let RunOutcome {
+        run_id: first_id,
         terminal: Terminal::Accepted(first),
-        ..
     } = fixture.execute(&contract, &repo, &backend)
     else {
         panic!("first run");
@@ -4307,13 +4315,14 @@ fn the_runner_writes_timing_rows_for_runs_and_for_reused_outcomes() {
     assert_eq!(
         rows(&after_first, Step::Check, Source::Ran),
         1,
-        "the base command ran once: {after_first:?}"
+        "the candidate's command ran once, the base's never: {after_first:?}"
     );
     assert_eq!(
         rows(&after_first, Step::Check, Source::Reused),
-        1,
-        "the identical candidate reused the base's outcome: {after_first:?}"
+        0,
+        "a deferred base has nothing to reuse: {after_first:?}"
     );
+    seed_baseline_cache(&fixture, &repo, &first_id, &first.verification.checks);
 
     let RunOutcome {
         terminal: Terminal::Accepted(second),
@@ -4331,7 +4340,7 @@ fn the_runner_writes_timing_rows_for_runs_and_for_reused_outcomes() {
     );
     assert_eq!(
         rows(&after_second, Step::Check, Source::Reused),
-        3,
+        2,
         "the hit's base and its identical candidate are both recorded as reused: {after_second:?}"
     );
     assert_eq!(
@@ -4656,7 +4665,8 @@ fn a_run_cancelled_while_its_check_runs_stops_the_check_and_ends_cancelled() {
     let started = Instant::now();
     let outcome = std::thread::scope(|scope| {
         scope.spawn(move || {
-            // The run registers, then its base check starts and hangs.
+            // The run registers, then its candidate's check starts and
+            // hangs (the base is deferred, ADR-0013).
             while canceller.status().runs.is_empty() {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -4685,7 +4695,11 @@ fn a_run_cancelled_while_its_check_runs_stops_the_check_and_ends_cancelled() {
     else {
         panic!("expected cancellation, got {outcome:?}");
     };
-    assert_eq!(launches.load(Ordering::SeqCst), 0, "no worker was bought");
+    assert_eq!(
+        launches.load(Ordering::SeqCst),
+        1,
+        "one worker, then its check"
+    );
     assert_eq!(
         fixture.ledger.run_status(&run_id).expect("status"),
         Some(State::Cancelled)
@@ -4698,6 +4712,70 @@ fn a_run_cancelled_while_its_check_runs_stops_the_check_and_ends_cancelled() {
         .filter(|line| line.contains("\"kind\":\"outcome\""))
         .count();
     assert_eq!(outcomes, 1, "{events}");
+}
+
+/// A cancel that arrives while the base runs on demand (ADR-0013): the
+/// base's check is stopped, the attempt is closed cancelled with its
+/// candidate kept, and the `verify-base` tree is gone.
+#[test]
+fn a_run_cancelled_while_the_base_runs_on_demand_keeps_the_candidate() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(
+        vec![sh(
+            "case \"$(pwd -P)\" in */verify-base) sleep 60;; esac; exit 1",
+        )],
+        3,
+    );
+    let machine = fixture.machine_for(&repo);
+    let gate = Arc::new(crate::admission::LocalGate::new(
+        ConcurrencyLimits::default(),
+        crate::ledger::now_rfc3339,
+    ));
+    let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let backend = changing_worker(Arc::clone(&launches));
+    let canceller = Arc::clone(&gate);
+    let verify_runs = verify_root(&fixture.artifacts);
+    let started = Instant::now();
+    let outcome = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            // Cancel once some run's base tree exists, and a moment more
+            // for its check to start.
+            let base_exists = || {
+                std::fs::read_dir(&verify_runs).is_ok_and(|runs| {
+                    runs.flatten()
+                        .any(|run| run.path().join("verify-base").exists())
+                })
+            };
+            while !base_exists() && started.elapsed() < Duration::from_secs(60) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            for run_id in canceller.status().runs.keys() {
+                canceller.cancel_run(run_id);
+            }
+        });
+        fixture.execute_managed(
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            &backend,
+            gate.as_ref(),
+        )
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(50),
+        "the base's check was stopped, not waited for: {:?}",
+        started.elapsed()
+    );
+    let RunOutcome {
+        run_id,
+        terminal: Terminal::Cancelled { detail },
+    } = outcome
+    else {
+        panic!("expected cancellation, got {outcome:?}");
+    };
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert_kept_after_base(&fixture, &run_id, State::Cancelled, &detail);
 }
 
 #[test]
@@ -5144,6 +5222,7 @@ fn baseline_results_are_cached_only_when_the_profile_opts_in() {
         panic!("{first:?}");
     };
     assert!(!receipt.verification.baseline_cached, "off by default");
+    assert!(receipt.verification.baseline_deferred);
     repo.verification
         .profiles
         .get_mut("profile")
@@ -5155,13 +5234,22 @@ fn baseline_results_are_cached_only_when_the_profile_opts_in() {
     let RunOutcome {
         terminal: Terminal::Accepted(receipt),
         ..
-    } = second
+    } = &second
     else {
         panic!("{second:?}");
     };
-    assert!(
-        !receipt.verification.baseline_cached,
-        "the first opted-in run fills the cache"
+    assert!(!receipt.verification.baseline_cached);
+    assert_eq!(
+        cache_entries(&fixture),
+        0,
+        "a lazy run never writes the cache (ADR-0013)"
+    );
+    // A legacy entry, as an older relais wrote it, is still served.
+    seed_baseline_cache(
+        &fixture,
+        &repo,
+        &second.run_id,
+        &receipt.verification.checks,
     );
     let third =
         fixture.execute_with_machine(&fixture.contract(Review::Off), &repo, &machine, &backend);
@@ -5180,16 +5268,19 @@ fn baseline_results_are_cached_only_when_the_profile_opts_in() {
         receipt.verification.baseline_cached,
         "the same base, profile and toolchain hit"
     );
+    assert!(!receipt.verification.baseline_deferred);
     assert!(
         receipt.verification.baseline_failures.is_empty(),
         "only an all-green base is cached"
     );
 }
 
-/// A base with a failed check is never cached: every run judges it
-/// again, and still names the pre-existing failure.
+/// Proof, else lazy (ADR-0013): a green candidate on a red, uncached
+/// base never runs the base. Nothing is cached, no `base-cmd` log or
+/// `base` timing exists, the receipt says the base was deferred, and the
+/// run emitted `baseline_deferred`.
 #[test]
-fn a_red_base_is_rerun_every_time_not_cached() {
+fn a_green_candidate_on_an_unproven_base_runs_no_base_command() {
     let fixture = Fixture::new();
     let mut repo = fixture.repo_policy(vec![versionable_main_gone_check()], 3);
     repo.verification
@@ -5205,17 +5296,36 @@ fn a_red_base_is_rerun_every_time_not_cached() {
         let RunOutcome {
             terminal: Terminal::Accepted(receipt),
             ..
-        } = outcome
+        } = &outcome
         else {
             panic!("{round}: {outcome:?}");
         };
         assert!(!receipt.verification.baseline_cached, "{round} run");
-        assert_eq!(
-            receipt.verification.baseline_failures.len(),
-            1,
+        assert!(receipt.verification.baseline_deferred, "{round} run");
+        assert!(
+            receipt.verification.baseline_failures.is_empty(),
+            "{round} run: the base was never asked"
+        );
+        let logs = fixture.artifacts.join(outcome.run_id.as_str()).join("logs");
+        assert!(!logs.join("base-cmd0.log").exists(), "{round} run");
+        let phases = fixture
+            .ledger
+            .check_timing_phases(&outcome.run_id)
+            .expect("timings");
+        assert!(
+            phases.iter().all(|(phase, _)| !phase.starts_with("base")),
+            "{round} run: {phases:?}"
+        );
+        assert!(
+            decisions_of(&fixture, &outcome.run_id).contains(&"baseline_deferred".to_string()),
             "{round} run"
         );
+        assert!(!fixture
+            .verify_dir(&outcome.run_id)
+            .join("verify-base")
+            .exists());
     }
+    assert_eq!(cache_entries(&fixture), 0);
 }
 
 /// The runner's own machinery failing — here, the run directory made
@@ -5287,6 +5397,58 @@ fn sh(script: &str) -> CommandSpec {
     }
 }
 
+/// A worker that counts its launches and changes the tree each time
+/// without completing: its candidate is never the base, so a red one
+/// sends the base to be checked on demand (ADR-0013).
+fn changing_worker(launches: Arc<std::sync::atomic::AtomicUsize>) -> MockBackend {
+    MockBackend::new(move |spec| {
+        let n = launches.fetch_add(1, Ordering::SeqCst);
+        std::fs::write(
+            spec.work_dir.join(format!("src/change-{n}.txt")),
+            "change\n",
+        )
+        .expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    })
+}
+
+/// What an ending after a paid worker must leave (ADR-0013): attempt 1
+/// closed in `state` with its candidate kept, the detail naming the
+/// candidate and how to verify it again, and no `verify-base` tree left.
+fn assert_kept_after_base(fixture: &Fixture, run_id: &RunId, state: State, detail: &str) {
+    let endings = fixture.ledger.attempt_endings(run_id).expect("attempts");
+    let (index, ended, sha) = endings.first().cloned().expect("an attempt ran");
+    assert_eq!(index, 1, "{endings:?}");
+    assert_eq!(ended, state.as_str(), "{endings:?}");
+    let sha = sha.expect("the candidate is kept on the attempt");
+    assert_eq!(
+        fixture
+            .ledger
+            .latest_attempt_candidate(run_id)
+            .expect("candidate"),
+        Some(sha.clone())
+    );
+    if state == State::Blocked {
+        assert!(
+            detail.contains(&format!(
+                "the candidate is kept: verify it again without a worker with a `kind: verify` \
+                 run, `candidate {{run: {}, index: 1}}`",
+                run_id.as_str()
+            )),
+            "{detail}"
+        );
+    }
+    assert!(
+        !fixture.verify_dir(run_id).join("verify-base").exists(),
+        "the base's tree is removed at the run's end"
+    );
+}
+
 /// A worker that counts its launches and never completes.
 fn counting_worker(launches: Arc<std::sync::atomic::AtomicUsize>) -> MockBackend {
     MockBackend::new(move |_spec| {
@@ -5311,12 +5473,73 @@ fn evidence_of(fixture: &Fixture, run_id: &RunId, kind: EvidenceKind) -> Vec<(St
         .collect()
 }
 
+/// Write a legacy baseline-cache entry for the base `run_id` ran on, as a
+/// relais before ADR-0013 did: a lazy run never writes one, but a hit is
+/// still served. The key is computed as the runner computes it, from the
+/// run's own manifest.
+fn seed_baseline_cache(
+    fixture: &Fixture,
+    repo: &RepoPolicy,
+    run_id: &RunId,
+    checks: &[crate::verify::CheckOutcome],
+) {
+    let manifest: crate::context::ContextManifest = serde_json::from_str(
+        &std::fs::read_to_string(
+            fixture
+                .artifacts
+                .join(run_id.as_str())
+                .join("manifest.json"),
+        )
+        .expect("the run's manifest"),
+    )
+    .expect("a manifest");
+    let tree = git(
+        &fixture.repo,
+        &["rev-parse", &format!("{}^{{tree}}", manifest.base_sha)],
+    );
+    let profile = repo.verification.profiles.get("profile").expect("profile");
+    let toolchain = crate::verify::resolve_toolchain(profile, &|program| {
+        crate::tooling::program_version(program, None)
+    })
+    .expect("a versionable toolchain");
+    let key =
+        crate::verify::baseline_key(tree.trim(), profile, &manifest.tool_versions, &toolchain);
+    let stored = crate::verify::BaselineCache::new(
+        &fixture
+            .artifacts
+            .parent()
+            .expect("state")
+            .join("baseline-cache"),
+    )
+    .put(&key, &[], checks);
+    assert_eq!(stored, crate::verify::Stored::WithOutcomes);
+}
+
+/// How many entries the baseline cache holds.
+fn cache_entries(fixture: &Fixture) -> usize {
+    std::fs::read_dir(
+        fixture
+            .artifacts
+            .parent()
+            .expect("state")
+            .join("baseline-cache"),
+    )
+    .map(|entries| {
+        entries
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .count()
+    })
+    .unwrap_or(0)
+}
+
 /// The application-landscape failure: every command exits 127 at the
-/// base. Two workers were bought against it. Now: blocked before any
-/// dispatch, the base's logs on the record, the remedy named, and
+/// base. With the base deferred (ADR-0013), the first red candidate
+/// checks it on demand: blocked there, after one worker, with the
+/// candidate kept, the base's logs on the record, the remedy named, and
 /// nothing cached.
 #[test]
-fn a_baseline_whose_commands_cannot_run_blocks_before_any_worker() {
+fn a_baseline_whose_commands_cannot_run_blocks_at_the_first_red_candidate() {
     let fixture = Fixture::new();
     std::fs::write(fixture.repo.join("package-lock.json"), "{}").expect("lockfile");
     git(&fixture.repo, &["add", "-A"]);
@@ -5343,7 +5566,7 @@ fn a_baseline_whose_commands_cannot_run_blocks_before_any_worker() {
         .expect("profile")
         .cache_baseline = true;
     let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let backend = counting_worker(Arc::clone(&launches));
+    let backend = changing_worker(Arc::clone(&launches));
     let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
     let RunOutcome {
         run_id,
@@ -5353,7 +5576,12 @@ fn a_baseline_whose_commands_cannot_run_blocks_before_any_worker() {
         panic!("expected blocked, got {outcome:?}");
     };
     assert_eq!(code, BlockCode::BaselineUnrunnable, "{detail}");
-    assert_eq!(launches.load(Ordering::SeqCst), 0, "no worker was bought");
+    assert_eq!(
+        launches.load(Ordering::SeqCst),
+        1,
+        "one worker, then the base"
+    );
+    assert_kept_after_base(&fixture, &run_id, State::Blocked, &detail);
     assert!(detail.contains("exited 127"), "{detail}");
     assert!(
         detail.contains("package-lock.json is present"),
@@ -5364,21 +5592,19 @@ fn a_baseline_whose_commands_cannot_run_blocks_before_any_worker() {
         "the exact block is suggested: {detail}"
     );
     assert!(detail.contains("re-grant trust"), "{detail}");
-    let check_logs = evidence_of(&fixture, &run_id, EvidenceKind::CheckLog);
+    let check_logs: Vec<(String, String)> = evidence_of(&fixture, &run_id, EvidenceKind::CheckLog)
+        .into_iter()
+        .filter(|(path, _)| path.contains("base-cmd"))
+        .collect();
     assert_eq!(
         check_logs.len(),
         2,
         "both base logs are evidence: {check_logs:?}"
     );
     for (path, sha) in &check_logs {
-        assert!(path.contains("base-cmd"), "{path}");
         let bytes = std::fs::read(path).expect("the log exists");
         assert_eq!(sha, &crate::ids::sha256_hex(&bytes), "{path}");
     }
-    assert!(
-        !fixture.worktree(&run_id).exists(),
-        "no task worktree was created"
-    );
     let cache_dir = fixture.artifacts.parent().unwrap().join("baseline-cache");
     let cached = std::fs::read_dir(&cache_dir)
         .map(|entries| entries.count())
@@ -5393,9 +5619,9 @@ fn a_baseline_whose_commands_cannot_run_blocks_before_any_worker() {
 /// A check that ran past its wall limit at the base is a base that
 /// could not be verified, not a base that failed: nothing ran to a
 /// verdict, so there is nothing to compare a candidate against.
-/// Blocked before any worker, and the detail names the check, how it
-/// ended, and the limit it ran against — not a claim that the code
-/// is broken.
+/// Blocked at the first red candidate (ADR-0013), with the candidate
+/// kept, and the detail names the check, how it ended, and the limit it
+/// ran against — not a claim that the code is broken.
 #[test]
 fn a_baseline_check_the_wall_clock_kills_is_unrunnable_not_failed() {
     let fixture = Fixture::new();
@@ -5413,17 +5639,22 @@ fn a_baseline_check_the_wall_clock_kills_is_unrunnable_not_failed() {
         3,
     );
     let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let backend = counting_worker(Arc::clone(&launches));
+    let backend = changing_worker(Arc::clone(&launches));
     let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
     let RunOutcome {
+        run_id,
         terminal: Terminal::Blocked { code, detail },
-        ..
     } = outcome
     else {
         panic!("expected blocked, got {outcome:?}");
     };
     assert_eq!(code, BlockCode::BaselineUnrunnable, "{detail}");
-    assert_eq!(launches.load(Ordering::SeqCst), 0, "no worker was bought");
+    assert_eq!(
+        launches.load(Ordering::SeqCst),
+        1,
+        "one worker, then the base"
+    );
+    assert_kept_after_base(&fixture, &run_id, State::Blocked, &detail);
     assert!(detail.contains("timed out"), "{detail}");
     assert!(detail.contains("1s wall limit"), "{detail}");
     assert!(
@@ -5448,7 +5679,7 @@ fn a_declared_setup_that_does_not_make_the_program_available_says_so() {
     git(&fixture.repo, &["commit", "-q", "-m", "lockfile"]);
     let repo =
         fixture.repo_policy_with_setup(vec![sh("true")], vec![sh("relais-no-such-binary-4f3a")], 3);
-    let backend = conditional_worker("");
+    let backend = changing_worker(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
     let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
     let RunOutcome {
         terminal: Terminal::Blocked { code, detail },
@@ -5469,18 +5700,22 @@ fn a_declared_setup_that_does_not_make_the_program_available_says_so() {
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
-/// A setup that fails at the base blocks the run: its log is evidence
-/// with a matching hash, and the commands never ran.
+/// A setup that fails at the base, checked on demand for a red candidate
+/// (ADR-0013), blocks the run with the candidate kept: its log is
+/// evidence with a matching hash, and the base's commands never ran.
 #[test]
-fn a_failing_setup_at_the_base_blocks_and_launches_nothing() {
+fn a_failing_setup_at_the_base_blocks_at_the_first_red_candidate() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy_with_setup(
-        vec![sh("echo boom >&2; exit 1"), sh("echo never")],
-        vec![passing_check()],
+        vec![
+            sh("case \"$(pwd -P)\" in */verify-base) echo boom >&2; exit 1;; esac"),
+            sh("echo never"),
+        ],
+        vec![sh("exit 1")],
         3,
     );
     let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let backend = counting_worker(Arc::clone(&launches));
+    let backend = changing_worker(Arc::clone(&launches));
     let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
     let RunOutcome {
         run_id,
@@ -5490,10 +5725,14 @@ fn a_failing_setup_at_the_base_blocks_and_launches_nothing() {
         panic!("expected blocked, got {outcome:?}");
     };
     assert_eq!(code, BlockCode::VerificationSetupFailed, "{detail}");
-    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert_kept_after_base(&fixture, &run_id, State::Blocked, &detail);
     assert!(detail.contains("the base revision"), "{detail}");
     assert!(detail.contains("exit 1"), "{detail}");
-    let setup_logs = evidence_of(&fixture, &run_id, EvidenceKind::SetupLog);
+    let setup_logs: Vec<(String, String)> = evidence_of(&fixture, &run_id, EvidenceKind::SetupLog)
+        .into_iter()
+        .filter(|(path, _)| path.contains("base-setup"))
+        .collect();
     assert_eq!(setup_logs.len(), 1, "{setup_logs:?}");
     let (path, sha) = &setup_logs[0];
     assert!(path.ends_with("base-setup0.log"), "{path}");
@@ -5509,7 +5748,181 @@ fn a_failing_setup_at_the_base_blocks_and_launches_nothing() {
         !logs.join("base-cmd0.log").exists(),
         "the commands never ran"
     );
-    assert!(evidence_of(&fixture, &run_id, EvidenceKind::CheckLog).is_empty());
+    assert!(evidence_of(&fixture, &run_id, EvidenceKind::CheckLog)
+        .iter()
+        .all(|(path, _)| !path.contains("base-cmd")));
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+/// A check red at the candidate and at the base, that appends a line to
+/// `counter` each time it runs in the base's tree.
+fn red_everywhere_counting_base_runs(counter: &Path) -> CommandSpec {
+    sh(&format!(
+        "case \"$(pwd -P)\" in */verify-base) echo ran >> '{}';; esac; exit 1",
+        counter.display().to_string().replace('\\', "/")
+    ))
+}
+
+fn lines_in(path: &Path) -> usize {
+    std::fs::read_to_string(path).map_or(0, |text| text.lines().count())
+}
+
+/// A red candidate on a deferred base (ADR-0013) runs only its red checks
+/// on the base, each logged under its profile index: the green command 0
+/// never runs there, red command 1 does as `base-cmd1`. The failure is
+/// pre-existing, so the run ends `baseline_failure_not_waived`, and the
+/// base's tree is gone.
+#[test]
+fn a_red_candidate_runs_only_its_red_checks_on_the_base() {
+    let fixture = Fixture::new();
+    let counter = fixture.dir.join("base-runs");
+    let red = red_everywhere_counting_base_runs(&counter);
+    let red_label = crate::verify::check_label(&red);
+    let repo = fixture.repo_policy(vec![passing_check(), red], 3);
+    let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let outcome = fixture.execute(
+        &fixture.contract(Review::Off),
+        &repo,
+        &changing_worker(Arc::clone(&launches)),
+    );
+    let RunOutcome {
+        run_id,
+        terminal: Terminal::NeedsDecision { reason, detail },
+    } = outcome
+    else {
+        panic!("expected needs_decision, got {outcome:?}");
+    };
+    assert_eq!(reason, Reason::BaselineFailureNotWaived, "{detail}");
+    assert_eq!(lines_in(&counter), 1, "the red check ran once on the base");
+    let logs = fixture.artifacts.join(run_id.as_str()).join("logs");
+    assert!(
+        logs.join("base-cmd1.log").exists(),
+        "the profile index is kept"
+    );
+    assert!(
+        !logs.join("base-cmd0.log").exists(),
+        "a green check never runs on the base"
+    );
+    let phases = fixture
+        .ledger
+        .check_timing_phases(&run_id)
+        .expect("timings");
+    let base: Vec<&(String, String)> = phases.iter().filter(|(phase, _)| phase == "base").collect();
+    assert_eq!(base.len(), 1, "{phases:?}");
+    assert_eq!(base[0].1, red_label);
+    let events =
+        std::fs::read_to_string(fixture.artifacts.join(run_id.as_str()).join("events.jsonl"))
+            .expect("events.jsonl");
+    assert!(events.contains("on demand · 1 check"), "{events}");
+    assert!(events.contains("1 check · 1 red on base"), "{events}");
+    assert!(!fixture.verify_dir(&run_id).join("verify-base").exists());
+    assert_eq!(cache_entries(&fixture), 0, "a partial base is never cached");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+/// A second red attempt asks the base again for the same labels: the memo
+/// answers, and nothing runs on the base twice.
+#[test]
+fn a_second_red_attempt_reuses_the_base_checked_on_demand() {
+    let fixture = Fixture::new();
+    let counter = fixture.dir.join("base-runs");
+    let repo = fixture.repo_policy_with_setup(
+        vec![sh("true")],
+        vec![red_everywhere_counting_base_runs(&counter)],
+        3,
+    );
+    let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let outcome = fixture.execute(
+        &fixture.contract(Review::Off),
+        &repo,
+        &changing_worker(Arc::clone(&launches)),
+    );
+    assert!(
+        launches.load(Ordering::SeqCst) >= 2,
+        "more than one red attempt: {outcome:?}"
+    );
+    assert_eq!(lines_in(&counter), 1, "the base ran once: {outcome:?}");
+    let logs = fixture.artifacts.join(outcome.run_id.as_str()).join("logs");
+    assert!(logs.join("base-setup0.log").exists());
+    let base_setups = evidence_of(&fixture, &outcome.run_id, EvidenceKind::SetupLog)
+        .into_iter()
+        .filter(|(path, _)| path.contains("base-setup"))
+        .count();
+    assert_eq!(base_setups, 1, "the base's setup ran once");
+    assert!(!fixture
+        .verify_dir(&outcome.run_id)
+        .join("verify-base")
+        .exists());
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+/// An inspection's tree is the base's: on a red, deferred base its own red
+/// checks are the base's failures, so it is accepted with nothing run on
+/// the base (ADR-0013).
+#[test]
+fn an_identical_tree_inspection_on_a_red_base_is_accepted_without_a_base_run() {
+    let fixture = Fixture::new();
+    let counter = fixture.dir.join("base-runs");
+    let red = red_everywhere_counting_base_runs(&counter);
+    let label = crate::verify::check_label(&red);
+    let repo = fixture.repo_policy(vec![red], 3);
+    let (backend, launches) = inspecting_backend("DONE: the check is red at the base", "unused");
+    let outcome = fixture.execute(&inspect_contract(), &repo, &backend);
+    let RunOutcome {
+        run_id,
+        terminal: Terminal::Accepted(receipt),
+    } = outcome
+    else {
+        panic!("expected acceptance, got {outcome:?}");
+    };
+    assert_eq!(
+        launches.lock().expect("launches").len(),
+        1,
+        "the worker only"
+    );
+    assert_eq!(lines_in(&counter), 0, "nothing ran on the base");
+    assert!(receipt.verification.baseline_deferred);
+    assert_eq!(receipt.verification.baseline_failures, vec![label]);
+    let logs = fixture.artifacts.join(run_id.as_str()).join("logs");
+    assert!(!logs.join("base-cmd0.log").exists());
+    assert!(!fixture.verify_dir(&run_id).join("verify-base").exists());
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+/// The base checked on demand keeps its full outcomes, JUnit included: a
+/// candidate whose failing tests all fail at the base too ends
+/// `baseline_failure_not_waived` on attempt 1, with no repair spent.
+#[test]
+fn a_junit_preexisting_failure_on_a_deferred_base_spends_no_repair() {
+    let fixture = Fixture::new();
+    let script = "if case \"$(pwd -P)\" in */verify-base) true;; *) false;; esac; then \
+                  printf '%s' '<testsuite><testcase name=\"a\"><failure/></testcase>\
+                  <testcase name=\"b\"><failure/></testcase></testsuite>' > junit.xml; \
+                  else printf '%s' '<testsuite><testcase name=\"a\"><failure/></testcase>\
+                  <testcase name=\"b\"/></testsuite>' > junit.xml; fi; exit 1";
+    let repo = fixture.repo_policy(
+        vec![CommandSpec {
+            junit: Some("junit.xml".into()),
+            ..sh(script)
+        }],
+        3,
+    );
+    let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let outcome = fixture.execute(
+        &fixture.contract(Review::Off),
+        &repo,
+        &changing_worker(Arc::clone(&launches)),
+    );
+    let RunOutcome {
+        terminal: Terminal::NeedsDecision { reason, detail },
+        ..
+    } = outcome
+    else {
+        panic!("expected needs_decision, got {outcome:?}");
+    };
+    assert_eq!(reason, Reason::BaselineFailureNotWaived, "{detail}");
+    assert!(detail.contains("no repair was spent"), "{detail}");
+    assert_eq!(launches.load(Ordering::SeqCst), 1, "attempt 1 only");
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
@@ -5536,13 +5949,14 @@ fn a_baseline_verdict_is_keyed_by_the_tree_not_the_commit() {
         fixture.execute_with_machine(&fixture.contract(Review::Off), &repo, &machine, &backend)
     };
     let RunOutcome {
+        run_id: first_id,
         terminal: Terminal::Accepted(first),
-        ..
     } = run(&fixture)
     else {
         panic!("first run");
     };
     assert!(!first.verification.baseline_cached);
+    seed_baseline_cache(&fixture, &repo, &first_id, &first.verification.checks);
 
     git(
         &fixture.repo,
@@ -6330,12 +6744,13 @@ fn a_cache_hit_still_runs_task_setup_and_a_failure_launches_nothing() {
     else {
         panic!("{first:?}");
     };
-    assert!(
-        !receipt.verification.baseline_cached,
-        "the first run fills the cache"
-    );
+    assert!(!receipt.verification.baseline_cached);
     let first_logs = fixture.artifacts.join(first_id.as_str()).join("logs");
-    assert!(first_logs.join("base-setup0.log").exists());
+    assert!(
+        !first_logs.join("base-setup0.log").exists(),
+        "a green run on a deferred base never set the base up"
+    );
+    seed_baseline_cache(&fixture, &repo, &first_id, &receipt.verification.checks);
     assert!(first_logs.join("task-setup0.log").exists());
     assert!(first_logs.join("attempt1-setup0.log").exists());
 
@@ -6531,20 +6946,21 @@ fn a_candidate_exit_127_is_a_candidate_failure() {
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
-/// A candidate that is the base tree reuses the baseline's outcomes,
-/// and with them the base's setup: nothing is installed twice.
+/// A candidate that is the base tree, on a deferred base (ADR-0013), is
+/// verified as itself: the base never ran, so it has nothing to reuse,
+/// and its setup is installed once, for the candidate.
 #[test]
-fn an_identical_candidate_reuses_the_baseline_and_skips_setup() {
+fn an_identical_candidate_on_a_deferred_base_is_verified_as_itself() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy_with_setup(vec![sh("true")], vec![passing_check()], 1);
     let backend = conditional_worker("");
     let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
     let logs = fixture.artifacts.join(outcome.run_id.as_str()).join("logs");
-    assert!(logs.join("base-setup0.log").exists());
+    assert!(!logs.join("base-setup0.log").exists(), "{outcome:?}");
     assert!(logs.join("task-setup0.log").exists());
     assert!(
-        !logs.join("attempt1-setup0.log").exists(),
-        "the base's outcomes were reused, setup included: {outcome:?}"
+        logs.join("attempt1-setup0.log").exists(),
+        "the candidate is set up and checked itself: {outcome:?}"
     );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
@@ -9897,13 +10313,16 @@ fn an_in_place_runs_base_seed_keeps_the_callers_window() {
     let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
     backdate(&fixture.repo.join("node_modules/dep/index.js"), long_ago);
     backdate(&fixture.repo.join("node_modules/dep"), long_ago);
-    let (repo, machine) = in_place_policy(&fixture);
+    // A check red everywhere: the candidate goes red, so the deferred
+    // base is checked on demand and seeded (ADR-0013).
+    let repo = fixture.repo_policy_with_setup(Vec::new(), vec![sh("exit 1")], 1);
+    let machine = fixture.machine_for(&repo);
     let outcome = fixture.execute_in(
         Workspace::InPlace,
         &fixture.contract(Review::Off),
         &repo,
         &machine,
-        &conditional_worker("relais task"),
+        &changing_worker(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
     );
     let decisions = decisions_of(&fixture, &outcome.run_id);
     assert_eq!(

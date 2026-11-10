@@ -239,7 +239,12 @@ impl<'a> RunEngine<'a> {
         notes.extend(self.guidance_note(&preflight.manifest));
         let report = VerificationReport {
             notes,
-            ..verification_report(attempt, candidate, verified)
+            ..verification_report(
+                attempt,
+                candidate,
+                verified,
+                self.base_failures(attempt.baseline),
+            )
         };
         let patch_adds_test = self.patch_adds_test(attempt, &candidate.sha)?;
         let (criteria, mandatory_evidence_independence) = self.settle(
@@ -551,7 +556,8 @@ impl<'a> RunEngine<'a> {
             );
             None
         };
-        let report = verification_report(ctx, candidate, &verified);
+        let report =
+            verification_report(ctx, candidate, &verified, self.base_failures(ctx.baseline));
         let (criteria, _) = self.settle(
             ctx,
             &report,
@@ -1064,10 +1070,13 @@ impl<'a> RunEngine<'a> {
 }
 
 /// The report a candidate's checks, gaps and amont findings add up to.
+/// `baseline_failures` is the merged view: the baseline's, and what the
+/// base checked on demand found (ADR-0013).
 pub(super) fn verification_report(
     ctx: &AttemptContext<'_>,
     candidate: &Candidate,
     verified: &Verified,
+    baseline_failures: Vec<String>,
 ) -> VerificationReport {
     let preflight = ctx.preflight;
     VerificationReport {
@@ -1079,7 +1088,7 @@ pub(super) fn verification_report(
         gaps: verified.gaps.clone(),
         gaps_not_judged: verified.gaps_not_judged.clone(),
         notes: verified.notes.clone(),
-        baseline_failures: ctx.baseline.failures.clone(),
+        baseline_failures,
         amont_bypasses: verified.amont_bypasses.clone(),
         amont_downgrades: verified.amont_downgrades.clone(),
         verification_inputs_changed: verified.verification_inputs_changed.clone(),
@@ -1087,6 +1096,7 @@ pub(super) fn verification_report(
         baseline_cached: ctx.baseline.cached,
         baseline_cache_refused: ctx.baseline.cache_refused.clone(),
         baseline_proven: ctx.baseline.proven,
+        baseline_deferred: ctx.baseline.deferred,
     }
 }
 

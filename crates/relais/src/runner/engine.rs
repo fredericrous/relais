@@ -2,14 +2,14 @@
 
 use super::setup_gate;
 use super::{
-    admission_block, baseline_summary, decide, exhaustion, fresh_progress, scheduler,
-    setup_failure_detail, state_sibling, sweep_ended_verify_dirs, verify, verify_root, workspace,
-    worktree_root, Arc, AtomicBool, AttemptContext, AttemptKind, BlockCode, Budget, BudgetClock,
-    BudgetLimits, Budgets, Candidate, CostKind, Duration, EffectiveAuthority, Event, Events,
-    EvidenceKind, Exhausted, Finish, Gate, Instant, KeptCandidate, Limit, Next, Observation,
-    Ordering, PackageId, PackageRole, PathBuf, Phase, Reason, Refusal, Request, RunConfig,
-    RunEngine, RunError, RunId, RunOutcome, State, Summary, Terminal, Transition, UsagePhase,
-    ADMISSION_POLL,
+    admission_block, baseline_summary, decide, exhaustion, fresh_progress, kept_sentence,
+    scheduler, setup_failure_detail, state_sibling, sweep_ended_verify_dirs, verify, verify_root,
+    workspace, worktree_root, Arc, AtomicBool, AttemptContext, AttemptKind, BaseMemo, BlockCode,
+    Budget, BudgetClock, BudgetLimits, Budgets, Candidate, CostKind, Duration, EffectiveAuthority,
+    Event, Events, EvidenceKind, Exhausted, Finish, Gate, Instant, KeptCandidate, Limit, Next,
+    Observation, Ordering, PackageId, PackageRole, PathBuf, Phase, Reason, Refusal, Request,
+    RunConfig, RunEngine, RunError, RunId, RunOutcome, State, Summary, Terminal, Transition,
+    UsagePhase, ADMISSION_POLL,
 };
 
 impl<'a> RunEngine<'a> {
@@ -86,6 +86,7 @@ impl<'a> RunEngine<'a> {
             inplace: None,
             last_snapshot: None,
             timed_out_settled: None,
+            base_memo: BaseMemo::default(),
             reviewer_gap: None,
             candidates_run: None,
             worker_code_rules_gap: None,
@@ -152,7 +153,7 @@ impl<'a> RunEngine<'a> {
 
     /// Whether the coordinator has cancelled this run: the watcher saw it,
     /// or the gate says so now.
-    fn cancel_requested(&self) -> bool {
+    pub(super) fn cancel_requested(&self) -> bool {
         self.cancel_asked.load(Ordering::SeqCst)
             || self
                 .config
@@ -274,6 +275,9 @@ impl<'a> RunEngine<'a> {
         // A package (child) run has its own run id and so its own holdout
         // directory; it removes it here like a root run does.
         self.remove_holdout_dir();
+        // The base checked on demand kept its `verify-base` tree for the
+        // run: it goes now, whatever the ending (ADR-0013).
+        self.release_base_tree();
         // Each verification worktree removed itself; the run's own
         // `verify/<run>/` directory is left empty, and goes too. One that
         // still holds a file (a release that failed) stays visible.
@@ -705,6 +709,7 @@ impl<'a> RunEngine<'a> {
                 baseline_cached: baseline.cached,
                 baseline_cache_refused: &baseline.cache_refused,
                 baseline_proven: baseline.proven,
+                baseline_deferred: baseline.deferred,
                 logs_dir: &baseline.logs_dir,
                 holdouts: &preflight.holdouts,
             };
@@ -925,27 +930,6 @@ impl<'a> RunEngine<'a> {
         Some((label, found, measured))
     }
 
-    /// The base's failed check showed exhaustion: `blocked
-    /// (baseline_resource_exhausted)`, never a red base.
-    pub(super) fn end_on_baseline_exhaustion(
-        &mut self,
-        checks: &[verify::CheckOutcome],
-    ) -> Result<Option<RunOutcome>, RunError> {
-        let Some((label, found, measured)) = self.exhaustion_in(checks) else {
-            return Ok(None);
-        };
-        let detail = exhaustion::baseline_text(&label, &found, &measured);
-        self.finish(
-            Reason::BaselineResourceExhausted,
-            exhaustion::detail_json(&label, &found, &measured, None),
-            Terminal::BlockedBy {
-                reason: Reason::BaselineResourceExhausted,
-                detail,
-            },
-        )
-        .map(Some)
-    }
-
     /// The candidate's failed check showed exhaustion: `needs_decision
     /// (resource_exhausted)` with the candidate preserved and no repair
     /// (SPEC §10). Exhaustion is observed, not proof the code is innocent.
@@ -1091,11 +1075,7 @@ impl<'a> RunEngine<'a> {
                 }
                 let mut detail_json = serde_json::json!({ "detail": detail });
                 if let Some(kept) = candidate {
-                    detail.push_str(&format!(
-                        "; the candidate is kept: verify it again without a worker with a \
-                         `kind: verify` run, `candidate {{run: {}, index: {}}}`",
-                        kept.run, kept.index
-                    ));
+                    detail.push_str(&format!("; {}", kept_sentence(kept)));
                     detail_json = serde_json::json!({
                         "detail": detail,
                         "candidate": { "run": kept.run, "index": kept.index, "sha": kept.sha },

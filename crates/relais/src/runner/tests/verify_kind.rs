@@ -278,21 +278,39 @@ fn a_patch_changed_after_validation_ends_candidate_digest_mismatch() {
         .artifacts
         .join(source.as_str())
         .join("candidate-latest.patch");
-    // The baseline runs after validation and before the candidate is
-    // applied: it is where the file changes.
-    let repo = fixture.repo_policy(
-        // Forward slashes: `sh -c` reads a Windows path's backslashes as
-        // escapes and would append to another file.
-        vec![sh(&format!(
-            "echo tampered >> '{}'",
-            latest.display().to_string().replace('\\', "/")
-        ))],
-        3,
-    );
+    // The baseline step comes after validation and before the candidate is
+    // applied: it is where the file changes. The base is deferred
+    // (ADR-0013), so nothing runs there; the change is made by a reader
+    // of the run's own events as the step is announced.
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    struct TamperAtBaseline {
+        patch: PathBuf,
+    }
+    impl std::io::Write for TamperAtBaseline {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let line = String::from_utf8_lossy(buf);
+            if line.contains("\"name\":\"baseline\"") && line.contains("deferred") {
+                let mut file = std::fs::OpenOptions::new().append(true).open(&self.patch)?;
+                file.write_all(b"tampered\n")?;
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let wire = Wire::to(TamperAtBaseline {
+        patch: latest.clone(),
+    });
     let seen = launches();
     let backend = counting_worker(Arc::clone(&seen));
-    let (run_id, reason, detail) =
-        blocked_by(fixture.execute(&verify_contract(&source, None), &repo, &backend));
+    let (run_id, reason, detail) = blocked_by(fixture.execute_on(
+        wire,
+        None,
+        &verify_contract(&source, None),
+        &repo,
+        &backend,
+    ));
     assert_eq!(reason, Reason::CandidateDigestMismatch, "{detail}");
     assert!(detail.contains("candidate-latest.patch"), "{detail}");
     assert_eq!(seen.load(Ordering::SeqCst), 0);

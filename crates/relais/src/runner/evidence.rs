@@ -261,7 +261,7 @@ impl<'a> RunEngine<'a> {
             gaps,
             gaps_not_judged,
             notes,
-            baseline_failures: ctx.baseline.failures.clone(),
+            baseline_failures: self.base_failures(ctx.baseline),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
@@ -269,6 +269,7 @@ impl<'a> RunEngine<'a> {
             baseline_cached: ctx.baseline.cached,
             baseline_cache_refused: ctx.baseline.cache_refused.clone(),
             baseline_proven: ctx.baseline.proven,
+            baseline_deferred: ctx.baseline.deferred,
         };
         let patch_adds_test = self.patch_adds_test(ctx, &candidate.sha)?;
         let (criteria, mandatory_evidence_independence) = self.settle(

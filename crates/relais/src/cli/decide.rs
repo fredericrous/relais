@@ -841,6 +841,7 @@ mod tests {
                 baseline_cached: false,
                 baseline_cache_refused: None,
                 baseline_proven: false,
+                baseline_deferred: false,
             },
             kind: relais::contract::Kind::Change,
             candidate: None,

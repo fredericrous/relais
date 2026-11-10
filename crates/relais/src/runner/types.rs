@@ -186,6 +186,9 @@ pub(super) struct Baseline {
     /// amont reported every profile gate stamped or attested on the base
     /// tree, so the base was not run: it is green by that proof (t04).
     pub(super) proven: bool,
+    /// Neither cached nor proven: nothing ran on the base up front, and
+    /// it is checked only on a red candidate's red checks (ADR-0013).
+    pub(super) deferred: bool,
     /// Where this run's check logs are written.
     pub(super) logs_dir: PathBuf,
 }
