@@ -19,24 +19,9 @@
         "name": "baseline"
       },
       {
-        "kind": "check_started",
-        "label": "setup:sh@0500b2cc"
-      },
-      {
-        "kind": "output",
-        "label": "setup:sh@0500b2cc"
-      },
-      {
-        "kind": "check_ended",
-        "label": "setup:sh@0500b2cc"
-      },
-      {
-        "kind": "check_started",
-        "label": "sh@c151f618"
-      },
-      {
-        "kind": "check_ended",
-        "label": "sh@c151f618"
+        "kind": "decision",
+        "reason": "base tree <hex> is neither cached nor proven by amont; it is checked only when a candidate fails, and only on the checks that failed",
+        "what": "baseline_deferred"
       },
       {
         "kind": "step",
@@ -101,6 +86,34 @@
       {
         "kind": "check_ended",
         "label": "sh@c151f618"
+      },
+      {
+        "kind": "step",
+        "name": "baseline"
+      },
+      {
+        "kind": "check_started",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "output",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "check_ended",
+        "label": "setup:sh@0500b2cc"
+      },
+      {
+        "kind": "check_started",
+        "label": "sh@c151f618"
+      },
+      {
+        "kind": "check_ended",
+        "label": "sh@c151f618"
+      },
+      {
+        "kind": "step",
+        "name": "baseline"
       },
       {
         "kind": "decision",
@@ -291,6 +304,19 @@
         "name": "baseline"
       },
       {
+        "kind": "decision",
+        "reason": "base tree <hex> is neither cached nor proven by amont; it is checked only when a candidate fails, and only on the checks that failed",
+        "what": "baseline_deferred"
+      },
+      {
+        "kind": "step",
+        "name": "baseline"
+      },
+      {
+        "kind": "step",
+        "name": "worktree · setup"
+      },
+      {
         "kind": "check_started",
         "label": "setup:sh@b502577e"
       },
@@ -308,16 +334,22 @@
         "state": "blocked"
       },
       {
+        "kind": "phase",
+        "reason": "worktree_retired",
+        "state": "blocked"
+      },
+      {
         "kind": "outcome",
         "state": "blocked"
       }
     ],
     "logs": [
-      "base-setup0.log"
+      "task-setup0.log"
     ],
     "scenario": "blocked-by-failed-setup",
     "transitions": [
-      "  prepared -> blocked (blocked_preflight)"
+      "  prepared -> blocked (blocked_preflight)",
+      "  blocked -> blocked (worktree_retired)"
     ],
     "verify": [],
     "worktrees": []

@@ -30,7 +30,7 @@ use crate::admission::{
 };
 use crate::backend::{Backend, LaunchResult, LaunchSpec};
 use crate::context::{self, ContextManifest, Guidance, GuidanceGap, GuidanceSource, RuleRef};
-use crate::contract::{Review, TaskContract};
+use crate::contract::TaskContract;
 use crate::exhaustion;
 use crate::ids::{DispatchId, PackageId, RunId};
 use crate::ledger::{EvidenceKind, Ledger, LedgerError, Transition, UsageEvent};
@@ -73,7 +73,7 @@ mod workspace_ops;
 
 pub use crate::prune::sweep_ended_verify_dirs;
 pub use crate::workspace::OutOfScope;
-use baseline::{baseline_summary, setup_failure_detail};
+use baseline::{baseline_summary, kept_sentence, setup_failure_detail, BaseMemo};
 pub use config::{holdout_root, verify_root, worktree_root, DesignSource, RunConfig};
 use config::{retirement_detail, state_sibling};
 use error::Finish;
@@ -93,8 +93,8 @@ use spend::{fresh_progress, Progress};
 pub use types::PackageRole;
 use types::{
     cost_booked, dispatch_ended, harness_reading, split_profile_gaps, unpriced_native_model,
-    AttemptContext, Attempted, Baseline, Candidate, CandidateConflicts, Dispatched, InPlaceRun,
-    PendingEvidence, Preflight, PreparedCandidate, Snapshot, Step, Verified,
+    AttemptContext, Attempted, BaseSource, Baseline, Candidate, CandidateConflicts, Dispatched,
+    InPlaceRun, PendingEvidence, Preflight, PreparedCandidate, Snapshot, Step, Verified,
 };
 pub(crate) use types::{AttemptLabel, KeptCandidate, ManagedDispatch, Phase};
 
@@ -278,6 +278,8 @@ pub(crate) struct RunEngine<'a> {
     /// The answer relais gave this run's wall-time stop, written before its
     /// worktree was retired; the run's end reads it for its outcome.
     pub(in crate::runner) timed_out_settled: Option<successor::Settled>,
+    /// What the base checked on demand established so far (ADR-0013).
+    pub(in crate::runner) base_memo: BaseMemo<'a>,
 }
 
 #[cfg(test)]

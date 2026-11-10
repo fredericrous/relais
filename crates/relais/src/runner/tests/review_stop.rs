@@ -411,7 +411,7 @@ fn an_inspection_whose_report_review_is_unavailable_is_approvable() {
     let RunOutcome {
         run_id,
         terminal: Terminal::NeedsReview { .. },
-    } = fixture.execute(&inspect_contract(), &repo, &backend)
+    } = fixture.execute(&super::required(inspect_contract()), &repo, &backend)
     else {
         panic!("an unavailable report review is needs_review");
     };

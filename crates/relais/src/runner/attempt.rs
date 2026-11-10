@@ -7,9 +7,9 @@ use super::{
     spend_limit, split_profile_gaps, unpriced_native_model, verify, workspace, AgentKind,
     AttemptContext, AttemptKind, AttemptLabel, Attempted, BlockCode, Candidate, Ceiling,
     Dispatched, Duration, Ended, EvidenceKind, Instant, LaunchSpec, Limit, ManagedDispatch, Next,
-    Observation, PathBuf, PendingEvidence, Phase, Progress, Reason, RepairFailure, Review,
-    RunEngine, RunError, RunOutcome, Snapshot, State, Step, Terminal, UsageEvent, Verified,
-    VerifyFailure, WorkspaceError,
+    Observation, PathBuf, PendingEvidence, Phase, Progress, Reason, RepairFailure, RunEngine,
+    RunError, RunOutcome, Snapshot, State, Step, Terminal, UsageEvent, Verified, VerifyFailure,
+    WorkspaceError,
 };
 use crate::backend::{LoopedWorker, Repeated};
 
@@ -1001,9 +1001,9 @@ impl<'a> RunEngine<'a> {
         // verification": §9's table sends that to the user as
         // `needs_decision`, because no reviewer can decide on the
         // user's behalf that a loosened build is what was wanted.
-        // Editing the TEST TREE is work §10 explicitly invites, so
-        // it stays what it was: explicit review, whatever the route
-        // said (audit B8).
+        // Editing the TEST TREE is work §10 explicitly invites: it is
+        // recorded, and reviewed only under `review: required`
+        // (ADR-0013).
         let touched_inputs = verify::classify_with_holdout_inputs(
             &authority.verification_profile,
             &crate::holdout::protected_inputs(&ctx.preflight.holdouts),
@@ -1036,8 +1036,10 @@ impl<'a> RunEngine<'a> {
             )?));
         }
         let verification_inputs_changed = touched_inputs.tests;
-        let review_required = ctx.preflight.decision.review >= Review::Required
-            || !verification_inputs_changed.is_empty();
+        // Editing the test tree no longer forces a review (ADR-0013): the
+        // paths ride on the receipt, and the reviewer's prompt names them
+        // when the routed level asks for one.
+        let review_required = ctx.preflight.decision.review.is_required();
 
         // A candidate that carries the base tree has the baseline's
         // results by identity: the commands are not spent again, and
@@ -1067,17 +1069,6 @@ impl<'a> RunEngine<'a> {
                 .result_text
                 .as_deref()
                 .is_none_or(|text| text.trim().is_empty());
-        // Entered only once the candidate is to be verified.
-        if !verification_inputs_changed.is_empty()
-            && ctx.preflight.decision.review < Review::Required
-        {
-            self.transition(
-                State::Verifying,
-                Reason::VerificationInputsChanged,
-                serde_json::json!({ "paths": verification_inputs_changed }),
-            )?;
-        }
-
         // Verification against an immutable copy of the candidate
         // (SPEC §10). Entering `verifying` is a transition like every
         // other: assigned straight to the field, the ledger never
@@ -1094,7 +1085,7 @@ impl<'a> RunEngine<'a> {
                 Reason::CandidateIdenticalToBase,
                 serde_json::json!({ "candidate": candidate.sha }),
             )?;
-            ctx.baseline.checks.as_deref()
+            ctx.baseline.checks()
         } else {
             None
         };
@@ -1239,16 +1230,34 @@ impl<'a> RunEngine<'a> {
                 self.stop(&progress.budget, Observation::VerificationGap(gaps))?,
             ));
         }
+        // Proof, else lazy (ADR-0013): a base that was neither cached nor
+        // proven is checked now, on this candidate's red checks only. A
+        // candidate carrying the base tree is the base: its own red checks
+        // are the base's failures, and nothing runs again. A `kind: verify`
+        // change fails on any red check whatever the base says, so the
+        // base is not run for it.
+        let red: Vec<String> = checks
+            .iter()
+            .filter(|check| check.failed())
+            .map(|check| check.label.clone())
+            .collect();
+        let base_decides = inspecting || !self.config.contract.is_verify();
+        if ctx.baseline.is_deferred() && !red.is_empty() && base_decides {
+            if identical {
+                self.base_is_candidate(&checks);
+            } else if let Some(outcome) =
+                self.base_on_demand(ctx, &candidate, &red, &progress.budget)?
+            {
+                return Ok(Step::Ended(outcome));
+            }
+        }
+        let base_failures = self.base_failures(ctx.baseline);
         // An inspection changes nothing, so a check already failing at
         // the base is not its to repair (SPEC §10).
         let mut failures: Vec<String> = if inspecting {
-            verify::new_failure_labels(&checks, &ctx.baseline.failures)
+            verify::new_failure_labels(&checks, &base_failures)
         } else {
-            checks
-                .iter()
-                .filter(|check| check.failed())
-                .map(|check| check.label.clone())
-                .collect()
+            red
         };
         let check_count = failures.len();
         let acceptance = self.effective_acceptance()?;
@@ -1300,9 +1309,7 @@ impl<'a> RunEngine<'a> {
             let same_failures =
                 progress.last_failures.as_deref() == Some(repair_failures.as_slice());
             progress.last_candidate = Some(candidate.sha.clone());
-            let all_preexisting = failures
-                .iter()
-                .all(|label| ctx.baseline.failures.contains(label));
+            let all_preexisting = failures.iter().all(|label| base_failures.contains(label));
             progress.last_failures = Some(repair_failures);
             // Plan C1: complete JUnit on both sides says every failing
             // test already fails at the base and nothing targets it. A
@@ -1314,10 +1321,8 @@ impl<'a> RunEngine<'a> {
                     None
                 };
             progress.holdout_stop = holdout_only.clone();
-            if let Some(tests) = ctx
-                .baseline
-                .checks
-                .as_deref()
+            if let Some(tests) = self
+                .base_checks(ctx.baseline)
                 .filter(|_| holdout_failures.is_empty())
                 .and_then(|base| {
                     verify::guarded_preexisting(

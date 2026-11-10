@@ -13,6 +13,7 @@ use super::config::holdout_root;
 use super::engine::{watch_cancel, CancelWatch};
 use super::holdout_exposure::{scan_transcript, Markers};
 use super::setup_gate;
+use super::workspace_ops::SetupWithin;
 use super::{AttemptLabel, HoldoutStop, RunEngine, RunError, VerifyFailure};
 use crate::holdout::{self, ResolvedHoldout};
 use crate::ledger::HoldoutOutcomeRow;
@@ -486,7 +487,10 @@ impl<'a> RunEngine<'a> {
                 &authority.verification_profile,
                 &logs,
                 &prefix,
-                cancel,
+                SetupWithin {
+                    cancel,
+                    budgets: &self.budgets,
+                },
             )
         });
         let setup = match setup {

@@ -841,6 +841,7 @@ mod tests {
                 baseline_cached: false,
                 baseline_cache_refused: None,
                 baseline_proven: false,
+                baseline_deferred: false,
             },
             kind: relais::contract::Kind::Change,
             candidate: None,
@@ -853,6 +854,7 @@ mod tests {
             mandatory_evidence_independence: None,
             recipe: relais::policy::RecipeRecord::NotRecorded,
             verification_profile_hash: "vph".into(),
+            review_level: None,
             review: ReviewRecord::NotRun(ReviewNotRun::OverBudget {
                 patch_bytes: 300_000,
                 budget_bytes: 196_608,

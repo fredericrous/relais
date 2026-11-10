@@ -839,6 +839,26 @@ impl Ledger {
             .collect())
     }
 
+    /// Every attempt of a run with the state it finished in and the
+    /// candidate it kept, by attempt index: what a test of an ending reads.
+    #[cfg(test)]
+    pub(crate) fn attempt_endings(&self, id: &RunId) -> Result<Vec<(u32, String, Option<String>)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT attempt_index, state, candidate_sha FROM attempts
+              WHERE run_id = ?1 ORDER BY attempt_index, id",
+        )?;
+        let rows = statement
+            .query_map([id.as_str()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// The base a run's contract resolved to (SPEC §4), from its newest
     /// contract revision.
     pub fn run_base_sha(&self, id: &RunId) -> Result<Option<String>> {

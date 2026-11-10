@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 
 use crate::backend::LaunchSpec;
 use crate::context::ContextManifest;
+use crate::contract::WorkPackage;
 use crate::contract::{Decomposition, DecompositionMode, Kind, TaskContract, WorkPlan};
-use crate::contract::{Review, WorkPackage};
 use crate::ledger::UsageEvent;
 use crate::lifecycle::UsagePhase;
 use crate::money::MicroUsd;
@@ -64,6 +64,9 @@ pub(crate) struct RootContext<'a> {
     pub baseline_cache_refused: &'a Option<crate::verify::CacheRefused>,
     /// The base was proven by amont's stamps and not run (t04).
     pub baseline_proven: bool,
+    /// The base was neither cached nor proven, so nothing ran up front
+    /// (ADR-0013). The scheduler never attributes failures to the base.
+    pub baseline_deferred: bool,
     pub logs_dir: &'a Path,
     /// The holdouts the root contract names (ADR-0045): their overlay paths
     /// are reserved and their inputs protected on the assembled candidate.
@@ -1057,8 +1060,9 @@ fn accept_integrated(
         completeness: ledger.run_cost_completeness(&engine.run_id)?,
     };
     let verification_inputs_changed = assembled.touched_inputs.tests.clone();
-    let review_required =
-        root.decision.review >= Review::Required || !verification_inputs_changed.is_empty();
+    // Edited tests are recorded, not reviewed, unless the routed level
+    // asks for a review (ADR-0013).
+    let review_required = root.decision.review.is_required();
     if review_required {
         // A patch one reviewer cannot be given to read dispatches no
         // reviewer: the run asks a person (SPEC §10).
@@ -1231,6 +1235,7 @@ fn integrated_receipt(
         baseline_cached: root.baseline_cached,
         baseline_cache_refused: root.baseline_cache_refused.clone(),
         baseline_proven: root.baseline_proven,
+        baseline_deferred: root.baseline_deferred,
     };
     // The criteria settled here are the ROOT contract's, not the work
     // plan's `integration_acceptance` — the latter is still bare strings
@@ -1253,7 +1258,7 @@ fn integrated_receipt(
         },
         engine.config.contract.kind(),
         assembled.patch_adds_test,
-        None,
+        verify::ReportJudgment::Missing,
     );
     Ok(Receipt {
         run_id: engine.run_id.as_str().to_string(),
@@ -1280,6 +1285,7 @@ fn integrated_receipt(
         ),
         verification_profile_hash: root.authority.verification_profile.hash(),
         review,
+        review_level: Some(root.decision.review),
         ladder: verify::LadderRecord::PerPackage(assembly.ladders.clone()),
         efforts_used: assembly.efforts_used.clone(),
         candidates: engine.candidates_record(&assembly.head),
@@ -1478,6 +1484,7 @@ pub fn package_dir(root_artifacts: &Path, package_id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::Review;
 
     #[test]
     fn coverage_is_prefix_based_and_conservative() {

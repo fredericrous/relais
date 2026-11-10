@@ -171,23 +171,71 @@ impl Preflight {
     }
 }
 
-/// What the base revision's own verification established (SPEC §10).
-pub(super) struct Baseline {
-    /// Check labels that already fail at the base.
-    pub(super) failures: Vec<String>,
-    /// The base's outcomes when the commands actually ran: a candidate
-    /// carrying the base tree has exactly these, without spending them
-    /// again. `None` when the verdict came from the cache.
-    pub(super) checks: Option<Vec<verify::CheckOutcome>>,
-    /// The verdict came from the baseline cache (SPEC §18).
-    pub(super) cached: bool,
-    /// Why the baseline could not be cached, when it could not (V2).
-    pub(super) cache_refused: Option<verify::CacheRefused>,
+/// Where a run's knowledge of the base came from before any worker
+/// (SPEC §10, ADR-0013). Exactly one holds.
+pub(super) enum BaseSource {
+    /// A baseline-cache hit (SPEC §18): its failures, and its outcomes when
+    /// the entry kept them, so a candidate carrying the base tree has
+    /// exactly these without spending them again.
+    Cached {
+        failures: Vec<String>,
+        checks: Option<Vec<verify::CheckOutcome>>,
+    },
     /// amont reported every profile gate stamped or attested on the base
     /// tree, so the base was not run: it is green by that proof (t04).
-    pub(super) proven: bool,
+    Proven,
+    /// Neither cached nor proven: nothing ran on the base up front, and it
+    /// is checked only on a red candidate's red checks.
+    Deferred,
+}
+
+/// What the base revision's own verification established (SPEC §10).
+pub(super) struct Baseline {
+    pub(super) source: BaseSource,
+    /// Why the baseline could not be cached, when it could not (V2).
+    pub(super) cache_refused: Option<verify::CacheRefused>,
     /// Where this run's check logs are written.
     pub(super) logs_dir: PathBuf,
+}
+
+/// The three persisted receipt flags a [`BaseSource`] stands for.
+pub(super) struct BaselineFlags {
+    pub(super) cached: bool,
+    pub(super) proven: bool,
+    pub(super) deferred: bool,
+}
+
+impl Baseline {
+    /// Check labels already failing at the base before any worker: only a
+    /// cache hit knows any.
+    pub(super) fn failures(&self) -> &[String] {
+        match &self.source {
+            BaseSource::Cached { failures, .. } => failures,
+            BaseSource::Proven | BaseSource::Deferred => &[],
+        }
+    }
+
+    /// The base's outcomes a cache hit kept.
+    pub(super) fn checks(&self) -> Option<&[verify::CheckOutcome]> {
+        match &self.source {
+            BaseSource::Cached { checks, .. } => checks.as_deref(),
+            BaseSource::Proven | BaseSource::Deferred => None,
+        }
+    }
+
+    pub(super) fn is_deferred(&self) -> bool {
+        matches!(self.source, BaseSource::Deferred)
+    }
+
+    /// The receipt's `baseline_cached`, `baseline_proven` and
+    /// `baseline_deferred`, derived in this one place.
+    pub(super) fn flags(&self) -> BaselineFlags {
+        BaselineFlags {
+            cached: matches!(self.source, BaseSource::Cached { .. }),
+            proven: matches!(self.source, BaseSource::Proven),
+            deferred: self.is_deferred(),
+        }
+    }
 }
 
 /// Everything the attempt loop reads and never changes.

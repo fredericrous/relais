@@ -291,14 +291,18 @@ fn an_expiry_with_no_candidate_under_verification_names_none() {
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
     let machine = queued_machine(&fixture, &repo);
 
-    let baseline = fixture.execute_managed(
+    // The base is deferred (ADR-0013): the first heavy command is the
+    // task tree's setup, before any worker.
+    let with_setup = fixture.repo_policy_with_setup(vec![sh("true")], vec![main_gone_check()], 3);
+    let setup_machine = queued_machine(&fixture, &with_setup);
+    let task_setup = fixture.execute_managed(
         &fixture.contract(Review::Off),
-        &repo,
-        &machine,
+        &with_setup,
+        &setup_machine,
         &conditional_worker("relais task"),
         &QueueingGate::new(Heavy::Never, usize::MAX),
     );
-    assert!(blocked_detail(&fixture, &baseline)
+    assert!(blocked_detail(&fixture, &task_setup)
         .get("candidate")
         .is_none());
 
@@ -314,8 +318,9 @@ fn an_expiry_with_no_candidate_under_verification_names_none() {
         .is_none());
 }
 
-/// The heavy grants a baseline takes with one setup step: the step, then the checks.
-const HEAVY_GRANTS_OF_A_BASELINE: usize = 2;
+/// The heavy grants taken before the task tree's setup: none, since the
+/// base is deferred to the first red candidate (ADR-0013).
+const HEAVY_GRANTS_BEFORE_THE_TASK_SETUP: usize = 0;
 
 #[test]
 fn an_expiry_while_the_task_trees_setup_queues_ends_blocked() {
@@ -323,7 +328,7 @@ fn an_expiry_while_the_task_trees_setup_queues_ends_blocked() {
     let repo = fixture.repo_policy_with_setup(vec![sh("true")], vec![main_gone_check()], 3);
     let machine = queued_machine(&fixture, &repo);
     let gate = QueueingGate::new(
-        Heavy::AfterHeavyGrants(HEAVY_GRANTS_OF_A_BASELINE),
+        Heavy::AfterHeavyGrants(HEAVY_GRANTS_BEFORE_THE_TASK_SETUP),
         usize::MAX,
     );
     let outcome = fixture.execute_managed(
@@ -337,17 +342,15 @@ fn an_expiry_while_the_task_trees_setup_queues_ends_blocked() {
     // `BlockedBy` to `CliOutcome::Blocked`, which `cli/outcome.rs::exit_code`
     // maps to 3. The binary-only `cli` module is out of reach of this test.
     let detail = blocked_detail(&fixture, &outcome);
-    // The baseline finished first: its check ran and left its log. A stop
-    // during the baseline (`baseline.rs` handles that path already) ends
-    // with the same reason and no attempt, and would leave no such log.
+    // The base is deferred, so nothing of it ran before the stop.
     let base_log = fixture
         .artifacts
         .join(outcome.run_id.as_str())
         .join("logs")
         .join("base-cmd0.log");
     assert!(
-        base_log.exists(),
-        "the baseline's check ran before the stop: {}",
+        !base_log.exists(),
+        "the deferred base ran nothing: {}",
         base_log.display()
     );
     // The stop came while the setup queued: no worker was dispatched, so no

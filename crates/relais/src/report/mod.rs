@@ -76,8 +76,8 @@ fn accepted_by_person(
 /// status` prints, so its JSON agrees with the sentence a person sees),
 /// so a downstream parser can tell an old shape from a new one instead of
 /// guessing from key presence. 9: `never_shipped_tasks`. 10:
-/// `repair_outcomes`. 11: `advisor_data`. 12: `advisor_data` becomes `decision_labels`. 13: `harness`. 14: `holdouts`. 15: `answered`, the unknown subagents by parent and the unmatched check commands in session routing. 16: `holdouts.by_source`. 17: `harness.steps[].models[]` gains cost and tokens. 18: `auto_settled`.
-pub const REPORT_SCHEMA_VERSION: u32 = 18;
+/// `repair_outcomes`. 11: `advisor_data`. 12: `advisor_data` becomes `decision_labels`. 13: `harness`. 14: `holdouts`. 15: `answered`, the unknown subagents by parent and the unmatched check commands in session routing. 16: `holdouts.by_source`. 17: `harness.steps[].models[]` gains cost and tokens. 18: `auto_settled`. 19: `runs[]` gains `verification_inputs_changed`, `reviewed` and `review_level`.
+pub const REPORT_SCHEMA_VERSION: u32 = 19;
 
 /// A dimension `relais report --by` groups the window's tasks over (SPEC
 /// §11: "compare like task classes and policy versions"). Total over the
@@ -661,6 +661,44 @@ pub struct RunLine {
     /// worker wrote anything, so it is counted as its own kind.
     #[serde(default)]
     pub verify: bool,
+    /// The test and verification inputs the run's receipt says its
+    /// candidate edited; empty without a receipt.
+    #[serde(default)]
+    pub verification_inputs_changed: Vec<String>,
+    /// Whether a reviewer read the receipt's candidate (ADR-0013): `None`
+    /// without a receipt, or on one from before the review was recorded.
+    #[serde(default)]
+    pub reviewed: Option<bool>,
+    /// The review level the route settled on, when the receipt records it.
+    #[serde(default)]
+    pub review_level: Option<crate::contract::Review>,
+}
+
+/// What a run's stored receipt says about its review, read best-effort:
+/// a receipt that is absent, unreadable or older than a field reads as
+/// saying nothing about it, and the report still renders.
+fn review_facts(
+    ledger: &Ledger,
+    run_id: &crate::ids::RunId,
+) -> (Vec<String>, Option<bool>, Option<crate::contract::Review>) {
+    let Ok(Some((receipt, _hash))) = ledger.receipt(run_id) else {
+        return (Vec::new(), None, None);
+    };
+    let changed = receipt
+        .pointer("/verification/verification_inputs_changed")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+        .unwrap_or_default();
+    let reviewed = receipt
+        .get("review")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<crate::verify::ReviewRecord>(value).ok())
+        .and_then(|record| record.reviewed());
+    let level = receipt
+        .get("review_level")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<crate::contract::Review>(value).ok());
+    (changed, reviewed, level)
 }
 
 /// One task's contribution to the window (SPEC §20's task spine): every
@@ -999,6 +1037,7 @@ pub fn runs_report(
             }
         }
         window_runs.push((run_id.clone(), status));
+        let (verification_inputs_changed, reviewed, review_level) = review_facts(ledger, &run_id);
         runs.push(RunLine {
             run_id: run_id.to_string(),
             status,
@@ -1010,6 +1049,9 @@ pub fn runs_report(
             final_detail,
             standing,
             verify: ledger.run_is_verify(&run_id)?,
+            verification_inputs_changed,
+            reviewed,
+            review_level,
         });
     }
     let accepted = runs.iter().filter(|run| run.status.is_accepted()).count();
@@ -1359,6 +1401,13 @@ impl Report {
             }
             if let Some(detail) = &run.final_detail {
                 out.push_str(&format!("    {}\n", truncate_chars(detail, 120)));
+            }
+            if let Some(line) = crate::verify::unreviewed_test_edits_line(
+                &run.verification_inputs_changed,
+                run.reviewed,
+                run.review_level,
+            ) {
+                out.push_str(&format!("    {line}\n"));
             }
         }
         out.push('\n');
@@ -2095,28 +2144,31 @@ mod tests {
         );
     }
 
-    /// The detail line is reviewer prose: a fixed BYTE slice at 120 in a
-    /// sentence whose 121st byte lands inside an em dash panics.
-    #[test]
-    fn render_truncates_on_char_boundaries_not_bytes() {
-        // 119 ASCII characters, then an em dash straddling byte 120.
-        let detail = format!("{}—{}", "a".repeat(119), "b".repeat(50));
-        assert!(!detail.is_char_boundary(120), "the fixture must straddle");
-        let report = Report {
+    /// One accepted run's line, as `runs_report` builds it.
+    fn accepted_run(final_detail: Option<String>) -> RunLine {
+        RunLine {
+            run_id: "run-a".into(),
+            status: State::Accepted,
+            attempts: 1,
+            cost: MicroUsd::from_micros(10),
+            cost_completeness: CostCompleteness::Actual,
+            phase_costs: vec![],
+            models: vec!["haiku".into()],
+            final_detail,
+            standing: true,
+            verify: false,
+            verification_inputs_changed: Vec::new(),
+            reviewed: None,
+            review_level: None,
+        }
+    }
+
+    /// A report of the one run `run`.
+    fn one_run_report(run: RunLine) -> Report {
+        Report {
             schema_version: REPORT_SCHEMA_VERSION,
             since: "2026-09-01".into(),
-            runs: vec![RunLine {
-                run_id: "run-a".into(),
-                status: State::Accepted,
-                attempts: 1,
-                cost: MicroUsd::from_micros(10),
-                cost_completeness: CostCompleteness::Actual,
-                phase_costs: vec![],
-                models: vec!["haiku".into()],
-                final_detail: Some(detail),
-                standing: true,
-                verify: false,
-            }],
+            runs: vec![run],
             accepted: 1,
             standing: 1,
             total_cost: MicroUsd::from_micros(10),
@@ -2173,7 +2225,17 @@ mod tests {
             learning: None,
             review_outcomes: None,
             check_timings: None,
-        };
+        }
+    }
+
+    /// The detail line is reviewer prose: a fixed BYTE slice at 120 in a
+    /// sentence whose 121st byte lands inside an em dash panics.
+    #[test]
+    fn render_truncates_on_char_boundaries_not_bytes() {
+        // 119 ASCII characters, then an em dash straddling byte 120.
+        let detail = format!("{}—{}", "a".repeat(119), "b".repeat(50));
+        assert!(!detail.is_char_boundary(120), "the fixture must straddle");
+        let report = one_run_report(accepted_run(Some(detail)));
         let rendered = report.render();
         assert!(
             rendered.contains(&format!("    {}—…\n", "a".repeat(119))),
@@ -2181,11 +2243,112 @@ mod tests {
         );
     }
 
+    /// Edited tests no reviewer read are said in one plain line under the
+    /// run (ADR-0013); `--json` carries the facts and prints no such line,
+    /// and stays one JSON value.
+    #[test]
+    fn a_run_whose_edited_tests_were_not_reviewed_says_so_in_one_line() {
+        let report = one_run_report(RunLine {
+            verification_inputs_changed: vec!["tests/x.rs".into()],
+            reviewed: Some(false),
+            review_level: Some(crate::contract::Review::Optional),
+            ..accepted_run(None)
+        });
+        let rendered = report.render();
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.contains("tests edited"))
+                .collect::<Vec<_>>(),
+            vec!["    tests edited; not reviewed (review: optional)"],
+            "{rendered}"
+        );
+        let json = serde_json::to_string_pretty(&report).expect("report serializes");
+        assert!(!json.contains("tests edited"), "{json}");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("one JSON value");
+        let run = &value["runs"][0];
+        assert_eq!(
+            run["verification_inputs_changed"],
+            serde_json::json!(["tests/x.rs"])
+        );
+        assert_eq!(run["reviewed"], serde_json::json!(false));
+        assert_eq!(run["review_level"], serde_json::json!("optional"));
+
+        // A reviewed run, and one that edited nothing, print no line.
+        for run in [
+            RunLine {
+                verification_inputs_changed: vec!["tests/x.rs".into()],
+                reviewed: Some(true),
+                review_level: Some(crate::contract::Review::Required),
+                ..accepted_run(None)
+            },
+            RunLine {
+                reviewed: Some(false),
+                review_level: Some(crate::contract::Review::Optional),
+                ..accepted_run(None)
+            },
+        ] {
+            let rendered = one_run_report(run).render();
+            assert!(!rendered.contains("tests edited"), "{rendered}");
+        }
+    }
+
     #[test]
     fn truncate_chars_keeps_short_text_and_clips_by_character() {
         assert_eq!(truncate_chars("héllo", 120), "héllo");
         assert_eq!(truncate_chars("héllo", 2), "hé…");
         assert_eq!(truncate_chars("—————", 3), "———…");
+    }
+
+    /// A receipt from before ADR-0013 (no `review`, no `review_level`)
+    /// still renders: it says nothing of a review, so no unreviewed-tests
+    /// line, while a new one that was not reviewed gets it.
+    #[test]
+    fn a_pre_change_receipt_still_renders_without_the_unreviewed_line() {
+        let dir = temp_dir("pre-review-level");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let old = serde_json::json!({
+            "run_id": "run-old",
+            "verification": { "verification_inputs_changed": ["tests/x.rs"] },
+            "criteria": [{ "id": "c", "statement": "s", "mandatory": true, "met": true,
+                           "settled_via": "report_review" }],
+        });
+        let new = serde_json::json!({
+            "run_id": "run-new",
+            "verification": { "verification_inputs_changed": ["tests/y.rs"] },
+            "review": "no_review",
+            "review_level": "optional",
+        });
+        for (run_id, receipt) in [("run-old", &old), ("run-new", &new)] {
+            let run = crate::ids::RunId::from_stored(run_id);
+            let task = crate::ids::TaskId::from_stored(format!("task-{run_id}"));
+            ledger
+                .insert_run(&run, "/repo", None, &task, "rk")
+                .expect("run");
+            ledger.store_receipt(&run, receipt, "h").expect("receipt");
+        }
+        let report = runs_report(&ledger, "2000-01-01T00:00:00+00:00", None).expect("report");
+        let old_line = report
+            .runs
+            .iter()
+            .find(|run| run.run_id == "run-old")
+            .expect("old");
+        assert_eq!(
+            old_line.verification_inputs_changed,
+            vec!["tests/x.rs".to_string()]
+        );
+        assert_eq!(old_line.reviewed, None);
+        assert_eq!(old_line.review_level, None);
+        let rendered = report.render();
+        assert_eq!(
+            rendered
+                .matches("tests edited; not reviewed (review: optional)")
+                .count(),
+            1,
+            "{rendered}"
+        );
+        // Best effort: a leftover temp dir costs nothing but disk.
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

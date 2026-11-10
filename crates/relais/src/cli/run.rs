@@ -566,6 +566,15 @@ pub(crate) fn run_command(
                 report::cost_line(receipt.cost, receipt.cost_completeness)
             );
             println!("run:     {}", outcome.run_id());
+            if let Some(line) = relais::verify::unreviewed_test_edits_line(
+                &receipt.verification.verification_inputs_changed,
+                receipt.review.reviewed(),
+                receipt.review_level,
+            ) {
+                // A note, not the run's result: stdout keeps the lines a
+                // script reads.
+                eprintln!("{line}");
+            }
             Ok(CliOutcome::Accepted)
         }
         Terminal::NeedsDecision { reason, detail } => {

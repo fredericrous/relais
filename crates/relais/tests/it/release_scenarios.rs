@@ -1513,9 +1513,17 @@ fn a_protocol_run_keeps_stdout_for_events_and_events_jsonl_holds_the_same() {
         .filter_map(|event| event["event"]["name"].as_str())
         .collect();
     steps.dedup();
+    // The base is deferred (ADR-0013): the first red candidate checks it
+    // on demand, under the same step name, after the worktree's setup.
     assert_eq!(
         steps,
-        ["preflight", "baseline", "worktree · setup", "receipt"],
+        [
+            "preflight",
+            "baseline",
+            "worktree · setup",
+            "baseline",
+            "receipt"
+        ],
         "{kinds:?}"
     );
     let preflight = protocol_events
@@ -2060,12 +2068,13 @@ fn a_run_waiting_on_a_person_is_salvaged_counted_and_takes_feedback() {
     assert_eq!(report["tasks"][0]["pending_feedback"], false, "{report}");
 }
 
-// SPEC §10: a baseline that cannot run, and a declared setup that does
-// not succeed, are blocked before a worker is launched — with the
-// remedy named, and with `relais plan` and `relais doctor` warning
-// about the missing setup ahead of the run.
+// SPEC §10, ADR-0013: a baseline that cannot run, and a declared setup
+// that does not succeed at the base, are blocked at the first red
+// candidate, with that candidate kept and the remedy named, and with
+// `relais plan` and `relais doctor` warning about the missing setup
+// ahead of the run.
 #[test]
-fn an_unrunnable_baseline_and_a_failed_setup_block_before_any_launch() {
+fn an_unrunnable_baseline_and_a_failed_base_setup_block_at_the_first_red_candidate() {
     let world = World::new("setup");
     std::fs::write(world.repo.join("package-lock.json"), "{}\n").expect("lockfile");
     git(&world.repo, &["add", "package-lock.json"]);
@@ -2107,26 +2116,28 @@ fn an_unrunnable_baseline_and_a_failed_setup_block_before_any_launch() {
     assert!(stderr.contains("baseline_unrunnable"), "{stderr}");
     assert!(stderr.contains("exited 127"), "{stderr}");
     assert!(
+        stderr.contains("verify the kept candidate: `relais run --task "),
+        "{stderr}"
+    );
+    assert!(
         stderr.contains("[[verification.profiles.default.setup]]"),
         "the block to declare is named: {stderr}"
     );
-    assert_eq!(world.worker_launches(), 0, "no worker was launched");
+    assert!(stderr.contains("verify the kept candidate"), "{stderr}");
+    assert_eq!(world.worker_launches(), 1, "one worker, then the base");
     let run_id = world.only_run_id();
     assert!(
         world.run_dir(&run_id).join("logs/base-cmd0.log").exists(),
         "the base's log is kept as evidence"
     );
-    assert!(
-        !world.worktree(&run_id).exists(),
-        "no task worktree was created"
-    );
 
-    // A declared setup that fails: blocked as well, still before a launch.
+    // A declared setup that fails at the base: blocked as well, at the
+    // first red candidate.
     let hash = world.write_policy_verifying(
         3,
         120,
         "[[verification.profiles.default.setup]]\n\
-         argv = [\"sh\", \"-c\", \"echo install failed >&2; exit 1\"]\n\
+         argv = [\"sh\", \"-c\", \"case \\\"$(pwd -P)\\\" in */verify-base) echo install failed >&2; exit 1;; esac\"]\n\
          timeout_seconds = 30\n\n\
          [[verification.profiles.default.commands]]\n\
          argv = [\"sh\", \"-c\", \"test ! -f src/main.rs\"]\n\
@@ -2144,13 +2155,8 @@ fn an_unrunnable_baseline_and_a_failed_setup_block_before_any_launch() {
     let stderr = text(&run.stderr);
     assert!(stderr.contains("verification_setup_failed"), "{stderr}");
     assert!(stderr.contains("the base revision"), "{stderr}");
-    assert_eq!(world.worker_launches(), 0, "still no worker");
-    let candidates = std::fs::read_dir(world.state.join("runs"))
-        .expect("runs")
-        .flatten()
-        .filter(|entry| entry.path().join("candidate-1.patch").exists())
-        .count();
-    assert_eq!(candidates, 0, "no blocked run reached a candidate");
+    assert!(stderr.contains("verify the kept candidate"), "{stderr}");
+    assert_eq!(world.worker_launches(), 2, "one worker more, then the base");
 }
 
 // P3 (e): a repository that configures an effort and no effort catalog

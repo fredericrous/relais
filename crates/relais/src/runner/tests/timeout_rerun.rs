@@ -100,19 +100,22 @@ fn a_baseline_check_that_times_out_once_then_passes_is_not_unrunnable() {
         argv: vec![
             "sh".into(),
             "-c".into(),
+            // Red on the candidate, so the deferred base is checked on
+            // demand (ADR-0013); at the base it times out once, then passes.
             format!(
-                "if [ -f {m} ]; then exit 0; else touch {m}; sleep 30; fi",
+                "case \"$(pwd -P)\" in */verify-base) \
+                 if [ -f {m} ]; then exit 0; else touch {m}; sleep 30; fi;; esac; exit 1",
                 m = marker.display()
             ),
         ],
         timeout_seconds: 1,
         ..passing_check()
     };
-    let repo = fixture.repo_policy(vec![check], 3);
+    let repo = fixture.repo_policy(vec![check], 1);
     let outcome = fixture.execute(
         &fixture.contract(Review::Off),
         &repo,
-        &conditional_worker(""),
+        &changing_worker(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
     );
     assert!(
         !matches!(
@@ -131,34 +134,51 @@ fn a_baseline_check_that_times_out_once_then_passes_is_not_unrunnable() {
 
 #[test]
 fn a_baseline_retry_draws_on_the_total_not_on_work() {
-    // The baseline spends more than the work budget on its timed-out run
-    // (10 s) and its re-run; work has not begun then, so the run is not cut
-    // off by it. The work budget still has to hold the real work after the
-    // baseline (the worker, the candidate's git and verification): one
-    // second did not on a Windows runner, whose git is slow, and failed
-    // there as "the work budget … is exhausted". Six seconds leaves that
-    // room and stays well under the baseline's ten.
+    // The base, checked on demand after a red candidate (ADR-0013),
+    // spends more than the work budget on its timed-out run (10 s) and its
+    // re-run. It draws on the total only, and its time is taken out of
+    // work, so the run is not cut off by it: a base run longer than the
+    // work left never ends the run `Work`. Six seconds of work leaves room
+    // for the worker and the candidate's checks on a slow git.
     let fixture = Fixture::new();
     let marker = fixture.dir.join("base-ran-once");
     let check = CommandSpec {
         argv: vec![
             "sh".into(),
             "-c".into(),
+            // Red on the candidate, so the deferred base is checked on
+            // demand (ADR-0013); at the base it times out once, then passes.
             format!(
-                "if [ -f {m} ]; then exit 0; else touch {m}; sleep 30; fi",
+                "case \"$(pwd -P)\" in */verify-base) \
+                 if [ -f {m} ]; then exit 0; else touch {m}; sleep 30; fi;; esac; exit 1",
                 m = marker.display()
             ),
         ],
         timeout_seconds: 10,
         ..passing_check()
     };
-    let repo = fixture.repo_policy(vec![check], 3);
+    let repo = fixture.repo_policy(vec![check], 1);
     let mut contract = fixture.contract(Review::Off);
     contract.limits.wall_seconds = Some(6);
-    let outcome = fixture.execute(&contract, &repo, &conditional_worker(""));
+    let outcome = fixture.execute(
+        &contract,
+        &repo,
+        &changing_worker(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+    );
+    // One attempt, red: the attempt ceiling ends it, not the clock.
     assert!(
-        !matches!(&outcome.terminal, Terminal::BudgetExhausted { .. }),
+        outcome.terminal.detail().contains("attempt ceiling"),
         "{:?}",
+        outcome.terminal
+    );
+    assert!(
+        fixture
+            .artifacts
+            .join(outcome.run_id.as_str())
+            .join("logs")
+            .join("base-cmd0-retry1.log")
+            .exists(),
+        "the base ran, and ran again: {:?}",
         outcome.terminal
     );
     assert!(events_of(&fixture, &outcome).contains("timed_out_then_passed"));

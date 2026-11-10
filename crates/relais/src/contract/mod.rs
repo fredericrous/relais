@@ -138,6 +138,29 @@ pub enum Review {
     Required,
 }
 
+impl Review {
+    /// Whether a separate reviewer must pass: the one test every caller
+    /// makes of a routed level (ADR-0013).
+    pub fn is_required(self) -> bool {
+        self == Review::Required
+    }
+
+    /// The level as a contract spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Review::Off => "off",
+            Review::Optional => "optional",
+            Review::Required => "required",
+        }
+    }
+}
+
+impl std::fmt::Display for Review {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// What is wrong with one declared write-scope pattern. A scope is
 /// untrusted input — it arrives in a contract file, or from a planner
 /// model under `"decomposition": "propose"` — so every pattern is

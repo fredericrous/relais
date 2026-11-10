@@ -1,15 +1,16 @@
 //! The run engine: its state, constructor, core and run driver.
 
 use super::setup_gate;
+use super::workspace_ops::SetupWithin;
 use super::{
-    admission_block, baseline_summary, decide, exhaustion, fresh_progress, scheduler,
-    setup_failure_detail, state_sibling, sweep_ended_verify_dirs, verify, verify_root, workspace,
-    worktree_root, Arc, AtomicBool, AttemptContext, AttemptKind, BlockCode, Budget, BudgetClock,
-    BudgetLimits, Budgets, Candidate, CostKind, Duration, EffectiveAuthority, Event, Events,
-    EvidenceKind, Exhausted, Finish, Gate, Instant, KeptCandidate, Limit, Next, Observation,
-    Ordering, PackageId, PackageRole, PathBuf, Phase, Reason, Refusal, Request, RunConfig,
-    RunEngine, RunError, RunId, RunOutcome, State, Summary, Terminal, Transition, UsagePhase,
-    ADMISSION_POLL,
+    admission_block, baseline_summary, decide, exhaustion, fresh_progress, kept_sentence,
+    scheduler, setup_failure_detail, state_sibling, sweep_ended_verify_dirs, verify, verify_root,
+    workspace, worktree_root, Arc, AtomicBool, AttemptContext, AttemptKind, BaseMemo, BlockCode,
+    Budget, BudgetClock, BudgetLimits, Budgets, Candidate, CostKind, Duration, EffectiveAuthority,
+    Event, Events, EvidenceKind, Exhausted, Finish, Gate, Instant, KeptCandidate, Limit, Next,
+    Observation, Ordering, PackageId, PackageRole, PathBuf, Phase, Reason, Refusal, Request,
+    RunConfig, RunEngine, RunError, RunId, RunOutcome, State, Summary, Terminal, Transition,
+    UsagePhase, ADMISSION_POLL,
 };
 
 impl<'a> RunEngine<'a> {
@@ -86,6 +87,7 @@ impl<'a> RunEngine<'a> {
             inplace: None,
             last_snapshot: None,
             timed_out_settled: None,
+            base_memo: BaseMemo::default(),
             reviewer_gap: None,
             candidates_run: None,
             worker_code_rules_gap: None,
@@ -152,7 +154,7 @@ impl<'a> RunEngine<'a> {
 
     /// Whether the coordinator has cancelled this run: the watcher saw it,
     /// or the gate says so now.
-    fn cancel_requested(&self) -> bool {
+    pub(super) fn cancel_requested(&self) -> bool {
         self.cancel_asked.load(Ordering::SeqCst)
             || self
                 .config
@@ -274,6 +276,9 @@ impl<'a> RunEngine<'a> {
         // A package (child) run has its own run id and so its own holdout
         // directory; it removes it here like a root run does.
         self.remove_holdout_dir();
+        // The base checked on demand kept its `verify-base` tree for the
+        // run: it goes now, whatever the ending (ADR-0013).
+        self.release_base_tree();
         // Each verification worktree removed itself; the run's own
         // `verify/<run>/` directory is left empty, and goes too. One that
         // still holds a file (a release that failed) stays visible.
@@ -694,17 +699,19 @@ impl<'a> RunEngine<'a> {
         // may answer "single worker", in which case the ordinary path
         // continues below.
         if let Some(decomposition) = &self.config.contract.decomposition {
+            let flags = baseline.flags();
             let root = scheduler::RootContext {
                 authority: &preflight.authority,
                 base_sha: &preflight.base_sha,
                 contract_hash: &preflight.contract_hash,
                 manifest: &preflight.manifest,
                 decision: &preflight.decision,
-                baseline_failures: &baseline.failures,
+                baseline_failures: baseline.failures(),
                 integration_gaps: &preflight.integration_gaps,
-                baseline_cached: baseline.cached,
+                baseline_cached: flags.cached,
                 baseline_cache_refused: &baseline.cache_refused,
-                baseline_proven: baseline.proven,
+                baseline_proven: flags.proven,
+                baseline_deferred: flags.deferred,
                 logs_dir: &baseline.logs_dir,
                 holdouts: &preflight.holdouts,
             };
@@ -766,7 +773,10 @@ impl<'a> RunEngine<'a> {
                 &preflight.authority.verification_profile,
                 &baseline.logs_dir,
                 "task",
-                cancel,
+                SetupWithin {
+                    cancel,
+                    budgets: &self.budgets,
+                },
             )
         });
         let setup = match setup {
@@ -925,27 +935,6 @@ impl<'a> RunEngine<'a> {
         Some((label, found, measured))
     }
 
-    /// The base's failed check showed exhaustion: `blocked
-    /// (baseline_resource_exhausted)`, never a red base.
-    pub(super) fn end_on_baseline_exhaustion(
-        &mut self,
-        checks: &[verify::CheckOutcome],
-    ) -> Result<Option<RunOutcome>, RunError> {
-        let Some((label, found, measured)) = self.exhaustion_in(checks) else {
-            return Ok(None);
-        };
-        let detail = exhaustion::baseline_text(&label, &found, &measured);
-        self.finish(
-            Reason::BaselineResourceExhausted,
-            exhaustion::detail_json(&label, &found, &measured, None),
-            Terminal::BlockedBy {
-                reason: Reason::BaselineResourceExhausted,
-                detail,
-            },
-        )
-        .map(Some)
-    }
-
     /// The candidate's failed check showed exhaustion: `needs_decision
     /// (resource_exhausted)` with the candidate preserved and no repair
     /// (SPEC §10). Exhaustion is observed, not proof the code is innocent.
@@ -978,12 +967,18 @@ impl<'a> RunEngine<'a> {
     /// block, because the machine, not the work, was what ran short.
     /// The heavy-command admission of this run (SPEC §23, ADR-0010).
     pub(crate) fn heavy(&self) -> verify::HeavyAdmission<'_> {
+        self.heavy_with(&self.budgets)
+    }
+
+    /// [`RunEngine::heavy`] drawing on `budgets`: an on-demand base run's
+    /// commands draw on the total only (ADR-0013).
+    pub(crate) fn heavy_with(&self, budgets: &Budgets) -> verify::HeavyAdmission<'_> {
         let cores = verify::cores();
         verify::HeavyAdmission {
             gate: self.config.gate,
             run_id: self.run_id.as_str().to_string(),
             session_id: self.config.session_id.clone(),
-            budgets: self.budgets.clone(),
+            budgets: budgets.clone(),
             events: self.events.clone(),
             cap: verify::heavy_cap(self.config.machine.concurrency.max_heavy_commands, cores),
             cores,
@@ -1091,11 +1086,7 @@ impl<'a> RunEngine<'a> {
                 }
                 let mut detail_json = serde_json::json!({ "detail": detail });
                 if let Some(kept) = candidate {
-                    detail.push_str(&format!(
-                        "; the candidate is kept: verify it again without a worker with a \
-                         `kind: verify` run, `candidate {{run: {}, index: {}}}`",
-                        kept.run, kept.index
-                    ));
+                    detail.push_str(&format!("; {}", kept_sentence(kept)));
                     detail_json = serde_json::json!({
                         "detail": detail,
                         "candidate": { "run": kept.run, "index": kept.index, "sha": kept.sha },

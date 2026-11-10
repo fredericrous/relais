@@ -252,6 +252,7 @@ impl<'a> RunEngine<'a> {
             verdict,
         } = pending;
         let preflight = ctx.preflight;
+        let flags = ctx.baseline.flags();
         let report = VerificationReport {
             candidate_sha: candidate.sha.clone(),
             base_sha: preflight.base_sha.clone(),
@@ -261,14 +262,15 @@ impl<'a> RunEngine<'a> {
             gaps,
             gaps_not_judged,
             notes,
-            baseline_failures: ctx.baseline.failures.clone(),
+            baseline_failures: self.base_failures(ctx.baseline),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
             integration_gaps: preflight.integration_gaps.clone(),
-            baseline_cached: ctx.baseline.cached,
+            baseline_cached: flags.cached,
             baseline_cache_refused: ctx.baseline.cache_refused.clone(),
-            baseline_proven: ctx.baseline.proven,
+            baseline_proven: flags.proven,
+            baseline_deferred: flags.deferred,
         };
         let patch_adds_test = self.patch_adds_test(ctx, &candidate.sha)?;
         let (criteria, mandatory_evidence_independence) = self.settle(
@@ -308,6 +310,7 @@ impl<'a> RunEngine<'a> {
             ),
             verification_profile_hash: preflight.authority.verification_profile.hash(),
             review: review_record_of(self.config.ledger, &self.run_id)?,
+            review_level: Some(preflight.decision.review),
             ladder: verify::LadderRecord::Single(preflight.decision.ladder.rungs().to_vec()),
             efforts_used: self.config.ledger.efforts_used(&self.run_id)?,
             candidates: self.candidates_record(&candidate.sha),
