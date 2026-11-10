@@ -273,7 +273,7 @@ relais programme frontier docs/programmes/<slug>   # open tickets whose blockers
 relais programme frontier <dir> --all --json       # also the in-flight ones; JSON array
 relais programme show <dir>                        # destination, counts, blocked tickets and their blockers, branches
 relais programme check <dir>                       # every problem as path:line: message on stderr; exit 2 when there is one
-relais programme list [--root <dir>]               # every map under <root>/*/docs/programmes, with counts
+relais programme list [--root <dir>] [--no-fetch]  # every map under <root>, worktrees included, with counts and source
 ```
 
 ### Session routing

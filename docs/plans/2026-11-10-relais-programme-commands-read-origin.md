@@ -240,4 +240,26 @@ Integration tests, each with a bare `upstream.git` as `origin`, as in
 
 - relais: backend, lang:rust, unix, tui
 
+## Decision log
+
+- 2026-11-10, the person, after the live run: a local copy wins only when its work is no older than origin's last commit touching the programme. The approved rule let a 7-day-old unpushed branch (`relais-wt-local-model-rung`, 19 closed) hide origin's `homelab-offload` (22 closed, changed 3 days ago). A tie goes to the local copy, so an edit in the same second as origin's commit is the person's.
+- Implementation: only repositories that can hold a programme (a checkout has `docs/programmes/`, or origin's ref does as of the last fetch) are fetched and read. 4 of the 72 repositories under `~/Developer/Perso` qualify. The first live run fetched all 72 and took 57 s, with 3 timeouts and 1 missing remote. The cost: the first programme an upstream charts in a repository that had none shows only after some other fetch (SPEC §31).
+- Implementation: `load_at` reads the map and every ticket in one `git cat-file --batch`; the per-repository work runs on the same 8-thread pool as the fetch; worktrees are read from `.git/worktrees/*/gitdir` without git. Each relais-supervised git call cost about 110 ms under load average 15, against 30 ms for a bare call.
+- Contract: text `list` gains the fourth column and `check --json` the `source` field, so the existing exact-output tests changed with them. The plan's "existing tests keep passing unchanged" held for every other assertion.
+- Carried from round 2 and applied: `child.kill()` for the SIGKILL, ssh `ServerAliveInterval`, stderr piped and drained, a TTY line for the one-repository fetch, SKILL.md step 1 `git show`, the CHANGELOG naming the fourth column, a `pgrep` check that the fetch runs before SIGINT, scoped to the test's group. The `rev-list` cost was measured (below), with no cap added.
+
+## Verification record
+
+| Check | Input | Expected | Actual |
+| --- | --- | --- | --- |
+| `cargo test --test it programme_cli` | 13 new tests + 15 existing | all pass | 28 passed |
+| mutation | tree-history test disabled | squash-merged test red | red (`working-tree` ≠ `origin/main`), reverted |
+| `cargo test --lib install::` | SKILL.md edited | the pin passes | passed |
+| clippy `-D warnings` | all targets | clean | clean |
+| live `list`, branch build, `~/Developer/Perso` | 72 repositories, load avg 11–15 | 8 rows, < 15 s | 8 rows, 6.7 s with fetch, 2.4 s `--no-fetch`, same rows |
+| live stale worktree | `homelab-offload`, worktree 7 days old | origin | `origin/main`, open 9 frontier 4 closed 22 |
+| live `frontier` | primary path and stale worktree path | 4 = `list` frontier | 4 and 4 |
+| live `check` | `relais/docs/programmes/homelab-offload` | exit 0 | exit 0 |
+| Ctrl-C during fetch | hanging upload-pack, SIGINT to the group | no process, no lock | passed (integration test) |
+
 <!-- panel: repos=relais adds= reviewers=backend,lang:rust,tui,unix body-sha=7ec1aa7ec5a4 -->

@@ -483,6 +483,9 @@ pub(crate) enum ProgrammeCommand {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
+        /// Read origin as of the last fetch instead of fetching it first
+        #[arg(long)]
+        no_fetch: bool,
     },
     /// Open tickets whose blockers are closed and that no `prog/<slug>/<id>`
     /// branch works, one per line: id, type/mode, repos, name
@@ -495,6 +498,9 @@ pub(crate) enum ProgrammeCommand {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
+        /// Read origin as of the last fetch instead of fetching it first
+        #[arg(long)]
+        no_fetch: bool,
     },
     /// The destination, the counts, each blocked ticket and its blockers,
     /// each in-flight ticket and its branch
@@ -504,6 +510,9 @@ pub(crate) enum ProgrammeCommand {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
+        /// Read origin as of the last fetch instead of fetching it first
+        #[arg(long)]
+        no_fetch: bool,
     },
     /// Report every problem in the map and its tickets, as
     /// `<path>:<line>: <problem>` on stderr; exit 2 when there is one
@@ -513,6 +522,9 @@ pub(crate) enum ProgrammeCommand {
         /// Also print `{problems: [...]}` on stdout
         #[arg(long)]
         json: bool,
+        /// Read origin as of the last fetch instead of fetching it first
+        #[arg(long)]
+        no_fetch: bool,
     },
 }
 
@@ -1479,20 +1491,32 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             proof_stdin,
         }),
         Command::Programme { cmd } => match cmd {
-            ProgrammeCommand::List { root, json } => {
-                programme_list_command(root.as_deref(), Format::from_json_flag(json))
-            }
-            ProgrammeCommand::Frontier { dir, all, json } => programme_frontier_command(
+            ProgrammeCommand::List {
+                root,
+                json,
+                no_fetch,
+            } => programme_list_command(root.as_deref(), Format::from_json_flag(json), !no_fetch),
+            ProgrammeCommand::Frontier {
+                dir,
+                all,
+                json,
+                no_fetch,
+            } => programme_frontier_command(
                 &dir,
                 Listing::from_all_flag(all),
                 Format::from_json_flag(json),
+                !no_fetch,
             ),
-            ProgrammeCommand::Show { dir, json } => {
-                programme_show_command(&dir, Format::from_json_flag(json))
-            }
-            ProgrammeCommand::Check { dir, json } => {
-                programme_check_command(&dir, Format::from_json_flag(json))
-            }
+            ProgrammeCommand::Show {
+                dir,
+                json,
+                no_fetch,
+            } => programme_show_command(&dir, Format::from_json_flag(json), !no_fetch),
+            ProgrammeCommand::Check {
+                dir,
+                json,
+                no_fetch,
+            } => programme_check_command(&dir, Format::from_json_flag(json), !no_fetch),
         },
         Command::Evidence { cmd } => match cmd {
             EvidenceCommand::Attach {
