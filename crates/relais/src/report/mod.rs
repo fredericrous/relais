@@ -10,6 +10,7 @@
 //! cohort. Savings are reported as measured comparisons only; nothing
 //! here converts token savings into subscription fee savings.
 
+mod auto_settled;
 mod decision_data;
 mod harness;
 mod holdouts;
@@ -18,6 +19,7 @@ mod reviewers;
 
 use serde::Serialize;
 
+pub use auto_settled::{auto_settled_report, settle_code_of_intent, AutoSettled, SettleOutcomes};
 pub use decision_data::{
     count_by_source, decision_labels, project_floor, revert_agreement, DecisionLabels,
     FloorProjection, Fraction, SourceCount,
@@ -74,8 +76,8 @@ fn accepted_by_person(
 /// status` prints, so its JSON agrees with the sentence a person sees),
 /// so a downstream parser can tell an old shape from a new one instead of
 /// guessing from key presence. 9: `never_shipped_tasks`. 10:
-/// `repair_outcomes`. 11: `advisor_data`. 12: `advisor_data` becomes `decision_labels`. 13: `harness`. 14: `holdouts`. 15: `answered`, the unknown subagents by parent and the unmatched check commands in session routing. 16: `holdouts.by_source`. 17: `harness.steps[].models[]` gains cost and tokens.
-pub const REPORT_SCHEMA_VERSION: u32 = 17;
+/// `repair_outcomes`. 11: `advisor_data`. 12: `advisor_data` becomes `decision_labels`. 13: `harness`. 14: `holdouts`. 15: `answered`, the unknown subagents by parent and the unmatched check commands in session routing. 16: `holdouts.by_source`. 17: `harness.steps[].models[]` gains cost and tokens. 18: `auto_settled`.
+pub const REPORT_SCHEMA_VERSION: u32 = 18;
 
 /// A dimension `relais report --by` groups the window's tasks over (SPEC
 /// §11: "compare like task classes and policy versions"). Total over the
@@ -787,6 +789,9 @@ pub struct Report {
     /// Per pipeline step and model, how often it ran and how often it caught
     /// what it guards against (decisions ADR-0042); ledger facts only.
     pub harness: HarnessReport,
+    /// The settles relais answered itself and how their successors ended
+    /// (ADR-0011); classified from the successor intents, never from notes.
+    pub auto_settled: AutoSettled,
     /// What holdouts caught and leaked over the window's runs (ADR-0045
     /// phase 4): the runs that named one, the catches and the exposures.
     pub holdouts: HoldoutsReport,
@@ -1215,6 +1220,7 @@ pub fn runs_report(
     let observational = recipe_view.then(|| RECIPE_OBSERVATIONAL_NOTE.to_string());
     let repair_outcomes = repairs::repair_outcomes(ledger, &window_runs)?;
     let harness = harness::harness_report(ledger, &window_runs)?;
+    let auto_settled = auto_settled::auto_settled_report(ledger, &window_runs)?;
     let holdouts = holdouts::holdouts_report(ledger, &window_runs)?;
     let accepted_tasks = tasks.iter().filter(|task| task.accepted).count();
     let accepted_tasks_by_person = tasks
@@ -1295,6 +1301,7 @@ pub fn runs_report(
         cohorts,
         repair_outcomes,
         harness,
+        auto_settled,
         holdouts,
         enforcement: EnforcementReport::observed(),
         orchestration,
@@ -1321,6 +1328,7 @@ impl Report {
             self.push_repair_lines(&mut out);
             out.push('\n');
             out.push_str(&self.harness.render());
+            out.push_str(&self.auto_settled.render());
             out.push_str(&self.holdouts.render());
             self.push_recipe_lines(&mut out);
             self.push_orchestration_lines(&mut out);
@@ -1554,6 +1562,7 @@ impl Report {
         self.push_repair_lines(&mut out);
         out.push('\n');
         out.push_str(&self.harness.render());
+        out.push_str(&self.auto_settled.render());
         out.push_str(&self.holdouts.render());
         self.push_recipe_lines(&mut out);
         out.push('\n');
@@ -2148,6 +2157,7 @@ mod tests {
             cohorts: None,
             repair_outcomes: Vec::new(),
             harness: HarnessReport { steps: Vec::new() },
+            auto_settled: AutoSettled::default(),
             holdouts: HoldoutsReport::default(),
             trial_spend: None,
             observational: None,
@@ -2358,6 +2368,7 @@ mod tests {
                 "accepted_tasks",
                 "accepted_tasks_by_person",
                 "accepted_tasks_by_relais",
+                "auto_settled",
                 "backfilled_tasks",
                 "check_timings",
                 "cohorts",
@@ -4727,5 +4738,142 @@ mod tests {
             assert!(text.contains(line), "{line} missing from {text}");
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A run left needing a decision, answered `revise` by `actor` with a
+    /// successor intent whose widened paths are `delta`; the successor is a
+    /// new run that ended in `successor_end`.
+    fn settled_by(
+        ledger: &Ledger,
+        name: &str,
+        actor: crate::ledger::Actor,
+        note: &str,
+        delta: &[&str],
+        successor_end: State,
+    ) {
+        let run = new_run(ledger, name);
+        go(ledger, &run, State::Running, "worker_dispatched");
+        go(ledger, &run, State::NeedsDecision, "scope_exceeded");
+        let intent = crate::ledger::NewIntent {
+            predecessor: run.clone(),
+            contract_digest: "digest".into(),
+            contract_json: "{}".into(),
+            scope_delta: delta.iter().map(|path| path.to_string()).collect(),
+            candidate: None,
+            review: None,
+        };
+        let stored = ledger
+            .resolve_decision_with_intent(
+                &run,
+                &crate::ledger::DecisionAnswer {
+                    resolution: Reason::DecisionRevised,
+                    actor,
+                    person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
+                    note: Some(note),
+                    successor_run: None,
+                    from_state: State::NeedsDecision,
+                    to_state: State::Cancelled,
+                },
+                &intent,
+            )
+            .expect("resolve")
+            .expect("open decision");
+        let successor = new_run(ledger, &format!("{name}-successor"));
+        ledger
+            .claim_intent(&stored.intent_id, &successor, &|_| {
+                crate::ledger::SuccessorProcess::Gone
+            })
+            .expect("claim");
+        go(ledger, &successor, State::Running, "worker_dispatched");
+        go(ledger, &successor, successor_end, "ended");
+    }
+
+    #[test]
+    fn auto_settled_counts_relais_settles_by_intent_not_by_note() {
+        use crate::ledger::Actor;
+        let dir = temp_dir("auto-settled");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        // Notes are deliberately misleading: only the intent decides.
+        settled_by(
+            &ledger,
+            "t",
+            Actor::Relais,
+            "scope_widened_small",
+            &["a/tests/x.rs"],
+            State::Accepted,
+        );
+        settled_by(
+            &ledger,
+            "s",
+            Actor::Relais,
+            "scope_widened_for_tests",
+            &["src/lib.rs"],
+            State::Failed,
+        );
+        settled_by(
+            &ledger,
+            "v",
+            Actor::Relais,
+            "anything",
+            &[],
+            State::NeedsReview,
+        );
+        settled_by(
+            &ledger,
+            "o",
+            Actor::Orchestrator,
+            "scope_widened_for_tests",
+            &[],
+            State::Accepted,
+        );
+        settled_by(
+            &ledger,
+            "p",
+            Actor::Person,
+            "timed out",
+            &["a/tests/x.rs"],
+            State::Accepted,
+        );
+        let repaired = new_run(&ledger, "repaired");
+        go(&ledger, &repaired, State::Running, "worker_dispatched");
+        go(&ledger, &repaired, State::Verifying, "verification_started");
+        go(
+            &ledger,
+            &repaired,
+            State::Repairing,
+            Reason::ReviewRepair.as_str(),
+        );
+        go(
+            &ledger,
+            &repaired,
+            State::Accepted,
+            "checks_and_review_passed",
+        );
+        let report = runs_report(&ledger, SINCE, None).expect("report");
+        let json = serde_json::to_value(&report).expect("json");
+        let settled = &json["auto_settled"];
+        assert_eq!(settled["widen_tests"]["count"], 1);
+        assert_eq!(settled["widen_tests"]["accepted"], 1);
+        assert_eq!(settled["widen_small"]["count"], 1);
+        assert_eq!(settled["widen_small"]["failed"], 1);
+        assert_eq!(settled["timed_out_verify"]["count"], 1);
+        assert_eq!(settled["timed_out_verify"]["needs_review"], 1);
+        assert_eq!(settled["review_repair"]["count"], 1);
+        assert_eq!(settled["review_repair"]["accepted"], 1);
+        let text = report.render();
+        assert!(text.contains(
+            "auto settled:\n  review_repair 1, widen_tests 1, widen_small 1, timed_out_verify 1\n"
+        ));
+        let settled_lines = text
+            .lines()
+            .skip_while(|line| !line.starts_with("auto settled:"))
+            .take(3);
+        assert!(
+            settled_lines.clone().count() == 3
+                && settled_lines.clone().all(|line| line.chars().count() <= 80),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&dir).ok(); // best-effort cleanup of a scratch directory
     }
 }

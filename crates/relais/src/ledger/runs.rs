@@ -78,6 +78,18 @@ pub struct ChildOf<'a> {
     pub package_id: &'a PackageId,
 }
 
+/// What [`Ledger::publish_candidate`] makes selectable.
+pub struct CandidatePublication<'a> {
+    pub run_id: &'a RunId,
+    pub attempt_id: i64,
+    /// The attempt's end state.
+    pub state: State,
+    pub worktree: Option<&'a str>,
+    pub candidate_sha: &'a str,
+    pub patch_path: &'a std::path::Path,
+    pub patch_sha256: &'a str,
+}
+
 impl Ledger {
     /// Record a task's row, if none exists yet, and the run row that
     /// belongs to it — one transaction (P1): a run whose task row lost a
@@ -487,6 +499,30 @@ impl Ledger {
                 candidate_sha
             ],
         )?;
+        Ok(())
+    }
+
+    /// Publishes an attempt's candidate: its end state, its `candidate_sha`
+    /// and the `CandidatePatch` evidence of its finished patch file, in one
+    /// transaction. Until it commits, `candidate_attempts` finds nothing of
+    /// the attempt, so a failure after the artifact files leaves no
+    /// selectable candidate.
+    pub fn publish_candidate(&self, published: &CandidatePublication<'_>) -> Result<()> {
+        let tx = self.write_tx()?;
+        self.finish_attempt(
+            published.attempt_id,
+            published.state,
+            published.worktree,
+            Some(published.candidate_sha),
+        )?;
+        self.record_evidence(
+            published.run_id,
+            Some(published.attempt_id),
+            crate::ledger::EvidenceKind::CandidatePatch,
+            published.patch_path,
+            Some(published.patch_sha256),
+        )?;
+        tx.commit()?;
         Ok(())
     }
 

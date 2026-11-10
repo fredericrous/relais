@@ -109,6 +109,20 @@ impl World {
         self.write_policy_with_wall(max_attempts, 120)
     }
 
+    /// `write_policy` for a scenario that needs a run to stop on
+    /// `scope_exceeded`: the fake worker's one-line `src/tick-*.txt` would
+    /// otherwise be widened by the small-overflow rule (SPEC §8).
+    fn write_policy_stopping_on_scope(&self, max_attempts: u32) -> String {
+        self.write_policy_with_execution(
+            max_attempts,
+            120,
+            "widen_scope_small_max_files = 0\n",
+            "[[verification.profiles.default.commands]]\n\
+             argv = [\"sh\", \"-c\", \"test ! -f src/main.rs\"]\n\
+             timeout_seconds = 30\n",
+        )
+    }
+
     fn write_policy_with_wall(&self, max_attempts: u32, max_wall_seconds: u64) -> String {
         self.write_policy_verifying(
             max_attempts,
@@ -124,6 +138,17 @@ impl World {
         &self,
         max_attempts: u32,
         max_wall_seconds: u64,
+        verification: &str,
+    ) -> String {
+        self.write_policy_with_execution(max_attempts, max_wall_seconds, "", verification)
+    }
+
+    /// `write_policy_verifying` with extra lines in `[execution]`.
+    fn write_policy_with_execution(
+        &self,
+        max_attempts: u32,
+        max_wall_seconds: u64,
+        extra_execution: &str,
         verification: &str,
     ) -> String {
         let policy = format!(
@@ -142,7 +167,7 @@ id = "fable"
 max_attempts = {max_attempts}
 max_repairs_before_escalation = 1
 max_wall_seconds = {max_wall_seconds}
-
+{extra_execution}
 [integrations]
 aval = "off"
 amont = "off"
@@ -1872,7 +1897,7 @@ fn a_salvaged_run_keeps_its_reason_counts_as_accepted_and_takes_feedback() {
 #[test]
 fn a_run_waiting_on_a_person_is_salvaged_counted_and_takes_feedback() {
     let world = World::new("salvage-waiting");
-    let hash = world.write_policy(3);
+    let hash = world.write_policy_stopping_on_scope(3);
     world.write_machine(&hash, "");
     let path = world.root.join("narrow.json");
     std::fs::write(
@@ -2279,7 +2304,16 @@ fn plan_and_run_agree_on_an_unresolvable_read_hint() {
 #[test]
 fn out_of_scope_edits_and_misspelled_controls_are_refused() {
     let world = World::new("scope");
-    let hash = world.write_policy(3);
+    // The one-line overflow below is small; relais's small rule is off so
+    // that a person still has to decide it.
+    let hash = world.write_policy_with_execution(
+        3,
+        120,
+        "widen_scope_small_max_files = 0\n",
+        "[[verification.profiles.default.commands]]\n\
+         argv = [\"sh\", \"-c\", \"test ! -f src/main.rs\"]\n\
+         timeout_seconds = 30\n",
+    );
     world.write_machine(&hash, "");
     // The fake sonnet worker writes src/tick-*.txt; a scope that excludes
     // src/ makes every candidate a scope violation.
@@ -2322,6 +2356,39 @@ fn out_of_scope_edits_and_misspelled_controls_are_refused() {
         text(&plan.stderr).contains("unknown field `reveiw`"),
         "{}",
         text(&plan.stderr)
+    );
+}
+
+// One small non-test file is answered by relais too, with its own code, and
+// the CLI says so without calling the paths tests.
+#[test]
+fn a_small_source_overflow_prints_its_own_code_and_the_successor_command() {
+    let world = World::new("widen-small");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    let path = world.write_task_scoped("narrow", "a small one", "off", &["docs/**"]);
+    let run = world.relais(&["run", "--task", path.to_str().unwrap()]);
+    let stderr = text(&run.stderr);
+    assert_eq!(run.status.code(), Some(7), "{stderr}");
+    assert!(
+        stderr.contains("cancelled (scope_widened_small)"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("widened the scope to the test paths"),
+        "{stderr}"
+    );
+    let ledger = relais::ledger::Ledger::open(&world.state.join("ledger.sqlite")).expect("ledger");
+    let decisions = ledger.answered_decisions().expect("decisions");
+    assert_eq!(decisions.len(), 1, "{stderr}");
+    assert_eq!(decisions[0].actor.as_deref(), Some("relais"));
+    let intent = ledger
+        .intent_of_decision(&decisions[0].run)
+        .expect("read")
+        .expect("a successor intent");
+    assert!(
+        stderr.contains(&format!("relais run --intent {}", intent.intent_id)),
+        "{stderr}"
     );
 }
 
@@ -2438,7 +2505,7 @@ fn a_cancelled_run_with_no_registered_candidate_gives_a_generic_footer() {
 #[test]
 fn a_run_awaiting_a_person_is_answered_by_decide_and_drops_off_the_open_list() {
     let world = World::new("decide");
-    let hash = world.write_policy(3);
+    let hash = world.write_policy_stopping_on_scope(3);
     world.write_machine(&hash, "");
     let path = world.root.join("narrow.json");
     std::fs::write(
@@ -2538,7 +2605,7 @@ fn a_run_awaiting_a_person_is_answered_by_decide_and_drops_off_the_open_list() {
 #[test]
 fn evidence_attach_refuses_unknowns_and_records_what_it_is_told() {
     let world = World::new("evidence-attach");
-    let hash = world.write_policy(3);
+    let hash = world.write_policy_stopping_on_scope(3);
     world.write_machine(&hash, "");
     let path = world.root.join("narrow.json");
     let statement = "src/main.rs no longer exists";
@@ -2917,7 +2984,7 @@ fn every_decide_answer_ends_the_run_they_answered_with_its_own_terminal_status()
     ];
     for (answer, expected_status) in answers {
         let world = World::new(&format!("decide-{answer}"));
-        let hash = world.write_policy(3);
+        let hash = world.write_policy_stopping_on_scope(3);
         world.write_machine(&hash, "");
         let path = world.root.join("narrow.json");
         std::fs::write(
@@ -3154,7 +3221,7 @@ fn a_human_sign_off_gap_is_cleared_only_by_decide_and_then_feedback_accepts_it()
 #[test]
 fn relais_feedback_accepts_a_person_approved_run_with_no_receipt() {
     let world = World::new("feedback-no-receipt");
-    let hash = world.write_policy(3);
+    let hash = world.write_policy_stopping_on_scope(3);
     world.write_machine(&hash, "");
     let path = world.root.join("narrow.json");
     std::fs::write(
@@ -6000,7 +6067,7 @@ fn an_unreadable_marker_is_named_by_retire_and_warned_by_doctor() {
 #[test]
 fn a_run_intent_refused_by_a_preflight_leaves_the_intent_pending_with_the_refusal() {
     let world = World::new("intent-refused");
-    let hash = world.write_policy(3);
+    let hash = world.write_policy_stopping_on_scope(3);
     world.write_machine(&hash, "");
     let path = world.root.join("narrow.json");
     std::fs::write(

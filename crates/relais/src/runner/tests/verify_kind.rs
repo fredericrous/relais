@@ -593,6 +593,46 @@ fn a_conflicting_from_candidate_hands_the_merge_to_the_worker_and_refuses_the_sn
         receipt.candidate.as_ref().map(|c| c.source_run.as_str()),
         Some(source.as_str())
     );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn a_timed_out_worker_that_leaves_a_conflict_unresolved_leaves_no_candidate() {
+    let fixture = Fixture::new();
+    let source = rewriting_source(&fixture);
+    commit_file(
+        &fixture,
+        "src/main.rs",
+        "fn main() { println!(\"target\"); }\n",
+    );
+    let backend = MockBackend::new(|_| MockOutcome {
+        exit_code: Some(0),
+        timed_out: true,
+        timed_out_stop: Some(crate::backend::TimedOutStop { agent: None }),
+        usage: Some(usage(100)),
+        ..Default::default()
+    });
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let outcome = fixture.execute(&continue_contract(&source), &repo, &backend);
+    assert!(
+        matches!(outcome.terminal, Terminal::Interrupted { .. }),
+        "{:?}",
+        outcome.terminal
+    );
+    assert!(fixture
+        .ledger
+        .candidate_attempts(&outcome.run_id)
+        .expect("candidates")
+        .is_empty());
+    let crash = fixture
+        .ledger
+        .transitions(&outcome.run_id)
+        .expect("history")
+        .into_iter()
+        .find(|transition| transition.reason == "process_crash")
+        .and_then(|transition| transition.detail)
+        .expect("a process_crash detail");
+    assert!(crash.get("candidate").is_none(), "{crash}");
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
@@ -856,7 +896,9 @@ fn a_widened_scope_verify_names_the_source_run_and_its_receipt_carries_the_delta
     use crate::runner::successor;
 
     let fixture = Fixture::new();
-    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let mut repo = fixture.repo_policy(vec![passing_check()], 3);
+    // A person answers this overflow: relais's small rule is off.
+    repo.execution.widen_scope_small_max_files = 0;
     // The worker leaves the scope the contract declares (`src/**`).
     let backend = MockBackend::new(|spec| {
         std::fs::create_dir_all(spec.work_dir.join("docs")).expect("mkdir");
@@ -1520,6 +1562,57 @@ fn the_successors_reviewer_prompt_names_the_widened_test_path() {
 }
 
 #[test]
+fn the_successor_of_a_review_off_small_widen_still_dispatches_a_reviewer() {
+    let fixture = Fixture::new();
+    let mut repo = fixture.repo_policy(vec![passing_check()], 3);
+    repo.execution.widen_scope_small_max_files = 1;
+    let run = widened_run(overflowing_run_on(
+        &fixture,
+        &repo,
+        &["examples/app.rs"],
+        Review::Off,
+        Wire::process(),
+    ));
+    let intent = fixture
+        .ledger
+        .intent_of_decision(&run)
+        .expect("read")
+        .expect("a successor intent");
+    let new_run = fixture.ids.run_id().expect("a run id");
+    assert!(matches!(
+        fixture
+            .ledger
+            .claim_intent(&intent.intent_id, &new_run, &|_| {
+                crate::ledger::SuccessorProcess::Alive { started: None }
+            })
+            .expect("claim"),
+        crate::ledger::Claim::Claimed(_)
+    ));
+    let contract = TaskContract::from_json_str(&intent.contract_json).expect("the contract");
+    let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log = Arc::clone(&prompts);
+    let backend = MockBackend::new(move |spec| {
+        log.lock().expect("log").push(spec.prompt.clone());
+        MockOutcome {
+            result_text: Some("FINDINGS: none".into()),
+            exit_code: Some(0),
+            usage: Some(usage(10)),
+            ..Default::default()
+        }
+    });
+    fixture.execute_as(Some(new_run), &contract, &repo, &backend);
+    let seen = prompts.lock().expect("log");
+    assert!(
+        seen.iter()
+            .any(|prompt| prompt.contains("semantic reviewer")),
+        "a reviewer was launched: {seen:?}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch directory
+}
+
+// The fixture's policy has the small rule off: under the default policy tests
+// plus one small edit widen, and this test is about the mixed shape only.
+#[test]
 fn a_mixed_overflow_still_waits_on_a_person() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![passing_check()], 3);
@@ -1568,6 +1661,129 @@ fn widening_for_tests_can_be_switched_off_in_policy() {
         .is_none());
     assert_eq!(fixture.ledger.open_decisions().expect("open").len(), 1);
     std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+#[test]
+fn one_small_source_overflow_is_widened_with_its_own_code_and_a_required_review() {
+    let fixture = Fixture::new();
+    let mut repo = fixture.repo_policy(vec![passing_check()], 3);
+    repo.execution.widen_scope_small_max_files = 1;
+    let wire = Lines::default();
+    let run = widened_run(overflowing_run_on(
+        &fixture,
+        &repo,
+        &["examples/app.rs"],
+        Review::Off,
+        Wire::to(wire.clone()),
+    ));
+    let done = wire.done();
+    assert_eq!(done["code"], "scope_widened_small", "{done}");
+    let decision = fixture
+        .ledger
+        .decision_of_run(&run)
+        .expect("read")
+        .expect("a decision row");
+    assert_eq!(decision.actor.as_deref(), Some("relais"));
+    let intent = fixture
+        .ledger
+        .intent_of_decision(&run)
+        .expect("read")
+        .expect("a successor intent");
+    let contract = TaskContract::from_json_str(&intent.contract_json).expect("contract");
+    assert!(contract.review >= Review::Required, "{:?}", contract.review);
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch directory
+}
+
+#[test]
+fn tests_plus_one_small_source_file_is_widened() {
+    let fixture = Fixture::new();
+    let mut repo = fixture.repo_policy(vec![passing_check()], 3);
+    repo.execution.widen_scope_small_max_files = 1;
+    let wire = Lines::default();
+    widened_run(overflowing_run_on(
+        &fixture,
+        &repo,
+        &["tests/extra_test.rs", "examples/app.rs"],
+        Review::Off,
+        Wire::to(wire.clone()),
+    ));
+    assert_eq!(wire.done()["code"], "scope_widened_small");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch directory
+}
+
+#[test]
+fn two_source_files_a_zero_limit_or_too_many_lines_stop_for_a_decision() {
+    let fixture = Fixture::new();
+    let mut repo = fixture.repo_policy(vec![passing_check()], 3);
+    repo.execution.widen_scope_small_max_files = 1;
+    needs_decision_run(overflowing_run(
+        &fixture,
+        &repo,
+        &["examples/a.rs", "examples/b.rs"],
+    ));
+    let mut off = fixture.repo_policy(vec![passing_check()], 3);
+    off.execution.widen_scope_small_max_files = 0;
+    needs_decision_run(overflowing_run(&fixture, &off, &["examples/c.rs"]));
+    let mut tight = fixture.repo_policy(vec![passing_check()], 3);
+    tight.execution.widen_scope_small_max_files = 1;
+    tight.execution.widen_scope_small_max_lines = 0;
+    needs_decision_run(overflowing_run(&fixture, &tight, &["examples/d.rs"]));
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch directory
+}
+
+#[test]
+fn widenable_counts_lines_and_refuses_unknown_counts() {
+    use crate::runner::successor::{widenable, ScopeChange, SmallScopeLimits, WidenRule};
+    let profile = crate::policy::VerificationProfile::default();
+    let limits = SmallScopeLimits {
+        max_files: 1,
+        max_lines: 10,
+    };
+    let change = |path: &str, added, removed| ScopeChange {
+        path: path.into(),
+        added,
+        removed,
+    };
+    assert!(matches!(
+        widenable(
+            &profile,
+            &[change("examples/a.rs", Some(7), Some(3))],
+            limits
+        ),
+        Some(WidenRule::Small(_))
+    ));
+    assert_eq!(
+        widenable(
+            &profile,
+            &[change("examples/a.rs", Some(7), Some(4))],
+            limits
+        ),
+        None
+    );
+    assert_eq!(
+        widenable(&profile, &[change("examples/a.rs", None, None)], limits),
+        None
+    );
+    assert_eq!(
+        widenable(
+            &profile,
+            &[change(".claude/x.md", Some(1), Some(0))],
+            limits
+        ),
+        None
+    );
+    let with_input = crate::policy::VerificationProfile {
+        inputs: vec!["scripts/check.sh".into()],
+        ..Default::default()
+    };
+    assert_eq!(
+        widenable(
+            &with_input,
+            &[change("scripts/check.sh", Some(1), Some(0))],
+            limits
+        ),
+        None
+    );
 }
 
 #[test]

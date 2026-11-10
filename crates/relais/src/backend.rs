@@ -366,6 +366,18 @@ pub struct LaunchResult {
     /// repeating one failing command: the attempt has no result to verify.
     #[serde(default)]
     pub looped: Option<LoopedWorker>,
+    /// Set when a worker ran to its wall time and its stop was confirmed:
+    /// nothing is writing its tree any more.
+    #[serde(default)]
+    pub timed_out_stop: Option<TimedOutStop>,
+}
+
+/// A worker that reached its wall time and was confirmed stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimedOutStop {
+    /// The native agent confirmed stopped; `None` for a subprocess whose
+    /// whole group is gone.
+    pub agent: Option<String>,
 }
 
 /// A worker that was stopped for repeating one failing command.
@@ -616,6 +628,7 @@ mod tests {
             unpriced: Vec::new(),
             lost_worker: None,
             looped: None,
+            timed_out_stop: None,
         };
         assert!(result.terminal_result_missing());
         let completed = LaunchResult {
@@ -666,6 +679,7 @@ mod tests {
             unpriced: Vec::new(),
             lost_worker: None,
             looped: None,
+            timed_out_stop: None,
         })
         .expect("serializes");
         stored

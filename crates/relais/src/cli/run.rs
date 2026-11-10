@@ -611,15 +611,22 @@ pub(crate) fn run_command(
             Ok(CliOutcome::Interrupted)
         }
         Terminal::Cancelled { detail } => {
-            // relais answered a test-only scope overflow itself (SPEC §8):
-            // the run is cancelled with that code, and there is nothing to
-            // decide, only the successor to launch.
+            // relais answered a scope overflow itself (SPEC §8): the run is
+            // cancelled with the code of the rule that fired, and there is
+            // nothing to decide, only the successor to launch.
             match ledger.intent_of_decision(&outcome.run_id) {
                 Ok(Some(intent)) => {
-                    eprintln!("cancelled (scope_widened_for_tests): {detail}");
-                    for line in widened_lines(&intent) {
-                        eprintln!("{line}");
+                    // The code comes from the intent's scope delta, as the
+                    // report counts it, never from the decision's note; one
+                    // that cannot be read is said, never guessed.
+                    match relais::report::settle_code_of_intent(&intent.scope_delta) {
+                        Ok(code) => eprintln!("cancelled ({code}): {detail}"),
+                        Err(e) => {
+                            eprintln!("cancelled: {detail}");
+                            eprintln!("could not tell which rule settled {}: {e}", outcome.run_id);
+                        }
                     }
+                    eprintln!("{}", launch_line(&intent));
                 }
                 Ok(None) => eprintln!("cancelled: {detail}"),
                 Err(e) => {
@@ -645,17 +652,10 @@ pub(crate) fn run_command(
     result
 }
 
-/// What a CLI run says when relais settled its scope overflow itself: the
-/// successor intent and the command that launches it.
-fn widened_lines(intent: &relais::ledger::SuccessorIntent) -> Vec<String> {
-    vec![
-        format!(
-            "relais widened the scope to the test paths and answered the decision (actor relais); \
-             successor intent {}",
-            intent.intent_id
-        ),
-        format!("run it with: relais run --intent {}", intent.intent_id),
-    ]
+/// The line that launches the successor relais recorded when it settled a
+/// run itself; the `cancelled (<code>)` line above it already says why.
+fn launch_line(intent: &relais::ledger::SuccessorIntent) -> String {
+    format!("run it with: relais run --intent {}", intent.intent_id)
 }
 
 /// Make the state directory's ballast file when it is missing and the
@@ -735,9 +735,100 @@ mod tests {
             .successor_intent(&id)
             .expect("read")
             .expect("the intent");
-        let lines = widened_lines(&intent);
-        assert!(lines[0].contains(&id), "{lines:?}");
-        assert_eq!(lines[1], format!("run it with: relais run --intent {id}"));
+        assert_eq!(
+            launch_line(&intent),
+            format!("run it with: relais run --intent {id}")
+        );
+    }
+
+    /// The code a settled run prints is read from its intent's scope delta,
+    /// the way the report counts it: an empty delta is a timed-out verify,
+    /// test paths alone a test widen, anything else the small rule.
+    #[test]
+    fn a_settled_run_names_its_rule_from_the_intent_not_the_note() {
+        use relais::report::settle_code_of_intent;
+        let delta = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            settle_code_of_intent(&[]).expect("reads"),
+            "timed_out_verify_queued"
+        );
+        assert_eq!(
+            settle_code_of_intent(&delta(&["crates/x/tests/a.rs"])).expect("reads"),
+            "scope_widened_for_tests"
+        );
+        assert_eq!(
+            settle_code_of_intent(&delta(&["crates/x/tests/a.rs", "src/lib.rs"])).expect("reads"),
+            "scope_widened_small"
+        );
+    }
+
+    #[test]
+    fn a_successor_of_a_relais_answer_is_known_and_one_of_a_person_is_not() {
+        use relais::runner::successor::is_relais_successor;
+        let (ledger, id, _dir) = ledger_with_intent("intent-actor");
+        let successor = RunId::from_stored("run-succ");
+        ledger
+            .claim_intent(&id, &successor, &successor_process)
+            .expect("claim");
+        // `ledger_with_intent` is answered by the orchestrator.
+        assert!(!is_relais_successor(&ledger, &successor).expect("read"));
+        assert!(!is_relais_successor(&ledger, &RunId::from_stored("run-none")).expect("read"));
+
+        let (relais_ledger, relais_id, _dir2) = relais_answered_ledger("intent-actor-relais");
+        let child = RunId::from_stored("run-child");
+        relais_ledger
+            .claim_intent(&relais_id, &child, &successor_process)
+            .expect("claim");
+        assert!(is_relais_successor(&relais_ledger, &child).expect("read"));
+    }
+
+    /// Like `ledger_with_intent`, answered by relais with the small rule's note.
+    fn relais_answered_ledger(tag: &str) -> (Ledger, String, relais::test_support::TempDir) {
+        use relais::ledger::{Actor, DecisionAnswer, NewIntent, RecordedVia};
+        use relais::lifecycle::{Reason, State};
+        let dir = relais::test_support::temp_dir(tag);
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let decided = RunId::from_stored("run-a");
+        ledger
+            .insert_run(&decided, "/r", None, &TaskId::from_stored("task-a"), "rk")
+            .expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: decided.clone(),
+                attempt_id: None,
+                from_state: None,
+                to_state: State::NeedsDecision,
+                reason: "scope_exceeded".into(),
+                detail: None,
+                at: ledger.now(),
+            })
+            .expect("waiting");
+        let note = "scope_widened_small: a small edit";
+        let intent = ledger
+            .resolve_decision_with_intent(
+                &decided,
+                &DecisionAnswer {
+                    resolution: Reason::DecisionRevised,
+                    actor: Actor::Relais,
+                    person_quote: None,
+                    recorded_via: RecordedVia::Cli,
+                    note: Some(note),
+                    successor_run: None,
+                    from_state: State::NeedsDecision,
+                    to_state: State::Cancelled,
+                },
+                &NewIntent {
+                    predecessor: decided.clone(),
+                    contract_digest: "digest".into(),
+                    contract_json: "{}".into(),
+                    scope_delta: Vec::new(),
+                    candidate: None,
+                    review: None,
+                },
+            )
+            .expect("written")
+            .expect("open decision");
+        (ledger, intent.intent_id, dir)
     }
 
     #[test]

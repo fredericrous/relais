@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use crate::contract::{ContractError, TaskContract};
+use crate::contract::{ContractError, Review, TaskContract};
 use crate::ids::RunId;
 use crate::ledger::{IntentReview, Ledger, LedgerError, NewIntent};
 use crate::lifecycle::{Reason, State};
@@ -81,6 +81,58 @@ fn raising_transition(
         .ok_or_else(|| PlanError::NotWidenable(format!("run {run} is not waiting on a decision")))
 }
 
+/// The transition that ended `run` interrupted: the last row into
+/// `interrupted` that is not a worktree retirement.
+fn interrupted_transition(
+    ledger: &Ledger,
+    run: &RunId,
+) -> Result<crate::ledger::Transition, PlanError> {
+    ledger
+        .transitions(run)?
+        .into_iter()
+        .rev()
+        .find(|t| t.to_state == State::Interrupted && t.reason != Reason::WorktreeRetired.as_str())
+        .ok_or_else(|| PlanError::NotWidenable(format!("run {run} did not end interrupted")))
+}
+
+/// The candidate sha a timed-out worker's `process_crash` transition
+/// recorded in its JSON detail: `None` unless the run was interrupted by a
+/// wall-time stop that left a candidate.
+pub fn timed_out_candidate(ledger: &Ledger, run: &RunId) -> Result<Option<String>, PlanError> {
+    let raised = interrupted_transition(ledger, run)?;
+    if raised.reason != Reason::ProcessCrash.as_str() {
+        return Ok(None);
+    }
+    let Some(detail) = raised.detail else {
+        return Ok(None);
+    };
+    if detail.get("timed_out").and_then(|flag| flag.as_bool()) != Some(true) {
+        return Ok(None);
+    }
+    Ok(detail
+        .get("candidate")
+        .and_then(|sha| sha.as_str())
+        .filter(|sha| !sha.is_empty())
+        .map(str::to_string))
+}
+
+/// The successor a timed-out run is answered with when relais settles it
+/// itself: `Ok(None)` unless the run ended interrupted on a wall-time stop
+/// that left a candidate, else the intent verifying that candidate with the
+/// scope unchanged.
+pub fn plan_timed_out_verify(
+    ledger: &Ledger,
+    run: &RunId,
+    contract: &TaskContract,
+    runs_dir: &Path,
+) -> Result<Option<NewIntent>, PlanError> {
+    if timed_out_candidate(ledger, run)?.is_none() {
+        return Ok(None);
+    }
+    let verify = settled_contract(contract, run, &[]).map_err(PlanError::Contract)?;
+    plan(ledger, run, &verify, Vec::new(), runs_dir).map(Some)
+}
+
 /// `--rerun-verify` answers a `resource_exhausted` decision only: a rerun of
 /// the same candidate is the answer to a machine that was out of room, not
 /// to a code failure or a scope question (plan B4).
@@ -125,38 +177,207 @@ pub fn out_of_scope_paths(ledger: &Ledger, run: &RunId) -> Result<Vec<String>, P
     Ok(paths)
 }
 
-/// Whether every out-of-scope path is a test-tree path (the globs of
-/// [`crate::verify::TEST_TREE_INPUTS`]) that is neither one of the
-/// profile's own verification inputs nor under a protected prefix. An empty
-/// list is not a tests-only overflow, and a pattern that cannot be
-/// compiled makes no path a test.
-pub fn is_tests_only(profile: &VerificationProfile, paths: &[String]) -> bool {
-    if paths.is_empty() || paths.iter().any(|path| is_protected_path(path)) {
+/// Whether `path` is a test-tree path (the globs of
+/// [`crate::verify::TEST_TREE_INPUTS`]) that is neither one of the profile's
+/// own verification inputs nor under a protected prefix. A pattern that
+/// cannot be compiled makes no path a test.
+fn is_test_path(profile: &VerificationProfile, path: &str) -> bool {
+    let paths = [path.to_string()];
+    if is_protected_path(path) {
         return false;
     }
-    match classify_verification_inputs(profile, paths) {
-        Ok(touched) => touched.policy.is_empty() && touched.tests.len() == paths.len(),
+    match classify_verification_inputs(profile, &paths) {
+        Ok(touched) => touched.policy.is_empty() && touched.tests.len() == 1,
         Err(_) => false,
     }
 }
 
+/// How much one small non-test edit may change, from `[execution]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmallScopeLimits {
+    pub max_files: u32,
+    pub max_lines: u32,
+}
+
+/// One changed path of a scope overflow, as the raising transition
+/// recorded it: `None` counts are a binary file or an unreadable count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeChange {
+    pub path: String,
+    pub added: Option<u64>,
+    pub removed: Option<u64>,
+}
+
+/// Which rule let relais widen a scope overflow itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WidenRule {
+    /// Every path is a test path.
+    Tests,
+    /// Test paths plus at most the allowed number of small non-test edits.
+    Small(Vec<ScopeChange>),
+}
+
+pub use crate::lifecycle::{
+    CODE_TIMED_OUT_VERIFY_QUEUED, CODE_WIDENED_FOR_TESTS, CODE_WIDENED_SMALL,
+};
+
+/// The note the answered decision of a timed-out run carries; it starts
+/// with the code.
+pub const TIMED_OUT_NOTE: &str = "timed_out_verify_queued: worker hit its wall time; relais \
+     verifies its tree (execution.verify_timed_out)";
+
+impl WidenRule {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Tests => CODE_WIDENED_FOR_TESTS,
+            Self::Small(_) => CODE_WIDENED_SMALL,
+        }
+    }
+
+    /// The note the answered decision carries; it starts with the code.
+    pub fn note(&self) -> String {
+        match self {
+            Self::Tests => format!(
+                "{CODE_WIDENED_FOR_TESTS}: scope widened for test paths \
+                 (execution.widen_scope_for_tests)"
+            ),
+            Self::Small(_) => format!(
+                "{CODE_WIDENED_SMALL}: scope widened by a small edit \
+                 (execution.widen_scope_small_max_files)"
+            ),
+        }
+    }
+}
+
+/// What a relais settle hands out: the code the run ends with, the sentence
+/// that says why, and the successor the plugin or the CLI launches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settled {
+    pub code: &'static str,
+    pub sentence: String,
+    pub successor: crate::protocol::SuccessorRef,
+}
+
+/// Whether a scope overflow is one relais may widen itself, and by which
+/// rule: no path protected, none a policy verification input, and every
+/// path a test path except at most `limits.max_files` non-test paths whose
+/// added plus removed lines sum to at most `limits.max_lines`. A change with
+/// an unknown count is not small.
+pub fn widenable(
+    profile: &VerificationProfile,
+    changes: &[ScopeChange],
+    limits: SmallScopeLimits,
+) -> Option<WidenRule> {
+    if changes.is_empty() || changes.iter().any(|change| is_protected_path(&change.path)) {
+        return None;
+    }
+    let paths: Vec<String> = changes.iter().map(|change| change.path.clone()).collect();
+    match classify_verification_inputs(profile, &paths) {
+        Ok(touched) if touched.policy.is_empty() => {}
+        // A policy verification input is never widened in by relais.
+        Ok(_) => return None,
+        // A pattern that cannot be compiled makes no path widenable: the
+        // overflow stops for a person, as it did before this rule.
+        Err(_) => return None,
+    }
+    let sources: Vec<&ScopeChange> = changes
+        .iter()
+        .filter(|change| !is_test_path(profile, &change.path))
+        .collect();
+    if sources.is_empty() {
+        return Some(WidenRule::Tests);
+    }
+    if sources.len() as u64 > u64::from(limits.max_files) {
+        return None;
+    }
+    let mut lines: u64 = 0;
+    for change in &sources {
+        lines = lines.checked_add(change.added?.checked_add(change.removed?)?)?;
+    }
+    (lines <= u64::from(limits.max_lines))
+        .then(|| WidenRule::Small(sources.into_iter().cloned().collect()))
+}
+
+/// The changed paths a `scope_exceeded` decision of `run` lists, with the
+/// counts its transition recorded beside `paths`. A transition from before
+/// the counts were recorded yields paths with unknown counts.
+pub fn out_of_scope_changes(ledger: &Ledger, run: &RunId) -> Result<Vec<ScopeChange>, PlanError> {
+    let paths = out_of_scope_paths(ledger, run)?;
+    let waiting = raising_transition(ledger, run)?;
+    let recorded = waiting
+        .detail
+        .as_ref()
+        .and_then(|detail| detail.get("changes"))
+        .and_then(|changes| changes.as_array());
+    Ok(paths
+        .into_iter()
+        .map(|path| {
+            let entry = recorded.and_then(|changes| {
+                changes
+                    .iter()
+                    .find(|change| change.get("path").and_then(|p| p.as_str()) == Some(&path))
+            });
+            let count = |key: &str| entry.and_then(|e| e.get(key)).and_then(|n| n.as_u64());
+            ScopeChange {
+                added: count("added"),
+                removed: count("removed"),
+                path,
+            }
+        })
+        .collect())
+}
+
 /// The successor `scope_exceeded` is answered with when relais settles it
-/// itself: `Ok(None)` unless the overflow is tests only, else the intent
-/// widening the scope by exactly those paths, and the paths.
-pub fn plan_test_widening(
+/// itself: `Ok(None)` unless [`widenable`] says yes, else the intent
+/// widening the scope by exactly the out-of-scope paths, the paths, and the
+/// rule that fired.
+pub fn plan_scope_widening(
     ledger: &Ledger,
     run: &RunId,
     contract: &TaskContract,
     profile: &VerificationProfile,
+    limits: SmallScopeLimits,
     runs_dir: &Path,
-) -> Result<Option<(NewIntent, Vec<String>)>, PlanError> {
-    let paths = out_of_scope_paths(ledger, run)?;
-    if !is_tests_only(profile, &paths) {
+) -> Result<Option<(NewIntent, Vec<String>, WidenRule)>, PlanError> {
+    let changes = out_of_scope_changes(ledger, run)?;
+    let Some(rule) = widenable(profile, &changes, limits) else {
         return Ok(None);
-    }
-    let widened = widened_contract(contract, run, &paths).map_err(PlanError::Contract)?;
+    };
+    let paths: Vec<String> = changes.into_iter().map(|change| change.path).collect();
+    let widened = settled_contract(contract, run, &paths).map_err(PlanError::Contract)?;
     let intent = plan(ledger, run, &widened, paths.clone(), runs_dir)?;
-    Ok(Some((intent, paths)))
+    Ok(Some((intent, paths, rule)))
+}
+
+/// The contract every automatic successor runs: [`widened_contract`] with
+/// its review raised to at least `Required`, keeping a stronger one, so a
+/// source edit relais let through is never accepted unreviewed.
+pub fn settled_contract(
+    contract: &TaskContract,
+    run: &RunId,
+    paths: &[String],
+) -> Result<TaskContract, ContractError> {
+    let widened = widened_contract(contract, run, paths)?;
+    if widened.review >= Review::Required {
+        return Ok(widened);
+    }
+    let mut reviewed_contract = widened.canonical_value();
+    if let Some(fields) = reviewed_contract.as_object_mut() {
+        fields.insert("review".into(), serde_json::json!(Review::Required));
+    }
+    TaskContract::from_json_str(&reviewed_contract.to_string())
+}
+
+/// Whether `run` is itself the successor of a decision relais answered: a
+/// settle is never settled again.
+pub fn is_relais_successor(ledger: &Ledger, run: &RunId) -> Result<bool, PlanError> {
+    let Some(intent) = ledger.intent_of_run(run)? else {
+        return Ok(false);
+    };
+    Ok(ledger
+        .decision_of_run(&intent.predecessor)?
+        .and_then(|decision| decision.actor)
+        .is_some_and(|actor| actor == crate::ledger::Actor::Relais.as_str()))
 }
 
 /// The contract `--widen-scope` builds: the decided run's own, as a
