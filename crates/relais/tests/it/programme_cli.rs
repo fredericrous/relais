@@ -430,6 +430,7 @@ fn list_finds_the_maps_of_every_repository_under_the_root() {
     let rows: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
     assert_eq!(rows.as_array().map(Vec::len), Some(2));
     assert_eq!(rows[1]["frontier"], 1);
+    assert_eq!(rows[1]["source"], "working-tree");
 }
 
 #[test]
@@ -557,6 +558,94 @@ fn an_in_flight_ticket_shows_its_branch_last_commit_age() {
     let out = world.programme(&["show", "--json"]);
     let shown: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
     assert_eq!(shown["in_flight"][0]["branch_age_secs"], 0);
+}
+
+#[test]
+fn list_reads_maps_from_the_origin_default_branch() {
+    let world = World::new("list-origin");
+    let alpha = world.root.join("alpha");
+    git(&alpha, &["add", "."]);
+    git(&alpha, &["commit", "-q", "-m", "programme"]);
+    let upstream = world.root.join("upstream.git");
+    let upstream_s = upstream.to_str().expect("utf8");
+    git(
+        &world.root,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            alpha.to_str().expect("utf8"),
+            upstream_s,
+        ],
+    );
+    // Upstream closes D and charts a second programme the checkout has not pulled.
+    let pusher = world.root.join("pusher");
+    git(
+        &world.root,
+        &["clone", "-q", upstream_s, pusher.to_str().expect("utf8")],
+    );
+    let demo = pusher.join("docs/programmes/demo");
+    std::fs::write(
+        demo.join("D.md"),
+        ticket("closed", "[]", None, "Name of D", Some("Decided.")),
+    )
+    .expect("ticket");
+    let later = pusher.join("docs/programmes/later");
+    std::fs::create_dir_all(&later).expect("dir");
+    std::fs::write(
+        later.join("map.md"),
+        MAP.replace("Ship the demo.", "Later goal."),
+    )
+    .expect("map");
+    git(&pusher, &["add", "."]);
+    git(&pusher, &["commit", "-q", "-m", "upstream"]);
+    git(&pusher, &["push", "-q", "origin", "HEAD"]);
+    std::fs::remove_dir_all(&pusher).expect("pusher gone");
+    let branch = {
+        let out = git_command(&alpha)
+            .args(["branch", "--show-current"])
+            .output()
+            .expect("git runs");
+        text(&out.stdout).trim().to_string()
+    };
+    git(&alpha, &["remote", "add", "origin", upstream_s]);
+    git(&alpha, &["fetch", "-q", "origin"]);
+    git(&alpha, &["remote", "set-head", "origin", &branch]);
+
+    let root = world.root.to_str().expect("utf8");
+    let out = world.relais(&["programme", "list", "--root", root]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "{root}/alpha/docs/programmes/demo/map.md\tShip the demo.\topen 2 frontier 2 closed 2\n\
+             {root}/alpha/docs/programmes/later/map.md\tLater goal.\topen 0 frontier 0 closed 0\n"
+        )
+    );
+    let out = world.relais(&["programme", "list", "--root", root, "--json"]);
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(rows[0]["source"], format!("origin/{branch}"));
+}
+
+#[test]
+fn list_reads_the_files_when_origin_head_dangles() {
+    let world = World::new("list-dangling");
+    let alpha = world.root.join("alpha");
+    git(
+        &alpha,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/gone",
+        ],
+    );
+    let root = world.root.to_str().expect("utf8");
+    let out = world.relais(&["programme", "list", "--root", root, "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(rows.as_array().map(Vec::len), Some(1));
+    assert_eq!(rows[0]["source"], "working-tree");
+    assert_eq!(rows[0]["open"], 3);
 }
 
 #[test]

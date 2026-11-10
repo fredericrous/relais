@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use relais::programme::analysis::{self, age_secs, Counts, Standing};
-use relais::programme::load::{find_programmes, main_checkout, Programme, ProgrammeError};
+use relais::programme::load::{find_programmes, main_checkout, Programme, ProgrammeError, Source};
 use relais::programme::model::Ticket;
 use serde_json::{json, Value};
 
@@ -392,10 +392,16 @@ pub(crate) fn list_command(root: Option<&Path>, format: Format) -> Result<CliOut
         Some(root) => root.to_path_buf(),
         None => default_root()?,
     };
-    let mut rows: Vec<(PathBuf, String, Counts)> = Vec::new();
+    let mut rows: Vec<(PathBuf, String, Counts, String)> = Vec::new();
     let mut outcome = CliOutcome::Accepted;
-    for dir in find_programmes(&root).map_err(programme_error)? {
-        let loaded = Programme::load(&dir)
+    for found in find_programmes(&root).map_err(programme_error)? {
+        let dir = found.dir();
+        let source = match &found.source {
+            Source::WorkingTree => "working-tree".to_string(),
+            Source::Ref(rev) => rev.clone(),
+        };
+        let loaded = found
+            .load()
             .and_then(|programme| programme.standings().map(|s| (programme, s)));
         match loaded {
             Ok((programme, standings)) => {
@@ -410,6 +416,7 @@ pub(crate) fn list_command(root: Option<&Path>, format: Format) -> Result<CliOut
                     dir.join(relais::programme::model::MAP_FILE),
                     destination,
                     analysis::counts(&standings),
+                    source,
                 ));
             }
             Err(error) => {
@@ -422,13 +429,14 @@ pub(crate) fn list_command(root: Option<&Path>, format: Format) -> Result<CliOut
         Format::Json => {
             let items: Vec<Value> = rows
                 .iter()
-                .map(|(path, destination, counts)| {
+                .map(|(path, destination, counts, source)| {
                     json!({
                         "path": path.display().to_string(),
                         "destination": destination,
                         "open": counts.open,
                         "frontier": counts.frontier,
                         "closed": counts.closed,
+                        "source": source,
                     })
                 })
                 .collect();
@@ -436,7 +444,7 @@ pub(crate) fn list_command(root: Option<&Path>, format: Format) -> Result<CliOut
         }
         Format::Text => rows
             .iter()
-            .map(|(path, destination, counts)| {
+            .map(|(path, destination, counts, _source)| {
                 format!(
                     "{}\t{destination}\topen {} frontier {} closed {}\n",
                     path.display(),
