@@ -46,7 +46,7 @@ use self::outcome::{exit_code, CliError, CliOutcome};
 use self::plan::{plan_command, PlanFormat};
 use self::programme::{
     check_command as programme_check_command, frontier_command as programme_frontier_command,
-    list_command as programme_list_command, show_command as programme_show_command, Format,
+    list_command as programme_list_command, show_command as programme_show_command, Fetch, Format,
     Listing,
 };
 use self::protocol::{announce_unstarted, open_protocol};
@@ -1495,7 +1495,11 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 root,
                 json,
                 no_fetch,
-            } => programme_list_command(root.as_deref(), Format::from_json_flag(json), !no_fetch),
+            } => programme_list_command(
+                root.as_deref(),
+                Format::from_json_flag(json),
+                Fetch::from_no_fetch_flag(no_fetch),
+            ),
             ProgrammeCommand::Frontier {
                 dir,
                 all,
@@ -1505,18 +1509,26 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 &dir,
                 Listing::from_all_flag(all),
                 Format::from_json_flag(json),
-                !no_fetch,
+                Fetch::from_no_fetch_flag(no_fetch),
             ),
             ProgrammeCommand::Show {
                 dir,
                 json,
                 no_fetch,
-            } => programme_show_command(&dir, Format::from_json_flag(json), !no_fetch),
+            } => programme_show_command(
+                &dir,
+                Format::from_json_flag(json),
+                Fetch::from_no_fetch_flag(no_fetch),
+            ),
             ProgrammeCommand::Check {
                 dir,
                 json,
                 no_fetch,
-            } => programme_check_command(&dir, Format::from_json_flag(json), !no_fetch),
+            } => programme_check_command(
+                &dir,
+                Format::from_json_flag(json),
+                Fetch::from_no_fetch_flag(no_fetch),
+            ),
         },
         Command::Evidence { cmd } => match cmd {
             EvidenceCommand::Attach {

@@ -32,6 +32,25 @@ impl Format {
     }
 }
 
+/// Whether a command fetches origin before reading it (SPEC §31).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fetch {
+    /// `git fetch --prune origin` first, bounded.
+    Origin,
+    /// Read origin as the last fetch left it (`--no-fetch`).
+    LastFetch,
+}
+
+impl Fetch {
+    pub(crate) fn from_no_fetch_flag(no_fetch: bool) -> Self {
+        if no_fetch {
+            Self::LastFetch
+        } else {
+            Self::Origin
+        }
+    }
+}
+
 /// Which tickets `frontier` lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Listing {
@@ -185,9 +204,13 @@ pub(crate) fn frontier_command(
     dir: &Path,
     listing: Listing,
     format: Format,
-    fetch: bool,
+    fetch: Fetch,
 ) -> Result<CliOutcome, CliError> {
-    let programme = resolve_dir(dir, fetch)?.load().map_err(programme_error)?;
+    let found = resolve_dir(dir, fetch)?;
+    if let (Source::Ref(rev), true) = (&found.source, stderr_is_terminal()) {
+        eprintln!("relais: reading {} from {rev}", dir.display());
+    }
+    let programme = found.load().map_err(programme_error)?;
     let standings = programme.standings().map_err(programme_error)?;
     let now = now_unix();
     let shown: Vec<(&Ticket, Option<Tip<'_>>)> = programme
@@ -258,9 +281,10 @@ pub(crate) fn frontier_command(
 pub(crate) fn show_command(
     dir: &Path,
     format: Format,
-    fetch: bool,
+    fetch: Fetch,
 ) -> Result<CliOutcome, CliError> {
-    let programme = resolve_dir(dir, fetch)?.load().map_err(programme_error)?;
+    let found = resolve_dir(dir, fetch)?;
+    let programme = found.load().map_err(programme_error)?;
     let standings = programme.standings().map_err(programme_error)?;
     let counts = analysis::counts(&standings);
     let blocked: Vec<(&Ticket, &Vec<String>)> = programme
@@ -285,6 +309,7 @@ pub(crate) fn show_command(
             "{}\n",
             json!({
                 "destination": programme.map.destination,
+                "source": found.source.label(),
                 "counts": counts_json(&counts),
                 "blocked": blocked.iter().map(|(t, by)| json!({
                     "id": t.id, "name": t.name, "blocked_by": by,
@@ -296,7 +321,11 @@ pub(crate) fn show_command(
             })
         ),
         Format::Text => {
-            let mut text = format!("Destination\n{}\n\n", programme.map.destination);
+            let mut text = format!(
+                "Destination\n{}\n\nRead from {}\n\n",
+                programme.map.destination,
+                found.source.label()
+            );
             text.push_str(&format!(
                 "open {} (frontier {}, blocked {}, in flight {}), closed {}, out of scope {}\n",
                 counts.open,
@@ -339,7 +368,7 @@ pub(crate) fn show_command(
 pub(crate) fn check_command(
     dir: &Path,
     format: Format,
-    fetch: bool,
+    fetch: Fetch,
 ) -> Result<CliOutcome, CliError> {
     let found = resolve_dir(dir, fetch)?;
     let programme = found.load().map_err(programme_error)?;
@@ -426,11 +455,11 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
                 let Some(item) = items.get(index) else {
                     break;
                 };
-                let result = f(item);
+                let mapped = f(item);
                 results
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push((index, result));
+                    .push((index, mapped));
             });
         }
     });
@@ -460,27 +489,17 @@ fn fetch_all(repos: &[PathBuf]) {
         };
         eprintln!("relais: fetching {what} (--no-fetch skips)");
     }
-    let failures: Vec<(usize, load::FetchFailure)> =
-        par_map(&with_origin, |repo| load::fetch_origin(repo))
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, fetched)| fetched.err().map(|failure| (index, failure)))
-            .collect();
+    let failures: Vec<(usize, load::FetchFailure)> = par_map(&with_origin, |repo| {
+        load::fetch_origin(repo, load::FETCH_BACKSTOP)
+    })
+    .into_iter()
+    .enumerate()
+    .filter_map(|(index, fetched)| fetched.err().map(|failure| (index, failure)))
+    .collect();
     for (index, failure) in &failures {
-        let locks = if failure.locks.is_empty() {
-            String::new()
-        } else {
-            let named: Vec<String> = failure
-                .locks
-                .iter()
-                .map(|l| l.display().to_string())
-                .collect();
-            format!("; lock left: {}", named.join(", "))
-        };
         eprintln!(
-            "relais: {}: fetch failed ({}); reading the last fetch{locks}",
-            with_origin[*index].display(),
-            failure.reason
+            "relais: {}: fetch failed ({failure}); reading the last fetch",
+            with_origin[*index].display()
         );
     }
     if !failures.is_empty() {
@@ -488,14 +507,19 @@ fn fetch_all(repos: &[PathBuf]) {
     }
 }
 
-/// Locates `dir`, fetches its repository unless told not to, and resolves
-/// where to read it from (SPEC §31).
-fn resolve_dir(dir: &Path, fetch: bool) -> Result<Found, CliError> {
+/// Locates `dir`, fetches its repository unless told not to, resolves
+/// where to read it from (SPEC §31) and names on stderr what the
+/// resolution set aside or skipped.
+fn resolve_dir(dir: &Path, fetch: Fetch) -> Result<Found, CliError> {
     let located = load::locate(dir).map_err(programme_error)?;
-    if fetch {
+    if fetch == Fetch::Origin {
         fetch_all(std::slice::from_ref(&located.repo));
     }
-    load::resolve(&located).map_err(programme_error)
+    let resolved = load::resolve(&located).map_err(programme_error)?;
+    for note in &resolved.notes {
+        eprintln!("relais: {note}");
+    }
+    Ok(resolved.found)
 }
 
 /// `(<ref>) ` before a message whose line numbers are the ref's, not the
@@ -510,7 +534,7 @@ fn ref_tag(source: &Source) -> String {
 pub(crate) fn list_command(
     root: Option<&Path>,
     format: Format,
-    fetch: bool,
+    fetch: Fetch,
 ) -> Result<CliOutcome, CliError> {
     let root = match root {
         Some(root) => root.to_path_buf(),
@@ -525,7 +549,7 @@ pub(crate) fn list_command(
         .zip(holds)
         .filter_map(|(repo, holds)| holds.then_some(repo))
         .collect();
-    if fetch {
+    if fetch == Fetch::Origin {
         fetch_all(&repos);
     }
     let mut rows: Vec<(PathBuf, String, Counts, String)> = Vec::new();
@@ -536,7 +560,12 @@ pub(crate) fn list_command(
         .zip(par_map(&repos, |repo| load::programmes_of(repo)))
     {
         match found {
-            Ok(found) => found_all.extend(found),
+            Ok(listed) => {
+                for note in &listed.notes {
+                    eprintln!("relais: {note}");
+                }
+                found_all.extend(listed.found);
+            }
             Err(error) => {
                 eprintln!("relais: {}: {error}", repo.display());
                 outcome = CliOutcome::OperationalFailure;

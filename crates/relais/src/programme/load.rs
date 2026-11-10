@@ -149,7 +149,18 @@ impl Programme {
             .map(|file| format!("{rev}:{prefix}{file}\n"))
             .collect();
         let printed = git_stdout_with_input(repo, &["cat-file", "--batch"], input)?;
-        let mut texts = batch_contents(&printed).into_iter();
+        let texts = batch_contents(&printed);
+        if texts.len() != files.len() {
+            return Err(ProgrammeError::Git {
+                repo: repo.to_path_buf(),
+                detail: format!(
+                    "cat-file printed {} objects for {} asked",
+                    texts.len(),
+                    files.len()
+                ),
+            });
+        }
+        let mut texts = texts.into_iter();
         let missing = |file: &str| ProgrammeError::Git {
             repo: repo.to_path_buf(),
             detail: format!("{rev}:{prefix}{file} is missing"),
@@ -434,13 +445,20 @@ fn programmes_at(repo: &Path, rev: &str) -> Result<BTreeSet<String>, ProgrammeEr
         .collect())
 }
 
-/// Origin's default ref and the programmes it holds, when the repository
-/// has one git can list. A ref git cannot list counts as none, so one
-/// repository never hides the others.
-fn origin_view(repo: &Path) -> Option<(String, BTreeSet<String>)> {
-    let rev = origin_default(repo)?;
-    let slugs = programmes_at(repo, &rev).ok()?; // unlistable: read the files instead
-    Some((rev, slugs))
+/// Origin's default ref and the programmes it holds.
+struct OriginView {
+    rev: String,
+    slugs: BTreeSet<String>,
+}
+
+/// Origin's view of a repository: `None` when it has no default ref, an
+/// error when git cannot list the ref it has.
+fn origin_view(repo: &Path) -> Result<Option<OriginView>, ProgrammeError> {
+    let Some(rev) = origin_default(repo) else {
+        return Ok(None);
+    };
+    let slugs = programmes_at(repo, &rev)?;
+    Ok(Some(OriginView { rev, slugs }))
 }
 
 /// What `git <args>` prints in `repo`, given `input` on stdin.
@@ -521,44 +539,67 @@ fn trees_on(repo: &Path, rev: &str, slug: &str) -> Result<BTreeSet<String>, Prog
         .collect())
 }
 
-/// What origin's default ref holds for one programme.
-struct OriginSide<'a> {
-    rev: &'a str,
-    /// Every tree the directory had in `rev`'s history.
-    trees: BTreeSet<String>,
-    /// The committer date of `rev`'s newest commit touching the directory;
-    /// `None` when `rev` does not hold the programme.
-    changed_at: Option<i64>,
+/// What origin's default ref says about one programme.
+enum Origin<'a> {
+    /// The repository has no origin default ref: the files decide.
+    Absent,
+    /// The ref exists and does not hold the programme.
+    Lacks { rev: &'a str },
+    /// The ref holds it: every tree its directory had in the ref's history,
+    /// and the committer date of the newest commit touching it.
+    Holds {
+        rev: &'a str,
+        trees: BTreeSet<String>,
+        changed_at: i64,
+    },
 }
 
-fn origin_side<'a>(
-    repo: &Path,
-    rev: &'a str,
-    slug: &str,
-    holds: bool,
-) -> Result<OriginSide<'a>, ProgrammeError> {
-    if !holds {
-        return Ok(OriginSide {
-            rev,
-            trees: BTreeSet::new(),
-            changed_at: None,
-        });
+impl Origin<'_> {
+    fn rev(&self) -> Option<&str> {
+        match self {
+            Self::Absent => None,
+            Self::Lacks { rev } | Self::Holds { rev, .. } => Some(rev),
+        }
     }
-    let changed_at = git_stdout(
+}
+
+fn origin_for<'a>(
+    repo: &Path,
+    view: Option<&'a OriginView>,
+    slug: &str,
+) -> Result<Origin<'a>, ProgrammeError> {
+    let Some(view) = view else {
+        return Ok(Origin::Absent);
+    };
+    if !view.slugs.contains(slug) {
+        return Ok(Origin::Lacks { rev: &view.rev });
+    }
+    let printed = git_stdout(
         repo,
-        &["log", "-1", "--format=%ct", rev, "--", &programme_rel(slug)],
-    )?
-    .trim()
-    .parse::<i64>()
-    .ok(); // an empty log: rev holds no commit touching it, so no date to beat
-    Ok(OriginSide {
-        rev,
-        trees: trees_on(repo, rev, slug)?,
-        changed_at: changed_at.or(Some(0)),
+        &[
+            "log",
+            "-1",
+            "--format=%ct",
+            &view.rev,
+            "--",
+            &programme_rel(slug),
+        ],
+    )?;
+    let changed_at = printed
+        .trim()
+        .parse::<i64>()
+        .map_err(|e| ProgrammeError::Git {
+            repo: repo.to_path_buf(),
+            detail: format!("last change of {slug} on {}: {e}", view.rev),
+        })?;
+    Ok(Origin::Holds {
+        rev: &view.rev,
+        trees: trees_on(repo, &view.rev, slug)?,
+        changed_at,
     })
 }
 
-/// Seconds since the epoch of a file's last change, when it has one.
+/// Seconds since the epoch of a path's last change, when it has one.
 fn mtime_unix(path: &Path) -> Option<i64> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     let secs = modified
@@ -568,14 +609,21 @@ fn mtime_unix(path: &Path) -> Option<i64> {
     i64::try_from(secs).ok()
 }
 
+/// One file `git status` lists under a programme.
+struct Dirty {
+    /// Repository-relative.
+    path: String,
+    deleted: bool,
+}
+
 /// What one checkout holds under `docs/programmes/`, read once for all of
 /// its programmes.
 struct CheckoutState {
     path: PathBuf,
-    /// Per slug, the files `git status --porcelain -z -uall` lists under it,
-    /// each with whether it was deleted. `-uall` names each file of an
-    /// untracked programme; `-z` keeps odd names unquoted.
-    dirty: BTreeMap<String, Vec<(String, bool)>>,
+    /// Per slug, the files `git status --porcelain -z -uall` lists under it.
+    /// `-uall` names each file of an untracked programme; `-z` keeps odd
+    /// names unquoted.
+    dirty: BTreeMap<String, Vec<Dirty>>,
     /// Per slug, HEAD's tree for its directory.
     head_trees: BTreeMap<String, String>,
 }
@@ -598,7 +646,7 @@ fn checkout_state(checkout: &Path) -> Result<CheckoutState, ProgrammeError> {
             "docs/programmes/",
         ],
     )?;
-    let mut dirty: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
+    let mut dirty: BTreeMap<String, Vec<Dirty>> = BTreeMap::new();
     let mut tokens = printed.split('\0').filter(|t| !t.is_empty());
     while let Some(token) = tokens.next() {
         let (Some(code), Some(path)) = (token.get(..2), token.get(3..)) else {
@@ -608,14 +656,18 @@ fn checkout_state(checkout: &Path) -> Result<CheckoutState, ProgrammeError> {
             tokens.next(); // a rename or copy is followed by its origin path
         }
         if let Some(slug) = slug_of(path) {
-            dirty
-                .entry(slug.to_string())
-                .or_default()
-                .push((path.to_string(), code.contains('D')));
+            dirty.entry(slug.to_string()).or_default().push(Dirty {
+                path: path.to_string(),
+                deleted: code.contains('D'),
+            });
         }
     }
-    let listed =
-        git_stdout(checkout, &["ls-tree", "-z", "HEAD", "docs/programmes/"]).unwrap_or_default(); // an unborn HEAD holds nothing committed
+    let born = git_stdout(checkout, &["rev-parse", "-q", "--verify", "HEAD"]).is_ok(); // exit 1: an unborn HEAD, which holds nothing committed
+    let listed = if born {
+        git_stdout(checkout, &["ls-tree", "-z", "HEAD", "docs/programmes/"])?
+    } else {
+        String::new()
+    };
     let head_trees = listed
         .split('\0')
         .filter_map(|entry| {
@@ -633,32 +685,50 @@ fn checkout_state(checkout: &Path) -> Result<CheckoutState, ProgrammeError> {
     })
 }
 
+/// When a changed file last changed: its own mtime, or for a deleted file
+/// the mtime of the nearest directory still on disk, which the deletion
+/// touched.
+fn changed_at(checkout: &Path, entry: &Dirty) -> Option<i64> {
+    let path = checkout.join(&entry.path);
+    if !entry.deleted {
+        return mtime_unix(&path);
+    }
+    path.ancestors()
+        .skip(1)
+        .take_while(|dir| dir.starts_with(checkout))
+        .find(|dir| dir.is_dir())
+        .and_then(mtime_unix)
+}
+
 /// The recency (Unix seconds) of the local work a checkout has on the
 /// programme `slug`, or `None` when it has none (SPEC §31).
 ///
 /// Uncommitted changes count, and so does a HEAD whose tree for the
 /// directory origin never held. Without origin, a checkout that has the
-/// files counts. The recency is the newest mtime among the changed files
-/// (a heuristic: a checkout or a rebase resets it) and the newest local
-/// commit touching the directory.
+/// files counts. The recency is the newest change among the listed files
+/// and the newest local commit touching the directory.
+// holds-until: a person reports a copy chosen or set aside because a
+// checkout or a rebase reset its files' mtimes; then a content-based
+// recency (the commit or stash that last touched each file) replaces it.
 fn local_work(
     state: &CheckoutState,
     slug: &str,
-    origin: Option<&OriginSide<'_>>,
+    origin: &Origin<'_>,
 ) -> Result<Option<i64>, ProgrammeError> {
     let rel = programme_rel(slug);
     let dirty = state.dirty.get(slug).map_or(&[][..], Vec::as_slice);
+    let head_tree = state.head_trees.get(slug);
     let committed = match origin {
-        None => state.path.join(&rel).join(MAP_FILE).is_file(),
-        Some(on) => state
-            .head_trees
-            .get(slug)
-            .is_some_and(|tree| !on.trees.contains(tree)),
+        Origin::Absent => state.path.join(&rel).join(MAP_FILE).is_file(),
+        Origin::Lacks { .. } => head_tree.is_some(),
+        Origin::Holds { trees, .. } => head_tree.is_some_and(|tree| !trees.contains(tree)),
     };
     if dirty.is_empty() && !committed {
         return Ok(None);
     }
-    let range = origin.map_or_else(|| "HEAD".to_string(), |on| format!("{}..HEAD", on.rev));
+    let range = origin
+        .rev()
+        .map_or_else(|| "HEAD".to_string(), |rev| format!("{rev}..HEAD"));
     let committed_at = if committed {
         git_stdout(
             &state.path,
@@ -666,17 +736,16 @@ fn local_work(
         )?
         .trim()
         .parse::<i64>()
-        .unwrap_or(0) // no commit in range touches it: the files' mtimes decide
+        .unwrap_or(0) // no commit in the range touches it: the files decide
     } else {
         0
     };
-    let changed_at = dirty
+    let files_at = dirty
         .iter()
-        .filter(|(_, deleted)| !deleted)
-        .filter_map(|(path, _)| mtime_unix(&state.path.join(path)))
+        .filter_map(|entry| changed_at(&state.path, entry))
         .max()
         .unwrap_or(0);
-    Ok(Some(committed_at.max(changed_at)))
+    Ok(Some(committed_at.max(files_at)))
 }
 
 /// The linked worktrees of the repository whose main checkout is `repo`,
@@ -712,9 +781,10 @@ fn local_slugs(checkout: &Path) -> BTreeSet<String> {
 /// Whether the repository whose main checkout is `repo` can hold a
 /// programme: a checkout has `docs/programmes/`, or origin's default ref
 /// does, as of the last fetch. One git call at most, so the many
-/// repositories without a programme cost little; the first programme an
-/// upstream charts in a repository that had none shows once something has
-/// fetched it.
+/// repositories without a programme cost little.
+// holds-until: a person reports a programme charted upstream, in a
+// repository that had none, that `list` missed; then such repositories
+// are fetched too, at the cost of a fetch per repository under the root.
 pub fn may_hold_programmes(repo: &Path) -> bool {
     let on_disk = |checkout: &Path| checkout.join("docs").join("programmes").is_dir();
     if on_disk(repo) || linked_worktrees(repo).iter().any(|c| on_disk(c)) {
@@ -726,6 +796,14 @@ pub fn may_hold_programmes(repo: &Path) -> bool {
         .is_ok_and(|printed| printed.lines().any(|line| line.contains(" tree ")))
 }
 
+/// Where one programme is read from, and the local copy it set aside.
+struct Choice {
+    found: Option<Found>,
+    /// A checkout whose local work was older than origin's last change, and
+    /// that ref: the person may expect their copy to be read.
+    set_aside: Option<(PathBuf, String)>,
+}
+
 /// Where the programme `slug` of `repo` is read from, among the checkout
 /// `states` (the main one first), per SPEC §31: the most recent checkout
 /// with local work (a tie goes to the earlier one), when that work is no
@@ -735,12 +813,9 @@ fn choose(
     repo: &Path,
     slug: &str,
     states: &[CheckoutState],
-    origin: Option<&(String, BTreeSet<String>)>,
-) -> Result<Option<Found>, ProgrammeError> {
-    let side = match origin {
-        Some((rev, slugs)) => Some(origin_side(repo, rev, slug, slugs.contains(slug))?),
-        None => None,
-    };
+    view: Option<&OriginView>,
+) -> Result<Choice, ProgrammeError> {
+    let origin = origin_for(repo, view, slug)?;
     let mut best: Option<(i64, &CheckoutState)> = None;
     for state in states {
         if !state
@@ -751,28 +826,40 @@ fn choose(
         {
             continue;
         }
-        if let Some(at) = local_work(state, slug, side.as_ref())? {
+        if let Some(at) = local_work(state, slug, &origin)? {
             if best.is_none_or(|(newest, _)| at > newest) {
                 best = Some((at, state));
             }
         }
     }
-    let origin_at = side.as_ref().and_then(|s| s.changed_at);
-    let local = best.filter(|(at, _)| origin_at.is_none_or(|origin_at| *at >= origin_at));
-    Ok(match (local, side) {
-        (Some((_, state)), _) => Some(Found {
-            repo: repo.to_path_buf(),
-            checkout: state.path.clone(),
-            slug: slug.to_string(),
-            source: Source::WorkingTree,
-        }),
-        (None, Some(side)) if side.changed_at.is_some() => Some(Found {
-            repo: repo.to_path_buf(),
-            checkout: repo.to_path_buf(),
-            slug: slug.to_string(),
-            source: Source::Ref(side.rev.to_string()),
-        }),
-        (None, _) => None,
+    let local = |state: &CheckoutState| Found {
+        repo: repo.to_path_buf(),
+        checkout: state.path.clone(),
+        slug: slug.to_string(),
+        source: Source::WorkingTree,
+    };
+    Ok(match (best, origin) {
+        (Some((_, state)), Origin::Absent | Origin::Lacks { .. }) => Choice {
+            found: Some(local(state)),
+            set_aside: None,
+        },
+        (Some((at, state)), Origin::Holds { changed_at, .. }) if at >= changed_at => Choice {
+            found: Some(local(state)),
+            set_aside: None,
+        },
+        (best, Origin::Holds { rev, .. }) => Choice {
+            found: Some(Found {
+                repo: repo.to_path_buf(),
+                checkout: repo.to_path_buf(),
+                slug: slug.to_string(),
+                source: Source::Ref(rev.to_string()),
+            }),
+            set_aside: best.map(|(_, state)| (state.path.clone(), rev.to_string())),
+        },
+        (None, Origin::Absent | Origin::Lacks { .. }) => Choice {
+            found: None,
+            set_aside: None,
+        },
     })
 }
 
@@ -791,32 +878,61 @@ pub fn repositories(root: &Path) -> Result<Vec<PathBuf>, ProgrammeError> {
     Ok(repos)
 }
 
+/// The programmes of one repository, and what was skipped on the way: each
+/// note is a line for stderr, never a failure.
+pub struct Listed {
+    pub found: Vec<Found>,
+    pub notes: Vec<String>,
+}
+
+/// Origin's view of a repository, noting a ref git could not list: the
+/// files are read instead, so one repository never hides the others.
+fn origin_view_noted(repo: &Path, notes: &mut Vec<String>) -> Option<OriginView> {
+    match origin_view(repo) {
+        Ok(view) => view,
+        Err(error) => {
+            notes.push(format!(
+                "{}: {error}; reading the files instead",
+                repo.display()
+            ));
+            None
+        }
+    }
+}
+
 /// The programmes of the repository whose main checkout is `repo`, by slug,
 /// once each. The candidates are origin's default branch and every
 /// checkout, linked worktrees included (SPEC §31).
-pub fn programmes_of(repo: &Path) -> Result<Vec<Found>, ProgrammeError> {
+pub fn programmes_of(repo: &Path) -> Result<Listed, ProgrammeError> {
+    let mut notes = Vec::new();
     if !may_hold_programmes(repo) {
-        return Ok(Vec::new());
+        return Ok(Listed {
+            found: Vec::new(),
+            notes,
+        });
     }
-    let origin = origin_view(repo);
+    let view = origin_view_noted(repo, &mut notes);
     let mut states = vec![checkout_state(repo)?];
-    // A linked worktree git cannot read is left out; the others still count.
-    states.extend(
-        linked_worktrees(repo)
-            .iter()
-            .filter_map(|c| checkout_state(c).ok()),
-    );
+    for linked in linked_worktrees(repo) {
+        match checkout_state(&linked) {
+            Ok(state) => states.push(state),
+            Err(error) => notes.push(format!("{}: {error}; skipped", linked.display())),
+        }
+    }
     let mut slugs: BTreeSet<String> = states.iter().flat_map(|s| local_slugs(&s.path)).collect();
-    if let Some((_, on_origin)) = &origin {
-        slugs.extend(on_origin.iter().cloned());
+    if let Some(view) = &view {
+        slugs.extend(view.slugs.iter().cloned());
     }
     let mut found = Vec::new();
     for slug in slugs {
-        if let Some(one) = choose(repo, &slug, &states, origin.as_ref())? {
+        // A copy set aside here is a stale branch among many: `list` is
+        // quiet about it; `frontier`, `show` and `check` on its directory
+        // say it.
+        if let Some(one) = choose(repo, &slug, &states, view.as_ref())?.found {
             found.push(one);
         }
     }
-    Ok(found)
+    Ok(Listed { found, notes })
 }
 
 /// A programme directory as a command named it: the checkout that holds
@@ -861,76 +977,159 @@ pub fn locate(dir: &Path) -> Result<Located, ProgrammeError> {
     })
 }
 
+/// A located programme and where it is read from, with lines for stderr.
+pub struct Resolved {
+    pub found: Found,
+    pub notes: Vec<String>,
+}
+
 /// Where `frontier`, `show` and `check` read a located programme from
-/// (SPEC §31): its checkout's files when they hold local work newer than
+/// (SPEC §31): its checkout's files when they hold local work no older than
 /// origin's last change, else origin's default branch when it holds the
-/// programme, else the files.
-pub fn resolve(located: &Located) -> Result<Found, ProgrammeError> {
-    let origin = origin_view(&located.repo);
+/// programme, else the files. Local work set aside is named in a note, so
+/// a `check` that passes on origin never hides the edits it did not read.
+pub fn resolve(located: &Located) -> Result<Resolved, ProgrammeError> {
+    let mut notes = Vec::new();
+    let view = origin_view_noted(&located.repo, &mut notes);
     let state = checkout_state(&located.checkout)?;
-    let found = choose(
+    let choice = choose(
         &located.repo,
         &located.slug,
         std::slice::from_ref(&state),
-        origin.as_ref(),
+        view.as_ref(),
     )?;
+    if let Some((_, rev)) = &choice.set_aside {
+        notes.push(format!(
+            "{}: local work older than {rev}'s last change; reading {rev}",
+            located.dir.display()
+        ));
+    }
     let files = located
         .checkout
         .join(programme_rel(&located.slug))
         .join(MAP_FILE);
-    match found {
-        Some(found) => Ok(Found {
+    let found = match choice.found {
+        Some(found) => Found {
             checkout: located.checkout.clone(),
             ..found
-        }),
-        None if files.is_file() => Ok(Found {
+        },
+        None if files.is_file() => Found {
             repo: located.repo.clone(),
             checkout: located.checkout.clone(),
             slug: located.slug.clone(),
             source: Source::WorkingTree,
-        }),
-        None => Err(ProgrammeError::Read {
-            path: located.dir.join(MAP_FILE),
-            cause: std::io::Error::from(std::io::ErrorKind::NotFound),
-        }),
-    }
+        },
+        None => {
+            return Err(ProgrammeError::Read {
+                path: located.dir.join(MAP_FILE),
+                cause: std::io::Error::from(std::io::ErrorKind::NotFound),
+            })
+        }
+    };
+    Ok(Resolved { found, notes })
 }
 
 /// How long a fetch runs before relais asks it to stop; git's own ssh and
 /// HTTP limits (5 s) normally end it first.
-const FETCH_BACKSTOP: Duration = Duration::from_secs(10);
+pub const FETCH_BACKSTOP: Duration = Duration::from_secs(10);
 /// How long a fetch asked to stop has before it is killed.
 const FETCH_GRACE: Duration = Duration::from_secs(2);
 
 /// Why a fetch did not refresh origin's refs.
 #[derive(Debug)]
+pub enum FetchFailureKind {
+    /// It was still running at the backstop.
+    TimedOut(Duration),
+    /// git ended with a failure; its most telling stderr line.
+    Git(String),
+    /// git could not be started or waited for.
+    Process(std::io::Error),
+}
+
+impl std::fmt::Display for FetchFailureKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut(after) => write!(f, "timed out after {} s", after.as_secs()),
+            Self::Git(line) => f.write_str(line),
+            Self::Process(error) => write!(f, "git: {error}"),
+        }
+    }
+}
+
+/// A fetch that failed, and the lock files it left that were not there
+/// before it ran.
+#[derive(Debug)]
 pub struct FetchFailure {
-    /// `timed out after 10 s`, or the first non-empty line git printed.
-    pub reason: String,
-    /// Lock files left under the git directory afterwards.
+    pub kind: FetchFailureKind,
     pub locks: Vec<PathBuf>,
 }
+
+impl std::fmt::Display for FetchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.kind)?;
+        if !self.locks.is_empty() {
+            let named: Vec<String> = self.locks.iter().map(|l| l.display().to_string()).collect();
+            write!(
+                f,
+                "; lock left: {} (remove it if no git is running)",
+                named.join(", ")
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for FetchFailure {}
 
 /// Whether the repository names an `origin` remote.
 pub fn has_origin(repo: &Path) -> bool {
     git_stdout(repo, &["remote", "get-url", "origin"]).is_ok() // exit 2: no such remote
 }
 
-/// `git fetch --prune -q origin` in `repo`, bounded (SPEC §31).
+/// The line of git's stderr that says why: the first `fatal:` or `error:`
+/// line, else the first non-empty one (a `warning:` often comes first).
+fn telling_line(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines
+        .iter()
+        .find(|l| l.starts_with("fatal:") || l.starts_with("error:"))
+        .or_else(|| lines.first())
+        .map_or_else(|| "git fetch failed".to_string(), ToString::to_string)
+}
+
+/// `git fetch --prune -q origin` in `repo`, bounded by `backstop`
+/// (SPEC §31; callers pass [`FETCH_BACKSTOP`]).
 ///
 /// The child stays in relais's own process group, so a terminal Ctrl-C
 /// reaches git and its ssh, and git removes its own lock files; the
 /// backstop asks it to stop with SIGTERM, which git also cleans up after,
-/// and kills it only when it did not stop within the grace period.
-pub fn fetch_origin(repo: &Path) -> Result<(), FetchFailure> {
+/// and kills it when it did not stop within the grace period. A parent
+/// that signals relais's pid alone (a `timeout(1)`, a hook's limit) ends
+/// relais and its backstop: git then runs on, bounded only by the ssh and
+/// HTTP limits set here (about 5 s), and not at all over a local or `ext::`
+/// transport.
+pub fn fetch_origin(repo: &Path, backstop: Duration) -> Result<(), FetchFailure> {
     use std::io::Read;
-    let failed = |reason: String| FetchFailure {
-        reason,
-        locks: Vec::new(),
+    let locks_before = lock_files(repo);
+    let fail = |kind: FetchFailureKind| {
+        let mut locks = lock_files(repo);
+        locks.retain(|lock| !locks_before.contains(lock));
+        FetchFailure { kind, locks }
     };
     let mut command = crate::workspace::git_command(repo);
     command
-        .args(["fetch", "--prune", "-q", "origin"])
+        .args([
+            "-c",
+            "credential.interactive=never",
+            "fetch",
+            "--prune",
+            "-q",
+            "origin",
+        ])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env(
             "GIT_SSH_COMMAND",
@@ -941,11 +1140,13 @@ pub fn fetch_origin(repo: &Path) -> Result<(), FetchFailure> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-    let mut child = command.spawn().map_err(|e| failed(e.to_string()))?;
+    let mut child = command
+        .spawn()
+        .map_err(|e| fail(FetchFailureKind::Process(e)))?;
     let stderr = child.stderr.take();
     // Drained on its own thread so a chatty git never blocks on the pipe;
     // an ssh orphaned by the kill may hold it open, so it is joined only
-    // when git ended on its own.
+    // when git ended on its own, and otherwise ends with that ssh.
     let reader = std::thread::spawn(move || {
         let mut text = String::new();
         if let Some(mut pipe) = stderr {
@@ -958,12 +1159,16 @@ pub fn fetch_origin(repo: &Path) -> Result<(), FetchFailure> {
     let mut killed = false;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => break status,
             Ok(None) => {}
-            Err(e) => return Err(failed(e.to_string())),
+            Err(e) => {
+                drop(child.kill()); // already gone: the wait below returns at once
+                drop(child.wait()); // reaped so no zombie outlives the error
+                return Err(fail(FetchFailureKind::Process(e)));
+            }
         }
         match asked {
-            None if started.elapsed() >= FETCH_BACKSTOP => {
+            None if started.elapsed() >= backstop => {
                 drop(crate::procs::terminate(child.id())); // already gone: the next try_wait says so
                 asked = Some(std::time::Instant::now());
             }
@@ -975,30 +1180,19 @@ pub fn fetch_origin(repo: &Path) -> Result<(), FetchFailure> {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let reason = if asked.is_some() {
-        format!("timed out after {} s", FETCH_BACKSTOP.as_secs())
-    } else {
-        match status {
-            Some(status) if status.success() => return Ok(()),
-            _ => {
-                let text = reader.join().unwrap_or_default();
-                text.lines()
-                    .map(str::trim)
-                    .find(|line| !line.is_empty())
-                    .unwrap_or("git fetch failed")
-                    .to_string()
-            }
-        }
-    };
-    Err(FetchFailure {
-        reason,
-        locks: leftover_locks(repo),
-    })
+    if asked.is_some() {
+        return Err(fail(FetchFailureKind::TimedOut(backstop)));
+    }
+    if status.success() {
+        return Ok(());
+    }
+    let text = reader.join().unwrap_or_default();
+    Err(fail(FetchFailureKind::Git(telling_line(&text))))
 }
 
 /// The `*.lock` files under the repository's common git directory: its
 /// top level and `refs/`, where a fetch takes its locks.
-fn leftover_locks(repo: &Path) -> Vec<PathBuf> {
+fn lock_files(repo: &Path) -> Vec<PathBuf> {
     let Ok(printed) = git_stdout(
         repo,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -1024,4 +1218,88 @@ fn leftover_locks(repo: &Path) -> Vec<PathBuf> {
     }
     locks.sort();
     locks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = crate::workspace::git_command(dir)
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn a_fetch_past_the_backstop_is_stopped_and_leaves_no_lock() {
+        let scratch = crate::test_support::short_temp_dir("fetch-backstop");
+        let upstream = scratch.join("upstream");
+        let local = scratch.join("local");
+        for repo in [&upstream, &local] {
+            std::fs::create_dir_all(repo).expect("dir");
+            git(repo, &["init", "-q"]);
+            git(repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        }
+        let url = upstream.to_str().expect("utf8");
+        git(&local, &["remote", "add", "origin", url]);
+        git(
+            &local,
+            &[
+                "config",
+                "remote.origin.uploadpack",
+                "sleep 60; git-upload-pack",
+            ],
+        );
+        let started = std::time::Instant::now();
+        let failure = fetch_origin(&local, Duration::from_secs(1)).expect_err("it hangs");
+        assert!(
+            matches!(failure.kind, FetchFailureKind::TimedOut(after) if after == Duration::from_secs(1)),
+            "{failure}"
+        );
+        assert_eq!(failure.to_string(), "timed out after 1 s");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(lock_files(&local), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn the_telling_line_is_the_fatal_one() {
+        assert_eq!(
+            telling_line("warning: redirecting\nfatal: repository not found\n"),
+            "fatal: repository not found"
+        );
+        assert_eq!(
+            telling_line("\n  remote: Not found.\n"),
+            "remote: Not found."
+        );
+        assert_eq!(telling_line(""), "git fetch failed");
+    }
+
+    #[test]
+    fn a_cat_file_batch_is_split_into_its_objects() {
+        let printed = "a1 blob 3\nabc\nb2 missing\nc3 blob 0\n\n";
+        assert_eq!(
+            batch_contents(printed),
+            [Some("abc".to_string()), None, Some(String::new())]
+        );
+    }
 }

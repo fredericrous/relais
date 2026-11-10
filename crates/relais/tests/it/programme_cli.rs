@@ -254,6 +254,7 @@ fn show_gives_the_destination_counts_blockers_and_branches() {
     assert_eq!(
         text(&out.stdout),
         "Destination\nShip the demo.\nThen stop.\n\n\
+         Read from working-tree\n\n\
          open 3 (frontier 1, blocked 1, in flight 1), closed 1, out of scope 1\n\n\
          Blocked\n  Name of C (C): blocked by D\n\n\
          In flight\n  Name of D (D): prog/demo/D 0m\n"
@@ -1154,8 +1155,17 @@ fn a_ctrl_c_during_the_fetch_leaves_no_fetch_and_no_lock() {
     );
     let pgid_t = libc::pid_t::try_from(pgid).expect("pid fits");
     // SAFETY: killpg only sends a signal to the group this test started.
+    let signalled = std::time::Instant::now();
     assert_eq!(unsafe { libc::killpg(pgid_t, libc::SIGINT) }, 0);
-    child.wait().expect("relais ends");
+    let status = child.wait().expect("relais ends");
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
+    }
+    assert!(
+        signalled.elapsed() < std::time::Duration::from_secs(5),
+        "relais stopped well before the 10 s backstop"
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     while !in_group(pgid, ".").is_empty() {
         assert!(
@@ -1206,4 +1216,45 @@ fn a_worktree_older_than_origins_last_change_reads_origin() {
     let dir = linked.join("docs/programmes/demo");
     let out = world.relais(&["programme", "frontier", dir.to_str().expect("utf8")]);
     assert_eq!(ids(&out.stdout), ["B", "C"], "{}", text(&out.stderr));
+}
+
+#[test]
+fn show_names_where_it_read_from() {
+    let world = World::new("show-source");
+    let branch = with_upstream(&world);
+    push_upstream(&world, close_d);
+    let out = world.programme(&["show"]);
+    assert!(
+        text(&out.stdout).contains(&format!("\n\nRead from origin/{branch}\n\n")),
+        "{}",
+        text(&out.stdout)
+    );
+    let out = world.programme(&["show", "--json", "--no-fetch"]);
+    assert_eq!(json_of(&out)["source"], format!("origin/{branch}"));
+}
+
+#[test]
+fn local_edits_older_than_origin_are_named_when_set_aside() {
+    let world = World::new("set-aside");
+    let branch = with_upstream(&world);
+    world.write("X.md", &poetry());
+    let old = std::process::Command::new("touch")
+        .args(["-t", "202001010000"])
+        .arg(world.dir().join("X.md"))
+        .status()
+        .expect("touch runs");
+    assert!(old.success());
+    push_upstream(&world, close_d);
+    // Origin's copy is what is checked (its closed D is unlinked: exit 2);
+    // the person's older edit is named, not silently skipped.
+    let out = world.programme(&["check"]);
+    let expected = format!(
+        "relais: {}: local work older than origin/{branch}'s last change; reading origin/{branch}\n",
+        world.dir().display()
+    );
+    assert!(
+        text(&out.stderr).contains(&expected),
+        "{}",
+        text(&out.stderr)
+    );
 }
