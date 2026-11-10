@@ -10,8 +10,8 @@ repos = ["relais"]
 ## Question
 
 The relais ADR that records: acceptance through greengate when present and
-a plain run otherwise, the semantic reviewer removed (t05), and the baseline
-rule (t08), together with the SPEC sections and ADRs t01 lists as affected.
+a plain run otherwise, the semantic reviewer made opt-in (t05), and the
+baseline rule (t08), together with the SPEC sections and ADRs t01 lists as affected.
 What is the record, and does the person accept it?
 
 ## Resolution
