@@ -499,10 +499,30 @@ impl<'a> RunEngine<'a> {
     /// A `kind: verify` contract for the kept candidate, written beside the
     /// run's evidence, and the command that runs it: the run's own
     /// contract, verifying `candidate {run, index}` without a worker. `None`
-    /// when it cannot be written or does not validate.
+    /// when it cannot be written or does not validate; why is recorded as a
+    /// `verify_contract_not_written` decision, so the fallback sentence is
+    /// never a silent one.
     fn verify_command(&self, kept: &KeptCandidate) -> Option<String> {
+        match self.write_verify_contract(kept) {
+            Ok(path) => Some(format!(
+                "relais run --task {}",
+                shell_word(&path.to_string_lossy())
+            )),
+            Err(why) => {
+                self.events.emit(Event::Decision {
+                    what: "verify_contract_not_written".into(),
+                    reason: why,
+                });
+                None
+            }
+        }
+    }
+
+    fn write_verify_contract(&self, kept: &KeptCandidate) -> Result<PathBuf, String> {
         let mut value = self.config.contract.canonical_value();
-        let fields = value.as_object_mut()?;
+        let fields = value
+            .as_object_mut()
+            .ok_or("the run's contract is not a JSON object")?;
         fields.insert("kind".into(), "verify".into());
         fields.insert(
             "candidate".into(),
@@ -510,16 +530,15 @@ impl<'a> RunEngine<'a> {
         );
         fields.remove("from_candidate");
         fields.remove("decomposition");
-        let text = serde_json::to_string_pretty(&value).ok()?;
-        crate::contract::TaskContract::from_json_str(&text).ok()?;
+        let text = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+        crate::contract::TaskContract::from_json_str(&text)
+            .map_err(|e| format!("the verify contract does not validate: {e}"))?;
         let path = self
             .artifacts
             .join(format!("verify-candidate-{}.json", kept.index));
-        crate::fsutil::write_atomic(&path, &text).ok()?;
-        Some(format!(
-            "relais run --task {}",
-            shell_word(&path.to_string_lossy())
-        ))
+        crate::fsutil::write_atomic(&path, &text)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(path)
     }
 
     /// End the run on an on-demand base run that gave no verdict. A worker

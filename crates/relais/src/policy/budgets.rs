@@ -265,6 +265,7 @@ impl Budgets {
     /// run's elapsed time, less the queue waits already charged within it,
     /// is taken out of work; the total is charged by the clock, as for a
     /// wait, and the admission budget is not charged again.
+    #[must_use = "dropping the guard ends the base run's timing"]
     pub fn base_run(&self) -> BaseRun {
         let at = self.now();
         BaseRun {
@@ -284,7 +285,7 @@ impl Budgets {
 
     /// What remains for a command: base-tree setup and baseline commands
     /// draw on `total`; once work has begun, on `work` and `total`, except
-    /// for an on-demand base run's ([`Budgets::for_base`]).
+    /// for an on-demand base run's ([`Budgets::base_run`], [`Draws::TotalOnly`]).
     pub fn remaining(&self) -> Duration {
         let total = self.total_remaining();
         if self.draws == Draws::TotalOnly {
@@ -358,6 +359,7 @@ impl Budgets {
 
 /// An on-demand base run being timed. Created by [`Budgets::base_run`];
 /// dropping it takes the run's time out of work.
+#[must_use = "dropping the guard ends the base run's timing"]
 pub struct BaseRun {
     view: Budgets,
     at: i64,
