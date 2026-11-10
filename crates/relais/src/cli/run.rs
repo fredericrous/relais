@@ -666,17 +666,27 @@ fn settle_code(ledger: &Ledger, run: &relais::ids::RunId) -> &'static str {
 /// What a CLI run says when relais settled its scope overflow itself: the
 /// rule that fired, the successor intent and the command that launches it.
 fn widened_lines(code: &str, intent: &relais::ledger::SuccessorIntent) -> Vec<String> {
-    let rule = if code == relais::runner::successor::CODE_WIDENED_SMALL {
-        "to one small source edit, tests included"
+    use relais::runner::successor::{CODE_TIMED_OUT_VERIFY_QUEUED, CODE_WIDENED_SMALL};
+    let first = if code == CODE_TIMED_OUT_VERIFY_QUEUED {
+        format!(
+            "the worker hit its wall time; relais answered the decision (actor relais) and \
+             queued successor intent {} to verify and review its tree",
+            intent.intent_id
+        )
     } else {
-        "to the test paths"
-    };
-    vec![
+        let rule = if code == CODE_WIDENED_SMALL {
+            "to one small source edit, tests included"
+        } else {
+            "to the test paths"
+        };
         format!(
             "relais widened the scope {rule} and answered the decision (actor relais); \
              successor intent {}",
             intent.intent_id
-        ),
+        )
+    };
+    vec![
+        first,
         format!("run it with: relais run --intent {}", intent.intent_id),
     ]
 }
@@ -765,6 +775,12 @@ mod tests {
         );
         let small = widened_lines("scope_widened_small", &intent);
         assert!(!small[0].contains("test paths"), "{small:?}");
+        let timed_out = widened_lines("timed_out_verify_queued", &intent);
+        assert!(
+            timed_out[0].contains("wall time") && !timed_out[0].contains("widened"),
+            "{timed_out:?}"
+        );
+        assert_eq!(timed_out[1], lines[1]);
         assert_eq!(lines[1], format!("run it with: relais run --intent {id}"));
     }
 

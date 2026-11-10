@@ -1192,6 +1192,7 @@ mod tests {
                 widen_scope_for_tests: true,
                 widen_scope_small_max_files: 1,
                 widen_scope_small_max_lines: 10,
+                verify_timed_out: true,
                 loop_threshold: None,
             },
             integrations: Default::default(),

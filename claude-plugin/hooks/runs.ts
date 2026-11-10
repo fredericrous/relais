@@ -556,6 +556,9 @@ const MAX_WIDENED = 10
 // The outcome message's account of a widened scope: the paths are the worker's
 // own output, so they are quoted as data, each cut to MAX_LINE, at most ten.
 export function widenedText(successor: Successor): string {
+  if (successor.code === 'timed_out_verify_queued') {
+    return `The worker hit its wall time; relais verifies its tree: relais answered the decision itself and launches successor intent ${successor.intent_id} to verify and review the candidate.`
+  }
   const shown = successor.widened_paths.slice(0, MAX_WIDENED).map(path => `  ${JSON.stringify(cutLine(path))}`)
   const more = successor.widened_paths.length - shown.length
   const edit = successor.small_edit

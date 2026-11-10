@@ -275,6 +275,9 @@ pub(crate) struct RunEngine<'a> {
     /// what the storage-full path names a ref for when the disk fills
     /// after the snapshot exists (SPEC §10).
     pub(in crate::runner) last_snapshot: Option<(u32, String)>,
+    /// The answer relais gave this run's wall-time stop, written before its
+    /// worktree was retired; the run's end reads it for its outcome.
+    pub(in crate::runner) timed_out_settled: Option<successor::Settled>,
 }
 
 #[cfg(test)]

@@ -480,6 +480,13 @@ pub struct ExecutionPolicy {
         skip_serializing_if = "is_default_widen_scope_small_max_lines"
     )]
     pub widen_scope_small_max_lines: u32,
+    /// Whether a change run whose worker hit its wall time, was confirmed
+    /// stopped and left an edit is answered by relais itself with a
+    /// `kind: verify` successor of that candidate. `false` keeps the
+    /// interrupted stop for a person. Left out of the serialized
+    /// declaration while it is the default.
+    #[serde(default = "default_verify_timed_out", skip_serializing_if = "is_true")]
+    pub verify_timed_out: bool,
     /// How many identical failing commands, with no edit between, stop a
     /// native worker (SPEC §5). Unset leaves the guard off; below
     /// [`MIN_LOOP_THRESHOLD`] is refused at parse time. Left out of the
@@ -506,6 +513,10 @@ pub enum LoopGuardMode {
 pub const MIN_LOOP_THRESHOLD: u32 = 2;
 
 fn default_widen_scope_for_tests() -> bool {
+    true
+}
+
+fn default_verify_timed_out() -> bool {
     true
 }
 
@@ -3033,6 +3044,24 @@ keys = ["output.contract"]
         assert_eq!(repo.authority_hash(), defaults.authority_hash());
         assert_ne!(repo.authority_hash(), named(0, 10).authority_hash());
         assert_ne!(repo.authority_hash(), named(1, 40).authority_hash());
+    }
+
+    /// `verify_timed_out` is left out of the authority hash at its default
+    /// and moves it when switched off.
+    #[test]
+    fn verify_timed_out_keeps_the_authority_hash_at_its_default() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let named = |value: bool| {
+            RepoPolicy::from_toml_str(&REPO_TOML.replacen(
+                "[execution]\n",
+                &format!("[execution]\nverify_timed_out = {value}\n"),
+                1,
+            ))
+            .expect("parses")
+        };
+        assert!(repo.execution.verify_timed_out);
+        assert_eq!(repo.authority_hash(), named(true).authority_hash());
+        assert_ne!(repo.authority_hash(), named(false).authority_hash());
     }
 
     /// `[pricing]` is machine policy, not repo policy (SPEC §11): adding

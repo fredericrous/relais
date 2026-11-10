@@ -2279,6 +2279,15 @@ fn what_a_stopped_agent_writes_later_is_not_booked_to_the_next_attempt() {
 fn leaves_the_tree_alone(_tree: &Path, _prompt: &str) {}
 
 fn timed_out_run(plugin: Plugin, work: Work, fixture: &Fixture) -> Native {
+    timed_out_run_settling(plugin, work, fixture, false)
+}
+
+fn timed_out_run_settling(
+    plugin: Plugin,
+    work: Work,
+    fixture: &Fixture,
+    verify_timed_out: bool,
+) -> Native {
     run_native_waiting(
         fixture,
         Review::Off,
@@ -2290,7 +2299,10 @@ fn timed_out_run(plugin: Plugin, work: Work, fixture: &Fixture) -> Native {
             hello_lapse: Duration::from_secs(120),
             transcript_lookups: 3,
         },
-        |repo| repo.execution.max_wall_seconds = 3,
+        |repo| {
+            repo.execution.max_wall_seconds = 3;
+            repo.execution.verify_timed_out = verify_timed_out;
+        },
     )
 }
 
@@ -2326,6 +2338,101 @@ fn a_worker_that_edits_then_outlives_its_wall_time_and_acks_the_stop_leaves_a_ca
     let detail = process_crash_detail(&fixture, &run);
     assert_eq!(detail["timed_out"], true, "{detail}");
     assert_eq!(detail["candidate"], serde_json::json!(sha), "{detail}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn a_timed_out_worker_with_a_candidate_is_answered_by_relais_with_a_verify_successor() {
+    let fixture = Fixture::new();
+    let run = timed_out_run_settling(Plugin::NeverStopsAcksStop, fixes_at_once, &fixture, true);
+    let id = run.outcome.run_id.clone();
+    assert!(
+        matches!(run.outcome.terminal, Terminal::Cancelled { .. }),
+        "the caller sees the resolved end: {:?}",
+        run.outcome.terminal
+    );
+    assert_eq!(
+        fixture.ledger.run_status(&id).expect("status"),
+        Some(State::Cancelled)
+    );
+    let decision = fixture
+        .ledger
+        .decision_of_run(&id)
+        .expect("read")
+        .expect("a decision row");
+    assert_eq!(decision.resolution, Some(Reason::DecisionRevised));
+    assert_eq!(decision.actor.as_deref(), Some("relais"));
+    assert!(
+        decision
+            .note
+            .as_deref()
+            .is_some_and(|note| note.starts_with("timed_out_verify_queued: ")),
+        "{decision:?}"
+    );
+    let intent = fixture
+        .ledger
+        .intent_of_decision(&id)
+        .expect("read")
+        .expect("a successor intent");
+    let contract = TaskContract::from_json_str(&intent.contract_json).expect("contract");
+    assert!(contract.is_verify());
+    assert!(contract.review >= Review::Required);
+    assert!(intent.scope_delta.is_empty());
+    let candidates = fixture.ledger.candidate_attempts(&id).expect("candidates");
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+    assert_eq!(
+        intent
+            .candidate
+            .as_ref()
+            .map(|candidate| candidate.source_run.as_str()),
+        Some(id.as_str())
+    );
+    let worktree = crate::runner::worktree_root(&fixture.artifacts).join(id.as_str());
+    assert!(
+        !worktree.join("task").exists(),
+        "the timed-out run's worktree is retired"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+}
+
+#[test]
+fn a_timed_out_worker_is_not_answered_when_the_policy_key_is_off_or_there_is_no_candidate() {
+    let fixture = Fixture::new();
+    let off = timed_out_run_settling(Plugin::NeverStopsAcksStop, fixes_at_once, &fixture, false);
+    assert!(fixture
+        .ledger
+        .intent_of_decision(&off.outcome.run_id)
+        .expect("read")
+        .is_none());
+    assert_eq!(
+        fixture
+            .ledger
+            .run_status(&off.outcome.run_id)
+            .expect("status"),
+        Some(State::Interrupted)
+    );
+    let open = fixture
+        .ledger
+        .decision_of_run(&off.outcome.run_id)
+        .expect("read")
+        .expect("the decision stays open");
+    assert!(open.resolution.is_none(), "{open:?}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
+
+    let fixture = Fixture::new();
+    let none = timed_out_run_settling(Plugin::NeverStops, fixes_at_once, &fixture, true);
+    assert!(fixture
+        .ledger
+        .intent_of_decision(&none.outcome.run_id)
+        .expect("read")
+        .is_none());
+    assert_eq!(
+        fixture
+            .ledger
+            .run_status(&none.outcome.run_id)
+            .expect("status"),
+        Some(State::Interrupted)
+    );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
 }
 

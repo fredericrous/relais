@@ -314,9 +314,9 @@ pub enum Request<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<&'a str>,
         /// The successor intent relais recorded when it settled a test-only
-        /// scope overflow itself (SPEC §8); `outcome` is then `cancelled`
-        /// with code `scope_widened_for_tests` or `scope_widened_small`, and the plugin
-        /// launches it.
+        /// scope overflow or a wall-time stop itself (SPEC §8); `outcome` is then
+        /// `cancelled` with code `scope_widened_for_tests`, `scope_widened_small`
+        /// or `timed_out_verify_queued`, and the plugin launches it.
         #[serde(skip_serializing_if = "Option::is_none")]
         successor_intent: Option<&'a SuccessorRef>,
     },
@@ -332,7 +332,8 @@ pub struct SuccessorRef {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub widened_paths: Vec<String>,
     /// The settle rule that made this successor: `scope_widened_for_tests`
-    /// or `scope_widened_small`; the plugin picks its sentence by it.
+    /// `scope_widened_small` or `timed_out_verify_queued`; the plugin picks its
+    /// sentence by it.
     pub code: String,
     /// The one small non-test edit, for `scope_widened_small`.
     #[serde(skip_serializing_if = "Option::is_none")]

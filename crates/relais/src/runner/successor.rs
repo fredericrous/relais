@@ -81,6 +81,58 @@ fn raising_transition(
         .ok_or_else(|| PlanError::NotWidenable(format!("run {run} is not waiting on a decision")))
 }
 
+/// The transition that ended `run` interrupted: the last row into
+/// `interrupted` that is not a worktree retirement.
+fn interrupted_transition(
+    ledger: &Ledger,
+    run: &RunId,
+) -> Result<crate::ledger::Transition, PlanError> {
+    ledger
+        .transitions(run)?
+        .into_iter()
+        .rev()
+        .find(|t| t.to_state == State::Interrupted && t.reason != Reason::WorktreeRetired.as_str())
+        .ok_or_else(|| PlanError::NotWidenable(format!("run {run} did not end interrupted")))
+}
+
+/// The candidate sha a timed-out worker's `process_crash` transition
+/// recorded in its JSON detail: `None` unless the run was interrupted by a
+/// wall-time stop that left a candidate.
+pub fn timed_out_candidate(ledger: &Ledger, run: &RunId) -> Result<Option<String>, PlanError> {
+    let raised = interrupted_transition(ledger, run)?;
+    if raised.reason != Reason::ProcessCrash.as_str() {
+        return Ok(None);
+    }
+    let Some(detail) = raised.detail else {
+        return Ok(None);
+    };
+    if detail.get("timed_out").and_then(|flag| flag.as_bool()) != Some(true) {
+        return Ok(None);
+    }
+    Ok(detail
+        .get("candidate")
+        .and_then(|sha| sha.as_str())
+        .filter(|sha| !sha.is_empty())
+        .map(str::to_string))
+}
+
+/// The successor a timed-out run is answered with when relais settles it
+/// itself: `Ok(None)` unless the run ended interrupted on a wall-time stop
+/// that left a candidate, else the intent verifying that candidate with the
+/// scope unchanged.
+pub fn plan_timed_out_verify(
+    ledger: &Ledger,
+    run: &RunId,
+    contract: &TaskContract,
+    runs_dir: &Path,
+) -> Result<Option<NewIntent>, PlanError> {
+    if timed_out_candidate(ledger, run)?.is_none() {
+        return Ok(None);
+    }
+    let verify = settled_contract(contract, run, &[]).map_err(PlanError::Contract)?;
+    plan(ledger, run, &verify, Vec::new(), runs_dir).map(Some)
+}
+
 /// `--rerun-verify` answers a `resource_exhausted` decision only: a rerun of
 /// the same candidate is the answer to a machine that was out of room, not
 /// to a code failure or a scope question (plan B4).
@@ -168,6 +220,12 @@ pub enum WidenRule {
 /// Codes a relais settle ends its run with.
 pub const CODE_WIDENED_FOR_TESTS: &str = "scope_widened_for_tests";
 pub const CODE_WIDENED_SMALL: &str = "scope_widened_small";
+pub const CODE_TIMED_OUT_VERIFY_QUEUED: &str = "timed_out_verify_queued";
+
+/// The note the answered decision of a timed-out run carries; it starts
+/// with the code.
+pub const TIMED_OUT_NOTE: &str = "timed_out_verify_queued: worker hit its wall time; relais \
+     verifies its tree (execution.verify_timed_out)";
 
 impl WidenRule {
     pub fn code(&self) -> &'static str {
@@ -204,9 +262,13 @@ pub struct Settled {
 /// The code a relais answer's note starts with, if it names a known one.
 pub fn settle_code_of_note(note: &str) -> Option<&'static str> {
     let (code, _) = note.split_once(": ")?;
-    [CODE_WIDENED_FOR_TESTS, CODE_WIDENED_SMALL]
-        .into_iter()
-        .find(|known| *known == code)
+    [
+        CODE_WIDENED_FOR_TESTS,
+        CODE_WIDENED_SMALL,
+        CODE_TIMED_OUT_VERIFY_QUEUED,
+    ]
+    .into_iter()
+    .find(|known| *known == code)
 }
 
 /// Whether a scope overflow is one relais may widen itself, and by which

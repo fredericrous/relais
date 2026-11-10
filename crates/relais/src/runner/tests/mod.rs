@@ -185,6 +185,9 @@ impl Fixture {
                 // small rule's own tests turn it on.
                 widen_scope_small_max_files: 0,
                 widen_scope_small_max_lines: 10,
+                // Off in the fixture: the timeout tests assert the interrupted stop;
+                // the settle's own tests turn it on.
+                verify_timed_out: false,
                 loop_threshold: None,
             },
             integrations: Default::default(),

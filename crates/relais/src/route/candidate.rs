@@ -761,6 +761,7 @@ fn validate_new_recipe(
             widen_scope_for_tests,
             widen_scope_small_max_files,
             widen_scope_small_max_lines,
+            verify_timed_out,
             loop_threshold,
         } = execution;
         // NOT a knob. Raising effort on repair is spend, and a learner
@@ -789,6 +790,13 @@ fn validate_new_recipe(
             return Err(CandidateRejection::FixedRecipeFieldChanged {
                 name: new_name.clone(),
                 field: "execution.widen_scope_small_max_lines",
+            });
+        }
+        // NOT a knob either: it decides whether relais verifies a timed-out tree.
+        if *verify_timed_out != incumbent.execution.verify_timed_out {
+            return Err(CandidateRejection::FixedRecipeFieldChanged {
+                name: new_name.clone(),
+                field: "execution.verify_timed_out",
             });
         }
         // NOT a knob either: it decides when a worker is stopped.
@@ -2137,6 +2145,13 @@ mod tests {
                 "execution.widen_scope_small_max_lines",
                 ExecutionPolicy {
                     widen_scope_small_max_lines: 500,
+                    ..ExecutionPolicy::default()
+                },
+            ),
+            (
+                "execution.verify_timed_out",
+                ExecutionPolicy {
+                    verify_timed_out: true,
                     ..ExecutionPolicy::default()
                 },
             ),

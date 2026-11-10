@@ -85,6 +85,7 @@ impl<'a> RunEngine<'a> {
             own_write_leases: std::collections::BTreeSet::new(),
             inplace: None,
             last_snapshot: None,
+            timed_out_settled: None,
             reviewer_gap: None,
             candidates_run: None,
             worker_code_rules_gap: None,
@@ -318,7 +319,9 @@ impl<'a> RunEngine<'a> {
             .is_file()
             .then(|| written.to_string_lossy().into_owned());
         let summary = Summary::of_candidate(&self.artifacts);
-        let widened = self.settle_scope_overflow(&outcome);
+        let widened = self
+            .settle_scope_overflow(&outcome)
+            .or_else(|| self.timed_out_settled.take());
         // The state the ledger now holds: a widened run was answered
         // (`revise`) and cancelled, whatever its terminal said.
         let resolved = if widened.is_some() {
@@ -805,8 +808,103 @@ impl<'a> RunEngine<'a> {
                 }
             }
         };
+        if let Some(settled) = self.settle_timed_out(&outcome) {
+            // The decision is answered and the run is cancelled: the tree
+            // goes like a cancelled run's, now the successor's intent holds
+            // its candidate.
+            self.state = State::Cancelled;
+            let cancelled = RunOutcome {
+                run_id: outcome.run_id.clone(),
+                terminal: Terminal::Cancelled {
+                    detail: settled.sentence.clone(),
+                },
+            };
+            self.timed_out_settled = Some(settled);
+            self.retire_worktree(&worktree, &cancelled)?;
+            return Ok(outcome);
+        }
         self.retire_worktree(&worktree, &outcome)?;
         Ok(outcome)
+    }
+
+    /// A change run that ended interrupted on its worker's wall time, with
+    /// the stop confirmed and an edit published as its candidate, is
+    /// answered here, by relais: `revise` with a `kind: verify` successor
+    /// of that candidate, scope unchanged (SPEC §8). `None` when the run
+    /// ended another way, policy says no, the run is a verify, a child, a
+    /// replay or the successor of a relais settle, or planning or the write
+    /// failed, in which case the decision stays open for a person.
+    fn settle_timed_out(&self, outcome: &RunOutcome) -> Option<super::successor::Settled> {
+        let config = self.config;
+        let ordinary = self.parent.is_none()
+            && config.purpose != Some(crate::lifecycle::RunPurpose::Replay)
+            && config.contract.kind() == crate::contract::Kind::Change
+            && !config.contract.is_verify();
+        if !matches!(outcome.terminal, Terminal::Interrupted { .. })
+            || !ordinary
+            || !config.repo_policy.execution.verify_timed_out
+        {
+            return None;
+        }
+        match super::successor::is_relais_successor(config.ledger, &self.run_id) {
+            Ok(false) => {}
+            Ok(true) => return None,
+            Err(e) => {
+                self.step("verify_timed_out", format!("not settled: {e}"));
+                return None;
+            }
+        }
+        let intent = match super::successor::plan_timed_out_verify(
+            config.ledger,
+            &self.run_id,
+            config.contract,
+            &config.artifacts_dir,
+        ) {
+            Ok(Some(intent)) => intent,
+            Ok(None) => return None,
+            Err(e) => {
+                self.step("verify_timed_out", format!("not settled: {e}"));
+                return None;
+            }
+        };
+        let written = config.ledger.resolve_decision_with_intent(
+            &self.run_id,
+            &crate::ledger::DecisionAnswer {
+                resolution: Reason::DecisionRevised,
+                actor: crate::ledger::Actor::Relais,
+                person_quote: None,
+                recorded_via: crate::ledger::RecordedVia::Cli,
+                note: Some(super::successor::TIMED_OUT_NOTE),
+                successor_run: None,
+                from_state: State::Interrupted,
+                to_state: State::Cancelled,
+            },
+            &intent,
+        );
+        let stored = match written {
+            Ok(Some(stored)) => stored,
+            Ok(None) => return None,
+            Err(e) => {
+                self.step("verify_timed_out", format!("not settled: {e}"));
+                return None;
+            }
+        };
+        let sentence = format!(
+            "the worker hit its wall time; relais recorded successor intent {} to verify and \
+             review its tree",
+            stored.intent_id
+        );
+        Some(super::successor::Settled {
+            code: super::successor::CODE_TIMED_OUT_VERIFY_QUEUED,
+            sentence,
+            successor: crate::protocol::SuccessorRef {
+                intent_id: stored.intent_id,
+                repo: config.repo_dir.to_string_lossy().into_owned(),
+                widened_paths: Vec::new(),
+                code: super::successor::CODE_TIMED_OUT_VERIFY_QUEUED.to_string(),
+                small_edit: None,
+            },
+        })
     }
 
     /// A failed check among `checks` that shows exhaustion, with what the

@@ -256,6 +256,10 @@ test('the widened text picks its sentence by code', () => {
   const small = widenedText({ ...base, code: 'scope_widened_small', small_edit: { path: 'src/a.rs', added: 4, removed: 2 } })
   expect(small).toContain('one small source edit "src/a.rs" (+4/-2)')
   expect(small).not.toContain('for tests')
+  const timedOut = widenedText({ ...base, widened_paths: [], code: 'timed_out_verify_queued' })
+  expect(timedOut).toContain('wall time')
+  expect(timedOut).not.toContain('src/a.rs')
+  expect(timedOut).not.toContain('widened')
 })
 
 test('the widened paths are quoted data, each cut to MAX_LINE, at most ten, then +k more', () => {
