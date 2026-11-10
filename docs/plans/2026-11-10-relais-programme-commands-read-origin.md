@@ -268,6 +268,7 @@ Integration tests, each with a bare `upstream.git` as `origin`, as in
 
 ## Implementation review
 
+- Rebased onto #431 (tree e215b658; code commits identical by range-diff, CHANGELOG context moved, RULES sha unchanged): all five seats re-ran a Delta and approve.
 - implementation-review: approve (round 3). Fixed: flag args → `Fetch`/`Origin` enums, `result` → `mapped`, the notes out-parameter. 175k, 62 s.
 - backend: approve (round 3). Fixed: set-aside note, skipped-worktree notes, backstop unit test, try_wait reap, new-locks-only, holds-until, SPEC wording. 291k, 104 s.
 - lang:rust: approve (round 2). Fixed: `Origin` enum, typed `FetchFailure` + `source()`, unborn-HEAD check, batch count check, exhaustive `Fetch` match. 170k, 71 s.
