@@ -705,6 +705,7 @@ fn has_conflict_marker(path: &Path) -> Result<bool> {
 pub const PROTECTED_PATH_PREFIXES: &[&str] = &[
     "relais.toml",
     "amont.conf",
+    "greengate.conf",
     ".adr.yaml",
     ".claude/",
     ".relais/",

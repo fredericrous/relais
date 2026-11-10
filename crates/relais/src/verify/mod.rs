@@ -2288,7 +2288,8 @@ pub fn parse_amont_list(stdout: &str) -> Result<AmontInventory, InventoryError> 
     let value: serde_json::Value =
         serde_json::from_str(stdout.trim()).map_err(|e| unreadable(format!("not JSON: {e}")))?;
     match value.get("format").and_then(|f| f.as_str()) {
-        Some("amont-list-v1") => {}
+        // greengate 4.0 names the same envelope; both until the census.
+        Some("amont-list-v1" | "greengate-list-v1") => {}
         other => {
             return Err(unreadable(format!(
                 "envelope format is {}, not `amont-list-v1`",
@@ -5157,6 +5158,15 @@ mod tests {
         assert!(
             followed_took <= silent_took + allowed,
             "followed {followed_took:?} against {silent_took:?} without the follower"
+        );
+    }
+
+    #[test]
+    fn greengate_names_the_same_list_envelope() {
+        let renamed = AMONT_SAMPLE.replace("amont-list-v1", "greengate-list-v1");
+        assert_eq!(
+            parse_amont_list(&renamed).expect("greengate-list-v1 parses"),
+            parse_amont_list(AMONT_SAMPLE).expect("amont-list-v1 parses"),
         );
     }
 
