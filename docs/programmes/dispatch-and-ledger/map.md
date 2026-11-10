@@ -5,9 +5,9 @@
 relais keeps acceptance as one interface with two adapters: through
 greengate (`amont run --stamp`) when amont is present, so the push gate
 reuses that verdict instead of running the checks again, and a plain command
-run when it is not. relais's own semantic reviewer is removed in favour of
-implementation-review, and a baseline runs only when greengate cannot prove
-the base. Decided, and running on relais and amont, with check-hours and
+run when it is not. relais's own semantic reviewer runs only when a contract asks for it
+(implementation-review covers the rest), and a baseline runs only after a
+red candidate, when greengate cannot prove the base. Decided, and running on relais and amont, with check-hours and
 review spend per run measured before (t02) and after.
 
 ## Notes
@@ -50,6 +50,8 @@ review spend per run measured before (t02) and after.
 - [What reads relais's baseline, verification and review results today](t01-verdict-consumers.md): stamp-proven base already built; the reviewer is ~2,400 lines plus the inspect report review (inspect's only verification) and the forced review on edited tests; learner unaffected
 - [How much check and review time relais spends that a later gate repeats](t02-duplicate-check-cost.md): since 10-10, 21 h of baseline, 23 h of verification, $441 of review (38% of $1,151); every check repeats at push, the review at F4b; exact share unjoined
 - [What stops amont's push gate from reusing a relais candidate's verdict](t03-attempt-ends-on-amont.md): only the profiles: amont's runs `make check`, so nothing is stamped; relais's side and the stamp keying already work; split the profile per gate
+- [Where review happens once relais's reviewer is removed](t05-review-leaves-relais.md): opt-in: no reviewer by default, `review: required` brings it with the inspect and edited-test guards
+- [When relais runs a baseline](t08-when-a-baseline-runs.md): none when greengate proves the base; otherwise only after a red candidate, on the red checks
 - [Which repositories' relais profiles can split into amont gates](t09-profiles-per-gate.md): the six Rust repositories split cleanly (fmt, clippy, cargo-test) with a few plain leftovers; happier cannot; JS/Go/Python matches unverified
 
 ## Not yet specified
