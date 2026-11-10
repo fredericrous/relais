@@ -342,6 +342,13 @@ Observed before the push, at d0c57a55, rebased on 4bdca927:
   (Decision log), stated in the CHANGELOG as an upgrade requirement. 55k + 82k.
 - tui (opus): approve-with-changes, then approve. Fixed: the command,
   separate sentences, a clearer deferred label. 49k + 72k.
+- CI on relais#433 failed on windows-latest: the test built the verify
+  command unquoted, and `shell_word` quotes Windows paths. Fixed in
+  `8a028064`. implementation-review (opus) approve, 22k tokens; lang:rust
+  (opus) approve, 21k tokens. backend, tui and unix keep their pass on the
+  ancestor tree. A load-dependent total-budget timeout in
+  `a_protocol_run_keeps_stdout_…` failed one hook run and passed alone in
+  16 s.
 
 ## Outcome
 
