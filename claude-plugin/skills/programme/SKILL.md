@@ -103,9 +103,13 @@ Resolution.
 0. **Find the map.** Run `relais programme list` (from `~/Developer/...`
    or any repository beside the one that holds it) and match on the
    destination or the programme's name. If nothing matches, ask the
-   person; never chart a second map for the same work. Done when one map
-   path is chosen.
-1. **Read** `map.md`, then run `relais programme frontier <dir>`. Take the
+   person; never chart a second map for the same work. The path may be in
+   a linked worktree (a programme with unpushed work there), or absent on
+   disk when the last column is a ref (origin alone holds it); `frontier`
+   on that path reads the same source. Done when one map path is chosen.
+1. **Read** `map.md`: when `list`'s last column is a ref, with
+   `git show <ref>:docs/programmes/<slug>/map.md` in the repository, since
+   the file may be absent on disk. Then run `relais programme frontier <dir>`. Take the
    ticket the person named, or the first frontier ticket. Done when one
    ticket id is chosen.
 2. **Start** the `worktree-task` skill on branch `prog/<slug>/<id>` in the
