@@ -629,7 +629,7 @@ pub(super) fn baseline_summary(baseline: &Baseline) -> String {
 
 /// A path as one shell word: bare when it holds nothing a shell reads,
 /// else single-quoted.
-fn shell_word(text: &str) -> String {
+pub(super) fn shell_word(text: &str) -> String {
     let plain = text
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,=".contains(c));

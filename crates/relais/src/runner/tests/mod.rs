@@ -5450,7 +5450,8 @@ fn assert_kept_after_base(fixture: &Fixture, run_id: &RunId, state: State, detai
         assert!(
             detail.ends_with(&format!(
                 "verify the kept candidate: `relais run --task {}`.",
-                contract.display()
+                // Quoted as the product quotes it: a Windows path holds `\`.
+                super::baseline::shell_word(&contract.to_string_lossy())
             )),
             "{detail}"
         );
