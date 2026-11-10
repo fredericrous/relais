@@ -55,23 +55,19 @@ review spend per run measured before (t02) and after.
 - [Record relais's two acceptance adapters, the reviewer's removal and the baseline rule](t07-supersede-acceptance.md): ADR-0013 accepted; SPEC and the older ADRs are amended by each build PR
 - [Which repositories' relais profiles can split into amont gates](t09-profiles-per-gate.md): the six Rust repositories split cleanly (fmt, clippy, cargo-test) with a few plain leftovers; happier cannot; JS/Go/Python matches unverified
 
-## Build queue (decided in ADR-0013, not yet built)
+## Built (2026-11-10)
 
-Each item is an ordinary plan. It amends its SPEC sections and older ADRs in
-its own PR.
-
-1. Split the six Rust repositories' relais profiles per gate (`amont run
-   --stamp fmt|clippy|cargo-test`, with the leftovers plain), per
-   [t09](t09-profiles-per-gate.md), amont first ([t03](t03-attempt-ends-on-amont.md)'s line).
-   - Verify that relais's verify environment resolves the same `cargo` as
-     the push shell.
-2. Add the default-off review switch: the reviewer and its two guards only
-   under `review: required` ([t05](t05-review-leaves-relais.md)).
-3. Proof, else lazy: no up-front baseline, and a base run of the red checks
-   after a red candidate ([t08](t08-when-a-baseline-runs.md)). Ask first:
-   `fix/budget-cut-baseline-and-gate-test` touches the same stage.
-4. After-measure: rerun decisions
-   `docs/programmes/one-verdict-per-tree/t11-measure.py` and t02's queries.
+1. **Profiles split per gate** ([t09](t09-profiles-per-gate.md)): greengate#445, greenpiste#238 (amont-agent), adr-lint#57, grh#35, aval#57, fleet-lsp#38.
+   - The five repositories besides amont also declare `pre-commit cargo-test` (decisions ADR-0009). Without it, `cargo-test` is a scoped pre-push gate that stamps nothing on a tree with no Rust change, and `amont run --stamp` exits 4.
+   - Each push afterwards reused the stamped `cargo-test` verdict.
+   - sre-agent and homelab are not split: their gate matches are unverified ([t09](t09-profiles-per-gate.md)).
+2. **The reviewer runs only under `review: required`** ([t05](t05-review-leaves-relais.md)), relais#433.
+3. **Proof, else lazy** ([t08](t08-when-a-baseline-runs.md)), relais#433.
+   - `fix/budget-cut-baseline-and-gate-test` was not in the way: its PR #340 was closed on 10-29.
+   - Plan: `docs/plans/2026-11-10-relais-reviews-on-request.md`. Released in v0.53.0.
+4. **After-measure:** due 2026-11-18, a week after v0.53.0 is installed. Rerun decisions `docs/programmes/one-verdict-per-tree/t11-measure.py` and t02's queries.
+   - It passes if base seconds per run fall below 0.74 × the full-baseline seconds, and review spend falls to the opt-in share.
+   - Then the destination is reached.
 
 ## Not yet specified
 
