@@ -463,6 +463,23 @@ pub struct ExecutionPolicy {
         skip_serializing_if = "is_true"
     )]
     pub widen_scope_for_tests: bool,
+    /// How many non-test files a scope overflow may add to its test paths
+    /// and still be widened by relais itself; `0` turns the small rule
+    /// off. Left out of the serialized declaration while it is the
+    /// default, so a policy that never names it keeps its authority hash.
+    #[serde(
+        default = "default_widen_scope_small_max_files",
+        skip_serializing_if = "is_default_widen_scope_small_max_files"
+    )]
+    pub widen_scope_small_max_files: u32,
+    /// The most lines (added plus removed) those non-test files may change
+    /// together. Left out of the serialized declaration while it is the
+    /// default.
+    #[serde(
+        default = "default_widen_scope_small_max_lines",
+        skip_serializing_if = "is_default_widen_scope_small_max_lines"
+    )]
+    pub widen_scope_small_max_lines: u32,
     /// How many identical failing commands, with no edit between, stop a
     /// native worker (SPEC §5). Unset leaves the guard off; below
     /// [`MIN_LOOP_THRESHOLD`] is refused at parse time. Left out of the
@@ -490,6 +507,25 @@ pub const MIN_LOOP_THRESHOLD: u32 = 2;
 
 fn default_widen_scope_for_tests() -> bool {
     true
+}
+
+const DEFAULT_WIDEN_SCOPE_SMALL_MAX_FILES: u32 = 1;
+const DEFAULT_WIDEN_SCOPE_SMALL_MAX_LINES: u32 = 10;
+
+fn default_widen_scope_small_max_files() -> u32 {
+    DEFAULT_WIDEN_SCOPE_SMALL_MAX_FILES
+}
+
+fn default_widen_scope_small_max_lines() -> u32 {
+    DEFAULT_WIDEN_SCOPE_SMALL_MAX_LINES
+}
+
+fn is_default_widen_scope_small_max_files(value: &u32) -> bool {
+    *value == DEFAULT_WIDEN_SCOPE_SMALL_MAX_FILES
+}
+
+fn is_default_widen_scope_small_max_lines(value: &u32) -> bool {
+    *value == DEFAULT_WIDEN_SCOPE_SMALL_MAX_LINES
 }
 
 fn is_true(value: &bool) -> bool {
@@ -2972,6 +3008,31 @@ keys = ["output.contract"]
             !a.trust_granted(),
             "the grant was reviewed without the setup"
         );
+    }
+
+    /// The small-widen limits are left out of the authority hash at their
+    /// defaults, so naming them with their default values keeps a grant
+    /// valid, while tuning them moves the hash (SPEC §8).
+    #[test]
+    fn the_small_widen_limits_keep_the_authority_hash_at_their_defaults() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let named = |files: u32, lines: u32| {
+            RepoPolicy::from_toml_str(&REPO_TOML.replacen(
+                "[execution]\n",
+                &format!(
+                    "[execution]\nwiden_scope_small_max_files = {files}\n\
+                     widen_scope_small_max_lines = {lines}\n"
+                ),
+                1,
+            ))
+            .expect("parses")
+        };
+        let defaults = named(1, 10);
+        assert_eq!(defaults.execution.widen_scope_small_max_files, 1);
+        assert_eq!(defaults.execution.widen_scope_small_max_lines, 10);
+        assert_eq!(repo.authority_hash(), defaults.authority_hash());
+        assert_ne!(repo.authority_hash(), named(0, 10).authority_hash());
+        assert_ne!(repo.authority_hash(), named(1, 40).authority_hash());
     }
 
     /// `[pricing]` is machine policy, not repo policy (SPEC §11): adding

@@ -1190,6 +1190,8 @@ mod tests {
                 max_agents_total: 24,
                 repair_effort: Default::default(),
                 widen_scope_for_tests: true,
+                widen_scope_small_max_files: 1,
+                widen_scope_small_max_lines: 10,
                 loop_threshold: None,
             },
             integrations: Default::default(),

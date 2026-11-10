@@ -181,6 +181,10 @@ impl Fixture {
                 max_agents_total: 24,
                 repair_effort: Default::default(),
                 widen_scope_for_tests: true,
+                // Off in the fixture: its many overflow tests wait on a decision; the
+                // small rule's own tests turn it on.
+                widen_scope_small_max_files: 0,
+                widen_scope_small_max_lines: 10,
                 loop_threshold: None,
             },
             integrations: Default::default(),

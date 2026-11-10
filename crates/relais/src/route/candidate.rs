@@ -759,6 +759,8 @@ fn validate_new_recipe(
             max_agents_total,
             repair_effort,
             widen_scope_for_tests,
+            widen_scope_small_max_files,
+            widen_scope_small_max_lines,
             loop_threshold,
         } = execution;
         // NOT a knob. Raising effort on repair is spend, and a learner
@@ -774,6 +776,19 @@ fn validate_new_recipe(
             return Err(CandidateRejection::FixedRecipeFieldChanged {
                 name: new_name.clone(),
                 field: "execution.widen_scope_for_tests",
+            });
+        }
+        // NOT knobs either: they widen what a run may write.
+        if *widen_scope_small_max_files != incumbent.execution.widen_scope_small_max_files {
+            return Err(CandidateRejection::FixedRecipeFieldChanged {
+                name: new_name.clone(),
+                field: "execution.widen_scope_small_max_files",
+            });
+        }
+        if *widen_scope_small_max_lines != incumbent.execution.widen_scope_small_max_lines {
+            return Err(CandidateRejection::FixedRecipeFieldChanged {
+                name: new_name.clone(),
+                field: "execution.widen_scope_small_max_lines",
             });
         }
         // NOT a knob either: it decides when a worker is stopped.
@@ -2106,6 +2121,47 @@ mod tests {
                 value: bounds().max_wall_seconds + 1,
             }
         );
+    }
+
+    #[test]
+    fn a_tuned_recipe_cannot_change_the_small_scope_widening_limits() {
+        for (field, execution) in [
+            (
+                "execution.widen_scope_small_max_files",
+                ExecutionPolicy {
+                    widen_scope_small_max_files: 5,
+                    ..ExecutionPolicy::default()
+                },
+            ),
+            (
+                "execution.widen_scope_small_max_lines",
+                ExecutionPolicy {
+                    widen_scope_small_max_lines: 500,
+                    ..ExecutionPolicy::default()
+                },
+            ),
+        ] {
+            let base = base_recipe();
+            let incumbent = policy_with_recipes(vec![base.clone()]);
+            let mut tuned = base.clone();
+            tuned.revision = 1;
+            tuned.execution = Some(execution);
+            let candidate = policy_with_recipes(vec![base, tuned]);
+            let err = validate_candidate(
+                &incumbent,
+                &candidate,
+                &bounds(),
+                CandidateAdmission::Promote,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                CandidateRejection::FixedRecipeFieldChanged {
+                    name: "docs-touchup".into(),
+                    field,
+                }
+            );
+        }
     }
 
     #[test]

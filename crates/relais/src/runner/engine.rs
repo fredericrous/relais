@@ -318,7 +318,7 @@ impl<'a> RunEngine<'a> {
             .is_file()
             .then(|| written.to_string_lossy().into_owned());
         let summary = Summary::of_candidate(&self.artifacts);
-        let widened = self.widen_for_tests(&outcome);
+        let widened = self.settle_scope_overflow(&outcome);
         // The state the ledger now holds: a widened run was answered
         // (`revise`) and cancelled, whatever its terminal said.
         let resolved = if widened.is_some() {
@@ -330,8 +330,8 @@ impl<'a> RunEngine<'a> {
             state: resolved.as_str().to_string(),
             receipt: receipt.clone(),
             summary,
-            reason: widened.as_ref().map(|(sentence, _)| sentence.clone()),
-            successor_intent: widened.as_ref().map(|(_, successor)| successor.clone()),
+            reason: widened.as_ref().map(|settled| settled.sentence.clone()),
+            successor_intent: widened.as_ref().map(|settled| settled.successor.clone()),
         });
         // A replay's `done` waits for its trial to be recorded: its caller
         // sends it (`relais dataset replay`).
@@ -341,9 +341,9 @@ impl<'a> RunEngine<'a> {
         };
         if announces {
             let (code, detail) = match &widened {
-                Some((sentence, _)) => (
-                    Some("scope_widened_for_tests".to_string()),
-                    Some(sentence.as_str()),
+                Some(settled) => (
+                    Some(settled.code.to_string()),
+                    Some(settled.sentence.as_str()),
                 ),
                 None => outcome.terminal.named_reason(),
             };
@@ -355,7 +355,7 @@ impl<'a> RunEngine<'a> {
                 trial: None,
                 code: code.as_deref(),
                 detail,
-                successor_intent: widened.as_ref().map(|(_, successor)| successor),
+                successor_intent: widened.as_ref().map(|settled| &settled.successor),
             };
             // Dropped on failure: the plugin that was reading is gone, the
             // run's outcome is in the ledger and in `events.jsonl`.
@@ -364,28 +364,28 @@ impl<'a> RunEngine<'a> {
         // The caller (CLI exit status, stderr, trial settlement) reads the
         // resolved state, not the terminal the decision was opened from.
         match widened {
-            Some((sentence, _)) => Ok(RunOutcome {
+            Some(settled) => Ok(RunOutcome {
                 run_id: outcome.run_id,
-                terminal: Terminal::Cancelled { detail: sentence },
+                terminal: Terminal::Cancelled {
+                    detail: settled.sentence,
+                },
             }),
             None => Ok(outcome),
         }
     }
 
-    /// A scope overflow made only of tests is answered here, by relais:
+    /// A scope overflow that is only tests, or tests plus one small edit
+    /// ([`super::successor::widenable`]), is answered here, by relais:
     /// `revise` with the scope widened to those paths, as a successor
-    /// intent (SPEC §8). Returns the sentence the outcome carries and the
-    /// intent it names; `None` when the run did not stop that way, policy
-    /// says no, or the planning or the write failed, in which case the
-    /// decision stays open for a person, as it always did.
+    /// intent (SPEC §8). Returns what the outcome carries; `None` when the
+    /// run did not stop that way, policy says no, the run is itself the
+    /// successor of a relais settle, or the planning or the write failed,
+    /// in which case the decision stays open for a person, as it always did.
     // holds-until: no overlay filter here; the holdout overlay collision
     // (runner/attempt.rs, runner/scheduler.rs) ends a run before any scope can
     // be widened. Ends if phase 5 of the holdout plan counts a
     // holdout_exposures that bypassed the collision (ADR-0045).
-    fn widen_for_tests(
-        &self,
-        outcome: &RunOutcome,
-    ) -> Option<(String, crate::protocol::SuccessorRef)> {
+    fn settle_scope_overflow(&self, outcome: &RunOutcome) -> Option<super::successor::Settled> {
         let config = self.config;
         let overflowed = matches!(
             outcome.terminal,
@@ -396,29 +396,43 @@ impl<'a> RunEngine<'a> {
         );
         let ordinary =
             self.parent.is_none() && config.purpose != Some(crate::lifecycle::RunPurpose::Replay);
-        if !overflowed || !ordinary || !config.repo_policy.execution.widen_scope_for_tests {
+        let execution = &config.repo_policy.execution;
+        if !overflowed || !ordinary || !execution.widen_scope_for_tests {
             return None;
+        }
+        match super::successor::is_relais_successor(config.ledger, &self.run_id) {
+            Ok(false) => {}
+            Ok(true) => return None,
+            Err(e) => {
+                self.step("widen_scope", format!("not widened: {e}"));
+                return None;
+            }
         }
         let profile = config
             .repo_policy
             .verification
             .profiles
             .get(&config.contract.verification_profile)?;
-        let planned = super::successor::plan_test_widening(
+        let planned = super::successor::plan_scope_widening(
             config.ledger,
             &self.run_id,
             config.contract,
             profile,
+            super::successor::SmallScopeLimits {
+                max_files: execution.widen_scope_small_max_files,
+                max_lines: execution.widen_scope_small_max_lines,
+            },
             &config.artifacts_dir,
         );
-        let (intent, paths) = match planned {
+        let (intent, paths, rule) = match planned {
             Ok(Some(planned)) => planned,
             Ok(None) => return None,
             Err(e) => {
-                self.step("widen_scope_for_tests", format!("not widened: {e}"));
+                self.step("widen_scope", format!("not widened: {e}"));
                 return None;
             }
         };
+        let note = rule.note();
         let written = config.ledger.resolve_decision_with_intent(
             &self.run_id,
             &crate::ledger::DecisionAnswer {
@@ -426,7 +440,7 @@ impl<'a> RunEngine<'a> {
                 actor: crate::ledger::Actor::Relais,
                 person_quote: None,
                 recorded_via: crate::ledger::RecordedVia::Cli,
-                note: Some("scope widened for test paths (execution.widen_scope_for_tests)"),
+                note: Some(&note),
                 successor_run: None,
                 from_state: State::NeedsDecision,
                 to_state: State::Cancelled,
@@ -437,24 +451,54 @@ impl<'a> RunEngine<'a> {
             Ok(Some(stored)) => stored,
             Ok(None) => return None,
             Err(e) => {
-                self.step("widen_scope_for_tests", format!("not widened: {e}"));
+                self.step("widen_scope", format!("not widened: {e}"));
                 return None;
             }
         };
+        let what = match &rule {
+            super::successor::WidenRule::Tests => {
+                "the diff left the scope only by test paths".to_string()
+            }
+            super::successor::WidenRule::Small(edits) => format!(
+                "the diff left the scope by one small edit: {}",
+                edits
+                    .iter()
+                    .map(|edit| match (edit.added, edit.removed) {
+                        (Some(added), Some(removed)) => {
+                            format!("{} (+{added}/-{removed})", edit.path)
+                        }
+                        _ => edit.path.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
         let sentence = format!(
-            "the diff left the scope only by test paths; relais widened the scope to them and \
-             recorded successor intent {} to verify and review the candidate again: {}",
+            "{what}; relais widened the scope to the changed paths and recorded successor \
+             intent {} to verify and review the candidate again: {}",
             stored.intent_id,
             paths.join(", ")
         );
-        Some((
+        Some(super::successor::Settled {
+            code: rule.code(),
             sentence,
-            crate::protocol::SuccessorRef {
+            successor: crate::protocol::SuccessorRef {
                 intent_id: stored.intent_id,
                 repo: config.repo_dir.to_string_lossy().into_owned(),
                 widened_paths: paths,
+                code: rule.code().to_string(),
+                small_edit: match &rule {
+                    super::successor::WidenRule::Tests => None,
+                    super::successor::WidenRule::Small(edits) => {
+                        edits.first().map(|edit| crate::protocol::SmallEdit {
+                            path: edit.path.clone(),
+                            added: edit.added,
+                            removed: edit.removed,
+                        })
+                    }
+                },
             },
-        ))
+        })
     }
 
     fn run_to_outcome(&mut self) -> Finish {

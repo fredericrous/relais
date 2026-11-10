@@ -250,6 +250,14 @@ test('one outcome line carrying a successor intent launches exactly one child an
   expect(prompts).not.toContain('tests/b9.rs')
 })
 
+test('the widened text picks its sentence by code', () => {
+  const base = { intent_id: 'i', repo: '/r', widened_paths: ['src/a.rs'] }
+  expect(widenedText({ ...base, code: 'scope_widened_for_tests' })).toContain('widened for tests')
+  const small = widenedText({ ...base, code: 'scope_widened_small', small_edit: { path: 'src/a.rs', added: 4, removed: 2 } })
+  expect(small).toContain('one small source edit "src/a.rs" (+4/-2)')
+  expect(small).not.toContain('for tests')
+})
+
 test('the widened paths are quoted data, each cut to MAX_LINE, at most ten, then +k more', () => {
   const text = widenedText({ intent_id: 'i', repo: '/r', widened_paths: widenedPaths })
   const quoted = text.split('\n').filter(l => l.startsWith('  "'))

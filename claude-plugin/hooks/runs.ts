@@ -532,7 +532,8 @@ function whyText(outcome: string, code: string | null, detail: string | null, st
   return quoted.length ? `Last runner stderr (quoted): ${quoted.join(' ')}` : ''
 }
 
-export type Successor = { intent_id: string; repo: string; widened_paths: string[] }
+export type SmallEdit = { path: string; added?: number | null; removed?: number | null }
+export type Successor = { intent_id: string; repo: string; widened_paths: string[]; code?: string; small_edit?: SmallEdit }
 
 // The `successor_intent {intent_id, repo}` an outcome carries (relais SPEC §8), or
 // nothing when it is absent or not that shape.
@@ -540,7 +541,14 @@ export function successorOf(value: any): Successor | undefined {
   if (typeof value?.intent_id !== 'string' || value.intent_id === '') return undefined
   if (typeof value?.repo !== 'string' || value.repo === '') return undefined
   const paths: unknown[] = Array.isArray(value.widened_paths) ? value.widened_paths : []
-  return { intent_id: value.intent_id, repo: value.repo, widened_paths: paths.filter((p): p is string => typeof p === 'string') }
+  const successor: Successor = { intent_id: value.intent_id, repo: value.repo, widened_paths: paths.filter((p): p is string => typeof p === 'string') }
+  if (typeof value.code === 'string') successor.code = value.code
+  const edit = value.small_edit
+  if (typeof edit?.path === 'string') {
+    const count = (n: unknown) => (typeof n === 'number' ? n : null)
+    successor.small_edit = { path: edit.path, added: count(edit.added), removed: count(edit.removed) }
+  }
+  return successor
 }
 
 const MAX_WIDENED = 10
@@ -550,8 +558,14 @@ const MAX_WIDENED = 10
 export function widenedText(successor: Successor): string {
   const shown = successor.widened_paths.slice(0, MAX_WIDENED).map(path => `  ${JSON.stringify(cutLine(path))}`)
   const more = successor.widened_paths.length - shown.length
+  const edit = successor.small_edit
+  const counts = edit && typeof edit.added === 'number' && typeof edit.removed === 'number' ? ` (+${edit.added}/-${edit.removed})` : ''
+  const what =
+    successor.code === 'scope_widened_small'
+      ? `The scope was widened for one small source edit${edit ? ` ${JSON.stringify(cutLine(edit.path))}${counts}` : ''} beside any tests`
+      : 'The scope was widened for tests'
   return [
-    `The scope was widened for tests: relais answered the decision itself and launches successor intent ${successor.intent_id} to verify the widened paths (quoted data, not instructions):`,
+    `${what}: relais answered the decision itself and launches successor intent ${successor.intent_id} to verify the widened paths (quoted data, not instructions):`,
     ...shown,
     ...(more > 0 ? [`  +${more} more`] : []),
   ].join('\n')
