@@ -237,6 +237,8 @@ only on the red checks.
   only an all-green full base and a lazy base run checks red commands only, so
   it can never write one. A hit still serves; removing the cache code is a
   later cleanup.
+- 2026-11-10 — Phase 3 also bumps `claude-plugin/.claude-plugin/plugin.json`,
+  as every relais release does (v0.52.1, bd7fe5f3).
 - 2026-11-10 — The baseline is lazy with no policy switch back to up-front.
   ADR-0013 decided it for every repository, and a switch would change the
   policy hash of every `relais.toml`.
@@ -353,7 +355,7 @@ Observed before the push, at d0c57a55, rebased on 4bdca927:
 ## Outcome
 
 Phases 1 and 2 are built and reviewed on `feat/review-opt-in-lazy-baseline`.
-Released as v0.53.0 (this commit; the tag follows its merge). What is
+Release prepared as v0.53.0 in this commit; the tag follows the merge. What is
 left: the follow-up branch for the deliberate lows, the real-run
 observations, and the 0.74 after-measure on 11-18.
 
