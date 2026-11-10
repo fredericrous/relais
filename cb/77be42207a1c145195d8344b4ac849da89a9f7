@@ -1,0 +1,20 @@
+amont-provenance-v1
+commit cb77be42207a1c145195d8344b4ac849da89a9f7
+tree ab5ecd9cc11d6dbfc77840c4f63fef7c8209ec09
+canon 10d870a7de7377f0d78725fea65f731235976006
+patch 311c775f1a208be0bd155857e04c97893a45c34b
+plan docs/plans/2026-11-10-settle-timeouts-small-scope.md 6d975252a98bd6cce75562d642c532634bd98bd1deac8251f4aa0149d591b62b
+review reviewed fd2529794e1ae7f4c603e5819517f444f20041e460ad13b1b781eae30b99c33b
+code-review backend reviewed fd2529794e1ae7f4c603e5819517f444f20041e460ad13b1b781eae30b99c33b
+code-review lang:rust reviewed fd2529794e1ae7f4c603e5819517f444f20041e460ad13b1b781eae30b99c33b
+code-review unix reviewed fd2529794e1ae7f4c603e5819517f444f20041e460ad13b1b781eae30b99c33b
+code-review tui reviewed fd2529794e1ae7f4c603e5819517f444f20041e460ad13b1b781eae30b99c33b
+preview not-required
+producer amont-agent 3.28.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAEBIoiz5aZAKtlRhy92ADl/21WMxkoTd3YjhF/6neCcXmRB+pn
+eRF4EoV8hXKfdcWZKA9ScvDAiPonzDqsH0Go0N
+-----END SSH SIGNATURE-----
