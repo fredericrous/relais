@@ -45,6 +45,12 @@ keys:
     description: How a run spends time on a loaded machine (work, admission wait, disk wait and total), what each budget's exhaustion ends as, and why resource exhaustion is evidence rather than a verdict
   execution.settle-before-asking:
     description: Which stops a run settles itself before asking a person (minor review findings, a tests-only scope overflow, a reviewer with no result), and the bound on each
+  acceptance.adapters:
+    description: How relais checks a candidate with amont (greengate) installed and without it, and what a profile states for a gate's verdict to be reused at push
+  acceptance.semantic-review:
+    description: When relais's own semantic reviewer runs, what comes with it, and what reviews a run that does not ask for it
+  acceptance.baseline:
+    description: When relais checks the base tree (never when amont proves it, else only after a red candidate), and what the base run covers
 
 # Which parts of this repository have which traits (aval 1.7, SEMANTICS
 # section 2.5), as `aval traits --detect` proposed and a reviewer accepted.

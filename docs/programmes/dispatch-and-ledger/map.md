@@ -52,7 +52,26 @@ review spend per run measured before (t02) and after.
 - [What stops amont's push gate from reusing a relais candidate's verdict](t03-attempt-ends-on-amont.md): only the profiles: amont's runs `make check`, so nothing is stamped; relais's side and the stamp keying already work; split the profile per gate
 - [Where review happens once relais's reviewer is removed](t05-review-leaves-relais.md): opt-in: no reviewer by default, `review: required` brings it with the inspect and edited-test guards
 - [When relais runs a baseline](t08-when-a-baseline-runs.md): none when greengate proves the base; otherwise only after a red candidate, on the red checks
+- [Record relais's two acceptance adapters, the reviewer's removal and the baseline rule](t07-supersede-acceptance.md): ADR-0013 accepted; SPEC and the older ADRs are amended by each build PR
 - [Which repositories' relais profiles can split into amont gates](t09-profiles-per-gate.md): the six Rust repositories split cleanly (fmt, clippy, cargo-test) with a few plain leftovers; happier cannot; JS/Go/Python matches unverified
+
+## Build queue (decided in ADR-0013, not yet built)
+
+Each item is an ordinary plan. It amends its SPEC sections and older ADRs in
+its own PR.
+
+1. Split the six Rust repositories' relais profiles per gate (`amont run
+   --stamp fmt|clippy|cargo-test`, with the leftovers plain), per
+   [t09](t09-profiles-per-gate.md), amont first ([t03](t03-attempt-ends-on-amont.md)'s line).
+   - Verify that relais's verify environment resolves the same `cargo` as
+     the push shell.
+2. Add the default-off review switch: the reviewer and its two guards only
+   under `review: required` ([t05](t05-review-leaves-relais.md)).
+3. Proof, else lazy: no up-front baseline, and a base run of the red checks
+   after a red candidate ([t08](t08-when-a-baseline-runs.md)). Ask first:
+   `fix/budget-cut-baseline-and-gate-test` touches the same stage.
+4. After-measure: rerun decisions
+   `docs/programmes/one-verdict-per-tree/t11-measure.py` and t02's queries.
 
 ## Not yet specified
 
