@@ -31,7 +31,12 @@ max_repairs_before_escalation = 1
 # 1200 s with nothing to show). A wall clock a real package fits in only
 # on a good day buys interrupted runs, and an interrupted run has already
 # paid for its worker.
-max_wall_seconds = 2700
+# Raised to 60 minutes on 2026-11-10: from 10-10 to 11-09, 17 of 414 runs
+# still ended "did not stop within the attempt's wall time" (8 first attempts
+# at the full 2700 s, 9 repairs left with what the earlier attempts had not
+# used; 12 candidates accepted by hand), and 18 successful runs used over 80%
+# of the budget.
+max_wall_seconds = 3600
 allow_nested_agents = true
 max_agent_depth = 3
 max_agents_total = 24
