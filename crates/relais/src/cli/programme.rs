@@ -512,8 +512,9 @@ fn fetch_all(repos: &[PathBuf]) {
 /// resolution set aside or skipped.
 fn resolve_dir(dir: &Path, fetch: Fetch) -> Result<Found, CliError> {
     let located = load::locate(dir).map_err(programme_error)?;
-    if fetch == Fetch::Origin {
-        fetch_all(std::slice::from_ref(&located.repo));
+    match fetch {
+        Fetch::Origin => fetch_all(std::slice::from_ref(&located.repo)),
+        Fetch::LastFetch => {}
     }
     let resolved = load::resolve(&located).map_err(programme_error)?;
     for note in &resolved.notes {
@@ -549,8 +550,9 @@ pub(crate) fn list_command(
         .zip(holds)
         .filter_map(|(repo, holds)| holds.then_some(repo))
         .collect();
-    if fetch == Fetch::Origin {
-        fetch_all(&repos);
+    match fetch {
+        Fetch::Origin => fetch_all(&repos),
+        Fetch::LastFetch => {}
     }
     let mut rows: Vec<(PathBuf, String, Counts, String)> = Vec::new();
     let mut outcome = CliOutcome::Accepted;

@@ -1249,7 +1249,7 @@ fn local_edits_older_than_origin_are_named_when_set_aside() {
     // the person's older edit is named, not silently skipped.
     let out = world.programme(&["check"]);
     let expected = format!(
-        "relais: {}: local work older than origin/{branch}'s last change; reading origin/{branch}\n",
+        "relais: {}: local work older than origin/{branch}'s last change; reading origin/{branch} (commit or edit the files to read yours)\n",
         world.dir().display()
     );
     assert!(

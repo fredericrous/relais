@@ -799,9 +799,9 @@ pub fn may_hold_programmes(repo: &Path) -> bool {
 /// Where one programme is read from, and the local copy it set aside.
 struct Choice {
     found: Option<Found>,
-    /// A checkout whose local work was older than origin's last change, and
-    /// that ref: the person may expect their copy to be read.
-    set_aside: Option<(PathBuf, String)>,
+    /// The ref read instead of a checkout whose local work was older than
+    /// its last change: the person may expect their copy to be read.
+    set_aside: Option<String>,
 }
 
 /// Where the programme `slug` of `repo` is read from, among the checkout
@@ -854,7 +854,7 @@ fn choose(
                 slug: slug.to_string(),
                 source: Source::Ref(rev.to_string()),
             }),
-            set_aside: best.map(|(_, state)| (state.path.clone(), rev.to_string())),
+            set_aside: best.map(|_| rev.to_string()),
         },
         (None, Origin::Absent | Origin::Lacks { .. }) => Choice {
             found: None,
@@ -885,18 +885,19 @@ pub struct Listed {
     pub notes: Vec<String>,
 }
 
-/// Origin's view of a repository, noting a ref git could not list: the
-/// files are read instead, so one repository never hides the others.
-fn origin_view_noted(repo: &Path, notes: &mut Vec<String>) -> Option<OriginView> {
+/// Origin's view of a repository, and a note when git could not list its
+/// ref: the files are read instead, so one repository never hides the
+/// others.
+fn origin_view_noted(repo: &Path) -> (Option<OriginView>, Option<String>) {
     match origin_view(repo) {
-        Ok(view) => view,
-        Err(error) => {
-            notes.push(format!(
+        Ok(view) => (view, None),
+        Err(error) => (
+            None,
+            Some(format!(
                 "{}: {error}; reading the files instead",
                 repo.display()
-            ));
-            None
-        }
+            )),
+        ),
     }
 }
 
@@ -911,7 +912,8 @@ pub fn programmes_of(repo: &Path) -> Result<Listed, ProgrammeError> {
             notes,
         });
     }
-    let view = origin_view_noted(repo, &mut notes);
+    let (view, note) = origin_view_noted(repo);
+    notes.extend(note);
     let mut states = vec![checkout_state(repo)?];
     for linked in linked_worktrees(repo) {
         match checkout_state(&linked) {
@@ -989,8 +991,8 @@ pub struct Resolved {
 /// programme, else the files. Local work set aside is named in a note, so
 /// a `check` that passes on origin never hides the edits it did not read.
 pub fn resolve(located: &Located) -> Result<Resolved, ProgrammeError> {
-    let mut notes = Vec::new();
-    let view = origin_view_noted(&located.repo, &mut notes);
+    let (view, note) = origin_view_noted(&located.repo);
+    let mut notes: Vec<String> = note.into_iter().collect();
     let state = checkout_state(&located.checkout)?;
     let choice = choose(
         &located.repo,
@@ -998,9 +1000,9 @@ pub fn resolve(located: &Located) -> Result<Resolved, ProgrammeError> {
         std::slice::from_ref(&state),
         view.as_ref(),
     )?;
-    if let Some((_, rev)) = &choice.set_aside {
+    if let Some(rev) = &choice.set_aside {
         notes.push(format!(
-            "{}: local work older than {rev}'s last change; reading {rev}",
+            "{}: local work older than {rev}'s last change; reading {rev} (commit or edit the files to read yours)",
             located.dir.display()
         ));
     }
@@ -1079,7 +1081,14 @@ impl std::fmt::Display for FetchFailure {
     }
 }
 
-impl std::error::Error for FetchFailure {}
+impl std::error::Error for FetchFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            FetchFailureKind::Process(error) => Some(error),
+            FetchFailureKind::TimedOut(_) | FetchFailureKind::Git(_) => None,
+        }
+    }
+}
 
 /// Whether the repository names an `origin` remote.
 pub fn has_origin(repo: &Path) -> bool {
