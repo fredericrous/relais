@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/review-opt-in-lazy-baseline
 repos: [relais]
 adrs: [relais:ADR-0013, relais:ADR-0010, relais:ADR-0011, decisions:ADR-0045]
@@ -213,7 +213,7 @@ only on the red checks.
       `PreexistingTestFailures` on attempt 1 (the memo keeps full `CheckOutcome`s);
     - the rewritten base-ending tests assert `finish_attempt` `Blocked` and the
       kept candidate's sha.
-- [ ] Phase 3 — release: `CHANGELOG.md`, `Cargo.toml`, `Cargo.lock`, via the `tag-release`
+- [x] Phase 3 — release: `CHANGELOG.md`, `Cargo.toml`, `Cargo.lock`, via the `tag-release`
   skill (v0.53.0). Installing it and reinstalling the plugin are the
   person's.
 
@@ -237,6 +237,8 @@ only on the red checks.
   only an all-green full base and a lazy base run checks red commands only, so
   it can never write one. A hit still serves; removing the cache code is a
   later cleanup.
+- 2026-11-10 — Phase 3 also bumps `claude-plugin/.claude-plugin/plugin.json`,
+  as every relais release does (v0.52.1, bd7fe5f3).
 - 2026-11-10 — The baseline is lazy with no policy switch back to up-front.
   ADR-0013 decided it for every repository, and a switch would change the
   policy hash of every `relais.toml`.
@@ -353,7 +355,8 @@ Observed before the push, at d0c57a55, rebased on 4bdca927:
 ## Outcome
 
 Phases 1 and 2 are built and reviewed on `feat/review-opt-in-lazy-baseline`.
-Next: Phase 3, the release (v0.53.0), then the follow-up branch for the
-deliberate lows.
+Release prepared as v0.53.0 in this commit; the tag follows the merge. What is
+left: the follow-up branch for the deliberate lows, the real-run
+observations, and the 0.74 after-measure on 11-18.
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix body-sha=8e960c48cbd2 -->
