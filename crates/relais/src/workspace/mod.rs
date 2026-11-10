@@ -1753,6 +1753,8 @@ mod tests {
             ".gitlab-ci.yml",
             "crates/relais/relais.toml",
             "crates/relais/.relais/task.json",
+            "amont.conf",
+            "greengate.conf",
         ] {
             assert!(is_protected_path(path), "{path} is protected");
         }

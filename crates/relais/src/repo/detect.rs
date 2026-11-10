@@ -286,9 +286,9 @@ const AMONT_LIST_TIMEOUT: Duration = Duration::from_secs(10);
 /// amont's declared `block` checks: seen, never proposed. Their command
 /// column is a shell line, and a policy names argv, never shell recipes
 /// (SPEC §6). amont is asked: declared checks whose line says `block`
-/// (see [`declares_block`]), so neither a machine's `amont.severity.*`
-/// overrides nor whether this clone trusts its `amont.conf` changes the
-/// answer. Without a usable answer the file is read directly, and a note
+/// (see [`declares_block`]), so neither a machine's severity overrides
+/// nor whether this clone trusts its gate manifest (`greengate.conf`, else
+/// `amont.conf`) changes the answer. Without a usable answer the file is read directly, and a note
 /// says so.
 fn amont_gates(root: &Path, amont: Option<&Path>, notes: &mut Vec<String>) -> Vec<Skipped> {
     let Some(manifest) = gate_manifest(root) else {
@@ -309,9 +309,6 @@ fn amont_gates(root: &Path, amont: Option<&Path>, notes: &mut Vec<String>) -> Ve
 /// 3.x and amont read, kept until the fleet sweep has renamed every
 /// repository's (the census of greengate's hard rename removes it).
 const GATE_MANIFESTS: [&str; 2] = ["greengate.conf", "amont.conf"];
-
-/// The listing envelopes: greengate 4.0's, then amont's.
-const LIST_FORMATS: [&str; 2] = ["greengate-list-v1", "amont-list-v1"];
 
 /// The manifest this repository declares its gates in, the new name winning.
 fn gate_manifest(root: &Path) -> Option<&'static str> {
@@ -336,9 +333,12 @@ fn amont_list(bin: &Path, root: &Path, manifest: &str) -> Result<Vec<Skipped>, S
         .map_err(|_| "amont list --json printed no JSON".to_string())?;
     if !listing["format"]
         .as_str()
-        .is_some_and(|format| LIST_FORMATS.contains(&format))
+        .is_some_and(|format| crate::verify::LIST_FORMATS.contains(&format))
     {
-        return Err("amont list --json is not amont-list-v1".into());
+        return Err(format!(
+            "amont list --json is not {}",
+            crate::verify::LIST_FORMATS.join(" or ")
+        ));
     }
     let checks = listing["checks"]
         .as_array()
@@ -358,7 +358,7 @@ fn amont_list(bin: &Path, root: &Path, manifest: &str) -> Result<Vec<Skipped>, S
     Ok(gates)
 }
 
-/// Does this listing entry's `amont.conf` line say `block`? Its
+/// Does this listing entry's gate-manifest line say `block`? Its
 /// `manifest_severity` (amont 1.58) is the line's own word, trusted or not;
 /// `declared_severity` reads `warn` for a check that cannot run, an
 /// untrusted one included, and serves only an amont that predates it.
@@ -369,7 +369,7 @@ fn declares_block(check: &serde_json::Value) -> bool {
     }
 }
 
-/// The fallback: amont.conf's `block` lines, read as text. Deprecated —
+/// The fallback: the gate manifest's `block` lines, read as text. Deprecated —
 /// the grammar is amont's — and kept for a machine without amont.
 fn amont_conf_gates(root: &Path, manifest: &str) -> Vec<Skipped> {
     let Ok(text) = std::fs::read_to_string(root.join(manifest)) else {
@@ -872,7 +872,7 @@ mod tests {
                 "detect-amont-format",
                 r#"{"format":"amont-list-v2","checks":[]}"#,
                 0,
-                "amont list --json is not amont-list-v1",
+                "amont list --json is not greengate-list-v1 or amont-list-v1",
             ),
         ] {
             let dir = amont_repo(label);
@@ -920,6 +920,20 @@ mod tests {
         );
         let proposal = detect_policy_with(&dir, Some(&bin));
         assert_eq!(proposal.skipped, the_cargo_test_gate());
+        assert!(proposal.notes.is_empty(), "{:?}", proposal.notes);
+
+        // A swept repository: greengate answers for greengate.conf, and the
+        // gates are labelled with the manifest they came from.
+        std::fs::write(dir.join("greengate.conf"), AMONT_CONF).expect("greengate.conf");
+        std::fs::remove_file(dir.join("amont.conf")).expect("amont.conf gone");
+        let proposal = detect_policy_with(&dir, Some(&bin));
+        assert_eq!(
+            proposal.skipped,
+            [Skipped {
+                what: "greengate.conf: pre-commit cargo-test".into(),
+                reason: "not a plain command".into(),
+            }]
+        );
         assert!(proposal.notes.is_empty(), "{:?}", proposal.notes);
     }
 
