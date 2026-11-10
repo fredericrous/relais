@@ -628,6 +628,27 @@ fn list_reads_maps_from_the_origin_default_branch() {
 }
 
 #[test]
+fn list_reads_the_files_when_origin_head_dangles() {
+    let world = World::new("list-dangling");
+    let alpha = world.root.join("alpha");
+    git(
+        &alpha,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/gone",
+        ],
+    );
+    let root = world.root.to_str().expect("utf8");
+    let out = world.relais(&["programme", "list", "--root", root, "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(rows.as_array().map(Vec::len), Some(1));
+    assert_eq!(rows[0]["source"], "working-tree");
+    assert_eq!(rows[0]["open"], 3);
+}
+
+#[test]
 fn list_names_a_map_once_though_a_linked_worktree_holds_it() {
     let world = World::new("list-once");
     let alpha = world.root.join("alpha");

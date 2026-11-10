@@ -355,27 +355,24 @@ impl Found {
 
 /// The remote-tracking ref of `origin`'s default branch: what
 /// `origin/HEAD` points at, else `origin/main` when it exists.
+/// Each candidate must resolve to a commit: an `origin/HEAD` left dangling by
+/// a renamed upstream branch is skipped, never read.
 fn origin_default(repo: &Path) -> Option<String> {
+    let resolves = |rev: &str| {
+        git_stdout(
+            repo,
+            &["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")],
+        )
+        .is_ok() // exit 1: the ref names no commit
+    };
     let head = git_stdout(
         repo,
         &["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"],
     )
     .ok() // a missing origin/HEAD exits 1; fall back to origin/main
     .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty());
-    head.or_else(|| {
-        git_stdout(
-            repo,
-            &[
-                "rev-parse",
-                "--verify",
-                "-q",
-                "refs/remotes/origin/main^{commit}",
-            ],
-        )
-        .ok() // no origin/main: the working tree is read instead
-        .map(|_| "origin/main".to_string())
-    })
+    .filter(|s| !s.is_empty() && resolves(s));
+    head.or_else(|| Some("origin/main".to_string()).filter(|main| resolves(main)))
 }
 
 /// The slugs of `docs/programmes/*/map.md` in the commit `rev`, sorted.
@@ -426,8 +423,12 @@ pub fn find_programmes(root: &Path) -> Result<Vec<Found>, ProgrammeError> {
         if !repo.join(".git").is_dir() {
             continue;
         }
-        if let Some(rev) = origin_default(&repo) {
-            for slug in programmes_at(&repo, &rev)? {
+        // A ref git cannot list falls back to the files, so one repository
+        // never hides the others.
+        let at_origin = origin_default(&repo)
+            .and_then(|rev| programmes_at(&repo, &rev).ok().map(|slugs| (rev, slugs)));
+        if let Some((rev, slugs)) = at_origin {
+            for slug in slugs {
                 found.push(Found {
                     repo: repo.clone(),
                     slug,
