@@ -660,6 +660,11 @@ impl std::fmt::Display for RunPurpose {
     }
 }
 
+/// Codes a relais settle ends its run with.
+pub const CODE_WIDENED_FOR_TESTS: &str = "scope_widened_for_tests";
+pub const CODE_WIDENED_SMALL: &str = "scope_widened_small";
+pub const CODE_TIMED_OUT_VERIFY_QUEUED: &str = "timed_out_verify_queued";
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -594,15 +594,12 @@ impl<'a> RunEngine<'a> {
             let timed_out = result.ended == Ended::TimedOut;
             let candidate = if timed_out && result.timed_out_stop.is_some() {
                 match self.snapshot_timed_out(ctx, attempt_id, index)? {
-                    TimedOutTree::Candidate(sha) => Some(sha),
+                    TimedOutTree::Candidate(sha, note) => {
+                        append_note(&mut detail, note);
+                        Some(sha)
+                    }
                     TimedOutTree::NoCandidate(note) => {
-                        if let Some(note) = note {
-                            if detail.is_empty() {
-                                detail = note;
-                            } else {
-                                detail = format!("{detail}; {note}");
-                            }
-                        }
+                        append_note(&mut detail, note);
                         None
                     }
                 }
@@ -690,16 +687,21 @@ impl<'a> RunEngine<'a> {
         index: u32,
     ) -> Result<TimedOutTree, RunError> {
         let worktree_path = ctx.worktree_path;
-        if self.wait_for_writers(worktree_path)?.is_some() {
-            return Ok(TimedOutTree::NoCandidate(None));
+        if let Some(holder) = self.wait_for_writers(worktree_path)? {
+            return Ok(TimedOutTree::NoCandidate(Some(format!(
+                "no candidate: the tree was still held by {holder:?}"
+            ))));
         }
         let sha = match ctx.worktree.snapshot_resolved(
             &format!("run {} attempt {index}", self.run_id),
             ctx.preflight.conflicted_paths(),
         ) {
             Ok(sha) => sha,
-            Err(WorkspaceError::UnresolvedConflict(_)) => {
-                return Ok(TimedOutTree::NoCandidate(None));
+            Err(WorkspaceError::UnresolvedConflict(paths)) => {
+                return Ok(TimedOutTree::NoCandidate(Some(format!(
+                    "no candidate: an unresolved conflict at snapshot ({})",
+                    paths.join(", ")
+                ))));
             }
             Err(e) if e.is_storage_full() => return Err(e.into()),
             Err(e) => {
@@ -729,12 +731,15 @@ impl<'a> RunEngine<'a> {
             }
         }
         match self.publish_snapshot(ctx, attempt_id, index, State::Interrupted, &sha) {
-            Ok(_) => Ok(TimedOutTree::Candidate(sha)),
+            Ok(_) => Ok(TimedOutTree::Candidate(sha, None)),
             Err(e) if e.is_storage_full() => Err(e),
             // The ledger already holds the candidate when only the latest
-            // patch could not be written: the detail must say so too.
-            Err(_) if self.last_snapshot.as_ref() == Some(&(index, sha.clone())) => {
-                Ok(TimedOutTree::Candidate(sha))
+            // patch could not be written: the detail says so too.
+            Err(e) if self.last_snapshot.as_ref() == Some(&(index, sha.clone())) => {
+                Ok(TimedOutTree::Candidate(
+                    sha,
+                    Some(format!("candidate-latest.patch could not be written ({e})")),
+                ))
             }
             Err(e) => Ok(TimedOutTree::NoCandidate(Some(format!(
                 "the candidate could not be published ({e})"
@@ -749,7 +754,7 @@ impl<'a> RunEngine<'a> {
     /// publication leaves nothing selectable. Returns the path of `candidate-latest.patch`.
     fn publish_snapshot(
         &mut self,
-        ctx: &AttemptContext<'_>,
+        attempt_context: &AttemptContext<'_>,
         attempt_id: i64,
         index: u32,
         end: State,
@@ -780,17 +785,32 @@ impl<'a> RunEngine<'a> {
             }
         }
         crate::storage_full::at(crate::storage_full::Site::Snapshot)?;
-        write_whole(
-            &self.artifacts.join(format!("candidate-{index}.sha")),
-            sha.as_bytes(),
-        )?;
+        let sha_path = self.artifacts.join(format!("candidate-{index}.sha"));
+        write_whole(&sha_path, sha.as_bytes())?;
         let patch_path = self.artifacts.join(format!("candidate-{index}.patch"));
         let partial = patch_path.with_extension("patch.partial");
-        ctx.worktree.export_patch(sha, &partial)?;
-        let patch = std::fs::read(&partial)?;
-        std::fs::File::open(&partial)?.sync_all()?;
-        std::fs::rename(&partial, &patch_path)?;
-        let held_worktree = ctx.worktree_path.to_string_lossy().into_owned();
+        let exported = (|| -> Result<Vec<u8>, RunError> {
+            attempt_context.worktree.export_patch(sha, &partial)?;
+            let patch = std::fs::read(&partial)?;
+            // Windows refuses to flush a handle opened read-only.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&partial)?
+                .sync_all()?;
+            std::fs::rename(&partial, &patch_path)?;
+            Ok(patch)
+        })();
+        let patch = match exported {
+            Ok(patch) => patch,
+            Err(e) => {
+                // Nothing was published: leave no half-made candidate files.
+                // A file already gone, or never made, leaves nothing to clean.
+                let _ = std::fs::remove_file(&partial); // cleanup only: the error that matters is `e`
+                let _ = std::fs::remove_file(&sha_path); // cleanup only: the error that matters is `e`
+                return Err(e);
+            }
+        };
+        let held_worktree = attempt_context.worktree_path.to_string_lossy().into_owned();
         self.config
             .ledger
             .publish_candidate(&crate::ledger::CandidatePublication {
@@ -819,7 +839,7 @@ impl<'a> RunEngine<'a> {
     /// pipeline.
     fn snapshot_tree(
         &mut self,
-        ctx: &AttemptContext<'_>,
+        attempt_context: &AttemptContext<'_>,
         progress: &Progress,
         attempted: Attempted,
         result_text: Option<String>,
@@ -833,9 +853,9 @@ impl<'a> RunEngine<'a> {
         } = attempted;
         // The candidate snapshot is recorded outside model control,
         // added files included (SPEC §8).
-        let sha = match ctx.worktree.snapshot_resolved(
+        let sha = match attempt_context.worktree.snapshot_resolved(
             &format!("run {} attempt {index}", self.run_id),
-            ctx.preflight.conflicted_paths(),
+            attempt_context.preflight.conflicted_paths(),
         ) {
             Ok(sha) => sha,
             Err(WorkspaceError::UnresolvedConflict(paths)) => {
@@ -848,7 +868,8 @@ impl<'a> RunEngine<'a> {
                 ));
             }
         };
-        let latest_patch = self.publish_snapshot(ctx, attempt_id, index, State::Verifying, &sha)?;
+        let latest_patch =
+            self.publish_snapshot(attempt_context, attempt_id, index, State::Verifying, &sha)?;
 
         // Write scope is checked on the actual diff; a violation can
         // never be accepted (SPEC §8, §9).
@@ -856,7 +877,8 @@ impl<'a> RunEngine<'a> {
         // tree it began from; a verify applies its candidate as its own
         // change, so it stays measured from the base (SPEC §8).
         let floor = workspace::ScopeFloor::of_run(
-            ctx.preflight
+            attempt_context
+                .preflight
                 .candidate
                 .as_ref()
                 .map(|prepared| prepared.tree.as_str()),
@@ -865,9 +887,9 @@ impl<'a> RunEngine<'a> {
         // A holdout's overlay path is the holdout's: a candidate that
         // wrote it ends the run, before any scope answer that could offer
         // to widen to it, and with nothing for a repair prompt to carry.
-        let written = match ctx
+        let written = match attempt_context
             .worktree
-            .changed_paths_from(floor.revision(ctx.worktree), &sha)
+            .changed_paths_from(floor.revision(attempt_context.worktree), &sha)
         {
             Ok(written) => written,
             Err(e) => {
@@ -877,7 +899,7 @@ impl<'a> RunEngine<'a> {
             }
         };
         if let Some((holdout, overlay)) =
-            crate::holdout::overlay_collision(&ctx.preflight.holdouts, &written)
+            crate::holdout::overlay_collision(&attempt_context.preflight.holdouts, &written)
         {
             ledger.finish_attempt(attempt_id, State::Failed, None, Some(&sha))?;
             let detail = format!(
@@ -895,7 +917,12 @@ impl<'a> RunEngine<'a> {
                 Terminal::Failed { detail },
             )?));
         }
-        match workspace::check_scope_from(ctx.worktree, &sha, self.config.contract, floor) {
+        match workspace::check_scope_from(
+            attempt_context.worktree,
+            &sha,
+            self.config.contract,
+            floor,
+        ) {
             Ok(_) => {}
             Err(WorkspaceError::ScopeViolation(paths)) => {
                 ledger.finish_attempt(attempt_id, State::NeedsDecision, None, Some(&sha))?;
@@ -903,7 +930,7 @@ impl<'a> RunEngine<'a> {
                     &progress.budget,
                     Observation::ScopeViolation(workspace::out_of_scope(
                         self.config.repo_dir,
-                        floor.revision(ctx.worktree),
+                        floor.revision(attempt_context.worktree),
                         &sha,
                         paths,
                     )),
@@ -1410,9 +1437,22 @@ impl<'a> RunEngine<'a> {
 
 /// What a timed-out worker's tree came to.
 enum TimedOutTree {
-    Candidate(String),
+    /// The published candidate, and a note when part of its publication
+    /// failed after the ledger already held it.
+    Candidate(String, Option<String>),
     /// No candidate; the note says why when it is not the ordinary case.
     NoCandidate(Option<String>),
+}
+
+/// Appends `note` to an attempt's detail, `; `-separated.
+fn append_note(detail: &mut String, note: Option<String>) {
+    let Some(note) = note else { return };
+    if detail.is_empty() {
+        *detail = note;
+    } else {
+        detail.push_str("; ");
+        detail.push_str(&note);
+    }
 }
 
 /// Writes `bytes` to a temporary file beside `path`, makes them durable,

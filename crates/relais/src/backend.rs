@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::catalog::{Admission, EffortSet};
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::EffortId;
-use crate::procs::{Ended, ProcessEnd, RunError};
+use crate::procs::{Ended, RunError};
 
 #[derive(Debug)]
 pub enum BackendError {
@@ -403,14 +403,6 @@ pub enum Repeated {
 pub struct LostWorker {
     /// The agent the worker ran as; `None` when none had bound.
     pub agent: Option<String>,
-}
-
-impl TimedOutStop {
-    /// The stop of a subprocess worker that ran to its wall time, when its
-    /// whole process group is gone. A verification command never asks.
-    pub fn of_process(end: &ProcessEnd) -> Option<Self> {
-        end.stop_confirmed().then_some(Self { agent: None })
-    }
 }
 
 impl LaunchResult {

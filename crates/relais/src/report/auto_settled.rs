@@ -12,13 +12,10 @@
 use serde::Serialize;
 
 use crate::ids::RunId;
-use crate::ledger::{Ledger, LedgerError};
+use crate::ledger::{Actor, Ledger, LedgerError};
 use crate::lifecycle::{Reason, State};
 use crate::verify::test_tree_matcher;
 use crate::workspace::is_protected_path;
-
-/// The actor a settle relais answered itself carries.
-const RELAIS_ACTOR: &str = "relais";
 
 /// How many settles of one rule there were, and how their successors (for a
 /// `review_repair`, the run itself) ended.
@@ -39,7 +36,18 @@ impl SettleOutcomes {
             Some(State::Accepted | State::AcceptedByPerson) => self.accepted += 1,
             Some(State::Failed | State::BudgetExhausted) => self.failed += 1,
             Some(State::NeedsReview) => self.needs_review += 1,
-            _ => self.other += 1,
+            Some(
+                State::Prepared
+                | State::Running
+                | State::Verifying
+                | State::Repairing
+                | State::Escalating
+                | State::NeedsDecision
+                | State::Blocked
+                | State::Cancelled
+                | State::Interrupted,
+            )
+            | None => self.other += 1,
         }
     }
 }
@@ -57,6 +65,27 @@ enum Widening {
     TimedOutVerify,
     Tests,
     Small,
+}
+
+impl Widening {
+    /// The outcome code the rule ends its run with (SPEC §8).
+    fn code(&self) -> &'static str {
+        use crate::lifecycle::{
+            CODE_TIMED_OUT_VERIFY_QUEUED, CODE_WIDENED_FOR_TESTS, CODE_WIDENED_SMALL,
+        };
+        match self {
+            Widening::TimedOutVerify => CODE_TIMED_OUT_VERIFY_QUEUED,
+            Widening::Tests => CODE_WIDENED_FOR_TESTS,
+            Widening::Small => CODE_WIDENED_SMALL,
+        }
+    }
+}
+
+/// The outcome code of the settle a relais-written successor intent
+/// carries, read from its scope delta exactly as the report counts it, never
+/// from the decision's note. The CLI names a settled run's code with it.
+pub fn settle_code_of_intent(scope_delta: &[String]) -> Result<&'static str, LedgerError> {
+    classify(scope_delta).map(|widening| widening.code())
 }
 
 fn classify(scope_delta: &[String]) -> Result<Widening, LedgerError> {
@@ -93,7 +122,7 @@ pub fn auto_settled_report(
             section.review_repair.add(ledger.run_status(&run)?);
         }
         let settled_by_relais = ledger.decision_of_run(&run)?.is_some_and(|d| {
-            d.actor.as_deref() == Some(RELAIS_ACTOR)
+            d.actor.as_deref() == Some(Actor::Relais.as_str())
                 && d.resolution == Some(Reason::DecisionRevised)
         });
         if settled_by_relais {
@@ -116,8 +145,8 @@ pub fn auto_settled_report(
 }
 
 impl AutoSettled {
-    /// Two lines within 80 columns: the count per rule, then how the
-    /// successors ended.
+    /// A label, then two indented lines within 80 columns at up to
+    /// three-digit counts: the count per rule, then how the successors ended.
     pub fn render(&self) -> String {
         let rules = [
             &self.review_repair,
@@ -128,7 +157,7 @@ impl AutoSettled {
         let sum =
             |field: fn(&SettleOutcomes) -> usize| rules.iter().map(|r| field(r)).sum::<usize>();
         format!(
-            "auto settled: review_repair {}, widen_tests {}, widen_small {}, timed_out_verify {}\n  \
+            "auto settled:\n  review_repair {}, widen_tests {}, widen_small {}, timed_out_verify {}\n  \
              outcomes: {} accepted, {} failed, {} needs_review, {} other\n",
             self.review_repair.count,
             self.widen_tests.count,

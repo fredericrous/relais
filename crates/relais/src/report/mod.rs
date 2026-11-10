@@ -19,7 +19,7 @@ mod reviewers;
 
 use serde::Serialize;
 
-pub use auto_settled::{auto_settled_report, AutoSettled, SettleOutcomes};
+pub use auto_settled::{auto_settled_report, settle_code_of_intent, AutoSettled, SettleOutcomes};
 pub use decision_data::{
     count_by_source, decision_labels, project_floor, revert_agreement, DecisionLabels,
     FloorProjection, Fraction, SourceCount,
@@ -4863,17 +4863,17 @@ mod tests {
         assert_eq!(settled["review_repair"]["accepted"], 1);
         let text = report.render();
         assert!(text.contains(
-            "auto settled: review_repair 1, widen_tests 1, widen_small 1, timed_out_verify 1\n"
+            "auto settled:\n  review_repair 1, widen_tests 1, widen_small 1, timed_out_verify 1\n"
         ));
         let settled_lines = text
             .lines()
             .skip_while(|line| !line.starts_with("auto settled:"))
-            .take(2);
+            .take(3);
         assert!(
-            settled_lines.clone().count() == 2
+            settled_lines.clone().count() == 3
                 && settled_lines.clone().all(|line| line.chars().count() <= 80),
             "{text}"
         );
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort cleanup of a scratch directory
     }
 }

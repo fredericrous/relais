@@ -217,10 +217,9 @@ pub enum WidenRule {
     Small(Vec<ScopeChange>),
 }
 
-/// Codes a relais settle ends its run with.
-pub const CODE_WIDENED_FOR_TESTS: &str = "scope_widened_for_tests";
-pub const CODE_WIDENED_SMALL: &str = "scope_widened_small";
-pub const CODE_TIMED_OUT_VERIFY_QUEUED: &str = "timed_out_verify_queued";
+pub use crate::lifecycle::{
+    CODE_TIMED_OUT_VERIFY_QUEUED, CODE_WIDENED_FOR_TESTS, CODE_WIDENED_SMALL,
+};
 
 /// The note the answered decision of a timed-out run carries; it starts
 /// with the code.
@@ -259,18 +258,6 @@ pub struct Settled {
     pub successor: crate::protocol::SuccessorRef,
 }
 
-/// The code a relais answer's note starts with, if it names a known one.
-pub fn settle_code_of_note(note: &str) -> Option<&'static str> {
-    let (code, _) = note.split_once(": ")?;
-    [
-        CODE_WIDENED_FOR_TESTS,
-        CODE_WIDENED_SMALL,
-        CODE_TIMED_OUT_VERIFY_QUEUED,
-    ]
-    .into_iter()
-    .find(|known| *known == code)
-}
-
 /// Whether a scope overflow is one relais may widen itself, and by which
 /// rule: no path protected, none a policy verification input, and every
 /// path a test path except at most `limits.max_files` non-test paths whose
@@ -287,7 +274,11 @@ pub fn widenable(
     let paths: Vec<String> = changes.iter().map(|change| change.path.clone()).collect();
     match classify_verification_inputs(profile, &paths) {
         Ok(touched) if touched.policy.is_empty() => {}
-        _ => return None,
+        // A policy verification input is never widened in by relais.
+        Ok(_) => return None,
+        // A pattern that cannot be compiled makes no path widenable: the
+        // overflow stops for a person, as it did before this rule.
+        Err(_) => return None,
     }
     let sources: Vec<&ScopeChange> = changes
         .iter()
@@ -370,11 +361,11 @@ pub fn settled_contract(
     if widened.review >= Review::Required {
         return Ok(widened);
     }
-    let mut value = widened.canonical_value();
-    if let Some(fields) = value.as_object_mut() {
+    let mut reviewed_contract = widened.canonical_value();
+    if let Some(fields) = reviewed_contract.as_object_mut() {
         fields.insert("review".into(), serde_json::json!(Review::Required));
     }
-    TaskContract::from_json_str(&value.to_string())
+    TaskContract::from_json_str(&reviewed_contract.to_string())
 }
 
 /// Whether `run` is itself the successor of a decision relais answered: a

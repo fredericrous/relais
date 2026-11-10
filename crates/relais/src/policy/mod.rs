@@ -531,12 +531,12 @@ fn default_widen_scope_small_max_lines() -> u32 {
     DEFAULT_WIDEN_SCOPE_SMALL_MAX_LINES
 }
 
-fn is_default_widen_scope_small_max_files(value: &u32) -> bool {
-    *value == DEFAULT_WIDEN_SCOPE_SMALL_MAX_FILES
+fn is_default_widen_scope_small_max_files(max_files: &u32) -> bool {
+    *max_files == DEFAULT_WIDEN_SCOPE_SMALL_MAX_FILES
 }
 
-fn is_default_widen_scope_small_max_lines(value: &u32) -> bool {
-    *value == DEFAULT_WIDEN_SCOPE_SMALL_MAX_LINES
+fn is_default_widen_scope_small_max_lines(max_lines: &u32) -> bool {
+    *max_lines == DEFAULT_WIDEN_SCOPE_SMALL_MAX_LINES
 }
 
 fn is_true(value: &bool) -> bool {
@@ -3051,17 +3051,17 @@ keys = ["output.contract"]
     #[test]
     fn verify_timed_out_keeps_the_authority_hash_at_its_default() {
         let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
-        let named = |value: bool| {
+        let named = |setting: &str| {
             RepoPolicy::from_toml_str(&REPO_TOML.replacen(
                 "[execution]\n",
-                &format!("[execution]\nverify_timed_out = {value}\n"),
+                &format!("[execution]\nverify_timed_out = {setting}\n"),
                 1,
             ))
             .expect("parses")
         };
         assert!(repo.execution.verify_timed_out);
-        assert_eq!(repo.authority_hash(), named(true).authority_hash());
-        assert_ne!(repo.authority_hash(), named(false).authority_hash());
+        assert_eq!(repo.authority_hash(), named("true").authority_hash());
+        assert_ne!(repo.authority_hash(), named("false").authority_hash());
     }
 
     /// `[pricing]` is machine policy, not repo policy (SPEC §11): adding

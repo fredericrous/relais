@@ -1607,7 +1607,7 @@ fn the_successor_of_a_review_off_small_widen_still_dispatches_a_reviewer() {
             .any(|prompt| prompt.contains("semantic reviewer")),
         "a reviewer was launched: {seen:?}"
     );
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch directory
 }
 
 // The fixture's policy has the small rule off: under the default policy tests
@@ -1691,7 +1691,7 @@ fn one_small_source_overflow_is_widened_with_its_own_code_and_a_required_review(
         .expect("a successor intent");
     let contract = TaskContract::from_json_str(&intent.contract_json).expect("contract");
     assert!(contract.review >= Review::Required, "{:?}", contract.review);
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch directory
 }
 
 #[test]
@@ -1708,7 +1708,7 @@ fn tests_plus_one_small_source_file_is_widened() {
         Wire::to(wire.clone()),
     ));
     assert_eq!(wire.done()["code"], "scope_widened_small");
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch directory
 }
 
 #[test]
@@ -1728,7 +1728,7 @@ fn two_source_files_a_zero_limit_or_too_many_lines_stop_for_a_decision() {
     tight.execution.widen_scope_small_max_files = 1;
     tight.execution.widen_scope_small_max_lines = 0;
     needs_decision_run(overflowing_run(&fixture, &tight, &["examples/d.rs"]));
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch directory
 }
 
 #[test]

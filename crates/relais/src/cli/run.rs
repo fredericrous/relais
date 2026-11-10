@@ -616,11 +616,17 @@ pub(crate) fn run_command(
             // nothing to decide, only the successor to launch.
             match ledger.intent_of_decision(&outcome.run_id) {
                 Ok(Some(intent)) => {
-                    let code = settle_code(&ledger, &outcome.run_id);
-                    eprintln!("cancelled ({code}): {detail}");
-                    for line in widened_lines(code, &intent) {
-                        eprintln!("{line}");
+                    // The code comes from the intent's scope delta, as the
+                    // report counts it, never from the decision's note; one
+                    // that cannot be read is said, never guessed.
+                    match relais::report::settle_code_of_intent(&intent.scope_delta) {
+                        Ok(code) => eprintln!("cancelled ({code}): {detail}"),
+                        Err(e) => {
+                            eprintln!("cancelled: {detail}");
+                            eprintln!("could not tell which rule settled {}: {e}", outcome.run_id);
+                        }
                     }
+                    eprintln!("{}", launch_line(&intent));
                 }
                 Ok(None) => eprintln!("cancelled: {detail}"),
                 Err(e) => {
@@ -646,49 +652,10 @@ pub(crate) fn run_command(
     result
 }
 
-/// The code of the rule by which relais answered `run`'s decision, read
-/// from the note it wrote. A ledger that cannot be read is said on stderr
-/// and the first rule's code stands, as it did before there were two.
-fn settle_code(ledger: &Ledger, run: &relais::ids::RunId) -> &'static str {
-    use relais::runner::successor::{settle_code_of_note, CODE_WIDENED_FOR_TESTS};
-    match ledger.decision_of_run(run) {
-        Ok(decision) => decision
-            .and_then(|decision| decision.note)
-            .and_then(|note| settle_code_of_note(&note))
-            .unwrap_or(CODE_WIDENED_FOR_TESTS),
-        Err(e) => {
-            eprintln!("could not read which rule settled {run}: {e}");
-            CODE_WIDENED_FOR_TESTS
-        }
-    }
-}
-
-/// What a CLI run says when relais settled its scope overflow itself: the
-/// rule that fired, the successor intent and the command that launches it.
-fn widened_lines(code: &str, intent: &relais::ledger::SuccessorIntent) -> Vec<String> {
-    use relais::runner::successor::{CODE_TIMED_OUT_VERIFY_QUEUED, CODE_WIDENED_SMALL};
-    let first = if code == CODE_TIMED_OUT_VERIFY_QUEUED {
-        format!(
-            "the worker hit its wall time; relais answered the decision (actor relais) and \
-             queued successor intent {} to verify and review its tree",
-            intent.intent_id
-        )
-    } else {
-        let rule = if code == CODE_WIDENED_SMALL {
-            "to one small source edit, tests included"
-        } else {
-            "to the test paths"
-        };
-        format!(
-            "relais widened the scope {rule} and answered the decision (actor relais); \
-             successor intent {}",
-            intent.intent_id
-        )
-    };
-    vec![
-        first,
-        format!("run it with: relais run --intent {}", intent.intent_id),
-    ]
+/// The line that launches the successor relais recorded when it settled a
+/// run itself; the `cancelled (<code>)` line above it already says why.
+fn launch_line(intent: &relais::ledger::SuccessorIntent) -> String {
+    format!("run it with: relais run --intent {}", intent.intent_id)
 }
 
 /// Make the state directory's ballast file when it is missing and the
@@ -768,20 +735,31 @@ mod tests {
             .successor_intent(&id)
             .expect("read")
             .expect("the intent");
-        let lines = widened_lines("scope_widened_for_tests", &intent);
-        assert!(
-            lines[0].contains(&id) && lines[0].contains("test paths"),
-            "{lines:?}"
+        assert_eq!(
+            launch_line(&intent),
+            format!("run it with: relais run --intent {id}")
         );
-        let small = widened_lines("scope_widened_small", &intent);
-        assert!(!small[0].contains("test paths"), "{small:?}");
-        let timed_out = widened_lines("timed_out_verify_queued", &intent);
-        assert!(
-            timed_out[0].contains("wall time") && !timed_out[0].contains("widened"),
-            "{timed_out:?}"
+    }
+
+    /// The code a settled run prints is read from its intent's scope delta,
+    /// the way the report counts it: an empty delta is a timed-out verify,
+    /// test paths alone a test widen, anything else the small rule.
+    #[test]
+    fn a_settled_run_names_its_rule_from_the_intent_not_the_note() {
+        use relais::report::settle_code_of_intent;
+        let delta = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            settle_code_of_intent(&[]).expect("reads"),
+            "timed_out_verify_queued"
         );
-        assert_eq!(timed_out[1], lines[1]);
-        assert_eq!(lines[1], format!("run it with: relais run --intent {id}"));
+        assert_eq!(
+            settle_code_of_intent(&delta(&["crates/x/tests/a.rs"])).expect("reads"),
+            "scope_widened_for_tests"
+        );
+        assert_eq!(
+            settle_code_of_intent(&delta(&["crates/x/tests/a.rs", "src/lib.rs"])).expect("reads"),
+            "scope_widened_small"
+        );
     }
 
     #[test]
@@ -802,10 +780,6 @@ mod tests {
             .claim_intent(&relais_id, &child, &successor_process)
             .expect("claim");
         assert!(is_relais_successor(&relais_ledger, &child).expect("read"));
-        assert_eq!(
-            settle_code(&relais_ledger, &RunId::from_stored("run-a")),
-            "scope_widened_small"
-        );
     }
 
     /// Like `ledger_with_intent`, answered by relais with the small rule's note.

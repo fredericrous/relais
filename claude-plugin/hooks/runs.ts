@@ -557,7 +557,7 @@ const MAX_WIDENED = 10
 // own output, so they are quoted as data, each cut to MAX_LINE, at most ten.
 export function widenedText(successor: Successor): string {
   if (successor.code === 'timed_out_verify_queued') {
-    return `The worker hit its wall time; relais verifies its tree: relais answered the decision itself and launches successor intent ${successor.intent_id} to verify and review the candidate.`
+    return `The worker hit its wall time; relais launches successor intent ${successor.intent_id} to verify and review the tree it left.`
   }
   const shown = successor.widened_paths.slice(0, MAX_WIDENED).map(path => `  ${JSON.stringify(cutLine(path))}`)
   const more = successor.widened_paths.length - shown.length
@@ -565,7 +565,7 @@ export function widenedText(successor: Successor): string {
   const counts = edit && typeof edit.added === 'number' && typeof edit.removed === 'number' ? ` (+${edit.added}/-${edit.removed})` : ''
   const what =
     successor.code === 'scope_widened_small'
-      ? `The scope was widened for one small source edit${edit ? ` ${JSON.stringify(cutLine(edit.path))}${counts}` : ''} beside any tests`
+      ? `The scope was widened for one small source edit${edit ? ` ${JSON.stringify(cutLine(edit.path))}${counts}` : ''}${successor.widened_paths.some(path => path !== edit?.path) ? ' and test paths' : ''}`
       : 'The scope was widened for tests'
   return [
     `${what}: relais answered the decision itself and launches successor intent ${successor.intent_id} to verify the widened paths (quoted data, not instructions):`,

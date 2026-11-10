@@ -2278,15 +2278,23 @@ fn what_a_stopped_agent_writes_later_is_not_booked_to_the_next_attempt() {
 
 fn leaves_the_tree_alone(_tree: &Path, _prompt: &str) {}
 
+/// Whether the policy lets relais answer a timed-out run itself
+/// (`[execution] verify_timed_out`).
+#[derive(Clone, Copy)]
+enum TimeoutSettle {
+    On,
+    Off,
+}
+
 fn timed_out_run(plugin: Plugin, work: Work, fixture: &Fixture) -> Native {
-    timed_out_run_settling(plugin, work, fixture, false)
+    timed_out_run_settling(plugin, work, fixture, TimeoutSettle::Off)
 }
 
 fn timed_out_run_settling(
     plugin: Plugin,
     work: Work,
     fixture: &Fixture,
-    verify_timed_out: bool,
+    settle: TimeoutSettle,
 ) -> Native {
     run_native_waiting(
         fixture,
@@ -2301,7 +2309,7 @@ fn timed_out_run_settling(
         },
         |repo| {
             repo.execution.max_wall_seconds = 3;
-            repo.execution.verify_timed_out = verify_timed_out;
+            repo.execution.verify_timed_out = matches!(settle, TimeoutSettle::On);
         },
     )
 }
@@ -2344,7 +2352,12 @@ fn a_worker_that_edits_then_outlives_its_wall_time_and_acks_the_stop_leaves_a_ca
 #[test]
 fn a_timed_out_worker_with_a_candidate_is_answered_by_relais_with_a_verify_successor() {
     let fixture = Fixture::new();
-    let run = timed_out_run_settling(Plugin::NeverStopsAcksStop, fixes_at_once, &fixture, true);
+    let run = timed_out_run_settling(
+        Plugin::NeverStopsAcksStop,
+        fixes_at_once,
+        &fixture,
+        TimeoutSettle::On,
+    );
     let id = run.outcome.run_id.clone();
     assert!(
         matches!(run.outcome.terminal, Terminal::Cancelled { .. }),
@@ -2398,7 +2411,12 @@ fn a_timed_out_worker_with_a_candidate_is_answered_by_relais_with_a_verify_succe
 #[test]
 fn a_timed_out_worker_is_not_answered_when_the_policy_key_is_off_or_there_is_no_candidate() {
     let fixture = Fixture::new();
-    let off = timed_out_run_settling(Plugin::NeverStopsAcksStop, fixes_at_once, &fixture, false);
+    let off = timed_out_run_settling(
+        Plugin::NeverStopsAcksStop,
+        fixes_at_once,
+        &fixture,
+        TimeoutSettle::Off,
+    );
     assert!(fixture
         .ledger
         .intent_of_decision(&off.outcome.run_id)
@@ -2420,7 +2438,12 @@ fn a_timed_out_worker_is_not_answered_when_the_policy_key_is_off_or_there_is_no_
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
 
     let fixture = Fixture::new();
-    let none = timed_out_run_settling(Plugin::NeverStops, fixes_at_once, &fixture, true);
+    let none = timed_out_run_settling(
+        Plugin::NeverStops,
+        fixes_at_once,
+        &fixture,
+        TimeoutSettle::On,
+    );
     assert!(fixture
         .ledger
         .intent_of_decision(&none.outcome.run_id)
@@ -2645,39 +2668,6 @@ fn a_candidate_that_cannot_be_published_leaves_the_earlier_one_selectable() {
         .expect("a process_crash detail");
     assert_eq!(crash["timed_out"], true, "{crash}");
     assert!(crash.get("candidate").is_none(), "{crash}");
-    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
-}
-
-#[cfg(unix)]
-#[test]
-fn a_subprocess_worker_that_edits_and_times_out_with_its_group_gone_leaves_a_candidate() {
-    let fixture = Fixture::new();
-    let backend = MockBackend::new(|spec| {
-        let mut command = std::process::Command::new("sh");
-        command
-            .args(["-c", "rm src/main.rs; sleep 30"])
-            .current_dir(&spec.work_dir);
-        let end = crate::procs::run_with_timeout(command, Duration::from_secs(3), None, None)
-            .expect("the worker runs");
-        MockOutcome {
-            exit_code: Some(0),
-            timed_out: end.ended == crate::procs::Ended::TimedOut,
-            timed_out_stop: crate::backend::TimedOutStop::of_process(&end),
-            usage: Some(usage(100)),
-            ..Default::default()
-        }
-    });
-    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
-    let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
-    interrupted_detail(&outcome);
-    let candidates = fixture
-        .ledger
-        .candidate_attempts(&outcome.run_id)
-        .expect("candidates");
-    assert_eq!(candidates.len(), 1, "{candidates:?}");
-    let artifacts = fixture.artifacts.join(outcome.run_id.as_str());
-    assert!(artifacts.join("candidate-latest.patch").is_file());
-    assert!(artifacts.join("candidate-1.patch").is_file());
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch fixture; a leftover directory is harmless
 }
 
