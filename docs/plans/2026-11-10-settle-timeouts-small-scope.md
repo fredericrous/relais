@@ -1,5 +1,5 @@
 ---
-status: active
+status: active  # next: the live check on a real native worker, before the release
 branch: feat/settle-timeouts-small-scope
 repos: [relais]
 adrs: [ADR-0010, ADR-0011, ADR-0012]
@@ -132,3 +132,28 @@ A new ADR superseding the `execution.settle-before-asking` head (HEADS.md row up
 - relais: backend, lang:rust, unix, tui (CLI stderr and plugin pane sentences change for each code; architect left out: no new module, crate or repository)
 
 <!-- panel: repos=relais reviewers=architect,backend,lang:rust,po,tui,unix,codex body-sha=9cf37f8ea7e3 -->
+
+## Outcome
+
+Observed on branch `feat/settle-timeouts-small-scope` before the push (input → expected → actual).
+
+- **Unit and integration tests, final tree** (`e6f69c38`): the full pre-commit gate (fmt, clippy `-D warnings`, module cycles, cargo-test, plugin-test) → green → green. Focused runs on the review fixes: lib 287 passed, CLI 7, integration (`release_scenarios`, `learning_cycle`, `review_outcome`, `holdout_report`) 111, plugin suite passed; native 43 after the last change.
+- **Small widen** (`release_scenarios`, real CLI with the fake worker): a one-line out-of-scope edit → `cancelled (scope_widened_small)` + `run it with: relais run --intent <id>` → as expected; six older scenarios that need a `scope_exceeded` stop now opt out with `widen_scope_small_max_files = 0`.
+- **Timed-out tree** (`runner/tests/native.rs`, scripted plugin): edit then outlive the wall time and ack → `interrupted` with a published candidate, then `cancelled (timed_out_verify_queued)` with one relais decision and a verify successor reviewed at least `Required`, worktree retired → as expected; no ack, no edit, cancel during the wait, unresolved conflict, and storage-full on either path → no selectable candidate → as expected.
+- **Report**: a fixture ledger with one settle of each rule → `auto_settled` counts each and its successor's end, from the intent rows; the text block fits 80 columns at three-digit counts → as expected.
+- **Not run: the live check** on a real native worker in a scratch `RELAIS_STATE_DIR` (Verification, second bullet). The person asked on 2026-11-10 not to route work through relais in this session. It must run before the release.
+- **Baseline written before release** (backend round-2 carry): in the 30 days to 2026-11-09, 80 `scope_exceeded` decisions, 8 answered by relais (tests-only widen), 72 by the orchestrator or a person (about 16.8/week); 30 of the 88 stops were one file of 10 lines or fewer.
+
+## Decision log
+
+- 2026-11-10: **The subprocess half of A1 is not built.** relais has no subprocess worker backend: only `NativeBackend` and the test `MockBackend` implement `Backend`; the claude adapter's subprocess is a probe. The draft `TimedOutStop::of_process` had no production caller and was removed with its tests; SPEC §8 and ADR-0012 say workers are native. A1's subprocess sentence and the matching Tests bullet stand as written history.
+- 2026-11-10: **The CLI names the settle code from the intent, not from `RunOutcome`** (A3, B3 said `RunOutcome` carries `Settled.code`). It classifies the intent's scope delta through `report::settle_code_of_intent`, the classifier the report counts with, so the two cannot disagree; a delta it cannot read is said on stderr, never guessed. Threading a code through the 16 `RunOutcome` constructions is a follow-up. The codes moved to `lifecycle` so `report` does not import `runner`.
+- 2026-11-10: **Work routed through relais, then by hand.** B1–B3, A1+A2 and A3 relais runs each hit their wall time or a scope stop with the work written; each was finished and verified by hand, recorded `salvaged` (B, C, A1+A2) in the ledger. From A3 on the person asked to stop using relais in this session; A3's candidate was applied by hand and run `run-65fe7432b2f4f-13ca1` is left `needs_decision` for the person.
+
+## Implementation review
+
+- implementation-review (opus): round 1 approve-with-changes, 6 blocking + 1 high + 1 medium, all fixed; delta approve-with-changes, 0 blockers; deliberate: the `release_scenarios.rs:2378` negative assertion is a regression guard against the removed line; plan wording recorded in the Decision log. 108k + 57k tokens, 105 s + 46 s.
+- backend (opus): round 1 approve-with-changes (3), delta **approve**. 81k + 60k, 138 s + 28 s.
+- lang:rust (opus): round 1 approve-with-changes (5), delta approve-with-changes; deliberate, accepted by the seat: `SettleCode` enum on `RunOutcome`, the `timed_out_settled` field, `Option` counts in `WidenRule::Small`, a single `small_edit` on the wire while `max_files` defaults to 1 (follow-ups); its delta test suggestion is covered by the report's intent-row test. 73k + 41k, 64 s + 17 s.
+- unix (opus): round 1 approve-with-changes (1 high: fsync through a read-only handle, fixed), delta **approve**. 55k + 55k, 67 s + 21 s.
+- tui (opus): round 1 approve-with-changes (5), delta **approve**; its optional low wording note on the unreadable-delta line is kept as is. 61k + 40k, 67 s + 15 s.
