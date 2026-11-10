@@ -590,22 +590,16 @@ impl<'a> RunEngine<'a> {
 
         // Missing terminal result = interrupted, not failed (SPEC §9).
         if result.terminal_result_missing() {
-            let mut detail = result.failure_detail.clone().unwrap_or_default();
             let timed_out = result.ended == Ended::TimedOut;
-            let candidate = if timed_out && result.timed_out_stop.is_some() {
+            let (candidate, note) = if timed_out && result.timed_out_stop.is_some() {
                 match self.snapshot_timed_out(ctx, attempt_id, index)? {
-                    TimedOutTree::Candidate(sha, note) => {
-                        append_note(&mut detail, note);
-                        Some(sha)
-                    }
-                    TimedOutTree::NoCandidate(note) => {
-                        append_note(&mut detail, note);
-                        None
-                    }
+                    TimedOutTree::Candidate(sha, note) => (Some(sha), note),
+                    TimedOutTree::NoCandidate(note) => (None, note),
                 }
             } else {
-                None
+                (None, None)
             };
+            let detail = with_note(result.failure_detail.clone().unwrap_or_default(), note);
             if candidate.is_none() {
                 ledger.finish_attempt(
                     attempt_id,
@@ -1444,14 +1438,12 @@ enum TimedOutTree {
     NoCandidate(Option<String>),
 }
 
-/// Appends `note` to an attempt's detail, `; `-separated.
-fn append_note(detail: &mut String, note: Option<String>) {
-    let Some(note) = note else { return };
-    if detail.is_empty() {
-        *detail = note;
-    } else {
-        detail.push_str("; ");
-        detail.push_str(&note);
+/// An attempt's detail with `note` after it, `; `-separated.
+fn with_note(detail: String, note: Option<String>) -> String {
+    match note {
+        None => detail,
+        Some(note) if detail.is_empty() => note,
+        Some(note) => format!("{detail}; {note}"),
     }
 }
 
