@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/review-opt-in-lazy-baseline
 repos: [relais]
 adrs: [relais:ADR-0013, relais:ADR-0010, relais:ADR-0011, decisions:ADR-0045]
@@ -213,7 +213,7 @@ only on the red checks.
       `PreexistingTestFailures` on attempt 1 (the memo keeps full `CheckOutcome`s);
     - the rewritten base-ending tests assert `finish_attempt` `Blocked` and the
       kept candidate's sha.
-- [ ] Phase 3 — release: `CHANGELOG.md`, `Cargo.toml`, `Cargo.lock`, via the `tag-release`
+- [x] Phase 3 — release: `CHANGELOG.md`, `Cargo.toml`, `Cargo.lock`, via the `tag-release`
   skill (v0.53.0). Installing it and reinstalling the plugin are the
   person's.
 
@@ -353,7 +353,8 @@ Observed before the push, at d0c57a55, rebased on 4bdca927:
 ## Outcome
 
 Phases 1 and 2 are built and reviewed on `feat/review-opt-in-lazy-baseline`.
-Next: Phase 3, the release (v0.53.0), then the follow-up branch for the
-deliberate lows.
+Released as v0.53.0 (this commit; the tag follows its merge). What is
+left: the follow-up branch for the deliberate lows, the real-run
+observations, and the 0.74 after-measure on 11-18.
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix body-sha=8e960c48cbd2 -->

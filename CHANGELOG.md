@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.53.0
+
 - **A worker that hits its wall time no longer loses its work (ADR-0012).** relais now confirms the worker stopped, keeps the tree it left as the attempt's candidate, and answers the run itself with a `kind: verify` successor that checks and reviews it. The run ends `cancelled (timed_out_verify_queued)` and exits 7, not 6 (interrupted): a script that branched on 6 for a wall-time end should also handle 7 with that code. `[execution] verify_timed_out = false` restores the old stop.
 - **A small edit just outside the scope is widened like a test (ADR-0012).** A scope overflow of test paths plus one non-test file of 10 or fewer changed lines is answered by relais with a verify successor (`cancelled (scope_widened_small)`). Tune it with `[execution] widen_scope_small_max_files` and `widen_scope_small_max_lines`; `widen_scope_small_max_files = 0` turns it off.
 - **Every successor relais writes for itself is reviewed.** Its review is raised to at least `required`, so a source-only change from a review-off contract is still read, and a successor of such a settle is never settled again.
