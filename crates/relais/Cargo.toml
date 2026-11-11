@@ -55,7 +55,8 @@ amont-quiet = "1.60"
 # decisions ADR-0049): greengate owns the protocol and `greenharness-slots` is its one
 # implementation, so relais links it instead of carrying a copy. What it
 # pulls: one std-only crate, no dependencies and no build script, released
-# with amont.
+# with greengate (4.0.0). If greengate stopped publishing it, relais would pin
+# the last version: the queue is a small directory protocol, vendorable.
 greenharness-slots = "4.0"
 
 # Process facts and signals live in `procs`; the endpoint in `ipc`. Each

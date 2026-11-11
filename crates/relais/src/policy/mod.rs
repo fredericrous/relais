@@ -1030,9 +1030,9 @@ pub struct ResourceSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_free_bytes: Option<u64>,
     /// The host slot directory every heavy job on the machine queues on
-    /// (amont ADR-0014, the `greenharness-slots` crate): a heavy command takes as
-    /// many slots as its weight after its coordinator tokens. Unset:
-    /// amont's own directory, so relais joins the host queue with nothing
+    /// (amont ADR-0014, greengate's `greenharness-slots` crate): a heavy command
+    /// takes as many slots as its weight after its coordinator tokens. Unset:
+    /// greengate's own directory, so relais joins the host queue with nothing
     /// configured. `"off"`: the coordinator's queue alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_host_slots: Option<String>,
@@ -3992,13 +3992,14 @@ timeout_seconds = 60
             .expect("this repository's own relais.toml parses");
         assert_eq!(
             own.authority_hash(),
-            "6fb04a283d4bc5054c0f28332b04a599bbbcee49c2acd8c7a84970d4b283cbd8",
-            "the hash of this repository's own policy must not move (it moved deliberately eight \
+            "93ca8f03b55b50e7103b38fbefdb4e47ae572c93c25a85661275ae89296077dd",
+            "the hash of this repository's own policy must not move (it moved deliberately nine \
 times: when the per-type recipes were seeded, when `cache_baseline` was turned on, when \
 `make check` was split into one check per gate, when the `make test` and `make msrv` \
 limits were raised, when `make msrv` and `make audit` were left to CI, sixth: commands \
 run through amont gates, seventh: the `cli` child-cycle gate joined them, and eighth: \
-`max_wall_seconds` went from 2700 to 3600)"
+`max_wall_seconds` went from 2700 to 3600, and ninth: the checks' busy variable became \
+greengate 4.0's `GREENGATE_ON_BUSY`)"
         );
         let tiered = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
         assert_eq!(

@@ -7,7 +7,7 @@
 //!
 //! 1. the coordinator's tokens (`weight` of them, queued behind whoever
 //!    holds them);
-//! 2. `weight` host slots, all or none, through amont's `greenharness-slots` crate
+//! 2. `weight` host slots, all or none, through greengate's `greenharness-slots` crate
 //!    (amont ADR-0014, decisions ADR-0049), so every heavy job on the
 //!    machine shares one queue: amont's gates, relais's checks, anything run
 //!    through `amont slot run`. The directory is amont's by default
@@ -906,7 +906,7 @@ impl Drop for Admitted<'_> {
 }
 
 mod slots {
-    //! The host slots, through amont's `greenharness-slots` crate (amont ADR-0014):
+    //! The host slots, through greengate's `greenharness-slots` crate (amont ADR-0014):
     //! a waiter keeps its place across polls, and relais drives the polling
     //! from its own queue, so the coordinator lease keeps its heartbeat and
     //! the wait is charged like any other.

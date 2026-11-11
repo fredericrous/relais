@@ -1257,11 +1257,16 @@ mod host_slot_dir_tests {
     use super::host_slot_dir;
     use std::path::PathBuf;
 
-    /// With nothing configured relais queues in amont's directory; `"off"`
+    /// With nothing configured relais queues in greengate's directory; `"off"`
     /// is the coordinator's queue alone; a path is used as given.
     #[test]
-    fn a_run_with_no_setting_queues_in_amonts_directory() {
+    fn a_run_with_no_setting_queues_in_greengates_directory() {
         assert_eq!(host_slot_dir(None), Some(greenharness_slots::dir()));
+        // And it is the one 3.x's `amont-slots` is not: the crate's name, not
+        // only the crate's own answer, says which queue this joins.
+        let name = host_slot_dir(None).unwrap();
+        let name = name.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("greenharness-slots"), "{name}");
         assert_eq!(host_slot_dir(Some("off")), None);
         assert_eq!(
             host_slot_dir(Some("/run/slots")),
