@@ -1,7 +1,7 @@
 +++
 type = "research"
 mode = "hitl"
-status = "open"
+status = "closed"
 blocked_by = ["t27-cliproxy-on-homelab"]
 repos = ["homelab"]
 +++
@@ -30,3 +30,15 @@ One row per leg (LAN, off-LAN, cluster down): the command, the expected
 result, the actual result, and the time to the first token for a streamed
 call against 127.0.0.1 today. Then one line: the cutover is safe, or it waits
 on a named fix.
+
+## Resolution
+
+Closed on the person's report, 2026-11-11: they tested it themselves. The
+laptop reached the homelab proxy **over Headscale on a cellular connection**,
+and the Mac needed nothing more. The person did not report the LAN leg, the
+time to first token or what the Mac sees when the cluster is down, so those
+are not recorded here.
+
+This does not settle t12's open item: the route to the apiserver VIP
+`192.168.1.65:6443` off-LAN is still unproven. The proxy is reached by its own
+route, not through that VIP.

@@ -84,6 +84,33 @@ verdict, with a macOS attestation as an extra verdict owed before a release
 Rust gate qualifies, and which verdicts a commit, a push and a release owe,
 is open again below.
 
+**Findings from the 2026-11-11 code review of greengate, for the answer:**
+
+- **The built-in Rust hooks cannot be `platform=any`.** `cargo-fmt`, `clippy`
+  and `pre-push-cargo-test` are code in `hooks/rust_tools.rs`, with no marker.
+  Only a declared `amont.conf` line can carry `platform=any`
+  (`manifest.rs:1817-1825`), and it is refused beside `fix`, `files` or `index`.
+  A repository would re-declare the gate as a line. Whether a declared
+  `cargo-test` also double-runs beside the built-in is unverified.
+- **fmt and clippy are the best candidates.** They are Linux-clean in CI
+  (the `rust` job: fmt and clippy on ubuntu, about 1 minute) and need no
+  `fix` or `files`.
+- **`cargo-test` meets a policy conflict.** greengate's own rule limits the
+  marker to lint, type and cycle checks, "never a test suite that executes
+  the product" (`docs/custom-checks.md:201-203`). CI proof does not override
+  it, so marking `cargo-test` `platform=any` needs a documented policy change,
+  which is the person's decision.
+- **CI's Linux leg is not the pod's verdict.** CI runs `make test` with ruff,
+  uv, yamllint, hadolint, yq and the k8s tools installed, and fails if a
+  tool-gated case was skipped. The declared gate is `cargo test --locked`
+  (`amont.conf:42`) in a pod limited to 4Gi and 2 CPU.
+- **The gate-runner image has no Rust toolchain** (debian, node 22, pnpm, uv,
+  python3, git; no cargo, rustup or C compiler, which relais's bundled SQLite
+  needs). A Rust gate needs a `clusterPrepare` toolchain step or a new image,
+  and t31's cache.
+- **The marker is a separate switch from CI's `platform: any`.** They are two
+  declarations, not one.
+
 ## Look at
 
 - `.github/workflows/ci.yaml` in relais and amont: the platform matrix and

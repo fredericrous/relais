@@ -1,7 +1,7 @@
 +++
 type = "grilling"
 mode = "hitl"
-status = "closed"
+status = "open"
 blocked_by = ["t22-stamp-from-remote-run"]
 repos = ["amont", "homelab"]
 +++
@@ -71,3 +71,44 @@ advisor review on 2026-11-01.
     gates?
   - Gate identity for a remote run.
   - The Lease wait inside hooks.
+
+## Reopened 2026-11-11
+
+A review of greengate and relais found the decision implemented in part, and
+found a premise that fails once more than one node signs.
+
+**What the code does** (`crates/greengate-runtime/src/cluster.rs:1762-1812`,
+`attest.rs:182-260`, `dispatch.rs:1994-2021`):
+- The pass is judged from Kubernetes-recorded facts: the Job's `Complete`
+  state, the fetch init container's `tree <sha>` termination message, the gate
+  container's exit code and `status.imageID`. Logs are not used.
+- The laptop signs a second block of platform `x86_64-linux` with its own
+  key, only for gates it proved on the cluster.
+- Job creation is fenced to the `amont-gate-runner` ServiceAccount
+  (`homelab: apps/amont-gates/rbac.yaml`), and Workflow creation by an
+  admission policy.
+
+**What does not hold:**
+- **The signed block carries no image id, job or command.** Those sit in an
+  unsigned note (`refs/notes/amont-gate-cluster`). A verifier cannot tell a
+  cluster-derived `x86_64-linux` block from one CI signed, and the build-plan
+  point above (a format change in git-attest) is still open.
+- **The proven set is process memory** (`cluster.rs:75`, `PROVED`), so only
+  the hook process that ran or collected the gate can sign it. Whether a pass
+  read later from the stored note reaches the attestation path was not traced.
+- **The key is one unencrypted file** (`~/.ssh/amont-attest`, mode 600, no
+  Keychain, no agent), the same principal for every gate and platform. Anyone
+  who copies it is the laptop.
+- **"The laptop is the only signer" fails with several nodes.** A Coder node
+  or any second host needs its own identity. `allowed_signers` (one file per
+  repository) cannot say which node may sign which gate class or platform, has
+  no expiry, and revocation means deleting two notes refs on origin. Blocks
+  have no nonce and bind to a tree, not a node.
+- relais does not verify signatures. It runs `amont attest covered` and
+  matches the gate name in its output (`verify/mod.rs:2657-2696`), with the
+  command still named `amont`.
+
+The decision to reopen is the person's. The follow-on design (node identity,
+a key registry, what a node may sign) belongs in the agents-many-nodes
+programme (homelab repo), ticket t07. Signing and verification stay in
+greengate, which is public under MIT.

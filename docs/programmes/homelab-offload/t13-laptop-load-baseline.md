@@ -112,3 +112,11 @@ The ticket stays open until the 7-day window ends.
   on 12 CPUs.
 - **Closing:** at the window's end, compute the working-hours median of
   load15 and the per-bucket CPU-seconds per day, then set the target.
+
+## Status 2026-11-11
+
+The sampling window ended on 2026-11-08. `~/.local/state/laptop-load/samples.tsv`
+holds 47,274 rows, the last at epoch 1794175909. The closing session (the
+coverage and per-day table, the median load15, and the one-sentence target)
+has not been written. t08 and the Destination's "laptop load drops by the
+target" wait on it. No other work is needed first.
