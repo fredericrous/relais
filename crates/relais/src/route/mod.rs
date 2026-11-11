@@ -1193,6 +1193,8 @@ mod tests {
                 widen_scope_small_max_files: 1,
                 widen_scope_small_max_lines: 10,
                 verify_timed_out: true,
+                min_repair_seconds: 600,
+                min_escalation_seconds: 900,
                 loop_threshold: None,
             },
             integrations: Default::default(),

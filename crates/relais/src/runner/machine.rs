@@ -215,6 +215,25 @@ pub enum Limit {
     /// budget is [`Limit::WallClock`]; waiting for a lease or the disk
     /// ends the run `blocked`, not here.
     Total,
+    /// A repair or escalation was owed a wall-time floor (`[execution]
+    /// min_repair_seconds` / `min_escalation_seconds`) that the run's
+    /// total budget no longer covers; the attempt was not launched.
+    RepairFloor {
+        kind: AttemptKind,
+        floor_s: u64,
+        total_left_s: u64,
+    },
+}
+
+impl AttemptKind {
+    /// The `[execution]` key that sets this kind's wall-time floor.
+    pub fn floor_key(self) -> Option<&'static str> {
+        match self {
+            Self::Initial => None,
+            Self::Repair => Some("min_repair_seconds"),
+            Self::Escalation => Some("min_escalation_seconds"),
+        }
+    }
 }
 
 /// How serious a reviewer calls one finding.
@@ -837,6 +856,29 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
                     "the total time for the run is exhausted".to_string(),
                     serde_json::json!({ "limit": "total" }),
                 ),
+                Limit::RepairFloor {
+                    kind,
+                    floor_s,
+                    total_left_s,
+                } => {
+                    let key = kind.floor_key().unwrap_or("min_repair_seconds");
+                    let detail = format!(
+                        "a {} needs {floor_s} s (`[execution] {key}`); the run's total budget \
+                         has {total_left_s} s left; raise `limits.total_seconds` or set \
+                         `{key} = 0`",
+                        kind.as_str()
+                    );
+                    (
+                        detail.clone(),
+                        serde_json::json!({
+                            "limit": "total",
+                            "cause": "repair_floor_exceeds_total",
+                            "floor_s": floor_s,
+                            "total_left_s": total_left_s,
+                            "detail": detail,
+                        }),
+                    )
+                }
             };
             Decision::stop(
                 State::BudgetExhausted,
@@ -1200,6 +1242,11 @@ mod tests {
                 detail: "".into(),
             },
             Limit::Total,
+            Limit::RepairFloor {
+                kind: AttemptKind::Repair,
+                floor_s: 600,
+                total_left_s: 212,
+            },
         ] {
             let d = decide(&b, Observation::LimitReached(limit));
             assert_eq!(d.state, State::BudgetExhausted);

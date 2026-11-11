@@ -84,15 +84,15 @@ A repair or escalation either gets at least its floor, paid from the run's total
 
 ## Phases
 
-- [ ] Phase 1 — Budgets can extend work: `crates/relais/src/policy/budgets.rs`
+- [x] Phase 1 — Budgets can extend work: `crates/relais/src/policy/budgets.rs`
   - `Spent.work_extension: i64` and `pub fn extend_work(&self, by: Duration)`, converting with `i64::try_from(by.as_millis()).unwrap_or(i64::MAX)` and `saturating_add`. `work_remaining()` reads `limits.work + work_extension`; `total` is untouched.
   - Unit tests with the existing `ManualClock`: an extension lengthens `work_remaining` and leaves `total_remaining` alone; `exhausted()` returns `Work` only after the extension is spent too.
-- [ ] Phase 2 — Policy keys: `crates/relais/src/policy/mod.rs`, `crates/relais/src/route/candidate.rs`
+- [x] Phase 2 — Policy keys: `crates/relais/src/policy/mod.rs`, `crates/relais/src/route/candidate.rs`
   - `ExecutionPolicy.min_repair_seconds: u64` (default 600) and `min_escalation_seconds: u64` (default 900), each with `default = …` and an `is_default_*` `skip_serializing_if` predicate, as for `widen_scope_small_max_files` (L470-474).
   - `EffectiveAuthority` carries both, already capped at the effective `max_wall_seconds`.
   - `route/candidate.rs:753-808`: both keys are fixed fields, so a tuned candidate that changes them is refused with `FixedRecipeFieldChanged`, like `verify_timed_out`.
   - Tests: the authority hash is unchanged at default values (like `verify_timed_out_keeps_the_authority_hash_at_its_default`, ~L3052); a candidate that changes either key is refused; a contract with `limits.wall_seconds = 60` caps both floors at 60.
-- [ ] Phase 3 — Apply the floor: `crates/relais/src/runner/attempt.rs`, `crates/relais/src/runner/engine.rs`, `crates/relais/src/runner/machine.rs`, `crates/relais/src/runner/scheduler.rs`
+- [x] Phase 3 — Apply the floor: `crates/relais/src/runner/attempt.rs`, `crates/relais/src/runner/engine.rs`, `crates/relais/src/runner/machine.rs`, `crates/relais/src/runner/scheduler.rs`
   - **Prologue (go or refuse).** In `ceiling_reached` (`attempt.rs:206`, where `kind` is known; see `:1409`), before `exhausted()`: if `kind` is Repair or Escalation, the floor is above zero, and `total_remaining < floor`, refuse. A refused launch writes no attempt or dispatch row. When the total covers the floor, a `Work` exhaustion no longer stops a Repair or Escalation here.
   - **Refusal path.** `Limit::WallClock` is a unit variant with a fixed sentence (`machine.rs:820-823`), and `end_on_exhausted` takes no detail (`engine.rs:1066-1074`). Add `Limit::RepairFloor { kind, floor_s, total_left_s }`, matched where `Limit` is (`machine.rs:1193`, `scheduler.rs:678`), built like the AdmissionWait branch (`engine.rs:1076-1094`). It keeps `Reason::LimitReached` and the `budget_exhausted` state. Its JSON is `{"limit": "total", "cause": "repair_floor_exceeds_total", "floor_s", "total_left_s"}`, so a reader of `limit` gets the total that refused it (ADR-0010) and no new `Reason` is stored.
   - **Extension at launch.** In `dispatch_attempt`, just before the `worker_dispatched` transition (`attempt.rs:361`), so its detail can carry the amount: work out the shortfall `floor − work_remaining` then and call `extend_work` with it. At `remaining_wall` (`:375`), launch with `remaining().max(floor.min(total_remaining()))`, so the milliseconds between the transition and the launch cannot shave the floor.

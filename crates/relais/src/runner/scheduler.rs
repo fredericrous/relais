@@ -1557,6 +1557,8 @@ mod tests {
             models: std::collections::BTreeMap::new(),
             max_attempts: 3,
             max_wall_seconds: 60,
+            min_repair_seconds: 60,
+            min_escalation_seconds: 60,
             max_repairs_before_escalation: 1,
             allow_nested_agents: false,
             max_agent_depth: 1,
