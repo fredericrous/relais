@@ -20,8 +20,10 @@ and push gate for that tree?
 
 - Each gate in `amont.conf` declares whether it is platform-independent.
 - A stamp earned on Linux counts on the laptop only for those gates.
-- macOS-sensitive gates, such as relais's `cargo-test` under ADR-0041, stay
-  local.
+- macOS-sensitive gates stay local. The example given here, relais's
+  `cargo-test` under ADR-0041, was wrong: it passes on Linux in CI (see
+  t23's Correction, 2026-11-11). The per-gate rule stands; which gates
+  qualify is t23's reopened question.
 
 The rule is written as a decisions ADR amending ADR-0041 when t22 is built.
 
