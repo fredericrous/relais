@@ -1,0 +1,18 @@
+amont-provenance-v1
+commit 96e2de73fb49a80baab24a7fc53d2b6dd66dd808
+tree 85567b586100c227a9325247ea4425ae1103f673
+canon 2eaebb217bb221ea508bcd52fb6ce7f718b47abd
+patch 76a0909f765f02c521e34095bce91d15da55c4ba
+plan docs/plans/2026-11-11-repair-gets-guaranteed-wall-time.md 53f516fee42c442e14f6a34a77dcb340976d923b9aeeb965483649d2e0b35103
+review reviewed be6b95d3770a39673da53d024662e007660e67665e46196152aefc773ab241da
+code-review backend reviewed be6b95d3770a39673da53d024662e007660e67665e46196152aefc773ab241da
+code-review lang:rust reviewed be6b95d3770a39673da53d024662e007660e67665e46196152aefc773ab241da
+preview not-required
+producer amont-agent 3.28.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAEBm34SX9RIolrvYJkL1QQzHDd6iuVRt//Z/WirLSDM/6gVhcP
+Md/A/HHaWr0huSITi/yaU28SCUdHYaaz1nudoJ
+-----END SSH SIGNATURE-----
