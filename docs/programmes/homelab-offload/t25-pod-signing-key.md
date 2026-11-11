@@ -110,5 +110,5 @@ found a premise that fails once more than one node signs.
 
 The decision to reopen is the person's. The follow-on design (node identity,
 a key registry, what a node may sign) belongs in the agents-many-nodes
-programme (homelab repo), ticket t07. Signing and verification stay in
+programme (homelab repo), ticket an-t07. Signing and verification stay in
 greengate, which is public under MIT.

@@ -53,7 +53,11 @@ production.
   `docs/programmes/agents-many-nodes/`) takes the longer goal of sessions and
   runs on several nodes, including a Coder workspace. Its tickets decide where
   the coordinator lives, so t02, t08, t11, t16 and t17 here should be read
-  against it.
+  against it. Its tickets are prefixed `an-` (an-t01 to an-t07), so a bare
+  `tNN` in this map always means a ticket here. It depends on t24 (the live
+  proxy test) and t30 (the Mac reaching the proxy off-LAN), which stay open
+  here. The pod signing key (t25, closed) overlaps its an-t07, which owns the
+  node identity and signer design, so keep one key model across both.
 
 ## Decisions so far
 

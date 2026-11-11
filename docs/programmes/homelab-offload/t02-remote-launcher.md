@@ -18,7 +18,7 @@ Options: revive a headless `Backend` implementation (`crates/relais/src/backend.
 - **A fourth option exists: a Coder workspace node.** homelab already runs
   Coder (namespace `code-server`). A session there is a native dispatch, so
   t01's "every dispatch is native" needs no amendment. It overlaps the
-  programme agents-many-nodes (homelab repo), tickets t04 and t05 there.
+  programme agents-many-nodes (homelab repo), tickets an-t04 and an-t05 there.
 - **What a worker needs from relais today** (review of `native.rs`,
   `adapter/native.rs`, `admission/native.rs`): a run starts only from a live
   Claude Code session with the relais plugin loaded (`RELAIS_HOST=claude-code-mod`
@@ -33,7 +33,7 @@ Options: revive a headless `Backend` implementation (`crates/relais/src/backend.
 - `crates/relais/src/backend.rs:537-560` (the seam) and
   `crates/relais/src/adapter/native.rs`.
 - `claude-plugin/hooks/register.ts`, `runs.ts` and `callbacks.ts`.
-- The agents-many-nodes tickets t04 and t05 in the homelab repo.
+- The agents-many-nodes tickets an-t04 and an-t05 in the homelab repo.
 
 ## Answer looks like
 
