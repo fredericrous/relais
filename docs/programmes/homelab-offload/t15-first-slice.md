@@ -41,7 +41,9 @@ Still valid, whoever runs the gate:
 
 The slice is now **amont running `platform=any` gates** (lint, types, cycle
 checks) on the wk-3 runner pod, returning signed attestations. It is no
-longer relais heavy checks. relais `cargo-test` stays local.
+longer relais heavy checks. relais `cargo-test` stays local. *(2026-11-11:
+the Rust rows of t23 were reopened; CI proves `cargo-test` on Linux, so
+this exclusion is not settled.)*
 
 ## Update 2026-11-01 (t25): what in the notes above no longer holds
 
@@ -67,7 +69,8 @@ Still valid:
 gate, and the laptop signs a `platform x86_64-linux` attestation from the
 Kubernetes-recorded outcome.**
 
-- relais and amont `cargo-test` stay on macOS.
+- relais and amont `cargo-test` stay on macOS. *(Reopened 2026-11-11, see
+  t23's Correction: both pass on Linux in CI.)*
 - The targets are the lint, type and cycle gates: duro typecheck and lint,
   trade-agents ruff and pyright, relais `module-cycles` and
   `child-cycles-*` (t23).

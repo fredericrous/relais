@@ -13,8 +13,9 @@ The Rust gates (`cargo-test`, clippy) of amont and relais are the gates that
 hold host slots longest: on 2026-11-07 a land's `cargo-test` waited 1m53s
 behind other Rust suites, and slot waits reached 12–18 min (amont 2.3.0's
 plan, `docs/plans/2026-11-07-a-land-waits-for-a-slot-once.md` in amont).
-They stay on the laptop today (t23: `cargo-test` is macOS), but a Linux pod
-that ran their `platform=any` part would start cold every time. The cluster
+They stay on the laptop today. t23 said `cargo-test` is macOS-only; that was
+wrong (reopened 2026-11-11: CI passes it on Linux for both repos), so a Linux
+pod or Coder workspace could run them, and would start cold every time. The cluster
 has mirrors for npm, Go and images, but none for cargo (map notes). Which
 cache makes a cold pod's Rust build cost close to an incremental one:
 

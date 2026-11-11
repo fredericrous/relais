@@ -45,9 +45,11 @@ The architect seat decides, as the person asked for t18.
     `kubectl --kubeconfig` through std `Command` adds no crate.
 - **What it buys:** only `platform=any` gates move, meaning lint, types and
   cycle checks (t23). That is a real win for duro, trade-agents and relais's
-  cycle scripts. It is **not** a win for relais or amont `cargo-test`, which
-  stay on macOS: the 36-minute pre-push `cargo-test` hold seen on
-  2026-11-01 is not offloadable.
+  cycle scripts. It was judged **not** a win for relais or amont
+  `cargo-test`, "which stay on macOS" (the 36-minute pre-push hold seen on
+  2026-11-01). *(2026-11-11: that premise was wrong; CI passes `cargo-test`
+  on Linux for both repos, so the hold may be offloadable. See t23's
+  Correction.)*
 - **Failure order:**
   1. Try the Lease with a short wait.
   2. If it is not free or the cluster is off, run locally under a host
