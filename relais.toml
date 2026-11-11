@@ -79,7 +79,7 @@ timeout_seconds = 300
 # suite instead of running it a third and fourth time (decisions programme
 # "one verdict per tree", S2). A gate whose verdict is not recorded — absent
 # or deferred — is a verification gap, never a pass. `AMONT_ON_BUSY=wait`:
-# relais already holds the host slot (`AMONT_HOST_SLOT=held`), so a nested
+# relais already holds the host slot (`GREENHARNESS_HOST_SLOT=held`), so a nested
 # amont never defers; the setting says so explicitly. The five lint gates
 # are `make lint`'s parts; `cargo-test` is `make test`; `plugin-test` is
 # `make plugin`.

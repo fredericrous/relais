@@ -18,12 +18,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3fcf90692b077eebd4afd0e44e3bf48a66a67c76ccbf7450b851642b5855834f"
 
 [[package]]
-name = "amont-slots"
-version = "1.62.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "135a5d97cb4d6159abd6440025ca17aa17d0e85268b2cfd746bfbd94f12dfa49"
-
-[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -365,6 +359,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "greenharness-slots"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25d859497cff55223816037f8b942dee723aec6fc0f4d25abf446d4b11ff3860"
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -646,10 +646,10 @@ name = "relais"
 version = "0.55.0"
 dependencies = [
  "amont-quiet",
- "amont-slots",
  "chrono",
  "clap",
  "globset",
+ "greenharness-slots",
  "libc",
  "proptest",
  "quick-xml",

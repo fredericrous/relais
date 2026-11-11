@@ -1030,16 +1030,16 @@ pub struct ResourceSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_free_bytes: Option<u64>,
     /// The host slot directory every heavy job on the machine queues on
-    /// (amont ADR-0014, the `amont-slots` crate): a heavy command takes as
+    /// (amont ADR-0014, the `greenharness-slots` crate): a heavy command takes as
     /// many slots as its weight after its coordinator tokens. Unset:
     /// amont's own directory, so relais joins the host queue with nothing
     /// configured. `"off"`: the coordinator's queue alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_host_slots: Option<String>,
     /// How many host slots there are, fixed, with no load test. Unset: the
-    /// automatic sizing of the slot directory (`amont-slots` `Sizing::Auto`,
+    /// automatic sizing of the slot directory (`greenharness-slots` `Sizing::Auto`,
     /// half the cores, admitted while the load is below the core count).
-    /// Set it to the same value as `git config --global amont.hostSlots`
+    /// Set it to the same value as `git config --global greengate.hostSlots`
     /// when that is set: the two tools then agree on the cap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_slots: Option<u32>,

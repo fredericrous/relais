@@ -995,8 +995,8 @@ impl<'a> RunEngine<'a> {
             cores,
             slots: host_slot_dir(self.config.machine.resources.shared_host_slots.as_deref()),
             sizing: match self.config.machine.resources.host_slots {
-                Some(n) => amont_slots::Sizing::Fixed(n),
-                None => amont_slots::Sizing::Auto,
+                Some(n) => greenharness_slots::Sizing::Fixed(n),
+                None => greenharness_slots::Sizing::Auto,
             },
             ancestor_holds_slots: verify::ancestor_holds_slots(
                 std::env::var(verify::HOST_SLOT_ENV).ok().as_deref(),
@@ -1201,7 +1201,7 @@ pub(super) fn budget_limits(
 /// (amont ADR-0014: relais joins the host queue with nothing configured).
 pub(crate) fn host_slot_dir(setting: Option<&str>) -> Option<PathBuf> {
     match setting {
-        None => Some(amont_slots::dir()),
+        None => Some(greenharness_slots::dir()),
         Some("off") => None,
         Some(dir) => Some(PathBuf::from(dir)),
     }
@@ -1261,7 +1261,7 @@ mod host_slot_dir_tests {
     /// is the coordinator's queue alone; a path is used as given.
     #[test]
     fn a_run_with_no_setting_queues_in_amonts_directory() {
-        assert_eq!(host_slot_dir(None), Some(amont_slots::dir()));
+        assert_eq!(host_slot_dir(None), Some(greenharness_slots::dir()));
         assert_eq!(host_slot_dir(Some("off")), None);
         assert_eq!(
             host_slot_dir(Some("/run/slots")),

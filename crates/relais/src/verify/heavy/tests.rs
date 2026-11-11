@@ -165,7 +165,7 @@ fn admission<'a>(
         cap,
         cores,
         slots: None,
-        sizing: amont_slots::Sizing::Fixed(4),
+        sizing: greenharness_slots::Sizing::Fixed(4),
         ancestor_holds_slots: false,
         poll: Duration::from_millis(10),
         announce_every: ANNOUNCE_EVERY,
@@ -840,7 +840,7 @@ fn an_ancestor_that_holds_host_slots_is_not_queued_behind_and_the_fact_is_passed
 
     let outcome = run_observed_within(ObservedRun {
         dir: &dir,
-        spec: &sh("echo slot=$AMONT_HOST_SLOT"),
+        spec: &sh("echo slot=$GREENHARNESS_HOST_SLOT"),
         logs_dir: &dir.join("logs"),
         label: "cmd0",
         log_stem: "x-cmd0",
@@ -865,7 +865,7 @@ mod host_slots {
     use super::*;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
-    /// A private slot directory, as `amont-slots` requires (0700, ours).
+    /// A private slot directory, as `greenharness-slots` requires (0700, ours).
     fn slot_dir(tag: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("relais-heavy-slots-{tag}-{}", std::process::id()));
@@ -879,17 +879,17 @@ mod host_slots {
     }
 
     /// Another holder of one slot in `dir`, through the same crate.
-    fn other_holder(dir: &Path, command: &str) -> amont_slots::Lease {
-        let mut waiter = amont_slots::Waiter::new_in(
+    fn other_holder(dir: &Path, command: &str) -> greenharness_slots::Lease {
+        let mut waiter = greenharness_slots::Waiter::new_in(
             dir,
-            amont_slots::Sizing::Fixed(1),
+            greenharness_slots::Sizing::Fixed(1),
             1,
-            amont_slots::Holder::here("other", command),
+            greenharness_slots::Holder::here("other", command),
         )
         .expect("waiter");
         match waiter.poll().expect("poll") {
-            amont_slots::Poll::Granted(lease) => lease,
-            amont_slots::Poll::Waiting(q) => panic!("the slot was free: {q:?}"),
+            greenharness_slots::Poll::Granted(lease) => lease,
+            greenharness_slots::Poll::Waiting(q) => panic!("the slot was free: {q:?}"),
         }
     }
 
@@ -903,7 +903,7 @@ mod host_slots {
         register(&gate, "run-n");
         let mut shared = admission(&gate, "run-n", 1, 4);
         shared.slots = Some(missing.clone());
-        shared.sizing = amont_slots::Sizing::Fixed(1);
+        shared.sizing = greenharness_slots::Sizing::Fixed(1);
         let lease = shared.admit(&ask(&BTreeMap::new(), 1)).expect("admitted");
         assert_eq!(lease.host_slots(), 1);
         assert_eq!(
@@ -958,7 +958,7 @@ mod host_slots {
         register(&gate, "run-w");
         let mut shared = admission(&gate, "run-w", 2, 16);
         shared.slots = Some(dir.clone());
-        shared.sizing = amont_slots::Sizing::Fixed(1);
+        shared.sizing = greenharness_slots::Sizing::Fixed(1);
         let refused = shared.admit(&ask(&BTreeMap::new(), 2)).err();
         assert!(
             matches!(
@@ -1011,7 +1011,7 @@ mod host_slots {
         let clock = ManualClock::new();
         let mut with_slots = admission(&gate, "run-s", 1, 4);
         with_slots.slots = Some(slots_dir.clone());
-        with_slots.sizing = amont_slots::Sizing::Fixed(1);
+        with_slots.sizing = greenharness_slots::Sizing::Fixed(1);
         with_slots.budgets = budgets_on(&clock, 60);
         with_slots.events =
             Events::for_run_on("run-s", &dir, crate::protocol::Wire::to(std::io::sink()));
@@ -1044,7 +1044,7 @@ mod host_slots {
         });
         let outcome = run_observed_within(ObservedRun {
             dir: &dir,
-            spec: &sh("echo slot=$AMONT_HOST_SLOT"),
+            spec: &sh("echo slot=$GREENHARNESS_HOST_SLOT"),
             logs_dir: &dir.join("logs"),
             label: "cmd0",
             log_stem: "x-cmd0",

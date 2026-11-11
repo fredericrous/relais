@@ -352,7 +352,7 @@ pub(crate) fn heavy_finding(settings: &MachineSettings, cores: u32) -> Finding {
         Some(dir) => format!("shared host slots in {dir}, {sizing}"),
         None => format!(
             "shared host slots in {}, {sizing}",
-            amont_slots::dir().display()
+            greenharness_slots::dir().display()
         ),
     };
     Finding {

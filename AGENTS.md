@@ -39,7 +39,7 @@ check whose processes are busy on CPU is not "silent": it can run to the
 1h00m ceiling. A check waiting on a cargo or uv lock answers to
 `amont.lockWait` instead, the silence budget stretches with the machine's
 load (`amont.idleLoadScale`), and a heavy check (clippy, a test suite) may
-first queue for a host slot (`amont.hostSlots`) while other worktrees run
+first queue for a host slot (`greengate.hostSlots`) while other worktrees run
 theirs. A test suite may legitimately run for most of that. If your tooling caps a foreground command below it,
 run the command in the background and read its result when it exits —
 while it runs, a line a minute on stderr says which check is alive and
