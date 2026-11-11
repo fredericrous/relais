@@ -4649,6 +4649,10 @@ fn coordinator_outage_blocks_instead_of_launching_unmanaged() {
 #[test]
 fn a_run_cancelled_while_its_check_runs_stops_the_check_and_ends_cancelled() {
     let fixture = Fixture::new();
+    // The check says it started before it hangs: the cancel waits for that,
+    // never for a fixed time, which a loaded host overran (the worker and
+    // the candidate's check had not started 500 ms after registration).
+    let started_marker = fixture.dir.join("check-started");
     let hanging = CommandSpec {
         name: None,
         junit: None,
@@ -4656,7 +4660,11 @@ fn a_run_cancelled_while_its_check_runs_stops_the_check_and_ends_cancelled() {
         retry: None,
         env: Default::default(),
         reuse: None,
-        argv: vec!["sh".into(), "-c".into(), "sleep 60".into()],
+        argv: vec![
+            "sh".into(),
+            "-c".into(),
+            format!("touch '{}'; sleep 60", started_marker.display()),
+        ],
         timeout_seconds: 120,
     };
     let repo = fixture.repo_policy(vec![hanging], 3);
@@ -4672,11 +4680,8 @@ fn a_run_cancelled_while_its_check_runs_stops_the_check_and_ends_cancelled() {
     let outcome = std::thread::scope(|scope| {
         scope.spawn(move || {
             // The run registers, then its candidate's check starts and
-            // hangs (the base is deferred, ADR-0013).
-            while canceller.status().runs.is_empty() {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            std::thread::sleep(Duration::from_millis(500));
+            // hangs (the base is deferred, ADR-0013): cancel once it has.
+            crate::test_support::wait_until(Duration::from_secs(60), || started_marker.exists());
             for run_id in canceller.status().runs.keys() {
                 canceller.cancel_run(run_id);
             }
@@ -4726,10 +4731,14 @@ fn a_run_cancelled_while_its_check_runs_stops_the_check_and_ends_cancelled() {
 #[test]
 fn a_run_cancelled_while_the_base_runs_on_demand_keeps_the_candidate() {
     let fixture = Fixture::new();
+    // The base's check says it started before it hangs: the cancel waits
+    // for that, not for a fixed time after the base tree appears.
+    let started_marker = fixture.dir.join("base-check-started");
     let repo = fixture.repo_policy(
-        vec![sh(
-            "case \"$(pwd -P)\" in */verify-base) sleep 60;; esac; exit 1",
-        )],
+        vec![sh(&format!(
+            "case \"$(pwd -P)\" in */verify-base) touch '{}'; sleep 60;; esac; exit 1",
+            started_marker.display()
+        ))],
         3,
     );
     let machine = fixture.machine_for(&repo);
@@ -4740,22 +4749,11 @@ fn a_run_cancelled_while_the_base_runs_on_demand_keeps_the_candidate() {
     let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let backend = changing_worker(Arc::clone(&launches));
     let canceller = Arc::clone(&gate);
-    let verify_runs = verify_root(&fixture.artifacts);
     let started = Instant::now();
     let outcome = std::thread::scope(|scope| {
         scope.spawn(move || {
-            // Cancel once some run's base tree exists, and a moment more
-            // for its check to start.
-            let base_exists = || {
-                std::fs::read_dir(&verify_runs).is_ok_and(|runs| {
-                    runs.flatten()
-                        .any(|run| run.path().join("verify-base").exists())
-                })
-            };
-            while !base_exists() && started.elapsed() < Duration::from_secs(60) {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            std::thread::sleep(Duration::from_millis(500));
+            // Cancel once the base's check has started.
+            crate::test_support::wait_until(Duration::from_secs(60), || started_marker.exists());
             for run_id in canceller.status().runs.keys() {
                 canceller.cancel_run(run_id);
             }
