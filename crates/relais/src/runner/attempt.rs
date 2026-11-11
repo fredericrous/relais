@@ -6,10 +6,10 @@ use super::{
     build_prompt, build_review_repair_prompt, conflict_block, effort_str, fresh_progress,
     spend_limit, split_profile_gaps, unpriced_native_model, verify, workspace, AgentKind,
     AttemptContext, AttemptKind, AttemptLabel, Attempted, BlockCode, Candidate, Ceiling,
-    Dispatched, Duration, Ended, EvidenceKind, Instant, LaunchSpec, Limit, ManagedDispatch, Next,
-    Observation, PathBuf, PendingEvidence, Phase, Progress, Reason, RepairFailure, RunEngine,
-    RunError, RunOutcome, Snapshot, State, Step, Terminal, UsageEvent, Verified, VerifyFailure,
-    WorkspaceError,
+    Dispatched, Duration, Ended, EvidenceKind, FloorKind, Instant, LaunchSpec, Limit,
+    ManagedDispatch, Next, Observation, PathBuf, PendingEvidence, Phase, Progress, Reason,
+    RepairFailure, RunEngine, RunError, RunOutcome, Snapshot, State, Step, Terminal, UsageEvent,
+    Verified, VerifyFailure, WorkspaceError,
 };
 use crate::backend::{LoopedWorker, Repeated};
 
@@ -180,7 +180,7 @@ impl<'a> RunEngine<'a> {
     /// §11). `Some(outcome)` means one was reached and the run ended.
     fn ceiling_reached(
         &mut self,
-        ctx: &AttemptContext<'_>,
+        context: &AttemptContext<'_>,
         progress: &Progress,
     ) -> Result<Option<RunOutcome>, RunError> {
         if progress.budget.attempts_used >= progress.budget.max_attempts {
@@ -210,18 +210,17 @@ impl<'a> RunEngine<'a> {
         // A repair or escalation is owed its wall-time floor, paid from
         // the total: the work budget alone no longer stops it, but the
         // wait budgets and the total still do.
-        let floor = wall_floor(&ctx.preflight.authority, progress.kind);
-        let exhausted = if floor.is_zero() {
-            self.budgets.exhausted()
-        } else {
+        let exhausted = if let Some((floor_kind, floor)) =
+            wall_floor(&context.preflight.authority, progress.kind)
+        {
             let total_left = self.budgets.total_remaining();
             if total_left < floor {
                 let kept = progress.last_candidate.as_deref().map(|sha| {
-                    self.kept_candidate(ctx.preflight, progress.budget.attempts_used, sha)
+                    self.kept_candidate(context.preflight, progress.budget.attempts_used, sha)
                 });
                 return Ok(Some(self.end_on_repair_floor(
                     Limit::RepairFloor {
-                        kind: progress.kind,
+                        kind: floor_kind,
                         floor_s: floor.as_secs(),
                         total_left_s: total_left.as_secs(),
                     },
@@ -230,6 +229,8 @@ impl<'a> RunEngine<'a> {
                 )?));
             }
             self.budgets.exhausted_except_work()
+        } else {
+            self.budgets.exhausted()
         };
         if let Some(exhausted) = exhausted {
             return Ok(Some(self.end_on_exhausted(
@@ -389,23 +390,25 @@ impl<'a> RunEngine<'a> {
         // A repair or escalation starts with at least its floor: the work
         // budget is extended by the shortfall, and the extension is recorded.
         let floor = wall_floor(authority, kind);
-        let shortfall = floor.saturating_sub(self.budgets.work_remaining());
+        let floor_wall = floor.map_or(Duration::ZERO, |(_, wall)| wall);
+        let shortfall = floor_wall.saturating_sub(self.budgets.work_remaining());
         let mut dispatched_detail = serde_json::json!({
             "dispatch_id": dispatch_id.as_str(),
             "attempt_index": index,
             "tier": tier.as_str(),
             "kind": kind.as_str(),
         });
-        if !shortfall.is_zero() {
+        if let Some((floor_kind, _)) = floor.filter(|_| !shortfall.is_zero()) {
             self.budgets.extend_work(shortfall);
-            let extended_s = shortfall.as_secs() + u64::from(shortfall.subsec_nanos() > 0);
-            let key = kind.floor_key().unwrap_or("min_repair_seconds");
+            let extended_s =
+                u64::try_from(shortfall.as_millis().div_ceil(1000)).unwrap_or(u64::MAX);
+            let key = floor_kind.key();
             dispatched_detail["work_extended_s"] = serde_json::json!(extended_s);
             dispatched_detail["detail"] = serde_json::json!(format!(
                 "{} was extended by {extended_s} s to its {} s floor (`[execution] {key}`), \
                  paid from the total budget",
-                kind.with_article(),
-                floor.as_secs()
+                floor_kind.with_article(),
+                floor_wall.as_secs()
             ));
         }
         self.transition(State::Running, Reason::WorkerDispatched, dispatched_detail)?;
@@ -416,7 +419,7 @@ impl<'a> RunEngine<'a> {
         let remaining_wall = self
             .budgets
             .remaining()
-            .max(floor.min(self.budgets.total_remaining()))
+            .max(floor_wall.min(self.budgets.total_remaining()))
             .max(Duration::from_secs(1));
         // What this attempt may still spend, not the whole ceiling
         // again: the budget is the run's, not the attempt's.
@@ -1510,12 +1513,16 @@ fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&partial, path)
 }
 
-/// The wall time an attempt of this kind starts with at least; zero for an
-/// initial attempt or a floor switched off.
-fn wall_floor(authority: &crate::policy::EffectiveAuthority, kind: AttemptKind) -> Duration {
-    Duration::from_secs(match kind {
-        AttemptKind::Initial => 0,
-        AttemptKind::Repair => authority.min_repair_seconds,
-        AttemptKind::Escalation => authority.min_escalation_seconds,
-    })
+/// The wall time an attempt of this kind starts with at least, and the kind
+/// of floor it is; none for an initial attempt or a floor switched off.
+fn wall_floor(
+    authority: &crate::policy::EffectiveAuthority,
+    kind: AttemptKind,
+) -> Option<(FloorKind, Duration)> {
+    let floor_kind = kind.floor_kind()?;
+    let seconds = match floor_kind {
+        FloorKind::Repair => authority.min_repair_seconds,
+        FloorKind::Escalation => authority.min_escalation_seconds,
+    };
+    (seconds > 0).then(|| (floor_kind, Duration::from_secs(seconds)))
 }

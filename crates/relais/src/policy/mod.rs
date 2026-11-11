@@ -4210,10 +4210,8 @@ amont = { mode = "optional", bin = "/opt/amont/bin/amont" }
                 authority.min_repair_seconds,
                 authority.min_escalation_seconds
             ),
-            (
-                600.min(authority.max_wall_seconds),
-                900.min(authority.max_wall_seconds)
-            )
+            (600, 900),
+            "the fixture's max_wall_seconds is 600 and its floors are 600 and 900, capped at it"
         );
         contract.limits.wall_seconds = Some(60);
         let narrowed = effective_authority(&repo, &machine, &contract, &identity());

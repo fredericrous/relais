@@ -629,7 +629,11 @@ mod tests {
         budgets.begin_work();
         budgets.extend_work(Duration::from_secs(u64::MAX));
         budgets.extend_work(Duration::from_secs(10));
-        assert!(budgets.work_remaining() > Duration::from_secs(100));
+        assert_eq!(
+            budgets.work_remaining(),
+            Duration::from_millis(9_223_372_036_854_875_807),
+            "the extension saturates at i64::MAX ms (9_223_372_036_854_775_807), on top of the 100 s of work"
+        );
     }
 
     #[test]

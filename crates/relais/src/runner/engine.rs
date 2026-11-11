@@ -251,7 +251,13 @@ impl<'a> RunEngine<'a> {
         budget: &Budget,
         observation: Observation,
     ) -> Result<RunOutcome, RunError> {
-        match self.decide(budget, observation)? {
+        let next = self.decide(budget, observation)?;
+        self.outcome_of_stop(next)
+    }
+
+    /// The run's outcome for a recorded `Next` that must be a stop.
+    fn outcome_of_stop(&self, next: Next) -> Result<RunOutcome, RunError> {
+        match next {
             Next::Stop(terminal) => Ok(RunOutcome {
                 run_id: self.run_id.clone(),
                 terminal,
@@ -1086,15 +1092,8 @@ impl<'a> RunEngine<'a> {
             decision.detail["candidate"] =
                 serde_json::json!({ "run": kept.run, "index": kept.index, "sha": kept.sha });
         }
-        match self.record_decision(decision)? {
-            Next::Stop(terminal) => Ok(RunOutcome {
-                run_id: self.run_id.clone(),
-                terminal,
-            }),
-            other => Err(RunError::Other(format!(
-                "the machine answered {other:?} to a terminal observation"
-            ))),
-        }
+        let next = self.record_decision(decision)?;
+        self.outcome_of_stop(next)
     }
 
     pub(crate) fn end_on_exhausted(

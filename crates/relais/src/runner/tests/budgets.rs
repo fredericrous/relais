@@ -556,6 +556,36 @@ impl Gate for LateGrantGate {
 }
 
 #[test]
+fn a_queued_worker_is_launched_with_no_more_than_the_total_has_left() {
+    let (fixture, skew) = skewed_fixture();
+    let repo = floored_repo(&fixture);
+    let machine = fixture.machine_for(&repo);
+    let gate = LateGrantGate {
+        inner: crate::admission::LocalGate::new(
+            ConcurrencyLimits::default(),
+            crate::ledger::now_rfc3339,
+        ),
+        skew: Arc::clone(&skew),
+        jump_seconds: 80,
+        model_work_requests: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let (backend, walls) = skewing_worker(skew, vec![0], 1);
+    let mut contract = fixture.contract(Review::Off);
+    contract.limits.total_seconds = Some(150);
+    let outcome = fixture.execute_managed(&contract, &repo, &machine, &backend, &gate);
+    assert!(
+        matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    let walls = walls.lock().unwrap().clone();
+    assert_eq!(
+        walls,
+        vec![Duration::from_secs(70)],
+        "the 80 s queue left 70 s of the 150 s total; the work budget alone says 100 s"
+    );
+}
+
+#[test]
 fn a_spent_admission_wait_blocks_the_repair_even_though_the_total_covers_its_floor() {
     // The first attempt queued 100 s (budget 60 s) and then worked 120 s
     // (budget 100 s): work and the admission wait are both spent, the total
