@@ -44,7 +44,7 @@ production.
 - **2026-11-11 review.** A review of greengate (formerly amont) and relais
   corrected this map: `cargo-test` passes on Linux in CI for both repositories
   (t23); the detached lane takes only pre-push gates and was never enabled
-  (t15, t26); the signing decision is reopened (t25); the relais coordinator is
+  (t15, t26); the signing decision was reopened and closed again (t25); the relais coordinator is
   portable to Linux but a run is bound to a live Claude Code session and to one
   host (t02). Names: greengate 4.0 (a local branch, not yet on origin) renames
   `amont.cluster.*`, `AMONT_*` and the `amont-gates` namespace; tickets here
@@ -56,7 +56,7 @@ production.
   against it. Its tickets are prefixed `an-` (an-t01 to an-t07), so a bare
   `tNN` in this map always means a ticket here. It depends on t24 (the live
   proxy test) and t30 (the Mac reaching the proxy off-LAN), which stay open
-  here. The pod signing key (t25, closed) overlaps its an-t07, which owns the
+  here. The pod signing key (t25, closed again 2026-11-11) defers to its an-t07, which owns the
   node identity and signer design, so keep one key model across both.
 
 ## Decisions so far
@@ -66,7 +66,7 @@ production.
 - [Which proxy owns each OAuth account once the homelab runs one](t28-oauth-account-owner.md): the homelab proxy holds every account and the Mac points at it, its own proxy stopped (the person, 2026-11-07); cutover never runs both; the off-LAN path (t30) is confirmed by the person, 2026-11-11.
 - [How CLIProxyAPI and its management center run on the homelab](t27-cliproxy-on-homelab.md): upstream `eceasy/cli-proxy-api` by digest, one replica on an RWO PVC (refresh rewrites the OAuth files), per-consumer access keys from Vault, the bundled panel with management not routed, `cliproxy` namespace egress to Anthropic/OpenAI/the LiteLLM gateway; deployed since (the proxy runs on the homelab).
 - [How work handed to the cluster outlives the laptop](t26-execution-service.md): two lanes; commit-blocking gates keep the kubectl executor, everything else becomes an Argo Workflow (already installed) fed by a Forgejo snapshot (real parent) or a pull-mirror; Argo holds slots, cancel and 7-day results; the laptop stays the only signer and collects on wake (t25 reopens with worker pods); next: a build plan.
-- [Where the pod's attestation signing key lives](t25-pod-signing-key.md): *(reopened 2026-11-11, now open)* decided as nowhere new, the laptop signs from Kubernetes-recorded facts, one Job per gate, Job-create fenced; a code review found it built in part and failing once a second node signs.
+- [Where the pod's attestation signing key lives](t25-pod-signing-key.md): *(amended 2026-11-11)* no key in a pod; a node with a valid certificate (an-t07, homelab repo) signs from Kubernetes-recorded facts read again at signing time; one Job per gate; Job-create fenced; the image digest in the signed block is deferred.
 - [Which slice ships first and alone](t15-first-slice.md): amont runs `platform=any` gates (lint, types, cycles) on wk-3, one Job per gate, laptop-signed; enabled after the t13 window. *(2026-11-11 review: never enabled, and as planned it cannot run: the detached lane takes only pre-push gates and relais's cycle gates are pre-commit. See t15.)*
 - [Which tool runs a gate on the cluster](t21-remote-runner-owner.md): amont, behind a `platform=any` gate and a per-repo opt-in; the pod returns a signed attestation; relais keeps calling `amont run --stamp` (architect seat).
 - [Who owns the cluster lease protocol](t18-cluster-lease-owner.md): amont, in a new std-only crate relais links for worker pods.
@@ -95,7 +95,6 @@ the ones with no open blocker):
   `platform=any`, and the policy conflict over test suites.
 - [t24](t24-litellm-live-test.md): only cluster reachability to the proxy is
   confirmed.
-- [t25](t25-pod-signing-key.md): reopened; a second signing node.
 - [t31](t31-rust-build-cache.md): the Rust build cache, a desk answer.
 - [t02](t02-remote-launcher.md), [t08](t08-placement-policy.md),
   [t11](t11-auto-adjust-loop.md), [t16](t16-remote-run-visibility.md),
