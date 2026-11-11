@@ -117,6 +117,8 @@ struct Spent {
     /// Of `waited_in_work`, the time an on-demand base run took after work
     /// began (ADR-0013): kept apart so it is never read as a queue wait.
     base_in_work: i64,
+    /// Time added to the work budget at launch (a repair's floor).
+    work_extension: i64,
 }
 
 /// Which budgets a command draws on.
@@ -166,6 +168,7 @@ impl Budgets {
                 disk_waited: 0,
                 waited_in_work: 0,
                 base_in_work: 0,
+                work_extension: 0,
             })),
             draws: Draws::WorkAndTotal,
         }
@@ -254,9 +257,20 @@ impl Budgets {
             None => self.limits.work,
             Some(started) => {
                 let worked = (now - started - spent.waited_in_work).max(0);
-                self.limits.work.saturating_sub(from_millis(worked))
+                let allowed = self
+                    .limits
+                    .work
+                    .saturating_add(from_millis(spent.work_extension));
+                allowed.saturating_sub(from_millis(worked))
             }
         }
+    }
+
+    /// Lengthen the work budget by `by`; the total is untouched.
+    pub fn extend_work(&self, by: Duration) {
+        let millis = i64::try_from(by.as_millis()).unwrap_or(i64::MAX);
+        let mut spent = self.lock();
+        spent.work_extension = spent.work_extension.saturating_add(millis);
     }
 
     /// Start an on-demand base run (ADR-0013): the guard's view of the
@@ -313,6 +327,19 @@ impl Budgets {
         if started && self.draws == Draws::WorkAndTotal && self.work_remaining().is_zero() {
             return Some(Exhausted::Work);
         }
+        self.exhausted_waits()
+    }
+
+    /// Like [`Budgets::exhausted`] but ignoring the work budget: for an
+    /// attempt whose floor the total covers.
+    pub fn exhausted_except_work(&self) -> Option<Exhausted> {
+        if self.total_remaining().is_zero() {
+            return Some(Exhausted::Total);
+        }
+        self.exhausted_waits()
+    }
+
+    fn exhausted_waits(&self) -> Option<Exhausted> {
         let spent = self.lock();
         if from_millis(spent.admission_waited) >= self.limits.admission_wait
             && !self.limits.admission_wait.is_zero()
@@ -546,6 +573,67 @@ mod tests {
         assert_eq!(budgets.work_remaining(), Duration::from_secs(20));
         assert_eq!(budgets.exhausted(), None);
         assert_eq!(budgets.total_remaining(), Duration::from_secs(350));
+    }
+
+    #[test]
+    fn an_extension_lengthens_work_and_leaves_the_total_alone() {
+        let clock = ManualClock::new();
+        let budgets = Budgets::start(clock.clone(), limits(100, 50, 50, 500));
+        budgets.begin_work();
+        clock.advance(90);
+        assert_eq!(budgets.work_remaining(), Duration::from_secs(10));
+        let total_before = budgets.total_remaining();
+        budgets.extend_work(Duration::from_secs(50));
+        assert_eq!(budgets.work_remaining(), Duration::from_secs(60));
+        assert_eq!(budgets.total_remaining(), total_before);
+    }
+
+    #[test]
+    fn work_is_exhausted_only_after_the_extension_is_spent() {
+        let clock = ManualClock::new();
+        let budgets = Budgets::start(clock.clone(), limits(100, 50, 50, 500));
+        budgets.begin_work();
+        clock.advance(100);
+        assert_eq!(budgets.exhausted(), Some(Exhausted::Work));
+        budgets.extend_work(Duration::from_secs(30));
+        assert_eq!(budgets.exhausted(), None);
+        clock.advance(29);
+        assert_eq!(budgets.exhausted(), None);
+        clock.advance(1);
+        assert_eq!(budgets.exhausted(), Some(Exhausted::Work));
+    }
+
+    #[test]
+    fn exhausted_except_work_ignores_work_but_not_the_waits_or_the_total() {
+        let clock = ManualClock::new();
+        let budgets = Budgets::start(clock.clone(), limits(100, 50, 50, 500));
+        budgets.begin_work();
+        clock.advance(100);
+        assert_eq!(budgets.exhausted(), Some(Exhausted::Work));
+        assert_eq!(budgets.exhausted_except_work(), None);
+        {
+            let mut wait = budgets.wait(WaitKind::Admission);
+            clock.advance(50);
+            // Work is spent too, so the plain check names work first.
+            assert_eq!(wait.tick(), Some(Exhausted::Work));
+        }
+        assert_eq!(
+            budgets.exhausted_except_work(),
+            Some(Exhausted::AdmissionWait)
+        );
+    }
+
+    #[test]
+    fn a_huge_extension_saturates() {
+        let budgets = Budgets::start(ManualClock::new(), limits(100, 50, 50, 500));
+        budgets.begin_work();
+        budgets.extend_work(Duration::from_secs(u64::MAX));
+        budgets.extend_work(Duration::from_secs(10));
+        assert_eq!(
+            budgets.work_remaining(),
+            Duration::from_millis(9_223_372_036_854_875_807),
+            "the extension saturates at i64::MAX ms (9_223_372_036_854_775_807), on top of the 100 s of work"
+        );
     }
 
     #[test]

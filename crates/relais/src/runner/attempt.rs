@@ -6,10 +6,10 @@ use super::{
     build_prompt, build_review_repair_prompt, conflict_block, effort_str, fresh_progress,
     spend_limit, split_profile_gaps, unpriced_native_model, verify, workspace, AgentKind,
     AttemptContext, AttemptKind, AttemptLabel, Attempted, BlockCode, Candidate, Ceiling,
-    Dispatched, Duration, Ended, EvidenceKind, Instant, LaunchSpec, Limit, ManagedDispatch, Next,
-    Observation, PathBuf, PendingEvidence, Phase, Progress, Reason, RepairFailure, RunEngine,
-    RunError, RunOutcome, Snapshot, State, Step, Terminal, UsageEvent, Verified, VerifyFailure,
-    WorkspaceError,
+    Dispatched, Duration, Ended, EvidenceKind, FloorKind, Instant, LaunchSpec, Limit,
+    ManagedDispatch, Next, Observation, PathBuf, PendingEvidence, Phase, Progress, Reason,
+    RepairFailure, RunEngine, RunError, RunOutcome, Snapshot, State, Step, Terminal, UsageEvent,
+    Verified, VerifyFailure, WorkspaceError,
 };
 use crate::backend::{LoopedWorker, Repeated};
 
@@ -27,7 +27,7 @@ impl<'a> RunEngine<'a> {
             if let Some(outcome) = self.end_if_cancelled()? {
                 return Ok(outcome);
             }
-            if let Some(outcome) = self.ceiling_reached(&progress)? {
+            if let Some(outcome) = self.ceiling_reached(ctx, &progress)? {
                 return Ok(outcome);
             }
             let mut dispatched = match self.dispatch_attempt(ctx, &mut progress)? {
@@ -178,7 +178,11 @@ impl<'a> RunEngine<'a> {
 
     /// Budget ceilings are checked BEFORE admitting more work (SPEC §9,
     /// §11). `Some(outcome)` means one was reached and the run ended.
-    fn ceiling_reached(&mut self, progress: &Progress) -> Result<Option<RunOutcome>, RunError> {
+    fn ceiling_reached(
+        &mut self,
+        context: &AttemptContext<'_>,
+        progress: &Progress,
+    ) -> Result<Option<RunOutcome>, RunError> {
         if progress.budget.attempts_used >= progress.budget.max_attempts {
             if let (Some(holdout), Some(failures)) = (
                 progress.holdout_stop.clone(),
@@ -203,7 +207,32 @@ impl<'a> RunEngine<'a> {
                 )?,
             ));
         }
-        if let Some(exhausted) = self.budgets.exhausted() {
+        // A repair or escalation is owed its wall-time floor, paid from
+        // the total: the work budget alone no longer stops it, but the
+        // wait budgets and the total still do.
+        let exhausted = if let Some((floor_kind, floor)) =
+            wall_floor(&context.preflight.authority, progress.kind)
+        {
+            let total_left = self.budgets.total_remaining();
+            if total_left < floor {
+                let kept = progress.last_candidate.as_deref().map(|sha| {
+                    self.kept_candidate(context.preflight, progress.budget.attempts_used, sha)
+                });
+                return Ok(Some(self.end_on_repair_floor(
+                    Limit::RepairFloor {
+                        kind: floor_kind,
+                        floor_s: floor.as_secs(),
+                        total_left_s: total_left.as_secs(),
+                    },
+                    &progress.budget,
+                    kept.as_ref(),
+                )?));
+            }
+            self.budgets.exhausted_except_work()
+        } else {
+            self.budgets.exhausted()
+        };
+        if let Some(exhausted) = exhausted {
             return Ok(Some(self.end_on_exhausted(
                 exhausted,
                 &progress.budget,
@@ -358,21 +387,40 @@ impl<'a> RunEngine<'a> {
         // kind of attempt it is (SPEC §9): the chain used to skip
         // straight from `prepared` to `verifying`, so a run ten minutes
         // into its first attempt still read as not yet started.
-        self.transition(
-            State::Running,
-            Reason::WorkerDispatched,
-            serde_json::json!({
-                "dispatch_id": dispatch_id.as_str(),
-                "attempt_index": index,
-                "tier": tier.as_str(),
-                "kind": kind.as_str(),
-            }),
-        )?;
+        // A repair or escalation starts with at least its floor: the work
+        // budget is extended by the shortfall, and the extension is recorded.
+        let floor = wall_floor(authority, kind);
+        let floor_wall = floor.map_or(Duration::ZERO, |(_, wall)| wall);
+        let shortfall = floor_wall.saturating_sub(self.budgets.work_remaining());
+        let mut dispatched_detail = serde_json::json!({
+            "dispatch_id": dispatch_id.as_str(),
+            "attempt_index": index,
+            "tier": tier.as_str(),
+            "kind": kind.as_str(),
+        });
+        if let Some((floor_kind, _)) = floor.filter(|_| !shortfall.is_zero()) {
+            self.budgets.extend_work(shortfall);
+            let extended_s =
+                u64::try_from(shortfall.as_millis().div_ceil(1000)).unwrap_or(u64::MAX);
+            let key = floor_kind.key();
+            dispatched_detail["work_extended_s"] = serde_json::json!(extended_s);
+            dispatched_detail["detail"] = serde_json::json!(format!(
+                "{} was extended by {extended_s} s to its {} s floor (`[execution] {key}`), \
+                 paid from the total budget",
+                floor_kind.with_article(),
+                floor_wall.as_secs()
+            ));
+        }
+        self.transition(State::Running, Reason::WorkerDispatched, dispatched_detail)?;
         // Re-taken after `transition(&mut self)`: the shared reference the
         // function opened with cannot outlive that mutable call.
         let ledger = self.config.ledger;
 
-        let remaining_wall = self.budgets.remaining().max(Duration::from_secs(1));
+        let remaining_wall = self
+            .budgets
+            .remaining()
+            .max(floor_wall.min(self.budgets.total_remaining()))
+            .max(Duration::from_secs(1));
         // What this attempt may still spend, not the whole ceiling
         // again: the budget is the run's, not the attempt's.
         // Saturating: a wrapped remainder would read as a budget
@@ -1463,4 +1511,18 @@ fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()?;
     drop(file);
     std::fs::rename(&partial, path)
+}
+
+/// The wall time an attempt of this kind starts with at least, and the kind
+/// of floor it is; none for an initial attempt or a floor switched off.
+fn wall_floor(
+    authority: &crate::policy::EffectiveAuthority,
+    kind: AttemptKind,
+) -> Option<(FloorKind, Duration)> {
+    let floor_kind = kind.floor_kind()?;
+    let seconds = match floor_kind {
+        FloorKind::Repair => authority.min_repair_seconds,
+        FloorKind::Escalation => authority.min_escalation_seconds,
+    };
+    (seconds > 0).then(|| (floor_kind, Duration::from_secs(seconds)))
 }

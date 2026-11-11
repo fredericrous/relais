@@ -189,6 +189,8 @@ impl Fixture {
                 // Off in the fixture: the timeout tests assert the interrupted stop;
                 // the settle's own tests turn it on.
                 verify_timed_out: false,
+                min_repair_seconds: 600,
+                min_escalation_seconds: 900,
                 loop_threshold: None,
             },
             integrations: Default::default(),
@@ -242,6 +244,9 @@ impl Fixture {
             workspace: Default::default(),
             resources: crate::policy::ResourceSettings {
                 min_free_bytes: Some(0),
+                // Off: a test run must not queue on the machine's real amont
+                // host-slot directory, where another job's slots would stall it.
+                shared_host_slots: Some("off".into()),
                 ..Default::default()
             },
             schema_version: 1,
@@ -8087,6 +8092,8 @@ fn guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_g
         models: BTreeMap::new(),
         max_attempts: 1,
         max_wall_seconds: 60,
+        min_repair_seconds: 60,
+        min_escalation_seconds: 60,
         max_repairs_before_escalation: 1,
         allow_nested_agents: false,
         max_agent_depth: 1,

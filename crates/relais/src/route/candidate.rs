@@ -762,8 +762,23 @@ fn validate_new_recipe(
             widen_scope_small_max_files,
             widen_scope_small_max_lines,
             verify_timed_out,
+            min_repair_seconds,
+            min_escalation_seconds,
             loop_threshold,
         } = execution;
+        // NOT knobs either: they decide how much spend a repair is owed.
+        if *min_repair_seconds != incumbent.execution.min_repair_seconds {
+            return Err(CandidateRejection::FixedRecipeFieldChanged {
+                name: new_name.clone(),
+                field: "execution.min_repair_seconds",
+            });
+        }
+        if *min_escalation_seconds != incumbent.execution.min_escalation_seconds {
+            return Err(CandidateRejection::FixedRecipeFieldChanged {
+                name: new_name.clone(),
+                field: "execution.min_escalation_seconds",
+            });
+        }
         // NOT a knob. Raising effort on repair is spend, and a learner
         // does not choose its own.
         if *repair_effort != incumbent.execution.repair_effort {
@@ -2152,6 +2167,20 @@ mod tests {
                 "execution.verify_timed_out",
                 ExecutionPolicy {
                     verify_timed_out: true,
+                    ..ExecutionPolicy::default()
+                },
+            ),
+            (
+                "execution.min_repair_seconds",
+                ExecutionPolicy {
+                    min_repair_seconds: 5,
+                    ..ExecutionPolicy::default()
+                },
+            ),
+            (
+                "execution.min_escalation_seconds",
+                ExecutionPolicy {
+                    min_escalation_seconds: 5,
                     ..ExecutionPolicy::default()
                 },
             ),

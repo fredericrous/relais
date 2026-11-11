@@ -215,6 +215,50 @@ pub enum Limit {
     /// budget is [`Limit::WallClock`]; waiting for a lease or the disk
     /// ends the run `blocked`, not here.
     Total,
+    /// A repair or escalation was owed a wall-time floor (`[execution]
+    /// min_repair_seconds` / `min_escalation_seconds`) that the run's
+    /// total budget no longer covers; the attempt was not launched.
+    RepairFloor {
+        kind: FloorKind,
+        floor_s: u64,
+        total_left_s: u64,
+    },
+}
+
+/// An attempt kind that is owed a wall-time floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorKind {
+    Repair,
+    Escalation,
+}
+
+impl AttemptKind {
+    /// The kind of floor this attempt is owed; none for an initial attempt.
+    pub fn floor_kind(self) -> Option<FloorKind> {
+        match self {
+            Self::Initial => None,
+            Self::Repair => Some(FloorKind::Repair),
+            Self::Escalation => Some(FloorKind::Escalation),
+        }
+    }
+}
+
+impl FloorKind {
+    /// The `[execution]` key that sets this kind's wall-time floor.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Repair => "min_repair_seconds",
+            Self::Escalation => "min_escalation_seconds",
+        }
+    }
+
+    /// This kind as a noun with its article, for a sentence a person reads.
+    pub fn with_article(self) -> &'static str {
+        match self {
+            Self::Repair => "a repair",
+            Self::Escalation => "an escalation",
+        }
+    }
 }
 
 /// How serious a reviewer calls one finding.
@@ -837,6 +881,29 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
                     "the total time for the run is exhausted".to_string(),
                     serde_json::json!({ "limit": "total" }),
                 ),
+                Limit::RepairFloor {
+                    kind,
+                    floor_s,
+                    total_left_s,
+                } => {
+                    let key = kind.key();
+                    let detail = format!(
+                        "{} needs {floor_s} s (`[execution] {key}`); the run's total budget \
+                         has {total_left_s} s left; raise `limits.total_seconds` or set \
+                         `{key} = 0`",
+                        kind.with_article()
+                    );
+                    (
+                        detail.clone(),
+                        serde_json::json!({
+                            "limit": "total",
+                            "cause": "repair_floor_exceeds_total",
+                            "floor_s": floor_s,
+                            "total_left_s": total_left_s,
+                            "detail": detail,
+                        }),
+                    )
+                }
             };
             Decision::stop(
                 State::BudgetExhausted,
@@ -1200,11 +1267,35 @@ mod tests {
                 detail: "".into(),
             },
             Limit::Total,
+            Limit::RepairFloor {
+                kind: FloorKind::Repair,
+                floor_s: 600,
+                total_left_s: 212,
+            },
         ] {
             let d = decide(&b, Observation::LimitReached(limit));
             assert_eq!(d.state, State::BudgetExhausted);
             assert_eq!(d.reason, Reason::LimitReached);
         }
+    }
+
+    /// The floor refusal names the attempt with its article and the key
+    /// for its own kind.
+    #[test]
+    fn a_floor_refusal_names_the_kind_with_its_article_and_its_key() {
+        let counters = budget(1, None);
+        let escalation = decide(
+            &counters,
+            Observation::LimitReached(Limit::RepairFloor {
+                kind: FloorKind::Escalation,
+                floor_s: 900,
+                total_left_s: 212,
+            }),
+        );
+        let detail = escalation.detail["detail"].as_str().expect("a sentence");
+        assert!(detail.starts_with("an escalation needs 900 s"), "{detail}");
+        assert!(detail.contains("`min_escalation_seconds = 0`"), "{detail}");
+        assert_eq!(FloorKind::Repair.with_article(), "a repair");
     }
 
     /// SPEC §8, §12: every end retires the worktree — its tree is a

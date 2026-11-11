@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+- **A repair gets a guaranteed wall time (ADR-0014).** A repair or an escalation no longer starts with only what the earlier attempts left of the work budget: it gets at least `[execution] min_repair_seconds` (default 600) or `min_escalation_seconds` (default 900), capped at the effective `max_wall_seconds`. The work budget is extended by the shortfall, paid from the run's total, and `relais explain` shows it on the `worker_dispatched` line (`work_extended_s`). When the total cannot cover the floor, the attempt is not launched and the run ends `budget_exhausted` with `cause: repair_floor_exceeds_total`, naming the key and `limits.total_seconds`. Set a key to `0` for the old behaviour. A policy that names neither key keeps its authority hash, so no trust grant needs renewing. A worker that waits in the admission queue is now launched with no more than the run's total has left; reviewers keep their 300 s floor.
+
 ## v0.54.0
 
 - **relais reads greengate 4.0's names beside the old ones.** A repository's gates come from `greengate.conf` when it has one, else `amont.conf`, and are labelled with the file they came from (`greengate.conf: pre-commit cargo-test`). A `greengate-list-v1` answer from `list --json` is read like `amont-list-v1`, in policy detection and in verification's inventory; a refusal now names both formats. `greengate.conf` is protected repository configuration, as `amont.conf` is. Nothing changes in a repository that still has only `amont.conf`.

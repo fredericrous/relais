@@ -426,7 +426,7 @@ pub struct ArchitectureMapping {
     pub scope: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ExecutionPolicy {
     #[serde(default = "default_max_attempts")]
@@ -487,6 +487,22 @@ pub struct ExecutionPolicy {
     /// declaration while it is the default.
     #[serde(default = "default_verify_timed_out", skip_serializing_if = "is_true")]
     pub verify_timed_out: bool,
+    /// The wall time a repair attempt starts with at least, in seconds: a
+    /// work budget with less left is extended by the shortfall when the
+    /// run's total covers it, else the repair is not launched. Capped at
+    /// the effective `max_wall_seconds`; `0` turns the floor off. Left out
+    /// of the serialized declaration while it is the default.
+    #[serde(
+        default = "default_min_repair_seconds",
+        skip_serializing_if = "is_default_min_repair_seconds"
+    )]
+    pub min_repair_seconds: u64,
+    /// The same floor for an escalation attempt.
+    #[serde(
+        default = "default_min_escalation_seconds",
+        skip_serializing_if = "is_default_min_escalation_seconds"
+    )]
+    pub min_escalation_seconds: u64,
     /// How many identical failing commands, with no edit between, stop a
     /// native worker (SPEC §5). Unset leaves the guard off; below
     /// [`MIN_LOOP_THRESHOLD`] is refused at parse time. Left out of the
@@ -494,6 +510,32 @@ pub struct ExecutionPolicy {
     /// it keeps its authority hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loop_threshold: Option<u32>,
+}
+
+/// What a policy with no `[execution]` table gets. Every field keeps the
+/// value the derived `Default` gave it, because those values are part of
+/// the authority hash of such a policy; only the two wall-time floors,
+/// which are left out of the serialized declaration at their defaults,
+/// take their documented defaults instead of 0 (which would turn them off).
+impl Default for ExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 0,
+            max_repairs_before_escalation: 0,
+            max_wall_seconds: 0,
+            allow_nested_agents: false,
+            max_agent_depth: 0,
+            max_agents_total: 0,
+            repair_effort: RepairEffort::default(),
+            widen_scope_for_tests: false,
+            widen_scope_small_max_files: 0,
+            widen_scope_small_max_lines: 0,
+            verify_timed_out: false,
+            min_repair_seconds: DEFAULT_MIN_REPAIR_SECONDS,
+            min_escalation_seconds: DEFAULT_MIN_ESCALATION_SECONDS,
+            loop_threshold: None,
+        }
+    }
 }
 
 /// What the loop guard does for one native worker: the three states that a
@@ -537,6 +579,25 @@ fn is_default_widen_scope_small_max_files(max_files: &u32) -> bool {
 
 fn is_default_widen_scope_small_max_lines(max_lines: &u32) -> bool {
     *max_lines == DEFAULT_WIDEN_SCOPE_SMALL_MAX_LINES
+}
+
+const DEFAULT_MIN_REPAIR_SECONDS: u64 = 600;
+const DEFAULT_MIN_ESCALATION_SECONDS: u64 = 900;
+
+fn default_min_repair_seconds() -> u64 {
+    DEFAULT_MIN_REPAIR_SECONDS
+}
+
+fn default_min_escalation_seconds() -> u64 {
+    DEFAULT_MIN_ESCALATION_SECONDS
+}
+
+fn is_default_min_repair_seconds(seconds: &u64) -> bool {
+    *seconds == DEFAULT_MIN_REPAIR_SECONDS
+}
+
+fn is_default_min_escalation_seconds(seconds: &u64) -> bool {
+    *seconds == DEFAULT_MIN_ESCALATION_SECONDS
 }
 
 fn is_true(value: &bool) -> bool {
@@ -2390,6 +2451,11 @@ pub struct EffectiveAuthority {
     pub models: BTreeMap<Tier, ModelProfile>,
     pub max_attempts: u32,
     pub max_wall_seconds: u64,
+    /// The wall time a repair starts with at least, capped at
+    /// `max_wall_seconds`; `0` is off.
+    pub min_repair_seconds: u64,
+    /// The same floor for an escalation.
+    pub min_escalation_seconds: u64,
     pub max_repairs_before_escalation: u32,
     /// Agent-tree limits: repo policy intersected with machine
     /// concurrency, the coordinator enforces them per run (SPEC §23).
@@ -2614,6 +2680,8 @@ pub fn effective_authority(
         models,
         max_attempts,
         max_wall_seconds,
+        min_repair_seconds: repo.execution.min_repair_seconds.min(max_wall_seconds),
+        min_escalation_seconds: repo.execution.min_escalation_seconds.min(max_wall_seconds),
         max_repairs_before_escalation: repo.execution.max_repairs_before_escalation,
         allow_nested_agents: repo.execution.allow_nested_agents,
         max_agent_depth,
@@ -4103,6 +4171,73 @@ amont = { mode = "optional", bin = "/opt/amont/bin/amont" }
             a.max_attempts, 5,
             "and a written one past the ceiling does not broaden"
         );
+    }
+
+    /// The repair and escalation floors are left out of the authority hash
+    /// at their defaults and move it when tuned.
+    #[test]
+    fn the_wall_floors_keep_the_authority_hash_at_their_defaults() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let named = |repair: u64, escalation: u64| {
+            RepoPolicy::from_toml_str(&REPO_TOML.replacen(
+                "[execution]\n",
+                &format!(
+                    "[execution]\nmin_repair_seconds = {repair}\n\
+                     min_escalation_seconds = {escalation}\n"
+                ),
+                1,
+            ))
+            .expect("parses")
+        };
+        assert_eq!(repo.execution.min_repair_seconds, 600);
+        assert_eq!(repo.execution.min_escalation_seconds, 900);
+        assert_eq!(repo.authority_hash(), named(600, 900).authority_hash());
+        assert_ne!(repo.authority_hash(), named(0, 900).authority_hash());
+        assert_ne!(repo.authority_hash(), named(600, 1).authority_hash());
+    }
+
+    /// The effective floors never exceed the effective wall time.
+    #[test]
+    fn the_effective_floors_are_capped_at_the_effective_wall_time() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let machine = MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo)))
+            .expect("machine parses");
+        let mut contract = contract();
+        contract.limits = crate::contract::Limits::default();
+        let authority = effective_authority(&repo, &machine, &contract, &identity());
+        assert_eq!(
+            (
+                authority.min_repair_seconds,
+                authority.min_escalation_seconds
+            ),
+            (600, 900),
+            "the fixture's max_wall_seconds is 600 and its floors are 600 and 900, capped at it"
+        );
+        contract.limits.wall_seconds = Some(60);
+        let narrowed = effective_authority(&repo, &machine, &contract, &identity());
+        assert_eq!(narrowed.min_repair_seconds, 60);
+        assert_eq!(narrowed.min_escalation_seconds, 60);
+    }
+
+    /// A policy with no `[execution]` table gets the documented floors, not
+    /// 0, and its serialized declaration (what the authority hash reads)
+    /// names neither key, as before the floors existed.
+    #[test]
+    fn a_policy_without_an_execution_table_keeps_the_default_floors_and_its_hash() {
+        let defaults = ExecutionPolicy::default();
+        assert_eq!(defaults.min_repair_seconds, 600);
+        assert_eq!(defaults.min_escalation_seconds, 900);
+        let declared = serde_json::to_value(&defaults).expect("serializes");
+        assert!(declared.get("min_repair_seconds").is_none(), "{declared}");
+        assert!(
+            declared.get("min_escalation_seconds").is_none(),
+            "{declared}"
+        );
+        // Every other field keeps the value the derived `Default` gave it.
+        assert_eq!(defaults.max_attempts, 0);
+        assert_eq!(defaults.max_wall_seconds, 0);
+        assert!(!defaults.widen_scope_for_tests);
+        assert!(!defaults.verify_timed_out);
     }
 
     /// `retry` is optional: a check without it writes back without the key,
