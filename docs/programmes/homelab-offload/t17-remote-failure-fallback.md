@@ -18,7 +18,7 @@ wait, then local run, then defer to CI, never red) and t26 item 7 (what a
 closed lid does per consumer). Only **worker pods and Coder sessions** are
 open here. Treat the gate cases as closed by reference and keep this ticket
 for workers. The "laptop sleeps" case also overlaps the session handoff
-question in the agents-many-nodes programme (homelab repo, ticket t03), where
+question in the agents-many-nodes programme (homelab repo, ticket an-t03), where
 a session continues on another node instead of falling back.
 
 ## Look at

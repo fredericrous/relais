@@ -27,7 +27,7 @@ coordinator does not have.
 - t26 items 4 and 5, and its build state.
 - `crates/relais/src/quiet.rs:445` and `crates/relais/src/ipc.rs` (the
   local-only endpoint).
-- The agents-many-nodes ticket t01 (homelab repo), which lists which state is
+- The agents-many-nodes ticket an-t01 (homelab repo), which lists which state is
   host-local.
 
 ## Answer looks like
