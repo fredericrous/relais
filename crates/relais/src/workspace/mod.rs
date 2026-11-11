@@ -705,6 +705,7 @@ fn has_conflict_marker(path: &Path) -> Result<bool> {
 pub const PROTECTED_PATH_PREFIXES: &[&str] = &[
     "relais.toml",
     "amont.conf",
+    "greengate.conf",
     ".adr.yaml",
     ".claude/",
     ".relais/",
@@ -1752,6 +1753,8 @@ mod tests {
             ".gitlab-ci.yml",
             "crates/relais/relais.toml",
             "crates/relais/.relais/task.json",
+            "amont.conf",
+            "greengate.conf",
         ] {
             assert!(is_protected_path(path), "{path} is protected");
         }

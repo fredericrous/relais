@@ -2280,7 +2280,12 @@ impl std::fmt::Display for InventoryError {
 
 impl std::error::Error for InventoryError {}
 
-/// Read an `amont-list-v1` envelope. A shape this relais cannot read is
+/// The listing envelopes relais reads: greengate 4.0's, then the one
+/// greengate 3.x and amont print. The only copy; the census of greengate's
+/// hard rename drops the old one.
+pub(crate) const LIST_FORMATS: [&str; 2] = ["greengate-list-v1", "amont-list-v1"];
+
+/// Read a `greengate-list-v1` or `amont-list-v1` envelope. A shape this relais cannot read is
 /// [`InventoryError::Unreadable`] naming what was wrong with it — never
 /// an empty inventory, which would read as "nothing is enforced".
 pub fn parse_amont_list(stdout: &str) -> Result<AmontInventory, InventoryError> {
@@ -2288,11 +2293,12 @@ pub fn parse_amont_list(stdout: &str) -> Result<AmontInventory, InventoryError> 
     let value: serde_json::Value =
         serde_json::from_str(stdout.trim()).map_err(|e| unreadable(format!("not JSON: {e}")))?;
     match value.get("format").and_then(|f| f.as_str()) {
-        Some("amont-list-v1") => {}
+        Some(format) if LIST_FORMATS.contains(&format) => {}
         other => {
             return Err(unreadable(format!(
-                "envelope format is {}, not `amont-list-v1`",
-                other.unwrap_or("absent")
+                "envelope format is {}, not `{}`",
+                other.unwrap_or("absent"),
+                LIST_FORMATS.join("` or `")
             )))
         }
     }
@@ -5157,6 +5163,15 @@ mod tests {
         assert!(
             followed_took <= silent_took + allowed,
             "followed {followed_took:?} against {silent_took:?} without the follower"
+        );
+    }
+
+    #[test]
+    fn greengate_names_the_same_list_envelope() {
+        let renamed = AMONT_SAMPLE.replace("amont-list-v1", "greengate-list-v1");
+        assert_eq!(
+            parse_amont_list(&renamed).expect("greengate-list-v1 parses"),
+            parse_amont_list(AMONT_SAMPLE).expect("amont-list-v1 parses"),
         );
     }
 

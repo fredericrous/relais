@@ -286,27 +286,39 @@ const AMONT_LIST_TIMEOUT: Duration = Duration::from_secs(10);
 /// amont's declared `block` checks: seen, never proposed. Their command
 /// column is a shell line, and a policy names argv, never shell recipes
 /// (SPEC §6). amont is asked: declared checks whose line says `block`
-/// (see [`declares_block`]), so neither a machine's `amont.severity.*`
-/// overrides nor whether this clone trusts its `amont.conf` changes the
-/// answer. Without a usable answer the file is read directly, and a note
+/// (see [`declares_block`]), so neither a machine's severity overrides
+/// nor whether this clone trusts its gate manifest (`greengate.conf`, else
+/// `amont.conf`) changes the answer. Without a usable answer the file is read directly, and a note
 /// says so.
 fn amont_gates(root: &Path, amont: Option<&Path>, notes: &mut Vec<String>) -> Vec<Skipped> {
-    if !root.join("amont.conf").is_file() {
+    let Some(manifest) = gate_manifest(root) else {
         return Vec::new();
-    }
+    };
     let why = match amont {
         None => "amont not found".to_string(),
-        Some(bin) => match amont_list(bin, root) {
+        Some(bin) => match amont_list(bin, root, manifest) {
             Ok(gates) => return gates,
             Err(why) => why,
         },
     };
-    notes.push(format!("{why}; reading amont.conf directly (deprecated)"));
-    amont_conf_gates(root)
+    notes.push(format!("{why}; reading {manifest} directly (deprecated)"));
+    amont_conf_gates(root, manifest)
+}
+
+/// The gate's manifest names: greengate 4.0's first, then the one greengate
+/// 3.x and amont read, kept until the fleet sweep has renamed every
+/// repository's (the census of greengate's hard rename removes it).
+const GATE_MANIFESTS: [&str; 2] = ["greengate.conf", "amont.conf"];
+
+/// The manifest this repository declares its gates in, the new name winning.
+fn gate_manifest(root: &Path) -> Option<&'static str> {
+    GATE_MANIFESTS
+        .into_iter()
+        .find(|name| root.join(name).is_file())
 }
 
 /// The declared block checks, as `amont list --json` reports them.
-fn amont_list(bin: &Path, root: &Path) -> Result<Vec<Skipped>, String> {
+fn amont_list(bin: &Path, root: &Path, manifest: &str) -> Result<Vec<Skipped>, String> {
     let mut command = std::process::Command::new(bin);
     command.args(["list", "--json"]).current_dir(root);
     let end = crate::procs::run_with_timeout(command, AMONT_LIST_TIMEOUT, None, None)
@@ -319,8 +331,14 @@ fn amont_list(bin: &Path, root: &Path) -> Result<Vec<Skipped>, String> {
     }
     let listing: serde_json::Value = serde_json::from_str(&end.stdout)
         .map_err(|_| "amont list --json printed no JSON".to_string())?;
-    if listing["format"] != "amont-list-v1" {
-        return Err("amont list --json is not amont-list-v1".into());
+    if !listing["format"]
+        .as_str()
+        .is_some_and(|format| crate::verify::LIST_FORMATS.contains(&format))
+    {
+        return Err(format!(
+            "amont list --json is not {}",
+            crate::verify::LIST_FORMATS.join(" or ")
+        ));
     }
     let checks = listing["checks"]
         .as_array()
@@ -328,13 +346,19 @@ fn amont_list(bin: &Path, root: &Path) -> Result<Vec<Skipped>, String> {
     let mut gates: Vec<Skipped> = checks
         .iter()
         .filter(|c| c["source"] == "declared" && declares_block(c))
-        .filter_map(|c| Some(gate(c["stage"].as_str()?, c["short_name"].as_str()?)))
+        .filter_map(|c| {
+            Some(gate(
+                manifest,
+                c["stage"].as_str()?,
+                c["short_name"].as_str()?,
+            ))
+        })
         .collect();
     gates.sort_by(|a, b| a.what.cmp(&b.what));
     Ok(gates)
 }
 
-/// Does this listing entry's `amont.conf` line say `block`? Its
+/// Does this listing entry's gate-manifest line say `block`? Its
 /// `manifest_severity` (amont 1.58) is the line's own word, trusted or not;
 /// `declared_severity` reads `warn` for a check that cannot run, an
 /// untrusted one included, and serves only an amont that predates it.
@@ -345,10 +369,10 @@ fn declares_block(check: &serde_json::Value) -> bool {
     }
 }
 
-/// The fallback: amont.conf's `block` lines, read as text. Deprecated —
+/// The fallback: the gate manifest's `block` lines, read as text. Deprecated —
 /// the grammar is amont's — and kept for a machine without amont.
-fn amont_conf_gates(root: &Path) -> Vec<Skipped> {
-    let Ok(text) = std::fs::read_to_string(root.join("amont.conf")) else {
+fn amont_conf_gates(root: &Path, manifest: &str) -> Vec<Skipped> {
+    let Ok(text) = std::fs::read_to_string(root.join(manifest)) else {
         return Vec::new();
     };
     let mut gates: Vec<Skipped> = text
@@ -360,7 +384,7 @@ fn amont_conf_gates(root: &Path) -> Vec<Skipped> {
             }
             let fields: Vec<&str> = line.split_whitespace().collect();
             match fields.as_slice() {
-                [stage, name, _scope, "block", _command, ..] => Some(gate(stage, name)),
+                [stage, name, _scope, "block", _command, ..] => Some(gate(manifest, stage, name)),
                 _ => None,
             }
         })
@@ -370,9 +394,9 @@ fn amont_conf_gates(root: &Path) -> Vec<Skipped> {
 }
 
 /// One skipped gate, labelled the same whichever way it was read.
-fn gate(stage: &str, name: &str) -> Skipped {
+fn gate(manifest: &str, stage: &str, name: &str) -> Skipped {
     Skipped {
-        what: format!("amont.conf: {stage} {name}"),
+        what: format!("{manifest}: {stage} {name}"),
         reason: "not a plain command".into(),
     }
 }
@@ -848,7 +872,7 @@ mod tests {
                 "detect-amont-format",
                 r#"{"format":"amont-list-v2","checks":[]}"#,
                 0,
-                "amont list --json is not amont-list-v1",
+                "amont list --json is not greengate-list-v1 or amont-list-v1",
             ),
         ] {
             let dir = amont_repo(label);
@@ -861,6 +885,56 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    #[test]
+    fn a_greengate_conf_wins_over_amont_conf_and_names_its_gates() {
+        let dir = amont_repo("detect-greengate-conf");
+        std::fs::write(
+            dir.join("greengate.conf"),
+            "pre-push  clippy  *.rs  block  cargo clippy\n",
+        )
+        .expect("greengate.conf");
+        let proposal = detect_policy_with(&dir, None);
+        assert_eq!(
+            proposal.notes,
+            ["amont not found; reading greengate.conf directly (deprecated)"]
+        );
+        assert_eq!(
+            proposal.skipped,
+            [Skipped {
+                what: "greengate.conf: pre-push clippy".into(),
+                reason: "not a plain command".into(),
+            }]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_greengate_list_envelope_is_read() {
+        let dir = amont_repo("detect-greengate-list");
+        let bin = fake_amont(
+            &dir,
+            &LISTING.replace("amont-list-v1", "greengate-list-v1"),
+            0,
+        );
+        let proposal = detect_policy_with(&dir, Some(&bin));
+        assert_eq!(proposal.skipped, the_cargo_test_gate());
+        assert!(proposal.notes.is_empty(), "{:?}", proposal.notes);
+
+        // A swept repository: greengate answers for greengate.conf, and the
+        // gates are labelled with the manifest they came from.
+        std::fs::write(dir.join("greengate.conf"), AMONT_CONF).expect("greengate.conf");
+        std::fs::remove_file(dir.join("amont.conf")).expect("amont.conf gone");
+        let proposal = detect_policy_with(&dir, Some(&bin));
+        assert_eq!(
+            proposal.skipped,
+            [Skipped {
+                what: "greengate.conf: pre-commit cargo-test".into(),
+                reason: "not a plain command".into(),
+            }]
+        );
+        assert!(proposal.notes.is_empty(), "{:?}", proposal.notes);
     }
 
     #[test]
