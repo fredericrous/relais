@@ -234,6 +234,15 @@ impl AttemptKind {
             Self::Escalation => Some("min_escalation_seconds"),
         }
     }
+
+    /// This kind as a noun with its article, for a sentence a person reads.
+    pub fn with_article(self) -> &'static str {
+        match self {
+            Self::Initial => "an initial attempt",
+            Self::Repair => "a repair",
+            Self::Escalation => "an escalation",
+        }
+    }
 }
 
 /// How serious a reviewer calls one finding.
@@ -863,10 +872,10 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
                 } => {
                     let key = kind.floor_key().unwrap_or("min_repair_seconds");
                     let detail = format!(
-                        "a {} needs {floor_s} s (`[execution] {key}`); the run's total budget \
+                        "{} needs {floor_s} s (`[execution] {key}`); the run's total budget \
                          has {total_left_s} s left; raise `limits.total_seconds` or set \
                          `{key} = 0`",
-                        kind.as_str()
+                        kind.with_article()
                     );
                     (
                         detail.clone(),
@@ -1252,6 +1261,25 @@ mod tests {
             assert_eq!(d.state, State::BudgetExhausted);
             assert_eq!(d.reason, Reason::LimitReached);
         }
+    }
+
+    /// The floor refusal names the attempt with its article and the key
+    /// for its own kind.
+    #[test]
+    fn a_floor_refusal_names_the_kind_with_its_article_and_its_key() {
+        let b = budget(1, None);
+        let escalation = decide(
+            &b,
+            Observation::LimitReached(Limit::RepairFloor {
+                kind: AttemptKind::Escalation,
+                floor_s: 900,
+                total_left_s: 212,
+            }),
+        );
+        let detail = escalation.detail["detail"].as_str().expect("a sentence");
+        assert!(detail.starts_with("an escalation needs 900 s"), "{detail}");
+        assert!(detail.contains("`min_escalation_seconds = 0`"), "{detail}");
+        assert_eq!(AttemptKind::Repair.with_article(), "a repair");
     }
 
     /// SPEC §8, §12: every end retires the worktree — its tree is a

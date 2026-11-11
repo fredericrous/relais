@@ -402,9 +402,9 @@ impl<'a> RunEngine<'a> {
             let key = kind.floor_key().unwrap_or("min_repair_seconds");
             dispatched_detail["work_extended_s"] = serde_json::json!(extended_s);
             dispatched_detail["detail"] = serde_json::json!(format!(
-                "a {} was extended by {extended_s} s to its {} s floor (`[execution] {key}`), \
+                "{} was extended by {extended_s} s to its {} s floor (`[execution] {key}`), \
                  paid from the total budget",
-                kind.as_str(),
+                kind.with_article(),
                 floor.as_secs()
             ));
         }
