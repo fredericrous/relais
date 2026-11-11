@@ -81,3 +81,15 @@ Kubernetes-recorded outcome.**
 
 Decided as staff engineer under the 2026-10-31 delegation, from t21, t22, t23
 and t25.
+
+## Update 2026-11-11 (review): the first slice as planned cannot run
+
+The detached lane's `eligible` takes only pre-push externals
+(`detached.rs:149-170`, greengate v3.1.0). relais declares `module-cycles` and
+`child-cycles-*` at **pre-commit** with no pre-push twin (`amont.conf:46-54`),
+so a rehearsal would print "no gate of this rehearsal can go to the cluster".
+The homelab plan's phase-3 check ("`git push` skips the cycle gates") cannot
+pass as written. Those gates fit the Job lane at commit, or need pre-push
+twins. Phase 3 (set the keys, mark the gates, run closed-lid) was also never
+done: no `amont.cluster.*` key is set on the laptop and no repository declares
+`platform=any`.

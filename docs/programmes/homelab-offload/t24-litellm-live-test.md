@@ -2,7 +2,7 @@
 type = "research"
 mode = "hitl"
 status = "open"
-blocked_by = ["t27-cliproxy-on-homelab", "t28-oauth-account-owner"]
+blocked_by = []
 repos = ["homelab", "relais"]
 +++
 # Does a pod reach Claude, Codex and Qwen end to end through the homelab CLIProxyAPI
@@ -24,6 +24,16 @@ access key and nothing else:
 
 It is hitl: the person signs the OAuth accounts in through the management
 center.
+
+## Progress 2026-11-11
+
+t27 and t28 are closed, so nothing blocks this ticket. The person tested one
+thing themselves: **the CLIProxyAPI is reachable from the cluster.** The
+checks above (Claude Code streaming and tool use, Codex and Qwen, prompt
+caching, ledger spend, quota behaviour) are **not yet tested**, so the ticket
+stays open. A Coder workspace pod (namespace `code-server`) is a second client
+worth testing; the shared token budget across nodes is the open question
+tracked in the agents-many-nodes programme (homelab repo).
 
 ## Look at
 

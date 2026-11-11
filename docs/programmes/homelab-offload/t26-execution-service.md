@@ -180,3 +180,33 @@ ADR-0016), homelab (pull-mirrors, the snapshot org, Argo namespace and
 template, CNP, RBAC) and relais (collect, a remote run state). Its first
 slice is `amont rehearse --cluster` end to end.
 
+
+## Build state 2026-11-11
+
+A review of greengate (v3.1.0) against this Resolution. The detached lane
+(ADR-0017: `rehearse --cluster`, `cluster collect`, collect at hook start, the
+Forgejo snapshot and mirror fetch, the laptop-signed `x86_64-linux` block) is
+built and released. These parts are **not built**:
+
+- **A `gate-run` WorkflowTemplate, Argo semaphores and artifacts.** The
+  Workflow is an inline spec with `parallelism: 1` and a 48 h TTL
+  (`workflow.rs:191-199,417`), not a 7-day result. The Argo controller has no
+  `artifactRepository` configured, so "the artifact store already exists"
+  holds for the Ceph object store only, not for Argo.
+- **Placement by load** (item 6). A gate goes to the cluster whenever
+  `executor cluster` is set; the detached lane is chosen only by `--cluster`
+  or `amont.rehearse.cluster`.
+- **An in-cluster signer, and relais collect with a "running remotely" state.**
+- **Detached pre-commit gates.** `eligible` takes only pre-push externals
+  (`detached.rs:149-170`). relais declares `module-cycles` and `child-cycles-*`
+  at pre-commit with no pre-push twin, so the first slice as planned would
+  print "no gate of this rehearsal can go to the cluster". They fit the Job
+  lane, or need pre-push twins.
+- **Enabling it.** No `amont.cluster.*` key is set on the laptop and no
+  repository declares `platform=any` or `executor cluster`: phase 3 never ran,
+  and its live checks (a closed-lid run, a held notes-ref lock, collect within
+  300 ms, a pod at the 4Gi ceiling) are unrecorded.
+- **Names change at greengate 4.0** (a local branch, `feat/greengate-hard-rename`,
+  not on origin): `amont.cluster.*` becomes `greengate.*`, `AMONT_*` becomes
+  `GREENGATE_*`, the run label `amont.run` becomes `greengate.run`, and the
+  homelab namespace `amont-gates` has an unticked cutover to `greengate-gates`.

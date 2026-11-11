@@ -73,3 +73,15 @@ it only for gates `amont.conf` declares platform-independent.**
   - Where the pod's signing key lives: t25.
 - **Correction to the map:** stamps are not keyed by platform; attestations
   are.
+
+## Built state 2026-11-11
+
+A review of the greengate code (`dispatch.rs:1994-2021`, `attest.rs:182-260`,
+`run_stamp.rs:558-580`) found the design built the other way round in one
+place. The laptop does not convert a pod's attestation into a local stamp. It
+signs a separate `x86_64-linux` attestation block for the gates the cluster
+proved, and never writes a local token for them (`dispatch.rs:526-528`).
+`amont stamps` passes the `platform=any` gate ids to the verifier as
+`anywhere`. The sentence "a remote executor must never stamp" survives only in
+ADR-0015's text (`adr/0015-a-runner-earns-the-stamp.md:67`); the code obeys
+its intent, not its letter. t25 is reopened for the signing questions.
