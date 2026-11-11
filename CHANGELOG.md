@@ -8,6 +8,11 @@ missing here.
 
 ## Unreleased
 
+## v0.54.0
+
+- **relais reads greengate 4.0's names beside the old ones.** A repository's gates come from `greengate.conf` when it has one, else `amont.conf`, and are labelled with the file they came from (`greengate.conf: pre-commit cargo-test`). A `greengate-list-v1` answer from `list --json` is read like `amont-list-v1`, in policy detection and in verification's inventory; a refusal now names both formats. `greengate.conf` is protected repository configuration, as `amont.conf` is. Nothing changes in a repository that still has only `amont.conf`.
+- **A `kind: verify` contract relais cannot write is now recorded, not dropped.** The run's message says why the verify command is missing.
+
 ## v0.53.0
 
 - **A worker that hits its wall time no longer loses its work (ADR-0012).** relais now confirms the worker stopped, keeps the tree it left as the attempt's candidate, and answers the run itself with a `kind: verify` successor that checks and reviews it. The run ends `cancelled (timed_out_verify_queued)` and exits 7, not 6 (interrupted): a script that branched on 6 for a wall-time end should also handle 7 with that code. `[execution] verify_timed_out = false` restores the old stop.
