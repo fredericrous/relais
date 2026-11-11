@@ -40,7 +40,11 @@ finding that OSD disk I/O is the binding limit.
 
 ## Answer looks like
 
-One row per option: what it caches, where it runs, the egress it needs, the
-disk and I/O it costs, and a measured cold vs. warm build time of
-amont's workspace in a wk-3 pod. Then one line: the option the first Rust
-slice uses, or that Rust gates stay on the laptop and why.
+A desk answer, with no cluster pod run. One row per option: what it caches,
+where it runs, the egress it needs, and the disk and I/O it costs on wk-3.
+Then one line: the option the first Rust slice uses, or that no cache is
+needed yet and why.
+
+A measured cold vs. warm build in a wk-3 pod is **not** part of this ticket.
+It is needed only once a cache option is chosen, and it then becomes its own
+ticket, with the chosen option as its question.
