@@ -210,11 +210,16 @@ impl<'a> RunEngine<'a> {
 
         drop(queued);
         // The queue spent part of the total after the wall time was chosen:
-        // a queued worker never runs past what the total has left.
-        spec.wall_timeout = spec
-            .wall_timeout
-            .min(self.budgets.total_remaining())
-            .max(Duration::from_secs(1));
+        // a queued worker never runs past what the total has left. Only a
+        // worker: a reviewer keeps its `REVIEW_MIN_WALL` floor, which may
+        // run past the total by design (review/engine.rs). The ungated path
+        // above never queues, so it needs no cut.
+        if spec.agent == crate::runner::AgentKind::Worker {
+            spec.wall_timeout = spec
+                .wall_timeout
+                .min(self.budgets.total_remaining())
+                .max(Duration::from_secs(1));
+        }
         let lease_key = write_lease.map(|path| path.to_string_lossy().into_owned());
         if let Some(key) = lease_key.as_deref() {
             match gate.acquire_write(&spec.dispatch_id, key) {

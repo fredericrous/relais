@@ -585,6 +585,55 @@ fn a_queued_worker_is_launched_with_no_more_than_the_total_has_left() {
     );
 }
 
+/// The queue cut applies to workers only: a reviewer launched through the
+/// gate with less of the total left than `REVIEW_MIN_WALL` still gets that
+/// floor (review/engine.rs), as it did before the cut existed.
+#[test]
+fn a_gated_reviewer_keeps_its_own_floor_when_the_total_is_low() {
+    let (fixture, skew) = skewed_fixture();
+    let repo = floored_repo(&fixture);
+    let machine = fixture.machine_for(&repo);
+    let gate =
+        crate::admission::LocalGate::new(ConcurrencyLimits::default(), crate::ledger::now_rfc3339);
+    let review_walls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = Arc::clone(&review_walls);
+    let backend = MockBackend::new(move |spec| {
+        if spec.prompt.contains("semantic reviewer") {
+            record
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(spec.wall_timeout);
+            return MockOutcome {
+                result_text: Some("FINDINGS: none".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            };
+        }
+        // The worker fixes the tree and takes 90 s of the 150 s total.
+        skew.fetch_add(90, Ordering::SeqCst);
+        std::fs::remove_file(spec.work_dir.join("src/main.rs"))
+            .expect("the worker removes the file its check fails on");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let mut contract = fixture.contract(Review::Required);
+    contract.limits.total_seconds = Some(150);
+    let outcome = fixture.execute_managed(&contract, &repo, &machine, &backend, &gate);
+    let walls = review_walls.lock().unwrap().clone();
+    assert!(!walls.is_empty(), "a reviewer was launched: {outcome:?}");
+    assert!(
+        walls
+            .iter()
+            .all(|wall| *wall >= super::super::review::REVIEW_MIN_WALL),
+        "the reviewer keeps its floor although the total had under 60 s left: {walls:?}"
+    );
+}
+
 #[test]
 fn a_spent_admission_wait_blocks_the_repair_even_though_the_total_covers_its_floor() {
     // The first attempt queued 100 s (budget 60 s) and then worked 120 s
