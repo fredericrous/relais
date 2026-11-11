@@ -1,7 +1,7 @@
 +++
 type = "grilling"
 mode = "hitl"
-status = "open"
+status = "closed"
 blocked_by = ["t22-stamp-from-remote-run"]
 repos = ["amont", "homelab"]
 +++
@@ -112,3 +112,30 @@ The decision to reopen is the person's. The follow-on design (node identity,
 a key registry, what a node may sign) belongs in the agents-many-nodes
 programme (homelab repo), ticket an-t07. Signing and verification stay in
 greengate, which is public under MIT.
+
+## Amended 2026-11-11 (delegated, closed again)
+
+Decided as architect on the person's delegation, 2026-11-11, together with
+agents-many-nodes an-t07 (homelab repo), which owns node identity. The core of
+the 2026-11-01 Resolution stands:
+- no key in a pod;
+- no signer reachable from repo code;
+- the verdict comes from facts Kubernetes recorded;
+- one Job per gate;
+- Job creation is fenced.
+
+What changes is who may sign: **any node with a valid certificate**, not only
+the laptop. Each item of the reopen note is ruled on below.
+
+| Reopen finding | Ruling |
+|---|---|
+| The signed block has no image id, job or command (they sit in the unsigned `refs/notes/amont-gate-cluster`) | **Deferred, accepted for now.** The git-attest format change waits until a verifier needs to tell a cluster-derived block from a CI one. Until then the node id travels in the certificate (an-t07: `find-principals` returns `node-<id>`), and a cluster-derived block is signed only by a node, never by CI. |
+| The proven set is process memory (`cluster.rs:75`, `PROVED`) | **Fix in the build.** A node signs a cluster-proven gate from the Job's facts read again from the Kubernetes API at signing time (Complete, the fetch container's `tree` message, the gate container's exit code, `status.imageID`), never from the unsigned note and never from memory. A collect after a restart can then sign. |
+| The key is one unencrypted file (`~/.ssh/amont-attest`) | **Replaced by an-t07.** It becomes a per-node key with a 7-day SSH certificate. A copied key is worth at most 7 days, and revoking the machine in Happier stops renewal. The plain-key line in `allowed_signers` retires with the rollout. |
+| "The laptop is the only signer" fails with several nodes | **Dropped.** Any node whose certificate lists `platform:x86_64-linux` may sign a cluster-proven `platform=any` gate (ADR-0053) under the rules above. Pods are executions, not nodes: never a key. A Happier daemon running in the cluster is a node, and it has no Job-create in the runner namespace. |
+| relais greps `amont attest covered` instead of verifying | **Unchanged by this ticket, recorded.** By `ci.attestation-implementation` (ADR-0037), verification belongs to git-attest. relais should call git-attest's verifier through greengate's published surface rather than parse output. That is a relais change of its own, not part of signing. |
+
+**Signing scope** is unchanged: platform `x86_64-linux`, only for gates
+whose trusted `amont.conf` declares `platform=any`. The scope is now
+enforced by the certificate's `platform:` principals, as well as by the
+signer.
