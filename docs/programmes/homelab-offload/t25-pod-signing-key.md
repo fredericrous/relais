@@ -113,6 +113,31 @@ a key registry, what a node may sign) belongs in the agents-many-nodes
 programme (homelab repo), ticket an-t07. Signing and verification stay in
 greengate, which is public under MIT.
 
+## Short term: one in-cluster signer (the person, 2026-11-11)
+
+The person's short-term target is ephemeral agent containers on Kubernetes,
+not long-lived nodes. They chose **one in-cluster signer**. This replaces
+both "the laptop signs" and "any node with a certificate" until long-lived
+nodes exist. The full design is in agents-many-nodes an-t07 (homelab repo).
+In short:
+- `attest-signer` runs in its own namespace, with no Service and ingress
+  denied. Nothing calls it, which answers the 2026-11-01 objection to a
+  cluster signer: egress is now enforced per namespace.
+- It watches finished gate Jobs in `amont-gates` with a read-only
+  ServiceAccount. It signs from the Kubernetes-recorded facts listed below,
+  read again at signing time.
+- It signs platform `x86_64-linux` only, for `platform=any` gates.
+- It has no git credentials. The collector publishes the signed block.
+- One Vault-held ed25519 key, principal `cluster-signer`, in each
+  `allowed_signers` file.
+- Ephemeral agent pods have no key and no identity. They run in a namespace
+  with no Job-create in `amont-gates`.
+
+The rulings below still hold, with "a node with a valid certificate" read as
+"the in-cluster signer" for now. The exception is the unencrypted-key row:
+that key is now the signer's Vault-held key, and the certificate path is
+deferred to long-lived nodes.
+
 ## Amended 2026-11-11 (delegated, closed again)
 
 Decided as architect on the person's delegation, 2026-11-11, together with
