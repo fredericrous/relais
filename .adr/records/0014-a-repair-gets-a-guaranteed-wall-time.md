@@ -24,5 +24,6 @@ ADR-0010 made the work budget the run's: every attempt starts with what is left 
 
 - One run's work can exceed `max_wall_seconds` by up to `max_attempts − 1` floors, always within the total; a contract with a 60 s wall gets 60 s floors, so its work can reach about 60 s × `max_attempts`.
 - The verification of an extended repair still clips to what the budgets have left.
+- A worker of any kind that waited in the admission queue after its wall time was chosen is launched with no more than the total has left, so a queued worker never runs past the total. A reviewer keeps its own floor (`REVIEW_MIN_WALL`), as before.
 - A policy with no `[execution]` table keeps the default floors and its authority hash; both keys are left out of the declaration at their defaults, and a tuned recipe may not change them.
 - Check 14 days after the release: repair and escalation attempts that end at their wall time per week (from about 5.1) and the outcomes of extended attempts. Roll back by setting both keys to `0` if over at least 6 extended attempts more than half still time out or fail.
