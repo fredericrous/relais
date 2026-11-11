@@ -104,7 +104,7 @@ A repair or escalation either gets at least its floor, paid from the run's total
     - an Initial attempt is never extended;
     - an escalation uses `min_escalation_seconds`.
     - `wall_seconds_caps_the_work_and_nothing_else` (L205) is updated: it sets `min_repair_seconds = 0` to keep its refusal, and a sibling asserts the 1 s extension.
-- [ ] Phase 4 — Decision and docs: `.adr/records/0014-a-repair-gets-a-guaranteed-wall-time.md`, `.adr/records/HEADS.md`, `docs/SPEC.md`, `CHANGELOG.md`
+- [x] Phase 4 — Decision and docs: `.adr/records/0014-a-repair-gets-a-guaranteed-wall-time.md`, `.adr/records/HEADS.md`, `docs/SPEC.md`, `CHANGELOG.md`
   - ADR-0014 supersedes the `execution.resource-budgets` head (ADR-0010). The head keeps the four budgets and adds: a repair or escalation starts with at least its floor; the work budget is extended by the shortfall within `total`, and is recorded; otherwise the attempt is not launched.
   - SPEC: §9 L381 (work budget), §10 L438 (the "smaller of its own timeout and what is left" sentence gains the exception), and the `[execution]` key reference.
   - CHANGELOG `## Unreleased`.
