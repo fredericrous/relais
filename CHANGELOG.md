@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.57.0
+
 - **relais sizes the host queue from the same cores and keys as greengate (greengate ADR-0021).** A command queued on the host slots now runs `weight × cores / slots cap` jobs wide, counting the physical cores the slots count, so a weight means the same width whoever holds it. On a 6-core, 12-thread laptop that is 2 wide where relais ran 4 (its logical count over its own coordinator cap); with no host queue (`shared_host_slots = "off"`, or `greengate.hostSlots 0`) the coordinator's cap shares the cores as before. relais reads `GREENGATE_HOST_SLOTS` / `GREENGATE_HOST_CORES` and `greengate.hostSlots` / `greengate.hostCores` through the slots crate, so nothing needs copying by hand: `[resources] host_slots` is deprecated (it still wins; `relais doctor` says so and names a mismatch), and `greengate.hostSlots 0` leaves the host slots off for relais too. The coordinator's own default cap is unchanged, a quarter of the logical cores. A command queued nowhere (slots off, or a slot directory refused) keeps the coordinator's share. `GREENGATE_HOST_SLOTS` outranks `host_slots`, and `host_slots = 0` turns the host slots off; whichever setting turns them off, the run's note and the doctor name it and how to undo it. Wait lines in `waits.jsonl` carry the width (`jobs`), `cap` and `cores`. `relais doctor` prints in words how many jobs a weight-1 command runs, says which `host_slots` value applies and which setting turned the slots off, warns of a host key it could not read or a `--global` config git could not read, and warns of an `amont.hostSlots` / `amont.hostCores` that greengate 4.0 no longer reads (`greengate migrate --global`). Uses `greenharness-slots` 4.0.0, the version already linked.
 
 ## v0.56.0
