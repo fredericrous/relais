@@ -1,0 +1,13 @@
+amont-attest-v2
+tree ca3cf7555ef17f51bfd200fb57a0f07a9fa7fe3a
+gates pre-push-cargo-test
+platform x86_64-linux
+canon b824d001958c11074cbb3b1a43b104bf42664d9d
+amont attest-sign-ubuntu-latest
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgwe+FHUie+0YKuEzx3YjiV6jyIC
+F0veynb1B9mEPADfwAAAAMYW1vbnQtYXR0ZXN0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3Nz
+aC1lZDI1NTE5AAAAQMES8FQ5eU/ECAQbBg03b/oqm9ufBQON3DBGZLmFObBMPaYlQpCx67
+9tmKdAHyzT752vDajKsfSxPq7eOPOBxwc=
+-----END SSH SIGNATURE-----
