@@ -377,8 +377,9 @@ pub(crate) fn heavy_findings(
             }
         ),
     };
-    let under_host_slot = shared != Some("off") && plan.sizing.is_some();
-    let (shares, by) = crate::verify::host_share(plan.machine, plan.sizing, under_host_slot, cap);
+    let placement =
+        crate::verify::Placement::from_held(shared != Some("off") && plan.sizing.is_some());
+    let (shares, by) = crate::verify::host_share(plan.machine, plan.sizing, placement, cap);
     let jobs = crate::verify::parallelism(1, plan.machine.cores, shares);
     let mut findings =
         vec![
@@ -3846,7 +3847,8 @@ mod tests {
         )
     }
 
-    fn global(key: &str, value: &str) -> (String, String, String) {
+    /// One `--global` git config row, as the crate reads it.
+    fn global_row(key: &str, value: &str) -> (String, String, String) {
         ("global".into(), key.to_ascii_lowercase(), value.into())
     }
 
@@ -3952,7 +3954,7 @@ mod tests {
         let by_git = heavy_findings(
             &machine_with(""),
             16,
-            &host_with(|_| None, &[global("greengate.hostSlots", "0")], 8),
+            &host_with(|_| None, &[global_row("greengate.hostSlots", "0")], 8),
             &NONE,
         );
         assert!(

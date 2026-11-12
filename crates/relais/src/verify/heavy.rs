@@ -271,19 +271,40 @@ pub fn overweight<'c>(
 /// both tools link, so a weight means the same width whoever holds it.
 pub use greenharness_slots::parallelism;
 
+/// Where a command runs, for its width: under a host slot (its own or an
+/// ancestor's), or queued only on the coordinator's tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    UnderHostSlot,
+    CoordinatorOnly,
+}
+
+impl Placement {
+    /// [`Placement::UnderHostSlot`] when `held`, else the coordinator's.
+    pub fn from_held(held: bool) -> Self {
+        if held {
+            Placement::UnderHostSlot
+        } else {
+            Placement::CoordinatorOnly
+        }
+    }
+}
+
 /// The cap a command's width divides the cores by, and its name for the
-/// doctor: the host slots' cap when the command runs under a host slot (its
-/// own, or an ancestor's), else the coordinator's `cap`. Pure: the one rule
-/// the admission and `relais doctor` both apply.
+/// doctor: the host slots' cap for a command under a host slot, else the
+/// coordinator's `cap`. Pure: the one rule the admission and `relais doctor`
+/// both apply.
 pub fn host_share(
     machine: greenharness_slots::Machine,
     sizing: Option<greenharness_slots::Sizing>,
-    under_host_slot: bool,
+    placement: Placement,
     coordinator_cap: u32,
 ) -> (u32, &'static str) {
-    match sizing {
-        Some(sizing) if under_host_slot => (sizing.cap_for(machine.cores), "slots"),
-        Some(_) | None => (coordinator_cap, "coordinator"),
+    match (sizing, placement) {
+        (Some(sizing), Placement::UnderHostSlot) => (sizing.cap_for(machine.cores), "slots"),
+        (Some(_) | None, Placement::UnderHostSlot | Placement::CoordinatorOnly) => {
+            (coordinator_cap, "coordinator")
+        }
     }
 }
 
@@ -502,8 +523,8 @@ impl<'a> HeavyAdmission<'a> {
     /// slot (its own or an ancestor's) the weight's share of the slots'
     /// cores, as a greengate holder of the same weight gets; otherwise the
     /// coordinator's cap shares the same cores ([`host_share`]).
-    pub(crate) fn width(&self, weight: u32, under_host_slot: bool) -> u32 {
-        let (shares, _) = host_share(self.machine, Some(self.sizing), under_host_slot, self.cap);
+    pub(crate) fn width(&self, weight: u32, placement: Placement) -> u32 {
+        let (shares, _) = host_share(self.machine, Some(self.sizing), placement, self.cap);
         parallelism(weight, self.machine.cores, shares)
     }
 
@@ -515,13 +536,12 @@ impl<'a> HeavyAdmission<'a> {
         &self,
         weight: u32,
         own: &BTreeMap<String, String>,
-        under_host_slot: bool,
+        placement: Placement,
     ) -> BTreeMap<String, String> {
         if !self.manages() {
             return own.clone();
         }
-        let mut environment =
-            child_environment(self.width(weight, under_host_slot), &BTreeMap::new());
+        let mut environment = child_environment(self.width(weight, placement), &BTreeMap::new());
         if self.ancestor_holds_slots {
             environment.insert(HOST_SLOT_ENV.to_string(), "held".to_string());
         }
@@ -643,7 +663,11 @@ impl<'a> HeavyAdmission<'a> {
         // Before a host slot is held, the width is the coordinator's share
         // (or the slots' when an ancestor holds them): a command that ends
         // up queued nowhere must not run narrower than the coordinator gives.
-        let environment = self.environment(ask.weight, ask.env, self.ancestor_holds_slots);
+        let environment = self.environment(
+            ask.weight,
+            ask.env,
+            Placement::from_held(self.ancestor_holds_slots),
+        );
         let Some(gate) = self.gate else {
             if self.manages() {
                 self.wait_for_disk(self.disk.estimate(ask.label), ask.cancel)?;
@@ -731,7 +755,7 @@ impl<'a> HeavyAdmission<'a> {
                 if let Some(held) = slots::take(dir, ask, self, &mut queue, gate, &lease.id)? {
                     lease.slots = Some(held);
                     // Under its own host slot: the slots' share, as greengate gives.
-                    lease.env = self.environment(ask.weight, ask.env, true);
+                    lease.env = self.environment(ask.weight, ask.env, Placement::UnderHostSlot);
                     lease
                         .env
                         .insert(HOST_SLOT_ENV.to_string(), "held".to_string());
@@ -1076,7 +1100,7 @@ mod slots {
         holder.session = admission.run_id.clone();
         let started = std::time::Instant::now();
         let slot_cap = admission.sizing.cap_for(admission.machine.cores);
-        let width = admission.width(ask.weight, true);
+        let width = admission.width(ask.weight, super::Placement::UnderHostSlot);
         // Every wait line names the sizing the command was queued under.
         let record = |waited_ms: u128, outcome: &str| {
             greenharness_slots::record_wait_named(

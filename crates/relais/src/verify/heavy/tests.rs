@@ -452,9 +452,18 @@ fn the_plan_names_the_setting_that_turned_the_host_slots_off() {
 fn the_width_rule_uses_the_slots_cap_only_under_a_host_slot() {
     let six = greenharness_slots::Machine { cores: 6 };
     let auto = Some(greenharness_slots::Sizing::Auto);
-    assert_eq!(host_share(six, auto, true, 1), (3, "slots"));
-    assert_eq!(host_share(six, auto, false, 1), (1, "coordinator"));
-    assert_eq!(host_share(six, None, true, 2), (2, "coordinator"));
+    assert_eq!(
+        host_share(six, auto, Placement::UnderHostSlot, 1),
+        (3, "slots")
+    );
+    assert_eq!(
+        host_share(six, auto, Placement::CoordinatorOnly, 1),
+        (1, "coordinator")
+    );
+    assert_eq!(
+        host_share(six, None, Placement::UnderHostSlot, 2),
+        (2, "coordinator")
+    );
 }
 
 #[test]
