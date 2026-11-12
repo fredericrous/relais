@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/programme-due-dates
 repos: [relais]
 adrs: [ADR-0062]
@@ -146,5 +146,18 @@ unblocks its t04, t05, t08 and t09.
   rows add `"due": null, "overdue": null` and nothing else → as planned.
 
 ## Outcome
+Shipped on this branch: `due` on task tickets, strict and round-trip
+checked; `frontier` due-first order, `[due …]`/`[overdue …]` marks, JSON
+`due`/`overdue` (null when undated); docs, help and CHANGELOG. The release
+(0.59.0) follows the merge; no ticket carries `due` until it is installed.
+Surprise: chrono's `%Y-%m-%d` accepts `02026-1-05` and `+999-01-01`, so a
+length check was not enough.
+
+## Implementation review
+- implementation-review: approve-with-changes → approve on Delta and a follow-up interdiff; fixed the `value` placeholder name, plan wording, a pure `frontier_row`; 44k + 57k + 33k + 37k tok.
+- backend: approve-with-changes → approve; round-trip date check, indented/quoted key test; 50k + 24k tok.
+- lang:rust: approve-with-changes → approve; Task-variant match, due_line doc; deliberate: `&'static str` errors in a private helper, per-row String; 53k + 27k + 28k tok.
+- tui: approve-with-changes → approve; `frontier --help` names the order, summary kept to one line; 59k + 25k + 28k tok.
+- unix: approve, carried by ancestry; 58k tok. First launches of all five pointed at a brief path that did not exist (the author's slip) and were relaunched.
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,codex body-sha=24611cdf3d40 -->
