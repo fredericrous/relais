@@ -9,8 +9,8 @@
 //!    holds them);
 //! 2. `weight` host slots, all or none, through greengate's `greenharness-slots` crate
 //!    (amont ADR-0014, decisions ADR-0049), so every heavy job on the
-//!    machine shares one queue: amont's gates, relais's checks, anything run
-//!    through `amont slot run`. The directory is amont's by default
+//!    machine shares one queue: greengate's gates, relais's checks, anything run
+//!    through `amont slot run`. The directory is greengate's by default
 //!    (`[resources] shared_host_slots`, `"off"` for the coordinator's queue
 //!    alone); a directory the crate refuses is said once as
 //!    `host_slots_off`. The runner holds the slots, never the check: their
@@ -553,7 +553,7 @@ impl<'a> HeavyAdmission<'a> {
             }
             return Ok(Admitted::unadmitted(environment));
         };
-        // The shared queue is amont's: its files are counted before any
+        // The shared queue is greengate's: its files are counted before any
         // token is queued for, so a weight it can never grant is refused
         // without waiting.
         let shared = match (&self.slots, self.ancestor_holds_slots) {

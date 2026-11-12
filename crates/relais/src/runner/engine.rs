@@ -1196,7 +1196,7 @@ pub(super) fn budget_limits(
     )
 }
 
-/// The host slot directory a run queues on: amont's own unless
+/// The host slot directory a run queues on: greengate's own unless
 /// `[resources] shared_host_slots` names another, and none for `"off"`
 /// (amont ADR-0014: relais joins the host queue with nothing configured).
 pub(crate) fn host_slot_dir(setting: Option<&str>) -> Option<PathBuf> {
