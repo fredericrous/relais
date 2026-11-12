@@ -41,4 +41,8 @@ The branch binary's `relais doctor`, run with HOME, `RELAIS_CONFIG_DIR`, `RELAIS
 
 ## Implementation review
 
-Filled at the close of the branch.
+- implementation-review: rework in round 1, then approve on the delta. Its blocker said the crate APIs were unreleased; it was withdrawn once checked against the published `greenharness-slots` 4.0.0 registry source. Fixed: verification actuals recorded, relais's `parallelism` copy deleted, the `_` arm gone (105k + 119k).
+- unix and architect: approve-with-changes, then approve. Fixed: `GREENGATE_HOST_SLOTS` outranks `host_slots`; off is named by its real source; git exit codes are read; one width rule (`host_share`) shared by the admission and the doctor.
+- backend, lang:rust, tui: approve-with-changes twice, lows only. Fixed: the pure `host_queue` with tests; a refused directory runs at the coordinator's width; `Placement` replaces the bool flag; the doctor width line in words within 80 columns.
+- deliberate, carried to a follow-up PR before the relais release: SPEC §23 precedence wording, `Fix:` on the off and git-failure lines, `host_share` returning `Placement` and not a string, `HostSlots { On, Off }` for the paired fields, a typed legacy-read error. Per-call host resolution is kept: the crate caches the git rows and the core count.
+- next: the follow-up PR, then release relais; installing it is the person's.
