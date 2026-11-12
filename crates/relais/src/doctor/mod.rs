@@ -329,37 +329,140 @@ pub(crate) fn permissions_finding(settings: &MachineSettings) -> Option<Finding>
         })
 }
 
-/// The `heavy` finding: how many heavy-command tokens the machine hands
-/// out (`max_heavy_commands`, else a quarter of the cores, at least one),
-/// and the host slots every heavy job queues on: greengate's directory unless
-/// `[resources] shared_host_slots` names another or says `"off"`, sized
-/// automatically unless `host_slots` fixes it (SPEC §23). Information,
-/// never a warning.
-pub(crate) fn heavy_finding(settings: &MachineSettings, cores: u32) -> Finding {
+/// The `heavy` findings: how many heavy-command tokens the machine hands
+/// out (`max_heavy_commands`, else a quarter of the logical cores, at least
+/// one), the host slots every heavy job queues on (greengate's directory
+/// unless `[resources] shared_host_slots` names another or says `"off"`),
+/// and the width a command of weight 1 gets: its share of the cores the
+/// slots count, which are the physical cores unless `greengate.hostCores`
+/// says otherwise (SPEC §23, greengate ADR-0021). The first finding is
+/// information; the others are warnings: a `host_slots` that is deprecated
+/// and wins over `greengate.hostSlots`, what the key resolution found wrong,
+/// and `legacy` (`amont.hostSlots` / `amont.hostCores` rows in `--global`
+/// config) that greengate 4.0 no longer reads.
+pub(crate) fn heavy_findings(
+    settings: &MachineSettings,
+    logical_cores: u32,
+    host: &greenharness_slots::host::HostSizing,
+    legacy: &[(String, String)],
+) -> Vec<Finding> {
+    use greenharness_slots::Sizing;
     let configured = settings.concurrency.max_heavy_commands;
-    let cap = crate::verify::heavy_cap(configured, cores);
+    let cap = crate::verify::heavy_cap(configured, logical_cores);
+    let plan = crate::verify::host_plan(host, settings.resources.host_slots);
     let source = if configured.is_some() {
         "machine.toml"
     } else {
         "a quarter of the cores"
     };
-    let sizing = match settings.resources.host_slots {
-        Some(n) => format!("{n} fixed"),
-        None => "sized from the load".to_string(),
+    let sizing = match plan.sizing {
+        None => "off (greengate.hostSlots 0)".to_string(),
+        Some(Sizing::Fixed(n)) => format!("{n} fixed"),
+        Some(Sizing::Auto) => "sized from the load".to_string(),
     };
-    let slots = match settings.resources.shared_host_slots.as_deref() {
+    let shared = settings.resources.shared_host_slots.as_deref();
+    let slots = match shared {
         Some("off") => "no shared host slots (the coordinator queue only)".to_string(),
+        _ if plan.sizing.is_none() => format!("no shared host slots, {sizing}"),
         Some(dir) => format!("shared host slots in {dir}, {sizing}"),
         None => format!(
             "shared host slots in {}, {sizing}",
             greenharness_slots::dir().display()
         ),
     };
-    Finding {
+    // Queued on the host slots, a command gets its share of the slots'
+    // cores; with no host queue, the coordinator's cap shares them.
+    let (shares, shares_of) = match plan.sizing {
+        Some(sizing) if shared != Some("off") => (sizing.cap_for(plan.machine.cores), "slots cap"),
+        _ => (cap, "coordinator cap"),
+    };
+    let width = crate::verify::parallelism(1, plan.machine.cores, shares);
+    let mut findings = vec![Finding {
         component: "heavy",
         level: Level::Ok,
-        detail: format!("max_heavy_commands {cap} ({source}); {slots}"),
+        detail: format!(
+            "max_heavy_commands {cap} ({source}); {slots}; width {width} ({} cores / {shares_of} {shares})",
+            plan.machine.cores
+        ),
+    }];
+    if let Some(n) = settings.resources.host_slots {
+        let theirs = match host.slots.value {
+            None => "off".to_string(),
+            Some(Sizing::Auto) => "auto".to_string(),
+            Some(Sizing::Fixed(m)) => m.to_string(),
+        };
+        let differs = host.slots.value != Some(Sizing::Fixed(n));
+        findings.push(Finding {
+            component: "heavy",
+            level: Level::Warn,
+            detail: format!(
+                "[resources] host_slots = {n} is deprecated: relais reads greengate.hostSlots \
+                 itself, as greengate does{}. Fix: remove host_slots from machine.toml",
+                if differs {
+                    format!("; it wins over greengate.hostSlots ({theirs}), so the two tools size the queue differently")
+                } else {
+                    String::new()
+                }
+            ),
+        });
     }
+    findings.extend(plan.warnings.iter().map(|warning| Finding {
+        component: "heavy",
+        level: Level::Warn,
+        detail: warning.replace("\n  Fix:", ". Fix:"),
+    }));
+    findings.extend(legacy_host_key_findings(legacy));
+    findings
+}
+
+/// One warning per `amont.hostSlots` / `amont.hostCores` in `--global`
+/// config, given as `(key, value)` rows with the key lowercased: greengate
+/// 4.0 reads only the `greengate.*` names, and relais reads them through the
+/// same crate, so the old rows are ignored until `greengate migrate
+/// --global` moves them.
+pub(crate) fn legacy_host_key_findings(rows: &[(String, String)]) -> Vec<Finding> {
+    rows.iter()
+        .filter_map(|(key, value)| {
+            let new = match key.as_str() {
+                "amont.hostslots" => "greengate.hostSlots",
+                "amont.hostcores" => "greengate.hostCores",
+                _ => return None,
+            };
+            Some(Finding {
+                component: "heavy",
+                level: Level::Warn,
+                detail: format!(
+                    "{key} = {value} in git config --global is ignored: greengate 4.0 and relais \
+                     read {new}. Fix: greengate migrate --global"
+                ),
+            })
+        })
+        .collect()
+}
+
+/// The `amont.hostSlots` / `amont.hostCores` rows of `--global` git config,
+/// as `(key lowercased, value)`. Empty when git is absent or the keys are
+/// not set: a missing git is not a finding.
+fn legacy_host_rows() -> Vec<(String, String)> {
+    let Ok(out) = std::process::Command::new("git")
+        .args([
+            "config",
+            "--global",
+            "--get-regexp",
+            r"^amont\.host(slots|cores)$",
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(' ')?;
+            Some((key.to_ascii_lowercase(), value.to_string()))
+        })
+        .collect()
 }
 
 /// The `disk` findings: one line per volume the run writes, with what is
@@ -1332,7 +1435,12 @@ pub fn doctor(
                     max_effort = settings.routing.max_effort.clone();
                     findings.extend(sandbox_finding(&settings));
                     findings.extend(permissions_finding(&settings));
-                    findings.push(heavy_finding(&settings, crate::verify::cores()));
+                    findings.extend(heavy_findings(
+                        &settings,
+                        crate::verify::logical_cores(),
+                        &greenharness_slots::host::from_host(greenharness_slots::detect_cores()),
+                        &legacy_host_rows(),
+                    ));
                     let mut written = vec![repo_dir.to_path_buf(), std::env::temp_dir()];
                     written.extend(paths::state_dir().ok());
                     findings.extend(disk_findings(
@@ -3670,9 +3778,37 @@ mod tests {
             .expect("a valid machine.toml")
     }
 
+    /// The host sizing greengate would resolve from no keys and `cores`
+    /// detected cores: hermetic, never this machine's git config.
+    fn host(cores: u32) -> greenharness_slots::host::HostSizing {
+        host_with(|_| None, &[], cores)
+    }
+
+    fn host_with(
+        env: impl Fn(&str) -> Option<String>,
+        rows: &[(String, String, String)],
+        cores: u32,
+    ) -> greenharness_slots::host::HostSizing {
+        greenharness_slots::host::resolve(
+            env,
+            rows,
+            greenharness_slots::host::Resolved {
+                value: cores,
+                source: greenharness_slots::host::Source::Detected,
+            },
+        )
+    }
+
+    fn first(findings: &[Finding]) -> &Finding {
+        findings.first().expect("a heavy finding")
+    }
+
     #[test]
     fn doctor_shows_max_heavy_commands_and_the_shared_slot_directory() {
-        let default = heavy_finding(&machine_with(""), 16);
+        // 16 logical cores, 8 physical: a coordinator cap of 4, 4 slots.
+        let default = heavy_findings(&machine_with(""), 16, &host(8), &[]);
+        assert_eq!(default.len(), 1, "{default:?}");
+        let default = first(&default);
         assert_eq!(default.level, Level::Ok);
         assert!(
             default.detail.contains("max_heavy_commands 4"),
@@ -3685,28 +3821,171 @@ mod tests {
             "on by default, in greengate's directory: {}",
             default.detail
         );
-        let off = heavy_finding(
+        assert!(
+            default.detail.ends_with("width 2 (8 cores / slots cap 4)"),
+            "{}",
+            default.detail
+        );
+        let off = heavy_findings(
             &machine_with("[resources]\nshared_host_slots = \"off\"\n"),
             16,
+            &host(8),
+            &[],
         );
+        let off = first(&off);
         assert!(
             off.detail.contains("no shared host slots"),
             "{}",
             off.detail
         );
-        let set = heavy_finding(
+        assert!(
+            off.detail
+                .ends_with("width 2 (8 cores / coordinator cap 4)"),
+            "{}",
+            off.detail
+        );
+    }
+
+    /// Without hyper-threads and with no host queue, the width is what it
+    /// was: the coordinator's cap shares the cores.
+    #[test]
+    fn doctor_keeps_the_coordinators_width_where_no_host_queue_is_used() {
+        let off = heavy_findings(
+            &machine_with("[resources]\nshared_host_slots = \"off\"\n"),
+            8,
+            &host(8),
+            &[],
+        );
+        assert!(
+            first(&off)
+                .detail
+                .ends_with("width 4 (8 cores / coordinator cap 2)"),
+            "{}",
+            first(&off).detail
+        );
+    }
+
+    #[test]
+    fn a_host_slots_setting_is_deprecated_and_says_when_it_overrides_greengate() {
+        let set = heavy_findings(
             &machine_with(
                 "[concurrency]\nmax_heavy_commands = 3\n[resources]\nshared_host_slots = \"/run/slots\"\nhost_slots = 2\n",
             ),
             16,
+            &host(8),
+            &[],
+        );
+        assert_eq!(set.len(), 2, "{set:?}");
+        assert!(
+            set[0].detail.contains("max_heavy_commands 3"),
+            "{}",
+            set[0].detail
+        );
+        assert!(set[0].detail.contains("/run/slots"), "{}", set[0].detail);
+        assert!(set[0].detail.contains("2 fixed"), "{}", set[0].detail);
+        assert!(
+            set[0].detail.ends_with("width 4 (8 cores / slots cap 2)"),
+            "{}",
+            set[0].detail
+        );
+        assert_eq!(set[1].level, Level::Warn);
+        assert!(
+            set[1].detail.contains("host_slots = 2 is deprecated")
+                && set[1]
+                    .detail
+                    .contains("wins over greengate.hostSlots (auto)")
+                && set[1].detail.contains("Fix: remove host_slots"),
+            "{}",
+            set[1].detail
+        );
+        // The same number on both sides is still deprecated, but agrees.
+        let rows = [(
+            "global".to_string(),
+            "greengate.hostslots".to_string(),
+            "2".to_string(),
+        )];
+        let same = heavy_findings(
+            &machine_with("[resources]\nhost_slots = 2\n"),
+            16,
+            &host_with(|_| None, &rows, 8),
+            &[],
         );
         assert!(
-            set.detail.contains("max_heavy_commands 3"),
+            same[1].detail.contains("is deprecated"),
             "{}",
-            set.detail
+            same[1].detail
         );
-        assert!(set.detail.contains("/run/slots"), "{}", set.detail);
-        assert!(set.detail.contains("2 fixed"), "{}", set.detail);
+        assert!(
+            !same[1].detail.contains("differently"),
+            "{}",
+            same[1].detail
+        );
+    }
+
+    #[test]
+    fn the_key_resolution_warnings_and_greengate_host_slots_zero_are_said() {
+        let bad = heavy_findings(
+            &machine_with(""),
+            16,
+            &host_with(
+                |name| (name == greenharness_slots::host::CORES_ENV).then(|| "abc".to_string()),
+                &[],
+                8,
+            ),
+            &[],
+        );
+        assert_eq!(bad.len(), 2, "{bad:?}");
+        assert_eq!(bad[1].level, Level::Warn);
+        assert!(
+            bad[1].detail.contains("GREENGATE_HOST_CORES")
+                && bad[1].detail.contains(". Fix: unset GREENGATE_HOST_CORES")
+                && !bad[1].detail.contains('\n'),
+            "{}",
+            bad[1].detail
+        );
+        let rows = [(
+            "global".to_string(),
+            "greengate.hostslots".to_string(),
+            "0".to_string(),
+        )];
+        let none = heavy_findings(&machine_with(""), 16, &host_with(|_| None, &rows, 8), &[]);
+        assert!(
+            first(&none).detail.contains("off (greengate.hostSlots 0)"),
+            "{}",
+            first(&none).detail
+        );
+        assert!(
+            first(&none)
+                .detail
+                .ends_with("width 2 (8 cores / coordinator cap 4)"),
+            "{}",
+            first(&none).detail
+        );
+    }
+
+    #[test]
+    fn a_legacy_amont_host_key_is_ignored_and_the_fix_is_named() {
+        let rows = [
+            ("amont.hostslots".to_string(), "3".to_string()),
+            ("amont.hostcores".to_string(), "4".to_string()),
+            ("amont.other".to_string(), "x".to_string()),
+        ];
+        let found = legacy_host_key_findings(&rows);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().all(|f| f.level == Level::Warn));
+        assert!(
+            found[0].detail.contains("amont.hostslots = 3")
+                && found[0].detail.contains("read greengate.hostSlots")
+                && found[0].detail.contains("Fix: greengate migrate --global"),
+            "{}",
+            found[0].detail
+        );
+        assert!(
+            found[1].detail.contains("read greengate.hostCores"),
+            "{}",
+            found[1].detail
+        );
+        assert!(legacy_host_key_findings(&[]).is_empty());
     }
 
     /// One volume with the space a test gives it.

@@ -984,20 +984,28 @@ impl<'a> RunEngine<'a> {
     /// [`RunEngine::heavy`] drawing on `budgets`: an on-demand base run's
     /// commands draw on the total only (ADR-0013).
     pub(crate) fn heavy_with(&self, budgets: &Budgets) -> verify::HeavyAdmission<'_> {
-        let cores = verify::cores();
-        verify::HeavyAdmission {
+        // The coordinator's cap reads the logical cores (relais ADR-0010);
+        // the host queue reads the sizing greengate reads: the physical
+        // cores and its two host keys, resolved once by the slots crate.
+        let plan = verify::host_plan(
+            &greenharness_slots::host::from_host(greenharness_slots::detect_cores()),
+            self.config.machine.resources.host_slots,
+        );
+        let admission = verify::HeavyAdmission {
             gate: self.config.gate,
             run_id: self.run_id.as_str().to_string(),
             session_id: self.config.session_id.clone(),
             budgets: budgets.clone(),
             events: self.events.clone(),
-            cap: verify::heavy_cap(self.config.machine.concurrency.max_heavy_commands, cores),
-            cores,
-            slots: host_slot_dir(self.config.machine.resources.shared_host_slots.as_deref()),
-            sizing: match self.config.machine.resources.host_slots {
-                Some(n) => greenharness_slots::Sizing::Fixed(n),
-                None => greenharness_slots::Sizing::Auto,
-            },
+            cap: verify::heavy_cap(
+                self.config.machine.concurrency.max_heavy_commands,
+                verify::logical_cores(),
+            ),
+            machine: plan.machine,
+            slots: plan.sizing.and_then(|_| {
+                host_slot_dir(self.config.machine.resources.shared_host_slots.as_deref())
+            }),
+            sizing: plan.sizing.unwrap_or(greenharness_slots::Sizing::Auto),
             ancestor_holds_slots: verify::ancestor_holds_slots(
                 std::env::var(verify::HOST_SLOT_ENV).ok().as_deref(),
             ),
@@ -1015,7 +1023,9 @@ impl<'a> RunEngine<'a> {
                 paths: self.disk_paths(),
                 growth: &self.growth,
             },
-        }
+        };
+        admission.note_host_sizing(&plan);
+        admission
     }
 
     /// The places this run writes (SPEC §23): the state directory, the

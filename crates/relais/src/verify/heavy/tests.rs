@@ -163,7 +163,7 @@ fn admission<'a>(
         budgets: Budgets::unbounded(),
         events: Events::silent(),
         cap,
-        cores,
+        machine: greenharness_slots::Machine { cores },
         slots: None,
         sizing: greenharness_slots::Sizing::Fixed(4),
         ancestor_holds_slots: false,
@@ -324,6 +324,95 @@ impl Gate for Recording {
     fn enforcement(&self) -> Enforcement {
         self.inner.enforcement()
     }
+}
+
+/// The host sizing greengate would resolve, from no keys and a detected
+/// core count: hermetic, never this machine's git config.
+fn detected_host(cores: u32) -> greenharness_slots::host::HostSizing {
+    greenharness_slots::host::resolve(
+        |_| None,
+        &[],
+        greenharness_slots::host::Resolved {
+            value: cores,
+            source: greenharness_slots::host::Source::Detected,
+        },
+    )
+}
+
+#[test]
+fn the_host_plan_counts_the_detected_cores_and_sizes_the_slots_automatically() {
+    let plan = host_plan(&detected_host(6), None);
+    assert_eq!(plan.machine.cores, 6);
+    assert_eq!(plan.sizing, Some(greenharness_slots::Sizing::Auto));
+    assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+}
+
+#[test]
+fn relais_own_host_slots_still_wins_over_the_greengate_keys() {
+    let rows = [(
+        "global".to_string(),
+        "greengate.hostslots".to_string(),
+        "5".to_string(),
+    )];
+    let host = greenharness_slots::host::resolve(
+        |_| None,
+        &rows,
+        greenharness_slots::host::Resolved {
+            value: 6,
+            source: greenharness_slots::host::Source::Detected,
+        },
+    );
+    assert_eq!(
+        host_plan(&host, None).sizing,
+        Some(greenharness_slots::Sizing::Fixed(5))
+    );
+    assert_eq!(
+        host_plan(&host, Some(2)).sizing,
+        Some(greenharness_slots::Sizing::Fixed(2)),
+        "the deprecated setting wins"
+    );
+}
+
+#[test]
+fn greengate_host_slots_zero_turns_the_host_slots_off_for_relais_too() {
+    let rows = [(
+        "global".to_string(),
+        "greengate.hostslots".to_string(),
+        "0".to_string(),
+    )];
+    let host = greenharness_slots::host::resolve(
+        |_| None,
+        &rows,
+        greenharness_slots::host::Resolved {
+            value: 6,
+            source: greenharness_slots::host::Source::Detected,
+        },
+    );
+    assert_eq!(host_plan(&host, None).sizing, None);
+}
+
+#[test]
+fn the_host_plan_carries_the_core_override_and_the_warnings() {
+    let host = greenharness_slots::host::resolve(
+        |name| (name == greenharness_slots::host::CORES_ENV).then(|| "4".to_string()),
+        &[],
+        greenharness_slots::host::Resolved {
+            value: 6,
+            source: greenharness_slots::host::Source::Detected,
+        },
+    );
+    assert_eq!(host_plan(&host, None).machine.cores, 4);
+    let bad = greenharness_slots::host::resolve(
+        |name| (name == greenharness_slots::host::SLOTS_ENV).then(|| "abc".to_string()),
+        &[],
+        greenharness_slots::host::Resolved {
+            value: 6,
+            source: greenharness_slots::host::Source::Detected,
+        },
+    );
+    let plan = host_plan(&bad, None);
+    assert_eq!(plan.warnings.len(), 1);
+    assert_eq!(plan.sizing, Some(greenharness_slots::Sizing::Auto));
 }
 
 #[test]
@@ -918,6 +1007,56 @@ mod host_slots {
         assert_eq!(mode, 0o700);
         drop(lease);
         std::fs::remove_dir_all(&scratch).ok(); // best-effort: a scratch dir
+    }
+
+    /// Queued on the host slots, a command gets its weight's share of the
+    /// slots' cores, as a greengate holder does (the coordinator's cap alone
+    /// would give it twice that), and its wait line names the sizing.
+    #[test]
+    fn a_queued_command_gets_the_slots_share_and_its_wait_line_names_it() {
+        let scratch = temp_dir("slots-width");
+        let slots = scratch.join("queue");
+        let gate = gate_with(2);
+        register(&gate, "run-w2");
+        // 8 cores, 4 fixed slots, a coordinator cap of 2.
+        let mut shared = admission(&gate, "run-w2", 2, 8);
+        shared.slots = Some(slots.clone());
+        shared.sizing = greenharness_slots::Sizing::Fixed(4);
+        let lease = shared.admit(&ask(&BTreeMap::new(), 1)).expect("admitted");
+        assert_eq!(
+            lease.env().get("CARGO_BUILD_JOBS").map(String::as_str),
+            Some("2"),
+            "8 cores / 4 slots, not 8 / the coordinator's 2"
+        );
+        let line = std::fs::read_to_string(slots.join("waits.jsonl")).expect("waits.jsonl");
+        for part in [
+            "\"tool\":\"relais\"",
+            "\"weight\":1",
+            "\"jobs\":2",
+            "\"cap\":4",
+            "\"cores\":8",
+            "\"outcome\":\"admitted\"",
+        ] {
+            assert!(line.contains(part), "{part} in {line}");
+        }
+        drop(lease);
+        std::fs::remove_dir_all(&scratch).ok(); // best-effort: a scratch dir
+    }
+
+    /// With no host queue, the coordinator's cap shares the cores, as it
+    /// always did: the width does not shrink for a run that queues nowhere.
+    #[test]
+    fn with_no_host_queue_the_coordinators_cap_shares_the_cores() {
+        let gate = gate_with(2);
+        register(&gate, "run-w3");
+        let alone = admission(&gate, "run-w3", 2, 8);
+        assert!(alone.slots.is_none());
+        let lease = alone.admit(&ask(&BTreeMap::new(), 1)).expect("admitted");
+        assert_eq!(
+            lease.env().get("CARGO_BUILD_JOBS").map(String::as_str),
+            Some("4"),
+            "8 cores / the coordinator's 2"
+        );
     }
 
     /// A directory another user could have made (0755) is refused by the

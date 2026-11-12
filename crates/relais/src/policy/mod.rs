@@ -1036,11 +1036,13 @@ pub struct ResourceSettings {
     /// configured. `"off"`: the coordinator's queue alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_host_slots: Option<String>,
-    /// How many host slots there are, fixed, with no load test. Unset: the
-    /// automatic sizing of the slot directory (`greenharness-slots` `Sizing::Auto`,
-    /// half the cores, admitted while the load is below the core count).
-    /// Set it to the same value as `git config --global greengate.hostSlots`
-    /// when that is set: the two tools then agree on the cap.
+    /// How many host slots there are, fixed, with no load test. Deprecated:
+    /// relais reads `greengate.hostSlots` (and `greengate.hostCores`) itself
+    /// through the slots crate, as greengate does, so nothing needs copying
+    /// here. When set it still wins, and `relais doctor` says so and names a
+    /// mismatch. Unset: the keys, else the automatic sizing
+    /// (`greenharness-slots` `Sizing::Auto`, half the physical cores,
+    /// admitted while the load is below that count).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_slots: Option<u32>,
 }

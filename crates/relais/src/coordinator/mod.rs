@@ -3068,7 +3068,7 @@ pub fn effective_limits(configured: &ConcurrencyLimits) -> ConcurrencyLimits {
             .max_active_agents_per_session
             .or(DEFAULT_LIMITS.max_active_agents_per_session),
         max_heavy_commands: configured.max_heavy_commands.or(Some(
-            crate::verify::default_heavy_commands(crate::verify::cores()),
+            crate::verify::default_heavy_commands(crate::verify::logical_cores()),
         )),
         max_training_jobs: configured
             .max_training_jobs

@@ -176,11 +176,45 @@ pub fn heavy_cap(configured: Option<u32>, cores: u32) -> u32 {
         .max(1)
 }
 
-/// The cores this machine has, never zero.
-pub fn cores() -> u32 {
-    std::thread::available_parallelism()
-        .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX))
-        .unwrap_or(1)
+/// The logical cores this machine has, never zero. Only the coordinator's
+/// own cap ([`default_heavy_commands`]) reads this (relais ADR-0010: a
+/// quarter of them); a command's width counts the cores the host slots
+/// count ([`HostPlan::machine`]).
+pub fn logical_cores() -> u32 {
+    greenharness_slots::logical_cores()
+}
+
+/// What relais sizes the host queue from: greengate's two host keys,
+/// resolved once by the slots crate for every client, and relais's own
+/// `[resources] host_slots`, which is deprecated but still wins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPlan {
+    /// `None`: the host slots are off (`greengate.hostSlots 0`).
+    pub sizing: Option<greenharness_slots::Sizing>,
+    /// The cores the slots count: `greengate.hostCores`, else the physical
+    /// cores.
+    pub machine: greenharness_slots::Machine,
+    /// What the resolution found wrong, each with its fix, for the caller
+    /// to say once.
+    pub warnings: Vec<String>,
+}
+
+/// The plan for `host` and relais's own `override_slots`. Pure: the caller
+/// resolves the host with [`greenharness_slots::host::from_host`].
+pub fn host_plan(
+    host: &greenharness_slots::host::HostSizing,
+    override_slots: Option<u32>,
+) -> HostPlan {
+    HostPlan {
+        sizing: match override_slots {
+            Some(n) => Some(greenharness_slots::Sizing::Fixed(n)),
+            None => host.slots.value,
+        },
+        machine: greenharness_slots::Machine {
+            cores: host.cores.value.max(1),
+        },
+        warnings: host.warnings.clone(),
+    }
 }
 
 /// The first command of a profile whose weight no machine setting can
@@ -317,6 +351,7 @@ pub struct Tries {
     epoch: u32,
     counts: Arc<Mutex<BTreeMap<String, u32>>>,
     slots_off_said: Arc<AtomicBool>,
+    sizing_said: Arc<AtomicBool>,
 }
 
 impl Tries {
@@ -345,9 +380,12 @@ pub struct HeavyAdmission<'a> {
     pub session_id: String,
     pub budgets: Budgets,
     pub events: Events,
-    /// `max_heavy_commands` in force.
+    /// `max_heavy_commands` in force: the coordinator's cap, read from the
+    /// logical cores.
     pub cap: u32,
-    pub cores: u32,
+    /// The cores the host slots count, so a command's width reads the same
+    /// machine greengate does.
+    pub machine: greenharness_slots::Machine,
     pub slots: Option<PathBuf>,
     /// How many host slots there are (`[resources] host_slots`, else the
     /// automatic sizing).
@@ -391,7 +429,7 @@ impl<'a> HeavyAdmission<'a> {
             budgets: Budgets::unbounded(),
             events: Events::silent(),
             cap: 1,
-            cores: 1,
+            machine: greenharness_slots::Machine { cores: 1 },
             slots: None,
             sizing: greenharness_slots::Sizing::Auto,
             ancestor_holds_slots: false,
@@ -419,6 +457,18 @@ impl<'a> HeavyAdmission<'a> {
         !self.run_id.is_empty()
     }
 
+    /// How many jobs a command of `weight` tokens may start. Queued on the
+    /// host slots, it gets the weight's share of the slots' cores, as a
+    /// greengate holder of the same weight does; with no host queue, the
+    /// coordinator's cap shares the same cores.
+    fn width(&self, weight: u32) -> u32 {
+        let shares = match self.slots {
+            Some(_) => self.sizing.cap_for(self.machine.cores),
+            None => self.cap,
+        };
+        parallelism(weight, self.machine.cores, shares)
+    }
+
     /// The environment of a command of `weight` tokens: the parallelism
     /// bounds, the host-slot fact when an ancestor holds the slots, and
     /// then the check's own `env`, which wins.
@@ -426,8 +476,7 @@ impl<'a> HeavyAdmission<'a> {
         if !self.manages() {
             return own.clone();
         }
-        let mut environment =
-            child_environment(parallelism(weight, self.cores, self.cap), &BTreeMap::new());
+        let mut environment = child_environment(self.width(weight), &BTreeMap::new());
         if self.ancestor_holds_slots {
             environment.insert(HOST_SLOT_ENV.to_string(), "held".to_string());
         }
@@ -659,6 +708,25 @@ impl<'a> HeavyAdmission<'a> {
             queue.wait(Holding::Disk(short), cancel, self.sleeper.as_ref())?;
         }
         Ok(())
+    }
+
+    /// Say once per run what was wrong with the host sizing keys, and that
+    /// `greengate.hostSlots 0` has the host slots off, on stderr and as an
+    /// event.
+    pub fn note_host_sizing(&self, plan: &HostPlan) {
+        if self.tries.sizing_said.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        for warning in &plan.warnings {
+            eprintln!("relais: host_sizing: {warning}");
+            self.events.emit(Event::EnvironmentWarning {
+                what: "host_sizing".into(),
+                detail: warning.clone(),
+            });
+        }
+        if plan.sizing.is_none() {
+            self.host_slots_off("greengate.hostSlots is 0");
+        }
     }
 
     /// Say once, on stderr and as an event, that the shared host slots are
@@ -933,7 +1001,7 @@ mod slots {
             admission.host_slots_off(&why);
             return Ok(None);
         }
-        let cap = admission.sizing.cap();
+        let cap = admission.sizing.cap_for(admission.machine.cores);
         if weight > cap {
             return Err(LeaseStop::HostSlots {
                 weight,
@@ -957,24 +1025,41 @@ mod slots {
         let mut holder = greenharness_slots::Holder::here("relais", ask.label);
         holder.session = admission.run_id.clone();
         let started = std::time::Instant::now();
-        let mut waiter =
-            match greenharness_slots::Waiter::new_in(dir, admission.sizing, ask.weight, holder) {
-                Ok(waiter) => waiter,
-                Err(e) => {
-                    admission.host_slots_off(&format!("a host slot could not be queued for: {e}"));
-                    return Ok(None);
-                }
-            };
+        let slot_cap = admission.sizing.cap_for(admission.machine.cores);
+        let width = super::parallelism(ask.weight, admission.machine.cores, slot_cap);
+        // Every wait line names the sizing the command was queued under.
+        let record = |waited_ms: u128, outcome: &str| {
+            greenharness_slots::record_wait_named(
+                dir,
+                "relais",
+                greenharness_slots::WaitContext {
+                    cap: Some(slot_cap),
+                    cores: Some(admission.machine.cores),
+                    ..greenharness_slots::WaitContext::default()
+                },
+                ask.weight,
+                Some(width),
+                waited_ms,
+                outcome,
+            );
+        };
+        let mut waiter = match greenharness_slots::Waiter::new_in_on(
+            dir,
+            admission.sizing,
+            ask.weight,
+            holder,
+            admission.machine,
+        ) {
+            Ok(waiter) => waiter,
+            Err(e) => {
+                admission.host_slots_off(&format!("a host slot could not be queued for: {e}"));
+                return Ok(None);
+            }
+        };
         loop {
             let queued = match waiter.poll() {
                 Ok(greenharness_slots::Poll::Granted(held)) => {
-                    greenharness_slots::record_wait(
-                        dir,
-                        "relais",
-                        ask.weight,
-                        started.elapsed().as_millis(),
-                        "admitted",
-                    );
+                    record(started.elapsed().as_millis(), "admitted");
                     return Ok(Some(held));
                 }
                 Ok(greenharness_slots::Poll::Waiting(queued)) => queued,
@@ -998,13 +1083,7 @@ mod slots {
             if let Err(stop) = waited {
                 // Ended by the budget or a cancel: a sample too, or the
                 // day-14 wait percentiles would see only the admissions.
-                greenharness_slots::record_wait(
-                    dir,
-                    "relais",
-                    ask.weight,
-                    started.elapsed().as_millis(),
-                    "deferred",
-                );
+                record(started.elapsed().as_millis(), "deferred");
                 return Err(stop);
             }
         }
