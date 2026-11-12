@@ -8,11 +8,32 @@ use std::process::Command;
 
 use serde::Serialize;
 
-/// The notes ref amont writes stamps under.
-pub const NOTES_REF: &str = "refs/notes/amont-gate";
+/// One name the gate's stamps are written under: the notes ref, and the
+/// version header a note under that ref must start with. A note is read
+/// whole under the name of the ref it sits in (ADR-0068).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoteName {
+    pub notes_ref: &'static str,
+    pub version: &'static str,
+}
 
-/// The only note version this reader accepts.
-pub const NOTE_VERSION: &str = "amont-gate-v1";
+/// greengate's name, read first.
+pub const GREEN: NoteName = NoteName {
+    notes_ref: "refs/notes/greengate-gate",
+    version: "greengate-gate-v1",
+};
+
+/// amont's name, read only when [`GREEN`] has no note for the tree.
+/// LEGACY: removed at the census after the 30-day window (ADR-0068,
+/// decisions plan 2026-11-12-greengate-signs-notes-under-green-names,
+/// Phase 5), with its place in [`READ_ORDER`].
+pub const LEGACY: NoteName = NoteName {
+    notes_ref: "refs/notes/amont-gate",
+    version: "amont-gate-v1",
+};
+
+/// The refs [`read`] tries, in order; the first with a note decides.
+pub const READ_ORDER: [NoteName; 2] = [GREEN, LEGACY];
 
 /// One gate run: when (seconds since the epoch) and which gate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -71,11 +92,12 @@ fn parse_run(line: &str) -> Option<(GateRun, bool)> {
     ))
 }
 
-/// A note's text as the stamp of `tree`. A first line that does not start
-/// with [`NOTE_VERSION`] is no evidence at all.
-pub fn parse_note(tree: &str, text: &str) -> GateStamp {
+/// A note's text, read from `name`'s ref, as the stamp of `tree`. A first
+/// line that does not start with `name`'s version is no evidence at all,
+/// even when it is the other name's version.
+pub fn parse_note(name: NoteName, tree: &str, text: &str) -> GateStamp {
     let mut lines = text.lines();
-    if !lines.next().is_some_and(|l| l.starts_with(NOTE_VERSION)) {
+    if !lines.next().is_some_and(|l| l.starts_with(name.version)) {
         return GateStamp::unstamped();
     }
     let (mut passed, mut failed) = (Vec::new(), Vec::new());
@@ -117,7 +139,9 @@ fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output, GateError> {
         .map_err(|e| GateError(format!("git could not run: {e}")))
 }
 
-/// The stamp on `HEAD^{tree}` of the repository at `repo`.
+/// The stamp on `HEAD^{tree}` of the repository at `repo`: the note under
+/// the first ref of [`READ_ORDER`] that has one. A note whose header does
+/// not match its ref reads as unstamped; the next ref is not tried.
 pub fn read(repo: &Path) -> Result<GateStamp, GateError> {
     if !repo.is_dir() {
         return Err(GateError(format!("{} is not a directory", repo.display())));
@@ -130,23 +154,30 @@ pub fn read(repo: &Path) -> Result<GateStamp, GateError> {
         )));
     }
     let tree = String::from_utf8_lossy(&tree.stdout).trim().to_string();
-    let note = git(
-        repo,
-        &[
-            "notes",
-            &format!("--ref={NOTES_REF}"),
-            "show",
-            "HEAD^{tree}",
-        ],
-    )?;
-    if note.status.success() {
-        return Ok(parse_note(&tree, &String::from_utf8_lossy(&note.stdout)));
+    for name in READ_ORDER {
+        let note = git(
+            repo,
+            &[
+                "notes",
+                &format!("--ref={}", name.notes_ref),
+                "show",
+                "HEAD^{tree}",
+            ],
+        )?;
+        if note.status.success() {
+            let text = String::from_utf8_lossy(&note.stdout);
+            return Ok(parse_note(name, &tree, &text));
+        }
+        let stderr = String::from_utf8_lossy(&note.stderr);
+        if !stderr.contains("no note found") {
+            return Err(GateError(format!(
+                "git notes --ref={} show: {}",
+                name.notes_ref,
+                stderr.trim()
+            )));
+        }
     }
-    let stderr = String::from_utf8_lossy(&note.stderr);
-    if stderr.contains("no note found") {
-        return Ok(GateStamp::unstamped());
-    }
-    Err(GateError(format!("git notes show: {}", stderr.trim())))
+    Ok(GateStamp::unstamped())
 }
 
 #[cfg(test)]
@@ -174,18 +205,25 @@ mod tests {
         );
     }
 
+    /// A one-commit repository with `note` on its tree under amont's ref.
     fn repo_with_note(note: Option<&str>) -> (crate::test_support::TempDir, String) {
+        let notes: Vec<(&str, &str)> = note.map(|n| (LEGACY.notes_ref, n)).into_iter().collect();
+        repo_with_notes(&notes)
+    }
+
+    /// A one-commit repository with each `(ref, note)` on its tree.
+    fn repo_with_notes(notes: &[(&str, &str)]) -> (crate::test_support::TempDir, String) {
         let dir = crate::test_support::temp_dir("gate-stamp");
         run_git(&dir, &["init", "-q", "--template="]);
         std::fs::write(dir.join("a.txt"), "a").unwrap();
         run_git(&dir, &["add", "a.txt"]);
         run_git(&dir, &["commit", "-q", "-m", "feat: one"]);
-        if let Some(note) = note {
+        for (notes_ref, note) in notes {
             run_git(
                 &dir,
                 &[
                     "notes",
-                    &format!("--ref={NOTES_REF}"),
+                    &format!("--ref={notes_ref}"),
                     "add",
                     "-m",
                     note,
@@ -252,6 +290,98 @@ mod tests {
         assert_eq!(read(&dir).unwrap(), GateStamp::unstamped());
     }
 
+    fn passed_gates(stamp: GateStamp) -> Vec<String> {
+        stamp.passed.unwrap().into_iter().map(|r| r.gate).collect()
+    }
+
+    #[test]
+    fn a_stamp_is_read_from_greengates_ref() {
+        let (dir, tree) = repo_with_notes(&[(
+            GREEN.notes_ref,
+            "greengate-gate-v1\nrun 1760000000 pre-push pass",
+        )]);
+        let stamp = read(&dir).unwrap();
+        assert!(stamp.stamped);
+        assert_eq!(stamp.tree.as_deref(), Some(tree.as_str()));
+        assert_eq!(passed_gates(stamp), vec!["pre-push"]);
+    }
+
+    #[test]
+    fn a_stamp_is_read_from_amonts_ref_when_greengates_has_none() {
+        let (dir, _) = repo_with_notes(&[(
+            LEGACY.notes_ref,
+            "amont-gate-v1\nrun 1760000000 legacy pass",
+        )]);
+        assert_eq!(passed_gates(read(&dir).unwrap()), vec!["legacy"]);
+    }
+
+    #[test]
+    fn amonts_ref_is_read_when_greengates_ref_exists_without_this_trees_note() {
+        let (dir, _) = repo_with_notes(&[(
+            LEGACY.notes_ref,
+            "amont-gate-v1\nrun 1760000000 legacy pass",
+        )]);
+        // The green ref exists, with a note on another object only.
+        run_git(
+            &dir,
+            &[
+                "notes",
+                &format!("--ref={}", GREEN.notes_ref),
+                "add",
+                "-m",
+                "greengate-gate-v1\nrun 1760000100 green pass",
+                "HEAD",
+            ],
+        );
+        assert_eq!(passed_gates(read(&dir).unwrap()), vec!["legacy"]);
+    }
+
+    #[test]
+    fn with_notes_under_both_refs_greengates_note_is_read() {
+        let (dir, _) = repo_with_notes(&[
+            (
+                LEGACY.notes_ref,
+                "amont-gate-v1\nrun 1760000000 legacy pass",
+            ),
+            (
+                GREEN.notes_ref,
+                "greengate-gate-v1\nrun 1760000100 green pass",
+            ),
+        ]);
+        assert_eq!(passed_gates(read(&dir).unwrap()), vec!["green"]);
+    }
+
+    #[test]
+    fn a_greengate_header_under_amonts_ref_is_unstamped() {
+        let (dir, _) = repo_with_notes(&[(
+            LEGACY.notes_ref,
+            "greengate-gate-v1\nrun 1760000000 pre-push pass",
+        )]);
+        assert_eq!(read(&dir).unwrap(), GateStamp::unstamped());
+    }
+
+    #[test]
+    fn an_amont_header_under_greengates_ref_is_unstamped_not_reread() {
+        // The old ref holds a valid note too: a mismatched note under the
+        // green ref decides, and the old ref is not tried.
+        let (dir, _) = repo_with_notes(&[
+            (
+                GREEN.notes_ref,
+                "amont-gate-v1\nrun 1760000000 pre-push pass",
+            ),
+            (
+                LEGACY.notes_ref,
+                "amont-gate-v1\nrun 1760000000 legacy pass",
+            ),
+        ]);
+        assert_eq!(read(&dir).unwrap(), GateStamp::unstamped());
+        let (dir, _) = repo_with_notes(&[(
+            GREEN.notes_ref,
+            "amont-gate-v1\nrun 1760000000 pre-push pass",
+        )]);
+        assert_eq!(read(&dir).unwrap(), GateStamp::unstamped());
+    }
+
     #[test]
     fn a_directory_that_is_not_a_repository_is_an_error() {
         let dir = crate::test_support::temp_dir("gate-stamp-none");
@@ -261,7 +391,7 @@ mod tests {
 
     #[test]
     fn the_document_has_the_contracts_keys() {
-        let stamp = parse_note("abc", "amont-gate-v1\nrun 5 g pass\nrun 6 g fail");
+        let stamp = parse_note(LEGACY, "abc", "amont-gate-v1\nrun 5 g pass\nrun 6 g fail");
         let value = serde_json::to_value(&stamp).unwrap();
         assert_eq!(
             value,
