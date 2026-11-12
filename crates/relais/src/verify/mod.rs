@@ -5084,6 +5084,7 @@ mod tests {
 
     /// A check printing 10 MB: events carry at most 64 KB of its text, in
     /// pieces of at most 4 KB, and count the rest; the log keeps it all;
+    /// the follower sends a bounded number of events, never one per write;
     /// and following the check costs it no time worth measuring.
     #[test]
     fn a_check_printing_ten_megabytes_streams_a_bounded_prefix_and_counts_the_rest() {
@@ -5097,6 +5098,9 @@ mod tests {
         let mut silent = None;
         let mut followed_took = std::time::Duration::MAX;
         let mut followed = None;
+        // How long the last followed run took, for the bound on its events.
+        let mut last_followed_took = std::time::Duration::ZERO;
+        let load_before = crate::procs::load_average();
         for round in 0..3 {
             let start = std::time::Instant::now();
             silent =
@@ -5116,8 +5120,10 @@ mod tests {
                 )
                 .expect("runs"),
             );
-            followed_took = followed_took.min(start.elapsed());
+            last_followed_took = start.elapsed();
+            followed_took = followed_took.min(last_followed_took);
         }
+        let load_after = crate::procs::load_average();
         let silent = silent.expect("ran");
         let followed = followed.expect("ran");
 
@@ -5150,20 +5156,49 @@ mod tests {
         );
         assert!(elided > 0);
 
-        // What this guards against is a follower that costs the check real
-        // time (an event per write, a blocking reader): several times the
-        // silent run. Run-to-run noise is about ±11% even as the best of
-        // three (measured 2026-10-09: followed 2.28–2.88 s against silent
-        // 2.57–2.74 s, either side faster), so a 5% bound failed one run in
-        // five. Half the silent run is well outside the noise and well
-        // inside any real regression.
+        // An event per write, counted rather than timed, so any load holds
+        // it: the follower polls at most once per `OUTPUT_MERGE`, and a poll
+        // adds at most one piece shorter than `OUTPUT_CHUNK_BYTES`. So the
+        // full pieces of the budget, one per poll the run allowed, the final
+        // poll and the elided count bound the events. One per write of a
+        // 10 MB flood would be hundreds.
+        let merge = crate::protocol::OUTPUT_MERGE.as_millis();
+        let polls =
+            usize::try_from(last_followed_took.as_millis() / merge).unwrap_or(usize::MAX) + 1;
+        let full_pieces = usize::try_from(crate::protocol::OUTPUT_BUDGET_BYTES)
+            .unwrap_or(usize::MAX)
+            / crate::protocol::OUTPUT_CHUNK_BYTES;
+        let most = full_pieces + polls + 1;
+        assert!(
+            outputs.len() <= most,
+            "{} output events, at most {most} for {polls} polls",
+            outputs.len()
+        );
+
+        // A follower that blocks the check costs it real time: several
+        // times the silent run. Run-to-run noise is about ±11% even as the
+        // best of three on an idle host (measured 2026-10-09: followed
+        // 2.28–2.88 s against silent 2.57–2.74 s, either side faster), so
+        // half the silent run is the slack there. A loaded host stretches
+        // the noise with it (2026-11-12, load 115 on 12 threads: followed
+        // 7.5 s against 3.4 s, both 5-8 s run alone), so the slack scales
+        // by load per core, as greengate's `idleLoadScale` does, capped at
+        // 16. An idle CI runner keeps the tight bound.
+        let threads = std::thread::available_parallelism().map_or(1.0, |n| n.get() as f64);
+        let load = load_before
+            .into_iter()
+            .chain(load_after)
+            .fold(0.0_f64, f64::max);
+        let scale = (load / threads).clamp(1.0, 16.0);
         let allowed = std::cmp::max(
             silent_took.mul_f64(0.5),
             std::time::Duration::from_millis(500),
-        );
+        )
+        .mul_f64(scale);
         assert!(
             followed_took <= silent_took + allowed,
-            "followed {followed_took:?} against {silent_took:?} without the follower"
+            "followed {followed_took:?} against {silent_took:?} without the follower \
+             (slack x{scale:.1} for load {load:.1} on {threads} threads)"
         );
     }
 
