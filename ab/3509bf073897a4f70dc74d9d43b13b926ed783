@@ -1,0 +1,20 @@
+amont-provenance-v1
+commit 5083184d51f1d460bcecc692def3ab9a8d0fe7de
+tree ab3509bf073897a4f70dc74d9d43b13b926ed783
+canon bcdb3cf93c9e8821f1cb538c420b1931be4a1a3e
+patch c4188350ef439028edf3900535d19955a3c5a9cd
+plan docs/plans/2026-11-12-programme-tickets-carry-a-due-date.md 26076a0268e45918a9a1d4f95993f32b537098a8d67224863682c31b2de0d7b4
+review reviewed d9d61304e723d590d55b3005195e5c654a75b9288a650aa01015d1bb4683d136
+code-review backend carried 2a5485c826d9557b22c0e08d5ea96f1ee07831445bca10cd755515097999da64
+code-review lang:rust reviewed d9d61304e723d590d55b3005195e5c654a75b9288a650aa01015d1bb4683d136
+code-review unix carried 6a2b1537c09902f486be5327fede0663cf64b66dee3f239ef790a9340abd915c
+code-review tui reviewed d9d61304e723d590d55b3005195e5c654a75b9288a650aa01015d1bb4683d136
+preview not-required
+producer amont-agent 3.31.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAQYW1vbnQtcHJvdmVuYW5jZQAAAAAAAAAGc2hhNTEyAAAAUwAA
+AAtzc2gtZWQyNTUxOQAAAEDaZjzlOCFU6OJEEHBMh/YrLN3tvRNKPnUD8SVvi0455lLH2u
+a9tEnZz+M7oi+PnwnJL1YTppV6R8S2fRU9+kcA
+-----END SSH SIGNATURE-----
