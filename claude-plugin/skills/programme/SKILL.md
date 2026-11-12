@@ -58,6 +58,23 @@ repos = ["relais", "amont"]   # the repositories it touches; default: the map's
 <when closed: the answer, and links to assets, ADRs, PRs and runs>
 ```
 
+A `task` ticket may also hold a follow-up measure that a plan schedules for
+later: it carries a due date, and `relais programme frontier` lists dated
+tickets first, soonest first, marking the overdue ones.
+
+```markdown
++++
+type = "task"
+mode = "afk"
+status = "open"
+blocked_by = []
+due = "2026-11-19"       # task tickets only; a quoted YYYY-MM-DD
++++
+# Recount the settle timeouts a week after the release
+## Question
+<the measure to take, and what its result decides>
+```
+
 Text the person reads names a ticket by its `# ` name, never by its bare
 id.
 

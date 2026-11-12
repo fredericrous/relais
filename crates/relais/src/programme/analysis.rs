@@ -303,6 +303,8 @@ mod tests {
             status_line: 4,
             blocked_by_line: 5,
             repos_line: 6,
+            due: None,
+            due_line: 7,
             heading_line: 8,
         }
     }

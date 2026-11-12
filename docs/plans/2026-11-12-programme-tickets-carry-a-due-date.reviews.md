@@ -1,0 +1,7 @@
+# Programme tickets carry a due date — full reviews
+
+## Full reviews (reference)
+Round 1 (opus): lang:rust approve-with-changes (30k, 26 s): Option sort puts None first (high), lenient chrono parse (high), unquoted TOML date, check order when kind is None, allow-list test, overdue boundary, JSON omission (rejected for null), prefix width. backend approve-with-changes (31k, 42 s): rollout order (high), --all rows, JSON null, unquoted date message, boundary check, embed test — all applied.
+Round 2 (opus, resumed): backend approve-with-changes (36k, 16 s); lang:rust approve-with-changes (34k, 15 s).
+Carried into implementation: (1) Behaviour's unquoted-date bullet is wrong: the message is `due must be a quoted string "YYYY-MM-DD"` (rust r2#1, backend r2#4); (2) a malformed `due` on a non-task gives only the task-only problem; (3) `frontier_json` asserts `"due": null, "overdue": null` on an undated row, `overdue` never `false` without a date; (4) `fit_name` truncates only the name, never the mark (width-40 test); (5) the unit check names `due_mark`; (6) codex: keep the fifth field under `--all`, asserted with dated ready and in-flight tickets; (7) codex: SKILL.md gets a separate valid dated `task` example (the existing one is `research`) and says tasks can hold follow-up measures; (8) codex: `key_line` must find an indented or quoted `due` key, tested on a non-default line.
+Codex (gpt-6-astra, high): approve-with-changes, 3 medium findings above; it changed no file.
