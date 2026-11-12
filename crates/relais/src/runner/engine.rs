@@ -991,6 +991,10 @@ impl<'a> RunEngine<'a> {
             &greenharness_slots::host::from_host(greenharness_slots::detect_cores()),
             self.config.machine.resources.host_slots,
         );
+        let (queue_dir, queue_sizing) = host_queue(
+            &plan,
+            self.config.machine.resources.shared_host_slots.as_deref(),
+        );
         let admission = verify::HeavyAdmission {
             gate: self.config.gate,
             run_id: self.run_id.as_str().to_string(),
@@ -1002,10 +1006,8 @@ impl<'a> RunEngine<'a> {
                 verify::logical_cores(),
             ),
             machine: plan.machine,
-            slots: plan.sizing.and_then(|_| {
-                host_slot_dir(self.config.machine.resources.shared_host_slots.as_deref())
-            }),
-            sizing: plan.sizing.unwrap_or(greenharness_slots::Sizing::Auto),
+            slots: queue_dir,
+            sizing: queue_sizing,
             ancestor_holds_slots: verify::ancestor_holds_slots(
                 std::env::var(verify::HOST_SLOT_ENV).ok().as_deref(),
             ),
@@ -1217,6 +1219,21 @@ pub(crate) fn host_slot_dir(setting: Option<&str>) -> Option<PathBuf> {
     }
 }
 
+/// The host queue a run's commands join, from its `plan` and the
+/// `shared_host_slots` setting: the directory and its sizing, or no
+/// directory when the host slots are off (the setting says `"off"`, or the
+/// plan's sizing is `None`). Pure, so the mapping is tested without a
+/// machine; with no directory the sizing is never read.
+pub(crate) fn host_queue(
+    plan: &verify::HostPlan,
+    shared_setting: Option<&str>,
+) -> (Option<PathBuf>, greenharness_slots::Sizing) {
+    match plan.sizing {
+        Some(sizing) => (host_slot_dir(shared_setting), sizing),
+        None => (None, greenharness_slots::Sizing::Auto),
+    }
+}
+
 /// What a cancel watcher needs of a run, all of it shareable across threads.
 pub(super) struct CancelWatch<'a> {
     pub(super) gate: Option<&'a (dyn Gate + Sync)>,
@@ -1264,8 +1281,41 @@ pub(super) fn watch_cancel<T>(
 
 #[cfg(test)]
 mod host_slot_dir_tests {
-    use super::host_slot_dir;
+    use super::{host_queue, host_slot_dir};
     use std::path::PathBuf;
+
+    fn plan(sizing: Option<greenharness_slots::Sizing>) -> crate::verify::HostPlan {
+        crate::verify::HostPlan {
+            sizing,
+            machine: greenharness_slots::Machine { cores: 6 },
+            warnings: Vec::new(),
+            off_by: None,
+        }
+    }
+
+    /// The run joins the host queue only when the plan sizes it: off
+    /// (`greengate.hostSlots 0`) means no directory, whatever the setting.
+    #[test]
+    fn the_host_queue_follows_the_plan_and_the_shared_setting() {
+        let fixed = Some(greenharness_slots::Sizing::Fixed(2));
+        assert_eq!(
+            host_queue(&plan(fixed), None),
+            (
+                Some(greenharness_slots::dir()),
+                greenharness_slots::Sizing::Fixed(2)
+            )
+        );
+        assert_eq!(
+            host_queue(&plan(fixed), Some("/run/slots")),
+            (
+                Some(PathBuf::from("/run/slots")),
+                greenharness_slots::Sizing::Fixed(2)
+            )
+        );
+        assert_eq!(host_queue(&plan(fixed), Some("off")).0, None);
+        assert_eq!(host_queue(&plan(None), None).0, None);
+        assert_eq!(host_queue(&plan(None), Some("/run/slots")).0, None);
+    }
 
     /// With nothing configured relais queues in greengate's directory; `"off"`
     /// is the coordinator's queue alone; a path is used as given.

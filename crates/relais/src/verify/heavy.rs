@@ -197,23 +197,50 @@ pub struct HostPlan {
     /// What the resolution found wrong, each with its fix, for the caller
     /// to say once.
     pub warnings: Vec<String>,
+    /// When `sizing` is `None`, the setting that turned the host slots off,
+    /// as a person would undo it: `GREENGATE_HOST_SLOTS=0`,
+    /// `greengate.hostSlots 0 (git config --global)`, or
+    /// `[resources] host_slots = 0`.
+    pub off_by: Option<String>,
 }
 
 /// The plan for `host` and relais's own `override_slots`. Pure: the caller
 /// resolves the host with [`greenharness_slots::host::from_host`].
+/// Precedence: `GREENGATE_HOST_SLOTS` (an environment variable outranks a
+/// file), then the deprecated `override_slots` from machine.toml, then
+/// `greengate.hostSlots` in git config, then the automatic sizing. An
+/// `override_slots` of 0 turns the host slots off, as `greengate.hostSlots
+/// 0` does.
 pub fn host_plan(
     host: &greenharness_slots::host::HostSizing,
     override_slots: Option<u32>,
 ) -> HostPlan {
+    use greenharness_slots::host::Source;
     HostPlan {
-        sizing: match override_slots {
-            Some(n) => Some(greenharness_slots::Sizing::Fixed(n)),
-            None => host.slots.value,
+        sizing: match (host.slots.source, override_slots) {
+            (Source::Env, _) | (_, None) => host.slots.value,
+            (_, Some(0)) => None,
+            (_, Some(n)) => Some(greenharness_slots::Sizing::Fixed(n)),
         },
         machine: greenharness_slots::Machine {
             cores: host.cores.value.max(1),
         },
         warnings: host.warnings.clone(),
+        off_by: match (host.slots.source, override_slots, host.slots.value) {
+            (Source::Env, _, None) => Some(format!("{}=0", greenharness_slots::host::SLOTS_ENV)),
+            (Source::Env, _, Some(_)) => None,
+            (_, Some(0), _) => Some("[resources] host_slots = 0".to_string()),
+            (_, Some(_), _) => None,
+            (Source::Global, None, None) => Some(format!(
+                "{} 0 (git config --global)",
+                greenharness_slots::host::SLOTS_KEY
+            )),
+            (Source::System, None, None) => Some(format!(
+                "{} 0 (git config --system)",
+                greenharness_slots::host::SLOTS_KEY
+            )),
+            (_, None, _) => None,
+        },
     }
 }
 
@@ -239,11 +266,25 @@ pub fn overweight<'c>(
         })
 }
 
-/// How many jobs a command of `weight` tokens may start:
-/// `max(1, weight * cores / cap)`.
-pub fn parallelism(weight: u32, cores: u32, cap: u32) -> u32 {
-    let jobs = u64::from(weight) * u64::from(cores) / u64::from(cap.max(1));
-    u32::try_from(jobs).unwrap_or(u32::MAX).max(1)
+/// How many jobs a command of `weight` tokens may start,
+/// `max(1, weight * cores / cap)`: greengate's own formula, from the crate
+/// both tools link, so a weight means the same width whoever holds it.
+pub use greenharness_slots::parallelism;
+
+/// The cap a command's width divides the cores by, and its name for the
+/// doctor: the host slots' cap when the command runs under a host slot (its
+/// own, or an ancestor's), else the coordinator's `cap`. Pure: the one rule
+/// the admission and `relais doctor` both apply.
+pub fn host_share(
+    machine: greenharness_slots::Machine,
+    sizing: Option<greenharness_slots::Sizing>,
+    under_host_slot: bool,
+    coordinator_cap: u32,
+) -> (u32, &'static str) {
+    match sizing {
+        Some(sizing) if under_host_slot => (sizing.cap_for(machine.cores), "slots"),
+        Some(_) | None => (coordinator_cap, "coordinator"),
+    }
 }
 
 /// The environment of a command admitted with `jobs` jobs: the bounds
@@ -457,26 +498,30 @@ impl<'a> HeavyAdmission<'a> {
         !self.run_id.is_empty()
     }
 
-    /// How many jobs a command of `weight` tokens may start. Queued on the
-    /// host slots, it gets the weight's share of the slots' cores, as a
-    /// greengate holder of the same weight does; with no host queue, the
-    /// coordinator's cap shares the same cores.
-    fn width(&self, weight: u32) -> u32 {
-        let shares = match self.slots {
-            Some(_) => self.sizing.cap_for(self.machine.cores),
-            None => self.cap,
-        };
+    /// How many jobs a command of `weight` tokens may start: under a host
+    /// slot (its own or an ancestor's) the weight's share of the slots'
+    /// cores, as a greengate holder of the same weight gets; otherwise the
+    /// coordinator's cap shares the same cores ([`host_share`]).
+    pub(crate) fn width(&self, weight: u32, under_host_slot: bool) -> u32 {
+        let (shares, _) = host_share(self.machine, Some(self.sizing), under_host_slot, self.cap);
         parallelism(weight, self.machine.cores, shares)
     }
 
     /// The environment of a command of `weight` tokens: the parallelism
-    /// bounds, the host-slot fact when an ancestor holds the slots, and
-    /// then the check's own `env`, which wins.
-    fn environment(&self, weight: u32, own: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    /// bounds for whether it runs under a host slot, the host-slot fact
+    /// when an ancestor holds the slots, and then the check's own `env`,
+    /// which wins.
+    fn environment(
+        &self,
+        weight: u32,
+        own: &BTreeMap<String, String>,
+        under_host_slot: bool,
+    ) -> BTreeMap<String, String> {
         if !self.manages() {
             return own.clone();
         }
-        let mut environment = child_environment(self.width(weight), &BTreeMap::new());
+        let mut environment =
+            child_environment(self.width(weight, under_host_slot), &BTreeMap::new());
         if self.ancestor_holds_slots {
             environment.insert(HOST_SLOT_ENV.to_string(), "held".to_string());
         }
@@ -595,7 +640,10 @@ impl<'a> HeavyAdmission<'a> {
                 cap: self.cap,
             });
         }
-        let environment = self.environment(ask.weight, ask.env);
+        // Before a host slot is held, the width is the coordinator's share
+        // (or the slots' when an ancestor holds them): a command that ends
+        // up queued nowhere must not run narrower than the coordinator gives.
+        let environment = self.environment(ask.weight, ask.env, self.ancestor_holds_slots);
         let Some(gate) = self.gate else {
             if self.manages() {
                 self.wait_for_disk(self.disk.estimate(ask.label), ask.cancel)?;
@@ -682,6 +730,8 @@ impl<'a> HeavyAdmission<'a> {
                 // `lease` drops on an error and gives its tokens back.
                 if let Some(held) = slots::take(dir, ask, self, &mut queue, gate, &lease.id)? {
                     lease.slots = Some(held);
+                    // Under its own host slot: the slots' share, as greengate gives.
+                    lease.env = self.environment(ask.weight, ask.env, true);
                     lease
                         .env
                         .insert(HOST_SLOT_ENV.to_string(), "held".to_string());
@@ -718,14 +768,14 @@ impl<'a> HeavyAdmission<'a> {
             return;
         }
         for warning in &plan.warnings {
-            eprintln!("relais: host_sizing: {warning}");
+            eprintln!("relais: host sizing: {warning}");
             self.events.emit(Event::EnvironmentWarning {
                 what: "host_sizing".into(),
                 detail: warning.clone(),
             });
         }
-        if plan.sizing.is_none() {
-            self.host_slots_off("greengate.hostSlots is 0");
+        if let (None, Some(by)) = (plan.sizing, &plan.off_by) {
+            self.host_slots_off(&format!("{by} turns them off"));
         }
     }
 
@@ -1026,7 +1076,7 @@ mod slots {
         holder.session = admission.run_id.clone();
         let started = std::time::Instant::now();
         let slot_cap = admission.sizing.cap_for(admission.machine.cores);
-        let width = super::parallelism(ask.weight, admission.machine.cores, slot_cap);
+        let width = admission.width(ask.weight, true);
         // Every wait line names the sizing the command was queued under.
         let record = |waited_ms: u128, outcome: &str| {
             greenharness_slots::record_wait_named(
