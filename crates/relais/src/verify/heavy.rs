@@ -7,16 +7,16 @@
 //!
 //! 1. the coordinator's tokens (`weight` of them, queued behind whoever
 //!    holds them);
-//! 2. `weight` host slots, all or none, through amont's `amont-slots` crate
+//! 2. `weight` host slots, all or none, through greengate's `greenharness-slots` crate
 //!    (amont ADR-0014, decisions ADR-0049), so every heavy job on the
-//!    machine shares one queue: amont's gates, relais's checks, anything run
-//!    through `amont slot run`. The directory is amont's by default
+//!    machine shares one queue: greengate's gates, relais's checks, anything run
+//!    through `amont slot run`. The directory is greengate's by default
 //!    (`[resources] shared_host_slots`, `"off"` for the coordinator's queue
 //!    alone); a directory the crate refuses is said once as
 //!    `host_slots_off`. The runner holds the slots, never the check: their
 //!    descriptors are close-on-exec, so a daemon a check leaves behind does
 //!    not keep one. Where an ancestor already holds slots
-//!    (`AMONT_HOST_SLOT=held` in relais's own environment) nothing is
+//!    (`GREENHARNESS_HOST_SLOT=held` in relais's own environment) nothing is
 //!    queued for, and the variable is passed on;
 //! 3. the child's environment: the parallelism bounds below, then the
 //!    check's own `env`;
@@ -60,7 +60,7 @@ pub const ANNOUNCE_EVERY: Duration = Duration::from_secs(30);
 
 /// The environment variable a held host slot exports, so an amont started
 /// inside the check does not queue again (amont ADR-0009).
-pub const HOST_SLOT_ENV: &str = amont_slots::HELD_ENV;
+pub const HOST_SLOT_ENV: &str = greenharness_slots::HELD_ENV;
 
 /// How often a lease the coordinator could not tie to a process group says
 /// it is alive while its check runs (the coordinator frees a lease it has
@@ -85,7 +85,7 @@ pub const UNREACHABLE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 pub const COORDINATOR_UNREACHABLE_CLASS: &str = "coordinator_unreachable";
 
 /// Whether relais's own environment says an ancestor already holds host
-/// slots for this process tree (`AMONT_HOST_SLOT=held`, amont ADR-0009).
+/// slots for this process tree (`GREENHARNESS_HOST_SLOT=held`, amont ADR-0009).
 /// Read at the boundary (the runner), passed in as a fact.
 pub fn ancestor_holds_slots(value: Option<&str>) -> bool {
     value == Some("held")
@@ -351,7 +351,7 @@ pub struct HeavyAdmission<'a> {
     pub slots: Option<PathBuf>,
     /// How many host slots there are (`[resources] host_slots`, else the
     /// automatic sizing).
-    pub sizing: amont_slots::Sizing,
+    pub sizing: greenharness_slots::Sizing,
     /// An ancestor holds host slots for this tree: nothing is queued for
     /// here, and the fact is passed on to the check.
     pub ancestor_holds_slots: bool,
@@ -393,7 +393,7 @@ impl<'a> HeavyAdmission<'a> {
             cap: 1,
             cores: 1,
             slots: None,
-            sizing: amont_slots::Sizing::Auto,
+            sizing: greenharness_slots::Sizing::Auto,
             ancestor_holds_slots: false,
             poll: ADMISSION_POLL,
             announce_every: ANNOUNCE_EVERY,
@@ -553,7 +553,7 @@ impl<'a> HeavyAdmission<'a> {
             }
             return Ok(Admitted::unadmitted(environment));
         };
-        // The shared queue is amont's: its files are counted before any
+        // The shared queue is greengate's: its files are counted before any
         // token is queued for, so a weight it can never grant is refused
         // without waiting.
         let shared = match (&self.slots, self.ancestor_holds_slots) {
@@ -809,7 +809,7 @@ pub struct Admitted<'a> {
     env: BTreeMap<String, String>,
     /// The host slots held, by this runner and never by the check: released
     /// when the lease drops, after the check ended.
-    slots: Option<amont_slots::Lease>,
+    slots: Option<greenharness_slots::Lease>,
 }
 
 impl<'a> Admitted<'a> {
@@ -843,7 +843,9 @@ impl<'a> Admitted<'a> {
 
     /// How many host slots this lease holds.
     pub fn host_slots(&self) -> usize {
-        self.slots.as_ref().map_or(0, amont_slots::Lease::weight)
+        self.slots
+            .as_ref()
+            .map_or(0, greenharness_slots::Lease::weight)
     }
 
     /// Tell the coordinator which process group runs the command, so the
@@ -904,7 +906,7 @@ impl Drop for Admitted<'_> {
 }
 
 mod slots {
-    //! The host slots, through amont's `amont-slots` crate (amont ADR-0014):
+    //! The host slots, through greengate's `greenharness-slots` crate (amont ADR-0014):
     //! a waiter keeps its place across polls, and relais drives the polling
     //! from its own queue, so the coordinator lease keeps its heartbeat and
     //! the wait is charged like any other.
@@ -923,11 +925,11 @@ mod slots {
         weight: u32,
         admission: &HeavyAdmission<'_>,
     ) -> Result<Option<PathBuf>, LeaseStop> {
-        if !amont_slots::SUPPORTED {
+        if !greenharness_slots::SUPPORTED {
             admission.host_slots_off("host slots need flock, which this platform does not have");
             return Ok(None);
         }
-        if let Err(why) = amont_slots::safe_dir(dir) {
+        if let Err(why) = greenharness_slots::safe_dir(dir) {
             admission.host_slots_off(&why);
             return Ok(None);
         }
@@ -951,12 +953,12 @@ mod slots {
         queue: &mut Queue<'_>,
         gate: &(dyn Gate + Sync),
         lease: &str,
-    ) -> Result<Option<amont_slots::Lease>, LeaseStop> {
-        let mut holder = amont_slots::Holder::here("relais", ask.label);
+    ) -> Result<Option<greenharness_slots::Lease>, LeaseStop> {
+        let mut holder = greenharness_slots::Holder::here("relais", ask.label);
         holder.session = admission.run_id.clone();
         let started = std::time::Instant::now();
         let mut waiter =
-            match amont_slots::Waiter::new_in(dir, admission.sizing, ask.weight, holder) {
+            match greenharness_slots::Waiter::new_in(dir, admission.sizing, ask.weight, holder) {
                 Ok(waiter) => waiter,
                 Err(e) => {
                     admission.host_slots_off(&format!("a host slot could not be queued for: {e}"));
@@ -965,8 +967,8 @@ mod slots {
             };
         loop {
             let queued = match waiter.poll() {
-                Ok(amont_slots::Poll::Granted(held)) => {
-                    amont_slots::record_wait(
+                Ok(greenharness_slots::Poll::Granted(held)) => {
+                    greenharness_slots::record_wait(
                         dir,
                         "relais",
                         ask.weight,
@@ -975,7 +977,7 @@ mod slots {
                     );
                     return Ok(Some(held));
                 }
-                Ok(amont_slots::Poll::Waiting(queued)) => queued,
+                Ok(greenharness_slots::Poll::Waiting(queued)) => queued,
                 Err(e) => {
                     admission.host_slots_off(&format!("a host slot could not be locked: {e}"));
                     return Ok(None);
@@ -996,7 +998,7 @@ mod slots {
             if let Err(stop) = waited {
                 // Ended by the budget or a cancel: a sample too, or the
                 // day-14 wait percentiles would see only the admissions.
-                amont_slots::record_wait(
+                greenharness_slots::record_wait(
                     dir,
                     "relais",
                     ask.weight,
@@ -1010,8 +1012,8 @@ mod slots {
 
     /// `relais: cargo test (amont-wt-x, 4m), 1 unknown (old client)`, or
     /// nothing when no holder said who it is.
-    fn behind(queued: &amont_slots::Queue) -> Option<String> {
-        let now = amont_slots::now_ms();
+    fn behind(queued: &greenharness_slots::Queue) -> Option<String> {
+        let now = greenharness_slots::now_ms();
         let mut who: Vec<String> = queued.holders.iter().map(|h| h.describe(now)).collect();
         if queued.unknown > 0 {
             who.push(format!("{} unknown (old client)", queued.unknown));

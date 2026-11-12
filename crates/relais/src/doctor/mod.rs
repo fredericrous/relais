@@ -331,7 +331,7 @@ pub(crate) fn permissions_finding(settings: &MachineSettings) -> Option<Finding>
 
 /// The `heavy` finding: how many heavy-command tokens the machine hands
 /// out (`max_heavy_commands`, else a quarter of the cores, at least one),
-/// and the host slots every heavy job queues on: amont's directory unless
+/// and the host slots every heavy job queues on: greengate's directory unless
 /// `[resources] shared_host_slots` names another or says `"off"`, sized
 /// automatically unless `host_slots` fixes it (SPEC §23). Information,
 /// never a warning.
@@ -352,7 +352,7 @@ pub(crate) fn heavy_finding(settings: &MachineSettings, cores: u32) -> Finding {
         Some(dir) => format!("shared host slots in {dir}, {sizing}"),
         None => format!(
             "shared host slots in {}, {sizing}",
-            amont_slots::dir().display()
+            greenharness_slots::dir().display()
         ),
     };
     Finding {
@@ -3682,7 +3682,7 @@ mod tests {
         assert!(
             default.detail.contains("shared host slots in")
                 && default.detail.contains("sized from the load"),
-            "on by default, in amont's directory: {}",
+            "on by default, in greengate's directory: {}",
             default.detail
         );
         let off = heavy_finding(

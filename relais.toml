@@ -78,41 +78,41 @@ timeout_seconds = 300
 # candidate's tree, so the person's commit and push of that tree skip the
 # suite instead of running it a third and fourth time (decisions programme
 # "one verdict per tree", S2). A gate whose verdict is not recorded — absent
-# or deferred — is a verification gap, never a pass. `AMONT_ON_BUSY=wait`:
-# relais already holds the host slot (`AMONT_HOST_SLOT=held`), so a nested
+# or deferred — is a verification gap, never a pass. `GREENGATE_ON_BUSY=wait`:
+# relais already holds the host slot (`GREENHARNESS_HOST_SLOT=held`), so a nested
 # amont never defers; the setting says so explicitly. The five lint gates
 # are `make lint`'s parts; `cargo-test` is `make test`; `plugin-test` is
 # `make plugin`.
 [[verification.profiles.default.commands]]
 argv = ["amont", "run", "--stamp", "cargo-fmt"]
 timeout_seconds = 300
-env = { AMONT_ON_BUSY = "wait" }
+env = { GREENGATE_ON_BUSY = "wait" }
 
 [[verification.profiles.default.commands]]
 argv = ["amont", "run", "--stamp", "clippy"]
 # `make lint` measured 10 s with fmt and clippy on a warm build.
 timeout_seconds = 300
-env = { AMONT_ON_BUSY = "wait" }
+env = { GREENGATE_ON_BUSY = "wait" }
 
 [[verification.profiles.default.commands]]
 argv = ["amont", "run", "--stamp", "module-cycles"]
 timeout_seconds = 300
-env = { AMONT_ON_BUSY = "wait" }
+env = { GREENGATE_ON_BUSY = "wait" }
 
 [[verification.profiles.default.commands]]
 argv = ["amont", "run", "--stamp", "child-cycles-ledger"]
 timeout_seconds = 300
-env = { AMONT_ON_BUSY = "wait" }
+env = { GREENGATE_ON_BUSY = "wait" }
 
 [[verification.profiles.default.commands]]
 argv = ["amont", "run", "--stamp", "child-cycles-runner"]
 timeout_seconds = 300
-env = { AMONT_ON_BUSY = "wait" }
+env = { GREENGATE_ON_BUSY = "wait" }
 
 [[verification.profiles.default.commands]]
 argv = ["amont", "run", "--stamp", "child-cycles-cli"]
 timeout_seconds = 300
-env = { AMONT_ON_BUSY = "wait" }
+env = { GREENGATE_ON_BUSY = "wait" }
 
 [[verification.profiles.default.commands]]
 argv = ["amont", "run", "--stamp", "cargo-test"]
@@ -126,7 +126,7 @@ argv = ["amont", "run", "--stamp", "cargo-test"]
 # `baseline_unrunnable`; 1800 s is the single `make check`'s old limit.
 timeout_seconds = 1800
 weight = 2
-env = { AMONT_ON_BUSY = "wait" }
+env = { GREENGATE_ON_BUSY = "wait" }
 
 [[verification.profiles.default.commands]]
 argv = ["amont", "run", "--stamp", "plugin-test"]
@@ -135,7 +135,7 @@ argv = ["amont", "run", "--stamp", "plugin-test"]
 # owns the rerun `scripts/plugin-test.sh` does in CI.
 timeout_seconds = 300
 retry = 1
-env = { AMONT_ON_BUSY = "wait" }
+env = { GREENGATE_ON_BUSY = "wait" }
 
 # A candidate that touches what the profile's verdict depends on — build
 # manifests, lockfiles, the test tree, fixtures, or a program the profile
