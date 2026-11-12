@@ -1223,14 +1223,15 @@ pub(crate) fn host_slot_dir(setting: Option<&str>) -> Option<PathBuf> {
 /// `shared_host_slots` setting: the directory and its sizing, or no
 /// directory when the host slots are off (the setting says `"off"`, or the
 /// plan's sizing is `None`). Pure, so the mapping is tested without a
-/// machine; with no directory the sizing is never read.
+/// machine. The sizing is `None` with the host slots off, so a command an
+/// ancestor holds a slot for still gets no slots' share from a placeholder.
 pub(crate) fn host_queue(
     plan: &verify::HostPlan,
     shared_setting: Option<&str>,
-) -> (Option<PathBuf>, greenharness_slots::Sizing) {
-    match plan.sizing {
-        Some(sizing) => (host_slot_dir(shared_setting), sizing),
-        None => (None, greenharness_slots::Sizing::Auto),
+) -> (Option<PathBuf>, Option<greenharness_slots::Sizing>) {
+    match plan.slots.sizing() {
+        Some(sizing) => (host_slot_dir(shared_setting), Some(sizing)),
+        None => (None, None),
     }
 }
 
@@ -1286,10 +1287,12 @@ mod host_slot_dir_tests {
 
     fn plan(sizing: Option<greenharness_slots::Sizing>) -> crate::verify::HostPlan {
         crate::verify::HostPlan {
-            sizing,
+            slots: match sizing {
+                Some(sizing) => crate::verify::HostSlots::On(sizing),
+                None => crate::verify::HostSlots::Off(crate::verify::HostSlotsOff::GitGlobal),
+            },
             machine: greenharness_slots::Machine { cores: 6 },
             warnings: Vec::new(),
-            off_by: None,
         }
     }
 
@@ -1300,17 +1303,16 @@ mod host_slot_dir_tests {
         let fixed = Some(greenharness_slots::Sizing::Fixed(2));
         assert_eq!(
             host_queue(&plan(fixed), None),
-            (
-                Some(greenharness_slots::dir()),
-                greenharness_slots::Sizing::Fixed(2)
-            )
+            (Some(greenharness_slots::dir()), fixed)
         );
         assert_eq!(
             host_queue(&plan(fixed), Some("/run/slots")),
-            (
-                Some(PathBuf::from("/run/slots")),
-                greenharness_slots::Sizing::Fixed(2)
-            )
+            (Some(PathBuf::from("/run/slots")), fixed)
+        );
+        assert_eq!(
+            host_queue(&plan(None), None),
+            (None, None),
+            "no placeholder sizing"
         );
         assert_eq!(host_queue(&plan(fixed), Some("off")).0, None);
         assert_eq!(host_queue(&plan(None), None).0, None);
