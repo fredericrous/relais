@@ -176,11 +176,72 @@ pub fn heavy_cap(configured: Option<u32>, cores: u32) -> u32 {
         .max(1)
 }
 
-/// The cores this machine has, never zero.
-pub fn cores() -> u32 {
-    std::thread::available_parallelism()
-        .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX))
-        .unwrap_or(1)
+/// The logical cores this machine has, never zero. Only the coordinator's
+/// own cap ([`default_heavy_commands`]) reads this (relais ADR-0010: a
+/// quarter of them); a command's width counts the cores the host slots
+/// count ([`HostPlan::machine`]).
+pub fn logical_cores() -> u32 {
+    greenharness_slots::logical_cores()
+}
+
+/// What relais sizes the host queue from: greengate's two host keys,
+/// resolved once by the slots crate for every client, and relais's own
+/// `[resources] host_slots`, which is deprecated but still wins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPlan {
+    /// `None`: the host slots are off (`greengate.hostSlots 0`).
+    pub sizing: Option<greenharness_slots::Sizing>,
+    /// The cores the slots count: `greengate.hostCores`, else the physical
+    /// cores.
+    pub machine: greenharness_slots::Machine,
+    /// What the resolution found wrong, each with its fix, for the caller
+    /// to say once.
+    pub warnings: Vec<String>,
+    /// When `sizing` is `None`, the setting that turned the host slots off,
+    /// as a person would undo it: `GREENGATE_HOST_SLOTS=0`,
+    /// `greengate.hostSlots 0 (git config --global)`, or
+    /// `[resources] host_slots = 0`.
+    pub off_by: Option<String>,
+}
+
+/// The plan for `host` and relais's own `override_slots`. Pure: the caller
+/// resolves the host with [`greenharness_slots::host::from_host`].
+/// Precedence: `GREENGATE_HOST_SLOTS` (an environment variable outranks a
+/// file), then the deprecated `override_slots` from machine.toml, then
+/// `greengate.hostSlots` in git config, then the automatic sizing. An
+/// `override_slots` of 0 turns the host slots off, as `greengate.hostSlots
+/// 0` does.
+pub fn host_plan(
+    host: &greenharness_slots::host::HostSizing,
+    override_slots: Option<u32>,
+) -> HostPlan {
+    use greenharness_slots::host::Source;
+    HostPlan {
+        sizing: match (host.slots.source, override_slots) {
+            (Source::Env, _) | (_, None) => host.slots.value,
+            (_, Some(0)) => None,
+            (_, Some(n)) => Some(greenharness_slots::Sizing::Fixed(n)),
+        },
+        machine: greenharness_slots::Machine {
+            cores: host.cores.value.max(1),
+        },
+        warnings: host.warnings.clone(),
+        off_by: match (host.slots.source, override_slots, host.slots.value) {
+            (Source::Env, _, None) => Some(format!("{}=0", greenharness_slots::host::SLOTS_ENV)),
+            (Source::Env, _, Some(_)) => None,
+            (_, Some(0), _) => Some("[resources] host_slots = 0".to_string()),
+            (_, Some(_), _) => None,
+            (Source::Global, None, None) => Some(format!(
+                "{} 0 (git config --global)",
+                greenharness_slots::host::SLOTS_KEY
+            )),
+            (Source::System, None, None) => Some(format!(
+                "{} 0 (git config --system)",
+                greenharness_slots::host::SLOTS_KEY
+            )),
+            (_, None, _) => None,
+        },
+    }
 }
 
 /// The first command of a profile whose weight no machine setting can
@@ -205,11 +266,46 @@ pub fn overweight<'c>(
         })
 }
 
-/// How many jobs a command of `weight` tokens may start:
-/// `max(1, weight * cores / cap)`.
-pub fn parallelism(weight: u32, cores: u32, cap: u32) -> u32 {
-    let jobs = u64::from(weight) * u64::from(cores) / u64::from(cap.max(1));
-    u32::try_from(jobs).unwrap_or(u32::MAX).max(1)
+/// How many jobs a command of `weight` tokens may start,
+/// `max(1, weight * cores / cap)`: greengate's own formula, from the crate
+/// both tools link, so a weight means the same width whoever holds it.
+pub use greenharness_slots::parallelism;
+
+/// Where a command runs, for its width: under a host slot (its own or an
+/// ancestor's), or queued only on the coordinator's tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    UnderHostSlot,
+    CoordinatorOnly,
+}
+
+impl Placement {
+    /// [`Placement::UnderHostSlot`] when `held`, else the coordinator's.
+    pub fn from_held(held: bool) -> Self {
+        if held {
+            Placement::UnderHostSlot
+        } else {
+            Placement::CoordinatorOnly
+        }
+    }
+}
+
+/// The cap a command's width divides the cores by, and its name for the
+/// doctor: the host slots' cap for a command under a host slot, else the
+/// coordinator's `cap`. Pure: the one rule the admission and `relais doctor`
+/// both apply.
+pub fn host_share(
+    machine: greenharness_slots::Machine,
+    sizing: Option<greenharness_slots::Sizing>,
+    placement: Placement,
+    coordinator_cap: u32,
+) -> (u32, &'static str) {
+    match (sizing, placement) {
+        (Some(sizing), Placement::UnderHostSlot) => (sizing.cap_for(machine.cores), "slots"),
+        (Some(_) | None, Placement::UnderHostSlot | Placement::CoordinatorOnly) => {
+            (coordinator_cap, "coordinator")
+        }
+    }
 }
 
 /// The environment of a command admitted with `jobs` jobs: the bounds
@@ -317,6 +413,7 @@ pub struct Tries {
     epoch: u32,
     counts: Arc<Mutex<BTreeMap<String, u32>>>,
     slots_off_said: Arc<AtomicBool>,
+    sizing_said: Arc<AtomicBool>,
 }
 
 impl Tries {
@@ -345,9 +442,12 @@ pub struct HeavyAdmission<'a> {
     pub session_id: String,
     pub budgets: Budgets,
     pub events: Events,
-    /// `max_heavy_commands` in force.
+    /// `max_heavy_commands` in force: the coordinator's cap, read from the
+    /// logical cores.
     pub cap: u32,
-    pub cores: u32,
+    /// The cores the host slots count, so a command's width reads the same
+    /// machine greengate does.
+    pub machine: greenharness_slots::Machine,
     pub slots: Option<PathBuf>,
     /// How many host slots there are (`[resources] host_slots`, else the
     /// automatic sizing).
@@ -391,7 +491,7 @@ impl<'a> HeavyAdmission<'a> {
             budgets: Budgets::unbounded(),
             events: Events::silent(),
             cap: 1,
-            cores: 1,
+            machine: greenharness_slots::Machine { cores: 1 },
             slots: None,
             sizing: greenharness_slots::Sizing::Auto,
             ancestor_holds_slots: false,
@@ -419,15 +519,29 @@ impl<'a> HeavyAdmission<'a> {
         !self.run_id.is_empty()
     }
 
+    /// How many jobs a command of `weight` tokens may start: under a host
+    /// slot (its own or an ancestor's) the weight's share of the slots'
+    /// cores, as a greengate holder of the same weight gets; otherwise the
+    /// coordinator's cap shares the same cores ([`host_share`]).
+    pub(crate) fn width(&self, weight: u32, placement: Placement) -> u32 {
+        let (shares, _) = host_share(self.machine, Some(self.sizing), placement, self.cap);
+        parallelism(weight, self.machine.cores, shares)
+    }
+
     /// The environment of a command of `weight` tokens: the parallelism
-    /// bounds, the host-slot fact when an ancestor holds the slots, and
-    /// then the check's own `env`, which wins.
-    fn environment(&self, weight: u32, own: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    /// bounds for whether it runs under a host slot, the host-slot fact
+    /// when an ancestor holds the slots, and then the check's own `env`,
+    /// which wins.
+    fn environment(
+        &self,
+        weight: u32,
+        own: &BTreeMap<String, String>,
+        placement: Placement,
+    ) -> BTreeMap<String, String> {
         if !self.manages() {
             return own.clone();
         }
-        let mut environment =
-            child_environment(parallelism(weight, self.cores, self.cap), &BTreeMap::new());
+        let mut environment = child_environment(self.width(weight, placement), &BTreeMap::new());
         if self.ancestor_holds_slots {
             environment.insert(HOST_SLOT_ENV.to_string(), "held".to_string());
         }
@@ -546,7 +660,14 @@ impl<'a> HeavyAdmission<'a> {
                 cap: self.cap,
             });
         }
-        let environment = self.environment(ask.weight, ask.env);
+        // Before a host slot is held, the width is the coordinator's share
+        // (or the slots' when an ancestor holds them): a command that ends
+        // up queued nowhere must not run narrower than the coordinator gives.
+        let environment = self.environment(
+            ask.weight,
+            ask.env,
+            Placement::from_held(self.ancestor_holds_slots),
+        );
         let Some(gate) = self.gate else {
             if self.manages() {
                 self.wait_for_disk(self.disk.estimate(ask.label), ask.cancel)?;
@@ -633,6 +754,8 @@ impl<'a> HeavyAdmission<'a> {
                 // `lease` drops on an error and gives its tokens back.
                 if let Some(held) = slots::take(dir, ask, self, &mut queue, gate, &lease.id)? {
                     lease.slots = Some(held);
+                    // Under its own host slot: the slots' share, as greengate gives.
+                    lease.env = self.environment(ask.weight, ask.env, Placement::UnderHostSlot);
                     lease
                         .env
                         .insert(HOST_SLOT_ENV.to_string(), "held".to_string());
@@ -659,6 +782,25 @@ impl<'a> HeavyAdmission<'a> {
             queue.wait(Holding::Disk(short), cancel, self.sleeper.as_ref())?;
         }
         Ok(())
+    }
+
+    /// Say once per run what was wrong with the host sizing keys, and that
+    /// `greengate.hostSlots 0` has the host slots off, on stderr and as an
+    /// event.
+    pub fn note_host_sizing(&self, plan: &HostPlan) {
+        if self.tries.sizing_said.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        for warning in &plan.warnings {
+            eprintln!("relais: host sizing: {warning}");
+            self.events.emit(Event::EnvironmentWarning {
+                what: "host_sizing".into(),
+                detail: warning.clone(),
+            });
+        }
+        if let (None, Some(by)) = (plan.sizing, &plan.off_by) {
+            self.host_slots_off(&format!("{by} turns them off"));
+        }
     }
 
     /// Say once, on stderr and as an event, that the shared host slots are
@@ -933,7 +1075,7 @@ mod slots {
             admission.host_slots_off(&why);
             return Ok(None);
         }
-        let cap = admission.sizing.cap();
+        let cap = admission.sizing.cap_for(admission.machine.cores);
         if weight > cap {
             return Err(LeaseStop::HostSlots {
                 weight,
@@ -957,24 +1099,41 @@ mod slots {
         let mut holder = greenharness_slots::Holder::here("relais", ask.label);
         holder.session = admission.run_id.clone();
         let started = std::time::Instant::now();
-        let mut waiter =
-            match greenharness_slots::Waiter::new_in(dir, admission.sizing, ask.weight, holder) {
-                Ok(waiter) => waiter,
-                Err(e) => {
-                    admission.host_slots_off(&format!("a host slot could not be queued for: {e}"));
-                    return Ok(None);
-                }
-            };
+        let slot_cap = admission.sizing.cap_for(admission.machine.cores);
+        let width = admission.width(ask.weight, super::Placement::UnderHostSlot);
+        // Every wait line names the sizing the command was queued under.
+        let record = |waited_ms: u128, outcome: &str| {
+            greenharness_slots::record_wait_named(
+                dir,
+                "relais",
+                greenharness_slots::WaitContext {
+                    cap: Some(slot_cap),
+                    cores: Some(admission.machine.cores),
+                    ..greenharness_slots::WaitContext::default()
+                },
+                ask.weight,
+                Some(width),
+                waited_ms,
+                outcome,
+            );
+        };
+        let mut waiter = match greenharness_slots::Waiter::new_in_on(
+            dir,
+            admission.sizing,
+            ask.weight,
+            holder,
+            admission.machine,
+        ) {
+            Ok(waiter) => waiter,
+            Err(e) => {
+                admission.host_slots_off(&format!("a host slot could not be queued for: {e}"));
+                return Ok(None);
+            }
+        };
         loop {
             let queued = match waiter.poll() {
                 Ok(greenharness_slots::Poll::Granted(held)) => {
-                    greenharness_slots::record_wait(
-                        dir,
-                        "relais",
-                        ask.weight,
-                        started.elapsed().as_millis(),
-                        "admitted",
-                    );
+                    record(started.elapsed().as_millis(), "admitted");
                     return Ok(Some(held));
                 }
                 Ok(greenharness_slots::Poll::Waiting(queued)) => queued,
@@ -998,13 +1157,7 @@ mod slots {
             if let Err(stop) = waited {
                 // Ended by the budget or a cancel: a sample too, or the
                 // day-14 wait percentiles would see only the admissions.
-                greenharness_slots::record_wait(
-                    dir,
-                    "relais",
-                    ask.weight,
-                    started.elapsed().as_millis(),
-                    "deferred",
-                );
+                record(started.elapsed().as_millis(), "deferred");
                 return Err(stop);
             }
         }

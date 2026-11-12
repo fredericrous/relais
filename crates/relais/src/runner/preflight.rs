@@ -183,7 +183,7 @@ impl<'a> RunEngine<'a> {
         // run here: refused now, whether or not a coordinator is up.
         let heavy_cap = verify::heavy_cap(
             self.config.machine.concurrency.max_heavy_commands,
-            verify::cores(),
+            verify::logical_cores(),
         );
         let profile = &authority.verification_profile;
         if let Some(detail) =
