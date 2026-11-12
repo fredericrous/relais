@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.58.0
+
 - **relais reads the gate stamp greengate writes under its green name (ADR-0068).** `relais native gate-stamp` reads `refs/notes/greengate-gate` first and `refs/notes/amont-gate` only when the green ref has no note for the tree, so a task's `amont-gate@<tree7>` check counts a push stamped by greengate before and after its notes switch. A note must carry its ref's header (`greengate-gate-v1` or `amont-gate-v1`); a note under one ref with the other's header reads as unstamped, and the other ref is not tried. The old ref is read until the census that closes the 30-day window.
 
 ## v0.57.0
