@@ -91,6 +91,10 @@ unblocks its t04, t05, t08 and t09.
   relais refuses the key (`unknown frontmatter key`, parse.rs:87-95).
 
 ## Decision log
+- 2026-11-12 — Delta review: the help paragraph splits so the subcommand
+  list keeps its one-line summary (tui); `due_line`'s doc says it falls back
+  to line 2 like every key (lang:rust); a test pins the indented and quoted
+  `status` key line the CHANGELOG now promises (backend).
 - 2026-11-12 — Implementation review: a date is kept only when it prints
   back as its own text (chrono's `%Y-%m-%d` took `02026-1-05` and
   `+999-01-01`); the frontier row is a pure `frontier_row`, so the

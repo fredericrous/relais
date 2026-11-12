@@ -488,9 +488,10 @@ pub(crate) enum ProgrammeCommand {
         no_fetch: bool,
     },
     /// Open tickets whose blockers are closed and that no `prog/<slug>/<id>`
-    /// branch works, one per line: id, type/mode, repos, name; tickets with
-    /// a `due` date first, soonest first, their name prefixed
-    /// `[due YYYY-MM-DD]` or `[overdue YYYY-MM-DD]`
+    /// branch works, one per line: id, type/mode, repos, name
+    ///
+    /// Tickets with a `due` date come first, soonest first, their name
+    /// prefixed `[due YYYY-MM-DD]` or `[overdue YYYY-MM-DD]`.
     Frontier {
         /// The programme directory, docs/programmes/<slug>
         dir: PathBuf,

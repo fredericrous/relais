@@ -457,4 +457,16 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn an_indented_or_quoted_status_key_reports_its_own_line() {
+        for key in ["  status", "\"status\""] {
+            let text = TICKET.replace("status = \"open\"", &format!("{key} = \"bogus\""));
+            let lines: Vec<usize> = due_problems(&text)
+                .into_iter()
+                .map(|(line, _)| line)
+                .collect();
+            assert_eq!(lines, [4], "{key}");
+        }
+    }
 }
