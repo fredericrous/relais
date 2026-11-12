@@ -101,6 +101,8 @@ pub struct Ticket {
     pub repos_line: usize,
     /// The calendar day a `task` ticket is due; `None` when unset.
     pub due: Option<chrono::NaiveDate>,
+    /// The line of `due`, kept beside the other `*_line` fields for callers
+    /// that report against it; 0 when unset.
     pub due_line: usize,
     pub heading_line: usize,
 }

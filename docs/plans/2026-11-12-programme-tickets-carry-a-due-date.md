@@ -53,9 +53,11 @@ unblocks its t04, t05, t08 and t09.
 - `due = "2026-11-19"` on a `task` ticket: `check` exit 0.
 - `due` on a `research`/`prototype`/`grilling` ticket: a problem
   `<file>:<line>: due is only allowed on a task ticket`, exit 2.
-- `due = "2026-13-40"`, `due = "next week"`, an unquoted TOML date or
-  another non-string: a problem
+- `due = "2026-13-40"`, `due = "next week"`, `"2026-1-5"`, `"02026-1-05"`
+  or another non-string: a problem
   `<file>:<line>: due must be a date as "YYYY-MM-DD"`, exit 2.
+- An unquoted TOML date (`due = 2026-11-19`): a problem
+  `<file>:<line>: due must be a quoted string "YYYY-MM-DD"`, exit 2.
 - `frontier` orders open, unblocked tickets: those with `due` first, by
   date ascending, ties by id; then those without `due` in today's id order.
   Under `--all`, in-flight rows sort with the same key and carry the same mark.
@@ -89,6 +91,12 @@ unblocks its t04, t05, t08 and t09.
   relais refuses the key (`unknown frontmatter key`, parse.rs:87-95).
 
 ## Decision log
+- 2026-11-12 — Implementation review: a date is kept only when it prints
+  back as its own text (chrono's `%Y-%m-%d` took `02026-1-05` and
+  `+999-01-01`); the frontier row is a pure `frontier_row`, so the
+  truncation test covers the code `frontier` runs; `--help` names the order
+  and the marks. Deliberate: `parse_due` keeps `&'static str` errors, a
+  private helper whose two messages become a `Problem` at once.
 - 2026-11-12 — The first commit gate failed: a binary truncation test
   could never truncate (`terminal_width` is `None` off a terminal), and a
   focused run filtered on `due` had skipped it by name. It became a unit
@@ -109,8 +117,10 @@ unblocks its t04, t05, t08 and t09.
   due date → `[due 2026-11-12] `; the day before → `[overdue …]`; the day
   after → `[due …]`; `order_frontier` puts D(11-01), B and E (12-01, tie by
   id), then A and C undated → passed.
-- Phase 1: `relais programme check` on three scratch programmes, one each
-  with a valid, a misplaced and a malformed `due` → binary tests: valid →
+- Phase 1: `relais programme check` on two scratch programmes (the valid
+  case in `the_frontier_lists_due_tickets_first_and_marks_the_overdue`, a
+  misplaced and a malformed `due` together in
+  `check_refuses_a_misplaced_or_malformed_due_at_its_line`) → binary tests: valid →
   exit 0; `2026-1-5` → `F.md:6: due must be a date as "YYYY-MM-DD"`;
   `due` on a research ticket → `G.md:6: due is only allowed on a task
   ticket`, exit 2, nothing on stdout. Unit: unquoted date → `due must be a

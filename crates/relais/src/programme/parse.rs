@@ -29,12 +29,15 @@ fn prose_lines<'a>(lines: &[&'a str], from: usize) -> Vec<(usize, &'a str)> {
     kept
 }
 
-/// A `due` value: a quoted `YYYY-MM-DD` string naming a real day.
-fn parse_due(value: &toml::Value) -> Result<chrono::NaiveDate, &'static str> {
-    match value {
-        toml::Value::String(text) if text.chars().count() == 10 => {
-            chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| DUE_NOT_A_DATE)
-        }
+/// A `due` value: a quoted `YYYY-MM-DD` string naming a real day. chrono's
+/// `%Y-%m-%d` also takes a signed or longer year and one-digit fields, so the
+/// day must print back as the exact text it was read from.
+fn parse_due(raw_due: &toml::Value) -> Result<chrono::NaiveDate, &'static str> {
+    match raw_due {
+        toml::Value::String(text) => chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+            .ok()
+            .filter(|day| day.format("%Y-%m-%d").to_string() == *text)
+            .ok_or(DUE_NOT_A_DATE),
         toml::Value::Datetime(_) => Err("due must be a quoted string \"YYYY-MM-DD\""),
         _ => Err(DUE_NOT_A_DATE),
     }
@@ -172,7 +175,10 @@ pub fn parse_ticket(id: &str, text: &str) -> (Option<Ticket>, Vec<Problem>) {
         .flatten();
     let repos = repos.map_err(|found| problems.push(found)).ok().flatten();
     let due = match (table.get("due"), kind) {
-        (Some(_), Some(found)) if found != TicketType::Task => {
+        (Some(raw_due), Some(TicketType::Task)) => parse_due(raw_due)
+            .map_err(|message| problems.push(problem(&file, key_line("due"), message)))
+            .ok(),
+        (Some(_), Some(_)) => {
             problems.push(problem(
                 &file,
                 key_line("due"),
@@ -180,10 +186,8 @@ pub fn parse_ticket(id: &str, text: &str) -> (Option<Ticket>, Vec<Problem>) {
             ));
             None
         }
-        (Some(value), Some(_)) => parse_due(value)
-            .map_err(|message| problems.push(problem(&file, key_line("due"), message)))
-            .ok(),
-        (Some(_) | None, _) => None,
+        // No `due`, or a type that did not parse (already a problem).
+        (None, _) | (_, None) => None,
     };
 
     let body = prose_lines(&lines, close + 1);
@@ -416,7 +420,15 @@ mod tests {
 
     #[test]
     fn a_malformed_due_is_refused() {
-        for value in ["\"2026-1-5\"", "\"2026-02-30\"", "\"next week\"", "5"] {
+        for value in [
+            "\"2026-1-5\"",
+            "\"2026-02-30\"",
+            "\"next week\"",
+            "5",
+            "\"02026-1-05\"",
+            "\"+999-01-01\"",
+            "\" 2026-1-05\"",
+        ] {
             assert_eq!(
                 due_problems(&task_with(&format!("due = {value}"))),
                 [(6, "due must be a date as \"YYYY-MM-DD\"".to_string())],

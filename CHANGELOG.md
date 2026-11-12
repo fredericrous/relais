@@ -10,7 +10,7 @@ missing here.
 
 ### Added
 
-- **A `task` programme ticket may carry `due = "YYYY-MM-DD"`.** `relais programme check` accepts it there and refuses it malformed or on another ticket type. `relais programme frontier` lists due tickets first, soonest first, then the undated ones in id order, prefixes the name with `[due YYYY-MM-DD] ` or `[overdue YYYY-MM-DD] `, and adds `due` and `overdue` (both `null` when unset) to `--json`. An older relais refuses the key, so no programme should carry `due` until this release is installed.
+- **A `task` programme ticket may carry `due = "YYYY-MM-DD"`.** `relais programme check` accepts it there and refuses it malformed or on another ticket type. `relais programme frontier` lists due tickets first, soonest first, then the undated ones in id order, prefixes the name with `[due YYYY-MM-DD] ` or `[overdue YYYY-MM-DD] `, and adds `due` and `overdue` (both `null` when unset) to `--json`. An older relais refuses the key, so no programme should carry `due` until this release is installed. A problem on an indented or quoted front-matter key (`  status = …`, `"status" = …`) now names that key's own line, not line 2.
 
 ## v0.58.0
 

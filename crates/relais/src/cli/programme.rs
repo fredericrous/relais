@@ -187,6 +187,14 @@ fn order_frontier<T>(rows: &mut [T], due_of: impl Fn(&T) -> Option<NaiveDate>) {
     });
 }
 
+/// One text row of `frontier`: only the name is cut to `width`; the
+/// prefix, the due mark and the label are counted and kept whole.
+fn frontier_row(prefix: &str, mark: &str, name: &str, label: &str, width: Option<usize>) -> String {
+    let used = display_width(prefix) + display_width(mark) + display_width(label);
+    let name = fit_name(name, used, width);
+    format!("{prefix}{mark}{name}{label}\n")
+}
+
 /// Whether a due date has passed on `today`: the same day is still due.
 fn is_overdue(due: NaiveDate, today: NaiveDate) -> bool {
     due < today
@@ -298,12 +306,7 @@ pub(crate) fn frontier_command(
                     (None, Listing::ReadyOnly) => String::new(),
                 };
                 let mark = due_mark(ticket.due, today);
-                let name = fit_name(
-                    &ticket.name,
-                    display_width(&prefix) + display_width(&mark) + display_width(&label),
-                    width,
-                );
-                text.push_str(&format!("{prefix}{mark}{name}{label}\n"));
+                text.push_str(&frontier_row(&prefix, &mark, &ticket.name, &label, width));
             }
             text
         }
@@ -703,24 +706,24 @@ mod tests {
 
     #[test]
     fn a_narrow_row_cuts_the_due_name_never_its_mark() {
-        // The row is `{prefix}{mark}{name}`: only the name goes through
-        // `fit_name`, with the prefix and the mark counted as used.
         let prefix = "F\ttask/afk\talpha\t";
         let mark = due_mark(Some(day(2000, 1, 1)), day(2026, 11, 12));
-        let used = display_width(prefix) + display_width(&mark);
+        let long = "A rather long ticket name to cut";
         // 40 columns: the prefix and the mark already fill them, so the name
         // shrinks to the ellipsis and the mark stays whole.
-        let name = fit_name("A rather long ticket name to cut", used, Some(40));
         assert_eq!(
-            format!("{prefix}{mark}{name}"),
-            format!("{prefix}[overdue 2000-01-01] …")
+            frontier_row(prefix, &mark, long, "", Some(40)),
+            format!("{prefix}[overdue 2000-01-01] …\n")
         );
         // 60 columns: the name is cut to fit, the row is exactly 60 wide.
-        let name = fit_name("A rather long ticket name to cut", used, Some(60));
-        let row = format!("{prefix}{mark}{name}");
+        let row = frontier_row(prefix, &mark, long, "", Some(60));
         assert!(row.contains("\t[overdue 2000-01-01] A rath"), "{row}");
-        assert!(name.ends_with('…'), "{name}");
-        assert_eq!(display_width(&row), 60, "{row}");
+        assert_eq!(display_width(row.trim_end_matches('\n')), 60, "{row}");
+        // No width: nothing is cut.
+        assert_eq!(
+            frontier_row(prefix, &mark, long, "", None),
+            format!("{prefix}[overdue 2000-01-01] {long}\n")
+        );
     }
 
     #[test]
