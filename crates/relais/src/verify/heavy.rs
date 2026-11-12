@@ -189,19 +189,70 @@ pub fn logical_cores() -> u32 {
 /// `[resources] host_slots`, which is deprecated but still wins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPlan {
-    /// `None`: the host slots are off (`greengate.hostSlots 0`).
-    pub sizing: Option<greenharness_slots::Sizing>,
+    /// Whether the host slots are on, and how they are sized, or which
+    /// setting turned them off.
+    pub slots: HostSlots,
     /// The cores the slots count: `greengate.hostCores`, else the physical
     /// cores.
     pub machine: greenharness_slots::Machine,
     /// What the resolution found wrong, each with its fix, for the caller
     /// to say once.
     pub warnings: Vec<String>,
-    /// When `sizing` is `None`, the setting that turned the host slots off,
-    /// as a person would undo it: `GREENGATE_HOST_SLOTS=0`,
-    /// `greengate.hostSlots 0 (git config --global)`, or
-    /// `[resources] host_slots = 0`.
-    pub off_by: Option<String>,
+}
+
+/// The host slots of a plan: on with their sizing, or off with the setting
+/// that turned them off, as a person would undo it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostSlots {
+    On(greenharness_slots::Sizing),
+    Off(HostSlotsOff),
+}
+
+/// The setting that turned the host slots off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostSlotsOff {
+    /// `GREENGATE_HOST_SLOTS=0`.
+    Env,
+    /// `greengate.hostSlots 0` in `--global` git config.
+    GitGlobal,
+    /// `greengate.hostSlots 0` in `--system` git config.
+    GitSystem,
+    /// `[resources] host_slots = 0` in machine.toml.
+    MachineToml,
+}
+
+impl HostSlotsOff {
+    /// The setting, as a person would read it: `GREENGATE_HOST_SLOTS=0`.
+    pub fn setting(self) -> String {
+        use greenharness_slots::host::{SLOTS_ENV, SLOTS_KEY};
+        match self {
+            HostSlotsOff::Env => format!("{SLOTS_ENV}=0"),
+            HostSlotsOff::GitGlobal => format!("{SLOTS_KEY} 0 (git config --global)"),
+            HostSlotsOff::GitSystem => format!("{SLOTS_KEY} 0 (git config --system)"),
+            HostSlotsOff::MachineToml => "[resources] host_slots = 0".to_string(),
+        }
+    }
+
+    /// How to turn the host slots back on.
+    pub fn fix(self) -> String {
+        use greenharness_slots::host::{SLOTS_ENV, SLOTS_KEY};
+        match self {
+            HostSlotsOff::Env => format!("unset {SLOTS_ENV}"),
+            HostSlotsOff::GitGlobal => format!("git config --global --unset {SLOTS_KEY}"),
+            HostSlotsOff::GitSystem => format!("git config --system --unset {SLOTS_KEY}"),
+            HostSlotsOff::MachineToml => "remove host_slots from machine.toml".to_string(),
+        }
+    }
+}
+
+impl HostSlots {
+    /// The sizing when the host slots are on.
+    pub fn sizing(&self) -> Option<greenharness_slots::Sizing> {
+        match self {
+            HostSlots::On(sizing) => Some(*sizing),
+            HostSlots::Off(_) => None,
+        }
+    }
 }
 
 /// The plan for `host` and relais's own `override_slots`. Pure: the caller
@@ -216,31 +267,22 @@ pub fn host_plan(
     override_slots: Option<u32>,
 ) -> HostPlan {
     use greenharness_slots::host::Source;
+    let slots = match (host.slots.source, override_slots, host.slots.value) {
+        (Source::Env, _, Some(sizing)) | (_, None, Some(sizing)) => HostSlots::On(sizing),
+        (Source::Env, _, None) => HostSlots::Off(HostSlotsOff::Env),
+        (_, Some(0), _) => HostSlots::Off(HostSlotsOff::MachineToml),
+        (_, Some(n), _) => HostSlots::On(greenharness_slots::Sizing::Fixed(n)),
+        (Source::System, None, None) => HostSlots::Off(HostSlotsOff::GitSystem),
+        // `None` comes only from a `0` the crate read: global, or detected
+        // never (it sizes automatically).
+        (_, None, None) => HostSlots::Off(HostSlotsOff::GitGlobal),
+    };
     HostPlan {
-        sizing: match (host.slots.source, override_slots) {
-            (Source::Env, _) | (_, None) => host.slots.value,
-            (_, Some(0)) => None,
-            (_, Some(n)) => Some(greenharness_slots::Sizing::Fixed(n)),
-        },
+        slots,
         machine: greenharness_slots::Machine {
             cores: host.cores.value.max(1),
         },
         warnings: host.warnings.clone(),
-        off_by: match (host.slots.source, override_slots, host.slots.value) {
-            (Source::Env, _, None) => Some(format!("{}=0", greenharness_slots::host::SLOTS_ENV)),
-            (Source::Env, _, Some(_)) => None,
-            (_, Some(0), _) => Some("[resources] host_slots = 0".to_string()),
-            (_, Some(_), _) => None,
-            (Source::Global, None, None) => Some(format!(
-                "{} 0 (git config --global)",
-                greenharness_slots::host::SLOTS_KEY
-            )),
-            (Source::System, None, None) => Some(format!(
-                "{} 0 (git config --system)",
-                greenharness_slots::host::SLOTS_KEY
-            )),
-            (_, None, _) => None,
-        },
     }
 }
 
@@ -290,20 +332,22 @@ impl Placement {
     }
 }
 
-/// The cap a command's width divides the cores by, and its name for the
-/// doctor: the host slots' cap for a command under a host slot, else the
-/// coordinator's `cap`. Pure: the one rule the admission and `relais doctor`
-/// both apply.
+/// The cap a command's width divides the cores by, and the placement it
+/// was counted for: the host slots' cap for a command under a host slot
+/// when the slots are on, else the coordinator's `cap`. Pure: the one rule
+/// the admission and `relais doctor` both apply.
 pub fn host_share(
     machine: greenharness_slots::Machine,
     sizing: Option<greenharness_slots::Sizing>,
     placement: Placement,
     coordinator_cap: u32,
-) -> (u32, &'static str) {
+) -> (u32, Placement) {
     match (sizing, placement) {
-        (Some(sizing), Placement::UnderHostSlot) => (sizing.cap_for(machine.cores), "slots"),
+        (Some(sizing), Placement::UnderHostSlot) => {
+            (sizing.cap_for(machine.cores), Placement::UnderHostSlot)
+        }
         (Some(_) | None, Placement::UnderHostSlot | Placement::CoordinatorOnly) => {
-            (coordinator_cap, "coordinator")
+            (coordinator_cap, Placement::CoordinatorOnly)
         }
     }
 }
@@ -449,9 +493,9 @@ pub struct HeavyAdmission<'a> {
     /// machine greengate does.
     pub machine: greenharness_slots::Machine,
     pub slots: Option<PathBuf>,
-    /// How many host slots there are (`[resources] host_slots`, else the
-    /// automatic sizing).
-    pub sizing: greenharness_slots::Sizing,
+    /// How many host slots there are, from the run's plan; `None` when the
+    /// host slots are off, so no width is ever read from a placeholder.
+    pub sizing: Option<greenharness_slots::Sizing>,
     /// An ancestor holds host slots for this tree: nothing is queued for
     /// here, and the fact is passed on to the check.
     pub ancestor_holds_slots: bool,
@@ -493,7 +537,7 @@ impl<'a> HeavyAdmission<'a> {
             cap: 1,
             machine: greenharness_slots::Machine { cores: 1 },
             slots: None,
-            sizing: greenharness_slots::Sizing::Auto,
+            sizing: None,
             ancestor_holds_slots: false,
             poll: ADMISSION_POLL,
             announce_every: ANNOUNCE_EVERY,
@@ -524,7 +568,7 @@ impl<'a> HeavyAdmission<'a> {
     /// cores, as a greengate holder of the same weight gets; otherwise the
     /// coordinator's cap shares the same cores ([`host_share`]).
     pub(crate) fn width(&self, weight: u32, placement: Placement) -> u32 {
-        let (shares, _) = host_share(self.machine, Some(self.sizing), placement, self.cap);
+        let (shares, _) = host_share(self.machine, self.sizing, placement, self.cap);
         parallelism(weight, self.machine.cores, shares)
     }
 
@@ -798,8 +842,12 @@ impl<'a> HeavyAdmission<'a> {
                 detail: warning.clone(),
             });
         }
-        if let (None, Some(by)) = (plan.sizing, &plan.off_by) {
-            self.host_slots_off(&format!("{by} turns them off"));
+        if let HostSlots::Off(by) = plan.slots {
+            self.host_slots_off(&format!(
+                "{} turns them off. Fix: {}",
+                by.setting(),
+                by.fix()
+            ));
         }
     }
 
@@ -1075,7 +1123,11 @@ mod slots {
             admission.host_slots_off(&why);
             return Ok(None);
         }
-        let cap = admission.sizing.cap_for(admission.machine.cores);
+        let Some(sizing) = admission.sizing else {
+            // A directory with the host slots off: queued nowhere.
+            return Ok(None);
+        };
+        let cap = sizing.cap_for(admission.machine.cores);
         if weight > cap {
             return Err(LeaseStop::HostSlots {
                 weight,
@@ -1096,10 +1148,13 @@ mod slots {
         gate: &(dyn Gate + Sync),
         lease: &str,
     ) -> Result<Option<greenharness_slots::Lease>, LeaseStop> {
+        let Some(sizing) = admission.sizing else {
+            return Ok(None);
+        };
         let mut holder = greenharness_slots::Holder::here("relais", ask.label);
         holder.session = admission.run_id.clone();
         let started = std::time::Instant::now();
-        let slot_cap = admission.sizing.cap_for(admission.machine.cores);
+        let slot_cap = sizing.cap_for(admission.machine.cores);
         let width = admission.width(ask.weight, super::Placement::UnderHostSlot);
         // Every wait line names the sizing the command was queued under.
         let record = |waited_ms: u128, outcome: &str| {
@@ -1119,7 +1174,7 @@ mod slots {
         };
         let mut waiter = match greenharness_slots::Waiter::new_in_on(
             dir,
-            admission.sizing,
+            sizing,
             ask.weight,
             holder,
             admission.machine,

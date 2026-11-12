@@ -165,7 +165,7 @@ fn admission<'a>(
         cap,
         machine: greenharness_slots::Machine { cores },
         slots: None,
-        sizing: greenharness_slots::Sizing::Fixed(4),
+        sizing: Some(greenharness_slots::Sizing::Fixed(4)),
         ancestor_holds_slots: false,
         poll: Duration::from_millis(10),
         announce_every: ANNOUNCE_EVERY,
@@ -343,7 +343,7 @@ fn detected_host(cores: u32) -> greenharness_slots::host::HostSizing {
 fn the_host_plan_counts_the_detected_cores_and_sizes_the_slots_automatically() {
     let plan = host_plan(&detected_host(6), None);
     assert_eq!(plan.machine.cores, 6);
-    assert_eq!(plan.sizing, Some(greenharness_slots::Sizing::Auto));
+    assert_eq!(plan.slots.sizing(), Some(greenharness_slots::Sizing::Auto));
     assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
 }
 
@@ -363,11 +363,11 @@ fn relais_own_host_slots_still_wins_over_the_greengate_keys() {
         },
     );
     assert_eq!(
-        host_plan(&host, None).sizing,
+        host_plan(&host, None).slots.sizing(),
         Some(greenharness_slots::Sizing::Fixed(5))
     );
     assert_eq!(
-        host_plan(&host, Some(2)).sizing,
+        host_plan(&host, Some(2)).slots.sizing(),
         Some(greenharness_slots::Sizing::Fixed(2)),
         "the deprecated setting wins"
     );
@@ -388,7 +388,7 @@ fn greengate_host_slots_zero_turns_the_host_slots_off_for_relais_too() {
             source: greenharness_slots::host::Source::Detected,
         },
     );
-    assert_eq!(host_plan(&host, None).sizing, None);
+    assert_eq!(host_plan(&host, None).slots.sizing(), None);
 }
 
 #[test]
@@ -402,7 +402,7 @@ fn greengate_host_slots_from_the_environment_wins_over_host_slots() {
         },
     );
     assert_eq!(
-        host_plan(&host, Some(2)).sizing,
+        host_plan(&host, Some(2)).slots.sizing(),
         Some(greenharness_slots::Sizing::Fixed(5)),
         "an environment variable outranks a file"
     );
@@ -431,21 +431,61 @@ fn the_plan_names_the_setting_that_turned_the_host_slots_off() {
         "0".to_string(),
     )];
     let by_git = host_plan(&resolved(None, &git), None);
-    assert_eq!(by_git.sizing, None);
-    assert_eq!(
-        by_git.off_by.as_deref(),
-        Some("greengate.hostSlots 0 (git config --global)")
-    );
+    assert_eq!(by_git.slots.sizing(), None);
+    assert_eq!(by_git.slots, HostSlots::Off(HostSlotsOff::GitGlobal));
     let by_env = host_plan(&resolved(Some("0"), &[]), Some(3));
-    assert_eq!(by_env.sizing, None);
-    assert_eq!(by_env.off_by.as_deref(), Some("GREENGATE_HOST_SLOTS=0"));
+    assert_eq!(by_env.slots.sizing(), None);
+    assert_eq!(by_env.slots, HostSlots::Off(HostSlotsOff::Env));
     let by_file = host_plan(&resolved(None, &[]), Some(0));
-    assert_eq!(by_file.sizing, None);
+    assert_eq!(by_file.slots.sizing(), None);
+    assert_eq!(by_file.slots, HostSlots::Off(HostSlotsOff::MachineToml));
     assert_eq!(
-        by_file.off_by.as_deref(),
-        Some("[resources] host_slots = 0")
+        host_plan(&resolved(None, &[]), None).slots,
+        HostSlots::On(greenharness_slots::Sizing::Auto)
     );
-    assert_eq!(host_plan(&resolved(None, &[]), None).off_by, None);
+}
+
+#[test]
+fn an_off_setting_names_itself_and_its_fix() {
+    assert_eq!(HostSlotsOff::Env.setting(), "GREENGATE_HOST_SLOTS=0");
+    assert_eq!(HostSlotsOff::Env.fix(), "unset GREENGATE_HOST_SLOTS");
+    assert_eq!(
+        HostSlotsOff::GitGlobal.setting(),
+        "greengate.hostSlots 0 (git config --global)"
+    );
+    assert_eq!(
+        HostSlotsOff::GitGlobal.fix(),
+        "git config --global --unset greengate.hostSlots"
+    );
+    assert_eq!(
+        HostSlotsOff::GitSystem.fix(),
+        "git config --system --unset greengate.hostSlots"
+    );
+    assert_eq!(
+        HostSlotsOff::MachineToml.setting(),
+        "[resources] host_slots = 0"
+    );
+    assert_eq!(
+        HostSlotsOff::MachineToml.fix(),
+        "remove host_slots from machine.toml"
+    );
+}
+
+/// With the host slots off, an ancestor's held slot gives no slots' share
+/// from a placeholder sizing: the coordinator's share stands.
+#[test]
+fn an_ancestor_slot_with_the_host_slots_off_keeps_the_coordinators_width() {
+    let gate = gate_with(2);
+    register(&gate, "run-a0");
+    let mut nested = admission(&gate, "run-a0", 2, 8);
+    nested.sizing = None;
+    nested.ancestor_holds_slots = true;
+    let lease = nested.admit(&ask(&BTreeMap::new(), 1)).expect("admitted");
+    assert_eq!(
+        lease.env().get("CARGO_BUILD_JOBS").map(String::as_str),
+        Some("4"),
+        "8 cores / the coordinator's 2"
+    );
 }
 
 #[test]
@@ -454,15 +494,15 @@ fn the_width_rule_uses_the_slots_cap_only_under_a_host_slot() {
     let auto = Some(greenharness_slots::Sizing::Auto);
     assert_eq!(
         host_share(six, auto, Placement::UnderHostSlot, 1),
-        (3, "slots")
+        (3, Placement::UnderHostSlot)
     );
     assert_eq!(
         host_share(six, auto, Placement::CoordinatorOnly, 1),
-        (1, "coordinator")
+        (1, Placement::CoordinatorOnly)
     );
     assert_eq!(
         host_share(six, None, Placement::UnderHostSlot, 2),
-        (2, "coordinator")
+        (2, Placement::CoordinatorOnly)
     );
 }
 
@@ -487,7 +527,7 @@ fn the_host_plan_carries_the_core_override_and_the_warnings() {
     );
     let plan = host_plan(&bad, None);
     assert_eq!(plan.warnings.len(), 1);
-    assert_eq!(plan.sizing, Some(greenharness_slots::Sizing::Auto));
+    assert_eq!(plan.slots.sizing(), Some(greenharness_slots::Sizing::Auto));
 }
 
 #[test]
@@ -1067,7 +1107,7 @@ mod host_slots {
         register(&gate, "run-n");
         let mut shared = admission(&gate, "run-n", 1, 4);
         shared.slots = Some(missing.clone());
-        shared.sizing = greenharness_slots::Sizing::Fixed(1);
+        shared.sizing = Some(greenharness_slots::Sizing::Fixed(1));
         let lease = shared.admit(&ask(&BTreeMap::new(), 1)).expect("admitted");
         assert_eq!(lease.host_slots(), 1);
         assert_eq!(
@@ -1096,7 +1136,7 @@ mod host_slots {
         // 8 cores, 4 fixed slots, a coordinator cap of 2.
         let mut shared = admission(&gate, "run-w2", 2, 8);
         shared.slots = Some(slots.clone());
-        shared.sizing = greenharness_slots::Sizing::Fixed(4);
+        shared.sizing = Some(greenharness_slots::Sizing::Fixed(4));
         let lease = shared.admit(&ask(&BTreeMap::new(), 1)).expect("admitted");
         assert_eq!(
             lease.env().get("CARGO_BUILD_JOBS").map(String::as_str),
@@ -1177,7 +1217,7 @@ mod host_slots {
         // 8 cores, 4 fixed slots, a coordinator cap of 2.
         let mut refused = admission(&gate, "run-r", 2, 8);
         refused.slots = Some(open.clone());
-        refused.sizing = greenharness_slots::Sizing::Fixed(4);
+        refused.sizing = Some(greenharness_slots::Sizing::Fixed(4));
         let lease = refused
             .admit(&ask(&BTreeMap::new(), 1))
             .expect("falls back");
@@ -1198,7 +1238,7 @@ mod host_slots {
         register(&gate, "run-w");
         let mut shared = admission(&gate, "run-w", 2, 16);
         shared.slots = Some(dir.clone());
-        shared.sizing = greenharness_slots::Sizing::Fixed(1);
+        shared.sizing = Some(greenharness_slots::Sizing::Fixed(1));
         let refused = shared.admit(&ask(&BTreeMap::new(), 2)).err();
         assert!(
             matches!(
@@ -1251,7 +1291,7 @@ mod host_slots {
         let clock = ManualClock::new();
         let mut with_slots = admission(&gate, "run-s", 1, 4);
         with_slots.slots = Some(slots_dir.clone());
-        with_slots.sizing = greenharness_slots::Sizing::Fixed(1);
+        with_slots.sizing = Some(greenharness_slots::Sizing::Fixed(1));
         with_slots.budgets = budgets_on(&clock, 60);
         with_slots.events =
             Events::for_run_on("run-s", &dir, crate::protocol::Wire::to(std::io::sink()));

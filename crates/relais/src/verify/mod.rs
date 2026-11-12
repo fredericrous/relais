@@ -45,8 +45,8 @@ pub use end::CheckEnd;
 pub use heavy::{
     ancestor_holds_slots, child_environment, default_heavy_commands, dispatch_id, heavy_cap,
     host_plan, host_share, logical_cores, overweight, parallelism, Admitted, Ask, HeavyAdmission,
-    HostPlan, Jitter, LeaseStop, Placement, SeededJitter, Sleeper, ThreadSleeper, Tries,
-    ANNOUNCE_EVERY, HOST_SLOT_ENV, LEASE_HEARTBEAT_EVERY,
+    HostPlan, HostSlots, HostSlotsOff, Jitter, LeaseStop, Placement, SeededJitter, Sleeper,
+    ThreadSleeper, Tries, ANNOUNCE_EVERY, HOST_SLOT_ENV, LEASE_HEARTBEAT_EVERY,
 };
 pub use holdout_run::{HoldoutAttempt, HoldoutRun, HoldoutTest, HoldoutVerdict};
 pub use junit::{parse_junit, parse_report, JunitArtifact, JunitError, JunitReport, TestOutcome};

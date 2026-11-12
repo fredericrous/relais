@@ -349,8 +349,9 @@ pub(crate) fn heavy_findings(
     settings: &MachineSettings,
     logical_cores: u32,
     host: &greenharness_slots::host::HostSizing,
-    legacy: &Result<Vec<(String, String)>, String>,
+    legacy: &Result<Vec<(String, String)>, LegacyReadError>,
 ) -> Vec<Finding> {
+    use crate::verify::{HostSlots, Placement};
     use greenharness_slots::Sizing;
     let configured = settings.concurrency.max_heavy_commands;
     let cap = crate::verify::heavy_cap(configured, logical_cores);
@@ -361,11 +362,14 @@ pub(crate) fn heavy_findings(
         "a quarter of the cores"
     };
     let shared = settings.resources.shared_host_slots.as_deref();
-    let queue = match (shared, plan.sizing, &plan.off_by) {
-        (Some("off"), _, _) => "no shared host slots (the coordinator queue only)".to_string(),
-        (_, None, Some(by)) => format!("no shared host slots: {by} turns them off"),
-        (_, None, None) => "no shared host slots".to_string(),
-        (dir, Some(sizing), _) => format!(
+    let queue = match (shared, &plan.slots) {
+        (Some("off"), _) => "no shared host slots (the coordinator queue only)".to_string(),
+        (_, HostSlots::Off(by)) => format!(
+            "no shared host slots: {} turns them off. Fix: {}",
+            by.setting(),
+            by.fix()
+        ),
+        (dir, HostSlots::On(sizing)) => format!(
             "shared host slots in {}, {}",
             dir.map_or_else(
                 || greenharness_slots::dir().display().to_string(),
@@ -377,28 +381,30 @@ pub(crate) fn heavy_findings(
             }
         ),
     };
-    let placement =
-        crate::verify::Placement::from_held(shared != Some("off") && plan.sizing.is_some());
-    let (shares, by) = crate::verify::host_share(plan.machine, plan.sizing, placement, cap);
+    let placement = Placement::from_held(shared != Some("off") && plan.slots.sizing().is_some());
+    let (shares, counted) =
+        crate::verify::host_share(plan.machine, plan.slots.sizing(), placement, cap);
     let jobs = crate::verify::parallelism(1, plan.machine.cores, shares);
-    let mut findings =
-        vec![
-            Finding {
-                component: "heavy",
-                level: Level::Ok,
-                detail: format!("max_heavy_commands {cap} ({source}); {queue}"),
-            },
-            Finding {
-                component: "heavy",
-                level: Level::Ok,
-                detail: format!(
+    let mut findings = vec![
+        Finding {
+            component: "heavy",
+            level: Level::Ok,
+            detail: format!("max_heavy_commands {cap} ({source}); {queue}"),
+        },
+        Finding {
+            component: "heavy",
+            level: Level::Ok,
+            detail: format!(
                 "a weight-1 command runs {jobs} job{} at a time: {} cores shared by {shares} {}",
                 if jobs == 1 { "" } else { "s" },
                 plan.machine.cores,
-                if by == "slots" { "host slots" } else { "coordinator tokens" },
+                match counted {
+                    Placement::UnderHostSlot => "host slots",
+                    Placement::CoordinatorOnly => "coordinator tokens",
+                },
             ),
-            },
-        ];
+        },
+    ];
     if let Some(n) = settings.resources.host_slots {
         use greenharness_slots::host::Source;
         let greengate = match host.slots.value {
@@ -436,7 +442,8 @@ pub(crate) fn heavy_findings(
             component: "heavy",
             level: Level::Warn,
             detail: format!(
-                "the --global git config could not be read for old amont.host* keys: {why}"
+                "the --global git config could not be read for old amont.host* keys: {why}. \
+                 Fix: run git config --global --list to see the error"
             ),
         }),
     }
@@ -468,12 +475,29 @@ pub(crate) fn legacy_host_key_findings(rows: &[(String, String)]) -> Vec<Finding
         .collect()
 }
 
+/// git could not answer for the `--global` config: its exit code (`None`
+/// on a signal) and what it wrote on stderr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LegacyReadError {
+    pub(crate) code: Option<i32>,
+    pub(crate) stderr: String,
+}
+
+impl std::fmt::Display for LegacyReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.code {
+            Some(code) => write!(f, "git exited {code} ({})", self.stderr),
+            None => write!(f, "git exited on a signal ({})", self.stderr),
+        }
+    }
+}
+
 /// The `amont.hostSlots` / `amont.hostCores` rows of `--global` git config,
 /// as `(key lowercased, value)`, from `git config --get-regexp`'s exit code
 /// and output: 0 is rows, 1 is none set. Any other exit is an `Err` naming
 /// it (an unreadable config would otherwise hide the keys). A missing `git`
 /// is no rows, not a finding: relais runs without one.
-fn legacy_host_rows() -> Result<Vec<(String, String)>, String> {
+fn legacy_host_rows() -> Result<Vec<(String, String)>, LegacyReadError> {
     let Ok(out) = std::process::Command::new("git")
         .args([
             "config",
@@ -495,7 +519,7 @@ pub(crate) fn legacy_rows_from(
     code: Option<i32>,
     stdout: &[u8],
     stderr: &[u8],
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<(String, String)>, LegacyReadError> {
     match code {
         Some(0) => Ok(String::from_utf8_lossy(stdout)
             .lines()
@@ -505,11 +529,10 @@ pub(crate) fn legacy_rows_from(
             })
             .collect()),
         Some(1) => Ok(Vec::new()),
-        other => Err(format!(
-            "git exited {} ({})",
-            other.map_or_else(|| "on a signal".to_string(), |c| c.to_string()),
-            String::from_utf8_lossy(stderr).trim()
-        )),
+        code => Err(LegacyReadError {
+            code,
+            stderr: String::from_utf8_lossy(stderr).trim().to_string(),
+        }),
     }
 }
 
@@ -3852,7 +3875,7 @@ mod tests {
         ("global".into(), key.to_ascii_lowercase(), value.into())
     }
 
-    const NONE: Result<Vec<(String, String)>, String> = Ok(Vec::new());
+    const NONE: Result<Vec<(String, String)>, LegacyReadError> = Ok(Vec::new());
 
     fn details(findings: &[Finding]) -> Vec<&str> {
         findings.iter().map(|f| f.detail.as_str()).collect()
@@ -3959,7 +3982,8 @@ mod tests {
         );
         assert!(
             by_git[0].detail.ends_with(
-                "no shared host slots: greengate.hostSlots 0 (git config --global) turns them off"
+                "no shared host slots: greengate.hostSlots 0 (git config --global) turns them \
+                 off. Fix: git config --global --unset greengate.hostSlots"
             ),
             "{}",
             by_git[0].detail
@@ -3975,7 +3999,7 @@ mod tests {
         assert!(
             by_env[0]
                 .detail
-                .contains("GREENGATE_HOST_SLOTS=0 turns them off"),
+                .contains("GREENGATE_HOST_SLOTS=0 turns them off. Fix: unset GREENGATE_HOST_SLOTS"),
             "{}",
             by_env[0].detail
         );
@@ -3988,7 +4012,7 @@ mod tests {
         assert!(
             by_file[0]
                 .detail
-                .contains("[resources] host_slots = 0 turns them off"),
+                .contains("[resources] host_slots = 0 turns them off. Fix: remove host_slots"),
             "{}",
             by_file[0].detail
         );
@@ -4057,7 +4081,7 @@ mod tests {
         assert_eq!(legacy_rows_from(Some(1), b"", b""), Ok(Vec::new()));
         let failed = legacy_rows_from(Some(3), b"", b"fatal: bad config line 4");
         assert_eq!(
-            failed,
+            failed.as_ref().map_err(ToString::to_string),
             Err("git exited 3 (fatal: bad config line 4)".to_string())
         );
         let warned = heavy_findings(&machine_with(""), 16, &host(8), &failed);
