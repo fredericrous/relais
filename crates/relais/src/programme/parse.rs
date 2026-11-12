@@ -29,6 +29,19 @@ fn prose_lines<'a>(lines: &[&'a str], from: usize) -> Vec<(usize, &'a str)> {
     kept
 }
 
+/// A `due` value: a quoted `YYYY-MM-DD` string naming a real day.
+fn parse_due(value: &toml::Value) -> Result<chrono::NaiveDate, &'static str> {
+    match value {
+        toml::Value::String(text) if text.chars().count() == 10 => {
+            chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| DUE_NOT_A_DATE)
+        }
+        toml::Value::Datetime(_) => Err("due must be a quoted string \"YYYY-MM-DD\""),
+        _ => Err(DUE_NOT_A_DATE),
+    }
+}
+
+const DUE_NOT_A_DATE: &str = "due must be a date as \"YYYY-MM-DD\"";
+
 /// The ticket `id` read from `text`. The ticket is `None` when its
 /// frontmatter cannot be read or its type, mode or status is missing or
 /// unknown: nothing else about it can be trusted then.
@@ -79,13 +92,21 @@ pub fn parse_ticket(id: &str, text: &str) -> (Option<Ticket>, Vec<Problem>) {
         frontmatter_lines
             .iter()
             .position(|l| {
-                l.strip_prefix(key)
-                    .is_some_and(|rest| rest.trim_start().starts_with('='))
+                let bare = l.trim_start();
+                let rest = bare
+                    .strip_prefix(key)
+                    .or_else(|| bare.strip_prefix('"')?.strip_prefix(key)?.strip_prefix('"'))
+                    .or_else(|| {
+                        bare.strip_prefix('\'')?
+                            .strip_prefix(key)?
+                            .strip_prefix('\'')
+                    });
+                rest.is_some_and(|rest| rest.trim_start().starts_with('='))
             })
             .map_or(2, |index| index + 2)
     };
     for key in table.keys() {
-        if !["type", "mode", "status", "blocked_by", "repos"].contains(&key.as_str()) {
+        if !["type", "mode", "status", "blocked_by", "repos", "due"].contains(&key.as_str()) {
             problems.push(problem(
                 &file,
                 key_line(key),
@@ -150,6 +171,20 @@ pub fn parse_ticket(id: &str, text: &str) -> (Option<Ticket>, Vec<Problem>) {
         .ok()
         .flatten();
     let repos = repos.map_err(|found| problems.push(found)).ok().flatten();
+    let due = match (table.get("due"), kind) {
+        (Some(_), Some(found)) if found != TicketType::Task => {
+            problems.push(problem(
+                &file,
+                key_line("due"),
+                "due is only allowed on a task ticket",
+            ));
+            None
+        }
+        (Some(value), Some(_)) => parse_due(value)
+            .map_err(|message| problems.push(problem(&file, key_line("due"), message)))
+            .ok(),
+        (Some(_) | None, _) => None,
+    };
 
     let body = prose_lines(&lines, close + 1);
     let heading = body
@@ -194,6 +229,8 @@ pub fn parse_ticket(id: &str, text: &str) -> (Option<Ticket>, Vec<Problem>) {
         status_line: key_line("status"),
         blocked_by_line: key_line("blocked_by"),
         repos_line: key_line("repos"),
+        due,
+        due_line: key_line("due"),
         heading_line,
     };
     (Some(ticket), problems)
@@ -340,5 +377,72 @@ mod tests {
         assert_eq!(found[1].0, 7, "Notes twice");
         assert!(found[2].1.contains("Not yet specified"));
         assert!(found[3].1.contains("Out of scope"));
+    }
+
+    fn task_with(extra: &str) -> String {
+        TICKET.replace("research", "task").replace(
+            "blocked_by = [\"A\"]\n",
+            &format!("blocked_by = [\"A\"]\n{extra}\n"),
+        )
+    }
+
+    fn due_problems(text: &str) -> Vec<(usize, String)> {
+        parse_ticket("B", text)
+            .1
+            .into_iter()
+            .map(|p| (p.line, p.message))
+            .collect()
+    }
+
+    #[test]
+    fn a_valid_due_on_a_task_is_read() {
+        let (ticket, problems) = parse_ticket("B", &task_with("due = \"2026-11-19\""));
+        assert_eq!(problems, []);
+        let ticket = ticket.expect("ticket");
+        assert_eq!(ticket.due, chrono::NaiveDate::from_ymd_opt(2026, 11, 19));
+        assert_eq!(ticket.due_line, 6);
+    }
+
+    #[test]
+    fn due_on_another_type_gives_only_the_task_only_problem() {
+        for value in ["\"2026-11-19\"", "\"next week\""] {
+            let text = TICKET.replace("blocked_by", &format!("due = {value}\nblocked_by"));
+            assert_eq!(
+                due_problems(&text),
+                [(5, "due is only allowed on a task ticket".to_string())]
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_due_is_refused() {
+        for value in ["\"2026-1-5\"", "\"2026-02-30\"", "\"next week\"", "5"] {
+            assert_eq!(
+                due_problems(&task_with(&format!("due = {value}"))),
+                [(6, "due must be a date as \"YYYY-MM-DD\"".to_string())],
+                "{value}"
+            );
+        }
+        let (ticket, _) = parse_ticket("B", &task_with("due = \"nope\""));
+        assert_eq!(ticket.expect("ticket").due, None);
+    }
+
+    #[test]
+    fn an_unquoted_date_has_its_own_message() {
+        assert_eq!(
+            due_problems(&task_with("due = 2026-11-19")),
+            [(6, "due must be a quoted string \"YYYY-MM-DD\"".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_indented_or_quoted_due_key_reports_its_own_line() {
+        for key in ["  due", "\"due\"", "'due'"] {
+            assert_eq!(
+                due_problems(&task_with(&format!("{key} = \"x\""))),
+                [(6, "due must be a date as \"YYYY-MM-DD\"".to_string())],
+                "{key}"
+            );
+        }
     }
 }

@@ -66,11 +66,11 @@ unblocks its t04, t05, t08 and t09.
   true|false`, both `null` when the ticket has no `due` (as `branch` is).
 
 ## Phases
-- [ ] Phase 1 — model and check: `crates/relais/src/programme/model.rs`
+- [x] Phase 1 — model and check: `crates/relais/src/programme/model.rs`
   (`Ticket.due: Option<NaiveDate>`, `due_line`),
   `crates/relais/src/programme/parse.rs` (allow-list, strict date parse requiring exactly 10 chars before `NaiveDate::parse_from_str` so `2026-1-5` is refused, an unquoted TOML date given its own message, the task-only problem raised only when `kind` is `Some`, `Ticket.due = None` on every failure, unit tests incl. `2026-1-5`, `2026-02-30`, unquoted date, valid `due` giving zero problems), `crates/relais/src/programme/analysis.rs` (test
   helper `ticket()` and any struct literal).
-- [ ] Phase 2 — frontier order and marks: `crates/relais/src/cli/programme.rs`
+- [x] Phase 2 — frontier order and marks: `crates/relais/src/cli/programme.rs`
   (a pure `order_frontier(tickets, today)` using a stable sort on the key
   `(due.is_none(), due)`, so undated tickets stay last in id order, also
   for `--all` rows; a pure `due_mark(due, today)` unit-tested on the day
@@ -79,7 +79,7 @@ unblocks its t04, t05, t08 and t09.
   `chrono::Local`),
   `crates/relais/tests/it/programme_cli.rs` (binary tests with far-past and
   far-future dates: order, overdue mark, JSON fields, `check` problems).
-- [ ] Phase 3 — docs and release notes:
+- [x] Phase 3 — docs and release notes:
   `claude-plugin/skills/programme/SKILL.md` (the field in the ticket
   example), `docs/SPEC.md` (front matter and frontier order; after the SKILL.md edit
   run `cargo test -p relais --lib install::` and the plugin embed test),
@@ -89,6 +89,14 @@ unblocks its t04, t05, t08 and t09.
   relais refuses the key (`unknown frontmatter key`, parse.rs:87-95).
 
 ## Decision log
+- 2026-11-12 — The first commit gate failed: a binary truncation test
+  could never truncate (`terminal_width` is `None` off a terminal), and a
+  focused run filtered on `due` had skipped it by name. It became a unit
+  test of `fit_name` with the mark's width.
+- 2026-11-12 — Implemented by relais run run-66018fe7ed9dd-18ea (accepted);
+  it added unit tests but none in `programme_cli.rs`, so the binary tests
+  were written by hand. Phases 1 and 2 share a commit because the commit
+  gate runs the whole suite. Release is 0.59.0: `main` was already 0.58.0.
 - 2026-11-12 — The overdue mark is a name prefix, not a column, because the
   four-column text shape is relied on by `cut`/`awk` users (the comment by
   the row format in `cli/programme.rs`).
@@ -97,18 +105,31 @@ unblocks its t04, t05, t08 and t09.
   taking `today`, so tests never touch the clock.
 
 ## Verification
-- Phase 2 unit: `order_frontier` with `today` equal to a ticket's due date →
-  `[due …]`, not `[overdue …]`; the day before today → overdue → <observed>.
+- Phase 2 unit: `due_mark` (the carried naming) with `today` equal to the
+  due date → `[due 2026-11-12] `; the day before → `[overdue …]`; the day
+  after → `[due …]`; `order_frontier` puts D(11-01), B and E (12-01, tie by
+  id), then A and C undated → passed.
 - Phase 1: `relais programme check` on three scratch programmes, one each
-  with a valid, a misplaced and a malformed `due` → exit 0 / 2 / 2, the problem lines at
-  the right line numbers → <observed>.
+  with a valid, a misplaced and a malformed `due` → binary tests: valid →
+  exit 0; `2026-1-5` → `F.md:6: due must be a date as "YYYY-MM-DD"`;
+  `due` on a research ticket → `G.md:6: due is only allowed on a task
+  ticket`, exit 2, nothing on stdout. Unit: unquoted date → `due must be a
+  quoted string "YYYY-MM-DD"`; indented and quoted keys report their own
+  line → passed.
 - Phase 2: `relais programme frontier` on a scratch programme with tickets
   due 2000-01-01, 2999-01-01 and undated → that order; the first prefixed
-  `[overdue 2000-01-01]`; `--json` carries `due` and `overdue` →
-  <observed>.
+  `[overdue 2000-01-01]`, the second `[due 2999-01-01]`; `--json`: `"due"`,
+  `"overdue": true` on the first row, `false` on the second, both `null` on
+  undated rows, `name` unprefixed; `--all` keeps five fields with an
+  in-flight dated ticket → passed (`programme_cli`: 33 passed). Truncation
+  is a unit test (`a_narrow_row_cuts_the_due_name_never_its_mark`): the
+  binary only truncates on a terminal, so a piped test cannot see it; at 40
+  columns the name collapses to `…` and the mark stays whole, at 60 the
+  name is cut and the row is exactly 60 wide → passed.
 - Real input: `check` and `frontier` on
-  `decisions/docs/programmes/session-boundaries` (no `due` yet) → output
-  identical to the installed relais → <observed>.
+  `decisions/docs/programmes/session-boundaries` (no `due` yet) → `check`
+  and text `frontier` byte-identical to the installed relais 0.57.0; `--json`
+  rows add `"due": null, "overdue": null` and nothing else → as planned.
 
 ## Outcome
 

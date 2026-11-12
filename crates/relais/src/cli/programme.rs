@@ -8,6 +8,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use chrono::NaiveDate;
 use relais::programme::analysis::{self, age_secs, Counts, Standing};
 use relais::programme::load::{self, main_checkout, Found, Programme, ProgrammeError, Source};
 use relais::programme::model::Ticket;
@@ -177,7 +178,35 @@ fn format_age(secs: u64) -> String {
     }
 }
 
-fn ticket_json(programme: &Programme, ticket: &Ticket, tip: Option<&Tip<'_>>) -> Value {
+/// The frontier's order: tickets with a due date first, soonest first, then
+/// the undated ones; the sort is stable, so ties keep the tickets' id order.
+fn order_frontier<T>(rows: &mut [T], due_of: impl Fn(&T) -> Option<NaiveDate>) {
+    rows.sort_by_key(|row| {
+        let due = due_of(row);
+        (due.is_none(), due)
+    });
+}
+
+/// Whether a due date has passed on `today`: the same day is still due.
+fn is_overdue(due: NaiveDate, today: NaiveDate) -> bool {
+    due < today
+}
+
+/// `[due YYYY-MM-DD] ` or `[overdue YYYY-MM-DD] `, empty when undated.
+fn due_mark(due: Option<NaiveDate>, today: NaiveDate) -> String {
+    match due {
+        None => String::new(),
+        Some(date) if is_overdue(date, today) => format!("[overdue {date}] "),
+        Some(date) => format!("[due {date}] "),
+    }
+}
+
+fn ticket_json(
+    programme: &Programme,
+    ticket: &Ticket,
+    tip: Option<&Tip<'_>>,
+    today: NaiveDate,
+) -> Value {
     json!({
         "id": ticket.id,
         "type": ticket.kind.as_str(),
@@ -186,6 +215,8 @@ fn ticket_json(programme: &Programme, ticket: &Ticket, tip: Option<&Tip<'_>>) ->
         "name": ticket.name,
         "branch": tip.map(|t| t.branch),
         "branch_age_secs": tip.map(|t| t.age_secs),
+        "due": ticket.due.map(|date| date.to_string()),
+        "overdue": ticket.due.map(|date| is_overdue(date, today)),
     })
 }
 
@@ -213,7 +244,8 @@ pub(crate) fn frontier_command(
     let programme = found.load().map_err(programme_error)?;
     let standings = programme.standings().map_err(programme_error)?;
     let now = now_unix();
-    let shown: Vec<(&Ticket, Option<Tip<'_>>)> = programme
+    let today = chrono::Local::now().date_naive();
+    let mut shown: Vec<(&Ticket, Option<Tip<'_>>)> = programme
         .tickets
         .values()
         .filter_map(|ticket| match (&standings[&ticket.id], listing) {
@@ -228,6 +260,7 @@ pub(crate) fn frontier_command(
             ) => None,
         })
         .collect();
+    order_frontier(&mut shown, |(ticket, _)| ticket.due);
     if shown.is_empty() {
         let counts = analysis::counts(&standings);
         eprintln!(
@@ -240,7 +273,7 @@ pub(crate) fn frontier_command(
         Format::Json => {
             let rows: Vec<Value> = shown
                 .iter()
-                .map(|(ticket, tip)| ticket_json(&programme, ticket, tip.as_ref()))
+                .map(|(ticket, tip)| ticket_json(&programme, ticket, tip.as_ref(), today))
                 .collect();
             format!("{}\n", Value::Array(rows))
         }
@@ -264,12 +297,13 @@ pub(crate) fn frontier_command(
                     (None, Listing::WithInFlight) => "\t".to_string(),
                     (None, Listing::ReadyOnly) => String::new(),
                 };
+                let mark = due_mark(ticket.due, today);
                 let name = fit_name(
                     &ticket.name,
-                    display_width(&prefix) + display_width(&label),
+                    display_width(&prefix) + display_width(&mark) + display_width(&label),
                     width,
                 );
-                text.push_str(&format!("{prefix}{name}{label}\n"));
+                text.push_str(&format!("{prefix}{mark}{name}{label}\n"));
             }
             text
         }
@@ -647,6 +681,61 @@ mod tests {
         assert_eq!(fit_name("A long name", 10, Some(21)), "A long name");
         assert_eq!(fit_name("A long name", 10, Some(15)), "A lo…");
         assert_eq!(fit_name("A long name", 30, Some(15)), "…");
+    }
+
+    fn day(year: i32, month: u32, date: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, date).expect("a real day")
+    }
+
+    #[test]
+    fn dated_rows_come_first_soonest_first_then_undated_in_id_order() {
+        let mut rows = vec![
+            ("A", None),
+            ("B", Some(day(2026, 12, 1))),
+            ("C", None),
+            ("D", Some(day(2026, 11, 1))),
+            ("E", Some(day(2026, 12, 1))),
+        ];
+        order_frontier(&mut rows, |row| row.1);
+        let ids: Vec<&str> = rows.iter().map(|row| row.0).collect();
+        assert_eq!(ids, ["D", "B", "E", "A", "C"]);
+    }
+
+    #[test]
+    fn a_narrow_row_cuts_the_due_name_never_its_mark() {
+        // The row is `{prefix}{mark}{name}`: only the name goes through
+        // `fit_name`, with the prefix and the mark counted as used.
+        let prefix = "F\ttask/afk\talpha\t";
+        let mark = due_mark(Some(day(2000, 1, 1)), day(2026, 11, 12));
+        let used = display_width(prefix) + display_width(&mark);
+        // 40 columns: the prefix and the mark already fill them, so the name
+        // shrinks to the ellipsis and the mark stays whole.
+        let name = fit_name("A rather long ticket name to cut", used, Some(40));
+        assert_eq!(
+            format!("{prefix}{mark}{name}"),
+            format!("{prefix}[overdue 2000-01-01] …")
+        );
+        // 60 columns: the name is cut to fit, the row is exactly 60 wide.
+        let name = fit_name("A rather long ticket name to cut", used, Some(60));
+        let row = format!("{prefix}{mark}{name}");
+        assert!(row.contains("\t[overdue 2000-01-01] A rath"), "{row}");
+        assert!(name.ends_with('…'), "{name}");
+        assert_eq!(display_width(&row), 60, "{row}");
+    }
+
+    #[test]
+    fn a_due_date_is_overdue_only_before_today() {
+        let today = day(2026, 11, 12);
+        assert_eq!(due_mark(None, today), "");
+        assert_eq!(
+            due_mark(Some(day(2026, 11, 11)), today),
+            "[overdue 2026-11-11] "
+        );
+        assert_eq!(due_mark(Some(today), today), "[due 2026-11-12] ");
+        assert_eq!(
+            due_mark(Some(day(2026, 11, 13)), today),
+            "[due 2026-11-13] "
+        );
     }
 
     #[test]

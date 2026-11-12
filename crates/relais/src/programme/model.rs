@@ -99,6 +99,9 @@ pub struct Ticket {
     pub status_line: usize,
     pub blocked_by_line: usize,
     pub repos_line: usize,
+    /// The calendar day a `task` ticket is due; `None` when unset.
+    pub due: Option<chrono::NaiveDate>,
+    pub due_line: usize,
     pub heading_line: usize,
 }
 

@@ -1258,3 +1258,81 @@ fn local_edits_older_than_origin_are_named_when_set_aside() {
         text(&out.stderr)
     );
 }
+
+/// A ready `task` ticket with `due`, written into the demo programme.
+fn dated(name: &str, due: &str) -> String {
+    ticket("open", "[]", None, name, None).replacen(
+        "blocked_by = []\n",
+        &format!("blocked_by = []\ndue = \"{due}\"\n"),
+        1,
+    )
+}
+
+#[test]
+fn the_frontier_lists_due_tickets_first_and_marks_the_overdue() {
+    let world = World::new("due");
+    world.write("F.md", &dated("Name of F", "2999-01-01"));
+    world.write("G.md", &dated("Name of G", "2000-01-01"));
+    let out = world.programme(&["check"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+
+    let out = world.programme(&["frontier"]);
+    assert_eq!(
+        text(&out.stdout),
+        "G\ttask/afk\talpha\t[overdue 2000-01-01] Name of G\n\
+         F\ttask/afk\talpha\t[due 2999-01-01] Name of F\n\
+         B\ttask/afk\talpha\tName of B\n\
+         D\ttask/afk\talpha\tName of D\n"
+    );
+
+    let out = world.programme(&["frontier", "--json"]);
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(rows[0]["due"], "2000-01-01");
+    assert_eq!(rows[0]["overdue"], true);
+    assert_eq!(rows[0]["name"], "Name of G");
+    assert_eq!(rows[1]["overdue"], false);
+    assert!(rows[2]["due"].is_null(), "{}", rows[2]);
+    assert!(rows[2]["overdue"].is_null(), "{}", rows[2]);
+}
+
+#[test]
+fn an_in_flight_due_ticket_keeps_five_fields_and_its_mark() {
+    let world = World::new("duefl");
+    world.write("F.md", &dated("Name of F", "2000-01-01"));
+    commit_dated(&world.root.join("alpha"), "prog/demo/F", unix_now() - 3600);
+    let out = world.programme(&["frontier", "--all"]);
+    let stdout = text(&out.stdout);
+    let fields: Vec<usize> = stdout
+        .lines()
+        .map(|line| line.split('\t').count())
+        .collect();
+    assert_eq!(fields, [5, 5, 5], "{stdout}");
+    assert!(
+        stdout.starts_with(
+            "F\ttask/afk\talpha\t[overdue 2000-01-01] Name of F\tin-flight prog/demo/F 1h\n"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn check_refuses_a_misplaced_or_malformed_due_at_its_line() {
+    let world = World::new("duebad");
+    world.write("F.md", &dated("Name of F", "2026-1-5"));
+    world.write(
+        "G.md",
+        &dated("Name of G", "2026-11-19").replacen("type = \"task\"", "type = \"research\"", 1),
+    );
+    let out = world.programme(&["check"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("F.md:6: due must be a date as \"YYYY-MM-DD\""),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("G.md:6: due is only allowed on a task ticket"),
+        "{stderr}"
+    );
+    assert_eq!(text(&out.stdout), "");
+}
