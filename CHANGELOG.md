@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.56.0
+
 - **relais joins the host queue greengate 4.0 owns, under its new names.** It links the `greenharness-slots` crate instead of `amont-slots`, so the queue directory is `greenharness-slots` (`GREENHARNESS_SLOT_DIR` names another), a holder's marker is `GREENHARNESS_HOST_SLOT=held`, and the sizing keys are `greengate.hostSlots` / `greengate.hostCores`. A lock directory cannot be read under two names, so install this with greengate 4.0 and greenpiste, with no host slot held: apart, the host runs two queues. An `AMONT_HOST_SLOT` in a check's environment is no longer read, so no check of an old binary may be running while you install. relais's own checks set greengate 4.0's `GREENGATE_ON_BUSY=wait` in place of `AMONT_ON_BUSY`, which 4.0 does not read.
 
 ## v0.55.0
