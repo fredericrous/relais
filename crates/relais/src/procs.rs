@@ -277,7 +277,9 @@ pub fn parent_pid() -> Option<u32> {
 }
 
 /// The one-minute load average, when the platform keeps one. Recorded
-/// beside a measurement, never used to gate one.
+/// beside a measurement; production code never gates on it. A test may
+/// scale a timing bound's slack by it, so a loaded host does not fail a
+/// bound an idle one holds.
 pub fn load_average() -> Option<f64> {
     imp::load_average()
 }
