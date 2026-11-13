@@ -591,7 +591,7 @@ const treeStamp = (passed: number[], failed: number[]) => ({
   failed: failed.map(epoch => ({ gate: 'pre-push', epoch })),
 })
 
-test('a passing gate stamp inside the task window is a passing greengate-gate check of kind gate',async ($: any, on: any) => {
+test('a passing gate stamp inside the task window is a passing greengate-gate check of kind gate', async ($: any, on: any) => {
   const engine = await routedSession($, on)
   const stamped = repositoryWithStamp(engine, treeStamp([SESSION_START_EPOCH], []))
   await personTurn($, engine, 'rename foo to bar, tests exist')
