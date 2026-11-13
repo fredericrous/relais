@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.60.0
+
 - **A task's gate check is named `greengate-gate@<tree7>` (ADR-0068).** The plugin names the check for the greengate stamp it reads, where it named `amont-gate@<tree7>` before. Ledger rows written earlier keep `amont-gate@`; the name is stored as written and `kind = gate` alone marks a gate check, so a count of gate checks counts by `kind`, not by name, and nothing in the ledger is rewritten. The gate stamp reader is unchanged: it reads `refs/notes/greengate-gate` and, until the census that closes the 30-day window, `refs/notes/amont-gate`.
 
 ## v0.59.0
