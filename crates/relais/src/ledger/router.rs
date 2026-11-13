@@ -1485,7 +1485,7 @@ mod tests {
                 passed: true,
             },
             RouterCheck {
-                name: "amont-gate@abc1234".into(),
+                name: "greengate-gate@abc1234".into(),
                 kind: "gate".into(),
                 passed: false,
             },
@@ -1531,6 +1531,38 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, Some(3));
+    }
+
+    #[test]
+    fn a_gate_check_under_either_prefix_still_counts() {
+        // ADR-0068: the plugin writes `greengate-gate@`; rows written before
+        // it keep `amont-gate@` and must still read back as gate checks.
+        let (ledger, _dir) = ledger();
+        let checks = vec![
+            RouterCheck {
+                name: "amont-gate@abc1234".into(),
+                kind: "gate".into(),
+                passed: true,
+            },
+            RouterCheck {
+                name: "greengate-gate@def5678".into(),
+                kind: "gate".into(),
+                passed: false,
+            },
+        ];
+        ledger
+            .record_router_batch(
+                "s",
+                &[RouterRecord::Task(RouterTaskRow {
+                    checks: checks.clone(),
+                    ..task("unknown", 0)
+                })],
+            )
+            .unwrap();
+        let stored = ledger.router_task("s", "t1", None).unwrap().unwrap();
+        assert_eq!(stored.checks, checks);
+        let gate_checks = stored.checks.iter().filter(|c| c.kind == "gate").count();
+        assert_eq!(gate_checks, 2);
     }
 
     #[test]

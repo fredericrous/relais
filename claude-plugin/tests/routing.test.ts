@@ -591,7 +591,7 @@ const treeStamp = (passed: number[], failed: number[]) => ({
   failed: failed.map(epoch => ({ gate: 'pre-push', epoch })),
 })
 
-test('a passing amont stamp inside the task window is a passing amont-gate check of kind gate', async ($: any, on: any) => {
+test('a passing gate stamp inside the task window is a passing greengate-gate check of kind gate',async ($: any, on: any) => {
   const engine = await routedSession($, on)
   const stamped = repositoryWithStamp(engine, treeStamp([SESSION_START_EPOCH], []))
   await personTurn($, engine, 'rename foo to bar, tests exist')
@@ -599,7 +599,7 @@ test('a passing amont stamp inside the task window is a passing amont-gate check
   await endSession($, engine)
   expect(stamped.map(argv => argv.slice(1))).toEqual([['native', 'gate-stamp', '--cwd', '/repo']])
   const [task] = observed(engine, 'task')
-  expect(task.checks).toEqual([{ name: 'amont-gate@0123456', kind: 'gate', passed: true }])
+  expect(task.checks).toEqual([{ name: 'greengate-gate@0123456', kind: 'gate', passed: true }])
   expect(task.outcome).toBe('completed_verified')
 })
 
@@ -610,7 +610,7 @@ test('a failing amont stamp inside the window is a failed check; runs outside th
   await toolCall($, failing, edit('/repo/src/a.rs'), { result: {}, text: 'ok' })
   await endSession($, failing)
   const [task] = observed(failing, 'task')
-  expect(task.checks).toEqual([{ name: 'amont-gate@0123456', kind: 'gate', passed: false }])
+  expect(task.checks).toEqual([{ name: 'greengate-gate@0123456', kind: 'gate', passed: false }])
   expect(task.outcome).toBe('unknown')
 })
 
