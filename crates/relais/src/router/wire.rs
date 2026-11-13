@@ -975,7 +975,7 @@ mod tests {
         value["records"][0]["table_version"] = serde_json::json!(2);
         value["records"][3]["checks"] = serde_json::json!([
             { "name": "go vet ./...", "kind": "lint", "passed": true },
-            { "name": "amont-gate@abc1234", "kind": "gate", "passed": false }
+            { "name": "greengate-gate@abc1234", "kind": "gate", "passed": false }
         ]);
         value["records"]
             .as_array_mut()

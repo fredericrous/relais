@@ -239,7 +239,7 @@ test('a gate stamp: a pass inside the window is a passing check, a fail a failed
         failed: failed.map(e => ({ gate: 'pre-push', epoch: e })),
       }),
     )!
-  const name = 'amont-gate@abcdef0'
+  const name = 'greengate-gate@abcdef0'
   expect(gateChecks(stamp([epoch(10)], []), start, end)).toEqual([{ name, kind: 'gate', passed: true }])
   expect(gateChecks(stamp([], [epoch(10)]), start, end)).toEqual([{ name, kind: 'gate', passed: false }])
   // A fail after the pass: only the failure; a pass after the fail: the last word is a pass.

@@ -1485,7 +1485,7 @@ mod tests {
                 passed: true,
             },
             RouterCheck {
-                name: "amont-gate@abc1234".into(),
+                name: "greengate-gate@abc1234".into(),
                 kind: "gate".into(),
                 passed: false,
             },

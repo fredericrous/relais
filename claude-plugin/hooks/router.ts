@@ -1376,7 +1376,7 @@ export function gateChecks(stamp: GateStamp, startedAt: number, endedAt: number)
   const inside = (r: { epoch: number }) => r.epoch >= from && r.epoch <= to
   const passes = (stamp.passed ?? []).filter(inside)
   const fails = (stamp.failed ?? []).filter(inside)
-  const name = `amont-gate@${stamp.tree.slice(0, 7)}`
+  const name = `greengate-gate@${stamp.tree.slice(0, 7)}`
   const out: { name: string; kind: 'gate'; passed: boolean }[] = []
   if (fails.length > 0) out.push({ name, kind: 'gate', passed: false })
   const lastFail = Math.max(-Infinity, ...fails.map(r => r.epoch))
