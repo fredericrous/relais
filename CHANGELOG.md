@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.61.0
+
 - **Plan-review outcomes are read under greenpiste's new data names.** The ledger is read from `<config>/greenpiste/plan-review/outcomes.jsonl`, and from `<config>/amont-agent/plan-review/outcomes.jsonl` only while the new file is absent. Rows with schema `greenpiste-review-outcome-v1` or `amont-agent-review-outcome-v1` are read, as are merge rows `greenpiste-review-merge-v1` or `amont-agent-review-merge-v1`. The plan root comes from `GREENPISTE_PLAN_ROOT`, then `AMONT_AGENT_PLAN_ROOT`. The quiet watcher already skips both writers' temp files (any dotfile). The old names go at the programme census.
 
 ## v0.60.0
