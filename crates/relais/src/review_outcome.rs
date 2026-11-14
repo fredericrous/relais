@@ -37,7 +37,7 @@ const OLD_LEDGER_PARTS: [&str; 3] = ["amont-agent", "plan-review", "outcomes.jso
 /// The environment variable greenpiste resolves its plan root from.
 pub const PLAN_ROOT_ENV: &str = "GREENPISTE_PLAN_ROOT";
 /// Removed at the greenpiste data-name programme census.
-pub const OLD_PLAN_ROOT_ENV: &str = "AMONT_AGENT_PLAN_ROOT";
+const OLD_PLAN_ROOT_ENV: &str = "AMONT_AGENT_PLAN_ROOT";
 /// How much of a body sha a plan file's `body-sha=` stamp carries.
 const STAMP_LEN: usize = 12;
 
@@ -395,7 +395,8 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// The flags when given, otherwise amont-agent's own defaults.
+    /// The flags when given, otherwise greenpiste's defaults (before its
+    /// migration, amont-agent's).
     pub fn resolve(
         ledger: Option<PathBuf>,
         plan_root: Option<PathBuf>,
@@ -410,10 +411,12 @@ impl Settings {
                 default_ledger(&base)
             }
         };
-        let plan_root = match plan_root
-            .or_else(|| paths::dir_override(PLAN_ROOT_ENV))
-            .or_else(|| paths::dir_override(OLD_PLAN_ROOT_ENV))
-        {
+        let plan_root = match plan_root.or_else(|| {
+            plan_root_from_env(
+                paths::dir_override(PLAN_ROOT_ENV),
+                paths::dir_override(OLD_PLAN_ROOT_ENV),
+            )
+        }) {
             Some(dir) => dir,
             None => paths::home_dir()?.join("Developer").join("Perso"),
         };
@@ -421,7 +424,13 @@ impl Settings {
     }
 }
 
+/// The new plan-root variable's value, else the old one's.
+fn plan_root_from_env(new: Option<PathBuf>, old: Option<PathBuf>) -> Option<PathBuf> {
+    new.or(old)
+}
+
 /// The new ledger under `base`, or the old one when the new file is absent.
+/// Any other error on the new path keeps it, so `read` reports that error.
 fn default_ledger(base: &Path) -> PathBuf {
     let under = |parts: [&str; 3]| {
         parts
@@ -429,10 +438,9 @@ fn default_ledger(base: &Path) -> PathBuf {
             .fold(base.to_path_buf(), |dir, part| dir.join(part))
     };
     let current = under(LEDGER_PARTS);
-    if std::fs::symlink_metadata(&current).is_ok() {
-        current
-    } else {
-        under(OLD_LEDGER_PARTS)
+    match std::fs::symlink_metadata(&current) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => under(OLD_LEDGER_PARTS),
+        _ => current,
     }
 }
 
@@ -572,7 +580,7 @@ pub fn read(settings: &Settings) -> Result<Option<Labelled>, IngestError> {
         .filter(|l| !l.trim_ascii().is_empty())
     {
         match serde_json::from_slice::<Row>(line) {
-            Ok(row) if (row.schema == ROW_SCHEMA || row.schema == OLD_ROW_SCHEMA) => {
+            Ok(row) if matches!(row.schema.as_str(), ROW_SCHEMA | OLD_ROW_SCHEMA) => {
                 // A line recorded twice is one review: the first stands.
                 if !rows.iter().any(|seen| seen.agent_id == row.agent_id) {
                     rows.push(row);
@@ -582,7 +590,7 @@ pub fn read(settings: &Settings) -> Result<Option<Labelled>, IngestError> {
             _ => {}
         }
         match serde_json::from_slice::<MergeRow>(line) {
-            Ok(row) if (row.schema == MERGE_SCHEMA || row.schema == OLD_MERGE_SCHEMA) => {
+            Ok(row) if matches!(row.schema.as_str(), MERGE_SCHEMA | OLD_MERGE_SCHEMA) => {
                 match (row.mode, row.agent_id) {
                     (MergeMode::Command, _) => merges_by_command += 1,
                     (MergeMode::Subagent, Some(agent_id)) => {
@@ -1041,11 +1049,24 @@ mod tests {
     }
 
     fn write_ledger(path: &Path, lines: &[serde_json::Value]) {
-        use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
         std::fs::write(path, text).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_new_plan_root_variable_wins_and_the_old_is_the_fallback() {
+        let new = || Some(PathBuf::from("/new"));
+        let old = || Some(PathBuf::from("/old"));
+        assert_eq!(plan_root_from_env(new(), None), new());
+        assert_eq!(plan_root_from_env(None, old()), old());
+        assert_eq!(plan_root_from_env(new(), old()), new());
+        assert_eq!(plan_root_from_env(None, None), None);
     }
 
     #[test]
@@ -1066,8 +1087,9 @@ mod tests {
         let base = crate::test_support::temp_dir("ledger-schemas");
         let path = base.join("outcomes.jsonl");
         let mut old_row = row("old-agent", "rust", 1, "b1");
-        old_row["schema"] = serde_json::json!(OLD_ROW_SCHEMA);
-        let new_row = row("new-agent", "rust", 1, "b1");
+        old_row["schema"] = serde_json::json!("amont-agent-review-outcome-v1");
+        let mut new_row = row("new-agent", "rust", 1, "b1");
+        new_row["schema"] = serde_json::json!("greenpiste-review-outcome-v1");
         let merge = |schema: &str, agent: &str| {
             serde_json::json!({
                 "schema": schema, "recorded_at": 11, "plan_path": "/plans/p.md",
@@ -1082,8 +1104,8 @@ mod tests {
             &[
                 old_row,
                 new_row,
-                merge(OLD_MERGE_SCHEMA, "old-agent"),
-                merge(MERGE_SCHEMA, "new-agent"),
+                merge("amont-agent-review-merge-v1", "old-agent"),
+                merge("greenpiste-review-merge-v1", "new-agent"),
             ],
         );
         let settings = Settings {
@@ -1092,5 +1114,15 @@ mod tests {
         };
         let labelled = read(&settings).unwrap().expect("ledger present");
         assert_eq!(labelled.invalid, 0, "every row parses");
+        let mut rows: Vec<&str> = labelled.rows.iter().map(|r| r.agent_id.as_str()).collect();
+        rows.sort_unstable();
+        assert_eq!(rows, ["new-agent", "old-agent"], "both review rows kept");
+        let mut merges: Vec<&str> = labelled
+            .merges
+            .iter()
+            .map(|m| m.agent_id.as_str())
+            .collect();
+        merges.sort_unstable();
+        assert_eq!(merges, ["new-agent", "old-agent"], "both merge rows kept");
     }
 }
