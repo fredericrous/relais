@@ -287,6 +287,16 @@ fn age_ms(path: &Path, now_ms: u64) -> Option<u64> {
     Some(now_ms.saturating_sub(at))
 }
 
+/// Prefix of a writer's temp file, which is renamed away the next moment.
+const TEMP_PREFIX: &str = ".greenpiste-tmp-";
+/// Removed at the greenpiste data-name programme census.
+const OLD_TEMP_PREFIX: &str = ".amont-agent-tmp-";
+
+/// Whether the file name is a writer's temp, never a run.
+fn is_writer_temp(id: &str) -> bool {
+    id.starts_with(TEMP_PREFIX) || id.starts_with(OLD_TEMP_PREFIX) || id.starts_with('.')
+}
+
 /// Entry ids and paths in the directory, in id order.
 fn entry_files(dir: &Path) -> Vec<(String, PathBuf)> {
     let Ok(read) = fs::read_dir(dir) else {
@@ -296,10 +306,10 @@ fn entry_files(dir: &Path) -> Vec<(String, PathBuf)> {
         .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        // A dotfile is a writer's temp (amont-agent's ends in `.json`),
+        // A dotfile is a writer's temp (greenpiste's ends in `.json`),
         // renamed away the next moment: seen, it would end as killed.
         .filter_map(|p| Some((p.file_stem()?.to_str()?.to_string(), p)))
-        .filter(|(id, _)| !id.starts_with('.'))
+        .filter(|(id, _)| !is_writer_temp(id))
         .collect();
     files.sort();
     files
@@ -566,6 +576,19 @@ mod tests {
             r#"{{"v":1,"tool":"amont","session":"s","check":"c","repo":"/r","log":{},"pid":{pid},"started":{started}{extra}}}"#,
             serde_json::to_string(&log.to_string_lossy()).unwrap()
         )
+    }
+
+    #[test]
+    fn both_temp_prefixes_are_a_writers_temp() {
+        assert!(super::is_writer_temp(&format!(
+            "{}1-1-0",
+            super::TEMP_PREFIX
+        )));
+        assert!(super::is_writer_temp(&format!(
+            "{}1-1-0",
+            super::OLD_TEMP_PREFIX
+        )));
+        assert!(!super::is_writer_temp("1-0"));
     }
 
     #[test]

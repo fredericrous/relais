@@ -21,15 +21,23 @@ use crate::ledger::{Ledger, LedgerError, ReviewOutcomeRow};
 use crate::paths;
 use crate::router::outcome::TaskOutcome;
 
-/// The only `schema` value a row may carry.
-const ROW_SCHEMA: &str = "amont-agent-review-outcome-v1";
-/// The schema of a merge row: what `amont-agent plan-apply` wrote when it
+/// The `schema` values an outcome row may carry.
+const ROW_SCHEMA: &str = "greenpiste-review-outcome-v1";
+/// Removed at the greenpiste data-name programme census.
+const OLD_ROW_SCHEMA: &str = "amont-agent-review-outcome-v1";
+/// The schema of a merge row: what `greenpiste plan-apply` wrote when it
 /// applied a review's patches (plan-review-edits-apply, Behaviour 3 and 5).
-const MERGE_SCHEMA: &str = "amont-agent-review-merge-v1";
-/// Where amont-agent keeps its ledger, under the Claude config directory.
-const LEDGER_PARTS: [&str; 3] = ["amont-agent", "plan-review", "outcomes.jsonl"];
-/// The environment variable amont-agent resolves its plan root from.
-pub const PLAN_ROOT_ENV: &str = "AMONT_AGENT_PLAN_ROOT";
+const MERGE_SCHEMA: &str = "greenpiste-review-merge-v1";
+/// Removed at the greenpiste data-name programme census.
+const OLD_MERGE_SCHEMA: &str = "amont-agent-review-merge-v1";
+/// Where greenpiste keeps its ledger, under the Claude config directory.
+const LEDGER_PARTS: [&str; 3] = ["greenpiste", "plan-review", "outcomes.jsonl"];
+/// Removed at the greenpiste data-name programme census.
+const OLD_LEDGER_PARTS: [&str; 3] = ["amont-agent", "plan-review", "outcomes.jsonl"];
+/// The environment variable greenpiste resolves its plan root from.
+pub const PLAN_ROOT_ENV: &str = "GREENPISTE_PLAN_ROOT";
+/// Removed at the greenpiste data-name programme census.
+pub const OLD_PLAN_ROOT_ENV: &str = "AMONT_AGENT_PLAN_ROOT";
 /// How much of a body sha a plan file's `body-sha=` stamp carries.
 const STAMP_LEN: usize = 12;
 
@@ -399,14 +407,32 @@ impl Settings {
                     Some(dir) => dir,
                     None => paths::home_dir()?.join(".claude"),
                 };
-                LEDGER_PARTS.iter().fold(base, |dir, part| dir.join(part))
+                default_ledger(&base)
             }
         };
-        let plan_root = match plan_root.or_else(|| paths::dir_override(PLAN_ROOT_ENV)) {
+        let plan_root = match plan_root
+            .or_else(|| paths::dir_override(PLAN_ROOT_ENV))
+            .or_else(|| paths::dir_override(OLD_PLAN_ROOT_ENV))
+        {
             Some(dir) => dir,
             None => paths::home_dir()?.join("Developer").join("Perso"),
         };
         Ok(Self { ledger, plan_root })
+    }
+}
+
+/// The new ledger under `base`, or the old one when the new file is absent.
+fn default_ledger(base: &Path) -> PathBuf {
+    let under = |parts: [&str; 3]| {
+        parts
+            .iter()
+            .fold(base.to_path_buf(), |dir, part| dir.join(part))
+    };
+    let current = under(LEDGER_PARTS);
+    if std::fs::symlink_metadata(&current).is_ok() {
+        current
+    } else {
+        under(OLD_LEDGER_PARTS)
     }
 }
 
@@ -546,7 +572,7 @@ pub fn read(settings: &Settings) -> Result<Option<Labelled>, IngestError> {
         .filter(|l| !l.trim_ascii().is_empty())
     {
         match serde_json::from_slice::<Row>(line) {
-            Ok(row) if row.schema == ROW_SCHEMA => {
+            Ok(row) if (row.schema == ROW_SCHEMA || row.schema == OLD_ROW_SCHEMA) => {
                 // A line recorded twice is one review: the first stands.
                 if !rows.iter().any(|seen| seen.agent_id == row.agent_id) {
                     rows.push(row);
@@ -556,22 +582,24 @@ pub fn read(settings: &Settings) -> Result<Option<Labelled>, IngestError> {
             _ => {}
         }
         match serde_json::from_slice::<MergeRow>(line) {
-            Ok(row) if row.schema == MERGE_SCHEMA => match (row.mode, row.agent_id) {
-                (MergeMode::Command, _) => merges_by_command += 1,
-                (MergeMode::Subagent, Some(agent_id)) => {
-                    // The fallback is recorded once per launch; the first stands.
-                    if !merges
-                        .iter()
-                        .any(|seen: &MergeOutcome| seen.agent_id == agent_id)
-                    {
-                        merges.push(MergeOutcome {
-                            agent_id,
-                            verified: row.verified.unwrap_or(false),
-                        });
+            Ok(row) if (row.schema == MERGE_SCHEMA || row.schema == OLD_MERGE_SCHEMA) => {
+                match (row.mode, row.agent_id) {
+                    (MergeMode::Command, _) => merges_by_command += 1,
+                    (MergeMode::Subagent, Some(agent_id)) => {
+                        // The fallback is recorded once per launch; the first stands.
+                        if !merges
+                            .iter()
+                            .any(|seen: &MergeOutcome| seen.agent_id == agent_id)
+                        {
+                            merges.push(MergeOutcome {
+                                agent_id,
+                                verified: row.verified.unwrap_or(false),
+                            });
+                        }
                     }
+                    (MergeMode::Subagent, None) => invalid += 1,
                 }
-                (MergeMode::Subagent, None) => invalid += 1,
-            },
+            }
             _ => invalid += 1,
         }
     }
@@ -1010,5 +1038,59 @@ mod tests {
         let dir = crate::test_support::temp_dir("review-body");
         assert_eq!(read_body(&dir, "../x"), None);
         assert_eq!(read_body(&dir, ""), None);
+    }
+
+    fn write_ledger(path: &Path, lines: &[serde_json::Value]) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn the_new_ledger_path_wins_and_the_old_is_the_fallback() {
+        let base = crate::test_support::temp_dir("ledger-paths");
+        let new = base.join("greenpiste/plan-review/outcomes.jsonl");
+        let old = base.join("amont-agent/plan-review/outcomes.jsonl");
+        write_ledger(&old, &[]);
+        assert_eq!(default_ledger(&base), old);
+        write_ledger(&new, &[]);
+        assert_eq!(default_ledger(&base), new);
+        std::fs::remove_file(&old).unwrap();
+        assert_eq!(default_ledger(&base), new);
+    }
+
+    #[test]
+    fn both_row_and_merge_schemas_are_read() {
+        let base = crate::test_support::temp_dir("ledger-schemas");
+        let path = base.join("outcomes.jsonl");
+        let mut old_row = row("old-agent", "rust", 1, "b1");
+        old_row["schema"] = serde_json::json!(OLD_ROW_SCHEMA);
+        let new_row = row("new-agent", "rust", 1, "b1");
+        let merge = |schema: &str, agent: &str| {
+            serde_json::json!({
+                "schema": schema, "recorded_at": 11, "plan_path": "/plans/p.md",
+                "body_sha_before": null, "body_sha_after": null, "round": 1,
+                "accepted": 1, "applied": 1, "unmatched": [], "mode": "subagent",
+                "agent_id": agent, "model": null, "tokens": null, "seconds": null,
+                "verified": true,
+            })
+        };
+        write_ledger(
+            &path,
+            &[
+                old_row,
+                new_row,
+                merge(OLD_MERGE_SCHEMA, "old-agent"),
+                merge(MERGE_SCHEMA, "new-agent"),
+            ],
+        );
+        let settings = Settings {
+            ledger: path,
+            plan_root: base.to_path_buf(),
+        };
+        let labelled = read(&settings).unwrap().expect("ledger present");
+        assert_eq!(labelled.invalid, 0, "every row parses");
     }
 }

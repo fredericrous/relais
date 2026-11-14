@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+- **Plan-review outcomes are read under greenpiste's new data names.** The ledger is read from `<config>/greenpiste/plan-review/outcomes.jsonl`, and from `<config>/amont-agent/plan-review/outcomes.jsonl` only while the new file is absent. Rows with schema `greenpiste-review-outcome-v1` or `amont-agent-review-outcome-v1` are read, as are merge rows `greenpiste-review-merge-v1` or `amont-agent-review-merge-v1`. The plan root comes from `GREENPISTE_PLAN_ROOT`, then `AMONT_AGENT_PLAN_ROOT`. The quiet watcher skips `.greenpiste-tmp-` temp files as well as `.amont-agent-tmp-` ones. The old names go at the programme census.
+
 ## v0.60.0
 
 - **A task's gate check is named `greengate-gate@<tree7>` (ADR-0068).** The plugin names the check for the greengate stamp it reads, where it named `amont-gate@<tree7>` before. Ledger rows written earlier keep `amont-gate@`; the name is stored as written and `kind = gate` alone marks a gate check, so a count of gate checks counts by `kind`, not by name, and nothing in the ledger is rewritten. The gate stamp reader is unchanged: it reads `refs/notes/greengate-gate` and, until the census that closes the 30-day window, `refs/notes/amont-gate`.
