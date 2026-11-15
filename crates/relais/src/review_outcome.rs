@@ -168,6 +168,10 @@ struct MergeRow {
     round: Option<u32>,
     accepted: u64,
     applied: u64,
+    // The `role#n` labels a `command` merge applied; written by greenpiste,
+    // not read here. Declared so `deny_unknown_fields` keeps the row.
+    #[serde(rename = "applied_labels", default)]
+    _applied_labels: Option<Vec<String>>,
     unmatched: Vec<String>,
     mode: MergeMode,
     agent_id: Option<String>,
@@ -1099,13 +1103,27 @@ mod tests {
         next["plan"]["counts"] = serde_json::json!({"phases": 6});
         let mut parsed = row("parsed", "rust", 1, "b1");
         parsed["findings"] = serde_json::json!([{"n": 1, "severity": "high"}]);
-        write_ledger(&path, &[today, next, parsed, row("old", "rust", 1, "b1")]);
+        // A `command` merge row as greenpiste writes it, with the labels it
+        // applied.
+        let merge = serde_json::json!({
+            "schema": "amont-agent-review-merge-v1", "recorded_at": 11, "plan_path": "/plans/p.md",
+            "body_sha_before": "b1", "body_sha_after": "b2", "round": 1,
+            "accepted": 2, "applied": 2, "applied_labels": ["backend#1", "rust#2"],
+            "unmatched": [], "mode": "command",
+        });
+        write_ledger(
+            &path,
+            &[today, next, parsed, row("old", "rust", 1, "b1"), merge],
+        );
         let settings = Settings {
             ledger: path,
             plan_root: base.to_path_buf(),
         };
         let labelled = read(&settings).unwrap().expect("ledger present");
-        assert_eq!(labelled.invalid, 0, "every shape parses");
+        assert_eq!(
+            labelled.invalid, 0,
+            "every shape parses, the merge row included"
+        );
         assert_eq!(labelled.rows.len(), 4, "each agent's row is kept");
     }
 
