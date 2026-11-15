@@ -158,6 +158,57 @@ pub(crate) fn holdouts_finding() -> Option<doctor::Finding> {
     })
 }
 
+/// The `purge` finding: whether the automatic prune keeps up (ended runs
+/// past the prune age plus three days are the symptom), with the stamp's
+/// age, the state directory's size and the effective prune age. Nothing
+/// when the state directory is unknown. Deletes nothing.
+pub(crate) fn purge_finding() -> Option<doctor::Finding> {
+    use doctor::state_health as health;
+    let state_dir = paths::state_dir().ok()?;
+    let now = std::time::SystemTime::now();
+    let env = std::env::var(relais::prune::AUTO_PRUNE_DAYS_ENV).ok();
+    let setting = relais::prune::auto_prune_setting(false, env.as_deref());
+    let mut overdue = Vec::new();
+    if let Some(older_than) = health::overdue_after(&setting) {
+        let ledger = paths::ledger_path()
+            .ok()
+            .filter(|path| path.exists())
+            .and_then(|path| relais::ledger::Ledger::open(&path).ok());
+        if let Some(ledger) = &ledger {
+            let judge = relais::prune::RunJudge::load(ledger, &state_dir.join("baseline-cache"));
+            overdue = relais::prune::plan_run_prune(
+                &state_dir.join(paths::RUNS_DIR),
+                older_than,
+                now,
+                &|run, path| judge.judge(run, path),
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|dir| matches!(dir.verdict, relais::prune::RunVerdict::Prunable { .. }))
+            .collect();
+        }
+    }
+    Some(health::purge_finding(&health::PurgeFacts {
+        setting,
+        env_set: env.is_some(),
+        stamp_age: health::stamp_age(&state_dir, now),
+        state_bytes: relais::prune::tree_bytes(&state_dir),
+        overdue_runs: overdue.len(),
+        overdue_bytes: overdue.iter().map(|dir| dir.bytes).sum(),
+    }))
+}
+
+/// The `backups` note: the `ledger*` files beside the ledger, deleted by
+/// nobody. Nothing when there are none.
+pub(crate) fn backups_finding() -> Option<doctor::Finding> {
+    use doctor::state_health as health;
+    let state_dir = paths::state_dir().ok()?;
+    health::backups_finding(&health::ledger_backups(
+        &state_dir,
+        std::time::SystemTime::now(),
+    ))
+}
+
 /// What `relais doctor --json` prints: the findings, and the Claude Code
 /// integration described apart from them.
 #[derive(serde::Serialize)]
@@ -179,6 +230,8 @@ pub(crate) fn doctor_command(json: bool) -> Result<CliOutcome, CliError> {
     note_held_repair_effort(&mut report);
     report.findings.extend(loop_threshold_finding());
     report.findings.extend(holdouts_finding());
+    report.findings.extend(purge_finding());
+    report.findings.extend(backups_finding());
     if json {
         print_document(&DoctorDocument {
             report: &report,

@@ -13,6 +13,10 @@ missing here.
 - **`relais resume --retire --all` prunes old runs.** After its retirement it deletes ended runs with a receipt untouched for 30 days, at most once a day (`runs-prune.stamp`, `runs-prune.lock`), through the same judge as `--prune-runs`; `--no-prune` skips it for one call and `RELAIS_AUTO_PRUNE_DAYS` sets the age in days (`0` turns it off). Deletion renames the run to `runs/.pruning-<id>` first, so a crash is finished by the next prune. `--prune-runs` ends with a tally of kept runs by reason.
 - **The hook journal and `resume.log` are size-bounded.** `hook_journal.jsonl` is renamed to `hook_journal.jsonl.1` once it passes 32 MiB, and `resume.log` to `resume.log.1` once it passes 1 MiB (checked once, before `relais resume --log` opens it). One generation is kept; the live file and `.1` are mode 0600. A rotation that loses the race to another process is skipped, and a failed one is retried at the next write.
 
+### Added
+
+- **`relais doctor` watches the purge and lists ledger backups.** A `purge` finding warns when ended runs older than the prune age plus 3 days exist under `runs/` (the symptom, so a prune that fails every time is seen though its stamp is fresh), and prints the age of `runs-prune.stamp` (or that it is missing), the state-directory size and the effective prune age with its source; an invalid `RELAIS_AUTO_PRUNE_DAYS` is shown as invalid. A `backups` note lists every `ledger*` file beside the ledger by size (at most 10 lines, then a count and total), marks `bak-v27` and `bak-v30` as safe to delete once you will not roll back with a copyable `rm`, and marks every other file as not written by relais. Neither deletes anything.
+
 ### Fixed
 
 - **`--prune-runs` keeps a run a pinned candidate names and a run whose subtree holds a checkout or a live, waiting or pinned package run.** A verify of a source whose run directory was pruned blocks `candidate_missing`, not `candidate_digest_mismatch`.

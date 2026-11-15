@@ -692,7 +692,7 @@ pub fn auto_prune(
 }
 
 /// The bytes a tree holds (symlinks counted as themselves, not followed).
-fn tree_bytes(path: &Path) -> u64 {
+pub fn tree_bytes(path: &Path) -> u64 {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return 0;
     };
