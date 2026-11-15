@@ -1299,10 +1299,8 @@ fn daemon_log() -> std::process::Stdio {
         return std::process::Stdio::null();
     };
     let path = dir.join(DAEMON_LOG);
-    if std::fs::metadata(&path).is_ok_and(|m| m.len() > DAEMON_LOG_MAX) {
-        if let Err(e) = std::fs::rename(&path, dir.join(format!("{DAEMON_LOG}.1"))) {
-            eprintln!("relais coordinator: {} not rotated: {e}", path.display());
-        }
+    if let Err(e) = crate::fsutil::rotate_if_over(&path, DAEMON_LOG_MAX) {
+        eprintln!("relais coordinator: {} not rotated: {e}", path.display());
     }
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);

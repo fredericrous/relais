@@ -92,7 +92,7 @@ impl<'a> RunEngine<'a> {
                 .artifacts_dir
                 .parent()
                 .unwrap_or(&self.config.artifacts_dir)
-                .join("baseline-cache"),
+                .join(crate::paths::BASELINE_CACHE_DIR),
         );
         // The key names the toolchain the checks actually run on: a
         // `rustup update` changes the verdict, and the old key would

@@ -165,8 +165,95 @@ fn age(path: &Path, now: SystemTime) -> Option<Duration> {
     Some(now.duration_since(newest).unwrap_or(Duration::ZERO))
 }
 
-/// The keep reason of an `accepted` run whose receipt is not in the ledger.
-pub const NO_RECEIPT_REASON: &str = "no receipt in the ledger";
+/// Why a run directory is kept. The `Display` is the per-run line; the
+/// [`label`](KeepReason::label) is the fixed category the tally groups by,
+/// so a tally never carries a path, a run id or an error text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeepReason {
+    /// The run has not ended (`state` names where it is).
+    NotEnded { state: &'static str },
+    /// The run ended in a state a person still has to answer.
+    WaitsOnPerson { state: &'static str },
+    /// The ledger has no such run.
+    NotInLedger,
+    /// An `accepted` run whose receipt is not in the ledger.
+    NoReceipt,
+    /// A run that has not ended pins this run's candidate.
+    Pinned,
+    /// A package run beneath this one cannot go (`detail` says why).
+    PackageRun { run: String, detail: String },
+    /// A checkout remains beneath the directory (`at` names it, when known).
+    CheckoutBeneath { at: Option<PathBuf> },
+    /// This many baseline-cache entries cite the directory.
+    CitedByCache { entries: usize },
+    /// A source of the judgement could not be read.
+    Unreadable { what: String, error: String },
+}
+
+impl KeepReason {
+    /// The fixed short category of this reason.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NotEnded { .. } => "not ended",
+            Self::WaitsOnPerson { .. } => "waits on a person",
+            Self::NotInLedger => "not in the ledger",
+            Self::NoReceipt => "no receipt",
+            Self::Pinned => "pinned",
+            Self::PackageRun { .. } => "package run",
+            Self::CheckoutBeneath { .. } => "checkout beneath",
+            Self::CitedByCache { .. } => "cited by the cache",
+            Self::Unreadable { .. } => "unreadable",
+        }
+    }
+
+    fn unreadable(what: &str, error: impl std::fmt::Display) -> Self {
+        Self::Unreadable {
+            what: what.to_string(),
+            error: error.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for KeepReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotEnded { state } => write!(f, "{state} (not ended)"),
+            Self::WaitsOnPerson { state } => write!(f, "{state} (waits on a person)"),
+            Self::NotInLedger => write!(f, "not in the ledger"),
+            Self::NoReceipt => write!(f, "no receipt in the ledger"),
+            Self::Pinned => write!(f, "pinned by a run that has not ended"),
+            Self::PackageRun { run, detail } => write!(f, "package run {run} is {detail}"),
+            Self::CheckoutBeneath { at: None } => {
+                write!(f, "worktree (a checkout remains beneath it)")
+            }
+            Self::CheckoutBeneath { at: Some(at) } => write!(
+                f,
+                "worktree (a checkout remains beneath it: {})",
+                at.display()
+            ),
+            Self::CitedByCache { entries } => {
+                write!(f, "cited by {entries} baseline-cache entries")
+            }
+            Self::Unreadable { what, error } => write!(f, "{what} unreadable: {error}"),
+        }
+    }
+}
+
+/// Binary units, one decimal above bytes: `330.0 MiB`. The one size
+/// format of the prune output and `relais doctor`.
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut scaled = bytes as f64;
+    let mut unit = 0;
+    while scaled >= 1024.0 && unit < UNITS.len() - 1 {
+        scaled /= 1024.0;
+        unit += 1;
+    }
+    format!("{scaled:.1} {}", UNITS[unit])
+}
 
 /// Why a run directory may or may not be pruned, as the ledger has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,7 +263,7 @@ pub enum RunVerdict {
     /// `(kind, path)`.
     Prunable { dangling: Vec<(String, String)> },
     /// Kept, and why.
-    Kept(String),
+    Kept(KeepReason),
 }
 
 /// One run directory the preview lists.
@@ -276,7 +363,7 @@ pub struct Applied {
     /// The directories gone (by their original path).
     pub removed: Vec<PathBuf>,
     /// Prunable when planned, kept by the re-check just before deletion.
-    pub kept: Vec<(PathBuf, String)>,
+    pub kept: Vec<(PathBuf, KeepReason)>,
     /// Deletions that failed, with the error.
     pub failed: Vec<(PathBuf, io::Error)>,
 }
@@ -289,7 +376,10 @@ const PRUNING_PREFIX: &str = ".pruning-";
 /// go). The deletion is crash-safe: the directory is renamed to
 /// `.pruning-<run>` (the commit point) and then removed, and
 /// [`finish_interrupted`] completes a removal a crash cut short.
-pub fn apply_run_prune(plan: &[RunDir], recheck: &dyn Fn(&RunDir) -> Option<String>) -> Applied {
+pub fn apply_run_prune(
+    plan: &[RunDir],
+    recheck: &dyn Fn(&RunDir) -> Option<KeepReason>,
+) -> Applied {
     let mut applied = Applied::default();
     for dir in plan {
         if !matches!(dir.verdict, RunVerdict::Prunable { .. }) {
@@ -384,27 +474,27 @@ impl<'a> RunJudge<'a> {
     pub fn judge(&self, run: &str, path: &Path) -> RunVerdict {
         let id = crate::ids::RunId::from_stored(run);
         let state = match self.ledger.run_status(&id) {
-            Ok(None) => return RunVerdict::Kept("not in the ledger".to_string()),
+            Ok(None) => return RunVerdict::Kept(KeepReason::NotInLedger),
             Ok(Some(state)) => {
                 if let Some(why) = state_keeps(state) {
                     return RunVerdict::Kept(why);
                 }
                 state
             }
-            Err(e) => return RunVerdict::Kept(format!("ledger: {e}")),
+            Err(e) => return RunVerdict::Kept(KeepReason::unreadable("ledger", e)),
         };
         // Only an accepted run has a receipt stored; any other ended run
         // never will, so waiting for one would keep it forever.
         if state == crate::lifecycle::State::Accepted {
             match self.ledger.receipt(&id) {
                 Ok(Some(_)) => {}
-                Ok(None) => return RunVerdict::Kept(NO_RECEIPT_REASON.to_string()),
-                Err(e) => return RunVerdict::Kept(format!("ledger: {e}")),
+                Ok(None) => return RunVerdict::Kept(KeepReason::NoReceipt),
+                Err(e) => return RunVerdict::Kept(KeepReason::unreadable("ledger", e)),
             }
         }
         let pinned = match &self.pinned {
             Ok(pinned) => pinned,
-            Err(e) => return RunVerdict::Kept(format!("pinned candidates unreadable: {e}")),
+            Err(e) => return RunVerdict::Kept(KeepReason::unreadable("pinned candidates", e)),
         };
         if let Some(why) = pin_keeps(pinned, run) {
             return RunVerdict::Kept(why);
@@ -418,7 +508,7 @@ impl<'a> RunJudge<'a> {
         let spellings = spellings_of(path);
         let texts = match &self.cache_texts {
             Ok(texts) => texts,
-            Err(e) => return RunVerdict::Kept(format!("baseline cache unreadable: {e}")),
+            Err(e) => return RunVerdict::Kept(KeepReason::unreadable("baseline cache", e)),
         };
         for spelling in &spellings {
             let cited = format!(
@@ -428,7 +518,7 @@ impl<'a> RunJudge<'a> {
             );
             let citing = texts.iter().filter(|text| text.contains(&cited)).count();
             if citing > 0 {
-                return RunVerdict::Kept(format!("cited by {citing} baseline-cache entries"));
+                return RunVerdict::Kept(KeepReason::CitedByCache { entries: citing });
             }
         }
         let mut dangling = Vec::new();
@@ -441,7 +531,7 @@ impl<'a> RunJudge<'a> {
                         }
                     }
                 }
-                Err(e) => return RunVerdict::Kept(format!("ledger: {e}")),
+                Err(e) => return RunVerdict::Kept(KeepReason::unreadable("ledger", e)),
             }
         }
         RunVerdict::Prunable { dangling }
@@ -452,10 +542,10 @@ impl<'a> RunJudge<'a> {
     /// judge loaded keeps its source, and so is the subtree.
     // holds-until: ~10^4 candidate_inputs rows - the pin set is reloaded in
     // full for each deletion; a per-run indexed query after that
-    pub fn recheck(&self, run: &str, path: &Path) -> Option<String> {
+    pub fn recheck(&self, run: &str, path: &Path) -> Option<KeepReason> {
         let pinned = match self.ledger.pinned_candidates() {
             Ok(pinned) => pinned,
-            Err(e) => return Some(format!("pinned candidates unreadable: {e}")),
+            Err(e) => return Some(KeepReason::unreadable("pinned candidates", e)),
         };
         pin_keeps(&pinned, run)
             .or_else(|| self.subtree_keeps(&pinned, &crate::ids::RunId::from_stored(run), path))
@@ -473,7 +563,7 @@ impl<'a> RunJudge<'a> {
         pinned: &std::collections::BTreeSet<(String, u32)>,
         root: &crate::ids::RunId,
         path: &Path,
-    ) -> Option<String> {
+    ) -> Option<KeepReason> {
         let mut pending = vec![root.clone()];
         let mut seen = std::collections::BTreeSet::new();
         while let Some(parent) = pending.pop() {
@@ -482,14 +572,20 @@ impl<'a> RunJudge<'a> {
             }
             let children = match self.ledger.child_runs(&parent) {
                 Ok(children) => children,
-                Err(e) => return Some(format!("ledger: {e}")),
+                Err(e) => return Some(KeepReason::unreadable("ledger", e)),
             };
             for child in children {
                 if let Some(why) = state_keeps(child.status) {
-                    return Some(format!("package run {} is {why}", child.run));
+                    return Some(KeepReason::PackageRun {
+                        run: child.run.to_string(),
+                        detail: why.to_string(),
+                    });
                 }
                 if pin_keeps(pinned, child.run.as_str()).is_some() {
-                    return Some(format!("package run {} is pinned", child.run));
+                    return Some(KeepReason::PackageRun {
+                        run: child.run.to_string(),
+                        detail: "pinned".to_string(),
+                    });
                 }
                 pending.push(child.run);
             }
@@ -499,16 +595,20 @@ impl<'a> RunJudge<'a> {
 }
 
 /// Why a run in `state` is kept, when it is.
-fn state_keeps(state: crate::lifecycle::State) -> Option<String> {
+fn state_keeps(state: crate::lifecycle::State) -> Option<KeepReason> {
     use crate::lifecycle::State;
     match state {
         State::Prepared
         | State::Running
         | State::Verifying
         | State::Repairing
-        | State::Escalating => Some(format!("{} (not ended)", state.as_str())),
+        | State::Escalating => Some(KeepReason::NotEnded {
+            state: state.as_str(),
+        }),
         State::NeedsReview | State::NeedsDecision | State::Interrupted => {
-            Some(format!("{} (waits on a person)", state.as_str()))
+            Some(KeepReason::WaitsOnPerson {
+                state: state.as_str(),
+            })
         }
         State::Accepted
         | State::Blocked
@@ -519,44 +619,41 @@ fn state_keeps(state: crate::lifecycle::State) -> Option<String> {
     }
 }
 
-fn pin_keeps(pinned: &std::collections::BTreeSet<(String, u32)>, run: &str) -> Option<String> {
+fn pin_keeps(pinned: &std::collections::BTreeSet<(String, u32)>, run: &str) -> Option<KeepReason> {
     pinned
         .range((run.to_string(), 0)..=(run.to_string(), u32::MAX))
         .next()
-        .map(|_| "pinned by a run that has not ended".to_string())
+        .map(|_| KeepReason::Pinned)
 }
 
 /// A checkout under `dir` (a directory holding `.git`, or the legacy
 /// `worktree`), which is the run's work and never pruned with it. A
 /// directory that cannot be read keeps the run.
-fn checkout_beneath(dir: &Path) -> Option<String> {
+fn checkout_beneath(dir: &Path) -> Option<KeepReason> {
     if dir.join(crate::paths::LEGACY_WORKTREE_DIR).exists() {
-        return Some("worktree (a checkout remains beneath it)".to_string());
+        return Some(KeepReason::CheckoutBeneath { at: None });
     }
     let mut pending = vec![dir.to_path_buf()];
     while let Some(current) = pending.pop() {
         let entries = match std::fs::read_dir(&current) {
             Ok(entries) => entries,
-            Err(e) => return Some(format!("{} cannot be read: {e}", current.display())),
+            Err(e) => return Some(KeepReason::unreadable(&current.display().to_string(), e)),
         };
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(e) => return Some(format!("{} cannot be read: {e}", current.display())),
+                Err(e) => return Some(KeepReason::unreadable(&current.display().to_string(), e)),
             };
             let child = entry.path();
             match entry.file_type() {
                 Ok(kind) if kind.is_dir() => {
                     if child.join(".git").exists() {
-                        return Some(format!(
-                            "worktree (a checkout remains beneath it: {})",
-                            child.display()
-                        ));
+                        return Some(KeepReason::CheckoutBeneath { at: Some(child) });
                     }
                     pending.push(child);
                 }
                 Ok(_) => {}
-                Err(e) => return Some(format!("{} cannot be read: {e}", child.display())),
+                Err(e) => return Some(KeepReason::unreadable(&child.display().to_string(), e)),
             }
         }
     }
@@ -603,11 +700,9 @@ pub const DEFAULT_AUTO_PRUNE_DAYS: u64 = 30;
 /// The variable that sets the automatic prune's age in days.
 pub const AUTO_PRUNE_DAYS_ENV: &str = "RELAIS_AUTO_PRUNE_DAYS";
 
-/// What the person asked of the automatic prune.
+/// The automatic prune's age, as the environment and the default make it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoPruneSetting {
-    /// `--no-prune`.
-    Disabled,
     /// `RELAIS_AUTO_PRUNE_DAYS=0`.
     Off,
     /// Prune runs untouched for this many days.
@@ -616,18 +711,29 @@ pub enum AutoPruneSetting {
     Invalid(String),
 }
 
-/// Precedence, highest first: `--no-prune`, the variable, the default.
-pub fn auto_prune_setting(no_prune: bool, env_days: Option<&str>) -> AutoPruneSetting {
-    if no_prune {
-        return AutoPruneSetting::Disabled;
-    }
+/// Where the automatic prune's setting came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingSource {
+    Default,
+    Environment,
+}
+
+/// Parse the variable alone: the default when it is unset. `--no-prune` is
+/// a per-call choice of the command line and never reaches here.
+pub fn auto_prune_setting(env_days: Option<&str>) -> (AutoPruneSetting, SettingSource) {
     match env_days {
-        None => AutoPruneSetting::Days(DEFAULT_AUTO_PRUNE_DAYS),
-        Some(text) => match text.trim().parse::<u64>() {
-            Ok(0) => AutoPruneSetting::Off,
-            Ok(days) => AutoPruneSetting::Days(days),
-            Err(_) => AutoPruneSetting::Invalid(text.to_string()),
-        },
+        None => (
+            AutoPruneSetting::Days(DEFAULT_AUTO_PRUNE_DAYS),
+            SettingSource::Default,
+        ),
+        Some(text) => {
+            let setting = match text.trim().parse::<u64>() {
+                Ok(0) => AutoPruneSetting::Off,
+                Ok(days) => AutoPruneSetting::Days(days),
+                Err(_) => AutoPruneSetting::Invalid(text.to_string()),
+            };
+            (setting, SettingSource::Environment)
+        }
     }
 }
 
@@ -641,14 +747,78 @@ pub enum AutoPrune {
     Ran(AutoPruneReport),
 }
 
+/// The step of a prune that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneStep {
+    Lock,
+    Stamp,
+    ReadingRuns,
+    FinishingLeftover,
+    DeletingRun,
+}
+
+impl PruneStep {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Lock => "taking the lock",
+            Self::Stamp => "writing the stamp",
+            Self::ReadingRuns => "reading runs/",
+            Self::FinishingLeftover => "finishing a leftover",
+            Self::DeletingRun => "deleting a run",
+        }
+    }
+}
+
+/// A prune failure: the step, the path it was working on and the cause.
+#[derive(Debug)]
+pub struct PruneFailure {
+    pub step: PruneStep,
+    pub path: PathBuf,
+    pub error: io::Error,
+}
+
+impl PruneFailure {
+    pub fn new(step: PruneStep, path: &Path, error: io::Error) -> Self {
+        Self {
+            step,
+            path: path.to_path_buf(),
+            error,
+        }
+    }
+}
+
+impl std::fmt::Display for PruneFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}: {}",
+            self.step.describe(),
+            self.path.display(),
+            self.error
+        )
+    }
+}
+
+impl std::error::Error for PruneFailure {}
+
+/// A run directory the automatic prune deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedRun {
+    pub run: String,
+    pub age: Duration,
+    pub bytes: u64,
+    /// Evidence rows its deletion left pointing into it.
+    pub dangling: usize,
+}
+
 #[derive(Debug)]
 pub struct AutoPruneReport {
     /// Run directories older than the age, kept or not.
     pub listed: usize,
     /// The ones deleted.
-    pub removed: Vec<RunDir>,
+    pub removed: Vec<RemovedRun>,
     /// Failures, finishing a leftover or deleting.
-    pub failed: Vec<(PathBuf, io::Error)>,
+    pub failed: Vec<PruneFailure>,
 }
 
 fn stamp_is_fresh(stamp: &Path, now: SystemTime) -> bool {
@@ -658,6 +828,13 @@ fn stamp_is_fresh(stamp: &Path, now: SystemTime) -> bool {
         .ok()
         .and_then(|modified| now.duration_since(modified).ok())
         .is_some_and(|since| since < THROTTLE)
+}
+
+/// Take `runs-prune.lock` without waiting: `None` when another prune holds it.
+pub fn try_lock_prune(state_dir: &Path) -> Result<Option<crate::fsutil::LockFile>, PruneFailure> {
+    let path = state_dir.join(LOCK_FILE);
+    crate::fsutil::LockFile::try_acquire(&path)
+        .map_err(|error| PruneFailure::new(PruneStep::Lock, &path, error))
 }
 
 /// Prune the ended runs untouched for `age`, at most once per
@@ -670,34 +847,73 @@ pub fn auto_prune(
     age: Duration,
     now: SystemTime,
     apply: &dyn Fn(&RunJudge<'_>, &[RunDir]) -> Applied,
-) -> io::Result<AutoPrune> {
+) -> Result<AutoPrune, PruneFailure> {
     let stamp = state_dir.join(STAMP_FILE);
     if stamp_is_fresh(&stamp, now) {
         return Ok(AutoPrune::Throttled);
     }
-    let Some(_lock) = crate::fsutil::LockFile::try_acquire(&state_dir.join(LOCK_FILE))? else {
+    let Some(_lock) = try_lock_prune(state_dir)? else {
         return Ok(AutoPrune::Held);
     };
     if stamp_is_fresh(&stamp, now) {
         return Ok(AutoPrune::Throttled);
     }
-    std::fs::write(&stamp, format!("{}\n", crate::ledger::now_rfc3339()))?;
+    std::fs::write(&stamp, format!("{}\n", crate::ledger::now_rfc3339()))
+        .map_err(|error| PruneFailure::new(PruneStep::Stamp, &stamp, error))?;
     let runs = state_dir.join(crate::paths::RUNS_DIR);
-    let mut failed = finish_interrupted(&runs);
-    let judge = RunJudge::load(ledger, &state_dir.join("baseline-cache"));
-    let plan = plan_run_prune(&runs, age, now, &|run, path| judge.judge(run, path))?;
+    let mut failed: Vec<PruneFailure> = finish_interrupted(&runs)
+        .into_iter()
+        .map(|(path, error)| PruneFailure::new(PruneStep::FinishingLeftover, &path, error))
+        .collect();
+    let judge = RunJudge::load(ledger, &state_dir.join(crate::paths::BASELINE_CACHE_DIR));
+    let plan = plan_run_prune(&runs, age, now, &|run, path| judge.judge(run, path))
+        .map_err(|error| PruneFailure::new(PruneStep::ReadingRuns, &runs, error))?;
     let applied = apply(&judge, &plan);
-    failed.extend(applied.failed);
+    failed.extend(
+        applied
+            .failed
+            .into_iter()
+            .map(|(path, error)| PruneFailure::new(PruneStep::DeletingRun, &path, error)),
+    );
     let removed = plan
         .iter()
         .filter(|dir| applied.removed.contains(&dir.path))
-        .cloned()
+        .map(|dir| RemovedRun {
+            run: dir.run.clone(),
+            age: dir.age,
+            bytes: dir.bytes,
+            dangling: match &dir.verdict {
+                RunVerdict::Prunable { dangling } => dangling.len(),
+                RunVerdict::Kept(_) => 0,
+            },
+        })
         .collect();
     Ok(AutoPrune::Ran(AutoPruneReport {
         listed: plan.len(),
         removed,
         failed,
     }))
+}
+
+/// [`tree_bytes`] of `path` without the subtree at `skip`.
+pub fn tree_bytes_except(path: &Path, skip: &Path) -> u64 {
+    if path == skip {
+        return 0;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    std::fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| tree_bytes_except(&e.path(), skip))
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 /// The bytes a tree holds (symlinks counted as themselves, not followed).
@@ -790,7 +1006,7 @@ mod tests {
             std::fs::write(root.join(name).join("artifacts/logs/a.log"), "1234").unwrap();
         }
         let judge = |run: &str, _: &Path| match run {
-            "old-live" => RunVerdict::Kept("running".to_string()),
+            "old-live" => RunVerdict::Kept(KeepReason::NotEnded { state: "running" }),
             _ => RunVerdict::Prunable {
                 dangling: Vec::new(),
             },
@@ -853,21 +1069,58 @@ mod tests {
     }
 
     #[test]
-    fn the_setting_follows_flag_then_environment_then_default() {
+    fn the_setting_follows_environment_then_default() {
+        let days = |text| auto_prune_setting(Some(text));
+        assert_eq!(days("0").0, AutoPruneSetting::Off);
         assert_eq!(
-            auto_prune_setting(true, Some("5")),
-            AutoPruneSetting::Disabled
+            days("7"),
+            (AutoPruneSetting::Days(7), SettingSource::Environment)
         );
-        assert_eq!(auto_prune_setting(false, Some("0")), AutoPruneSetting::Off);
         assert_eq!(
-            auto_prune_setting(false, Some("7")),
-            AutoPruneSetting::Days(7)
+            auto_prune_setting(None),
+            (AutoPruneSetting::Days(30), SettingSource::Default)
         );
-        assert_eq!(auto_prune_setting(false, None), AutoPruneSetting::Days(30));
         assert_eq!(
-            auto_prune_setting(false, Some("soon")),
+            days("soon").0,
             AutoPruneSetting::Invalid("soon".to_string())
         );
+    }
+
+    #[test]
+    fn sizes_use_binary_units_with_their_names() {
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 / 2), "1.5 MiB");
+        assert_eq!(human_bytes(5 * 1024 * 1024 * 1024), "5.0 GiB");
+    }
+
+    #[test]
+    fn every_keep_reason_has_a_pathless_label() {
+        let reasons = [
+            KeepReason::NotEnded { state: "running" },
+            KeepReason::WaitsOnPerson {
+                state: "interrupted",
+            },
+            KeepReason::NotInLedger,
+            KeepReason::NoReceipt,
+            KeepReason::Pinned,
+            KeepReason::PackageRun {
+                run: "r-1".into(),
+                detail: "pinned".into(),
+            },
+            KeepReason::CheckoutBeneath {
+                at: Some(PathBuf::from("/s/runs/r/c")),
+            },
+            KeepReason::CitedByCache { entries: 2 },
+            KeepReason::Unreadable {
+                what: "/s/runs".into(),
+                error: "denied".into(),
+            },
+        ];
+        for reason in reasons {
+            let label = reason.label();
+            assert!(!label.contains('/') && !label.contains("r-1"), "{label}");
+        }
     }
 
     #[test]
@@ -942,7 +1195,7 @@ mod tests {
         let later = SystemTime::now() + 31 * DAY;
         let plan = plan_run_prune(&root, 30 * DAY, later, &judge).unwrap();
         let applied = apply_run_prune(&plan, &|dir| {
-            (dir.run == "run-a").then(|| "pinned".to_string())
+            (dir.run == "run-a").then_some(KeepReason::Pinned)
         });
         assert!(root.join("run-a").exists());
         assert!(!root.join("run-b").exists());

@@ -243,7 +243,7 @@ mod tests {
         assert!(!path.exists());
         assert_eq!(std::fs::read(dir.join("log.1")).expect("read"), b"12345");
         rotate_if_over(&path, 0).expect("absent file");
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort scratch cleanup
     }
 
     #[cfg(unix)]
@@ -260,6 +260,6 @@ mod tests {
         drop(held);
         rotate_if_over(&path, 1).expect("rotated");
         assert!(!path.exists());
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort scratch cleanup
     }
 }

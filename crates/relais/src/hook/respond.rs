@@ -1751,7 +1751,7 @@ mod tests {
         append_journal_capped(&path, &journal_entry_of(0, 99), 100).expect("append");
         assert_eq!(mode_of(&path), 0o600);
         assert_eq!(mode_of(&rotated), 0o600);
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort scratch cleanup
     }
 
     #[cfg(unix)]
@@ -1779,7 +1779,7 @@ mod tests {
             }
         }
         assert_eq!(lines, 400);
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort scratch cleanup
     }
 
     #[cfg(unix)]
@@ -1801,7 +1801,7 @@ mod tests {
                 .count(),
             10
         );
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort scratch cleanup
     }
 
     #[cfg(unix)]
@@ -1821,7 +1821,7 @@ mod tests {
             std::fs::read_to_string(&rotated).expect("read"),
             "old\nlate\n"
         );
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort scratch cleanup
     }
 
     #[cfg(unix)]
@@ -1844,7 +1844,7 @@ mod tests {
         }
         assert!(second, "second rotation");
         assert!(std::fs::metadata(&rotated).expect("rotated").len() < 2 * cap);
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort scratch cleanup
     }
 
     /// A queued spawn a freed seat admits MID-WAIT comes back silent —

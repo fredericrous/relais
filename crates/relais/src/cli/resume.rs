@@ -404,42 +404,71 @@ pub(crate) fn reconcile_run(
 /// is retired, one line each. A run that is not terminal, not on
 /// record, or whose dispatches are not provably dead is named and
 /// kept. A retirement that fails is relais's own failure to report.
-pub(crate) fn retire_all_command(no_prune: bool) -> Result<CliOutcome, CliError> {
+pub(crate) fn retire_all_command(auto_prune: AutoPruneChoice) -> Result<CliOutcome, CliError> {
     use relais::prune::{auto_prune_setting, AutoPruneSetting};
     let ledger = open_ledger()?;
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
-    let setting = match std::env::var_os(relais::prune::AUTO_PRUNE_DAYS_ENV) {
-        None => auto_prune_setting(no_prune, None),
-        Some(raw) => auto_prune_setting(no_prune, Some(&raw.to_string_lossy())),
-    };
+    let env_days = std::env::var_os(relais::prune::AUTO_PRUNE_DAYS_ENV)
+        .map(|raw| raw.to_string_lossy().into_owned());
     // The retirement first; the prune follows whatever it ended in.
     let retired = retire_all(&ledger, &state_dir);
-    let pruned = match setting {
-        AutoPruneSetting::Disabled => Ok(CliOutcome::Accepted),
-        AutoPruneSetting::Off => {
-            println!("auto-prune off: {}=0", relais::prune::AUTO_PRUNE_DAYS_ENV);
-            Ok(CliOutcome::Accepted)
-        }
-        AutoPruneSetting::Invalid(text) => Err(CliError::Usage {
-            detail: format!(
-                "{}={text:?} is not a whole number of days (0 turns the automatic prune off); \
-                 the automatic prune was skipped",
-                relais::prune::AUTO_PRUNE_DAYS_ENV
-            ),
-        }),
-        AutoPruneSetting::Days(days) => Ok(auto_prune_command(&ledger, &state_dir, days)),
+    let pruned = match auto_prune {
+        AutoPruneChoice::Skip => Ok(CliOutcome::Accepted),
+        AutoPruneChoice::Run => match auto_prune_setting(env_days.as_deref()).0 {
+            AutoPruneSetting::Off => {
+                eprintln!("auto-prune off: {}=0", relais::prune::AUTO_PRUNE_DAYS_ENV);
+                Ok(CliOutcome::Accepted)
+            }
+            AutoPruneSetting::Invalid(text) => Err(CliError::Usage {
+                detail: format!(
+                    "{}={text:?} is not a whole number of days (0 turns the automatic prune off); \
+                     the automatic prune was skipped",
+                    relais::prune::AUTO_PRUNE_DAYS_ENV
+                ),
+            }),
+            AutoPruneSetting::Days(days) => Ok(auto_prune_command(&ledger, &state_dir, days)),
+        },
     };
     match (retired, pruned) {
+        (Err(retire_error), Err(usage)) => {
+            // Only one error is returned; the other is still said.
+            eprintln!("relais: {usage}");
+            Err(retire_error)
+        }
         (Err(e), _) => Err(e),
         (Ok(CliOutcome::Accepted), pruned) => pruned,
-        (Ok(outcome), _) => Ok(outcome),
+        (Ok(outcome), Err(usage)) => {
+            // The retirement's own outcome stands; the skipped prune is still said.
+            eprintln!("relais: {usage}");
+            Ok(outcome)
+        }
+        (Ok(outcome), Ok(_)) => Ok(outcome),
+    }
+}
+
+/// Whether `retire --all` also runs the automatic prune. An enum, so the
+/// handler reads as what was asked (the clap edge is where the `bool`
+/// lives), like [`Retire`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutoPruneChoice {
+    Run,
+    Skip,
+}
+
+impl AutoPruneChoice {
+    pub(crate) fn from_flag(no_prune: bool) -> Self {
+        if no_prune {
+            Self::Skip
+        } else {
+            Self::Run
+        }
     }
 }
 
 /// The automatic prune of `retire --all`, its report on stdout and its
 /// failures on stderr.
 fn auto_prune_command(ledger: &Ledger, state_dir: &Path, days: u64) -> CliOutcome {
-    use relais::prune::{auto_prune, AutoPrune};
+    use relais::prune::{auto_prune, human_bytes, AutoPrune};
     let age = std::time::Duration::from_secs(days.saturating_mul(86_400));
     let report = match auto_prune(
         ledger,
@@ -463,10 +492,7 @@ fn auto_prune_command(ledger: &Ledger, state_dir: &Path, days: u64) -> CliOutcom
             dir.run,
             dir.age.as_secs() / 86_400,
             human_bytes(dir.bytes),
-            match &dir.verdict {
-                relais::prune::RunVerdict::Prunable { dangling } => dangling.len(),
-                relais::prune::RunVerdict::Kept(_) => 0,
-            }
+            dir.dangling
         );
     }
     println!(
@@ -476,12 +502,8 @@ fn auto_prune_command(ledger: &Ledger, state_dir: &Path, days: u64) -> CliOutcom
         report.listed,
         human_bytes(bytes)
     );
-    for (path, e) in &report.failed {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
-        eprintln!("relais: prune {name}: {e}");
+    for failure in &report.failed {
+        eprintln!("relais: prune: {failure}");
     }
     if report.failed.is_empty() {
         CliOutcome::Accepted
@@ -922,10 +944,28 @@ impl Prune {
 /// by a baseline-cache entry (which names its retry logs by path) is kept.
 /// The listing is stdout; what was done, and every hint, is stderr.
 pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, CliError> {
-    use relais::prune::{finish_interrupted, plan_run_prune, RunJudge, RunVerdict};
+    use relais::prune::{finish_interrupted, human_bytes, plan_run_prune, RunJudge, RunVerdict};
     let ledger = open_ledger()?;
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
-    let judge = RunJudge::load(&ledger, &state_dir.join("baseline-cache"));
+    // A deleting run shares the automatic prune's lock, held to the end.
+    let _lock = match prune {
+        Prune::Preview => None,
+        Prune::Write => match relais::prune::try_lock_prune(&state_dir) {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => {
+                eprintln!(
+                    "relais resume: another prune is running ({} is held); nothing was deleted",
+                    relais::prune::LOCK_FILE
+                );
+                return Ok(CliOutcome::OperationalFailure);
+            }
+            Err(e) => {
+                eprintln!("relais resume: {e}; nothing was deleted");
+                return Ok(CliOutcome::OperationalFailure);
+            }
+        },
+    };
+    let judge = RunJudge::load(&ledger, &state_dir.join(paths::BASELINE_CACHE_DIR));
     let runs_dir = state_dir.join(paths::RUNS_DIR);
     let older_than = std::time::Duration::from_secs(days.saturating_mul(86_400));
     let plan = match plan_run_prune(
@@ -946,7 +986,7 @@ pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, 
     let mut prunable = 0usize;
     let mut bytes = 0u64;
     let mut dangling_total = 0usize;
-    let mut kept_by_reason = std::collections::BTreeMap::<&str, usize>::new();
+    let mut kept_by_label = std::collections::BTreeMap::<&str, usize>::new();
     for dir in &plan {
         let days_old = dir.age.as_secs() / 86_400;
         match &dir.verdict {
@@ -965,7 +1005,7 @@ pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, 
                 }
             }
             RunVerdict::Kept(why) => {
-                *kept_by_reason.entry(why.as_str()).or_default() += 1;
+                *kept_by_label.entry(why.label()).or_default() += 1;
                 println!("keep   {}  {days_old}d  {why}", dir.run)
             }
         }
@@ -975,14 +1015,14 @@ pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, 
         plan.len(),
         human_bytes(bytes)
     );
-    if !kept_by_reason.is_empty() {
-        let tally: Vec<String> = kept_by_reason
+    if !kept_by_label.is_empty() {
+        let tally: Vec<String> = kept_by_label
             .iter()
-            .map(|(why, count)| format!("{count} {why}"))
+            .map(|(label, count)| format!("{count} {label}"))
             .collect();
         println!(
             "kept {}: {}",
-            kept_by_reason.values().sum::<usize>(),
+            kept_by_label.values().sum::<usize>(),
             tally.join(", ")
         );
     }
@@ -1018,15 +1058,6 @@ pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, 
     } else {
         CliOutcome::OperationalFailure
     })
-}
-
-fn human_bytes(bytes: u64) -> String {
-    const MB: u64 = 1024 * 1024;
-    if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else {
-        format!("{} KB", bytes.div_ceil(1024))
-    }
 }
 
 /// Retire every worktree one terminal run still holds.

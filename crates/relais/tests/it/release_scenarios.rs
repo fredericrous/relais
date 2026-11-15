@@ -6416,7 +6416,8 @@ fn the_age_the_off_switches_and_the_flag_decide_the_prune() {
     );
     assert_eq!(off.status.code(), Some(0), "{}", text(&off.stderr));
     assert!(old.exists() && !stamp.exists());
-    assert!(text(&off.stdout).contains("auto-prune off"));
+    assert!(text(&off.stderr).contains("auto-prune off"));
+    assert!(!text(&off.stdout).contains("auto-prune off"));
 
     let invalid = world.relais_with_env(
         &["resume", "--retire", "--all"],
@@ -6438,6 +6439,24 @@ fn the_age_the_off_switches_and_the_flag_decide_the_prune() {
     assert_eq!(longer.status.code(), Some(0), "{}", text(&longer.stderr));
     assert!(old.exists(), "31 days is younger than 40");
     assert!(stamp.exists());
+}
+
+#[test]
+fn an_invalid_prune_age_is_said_when_the_retirement_keeps_a_run() {
+    let world = world_with_ledger("autoprunekept");
+    let live = seed_run(&world, "live-one", "running", 1 * DAY);
+    std::fs::create_dir_all(world.state.join("worktrees/live-one/checkout")).expect("worktree");
+    let invalid = world.relais_with_env(
+        &["resume", "--retire", "--all"],
+        &[("RELAIS_AUTO_PRUNE_DAYS", "soon")],
+    );
+    assert_ne!(invalid.status.code(), Some(0), "{}", text(&invalid.stderr));
+    assert!(
+        text(&invalid.stderr).contains("RELAIS_AUTO_PRUNE_DAYS"),
+        "{}",
+        text(&invalid.stderr)
+    );
+    assert!(live.exists());
 }
 
 #[test]
@@ -6565,9 +6584,158 @@ fn a_failed_deletion_is_reported_and_the_others_still_go() {
     if swept.status.code() != Some(0) {
         assert_eq!(swept.status.code(), Some(1), "{}", text(&swept.stderr));
         assert!(
-            text(&swept.stderr).contains("relais: prune old-stuck"),
+            text(&swept.stderr).contains("deleting a run")
+                && text(&swept.stderr).contains("old-stuck"),
             "{}",
             text(&swept.stderr)
         );
     }
+}
+
+#[test]
+fn a_manual_write_refuses_while_the_prune_lock_is_held() {
+    let world = world_with_ledger("manuallock");
+    let old = seed_run(&world, "old-one", "failed", 31 * DAY);
+    let held = relais::fsutil::LockFile::try_acquire(&world.state.join("runs-prune.lock"))
+        .expect("lock file")
+        .expect("lock is free");
+    let refused = world.relais(&["resume", "--prune-runs", "0", "--write"]);
+    assert_ne!(refused.status.code(), Some(0), "{}", text(&refused.stdout));
+    assert!(
+        text(&refused.stderr).contains("another prune is running"),
+        "{}",
+        text(&refused.stderr)
+    );
+    assert!(old.exists(), "nothing is deleted while the lock is held");
+    drop(held);
+    let applied = world.relais(&["resume", "--prune-runs", "0", "--write"]);
+    assert_eq!(applied.status.code(), Some(0), "{}", text(&applied.stderr));
+    assert!(!old.exists());
+}
+
+#[test]
+fn the_tally_groups_runs_kept_for_one_reason_without_a_path() {
+    let world = world_with_ledger("tally");
+    for id in ["old-a", "old-b"] {
+        let dir = seed_run(&world, id, "failed", 31 * DAY);
+        std::fs::create_dir_all(dir.join("worktree")).expect("a legacy checkout");
+        backdate(&dir, 31 * DAY);
+    }
+    let preview = world.relais(&["resume", "--prune-runs", "0"]);
+    let out = text(&preview.stdout);
+    let tally = out
+        .lines()
+        .find(|l| l.starts_with("kept "))
+        .unwrap_or_else(|| panic!("no tally: {out}"));
+    assert_eq!(tally, "kept 2: 2 checkout beneath");
+}
+
+#[test]
+fn doctor_warns_when_the_ledger_cannot_be_opened() {
+    let world = world_with_ledger("doctorledger");
+    for leftover in ["ledger.sqlite-wal", "ledger.sqlite-shm"] {
+        std::fs::remove_file(world.state.join(leftover)).ok(); // absent when checkpointed
+    }
+    std::fs::write(
+        world.state.join("ledger.sqlite"),
+        "not a database ".repeat(40),
+    )
+    .expect("corrupt");
+    let doctor = world.relais(&["doctor", "--json"]);
+    let report: serde_json::Value =
+        serde_json::from_str(text(&doctor.stdout).trim()).expect("doctor --json is a document");
+    let purge = report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .find(|f| f["component"] == "purge")
+        .expect("a purge finding");
+    assert_ne!(purge["level"], "ok", "{purge}");
+    assert!(
+        purge["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("opening the ledger")),
+        "{purge}"
+    );
+}
+
+#[test]
+fn doctor_warns_of_old_runs_when_the_stamp_is_missing() {
+    let world = world_with_ledger("doctorstamp");
+    seed_run(&world, "old-one", "failed", 31 * DAY);
+    let doctor = world.relais(&["doctor", "--json"]);
+    let report: serde_json::Value =
+        serde_json::from_str(text(&doctor.stdout).trim()).expect("doctor --json is a document");
+    let purge = report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .find(|f| f["component"] == "purge")
+        .expect("a purge finding");
+    assert_eq!(purge["level"], "warn", "{purge}");
+    let detail = purge["detail"].as_str().expect("detail");
+    assert!(detail.contains("runs-prune.stamp"), "{detail}");
+    assert!(
+        detail.contains("relais resume --prune-runs --write"),
+        "{detail}"
+    );
+}
+
+// A verify of a run whose directory the prune removed says the patch is
+// missing, not that it changed.
+#[test]
+fn verifying_a_pruned_source_run_blocks_candidate_missing() {
+    let world = World::new("prunedsource");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    let policy_extra = r#"
+[[risk]]
+paths = ["src/**"]
+minimum_tier = "escalation"
+"#;
+    let mut policy = std::fs::read_to_string(world.repo.join("relais.toml")).expect("read");
+    policy.push_str(policy_extra);
+    std::fs::write(world.repo.join("relais.toml"), &policy).expect("write");
+    git(&world.repo, &["commit", "-q", "-am", "risk"]);
+    let hash = RepoPolicy::from_toml_str(&policy)
+        .expect("policy")
+        .authority_hash();
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(0), "{}", text(&run.stderr));
+    let source = World::run_id_of(&text(&run.stdout));
+
+    let pruned = world.relais(&["resume", "--prune-runs", "0", "--write"]);
+    assert_eq!(pruned.status.code(), Some(0), "{}", text(&pruned.stderr));
+    assert!(
+        !world.run_dir(&source).exists(),
+        "{}\n{}",
+        text(&pruned.stdout),
+        text(&pruned.stderr)
+    );
+
+    let verify = world.root.join("verify-task.json");
+    std::fs::write(
+        &verify,
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "verify",
+            "objective": "Verify the pruned candidate",
+            "base_ref": "HEAD",
+            "candidate": { "run": source },
+            "write_scope": ["src/**"],
+            "acceptance": ["src/main.rs no longer exists"],
+            "verification_profile": "default",
+            "review": "off",
+        })
+        .to_string(),
+    )
+    .expect("verify task");
+    let blocked = world.relais(&["run", "--task", verify.to_str().unwrap()]);
+    let shown = format!("{}\n{}", text(&blocked.stdout), text(&blocked.stderr));
+    assert_ne!(blocked.status.code(), Some(0), "{shown}");
+    assert!(shown.contains("candidate_missing"), "{shown}");
+    assert!(!shown.contains("candidate_digest_mismatch"), "{shown}");
+    world.stop_coordinator();
 }
