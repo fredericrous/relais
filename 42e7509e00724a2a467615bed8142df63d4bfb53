@@ -1,0 +1,21 @@
+greengate-provenance-v1
+commit bf0ee9a3831bbb4637fcb0291fa4c6b7840492ca
+tree 42e7509e00724a2a467615bed8142df63d4bfb53
+canon ef8ebd574f1c96247003af03140dfd910110623c
+patch c0747b19a7673adb0200fbac2aec7176bb22d973
+plan docs/plans/2026-11-15-relais-keeps-state-bounded.md 626a8708ab9fec5a04bb9a43489097cf6c4706667b8a9e938e75531bf3716f9d
+review reviewed f7615dab8720d5eb9b33812300849e03477843563e17523b2ecfe4b6a86b5404
+code-review backend reviewed f7615dab8720d5eb9b33812300849e03477843563e17523b2ecfe4b6a86b5404
+code-review lang:rust reviewed f7615dab8720d5eb9b33812300849e03477843563e17523b2ecfe4b6a86b5404
+code-review unix reviewed f7615dab8720d5eb9b33812300849e03477843563e17523b2ecfe4b6a86b5404
+code-review tui reviewed f7615dab8720d5eb9b33812300849e03477843563e17523b2ecfe4b6a86b5404
+code-review architect reviewed f7615dab8720d5eb9b33812300849e03477843563e17523b2ecfe4b6a86b5404
+preview not-required
+producer amont-agent 4.3.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABAsaIlJHbKT5wMqOw+n9DlbFIF6fOAlRvjkkdfhJ4X+P
+YOfbr1Q3J5mVlv/k0XvVGaJrdJzwB5Hkd2me+DqcdzDQ==
+-----END SSH SIGNATURE-----
