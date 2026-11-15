@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.64.0
+
 ### Fixed
 
 - **Merge rows that greenpiste writes after `plan-apply` are read, not dropped.** A `command` merge row carries `applied_labels` (the `role#n` findings it applied), and the merge-row reader, parsing with `deny_unknown_fields`, counted every such row invalid: 424 of 550 merge rows in this machine's ledger on 2026-11-15. They now parse; the labels themselves are not read.
