@@ -6,7 +6,8 @@
 //! - a verify directory goes only when it holds no file at all (a release
 //!   that failed leaves a worktree behind, and that stays visible);
 //! - a run directory goes only for a run the ledger records as ended,
-//!   not waiting on a person, with its receipt stored in the ledger, and
+//!   not waiting on a person, with its receipt stored in the ledger when it
+//!   is `accepted` (the only state that stores one), and
 //!   untouched for longer than the asked age. Pruning previews by default.
 
 use std::io;
@@ -164,15 +165,105 @@ fn age(path: &Path, now: SystemTime) -> Option<Duration> {
     Some(now.duration_since(newest).unwrap_or(Duration::ZERO))
 }
 
+/// Why a run directory is kept. The `Display` is the per-run line; the
+/// [`label`](KeepReason::label) is the fixed category the tally groups by,
+/// so a tally never carries a path, a run id or an error text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeepReason {
+    /// The run has not ended (`state` names where it is).
+    NotEnded { state: &'static str },
+    /// The run ended in a state a person still has to answer.
+    WaitsOnPerson { state: &'static str },
+    /// The ledger has no such run.
+    NotInLedger,
+    /// An `accepted` run whose receipt is not in the ledger.
+    NoReceipt,
+    /// A run that has not ended pins this run's candidate.
+    Pinned,
+    /// A package run beneath this one cannot go (`detail` says why).
+    PackageRun { run: String, detail: String },
+    /// A checkout remains beneath the directory (`at` names it, when known).
+    CheckoutBeneath { at: Option<PathBuf> },
+    /// This many baseline-cache entries cite the directory.
+    CitedByCache { entries: usize },
+    /// A source of the judgement could not be read.
+    Unreadable { what: String, error: String },
+}
+
+impl KeepReason {
+    /// The fixed short category of this reason.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NotEnded { .. } => "not ended",
+            Self::WaitsOnPerson { .. } => "waits on a person",
+            Self::NotInLedger => "not in the ledger",
+            Self::NoReceipt => "no receipt",
+            Self::Pinned => "pinned",
+            Self::PackageRun { .. } => "package run",
+            Self::CheckoutBeneath { .. } => "checkout beneath",
+            Self::CitedByCache { .. } => "cited by the cache",
+            Self::Unreadable { .. } => "unreadable",
+        }
+    }
+
+    fn unreadable(what: &str, error: impl std::fmt::Display) -> Self {
+        Self::Unreadable {
+            what: what.to_string(),
+            error: error.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for KeepReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotEnded { state } => write!(f, "{state} (not ended)"),
+            Self::WaitsOnPerson { state } => write!(f, "{state} (waits on a person)"),
+            Self::NotInLedger => write!(f, "not in the ledger"),
+            Self::NoReceipt => write!(f, "no receipt in the ledger"),
+            Self::Pinned => write!(f, "pinned by a run that has not ended"),
+            Self::PackageRun { run, detail } => write!(f, "package run {run} is {detail}"),
+            Self::CheckoutBeneath { at: None } => {
+                write!(f, "worktree (a checkout remains beneath it)")
+            }
+            Self::CheckoutBeneath { at: Some(at) } => write!(
+                f,
+                "worktree (a checkout remains beneath it: {})",
+                at.display()
+            ),
+            Self::CitedByCache { entries } => {
+                write!(f, "cited by {entries} baseline-cache entries")
+            }
+            Self::Unreadable { what, error } => write!(f, "{what} unreadable: {error}"),
+        }
+    }
+}
+
+/// Binary units, one decimal above bytes: `330.0 MiB`. The one size
+/// format of the prune output and `relais doctor`.
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut scaled = bytes as f64;
+    let mut unit = 0;
+    while scaled >= 1024.0 && unit < UNITS.len() - 1 {
+        scaled /= 1024.0;
+        unit += 1;
+    }
+    format!("{scaled:.1} {}", UNITS[unit])
+}
+
 /// Why a run directory may or may not be pruned, as the ledger has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunVerdict {
-    /// Ended, not waiting on a person, receipt in the ledger: prunable,
+    /// Ended, not waiting on a person, receipt in the ledger when accepted: prunable,
     /// leaving these evidence rows (of any run) pointing into it, as
     /// `(kind, path)`.
     Prunable { dangling: Vec<(String, String)> },
     /// Kept, and why.
-    Kept(String),
+    Kept(KeepReason),
 }
 
 /// One run directory the preview lists.
@@ -222,6 +313,10 @@ pub fn plan_run_prune(
         let Some(run) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
+        // `.pruning-<id>` is a deletion in flight: never listed or judged.
+        if run.starts_with('.') {
+            continue;
+        }
         let Some(age) = age(&path, now) else {
             continue;
         };
@@ -262,26 +357,567 @@ pub fn json_files_citing(dir: &Path, needle: &str) -> io::Result<usize> {
     Ok(citing)
 }
 
-/// Delete the prunable directories of a plan. Returns the ones removed
-/// and the ones that failed, with the error.
-pub fn apply_run_prune(plan: &[RunDir]) -> (Vec<PathBuf>, Vec<(PathBuf, io::Error)>) {
-    let mut removed = Vec::new();
-    let mut failed = Vec::new();
+/// What deleting a plan did.
+#[derive(Debug, Default)]
+pub struct Applied {
+    /// The directories gone (by their original path).
+    pub removed: Vec<PathBuf>,
+    /// Prunable when planned, kept by the re-check just before deletion.
+    pub kept: Vec<(PathBuf, KeepReason)>,
+    /// Deletions that failed, with the error.
+    pub failed: Vec<(PathBuf, io::Error)>,
+}
+
+/// The prefix of a directory whose deletion has begun.
+const PRUNING_PREFIX: &str = ".pruning-";
+
+/// Delete the prunable directories of a plan. `recheck` is asked just
+/// before each one and answers why it must be kept after all (`None` =
+/// go). The deletion is crash-safe: the directory is renamed to
+/// `.pruning-<run>` (the commit point) and then removed, and
+/// [`finish_interrupted`] completes a removal a crash cut short.
+pub fn apply_run_prune(
+    plan: &[RunDir],
+    recheck: &dyn Fn(&RunDir) -> Option<KeepReason>,
+) -> Applied {
+    let mut applied = Applied::default();
     for dir in plan {
         if !matches!(dir.verdict, RunVerdict::Prunable { .. }) {
             continue;
         }
-        match std::fs::remove_dir_all(&dir.path) {
-            Ok(()) => removed.push(dir.path.clone()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => removed.push(dir.path.clone()),
-            Err(e) => failed.push((dir.path.clone(), e)),
+        if let Some(why) = recheck(dir) {
+            applied.kept.push((dir.path.clone(), why));
+            continue;
+        }
+        let doomed = dir
+            .path
+            .with_file_name(format!("{PRUNING_PREFIX}{}", dir.run));
+        match std::fs::rename(&dir.path, &doomed) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                applied.removed.push(dir.path.clone());
+                continue;
+            }
+            Err(e) => {
+                applied.failed.push((dir.path.clone(), e));
+                continue;
+            }
+        }
+        match std::fs::remove_dir_all(&doomed) {
+            Ok(()) => applied.removed.push(dir.path.clone()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => applied.removed.push(dir.path.clone()),
+            Err(e) => applied.failed.push((dir.path.clone(), e)),
         }
     }
-    (removed, failed)
+    applied
+}
+
+/// Finish the removals a crash left behind: every `.pruning-*` directory
+/// directly under `runs` goes. Returns the ones that could not.
+pub fn finish_interrupted(runs: &Path) -> Vec<(PathBuf, io::Error)> {
+    let mut failed = Vec::new();
+    let entries = match std::fs::read_dir(runs) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return failed,
+        Err(e) => {
+            failed.push((runs.to_path_buf(), e));
+            return failed;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                failed.push((runs.to_path_buf(), e));
+                continue;
+            }
+        };
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(PRUNING_PREFIX)
+        {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => failed.push((entry.path(), e)),
+        }
+    }
+    failed
+}
+
+/// The one judgement of whether a run directory may go, shared by
+/// `relais resume --prune-runs` and the automatic prune. It reads the
+/// ledger's pinned candidates and every baseline-cache file once, when it
+/// is loaded; a source it could not read keeps every run.
+pub struct RunJudge<'a> {
+    ledger: &'a crate::ledger::Ledger,
+    pinned: Result<std::collections::BTreeSet<(String, u32)>, String>,
+    cache_texts: Result<Vec<String>, String>,
+}
+
+impl<'a> RunJudge<'a> {
+    pub fn load(ledger: &'a crate::ledger::Ledger, cache_dir: &Path) -> Self {
+        Self {
+            ledger,
+            pinned: ledger.pinned_candidates().map_err(|e| e.to_string()),
+            cache_texts: read_json_texts(cache_dir).map_err(|e| e.to_string()),
+        }
+    }
+
+    /// The verdict on `runs/<run>/` at `path`, checks in order: ended and
+    /// not waiting on a person, receipt (accepted runs only), pinned candidate, a subtree that
+    /// is safe to delete, baseline-cache citation; then the evidence rows
+    /// left dangling.
+    pub fn judge(&self, run: &str, path: &Path) -> RunVerdict {
+        let id = crate::ids::RunId::from_stored(run);
+        let state = match self.ledger.run_status(&id) {
+            Ok(None) => return RunVerdict::Kept(KeepReason::NotInLedger),
+            Ok(Some(state)) => {
+                if let Some(why) = state_keeps(state) {
+                    return RunVerdict::Kept(why);
+                }
+                state
+            }
+            Err(e) => return RunVerdict::Kept(KeepReason::unreadable("ledger", e)),
+        };
+        // Only an accepted run has a receipt stored; any other ended run
+        // never will, so waiting for one would keep it forever.
+        if state == crate::lifecycle::State::Accepted {
+            match self.ledger.receipt(&id) {
+                Ok(Some(_)) => {}
+                Ok(None) => return RunVerdict::Kept(KeepReason::NoReceipt),
+                Err(e) => return RunVerdict::Kept(KeepReason::unreadable("ledger", e)),
+            }
+        }
+        let pinned = match &self.pinned {
+            Ok(pinned) => pinned,
+            Err(e) => return RunVerdict::Kept(KeepReason::unreadable("pinned candidates", e)),
+        };
+        if let Some(why) = pin_keeps(pinned, run) {
+            return RunVerdict::Kept(why);
+        }
+        if let Some(why) = self.subtree_keeps(pinned, &id, path) {
+            return RunVerdict::Kept(why);
+        }
+        // A citation may name the directory as it was spelled when it was
+        // written or through its real path (a symlinked state directory,
+        // `/tmp` against `/private/tmp`): both spellings are looked for.
+        let spellings = spellings_of(path);
+        let texts = match &self.cache_texts {
+            Ok(texts) => texts,
+            Err(e) => return RunVerdict::Kept(KeepReason::unreadable("baseline cache", e)),
+        };
+        for spelling in &spellings {
+            let cited = format!(
+                "{}{}",
+                spelling.to_string_lossy(),
+                std::path::MAIN_SEPARATOR
+            );
+            let citing = texts.iter().filter(|text| text.contains(&cited)).count();
+            if citing > 0 {
+                return RunVerdict::Kept(KeepReason::CitedByCache { entries: citing });
+            }
+        }
+        let mut dangling = Vec::new();
+        for spelling in &spellings {
+            match self.ledger.evidence_under(spelling) {
+                Ok(rows) => {
+                    for row in rows {
+                        if !dangling.contains(&row) {
+                            dangling.push(row);
+                        }
+                    }
+                }
+                Err(e) => return RunVerdict::Kept(KeepReason::unreadable("ledger", e)),
+            }
+        }
+        RunVerdict::Prunable { dangling }
+    }
+
+    /// Asked just before a run directory is renamed away: why it must be
+    /// kept after all. The pin is read afresh, so one added since this
+    /// judge loaded keeps its source, and so is the subtree.
+    // holds-until: ~10^4 candidate_inputs rows - the pin set is reloaded in
+    // full for each deletion; a per-run indexed query after that
+    pub fn recheck(&self, run: &str, path: &Path) -> Option<KeepReason> {
+        let pinned = match self.ledger.pinned_candidates() {
+            Ok(pinned) => pinned,
+            Err(e) => return Some(KeepReason::unreadable("pinned candidates", e)),
+        };
+        pin_keeps(&pinned, run)
+            .or_else(|| self.subtree_keeps(&pinned, &crate::ids::RunId::from_stored(run), path))
+    }
+
+    /// Delete a plan, re-checking each run first.
+    pub fn apply(&self, plan: &[RunDir]) -> Applied {
+        apply_run_prune(plan, &|dir| self.recheck(&dir.run, &dir.path))
+    }
+
+    /// The deletion subtree of a run holds more than its own artifacts
+    /// when it decomposed: package runs, and the checkouts they left.
+    fn subtree_keeps(
+        &self,
+        pinned: &std::collections::BTreeSet<(String, u32)>,
+        root: &crate::ids::RunId,
+        path: &Path,
+    ) -> Option<KeepReason> {
+        let mut pending = vec![root.clone()];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(parent) = pending.pop() {
+            if !seen.insert(parent.as_str().to_string()) {
+                continue;
+            }
+            let children = match self.ledger.child_runs(&parent) {
+                Ok(children) => children,
+                Err(e) => return Some(KeepReason::unreadable("ledger", e)),
+            };
+            for child in children {
+                if let Some(why) = state_keeps(child.status) {
+                    return Some(KeepReason::PackageRun {
+                        run: child.run.to_string(),
+                        detail: why.to_string(),
+                    });
+                }
+                if pin_keeps(pinned, child.run.as_str()).is_some() {
+                    return Some(KeepReason::PackageRun {
+                        run: child.run.to_string(),
+                        detail: "pinned".to_string(),
+                    });
+                }
+                pending.push(child.run);
+            }
+        }
+        checkout_beneath(path)
+    }
+}
+
+/// Why a run in `state` is kept, when it is.
+fn state_keeps(state: crate::lifecycle::State) -> Option<KeepReason> {
+    use crate::lifecycle::State;
+    match state {
+        State::Prepared
+        | State::Running
+        | State::Verifying
+        | State::Repairing
+        | State::Escalating => Some(KeepReason::NotEnded {
+            state: state.as_str(),
+        }),
+        State::NeedsReview | State::NeedsDecision | State::Interrupted => {
+            Some(KeepReason::WaitsOnPerson {
+                state: state.as_str(),
+            })
+        }
+        State::Accepted
+        | State::Blocked
+        | State::Failed
+        | State::BudgetExhausted
+        | State::Cancelled
+        | State::AcceptedByPerson => None,
+    }
+}
+
+fn pin_keeps(pinned: &std::collections::BTreeSet<(String, u32)>, run: &str) -> Option<KeepReason> {
+    pinned
+        .range((run.to_string(), 0)..=(run.to_string(), u32::MAX))
+        .next()
+        .map(|_| KeepReason::Pinned)
+}
+
+/// A checkout under `dir` (a directory holding `.git`, or the legacy
+/// `worktree`), which is the run's work and never pruned with it. A
+/// directory that cannot be read keeps the run.
+fn checkout_beneath(dir: &Path) -> Option<KeepReason> {
+    if dir.join(crate::paths::LEGACY_WORKTREE_DIR).exists() {
+        return Some(KeepReason::CheckoutBeneath { at: None });
+    }
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(e) => return Some(KeepReason::unreadable(&current.display().to_string(), e)),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => return Some(KeepReason::unreadable(&current.display().to_string(), e)),
+            };
+            let child = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => {
+                    if child.join(".git").exists() {
+                        return Some(KeepReason::CheckoutBeneath { at: Some(child) });
+                    }
+                    pending.push(child);
+                }
+                Ok(_) => {}
+                Err(e) => return Some(KeepReason::unreadable(&child.display().to_string(), e)),
+            }
+        }
+    }
+    None
+}
+
+/// `path` as given and, when it differs, as its real path.
+fn spellings_of(path: &Path) -> Vec<PathBuf> {
+    let mut spellings = vec![path.to_path_buf()];
+    if let Ok(real) = std::fs::canonicalize(path) {
+        if real != path {
+            spellings.push(real);
+        }
+    }
+    spellings
+}
+
+/// The text of every `*.json` file directly under `dir` (none when it
+/// does not exist).
+fn read_json_texts(dir: &Path) -> io::Result<Vec<String>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut texts = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            texts.push(std::fs::read_to_string(&path)?);
+        }
+    }
+    Ok(texts)
+}
+
+/// The file whose mtime says when the automatic prune last ran.
+pub const STAMP_FILE: &str = "runs-prune.stamp";
+/// The lock one automatic prune holds while it runs.
+pub const LOCK_FILE: &str = "runs-prune.lock";
+/// How old the stamp must be before the automatic prune runs again.
+pub const THROTTLE: Duration = Duration::from_secs(86_400);
+/// The age the automatic prune uses when nothing says otherwise.
+pub const DEFAULT_AUTO_PRUNE_DAYS: u64 = 30;
+/// The variable that sets the automatic prune's age in days.
+pub const AUTO_PRUNE_DAYS_ENV: &str = "RELAIS_AUTO_PRUNE_DAYS";
+
+/// The automatic prune's age, as the environment and the default make it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoPruneSetting {
+    /// `RELAIS_AUTO_PRUNE_DAYS=0`.
+    Off,
+    /// Prune runs untouched for this many days.
+    Days(u64),
+    /// The variable holds something that is not a number of days.
+    Invalid(String),
+}
+
+/// Where the automatic prune's setting came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingSource {
+    Default,
+    Environment,
+}
+
+/// Parse the variable alone: the default when it is unset. `--no-prune` is
+/// a per-call choice of the command line and never reaches here.
+pub fn auto_prune_setting(env_days: Option<&str>) -> (AutoPruneSetting, SettingSource) {
+    match env_days {
+        None => (
+            AutoPruneSetting::Days(DEFAULT_AUTO_PRUNE_DAYS),
+            SettingSource::Default,
+        ),
+        Some(text) => {
+            let setting = match text.trim().parse::<u64>() {
+                Ok(0) => AutoPruneSetting::Off,
+                Ok(days) => AutoPruneSetting::Days(days),
+                Err(_) => AutoPruneSetting::Invalid(text.to_string()),
+            };
+            (setting, SettingSource::Environment)
+        }
+    }
+}
+
+/// What one automatic prune did.
+#[derive(Debug)]
+pub enum AutoPrune {
+    /// The stamp is newer than [`THROTTLE`].
+    Throttled,
+    /// Another prune holds the lock.
+    Held,
+    Ran(AutoPruneReport),
+}
+
+/// The step of a prune that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneStep {
+    Lock,
+    Stamp,
+    ReadingRuns,
+    FinishingLeftover,
+    DeletingRun,
+}
+
+impl PruneStep {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Lock => "taking the lock",
+            Self::Stamp => "writing the stamp",
+            Self::ReadingRuns => "reading runs/",
+            Self::FinishingLeftover => "finishing a leftover",
+            Self::DeletingRun => "deleting a run",
+        }
+    }
+}
+
+/// A prune failure: the step, the path it was working on and the cause.
+#[derive(Debug)]
+pub struct PruneFailure {
+    pub step: PruneStep,
+    pub path: PathBuf,
+    pub error: io::Error,
+}
+
+impl PruneFailure {
+    pub fn new(step: PruneStep, path: &Path, error: io::Error) -> Self {
+        Self {
+            step,
+            path: path.to_path_buf(),
+            error,
+        }
+    }
+}
+
+impl std::fmt::Display for PruneFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}: {}",
+            self.step.describe(),
+            self.path.display(),
+            self.error
+        )
+    }
+}
+
+impl std::error::Error for PruneFailure {}
+
+/// A run directory the automatic prune deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedRun {
+    pub run: String,
+    pub age: Duration,
+    pub bytes: u64,
+    /// Evidence rows its deletion left pointing into it.
+    pub dangling: usize,
+}
+
+#[derive(Debug)]
+pub struct AutoPruneReport {
+    /// Run directories older than the age, kept or not.
+    pub listed: usize,
+    /// The ones deleted.
+    pub removed: Vec<RemovedRun>,
+    /// Failures, finishing a leftover or deleting.
+    pub failed: Vec<PruneFailure>,
+}
+
+fn stamp_is_fresh(stamp: &Path, now: SystemTime) -> bool {
+    // A stamp from the future (a clock set back) counts as stale.
+    std::fs::metadata(stamp)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|since| since < THROTTLE)
+}
+
+/// Take `runs-prune.lock` without waiting: `None` when another prune holds it.
+pub fn try_lock_prune(state_dir: &Path) -> Result<Option<crate::fsutil::LockFile>, PruneFailure> {
+    let path = state_dir.join(LOCK_FILE);
+    crate::fsutil::LockFile::try_acquire(&path)
+        .map_err(|error| PruneFailure::new(PruneStep::Lock, &path, error))
+}
+
+/// Prune the ended runs untouched for `age`, at most once per
+/// [`THROTTLE`]: skip on a fresh stamp, take the lock (skip when held),
+/// look at the stamp again, write it, then finish leftovers, judge and
+/// hand the plan to `apply`.
+pub fn auto_prune(
+    ledger: &crate::ledger::Ledger,
+    state_dir: &Path,
+    age: Duration,
+    now: SystemTime,
+    apply: &dyn Fn(&RunJudge<'_>, &[RunDir]) -> Applied,
+) -> Result<AutoPrune, PruneFailure> {
+    let stamp = state_dir.join(STAMP_FILE);
+    if stamp_is_fresh(&stamp, now) {
+        return Ok(AutoPrune::Throttled);
+    }
+    let Some(_lock) = try_lock_prune(state_dir)? else {
+        return Ok(AutoPrune::Held);
+    };
+    if stamp_is_fresh(&stamp, now) {
+        return Ok(AutoPrune::Throttled);
+    }
+    std::fs::write(&stamp, format!("{}\n", crate::ledger::now_rfc3339()))
+        .map_err(|error| PruneFailure::new(PruneStep::Stamp, &stamp, error))?;
+    let runs = state_dir.join(crate::paths::RUNS_DIR);
+    let mut failed: Vec<PruneFailure> = finish_interrupted(&runs)
+        .into_iter()
+        .map(|(path, error)| PruneFailure::new(PruneStep::FinishingLeftover, &path, error))
+        .collect();
+    let judge = RunJudge::load(ledger, &state_dir.join(crate::paths::BASELINE_CACHE_DIR));
+    let plan = plan_run_prune(&runs, age, now, &|run, path| judge.judge(run, path))
+        .map_err(|error| PruneFailure::new(PruneStep::ReadingRuns, &runs, error))?;
+    let applied = apply(&judge, &plan);
+    failed.extend(
+        applied
+            .failed
+            .into_iter()
+            .map(|(path, error)| PruneFailure::new(PruneStep::DeletingRun, &path, error)),
+    );
+    let removed = plan
+        .iter()
+        .filter(|dir| applied.removed.contains(&dir.path))
+        .map(|dir| RemovedRun {
+            run: dir.run.clone(),
+            age: dir.age,
+            bytes: dir.bytes,
+            dangling: match &dir.verdict {
+                RunVerdict::Prunable { dangling } => dangling.len(),
+                RunVerdict::Kept(_) => 0,
+            },
+        })
+        .collect();
+    Ok(AutoPrune::Ran(AutoPruneReport {
+        listed: plan.len(),
+        removed,
+        failed,
+    }))
+}
+
+/// [`tree_bytes`] of `path` without the subtree at `skip`.
+pub fn tree_bytes_except(path: &Path, skip: &Path) -> u64 {
+    if path == skip {
+        return 0;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    std::fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| tree_bytes_except(&e.path(), skip))
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 /// The bytes a tree holds (symlinks counted as themselves, not followed).
-fn tree_bytes(path: &Path) -> u64 {
+pub fn tree_bytes(path: &Path) -> u64 {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return 0;
     };
@@ -370,7 +1006,7 @@ mod tests {
             std::fs::write(root.join(name).join("artifacts/logs/a.log"), "1234").unwrap();
         }
         let judge = |run: &str, _: &Path| match run {
-            "old-live" => RunVerdict::Kept("running".to_string()),
+            "old-live" => RunVerdict::Kept(KeepReason::NotEnded { state: "running" }),
             _ => RunVerdict::Prunable {
                 dangling: Vec::new(),
             },
@@ -388,9 +1024,9 @@ mod tests {
             assert!(root.join(name).exists());
         }
         // Applying removes only the prunable ones; a live run stays.
-        let (removed, failed) = apply_run_prune(&plan);
-        assert!(failed.is_empty());
-        assert_eq!(removed.len(), 2);
+        let applied = apply_run_prune(&plan, &|_| None);
+        assert!(applied.failed.is_empty());
+        assert_eq!(applied.removed.len(), 2);
         assert!(root.join("old-live/artifacts/logs/a.log").exists());
         assert!(!root.join("old-done").exists());
         std::fs::remove_dir_all(&root).ok(); // best-effort scratch cleanup
@@ -426,5 +1062,155 @@ mod tests {
         assert_eq!(json_files_citing(&cache, "/s/runs/run-1/").unwrap(), 1);
         assert_eq!(json_files_citing(&cache.join("none"), "x").unwrap(), 0);
         std::fs::remove_dir_all(&cache).ok(); // best-effort scratch cleanup
+    }
+
+    fn ledger_in(dir: &Path) -> crate::ledger::Ledger {
+        crate::ledger::Ledger::open(&dir.join("ledger.sqlite")).expect("open ledger")
+    }
+
+    #[test]
+    fn the_setting_follows_environment_then_default() {
+        let days = |text| auto_prune_setting(Some(text));
+        assert_eq!(days("0").0, AutoPruneSetting::Off);
+        assert_eq!(
+            days("7"),
+            (AutoPruneSetting::Days(7), SettingSource::Environment)
+        );
+        assert_eq!(
+            auto_prune_setting(None),
+            (AutoPruneSetting::Days(30), SettingSource::Default)
+        );
+        assert_eq!(
+            days("soon").0,
+            AutoPruneSetting::Invalid("soon".to_string())
+        );
+    }
+
+    #[test]
+    fn sizes_use_binary_units_with_their_names() {
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 / 2), "1.5 MiB");
+        assert_eq!(human_bytes(5 * 1024 * 1024 * 1024), "5.0 GiB");
+    }
+
+    #[test]
+    fn every_keep_reason_has_a_pathless_label() {
+        let reasons = [
+            KeepReason::NotEnded { state: "running" },
+            KeepReason::WaitsOnPerson {
+                state: "interrupted",
+            },
+            KeepReason::NotInLedger,
+            KeepReason::NoReceipt,
+            KeepReason::Pinned,
+            KeepReason::PackageRun {
+                run: "r-1".into(),
+                detail: "pinned".into(),
+            },
+            KeepReason::CheckoutBeneath {
+                at: Some(PathBuf::from("/s/runs/r/c")),
+            },
+            KeepReason::CitedByCache { entries: 2 },
+            KeepReason::Unreadable {
+                what: "/s/runs".into(),
+                error: "denied".into(),
+            },
+        ];
+        for reason in reasons {
+            let label = reason.label();
+            assert!(!label.contains('/') && !label.contains("r-1"), "{label}");
+        }
+    }
+
+    #[test]
+    fn the_stamp_is_written_before_deleting_and_throttles_the_next_prune() {
+        let state = scratch("auto");
+        let ledger = ledger_in(&state);
+        let stamp = state.join(STAMP_FILE);
+        let seen = std::cell::Cell::new(false);
+        let outcome = auto_prune(&ledger, &state, 30 * DAY, SystemTime::now(), &|_, _| {
+            seen.set(stamp.exists());
+            Applied::default()
+        })
+        .unwrap();
+        assert!(matches!(outcome, AutoPrune::Ran(_)));
+        assert!(seen.get(), "the stamp exists when deletion starts");
+        let again = auto_prune(&ledger, &state, 30 * DAY, SystemTime::now(), &|_, _| {
+            panic!("throttled")
+        })
+        .unwrap();
+        assert!(matches!(again, AutoPrune::Throttled));
+        // A day and an hour later it runs again; a stamp from the future is stale.
+        let later = SystemTime::now() + DAY + Duration::from_secs(3600);
+        let third =
+            auto_prune(&ledger, &state, 30 * DAY, later, &|_, _| Applied::default()).unwrap();
+        assert!(matches!(third, AutoPrune::Ran(_)));
+        let past = SystemTime::now() - 2 * DAY;
+        assert!(!stamp_is_fresh(&stamp, past));
+        std::fs::remove_dir_all(&state).ok(); // best-effort scratch cleanup
+    }
+
+    #[test]
+    fn a_held_lock_skips_the_prune() {
+        let state = scratch("held");
+        let ledger = ledger_in(&state);
+        let _held = crate::fsutil::LockFile::try_acquire(&state.join(LOCK_FILE))
+            .unwrap()
+            .expect("lock");
+        let outcome = auto_prune(&ledger, &state, 30 * DAY, SystemTime::now(), &|_, _| {
+            panic!("held")
+        })
+        .unwrap();
+        assert!(matches!(outcome, AutoPrune::Held));
+        assert!(!state.join(STAMP_FILE).exists());
+        std::fs::remove_dir_all(&state).ok(); // best-effort scratch cleanup
+    }
+
+    #[test]
+    fn a_leftover_pruning_directory_is_finished_and_never_listed() {
+        let runs = scratch("leftover");
+        std::fs::create_dir_all(runs.join(".pruning-x/logs")).unwrap();
+        std::fs::create_dir_all(runs.join("run-a")).unwrap();
+        let judge = |_: &str, _: &Path| RunVerdict::Prunable {
+            dangling: Vec::new(),
+        };
+        let later = SystemTime::now() + 31 * DAY;
+        let plan = plan_run_prune(&runs, 30 * DAY, later, &judge).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert!(finish_interrupted(&runs).is_empty());
+        assert!(!runs.join(".pruning-x").exists());
+        assert!(runs.join("run-a").exists());
+        std::fs::remove_dir_all(&runs).ok(); // best-effort scratch cleanup
+    }
+
+    #[test]
+    fn a_run_the_recheck_keeps_is_not_deleted() {
+        let root = scratch("recheck");
+        std::fs::create_dir_all(root.join("run-a")).unwrap();
+        std::fs::create_dir_all(root.join("run-b")).unwrap();
+        let judge = |_: &str, _: &Path| RunVerdict::Prunable {
+            dangling: Vec::new(),
+        };
+        let later = SystemTime::now() + 31 * DAY;
+        let plan = plan_run_prune(&root, 30 * DAY, later, &judge).unwrap();
+        let applied = apply_run_prune(&plan, &|dir| {
+            (dir.run == "run-a").then_some(KeepReason::Pinned)
+        });
+        assert!(root.join("run-a").exists());
+        assert!(!root.join("run-b").exists());
+        assert_eq!(applied.kept.len(), 1);
+        std::fs::remove_dir_all(&root).ok(); // best-effort scratch cleanup
+    }
+
+    #[test]
+    fn a_checkout_beneath_a_run_keeps_it() {
+        let root = scratch("checkout");
+        let run = root.join("run-a");
+        std::fs::create_dir_all(run.join("packages/verify/c/verify-base")).unwrap();
+        assert!(checkout_beneath(&run).is_none());
+        std::fs::write(run.join("packages/verify/c/verify-base/.git"), "gitdir: x").unwrap();
+        assert!(checkout_beneath(&run).is_some());
+        std::fs::remove_dir_all(&root).ok(); // best-effort scratch cleanup
     }
 }

@@ -17,11 +17,17 @@ use relais::workspace;
 use std::path::Path;
 use std::path::PathBuf;
 
+/// The size past which `resume.log` is renamed to `resume.log.1`.
+const RESUME_LOG_MAX: u64 = 1024 * 1024;
+
 /// Run this same `relais resume` again with its output appended to `log`
 /// (a timestamp line first), and report whether it succeeded. A detached
 /// sweep has no terminal to write to.
 pub(crate) fn resume_logged(log: &Path) -> Result<CliOutcome, CliError> {
     use std::io::Write;
+    // Once, before the file is opened and the child holds it; best
+    // effort, so a failed rotation costs the cap, never the sweep.
+    let _ = relais::fsutil::rotate_if_over(log, RESUME_LOG_MAX); // best effort, retried on the next sweep
     let open = || -> std::io::Result<std::fs::File> {
         if let Some(parent) = log.parent() {
             std::fs::create_dir_all(parent)?;
@@ -398,11 +404,117 @@ pub(crate) fn reconcile_run(
 /// is retired, one line each. A run that is not terminal, not on
 /// record, or whose dispatches are not provably dead is named and
 /// kept. A retirement that fails is relais's own failure to report.
-pub(crate) fn retire_all_command() -> Result<CliOutcome, CliError> {
+pub(crate) fn retire_all_command(auto_prune: AutoPruneChoice) -> Result<CliOutcome, CliError> {
+    use relais::prune::{auto_prune_setting, AutoPruneSetting};
     let ledger = open_ledger()?;
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
-    sweep_ended_holdouts(&ledger, &state_dir);
-    let retained = retained_with_verification(&state_dir)?;
+    let env_days = std::env::var_os(relais::prune::AUTO_PRUNE_DAYS_ENV)
+        .map(|raw| raw.to_string_lossy().into_owned());
+    // The retirement first; the prune follows whatever it ended in.
+    let retired = retire_all(&ledger, &state_dir);
+    let pruned = match auto_prune {
+        AutoPruneChoice::Skip => Ok(CliOutcome::Accepted),
+        AutoPruneChoice::Run => match auto_prune_setting(env_days.as_deref()).0 {
+            AutoPruneSetting::Off => {
+                eprintln!("auto-prune off: {}=0", relais::prune::AUTO_PRUNE_DAYS_ENV);
+                Ok(CliOutcome::Accepted)
+            }
+            AutoPruneSetting::Invalid(text) => Err(CliError::Usage {
+                detail: format!(
+                    "{}={text:?} is not a whole number of days (0 turns the automatic prune off); \
+                     the automatic prune was skipped",
+                    relais::prune::AUTO_PRUNE_DAYS_ENV
+                ),
+            }),
+            AutoPruneSetting::Days(days) => Ok(auto_prune_command(&ledger, &state_dir, days)),
+        },
+    };
+    match (retired, pruned) {
+        (Err(retire_error), Err(usage)) => {
+            // Only one error is returned; the other is still said.
+            eprintln!("relais: {usage}");
+            Err(retire_error)
+        }
+        (Err(e), _) => Err(e),
+        (Ok(CliOutcome::Accepted), pruned) => pruned,
+        (Ok(outcome), Err(usage)) => {
+            // The retirement's own outcome stands; the skipped prune is still said.
+            eprintln!("relais: {usage}");
+            Ok(outcome)
+        }
+        (Ok(outcome), Ok(_)) => Ok(outcome),
+    }
+}
+
+/// Whether `retire --all` also runs the automatic prune. An enum, so the
+/// handler reads as what was asked (the clap edge is where the `bool`
+/// lives), like [`Retire`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutoPruneChoice {
+    Run,
+    Skip,
+}
+
+impl AutoPruneChoice {
+    pub(crate) fn from_flag(no_prune: bool) -> Self {
+        if no_prune {
+            Self::Skip
+        } else {
+            Self::Run
+        }
+    }
+}
+
+/// The automatic prune of `retire --all`, its report on stdout and its
+/// failures on stderr.
+fn auto_prune_command(ledger: &Ledger, state_dir: &Path, days: u64) -> CliOutcome {
+    use relais::prune::{auto_prune, human_bytes, AutoPrune};
+    let age = std::time::Duration::from_secs(days.saturating_mul(86_400));
+    let report = match auto_prune(
+        ledger,
+        state_dir,
+        age,
+        std::time::SystemTime::now(),
+        &|judge, plan| judge.apply(plan),
+    ) {
+        Ok(AutoPrune::Throttled | AutoPrune::Held) => return CliOutcome::Accepted,
+        Ok(AutoPrune::Ran(report)) => report,
+        Err(e) => {
+            eprintln!("relais: prune: {e}");
+            return CliOutcome::OperationalFailure;
+        }
+    };
+    let mut bytes = 0u64;
+    for dir in &report.removed {
+        bytes += dir.bytes;
+        println!(
+            "prune  {}  {}d  {}  {} evidence rows left dangling",
+            dir.run,
+            dir.age.as_secs() / 86_400,
+            human_bytes(dir.bytes),
+            dir.dangling
+        );
+    }
+    println!(
+        "auto-prune {}: pruned {} of {} older than {days}d ({})",
+        relais::ledger::now_rfc3339(),
+        report.removed.len(),
+        report.listed,
+        human_bytes(bytes)
+    );
+    for failure in &report.failed {
+        eprintln!("relais: prune: {failure}");
+    }
+    if report.failed.is_empty() {
+        CliOutcome::Accepted
+    } else {
+        CliOutcome::OperationalFailure
+    }
+}
+
+fn retire_all(ledger: &Ledger, state_dir: &Path) -> Result<CliOutcome, CliError> {
+    sweep_ended_holdouts(ledger, state_dir);
+    let retained = retained_with_verification(state_dir)?;
     let InPlaceScan {
         runs: in_place,
         unreadable,
@@ -421,11 +533,11 @@ pub(crate) fn retire_all_command() -> Result<CliOutcome, CliError> {
     for (worktree, kind) in retained {
         let run = RunId::from_stored(worktree.run_id.clone());
         seen.insert(worktree.run_id.clone());
-        let Some(state) = settle_state(&ledger, &run, &worktree.path)? else {
+        let Some(state) = settle_state(ledger, &run, &worktree.path)? else {
             continue;
         };
-        let reconciliation = reconcile_run(&ledger, &run)?;
-        match retire_any(&ledger, &run, state, &reconciliation, &worktree.path, kind)? {
+        let reconciliation = reconcile_run(ledger, &run)?;
+        match retire_any(ledger, &run, state, &reconciliation, &worktree.path, kind)? {
             Retired::Retired => {}
             Retired::Kept => failed = true,
         }
@@ -438,11 +550,11 @@ pub(crate) fn retire_all_command() -> Result<CliOutcome, CliError> {
         if !seen.insert(run.as_str().to_string()) {
             continue;
         }
-        let Some(state) = settle_state(&ledger, &run, &path)? else {
+        let Some(state) = settle_state(ledger, &run, &path)? else {
             continue;
         };
-        let reconciliation = reconcile_run(&ledger, &run)?;
-        match retire_in_place(&ledger, &run, state, &reconciliation)? {
+        let reconciliation = reconcile_run(ledger, &run)?;
+        match retire_in_place(ledger, &run, state, &reconciliation)? {
             Some(CliOutcome::Accepted) => {}
             Some(_) => failed = true,
             None => {
@@ -457,7 +569,7 @@ pub(crate) fn retire_all_command() -> Result<CliOutcome, CliError> {
     // The checkouts just retired leave their run's `verify/<run>/` empty.
     relais::runner::sweep_ended_verify_dirs(
         &relais::runner::verify_root(&state_dir.join(paths::RUNS_DIR)),
-        &ledger,
+        ledger,
     );
     Ok(if failed {
         CliOutcome::OperationalFailure
@@ -828,77 +940,40 @@ impl Prune {
 /// dangling; delete the prunable ones, and the empty verify directories
 /// of ended runs, only with `--write`. A run that has not ended, waits on
 /// a person (needs_review, needs_decision, interrupted: `relais decide`
-/// still reads its artifacts), has no receipt in the ledger, or is cited
+/// still reads its artifacts), is `accepted` with no receipt in the ledger, or is cited
 /// by a baseline-cache entry (which names its retry logs by path) is kept.
 /// The listing is stdout; what was done, and every hint, is stderr.
 pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, CliError> {
-    use relais::prune::{apply_run_prune, json_files_citing, plan_run_prune, RunVerdict};
+    use relais::prune::{finish_interrupted, human_bytes, plan_run_prune, RunJudge, RunVerdict};
     let ledger = open_ledger()?;
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
-    let cache_dir = state_dir.join("baseline-cache");
-    let judge = |run: &str, path: &Path| -> RunVerdict {
-        let id = RunId::from_stored(run);
-        match ledger.run_status(&id) {
-            Ok(None) => return RunVerdict::Kept("not in the ledger".to_string()),
-            Ok(Some(
-                state @ (State::Prepared
-                | State::Running
-                | State::Verifying
-                | State::Repairing
-                | State::Escalating),
-            )) => return RunVerdict::Kept(format!("{} (not ended)", state.as_str())),
-            Ok(Some(state @ (State::NeedsReview | State::NeedsDecision | State::Interrupted))) => {
-                return RunVerdict::Kept(format!("{} (waits on a person)", state.as_str()))
+    // A deleting run shares the automatic prune's lock, held to the end.
+    let _lock = match prune {
+        Prune::Preview => None,
+        Prune::Write => match relais::prune::try_lock_prune(&state_dir) {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => {
+                eprintln!(
+                    "relais resume: another prune is running ({} is held); nothing was deleted",
+                    relais::prune::LOCK_FILE
+                );
+                return Ok(CliOutcome::OperationalFailure);
             }
-            Ok(Some(
-                State::Accepted
-                | State::Blocked
-                | State::Failed
-                | State::BudgetExhausted
-                | State::Cancelled
-                | State::AcceptedByPerson,
-            )) => {}
-            Err(e) => return RunVerdict::Kept(format!("ledger: {e}")),
-        }
-        match ledger.receipt(&id) {
-            Ok(Some(_)) => {}
-            Ok(None) => return RunVerdict::Kept("no receipt in the ledger".to_string()),
-            Err(e) => return RunVerdict::Kept(format!("ledger: {e}")),
-        }
-        // A citation may name the directory as it was spelled when it was
-        // written or through its real path (a symlinked state directory,
-        // `/tmp` against `/private/tmp`): both spellings are looked for.
-        let spellings = spellings_of(path);
-        for spelling in &spellings {
-            let cited = format!(
-                "{}{}",
-                spelling.to_string_lossy(),
-                std::path::MAIN_SEPARATOR
-            );
-            match json_files_citing(&cache_dir, &cited) {
-                Ok(0) => {}
-                Ok(n) => return RunVerdict::Kept(format!("cited by {n} baseline-cache entries")),
-                Err(e) => return RunVerdict::Kept(format!("baseline cache unreadable: {e}")),
+            Err(e) => {
+                eprintln!("relais resume: {e}; nothing was deleted");
+                return Ok(CliOutcome::OperationalFailure);
             }
-        }
-        let mut dangling = Vec::new();
-        for spelling in &spellings {
-            match ledger.evidence_under(spelling) {
-                Ok(rows) => {
-                    for row in rows {
-                        if !dangling.contains(&row) {
-                            dangling.push(row);
-                        }
-                    }
-                }
-                Err(e) => return RunVerdict::Kept(format!("ledger: {e}")),
-            }
-        }
-        RunVerdict::Prunable { dangling }
+        },
     };
+    let judge = RunJudge::load(&ledger, &state_dir.join(paths::BASELINE_CACHE_DIR));
     let runs_dir = state_dir.join(paths::RUNS_DIR);
     let older_than = std::time::Duration::from_secs(days.saturating_mul(86_400));
-    let plan = match plan_run_prune(&runs_dir, older_than, std::time::SystemTime::now(), &judge) {
+    let plan = match plan_run_prune(
+        &runs_dir,
+        older_than,
+        std::time::SystemTime::now(),
+        &|run, path| judge.judge(run, path),
+    ) {
         Ok(plan) => plan,
         Err(e) => {
             eprintln!(
@@ -911,6 +986,7 @@ pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, 
     let mut prunable = 0usize;
     let mut bytes = 0u64;
     let mut dangling_total = 0usize;
+    let mut kept_by_label = std::collections::BTreeMap::<&str, usize>::new();
     for dir in &plan {
         let days_old = dir.age.as_secs() / 86_400;
         match &dir.verdict {
@@ -928,7 +1004,10 @@ pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, 
                     println!("         dangling  {kind}  {path}");
                 }
             }
-            RunVerdict::Kept(why) => println!("keep   {}  {days_old}d  {why}", dir.run),
+            RunVerdict::Kept(why) => {
+                *kept_by_label.entry(why.label()).or_default() += 1;
+                println!("keep   {}  {days_old}d  {why}", dir.run)
+            }
         }
     }
     println!(
@@ -936,6 +1015,17 @@ pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, 
         plan.len(),
         human_bytes(bytes)
     );
+    if !kept_by_label.is_empty() {
+        let tally: Vec<String> = kept_by_label
+            .iter()
+            .map(|(label, count)| format!("{count} {label}"))
+            .collect();
+        println!(
+            "kept {}: {}",
+            kept_by_label.values().sum::<usize>(),
+            tally.join(", ")
+        );
+    }
     match prune {
         Prune::Preview => {
             if prunable > 0 {
@@ -950,8 +1040,13 @@ pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, 
     if !removed.is_empty() {
         eprintln!("removed {} empty verify directories", removed.len());
     }
-    let (gone, failed) = apply_run_prune(&plan);
-    eprintln!("deleted {} run directories", gone.len());
+    let mut failed = finish_interrupted(&runs_dir);
+    let applied = judge.apply(&plan);
+    for (path, why) in &applied.kept {
+        eprintln!("kept {}: {why}", path.display());
+    }
+    eprintln!("deleted {} run directories", applied.removed.len());
+    failed.extend(applied.failed);
     for (path, e) in &failed {
         eprintln!(
             "relais resume: {} could not be deleted: {e}",
@@ -963,26 +1058,6 @@ pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, 
     } else {
         CliOutcome::OperationalFailure
     })
-}
-
-/// `path` as given and, when it differs, as its real path.
-fn spellings_of(path: &Path) -> Vec<PathBuf> {
-    let mut spellings = vec![path.to_path_buf()];
-    if let Ok(real) = std::fs::canonicalize(path) {
-        if real != path {
-            spellings.push(real);
-        }
-    }
-    spellings
-}
-
-fn human_bytes(bytes: u64) -> String {
-    const MB: u64 = 1024 * 1024;
-    if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else {
-        format!("{} KB", bytes.div_ceil(1024))
-    }
 }
 
 /// Retire every worktree one terminal run still holds.

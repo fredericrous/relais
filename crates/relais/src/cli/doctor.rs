@@ -158,6 +158,102 @@ pub(crate) fn holdouts_finding() -> Option<doctor::Finding> {
     })
 }
 
+/// The `purge` finding: whether the automatic prune keeps up (ended runs
+/// past the prune age plus three days are the symptom, and so is a stamp
+/// that is missing or stale while old runs wait), with the stamp's age, the
+/// state directory's size and the effective prune age. Nothing when the
+/// state directory is unknown. Deletes nothing.
+pub(crate) fn purge_finding() -> Option<doctor::Finding> {
+    use doctor::state_health as health;
+    let state_dir = paths::state_dir().ok()?;
+    let now = std::time::SystemTime::now();
+    let env = std::env::var(relais::prune::AUTO_PRUNE_DAYS_ENV).ok();
+    let (setting, source) = relais::prune::auto_prune_setting(env.as_deref());
+    let runs = match health::prune_age(&setting) {
+        Some(age) => measure_runs(&state_dir, age, now),
+        None => health::RunsHealth::NotChecked,
+    };
+    let verify = relais::runner::verify_root(&state_dir.join(paths::RUNS_DIR));
+    Some(health::purge_finding(&health::PurgeFacts {
+        setting,
+        source,
+        stamp: health::stamp_state(&state_dir, now),
+        state_bytes: relais::prune::tree_bytes_except(&state_dir, &verify),
+        runs,
+    }))
+}
+
+/// The ended runs older than `age` the prune has not removed, or why that
+/// could not be told. A state directory with no ledger has no runs to judge.
+fn measure_runs(
+    state_dir: &Path,
+    age: std::time::Duration,
+    now: std::time::SystemTime,
+) -> doctor::state_health::RunsHealth {
+    use doctor::state_health::{RunCounts, RunsHealth, PURGE_GRACE};
+    use relais::prune::{KeepReason, RunVerdict};
+    let unmeasured = |operation: String, error: String| RunsHealth::Unmeasured { operation, error };
+    let ledger_path = match paths::ledger_path() {
+        Ok(path) => path,
+        Err(e) => return unmeasured("locating the ledger".to_string(), e.to_string()),
+    };
+    if !ledger_path.exists() {
+        return RunsHealth::NotChecked;
+    }
+    let ledger = match relais::ledger::Ledger::open(&ledger_path) {
+        Ok(ledger) => ledger,
+        Err(e) => {
+            return unmeasured(
+                format!("opening the ledger {}", ledger_path.display()),
+                e.to_string(),
+            )
+        }
+    };
+    let judge = relais::prune::RunJudge::load(&ledger, &state_dir.join(paths::BASELINE_CACHE_DIR));
+    let runs_dir = state_dir.join(paths::RUNS_DIR);
+    let old_runs = match relais::prune::plan_run_prune(&runs_dir, age, now, &|run, path| {
+        judge.judge(run, path)
+    }) {
+        Ok(old_runs) => old_runs,
+        Err(e) => {
+            return unmeasured(
+                format!("judging the runs in {}", runs_dir.display()),
+                e.to_string(),
+            )
+        }
+    };
+    let mut counts = RunCounts::default();
+    for dir in &old_runs {
+        let overdue = dir.age >= age + PURGE_GRACE;
+        match &dir.verdict {
+            RunVerdict::Prunable { .. } => {
+                counts.old_ended_runs += 1;
+                if overdue {
+                    counts.overdue_runs += 1;
+                    counts.overdue_bytes += dir.bytes;
+                }
+            }
+            RunVerdict::Kept(KeepReason::NoReceipt) if overdue => {
+                counts.receiptless_runs += 1;
+                counts.receiptless_bytes += dir.bytes;
+            }
+            RunVerdict::Kept(_) => {}
+        }
+    }
+    RunsHealth::Measured(counts)
+}
+
+/// The `backups` note: the `ledger*` files beside the ledger, deleted by
+/// nobody. Nothing when there are none.
+pub(crate) fn backups_finding() -> Option<doctor::Finding> {
+    use doctor::state_health as health;
+    let state_dir = paths::state_dir().ok()?;
+    health::backups_finding(
+        &state_dir,
+        &health::ledger_backups(&state_dir, std::time::SystemTime::now()),
+    )
+}
+
 /// What `relais doctor --json` prints: the findings, and the Claude Code
 /// integration described apart from them.
 #[derive(serde::Serialize)]
@@ -179,6 +275,8 @@ pub(crate) fn doctor_command(json: bool) -> Result<CliOutcome, CliError> {
     note_held_repair_effort(&mut report);
     report.findings.extend(loop_threshold_finding());
     report.findings.extend(holdouts_finding());
+    report.findings.extend(purge_finding());
+    report.findings.extend(backups_finding());
     if json {
         print_document(&DoctorDocument {
             report: &report,

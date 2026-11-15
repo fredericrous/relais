@@ -144,6 +144,8 @@ pub fn registry_dir() -> Result<PathBuf, HomeUnset> {
 pub const RUNS_DIR: &str = "runs";
 pub const WORKTREES_DIR: &str = "worktrees";
 pub const LEGACY_WORKTREE_DIR: &str = "worktree";
+/// The baseline cache (SPEC §18), beside `runs/` in the state directory.
+pub const BASELINE_CACHE_DIR: &str = "baseline-cache";
 
 /// One directory per run: receipts, patches, evidence.
 pub fn runs_dir() -> Result<PathBuf, HomeUnset> {

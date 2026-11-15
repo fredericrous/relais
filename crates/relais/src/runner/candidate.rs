@@ -164,6 +164,19 @@ pub(crate) fn cross_check(
 ) -> Result<Option<Refusal>, RunError> {
     let mismatch = |detail: String| Ok(Some(Refusal::new(Reason::CandidateDigestMismatch, detail)));
     let run = RunId::from_stored(resolved.source_run.as_str());
+    // A pruned source is not a changed patch: say what happened.
+    let run_dir = source.artifacts_dir.join(&resolved.source_run);
+    if matches!(run_dir.try_exists(), Ok(false)) {
+        return Ok(Some(Refusal::new(
+            Reason::CandidateMissing,
+            format!(
+                "the run directory {} was pruned, so run {} attempt {} has no patch files left to check",
+                run_dir.display(),
+                resolved.source_run,
+                resolved.index
+            ),
+        )));
+    }
     if !workspace::commit_exists(source.repo_dir, &resolved.candidate_commit) {
         return Ok(Some(Refusal::new(
             Reason::CandidateMissing,
@@ -228,4 +241,34 @@ pub(crate) fn conflict_detail(resolved: &ResolvedCandidate, files: &[String]) ->
         &resolved.target_base_sha[..resolved.target_base_sha.len().min(12)],
         files.join(", ")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pruned_source_run_blocks_candidate_missing() {
+        let dir = crate::test_support::short_temp_dir("candidate-pruned");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let artifacts = dir.join("runs");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        let source = Source {
+            repo_dir: &dir,
+            artifacts_dir: &artifacts,
+        };
+        let resolved = ResolvedCandidate {
+            source_run: "gone".to_string(),
+            index: 1,
+            candidate_commit: "c".to_string(),
+            patch_sha256: "p".to_string(),
+            source_base_sha: "b".to_string(),
+            target_base_sha: "t".to_string(),
+        };
+        let refusal = cross_check(&ledger, &source, &resolved)
+            .unwrap()
+            .expect("refused");
+        assert_eq!(refusal.reason, Reason::CandidateMissing);
+        assert!(refusal.detail.contains("pruned"), "{}", refusal.detail);
+    }
 }

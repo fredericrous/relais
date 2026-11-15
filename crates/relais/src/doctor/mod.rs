@@ -11,6 +11,8 @@
 //! ceiling the installed harness cannot take, and the standing of the
 //! `[trials]` envelope — off, or on with what it will and will not draw.
 
+pub mod state_health;
+
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;

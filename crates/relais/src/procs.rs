@@ -674,7 +674,28 @@ impl LockFile {
     /// locked at all. The lock is released when the returned value is
     /// dropped, and by the kernel if this process dies holding it.
     pub fn try_acquire(path: &Path) -> io::Result<Option<Self>> {
-        let file = std::fs::OpenOptions::new()
+        Self::try_acquire_with(path, std::fs::OpenOptions::new())
+    }
+
+    /// [`LockFile::try_acquire`], with the file created 0600 on Unix.
+    pub(crate) fn try_acquire_private(path: &Path) -> io::Result<Option<Self>> {
+        #[cfg(unix)]
+        let options = {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut options = std::fs::OpenOptions::new();
+            options.mode(0o600);
+            options
+        };
+        #[cfg(not(unix))]
+        let options = std::fs::OpenOptions::new();
+        Self::try_acquire_with(path, options)
+    }
+
+    fn try_acquire_with(
+        path: &Path,
+        mut options: std::fs::OpenOptions,
+    ) -> io::Result<Option<Self>> {
+        let file = options
             .create(true)
             .read(true)
             .write(true)

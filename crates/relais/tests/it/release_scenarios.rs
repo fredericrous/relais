@@ -3964,8 +3964,22 @@ fn a_finished_run_leaves_no_empty_verify_dir_and_pruning_previews_first() {
     assert!(out.contains(&run_id), "{out}");
     assert!(run_dir.is_dir(), "a preview deletes nothing");
 
-    // Without a receipt in the ledger, the ended run is kept and says why;
-    // even --write leaves it.
+    // A receipt is required only of an accepted run (the one state that
+    // stores one): without it, an accepted run is kept and says why; even
+    // --write leaves it.
+    {
+        let ledger = rusqlite::Connection::open(world.state.join("ledger.sqlite")).expect("open");
+        ledger
+            .execute(
+                "UPDATE runs SET status = 'accepted' WHERE id = ?1",
+                [&run_id],
+            )
+            .expect("mark the run accepted");
+        // The projected state is the latest transition's, so drop them.
+        ledger
+            .execute("DELETE FROM transitions WHERE run_id = ?1", [&run_id])
+            .expect("clear the transitions");
+    }
     let receipt_less = world.relais(&["resume", "--prune-runs", "0", "--write"]);
     let out = text(&receipt_less.stdout);
     assert_eq!(receipt_less.status.code(), Some(0), "{out}");
@@ -3974,7 +3988,10 @@ fn a_finished_run_leaves_no_empty_verify_dir_and_pruning_previews_first() {
             .any(|l| l.starts_with("keep") && l.contains(&run_id) && l.contains("no receipt")),
         "{out}"
     );
-    assert!(run_dir.is_dir(), "a run without a receipt is never pruned");
+    assert!(
+        run_dir.is_dir(),
+        "an accepted run without a receipt is never pruned"
+    );
 
     // With its receipt stored, the run is prunable and the evidence rows
     // pointing into it are counted: one more row citing a file under it
@@ -4112,6 +4129,51 @@ fn pruning_keeps_live_and_waiting_runs_and_names_dangling_rows() {
         text(&combined.stderr)
     );
     assert!(!log.exists(), "the logged resume never ran");
+}
+
+// A receipt is stored for `accepted` runs alone, so an old `blocked` or
+// `cancelled` run without one is pruned, while an old `accepted` run without
+// one is kept.
+#[test]
+fn pruning_requires_a_receipt_of_accepted_runs_only() {
+    let world = World::new("pruneaccepted");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+    let first = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(first.status.code(), Some(5), "{}", text(&first.stderr));
+    let ledger = rusqlite::Connection::open(world.state.join("ledger.sqlite")).expect("open");
+    let repo = world.repo.to_string_lossy().into_owned();
+    for (run, status) in [
+        ("run-blocked", "blocked"),
+        ("run-cancelled", "cancelled"),
+        ("run-accepted", "accepted"),
+    ] {
+        ledger
+            .execute(
+                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                rusqlite::params![run, repo, status],
+            )
+            .expect("insert a run");
+        let dir = world.state.join("runs").join(run).join("logs");
+        std::fs::create_dir_all(&dir).expect("run dir");
+        std::fs::write(dir.join("check.log"), "x").expect("log");
+    }
+    drop(ledger);
+
+    let applied = world.relais(&["resume", "--prune-runs", "0", "--write"]);
+    let out = text(&applied.stdout);
+    assert_eq!(applied.status.code(), Some(0), "{}", text(&applied.stderr));
+    assert!(!world.state.join("runs/run-blocked").exists());
+    assert!(!world.state.join("runs/run-cancelled").exists());
+    assert!(world.state.join("runs/run-accepted").exists());
+    assert!(
+        out.lines().any(|l| l.starts_with("keep")
+            && l.contains("run-accepted")
+            && l.contains("no receipt in the ledger")),
+        "{out}"
+    );
 }
 
 // A decomposed run's package keeps its verification checkout under the
@@ -6242,5 +6304,438 @@ fn deciding_salvaged_with_a_contained_candidate_records_the_landing() {
         .expect("read")
         .expect("a landing row");
     assert_eq!(landing.0, sha);
+    world.stop_coordinator();
+}
+
+// The automatic prune of `resume --retire --all` (plan 2026-11-15, Phase 2).
+
+const DAY: std::time::Duration = std::time::Duration::from_secs(86_400);
+
+fn backdate(dir: &Path, age: std::time::Duration) {
+    let when = std::time::SystemTime::now() - age;
+    let touch = |path: &Path| {
+        std::fs::File::open(path)
+            .expect("open")
+            .set_modified(when)
+            .expect("set mtime");
+    };
+    for entry in std::fs::read_dir(dir).expect("list").flatten() {
+        touch(&entry.path());
+    }
+    touch(dir);
+}
+
+/// A run row with a receipt and a run directory last touched `age` ago.
+fn seed_run(world: &World, id: &str, status: &str, age: std::time::Duration) -> PathBuf {
+    let ledger = rusqlite::Connection::open(world.state.join("ledger.sqlite")).expect("open");
+    ledger
+        .execute(
+            "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            rusqlite::params![id, world.repo.to_string_lossy(), status],
+        )
+        .expect("insert a run");
+    ledger
+        .execute(
+            "INSERT INTO receipts (run_id, receipt_json, hash, at) VALUES (?1, '{}', 'h', '2026-01-01T00:00:00Z')",
+            [id],
+        )
+        .expect("store a receipt");
+    let dir = world.state.join("runs").join(id);
+    std::fs::create_dir_all(dir.join("logs")).expect("run dir");
+    std::fs::write(dir.join("logs/check.log"), "x").expect("log");
+    backdate(&dir.join("logs"), age);
+    backdate(&dir, age);
+    dir
+}
+
+fn world_with_ledger(tag: &str) -> World {
+    let world = World::new(tag);
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+    let first = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(first.status.code(), Some(5), "{}", text(&first.stderr));
+    world
+}
+
+#[test]
+fn retire_all_prunes_old_runs_once_a_day() {
+    let world = world_with_ledger("autoprune");
+    let first = seed_run(&world, "old-one", "failed", 31 * DAY);
+    let swept = world.relais(&["resume", "--retire", "--all"]);
+    let out = text(&swept.stdout);
+    assert_eq!(
+        swept.status.code(),
+        Some(0),
+        "{out}\n{}",
+        text(&swept.stderr)
+    );
+    assert!(!first.exists(), "{out}");
+    assert!(
+        out.lines().any(|l| l.starts_with("prune  old-one  31d")),
+        "{out}"
+    );
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("auto-prune ") && l.contains("pruned 1 of 1 older than 30d")),
+        "{out}"
+    );
+    assert!(!out.contains("keep "), "{out}");
+    let stamp = world.state.join("runs-prune.stamp");
+    assert!(stamp.exists());
+
+    let second = seed_run(&world, "old-two", "failed", 31 * DAY);
+    let throttled = world.relais(&["resume", "--retire", "--all"]);
+    let out = text(&throttled.stdout);
+    assert!(second.exists(), "a fresh stamp throttles: {out}");
+    assert!(!out.contains("auto-prune"), "{out}");
+
+    std::fs::File::open(&stamp)
+        .expect("stamp")
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 3600))
+        .expect("age the stamp");
+    let again = world.relais(&["resume", "--retire", "--all"]);
+    assert_eq!(again.status.code(), Some(0), "{}", text(&again.stderr));
+    assert!(!second.exists(), "{}", text(&again.stdout));
+}
+
+#[test]
+fn the_age_the_off_switches_and_the_flag_decide_the_prune() {
+    let world = world_with_ledger("autoprunecontrols");
+    let old = seed_run(&world, "old-one", "failed", 31 * DAY);
+    let stamp = world.state.join("runs-prune.stamp");
+
+    let flagged = world.relais(&["resume", "--retire", "--all", "--no-prune"]);
+    assert_eq!(flagged.status.code(), Some(0), "{}", text(&flagged.stderr));
+    assert!(old.exists() && !stamp.exists());
+
+    let off = world.relais_with_env(
+        &["resume", "--retire", "--all"],
+        &[("RELAIS_AUTO_PRUNE_DAYS", "0")],
+    );
+    assert_eq!(off.status.code(), Some(0), "{}", text(&off.stderr));
+    assert!(old.exists() && !stamp.exists());
+    assert!(text(&off.stderr).contains("auto-prune off"));
+    assert!(!text(&off.stdout).contains("auto-prune off"));
+
+    let invalid = world.relais_with_env(
+        &["resume", "--retire", "--all"],
+        &[("RELAIS_AUTO_PRUNE_DAYS", "soon")],
+    );
+    assert_eq!(invalid.status.code(), Some(2), "{}", text(&invalid.stderr));
+    assert!(text(&invalid.stderr).contains("RELAIS_AUTO_PRUNE_DAYS"));
+    assert!(old.exists() && !stamp.exists());
+    assert!(
+        text(&invalid.stdout).contains("no run worktree is retained"),
+        "the retirement still ran: {}",
+        text(&invalid.stdout)
+    );
+
+    let longer = world.relais_with_env(
+        &["resume", "--retire", "--all"],
+        &[("RELAIS_AUTO_PRUNE_DAYS", "40")],
+    );
+    assert_eq!(longer.status.code(), Some(0), "{}", text(&longer.stderr));
+    assert!(old.exists(), "31 days is younger than 40");
+    assert!(stamp.exists());
+}
+
+#[test]
+fn an_invalid_prune_age_is_said_when_the_retirement_keeps_a_run() {
+    let world = world_with_ledger("autoprunekept");
+    let live = seed_run(&world, "live-one", "running", 1 * DAY);
+    std::fs::create_dir_all(world.state.join("worktrees/live-one/checkout")).expect("worktree");
+    let invalid = world.relais_with_env(
+        &["resume", "--retire", "--all"],
+        &[("RELAIS_AUTO_PRUNE_DAYS", "soon")],
+    );
+    assert_ne!(invalid.status.code(), Some(0), "{}", text(&invalid.stderr));
+    assert!(
+        text(&invalid.stderr).contains("RELAIS_AUTO_PRUNE_DAYS"),
+        "{}",
+        text(&invalid.stderr)
+    );
+    assert!(live.exists());
+}
+
+#[test]
+fn a_planted_pruning_directory_is_finished_and_never_judged() {
+    let world = world_with_ledger("autoprunecrash");
+    let planted = world.state.join("runs/.pruning-x");
+    std::fs::create_dir_all(planted.join("logs")).expect("plant");
+    std::fs::write(planted.join("logs/a.log"), "x").expect("file");
+    backdate(&planted, 40 * DAY);
+    let preview = world.relais(&["resume", "--prune-runs", "0"]);
+    assert!(!text(&preview.stdout).contains(".pruning-x"));
+    assert!(planted.exists(), "a preview finishes nothing");
+    let swept = world.relais(&["resume", "--retire", "--all"]);
+    assert_eq!(swept.status.code(), Some(0), "{}", text(&swept.stderr));
+    assert!(!planted.exists());
+    assert!(!text(&swept.stdout).contains(".pruning-x"));
+}
+
+#[test]
+fn a_pinned_source_run_is_kept_by_both_prunes() {
+    let world = world_with_ledger("autoprunepin");
+    let source = seed_run(&world, "src-run", "accepted", 31 * DAY);
+    seed_run(&world, "verifier", "running", std::time::Duration::ZERO);
+    let ledger = rusqlite::Connection::open(world.state.join("ledger.sqlite")).expect("open");
+    ledger
+        .execute(
+            "INSERT INTO candidate_inputs
+                (run_id, source_run, candidate_index, candidate_commit, patch_sha256,
+                 source_base_sha, target_base_sha, resolved_at)
+             VALUES ('verifier', 'src-run', 1, 'c', 'p', 'b', 't', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("pin");
+    drop(ledger);
+    let preview = world.relais(&["resume", "--prune-runs", "0"]);
+    let out = text(&preview.stdout);
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("keep") && l.contains("src-run") && l.contains("pinned")),
+        "{out}"
+    );
+    assert!(
+        out.lines().last().is_some_and(|l| l.starts_with("kept ")),
+        "{out}"
+    );
+    let swept = world.relais(&["resume", "--retire", "--all"]);
+    assert_eq!(swept.status.code(), Some(0), "{}", text(&swept.stderr));
+    assert!(source.exists());
+}
+
+#[test]
+fn a_modified_child_checkout_keeps_its_old_root_run() {
+    let world = world_with_ledger("autopruneroot");
+    let root_id = world.only_run_id();
+    let root = world.run_dir(&root_id);
+    let checkout = root.join("packages/verify/child-1/verify-base");
+    git(
+        &world.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &checkout.to_string_lossy(),
+            "HEAD",
+        ],
+    );
+    let tracked = git(&checkout, &["ls-files"]);
+    let file = tracked.lines().next().expect("a tracked file");
+    std::fs::write(checkout.join(file), "// edited\n").expect("edit");
+    let ledger = rusqlite::Connection::open(world.state.join("ledger.sqlite")).expect("open");
+    ledger
+        .execute(
+            "INSERT OR REPLACE INTO receipts (run_id, receipt_json, hash, at) VALUES (?1, '{}', 'h', '2026-01-01T00:00:00Z')",
+            [&root_id],
+        )
+        .expect("receipt");
+    drop(ledger);
+    backdate(&root.join("packages"), 40 * DAY);
+    backdate(&root, 40 * DAY);
+
+    let swept = world.relais(&["resume", "--retire", "--all"]);
+    assert!(root.exists(), "{}", text(&swept.stdout));
+    let pruned = world.relais(&["resume", "--prune-runs", "0", "--write"]);
+    assert!(root.exists(), "{}", text(&pruned.stdout));
+    assert!(checkout.exists());
+}
+
+#[test]
+fn retire_all_with_a_log_writes_prune_lines_and_no_keep_lines() {
+    let world = world_with_ledger("autoprunelog");
+    let old = seed_run(&world, "old-one", "failed", 31 * DAY);
+    seed_run(&world, "old-live", "running", 31 * DAY);
+    let log = world.state.join("resume.log");
+    let swept = world.relais(&[
+        "resume",
+        "--retire",
+        "--all",
+        "--log",
+        &log.to_string_lossy(),
+    ]);
+    assert_eq!(swept.status.code(), Some(0), "{}", text(&swept.stderr));
+    let logged = std::fs::read_to_string(&log).expect("log");
+    assert!(logged.contains("prune  old-one"), "{logged}");
+    assert!(logged.contains("auto-prune "), "{logged}");
+    assert!(!logged.lines().any(|l| l.starts_with("keep")), "{logged}");
+    assert!(!old.exists());
+    assert!(world.state.join("runs/old-live").exists());
+}
+
+#[test]
+fn a_failed_deletion_is_reported_and_the_others_still_go() {
+    use std::os::unix::fs::PermissionsExt;
+    let world = world_with_ledger("autoprunefail");
+    let stuck = seed_run(&world, "old-stuck", "failed", 40 * DAY);
+    let fine = seed_run(&world, "old-fine", "failed", 31 * DAY);
+    let logs = world.state.join("runs/.pruning-old-stuck/logs");
+    let locked = stuck.join("logs");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).expect("lock");
+    let swept = world.relais(&["resume", "--retire", "--all"]);
+    std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700)).expect("unlock");
+    assert!(!fine.exists(), "{}", text(&swept.stdout));
+    assert!(world.state.join("runs-prune.stamp").exists());
+    // Running as root, the deletion cannot fail and there is nothing to check.
+    if swept.status.code() != Some(0) {
+        assert_eq!(swept.status.code(), Some(1), "{}", text(&swept.stderr));
+        assert!(
+            text(&swept.stderr).contains("deleting a run")
+                && text(&swept.stderr).contains("old-stuck"),
+            "{}",
+            text(&swept.stderr)
+        );
+    }
+}
+
+#[test]
+fn a_manual_write_refuses_while_the_prune_lock_is_held() {
+    let world = world_with_ledger("manuallock");
+    let old = seed_run(&world, "old-one", "failed", 31 * DAY);
+    let held = relais::fsutil::LockFile::try_acquire(&world.state.join("runs-prune.lock"))
+        .expect("lock file")
+        .expect("lock is free");
+    let refused = world.relais(&["resume", "--prune-runs", "0", "--write"]);
+    assert_ne!(refused.status.code(), Some(0), "{}", text(&refused.stdout));
+    assert!(
+        text(&refused.stderr).contains("another prune is running"),
+        "{}",
+        text(&refused.stderr)
+    );
+    assert!(old.exists(), "nothing is deleted while the lock is held");
+    drop(held);
+    let applied = world.relais(&["resume", "--prune-runs", "0", "--write"]);
+    assert_eq!(applied.status.code(), Some(0), "{}", text(&applied.stderr));
+    assert!(!old.exists());
+}
+
+#[test]
+fn the_tally_groups_runs_kept_for_one_reason_without_a_path() {
+    let world = world_with_ledger("tally");
+    for id in ["old-a", "old-b"] {
+        let dir = seed_run(&world, id, "failed", 31 * DAY);
+        std::fs::create_dir_all(dir.join("worktree")).expect("a legacy checkout");
+        backdate(&dir, 31 * DAY);
+    }
+    let preview = world.relais(&["resume", "--prune-runs", "0"]);
+    let out = text(&preview.stdout);
+    let tally = out
+        .lines()
+        .find(|l| l.starts_with("kept "))
+        .unwrap_or_else(|| panic!("no tally: {out}"));
+    assert_eq!(tally, "kept 2: 2 checkout beneath");
+}
+
+#[test]
+fn doctor_warns_when_the_ledger_cannot_be_opened() {
+    let world = world_with_ledger("doctorledger");
+    for leftover in ["ledger.sqlite-wal", "ledger.sqlite-shm"] {
+        std::fs::remove_file(world.state.join(leftover)).ok(); // absent when checkpointed
+    }
+    std::fs::write(
+        world.state.join("ledger.sqlite"),
+        "not a database ".repeat(40),
+    )
+    .expect("corrupt");
+    let doctor = world.relais(&["doctor", "--json"]);
+    let report: serde_json::Value =
+        serde_json::from_str(text(&doctor.stdout).trim()).expect("doctor --json is a document");
+    let purge = report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .find(|f| f["component"] == "purge")
+        .expect("a purge finding");
+    assert_ne!(purge["level"], "ok", "{purge}");
+    assert!(
+        purge["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("opening the ledger")),
+        "{purge}"
+    );
+}
+
+#[test]
+fn doctor_warns_of_old_runs_when_the_stamp_is_missing() {
+    let world = world_with_ledger("doctorstamp");
+    seed_run(&world, "old-one", "failed", 31 * DAY);
+    let doctor = world.relais(&["doctor", "--json"]);
+    let report: serde_json::Value =
+        serde_json::from_str(text(&doctor.stdout).trim()).expect("doctor --json is a document");
+    let purge = report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .find(|f| f["component"] == "purge")
+        .expect("a purge finding");
+    assert_eq!(purge["level"], "warn", "{purge}");
+    let detail = purge["detail"].as_str().expect("detail");
+    assert!(detail.contains("runs-prune.stamp"), "{detail}");
+    assert!(
+        detail.contains("relais resume --prune-runs --write"),
+        "{detail}"
+    );
+}
+
+// A verify of a run whose directory the prune removed says the patch is
+// missing, not that it changed.
+#[test]
+fn verifying_a_pruned_source_run_blocks_candidate_missing() {
+    let world = World::new("prunedsource");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    let policy_extra = r#"
+[[risk]]
+paths = ["src/**"]
+minimum_tier = "escalation"
+"#;
+    let mut policy = std::fs::read_to_string(world.repo.join("relais.toml")).expect("read");
+    policy.push_str(policy_extra);
+    std::fs::write(world.repo.join("relais.toml"), &policy).expect("write");
+    git(&world.repo, &["commit", "-q", "-am", "risk"]);
+    let hash = RepoPolicy::from_toml_str(&policy)
+        .expect("policy")
+        .authority_hash();
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(0), "{}", text(&run.stderr));
+    let source = World::run_id_of(&text(&run.stdout));
+
+    let pruned = world.relais(&["resume", "--prune-runs", "0", "--write"]);
+    assert_eq!(pruned.status.code(), Some(0), "{}", text(&pruned.stderr));
+    assert!(
+        !world.run_dir(&source).exists(),
+        "{}\n{}",
+        text(&pruned.stdout),
+        text(&pruned.stderr)
+    );
+
+    let verify = world.root.join("verify-task.json");
+    std::fs::write(
+        &verify,
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "verify",
+            "objective": "Verify the pruned candidate",
+            "base_ref": "HEAD",
+            "candidate": { "run": source },
+            "write_scope": ["src/**"],
+            "acceptance": ["src/main.rs no longer exists"],
+            "verification_profile": "default",
+            "review": "off",
+        })
+        .to_string(),
+    )
+    .expect("verify task");
+    let blocked = world.relais(&["run", "--task", verify.to_str().unwrap()]);
+    let shown = format!("{}\n{}", text(&blocked.stdout), text(&blocked.stderr));
+    assert_ne!(blocked.status.code(), Some(0), "{shown}");
+    assert!(shown.contains("candidate_missing"), "{shown}");
+    assert!(!shown.contains("candidate_digest_mismatch"), "{shown}");
     world.stop_coordinator();
 }

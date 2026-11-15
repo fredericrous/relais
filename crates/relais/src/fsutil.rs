@@ -1,7 +1,13 @@
-//! File-system helpers with no dependency on the rest of the crate.
+//! File-system helpers. The only crate module this one reaches is `procs`:
+//! the kernel-held [`LockFile`] is implemented there, because `procs` is
+//! the one module that names a platform API (`flock` on Unix, `LockFile`
+//! over one byte past end-of-file on Windows), and is re-exported here
+//! for the callers that think of it as a file helper.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+pub use crate::procs::LockFile;
 
 /// Replace a file's contents so that a failed write leaves the previous
 /// contents intact: a temporary file IN THE SAME DIRECTORY (rename is
@@ -111,4 +117,74 @@ pub(crate) fn append_private_line(path: &Path, line: &str) -> std::io::Result<()
     bytes.extend_from_slice(line.as_bytes());
     bytes.push(b'\n');
     file.write_all(&bytes)
+}
+
+/// The sibling `<path><suffix>`: the name with `suffix` appended whole.
+fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Rename `path` to `<path>.1` when it is larger than `max` bytes,
+/// replacing the previous generation: one generation is kept.
+///
+/// The rename happens under a try-lock on `<path>.lock` (created 0600),
+/// so two processes that both saw the file over the cap do not rotate
+/// twice and destroy the generation the first one made. A held lock
+/// skips the rotation: whoever holds it is rotating. The size is read
+/// again under the lock, and the file is renamed only if it is still
+/// over `max`. Nothing is truncated, so a writer that still holds the
+/// old descriptor lands its whole line in `.1`.
+///
+/// Every error is returned; a caller that treats rotation as best effort
+/// ignores it and the next call retries.
+pub fn rotate_if_over(path: &Path, max: u64) -> std::io::Result<()> {
+    let Some(_lock) = LockFile::try_acquire_private(&sibling_with_suffix(path, ".lock"))? else {
+        return Ok(());
+    };
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() > max => {
+            std::fs::rename(path, sibling_with_suffix(path, ".1"))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotation_renames_only_a_file_over_the_cap() {
+        let dir = crate::test_support::temp_dir("rotate");
+        let path = dir.join("log");
+        std::fs::write(&path, b"12345").expect("write");
+        rotate_if_over(&path, 5).expect("at the cap");
+        assert!(path.exists(), "a file at the cap stays");
+        rotate_if_over(&path, 4).expect("over the cap");
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(dir.join("log.1")).expect("read"), b"12345");
+        rotate_if_over(&path, 0).expect("absent file");
+        std::fs::remove_dir_all(&dir).ok(); // best-effort scratch cleanup
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_held_rotation_lock_skips_the_rotation() {
+        let dir = crate::test_support::temp_dir("rotate-held");
+        let path = dir.join("log");
+        std::fs::write(&path, b"12345").expect("write");
+        let held = LockFile::try_acquire_private(&dir.join("log.lock"))
+            .expect("acquire")
+            .expect("free");
+        rotate_if_over(&path, 1).expect("skipped");
+        assert!(path.exists(), "the holder is rotating, not this call");
+        drop(held);
+        rotate_if_over(&path, 1).expect("rotated");
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).ok(); // best-effort scratch cleanup
+    }
 }
