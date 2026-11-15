@@ -39,3 +39,7 @@ root session and the plan's session window.
 ## Verification
 - `cargo test -p relais --test it report_runs`: the window, an empty window, no ledger, the default `since`, `--json` required, `report`'s flags refused, a malformed `--since` (exit 2), a terminal run with an open attempt, hours to an injected `now`, and a ledger byte-identical after two queries with `usage_events` unchanged. → Observed 2026-11-15: 10 passed, 0 failed (`--since 2026-11-8` first went red at exit 0, then green once only the canonical spelling parses).
 - Live: `relais report runs --json --since 2026-11-08 | jq '.schema, (.runs|length)'` → `1` and a count above 0, run from the installed release.
+
+## Implementation review
+- implementation-review (opus): round 1 approve-with-changes, with 2 blocking findings (the `json: bool` flag argument and the unchecked `--since`), both fixed in 78d4582f. Delta: approve-with-changes. One medium is kept deliberate: the default `since` is built by a format string, which matches `parse_since`'s form, and a test pins that.
+- backend, lang:rust, unix, tui (opus): round 1 approve-with-changes. Fixed: `--since` checked (exit 2), a broken pipe is success, an open last attempt ends at `updated_at`, `status: State`, help text. Delta: all approve. Low and deliberate: there is no broken-pipe test.
