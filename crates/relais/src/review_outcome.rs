@@ -83,11 +83,16 @@ impl Verdict {
 struct Finding {
     // Validated for shape (`deny_unknown_fields` needs every key declared),
     // not read by the labels.
-    #[serde(rename = "role")]
-    _role: String,
+    // A finding greenpiste parsed from the reviewer's own text carries `n`
+    // and no role or disposition (its disposition is derived when stats are
+    // read); declared so `deny_unknown_fields` keeps the row.
+    #[serde(rename = "role", default)]
+    _role: Option<String>,
     severity: Severity,
-    #[serde(rename = "disposition")]
-    _disposition: Disposition,
+    #[serde(rename = "disposition", default)]
+    _disposition: Option<Disposition>,
+    #[serde(rename = "n", default)]
+    _n: Option<u64>,
     #[serde(default)]
     section: Option<String>,
     #[serde(default)]
@@ -103,6 +108,16 @@ struct PlanFeatures {
     repos: Vec<String>,
     #[serde(rename = "body_lines")]
     _body_lines: u64,
+    // Written by greenpiste since its seating record and its counts; not
+    // read here. Declared so `deny_unknown_fields` keeps the row: before,
+    // every row carrying them was dropped as invalid (733 of 1,561 review
+    // rows on 2026-11-15).
+    #[serde(rename = "seat_source", default)]
+    _seat_source: Option<String>,
+    #[serde(rename = "seat_classes", default)]
+    _seat_classes: Option<Vec<String>>,
+    #[serde(rename = "counts", default)]
+    _counts: Option<serde_json::Value>,
 }
 
 /// One line of the ledger.
@@ -125,6 +140,12 @@ struct Row {
     verdict: Option<Verdict>,
     remit: Vec<String>,
     findings: Vec<Finding>,
+    // greenpiste's count of numbered findings it could not parse, and the
+    // plan's id (greenpiste 4.3.0); declared, not read.
+    #[serde(rename = "findings_unparsed", default)]
+    _findings_unparsed: Option<u64>,
+    #[serde(rename = "plan_id", default)]
+    _plan_id: Option<String>,
 }
 
 /// One merge row: a `command` row when `plan-apply` applied the patches
@@ -1039,6 +1060,31 @@ mod tests {
         other["schema"] = serde_json::json!("v2");
         let parsed: Row = serde_json::from_value(other).expect("shape parses");
         assert_ne!(parsed.schema, ROW_SCHEMA);
+    }
+
+    #[test]
+    fn rows_as_greenpiste_writes_them_parse() {
+        // Today's row: seating features and unparsed findings.
+        let mut today = row("r", "rust", 1, "b1");
+        today["findings_unparsed"] = serde_json::json!(0);
+        today["plan"]["seat_source"] = serde_json::json!("paths");
+        today["plan"]["seat_classes"] = serde_json::json!(["cli", "lang:rust"]);
+        serde_json::from_value::<Row>(today.clone()).expect("a current greenpiste row parses");
+        // 4.3.0: the plan id and the panel counts.
+        let mut next = today;
+        next["plan_id"] = serde_json::json!("p-01JCZ0000000000000000000000");
+        next["plan"]["counts"] = serde_json::json!({"repos": 3, "phases": 6});
+        serde_json::from_value::<Row>(next).expect("a 4.3.0 row parses");
+        // Findings in each shape greenpiste writes: from stdin, and parsed
+        // from the reviewer's text (`n` and a severity only).
+        let mut parsed = row("r", "rust", 1, "b1");
+        parsed["findings"] = serde_json::json!([
+            {"n": 1, "severity": "high"},
+            {"role": "rust", "severity": "low", "disposition": "accepted", "n": 2, "section": "Goal", "area": "lang:rust"}
+        ]);
+        serde_json::from_value::<Row>(parsed).expect("both finding shapes parse");
+        // An old row, with none of them, still parses.
+        serde_json::from_value::<Row>(row("r", "rust", 1, "b1")).expect("an old row parses");
     }
 
     #[test]

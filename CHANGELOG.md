@@ -8,6 +8,10 @@ missing here.
 
 ## Unreleased
 
+### Fixed
+
+- **Plan-review rows that greenpiste writes today are read, not dropped.** The review-outcome reader declared fewer fields than greenpiste writes (`plan.seat_source`, `plan.seat_classes`, `findings_unparsed`, and a finding's `n` without a role or disposition). Because rows are parsed with `deny_unknown_fields`, every such row was counted invalid and left out of the labels: 996 of 1,561 review rows in this machine's ledger on 2026-11-15. All 1,561 now parse. The reader also accepts greenpiste 4.3.0's `plan_id` and `plan.counts`, so that release drops nothing.
+
 ## v0.62.0
 
 ### Added
