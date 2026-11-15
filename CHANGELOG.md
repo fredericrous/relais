@@ -8,6 +8,10 @@ missing here.
 
 ## Unreleased
 
+### Changed
+
+- **The hook journal and `resume.log` are size-bounded.** `hook_journal.jsonl` is renamed to `hook_journal.jsonl.1` once it passes 32 MiB, and `resume.log` to `resume.log.1` once it passes 1 MiB (checked once, before `relais resume --log` opens it). One generation is kept; the live file and `.1` are mode 0600. A rotation that loses the race to another process is skipped, and a failed one is retried at the next write.
+
 ## v0.64.0
 
 ### Fixed

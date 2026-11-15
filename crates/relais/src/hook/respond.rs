@@ -406,18 +406,38 @@ pub fn journal_entry(payload: &[u8], handled: &Handled) -> serde_json::Value {
 /// newline into the `writeln!` would have fixed nothing; what matters is
 /// that the whole record is one write.
 pub fn append_journal(path: &Path, entry: &serde_json::Value) -> std::io::Result<()> {
+    append_journal_capped(path, entry, JOURNAL_MAX)
+}
+
+fn append_journal_capped(
+    path: &Path,
+    entry: &serde_json::Value,
+    max_bytes: u64,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut file = open_owner_only(path)?;
     let mut line = entry.to_string();
     line.push('\n');
-    file.write_all(line.as_bytes())
+    file.write_all(line.as_bytes())?;
+    // Rotation is best effort (SPEC §23): a failed or skipped one costs
+    // nothing now and is tried again by the next append.
+    if file
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() > max_bytes)
+    {
+        let _ = crate::fsutil::rotate_if_over(path, max_bytes); // best effort, retried on the next append
+    }
+    Ok(())
 }
+
+/// The size past which the journal is renamed to `<journal>.1`.
+const JOURNAL_MAX: u64 = 32 * 1024 * 1024;
 
 #[cfg(unix)]
 fn open_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -426,11 +446,10 @@ fn open_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
     // `.mode` is masked by the process umask at creation, and this file
     // is appended to across separate hook invocations, so a permissive
     // umask could leave an EXISTING file wider than 0600 from its very
-    // first line. Set explicitly, matching `ipc::Listener::bind`.
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = file.metadata()?.permissions();
-    permissions.set_mode(0o600);
-    std::fs::set_permissions(path, permissions)?;
+    // first line. Set through the open file, not the path: a rotation may
+    // have renamed the journal since it was opened, and the path would
+    // then name a different file.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(file)
 }
 
@@ -1699,6 +1718,133 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(line)
                 .unwrap_or_else(|err| panic!("line is not valid JSON: {err}: {line:?}"));
         }
+    }
+
+    fn journal_entry_of(thread: usize, i: usize) -> serde_json::Value {
+        serde_json::json!({"thread": thread, "i": i})
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_past_its_cap_is_renamed_and_both_files_are_owner_only() {
+        let dir = crate::test_support::temp_dir("journal-rotate");
+        let path = dir.join("hook_journal.jsonl");
+        let rotated = dir.join("hook_journal.jsonl.1");
+        for i in 0..20 {
+            append_journal_capped(&path, &journal_entry_of(0, i), 100).expect("append");
+            if rotated.exists() {
+                break;
+            }
+        }
+        assert!(rotated.exists(), "the journal went past its cap");
+        assert!(!path.exists(), "the rename leaves no live file yet");
+        append_journal_capped(&path, &journal_entry_of(0, 99), 100).expect("append");
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(mode_of(&rotated), 0o600);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eight_threads_across_one_rotation_lose_no_line() {
+        let dir = crate::test_support::temp_dir("journal-rotate-threads");
+        let path = dir.join("hook_journal.jsonl");
+        std::thread::scope(|scope| {
+            for thread_id in 0..8 {
+                let path = &path;
+                scope.spawn(move || {
+                    for i in 0..50 {
+                        append_journal_capped(path, &journal_entry_of(thread_id, i), 5000)
+                            .expect("append");
+                    }
+                });
+            }
+        });
+        let mut lines = 0;
+        for file in [path.clone(), dir.join("hook_journal.jsonl.1")] {
+            for line in std::fs::read_to_string(&file).expect("read").lines() {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .unwrap_or_else(|err| panic!("not JSON: {err}: {line:?}"));
+                lines += 1;
+            }
+        }
+        assert_eq!(lines, 400);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_held_rotation_lock_skips_the_rotation_and_the_append_lands() {
+        let dir = crate::test_support::temp_dir("journal-rotate-held");
+        let path = dir.join("hook_journal.jsonl");
+        let _held = crate::fsutil::LockFile::try_acquire(&dir.join("hook_journal.jsonl.lock"))
+            .expect("acquire")
+            .expect("free");
+        for i in 0..10 {
+            append_journal_capped(&path, &journal_entry_of(0, i), 50).expect("append");
+        }
+        assert!(!dir.join("hook_journal.jsonl.1").exists());
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .lines()
+                .count(),
+            10
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_writer_that_opened_before_a_rename_lands_its_line_in_the_rotated_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::temp_dir("journal-stale-fd");
+        let path = dir.join("hook_journal.jsonl");
+        std::fs::write(&path, b"old\n").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("mode");
+        let mut file = open_owner_only(&path).expect("open");
+        let rotated = dir.join("hook_journal.jsonl.1");
+        std::fs::rename(&path, &rotated).expect("rotate");
+        file.write_all(b"late\n").expect("write");
+        assert_eq!(mode_of(&rotated), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&rotated).expect("read"),
+            "old\nlate\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_oversized_journal_is_rotated_twice_and_stays_under_twice_the_cap() {
+        let dir = crate::test_support::temp_dir("journal-rotate-twice");
+        let path = dir.join("hook_journal.jsonl");
+        let rotated = dir.join("hook_journal.jsonl.1");
+        let cap = 200;
+        std::fs::write(&path, vec![b'x'; 300]).expect("seed");
+        append_journal_capped(&path, &journal_entry_of(0, 0), cap).expect("first");
+        assert!(!path.exists(), "first rotation");
+        let mut second = false;
+        for i in 1..100 {
+            append_journal_capped(&path, &journal_entry_of(0, i), cap).expect("append");
+            if !path.exists() {
+                second = true;
+                break;
+            }
+        }
+        assert!(second, "second rotation");
+        assert!(std::fs::metadata(&rotated).expect("rotated").len() < 2 * cap);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A queued spawn a freed seat admits MID-WAIT comes back silent —

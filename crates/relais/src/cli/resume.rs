@@ -17,11 +17,17 @@ use relais::workspace;
 use std::path::Path;
 use std::path::PathBuf;
 
+/// The size past which `resume.log` is renamed to `resume.log.1`.
+const RESUME_LOG_MAX: u64 = 1024 * 1024;
+
 /// Run this same `relais resume` again with its output appended to `log`
 /// (a timestamp line first), and report whether it succeeded. A detached
 /// sweep has no terminal to write to.
 pub(crate) fn resume_logged(log: &Path) -> Result<CliOutcome, CliError> {
     use std::io::Write;
+    // Once, before the file is opened and the child holds it; best
+    // effort, so a failed rotation costs the cap, never the sweep.
+    let _ = relais::fsutil::rotate_if_over(log, RESUME_LOG_MAX); // best effort, retried on the next sweep
     let open = || -> std::io::Result<std::fs::File> {
         if let Some(parent) = log.parent() {
             std::fs::create_dir_all(parent)?;

@@ -636,68 +636,7 @@ pub fn clone_unsupported(error: &io::Error) -> bool {
     imp::clone_unsupported(error)
 }
 
-/// An exclusive lock the KERNEL holds on a file for as long as the
-/// holder lives, and releases however it dies — SIGKILL, a panic, a
-/// power cut. `flock(LOCK_EX|LOCK_NB)` on Unix, `LockFile` on Windows,
-/// which locks a byte range exclusively and fails immediately rather
-/// than waiting — the same contract, spelled twice.
-///
-/// The file's CONTENT is never locked, on either platform: the Windows
-/// lock covers one byte far past end-of-file, because its byte-range
-/// locks are mandatory and a lock over the content would stop anybody
-/// else reading the PID written there.
-///
-/// One caveat, and it is the kernel's: the lock belongs to the open
-/// file description, and `fork` copies it. A process spawned while the
-/// lock is held owns a copy of the descriptor until it `exec`s, which
-/// closes it (Rust opens files close-on-exec). So for the microseconds
-/// of somebody else's fork/exec, a released lock can still read as
-/// held. Election already answers that by retrying — `ensure_running`
-/// starts a daemon and pings until it answers — so the window costs a
-/// poll, never a wedge.
-///
-/// This is what makes coordinator election atomic (SPEC §23: "atomically
-/// elect one coordinator"). A PID written into a file is not: after a
-/// SIGKILL the file stays, the PID gets recycled by an unrelated
-/// process, and every later `relais run` reads a live PID and refuses to
-/// elect until somebody deletes the file by hand. With the lock, the
-/// file's content is informational and the question "is a coordinator
-/// serving?" is answered by the kernel.
-#[derive(Debug)]
-pub struct LockFile {
-    file: std::fs::File,
-}
-
-impl LockFile {
-    /// Take the lock without blocking. `Ok(None)` = somebody else holds
-    /// it (a live coordinator); `Err` = the file could not be opened or
-    /// locked at all. The lock is released when the returned value is
-    /// dropped, and by the kernel if this process dies holding it.
-    pub fn try_acquire(path: &Path) -> io::Result<Option<Self>> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(path)?;
-        if imp::try_lock_exclusive(&file)? {
-            Ok(Some(Self { file }))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Record who holds it. Informational only — `relais coordinator
-    /// status` and a human reading the state directory — never the
-    /// election's evidence.
-    pub fn write_pid(&mut self) -> io::Result<()> {
-        use std::io::{Seek, SeekFrom, Write};
-        self.file.set_len(0)?;
-        self.file.seek(SeekFrom::Start(0))?;
-        write!(self.file, "{}", std::process::id())?;
-        self.file.flush()
-    }
-}
+pub use crate::fsutil::LockFile;
 
 /// Why a supervised run could not be carried out. A process that RAN
 /// and failed is a `ProcessEnd` with a non-zero status; this is the
@@ -1348,21 +1287,6 @@ mod imp {
                 .is_some_and(|code| codes.contains(&code))
     }
 
-    pub fn try_lock_exclusive(file: &std::fs::File) -> io::Result<bool> {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: an advisory lock on a descriptor this process owns; the
-        // kernel drops it when the descriptor closes or the process dies.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(true);
-        }
-        let error = io::Error::last_os_error();
-        // EWOULDBLOCK (== EAGAIN here) is the whole point: somebody holds it.
-        match error.raw_os_error() {
-            Some(libc::EWOULDBLOCK) => Ok(false),
-            _ => Err(error),
-        }
-    }
-
     pub fn parent_pid() -> Option<u32> {
         // SAFETY: getppid has no failure mode and touches no memory.
         Some(unsafe { libc::getppid() } as u32)
@@ -1451,7 +1375,6 @@ mod imp {
         CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER,
         INVALID_HANDLE_VALUE, STILL_ACTIVE,
     };
-    use windows_sys::Win32::Storage::FileSystem::LockFile;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
@@ -1531,32 +1454,6 @@ mod imp {
 
     pub fn clone_unsupported(error: &io::Error) -> bool {
         error.kind() == io::ErrorKind::Unsupported
-    }
-
-    pub fn try_lock_exclusive(file: &std::fs::File) -> io::Result<bool> {
-        use std::os::windows::io::AsRawHandle;
-        // ONE byte, four gigabytes past anything the file will ever
-        // hold. Windows byte-range locks are MANDATORY, not advisory
-        // like `flock`: a lock over the file's actual content would stop
-        // every other process READING the PID inside it, which is the
-        // one thing that content is for. A range nothing reads is a
-        // pure token, and locking past end-of-file is legal.
-        const TOKEN_OFFSET_HIGH: u32 = 1;
-        // SAFETY: an exclusive byte-range lock on a handle this process
-        // owns. `LockFile` never blocks — it fails immediately when the
-        // range is already locked, which is `LOCK_NB` — and the lock
-        // goes when the handle closes, including on process death.
-        let locked = unsafe { LockFile(file.as_raw_handle() as _, 0, TOKEN_OFFSET_HIGH, 1, 0) };
-        if locked != 0 {
-            return Ok(true);
-        }
-        let error = io::Error::last_os_error();
-        // ERROR_LOCK_VIOLATION (33) is "somebody holds it", the Windows
-        // spelling of EWOULDBLOCK; anything else is a real failure.
-        match error.raw_os_error() {
-            Some(33) => Ok(false),
-            _ => Err(error),
-        }
     }
 
     /// WSAEMFILE, and the Win32 "too many open files" a socket call can
