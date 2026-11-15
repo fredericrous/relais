@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/bounded-state
 repos: [relais]
 adrs: []
@@ -142,12 +142,21 @@ Goal: steady state about 1.1 GiB (runs < 30 d 0.7 + journal <= 64 MiB + ledger 0
    - one week later, `du -sk` per row is at or below the Goal; roll back if a `candidate_missing` hits a run the ledger still pins, or `relais doctor` reports the stamp older than 3 days.
 4. `relais doctor` lists the hand-made backups. Deleting them stays the person's call, outside this plan.
 
-### Observed before the push (2026-11-15)
+### Observed before the push (2026-11-15, final tree `ae2fad8a`)
 Input → expected → actual.
-- Worktree `relais-wt-bounded-state` on `feat/bounded-state` from `origin/main`, rebased onto v0.62.0 → phases through relais → Phase 3 and the receipt follow-up accepted by relais with receipts (`run-6604f7ee5a525-963b`, `run-660537c2a21d4-547a`, all criteria met, 8 of 8 profile checks); Phases 2 and 4 committed through the local gates after relais's verify blocked twice on the host-slot queue under load (the person's choice).
-- `amont run --stamp clippy` and `--stamp cargo-test` on the rebased tree `14606054e631` → clean, all pass → stamped; 2,391 + 57 + 334 + 1 tests passed, 0 failed; the final code tree passed relais's profile checks and 31 commit gates.
-- Branch binary, `relais resume --prune-runs` (read-only preview, real state) → old ended runs prunable, the new keep reasons and the tally → first pilot: 37 of 357 prunable (10.5 MB), 298 kept for "no receipt" (relais stores receipts for `accepted` runs alone) → the person's receipt rule → second pilot: 299 of 357 prunable (888.0 MB), kept 58 (21 wait on a person, 24 `accepted` without a receipt, 1 with a checkout beneath it); `--help` lists `--no-prune`.
-- Branch binary, `relais doctor` (read-only) → purge health and backups → `purge`: 235 ended runs (906.2 MB) older than the age plus 3 days, 19 `accepted` runs (4.9 MB) without a receipt named as never pruned, stamp missing, state directory 2.7 GB; `backups`: 15 files, 313.8 MB, `rm` offered for `bak-v27`/`bak-v30` only.
+- Worktree `relais-wt-bounded-state` on `feat/bounded-state`, rebased onto v0.62.0 → phases through relais → Phase 3, the receipt follow-up and the review fixes accepted by relais with receipts (`run-6604f7ee5a525-963b`, `run-660537c2a21d4-547a`, `run-66054a634686f-141d2`, every criterion met, 8 of 8 profile checks); Phases 2 and 4 committed through the local gates after relais's verify blocked on the host-slot queue under load (the person's choice).
+- Checks on the final code tree → relais's profile checks (fmt, clippy, four cycle checks, cargo-test, plugin-test) pass; 32 commit gates pass. Earlier: clippy and cargo-test stamped on `14606054e631`, 2,391 + 57 + 334 + 1 tests, 0 failed.
+- `relais resume --prune-runs`, final binary, real state, read-only → old ended runs prunable, a tally by label → 299 of 357 prunable (888.0 MiB, 1,665 evidence rows); `kept 58: 13 checkout beneath, 24 no receipt, 21 waits on a person`. The round-1 binary had found 37 of 357, with 298 kept for "no receipt" (relais stores receipts for `accepted` runs alone) → the person's receipt rule.
+- `relais resume --retire --all --log` twice on a scratch copy (`RELAIS_STATE_DIR`, 356 cloned old runs, 1,116 MB) → prunes once, then throttled → 299 `prune` lines and `auto-prune …: pruned 299 of 356 older than 30d (888.0 MiB)`, no `keep` line, no `.pruning-*` left, stamp written; the second run added no line and left the stamp's mtime unchanged; the doctor then showed no overdue warning (260.0 MiB).
+- Journal rotation on a scratch state: a 33 MiB `hook_journal.jsonl` (0600), then one `relais hook` firing → rotated to `.1` with that firing's line and all 34,193 earlier ones; the next firing opened a fresh one-line journal; every file `-rw-------`.
+- `relais doctor`, final binary, real state → purge health and backups → `purge` warns: 235 overdue runs (864.2 MiB), the stamp missing, 19 `accepted` runs (4.7 MiB) without a receipt named as never pruned, a `next:` line; state directory 2.5 GiB without the verify checkouts. `backups`: 15 files, 299.3 MiB, `rm` for `bak-v27`/`bak-v30` only.
+
+## Implementation review
+- implementation-review: approve-with-changes; its 10 round-1 findings fixed (relais runs above); the delta's blocker, verification on the final tree, met above (109k + 160k, 147 + 52 s).
+- Profiles, delta: backend, unix, architect approve; tui, lang:rust approve-with-changes; every round-1 finding fixed (round 1 55–82k each).
+- deliberate: follow-up, cosmetic or internal — tui: backups header path over 80 columns, `checkout beneath` label, long purge lines.
+- deliberate: follow-up, internal — rust: `Kept(_) => 0` arm, `PruneFailure::source`, typed states in `KeepReason`, one env reader; architect: `human_bytes` module.
+- deliberate: follow-up — backend: a failed delete names `runs/<id>`, not `.pruning-<id>`; implementation-review: `tree_bytes_except` is a lower bound.
 
 ## Release
 Merge on green with `merge-when-green`, cut the next minor with `tag-release` (new automatic behaviour), and update the plugin so its session start runs the new binary.
