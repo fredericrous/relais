@@ -21,4 +21,9 @@ Beyond the canonical plan's list: `Finding` also accepts a finding parsed from t
 - `cargo test -p relais --lib review_outcome`: 18 passed, including `rows_as_greenpiste_writes_them_parse`.
 - A copy of this machine's ledger (2026-11-15), parsed line by line with `Row`: 565 parsed and 996 invalid before; 1,561 parsed and 0 invalid after.
 
+## Implementation review
+- implementation-review (opus): round 1 approve-with-changes, with one blocking finding (a history comment) that is fixed. The comments are merged, the extra Finding shape is recorded above, and an ingest test is added. Delta: approve.
+- backend, lang:rust (opus): round 1 approve-with-changes. A label test pins the backend-only shift to `unknown`, and the CHANGELOG says so. Delta: both approve.
+- Deliberate, as a follow-up: the summary line could name the first parse error next to `invalid N`.
+
 <!-- panel: repos=relais body-sha=f1267bf8ce83 -->
