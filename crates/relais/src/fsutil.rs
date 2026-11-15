@@ -1,7 +1,13 @@
-//! File-system helpers with no dependency on the rest of the crate.
+//! File-system helpers. The only crate module this one reaches is `procs`:
+//! the kernel-held [`LockFile`] is implemented there, because `procs` is
+//! the one module that names a platform API (`flock` on Unix, `LockFile`
+//! over one byte past end-of-file on Windows), and is re-exported here
+//! for the callers that think of it as a file helper.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+pub use crate::procs::LockFile;
 
 /// Replace a file's contents so that a failed write leaves the previous
 /// contents intact: a temporary file IN THE SAME DIRECTORY (rename is
@@ -111,87 +117,6 @@ pub(crate) fn append_private_line(path: &Path, line: &str) -> std::io::Result<()
     bytes.extend_from_slice(line.as_bytes());
     bytes.push(b'\n');
     file.write_all(&bytes)
-}
-
-/// An exclusive lock the KERNEL holds on a file for as long as the
-/// holder lives, and releases however it dies: SIGKILL, a panic, a
-/// power cut. It is `File::try_lock`, which is `flock(LOCK_EX|LOCK_NB)`
-/// on Unix and `LockFileEx` with `FAIL_IMMEDIATELY` on Windows, so it
-/// never waits. Nothing here names a platform API.
-///
-/// On Windows that lock is mandatory and covers the whole file, so
-/// another process cannot read the PID written by [`LockFile::write_pid`]
-/// while the lock is held; the PID is informational, never the election's
-/// evidence.
-///
-/// One caveat, and it is the kernel's: the lock belongs to the open
-/// file description, and `fork` copies it. A process spawned while the
-/// lock is held owns a copy of the descriptor until it `exec`s, which
-/// closes it (Rust opens files close-on-exec). So for the microseconds
-/// of somebody else's fork/exec, a released lock can still read as
-/// held. Election already answers that by retrying, so the window costs
-/// a poll, never a wedge.
-///
-/// This is what makes coordinator election atomic (SPEC §23: "atomically
-/// elect one coordinator"). A PID written into a file is not: after a
-/// SIGKILL the file stays and the PID gets recycled by an unrelated
-/// process. With the lock, the file's content is informational and the
-/// question "is a coordinator serving?" is answered by the kernel.
-#[derive(Debug)]
-pub struct LockFile {
-    file: std::fs::File,
-}
-
-impl LockFile {
-    /// Take the lock without blocking. `Ok(None)` = somebody else holds
-    /// it (a live coordinator); `Err` = the file could not be opened or
-    /// locked at all. The lock is released when the returned value is
-    /// dropped, and by the kernel if this process dies holding it.
-    pub fn try_acquire(path: &Path) -> std::io::Result<Option<Self>> {
-        Self::try_acquire_with(path, std::fs::OpenOptions::new())
-    }
-
-    /// [`LockFile::try_acquire`], with the file created 0600 on Unix.
-    fn try_acquire_private(path: &Path) -> std::io::Result<Option<Self>> {
-        #[cfg(unix)]
-        let options = {
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut options = std::fs::OpenOptions::new();
-            options.mode(0o600);
-            options
-        };
-        #[cfg(not(unix))]
-        let options = std::fs::OpenOptions::new();
-        Self::try_acquire_with(path, options)
-    }
-
-    fn try_acquire_with(
-        path: &Path,
-        mut options: std::fs::OpenOptions,
-    ) -> std::io::Result<Option<Self>> {
-        let file = options
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(path)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(Self { file })),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(error)) => Err(error),
-        }
-    }
-
-    /// Record who holds it. Informational only: `relais coordinator
-    /// status` and a human reading the state directory, never the
-    /// election's evidence.
-    pub fn write_pid(&mut self) -> std::io::Result<()> {
-        use std::io::{Seek, SeekFrom};
-        self.file.set_len(0)?;
-        self.file.seek(SeekFrom::Start(0))?;
-        write!(self.file, "{}", std::process::id())?;
-        self.file.flush()
-    }
 }
 
 /// The sibling `<path><suffix>`: the name with `suffix` appended whole.
