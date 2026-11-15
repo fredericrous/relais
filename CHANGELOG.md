@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.65.0
+
 ### Changed
 
 - **`relais resume --retire --all` prunes old runs.** After its retirement it deletes ended runs with a receipt untouched for 30 days, at most once a day (`runs-prune.stamp`, `runs-prune.lock`), through the same judge as `--prune-runs`; `--no-prune` skips it for one call and `RELAIS_AUTO_PRUNE_DAYS` sets the age in days (`0` turns it off). Deletion renames the run to `runs/.pruning-<id>` first, so a crash is finished by the next prune. `--prune-runs` ends with a tally of kept runs grouped by a fixed reason label (never a path or a run id). `relais resume --prune-runs --write` takes `runs-prune.lock` too: while another prune holds it, it says so on stderr, deletes nothing and exits non-zero. `--no-prune` conflicts with `--prune-runs`, and the `auto-prune off` line goes to stderr. Prune errors name their step and path, and sizes print in KiB, MiB and GiB.
