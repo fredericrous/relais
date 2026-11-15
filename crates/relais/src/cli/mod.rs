@@ -211,9 +211,14 @@ pub(crate) enum Command {
         #[arg(long, requires = "prune_runs")]
         write: bool,
         /// Retire the worktree(s) of terminal run(s) whose dispatches
-        /// are provably dead
+        /// are provably dead. With --all (or no run), also prunes ended
+        /// runs untouched for 30 days, at most once a day
+        /// (`RELAIS_AUTO_PRUNE_DAYS` sets the age, 0 turns it off)
         #[arg(long)]
         retire: bool,
+        /// With --retire and no run: do not prune old runs this time
+        #[arg(long, requires = "retire", conflicts_with = "run_id")]
+        no_prune: bool,
         /// With --retire and a run: vouch that the worker an in-place run
         /// lost (`inplace_worker_may_run`) has stopped, after closing its
         /// Claude Code session. The only way to free a tree whose lost
@@ -1373,6 +1378,7 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             retire,
             worker_stopped,
             all: _,
+            no_prune,
             log,
             prune_runs,
             write,
@@ -1384,7 +1390,7 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 Retire::from_flag(retire),
                 WorkerStopped::from_flag(worker_stopped),
             ),
-            (None, None, None) => retire_all_command(),
+            (None, None, None) => retire_all_command(no_prune),
         },
         Command::Report {
             cmd: Some(ReportCommand::Runs { since, json: _ }),

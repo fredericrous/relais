@@ -10,7 +10,12 @@ missing here.
 
 ### Changed
 
+- **`relais resume --retire --all` prunes old runs.** After its retirement it deletes ended runs with a receipt untouched for 30 days, at most once a day (`runs-prune.stamp`, `runs-prune.lock`), through the same judge as `--prune-runs`; `--no-prune` skips it for one call and `RELAIS_AUTO_PRUNE_DAYS` sets the age in days (`0` turns it off). Deletion renames the run to `runs/.pruning-<id>` first, so a crash is finished by the next prune. `--prune-runs` ends with a tally of kept runs by reason.
 - **The hook journal and `resume.log` are size-bounded.** `hook_journal.jsonl` is renamed to `hook_journal.jsonl.1` once it passes 32 MiB, and `resume.log` to `resume.log.1` once it passes 1 MiB (checked once, before `relais resume --log` opens it). One generation is kept; the live file and `.1` are mode 0600. A rotation that loses the race to another process is skipped, and a failed one is retried at the next write.
+
+### Fixed
+
+- **`--prune-runs` keeps a run a pinned candidate names and a run whose subtree holds a checkout or a live, waiting or pinned package run.** A verify of a source whose run directory was pruned blocks `candidate_missing`, not `candidate_digest_mismatch`.
 
 ## v0.64.0
 
