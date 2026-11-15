@@ -12,7 +12,7 @@
 
 **Codex** — approve-with-changes: the prune subtree holds package checkouts (high, applied to judge check 4); journal chmod by path races a rotation; the first rotation keeps the 332 MB journal as `.1`.
 
-**Carried into implementation (17):**
+**Carried into implementation (18):**
 1. Move `LockFile` into `fsutil` (re-export from `procs`); `rotate_if_over` takes it (rust, backend).
 2. Every `runs/` enumerator (judge, doctor, `tree_bytes`, listings) skips `.pruning-*`; test a planted one is finished, not judged (rust, architect, tui).
 3. (dropped with Phase 1.)
@@ -30,3 +30,4 @@
 15. `auto_prune` takes an injected apply closure to assert the stamp is written first (rust).
 16. No parent-dir fsync after a rename (unix).
 17. List judge check 4's child-checkout integration test under Integration tests too (backend, on the Codex edit).
+18. The doctor's purge finding also counts old `accepted` runs kept only for a missing receipt (118 of 318 since Oct 15), the one class still never pruned; waiving it too is the person's later call (backend, receipt delta).

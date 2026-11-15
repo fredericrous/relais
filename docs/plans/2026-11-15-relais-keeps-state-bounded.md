@@ -7,10 +7,10 @@ adrs: []
 # relais keeps its state directory bounded
 
 ## Review panel
-**Decided 2026-11-15:** Phase 1 (hard-link `candidate-latest.patch`) is dropped; the copy stays. Delta: backend approve-with-changes (57k, 23 s).
+**Decided 2026-11-15:** Phase 1 (hard-link `candidate-latest.patch`) is dropped; the copy stays. Delta: backend approve-with-changes (57k, 23 s). Receipt rule: the person made a receipt required for `accepted` runs only after the pilot found 298 old runs (1,090 MB) kept forever for lacking one; delta backend resolved (57k, 13 s).
 📍 relais · plan reviewed, worktree `relais-wt-bounded-state` made · next: land the plan, then Phase 2. Panel: architect, backend, rust, po, tui, unix (opus), codex.
 **Changed by review:** crash-safe prune (`.pruning-<id>`) keeping pinned, live-subtree and worktree runs; doctor watches the purge; Goal measured at ~1.1 GiB.
-**Verdicts:** R1 6 approve-with-changes; R2 2 approve, 4 approve-with-changes; codex approve-with-changes; 17 carried; words 1467 → 1941 (×1.32, past ×1.25 only by high fixes and corrected numbers); remove 0, merge 0.
+**Verdicts:** R1 6 approve-with-changes; R2 2 approve, 4 approve-with-changes; codex approve-with-changes; 18 carried; words 1467 → 1941 (×1.32, past ×1.25 only by high fixes and corrected numbers); remove 0, merge 0.
 
 📄 Full reviews: [2026-11-15-relais-keeps-state-bounded.reviews.md](2026-11-15-relais-keeps-state-bounded.reviews.md)
 
@@ -57,7 +57,7 @@ Goal: steady state about 1.1 GiB (runs < 30 d 0.7 + journal <= 64 MiB + ledger 0
 ### 2. Automatic, throttled prune of ended runs (`prune.rs`, `cli/resume.rs`)
 - **Shared judge.** Move the CLI closure (`resume.rs:840-897`) into `prune::RunJudge`, which loads `ledger.pinned_candidates()` and the baseline-cache texts once. It replaces today's 1.6M file reads. Checks, in order:
   1. ended and not waiting on a person (as today);
-  2. has a receipt (as today);
+  2. has a receipt, required for `accepted` runs only: relais stores receipts for `accepted` runs alone (measured 2026-11-15: 200 of 318 accepted, 0 of ~800 other ended runs since Oct 15), so any other ended run that waits on no one is judged without one (the person's decision, 2026-11-15);
   3. **new:** no pinned candidate names the run (live `kind: verify`, `from_candidate`, pending successor intents; `ledger/runs.rs:888`). This also fixes the manual `--prune-runs`;
   4. **new:** the whole deletion subtree is safe: keep the root if any descendant package run is live, waits on a person or is pinned, or if any checkout remains beneath it (legacy `worktree`, `packages/worktrees`, `packages/verify`); unreadable descendants keep it. Same for manual and automatic pruning, re-checked before the rename; an integration test keeps a modified child checkout under an old eligible parent;
   5. not cited by baseline-cache (as today);
@@ -129,6 +129,7 @@ Goal: steady state about 1.1 GiB (runs < 30 d 0.7 + journal <= 64 MiB + ledger 0
 - A `candidate_inputs` row from a `running` run keeps its source through `--retire --all`, and `--prune-runs 0` says `keep … pinned`.
 - `--retire --all --log` writes `prune <id>` lines to `resume.log` and no `keep` lines.
 - A verify of a pruned source blocks `candidate_missing`, not `candidate_digest_mismatch`.
+- An old `blocked` and an old `cancelled` run with no receipt are pruned; an old `accepted` run with no receipt is kept.
 
 ## Verification
 1. Work in a worktree from `origin/main` (`worktree-task`). Implementation goes through relais (`relais:relais`).
@@ -144,4 +145,4 @@ Goal: steady state about 1.1 GiB (runs < 30 d 0.7 + journal <= 64 MiB + ledger 0
 ## Release
 Merge on green with `merge-when-green`, cut the next minor with `tag-release` (new automatic behaviour), and update the plugin so its session start runs the new binary.
 
-<!-- panel: repos=relais reviewers=architect,backend,lang:rust,po,tui,unix,codex body-sha=ebbc789e3943 -->
+<!-- panel: repos=relais reviewers=architect,backend,lang:rust,po,tui,unix,codex body-sha=165becc63b32 -->
