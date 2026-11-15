@@ -84,7 +84,7 @@ Goal: steady state about 1.1 GiB (runs < 30 d 0.7 + journal <= 64 MiB + ledger 0
   - `rename` to `hook_journal.jsonl.1`, keeping one generation.
   - Nothing is ever truncated: a writer still holding the old fd lands its whole line in `.1`. Errors are ignored (best effort, SPEC §23); on a failed rename (Windows, open file) the next append retries, and the rotation tests are unix-only.
 - `resume_logged`: the same check and rename for `resume.log` at 1 MiB, done once before `open()` and never while the child holds the fd, mirroring `coordinator::daemon_log` (`coordinator/mod.rs:1297`).
-- Put the rotation (lock + re-check + rename) in one `fsutil::rotate_if_over(path, max)` helper used by the journal, `resume.log` and `coordinator::daemon_log`, so `hook` does not depend on `procs`; run `scripts/check-module-cycles.py` before starting this phase.
+- Put the rotation (lock + re-check + rename) in one `fsutil::rotate_if_over(path, max)` helper used by the journal, `resume.log` and `coordinator::daemon_log`, so `hook` does not import `procs` directly (the lock reaches it through `fsutil`'s re-export of `procs::LockFile`, with no cycle); run `scripts/check-module-cycles.py` before starting this phase.
 
 ### 4. Ledger backups: a doctor note, not a deleter (`cli/doctor.rs`)
 - relais writes only the fixed `bak-v27`/`bak-v30`: a keep-two cap would delete nothing.
@@ -150,12 +150,13 @@ Input → expected → actual.
 - `relais resume --retire --all --log` twice on a scratch copy (`RELAIS_STATE_DIR`, 356 cloned old runs, 1,116 MB) → prunes once, then throttled → 299 `prune` lines and `auto-prune …: pruned 299 of 356 older than 30d (888.0 MiB)`, no `keep` line, no `.pruning-*` left, stamp written; the second run added no line and left the stamp's mtime unchanged; the doctor then showed no overdue warning (260.0 MiB).
 - Journal rotation on a scratch state: a 33 MiB `hook_journal.jsonl` (0600), then one `relais hook` firing → rotated to `.1` with that firing's line and all 34,193 earlier ones; the next firing opened a fresh one-line journal; every file `-rw-------`.
 - `relais doctor`, final binary, real state → purge health and backups → `purge` warns: 235 overdue runs (864.2 MiB), the stamp missing, 19 `accepted` runs (4.7 MiB) without a receipt named as never pruned, a `next:` line; state directory 2.5 GiB without the verify checkouts. `backups`: 15 files, 299.3 MiB, `rm` for `bak-v27`/`bak-v30` only.
+- The first PR push, CI `test (windows-latest)` → every check green → failed with os error 33 in three lock tests: the move to `fsutil` had swapped main's Windows lock (one byte past end-of-file) for std `File::try_lock`, a whole-file mandatory lock. Fix `d1d6da78` (relais run `run-66055a0f751e7-edd9`, approved): `LockFile` back in `procs`, its `imp::try_lock_exclusive` byte-identical to `origin/main` on both platforms, `fsutil` re-exporting it; profile checks pass and a new test reads the lock file while it is held. The regression is recorded against `run-6604f7ee5a525-963b`.
 
 ## Implementation review
-- implementation-review: approve-with-changes; its 10 round-1 findings fixed (relais runs above); the delta's blocker, verification on the final tree, met above (109k + 160k, 147 + 52 s).
-- Profiles, delta: backend, unix, architect approve; tui, lang:rust approve-with-changes; every round-1 finding fixed (round 1 55–82k each).
-- deliberate: follow-up, cosmetic or internal — tui: backups header path over 80 columns, `checkout beneath` label, long purge lines.
-- deliberate: follow-up, internal — rust: `Kept(_) => 0` arm, `PruneFailure::source`, typed states in `KeepReason`, one env reader; architect: `human_bytes` module.
+- implementation-review: approve-with-changes, then approve on the Windows fix; 10 round-1 findings fixed, the delta's blocker (verification on the final tree) met above (109k + 160k + 25k).
+- Profiles: backend, unix, architect approve and tui, lang:rust approve-with-changes on the delta; on the Windows fix backend, unix, tui approve, lang:rust and architect approve-with-changes, low only.
+- deliberate: follow-up, cosmetic — tui: backups header path over 80 columns, `checkout beneath` label, long purge lines; unix: say an existing lock file keeps its mode.
+- deliberate: follow-up, internal — rust: `Kept(_) => 0` arm, `PruneFailure::source`, typed states in `KeepReason`, one env reader, `ERROR_LOCK_VIOLATION` for main's literal 33, the Unix-only rotation-lock test; architect: `human_bytes` module, one public path for `LockFile`.
 - deliberate: follow-up — backend: a failed delete names `runs/<id>`, not `.pruning-<id>`; implementation-review: `tree_bytes_except` is a lower bound.
 
 ## Release
