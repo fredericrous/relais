@@ -3964,8 +3964,22 @@ fn a_finished_run_leaves_no_empty_verify_dir_and_pruning_previews_first() {
     assert!(out.contains(&run_id), "{out}");
     assert!(run_dir.is_dir(), "a preview deletes nothing");
 
-    // Without a receipt in the ledger, the ended run is kept and says why;
-    // even --write leaves it.
+    // A receipt is required only of an accepted run (the one state that
+    // stores one): without it, an accepted run is kept and says why; even
+    // --write leaves it.
+    {
+        let ledger = rusqlite::Connection::open(world.state.join("ledger.sqlite")).expect("open");
+        ledger
+            .execute(
+                "UPDATE runs SET status = 'accepted' WHERE id = ?1",
+                [&run_id],
+            )
+            .expect("mark the run accepted");
+        // The projected state is the latest transition's, so drop them.
+        ledger
+            .execute("DELETE FROM transitions WHERE run_id = ?1", [&run_id])
+            .expect("clear the transitions");
+    }
     let receipt_less = world.relais(&["resume", "--prune-runs", "0", "--write"]);
     let out = text(&receipt_less.stdout);
     assert_eq!(receipt_less.status.code(), Some(0), "{out}");
@@ -3974,7 +3988,10 @@ fn a_finished_run_leaves_no_empty_verify_dir_and_pruning_previews_first() {
             .any(|l| l.starts_with("keep") && l.contains(&run_id) && l.contains("no receipt")),
         "{out}"
     );
-    assert!(run_dir.is_dir(), "a run without a receipt is never pruned");
+    assert!(
+        run_dir.is_dir(),
+        "an accepted run without a receipt is never pruned"
+    );
 
     // With its receipt stored, the run is prunable and the evidence rows
     // pointing into it are counted: one more row citing a file under it
@@ -4112,6 +4129,51 @@ fn pruning_keeps_live_and_waiting_runs_and_names_dangling_rows() {
         text(&combined.stderr)
     );
     assert!(!log.exists(), "the logged resume never ran");
+}
+
+// A receipt is stored for `accepted` runs alone, so an old `blocked` or
+// `cancelled` run without one is pruned, while an old `accepted` run without
+// one is kept.
+#[test]
+fn pruning_requires_a_receipt_of_accepted_runs_only() {
+    let world = World::new("pruneaccepted");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+    let first = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(first.status.code(), Some(5), "{}", text(&first.stderr));
+    let ledger = rusqlite::Connection::open(world.state.join("ledger.sqlite")).expect("open");
+    let repo = world.repo.to_string_lossy().into_owned();
+    for (run, status) in [
+        ("run-blocked", "blocked"),
+        ("run-cancelled", "cancelled"),
+        ("run-accepted", "accepted"),
+    ] {
+        ledger
+            .execute(
+                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                rusqlite::params![run, repo, status],
+            )
+            .expect("insert a run");
+        let dir = world.state.join("runs").join(run).join("logs");
+        std::fs::create_dir_all(&dir).expect("run dir");
+        std::fs::write(dir.join("check.log"), "x").expect("log");
+    }
+    drop(ledger);
+
+    let applied = world.relais(&["resume", "--prune-runs", "0", "--write"]);
+    let out = text(&applied.stdout);
+    assert_eq!(applied.status.code(), Some(0), "{}", text(&applied.stderr));
+    assert!(!world.state.join("runs/run-blocked").exists());
+    assert!(!world.state.join("runs/run-cancelled").exists());
+    assert!(world.state.join("runs/run-accepted").exists());
+    assert!(
+        out.lines().any(|l| l.starts_with("keep")
+            && l.contains("run-accepted")
+            && l.contains("no receipt in the ledger")),
+        "{out}"
+    );
 }
 
 // A decomposed run's package keeps its verification checkout under the

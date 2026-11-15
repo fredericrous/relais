@@ -6,7 +6,8 @@
 //! - a verify directory goes only when it holds no file at all (a release
 //!   that failed leaves a worktree behind, and that stays visible);
 //! - a run directory goes only for a run the ledger records as ended,
-//!   not waiting on a person, with its receipt stored in the ledger, and
+//!   not waiting on a person, with its receipt stored in the ledger when it
+//!   is `accepted` (the only state that stores one), and
 //!   untouched for longer than the asked age. Pruning previews by default.
 
 use std::io;
@@ -164,10 +165,13 @@ fn age(path: &Path, now: SystemTime) -> Option<Duration> {
     Some(now.duration_since(newest).unwrap_or(Duration::ZERO))
 }
 
+/// The keep reason of an `accepted` run whose receipt is not in the ledger.
+pub const NO_RECEIPT_REASON: &str = "no receipt in the ledger";
+
 /// Why a run directory may or may not be pruned, as the ledger has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunVerdict {
-    /// Ended, not waiting on a person, receipt in the ledger: prunable,
+    /// Ended, not waiting on a person, receipt in the ledger when accepted: prunable,
     /// leaving these evidence rows (of any run) pointing into it, as
     /// `(kind, path)`.
     Prunable { dangling: Vec<(String, String)> },
@@ -374,24 +378,29 @@ impl<'a> RunJudge<'a> {
     }
 
     /// The verdict on `runs/<run>/` at `path`, checks in order: ended and
-    /// not waiting on a person, receipt, pinned candidate, a subtree that
+    /// not waiting on a person, receipt (accepted runs only), pinned candidate, a subtree that
     /// is safe to delete, baseline-cache citation; then the evidence rows
     /// left dangling.
     pub fn judge(&self, run: &str, path: &Path) -> RunVerdict {
         let id = crate::ids::RunId::from_stored(run);
-        match self.ledger.run_status(&id) {
+        let state = match self.ledger.run_status(&id) {
             Ok(None) => return RunVerdict::Kept("not in the ledger".to_string()),
             Ok(Some(state)) => {
                 if let Some(why) = state_keeps(state) {
                     return RunVerdict::Kept(why);
                 }
+                state
             }
             Err(e) => return RunVerdict::Kept(format!("ledger: {e}")),
-        }
-        match self.ledger.receipt(&id) {
-            Ok(Some(_)) => {}
-            Ok(None) => return RunVerdict::Kept("no receipt in the ledger".to_string()),
-            Err(e) => return RunVerdict::Kept(format!("ledger: {e}")),
+        };
+        // Only an accepted run has a receipt stored; any other ended run
+        // never will, so waiting for one would keep it forever.
+        if state == crate::lifecycle::State::Accepted {
+            match self.ledger.receipt(&id) {
+                Ok(Some(_)) => {}
+                Ok(None) => return RunVerdict::Kept(NO_RECEIPT_REASON.to_string()),
+                Err(e) => return RunVerdict::Kept(format!("ledger: {e}")),
+            }
         }
         let pinned = match &self.pinned {
             Ok(pinned) => pinned,

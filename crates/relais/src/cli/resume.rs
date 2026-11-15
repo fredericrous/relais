@@ -918,7 +918,7 @@ impl Prune {
 /// dangling; delete the prunable ones, and the empty verify directories
 /// of ended runs, only with `--write`. A run that has not ended, waits on
 /// a person (needs_review, needs_decision, interrupted: `relais decide`
-/// still reads its artifacts), has no receipt in the ledger, or is cited
+/// still reads its artifacts), is `accepted` with no receipt in the ledger, or is cited
 /// by a baseline-cache entry (which names its retry logs by path) is kept.
 /// The listing is stdout; what was done, and every hint, is stderr.
 pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, CliError> {

@@ -169,6 +169,7 @@ pub(crate) fn purge_finding() -> Option<doctor::Finding> {
     let env = std::env::var(relais::prune::AUTO_PRUNE_DAYS_ENV).ok();
     let setting = relais::prune::auto_prune_setting(false, env.as_deref());
     let mut overdue = Vec::new();
+    let mut receiptless = Vec::new();
     if let Some(older_than) = health::overdue_after(&setting) {
         let ledger = paths::ledger_path()
             .ok()
@@ -176,16 +177,25 @@ pub(crate) fn purge_finding() -> Option<doctor::Finding> {
             .and_then(|path| relais::ledger::Ledger::open(&path).ok());
         if let Some(ledger) = &ledger {
             let judge = relais::prune::RunJudge::load(ledger, &state_dir.join("baseline-cache"));
-            overdue = relais::prune::plan_run_prune(
+            let old_runs = relais::prune::plan_run_prune(
                 &state_dir.join(paths::RUNS_DIR),
                 older_than,
                 now,
                 &|run, path| judge.judge(run, path),
             )
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|dir| matches!(dir.verdict, relais::prune::RunVerdict::Prunable { .. }))
-            .collect();
+            .unwrap_or_default();
+            receiptless = old_runs
+                .iter()
+                .filter(|dir| {
+                    matches!(&dir.verdict, relais::prune::RunVerdict::Kept(why)
+                        if why == relais::prune::NO_RECEIPT_REASON)
+                })
+                .cloned()
+                .collect();
+            overdue = old_runs
+                .into_iter()
+                .filter(|dir| matches!(dir.verdict, relais::prune::RunVerdict::Prunable { .. }))
+                .collect();
         }
     }
     Some(health::purge_finding(&health::PurgeFacts {
@@ -195,6 +205,8 @@ pub(crate) fn purge_finding() -> Option<doctor::Finding> {
         state_bytes: relais::prune::tree_bytes(&state_dir),
         overdue_runs: overdue.len(),
         overdue_bytes: overdue.iter().map(|dir| dir.bytes).sum(),
+        receiptless_runs: receiptless.len(),
+        receiptless_bytes: receiptless.iter().map(|dir| dir.bytes).sum(),
     }))
 }
 

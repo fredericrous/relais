@@ -30,6 +30,10 @@ pub struct PurgeFacts {
     /// Ended, prunable runs older than the age plus [`PURGE_GRACE`].
     pub overdue_runs: usize,
     pub overdue_bytes: u64,
+    /// Ended `accepted` runs older than the age plus [`PURGE_GRACE`] kept
+    /// only because the ledger holds no receipt for them.
+    pub receiptless_runs: usize,
+    pub receiptless_bytes: u64,
 }
 
 /// The age at which a run is overdue for the purge, when the prune is on.
@@ -59,6 +63,13 @@ pub fn purge_finding(facts: &PurgeFacts) -> Finding {
             "{} ended runs ({}) are older than the prune age plus 3 days: the automatic prune is not removing them",
             facts.overdue_runs,
             human_bytes(facts.overdue_bytes)
+        ));
+    }
+    if facts.receiptless_runs > 0 {
+        lines.push(format!(
+            "{} ended accepted runs ({}) are older than the prune age plus 3 days and have no receipt in the ledger: they are never pruned",
+            facts.receiptless_runs,
+            human_bytes(facts.receiptless_bytes)
         ));
     }
     let source = if facts.env_set {
@@ -234,6 +245,8 @@ mod tests {
             state_bytes: 1_100_000_000,
             overdue_runs: 0,
             overdue_bytes: 0,
+            receiptless_runs: 0,
+            receiptless_bytes: 0,
         }
     }
 
@@ -255,6 +268,18 @@ mod tests {
         });
         assert_eq!(finding.level, Level::Warn);
         assert!(finding.detail.contains("2 ended runs (5.0 MB)"));
+    }
+
+    #[test]
+    fn purge_counts_accepted_runs_kept_for_a_missing_receipt() {
+        let finding = purge_finding(&PurgeFacts {
+            receiptless_runs: 3,
+            receiptless_bytes: 2_000_000,
+            ..facts()
+        });
+        assert!(finding.detail.contains("3 ended accepted runs (2.0 MB)"));
+        assert!(finding.detail.contains("never pruned"));
+        assert!(!purge_finding(&facts()).detail.contains("no receipt"));
     }
 
     #[test]

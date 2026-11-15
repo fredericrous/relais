@@ -19,6 +19,7 @@ missing here.
 
 ### Fixed
 
+- **The prune requires a ledger receipt only of an `accepted` run.** relais stores a receipt for `accepted` runs alone, so the old rule kept every `blocked`, `cancelled`, `failed`, `budget_exhausted` and `accepted_by_person` run forever; those are now judged by the pin, subtree and baseline-cache checks alone, and an `accepted` run without a receipt is still kept (`no receipt in the ledger`). `relais doctor`'s `purge` finding counts the old `accepted` runs kept only for that reason, so they are no longer invisible.
 - **`--prune-runs` keeps a run a pinned candidate names and a run whose subtree holds a checkout or a live, waiting or pinned package run.** A verify of a source whose run directory was pruned blocks `candidate_missing`, not `candidate_digest_mismatch`.
 
 ## v0.64.0
