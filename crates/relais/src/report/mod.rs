@@ -16,6 +16,7 @@ mod harness;
 mod holdouts;
 mod repairs;
 mod reviewers;
+mod runs;
 
 use serde::Serialize;
 
@@ -28,6 +29,7 @@ pub use harness::{harness_report, HarnessReport, HarnessStep, Step, StepModel};
 pub use holdouts::{holdouts_report, HoldoutExposures, HoldoutsReport};
 pub use repairs::{EffortRepairs, RepairCost};
 pub use reviewers::{reviewer_report, ReviewerClass, ReviewerReport};
+pub use runs::{runs_document, RunSpan, RunsDocument, RUNS_SCHEMA};
 
 use crate::ledger::{DecisionRecord, Ledger, PhaseCost, TaskOrigin};
 use crate::lifecycle::{Reason, RunPurpose, State};

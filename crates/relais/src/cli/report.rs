@@ -17,6 +17,35 @@ use relais::paths;
 use relais::report;
 use std::path::Path;
 
+/// `relais report runs --json`: the runs of the window and their hours.
+/// It opens the ledger for reading only (no migration, no write) and
+/// imports no usage, so a weekly job calling it leaves the ledger as it
+/// found it. A machine with no ledger yet has no runs.
+pub(crate) fn report_runs_command(since: Option<&str>, json: bool) -> Result<CliOutcome, CliError> {
+    debug_assert!(json, "clap requires --json on `report runs`");
+    let since = since.map(|since| since.to_string()).unwrap_or_else(|| {
+        chrono::Utc::now()
+            .format("%Y-%m-01T00:00:00+00:00")
+            .to_string()
+    });
+    let path = paths::ledger_path().map_err(CliError::Home)?;
+    let document = if path.exists() {
+        let ledger = operational(Ledger::open_read_only(&path), "the ledger is unavailable")?;
+        operational(
+            report::runs_document(&ledger, &since, chrono::Utc::now()),
+            "the runs report",
+        )?
+    } else {
+        report::RunsDocument {
+            schema: report::RUNS_SCHEMA,
+            since,
+            runs: Vec::new(),
+        }
+    };
+    print_document(&document)?;
+    Ok(CliOutcome::Accepted)
+}
+
 pub(crate) fn report_command(
     since: Option<&str>,
     json: bool,

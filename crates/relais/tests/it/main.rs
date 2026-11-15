@@ -25,6 +25,7 @@ mod portable_scenarios;
 mod programme_cli;
 mod quiet_watch;
 mod release_scenarios;
+mod report_runs;
 mod review_outcome;
 mod review_parts_cli;
 mod session_router;
