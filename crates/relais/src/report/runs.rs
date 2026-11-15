@@ -41,10 +41,11 @@ pub fn runs_document(
     since: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<RunsDocument, LedgerError> {
-    let mut runs = Vec::new();
-    for window in ledger.runs_window(since)? {
-        runs.push(span(window, now)?);
-    }
+    let runs = ledger
+        .runs_window(since)?
+        .into_iter()
+        .map(|window| span(window, now))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(RunsDocument {
         schema: RUNS_SCHEMA,
         since: since.to_string(),
@@ -73,7 +74,7 @@ fn span(window: RunWindow, now: chrono::DateTime<chrono::Utc>) -> Result<RunSpan
         id: window.id.as_str().to_string(),
         repo: window.repo,
         root_session: window.root_session,
-        status: window.status,
+        status: window.status.as_str().to_string(),
         started_at: window.started_at,
         ended_at: window.ended_at,
         hours: (seconds / 3600.0 * 1000.0).round() / 1000.0,

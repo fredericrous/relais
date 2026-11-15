@@ -37,8 +37,8 @@ pub struct OrchestrationUsageRow {
 pub struct RunWindow {
     pub id: RunId,
     pub repo: String,
-    /// The projected state, spelled as [`crate::lifecycle::State::as_str`].
-    pub status: String,
+    /// The projected state.
+    pub status: State,
     pub root_session: Option<String>,
     pub started_at: String,
     pub ended_at: Option<String>,
@@ -110,12 +110,14 @@ impl Ledger {
     /// `ended_at` is `None` while the run's projected state is not
     /// terminal, whatever its finished attempts say: an earlier attempt's
     /// end does not end a run that is still going. For a terminal run it is
-    /// the latest attempt end, else the run's own `updated_at`.
+    /// the latest attempt end; when an attempt never recorded its end (a
+    /// crash, a retire) or no attempt ended, the run's own `updated_at`.
     pub fn runs_window(&self, since: &str) -> Result<Vec<RunWindow>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT id, repo_path, {PROJECTED_STATUS}, root_session, created_at, updated_at,
                     (SELECT MIN(a.started_at) FROM attempts a WHERE a.run_id = runs.id),
-                    (SELECT MAX(a.ended_at) FROM attempts a WHERE a.run_id = runs.id)
+                    (SELECT MAX(a.ended_at) FROM attempts a WHERE a.run_id = runs.id),
+                    (SELECT COUNT(*) FROM attempts a WHERE a.run_id = runs.id AND a.ended_at IS NULL)
              FROM runs
              WHERE created_at >= ?1 AND parent_run IS NULL
              ORDER BY created_at, rowid"
@@ -130,24 +132,31 @@ impl Ledger {
                 row.get::<_, String>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
             ))
         })?;
         let mut windows = Vec::new();
         for row in rows {
-            let (id, repo, status, root_session, created, updated, first_start, last_end) = row?;
-            let terminal = State::parse(&status)
-                .map_err(|unknown| LedgerError::Corrupt {
-                    what: format!("the state of run {id}"),
-                    detail: unknown.to_string(),
-                })?
-                .is_terminal();
+            let (id, repo, status, root_session, created, updated, first_start, last_end, open) =
+                row?;
+            let status = State::parse(&status).map_err(|unknown| LedgerError::Corrupt {
+                what: format!("the state of run {id}"),
+                detail: unknown.to_string(),
+            })?;
+            // An attempt left open would end the run at an earlier
+            // attempt's end, before its own last attempt started.
+            let end = if open > 0 {
+                Some(updated.clone())
+            } else {
+                last_end
+            };
             windows.push(RunWindow {
                 id: RunId::from_stored(id),
                 repo,
                 status,
                 root_session,
                 started_at: first_start.unwrap_or(created),
-                ended_at: terminal.then(|| last_end.unwrap_or(updated)),
+                ended_at: status.is_terminal().then(|| end.unwrap_or(updated)),
             });
         }
         Ok(windows)

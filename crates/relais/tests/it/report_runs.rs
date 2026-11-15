@@ -162,7 +162,10 @@ fn the_window_lists_each_run_with_its_start_end_and_hours() {
     let world = seeded("window");
     let doc = world.json(&["report", "runs", "--json", "--since", "2026-11-01"]);
     assert_eq!(doc["schema"], 1, "{doc}");
-    assert_eq!(doc["since"], "2026-11-01", "{doc}");
+    assert_eq!(
+        doc["since"], "2026-11-01T00:00:00+00:00",
+        "a date is echoed as RFC3339 UTC: {doc}"
+    );
     let runs = doc["runs"].as_array().expect("runs");
     assert_eq!(runs.len(), 2, "run-old is before the window: {doc}");
 
@@ -215,6 +218,79 @@ fn the_default_window_is_the_start_of_the_current_month() {
 }
 
 #[test]
+fn a_malformed_since_is_a_usage_error_not_a_wrong_window() {
+    let world = seeded("badsince");
+    for bad in ["2026-11-8", "garbage", "11/08/2026"] {
+        let output = world.relais(&["report", "runs", "--json", "--since", bad]);
+        assert_eq!(output.status.code(), Some(2), "{bad}: {output:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "{bad}: no document on a usage error"
+        );
+    }
+}
+
+#[test]
+fn a_terminal_run_with_an_open_attempt_ends_at_its_update() {
+    let world = World::new("openlast");
+    {
+        let ledger = Ledger::open(&world.ledger_path()).expect("ledger");
+        run(&ledger, "run-crashed", Some("s2"), Some(State::Accepted));
+    }
+    stamp(
+        &world,
+        "run-crashed",
+        "2026-11-12T09:00:00+00:00",
+        "2026-11-12T12:00:00+00:00",
+        &[
+            (
+                "2026-11-12T09:00:00+00:00",
+                Some("2026-11-12T09:30:00+00:00"),
+            ),
+            ("2026-11-12T10:00:00+00:00", None),
+        ],
+    );
+    let doc = world.json(&["report", "runs", "--json", "--since", "2026-11-01"]);
+    let run = &doc["runs"][0];
+    assert_eq!(
+        run["ended_at"], "2026-11-12T12:00:00+00:00",
+        "not the first attempt's end: {doc}"
+    );
+    assert_eq!(run["hours"], 3.0, "{doc}");
+}
+
+#[test]
+fn a_running_run_counts_hours_to_the_given_now() {
+    let world = seeded("fixednow");
+    let ledger = Ledger::open(&world.ledger_path()).expect("ledger");
+    let now = chrono::DateTime::parse_from_rfc3339("2026-11-14T10:40:00+00:00")
+        .expect("now")
+        .with_timezone(&chrono::Utc);
+    let doc =
+        relais::report::runs_document(&ledger, "2026-11-01T00:00:00+00:00", now).expect("document");
+    let live = doc
+        .runs
+        .iter()
+        .find(|r| r.id == "run-live")
+        .expect("run-live");
+    assert_eq!(live.hours, 2.5, "08:10 to 10:40");
+    let before = chrono::DateTime::parse_from_rfc3339("2026-11-14T08:00:00+00:00")
+        .expect("before")
+        .with_timezone(&chrono::Utc);
+    let doc = relais::report::runs_document(&ledger, "2026-11-01T00:00:00+00:00", before)
+        .expect("document");
+    let live = doc
+        .runs
+        .iter()
+        .find(|r| r.id == "run-live")
+        .expect("run-live");
+    assert_eq!(
+        live.hours, 0.0,
+        "a run stamped after now is zero hours, never negative"
+    );
+}
+
+#[test]
 fn json_is_required() {
     let world = seeded("nojson");
     let output = world.relais(&["report", "runs"]);
@@ -224,9 +300,9 @@ fn json_is_required() {
 #[test]
 fn report_flags_are_not_part_of_the_subcommand() {
     let world = seeded("flags");
-    for extra in [["--by", "task-type"], ["--no-import", ""]] {
+    for extra in [&["--by", "task-type"][..], &["--no-import"][..]] {
         let mut args = vec!["report", "runs", "--json"];
-        args.extend(extra.iter().filter(|a| !a.is_empty()));
+        args.extend_from_slice(extra);
         let output = world.relais(&args);
         assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
     }

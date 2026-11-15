@@ -28,7 +28,7 @@ root session and the plan's session window.
 ## Behaviour
 - `relais report runs --json [--since <date>]` is a subcommand of `report` with its own arguments. `--json` is required (exit 2 without it), and `report`'s `--by`, `--no-import` and `--since` before `runs` are refused.
 - One object per root run created at or after `--since` (default: the first of the month, UTC), oldest first: `id`, `repo`, `root_session`, `status` (the projected state), `started_at` (the earliest attempt start, else the run's creation), `ended_at` and `hours`.
-- `ended_at` is `null` while the projected state is not terminal, whatever its finished attempts say; for a terminal run it is the latest attempt end, else the run's `updated_at`. This is stricter than the full plan's wording ("the latest attempt end, else `updated_at` for a terminal run, else null"), which would end a running run at its first finished attempt.
+- `ended_at` is `null` while the projected state is not terminal, whatever its finished attempts say; for a terminal run it is the latest attempt end, or the run's `updated_at` when an attempt never recorded its end or none ended. This is stricter than the full plan's wording ("the latest attempt end, else `updated_at` for a terminal run, else null"), which would end a running run at its first finished attempt.
 - `hours` runs to now for a run still going, never negative, to three decimals.
 - It opens the ledger read-only (`Ledger::open_read_only`: no migration, no write, no usage import), and a machine with no ledger gets `runs: []` and no file.
 
@@ -37,5 +37,5 @@ root session and the plan's session window.
 - 2026-11-15 — Only root runs (`parent_run IS NULL`) are listed, as `report`'s own run list does, so a package run's hours are not counted twice.
 
 ## Verification
-- `cargo test -p relais --test it report_runs`: the window, an empty window, no ledger, the default `since`, `--json` required, `report`'s flags refused, and a ledger byte-identical after two queries with `usage_events` unchanged.
+- `cargo test -p relais --test it report_runs`: the window, an empty window, no ledger, the default `since`, `--json` required, `report`'s flags refused, a malformed `--since` (exit 2), a terminal run with an open attempt, hours to an injected `now`, and a ledger byte-identical after two queries with `usage_events` unchanged. → Observed 2026-11-15: 10 passed, 0 failed (`--since 2026-11-8` first went red at exit 0, then green once only the canonical spelling parses).
 - Live: `relais report runs --json --since 2026-11-08 | jq '.schema, (.runs|length)'` → `1` and a count above 0, run from the installed release.
