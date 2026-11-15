@@ -8,6 +8,10 @@ missing here.
 
 ## Unreleased
 
+### Added
+
+- **`relais report runs --json [--since <date>]` lists each run's start, end and hours.** One JSON document, `{"schema": 1, "since": …, "runs": […]}`, with one object per root run created in the window: `id`, `repo`, `root_session`, `status`, `started_at` (the first attempt's start), `ended_at` (`null` while the run goes on) and `hours` (a run still going is counted to now). It is for another tool to join on: greenpiste's time-to-done measure matches `root_session` against a plan's sessions. It only reads: it opens the ledger read-only, imports no usage and runs none of `report`'s other sections, and a machine with no ledger gets an empty list. `--json` is required, and `report`'s own flags (`--by`, `--no-import`, `--since` before `runs`) are refused with it. The default window starts on the first of the current month, UTC, as `report` does.
+
 ## v0.61.0
 
 - **Plan-review outcomes are read under greenpiste's new data names.** The ledger is read from `<config>/greenpiste/plan-review/outcomes.jsonl`, and from `<config>/amont-agent/plan-review/outcomes.jsonl` only while the new file is absent. Rows with schema `greenpiste-review-outcome-v1` or `amont-agent-review-outcome-v1` are read, as are merge rows `greenpiste-review-merge-v1` or `amont-agent-review-merge-v1`. The plan root comes from `GREENPISTE_PLAN_ROOT`, then `AMONT_AGENT_PLAN_ROOT`. The quiet watcher already skips both writers' temp files (any dotfile). The old names go at the programme census.

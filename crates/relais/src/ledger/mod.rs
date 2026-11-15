@@ -57,7 +57,7 @@ pub use runs::{
 };
 pub use schema::LEDGER_SCHEMA_VERSION;
 use schema::{applied_count, migrate};
-pub use sessions::OrchestrationUsageRow;
+pub use sessions::{OrchestrationUsageRow, RunWindow};
 pub use snapshot::{ReceiptResolution, VerificationSnapshot};
 pub use successor::{
     Claim, IntentReview, IntentState, NewIntent, SuccessorIntent, SuccessorProcess,

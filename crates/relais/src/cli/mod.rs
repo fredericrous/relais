@@ -55,7 +55,7 @@ use self::recipe::{
     recipe_rollback_command, recipe_show_command, AmendMode,
 };
 use self::replay::replay_command;
-use self::report::{report_command, usage_import_command};
+use self::report::{report_command, report_runs_command, usage_import_command};
 use self::resume::{
     prune_runs_command, resume_command, resume_logged, retire_all_command, Prune, Retire,
     WorkerStopped,
@@ -229,6 +229,7 @@ pub(crate) enum Command {
         log: Option<PathBuf>,
     },
     /// Cost and outcome reporting since a date (SPEC §11)
+    #[command(args_conflicts_with_subcommands = true)]
     Report {
         /// Inclusive lower bound, e.g. 2026-09-01
         #[arg(long)]
@@ -248,6 +249,8 @@ pub(crate) enum Command {
         /// already put in the ledger, not a fresh pass over transcripts
         #[arg(long = "no-import")]
         no_import: bool,
+        #[command(subcommand)]
+        cmd: Option<ReportCommand>,
     },
     /// The orchestrating Claude Code session's own usage (SPEC §11)
     Usage {
@@ -1002,6 +1005,45 @@ pub(crate) fn router_source(source: Option<RouterSource>) -> relais::router::Sou
     }
 }
 
+/// `--since` of `report runs`: a date (`2026-11-08`, read as UTC
+/// midnight) or an RFC3339 time, normalised to RFC3339 in UTC, so the
+/// ledger's text comparison and the echoed `since` see one form. Anything
+/// else is a usage error (exit 2), never a silently wrong window.
+fn parse_since(text: &str) -> Result<String, String> {
+    // chrono reads `2026-11-8` as a date too; only the canonical spelling
+    // is one, since the ledger compares text.
+    if let Some(day) = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .ok()
+        .filter(|day| day.format("%Y-%m-%d").to_string() == text)
+    {
+        if let Some(midnight) = day.and_hms_opt(0, 0, 0) {
+            return Ok(midnight.and_utc().to_rfc3339());
+        }
+    }
+    chrono::DateTime::parse_from_rfc3339(text)
+        .map(|at| at.with_timezone(&chrono::Utc).to_rfc3339())
+        .map_err(|_| format!("expected a date like 2026-11-08 or an RFC3339 time, got {text:?}"))
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ReportCommand {
+    /// When each run started and ended, and for how many hours, as one
+    /// JSON document another tool joins on
+    ///
+    /// Read-only: it opens the ledger for reading, imports no usage and
+    /// runs none of `report`'s other sections. Options go after `runs`:
+    /// `relais report runs --json --since 2026-11-08`.
+    Runs {
+        /// Inclusive lower bound: a date (2026-11-08, UTC midnight) or an
+        /// RFC3339 time; default the start of the current month, UTC
+        #[arg(long, value_parser = parse_since)]
+        since: Option<String>,
+        /// The only output form; required
+        #[arg(long, required = true)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand)]
 pub(crate) enum UsageCommand {
     /// Import orchestration usage from Claude Code session transcripts
@@ -1345,10 +1387,15 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             (None, None, None) => retire_all_command(),
         },
         Command::Report {
+            cmd: Some(ReportCommand::Runs { since, json: _ }),
+            ..
+        } => report_runs_command(since.as_deref()),
+        Command::Report {
             since,
             json,
             by,
             no_import,
+            cmd: None,
         } => report_command(since.as_deref(), json, by, no_import),
         Command::Usage { cmd } => match cmd {
             UsageCommand::Import {
