@@ -81,11 +81,11 @@ impl Verdict {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Finding {
-    // Validated for shape (`deny_unknown_fields` needs every key declared),
-    // not read by the labels.
-    // A finding greenpiste parsed from the reviewer's own text carries `n`
-    // and no role or disposition (its disposition is derived when stats are
-    // read); declared so `deny_unknown_fields` keeps the row.
+    // Two shapes, not told apart because neither part is read: a finding
+    // recorded from stdin (role, disposition, section, area) and one parsed
+    // from the reviewer's own text (`n` and a severity). Every key is
+    // declared so `deny_unknown_fields` keeps the row; only severity,
+    // section and area feed the labels.
     #[serde(rename = "role", default)]
     _role: Option<String>,
     severity: Severity,
@@ -108,10 +108,9 @@ struct PlanFeatures {
     repos: Vec<String>,
     #[serde(rename = "body_lines")]
     _body_lines: u64,
-    // Written by greenpiste since its seating record and its counts; not
-    // read here. Declared so `deny_unknown_fields` keeps the row: before,
-    // every row carrying them was dropped as invalid (733 of 1,561 review
-    // rows on 2026-11-15).
+    // `seat_source` and `seat_classes` are written by greenpiste today,
+    // `counts` from greenpiste 4.3.0. Not read here; declared so
+    // `deny_unknown_fields` keeps the row.
     #[serde(rename = "seat_source", default)]
     _seat_source: Option<String>,
     #[serde(rename = "seat_classes", default)]
@@ -1085,6 +1084,51 @@ mod tests {
         serde_json::from_value::<Row>(parsed).expect("both finding shapes parse");
         // An old row, with none of them, still parses.
         serde_json::from_value::<Row>(row("r", "rust", 1, "b1")).expect("an old row parses");
+    }
+
+    #[test]
+    fn every_shape_greenpiste_writes_is_read_with_no_invalid_row() {
+        let base = crate::test_support::temp_dir("ledger-shapes");
+        let path = base.join("outcomes.jsonl");
+        let mut today = row("today", "rust", 1, "b1");
+        today["findings_unparsed"] = serde_json::json!(0);
+        today["plan"]["seat_source"] = serde_json::json!("paths");
+        today["plan"]["seat_classes"] = serde_json::json!(["cli"]);
+        let mut next = row("next", "rust", 1, "b1");
+        next["plan_id"] = serde_json::json!("p-01JCZ0000000000000000000000");
+        next["plan"]["counts"] = serde_json::json!({"phases": 6});
+        let mut parsed = row("parsed", "rust", 1, "b1");
+        parsed["findings"] = serde_json::json!([{"n": 1, "severity": "high"}]);
+        write_ledger(&path, &[today, next, parsed, row("old", "rust", 1, "b1")]);
+        let settings = Settings {
+            ledger: path,
+            plan_root: base.to_path_buf(),
+        };
+        let labelled = read(&settings).unwrap().expect("ledger present");
+        assert_eq!(labelled.invalid, 0, "every shape parses");
+        assert_eq!(labelled.rows.len(), 4, "each agent's row is kept");
+    }
+
+    #[test]
+    fn a_later_backend_finding_with_no_section_makes_the_label_unknown() {
+        // A finding parsed from a backend reviewer's text has no section, so a
+        // high one leaves the earlier review undecidable, never clean.
+        // Only a review whose remit is everything (backend) sees it; a rust
+        // review ignores a finding with no area.
+        let mut later = row("b", "backend", 2, "b2");
+        later["findings"] = serde_json::json!([{"n": 1, "severity": "high"}]);
+        let rows = [
+            row("b0", "backend", 1, "b1"),
+            row("r", "rust", 1, "b1"),
+            later,
+        ];
+        let got = labels(&rows, true, &[FIRST, ("b2", BODY2_SAME)]);
+        assert_eq!(
+            got[0],
+            Label::Unknown(Reason::SectionChanged),
+            "the earlier backend review"
+        );
+        assert_eq!(got[1], Label::Clean, "the rust review is unaffected");
     }
 
     #[test]
