@@ -142,6 +142,13 @@ Goal: steady state about 1.1 GiB (runs < 30 d 0.7 + journal <= 64 MiB + ledger 0
    - one week later, `du -sk` per row is at or below the Goal; roll back if a `candidate_missing` hits a run the ledger still pins, or `relais doctor` reports the stamp older than 3 days.
 4. `relais doctor` lists the hand-made backups. Deleting them stays the person's call, outside this plan.
 
+### Observed before the push (2026-11-15)
+Input → expected → actual.
+- Worktree `relais-wt-bounded-state` on `feat/bounded-state` from `origin/main`, rebased onto v0.62.0 → phases through relais → Phase 3 and the receipt follow-up accepted by relais with receipts (`run-6604f7ee5a525-963b`, `run-660537c2a21d4-547a`, all criteria met, 8 of 8 profile checks); Phases 2 and 4 committed through the local gates after relais's verify blocked twice on the host-slot queue under load (the person's choice).
+- `amont run --stamp clippy` and `--stamp cargo-test` on the rebased tree `14606054e631` → clean, all pass → stamped; 2,391 + 57 + 334 + 1 tests passed, 0 failed; the final code tree passed relais's profile checks and 31 commit gates.
+- Branch binary, `relais resume --prune-runs` (read-only preview, real state) → old ended runs prunable, the new keep reasons and the tally → first pilot: 37 of 357 prunable (10.5 MB), 298 kept for "no receipt" (relais stores receipts for `accepted` runs alone) → the person's receipt rule → second pilot: 299 of 357 prunable (888.0 MB), kept 58 (21 wait on a person, 24 `accepted` without a receipt, 1 with a checkout beneath it); `--help` lists `--no-prune`.
+- Branch binary, `relais doctor` (read-only) → purge health and backups → `purge`: 235 ended runs (906.2 MB) older than the age plus 3 days, 19 `accepted` runs (4.9 MB) without a receipt named as never pruned, stamp missing, state directory 2.7 GB; `backups`: 15 files, 313.8 MB, `rm` offered for `bak-v27`/`bak-v30` only.
+
 ## Release
 Merge on green with `merge-when-green`, cut the next minor with `tag-release` (new automatic behaviour), and update the plugin so its session start runs the new binary.
 
