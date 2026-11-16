@@ -398,7 +398,7 @@ impl Left {
     pub fn hint(&self) -> &'static str {
         match self {
             Self::Original(_) => "",
-            Self::Renamed(_) => " (the next prune retries it; fix the error above first)",
+            Self::Renamed(_) => " (the next prune retries it once that error is fixed)",
         }
     }
 }
