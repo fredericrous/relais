@@ -8,6 +8,13 @@ missing here.
 
 ## Unreleased
 
+## v0.66.0
+
+### Changed
+
+- **`relais native contract` refuses a read hint that does not resolve at the contract's base.** A hint the base revision does not have is refused at submit: exit 2, the hint named on stderr, and nothing written to `.relais/tasks/`. It used to surface about twelve minutes later, at preflight. A contract with `from_candidate`, and one whose base does not resolve, are still checked at preflight.
+- **A small scope overflow widens to 2 files and 20 lines.** `widen_scope_small_max_files` defaults to 2 (was 1) and `widen_scope_small_max_lines` to 20 (was 10). A repository that never names the keys keeps its trust grant and widens at the new limits. A repository that names them explicitly at 1 / 10 or 2 / 20 changes its authority hash and must be trusted again. ADR-0012 records the change.
+
 ## v0.65.0
 
 ### Changed
