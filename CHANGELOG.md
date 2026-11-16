@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.66.1
+
 ### Changed
 
 - **A failed run deletion names the `runs/.pruning-<id>` directory left on disk**, `RELAIS_AUTO_PRUNE_DAYS` is read in one place so a non-UTF-8 value is reported as invalid by both `retire --all` and `relais doctor`, and `relais doctor`'s state-directory size reads `at least` because an unreadable entry counts as 0.
