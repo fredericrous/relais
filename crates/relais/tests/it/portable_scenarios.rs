@@ -2019,6 +2019,80 @@ fn native_contract_saves_a_contract_and_refuses_prose() {
     );
 }
 
+/// A read hint that does not resolve at the contract's base is refused at
+/// submit, with nothing written, and the hint named on stderr (t08).
+#[test]
+fn native_contract_refuses_a_read_hint_that_does_not_resolve_at_base() {
+    use std::io::Write;
+    let world = World::new("native-contract-hints");
+    world.write_policy();
+    let submit = |contract: serde_json::Value| {
+        let mut child = common::relais(BIN)
+            .args(["native", "contract"])
+            .current_dir(&world.repo)
+            .env("RELAIS_STATE_DIR", &world.state)
+            .env("RELAIS_CONFIG_DIR", &world.config)
+            .env("HOME", &world.root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("relais runs");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(contract.to_string().as_bytes())
+            .expect("written");
+        child.wait_with_output().expect("relais ends")
+    };
+    let contract = |base_ref: &str, hint: &str| {
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "change",
+            "objective": "Remove the obsolete entry point",
+            "base_ref": base_ref,
+            "write_scope": ["src/**"],
+            "acceptance": ["src/main.rs no longer exists"],
+            "verification_profile": "default",
+            "review": "off",
+            "read_hints": [hint],
+        })
+    };
+    let tasks = world.repo.join(".relais").join("tasks");
+    let count_tasks = || std::fs::read_dir(&tasks).map(|d| d.count()).unwrap_or(0);
+
+    // A hint that is not in the tree at the base: refused, nothing saved.
+    let missing = submit(contract("HEAD", "does/not/exist"));
+    assert_eq!(missing.status.code(), Some(2), "{}", text(&missing.stderr));
+    assert!(
+        text(&missing.stderr).contains("does/not/exist"),
+        "{}",
+        text(&missing.stderr)
+    );
+    assert_eq!(count_tasks(), 0, "a refused contract writes no file");
+
+    // A hint that exists at the base: accepted and saved.
+    let present = submit(contract("HEAD", "src/main.rs"));
+    assert_eq!(present.status.code(), Some(0), "{}", text(&present.stderr));
+    assert_eq!(count_tasks(), 1);
+
+    // The hint is checked at the contract's base, not at HEAD: a file
+    // added after `HEAD~1` is refused against that base.
+    std::fs::create_dir_all(world.repo.join("docs")).expect("docs");
+    std::fs::write(world.repo.join("docs").join("new.md"), "# new\n").expect("write");
+    git(&world.repo, &["add", "-A"]);
+    git(&world.repo, &["commit", "-q", "-m", "add docs"]);
+    let at_base = submit(contract("HEAD~1", "docs/new.md"));
+    assert_eq!(at_base.status.code(), Some(2), "{}", text(&at_base.stderr));
+    assert!(
+        text(&at_base.stderr).contains("docs/new.md"),
+        "the refusal names the hint: {}",
+        text(&at_base.stderr)
+    );
+    assert_eq!(count_tasks(), 1, "the refused contract adds no file");
+}
+
 /// The `done` lines a `relais run --protocol` wrote on stdout.
 #[cfg(unix)]
 fn done_lines(stdout: &[u8]) -> Vec<serde_json::Value> {

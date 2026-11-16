@@ -19,12 +19,14 @@ use relais::admission::Gate;
 use relais::admission::GateError;
 use relais::admission::StoppedOutcome;
 use relais::admission::StoppedReport;
+use relais::context;
 use relais::contract::TaskContract;
 use relais::ids::RunId;
 use relais::ledger::Ledger;
 use relais::paths;
 use relais::resume;
 use relais::runner::State;
+use relais::workspace;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -218,6 +220,27 @@ pub(crate) fn native_contract_command() -> Result<CliOutcome, CliError> {
         }
     };
     let root = project_dir()?;
+    // A read hint that does not resolve at the contract's base is refused
+    // here, before a run is queued, not 12 minutes later at preflight
+    // (t08). Checked as `plan` checks it. A base that does not resolve
+    // (not a repository, or a successor's base not yet made) and a
+    // `from_candidate` contract (its hints resolve in the candidate tree)
+    // are left to preflight.
+    if contract.from_candidate().is_none() {
+        if let Ok(base_sha) = workspace::resolve_base(&root, &contract.base_ref) {
+            if let Err(unresolvable) = context::fingerprint_hints(
+                &workspace::SystemGit,
+                &root,
+                &base_sha,
+                &contract.read_hints,
+            ) {
+                eprintln!(
+                    "relais native contract: {unresolvable} (base {base_sha}); fix the paths and resubmit"
+                );
+                return Ok(CliOutcome::InvalidInput);
+            }
+        }
+    }
     let dir = root.join(".relais");
     let tasks = dir.join("tasks");
     let written = (|| -> std::io::Result<PathBuf> {

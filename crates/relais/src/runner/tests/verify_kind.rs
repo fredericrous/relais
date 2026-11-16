@@ -197,7 +197,7 @@ fn a_clean_verify_dispatches_no_worker_and_persists_the_resolved_candidate() {
         .runs
         .iter()
         .any(|run| run.run_id == source.as_str() && !run.verify));
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 #[test]
@@ -225,7 +225,7 @@ fn a_verify_whose_check_fails_ends_failed_without_a_repair() {
         1,
         "one verified attempt and nothing after it"
     );
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 #[test]
@@ -266,7 +266,7 @@ fn a_conflicting_candidate_is_blocked_before_the_baseline() {
         .candidate_input(&run_id)
         .expect("read")
         .is_some());
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 #[test]
@@ -318,7 +318,7 @@ fn a_patch_changed_after_validation_ends_candidate_digest_mismatch() {
         fixture.ledger.run_status(&run_id).expect("status"),
         Some(State::Blocked)
     );
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 #[test]
@@ -330,7 +330,7 @@ fn a_source_that_has_not_ended_is_refused() {
     let (_, reason, detail) =
         blocked_by(fixture.execute(&verify_contract(&running, None), &repo, &backend));
     assert_eq!(reason, Reason::CandidateSourceRunning, "{detail}");
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 #[test]
@@ -377,7 +377,7 @@ fn a_source_without_a_candidate_or_without_its_commit_is_missing() {
         blocked_by(fixture.execute(&verify_contract(&source, None), &repo, &backend));
     assert_eq!(reason, Reason::CandidateMissing, "{detail}");
     assert!(detail.contains(&receipt.candidate_sha), "{detail}");
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 #[test]
@@ -389,7 +389,7 @@ fn a_source_from_another_repository_is_refused() {
     let (_, reason, detail) =
         blocked_by(fixture.execute(&verify_contract(&foreign, None), &repo, &backend));
     assert_eq!(reason, Reason::CandidateForeignRepo, "{detail}");
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 /// Resolution rewrites a ref that was lost, from the commit the ledger
@@ -413,7 +413,7 @@ fn resolution_applies_the_recorded_commit_and_rewrites_a_lost_ref() {
         receipt.candidate_sha,
         "the ref names the recorded commit again"
     );
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 /// While a run that has not ended references a candidate, a reap leaves its
@@ -474,7 +474,7 @@ fn a_pinned_candidate_survives_release_while_its_consumer_is_running() {
             .expect("release");
     assert_eq!(released.refs_removed, vec![name.clone()]);
     assert!(!source_dir.join("candidate-1.patch").exists());
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 // -- from_candidate on kind: change (A4) ---------------------------------
@@ -651,7 +651,7 @@ fn a_timed_out_worker_that_leaves_a_conflict_unresolved_leaves_no_candidate() {
         .and_then(|transition| transition.detail)
         .expect("a process_crash detail");
     assert!(crash.get("candidate").is_none(), "{crash}");
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 #[test]
@@ -688,7 +688,7 @@ fn a_clean_from_candidate_starts_with_the_candidate_applied_and_no_conflict_text
         "fn main() { /* candidate */ }\n"
     );
     assert!(!seen[0].0.contains("resolve these first"), "{}", seen[0].0);
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 // -- from_candidate read hints resolve in the merged tree ------------------
@@ -770,7 +770,7 @@ fn a_from_candidate_hint_may_name_a_file_only_its_parent_created() {
         ],
     );
     assert_eq!(manifest.fingerprints[0].blob, expected.trim());
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 #[test]
@@ -817,7 +817,7 @@ fn a_from_candidate_hint_hash_matches_the_merged_tree_after_the_target_advanced(
         .find(|f| f.path == "src/parent_only.rs")
         .expect("fingerprinted");
     assert_eq!(parent_only.blob, expected.trim());
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 #[test]
@@ -884,7 +884,7 @@ fn a_conflicting_from_candidate_resolves_its_hints_against_the_prepared_conflict
     );
     assert_ne!(hinted, target_blob.trim(), "not the target base's file");
     assert_ne!(hinted, candidate_blob.trim(), "not the candidate's file");
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 #[test]
@@ -903,7 +903,7 @@ fn a_change_without_from_candidate_still_blocks_on_a_hint_missing_at_base() {
         panic!("{outcome:?}");
     };
     assert_eq!(code, BlockCode::ReadHintUnresolvable);
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 // -- successor intent: widen scope (A5) -----------------------------------
@@ -1044,7 +1044,7 @@ fn a_widened_scope_verify_names_the_source_run_and_its_receipt_carries_the_delta
     )
     .expect("json");
     assert_eq!(written["predecessor"]["scope_delta"][0], "docs/extra.md");
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 #[test]
@@ -1090,7 +1090,7 @@ fn a_stored_row_resolved_against_another_base_is_refused_in_preflight() {
         Some(State::Blocked)
     );
     assert_eq!(seen.load(Ordering::SeqCst), 0);
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 #[test]
@@ -1106,7 +1106,7 @@ fn a_user_diff_config_does_not_change_the_candidate_digest() {
         matches!(outcome.terminal, Terminal::Accepted(_)),
         "{outcome:?}"
     );
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 /// A predictor that always estimates, and counts how often it was asked:
@@ -1224,7 +1224,7 @@ fn a_verify_run_records_no_routing_prediction() {
         .predictions(&verify.run_id)
         .expect("predictions")
         .is_empty());
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 /// Which of the runs a test launched for an intent have a row, whatever the
@@ -1373,7 +1373,7 @@ fn a_launch_that_dies_before_its_id_is_returned_leaves_exactly_one_successor_run
         Some(retry.clone())
     );
     assert_eq!(fixture.ledger.count_successor_intents().expect("count"), 1);
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 // -- a scope overflow made only of tests is widened by relais ------------
@@ -1525,7 +1525,7 @@ fn a_tests_only_overflow_is_answered_by_relais_with_a_widened_successor() {
     assert_eq!(done["outcome"], "cancelled", "{done}");
     assert_eq!(done["code"], "scope_widened_for_tests", "{done}");
     assert_eq!(done["successor_intent"], outcome["successor_intent"]);
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 /// The successor of a tests-only overflow, run with review on: the
@@ -1576,7 +1576,7 @@ fn the_successors_reviewer_prompt_names_the_widened_test_path() {
         .unwrap_or_else(|| panic!("a reviewer was launched: {seen:?}"));
     assert!(reviewer.contains("WIDENED"), "{reviewer}");
     assert!(reviewer.contains("tests/extra_test.rs"), "{reviewer}");
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 #[test]
@@ -1628,8 +1628,106 @@ fn the_successor_of_a_review_off_small_widen_still_dispatches_a_reviewer() {
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch directory
 }
 
+/// The shipped small-overflow defaults, with the keys unset: the execution
+/// table of a policy that never names them (ADR-0012, amended 2026-11-16).
+fn default_small_scope_repo(fixture: &Fixture) -> RepoPolicy {
+    let mut repo = fixture.repo_policy(vec![passing_check()], 3);
+    repo.execution = RepoPolicy::from_toml_str(
+        "schema_version = 1\n\
+         [models.research]\nid = \"haiku\"\n\
+         [models.implementation]\nid = \"sonnet\"\n\
+         [models.escalation]\nid = \"fable\"\n\
+         [execution]\nmax_attempts = 3\nmax_repairs_before_escalation = 1\nmax_wall_seconds = 120\n\
+         [verification.profiles.profile]\ncommands = []\n",
+    )
+    .expect("a policy that leaves the small limits unset parses")
+    .execution;
+    assert_eq!(repo.execution.widen_scope_small_max_files, 2);
+    assert_eq!(repo.execution.widen_scope_small_max_lines, 20);
+    repo
+}
+
+/// An out-of-scope overflow of `edits` (file, changed lines each).
+fn overflow_with_lines(
+    fixture: &Fixture,
+    repo: &RepoPolicy,
+    edits: &[(&str, usize)],
+) -> RunOutcome {
+    let edits: Vec<(String, usize)> = edits.iter().map(|(f, n)| (f.to_string(), *n)).collect();
+    let backend = MockBackend::new(move |spec| {
+        for (file, lines) in &edits {
+            let path = spec.work_dir.join(file);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(path, "// edit\n".repeat(*lines)).expect("write");
+        }
+        std::fs::write(spec.work_dir.join("src/main.rs"), "fn main() {}\n// e\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    fixture.execute_on(
+        Wire::process(),
+        None,
+        &fixture.contract(Review::Required),
+        repo,
+        &backend,
+    )
+}
+
+#[test]
+fn two_files_of_twenty_lines_widen_at_the_default_limits() {
+    let fixture = Fixture::new();
+    let repo = default_small_scope_repo(&fixture);
+    let run = widened_run(overflow_with_lines(
+        &fixture,
+        &repo,
+        &[("examples/a.rs", 10), ("examples/b.rs", 10)],
+    ));
+    assert!(fixture
+        .ledger
+        .intent_of_decision(&run)
+        .expect("read")
+        .is_some());
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
+}
+
+#[test]
+fn three_files_or_twenty_one_lines_stop_at_the_default_limits() {
+    let fixture = Fixture::new();
+    let repo = default_small_scope_repo(&fixture);
+    let three = needs_decision_run(overflow_with_lines(
+        &fixture,
+        &repo,
+        &[
+            ("examples/a.rs", 1),
+            ("examples/b.rs", 1),
+            ("examples/c.rs", 1),
+        ],
+    ));
+    assert!(fixture
+        .ledger
+        .intent_of_decision(&three)
+        .expect("read")
+        .is_none());
+    let twenty_one = needs_decision_run(overflow_with_lines(
+        &fixture,
+        &repo,
+        &[("examples/a.rs", 11), ("examples/b.rs", 10)],
+    ));
+    assert!(fixture
+        .ledger
+        .intent_of_decision(&twenty_one)
+        .expect("read")
+        .is_none());
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
+}
+
 // The fixture's policy has the small rule off: under the default policy tests
-// plus one small edit widen, and this test is about the mixed shape only.
+// plus small edits within 2 files / 20 lines widen, and this test is about the
+// mixed shape only.
 #[test]
 fn a_mixed_overflow_still_waits_on_a_person() {
     let fixture = Fixture::new();
@@ -1645,7 +1743,7 @@ fn a_mixed_overflow_still_waits_on_a_person() {
         .expect("read")
         .is_none());
     assert_eq!(fixture.ledger.open_decisions().expect("open").len(), 1);
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 #[test]
@@ -1663,7 +1761,7 @@ fn a_test_path_under_a_protected_prefix_still_waits_on_a_person() {
         .expect("read")
         .is_none());
     assert_eq!(fixture.ledger.open_decisions().expect("open").len(), 1);
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 #[test]
@@ -1678,7 +1776,7 @@ fn widening_for_tests_can_be_switched_off_in_policy() {
         .expect("read")
         .is_none());
     assert_eq!(fixture.ledger.open_decisions().expect("open").len(), 1);
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
 #[test]
