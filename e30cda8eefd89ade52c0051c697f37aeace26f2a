@@ -1,0 +1,18 @@
+greengate-provenance-v1
+commit e30cda8eefd89ade52c0051c697f37aeace26f2a
+tree bbe5b5138342c30e325d9b499629cf86514c870e
+canon 9974035fc9e459036f6849a7c3c432bcb025248e
+patch ff5a74bcad4a61b1e412add1fba6c3cbdc9cde04
+plan docs/plans/2026-11-16-greenpiste-becomes-greenbelay.md 035cd9d027454086587092c7e75edd5651fe524bb90f7be68d22140209788ce3
+review reviewed edf510e8b7a3e40ebb522697b79817d1122caf7382beb500f9e6d4ba0f97b7c0
+code-review backend carried 6f01d62a1780ed344c1cd021d515249a3556dd68ced86928a0274b6128492c0c
+code-review lang:rust reviewed edf510e8b7a3e40ebb522697b79817d1122caf7382beb500f9e6d4ba0f97b7c0
+preview not-required
+producer greenpiste 5.1.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABAvqh39l7IjI4cWcRKLGIObHSnun18z3nF4X6k5l+Ruo
+fXFiWDqZVPVD8tYoxtd8g/S1VTc1Qqcgu5WKtL0pyFDw==
+-----END SSH SIGNATURE-----
