@@ -8,6 +8,10 @@ missing here.
 
 ## Unreleased
 
+## v0.67.0
+
+### Changed
+
 - **greenpiste is now greenbelay** (ADR-0071). `relais review-outcome` reads
   greenbelay's ledger (`$CLAUDE_CONFIG_DIR/greenbelay/plan-review/outcomes.jsonl`,
   schemas `greenbelay-review-*-v1`, plan root `$GREENBELAY_PLAN_ROOT`, then
