@@ -1630,6 +1630,103 @@ fn the_successor_of_a_review_off_small_widen_still_dispatches_a_reviewer() {
 
 // The fixture's policy has the small rule off: under the default policy tests
 // plus one small edit widen, and this test is about the mixed shape only.
+/// The shipped small-overflow defaults, with the keys unset: the execution
+/// table of a policy that never names them (ADR-0012, amended 2026-11-16).
+fn default_small_scope_repo(fixture: &Fixture) -> RepoPolicy {
+    let mut repo = fixture.repo_policy(vec![passing_check()], 3);
+    repo.execution = RepoPolicy::from_toml_str(
+        "schema_version = 1\n\
+         [models.research]\nid = \"haiku\"\n\
+         [models.implementation]\nid = \"sonnet\"\n\
+         [models.escalation]\nid = \"fable\"\n\
+         [execution]\nmax_attempts = 3\nmax_repairs_before_escalation = 1\nmax_wall_seconds = 120\n\
+         [verification.profiles.profile]\ncommands = []\n",
+    )
+    .expect("a policy that leaves the small limits unset parses")
+    .execution;
+    assert_eq!(repo.execution.widen_scope_small_max_files, 2);
+    assert_eq!(repo.execution.widen_scope_small_max_lines, 20);
+    repo
+}
+
+/// An out-of-scope overflow of `edits` (file, changed lines each).
+fn overflow_with_lines(
+    fixture: &Fixture,
+    repo: &RepoPolicy,
+    edits: &[(&str, usize)],
+) -> RunOutcome {
+    let edits: Vec<(String, usize)> = edits.iter().map(|(f, n)| (f.to_string(), *n)).collect();
+    let backend = MockBackend::new(move |spec| {
+        for (file, lines) in &edits {
+            let path = spec.work_dir.join(file);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(path, "// edit\n".repeat(*lines)).expect("write");
+        }
+        std::fs::write(spec.work_dir.join("src/main.rs"), "fn main() {}\n// e\n").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    fixture.execute_on(
+        Wire::process(),
+        None,
+        &fixture.contract(Review::Required),
+        repo,
+        &backend,
+    )
+}
+
+#[test]
+fn two_files_of_twenty_lines_widen_at_the_default_limits() {
+    let fixture = Fixture::new();
+    let repo = default_small_scope_repo(&fixture);
+    let run = widened_run(overflow_with_lines(
+        &fixture,
+        &repo,
+        &[("examples/a.rs", 10), ("examples/b.rs", 10)],
+    ));
+    assert!(fixture
+        .ledger
+        .intent_of_decision(&run)
+        .expect("read")
+        .is_some());
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+#[test]
+fn three_files_or_twenty_one_lines_stop_at_the_default_limits() {
+    let fixture = Fixture::new();
+    let repo = default_small_scope_repo(&fixture);
+    let three = needs_decision_run(overflow_with_lines(
+        &fixture,
+        &repo,
+        &[
+            ("examples/a.rs", 1),
+            ("examples/b.rs", 1),
+            ("examples/c.rs", 1),
+        ],
+    ));
+    assert!(fixture
+        .ledger
+        .intent_of_decision(&three)
+        .expect("read")
+        .is_none());
+    let twenty_one = needs_decision_run(overflow_with_lines(
+        &fixture,
+        &repo,
+        &[("examples/a.rs", 11), ("examples/b.rs", 10)],
+    ));
+    assert!(fixture
+        .ledger
+        .intent_of_decision(&twenty_one)
+        .expect("read")
+        .is_none());
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
 #[test]
 fn a_mixed_overflow_still_waits_on_a_person() {
     let fixture = Fixture::new();

@@ -235,7 +235,7 @@ pub(crate) fn native_contract_command() -> Result<CliOutcome, CliError> {
                 &contract.read_hints,
             ) {
                 eprintln!(
-                    "relais native contract: read hints that do not resolve at the base: {unresolvable} (base {base_sha}); fix the paths and resubmit"
+                    "relais native contract: {unresolvable} (base {base_sha}); fix the paths and resubmit"
                 );
                 return Ok(CliOutcome::InvalidInput);
             }

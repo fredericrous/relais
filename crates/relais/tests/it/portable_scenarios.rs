@@ -2085,6 +2085,11 @@ fn native_contract_refuses_a_read_hint_that_does_not_resolve_at_base() {
     git(&world.repo, &["commit", "-q", "-m", "add docs"]);
     let at_base = submit(contract("HEAD~1", "docs/new.md"));
     assert_eq!(at_base.status.code(), Some(2), "{}", text(&at_base.stderr));
+    assert!(
+        text(&at_base.stderr).contains("docs/new.md"),
+        "the refusal names the hint: {}",
+        text(&at_base.stderr)
+    );
     assert_eq!(count_tasks(), 1, "the refused contract adds no file");
 }
 
