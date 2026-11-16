@@ -75,10 +75,10 @@ Two decisions already made in the time-to-done programme, shipped together:
 - Replay (65 of 96 `scope_widened_small`) — not run in this change; not claimed here.
 
 ## Implementation review
-- implementation-review: approve-with-changes, round 1 (6 findings, 78k tokens, 65 s); delta approve-with-changes (1 blocking, fixed in 8497f1eb; 44k tokens, 18 s).
-- code-review-backend: approve-with-changes, round 1 (3 findings, 59k, 88 s); delta approve-with-changes (2 low, fixed in 14d1f4dd; 54k, 52 s).
-- code-review-language (lang:rust): approve-with-changes, round 1 (3 findings, 55k, 117 s); delta approve-with-changes (2 low, fixed; 56k, 68 s).
-- Fixed: engine tests at the default limits; one refusal message; ADR choice line to 2 / 20 with HEADS.md; HEAD~1 hint assertion; reasons on cleanup discards; comment placement. Deliberate: none.
+- implementation-review: approve-with-changes, round 1 (6 findings, 78k tokens, 65 s); delta approve-with-changes (1 blocking, fixed in 8497f1eb; 44k tokens, 18 s); delta 2 approve (tree 842ef038, 38k tokens).
+- code-review-backend: approve-with-changes, round 1 (3 findings, 59k, 88 s); delta approve-with-changes (2 low, fixed in 14d1f4dd; 54k, 52 s); delta 2 approve (29k).
+- code-review-language (lang:rust): approve-with-changes, round 1 (3 findings, 55k, 117 s); delta approve-with-changes (2 low, fixed; 56k, 68 s); delta 2 approve-with-changes (2 low, comment wording only, deliberate: each cleanup line keeps the reason errors.never-swallowed requires; 28k).
+- Fixed: engine tests at the default limits; one refusal message; ADR choice line to 2 / 20 with HEADS.md; HEAD~1 hint assertion; reasons on cleanup discards; comment placement. Deliberate: the cleanup-comment wording differs between one older line and the new ones; kept, because each states its reason.
 - Not claimed: the replay count and the 7-day production count.
 
 ## Outcome
