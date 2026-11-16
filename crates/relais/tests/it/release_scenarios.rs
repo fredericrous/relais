@@ -6609,7 +6609,7 @@ fn a_failed_deletion_is_reported_and_the_others_still_go() {
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).expect("lock");
     let swept = world.relais(&["resume", "--retire", "--all"]);
     if swept.status.code() == Some(0) {
-        eprintln!("skipped: Running as root, nothing is refused");
+        eprintln!("skipped: running as root, nothing is refused");
         return;
     }
     if logs.exists() {
@@ -6638,7 +6638,7 @@ fn a_manual_write_whose_delete_fails_says_the_next_prune_retries_it() {
         .expect("lock");
     let applied = world.relais(&["resume", "--prune-runs", "0", "--write"]);
     if applied.status.code() == Some(0) {
-        eprintln!("skipped: Running as root, nothing is refused");
+        eprintln!("skipped: running as root, nothing is refused");
         return;
     }
     if logs.exists() {
@@ -6646,8 +6646,9 @@ fn a_manual_write_whose_delete_fails_says_the_next_prune_retries_it() {
     }
     let stderr = text(&applied.stderr);
     assert!(
-        stderr.contains("(left as ")
-            && stderr.contains(".pruning-old-stuck; the next prune retries it)"),
+        stderr.contains(".pruning-old-stuck")
+            && stderr.contains("(the next prune retries it)")
+            && !stderr.contains("left as"),
         "{stderr}"
     );
     assert!(!stderr.contains("finishes"), "{stderr}");

@@ -1051,7 +1051,7 @@ pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, 
     for dir in &failed {
         eprintln!(
             "relais resume: {} could not be deleted: {}{}",
-            dir.left_on_disk.display(),
+            dir.left_on_disk.path().display(),
             dir.error,
             dir.hint()
         );

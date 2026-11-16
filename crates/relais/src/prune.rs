@@ -369,10 +369,35 @@ pub struct Applied {
 pub struct FailedDir {
     /// What is left on disk: the original directory when the rename
     /// failed, `.pruning-<run>` after it.
-    pub left_on_disk: PathBuf,
-    /// Whether the rename to `.pruning-<run>` had happened.
-    pub renamed: bool,
+    pub left_on_disk: Left,
     pub error: io::Error,
+}
+
+/// What a failed deletion left on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Left {
+    /// The path as it was: the rename to `.pruning-<run>` had not happened.
+    Original(PathBuf),
+    /// A `.pruning-<run>` directory, which the next prune retries.
+    Renamed(PathBuf),
+}
+
+impl Left {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Original(path) | Self::Renamed(path) => path,
+        }
+    }
+
+    /// What to tell the person: a renamed directory is retried by the next
+    /// prune; one never renamed has no such promise. The failure line
+    /// already prints the path.
+    pub fn hint(&self) -> &'static str {
+        match self {
+            Self::Original(_) => "",
+            Self::Renamed(_) => " (the next prune retries it)",
+        }
+    }
 }
 
 /// The prefix of a directory whose deletion has begun.
@@ -411,8 +436,7 @@ pub fn apply_run_prune(
             }
             Err(e) => {
                 applied.failed.push(FailedDir {
-                    left_on_disk: dir.path.clone(),
-                    renamed: false,
+                    left_on_disk: Left::Original(dir.path.clone()),
                     error: e,
                 });
                 continue;
@@ -423,8 +447,7 @@ pub fn apply_run_prune(
             Err(e) if e.kind() == io::ErrorKind::NotFound => applied.removed.push(removed()),
             // The rename already happened: what is left on disk is `doomed`.
             Err(e) => applied.failed.push(FailedDir {
-                left_on_disk: doomed,
-                renamed: true,
+                left_on_disk: Left::Renamed(doomed),
                 error: e,
             }),
         }
@@ -433,23 +456,9 @@ pub fn apply_run_prune(
 }
 
 impl FailedDir {
-    /// What to tell the person about what is left: a renamed directory is
-    /// retried by the next prune; one never renamed has no such promise.
-    pub fn hint(&self) -> String {
-        left_hint(&self.left_on_disk, self.renamed)
-    }
-}
-
-/// The hint after a failed deletion: empty unless the directory was already
-/// renamed to `.pruning-<run>`, which the next prune tries again.
-pub fn left_hint(left_on_disk: &Path, renamed: bool) -> String {
-    if renamed {
-        format!(
-            " (left as {}; the next prune retries it)",
-            left_on_disk.display()
-        )
-    } else {
-        String::new()
+    /// See [`Left::hint`].
+    pub fn hint(&self) -> &'static str {
+        self.left_on_disk.hint()
     }
 }
 
@@ -463,8 +472,7 @@ pub fn finish_interrupted(runs: &Path) -> Vec<FailedDir> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return failed,
         Err(e) => {
             failed.push(FailedDir {
-                left_on_disk: runs.to_path_buf(),
-                renamed: false,
+                left_on_disk: Left::Original(runs.to_path_buf()),
                 error: e,
             });
             return failed;
@@ -475,8 +483,7 @@ pub fn finish_interrupted(runs: &Path) -> Vec<FailedDir> {
             Ok(entry) => entry,
             Err(e) => {
                 failed.push(FailedDir {
-                    left_on_disk: runs.to_path_buf(),
-                    renamed: false,
+                    left_on_disk: Left::Original(runs.to_path_buf()),
                     error: e,
                 });
                 continue;
@@ -493,8 +500,7 @@ pub fn finish_interrupted(runs: &Path) -> Vec<FailedDir> {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => failed.push(FailedDir {
-                left_on_disk: entry.path(),
-                renamed: true,
+                left_on_disk: Left::Renamed(entry.path()),
                 error: e,
             }),
         }
@@ -824,29 +830,30 @@ impl PruneStep {
 #[derive(Debug)]
 pub struct PruneFailure {
     pub step: PruneStep,
-    pub path: PathBuf,
+    pub path: Left,
     pub error: io::Error,
-    /// Whether `path` is a `.pruning-<run>` directory the next prune retries.
-    pub renamed: bool,
 }
 
 impl PruneFailure {
     pub fn new(step: PruneStep, path: &Path, error: io::Error) -> Self {
         Self {
             step,
-            path: path.to_path_buf(),
+            path: Left::Original(path.to_path_buf()),
             error,
-            renamed: false,
         }
     }
 
-    pub fn renamed(self, renamed: bool) -> Self {
-        Self { renamed, ..self }
+    pub fn left(step: PruneStep, left: Left, error: io::Error) -> Self {
+        Self {
+            step,
+            path: left,
+            error,
+        }
     }
 
-    /// See [`left_hint`].
-    pub fn hint(&self) -> String {
-        left_hint(&self.path, self.renamed)
+    /// See [`Left::hint`].
+    pub fn hint(&self) -> &'static str {
+        self.path.hint()
     }
 }
 
@@ -856,7 +863,7 @@ impl std::fmt::Display for PruneFailure {
             f,
             "{} {}: {}",
             self.step.describe(),
-            self.path.display(),
+            self.path.path().display(),
             self.error
         )
     }
@@ -931,12 +938,11 @@ pub fn auto_prune(
     let mut failed: Vec<PruneFailure> = finish_interrupted(&runs)
         .into_iter()
         .map(|failed| {
-            PruneFailure::new(
+            PruneFailure::left(
                 PruneStep::FinishingLeftover,
-                &failed.left_on_disk,
+                failed.left_on_disk,
                 failed.error,
             )
-            .renamed(failed.renamed)
         })
         .collect();
     let judge = RunJudge::load(ledger, &state_dir.join(crate::paths::BASELINE_CACHE_DIR));
@@ -944,8 +950,7 @@ pub fn auto_prune(
         .map_err(|error| PruneFailure::new(PruneStep::ReadingRuns, &runs, error))?;
     let applied = apply(&judge, &plan);
     failed.extend(applied.failed.into_iter().map(|failed| {
-        PruneFailure::new(PruneStep::DeletingRun, &failed.left_on_disk, failed.error)
-            .renamed(failed.renamed)
+        PruneFailure::left(PruneStep::DeletingRun, failed.left_on_disk, failed.error)
     }));
     let removed = plan
         .iter()
@@ -1308,8 +1313,10 @@ mod tests {
                 .expect("restore write permission where the directory is now");
         }
         assert_eq!(applied.failed.len(), 1, "{:?}", applied.failed);
-        assert_eq!(applied.failed[0].left_on_disk, doomed);
-        assert!(applied.failed[0].renamed);
+        assert_eq!(
+            applied.failed[0].left_on_disk,
+            Left::Renamed(doomed.clone())
+        );
         assert!(doomed.exists() && !root.join("run-a").exists());
         assert!(applied.removed.is_empty());
         std::fs::remove_dir_all(&root).expect("no scratch directory is left behind");

@@ -43,7 +43,13 @@ fn cut_middle(name: &str, max: usize) -> String {
         return name.to_string();
     }
     let extension = name.rfind('.').map_or(0, |dot| name[dot..].chars().count());
-    let tail = extension.min(max / 2).max(max / 4);
+    let file_name_len = name
+        .rfind('/')
+        .map_or(0, |slash| name[slash..].chars().count());
+    let tail = extension
+        .min(max / 2)
+        .max(max / 4)
+        .max(file_name_len.min(max / 2));
     let head = max.saturating_sub(ELLIPSIS.len() + tail);
     let start: String = name.chars().take(head).collect();
     let end: String = name.chars().skip(length - tail).collect();
@@ -150,7 +156,7 @@ pub fn purge_finding(facts: &PurgeFacts) -> Finding {
             if one_line.chars().count() <= LINE_BUDGET {
                 lines.push(one_line);
             } else {
-                lines.push(format!("  {} failed:", cut_end(operation, TEXT_BUDGET)));
+                lines.push(format!("  {} failed:", cut_middle(operation, TEXT_BUDGET)));
                 lines.push(format!("  {}", cut_end(error, TEXT_BUDGET)));
             }
         }
@@ -480,6 +486,26 @@ mod tests {
             ..facts()
         });
         assert!(finding.detail.contains("dated 2d in the future"));
+    }
+
+    #[test]
+    fn a_long_ledger_path_keeps_its_file_name_in_the_measurement_error() {
+        let long = "/Users/someone/Library/Application Support/relais/state/deeply/nested";
+        let finding = purge_finding(&PurgeFacts {
+            runs: RunsHealth::Unmeasured {
+                operation: format!("opening the ledger {long}/ledger.sqlite"),
+                error: "database is locked".into(),
+            },
+            ..facts()
+        });
+        assert!(
+            finding.detail.contains("ledger.sqlite"),
+            "{}",
+            finding.detail
+        );
+        for line in finding.detail.lines() {
+            assert!(line.chars().count() <= LINE_BUDGET, "{line}");
+        }
     }
 
     #[test]
