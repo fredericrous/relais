@@ -3527,7 +3527,7 @@ pub fn integration_gaps(
         ("aval", "aval", integrations.aval.as_ref()),
         ("amont", "amont", integrations.amont.as_ref()),
         (
-            "amont-agent",
+            "amont_agent",
             crate::tooling::default_bin("amont_agent"),
             integrations.amont_agent.as_ref(),
         ),
@@ -6958,7 +6958,7 @@ mod tests {
         let missing = integration_gaps(&integrations, &|bin| bin == "amont-agent");
         assert_eq!(
             missing,
-            vec!["amont-agent: required integration unavailable (binary `greenbelay` not on PATH)"]
+            vec!["amont_agent: required integration unavailable (binary `greenbelay` not on PATH)"]
         );
     }
 
