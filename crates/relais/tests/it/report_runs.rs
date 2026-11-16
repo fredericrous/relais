@@ -1,6 +1,6 @@
 //! `relais report runs --json` (time-to-done B1), through the real binary:
 //! the runs of a window with their start, end and hours, read without
-//! writing the ledger. greenpiste's time-to-done measure joins on it.
+//! writing the ledger. greenbelay's time-to-done measure joins on it.
 
 use crate::common;
 

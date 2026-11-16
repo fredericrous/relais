@@ -175,7 +175,7 @@ pub(crate) fn integration_finding(
     let bin = dependency
         .bin()
         .map(str::to_string)
-        .unwrap_or_else(|| default_integration_bin(name));
+        .unwrap_or_else(|| crate::tooling::default_bin(name).to_string());
     let mode = dependency.mode();
     // Installed, at whichever mode asked for it.
     let present = |mode: DependencyMode| Finding {
@@ -223,11 +223,6 @@ fn mode_word(mode: DependencyMode) -> &'static str {
         DependencyMode::Optional => "optional",
         DependencyMode::Off => "off",
     }
-}
-
-/// The config key is `amont_agent`; the binary is `amont-agent`.
-fn default_integration_bin(name: &str) -> String {
-    name.replace('_', "-")
 }
 
 /// The Claude Code line, including what the harness can and cannot
@@ -1443,7 +1438,7 @@ pub fn doctor(
                 ("amont", "amont", policy.integrations.amont.as_ref()),
                 (
                     "amont_agent",
-                    "amont-agent",
+                    crate::tooling::default_bin("amont_agent"),
                     policy.integrations.amont_agent.as_ref(),
                 ),
             ] {
@@ -2758,7 +2753,7 @@ mod tests {
         assert!(off.detail.contains("not checked"), "{}", off.detail);
 
         let undeclared =
-            integration_finding("amont_agent", "amont-agent", None, &missing, &no_version);
+            integration_finding("amont_agent", "greenbelay", None, &missing, &no_version);
         assert_eq!(undeclared.level, Level::Ok);
         assert!(
             undeclared.detail.contains("not declared"),
@@ -2768,15 +2763,15 @@ mod tests {
 
         let ok = integration_finding(
             "amont_agent",
-            "amont-agent",
+            "greenbelay",
             Some(&dependency("required")),
             &present,
             &version,
         );
         assert_eq!(ok.level, Level::Ok);
         assert!(
-            ok.detail.contains("`amont-agent` 1.2.3"),
-            "the config key is amont_agent, the binary amont-agent: {}",
+            ok.detail.contains("`greenbelay` 1.2.3"),
+            "the config key is amont_agent, the binary greenbelay: {}",
             ok.detail
         );
     }

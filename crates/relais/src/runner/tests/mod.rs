@@ -5113,7 +5113,7 @@ fn optional_integration_gaps_ride_in_the_receipt_and_are_not_passes() {
             .verification
             .integration_gaps
             .iter()
-            .any(|gap| gap.starts_with("amont-agent:") && gap.contains("not passed")),
+            .any(|gap| gap.starts_with("amont_agent:") && gap.contains("not passed")),
         "{:?}",
         receipt.verification.integration_gaps
     );

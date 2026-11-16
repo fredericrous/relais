@@ -1,7 +1,7 @@
 //! `relais report runs --json`: when each run started and ended, and for
 //! how long, as a document another tool can join on.
 //!
-//! greenpiste's time-to-done measure reads this and nothing of relais's
+//! greenbelay's time-to-done measure reads this and nothing of relais's
 //! ledger file (`harness.cross-tool-reads`), so the shape carries a
 //! `schema` token: a change that breaks a reader bumps it.
 

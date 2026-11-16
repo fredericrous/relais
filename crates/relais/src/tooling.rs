@@ -72,10 +72,14 @@ pub fn probe_integrations(repo: &RepoPolicy) -> Vec<Blocker> {
     blockers
 }
 
-/// The config key is `amont_agent`; the binary on PATH is `amont-agent`.
-fn default_bin(name: &str) -> &str {
+/// The binary an integration's config key names when the declaration gives
+/// no `bin`: the one place the key-to-binary mapping lives (doctor and
+/// verification ask it too). The key `amont_agent` keeps its name until the
+/// census; its binary is `greenbelay` (ADR-0071: no `amont-agent` copy is
+/// installed).
+pub(crate) fn default_bin(name: &str) -> &str {
     match name {
-        "amont_agent" => "amont-agent",
+        "amont_agent" => "greenbelay",
         other => other,
     }
 }
@@ -156,7 +160,7 @@ pub fn binary_available(bin: &str) -> bool {
 }
 
 /// Is the integration's binary on PATH? By the integration's config name
-/// (`amont_agent` → `amont-agent`), ignoring any `bin` override.
+/// (`amont_agent` → `greenbelay`), ignoring any `bin` override.
 pub fn integration_available(name: &str) -> bool {
     let name = name.replace('-', "_");
     binary_available(default_bin(&name))
@@ -260,8 +264,8 @@ mod tests {
     /// a hyphen, and a probe against the wrong spelling reports every
     /// machine as missing the integration.
     #[test]
-    fn the_agent_integrations_binary_name_is_hyphenated() {
-        assert_eq!(default_bin("amont_agent"), "amont-agent");
+    fn the_agent_integration_key_names_the_greenbelay_binary() {
+        assert_eq!(default_bin("amont_agent"), "greenbelay");
         assert_eq!(default_bin("aval"), "aval");
     }
 

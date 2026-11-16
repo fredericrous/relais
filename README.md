@@ -87,10 +87,10 @@ split wherever a caller has to act differently.
 | 21 | relais's own storage is full and the run could not be recorded (one stderr line names the volume); `relais resume <run>` reconciles from the last durable ledger state |
 
 `relais native review-outcome [--ledger <path>] [--plan-root <dir>] [--dry-run]`
-ingests greenpiste's plan-review outcomes ledger (default
-`$CLAUDE_CONFIG_DIR/greenpiste/plan-review/outcomes.jsonl`, `~/.claude` when
+ingests greenbelay's plan-review outcomes ledger (default
+`$CLAUDE_CONFIG_DIR/greenbelay/plan-review/outcomes.jsonl`, `~/.claude` when
 unset; the old `amont-agent/plan-review/outcomes.jsonl` while the new file is
-absent; plan root `$GREENPISTE_PLAN_ROOT`, then `$AMONT_AGENT_PLAN_ROOT`) and labels each reviewer `clean`, `miss` or `unknown` into the
+absent; plan root `$GREENBELAY_PLAN_ROOT`, then `$AMONT_AGENT_PLAN_ROOT`) and labels each reviewer `clean`, `miss` or `unknown` into the
 `review_outcomes` table; `relais report` shows the per-class `Reviewers`
 section and `learn cycle` runs the ingest at its start (a failure there is a
 cycle note, never a failed cycle). It prints `labelled N: clean a, miss b,

@@ -296,7 +296,7 @@ fn entry_files(dir: &Path) -> Vec<(String, PathBuf)> {
         .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        // A dotfile is a writer's temp (greenpiste's `.greenpiste-tmp-*`
+        // A dotfile is a writer's temp (greenbelay's `.greenbelay-tmp-*`
         // and amont-agent's `.amont-agent-tmp-*` end in `.json`),
         // renamed away the next moment: seen, it would end as killed.
         .filter_map(|p| Some((p.file_stem()?.to_str()?.to_string(), p)))

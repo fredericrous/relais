@@ -3527,8 +3527,8 @@ pub fn integration_gaps(
         ("aval", "aval", integrations.aval.as_ref()),
         ("amont", "amont", integrations.amont.as_ref()),
         (
-            "amont-agent",
-            "amont-agent",
+            "amont_agent",
+            crate::tooling::default_bin("amont_agent"),
             integrations.amont_agent.as_ref(),
         ),
     ] {
@@ -3538,9 +3538,9 @@ pub fn integration_gaps(
         let bin = dependency.bin().unwrap_or(default_bin);
         let installed = available(bin);
         match dependency.mode() {
-            DependencyMode::Required if !installed => {
-                gaps.push(format!("{name}: required integration unavailable"))
-            }
+            DependencyMode::Required if !installed => gaps.push(format!(
+                "{name}: required integration unavailable (binary `{bin}` not on PATH)"
+            )),
             DependencyMode::Optional if !installed => gaps.push(format!(
                 "{name}: optional integration not installed (reported, not passed)"
             )),
@@ -6942,6 +6942,24 @@ mod tests {
         let none = integration_gaps(&integrations, &|_| false);
         assert_eq!(none.len(), 2, "required missing + optional missing");
         assert!(none[0].starts_with("aval: required"));
+        assert!(none[0].contains("binary `aval`"), "{}", none[0]);
+    }
+
+    /// The `amont_agent` key (its name until the census) is satisfied by the
+    /// `greenbelay` binary and by nothing else (ADR-0071).
+    #[test]
+    fn the_agent_integration_is_found_by_the_greenbelay_binary() {
+        let integrations = crate::policy::Integrations {
+            aval: None,
+            amont: None,
+            amont_agent: Some(crate::policy::Dependency::Mode(DependencyMode::Required)),
+        };
+        assert!(integration_gaps(&integrations, &|bin| bin == "greenbelay").is_empty());
+        let missing = integration_gaps(&integrations, &|bin| bin == "amont-agent");
+        assert_eq!(
+            missing,
+            vec!["amont_agent: required integration unavailable (binary `greenbelay` not on PATH)"]
+        );
     }
 
     #[test]
