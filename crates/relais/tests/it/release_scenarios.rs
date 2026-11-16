@@ -6441,6 +6441,37 @@ fn the_age_the_off_switches_and_the_flag_decide_the_prune() {
     assert!(stamp.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_prune_age_is_invalid_for_retire_and_doctor() {
+    use std::os::unix::ffi::OsStrExt;
+    let world = world_with_ledger("autoprunenonutf8");
+    let old = seed_run(&world, "old-one", "failed", 31 * DAY);
+    let bad = std::ffi::OsStr::from_bytes(b"\xff\xfe");
+
+    let retire = world
+        .command(&[])
+        .env("RELAIS_AUTO_PRUNE_DAYS", bad)
+        .args(["resume", "--retire", "--all"])
+        .output()
+        .expect("relais runs");
+    assert_eq!(retire.status.code(), Some(2), "{}", text(&retire.stderr));
+    assert!(text(&retire.stderr).contains("RELAIS_AUTO_PRUNE_DAYS"));
+    assert!(old.exists(), "an invalid age prunes nothing");
+
+    let doctor = world
+        .command(&[])
+        .env("RELAIS_AUTO_PRUNE_DAYS", bad)
+        .arg("doctor")
+        .output()
+        .expect("relais runs");
+    assert!(
+        text(&doctor.stdout).contains("prune age: invalid RELAIS_AUTO_PRUNE_DAYS"),
+        "{}",
+        text(&doctor.stdout)
+    );
+}
+
 #[test]
 fn an_invalid_prune_age_is_said_when_the_retirement_keeps_a_run() {
     let world = world_with_ledger("autoprunekept");

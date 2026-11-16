@@ -10,6 +10,7 @@ missing here.
 
 ### Changed
 
+- **A failed run deletion names the `runs/.pruning-<id>` directory left on disk**, `RELAIS_AUTO_PRUNE_DAYS` is read in one place so a non-UTF-8 value is reported as invalid by both `retire --all` and `relais doctor`, and `relais doctor`'s state-directory size reads `at least` because an unreadable entry counts as 0.
 - **The `--prune-runs` tally says `worktree`** for a run kept because a checkout remains beneath it, matching the per-run keep line (it said `checkout beneath`). `relais doctor`'s `purge` and `backups` lines are split so none passes 80 columns with the doctor's indent: a long statement is followed by an indented `next:` or hint line, and the `backups` header names the state directory on its own line.
 
 ## v0.66.0

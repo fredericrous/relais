@@ -408,8 +408,7 @@ pub(crate) fn retire_all_command(auto_prune: AutoPruneChoice) -> Result<CliOutco
     use relais::prune::{auto_prune_setting, AutoPruneSetting};
     let ledger = open_ledger()?;
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
-    let env_days = std::env::var_os(relais::prune::AUTO_PRUNE_DAYS_ENV)
-        .map(|raw| raw.to_string_lossy().into_owned());
+    let env_days = relais::prune::read_auto_prune_env();
     // The retirement first; the prune follows whatever it ended in.
     let retired = retire_all(&ledger, &state_dir);
     let pruned = match auto_prune {

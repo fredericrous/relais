@@ -187,7 +187,7 @@ pub fn purge_finding(facts: &PurgeFacts) -> Finding {
         ),
     });
     lines.push(format!(
-        "state directory: {}\n  live verify checkouts under verify/ left out",
+        "state directory: at least {}\n  live verify checkouts under verify/ left out",
         human_bytes(facts.state_bytes)
     ));
     Finding {
