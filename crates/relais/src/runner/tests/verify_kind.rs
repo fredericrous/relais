@@ -1628,8 +1628,6 @@ fn the_successor_of_a_review_off_small_widen_still_dispatches_a_reviewer() {
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a scratch directory
 }
 
-// The fixture's policy has the small rule off: under the default policy tests
-// plus one small edit widen, and this test is about the mixed shape only.
 /// The shipped small-overflow defaults, with the keys unset: the execution
 /// table of a policy that never names them (ADR-0012, amended 2026-11-16).
 fn default_small_scope_repo(fixture: &Fixture) -> RepoPolicy {
@@ -1727,6 +1725,9 @@ fn three_files_or_twenty_one_lines_stop_at_the_default_limits() {
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
 }
 
+// The fixture's policy has the small rule off: under the default policy tests
+// plus small edits within 2 files / 20 lines widen, and this test is about the
+// mixed shape only.
 #[test]
 fn a_mixed_overflow_still_waits_on_a_person() {
     let fixture = Fixture::new();
