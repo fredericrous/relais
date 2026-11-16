@@ -376,7 +376,7 @@ pub struct FailedDir {
 }
 
 /// The prefix of a directory whose deletion has begun.
-pub const PRUNING_PREFIX: &str = ".pruning-";
+const PRUNING_PREFIX: &str = ".pruning-";
 
 /// Delete the prunable directories of a plan. `recheck` is asked just
 /// before each one and answers why it must be kept after all (`None` =
@@ -432,15 +432,41 @@ pub fn apply_run_prune(
     applied
 }
 
+impl FailedDir {
+    /// What to tell the person about what is left: a renamed directory is
+    /// retried by the next prune; one never renamed has no such promise.
+    pub fn hint(&self) -> String {
+        left_hint(&self.left_on_disk, self.renamed)
+    }
+}
+
+/// The hint after a failed deletion: empty unless the directory was already
+/// renamed to `.pruning-<run>`, which the next prune tries again.
+pub fn left_hint(left_on_disk: &Path, renamed: bool) -> String {
+    if renamed {
+        format!(
+            " (left as {}; the next prune retries it)",
+            left_on_disk.display()
+        )
+    } else {
+        String::new()
+    }
+}
+
 /// Finish the removals a crash left behind: every `.pruning-*` directory
-/// directly under `runs` goes. Returns the ones that could not.
-pub fn finish_interrupted(runs: &Path) -> Vec<(PathBuf, io::Error)> {
+/// directly under `runs` goes. Returns the ones that could not; each
+/// `.pruning-*` entry is `renamed`, the listing of `runs` itself is not.
+pub fn finish_interrupted(runs: &Path) -> Vec<FailedDir> {
     let mut failed = Vec::new();
     let entries = match std::fs::read_dir(runs) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return failed,
         Err(e) => {
-            failed.push((runs.to_path_buf(), e));
+            failed.push(FailedDir {
+                left_on_disk: runs.to_path_buf(),
+                renamed: false,
+                error: e,
+            });
             return failed;
         }
     };
@@ -448,7 +474,11 @@ pub fn finish_interrupted(runs: &Path) -> Vec<(PathBuf, io::Error)> {
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => {
-                failed.push((runs.to_path_buf(), e));
+                failed.push(FailedDir {
+                    left_on_disk: runs.to_path_buf(),
+                    renamed: false,
+                    error: e,
+                });
                 continue;
             }
         };
@@ -462,7 +492,11 @@ pub fn finish_interrupted(runs: &Path) -> Vec<(PathBuf, io::Error)> {
         match std::fs::remove_dir_all(entry.path()) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => failed.push((entry.path(), e)),
+            Err(e) => failed.push(FailedDir {
+                left_on_disk: entry.path(),
+                renamed: true,
+                error: e,
+            }),
         }
     }
     failed
@@ -792,6 +826,8 @@ pub struct PruneFailure {
     pub step: PruneStep,
     pub path: PathBuf,
     pub error: io::Error,
+    /// Whether `path` is a `.pruning-<run>` directory the next prune retries.
+    pub renamed: bool,
 }
 
 impl PruneFailure {
@@ -800,7 +836,17 @@ impl PruneFailure {
             step,
             path: path.to_path_buf(),
             error,
+            renamed: false,
         }
+    }
+
+    pub fn renamed(self, renamed: bool) -> Self {
+        Self { renamed, ..self }
+    }
+
+    /// See [`left_hint`].
+    pub fn hint(&self) -> String {
+        left_hint(&self.path, self.renamed)
     }
 }
 
@@ -884,7 +930,14 @@ pub fn auto_prune(
     let runs = state_dir.join(crate::paths::RUNS_DIR);
     let mut failed: Vec<PruneFailure> = finish_interrupted(&runs)
         .into_iter()
-        .map(|(path, error)| PruneFailure::new(PruneStep::FinishingLeftover, &path, error))
+        .map(|failed| {
+            PruneFailure::new(
+                PruneStep::FinishingLeftover,
+                &failed.left_on_disk,
+                failed.error,
+            )
+            .renamed(failed.renamed)
+        })
         .collect();
     let judge = RunJudge::load(ledger, &state_dir.join(crate::paths::BASELINE_CACHE_DIR));
     let plan = plan_run_prune(&runs, age, now, &|run, path| judge.judge(run, path))
@@ -892,6 +945,7 @@ pub fn auto_prune(
     let applied = apply(&judge, &plan);
     failed.extend(applied.failed.into_iter().map(|failed| {
         PruneFailure::new(PruneStep::DeletingRun, &failed.left_on_disk, failed.error)
+            .renamed(failed.renamed)
     }));
     let removed = plan
         .iter()
@@ -914,8 +968,8 @@ pub fn auto_prune(
 
 /// [`tree_bytes`] of `path` without the subtree at `skip`. A lower bound:
 /// an entry or listing that cannot be read counts as 0.
-/// holds-until: the doctor surfaces a count of unreadable entries, so the
-/// lower bound is no longer silent
+/// holds-until: the doctor reports a state-directory size that is read as
+/// too low
 pub fn tree_bytes_except(path: &Path, skip: &Path) -> u64 {
     if path == skip {
         return 0;
@@ -1236,20 +1290,22 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
         let applied = apply_run_prune(&plan, &|_| None);
         let doomed = root.join(".pruning-run-a");
+        if applied.failed.is_empty() {
+            // Running as root nothing is refused, so there is no failure to name.
+            assert!(!doomed.exists());
+            std::fs::remove_dir_all(&root).expect("remove scratch");
+            eprintln!("skipped: Running as root, nothing is refused");
+            return;
+        }
         // The rename moved the locked directory: restore it where it is now.
         let locked_now = if doomed.exists() {
             doomed.join("locked")
         } else {
             locked.clone()
         };
-        std::fs::set_permissions(&locked_now, std::fs::Permissions::from_mode(0o755))
-            .expect("restore write permission where the directory is now");
-        if applied.failed.is_empty() {
-            // Running as root nothing is refused, so there is no failure to name.
-            assert!(!doomed.exists());
-            std::fs::remove_dir_all(&root).expect("remove scratch");
-            eprintln!("skipped: running as root, the delete cannot fail");
-            return;
+        if locked_now.exists() {
+            std::fs::set_permissions(&locked_now, std::fs::Permissions::from_mode(0o755))
+                .expect("restore write permission where the directory is now");
         }
         assert_eq!(applied.failed.len(), 1, "{:?}", applied.failed);
         assert_eq!(applied.failed[0].left_on_disk, doomed);

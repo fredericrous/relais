@@ -6608,20 +6608,49 @@ fn a_failed_deletion_is_reported_and_the_others_still_go() {
     let locked = stuck.join("logs");
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).expect("lock");
     let swept = world.relais(&["resume", "--retire", "--all"]);
-    std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700)).expect("unlock");
+    if swept.status.code() == Some(0) {
+        eprintln!("skipped: Running as root, nothing is refused");
+        return;
+    }
+    if logs.exists() {
+        std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700)).expect("unlock");
+    }
     assert!(!fine.exists(), "{}", text(&swept.stdout));
     assert!(world.state.join("runs-prune.stamp").exists());
-    // Running as root, the deletion cannot fail and there is nothing to check.
-    if swept.status.code() != Some(0) {
-        assert_eq!(swept.status.code(), Some(1), "{}", text(&swept.stderr));
-        assert!(
-            text(&swept.stderr).contains("deleting a run")
-                && text(&swept.stderr).contains("old-stuck")
-                && text(&swept.stderr).contains(".pruning-old-stuck"),
-            "{}",
-            text(&swept.stderr)
-        );
+    assert_eq!(swept.status.code(), Some(1), "{}", text(&swept.stderr));
+    assert!(
+        text(&swept.stderr).contains("deleting a run")
+            && text(&swept.stderr).contains("old-stuck")
+            && text(&swept.stderr).contains(".pruning-old-stuck")
+            && text(&swept.stderr).contains("the next prune retries it"),
+        "{}",
+        text(&swept.stderr)
+    );
+}
+
+#[test]
+fn a_manual_write_whose_delete_fails_says_the_next_prune_retries_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let world = world_with_ledger("manualfail");
+    let stuck = seed_run(&world, "old-stuck", "failed", 40 * DAY);
+    let logs = world.state.join("runs/.pruning-old-stuck/logs");
+    std::fs::set_permissions(stuck.join("logs"), std::fs::Permissions::from_mode(0o500))
+        .expect("lock");
+    let applied = world.relais(&["resume", "--prune-runs", "0", "--write"]);
+    if applied.status.code() == Some(0) {
+        eprintln!("skipped: Running as root, nothing is refused");
+        return;
     }
+    if logs.exists() {
+        std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700)).expect("unlock");
+    }
+    let stderr = text(&applied.stderr);
+    assert!(
+        stderr.contains("(left as ")
+            && stderr.contains(".pruning-old-stuck; the next prune retries it)"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("finishes"), "{stderr}");
 }
 
 #[test]

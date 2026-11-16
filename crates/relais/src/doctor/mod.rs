@@ -264,7 +264,7 @@ pub(crate) fn claude_code_finding(caps: &Capabilities) -> Finding {
 
 /// Columns a finding's detail may use: `render` puts 16 of the 80 in
 /// front of it.
-const DETAIL_COLUMNS: usize = 62;
+pub(super) const DETAIL_COLUMNS: usize = 62;
 
 /// Every model the repo policy names, once, in tier order.
 pub fn policy_models(policy: &RepoPolicy) -> Vec<String> {

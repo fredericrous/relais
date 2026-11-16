@@ -15,10 +15,10 @@ pub const PURGE_GRACE: Duration = Duration::from_secs(3 * 86_400);
 const DAY: Duration = Duration::from_secs(86_400);
 const MAX_BACKUP_LINES: usize = 10;
 const RELAIS_BACKUP_NAMES: [&str; 2] = ["ledger.sqlite.bak-v27", "ledger.sqlite.bak-v30"];
-const SAFE_TO_DELETE: &str = "safe to delete later";
+const SAFE_TO_DELETE: &str = "safe if no rollback";
 const NOT_RELAIS: &str = "not from relais";
-/// The doctor indents a finding by 16 columns; a line fits 80 with it.
-const LINE_BUDGET: usize = 80 - 16;
+/// The columns a finding's line may use: the doctor's one detail budget.
+pub(super) const LINE_BUDGET: usize = super::DETAIL_COLUMNS;
 /// How much of an operator-supplied or system text one line keeps.
 const TEXT_BUDGET: usize = 50;
 const ELLIPSIS: &str = "...";
@@ -212,9 +212,9 @@ pub fn purge_finding(facts: &PurgeFacts) -> Finding {
                 one_line
             } else {
                 format!(
-                    "prune age: invalid {}\n  value: {:?}",
+                    "prune age: invalid {}\n  value: {}",
                     prune::AUTO_PRUNE_DAYS_ENV,
-                    cut_end(text, TEXT_BUDGET - 8)
+                    cut_end(&format!("{text:?}"), TEXT_BUDGET - 8)
                 )
             };
             format!("{shown}\n  the prune is skipped until it is a number of days")
@@ -352,8 +352,6 @@ fn human_age(age: Duration) -> String {
 mod tests {
     use super::*;
 
-    const INDENT_FOR_TEST: usize = 16;
-
     fn scratch(tag: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("relais-state-health-{tag}-{}", std::process::id()));
@@ -488,7 +486,7 @@ mod tests {
     fn purge_that_could_not_measure_warns_and_never_reports_zero() {
         let finding = purge_finding(&PurgeFacts {
             runs: RunsHealth::Unmeasured {
-                operation: "opening the ledger /s/ledger.sqlite".into(),
+                operation: "opening the ledger /s/l.sqlite".into(),
                 error: "database is locked".into(),
             },
             ..facts()
@@ -496,7 +494,7 @@ mod tests {
         assert_eq!(finding.level, Level::Warn);
         assert!(finding
             .detail
-            .contains("opening the ledger /s/ledger.sqlite failed: database is locked"));
+            .contains("opening the ledger /s/l.sqlite failed: database is locked"));
         assert!(!finding.detail.contains(" 0 "));
     }
 
@@ -540,7 +538,6 @@ mod tests {
 
     #[test]
     fn findings_fit_80_columns_after_the_indent_in_a_long_state_directory() {
-        const INDENT: usize = INDENT_FOR_TEST;
         let long = format!("{}/{}", scratch("width").display(), "deep-dir-".repeat(12));
         let dir = PathBuf::from(&long);
         std::fs::create_dir_all(&dir).unwrap();
@@ -585,8 +582,8 @@ mod tests {
             if line.starts_with("rm ") || line.starts_with("in ") {
                 continue;
             }
-            let columns = INDENT + line.chars().count();
-            assert!(columns <= 80, "{columns} columns: {line}");
+            let columns = line.chars().count();
+            assert!(columns <= LINE_BUDGET, "{columns} columns: {line}");
         }
         assert!(!purge.detail.contains(&wide) && !unmeasured.detail.contains(&wide));
         assert!(backups.detail.lines().any(|l| l == format!("in {long}")));
@@ -613,6 +610,15 @@ mod tests {
     #[test]
     fn invalid_age_and_measurement_error_lines_fit_80_columns_with_the_indent() {
         let wide = "q".repeat(200);
+        let control = "\u{1}".repeat(42);
+        let controlled = purge_finding(&PurgeFacts {
+            setting: AutoPruneSetting::Invalid(control),
+            source: SettingSource::Environment,
+            ..facts()
+        });
+        for line in controlled.detail.lines() {
+            assert!(line.chars().count() <= LINE_BUDGET, "{line}");
+        }
         let invalid = purge_finding(&PurgeFacts {
             setting: AutoPruneSetting::Invalid(wide.clone()),
             source: SettingSource::Environment,
@@ -626,7 +632,7 @@ mod tests {
             ..facts()
         });
         for line in invalid.detail.lines().chain(unmeasured.detail.lines()) {
-            assert!(16 + line.chars().count() <= 80, "{line}");
+            assert!(line.chars().count() <= LINE_BUDGET, "{line}");
         }
         assert!(invalid.detail.contains("..."));
         assert!(unmeasured.detail.contains("..."));
@@ -652,7 +658,7 @@ mod tests {
         );
         assert!(lines[12].starts_with("... and 4 more ("));
         for line in &lines[2..12] {
-            assert!(INDENT_FOR_TEST + line.len() <= 80, "{line}");
+            assert!(line.len() <= LINE_BUDGET, "{line}");
         }
     }
 }

@@ -503,7 +503,7 @@ fn auto_prune_command(ledger: &Ledger, state_dir: &Path, days: u64) -> CliOutcom
         human_bytes(bytes)
     );
     for failure in &report.failed {
-        eprintln!("relais: prune: {failure}");
+        eprintln!("relais: prune: {failure}{}", failure.hint());
     }
     if report.failed.is_empty() {
         CliOutcome::Accepted
@@ -1047,25 +1047,13 @@ pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, 
         eprintln!("kept {}: {why}", path.display());
     }
     eprintln!("deleted {} run directories", applied.removed.len());
-    failed.extend(
-        applied
-            .failed
-            .into_iter()
-            .map(|dir| (dir.left_on_disk, dir.error)),
-    );
-    for (path, e) in &failed {
-        let finishes_next = path.file_name().is_some_and(|name| {
-            name.to_string_lossy()
-                .starts_with(relais::prune::PRUNING_PREFIX)
-        });
-        let hint = if finishes_next {
-            " (the next prune finishes it)"
-        } else {
-            ""
-        };
+    failed.extend(applied.failed);
+    for dir in &failed {
         eprintln!(
-            "relais resume: {} could not be deleted: {e}{hint}",
-            path.display()
+            "relais resume: {} could not be deleted: {}{}",
+            dir.left_on_disk.display(),
+            dir.error,
+            dir.hint()
         );
     }
     Ok(if failed.is_empty() {
