@@ -31,3 +31,11 @@ ADR-0011 moved three mechanical stops off the orchestrating session. Two more co
 - A timed-out run with a candidate exits as cancelled (7), not interrupted.
 - `relais report` counts each settle and how its successor ended (`auto_settled`), from the successor intent rows, never from note text.
 - Check 14 days after each release: orchestrator salvages of timed-out runs per week (from about 9.1), orchestrator decisions on small non-test overflows (from about 7), and the successors' outcomes. Roll a rule back by its key, never by an older binary.
+
+## Amendment 2026-11-16: the small limits are 2 files and 20 lines
+
+The 1-file / 10-line limit left in the original decision still stopped the overflows it was meant to settle: the time-to-done replay (t06) of 96 recorded runs settled 51 as `scope_widened_small`, and 14 more fit 2 files of 20 lines or fewer (decisions#202, t07 option b). The defaults become `widen_scope_small_max_files = 2` and `widen_scope_small_max_lines = 20`; the keys and the rule are otherwise unchanged, and a repository that sets them keeps its own value.
+
+Trust: the defaults stay out of the authority hash, so a repository that never names the keys keeps its grant and now widens at 2 / 20. A repository that names them explicitly at 1 / 10 or 2 / 20 changes its hash and must be re-trusted; any other value hashes as before. Intended.
+
+Check 14 days after the release: `scope_widened_small` outcomes and the successors' results, against the replay's 65 of 96.

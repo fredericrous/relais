@@ -562,8 +562,8 @@ fn default_verify_timed_out() -> bool {
     true
 }
 
-const DEFAULT_WIDEN_SCOPE_SMALL_MAX_FILES: u32 = 1;
-const DEFAULT_WIDEN_SCOPE_SMALL_MAX_LINES: u32 = 10;
+const DEFAULT_WIDEN_SCOPE_SMALL_MAX_FILES: u32 = 2;
+const DEFAULT_WIDEN_SCOPE_SMALL_MAX_LINES: u32 = 20;
 
 fn default_widen_scope_small_max_files() -> u32 {
     DEFAULT_WIDEN_SCOPE_SMALL_MAX_FILES
@@ -3108,12 +3108,25 @@ keys = ["output.contract"]
             ))
             .expect("parses")
         };
-        let defaults = named(1, 10);
-        assert_eq!(defaults.execution.widen_scope_small_max_files, 1);
-        assert_eq!(defaults.execution.widen_scope_small_max_lines, 10);
+        let defaults = named(2, 20);
+        assert_eq!(defaults.execution.widen_scope_small_max_files, 2);
+        assert_eq!(defaults.execution.widen_scope_small_max_lines, 20);
         assert_eq!(repo.authority_hash(), defaults.authority_hash());
-        assert_ne!(repo.authority_hash(), named(0, 10).authority_hash());
-        assert_ne!(repo.authority_hash(), named(1, 40).authority_hash());
+        // The pre-0.66 values, named explicitly, are no longer the default:
+        // they move the hash, so a repository that set them is re-trusted.
+        assert_ne!(repo.authority_hash(), named(1, 10).authority_hash());
+        assert_ne!(repo.authority_hash(), named(0, 20).authority_hash());
+        assert_ne!(repo.authority_hash(), named(2, 40).authority_hash());
+    }
+
+    /// With the keys unset the small-widen limits are 2 files and 20 lines
+    /// (ADR-0012, amended): a repository that never names them is widened
+    /// at the new limits, and its grant still holds.
+    #[test]
+    fn the_small_widen_limits_default_to_two_files_and_twenty_lines_when_unset() {
+        let unset = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        assert_eq!(unset.execution.widen_scope_small_max_files, 2);
+        assert_eq!(unset.execution.widen_scope_small_max_lines, 20);
     }
 
     /// `verify_timed_out` is left out of the authority hash at its default
