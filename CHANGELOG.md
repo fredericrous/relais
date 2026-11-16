@@ -8,6 +8,14 @@ missing here.
 
 ## Unreleased
 
+- **greenpiste is now greenbelay** (ADR-0071). `relais review-outcome` reads
+  greenbelay's ledger (`$CLAUDE_CONFIG_DIR/greenbelay/plan-review/outcomes.jsonl`,
+  schemas `greenbelay-review-*-v1`, plan root `$GREENBELAY_PLAN_ROOT`, then
+  `$AMONT_AGENT_PLAN_ROOT`), and the `amont_agent` integration key (its name
+  until the census) looks for the `greenbelay` binary, in `relais doctor`
+  and in verification. Install greenbelay 6.0.0 with this release: no
+  `amont-agent` binary is installed any more.
+
 ## v0.66.2
 
 ### Changed

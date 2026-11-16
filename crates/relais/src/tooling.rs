@@ -72,10 +72,11 @@ pub fn probe_integrations(repo: &RepoPolicy) -> Vec<Blocker> {
     blockers
 }
 
-/// The config key is `amont_agent`; the binary on PATH is `amont-agent`.
+/// The config key is `amont_agent` (its name until the census); the binary
+/// on PATH is `greenbelay` (ADR-0071: no `amont-agent` copy is installed).
 fn default_bin(name: &str) -> &str {
     match name {
-        "amont_agent" => "amont-agent",
+        "amont_agent" => "greenbelay",
         other => other,
     }
 }
@@ -156,7 +157,7 @@ pub fn binary_available(bin: &str) -> bool {
 }
 
 /// Is the integration's binary on PATH? By the integration's config name
-/// (`amont_agent` → `amont-agent`), ignoring any `bin` override.
+/// (`amont_agent` → `greenbelay`), ignoring any `bin` override.
 pub fn integration_available(name: &str) -> bool {
     let name = name.replace('-', "_");
     binary_available(default_bin(&name))
@@ -261,7 +262,7 @@ mod tests {
     /// machine as missing the integration.
     #[test]
     fn the_agent_integrations_binary_name_is_hyphenated() {
-        assert_eq!(default_bin("amont_agent"), "amont-agent");
+        assert_eq!(default_bin("amont_agent"), "greenbelay");
         assert_eq!(default_bin("aval"), "aval");
     }
 

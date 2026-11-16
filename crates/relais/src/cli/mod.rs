@@ -937,18 +937,18 @@ pub(crate) enum NativeCommand {
     /// payload is invalid, and then nothing is written
     #[command(name = "router-observe")]
     RouterObserve,
-    /// Ingest greenpiste's plan-review outcomes ledger: label each
+    /// Ingest greenbelay's plan-review outcomes ledger: label each
     /// reviewer clean, miss or unknown into the relais ledger. Refuses
     /// (3) a ledger that is a symlink, not ours, or open to group or
     /// other; never writes machine.toml
     #[command(name = "review-outcome")]
     ReviewOutcome {
-        /// The outcomes ledger (default: greenpiste's, under the Claude
-        /// config directory; amont-agent's while greenpiste's is absent)
+        /// The outcomes ledger (default: greenbelay's, under the Claude
+        /// config directory; amont-agent's while greenbelay's is absent)
         #[arg(long)]
         ledger: Option<PathBuf>,
         /// Where the repositories' docs/plans live (default:
-        /// $GREENPISTE_PLAN_ROOT, then $AMONT_AGENT_PLAN_ROOT, else
+        /// $GREENBELAY_PLAN_ROOT, then $AMONT_AGENT_PLAN_ROOT, else
         /// ~/Developer/Perso)
         #[arg(long)]
         plan_root: Option<PathBuf>,

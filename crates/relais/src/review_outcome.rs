@@ -22,21 +22,21 @@ use crate::paths;
 use crate::router::outcome::TaskOutcome;
 
 /// The `schema` values an outcome row may carry.
-const ROW_SCHEMA: &str = "greenpiste-review-outcome-v1";
-/// Removed at the greenpiste data-name programme census.
+const ROW_SCHEMA: &str = "greenbelay-review-outcome-v1";
+/// Removed at the greenbelay data-name programme census.
 const OLD_ROW_SCHEMA: &str = "amont-agent-review-outcome-v1";
-/// The schema of a merge row: what `greenpiste plan-apply` wrote when it
+/// The schema of a merge row: what `greenbelay plan-apply` wrote when it
 /// applied a review's patches (plan-review-edits-apply, Behaviour 3 and 5).
-const MERGE_SCHEMA: &str = "greenpiste-review-merge-v1";
-/// Removed at the greenpiste data-name programme census.
+const MERGE_SCHEMA: &str = "greenbelay-review-merge-v1";
+/// Removed at the greenbelay data-name programme census.
 const OLD_MERGE_SCHEMA: &str = "amont-agent-review-merge-v1";
-/// Where greenpiste keeps its ledger, under the Claude config directory.
-const LEDGER_PARTS: [&str; 3] = ["greenpiste", "plan-review", "outcomes.jsonl"];
-/// Removed at the greenpiste data-name programme census.
+/// Where greenbelay keeps its ledger, under the Claude config directory.
+const LEDGER_PARTS: [&str; 3] = ["greenbelay", "plan-review", "outcomes.jsonl"];
+/// Removed at the greenbelay data-name programme census.
 const OLD_LEDGER_PARTS: [&str; 3] = ["amont-agent", "plan-review", "outcomes.jsonl"];
-/// The environment variable greenpiste resolves its plan root from.
-pub const PLAN_ROOT_ENV: &str = "GREENPISTE_PLAN_ROOT";
-/// Removed at the greenpiste data-name programme census.
+/// The environment variable greenbelay resolves its plan root from.
+pub const PLAN_ROOT_ENV: &str = "GREENBELAY_PLAN_ROOT";
+/// Removed at the greenbelay data-name programme census.
 const OLD_PLAN_ROOT_ENV: &str = "AMONT_AGENT_PLAN_ROOT";
 /// How much of a body sha a plan file's `body-sha=` stamp carries.
 const STAMP_LEN: usize = 12;
@@ -108,8 +108,8 @@ struct PlanFeatures {
     repos: Vec<String>,
     #[serde(rename = "body_lines")]
     _body_lines: u64,
-    // `seat_source` and `seat_classes` are written by greenpiste today,
-    // `counts` from greenpiste 4.3.0. Not read here; declared so
+    // `seat_source` and `seat_classes` are written by greenbelay today,
+    // `counts` from greenbelay 4.3.0. Not read here; declared so
     // `deny_unknown_fields` keeps the row.
     #[serde(rename = "seat_source", default)]
     _seat_source: Option<String>,
@@ -139,8 +139,8 @@ struct Row {
     verdict: Option<Verdict>,
     remit: Vec<String>,
     findings: Vec<Finding>,
-    // greenpiste's count of numbered findings it could not parse, and the
-    // plan's id (greenpiste 4.3.0); declared, not read.
+    // greenbelay's count of numbered findings it could not parse, and the
+    // plan's id (greenbelay 4.3.0); declared, not read.
     #[serde(rename = "findings_unparsed", default)]
     _findings_unparsed: Option<u64>,
     #[serde(rename = "plan_id", default)]
@@ -168,7 +168,7 @@ struct MergeRow {
     round: Option<u32>,
     accepted: u64,
     applied: u64,
-    // The `role#n` labels a `command` merge applied; written by greenpiste,
+    // The `role#n` labels a `command` merge applied; written by greenbelay,
     // not read here. Declared so `deny_unknown_fields` keeps the row.
     #[serde(rename = "applied_labels", default)]
     _applied_labels: Option<Vec<String>>,
@@ -419,7 +419,7 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// The flags when given, otherwise greenpiste's defaults (before its
+    /// The flags when given, otherwise greenbelay's defaults (before its
     /// migration, amont-agent's).
     pub fn resolve(
         ledger: Option<PathBuf>,
@@ -1066,19 +1066,19 @@ mod tests {
     }
 
     #[test]
-    fn rows_as_greenpiste_writes_them_parse() {
+    fn rows_as_greenbelay_writes_them_parse() {
         // Today's row: seating features and unparsed findings.
         let mut today = row("r", "rust", 1, "b1");
         today["findings_unparsed"] = serde_json::json!(0);
         today["plan"]["seat_source"] = serde_json::json!("paths");
         today["plan"]["seat_classes"] = serde_json::json!(["cli", "lang:rust"]);
-        serde_json::from_value::<Row>(today.clone()).expect("a current greenpiste row parses");
+        serde_json::from_value::<Row>(today.clone()).expect("a current greenbelay row parses");
         // 4.3.0: the plan id and the panel counts.
         let mut next = today;
         next["plan_id"] = serde_json::json!("p-01JCZ0000000000000000000000");
         next["plan"]["counts"] = serde_json::json!({"repos": 3, "phases": 6});
         serde_json::from_value::<Row>(next).expect("a 4.3.0 row parses");
-        // Findings in each shape greenpiste writes: from stdin, and parsed
+        // Findings in each shape greenbelay writes: from stdin, and parsed
         // from the reviewer's text (`n` and a severity only).
         let mut parsed = row("r", "rust", 1, "b1");
         parsed["findings"] = serde_json::json!([
@@ -1091,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn every_shape_greenpiste_writes_is_read_with_no_invalid_row() {
+    fn every_shape_greenbelay_writes_is_read_with_no_invalid_row() {
         let base = crate::test_support::temp_dir("ledger-shapes");
         let path = base.join("outcomes.jsonl");
         let mut today = row("today", "rust", 1, "b1");
@@ -1103,7 +1103,7 @@ mod tests {
         next["plan"]["counts"] = serde_json::json!({"phases": 6});
         let mut parsed = row("parsed", "rust", 1, "b1");
         parsed["findings"] = serde_json::json!([{"n": 1, "severity": "high"}]);
-        // A `command` merge row as greenpiste writes it, with the labels it
+        // A `command` merge row as greenbelay writes it, with the labels it
         // applied.
         let merge = serde_json::json!({
             "schema": "amont-agent-review-merge-v1", "recorded_at": 11, "plan_path": "/plans/p.md",
@@ -1180,7 +1180,7 @@ mod tests {
     #[test]
     fn the_new_ledger_path_wins_and_the_old_is_the_fallback() {
         let base = crate::test_support::temp_dir("ledger-paths");
-        let new = base.join("greenpiste/plan-review/outcomes.jsonl");
+        let new = base.join("greenbelay/plan-review/outcomes.jsonl");
         let old = base.join("amont-agent/plan-review/outcomes.jsonl");
         write_ledger(&old, &[]);
         assert_eq!(default_ledger(&base), old);
@@ -1197,7 +1197,7 @@ mod tests {
         let mut old_row = row("old-agent", "rust", 1, "b1");
         old_row["schema"] = serde_json::json!("amont-agent-review-outcome-v1");
         let mut new_row = row("new-agent", "rust", 1, "b1");
-        new_row["schema"] = serde_json::json!("greenpiste-review-outcome-v1");
+        new_row["schema"] = serde_json::json!("greenbelay-review-outcome-v1");
         let merge = |schema: &str, agent: &str| {
             serde_json::json!({
                 "schema": schema, "recorded_at": 11, "plan_path": "/plans/p.md",
@@ -1213,7 +1213,7 @@ mod tests {
                 old_row,
                 new_row,
                 merge("amont-agent-review-merge-v1", "old-agent"),
-                merge("greenpiste-review-merge-v1", "new-agent"),
+                merge("greenbelay-review-merge-v1", "new-agent"),
             ],
         );
         let settings = Settings {

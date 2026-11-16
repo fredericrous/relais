@@ -3528,7 +3528,7 @@ pub fn integration_gaps(
         ("amont", "amont", integrations.amont.as_ref()),
         (
             "amont-agent",
-            "amont-agent",
+            "greenbelay",
             integrations.amont_agent.as_ref(),
         ),
     ] {
