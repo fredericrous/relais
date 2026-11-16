@@ -10,6 +10,7 @@
 //!   is `accepted` (the only state that stores one), and
 //!   untouched for longer than the asked age. Pruning previews by default.
 
+use crate::lifecycle::State;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -171,17 +172,18 @@ fn age(path: &Path, now: SystemTime) -> Option<Duration> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeepReason {
     /// The run has not ended (`state` names where it is).
-    NotEnded { state: &'static str },
+    NotEnded { state: State },
     /// The run ended in a state a person still has to answer.
-    WaitsOnPerson { state: &'static str },
+    WaitsOnPerson { state: State },
     /// The ledger has no such run.
     NotInLedger,
     /// An `accepted` run whose receipt is not in the ledger.
     NoReceipt,
     /// A run that has not ended pins this run's candidate.
     Pinned,
-    /// A package run beneath this one cannot go (`detail` says why).
-    PackageRun { run: String, detail: String },
+    /// A package run beneath this one cannot go. `why` is the package run's
+    /// own reason: `NotEnded`, `WaitsOnPerson` or `Pinned`.
+    PackageRun { run: String, why: Box<KeepReason> },
     /// A checkout remains beneath the directory (`at` names it, when known).
     CheckoutBeneath { at: Option<PathBuf> },
     /// This many baseline-cache entries cite the directory.
@@ -200,7 +202,7 @@ impl KeepReason {
             Self::NoReceipt => "no receipt",
             Self::Pinned => "pinned",
             Self::PackageRun { .. } => "package run",
-            Self::CheckoutBeneath { .. } => "checkout beneath",
+            Self::CheckoutBeneath { .. } => "worktree",
             Self::CitedByCache { .. } => "cited by the cache",
             Self::Unreadable { .. } => "unreadable",
         }
@@ -217,12 +219,14 @@ impl KeepReason {
 impl std::fmt::Display for KeepReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotEnded { state } => write!(f, "{state} (not ended)"),
-            Self::WaitsOnPerson { state } => write!(f, "{state} (waits on a person)"),
+            Self::NotEnded { state } => write!(f, "{} (not ended)", state.as_str()),
+            Self::WaitsOnPerson { state } => {
+                write!(f, "{} (waits on a person)", state.as_str())
+            }
             Self::NotInLedger => write!(f, "not in the ledger"),
             Self::NoReceipt => write!(f, "no receipt in the ledger"),
             Self::Pinned => write!(f, "pinned by a run that has not ended"),
-            Self::PackageRun { run, detail } => write!(f, "package run {run} is {detail}"),
+            Self::PackageRun { run, why } => write!(f, "package run {run} is {why}"),
             Self::CheckoutBeneath { at: None } => {
                 write!(f, "worktree (a checkout remains beneath it)")
             }
@@ -237,22 +241,6 @@ impl std::fmt::Display for KeepReason {
             Self::Unreadable { what, error } => write!(f, "{what} unreadable: {error}"),
         }
     }
-}
-
-/// Binary units, one decimal above bytes: `330.0 MiB`. The one size
-/// format of the prune output and `relais doctor`.
-pub fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut scaled = bytes as f64;
-    let mut unit = 0;
-    while scaled >= 1024.0 && unit < UNITS.len() - 1 {
-        scaled /= 1024.0;
-        unit += 1;
-    }
-    format!("{scaled:.1} {}", UNITS[unit])
 }
 
 /// Why a run directory may or may not be pruned, as the ledger has it.
@@ -357,15 +345,59 @@ pub fn json_files_citing(dir: &Path, needle: &str) -> io::Result<usize> {
     Ok(citing)
 }
 
+/// A run directory deleted, by its original path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedDir {
+    pub path: PathBuf,
+    /// Evidence rows its deletion left pointing into it.
+    pub dangling: usize,
+}
+
 /// What deleting a plan did.
 #[derive(Debug, Default)]
 pub struct Applied {
-    /// The directories gone (by their original path).
-    pub removed: Vec<PathBuf>,
+    /// The directories gone, each with the evidence rows left pointing into it.
+    pub removed: Vec<RemovedDir>,
     /// Prunable when planned, kept by the re-check just before deletion.
     pub kept: Vec<(PathBuf, KeepReason)>,
-    /// Deletions that failed, with the error.
-    pub failed: Vec<(PathBuf, io::Error)>,
+    /// Deletions that failed.
+    pub failed: Vec<FailedDir>,
+}
+
+/// A deletion that failed.
+#[derive(Debug)]
+pub struct FailedDir {
+    /// What is left on disk: the original directory when the rename
+    /// failed, `.pruning-<run>` after it.
+    pub left_on_disk: Left,
+    pub error: io::Error,
+}
+
+/// What a failed deletion left on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Left {
+    /// The path as it was: the rename to `.pruning-<run>` had not happened.
+    Original(PathBuf),
+    /// A `.pruning-<run>` directory, which the next prune retries.
+    Renamed(PathBuf),
+}
+
+impl Left {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Original(path) | Self::Renamed(path) => path,
+        }
+    }
+
+    /// What to tell the person: a renamed directory is retried by the next
+    /// prune; one never renamed has no such promise. The failure line
+    /// already prints the path.
+    pub fn hint(&self) -> &'static str {
+        match self {
+            Self::Original(_) => "",
+            Self::Renamed(_) => " (the next prune retries it)",
+        }
+    }
 }
 
 /// The prefix of a directory whose deletion has begun.
@@ -382,9 +414,13 @@ pub fn apply_run_prune(
 ) -> Applied {
     let mut applied = Applied::default();
     for dir in plan {
-        if !matches!(dir.verdict, RunVerdict::Prunable { .. }) {
+        let RunVerdict::Prunable { dangling } = &dir.verdict else {
             continue;
-        }
+        };
+        let removed = || RemovedDir {
+            path: dir.path.clone(),
+            dangling: dangling.len(),
+        };
         if let Some(why) = recheck(dir) {
             applied.kept.push((dir.path.clone(), why));
             continue;
@@ -395,32 +431,50 @@ pub fn apply_run_prune(
         match std::fs::rename(&dir.path, &doomed) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                applied.removed.push(dir.path.clone());
+                applied.removed.push(removed());
                 continue;
             }
             Err(e) => {
-                applied.failed.push((dir.path.clone(), e));
+                applied.failed.push(FailedDir {
+                    left_on_disk: Left::Original(dir.path.clone()),
+                    error: e,
+                });
                 continue;
             }
         }
         match std::fs::remove_dir_all(&doomed) {
-            Ok(()) => applied.removed.push(dir.path.clone()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => applied.removed.push(dir.path.clone()),
-            Err(e) => applied.failed.push((dir.path.clone(), e)),
+            Ok(()) => applied.removed.push(removed()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => applied.removed.push(removed()),
+            // The rename already happened: what is left on disk is `doomed`.
+            Err(e) => applied.failed.push(FailedDir {
+                left_on_disk: Left::Renamed(doomed),
+                error: e,
+            }),
         }
     }
     applied
 }
 
+impl FailedDir {
+    /// See [`Left::hint`].
+    pub fn hint(&self) -> &'static str {
+        self.left_on_disk.hint()
+    }
+}
+
 /// Finish the removals a crash left behind: every `.pruning-*` directory
-/// directly under `runs` goes. Returns the ones that could not.
-pub fn finish_interrupted(runs: &Path) -> Vec<(PathBuf, io::Error)> {
+/// directly under `runs` goes. Returns the ones that could not; each
+/// `.pruning-*` entry is `renamed`, the listing of `runs` itself is not.
+pub fn finish_interrupted(runs: &Path) -> Vec<FailedDir> {
     let mut failed = Vec::new();
     let entries = match std::fs::read_dir(runs) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return failed,
         Err(e) => {
-            failed.push((runs.to_path_buf(), e));
+            failed.push(FailedDir {
+                left_on_disk: Left::Original(runs.to_path_buf()),
+                error: e,
+            });
             return failed;
         }
     };
@@ -428,7 +482,10 @@ pub fn finish_interrupted(runs: &Path) -> Vec<(PathBuf, io::Error)> {
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => {
-                failed.push((runs.to_path_buf(), e));
+                failed.push(FailedDir {
+                    left_on_disk: Left::Original(runs.to_path_buf()),
+                    error: e,
+                });
                 continue;
             }
         };
@@ -442,7 +499,10 @@ pub fn finish_interrupted(runs: &Path) -> Vec<(PathBuf, io::Error)> {
         match std::fs::remove_dir_all(entry.path()) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => failed.push((entry.path(), e)),
+            Err(e) => failed.push(FailedDir {
+                left_on_disk: Left::Renamed(entry.path()),
+                error: e,
+            }),
         }
     }
     failed
@@ -485,7 +545,7 @@ impl<'a> RunJudge<'a> {
         };
         // Only an accepted run has a receipt stored; any other ended run
         // never will, so waiting for one would keep it forever.
-        if state == crate::lifecycle::State::Accepted {
+        if state == State::Accepted {
             match self.ledger.receipt(&id) {
                 Ok(Some(_)) => {}
                 Ok(None) => return RunVerdict::Kept(KeepReason::NoReceipt),
@@ -578,13 +638,13 @@ impl<'a> RunJudge<'a> {
                 if let Some(why) = state_keeps(child.status) {
                     return Some(KeepReason::PackageRun {
                         run: child.run.to_string(),
-                        detail: why.to_string(),
+                        why: Box::new(why),
                     });
                 }
                 if pin_keeps(pinned, child.run.as_str()).is_some() {
                     return Some(KeepReason::PackageRun {
                         run: child.run.to_string(),
-                        detail: "pinned".to_string(),
+                        why: Box::new(KeepReason::Pinned),
                     });
                 }
                 pending.push(child.run);
@@ -595,20 +655,15 @@ impl<'a> RunJudge<'a> {
 }
 
 /// Why a run in `state` is kept, when it is.
-fn state_keeps(state: crate::lifecycle::State) -> Option<KeepReason> {
-    use crate::lifecycle::State;
+fn state_keeps(state: State) -> Option<KeepReason> {
     match state {
         State::Prepared
         | State::Running
         | State::Verifying
         | State::Repairing
-        | State::Escalating => Some(KeepReason::NotEnded {
-            state: state.as_str(),
-        }),
+        | State::Escalating => Some(KeepReason::NotEnded { state }),
         State::NeedsReview | State::NeedsDecision | State::Interrupted => {
-            Some(KeepReason::WaitsOnPerson {
-                state: state.as_str(),
-            })
+            Some(KeepReason::WaitsOnPerson { state })
         }
         State::Accepted
         | State::Blocked
@@ -770,10 +825,12 @@ impl PruneStep {
 }
 
 /// A prune failure: the step, the path it was working on and the cause.
+/// `Display` includes the cause, so callers print it with `{}` and need not
+/// walk the error chain.
 #[derive(Debug)]
 pub struct PruneFailure {
     pub step: PruneStep,
-    pub path: PathBuf,
+    pub path: Left,
     pub error: io::Error,
 }
 
@@ -781,9 +838,22 @@ impl PruneFailure {
     pub fn new(step: PruneStep, path: &Path, error: io::Error) -> Self {
         Self {
             step,
-            path: path.to_path_buf(),
+            path: Left::Original(path.to_path_buf()),
             error,
         }
+    }
+
+    pub fn left(step: PruneStep, left: Left, error: io::Error) -> Self {
+        Self {
+            step,
+            path: left,
+            error,
+        }
+    }
+
+    /// See [`Left::hint`].
+    pub fn hint(&self) -> &'static str {
+        self.path.hint()
     }
 }
 
@@ -793,13 +863,17 @@ impl std::fmt::Display for PruneFailure {
             f,
             "{} {}: {}",
             self.step.describe(),
-            self.path.display(),
+            self.path.path().display(),
             self.error
         )
     }
 }
 
-impl std::error::Error for PruneFailure {}
+impl std::error::Error for PruneFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
 
 /// A run directory the automatic prune deleted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -831,9 +905,9 @@ fn stamp_is_fresh(stamp: &Path, now: SystemTime) -> bool {
 }
 
 /// Take `runs-prune.lock` without waiting: `None` when another prune holds it.
-pub fn try_lock_prune(state_dir: &Path) -> Result<Option<crate::fsutil::LockFile>, PruneFailure> {
+pub fn try_lock_prune(state_dir: &Path) -> Result<Option<crate::procs::LockFile>, PruneFailure> {
     let path = state_dir.join(LOCK_FILE);
-    crate::fsutil::LockFile::try_acquire(&path)
+    crate::procs::LockFile::try_acquire(&path)
         .map_err(|error| PruneFailure::new(PruneStep::Lock, &path, error))
 }
 
@@ -863,29 +937,31 @@ pub fn auto_prune(
     let runs = state_dir.join(crate::paths::RUNS_DIR);
     let mut failed: Vec<PruneFailure> = finish_interrupted(&runs)
         .into_iter()
-        .map(|(path, error)| PruneFailure::new(PruneStep::FinishingLeftover, &path, error))
+        .map(|failed| {
+            PruneFailure::left(
+                PruneStep::FinishingLeftover,
+                failed.left_on_disk,
+                failed.error,
+            )
+        })
         .collect();
     let judge = RunJudge::load(ledger, &state_dir.join(crate::paths::BASELINE_CACHE_DIR));
     let plan = plan_run_prune(&runs, age, now, &|run, path| judge.judge(run, path))
         .map_err(|error| PruneFailure::new(PruneStep::ReadingRuns, &runs, error))?;
     let applied = apply(&judge, &plan);
-    failed.extend(
-        applied
-            .failed
-            .into_iter()
-            .map(|(path, error)| PruneFailure::new(PruneStep::DeletingRun, &path, error)),
-    );
+    failed.extend(applied.failed.into_iter().map(|failed| {
+        PruneFailure::left(PruneStep::DeletingRun, failed.left_on_disk, failed.error)
+    }));
     let removed = plan
         .iter()
-        .filter(|dir| applied.removed.contains(&dir.path))
-        .map(|dir| RemovedRun {
-            run: dir.run.clone(),
-            age: dir.age,
-            bytes: dir.bytes,
-            dangling: match &dir.verdict {
-                RunVerdict::Prunable { dangling } => dangling.len(),
-                RunVerdict::Kept(_) => 0,
-            },
+        .filter_map(|dir| {
+            let gone = applied.removed.iter().find(|gone| gone.path == dir.path)?;
+            Some(RemovedRun {
+                run: dir.run.clone(),
+                age: dir.age,
+                bytes: dir.bytes,
+                dangling: gone.dangling,
+            })
         })
         .collect();
     Ok(AutoPrune::Ran(AutoPruneReport {
@@ -895,7 +971,10 @@ pub fn auto_prune(
     }))
 }
 
-/// [`tree_bytes`] of `path` without the subtree at `skip`.
+/// [`tree_bytes`] of `path` without the subtree at `skip`. A lower bound:
+/// an entry or listing that cannot be read counts as 0.
+/// holds-until: the doctor reports a state-directory size that is read as
+/// too low
 pub fn tree_bytes_except(path: &Path, skip: &Path) -> u64 {
     if path == skip {
         return 0;
@@ -1006,7 +1085,9 @@ mod tests {
             std::fs::write(root.join(name).join("artifacts/logs/a.log"), "1234").unwrap();
         }
         let judge = |run: &str, _: &Path| match run {
-            "old-live" => RunVerdict::Kept(KeepReason::NotEnded { state: "running" }),
+            "old-live" => RunVerdict::Kept(KeepReason::NotEnded {
+                state: State::Running,
+            }),
             _ => RunVerdict::Prunable {
                 dangling: Vec::new(),
             },
@@ -1087,26 +1168,20 @@ mod tests {
     }
 
     #[test]
-    fn sizes_use_binary_units_with_their_names() {
-        assert_eq!(human_bytes(999), "999 B");
-        assert_eq!(human_bytes(1024), "1.0 KiB");
-        assert_eq!(human_bytes(3 * 1024 * 1024 / 2), "1.5 MiB");
-        assert_eq!(human_bytes(5 * 1024 * 1024 * 1024), "5.0 GiB");
-    }
-
-    #[test]
     fn every_keep_reason_has_a_pathless_label() {
         let reasons = [
-            KeepReason::NotEnded { state: "running" },
+            KeepReason::NotEnded {
+                state: State::Running,
+            },
             KeepReason::WaitsOnPerson {
-                state: "interrupted",
+                state: State::Interrupted,
             },
             KeepReason::NotInLedger,
             KeepReason::NoReceipt,
             KeepReason::Pinned,
             KeepReason::PackageRun {
                 run: "r-1".into(),
-                detail: "pinned".into(),
+                why: Box::new(KeepReason::Pinned),
             },
             KeepReason::CheckoutBeneath {
                 at: Some(PathBuf::from("/s/runs/r/c")),
@@ -1155,7 +1230,7 @@ mod tests {
     fn a_held_lock_skips_the_prune() {
         let state = scratch("held");
         let ledger = ledger_in(&state);
-        let _held = crate::fsutil::LockFile::try_acquire(&state.join(LOCK_FILE))
+        let _held = crate::procs::LockFile::try_acquire(&state.join(LOCK_FILE))
             .unwrap()
             .expect("lock");
         let outcome = auto_prune(&ledger, &state, 30 * DAY, SystemTime::now(), &|_, _| {
@@ -1200,6 +1275,72 @@ mod tests {
         assert!(root.join("run-a").exists());
         assert!(!root.join("run-b").exists());
         assert_eq!(applied.kept.len(), 1);
+        std::fs::remove_dir_all(&root).ok(); // best-effort scratch cleanup
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_delete_after_the_rename_names_the_pruning_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("failed-delete");
+        let locked = root.join("run-a/locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("f"), "x").unwrap();
+        let judge = |_: &str, _: &Path| RunVerdict::Prunable {
+            dangling: Vec::new(),
+        };
+        let later = SystemTime::now() + 31 * DAY;
+        let plan = plan_run_prune(&root, 30 * DAY, later, &judge).unwrap();
+        // A directory that cannot be written keeps its file from unlinking.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let applied = apply_run_prune(&plan, &|_| None);
+        let doomed = root.join(".pruning-run-a");
+        if applied.failed.is_empty() {
+            // Running as root nothing is refused, so there is no failure to name.
+            assert!(!doomed.exists());
+            std::fs::remove_dir_all(&root).expect("remove scratch");
+            eprintln!("skipped: Running as root, nothing is refused");
+            return;
+        }
+        // The rename moved the locked directory: restore it where it is now.
+        let locked_now = if doomed.exists() {
+            doomed.join("locked")
+        } else {
+            locked.clone()
+        };
+        if locked_now.exists() {
+            std::fs::set_permissions(&locked_now, std::fs::Permissions::from_mode(0o755))
+                .expect("restore write permission where the directory is now");
+        }
+        assert_eq!(applied.failed.len(), 1, "{:?}", applied.failed);
+        assert_eq!(
+            applied.failed[0].left_on_disk,
+            Left::Renamed(doomed.clone())
+        );
+        assert!(doomed.exists() && !root.join("run-a").exists());
+        assert!(applied.removed.is_empty());
+        std::fs::remove_dir_all(&root).expect("no scratch directory is left behind");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn a_removed_run_carries_its_dangling_count() {
+        let root = scratch("dangling");
+        std::fs::create_dir_all(root.join("run-a")).unwrap();
+        let rows = vec![("log".to_string(), "/x".to_string())];
+        let judge = |_: &str, _: &Path| RunVerdict::Prunable {
+            dangling: rows.clone(),
+        };
+        let later = SystemTime::now() + 31 * DAY;
+        let plan = plan_run_prune(&root, 30 * DAY, later, &judge).unwrap();
+        let applied = apply_run_prune(&plan, &|_| None);
+        assert_eq!(
+            applied.removed,
+            vec![RemovedDir {
+                path: root.join("run-a"),
+                dangling: 1
+            }]
+        );
         std::fs::remove_dir_all(&root).ok(); // best-effort scratch cleanup
     }
 

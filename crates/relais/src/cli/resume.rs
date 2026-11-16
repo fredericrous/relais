@@ -408,8 +408,7 @@ pub(crate) fn retire_all_command(auto_prune: AutoPruneChoice) -> Result<CliOutco
     use relais::prune::{auto_prune_setting, AutoPruneSetting};
     let ledger = open_ledger()?;
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
-    let env_days = std::env::var_os(relais::prune::AUTO_PRUNE_DAYS_ENV)
-        .map(|raw| raw.to_string_lossy().into_owned());
+    let env_days = super::read_auto_prune_env();
     // The retirement first; the prune follows whatever it ended in.
     let retired = retire_all(&ledger, &state_dir);
     let pruned = match auto_prune {
@@ -468,7 +467,8 @@ impl AutoPruneChoice {
 /// The automatic prune of `retire --all`, its report on stdout and its
 /// failures on stderr.
 fn auto_prune_command(ledger: &Ledger, state_dir: &Path, days: u64) -> CliOutcome {
-    use relais::prune::{auto_prune, human_bytes, AutoPrune};
+    use relais::prune::{auto_prune, AutoPrune};
+    use relais::units::human_bytes;
     let age = std::time::Duration::from_secs(days.saturating_mul(86_400));
     let report = match auto_prune(
         ledger,
@@ -503,7 +503,7 @@ fn auto_prune_command(ledger: &Ledger, state_dir: &Path, days: u64) -> CliOutcom
         human_bytes(bytes)
     );
     for failure in &report.failed {
-        eprintln!("relais: prune: {failure}");
+        eprintln!("relais: prune: {failure}{}", failure.hint());
     }
     if report.failed.is_empty() {
         CliOutcome::Accepted
@@ -944,7 +944,8 @@ impl Prune {
 /// by a baseline-cache entry (which names its retry logs by path) is kept.
 /// The listing is stdout; what was done, and every hint, is stderr.
 pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, CliError> {
-    use relais::prune::{finish_interrupted, human_bytes, plan_run_prune, RunJudge, RunVerdict};
+    use relais::prune::{finish_interrupted, plan_run_prune, RunJudge, RunVerdict};
+    use relais::units::human_bytes;
     let ledger = open_ledger()?;
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
     // A deleting run shares the automatic prune's lock, held to the end.
@@ -1047,10 +1048,12 @@ pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, 
     }
     eprintln!("deleted {} run directories", applied.removed.len());
     failed.extend(applied.failed);
-    for (path, e) in &failed {
+    for dir in &failed {
         eprintln!(
-            "relais resume: {} could not be deleted: {e}",
-            path.display()
+            "relais resume: {} could not be deleted: {}{}",
+            dir.left_on_disk.path().display(),
+            dir.error,
+            dir.hint()
         );
     }
     Ok(if failed.is_empty() {

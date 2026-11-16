@@ -677,7 +677,8 @@ impl LockFile {
         Self::try_acquire_with(path, std::fs::OpenOptions::new())
     }
 
-    /// [`LockFile::try_acquire`], with the file created 0600 on Unix.
+    /// [`LockFile::try_acquire`], with the file created 0600 on Unix. A lock
+    /// file that already exists keeps its mode: only creation sets it.
     pub(crate) fn try_acquire_private(path: &Path) -> io::Result<Option<Self>> {
         #[cfg(unix)]
         let options = {
@@ -1470,7 +1471,7 @@ mod imp {
 
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER,
-        INVALID_HANDLE_VALUE, STILL_ACTIVE,
+        ERROR_LOCK_VIOLATION, INVALID_HANDLE_VALUE, STILL_ACTIVE,
     };
     use windows_sys::Win32::Storage::FileSystem::LockFile;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -1572,10 +1573,10 @@ mod imp {
             return Ok(true);
         }
         let error = io::Error::last_os_error();
-        // ERROR_LOCK_VIOLATION (33) is "somebody holds it", the Windows
+        // ERROR_LOCK_VIOLATION is "somebody holds it", the Windows
         // spelling of EWOULDBLOCK; anything else is a real failure.
         match error.raw_os_error() {
-            Some(33) => Ok(false),
+            Some(code) if code == ERROR_LOCK_VIOLATION as i32 => Ok(false),
             _ => Err(error),
         }
     }

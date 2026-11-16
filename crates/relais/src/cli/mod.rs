@@ -1007,6 +1007,14 @@ pub(crate) enum RouterSource {
     PluginAsk,
 }
 
+/// The raw text of `RELAIS_AUTO_PRUNE_DAYS`, `None` when unset. The one
+/// reader: a value that is not UTF-8 is kept lossily, so it parses as
+/// invalid rather than as unset.
+pub(crate) fn read_auto_prune_env() -> Option<String> {
+    std::env::var_os(relais::prune::AUTO_PRUNE_DAYS_ENV)
+        .map(|raw| raw.to_string_lossy().into_owned())
+}
+
 pub(crate) fn router_source(source: Option<RouterSource>) -> relais::router::Source {
     match source {
         Some(RouterSource::PluginAsk) => relais::router::Source::PluginAsk,

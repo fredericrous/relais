@@ -6441,6 +6441,37 @@ fn the_age_the_off_switches_and_the_flag_decide_the_prune() {
     assert!(stamp.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_prune_age_is_invalid_for_retire_and_doctor() {
+    use std::os::unix::ffi::OsStrExt;
+    let world = world_with_ledger("autoprunenonutf8");
+    let old = seed_run(&world, "old-one", "failed", 31 * DAY);
+    let bad = std::ffi::OsStr::from_bytes(b"\xff\xfe");
+
+    let retire = world
+        .command(&[])
+        .env("RELAIS_AUTO_PRUNE_DAYS", bad)
+        .args(["resume", "--retire", "--all"])
+        .output()
+        .expect("relais runs");
+    assert_eq!(retire.status.code(), Some(2), "{}", text(&retire.stderr));
+    assert!(text(&retire.stderr).contains("RELAIS_AUTO_PRUNE_DAYS"));
+    assert!(old.exists(), "an invalid age prunes nothing");
+
+    let doctor = world
+        .command(&[])
+        .env("RELAIS_AUTO_PRUNE_DAYS", bad)
+        .arg("doctor")
+        .output()
+        .expect("relais runs");
+    assert!(
+        text(&doctor.stdout).contains("prune age: invalid RELAIS_AUTO_PRUNE_DAYS"),
+        "{}",
+        text(&doctor.stdout)
+    );
+}
+
 #[test]
 fn an_invalid_prune_age_is_said_when_the_retirement_keeps_a_run() {
     let world = world_with_ledger("autoprunekept");
@@ -6577,26 +6608,57 @@ fn a_failed_deletion_is_reported_and_the_others_still_go() {
     let locked = stuck.join("logs");
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).expect("lock");
     let swept = world.relais(&["resume", "--retire", "--all"]);
-    std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700)).expect("unlock");
+    if swept.status.code() == Some(0) {
+        eprintln!("skipped: running as root, nothing is refused");
+        return;
+    }
+    if logs.exists() {
+        std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700)).expect("unlock");
+    }
     assert!(!fine.exists(), "{}", text(&swept.stdout));
     assert!(world.state.join("runs-prune.stamp").exists());
-    // Running as root, the deletion cannot fail and there is nothing to check.
-    if swept.status.code() != Some(0) {
-        assert_eq!(swept.status.code(), Some(1), "{}", text(&swept.stderr));
-        assert!(
-            text(&swept.stderr).contains("deleting a run")
-                && text(&swept.stderr).contains("old-stuck"),
-            "{}",
-            text(&swept.stderr)
-        );
+    assert_eq!(swept.status.code(), Some(1), "{}", text(&swept.stderr));
+    assert!(
+        text(&swept.stderr).contains("deleting a run")
+            && text(&swept.stderr).contains("old-stuck")
+            && text(&swept.stderr).contains(".pruning-old-stuck")
+            && text(&swept.stderr).contains("the next prune retries it"),
+        "{}",
+        text(&swept.stderr)
+    );
+}
+
+#[test]
+fn a_manual_write_whose_delete_fails_says_the_next_prune_retries_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let world = world_with_ledger("manualfail");
+    let stuck = seed_run(&world, "old-stuck", "failed", 40 * DAY);
+    let logs = world.state.join("runs/.pruning-old-stuck/logs");
+    std::fs::set_permissions(stuck.join("logs"), std::fs::Permissions::from_mode(0o500))
+        .expect("lock");
+    let applied = world.relais(&["resume", "--prune-runs", "0", "--write"]);
+    if applied.status.code() == Some(0) {
+        eprintln!("skipped: running as root, nothing is refused");
+        return;
     }
+    if logs.exists() {
+        std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700)).expect("unlock");
+    }
+    let stderr = text(&applied.stderr);
+    assert!(
+        stderr.contains(".pruning-old-stuck")
+            && stderr.contains("(the next prune retries it)")
+            && !stderr.contains("left as"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("finishes"), "{stderr}");
 }
 
 #[test]
 fn a_manual_write_refuses_while_the_prune_lock_is_held() {
     let world = world_with_ledger("manuallock");
     let old = seed_run(&world, "old-one", "failed", 31 * DAY);
-    let held = relais::fsutil::LockFile::try_acquire(&world.state.join("runs-prune.lock"))
+    let held = relais::procs::LockFile::try_acquire(&world.state.join("runs-prune.lock"))
         .expect("lock file")
         .expect("lock is free");
     let refused = world.relais(&["resume", "--prune-runs", "0", "--write"]);
@@ -6627,7 +6689,7 @@ fn the_tally_groups_runs_kept_for_one_reason_without_a_path() {
         .lines()
         .find(|l| l.starts_with("kept "))
         .unwrap_or_else(|| panic!("no tally: {out}"));
-    assert_eq!(tally, "kept 2: 2 checkout beneath");
+    assert_eq!(tally, "kept 2: 2 worktree");
 }
 
 #[test]
