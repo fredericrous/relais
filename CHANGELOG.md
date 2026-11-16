@@ -13,8 +13,9 @@ missing here.
   schemas `greenbelay-review-*-v1`, plan root `$GREENBELAY_PLAN_ROOT`, then
   `$AMONT_AGENT_PLAN_ROOT`), and the `amont_agent` integration key (its name
   until the census) looks for the `greenbelay` binary, in `relais doctor`
-  and in verification. Install greenbelay 6.0.0 with this release: no
-  `amont-agent` binary is installed any more.
+  and in verification (a missing one is named in the gap). Install this
+  release only once greenbelay 6.0.0 is on PATH: until then the `amont_agent`
+  integration finds no binary, and runs that require it are blocked.
 
 ## v0.66.2
 

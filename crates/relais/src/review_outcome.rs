@@ -23,20 +23,20 @@ use crate::router::outcome::TaskOutcome;
 
 /// The `schema` values an outcome row may carry.
 const ROW_SCHEMA: &str = "greenbelay-review-outcome-v1";
-/// Removed at the greenbelay data-name programme census.
+/// The amont-agent name; removed at the 2026-12-13 census.
 const OLD_ROW_SCHEMA: &str = "amont-agent-review-outcome-v1";
 /// The schema of a merge row: what `greenbelay plan-apply` wrote when it
 /// applied a review's patches (plan-review-edits-apply, Behaviour 3 and 5).
 const MERGE_SCHEMA: &str = "greenbelay-review-merge-v1";
-/// Removed at the greenbelay data-name programme census.
+/// The amont-agent name; removed at the 2026-12-13 census.
 const OLD_MERGE_SCHEMA: &str = "amont-agent-review-merge-v1";
 /// Where greenbelay keeps its ledger, under the Claude config directory.
 const LEDGER_PARTS: [&str; 3] = ["greenbelay", "plan-review", "outcomes.jsonl"];
-/// Removed at the greenbelay data-name programme census.
+/// The amont-agent name; removed at the 2026-12-13 census.
 const OLD_LEDGER_PARTS: [&str; 3] = ["amont-agent", "plan-review", "outcomes.jsonl"];
 /// The environment variable greenbelay resolves its plan root from.
 pub const PLAN_ROOT_ENV: &str = "GREENBELAY_PLAN_ROOT";
-/// Removed at the greenbelay data-name programme census.
+/// The amont-agent name; removed at the 2026-12-13 census.
 const OLD_PLAN_ROOT_ENV: &str = "AMONT_AGENT_PLAN_ROOT";
 /// How much of a body sha a plan file's `body-sha=` stamp carries.
 const STAMP_LEN: usize = 12;
@@ -109,7 +109,7 @@ struct PlanFeatures {
     #[serde(rename = "body_lines")]
     _body_lines: u64,
     // `seat_source` and `seat_classes` are written by greenbelay today,
-    // `counts` from greenbelay 4.3.0. Not read here; declared so
+    // `counts` from the panel-counts rows on. Not read here; declared so
     // `deny_unknown_fields` keeps the row.
     #[serde(rename = "seat_source", default)]
     _seat_source: Option<String>,
@@ -140,7 +140,7 @@ struct Row {
     remit: Vec<String>,
     findings: Vec<Finding>,
     // greenbelay's count of numbered findings it could not parse, and the
-    // plan's id (greenbelay 4.3.0); declared, not read.
+    // plan's id (from the plan-id rows on); declared, not read.
     #[serde(rename = "findings_unparsed", default)]
     _findings_unparsed: Option<u64>,
     #[serde(rename = "plan_id", default)]
@@ -1073,11 +1073,11 @@ mod tests {
         today["plan"]["seat_source"] = serde_json::json!("paths");
         today["plan"]["seat_classes"] = serde_json::json!(["cli", "lang:rust"]);
         serde_json::from_value::<Row>(today.clone()).expect("a current greenbelay row parses");
-        // 4.3.0: the plan id and the panel counts.
+        // The plan id and the panel counts.
         let mut next = today;
         next["plan_id"] = serde_json::json!("p-01JCZ0000000000000000000000");
         next["plan"]["counts"] = serde_json::json!({"repos": 3, "phases": 6});
-        serde_json::from_value::<Row>(next).expect("a 4.3.0 row parses");
+        serde_json::from_value::<Row>(next).expect("a row with the plan id and counts parses");
         // Findings in each shape greenbelay writes: from stdin, and parsed
         // from the reviewer's text (`n` and a severity only).
         let mut parsed = row("r", "rust", 1, "b1");

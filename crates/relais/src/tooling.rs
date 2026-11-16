@@ -72,9 +72,12 @@ pub fn probe_integrations(repo: &RepoPolicy) -> Vec<Blocker> {
     blockers
 }
 
-/// The config key is `amont_agent` (its name until the census); the binary
-/// on PATH is `greenbelay` (ADR-0071: no `amont-agent` copy is installed).
-fn default_bin(name: &str) -> &str {
+/// The binary an integration's config key names when the declaration gives
+/// no `bin`: the one place the key-to-binary mapping lives (doctor and
+/// verification ask it too). The key `amont_agent` keeps its name until the
+/// census; its binary is `greenbelay` (ADR-0071: no `amont-agent` copy is
+/// installed).
+pub(crate) fn default_bin(name: &str) -> &str {
     match name {
         "amont_agent" => "greenbelay",
         other => other,
@@ -261,7 +264,7 @@ mod tests {
     /// a hyphen, and a probe against the wrong spelling reports every
     /// machine as missing the integration.
     #[test]
-    fn the_agent_integrations_binary_name_is_hyphenated() {
+    fn the_agent_integration_key_names_the_greenbelay_binary() {
         assert_eq!(default_bin("amont_agent"), "greenbelay");
         assert_eq!(default_bin("aval"), "aval");
     }
