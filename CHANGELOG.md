@@ -8,6 +8,12 @@ missing here.
 
 ## Unreleased
 
+## v0.66.2
+
+### Changed
+
+- **The last follow-ups of the bounded state directory (#482).** `relais doctor` keeps a backup's file name whole after a Windows `\` separator as well as `/`; a failed run deletion's hint reads `(the next prune retries it once that error is fixed)` on both the manual `--prune-runs --write` path and the automatic prune; the doctor's width rule is documented as counting characters, so a wide (CJK) name can pass the budget (a display-width crate was considered and dropped); `PruneFailure` names the path it failed at.
+
 ## v0.66.1
 
 ### Changed
