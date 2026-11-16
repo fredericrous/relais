@@ -6596,7 +6596,7 @@ fn a_failed_deletion_is_reported_and_the_others_still_go() {
 fn a_manual_write_refuses_while_the_prune_lock_is_held() {
     let world = world_with_ledger("manuallock");
     let old = seed_run(&world, "old-one", "failed", 31 * DAY);
-    let held = relais::fsutil::LockFile::try_acquire(&world.state.join("runs-prune.lock"))
+    let held = relais::procs::LockFile::try_acquire(&world.state.join("runs-prune.lock"))
         .expect("lock file")
         .expect("lock is free");
     let refused = world.relais(&["resume", "--prune-runs", "0", "--write"]);
@@ -6627,7 +6627,7 @@ fn the_tally_groups_runs_kept_for_one_reason_without_a_path() {
         .lines()
         .find(|l| l.starts_with("kept "))
         .unwrap_or_else(|| panic!("no tally: {out}"));
-    assert_eq!(tally, "kept 2: 2 checkout beneath");
+    assert_eq!(tally, "kept 2: 2 worktree");
 }
 
 #[test]

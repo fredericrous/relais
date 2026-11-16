@@ -1787,7 +1787,7 @@ mod tests {
     fn a_held_rotation_lock_skips_the_rotation_and_the_append_lands() {
         let dir = crate::test_support::temp_dir("journal-rotate-held");
         let path = dir.join("hook_journal.jsonl");
-        let _held = crate::fsutil::LockFile::try_acquire(&dir.join("hook_journal.jsonl.lock"))
+        let _held = crate::procs::LockFile::try_acquire(&dir.join("hook_journal.jsonl.lock"))
             .expect("acquire")
             .expect("free");
         for i in 0..10 {

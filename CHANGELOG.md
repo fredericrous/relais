@@ -8,6 +8,10 @@ missing here.
 
 ## Unreleased
 
+### Changed
+
+- **The `--prune-runs` tally says `worktree`** for a run kept because a checkout remains beneath it, matching the per-run keep line (it said `checkout beneath`). `relais doctor`'s `purge` and `backups` lines are split so none passes 80 columns with the doctor's indent: a long statement is followed by an indented `next:` or hint line, and the `backups` header names the state directory on its own line.
+
 ## v0.66.0
 
 ### Changed

@@ -468,7 +468,8 @@ impl AutoPruneChoice {
 /// The automatic prune of `retire --all`, its report on stdout and its
 /// failures on stderr.
 fn auto_prune_command(ledger: &Ledger, state_dir: &Path, days: u64) -> CliOutcome {
-    use relais::prune::{auto_prune, human_bytes, AutoPrune};
+    use relais::prune::{auto_prune, AutoPrune};
+    use relais::units::human_bytes;
     let age = std::time::Duration::from_secs(days.saturating_mul(86_400));
     let report = match auto_prune(
         ledger,
@@ -944,7 +945,8 @@ impl Prune {
 /// by a baseline-cache entry (which names its retry logs by path) is kept.
 /// The listing is stdout; what was done, and every hint, is stderr.
 pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, CliError> {
-    use relais::prune::{finish_interrupted, human_bytes, plan_run_prune, RunJudge, RunVerdict};
+    use relais::prune::{finish_interrupted, plan_run_prune, RunJudge, RunVerdict};
+    use relais::units::human_bytes;
     let ledger = open_ledger()?;
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
     // A deleting run shares the automatic prune's lock, held to the end.

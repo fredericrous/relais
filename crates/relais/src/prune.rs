@@ -200,7 +200,7 @@ impl KeepReason {
             Self::NoReceipt => "no receipt",
             Self::Pinned => "pinned",
             Self::PackageRun { .. } => "package run",
-            Self::CheckoutBeneath { .. } => "checkout beneath",
+            Self::CheckoutBeneath { .. } => "worktree",
             Self::CitedByCache { .. } => "cited by the cache",
             Self::Unreadable { .. } => "unreadable",
         }
@@ -237,22 +237,6 @@ impl std::fmt::Display for KeepReason {
             Self::Unreadable { what, error } => write!(f, "{what} unreadable: {error}"),
         }
     }
-}
-
-/// Binary units, one decimal above bytes: `330.0 MiB`. The one size
-/// format of the prune output and `relais doctor`.
-pub fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut scaled = bytes as f64;
-    let mut unit = 0;
-    while scaled >= 1024.0 && unit < UNITS.len() - 1 {
-        scaled /= 1024.0;
-        unit += 1;
-    }
-    format!("{scaled:.1} {}", UNITS[unit])
 }
 
 /// Why a run directory may or may not be pruned, as the ledger has it.
@@ -831,9 +815,9 @@ fn stamp_is_fresh(stamp: &Path, now: SystemTime) -> bool {
 }
 
 /// Take `runs-prune.lock` without waiting: `None` when another prune holds it.
-pub fn try_lock_prune(state_dir: &Path) -> Result<Option<crate::fsutil::LockFile>, PruneFailure> {
+pub fn try_lock_prune(state_dir: &Path) -> Result<Option<crate::procs::LockFile>, PruneFailure> {
     let path = state_dir.join(LOCK_FILE);
-    crate::fsutil::LockFile::try_acquire(&path)
+    crate::procs::LockFile::try_acquire(&path)
         .map_err(|error| PruneFailure::new(PruneStep::Lock, &path, error))
 }
 
@@ -1087,14 +1071,6 @@ mod tests {
     }
 
     #[test]
-    fn sizes_use_binary_units_with_their_names() {
-        assert_eq!(human_bytes(999), "999 B");
-        assert_eq!(human_bytes(1024), "1.0 KiB");
-        assert_eq!(human_bytes(3 * 1024 * 1024 / 2), "1.5 MiB");
-        assert_eq!(human_bytes(5 * 1024 * 1024 * 1024), "5.0 GiB");
-    }
-
-    #[test]
     fn every_keep_reason_has_a_pathless_label() {
         let reasons = [
             KeepReason::NotEnded { state: "running" },
@@ -1155,7 +1131,7 @@ mod tests {
     fn a_held_lock_skips_the_prune() {
         let state = scratch("held");
         let ledger = ledger_in(&state);
-        let _held = crate::fsutil::LockFile::try_acquire(&state.join(LOCK_FILE))
+        let _held = crate::procs::LockFile::try_acquire(&state.join(LOCK_FILE))
             .unwrap()
             .expect("lock");
         let outcome = auto_prune(&ledger, &state, 30 * DAY, SystemTime::now(), &|_, _| {

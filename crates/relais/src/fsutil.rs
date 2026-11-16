@@ -1,13 +1,12 @@
 //! File-system helpers. The only crate module this one reaches is `procs`:
 //! the kernel-held [`LockFile`] is implemented there, because `procs` is
 //! the one module that names a platform API (`flock` on Unix, `LockFile`
-//! over one byte past end-of-file on Windows), and is re-exported here
-//! for the callers that think of it as a file helper.
+//! over one byte past end-of-file on Windows).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub use crate::procs::LockFile;
+use crate::procs::LockFile;
 
 /// Replace a file's contents so that a failed write leaves the previous
 /// contents intact: a temporary file IN THE SAME DIRECTORY (rename is
@@ -171,7 +170,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok(); // best-effort scratch cleanup
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_held_rotation_lock_skips_the_rotation() {
         let dir = crate::test_support::temp_dir("rotate-held");

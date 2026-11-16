@@ -59,6 +59,7 @@ pub mod task_labels;
 pub mod test_support;
 pub mod tooling;
 pub mod trust;
+pub mod units;
 pub mod verify;
 pub mod workspace;
 

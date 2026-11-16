@@ -4,6 +4,7 @@
 
 use super::{Finding, Level};
 use crate::prune::{self, AutoPruneSetting, SettingSource};
+use crate::units::human_bytes;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -102,8 +103,7 @@ pub fn stamp_state(state_dir: &Path, now: SystemTime) -> StampState {
     }
 }
 
-const NEXT_STEP: &str =
-    "next: run `relais resume --prune-runs --write`, or read resume.log for `relais: prune` errors";
+const NEXT_STEP: &str = "next: run `relais resume --prune-runs --write`\n  or read resume.log for `relais: prune` errors";
 
 pub fn purge_finding(facts: &PurgeFacts) -> Finding {
     let mut lines = Vec::new();
@@ -113,19 +113,19 @@ pub fn purge_finding(facts: &PurgeFacts) -> Finding {
         RunsHealth::NotChecked => {}
         RunsHealth::Unmeasured { operation, error } => {
             level = Level::Warn;
-            lines.push(format!(
-                "the purge could not be measured: {operation} failed: {error}"
-            ));
+            lines.push("the purge could not be measured".to_string());
+            lines.push(format!("  {operation} failed: {error}"));
         }
         RunsHealth::Measured(counts) => {
             if counts.overdue_runs > 0 {
                 level = Level::Warn;
                 needs_next_step = true;
                 lines.push(format!(
-                    "{} ended runs ({}) are older than the prune age plus 3 days: the automatic prune is not removing them",
+                    "{} ended runs ({}) are past the prune age plus 3 days",
                     counts.overdue_runs,
-                    prune::human_bytes(counts.overdue_bytes)
+                    human_bytes(counts.overdue_bytes)
                 ));
+                lines.push("  the automatic prune is not removing them".to_string());
             }
             if counts.old_ended_runs > 0 && facts.stamp.is_stale() {
                 level = Level::Warn;
@@ -140,16 +140,20 @@ pub fn purge_finding(facts: &PurgeFacts) -> Finding {
                     }
                 };
                 lines.push(format!(
-                    "{} ended runs are old enough to prune and {why}: the automatic prune is not running",
+                    "{} ended runs are old enough to prune",
                     counts.old_ended_runs
                 ));
+                lines.push("  the automatic prune is not running".to_string());
+                lines.push(format!("  {why}"));
             }
             if counts.receiptless_runs > 0 {
                 lines.push(format!(
-                    "{} ended accepted runs ({}) are older than the prune age plus 3 days and have no receipt in the ledger: they are never pruned (`relais resume --prune-runs` lists them)",
+                    "{} ended accepted runs ({}) lack a receipt",
                     counts.receiptless_runs,
-                    prune::human_bytes(counts.receiptless_bytes)
+                    human_bytes(counts.receiptless_bytes)
                 ));
+                lines.push("  past the prune age, so never pruned".to_string());
+                lines.push("  `relais resume --prune-runs` lists them".to_string());
             }
         }
     }
@@ -166,7 +170,7 @@ pub fn purge_finding(facts: &PurgeFacts) -> Finding {
         AutoPruneSetting::Invalid(text) => {
             level = Level::Warn;
             format!(
-                "prune age: invalid {}={text:?}; the prune is skipped until it is a number of days",
+                "prune age: invalid {}={text:?}\n  the prune is skipped until it is a number of days",
                 prune::AUTO_PRUNE_DAYS_ENV
             )
         }
@@ -177,14 +181,14 @@ pub fn purge_finding(facts: &PurgeFacts) -> Finding {
         }
         StampState::Missing => format!("{} is missing: the prune has not run", prune::STAMP_FILE),
         StampState::InTheFuture(ahead) => format!(
-            "{} is dated {} in the future: the clock was set back",
+            "{} is dated {} in the future\n  the clock was set back",
             prune::STAMP_FILE,
             human_age(ahead)
         ),
     });
     lines.push(format!(
-        "state directory: {} (live verify checkouts under verify/ left out)",
-        prune::human_bytes(facts.state_bytes)
+        "state directory: {}\n  live verify checkouts under verify/ left out",
+        human_bytes(facts.state_bytes)
     ));
     Finding {
         component: "purge",
@@ -252,11 +256,11 @@ pub fn backups_finding(state_dir: &Path, backups: &[LedgerBackup]) -> Option<Fin
     }
     let total: u64 = backups.iter().map(|backup| backup.bytes).sum();
     let mut lines = vec![format!(
-        "{} ledger backup files in {}, {} in all; relais deletes none",
+        "{} ledger backup files, {} in all; relais deletes none",
         backups.len(),
-        state_dir.display(),
-        prune::human_bytes(total)
+        human_bytes(total)
     )];
+    lines.push(format!("in {}", state_dir.display()));
     let shown = &backups[..backups.len().min(MAX_BACKUP_LINES)];
     for backup in shown {
         let label = if backup.written_by_relais() {
@@ -267,7 +271,7 @@ pub fn backups_finding(state_dir: &Path, backups: &[LedgerBackup]) -> Option<Fin
         let name = backup.path.strip_prefix(state_dir).unwrap_or(&backup.path);
         lines.push(format!(
             "{:>9}  {:>4}  {label}  {}",
-            prune::human_bytes(backup.bytes),
+            human_bytes(backup.bytes),
             format!("{}d", backup.age.as_secs() / DAY.as_secs()),
             name.display()
         ));
@@ -277,7 +281,7 @@ pub fn backups_finding(state_dir: &Path, backups: &[LedgerBackup]) -> Option<Fin
         lines.push(format!(
             "... and {} more ({})",
             backups.len() - shown.len(),
-            prune::human_bytes(rest)
+            human_bytes(rest)
         ));
     }
     for backup in shown.iter().filter(|backup| backup.written_by_relais()) {
@@ -404,11 +408,9 @@ mod tests {
             assert_eq!(finding.level, Level::Warn, "{stamp:?}");
             assert!(finding.detail.contains("4 ended runs are old enough"));
             let wording = match stamp {
-                StampState::Missing => "and runs-prune.stamp is missing:",
-                StampState::InTheFuture(_) => "and runs-prune.stamp is dated in the future:",
-                StampState::Written(_) => {
-                    "and runs-prune.stamp has not been written for over 3 days:"
-                }
+                StampState::Missing => "runs-prune.stamp is missing",
+                StampState::InTheFuture(_) => "runs-prune.stamp is dated in the future",
+                StampState::Written(_) => "runs-prune.stamp has not been written for over 3 days",
             };
             assert!(finding.detail.contains(wording), "{}", finding.detail);
             assert!(finding.detail.contains("next: run"));
@@ -477,15 +479,53 @@ mod tests {
         let backups = ledger_backups(&dir, SystemTime::now());
         let finding = backups_finding(&dir, &backups).unwrap();
         let lines: Vec<&str> = finding.detail.lines().collect();
-        assert!(lines[1].contains(NOT_RELAIS) && lines[1].ends_with("ledger.sqlite.hand-made"));
-        assert!(lines[2].contains(SAFE_TO_DELETE) && lines[2].ends_with("ledger.sqlite.bak-v27"));
+        assert!(lines[2].contains(NOT_RELAIS) && lines[2].ends_with("ledger.sqlite.hand-made"));
+        assert!(lines[3].contains(SAFE_TO_DELETE) && lines[3].ends_with("ledger.sqlite.bak-v27"));
         assert_eq!(
-            lines[3],
+            lines[4],
             format!("rm {}", dir.join("ledger.sqlite.bak-v27").display())
         );
         assert!(!finding.detail.contains('\u{1b}'));
         assert!(dir.join("ledger.sqlite.bak-v27").exists());
         assert!(dir.join("ledger.sqlite.hand-made").exists());
+    }
+
+    #[test]
+    fn findings_fit_80_columns_after_the_indent_in_a_long_state_directory() {
+        const INDENT: usize = 16;
+        let long = format!("{}/{}", scratch("width").display(), "deep-dir-".repeat(12));
+        let dir = PathBuf::from(&long);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ledger.sqlite.bak-v27"), vec![0; 3000]).unwrap();
+        std::fs::write(dir.join("ledger.sqlite.hand-made"), vec![0; 9000]).unwrap();
+        let backups = backups_finding(&dir, &ledger_backups(&dir, SystemTime::now())).unwrap();
+        let purge = purge_finding(&PurgeFacts {
+            stamp: StampState::Written(4 * DAY),
+            runs: counts(RunCounts {
+                old_ended_runs: 9_999,
+                overdue_runs: 9_999,
+                overdue_bytes: 900 * 1024 * 1024 * 1024,
+                receiptless_runs: 9_999,
+                receiptless_bytes: 900 * 1024 * 1024 * 1024,
+            }),
+            ..facts()
+        });
+        for line in backups.detail.lines().chain(purge.detail.lines()) {
+            if line.starts_with("rm ") || line.starts_with("in ") {
+                continue;
+            }
+            // A backup entry line is held to 80 columns without the indent
+            // (the contract `backups_cap_at_ten_lines` states); every other
+            // line to 80 with it.
+            let is_entry = line.contains(SAFE_TO_DELETE) || line.contains(NOT_RELAIS);
+            let columns = if is_entry {
+                line.len()
+            } else {
+                INDENT + line.len()
+            };
+            assert!(columns <= 80, "{columns} columns: {line}");
+        }
+        assert!(backups.detail.lines().any(|l| l == format!("in {long}")));
     }
 
     #[test]
@@ -497,7 +537,8 @@ mod tests {
         std::fs::write(dir.join("ledger.sqlite.bak-v30"), vec![0; 50]).unwrap();
         let finding = backups_finding(&dir, &ledger_backups(&dir, SystemTime::now())).unwrap();
         let lines: Vec<&str> = finding.detail.lines().collect();
-        assert!(lines[0].contains(&dir.display().to_string()));
+        assert!(lines[0].len() < 64, "{}", lines[0]);
+        assert_eq!(lines[1], format!("in {}", dir.display()));
         assert_eq!(
             lines
                 .iter()
@@ -505,8 +546,8 @@ mod tests {
                 .count(),
             1 + lines.iter().filter(|l| l.starts_with("rm ")).count()
         );
-        assert!(lines[11].starts_with("... and 4 more ("));
-        for line in &lines[1..11] {
+        assert!(lines[12].starts_with("... and 4 more ("));
+        for line in &lines[2..12] {
             assert!(line.len() < 80, "{line}");
         }
     }
