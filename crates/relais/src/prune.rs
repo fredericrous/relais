@@ -376,9 +376,12 @@ pub struct FailedDir {
 /// What a failed deletion left on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Left {
-    /// The path as it was: the rename to `.pruning-<run>` had not happened.
+    /// The path a prune step failed on, as it was: the rename to
+    /// `.pruning-<run>` had not happened. The lock, stamp and reading-runs
+    /// steps are always `Original`.
     Original(PathBuf),
-    /// A `.pruning-<run>` directory, which the next prune retries.
+    /// The path a prune step failed on after it was renamed to
+    /// `.pruning-<run>`, which the next prune retries.
     Renamed(PathBuf),
 }
 
@@ -395,7 +398,7 @@ impl Left {
     pub fn hint(&self) -> &'static str {
         match self {
             Self::Original(_) => "",
-            Self::Renamed(_) => " (the next prune retries it)",
+            Self::Renamed(_) => " (the next prune retries it once that error is fixed)",
         }
     }
 }
@@ -830,7 +833,8 @@ impl PruneStep {
 #[derive(Debug)]
 pub struct PruneFailure {
     pub step: PruneStep,
-    pub path: Left,
+    /// Where the failed step left the path it worked on.
+    pub at: Left,
     pub error: io::Error,
 }
 
@@ -838,22 +842,22 @@ impl PruneFailure {
     pub fn new(step: PruneStep, path: &Path, error: io::Error) -> Self {
         Self {
             step,
-            path: Left::Original(path.to_path_buf()),
+            at: Left::Original(path.to_path_buf()),
             error,
         }
     }
 
-    pub fn left(step: PruneStep, left: Left, error: io::Error) -> Self {
+    pub fn with_left(step: PruneStep, left: Left, error: io::Error) -> Self {
         Self {
             step,
-            path: left,
+            at: left,
             error,
         }
     }
 
     /// See [`Left::hint`].
     pub fn hint(&self) -> &'static str {
-        self.path.hint()
+        self.at.hint()
     }
 }
 
@@ -863,7 +867,7 @@ impl std::fmt::Display for PruneFailure {
             f,
             "{} {}: {}",
             self.step.describe(),
-            self.path.path().display(),
+            self.at.path().display(),
             self.error
         )
     }
@@ -938,7 +942,7 @@ pub fn auto_prune(
     let mut failed: Vec<PruneFailure> = finish_interrupted(&runs)
         .into_iter()
         .map(|failed| {
-            PruneFailure::left(
+            PruneFailure::with_left(
                 PruneStep::FinishingLeftover,
                 failed.left_on_disk,
                 failed.error,
@@ -950,7 +954,7 @@ pub fn auto_prune(
         .map_err(|error| PruneFailure::new(PruneStep::ReadingRuns, &runs, error))?;
     let applied = apply(&judge, &plan);
     failed.extend(applied.failed.into_iter().map(|failed| {
-        PruneFailure::left(PruneStep::DeletingRun, failed.left_on_disk, failed.error)
+        PruneFailure::with_left(PruneStep::DeletingRun, failed.left_on_disk, failed.error)
     }));
     let removed = plan
         .iter()

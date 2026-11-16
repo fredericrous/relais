@@ -6622,7 +6622,7 @@ fn a_failed_deletion_is_reported_and_the_others_still_go() {
         text(&swept.stderr).contains("deleting a run")
             && text(&swept.stderr).contains("old-stuck")
             && text(&swept.stderr).contains(".pruning-old-stuck")
-            && text(&swept.stderr).contains("the next prune retries it"),
+            && text(&swept.stderr).contains("the next prune retries it once that error is fixed"),
         "{}",
         text(&swept.stderr)
     );
@@ -6647,7 +6647,7 @@ fn a_manual_write_whose_delete_fails_says_the_next_prune_retries_it() {
     let stderr = text(&applied.stderr);
     assert!(
         stderr.contains(".pruning-old-stuck")
-            && stderr.contains("(the next prune retries it)")
+            && stderr.contains("(the next prune retries it once that error is fixed)")
             && !stderr.contains("left as"),
         "{stderr}"
     );

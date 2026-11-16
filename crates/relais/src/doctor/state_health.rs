@@ -23,36 +23,50 @@ pub(super) const LINE_BUDGET: usize = super::DETAIL_COLUMNS;
 const TEXT_BUDGET: usize = 50;
 const ELLIPSIS: &str = "...";
 
+/// The width of `text` in the doctor's line budget. A character counts as one
+/// column, so a name with wide (CJK) characters, which a terminal draws two
+/// columns wide, can pass the budget.
+pub(super) fn columns(text: &str) -> usize {
+    text.chars().count()
+}
+
+/// The first `max` characters of `text`.
+fn take_columns(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+/// The last `max` characters of `text`.
+fn take_columns_from_end(text: &str, max: usize) -> String {
+    let skipped = columns(text).saturating_sub(max);
+    text.chars().skip(skipped).collect()
+}
+
 /// `text` cut to `max` characters with an ellipsis at the end.
 fn cut_end(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
+    if columns(text) <= max {
         return text.to_string();
     }
-    let head: String = text
-        .chars()
-        .take(max.saturating_sub(ELLIPSIS.len()))
-        .collect();
+    let head = take_columns(text, max.saturating_sub(ELLIPSIS.len()));
     format!("{head}{ELLIPSIS}")
 }
 
-/// `name` cut to `max` characters with an ellipsis in the middle, so the
-/// extension stays.
+/// `name` cut to `max` characters with an ellipsis in the middle, so the file
+/// name and the extension stay.
 fn cut_middle(name: &str, max: usize) -> String {
-    let length = name.chars().count();
-    if length <= max {
+    if columns(name) <= max {
         return name.to_string();
     }
-    let extension = name.rfind('.').map_or(0, |dot| name[dot..].chars().count());
+    let extension = name.rfind('.').map_or(0, |dot| columns(&name[dot..]));
     let file_name_len = name
-        .rfind('/')
-        .map_or(0, |slash| name[slash..].chars().count());
+        .rfind(['/', '\\'])
+        .map_or(0, |separator| columns(&name[separator..]));
     let tail = extension
         .min(max / 2)
         .max(max / 4)
         .max(file_name_len.min(max / 2));
     let head = max.saturating_sub(ELLIPSIS.len() + tail);
-    let start: String = name.chars().take(head).collect();
-    let end: String = name.chars().skip(length - tail).collect();
+    let start = take_columns(name, head);
+    let end = take_columns_from_end(name, tail);
     format!("{start}{ELLIPSIS}{end}")
 }
 
@@ -153,7 +167,7 @@ pub fn purge_finding(facts: &PurgeFacts) -> Finding {
             level = Level::Warn;
             lines.push("the purge could not be measured".to_string());
             let one_line = format!("  {operation} failed: {error}");
-            if one_line.chars().count() <= LINE_BUDGET {
+            if columns(&one_line) <= LINE_BUDGET {
                 lines.push(one_line);
             } else {
                 lines.push(format!("  {} failed:", cut_middle(operation, TEXT_BUDGET)));
@@ -214,7 +228,7 @@ pub fn purge_finding(facts: &PurgeFacts) -> Finding {
         AutoPruneSetting::Invalid(text) => {
             level = Level::Warn;
             let one_line = format!("prune age: invalid {}={text:?}", prune::AUTO_PRUNE_DAYS_ENV);
-            let shown = if one_line.chars().count() <= LINE_BUDGET {
+            let shown = if columns(&one_line) <= LINE_BUDGET {
                 one_line
             } else {
                 format!(
@@ -504,7 +518,7 @@ mod tests {
             finding.detail
         );
         for line in finding.detail.lines() {
-            assert!(line.chars().count() <= LINE_BUDGET, "{line}");
+            assert!(columns(line) <= LINE_BUDGET, "{line}");
         }
     }
 
@@ -608,8 +622,8 @@ mod tests {
             if line.starts_with("rm ") || line.starts_with("in ") {
                 continue;
             }
-            let columns = line.chars().count();
-            assert!(columns <= LINE_BUDGET, "{columns} columns: {line}");
+            let used = columns(line);
+            assert!(used <= LINE_BUDGET, "{used} columns: {line}");
         }
         assert!(!purge.detail.contains(&wide) && !unmeasured.detail.contains(&wide));
         assert!(backups.detail.lines().any(|l| l == format!("in {long}")));
@@ -619,16 +633,27 @@ mod tests {
     fn a_long_name_is_cut_in_its_middle_and_keeps_its_extension() {
         let name = format!("ledger.{}.sqlite", "x".repeat(150));
         let cut = cut_middle(&name, 30);
-        assert_eq!(cut.chars().count(), 30, "{cut}");
+        assert_eq!(columns(&cut), 30, "{cut}");
         assert!(cut.starts_with("ledger.") && cut.contains("...") && cut.ends_with(".sqlite"));
         assert_eq!(cut_middle("ledger.copy1", 30), "ledger.copy1");
+    }
+
+    #[test]
+    fn a_long_windows_path_keeps_its_file_name_whole() {
+        let path = format!("C:\\Users\\x\\{}\\ledger.sqlite", "d".repeat(80));
+        let cut = cut_middle(&path, 30);
+        assert!(
+            cut.contains("...") && cut.ends_with("ledger.sqlite"),
+            "{cut}"
+        );
+        assert!(columns(&cut) <= 30, "{cut}");
     }
 
     #[test]
     fn an_overlong_text_is_cut_to_the_budget_with_an_ellipsis() {
         let wide = "z".repeat(200);
         let cut = cut_end(&wide, TEXT_BUDGET);
-        assert_eq!(cut.chars().count(), TEXT_BUDGET);
+        assert_eq!(columns(&cut), TEXT_BUDGET);
         assert!(cut.ends_with("..."));
         assert_eq!(cut_end("soon", TEXT_BUDGET), "soon");
     }
@@ -643,7 +668,7 @@ mod tests {
             ..facts()
         });
         for line in controlled.detail.lines() {
-            assert!(line.chars().count() <= LINE_BUDGET, "{line}");
+            assert!(columns(line) <= LINE_BUDGET, "{line}");
         }
         let invalid = purge_finding(&PurgeFacts {
             setting: AutoPruneSetting::Invalid(wide.clone()),
@@ -658,7 +683,7 @@ mod tests {
             ..facts()
         });
         for line in invalid.detail.lines().chain(unmeasured.detail.lines()) {
-            assert!(line.chars().count() <= LINE_BUDGET, "{line}");
+            assert!(columns(line) <= LINE_BUDGET, "{line}");
         }
         assert!(invalid.detail.contains("..."));
         assert!(unmeasured.detail.contains("..."));
