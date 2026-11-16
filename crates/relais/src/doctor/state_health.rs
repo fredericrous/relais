@@ -15,8 +15,40 @@ pub const PURGE_GRACE: Duration = Duration::from_secs(3 * 86_400);
 const DAY: Duration = Duration::from_secs(86_400);
 const MAX_BACKUP_LINES: usize = 10;
 const RELAIS_BACKUP_NAMES: [&str; 2] = ["ledger.sqlite.bak-v27", "ledger.sqlite.bak-v30"];
-const SAFE_TO_DELETE: &str = "safe once you will not roll back";
-const NOT_RELAIS: &str = "not written by relais";
+const SAFE_TO_DELETE: &str = "safe to delete later";
+const NOT_RELAIS: &str = "not from relais";
+/// The doctor indents a finding by 16 columns; a line fits 80 with it.
+const LINE_BUDGET: usize = 80 - 16;
+/// How much of an operator-supplied or system text one line keeps.
+const TEXT_BUDGET: usize = 50;
+const ELLIPSIS: &str = "...";
+
+/// `text` cut to `max` characters with an ellipsis at the end.
+fn cut_end(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let head: String = text
+        .chars()
+        .take(max.saturating_sub(ELLIPSIS.len()))
+        .collect();
+    format!("{head}{ELLIPSIS}")
+}
+
+/// `name` cut to `max` characters with an ellipsis in the middle, so the
+/// extension stays.
+fn cut_middle(name: &str, max: usize) -> String {
+    let length = name.chars().count();
+    if length <= max {
+        return name.to_string();
+    }
+    let extension = name.rfind('.').map_or(0, |dot| name[dot..].chars().count());
+    let tail = extension.min(max / 2).max(max / 4);
+    let head = max.saturating_sub(ELLIPSIS.len() + tail);
+    let start: String = name.chars().take(head).collect();
+    let end: String = name.chars().skip(length - tail).collect();
+    format!("{start}{ELLIPSIS}{end}")
+}
 
 /// How `runs-prune.stamp` stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,7 +146,13 @@ pub fn purge_finding(facts: &PurgeFacts) -> Finding {
         RunsHealth::Unmeasured { operation, error } => {
             level = Level::Warn;
             lines.push("the purge could not be measured".to_string());
-            lines.push(format!("  {operation} failed: {error}"));
+            let one_line = format!("  {operation} failed: {error}");
+            if one_line.chars().count() <= LINE_BUDGET {
+                lines.push(one_line);
+            } else {
+                lines.push(format!("  {} failed:", cut_end(operation, TEXT_BUDGET)));
+                lines.push(format!("  {}", cut_end(error, TEXT_BUDGET)));
+            }
         }
         RunsHealth::Measured(counts) => {
             if counts.overdue_runs > 0 {
@@ -169,10 +207,17 @@ pub fn purge_finding(facts: &PurgeFacts) -> Finding {
         AutoPruneSetting::Off => format!("prune age: off ({}=0)", prune::AUTO_PRUNE_DAYS_ENV),
         AutoPruneSetting::Invalid(text) => {
             level = Level::Warn;
-            format!(
-                "prune age: invalid {}={text:?}\n  the prune is skipped until it is a number of days",
-                prune::AUTO_PRUNE_DAYS_ENV
-            )
+            let one_line = format!("prune age: invalid {}={text:?}", prune::AUTO_PRUNE_DAYS_ENV);
+            let shown = if one_line.chars().count() <= LINE_BUDGET {
+                one_line
+            } else {
+                format!(
+                    "prune age: invalid {}\n  value: {:?}",
+                    prune::AUTO_PRUNE_DAYS_ENV,
+                    cut_end(text, TEXT_BUDGET - 8)
+                )
+            };
+            format!("{shown}\n  the prune is skipped until it is a number of days")
         }
     });
     lines.push(match facts.stamp {
@@ -269,11 +314,12 @@ pub fn backups_finding(state_dir: &Path, backups: &[LedgerBackup]) -> Option<Fin
             NOT_RELAIS
         };
         let name = backup.path.strip_prefix(state_dir).unwrap_or(&backup.path);
+        let size = human_bytes(backup.bytes);
+        let age = format!("{}d", backup.age.as_secs() / DAY.as_secs());
+        let name_budget = LINE_BUDGET.saturating_sub(9 + 2 + 4 + 2 + label.len() + 2);
         lines.push(format!(
-            "{:>9}  {:>4}  {label}  {}",
-            human_bytes(backup.bytes),
-            format!("{}d", backup.age.as_secs() / DAY.as_secs()),
-            name.display()
+            "{size:>9}  {age:>4}  {label}  {}",
+            cut_middle(&name.display().to_string(), name_budget)
         ));
     }
     if backups.len() > shown.len() {
@@ -305,6 +351,8 @@ fn human_age(age: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const INDENT_FOR_TEST: usize = 16;
 
     fn scratch(tag: &str) -> PathBuf {
         let dir =
@@ -492,14 +540,20 @@ mod tests {
 
     #[test]
     fn findings_fit_80_columns_after_the_indent_in_a_long_state_directory() {
-        const INDENT: usize = 16;
+        const INDENT: usize = INDENT_FOR_TEST;
         let long = format!("{}/{}", scratch("width").display(), "deep-dir-".repeat(12));
         let dir = PathBuf::from(&long);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("ledger.sqlite.bak-v27"), vec![0; 3000]).unwrap();
         std::fs::write(dir.join("ledger.sqlite.hand-made"), vec![0; 9000]).unwrap();
+        let overlong = format!("ledger.{}.sqlite", "x".repeat(150));
+        std::fs::write(dir.join(&overlong), vec![0; 100]).unwrap();
         let backups = backups_finding(&dir, &ledger_backups(&dir, SystemTime::now())).unwrap();
+        assert!(backups.detail.contains("...") && backups.detail.contains(".sqlite\n"));
+        let wide = "z".repeat(200);
         let purge = purge_finding(&PurgeFacts {
+            setting: AutoPruneSetting::Invalid(wide.clone()),
+            source: SettingSource::Environment,
             stamp: StampState::Written(4 * DAY),
             runs: counts(RunCounts {
                 old_ended_runs: 9_999,
@@ -510,22 +564,72 @@ mod tests {
             }),
             ..facts()
         });
-        for line in backups.detail.lines().chain(purge.detail.lines()) {
+        let future = purge_finding(&PurgeFacts {
+            stamp: StampState::InTheFuture(900 * DAY),
+            ..facts()
+        });
+        let unmeasured = purge_finding(&PurgeFacts {
+            runs: RunsHealth::Unmeasured {
+                operation: format!("opening the ledger {long}/ledger.sqlite"),
+                error: wide.clone(),
+            },
+            ..facts()
+        });
+        for line in backups
+            .detail
+            .lines()
+            .chain(purge.detail.lines())
+            .chain(future.detail.lines())
+            .chain(unmeasured.detail.lines())
+        {
             if line.starts_with("rm ") || line.starts_with("in ") {
                 continue;
             }
-            // A backup entry line is held to 80 columns without the indent
-            // (the contract `backups_cap_at_ten_lines` states); every other
-            // line to 80 with it.
-            let is_entry = line.contains(SAFE_TO_DELETE) || line.contains(NOT_RELAIS);
-            let columns = if is_entry {
-                line.len()
-            } else {
-                INDENT + line.len()
-            };
+            let columns = INDENT + line.chars().count();
             assert!(columns <= 80, "{columns} columns: {line}");
         }
+        assert!(!purge.detail.contains(&wide) && !unmeasured.detail.contains(&wide));
         assert!(backups.detail.lines().any(|l| l == format!("in {long}")));
+    }
+
+    #[test]
+    fn a_long_name_is_cut_in_its_middle_and_keeps_its_extension() {
+        let name = format!("ledger.{}.sqlite", "x".repeat(150));
+        let cut = cut_middle(&name, 30);
+        assert_eq!(cut.chars().count(), 30, "{cut}");
+        assert!(cut.starts_with("ledger.") && cut.contains("...") && cut.ends_with(".sqlite"));
+        assert_eq!(cut_middle("ledger.copy1", 30), "ledger.copy1");
+    }
+
+    #[test]
+    fn an_overlong_text_is_cut_to_the_budget_with_an_ellipsis() {
+        let wide = "z".repeat(200);
+        let cut = cut_end(&wide, TEXT_BUDGET);
+        assert_eq!(cut.chars().count(), TEXT_BUDGET);
+        assert!(cut.ends_with("..."));
+        assert_eq!(cut_end("soon", TEXT_BUDGET), "soon");
+    }
+
+    #[test]
+    fn invalid_age_and_measurement_error_lines_fit_80_columns_with_the_indent() {
+        let wide = "q".repeat(200);
+        let invalid = purge_finding(&PurgeFacts {
+            setting: AutoPruneSetting::Invalid(wide.clone()),
+            source: SettingSource::Environment,
+            ..facts()
+        });
+        let unmeasured = purge_finding(&PurgeFacts {
+            runs: RunsHealth::Unmeasured {
+                operation: "reading runs/".into(),
+                error: wide,
+            },
+            ..facts()
+        });
+        for line in invalid.detail.lines().chain(unmeasured.detail.lines()) {
+            assert!(16 + line.chars().count() <= 80, "{line}");
+        }
+        assert!(invalid.detail.contains("..."));
+        assert!(unmeasured.detail.contains("..."));
     }
 
     #[test]
@@ -548,7 +652,7 @@ mod tests {
         );
         assert!(lines[12].starts_with("... and 4 more ("));
         for line in &lines[2..12] {
-            assert!(line.len() < 80, "{line}");
+            assert!(INDENT_FOR_TEST + line.len() <= 80, "{line}");
         }
     }
 }

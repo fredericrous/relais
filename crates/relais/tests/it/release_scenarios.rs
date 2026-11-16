@@ -6616,7 +6616,8 @@ fn a_failed_deletion_is_reported_and_the_others_still_go() {
         assert_eq!(swept.status.code(), Some(1), "{}", text(&swept.stderr));
         assert!(
             text(&swept.stderr).contains("deleting a run")
-                && text(&swept.stderr).contains("old-stuck"),
+                && text(&swept.stderr).contains("old-stuck")
+                && text(&swept.stderr).contains(".pruning-old-stuck"),
             "{}",
             text(&swept.stderr)
         );

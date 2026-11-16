@@ -408,7 +408,7 @@ pub(crate) fn retire_all_command(auto_prune: AutoPruneChoice) -> Result<CliOutco
     use relais::prune::{auto_prune_setting, AutoPruneSetting};
     let ledger = open_ledger()?;
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
-    let env_days = relais::prune::read_auto_prune_env();
+    let env_days = super::read_auto_prune_env();
     // The retirement first; the prune follows whatever it ended in.
     let retired = retire_all(&ledger, &state_dir);
     let pruned = match auto_prune {
@@ -1047,10 +1047,24 @@ pub(crate) fn prune_runs_command(days: u64, prune: Prune) -> Result<CliOutcome, 
         eprintln!("kept {}: {why}", path.display());
     }
     eprintln!("deleted {} run directories", applied.removed.len());
-    failed.extend(applied.failed);
+    failed.extend(
+        applied
+            .failed
+            .into_iter()
+            .map(|dir| (dir.left_on_disk, dir.error)),
+    );
     for (path, e) in &failed {
+        let finishes_next = path.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .starts_with(relais::prune::PRUNING_PREFIX)
+        });
+        let hint = if finishes_next {
+            " (the next prune finishes it)"
+        } else {
+            ""
+        };
         eprintln!(
-            "relais resume: {} could not be deleted: {e}",
+            "relais resume: {} could not be deleted: {e}{hint}",
             path.display()
         );
     }

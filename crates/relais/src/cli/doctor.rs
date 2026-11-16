@@ -167,7 +167,7 @@ pub(crate) fn purge_finding() -> Option<doctor::Finding> {
     use doctor::state_health as health;
     let state_dir = paths::state_dir().ok()?;
     let now = std::time::SystemTime::now();
-    let env = relais::prune::read_auto_prune_env();
+    let env = super::read_auto_prune_env();
     let (setting, source) = relais::prune::auto_prune_setting(env.as_deref());
     let runs = match health::prune_age(&setting) {
         Some(age) => measure_runs(&state_dir, age, now),

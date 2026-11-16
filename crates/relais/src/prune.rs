@@ -10,6 +10,7 @@
 //!   is `accepted` (the only state that stores one), and
 //!   untouched for longer than the asked age. Pruning previews by default.
 
+use crate::lifecycle::State;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -171,16 +172,17 @@ fn age(path: &Path, now: SystemTime) -> Option<Duration> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeepReason {
     /// The run has not ended (`state` names where it is).
-    NotEnded { state: crate::lifecycle::State },
+    NotEnded { state: State },
     /// The run ended in a state a person still has to answer.
-    WaitsOnPerson { state: crate::lifecycle::State },
+    WaitsOnPerson { state: State },
     /// The ledger has no such run.
     NotInLedger,
     /// An `accepted` run whose receipt is not in the ledger.
     NoReceipt,
     /// A run that has not ended pins this run's candidate.
     Pinned,
-    /// A package run beneath this one cannot go (`why` says why).
+    /// A package run beneath this one cannot go. `why` is the package run's
+    /// own reason: `NotEnded`, `WaitsOnPerson` or `Pinned`.
     PackageRun { run: String, why: Box<KeepReason> },
     /// A checkout remains beneath the directory (`at` names it, when known).
     CheckoutBeneath { at: Option<PathBuf> },
@@ -358,13 +360,23 @@ pub struct Applied {
     pub removed: Vec<RemovedDir>,
     /// Prunable when planned, kept by the re-check just before deletion.
     pub kept: Vec<(PathBuf, KeepReason)>,
-    /// Deletions that failed, with the path left on disk (the original
-    /// directory when the rename failed, `.pruning-<run>` after it) and the error.
-    pub failed: Vec<(PathBuf, io::Error)>,
+    /// Deletions that failed.
+    pub failed: Vec<FailedDir>,
+}
+
+/// A deletion that failed.
+#[derive(Debug)]
+pub struct FailedDir {
+    /// What is left on disk: the original directory when the rename
+    /// failed, `.pruning-<run>` after it.
+    pub left_on_disk: PathBuf,
+    /// Whether the rename to `.pruning-<run>` had happened.
+    pub renamed: bool,
+    pub error: io::Error,
 }
 
 /// The prefix of a directory whose deletion has begun.
-const PRUNING_PREFIX: &str = ".pruning-";
+pub const PRUNING_PREFIX: &str = ".pruning-";
 
 /// Delete the prunable directories of a plan. `recheck` is asked just
 /// before each one and answers why it must be kept after all (`None` =
@@ -398,7 +410,11 @@ pub fn apply_run_prune(
                 continue;
             }
             Err(e) => {
-                applied.failed.push((dir.path.clone(), e));
+                applied.failed.push(FailedDir {
+                    left_on_disk: dir.path.clone(),
+                    renamed: false,
+                    error: e,
+                });
                 continue;
             }
         }
@@ -406,7 +422,11 @@ pub fn apply_run_prune(
             Ok(()) => applied.removed.push(removed()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => applied.removed.push(removed()),
             // The rename already happened: what is left on disk is `doomed`.
-            Err(e) => applied.failed.push((doomed, e)),
+            Err(e) => applied.failed.push(FailedDir {
+                left_on_disk: doomed,
+                renamed: true,
+                error: e,
+            }),
         }
     }
     applied
@@ -485,7 +505,7 @@ impl<'a> RunJudge<'a> {
         };
         // Only an accepted run has a receipt stored; any other ended run
         // never will, so waiting for one would keep it forever.
-        if state == crate::lifecycle::State::Accepted {
+        if state == State::Accepted {
             match self.ledger.receipt(&id) {
                 Ok(Some(_)) => {}
                 Ok(None) => return RunVerdict::Kept(KeepReason::NoReceipt),
@@ -595,8 +615,7 @@ impl<'a> RunJudge<'a> {
 }
 
 /// Why a run in `state` is kept, when it is.
-fn state_keeps(state: crate::lifecycle::State) -> Option<KeepReason> {
-    use crate::lifecycle::State;
+fn state_keeps(state: State) -> Option<KeepReason> {
     match state {
         State::Prepared
         | State::Running
@@ -714,13 +733,6 @@ pub enum SettingSource {
     Environment,
 }
 
-/// The raw text of [`AUTO_PRUNE_DAYS_ENV`], `None` when unset. The one
-/// reader: a value that is not UTF-8 is kept lossily, so it parses as
-/// invalid rather than as unset.
-pub fn read_auto_prune_env() -> Option<String> {
-    std::env::var_os(AUTO_PRUNE_DAYS_ENV).map(|raw| raw.to_string_lossy().into_owned())
-}
-
 /// Parse the variable alone: the default when it is unset. `--no-prune` is
 /// a per-call choice of the command line and never reaches here.
 pub fn auto_prune_setting(env_days: Option<&str>) -> (AutoPruneSetting, SettingSource) {
@@ -773,6 +785,8 @@ impl PruneStep {
 }
 
 /// A prune failure: the step, the path it was working on and the cause.
+/// `Display` includes the cause, so callers print it with `{}` and need not
+/// walk the error chain.
 #[derive(Debug)]
 pub struct PruneFailure {
     pub step: PruneStep,
@@ -876,12 +890,9 @@ pub fn auto_prune(
     let plan = plan_run_prune(&runs, age, now, &|run, path| judge.judge(run, path))
         .map_err(|error| PruneFailure::new(PruneStep::ReadingRuns, &runs, error))?;
     let applied = apply(&judge, &plan);
-    failed.extend(
-        applied
-            .failed
-            .into_iter()
-            .map(|(path, error)| PruneFailure::new(PruneStep::DeletingRun, &path, error)),
-    );
+    failed.extend(applied.failed.into_iter().map(|failed| {
+        PruneFailure::new(PruneStep::DeletingRun, &failed.left_on_disk, failed.error)
+    }));
     let removed = plan
         .iter()
         .filter_map(|dir| {
@@ -903,6 +914,8 @@ pub fn auto_prune(
 
 /// [`tree_bytes`] of `path` without the subtree at `skip`. A lower bound:
 /// an entry or listing that cannot be read counts as 0.
+/// holds-until: the doctor surfaces a count of unreadable entries, so the
+/// lower bound is no longer silent
 pub fn tree_bytes_except(path: &Path, skip: &Path) -> u64 {
     if path == skip {
         return 0;
@@ -1014,7 +1027,7 @@ mod tests {
         }
         let judge = |run: &str, _: &Path| match run {
             "old-live" => RunVerdict::Kept(KeepReason::NotEnded {
-                state: crate::lifecycle::State::Running,
+                state: State::Running,
             }),
             _ => RunVerdict::Prunable {
                 dangling: Vec::new(),
@@ -1099,10 +1112,10 @@ mod tests {
     fn every_keep_reason_has_a_pathless_label() {
         let reasons = [
             KeepReason::NotEnded {
-                state: crate::lifecycle::State::Running,
+                state: State::Running,
             },
             KeepReason::WaitsOnPerson {
-                state: crate::lifecycle::State::Interrupted,
+                state: State::Interrupted,
             },
             KeepReason::NotInLedger,
             KeepReason::NoReceipt,
@@ -1222,18 +1235,29 @@ mod tests {
         // A directory that cannot be written keeps its file from unlinking.
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
         let applied = apply_run_prune(&plan, &|_| None);
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok(); // best-effort restore
         let doomed = root.join(".pruning-run-a");
-        if applied.failed.is_empty() {
-            // Running as root: nothing is refused, so there is no failure to name.
-            assert!(!doomed.exists());
+        // The rename moved the locked directory: restore it where it is now.
+        let locked_now = if doomed.exists() {
+            doomed.join("locked")
         } else {
-            assert_eq!(applied.failed.len(), 1, "{:?}", applied.failed);
-            assert_eq!(applied.failed[0].0, doomed);
-            assert!(doomed.exists() && !root.join("run-a").exists());
-            assert!(applied.removed.is_empty());
+            locked.clone()
+        };
+        std::fs::set_permissions(&locked_now, std::fs::Permissions::from_mode(0o755))
+            .expect("restore write permission where the directory is now");
+        if applied.failed.is_empty() {
+            // Running as root nothing is refused, so there is no failure to name.
+            assert!(!doomed.exists());
+            std::fs::remove_dir_all(&root).expect("remove scratch");
+            eprintln!("skipped: running as root, the delete cannot fail");
+            return;
         }
-        std::fs::remove_dir_all(&root).ok(); // best-effort scratch cleanup
+        assert_eq!(applied.failed.len(), 1, "{:?}", applied.failed);
+        assert_eq!(applied.failed[0].left_on_disk, doomed);
+        assert!(applied.failed[0].renamed);
+        assert!(doomed.exists() && !root.join("run-a").exists());
+        assert!(applied.removed.is_empty());
+        std::fs::remove_dir_all(&root).expect("no scratch directory is left behind");
+        assert!(!root.exists());
     }
 
     #[test]
