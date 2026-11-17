@@ -412,6 +412,7 @@ test('a running check still draws running · last line Ns ago', () => {
   const rows = rowsOf([t], 40)
   expect(activityOf(rows)).toHaveLength(1)
   expect(activityOf(rows)[0].text).toContain('running · ')
+  expect(waitRowsOf(rows)).toHaveLength(1)
 })
 
 test('two live runs in 12 rows: the shrunk frame keeps its head and wait row', () => {

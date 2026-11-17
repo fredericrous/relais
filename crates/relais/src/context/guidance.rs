@@ -436,10 +436,14 @@ pub fn fit_budget(guidance: &mut Guidance, budget: usize) {
     };
     let (keys_original, rules_original) = (size(&key_entries), size(&rule_entries));
     let measured = index + keys_original + rules_original;
-    if measured > budget {
+    // An index over the budget on its own is dropped below, so the ranking
+    // is measured without it rather than cut to nothing for its sake.
+    let index_kept = if index > budget { 0 } else { index };
+    let over = (index_kept + keys_original + rules_original).saturating_sub(budget);
+    if over > 0 {
         let (mut keys_kept, mut rules_kept) = (key_entries.len(), rule_entries.len());
         let (mut keys_bytes, mut rules_bytes) = (keys_original, rules_original);
-        while index + keys_bytes + rules_bytes > budget && (keys_kept > 0 || rules_kept > 0) {
+        while index_kept + keys_bytes + rules_bytes > budget && (keys_kept > 0 || rules_kept > 0) {
             // kept/original as a cross-multiplied comparison, no division.
             let keys_share = keys_bytes as u128 * rules_original.max(1) as u128;
             let rules_share = rules_bytes as u128 * keys_original.max(1) as u128;
@@ -488,8 +492,7 @@ pub fn fit_budget(guidance: &mut Guidance, budget: usize) {
                 source,
                 GapCause::OverBudget { measured, budget },
                 format!(
-                    "kept {kept} of {total} by rank, {} bytes over: {}",
-                    measured - budget,
+                    "kept {kept} of {total} by rank, {over} bytes over: {}",
                     names.join(", ")
                 ),
             ));
@@ -1453,6 +1456,19 @@ EOF"#;
         assert!(tiny.index.is_empty() && tiny.relevant_rules.is_empty());
         let sources: Vec<GuidanceSource> = tiny.gaps.iter().map(|gap| gap.source).collect();
         assert_eq!(sources, [GuidanceSource::Relevant, GuidanceSource::Index]);
+    }
+
+    #[test]
+    fn an_index_over_the_budget_alone_does_not_cut_a_ranking_that_fits() {
+        let mut guidance = guidance_with(50, 2);
+        let index_bytes = rendered_bytes(&guidance.index_lines());
+        let ranking_bytes = rendered_bytes(&guidance.relevant_entries(&[]));
+        assert!(ranking_bytes < index_bytes);
+        fit_budget(&mut guidance, ranking_bytes);
+        assert!(guidance.index.is_empty());
+        assert_eq!(guidance.relevant_rules.len(), 2, "{:?}", guidance.gaps);
+        let sources: Vec<GuidanceSource> = guidance.gaps.iter().map(|gap| gap.source).collect();
+        assert_eq!(sources, [GuidanceSource::Index]);
     }
 
     #[test]

@@ -49,7 +49,7 @@ The person saw two runs side by side in the relais pane (2026-10-27): a replay a
 
 - `make check` → exit 0.
 - Rust tests (`guidance.rs`, `context/mod.rs`, `runner/tests/mod.rs`):
-  - a ranked list of 20 keys and 20 rules over the budget keeps the highest scores, keys and rules interleaved, and the gap detail names `kept K of N`;
+  - a ranked list of 20 keys and 20 rules over the budget keeps entries of both lists, each cut from its own tail in proportion to its bytes (D3), and the gap detail names `kept K of N by rank`;
   - a list that fits records no gap; an empty prefix gives `relevant missing`;
   - entries without `score` keep aval's order, after the scored ones;
   - a ranked rule that is also a code rule is rendered once in the worker prompt; with the code-rule text unavailable it is rendered in the ranking; the planner prompt still carries it;
@@ -60,7 +60,7 @@ The person saw two runs side by side in the relais pane (2026-10-27): a replay a
   - two live runs in a 12-row room: the shrunk frame shows its head and its wait row;
   - a running check still shows `running · last line Ns ago`, and the wait text appears once.
   - a `waiting_for_slot` event before any `phase` event: the frame shows the wait row, and no `waiting for output` row beside it.
-- Live: start one long run and a second that queues for the heavy slot; the pane shows the second run's wait row with its position and minutes. On the next run of the Phase 1 contract, the receipt note says `relevant partial (kept K of N by score …)` with K > 0, and `manifest.json` lists the kept keys and rules.
+- Live: start one long run and a second that queues for the heavy slot; the pane shows the second run's wait row with its position and minutes. On the next run of the Phase 1 contract, the receipt note says `relevant partial (kept K of N by rank …)` with K > 0, and `manifest.json` lists the kept keys and rules.
 
 ## Not in scope
 
