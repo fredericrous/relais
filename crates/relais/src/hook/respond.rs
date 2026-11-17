@@ -2268,7 +2268,7 @@ mod tests {
         // to the end of the test so the receive does not end early.
         let (never_sent, blocked) = mpsc::channel::<()>();
         let slow = move |_: &Path| {
-            let _ = blocked.recv();
+            let _ = blocked.recv(); // blocks until the test ends; its Err then is the point, not a failure
             Ok("too late".to_string())
         };
         let handled = start_with("clear", slow, Duration::from_millis(20));
