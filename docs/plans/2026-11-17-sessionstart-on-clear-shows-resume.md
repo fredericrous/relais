@@ -210,19 +210,20 @@ elapsed ms.
   v0.69.0 (#492) and greenbelay 6.3.0 (greenharness/greenbelay#285), both
   installed with brew; the machine now runs relais 0.69.0 and greenbelay 6.3.1:
   - relais: `Cargo.toml`, `Cargo.lock`;
-  - greenbelay: `Cargo.toml`, `Cargo.lock`, `greenharness.toml`. This
-    waits until session `32290a5c`'s 6.1.0 has landed; re-run `greenbelay
-    board` first.
+  - greenbelay: `Cargo.toml`, `Cargo.lock`, `greenharness.toml`. It
+    waited for session `32290a5c`'s 6.1.0 to land, which it did.
   - Install both with brew.
-- [x] Phase 4 — live proof (done 2026-11-17; the live `/clear` missed, see Verification and Outcome), in t05's Resolution, its `repos`, and the map
+- [x] Phase 4 — live proof (2026-11-17; the replay half is done, and the live `/clear` missed and is carried to t19), in t05's Resolution, its `repos`, and the map
   (`decisions/docs/programmes/session-boundaries/t05-resume-on-clear.md`,
   `decisions/docs/programmes/session-boundaries/map.md`):
-  - the installed binaries on a real SessionStart payload in decisions, once
+  - [x] the installed binaries on a real SessionStart payload in decisions, once
     per source;
-  - then a real `/clear` at this session's boundary. The next session quotes
+  - [ ] **carried to decisions session-boundaries t19:** a real `/clear` at this session's boundary. The next session quotes
     its `SessionStart:clear` context as its first act; the handoff line's
     `next:` prompt asks for that quote, since clear-relay submits only
-    that prompt.
+    that prompt. The `/clear` ran and was quoted, but it started at the
+    non-repository Perso root, so it showed no notice (Verification, live
+    row).
 
 ## Decision log
 
@@ -289,6 +290,9 @@ elapsed ms.
   p95 exceeds 1,000 ms.
 - greenbelay: orphans named at a start and still unfiled a day later;
   target falling.
+- These records cover sessions started inside a repository only. A session
+  started at a non-repository root writes nothing here, and t19 tracks
+  that gap.
 
 ## Implementation review
 
@@ -299,6 +303,6 @@ elapsed ms.
 
 ## Outcome
 
-Shipped and installed: relais v0.69.0 names the ready programme tickets, with due ones first, at a `startup` or `clear` SessionStart, and greenbelay 6.3.0 names unfiled inbox lines. This is proven in decisions by a replay of the installed binaries for each source. The live `/clear` at the boundary missed, because that session started at the non-repository Perso root and neither hook reads anything outside a repository. Sessions often start there, so resuming from SessionStart alone does not yet hold in the common case: decisions session-boundaries t19. The 7-day measure above runs to 2026-11-24.
+Shipped and installed: relais v0.69.0 names the ready programme tickets, with due ones first, at a `startup` or `clear` SessionStart, and greenbelay 6.3.0 names unfiled inbox lines. The relais block is proven in decisions by a replay of the installed binaries for each source. The greenbelay inbox block is proven on a scratch repository only, because decisions' inbox is empty (installed greenbelay 6.3.1). The live `/clear` at the boundary missed, because that session started at the non-repository Perso root and neither hook reads anything outside a repository. 107 of the 140 session transcripts on disk on 2026-11-17 (76%) started there, so resuming from SessionStart alone does not yet hold in the common case. That is decisions session-boundaries t19, merged with decisions#237. The 7-day measure above runs to 2026-11-24.
 
 <!-- panel: repos=relais,amont-agent,decisions adds=contract reviewers=backend,lang:rust,tui,unix,architect,po,codex body-sha=7bac5f528f09 -->
