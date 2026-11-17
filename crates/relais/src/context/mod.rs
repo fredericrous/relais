@@ -2214,7 +2214,7 @@ mod tests {
     }
 
     #[test]
-    fn over_the_guidance_budget_the_relevant_block_goes_first() {
+    fn over_the_guidance_budget_the_ranking_is_cut_and_the_index_stays() {
         let c = contract(&[]);
         let r = repo();
         let big = Guided {
@@ -2231,6 +2231,13 @@ mod tests {
         assert_eq!(manifest.guidance.index.len(), 2);
         assert!(manifest.guidance.relevant_rules.is_empty());
         assert_eq!(manifest.guidance.gaps[0].source, GuidanceSource::Relevant);
+        assert!(
+            manifest.guidance.gaps[0]
+                .detail
+                .contains("kept 0 of 1 by rank"),
+            "{:?}",
+            manifest.guidance.gaps
+        );
     }
 
     #[test]

@@ -9853,6 +9853,42 @@ fn the_worker_prompt_carries_code_rule_bodies_before_the_task_line() {
 }
 
 #[test]
+fn a_ranked_code_rule_shown_in_full_is_rendered_once_and_the_planner_keeps_it() {
+    let fixture = Fixture::new();
+    let contract = fixture.contract(Review::Off);
+    let mut manifest = guided_manifest(&["errors.typed-values"], &[]);
+    manifest.guidance.code_rules = vec![code_rule("names.reveal-intent", "a name says what it is")];
+    manifest.guidance.relevant_rules = vec![RuleRef {
+        id: "names.reveal-intent".into(),
+        level: "constraint".into(),
+        statement: "RANKED-COPY".into(),
+    }];
+    let prompt = build_prompt(&contract, &manifest, 1, None, AttemptKind::Initial).0;
+    assert!(!prompt.contains("RANKED-COPY"), "{prompt}");
+    let planner = relevant_block(&manifest.guidance, &[]);
+    assert!(planner.contains("RANKED-COPY"), "{planner}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+#[test]
+fn a_ranked_code_rule_without_text_stays_in_the_ranking() {
+    let fixture = Fixture::new();
+    let contract = fixture.contract(Review::Off);
+    let mut manifest = guided_manifest(&["errors.typed-values"], &[]);
+    let mut rule = code_rule("names.reveal-intent", "");
+    rule.statement.clear();
+    manifest.guidance.code_rules = vec![rule];
+    manifest.guidance.relevant_rules = vec![RuleRef {
+        id: "names.reveal-intent".into(),
+        level: "constraint".into(),
+        statement: "RANKED-COPY".into(),
+    }];
+    let prompt = build_prompt(&contract, &manifest, 1, None, AttemptKind::Initial).0;
+    assert!(prompt.contains("RANKED-COPY"), "{prompt}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+#[test]
 fn a_code_rule_body_over_the_budget_is_dropped_whole_and_named() {
     let guidance = Guidance {
         code_rules: vec![
@@ -9861,7 +9897,7 @@ fn a_code_rule_body_over_the_budget_is_dropped_whole_and_named() {
         ],
         ..Guidance::default()
     };
-    let (text, gap) = prompt::worker_code_rules_block(&guidance, 100);
+    let (text, gap, _) = prompt::worker_code_rules_block(&guidance, 100);
     assert!(text.contains("a.small") && !text.contains("xxx") && !text.contains("b.huge"));
     let gap = gap.expect("a gap");
     assert_eq!(gap.source, GuidanceSource::CodeRules);
@@ -9887,7 +9923,7 @@ fn code_rules_without_text_are_not_rendered_as_empty_rules() {
         }],
         ..Guidance::default()
     };
-    let (text, gap) = prompt::worker_code_rules_block(&guidance, 1024);
+    let (text, gap, _) = prompt::worker_code_rules_block(&guidance, 1024);
     assert!(text.is_empty(), "{text}");
     let gap = gap.expect("a gap");
     assert_eq!(gap.cause, context::guidance::GapCause::TextUnavailable);
@@ -10023,7 +10059,7 @@ fn the_worker_reads_judged_rules_in_full_and_tool_checked_rules_as_lines() {
             "TOOLED-BODY\n\n**Checked by:** exact (cargo-fmt).",
         ),
     ];
-    let (text, gap) = prompt::worker_code_rules_block(&guidance, 64 * 1024);
+    let (text, gap, _) = prompt::worker_code_rules_block(&guidance, 64 * 1024);
     assert_eq!(gap, None);
     let full = fenced(&text, "code rules in force").expect("code rules");
     assert!(
@@ -10618,7 +10654,7 @@ fn prompt_rule_bytes_before_and_after_on_this_repository() {
         &CandidateNames::Named(std::collections::BTreeSet::new()),
     );
     let relevant = relevant_block(&guidance, &[]).len();
-    let (worker_after, _) = prompt::worker_code_rules_block(&guidance, 64 * 1024);
+    let (worker_after, _, _) = prompt::worker_code_rules_block(&guidance, 64 * 1024);
     let tool = prompt::tool_checked_ids(&guidance).len();
     println!(
         "code rules {} ({} tool-checked), process rules {}",
