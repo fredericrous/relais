@@ -17,6 +17,8 @@ missing here.
   programme frontier --no-fetch` uses. The `## Handoff` heading is documented
   as relais's read contract (`relais-handoff/1`, SPEC §31).
 - Every git child relais starts now sets `GIT_OPTIONAL_LOCKS=0`.
+- A supervised child's exit is now polled starting at 1 ms and doubling to
+  20 ms, instead of a fixed interval, so a short git call returns promptly.
 
 ## v0.68.0
 

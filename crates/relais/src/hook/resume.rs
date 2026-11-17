@@ -10,6 +10,7 @@ use std::path::Path;
 
 use chrono::NaiveDate;
 
+use super::respond::SkipReason;
 use crate::programme::frontier::{self, due_mark, has_handoff, Ready, ReadyRow};
 use crate::programme::load::{self, main_checkout, Found, Source};
 use crate::programme::model::MAP_FILE;
@@ -28,19 +29,21 @@ pub const HANDOFF_POINTER_CAP: usize = 3;
 /// its body.
 pub const HANDOFF_CONTRACT: &str = "relais-handoff/1";
 
-/// The context text for a session that starts in `cwd`, or `None` when
-/// `cwd` is in no repository, its repository holds no programme, nothing
-/// is ready, or anything fails: a session start is never failed by this.
+/// The context text for a session that starts in `cwd`, or why there is
+/// none: [`SkipReason::Nothing`] when its repository holds no programme or
+/// nothing is ready, [`SkipReason::Error`] when the repository or its
+/// programmes cannot be listed. A session start is never failed by this.
 /// Reads checkouts and origin as the last fetch left them; fetches nothing
 /// and prints nothing.
-pub fn gather(cwd: &Path) -> Option<String> {
-    let repo = main_checkout(cwd).ok()?;
-    let listed = load::programmes_of(&repo).ok()?;
-    let ready = frontier::ready(listed.found);
+pub fn gather(cwd: &Path) -> Result<String, SkipReason> {
+    let repo = main_checkout(cwd).map_err(|_| SkipReason::Error)?;
+    let listed = load::programmes_of(&repo).map_err(|_| SkipReason::Error)?;
+    let ready = frontier::ready(listed.found, listed.unreadable);
     let today = chrono::Local::now().date_naive();
     render(&repo, &ready, today, |found| {
         found.map_text().is_ok_and(|text| has_handoff(&text))
     })
+    .ok_or(SkipReason::Nothing)
 }
 
 /// Text for the ready tickets, or `None` when there is none. `handoff_in`
@@ -70,7 +73,7 @@ pub fn render(
         };
         text.push_str(&format!(
             " ({count} {noun} could not be read; run relais programme check {} for why)",
-            first.display()
+            shell_quote(&first.display().to_string())
         ));
     }
     text.push_str(":\n");
@@ -87,10 +90,17 @@ pub fn render(
     }
     if !hidden.is_empty() {
         let programmes: BTreeSet<usize> = hidden.iter().map(|row| row.programme).collect();
+        let noun = if programmes.len() == 1 {
+            "programme"
+        } else {
+            "programmes"
+        };
+        let first_hidden = ready.found[hidden[0].programme].dir();
         text.push_str(&format!(
-            "- … and {} more ready ({} programmes)\n",
+            "- … and {} more ready ({} {noun}; relais programme frontier --no-fetch {} lists them)\n",
             hidden.len(),
-            programmes.len()
+            programmes.len(),
+            shell_quote(&first_hidden.display().to_string())
         ));
     }
 
@@ -110,13 +120,7 @@ pub fn render(
         .map(|(position, _)| &ready.found[*position])
         .filter(|found| handoff_in(found))
         .take(HANDOFF_POINTER_CAP)
-        .map(|found| {
-            format!(
-                "- {}: the ## Handoff in {} says where the last session stopped ({HANDOFF_CONTRACT})\n",
-                found.slug,
-                map_locator(found)
-            )
-        })
+        .map(handoff_line)
         .collect();
     if !pointers.is_empty() {
         text.push_str("handoff:\n");
@@ -144,28 +148,34 @@ fn cut_name(name: &str) -> String {
     format!("{kept}…")
 }
 
+/// The line that points at `found`'s `## Handoff`: the file for a
+/// checkout's map, the command to run for a ref's.
+fn handoff_line(found: &Found) -> String {
+    match &found.source {
+        Source::WorkingTree => format!(
+            "- {}: the ## Handoff in {} says where the last session stopped ({HANDOFF_CONTRACT})\n",
+            found.slug,
+            found.dir().join(MAP_FILE).display()
+        ),
+        Source::Ref(rev) => format!(
+            "- {}: run {}; its ## Handoff says where the last session stopped ({HANDOFF_CONTRACT})\n",
+            found.slug,
+            show_command(found, rev, MAP_FILE)
+        ),
+    }
+}
+
 /// Where ticket `id` of `found` is read from: the programme directory for
 /// a checkout's files, the `git show` that prints it for a ref, which has
 /// no file in any checkout.
 fn ticket_locator(found: &Found, id: &str) -> String {
     match &found.source {
         Source::WorkingTree => found.dir().display().to_string(),
-        Source::Ref(_) => show_command(found, &format!("{id}.md")),
+        Source::Ref(rev) => show_command(found, rev, &format!("{id}.md")),
     }
 }
 
-/// Where the map of `found` is read from, by the same source as its tickets.
-fn map_locator(found: &Found) -> String {
-    match &found.source {
-        Source::WorkingTree => found.dir().join(MAP_FILE).display().to_string(),
-        Source::Ref(_) => show_command(found, MAP_FILE),
-    }
-}
-
-fn show_command(found: &Found, file: &str) -> String {
-    let Source::Ref(rev) = &found.source else {
-        return String::new();
-    };
+fn show_command(found: &Found, rev: &str, file: &str) -> String {
     format!(
         "git -C {} show {}",
         shell_quote(&found.repo.display().to_string()),
@@ -305,12 +315,31 @@ mod tests {
         assert_eq!(text.matches("Shown\n").count(), 8, "{text}");
         assert!(!text.contains("Hidden\n"), "{text}");
         assert!(
-            text.contains("- … and 2 more ready (2 programmes)\n"),
+            text.contains(
+                "- … and 2 more ready (2 programmes; relais programme frontier --no-fetch /work/repo/docs/programmes/alpha lists them)\n"
+            ),
             "{text}"
         );
         assert!(
             !text.contains("- beta:"),
             "a programme with no shown ticket has no locator: {text}"
+        );
+    }
+
+    #[test]
+    fn one_hidden_programme_is_singular_and_its_directory_is_quoted() {
+        let mut founds = two_programmes();
+        founds[0].checkout = PathBuf::from("/work/my repo");
+        let mut rows: Vec<ReadyRow> = (0..8)
+            .map(|n| row(1, "beta", &format!("t{n}"), "Shown", None))
+            .collect();
+        rows.push(row(0, "alpha", "t9", "Hidden", None));
+        let text = render_of(&ready_of(founds, rows), false);
+        assert!(
+            text.contains(
+                "- … and 1 more ready (1 programme; relais programme frontier --no-fetch '/work/my repo/docs/programmes/alpha' lists them)\n"
+            ),
+            "{text}"
         );
     }
 
@@ -334,6 +363,19 @@ mod tests {
         assert!(
             text.starts_with(
                 "relais/programmes: 1 ready in /work/repo (2 programmes could not be read; run relais programme check /work/repo/docs/programmes/broken for why):\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_unreadable_header_quotes_the_directory_to_check() {
+        let mut ready = ready_of(two_programmes(), vec![row(0, "alpha", "t1", "Ready", None)]);
+        ready.unreadable = vec![PathBuf::from("/work/my repo/docs/programmes/broken")];
+        let text = render_of(&ready, false);
+        assert!(
+            text.contains(
+                "(1 programme could not be read; run relais programme check '/work/my repo/docs/programmes/broken' for why)"
             ),
             "{text}"
         );
@@ -379,13 +421,19 @@ mod tests {
             .map(|n| row(n, &format!("p{n}"), "t1", "Ready", None))
             .collect();
         let text = render_of(&ready_of(founds, rows), true);
-        assert_eq!(text.matches("the ## Handoff in").count(), 3, "{text}");
+        assert_eq!(
+            text.matches("says where the last session stopped").count(),
+            3,
+            "{text}"
+        );
         assert!(
             text.contains("- p0: the ## Handoff in /work/repo/docs/programmes/p0/map.md"),
             "{text}"
         );
         assert!(
-            text.contains("- p1: the ## Handoff in git -C /work/repo show origin/main:docs/programmes/p1/map.md says"),
+            text.contains(
+                "- p1: run git -C /work/repo show origin/main:docs/programmes/p1/map.md; its ## Handoff says where the last session stopped (relais-handoff/1)\n"
+            ),
             "{text}"
         );
         assert!(text.contains(HANDOFF_CONTRACT), "{text}");
@@ -397,6 +445,23 @@ mod tests {
         let ready = ready_of(two_programmes(), vec![row(0, "alpha", "t1", "A", None)]);
         let text = render_of(&ready, false);
         assert!(!text.contains("handoff:"), "{text}");
+    }
+
+    #[test]
+    fn gather_says_why_it_said_nothing() {
+        let outside = crate::test_support::short_temp_dir("gather-outside");
+        assert_eq!(gather(&outside), Err(SkipReason::Error));
+
+        let repo = crate::test_support::short_temp_dir("gather-empty");
+        let git = |args: &[&str]| {
+            let out = crate::workspace::git_command(&repo)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        assert_eq!(gather(&repo), Err(SkipReason::Nothing));
     }
 
     #[test]

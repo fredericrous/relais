@@ -33,7 +33,7 @@
 
 use std::time::Duration;
 
-use super::event::{HookEvent, ToolCallPhase};
+use super::event::{HookEvent, SessionStart, ToolCallPhase};
 use crate::admission::{Decision, Refusal as AdmissionRefusal};
 use crate::policy::{CoordinatorUnreachableBehavior, HookAdmissionSettings};
 
@@ -144,16 +144,6 @@ pub enum HookAnswer {
 }
 
 impl HookAnswer {
-    /// The hook event this answer is spelled for: a refusal answers a
-    /// `PreToolUse`, context answers a `SessionStart`. Silence names none,
-    /// so it is spelled as the tool event it never prints for.
-    fn event_name(&self) -> &'static str {
-        match self {
-            HookAnswer::Context(_) => "SessionStart",
-            HookAnswer::Silent | HookAnswer::Refuse { .. } => "PreToolUse",
-        }
-    }
-
     /// The stdout payload for this answer: `None` when nothing is printed
     /// ([`HookAnswer::Silent`]) and JSON for [`HookAnswer::Refuse`] and
     /// [`HookAnswer::Context`], each naming its own event. Pure:
@@ -178,7 +168,7 @@ impl HookAnswer {
             HookAnswer::Context(text) => Some(
                 serde_json::json!({
                     "hookSpecificOutput": {
-                        "hookEventName": self.event_name(),
+                        "hookEventName": "SessionStart",
                         "additionalContext": text,
                     }
                 })
@@ -189,7 +179,7 @@ impl HookAnswer {
                 Some(
                     serde_json::json!({
                         "hookSpecificOutput": {
-                            "hookEventName": self.event_name(),
+                            "hookEventName": "PreToolUse",
                             "permissionDecision": "deny",
                             "permissionDecisionReason": reason,
                         }
@@ -242,14 +232,12 @@ pub fn decide(
 /// `respond` gathered for it (`None` when it gathered nothing). Pure: a
 /// session that keeps its conversation (`resume`, `compact`, `fork`), one
 /// with no working directory and an empty gather are all silence.
-pub fn decide_session_start(event: &HookEvent, gathered: Option<String>) -> HookAnswer {
-    match (event, gathered) {
-        (HookEvent::SessionStart(start), Some(text))
-            if start.fresh_session_cwd().is_some() && !text.trim().is_empty() =>
-        {
+pub fn decide_session_start(start: &SessionStart, gathered: Option<String>) -> HookAnswer {
+    match gathered {
+        Some(text) if start.fresh_session_cwd().is_some() && !text.trim().is_empty() => {
             HookAnswer::Context(text)
         }
-        _ => HookAnswer::Silent,
+        Some(_) | None => HookAnswer::Silent,
     }
 }
 
@@ -464,7 +452,7 @@ pub fn decide_or_silent(
 mod tests {
     use super::*;
     use crate::hook::event::{
-        AgentToolCall, SessionEnd, SessionStart, SubagentStart, SubagentStop,
+        AgentToolCall, SessionEnd, SessionSource, SubagentStart, SubagentStop,
     };
     use crate::ids::{AgentId, AgentType, PromptId, SessionId, ToolUseId};
     use crate::money::MicroUsd;
@@ -548,7 +536,7 @@ mod tests {
                 "SessionStart",
                 HookEvent::SessionStart(SessionStart {
                     session_id: SessionId::new("s1"),
-                    source: Some("startup".into()),
+                    source: Some(SessionSource::Startup),
                     cwd: Some("/repo".into()),
                 }),
             ),
@@ -816,25 +804,25 @@ mod tests {
         assert!(refusal.sentence().contains("could not reach"));
     }
 
-    fn session_start(source: Option<&str>, cwd: Option<&str>) -> HookEvent {
-        HookEvent::SessionStart(SessionStart {
+    fn session_start(source: Option<SessionSource>, cwd: Option<&str>) -> SessionStart {
+        SessionStart {
             session_id: SessionId::new("s1"),
-            source: source.map(str::to_string),
+            source,
             cwd: cwd.map(Into::into),
-        })
+        }
     }
 
     #[test]
     fn a_fresh_session_with_something_gathered_gets_context() {
-        for source in ["startup", "clear"] {
+        for source in [SessionSource::Startup, SessionSource::Clear] {
             let answer = decide_session_start(
-                &session_start(Some(source), Some("/repo")),
+                &session_start(Some(source.clone()), Some("/repo")),
                 Some("relais/programmes: 1 ready".into()),
             );
             assert_eq!(
                 answer,
                 HookAnswer::Context("relais/programmes: 1 ready".into()),
-                "{source}"
+                "{source:?}"
             );
         }
     }
@@ -843,26 +831,23 @@ mod tests {
     fn every_other_session_start_is_silent_whatever_was_gathered() {
         let text = || Some("relais/programmes: 1 ready".to_string());
         for event in [
-            session_start(Some("resume"), Some("/repo")),
-            session_start(Some("compact"), Some("/repo")),
-            session_start(Some("fork"), Some("/repo")),
+            session_start(Some(SessionSource::Resume), Some("/repo")),
+            session_start(Some(SessionSource::Compact), Some("/repo")),
+            session_start(Some(SessionSource::Fork), Some("/repo")),
+            session_start(Some(SessionSource::Other("later".into())), Some("/repo")),
             session_start(None, Some("/repo")),
-            session_start(Some("clear"), None),
+            session_start(Some(SessionSource::Clear), None),
         ] {
             assert!(
                 is_silent(&decide_session_start(&event, text())),
                 "{event:?}"
             );
         }
-        let fresh = session_start(Some("clear"), Some("/repo"));
+        let fresh = session_start(Some(SessionSource::Clear), Some("/repo"));
         assert!(is_silent(&decide_session_start(&fresh, None)));
         assert!(is_silent(&decide_session_start(
             &fresh,
             Some("  \n".into())
-        )));
-        assert!(is_silent(&decide_session_start(
-            &spawn(ToolCallPhase::Pre),
-            text()
         )));
     }
 
@@ -871,9 +856,10 @@ mod tests {
         let payload = HookAnswer::Context("two tickets".into())
             .stdout_payload()
             .expect("context prints");
-        let value: serde_json::Value = serde_json::from_str(&payload).expect("one JSON value");
+        let hook_output: serde_json::Value =
+            serde_json::from_str(&payload).expect("one JSON value");
         assert_eq!(
-            value,
+            hook_output,
             serde_json::json!({
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",

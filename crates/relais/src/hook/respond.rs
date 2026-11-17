@@ -44,18 +44,16 @@ pub struct Handled {
 /// without them: the hook's own timeout must never be the limit.
 pub const GATHER_DEADLINE: Duration = Duration::from_secs(3);
 
-/// Reads the context text for a session that starts in a directory.
-/// Injected so a test can stand in a slow one; a plain function so the
-/// worker thread that runs it owns everything it needs.
-pub type Gatherer = fn(&Path) -> Option<String>;
-
 /// Why a session start went without context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     /// The gatherer had not answered when the deadline passed.
     Deadline,
-    /// It answered with nothing: no repository, no programme, nothing ready.
+    /// It answered with nothing: the repository holds no programme, or
+    /// nothing in it is ready.
     Nothing,
+    /// It could not read the repository or its programmes.
+    Error,
     /// Its thread died or could not start.
     Failed,
 }
@@ -65,6 +63,7 @@ impl SkipReason {
         match self {
             SkipReason::Deadline => "deadline",
             SkipReason::Nothing => "nothing",
+            SkipReason::Error => "error",
             SkipReason::Failed => "failed",
         }
     }
@@ -84,18 +83,40 @@ pub enum Gather {
     },
 }
 
+const GATHER_THREAD_NAME: &str = "relais-hook-gather";
+
+/// Keep a panic on the gather thread off stderr: it is caught there and
+/// journalled as `skipped(failed)`, and a hook says nothing it was not
+/// asked to. Every other thread's panic still reaches the previous hook.
+pub fn silence_gather_panics() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().name() != Some(GATHER_THREAD_NAME) {
+            previous(info);
+        }
+    }));
+}
+
 /// Run `gatherer` on a worker thread and wait at most `deadline` for it.
 /// A thread still running at the deadline is left to finish on its own:
 /// the git children it started take no locks (`GIT_OPTIONAL_LOCKS`), and
-/// the process exits right after answering.
-fn gather_within(gatherer: Gatherer, cwd: &Path, deadline: Duration) -> (Option<String>, Gather) {
+/// the process exits right after answering. A gatherer that panics is
+/// caught on its thread and counts as [`SkipReason::Failed`]; see
+/// [`silence_gather_panics`] for keeping stderr clean.
+fn gather_within<G>(gatherer: G, cwd: &Path, deadline: Duration) -> (Option<String>, Gather)
+where
+    G: FnOnce(&Path) -> Result<String, SkipReason> + Send + 'static,
+{
     let started = Instant::now();
     let (sender, receiver) = mpsc::channel();
     let directory = cwd.to_path_buf();
     let spawned = std::thread::Builder::new()
-        .name("relais-hook-gather".into())
+        .name(GATHER_THREAD_NAME.into())
         .spawn(move || {
-            let _ = sender.send(gatherer(&directory)); // the receiver is gone once the deadline passed
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gatherer(&directory)))
+                    .unwrap_or(Err(SkipReason::Failed));
+            let _ = sender.send(outcome); // the receiver is gone once the deadline passed
         });
     let skipped = |why| {
         (
@@ -110,13 +131,13 @@ fn gather_within(gatherer: Gatherer, cwd: &Path, deadline: Duration) -> (Option<
         return skipped(SkipReason::Failed);
     }
     match receiver.recv_timeout(deadline) {
-        Ok(Some(text)) => (
+        Ok(Ok(text)) => (
             Some(text),
             Gather::Context {
                 elapsed: started.elapsed(),
             },
         ),
-        Ok(None) => skipped(SkipReason::Nothing),
+        Ok(Err(why)) => skipped(why),
         Err(mpsc::RecvTimeoutError::Timeout) => skipped(SkipReason::Deadline),
         Err(mpsc::RecvTimeoutError::Disconnected) => skipped(SkipReason::Failed),
     }
@@ -146,13 +167,16 @@ pub fn handle(payload: &[u8], settings: &HookAdmissionSettings, gate: &dyn Gate)
 }
 
 /// [`handle`] with the session-start gatherer and its deadline named.
-pub fn handle_with(
+pub fn handle_with<G>(
     payload: &[u8],
     settings: &HookAdmissionSettings,
     gate: &dyn Gate,
-    gatherer: Gatherer,
+    gatherer: G,
     deadline: Duration,
-) -> Handled {
+) -> Handled
+where
+    G: FnOnce(&Path) -> Result<String, SkipReason> + Send + 'static,
+{
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         handle_inner(payload, settings, gate, gatherer, deadline)
     }))
@@ -165,13 +189,16 @@ pub fn handle_with(
     })
 }
 
-fn handle_inner(
+fn handle_inner<G>(
     payload: &[u8],
     settings: &HookAdmissionSettings,
     gate: &dyn Gate,
-    gatherer: Gatherer,
+    gatherer: G,
     deadline: Duration,
-) -> Handled {
+) -> Handled
+where
+    G: FnOnce(&Path) -> Result<String, SkipReason> + Send + 'static,
+{
     let event = event::parse(payload);
     if let HookEvent::SessionStart(start) = &event {
         let Some(cwd) = start.fresh_session_cwd() else {
@@ -184,7 +211,7 @@ fn handle_inner(
             };
         };
         let (gathered, gather) = gather_within(gatherer, cwd, deadline);
-        let answer = decide_session_start(&event, gathered);
+        let answer = decide_session_start(start, gathered);
         return Handled {
             event,
             coordinator: None,
@@ -2168,24 +2195,26 @@ mod tests {
         .into_bytes()
     }
 
-    fn two_tickets(_: &Path) -> Option<String> {
-        Some("relais/programmes: 2 ready".to_string())
+    fn two_tickets(_: &Path) -> Result<String, SkipReason> {
+        Ok("relais/programmes: 2 ready".to_string())
     }
 
-    fn nothing(_: &Path) -> Option<String> {
-        None
+    fn nothing(_: &Path) -> Result<String, SkipReason> {
+        Err(SkipReason::Nothing)
     }
 
-    fn slow(_: &Path) -> Option<String> {
-        std::thread::sleep(Duration::from_millis(400));
-        Some("too late".to_string())
+    fn unreadable(_: &Path) -> Result<String, SkipReason> {
+        Err(SkipReason::Error)
     }
 
-    fn panics(_: &Path) -> Option<String> {
+    fn panics(_: &Path) -> Result<String, SkipReason> {
         panic!("a gatherer that dies");
     }
 
-    fn start_with(source: &str, gatherer: Gatherer, deadline: Duration) -> Handled {
+    fn start_with<G>(source: &str, gatherer: G, deadline: Duration) -> Handled
+    where
+        G: FnOnce(&Path) -> Result<String, SkipReason> + Send + 'static,
+    {
         handle_with(
             &start_payload(source),
             &settings(),
@@ -2214,7 +2243,7 @@ mod tests {
 
     #[test]
     fn a_session_that_keeps_its_conversation_never_asks_the_gatherer() {
-        fn must_not_run(_: &Path) -> Option<String> {
+        fn must_not_run(_: &Path) -> Result<String, SkipReason> {
             panic!("asked for a session that keeps its conversation");
         }
         for source in ["resume", "compact", "fork"] {
@@ -2235,6 +2264,13 @@ mod tests {
 
     #[test]
     fn a_gatherer_past_the_deadline_gets_silence_and_a_deadline_skip() {
+        // Blocks on a channel nothing is ever sent on; the sender stays alive
+        // to the end of the test so the receive does not end early.
+        let (never_sent, blocked) = mpsc::channel::<()>();
+        let slow = move |_: &Path| {
+            let _ = blocked.recv();
+            Ok("too late".to_string())
+        };
         let handled = start_with("clear", slow, Duration::from_millis(20));
         assert_eq!(handled.answer, HookAnswer::Silent);
         assert!(matches!(
@@ -2248,6 +2284,7 @@ mod tests {
         assert_eq!(entry["decision"], "silent");
         assert_eq!(entry["outcome"], "skipped(deadline)");
         assert!(entry["gather_ms"].is_u64(), "{entry}");
+        drop(never_sent);
     }
 
     #[test]
@@ -2256,6 +2293,11 @@ mod tests {
         assert_eq!(handled.answer, HookAnswer::Silent);
         let entry = journal_entry(&start_payload("startup"), &handled);
         assert_eq!(entry["outcome"], "skipped(nothing)");
+
+        let handled = start_with("startup", unreadable, Duration::from_secs(5));
+        assert_eq!(handled.answer, HookAnswer::Silent);
+        let entry = journal_entry(&start_payload("startup"), &handled);
+        assert_eq!(entry["outcome"], "skipped(error)");
 
         let handled = start_with("startup", panics, Duration::from_secs(5));
         assert_eq!(handled.answer, HookAnswer::Silent);

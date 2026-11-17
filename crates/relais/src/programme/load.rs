@@ -900,6 +900,10 @@ pub fn repositories(root: &Path) -> Result<Vec<PathBuf>, ProgrammeError> {
 pub struct Listed {
     pub found: Vec<Found>,
     pub notes: Vec<String>,
+    /// The main-checkout directory of each programme whose source could not
+    /// be selected (its `choose` failed), in slug order. Each also has a
+    /// line in `notes` saying why; the other programmes are still listed.
+    pub unreadable: Vec<PathBuf>,
 }
 
 /// Origin's view of a repository, and a note when git could not list its
@@ -927,12 +931,15 @@ pub fn programmes_of(repo: &Path) -> Result<Listed, ProgrammeError> {
         return Ok(Listed {
             found: Vec::new(),
             notes,
+            unreadable: Vec::new(),
         });
     }
     // Every step below spawns git processes (tens of ms each), and the
     // session-start hook reads this under a deadline: the independent ones
     // run on scoped threads, and their results are taken in input order, so
     // the outcome is the same as a sequential read.
+    // holds-until: ~7 worktrees, measured in decisions — a bounded pool once
+    // a repository's linked worktrees outnumber its cores by a wide margin
     let linked = linked_worktrees(repo);
     let ((view, note), main_state, linked_states) = std::thread::scope(|scope| {
         let view = scope.spawn(|| origin_view_noted(repo));
@@ -962,6 +969,8 @@ pub fn programmes_of(repo: &Path) -> Result<Listed, ProgrammeError> {
     if let Some(view) = &view {
         slugs.extend(view.slugs.iter().cloned());
     }
+    // holds-until: ~9 programmes, measured in decisions — a bounded pool once
+    // a repository holds enough programmes that one thread each starves git
     let chosen: Vec<_> = std::thread::scope(|scope| {
         let handles: Vec<_> = slugs
             .iter()
@@ -972,16 +981,38 @@ pub fn programmes_of(repo: &Path) -> Result<Listed, ProgrammeError> {
             .collect();
         handles.into_iter().map(join_scoped).collect()
     });
+    let (found, unreadable, failed) = settle(repo, slugs.iter(), chosen);
+    notes.extend(failed);
+    Ok(Listed {
+        found,
+        notes,
+        unreadable,
+    })
+}
+
+/// What each slug's selection came to: the programmes chosen, and for each
+/// slug whose selection failed its directory and a note saying why. A copy
+/// set aside is a stale branch among many: `list` is quiet about it;
+/// `frontier`, `show` and `check` on its directory say it.
+fn settle<'a>(
+    repo: &Path,
+    slugs: impl Iterator<Item = &'a String>,
+    chosen: Vec<Result<Choice, ProgrammeError>>,
+) -> (Vec<Found>, Vec<PathBuf>, Vec<String>) {
     let mut found = Vec::new();
-    for choice in chosen {
-        // A copy set aside here is a stale branch among many: `list` is
-        // quiet about it; `frontier`, `show` and `check` on its directory
-        // say it.
-        if let Some(one) = choice?.found {
-            found.push(one);
+    let mut unreadable = Vec::new();
+    let mut notes = Vec::new();
+    for (slug, choice) in slugs.zip(chosen) {
+        match choice {
+            Ok(choice) => found.extend(choice.found),
+            Err(error) => {
+                let dir = repo.join(programme_rel(slug));
+                notes.push(format!("{}: {error}; skipped", dir.display()));
+                unreadable.push(dir);
+            }
         }
     }
-    Ok(Listed { found, notes })
+    (found, unreadable, notes)
 }
 
 /// The value of a scoped thread; a panic in it is re-raised here, as it
@@ -1308,6 +1339,36 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn a_slug_that_fails_to_choose_is_unreadable_beside_a_good_one() {
+        let slugs = ["bad".to_string(), "good".to_string()];
+        let good = Found {
+            repo: PathBuf::from("/work/repo"),
+            checkout: PathBuf::from("/work/repo"),
+            slug: "good".to_string(),
+            source: Source::WorkingTree,
+        };
+        let chosen = vec![
+            Err(ProgrammeError::Git {
+                repo: PathBuf::from("/work/repo"),
+                detail: "broken".to_string(),
+            }),
+            Ok(Choice {
+                found: Some(good),
+                set_aside: None,
+            }),
+        ];
+        let (found, unreadable, notes) = settle(Path::new("/work/repo"), slugs.iter(), chosen);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].slug, "good");
+        assert_eq!(
+            unreadable,
+            vec![PathBuf::from("/work/repo/docs/programmes/bad")]
+        );
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("broken"), "{notes:?}");
     }
 
     #[test]

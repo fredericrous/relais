@@ -60,10 +60,35 @@ pub struct SessionStart {
     pub session_id: SessionId,
     /// Why the session began (`startup`, `clear`, `resume`, `compact`,
     /// `fork`); `None` when the payload does not say.
-    pub source: Option<String>,
+    pub source: Option<SessionSource>,
     /// The session's working directory; `None` when the payload does not
     /// carry one.
     pub cwd: Option<PathBuf>,
+}
+
+/// Why a session began, parsed once from the payload's `source`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSource {
+    Startup,
+    Clear,
+    Resume,
+    Compact,
+    Fork,
+    /// A source this binary does not know, kept as the harness spelled it.
+    Other(String),
+}
+
+impl SessionSource {
+    fn parse(source: String) -> Self {
+        match source.as_str() {
+            "startup" => SessionSource::Startup,
+            "clear" => SessionSource::Clear,
+            "resume" => SessionSource::Resume,
+            "compact" => SessionSource::Compact,
+            "fork" => SessionSource::Fork,
+            _ => SessionSource::Other(source),
+        }
+    }
 }
 
 impl SessionStart {
@@ -71,9 +96,15 @@ impl SessionStart {
     /// conversation (`startup` or `clear`) and names where it runs; `None`
     /// for any other source, which keeps its conversation.
     pub fn fresh_session_cwd(&self) -> Option<&Path> {
-        match self.source.as_deref() {
-            Some("startup" | "clear") => self.cwd.as_deref(),
-            _ => None,
+        match &self.source {
+            Some(SessionSource::Startup | SessionSource::Clear) => self.cwd.as_deref(),
+            Some(
+                SessionSource::Resume
+                | SessionSource::Compact
+                | SessionSource::Fork
+                | SessionSource::Other(_),
+            )
+            | None => None,
         }
     }
 }
@@ -197,7 +228,7 @@ fn classify(envelope: Envelope) -> HookEvent {
         "SessionStart" => match envelope.session_id {
             Some(session_id) => HookEvent::SessionStart(SessionStart {
                 session_id,
-                source: string_of(envelope.source),
+                source: string_of(envelope.source).map(SessionSource::parse),
                 cwd: string_of(envelope.cwd).map(PathBuf::from),
             }),
             None => HookEvent::NotOurs,

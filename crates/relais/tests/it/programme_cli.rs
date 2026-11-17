@@ -1384,8 +1384,8 @@ fn a_fresh_session_start_prints_the_ready_tickets_as_one_json_line() {
         let (code, stdout) = world.hook(&start_payload(Some(source), Some(&cwd)));
         assert_eq!(code, Some(0), "{source}");
         assert_eq!(stdout.lines().count(), 1, "{source}: {stdout}");
-        let value: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON line");
-        let output = &value["hookSpecificOutput"];
+        let hook_output: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON line");
+        let output = &hook_output["hookSpecificOutput"];
         assert_eq!(output["hookEventName"], "SessionStart", "{stdout}");
         let context = output["additionalContext"].as_str().expect("context text");
         assert!(
@@ -1460,8 +1460,9 @@ fn a_session_start_takes_no_index_lock_and_leaves_every_index_untouched() {
     assert_eq!(code, Some(0));
     assert!(stdout.contains("relais/programmes:"), "{stdout}");
     let after: Vec<_> = indexes.iter().map(|path| modified_at(path)).collect();
+    // The unchanged `.git/index` mtimes are the evidence that nothing took
+    // the lock: a lock file is gone again by the time the hook returns.
     assert_eq!(before, after);
-    assert!(!alpha.join(".git/index.lock").exists());
 }
 
 /// Every `- <slug>: <locator>` line of the block that follows `header`.
@@ -1541,8 +1542,8 @@ fn the_printed_locators_retrieve_the_copy_each_programme_was_selected_from() {
 
     let (code, stdout) = world.hook(&start_payload(Some("clear"), Some(&alpha)));
     assert_eq!(code, Some(0));
-    let value: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON line");
-    let context = value["hookSpecificOutput"]["additionalContext"]
+    let hook_output: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON line");
+    let context = hook_output["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .expect("context")
         .to_string();
@@ -1591,8 +1592,11 @@ fn the_printed_locators_retrieve_the_copy_each_programme_was_selected_from() {
         .expect("selected map")
         .contains("Resume from the worktree."));
     let ghost_pointer = handoff_of("ghost");
-    let command = &ghost_pointer[ghost_pointer.find("git -C ").expect("a git command")..];
-    let command = command.split(" says ").next().expect("command text");
+    let command = ghost_pointer
+        .strip_prefix("run ")
+        .and_then(|rest| rest.split_once("; its ## Handoff says where"))
+        .map(|(command, _)| command)
+        .unwrap_or_else(|| panic!("a run-this pointer: {ghost_pointer}"));
     assert!(
         sh(command).contains("Resume from the ghost."),
         "{ghost_pointer}"

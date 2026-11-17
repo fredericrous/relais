@@ -94,6 +94,12 @@ type Result<T> = std::result::Result<T, WorkspaceError>;
 /// silently point the snapshot, the scope check or the worktree at
 /// another repository's objects — the run would then verify one tree and
 /// record another. Relais always means the directory it names.
+///
+/// `GIT_OPTIONAL_LOCKS=0` applies to every relais git child, not only the
+/// hook's: a read-only command such as `git status` never needs the
+/// optional index refresh, and without it none of them takes `index.lock`
+/// against the person's own git. A command that writes the index asks for
+/// its lock regardless.
 pub fn git_command(dir: &Path) -> Command {
     let mut command = Command::new("git");
     command.current_dir(dir);

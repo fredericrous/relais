@@ -326,8 +326,20 @@ pub(crate) fn hook_respond_command() -> CliOutcome {
     CliOutcome::Accepted
 }
 
+/// Write the hook's answer on stdout. A reader that has gone away
+/// (`BrokenPipe`) is not a failure of the hook: the journal still follows.
+fn print_hook_answer(text: &str) {
+    use std::io::Write;
+    if let Err(error) = writeln!(std::io::stdout().lock(), "{text}") {
+        if error.kind() != std::io::ErrorKind::BrokenPipe {
+            eprintln!("relais hook: cannot write the answer: {error}");
+        }
+    }
+}
+
 pub(crate) fn hook_respond() {
     use std::io::Read;
+    relais::hook::respond::silence_gather_panics();
     let mut payload = Vec::new();
     // A truncated read leaves `payload` with whatever arrived so far;
     // `event::parse` treats that the same as any other input it cannot
@@ -350,14 +362,14 @@ pub(crate) fn hook_respond() {
             std::time::Duration::ZERO,
         );
         if let Some(text) = answer.stdout_payload() {
-            println!("{text}");
+            print_hook_answer(&text);
         }
         return;
     };
     let gate = relais::coordinator::RemoteGate::new(socket);
     let handled = relais::hook::respond::handle(&payload, &settings, &gate);
     if let Some(text) = handled.answer.stdout_payload() {
-        println!("{text}");
+        print_hook_answer(&text);
     }
     if let Ok(path) = paths::hook_journal_path() {
         let entry = relais::hook::respond::journal_entry(&payload, &handled);

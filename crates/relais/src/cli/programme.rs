@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
 use relais::programme::analysis::{self, age_secs, Counts, Standing};
-use relais::programme::frontier::{due_mark, is_overdue, order_frontier};
+use relais::programme::frontier::{due_mark, is_overdue, is_ready, order_frontier};
 use relais::programme::load::{self, main_checkout, Found, Programme, ProgrammeError, Source};
 use relais::programme::model::Ticket;
 use serde_json::{json, Value};
@@ -235,13 +235,13 @@ pub(crate) fn frontier_command(
         .tickets
         .values()
         .filter_map(|ticket| match (&standings[&ticket.id], listing) {
-            (Standing::Frontier, _) => Some((ticket, None)),
+            (standing, _) if is_ready(standing) => Some((ticket, None)),
             (standing @ Standing::InFlight { .. }, Listing::WithInFlight) => {
                 Some((ticket, tip_of(standing, now)))
             }
             (Standing::InFlight { .. }, Listing::ReadyOnly)
             | (
-                Standing::Blocked(_) | Standing::Closed | Standing::OutOfScope,
+                Standing::Frontier | Standing::Blocked(_) | Standing::Closed | Standing::OutOfScope,
                 Listing::ReadyOnly | Listing::WithInFlight,
             ) => None,
         })
@@ -580,6 +580,11 @@ pub(crate) fn list_command(
             Ok(listed) => {
                 for note in &listed.notes {
                     eprintln!("relais: {note}");
+                }
+                // A programme that could not be selected fails the listing's
+                // status as the whole repository used to, but not its rows.
+                if !listed.unreadable.is_empty() {
+                    outcome = CliOutcome::OperationalFailure;
                 }
                 found_all.extend(listed.found);
             }
