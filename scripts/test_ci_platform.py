@@ -237,10 +237,10 @@ class ReleasePlatforms(unittest.TestCase):
         self.assertIn("test (macos-latest)", guard.stderr)
 
     def fake_attest(self, directory, covered_by_platform):
-        """A `git-attest` that answers `covered --platform P` from a dict."""
+        """A `greensummit` that answers `covered --platform P` from a dict."""
         cases = "\n".join(
             f'  {p}) echo "{" ".join(g)}" ;;' for p, g in covered_by_platform.items())
-        path = os.path.join(directory, "git-attest")
+        path = os.path.join(directory, "greensummit")
         with open(path, "w") as handle:
             handle.write("#!/bin/sh\n"
                          'case "$3" in\n' + cases + "\n  *) : ;;\nesac\n")
@@ -250,7 +250,7 @@ class ReleasePlatforms(unittest.TestCase):
     def guard_with_attest(self, covered, attest_check):
         jobs = [self.leg("macos-latest"), self.leg("ubuntu-latest"), self.leg("windows-latest")]
         with tempfile.TemporaryDirectory() as directory:
-            env = dict(os.environ, GIT_ATTEST=self.fake_attest(directory, covered),
+            env = dict(os.environ, GREENSUMMIT_BIN=self.fake_attest(directory, covered),
                        ATTEST_CHECK=attest_check)
             with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
                 json.dump({"jobs": jobs}, handle)

@@ -273,31 +273,32 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      # attest's verifier at the version and archive digest its own release
-      # pins for v1.8.0: 1.8.0 refuses a platform-bound principal's block for
+      # greensummit's verifier at the version and archive digest its own
+      # release pins for v2.0.0: it reads only the greensummit notes
+      # (ADR-0073) and refuses a platform-bound principal's block for
       # another platform (cluster-signer@x86_64-linux, ADR-0069).
-      - name: git-attest 1.8.0
+      - name: greensummit 2.0.0
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          name=git-attest-1.8.0-x86_64-unknown-linux-musl
+          name=greensummit-2.0.0-x86_64-unknown-linux-musl
           # Through the API, not the web route, which throttles anonymous downloads (504s on 2026-11-08).
           for attempt in 1 2 3; do
             rc=0
-            timeout 120 gh release download "v1.8.0" --repo fredericrous/attest \
+            timeout 120 gh release download "v2.0.0" --repo greenharness/greensummit \
               --pattern "$name.tar.gz" -O "$RUNNER_TEMP/$name.tar.gz" --clobber || rc=$?
             [ "$rc" = 0 ] && break
             if [ "$attempt" = 3 ]; then
-              echo "::error::could not download $name.tar.gz from fredericrous/attest v1.8.0 (exit $rc; 124 = timed out after 120 s)"
+              echo "::error::could not download $name.tar.gz from greenharness/greensummit v2.0.0 (exit $rc; 124 = timed out after 120 s)"
               exit 1
             fi
             sleep $((attempt * 5))
           done
-          echo "4f3a68aa33137493433d92375439e0170b32872f0f5613981fafb231caf8a259  $RUNNER_TEMP/$name.tar.gz" \
+          echo "bc0ea42f9fb779173044a6cc9854c0a04633d5da7904b084592925cff6e515eb  $RUNNER_TEMP/$name.tar.gz" \
             | sha256sum -c -
           tar xzf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP"
-          echo "GIT_ATTEST=$RUNNER_TEMP/$name/git-attest" >> "$GITHUB_ENV"
+          echo "GREENSUMMIT_BIN=$RUNNER_TEMP/$name/greensummit" >> "$GITHUB_ENV"
       - env:
           GH_TOKEN: ${{ github.token }}
           DRY_RUN: ${{ needs.guard.outputs.dry_run }}

@@ -59,12 +59,12 @@ fetch_jobs() {
 }
 
 # Attested: for `pre-push-cargo-test` on each platform, a verified signature for
-# this exact tree, read with attest's verifier (the same read amont's
+# this exact tree, read with greensummit's verifier (the same read amont's
 # ci-release-gates.sh makes). Off until ATTEST_CHECK=1, so this change can land
 # before the first signed run exists; release.yaml turns it on after that proof.
 attested() {
   [ "${ATTEST_CHECK:-0}" = 1 ] || return 0
-  bin=${GIT_ATTEST:-git-attest}
+  bin=${GREENSUMMIT_BIN:-greensummit}
   missing_att=
   for p in x86_64-linux aarch64-macos x86_64-windows; do
     # stderr is not hidden: a failed verifier call says why in the log.
