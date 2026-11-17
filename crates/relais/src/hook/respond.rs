@@ -10,9 +10,10 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use super::decide::{decide_or_silent, CoordinatorAnswer, HookAnswer};
+use super::decide::{decide_or_silent, decide_session_start, CoordinatorAnswer, HookAnswer};
 use super::event::{self, HookEvent, ToolCallPhase};
 use crate::admission::{
     Decision, DispatchRequest, DispatchSource, Gate, Provenance, Refusal, ResourceClass,
@@ -34,6 +35,91 @@ pub struct Handled {
     /// answer, via [`wait_for_a_seat`]. Zero for every firing that was
     /// never queued at all.
     pub waited: Duration,
+    /// What reading the ready tickets came of, for a session start that
+    /// asked for them.
+    pub gather: Gather,
+}
+
+/// How long a session start waits for the ready tickets before it starts
+/// without them: the hook's own timeout must never be the limit.
+pub const GATHER_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Reads the context text for a session that starts in a directory.
+/// Injected so a test can stand in a slow one; a plain function so the
+/// worker thread that runs it owns everything it needs.
+pub type Gatherer = fn(&Path) -> Option<String>;
+
+/// Why a session start went without context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// The gatherer had not answered when the deadline passed.
+    Deadline,
+    /// It answered with nothing: no repository, no programme, nothing ready.
+    Nothing,
+    /// Its thread died or could not start.
+    Failed,
+}
+
+impl SkipReason {
+    fn label(self) -> &'static str {
+        match self {
+            SkipReason::Deadline => "deadline",
+            SkipReason::Nothing => "nothing",
+            SkipReason::Failed => "failed",
+        }
+    }
+}
+
+/// The record of one gather, for the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gather {
+    /// This event never asks: only a fresh session start does.
+    NotAsked,
+    Context {
+        elapsed: Duration,
+    },
+    Skipped {
+        why: SkipReason,
+        elapsed: Duration,
+    },
+}
+
+/// Run `gatherer` on a worker thread and wait at most `deadline` for it.
+/// A thread still running at the deadline is left to finish on its own:
+/// the git children it started take no locks (`GIT_OPTIONAL_LOCKS`), and
+/// the process exits right after answering.
+fn gather_within(gatherer: Gatherer, cwd: &Path, deadline: Duration) -> (Option<String>, Gather) {
+    let started = Instant::now();
+    let (sender, receiver) = mpsc::channel();
+    let directory = cwd.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("relais-hook-gather".into())
+        .spawn(move || {
+            let _ = sender.send(gatherer(&directory)); // the receiver is gone once the deadline passed
+        });
+    let skipped = |why| {
+        (
+            None,
+            Gather::Skipped {
+                why,
+                elapsed: started.elapsed(),
+            },
+        )
+    };
+    if spawned.is_err() {
+        return skipped(SkipReason::Failed);
+    }
+    match receiver.recv_timeout(deadline) {
+        Ok(Some(text)) => (
+            Some(text),
+            Gather::Context {
+                elapsed: started.elapsed(),
+            },
+        ),
+        Ok(None) => skipped(SkipReason::Nothing),
+        Err(mpsc::RecvTimeoutError::Timeout) => skipped(SkipReason::Deadline),
+        Err(mpsc::RecvTimeoutError::Disconnected) => skipped(SkipReason::Failed),
+    }
 }
 
 /// Handle one hook payload: parse it, ask the coordinator about a
@@ -50,19 +136,63 @@ pub struct Handled {
 /// a real socket and a real clock, neither of which `decide` itself
 /// touches.
 pub fn handle(payload: &[u8], settings: &HookAdmissionSettings, gate: &dyn Gate) -> Handled {
+    handle_with(
+        payload,
+        settings,
+        gate,
+        super::resume::gather,
+        GATHER_DEADLINE,
+    )
+}
+
+/// [`handle`] with the session-start gatherer and its deadline named.
+pub fn handle_with(
+    payload: &[u8],
+    settings: &HookAdmissionSettings,
+    gate: &dyn Gate,
+    gatherer: Gatherer,
+    deadline: Duration,
+) -> Handled {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        handle_inner(payload, settings, gate)
+        handle_inner(payload, settings, gate, gatherer, deadline)
     }))
     .unwrap_or(Handled {
         event: HookEvent::NotOurs,
         coordinator: None,
         answer: HookAnswer::Silent,
         waited: Duration::ZERO,
+        gather: Gather::NotAsked,
     })
 }
 
-fn handle_inner(payload: &[u8], settings: &HookAdmissionSettings, gate: &dyn Gate) -> Handled {
+fn handle_inner(
+    payload: &[u8],
+    settings: &HookAdmissionSettings,
+    gate: &dyn Gate,
+    gatherer: Gatherer,
+    deadline: Duration,
+) -> Handled {
     let event = event::parse(payload);
+    if let HookEvent::SessionStart(start) = &event {
+        let Some(cwd) = start.fresh_session_cwd() else {
+            return Handled {
+                event,
+                coordinator: None,
+                answer: HookAnswer::Silent,
+                waited: Duration::ZERO,
+                gather: Gather::NotAsked,
+            };
+        };
+        let (gathered, gather) = gather_within(gatherer, cwd, deadline);
+        let answer = decide_session_start(&event, gathered);
+        return Handled {
+            event,
+            coordinator: None,
+            answer,
+            waited: Duration::ZERO,
+            gather,
+        };
+    }
     let (coordinator, waited) = ask_coordinator(&event, settings, gate);
     let answer = decide_or_silent(&event, settings, coordinator.clone(), waited);
     follow_agent_lifecycle(&event, gate);
@@ -84,6 +214,7 @@ fn handle_inner(payload: &[u8], settings: &HookAdmissionSettings, gate: &dyn Gat
         coordinator,
         answer,
         waited,
+        gather: Gather::NotAsked,
     }
 }
 
@@ -331,6 +462,7 @@ fn wait_outcome(handled: &Handled) -> &'static str {
     match &handled.answer {
         HookAnswer::Silent => "admitted_after_waiting",
         HookAnswer::Refuse { .. } => "refused_after_waiting",
+        HookAnswer::Context(_) => "immediate",
     }
 }
 
@@ -358,6 +490,7 @@ pub fn journal_entry(payload: &[u8], handled: &Handled) -> serde_json::Value {
     });
     let (decision, reason, rule, availability) = match &handled.answer {
         HookAnswer::Silent => ("silent", None, None, None),
+        HookAnswer::Context(_) => ("context", None, None, None),
         HookAnswer::Refuse { refusal } => (
             "refuse",
             Some(refusal.sentence()),
@@ -386,7 +519,17 @@ pub fn journal_entry(payload: &[u8], handled: &Handled) -> serde_json::Value {
         "rule": rule,
         "availability": availability,
         "waited_ms": handled.waited.as_millis() as u64,
-        "outcome": wait_outcome(handled),
+        "outcome": match handled.gather {
+            Gather::NotAsked => wait_outcome(handled).to_string(),
+            Gather::Context { .. } => "context".to_string(),
+            Gather::Skipped { why, .. } => format!("skipped({})", why.label()),
+        },
+        "gather_ms": match handled.gather {
+            Gather::NotAsked => None,
+            Gather::Context { elapsed } | Gather::Skipped { elapsed, .. } => {
+                Some(elapsed.as_millis() as u64)
+            }
+        },
     })
 }
 
@@ -1569,6 +1712,7 @@ mod tests {
                 refusal: refusal.clone(),
             },
             waited: Duration::ZERO,
+            gather: Gather::NotAsked,
         };
         let entry = journal_entry(&payload, &handled);
         assert_eq!(entry["decision"], "refuse");
@@ -1599,6 +1743,7 @@ mod tests {
             coordinator: None,
             answer: HookAnswer::Silent,
             waited: Duration::ZERO,
+            gather: Gather::NotAsked,
         };
         let entry = journal_entry(b"not json {{{", &handled);
         assert_eq!(entry["payload"], "not json {{{");
@@ -1619,6 +1764,7 @@ mod tests {
             coordinator: Some(crate::admission::Decision::Granted),
             answer: HookAnswer::Silent,
             waited: Duration::from_millis(900),
+            gather: Gather::NotAsked,
         };
         let entry = journal_entry(&payload, &admitted);
         assert_eq!(entry["waited_ms"], 900);
@@ -1635,6 +1781,7 @@ mod tests {
                 },
             },
             waited: Duration::from_secs(2),
+            gather: Gather::NotAsked,
         };
         let entry = journal_entry(&payload, &refused);
         assert_eq!(entry["waited_ms"], 2_000);
@@ -2012,5 +2159,107 @@ mod tests {
             assert_eq!(handled.event, HookEvent::NotOurs, "{payload}");
             assert_eq!(handled.answer, HookAnswer::Silent, "{payload}");
         }
+    }
+
+    fn start_payload(source: &str) -> Vec<u8> {
+        format!(
+            r#"{{"hook_event_name":"SessionStart","session_id":"s1","source":"{source}","cwd":"/repo"}}"#
+        )
+        .into_bytes()
+    }
+
+    fn two_tickets(_: &Path) -> Option<String> {
+        Some("relais/programmes: 2 ready".to_string())
+    }
+
+    fn nothing(_: &Path) -> Option<String> {
+        None
+    }
+
+    fn slow(_: &Path) -> Option<String> {
+        std::thread::sleep(Duration::from_millis(400));
+        Some("too late".to_string())
+    }
+
+    fn panics(_: &Path) -> Option<String> {
+        panic!("a gatherer that dies");
+    }
+
+    fn start_with(source: &str, gatherer: Gatherer, deadline: Duration) -> Handled {
+        handle_with(
+            &start_payload(source),
+            &settings(),
+            &PanicsIfAsked,
+            gatherer,
+            deadline,
+        )
+    }
+
+    #[test]
+    fn a_fresh_session_start_answers_with_the_gathered_context() {
+        for source in ["startup", "clear"] {
+            let handled = start_with(source, two_tickets, Duration::from_secs(5));
+            assert_eq!(
+                handled.answer,
+                HookAnswer::Context("relais/programmes: 2 ready".into()),
+                "{source}"
+            );
+            assert!(matches!(handled.gather, Gather::Context { .. }));
+            let entry = journal_entry(&start_payload(source), &handled);
+            assert_eq!(entry["decision"], "context");
+            assert_eq!(entry["outcome"], "context");
+            assert!(entry["gather_ms"].is_u64(), "{entry}");
+        }
+    }
+
+    #[test]
+    fn a_session_that_keeps_its_conversation_never_asks_the_gatherer() {
+        fn must_not_run(_: &Path) -> Option<String> {
+            panic!("asked for a session that keeps its conversation");
+        }
+        for source in ["resume", "compact", "fork"] {
+            let handled = start_with(source, must_not_run, Duration::from_secs(5));
+            assert_eq!(handled.answer, HookAnswer::Silent, "{source}");
+            assert_eq!(handled.gather, Gather::NotAsked, "{source}");
+        }
+        let no_cwd = br#"{"hook_event_name":"SessionStart","session_id":"s1","source":"clear"}"#;
+        let handled = handle_with(
+            no_cwd,
+            &settings(),
+            &PanicsIfAsked,
+            must_not_run,
+            Duration::from_secs(5),
+        );
+        assert_eq!(handled.answer, HookAnswer::Silent);
+    }
+
+    #[test]
+    fn a_gatherer_past_the_deadline_gets_silence_and_a_deadline_skip() {
+        let handled = start_with("clear", slow, Duration::from_millis(20));
+        assert_eq!(handled.answer, HookAnswer::Silent);
+        assert!(matches!(
+            handled.gather,
+            Gather::Skipped {
+                why: SkipReason::Deadline,
+                ..
+            }
+        ));
+        let entry = journal_entry(&start_payload("clear"), &handled);
+        assert_eq!(entry["decision"], "silent");
+        assert_eq!(entry["outcome"], "skipped(deadline)");
+        assert!(entry["gather_ms"].is_u64(), "{entry}");
+    }
+
+    #[test]
+    fn a_gatherer_with_nothing_or_a_dead_thread_is_a_quiet_skip() {
+        let handled = start_with("startup", nothing, Duration::from_secs(5));
+        assert_eq!(handled.answer, HookAnswer::Silent);
+        let entry = journal_entry(&start_payload("startup"), &handled);
+        assert_eq!(entry["outcome"], "skipped(nothing)");
+
+        let handled = start_with("startup", panics, Duration::from_secs(5));
+        assert_eq!(handled.answer, HookAnswer::Silent);
+        let entry = journal_entry(&start_payload("startup"), &handled);
+        assert_eq!(entry["outcome"], "skipped(failed)");
     }
 }

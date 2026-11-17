@@ -4,6 +4,7 @@
 //! filesystem and git, and nothing here opens the ledger.
 
 pub mod analysis;
+pub mod frontier;
 pub mod load;
 pub mod model;
 pub mod parse;

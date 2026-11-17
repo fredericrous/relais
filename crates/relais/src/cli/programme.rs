@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
 use relais::programme::analysis::{self, age_secs, Counts, Standing};
+use relais::programme::frontier::{due_mark, is_overdue, order_frontier};
 use relais::programme::load::{self, main_checkout, Found, Programme, ProgrammeError, Source};
 use relais::programme::model::Ticket;
 use serde_json::{json, Value};
@@ -178,35 +179,12 @@ fn format_age(secs: u64) -> String {
     }
 }
 
-/// The frontier's order: tickets with a due date first, soonest first, then
-/// the undated ones; the sort is stable, so ties keep the tickets' id order.
-fn order_frontier<T>(rows: &mut [T], due_of: impl Fn(&T) -> Option<NaiveDate>) {
-    rows.sort_by_key(|row| {
-        let due = due_of(row);
-        (due.is_none(), due)
-    });
-}
-
 /// One text row of `frontier`: only the name is cut to `width`; the
 /// prefix, the due mark and the label are counted and kept whole.
 fn frontier_row(prefix: &str, mark: &str, name: &str, label: &str, width: Option<usize>) -> String {
     let used = display_width(prefix) + display_width(mark) + display_width(label);
     let name = fit_name(name, used, width);
     format!("{prefix}{mark}{name}{label}\n")
-}
-
-/// Whether a due date has passed on `today`: the same day is still due.
-fn is_overdue(due: NaiveDate, today: NaiveDate) -> bool {
-    due < today
-}
-
-/// `[due YYYY-MM-DD] ` or `[overdue YYYY-MM-DD] `, empty when undated.
-fn due_mark(due: Option<NaiveDate>, today: NaiveDate) -> String {
-    match due {
-        None => String::new(),
-        Some(date) if is_overdue(date, today) => format!("[overdue {date}] "),
-        Some(date) => format!("[due {date}] "),
-    }
 }
 
 fn ticket_json(

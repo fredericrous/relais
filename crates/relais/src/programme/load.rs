@@ -393,6 +393,23 @@ impl Found {
             Source::Ref(rev) => Programme::load_at(&self.repo, &self.slug, rev),
         }
     }
+
+    /// The text of its `map.md`, read from the same source as its tickets.
+    pub fn map_text(&self) -> Result<String, ProgrammeError> {
+        match &self.source {
+            Source::WorkingTree => {
+                let path = self.dir().join(MAP_FILE);
+                std::fs::read_to_string(&path).map_err(read_error(&path))
+            }
+            Source::Ref(rev) => git_stdout(
+                &self.repo,
+                &[
+                    "show",
+                    &format!("{rev}:{}/{MAP_FILE}", programme_rel(&self.slug)),
+                ],
+            ),
+        }
+    }
 }
 
 fn programme_rel(slug: &str) -> String {

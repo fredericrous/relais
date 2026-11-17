@@ -106,6 +106,10 @@ pub fn git_command(dir: &Path) -> Command {
     ] {
         command.env_remove(variable);
     }
+    // Read-only commands such as `git status` would otherwise refresh the
+    // index and take `index.lock`, so a hook reading a repository could
+    // collide with the person's own git.
+    command.env("GIT_OPTIONAL_LOCKS", "0");
     command
 }
 
