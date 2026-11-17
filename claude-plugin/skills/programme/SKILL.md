@@ -31,6 +31,8 @@ Triage first:
 <domain, skills every session reads, standing preferences>
 ## Decisions so far
 - [<ticket name>](<id>.md): <one-line gist>
+## Handoff
+<optional: where the last session left off; replaced at each boundary, never appended>
 ## Not yet specified
 <the fog: questions you can see coming but cannot state yet>
 ## Out of scope
@@ -145,8 +147,32 @@ Resolution.
      from Not yet specified;
    - rule out tickets past the destination: `status = "out-of-scope"`, a
      line under Out of scope, and their open dependents ruled out too or
-     their `blocked_by` changed.
-4. **Done** when `relais programme check <dir>` exits 0 and the pull
-   request has merged.
+     their `blocked_by` changed;
+   - file this session's follow-ups as `task` tickets (step 4).
+4. **Write the handoff**, without being asked, in the ticket's closing
+   commit, before the merge; never in memory or a file outside the
+   repository. When the `worktree-task` skill is installed, follow its
+   Handoff section. Otherwise:
+   - file the follow-ups you noticed as `task` tickets in this map, and
+     the inbox, when it exists, of every repository this session touched:
+     `inbox="$(git rev-parse --path-format=absolute --git-common-dir)/greenharness/inbox.md"`.
+     A line reads `<date> <session8> <text>`, where `session8` is the
+     first 8 characters of `CLAUDE_CODE_SESSION_ID`. Take the file first
+     (`mv "$inbox" "${inbox%.md}.<session8>.filing"`). File this session's lines
+     and those dated two or more days ago, append the others back with one
+     `>>` each, then delete the taken file;
+   - replace the map's `## Handoff` section: date, what merged, the live
+     state, what is next by ticket name, accepted gaps, and any steps left
+     to the person.
+5. **Done** when `relais programme check <dir>` exits 0 and the pull
+   request has merged. Then, once nothing of this session is in flight (no
+   uncommitted or unpushed work, no run or background task still going, no
+   question unanswered, no worktree left to remove), end the answer with
+   this line, last, with nothing after it; the prompt is one line of at
+   most 2,000 characters with no backtick:
+
+   ```
+   safe to /clear; next: `<the next session's first prompt>`
+   ```
 
 One ticket per session, except research, which may be fanned out.
