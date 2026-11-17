@@ -8,6 +8,14 @@ missing here.
 
 ## Unreleased
 
+## v0.68.0
+
+- The programme skill hands off at a closed ticket. A map may carry an
+  optional `## Handoff` section, replaced at each boundary. Working a ticket
+  files the session's follow-ups as `task` tickets, writes the handoff in the
+  closing commit, and ends with ``safe to /clear; next: `<prompt>` `` once
+  nothing is in flight, which the clear-relay plugin reads.
+
 ## v0.67.0
 
 ### Changed
