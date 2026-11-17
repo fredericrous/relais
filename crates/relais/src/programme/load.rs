@@ -393,6 +393,23 @@ impl Found {
             Source::Ref(rev) => Programme::load_at(&self.repo, &self.slug, rev),
         }
     }
+
+    /// The text of its `map.md`, read from the same source as its tickets.
+    pub fn map_text(&self) -> Result<String, ProgrammeError> {
+        match &self.source {
+            Source::WorkingTree => {
+                let path = self.dir().join(MAP_FILE);
+                std::fs::read_to_string(&path).map_err(read_error(&path))
+            }
+            Source::Ref(rev) => git_stdout(
+                &self.repo,
+                &[
+                    "show",
+                    &format!("{rev}:{}/{MAP_FILE}", programme_rel(&self.slug)),
+                ],
+            ),
+        }
+    }
 }
 
 fn programme_rel(slug: &str) -> String {
@@ -883,6 +900,10 @@ pub fn repositories(root: &Path) -> Result<Vec<PathBuf>, ProgrammeError> {
 pub struct Listed {
     pub found: Vec<Found>,
     pub notes: Vec<String>,
+    /// The main-checkout directory of each programme whose source could not
+    /// be selected (its `choose` failed), in slug order. Each also has a
+    /// line in `notes` saying why; the other programmes are still listed.
+    pub unreadable: Vec<PathBuf>,
 }
 
 /// Origin's view of a repository, and a note when git could not list its
@@ -910,31 +931,96 @@ pub fn programmes_of(repo: &Path) -> Result<Listed, ProgrammeError> {
         return Ok(Listed {
             found: Vec::new(),
             notes,
+            unreadable: Vec::new(),
         });
     }
-    let (view, note) = origin_view_noted(repo);
+    // Every step below spawns git processes (tens of ms each), and the
+    // session-start hook reads this under a deadline: the independent ones
+    // run on scoped threads, and their results are taken in input order, so
+    // the outcome is the same as a sequential read.
+    // holds-until: ~7 worktrees, measured in decisions — a bounded pool once
+    // a repository's linked worktrees outnumber its cores by a wide margin
+    let linked = linked_worktrees(repo);
+    let ((view, note), main_state, linked_states) = std::thread::scope(|scope| {
+        let view = scope.spawn(|| origin_view_noted(repo));
+        let main_state = scope.spawn(|| checkout_state(repo));
+        let linked_states: Vec<_> = linked
+            .iter()
+            .map(|path| scope.spawn(move || checkout_state(path)))
+            .collect();
+        (
+            join_scoped(view),
+            join_scoped(main_state),
+            linked_states
+                .into_iter()
+                .map(join_scoped)
+                .collect::<Vec<_>>(),
+        )
+    });
     notes.extend(note);
-    let mut states = vec![checkout_state(repo)?];
-    for linked in linked_worktrees(repo) {
-        match checkout_state(&linked) {
+    let mut states = vec![main_state?];
+    for (path, state) in linked.iter().zip(linked_states) {
+        match state {
             Ok(state) => states.push(state),
-            Err(error) => notes.push(format!("{}: {error}; skipped", linked.display())),
+            Err(error) => notes.push(format!("{}: {error}; skipped", path.display())),
         }
     }
     let mut slugs: BTreeSet<String> = states.iter().flat_map(|s| local_slugs(&s.path)).collect();
     if let Some(view) = &view {
         slugs.extend(view.slugs.iter().cloned());
     }
+    // holds-until: ~9 programmes, measured in decisions — a bounded pool once
+    // a repository holds enough programmes that one thread each starves git
+    let chosen: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = slugs
+            .iter()
+            .map(|slug| {
+                let (states, view) = (&states, view.as_ref());
+                scope.spawn(move || choose(repo, slug, states, view))
+            })
+            .collect();
+        handles.into_iter().map(join_scoped).collect()
+    });
+    let (found, unreadable, failed) = settle(repo, slugs.iter(), chosen);
+    notes.extend(failed);
+    Ok(Listed {
+        found,
+        notes,
+        unreadable,
+    })
+}
+
+/// What each slug's selection came to: the programmes chosen, and for each
+/// slug whose selection failed its directory and a note saying why. A copy
+/// set aside is a stale branch among many: `list` is quiet about it;
+/// `frontier`, `show` and `check` on its directory say it.
+fn settle<'a>(
+    repo: &Path,
+    slugs: impl Iterator<Item = &'a String>,
+    chosen: Vec<Result<Choice, ProgrammeError>>,
+) -> (Vec<Found>, Vec<PathBuf>, Vec<String>) {
     let mut found = Vec::new();
-    for slug in slugs {
-        // A copy set aside here is a stale branch among many: `list` is
-        // quiet about it; `frontier`, `show` and `check` on its directory
-        // say it.
-        if let Some(one) = choose(repo, &slug, &states, view.as_ref())?.found {
-            found.push(one);
+    let mut unreadable = Vec::new();
+    let mut notes = Vec::new();
+    for (slug, choice) in slugs.zip(chosen) {
+        match choice {
+            Ok(choice) => found.extend(choice.found),
+            Err(error) => {
+                let dir = repo.join(programme_rel(slug));
+                notes.push(format!("{}: {error}; skipped", dir.display()));
+                unreadable.push(dir);
+            }
         }
     }
-    Ok(Listed { found, notes })
+    (found, unreadable, notes)
+}
+
+/// The value of a scoped thread; a panic in it is re-raised here, as it
+/// would have been had the work run on this thread.
+fn join_scoped<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 /// A programme directory as a command named it: the checkout that holds
@@ -1253,6 +1339,36 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn a_slug_that_fails_to_choose_is_unreadable_beside_a_good_one() {
+        let slugs = ["bad".to_string(), "good".to_string()];
+        let good = Found {
+            repo: PathBuf::from("/work/repo"),
+            checkout: PathBuf::from("/work/repo"),
+            slug: "good".to_string(),
+            source: Source::WorkingTree,
+        };
+        let chosen = vec![
+            Err(ProgrammeError::Git {
+                repo: PathBuf::from("/work/repo"),
+                detail: "broken".to_string(),
+            }),
+            Ok(Choice {
+                found: Some(good),
+                set_aside: None,
+            }),
+        ];
+        let (found, unreadable, notes) = settle(Path::new("/work/repo"), slugs.iter(), chosen);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].slug, "good");
+        assert_eq!(
+            unreadable,
+            vec![PathBuf::from("/work/repo/docs/programmes/bad")]
+        );
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("broken"), "{notes:?}");
     }
 
     #[test]

@@ -8,6 +8,18 @@ missing here.
 
 ## Unreleased
 
+- `relais hook` now answers a `SessionStart` of source `startup` or `clear`,
+  in a git repository with programmes, with the ready tickets as session
+  context: due ones first, at most 8, each programme's source locator (a
+  `git show` for a ref-backed copy) and a pointer to its `## Handoff`. It
+  reads with a 3 s deadline, never fetches and takes no index lock; every
+  other session start stays silent. The ordering is the one `relais
+  programme frontier --no-fetch` uses. The `## Handoff` heading is documented
+  as relais's read contract (`relais-handoff/1`, SPEC §31).
+- Every git child relais starts now sets `GIT_OPTIONAL_LOCKS=0`.
+- A supervised child's exit is now polled starting at 1 ms and doubling to
+  20 ms, instead of a fixed interval, so a short git call returns promptly.
+
 ## v0.68.0
 
 - The programme skill hands off at a closed ticket. A map may carry an

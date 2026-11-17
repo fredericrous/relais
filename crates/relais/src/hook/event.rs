@@ -8,6 +8,8 @@
 //! were modelled rather than recorded verbatim); this module is written
 //! against what they showed, not against invented shapes.
 
+use std::path::{Path, PathBuf};
+
 use serde::Deserialize;
 
 use crate::ids::{AgentId, AgentType, PromptId, SessionId, ToolUseId};
@@ -56,6 +58,55 @@ pub enum HookEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStart {
     pub session_id: SessionId,
+    /// Why the session began (`startup`, `clear`, `resume`, `compact`,
+    /// `fork`); `None` when the payload does not say.
+    pub source: Option<SessionSource>,
+    /// The session's working directory; `None` when the payload does not
+    /// carry one.
+    pub cwd: Option<PathBuf>,
+}
+
+/// Why a session began, parsed once from the payload's `source`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSource {
+    Startup,
+    Clear,
+    Resume,
+    Compact,
+    Fork,
+    /// A source this binary does not know, kept as the harness spelled it.
+    Other(String),
+}
+
+impl SessionSource {
+    fn parse(source: String) -> Self {
+        match source.as_str() {
+            "startup" => SessionSource::Startup,
+            "clear" => SessionSource::Clear,
+            "resume" => SessionSource::Resume,
+            "compact" => SessionSource::Compact,
+            "fork" => SessionSource::Fork,
+            _ => SessionSource::Other(source),
+        }
+    }
+}
+
+impl SessionStart {
+    /// The directory to read when this session begins with an empty
+    /// conversation (`startup` or `clear`) and names where it runs; `None`
+    /// for any other source, which keeps its conversation.
+    pub fn fresh_session_cwd(&self) -> Option<&Path> {
+        match &self.source {
+            Some(SessionSource::Startup | SessionSource::Clear) => self.cwd.as_deref(),
+            Some(
+                SessionSource::Resume
+                | SessionSource::Compact
+                | SessionSource::Fork
+                | SessionSource::Other(_),
+            )
+            | None => None,
+        }
+    }
 }
 
 /// The session lifecycle ending.
@@ -138,6 +189,10 @@ struct Envelope {
     prompt_id: Option<PromptId>,
     agent_id: Option<AgentId>,
     agent_type: Option<AgentType>,
+    /// Only `SessionStart` reads these two, and they are held loosely: a
+    /// tool event whose `source` is not a string must not stop parsing.
+    source: Option<serde_json::Value>,
+    cwd: Option<serde_json::Value>,
     tool_name: Option<String>,
     tool_use_id: Option<ToolUseId>,
     /// Held loosely on purpose: its shape belongs to whichever tool ran,
@@ -171,7 +226,11 @@ fn classify(envelope: Envelope) -> HookEvent {
     };
     match event_name {
         "SessionStart" => match envelope.session_id {
-            Some(session_id) => HookEvent::SessionStart(SessionStart { session_id }),
+            Some(session_id) => HookEvent::SessionStart(SessionStart {
+                session_id,
+                source: string_of(envelope.source).map(SessionSource::parse),
+                cwd: string_of(envelope.cwd).map(PathBuf::from),
+            }),
             None => HookEvent::NotOurs,
         },
         "SessionEnd" => match envelope.session_id {
@@ -205,6 +264,14 @@ fn classify(envelope: Envelope) -> HookEvent {
         }
         "PostToolUseFailure" => classify_tool_call(ToolCallPhase::PostFailure, envelope),
         _ => HookEvent::NotOurs,
+    }
+}
+
+/// A payload field as a string; absent, or anything but a string, is `None`.
+fn string_of(field: Option<serde_json::Value>) -> Option<String> {
+    match field {
+        Some(serde_json::Value::String(text)) => Some(text),
+        _ => None,
     }
 }
 
@@ -257,7 +324,6 @@ fn classify_tool_call(phase: ToolCallPhase, envelope: Envelope) -> HookEvent {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::Path;
 
     fn fixture(name: &str) -> Vec<u8> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -272,9 +338,49 @@ mod tests {
         assert_eq!(
             event,
             HookEvent::SessionStart(SessionStart {
-                session_id: SessionId::new("s1")
+                session_id: SessionId::new("s1"),
+                source: None,
+                cwd: None,
             })
         );
+    }
+
+    #[test]
+    fn a_session_start_carries_its_source_and_cwd_and_only_fresh_ones_name_a_directory() {
+        let start = |source: &str| {
+            match parse(
+            format!(
+                r#"{{"hook_event_name":"SessionStart","session_id":"s1","source":"{source}","cwd":"/repo"}}"#
+            )
+            .as_bytes(),
+        ) {
+            HookEvent::SessionStart(start) => start,
+            other => panic!("not a session start: {other:?}"),
+        }
+        };
+        assert_eq!(start("clear").fresh_session_cwd(), Some(Path::new("/repo")));
+        assert_eq!(
+            start("startup").fresh_session_cwd(),
+            Some(Path::new("/repo"))
+        );
+        for source in ["resume", "compact", "fork"] {
+            assert_eq!(start(source).fresh_session_cwd(), None, "{source}");
+        }
+    }
+
+    #[test]
+    fn a_source_that_is_not_a_string_does_not_stop_a_payload_parsing() {
+        let event = parse(
+            br#"{"hook_event_name":"SessionStart","session_id":"s1","source":{"a":1},"cwd":7}"#,
+        );
+        assert!(matches!(
+            event,
+            HookEvent::SessionStart(SessionStart {
+                source: None,
+                cwd: None,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -407,7 +513,9 @@ mod tests {
         assert_eq!(
             event,
             HookEvent::SessionStart(SessionStart {
-                session_id: SessionId::new("s1")
+                session_id: SessionId::new("s1"),
+                source: None,
+                cwd: Some(PathBuf::from("/repo")),
             })
         );
     }

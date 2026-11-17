@@ -1336,3 +1336,269 @@ fn check_refuses_a_misplaced_or_malformed_due_at_its_line() {
     );
     assert_eq!(text(&out.stdout), "");
 }
+
+fn start_payload(source: Option<&str>, cwd: Option<&Path>) -> String {
+    let mut payload = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "s1",
+    });
+    if let Some(source) = source {
+        payload["source"] = source.into();
+    }
+    if let Some(cwd) = cwd {
+        payload["cwd"] = cwd.to_string_lossy().as_ref().into();
+    }
+    payload.to_string()
+}
+
+impl World {
+    /// `relais hook` with `payload` on stdin; its exit code and stdout.
+    fn hook(&self, payload: &str) -> (Option<i32>, String) {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut child = common::relais(BIN)
+            .env("RELAIS_STATE_DIR", &self.state)
+            .env("RELAIS_CONFIG_DIR", self.root.join("cfg"))
+            .arg("hook")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("relais hook spawns");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(payload.as_bytes())
+            .expect("write payload");
+        let out = child.wait_with_output().expect("relais hook runs");
+        (out.status.code(), text(&out.stdout))
+    }
+}
+
+#[test]
+fn a_fresh_session_start_prints_the_ready_tickets_as_one_json_line() {
+    let world = World::new("hookstart");
+    let cwd = world.root.join("alpha");
+    for source in ["startup", "clear"] {
+        let (code, stdout) = world.hook(&start_payload(Some(source), Some(&cwd)));
+        assert_eq!(code, Some(0), "{source}");
+        assert_eq!(stdout.lines().count(), 1, "{source}: {stdout}");
+        let hook_output: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON line");
+        let output = &hook_output["hookSpecificOutput"];
+        assert_eq!(output["hookEventName"], "SessionStart", "{stdout}");
+        let context = output["additionalContext"].as_str().expect("context text");
+        assert!(
+            context.starts_with("relais/programmes: 2 ready in "),
+            "{context}"
+        );
+        assert!(context.contains("- demo B: Name of B\n"), "{context}");
+        assert!(context.contains("- demo D: Name of D\n"), "{context}");
+        assert!(!context.contains("Name of C"), "{context}");
+    }
+}
+
+#[test]
+fn every_other_session_start_prints_nothing_and_exits_zero() {
+    let world = World::new("hooksilent");
+    let cwd = world.root.join("alpha");
+    for source in ["resume", "compact", "fork"] {
+        let (code, stdout) = world.hook(&start_payload(Some(source), Some(&cwd)));
+        assert_eq!((code, stdout.as_str()), (Some(0), ""), "{source}");
+    }
+    let (code, stdout) = world.hook(&start_payload(Some("clear"), None));
+    assert_eq!((code, stdout.as_str()), (Some(0), ""), "no cwd");
+    let (code, stdout) = world.hook(&start_payload(None, Some(&cwd)));
+    assert_eq!((code, stdout.as_str()), (Some(0), ""), "no source");
+    let no_programmes = world.root.join("other");
+    let (code, stdout) = world.hook(&start_payload(Some("clear"), Some(&no_programmes)));
+    assert_eq!((code, stdout.as_str()), (Some(0), ""), "no docs/programmes");
+    let outside = world.root.join("not-a-repository");
+    std::fs::create_dir_all(&outside).expect("plain directory");
+    let (code, stdout) = world.hook(&start_payload(Some("clear"), Some(&outside)));
+    assert_eq!((code, stdout.as_str()), (Some(0), ""), "no repository");
+}
+
+fn modified_at(path: &Path) -> std::time::SystemTime {
+    std::fs::metadata(path)
+        .expect("index exists")
+        .modified()
+        .expect("mtime")
+}
+
+#[test]
+fn a_session_start_takes_no_index_lock_and_leaves_every_index_untouched() {
+    let world = World::new("hooklocks");
+    let alpha = world.root.join("alpha");
+    git(&alpha, &["add", "docs"]);
+    git(&alpha, &["commit", "-q", "-m", "programme"]);
+    let linked = world.root.join("linked");
+    git(
+        &alpha,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "side",
+            linked.to_str().expect("utf8"),
+        ],
+    );
+    // Rewriting a tracked file with the same bytes leaves its stat data
+    // stale, which a plain `git status` answers by refreshing the index.
+    for checkout in [&alpha, &linked] {
+        let file = checkout.join("docs/programmes/demo/D.md");
+        let content = std::fs::read(&file).expect("tracked file");
+        std::fs::write(&file, content).expect("rewrite");
+    }
+    let indexes = [
+        alpha.join(".git/index"),
+        alpha.join(".git/worktrees/linked/index"),
+    ];
+    let before: Vec<_> = indexes.iter().map(|path| modified_at(path)).collect();
+    let (code, stdout) = world.hook(&start_payload(Some("startup"), Some(&alpha)));
+    assert_eq!(code, Some(0));
+    assert!(stdout.contains("relais/programmes:"), "{stdout}");
+    let after: Vec<_> = indexes.iter().map(|path| modified_at(path)).collect();
+    // The unchanged `.git/index` mtimes are the evidence that nothing took
+    // the lock: a lock file is gone again by the time the hook returns.
+    assert_eq!(before, after);
+}
+
+/// Every `- <slug>: <locator>` line of the block that follows `header`.
+fn locators(context: &str, header: &str) -> Vec<(String, String)> {
+    context
+        .lines()
+        .skip_while(|line| *line != header)
+        .skip(1)
+        .take_while(|line| line.starts_with("- "))
+        .filter_map(|line| {
+            let (slug, rest) = line.strip_prefix("- ")?.split_once(": ")?;
+            Some((slug.to_string(), rest.to_string()))
+        })
+        .collect()
+}
+
+fn sh(command: &str) -> String {
+    let out = std::process::Command::new("sh")
+        .args(["-c", command])
+        .output()
+        .expect("sh runs");
+    assert!(out.status.success(), "{command}: {}", text(&out.stderr));
+    text(&out.stdout)
+}
+
+#[test]
+fn the_printed_locators_retrieve_the_copy_each_programme_was_selected_from() {
+    let world = World::new("hooksource");
+    let alpha = world.root.join("alpha");
+    // `ghost` is held by origin only; `demo` is held by origin and edited
+    // in a linked worktree, whose copy then conflicts with the main one.
+    let ghost = alpha.join("docs/programmes/ghost");
+    std::fs::create_dir_all(&ghost).expect("ghost dir");
+    std::fs::write(
+        ghost.join("map.md"),
+        format!("{MAP}\n## Handoff\n\nResume from the ghost.\n"),
+    )
+    .expect("ghost map");
+    std::fs::write(
+        ghost.join("A.md"),
+        ticket("closed", "[]", None, "Ghost A", Some("Decided.")),
+    )
+    .expect("ghost A");
+    std::fs::write(
+        ghost.join("G.md"),
+        ticket("open", "[\"A\"]", None, "Ghost ticket G", None),
+    )
+    .expect("ghost G");
+    git(&alpha, &["add", "docs"]);
+    git(&alpha, &["commit", "-q", "-m", "programmes"]);
+    git(&alpha, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(&alpha, &["rm", "-q", "-r", "docs/programmes/ghost"]);
+    git(&alpha, &["commit", "-q", "-m", "drop ghost locally"]);
+    let linked = world.root.join("linked");
+    git(
+        &alpha,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "side",
+            linked.to_str().expect("utf8"),
+        ],
+    );
+    let copy = linked.join("docs/programmes/demo");
+    std::fs::write(
+        copy.join("D.md"),
+        ticket("open", "[]", None, "Worktree copy of D", None),
+    )
+    .expect("edit D in the worktree");
+    std::fs::write(
+        copy.join("map.md"),
+        format!("{MAP}\n## Handoff\n\nResume from the worktree.\n"),
+    )
+    .expect("edit map in the worktree");
+
+    let (code, stdout) = world.hook(&start_payload(Some("clear"), Some(&alpha)));
+    assert_eq!(code, Some(0));
+    let hook_output: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON line");
+    let context = hook_output["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("context")
+        .to_string();
+    assert!(
+        context.contains("- demo D: Worktree copy of D\n"),
+        "{context}"
+    );
+    assert!(context.contains("- ghost G: Ghost ticket G\n"), "{context}");
+
+    let tickets = locators(&context, "read a ticket from:");
+    let demo = &tickets
+        .iter()
+        .find(|(slug, _)| slug == "demo")
+        .expect("demo")
+        .1;
+    assert_eq!(
+        Path::new(demo),
+        copy.canonicalize().expect("copy exists"),
+        "{context}"
+    );
+    let selected = std::fs::read_to_string(Path::new(demo).join("D.md")).expect("selected D");
+    assert!(selected.contains("Worktree copy of D"));
+    let ghost_locator = &tickets
+        .iter()
+        .find(|(slug, _)| slug == "ghost")
+        .expect("ghost")
+        .1;
+    assert!(ghost_locator.starts_with("git -C "), "{context}");
+    assert!(sh(ghost_locator).contains("Ghost ticket G"), "{context}");
+
+    let handoffs = locators(&context, "handoff:");
+    let handoff_of = |slug: &str| {
+        handoffs
+            .iter()
+            .find(|(name, _)| name == slug)
+            .unwrap_or_else(|| panic!("{slug} has a pointer: {context}"))
+            .1
+            .clone()
+    };
+    let demo_pointer = handoff_of("demo");
+    let demo_map = demo_pointer
+        .split(' ')
+        .find(|word| word.ends_with("map.md"))
+        .expect("a map locator");
+    assert!(std::fs::read_to_string(demo_map)
+        .expect("selected map")
+        .contains("Resume from the worktree."));
+    let ghost_pointer = handoff_of("ghost");
+    let command = ghost_pointer
+        .strip_prefix("run ")
+        .and_then(|rest| rest.split_once("; its ## Handoff says where"))
+        .map(|(command, _)| command)
+        .unwrap_or_else(|| panic!("a run-this pointer: {ghost_pointer}"));
+    assert!(
+        sh(command).contains("Resume from the ghost."),
+        "{ghost_pointer}"
+    );
+}
