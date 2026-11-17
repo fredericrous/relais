@@ -847,6 +847,18 @@ fn a_candidate_setup_step_cut_off_by_the_total_ends_on_the_total() {
         matches!(&outcome.terminal, Terminal::BudgetExhausted { detail } if detail.contains("total")),
         "{outcome:?}"
     );
+    // The attempt closes blocked with its candidate kept.
+    let endings = fixture
+        .ledger
+        .attempt_endings(&outcome.run_id)
+        .expect("attempts");
+    let (index, ended, sha) = endings.first().cloned().expect("an attempt ran");
+    assert_eq!(
+        (index, ended.as_str()),
+        (1, State::Blocked.as_str()),
+        "{endings:?}"
+    );
+    assert!(sha.is_some(), "the candidate is kept: {endings:?}");
 }
 
 /// An engine for a run already on record and `running`, to end on a budget.
