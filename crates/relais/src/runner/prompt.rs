@@ -78,8 +78,9 @@ pub(super) fn build_prompt(
     previous_failures: Option<&[RepairFailure]>,
     kind: AttemptKind,
 ) -> (String, Option<GuidanceGap>) {
-    let (code_rules_text, code_rules_gap) =
+    let (code_rules_text, code_rules_gap, code_rules_shown) =
         worker_code_rules_block(&manifest.guidance, WORKER_CODE_RULES_BUDGET_BYTES);
+    let code_rules_shown: Vec<&str> = code_rules_shown.iter().map(String::as_str).collect();
     let mut prompt = code_rules_text;
     if let Some(gap) = &code_rules_gap {
         prompt.push_str(&format!("note: {}\n", gap.describe()));
@@ -100,7 +101,7 @@ pub(super) fn build_prompt(
         ));
     }
     prompt.push_str(&constraint_index_block(&manifest.guidance));
-    prompt.push_str(&relevant_block(&manifest.guidance, &[]));
+    prompt.push_str(&relevant_block(&manifest.guidance, &code_rules_shown));
     if let Some(design) = &manifest.design {
         prompt.push_str("the program design below was decided before you; build to its shape.\n");
         prompt.push_str(&data_block("program design", design));
@@ -388,13 +389,14 @@ impl RuleKind {
 /// The full text of the `governs: code` rules for the worker, whole rules in
 /// the order aval listed them under `budget`, and the gap naming what did
 /// not fit, or that the text is not available (a manifest read back from
-/// disk keeps ids and hashes only). Nothing when there are no code rules.
+/// disk keeps ids and hashes only), and the ids of the rules shown in full.
+/// Nothing when there are no code rules.
 pub(super) fn worker_code_rules_block(
     guidance: &Guidance,
     budget: usize,
-) -> (String, Option<GuidanceGap>) {
+) -> (String, Option<GuidanceGap>, Vec<String>) {
     if guidance.code_rules.is_empty() {
-        return (String::new(), None);
+        return (String::new(), None, Vec::new());
     }
     let rendered: Vec<RenderedRule> = guidance
         .code_rules
@@ -414,7 +416,7 @@ pub(super) fn worker_code_rules_block(
             context::guidance::GapCause::TextUnavailable,
             "the code rules are not available in this prompt",
         );
-        return (String::new(), Some(gap));
+        return (String::new(), Some(gap), Vec::new());
     }
     let (shown, gap) = fit_statements(
         &rendered,
@@ -431,7 +433,8 @@ pub(super) fn worker_code_rules_block(
     }
     let instruction = aval_rule_instruction(guidance, "before you write code it governs");
     text.push_str(&tool_checked_block(&indexed, &instruction));
-    (text, gap)
+    let shown_ids = shown.iter().map(|rule| rule.id.clone()).collect();
+    (text, gap, shown_ids)
 }
 
 /// The agent a prompt with index lines is for (ADR-0066), as the run's

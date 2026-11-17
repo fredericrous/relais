@@ -362,25 +362,12 @@ impl Guidance {
     /// The relevant block's entries, one per active decision and rule.
     /// `skip_rules` names rule ids already shown in full elsewhere.
     pub fn relevant_entries(&self, skip_rules: &[&str]) -> Vec<String> {
-        let keys = self
-            .relevant_keys
-            .iter()
-            .filter(|ranked| ranked.state == RankState::Active)
-            .filter_map(|ranked| {
-                let choice = ranked.choice.as_deref()?;
-                Some(match (&ranked.adr, &ranked.scope) {
-                    (Some(adr), Some(scope)) => {
-                        format!("`{}` ({adr}, {scope}): {choice}", ranked.key)
-                    }
-                    (Some(adr), None) => format!("`{}` ({adr}): {choice}", ranked.key),
-                    (None, _) => format!("`{}`: {choice}", ranked.key),
-                })
-            });
+        let keys = self.relevant_keys.iter().filter_map(key_entry);
         let rules = self
             .relevant_rules
             .iter()
             .filter(|rule| !skip_rules.contains(&rule.id.as_str()))
-            .map(|rule| format!("rule `{}` ({}): {}", rule.id, rule.level, rule.statement));
+            .map(rule_entry);
         keys.chain(rules).collect()
     }
 
@@ -390,41 +377,113 @@ impl Guidance {
     }
 }
 
+/// A ranked key as the relevant block prints it; none for a key that is
+/// not active or has no choice.
+fn key_entry(ranked: &RankedKey) -> Option<String> {
+    if ranked.state != RankState::Active {
+        return None;
+    }
+    let choice = ranked.choice.as_deref()?;
+    Some(match (&ranked.adr, &ranked.scope) {
+        (Some(adr), Some(scope)) => format!("`{}` ({adr}, {scope}): {choice}", ranked.key),
+        (Some(adr), None) => format!("`{}` ({adr}): {choice}", ranked.key),
+        (None, _) => format!("`{}`: {choice}", ranked.key),
+    })
+}
+
+fn rule_entry(rule: &RuleRef) -> String {
+    format!("rule `{}` ({}): {}", rule.id, rule.level, rule.statement)
+}
+
 /// Bytes a list of lines takes in a prompt.
 pub fn rendered_bytes(lines: &[String]) -> usize {
     lines.iter().map(|line| line.len() + 1).sum()
 }
 
-/// Keep the guidance inside `budget`: whole ranked entries leave from the
-/// end of the relevant block, rules before keys, and the gap names them
-/// (`relevant partial`, or `relevant missing` when none is left); the index
-/// is dropped only when it alone is over. Each drop is a gap with the
-/// measured and the budget bytes.
-/// The reviewer's statements are not counted here.
+/// Keep the guidance inside `budget`. The ranking is cut proportionally
+/// from the tail of each list (keys and rules each in aval's order): while
+/// over budget, the tail entry of the list whose kept rendered bytes are the
+/// larger fraction of that list's original rendered bytes is dropped, rules
+/// first on a tie. Rules that are code rules (`guidance.code_rules`) are
+/// measured as skipped, and a ranked key that renders no entry (not active,
+/// no choice) is kept. The gap says `kept K of N by rank` and names what
+/// went (`relevant partial`, or `relevant missing` when K is 0); the index is
+/// dropped only when it alone is over. The reviewer's statements are not
+/// counted here.
 pub fn fit_budget(guidance: &mut Guidance, budget: usize) {
     let index = rendered_bytes(&guidance.index_lines());
-    let measured = index + rendered_bytes(&guidance.relevant_entries(&[]));
-    if measured > budget {
-        // Whole entries leave from the end, ranked rules before ranked keys,
-        // so the best-ranked decisions stay when the block is only a little
-        // over (aval 1.11.0 ranks scoped decisions here, ADR-0046).
-        let mut dropped = Vec::new();
-        while index + rendered_bytes(&guidance.relevant_entries(&[])) > budget {
-            if let Some(rule) = guidance.relevant_rules.pop() {
-                dropped.push(format!("rule {}", rule.id));
-            } else if let Some(ranked) = guidance.relevant_keys.pop() {
-                // A key the block never showed (not active, no choice) is
-                // not a loss worth naming.
-                if ranked.state == RankState::Active && ranked.choice.is_some() {
-                    dropped.push(ranked.key);
-                }
+    let skipped: Vec<String> = guidance
+        .code_rules
+        .iter()
+        .map(|rule| rule.id.clone())
+        .collect();
+    let skipped: Vec<&str> = skipped.iter().map(String::as_str).collect();
+    let key_entries: Vec<(usize, String)> = guidance
+        .relevant_keys
+        .iter()
+        .enumerate()
+        .filter_map(|(at, ranked)| key_entry(ranked).map(|entry| (at, entry)))
+        .collect();
+    let rule_entries: Vec<(usize, String)> = guidance
+        .relevant_rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| !skipped.contains(&rule.id.as_str()))
+        .map(|(at, rule)| (at, rule_entry(rule)))
+        .collect();
+    let size = |entries: &[(usize, String)]| -> usize {
+        entries.iter().map(|(_, line)| line.len() + 1).sum()
+    };
+    let (keys_original, rules_original) = (size(&key_entries), size(&rule_entries));
+    let measured = index + keys_original + rules_original;
+    // An index over the budget on its own is dropped below, so the ranking
+    // is measured without it rather than cut to nothing for its sake.
+    let index_kept = if index > budget { 0 } else { index };
+    let over = (index_kept + keys_original + rules_original).saturating_sub(budget);
+    if over > 0 {
+        let (mut keys_kept, mut rules_kept) = (key_entries.len(), rule_entries.len());
+        let (mut keys_bytes, mut rules_bytes) = (keys_original, rules_original);
+        while index_kept + keys_bytes + rules_bytes > budget && (keys_kept > 0 || rules_kept > 0) {
+            // kept/original as a cross-multiplied comparison, no division.
+            let keys_share = keys_bytes as u128 * rules_original.max(1) as u128;
+            let rules_share = rules_bytes as u128 * keys_original.max(1) as u128;
+            let cut_rule = rules_kept > 0 && (keys_kept == 0 || rules_share >= keys_share);
+            if cut_rule {
+                rules_kept -= 1;
+                rules_bytes -= rule_entries[rules_kept].1.len() + 1;
             } else {
-                break;
+                keys_kept -= 1;
+                keys_bytes -= key_entries[keys_kept].1.len() + 1;
             }
         }
-        if !dropped.is_empty() {
-            dropped.reverse();
-            let source = if guidance.relevant_entries(&[]).is_empty() {
+        let dropped_keys: Vec<usize> = key_entries[keys_kept..].iter().map(|(at, _)| *at).collect();
+        let dropped_rules: Vec<usize> = rule_entries[rules_kept..]
+            .iter()
+            .map(|(at, _)| *at)
+            .collect();
+        let mut names: Vec<String> = dropped_keys
+            .iter()
+            .map(|at| guidance.relevant_keys[*at].key.clone())
+            .collect();
+        names.extend(
+            dropped_rules
+                .iter()
+                .map(|at| format!("rule {}", guidance.relevant_rules[*at].id)),
+        );
+        if !names.is_empty() {
+            let kept = keys_kept + rules_kept;
+            let total = key_entries.len() + rule_entries.len();
+            let mut at = 0;
+            guidance.relevant_keys.retain(|_| {
+                at += 1;
+                !dropped_keys.contains(&(at - 1))
+            });
+            at = 0;
+            guidance.relevant_rules.retain(|_| {
+                at += 1;
+                !dropped_rules.contains(&(at - 1))
+            });
+            let source = if kept == 0 {
                 GuidanceSource::Relevant
             } else {
                 GuidanceSource::RelevantPartial
@@ -433,10 +492,8 @@ pub fn fit_budget(guidance: &mut Guidance, budget: usize) {
                 source,
                 GapCause::OverBudget { measured, budget },
                 format!(
-                    "{} ranked entries dropped over budget (guidance measured {measured} bytes \
-                     against a {budget}-byte budget): {}",
-                    dropped.len(),
-                    dropped.join(", ")
+                    "kept {kept} of {total} by rank, {over} bytes over: {}",
+                    names.join(", ")
                 ),
             ));
         }
@@ -1311,8 +1368,76 @@ EOF"#;
         }
     }
 
+    fn ranked_key(key: &str, state: RankState, choice: Option<&str>) -> RankedKey {
+        RankedKey {
+            key: key.to_string(),
+            state,
+            adr: Some("decisions:ADR-0006".into()),
+            choice: choice.map(str::to_string),
+            scope: None,
+        }
+    }
+
+    fn twenty_and_twenty() -> Guidance {
+        let mut guidance = guidance_with(2, 20);
+        guidance.relevant_keys = (0..20)
+            .map(|i| {
+                ranked_key(
+                    &format!("k.key-{i}"),
+                    RankState::Active,
+                    Some(&"c".repeat(100)),
+                )
+            })
+            .collect();
+        guidance
+    }
+
     #[test]
-    fn over_budget_drops_relevant_first_then_the_index() {
+    fn over_budget_cuts_each_list_from_its_own_tail_in_proportion() {
+        let mut guidance = twenty_and_twenty();
+        let full = rendered_bytes(&guidance.index_lines())
+            + rendered_bytes(&guidance.relevant_entries(&[]));
+        fit_budget(&mut guidance, full / 2);
+        let (keys, rules) = (guidance.relevant_keys.len(), guidance.relevant_rules.len());
+        assert!(keys > 0 && keys < 20, "{keys}");
+        assert!(rules > 0 && rules < 20, "{rules}");
+        assert_eq!(guidance.relevant_keys[0].key, "k.key-0");
+        assert_eq!(
+            guidance.relevant_keys[keys - 1].key,
+            format!("k.key-{}", keys - 1)
+        );
+        assert_eq!(
+            guidance.relevant_rules[rules - 1].id,
+            format!("rel.rule-{}", rules - 1)
+        );
+        assert!(
+            rendered_bytes(&guidance.index_lines())
+                + rendered_bytes(&guidance.relevant_entries(&[]))
+                <= full / 2
+        );
+        assert_eq!(guidance.gaps.len(), 1);
+        let gap = &guidance.gaps[0];
+        assert_eq!(gap.source, GuidanceSource::RelevantPartial);
+        assert!(
+            gap.detail
+                .contains(&format!("kept {} of 40 by rank", keys + rules)),
+            "{}",
+            gap.detail
+        );
+        assert!(gap.detail.contains("bytes over:"), "{}", gap.detail);
+        assert!(gap.describe().starts_with("relevant partial"));
+    }
+
+    #[test]
+    fn a_ranking_that_fits_records_no_gap() {
+        let mut fits = twenty_and_twenty();
+        fit_budget(&mut fits, GUIDANCE_BUDGET_BYTES * 4);
+        assert!(fits.gaps.is_empty());
+        assert_eq!(fits.relevant_keys.len() + fits.relevant_rules.len(), 40);
+    }
+
+    #[test]
+    fn a_fully_cut_ranking_is_relevant_missing_and_the_index_survives() {
         let mut both = guidance_with(10, 50);
         let index_bytes = rendered_bytes(&both.index_lines());
         fit_budget(&mut both, index_bytes + 10);
@@ -1321,7 +1446,7 @@ EOF"#;
         assert_eq!(both.gaps.len(), 1);
         assert_eq!(both.gaps[0].source, GuidanceSource::Relevant);
         assert!(
-            both.gaps[0].detail.contains("bytes against a"),
+            both.gaps[0].detail.contains("kept 0 of 50 by rank"),
             "{:?}",
             both.gaps
         );
@@ -1331,44 +1456,57 @@ EOF"#;
         assert!(tiny.index.is_empty() && tiny.relevant_rules.is_empty());
         let sources: Vec<GuidanceSource> = tiny.gaps.iter().map(|gap| gap.source).collect();
         assert_eq!(sources, [GuidanceSource::Relevant, GuidanceSource::Index]);
-
-        let mut fits = guidance_with(3, 2);
-        fit_budget(&mut fits, GUIDANCE_BUDGET_BYTES);
-        assert!(fits.gaps.is_empty());
     }
 
     #[test]
-    fn a_block_a_little_over_keeps_its_ranked_keys_and_drops_trailing_rules() {
-        let mut guidance = guidance_with(2, 5);
-        guidance.relevant_keys = ["ui.design-system", "ui.measures"]
-            .iter()
-            .map(|key| RankedKey {
-                key: key.to_string(),
-                state: RankState::Active,
-                adr: Some("decisions:ADR-0006".into()),
-                choice: Some("@duro-app/ui".into()),
-                scope: Some("duro-stack".into()),
-            })
-            .collect();
-        let keys_and_two_rules = rendered_bytes(&guidance.index_lines())
-            + rendered_bytes(&guidance.relevant_entries(&[])[..4]);
-        fit_budget(&mut guidance, keys_and_two_rules);
+    fn an_index_over_the_budget_alone_does_not_cut_a_ranking_that_fits() {
+        let mut guidance = guidance_with(50, 2);
+        let index_bytes = rendered_bytes(&guidance.index_lines());
+        let ranking_bytes = rendered_bytes(&guidance.relevant_entries(&[]));
+        assert!(ranking_bytes < index_bytes);
+        fit_budget(&mut guidance, ranking_bytes);
+        assert!(guidance.index.is_empty());
+        assert_eq!(guidance.relevant_rules.len(), 2, "{:?}", guidance.gaps);
+        let sources: Vec<GuidanceSource> = guidance.gaps.iter().map(|gap| gap.source).collect();
+        assert_eq!(sources, [GuidanceSource::Index]);
+    }
 
-        let entries = guidance.relevant_entries(&[]);
-        assert_eq!(entries.len(), 4, "{entries:?}");
-        assert!(
-            entries[0].contains("(decisions:ADR-0006, duro-stack)"),
-            "{entries:?}"
-        );
-        assert_eq!(guidance.relevant_keys.len(), 2);
-        assert_eq!(guidance.relevant_rules.len(), 2);
-        assert_eq!(guidance.gaps.len(), 1);
-        let detail = &guidance.gaps[0].detail;
-        assert!(detail.contains("3 ranked entries dropped"), "{detail}");
-        assert!(detail.contains("rule rel.rule-2"), "{detail}");
-        assert!(!detail.contains("ui.design-system"), "{detail}");
+    #[test]
+    fn a_tie_cuts_a_rule_first() {
+        let mut guidance = guidance_with(0, 1);
+        guidance.relevant_keys = vec![ranked_key("k.one", RankState::Active, Some("c"))];
+        let both = rendered_bytes(&guidance.relevant_entries(&[]));
+        fit_budget(&mut guidance, both - 1);
+        assert!(guidance.relevant_rules.is_empty());
+        assert_eq!(guidance.relevant_keys.len(), 1);
         assert_eq!(guidance.gaps[0].source, GuidanceSource::RelevantPartial);
-        assert!(guidance.gaps[0].describe().starts_with("relevant partial"));
+    }
+
+    #[test]
+    fn a_key_that_renders_nothing_survives_the_cut() {
+        let mut guidance = guidance_with(0, 5);
+        guidance.relevant_keys = vec![
+            ranked_key("k.undecided", RankState::Undecided, None),
+            ranked_key("k.no-choice", RankState::Active, None),
+        ];
+        fit_budget(&mut guidance, 0);
+        assert!(guidance.relevant_rules.is_empty());
+        assert_eq!(guidance.relevant_keys.len(), 2);
+        assert!(guidance.gaps[0].detail.contains("kept 0 of 5 by rank"));
+    }
+
+    #[test]
+    fn code_rules_are_measured_as_skipped() {
+        let mut guidance = guidance_with(0, 3);
+        guidance.code_rules = vec![CodeRule::new("rel.rule-0".into(), "s".into(), "b".into())];
+        let without_first = rendered_bytes(&guidance.relevant_entries(&["rel.rule-0"]));
+        fit_budget(&mut guidance, without_first);
+        assert!(guidance.gaps.is_empty(), "{:?}", guidance.gaps);
+        assert_eq!(
+            guidance.relevant_rules.len(),
+            3,
+            "kept for the prompt to decide"
+        );
     }
 
     #[test]
