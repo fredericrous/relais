@@ -806,6 +806,17 @@ impl<'a> RunEngine<'a> {
             self.retire_worktree(&worktree, &outcome)?;
             return Ok(outcome);
         }
+        let setup_cut_by_budget = setup
+            .iter()
+            .any(|step| step.ended.recorded() == Some(crate::procs::Ended::TimedOut));
+        if setup_cut_by_budget {
+            if let Some(exhausted) = self.budgets.exhausted() {
+                let nominal = fresh_progress(&preflight).budget;
+                let outcome = self.end_on_exhausted(exhausted, &nominal, None)?;
+                self.retire_worktree(&worktree, &outcome)?;
+                return Ok(outcome);
+            }
+        }
         let outcome = match verify::setup_failure(&setup) {
             // The worktree exists and no worker has touched it; whatever
             // the setup left there — an installed `node_modules` the

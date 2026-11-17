@@ -772,6 +772,83 @@ fn a_base_check_cut_off_by_the_total_ends_on_the_total() {
     );
 }
 
+/// A setup that sleeps past any total on its `slow_from`th run (1-based) and
+/// is instant before that, counting its runs in `counter`.
+fn setup_slow_from(counter: &std::path::Path, slow_from: u32) -> CommandSpec {
+    sh(&format!(
+        "echo run >> '{p}'; if [ \"$(wc -l < '{p}')\" -ge {slow_from} ]; then sleep 60; fi",
+        p = counter.display()
+    ))
+}
+
+#[test]
+fn a_base_setup_step_cut_off_by_the_total_ends_on_the_total() {
+    // The setup runs three times: the task tree's, the candidate's, then the
+    // base's on demand, which is the one that sleeps; the total is long enough
+    // for the first two to finish, so only the base's setup is clipped.
+    let fixture = Fixture::new();
+    let runs = fixture.artifacts.join("setup-runs");
+    let mut repo =
+        fixture.repo_policy_with_setup(vec![setup_slow_from(&runs, 3)], vec![sh("exit 1")], 3);
+    repo.execution.min_repair_seconds = 0;
+    let mut contract = fixture.contract(Review::Off);
+    contract.limits.total_seconds = Some(8);
+    let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let outcome = fixture.execute(&contract, &repo, &changing_worker(launches));
+    assert!(
+        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail } if detail.contains("total")),
+        "{outcome:?}"
+    );
+    let logs = fixture.artifacts.join(outcome.run_id.as_str()).join("logs");
+    assert!(
+        logs.join("base-setup0.log").exists(),
+        "the base's setup was the cut step"
+    );
+    assert!(
+        logs.join("attempt1-setup0.log").exists(),
+        "the candidate's setup finished"
+    );
+}
+
+#[test]
+fn a_task_worktree_setup_step_cut_off_by_the_total_ends_on_the_total() {
+    let fixture = Fixture::new();
+    let runs = fixture.artifacts.join("setup-runs");
+    let repo =
+        fixture.repo_policy_with_setup(vec![setup_slow_from(&runs, 1)], vec![main_gone_check()], 3);
+    let mut contract = fixture.contract(Review::Off);
+    contract.limits.total_seconds = Some(1);
+    let outcome = fixture.execute(&contract, &repo, &conditional_worker(""));
+    assert!(
+        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail } if detail.contains("total")),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        fixture
+            .ledger
+            .dispatch_count(&outcome.run_id)
+            .expect("count"),
+        0,
+        "no worker launched"
+    );
+}
+
+#[test]
+fn a_candidate_setup_step_cut_off_by_the_total_ends_on_the_total() {
+    // Fast at the task tree, slow at the candidate.
+    let fixture = Fixture::new();
+    let runs = fixture.artifacts.join("setup-runs");
+    let repo =
+        fixture.repo_policy_with_setup(vec![setup_slow_from(&runs, 2)], vec![main_gone_check()], 3);
+    let mut contract = fixture.contract(Review::Off);
+    contract.limits.total_seconds = Some(8);
+    let outcome = fixture.execute(&contract, &repo, &conditional_worker(""));
+    assert!(
+        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail } if detail.contains("total")),
+        "{outcome:?}"
+    );
+}
+
 /// An engine for a run already on record and `running`, to end on a budget.
 fn ended_on(fixture: &Fixture, exhausted: Exhausted) -> RunOutcome {
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);

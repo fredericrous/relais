@@ -451,6 +451,15 @@ impl<'a> RunEngine<'a> {
                     label, found, measured,
                 )));
             }
+            // A setup step's timeout is clipped to what is left of the total:
+            // when the total ran out, the run's own budget ended it, as for a
+            // base check, and the run ends on the total.
+            let setup_timed_out = setup
+                .iter()
+                .any(|step| step.ended.recorded() == Some(Ended::TimedOut));
+            if setup_timed_out && self.budgets.exhausted() == Some(Exhausted::Total) {
+                return Ok(BaseRan::Ended(BaseEnding::Total));
+            }
             if let Some(failed) = verify::setup_failure(&setup) {
                 return Ok(BaseRan::Ended(BaseEnding::Blocked(
                     BlockCode::VerificationSetupFailed,

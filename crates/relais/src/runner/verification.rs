@@ -758,6 +758,7 @@ impl<'a> RunEngine<'a> {
             }
         };
         let mut setup_gap: Option<String> = None;
+        let mut setup_cut = false;
         let checks = match (reuse, holder.as_ref()) {
             // The candidate is the base tree: the baseline's outcomes are
             // its outcomes, by identity — and the base's setup already
@@ -802,8 +803,14 @@ impl<'a> RunEngine<'a> {
                     // gap, not a failure: no check ran, so nothing was
                     // tested, and no stronger model installs
                     // dependencies (SPEC §10). If the candidate changed
-                    // the lockfile, that is reported on its own.
+                    // the lockfile, that is reported on its own. A step the
+                    // run's budget cut is still that gap (the integration
+                    // path stops on it), and the attempt path reads
+                    // `setup_cut_by_budget` first to end on the budget with
+                    // the candidate kept.
                     Some(failed) => {
+                        setup_cut = failed.ended.recorded() == Some(crate::procs::Ended::TimedOut)
+                            && self.budgets.exhausted().is_some();
                         self.events.emit(crate::protocol::Event::Decision {
                             what: "verification_setup_gap".to_string(),
                             reason: format!(
@@ -842,14 +849,15 @@ impl<'a> RunEngine<'a> {
                 ))
             }
         };
-        if let Some(gap) = setup_gap {
+        if setup_gap.is_some() {
             if let Some(holder) = holder.as_mut() {
                 if let Err(e) = holder.release() {
                     eprintln!("relais: {e}");
                 }
             }
             return Ok(verify::Verified {
-                gaps: vec![gap],
+                gaps: setup_gap.into_iter().collect(),
+                setup_cut_by_budget: setup_cut,
                 ..Default::default()
             });
         }
@@ -1057,6 +1065,7 @@ impl<'a> RunEngine<'a> {
         Ok(verify::Verified {
             checks,
             gaps,
+            setup_cut_by_budget: false,
             acceptance_gaps,
             amont_bypasses: inventory
                 .as_ref()
