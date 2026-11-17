@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/resume-on-clear
 repos: [relais, amont-agent, decisions]
 adrs: [ADR-0062, ADR-0075]
@@ -205,14 +205,16 @@ elapsed ms.
   common dir), `docs/index.md` (documents the inbox line grammar and the
   `.filing` take as greenbelay's contract, with a version token, per
   `harness.cross-tool-reads`; the worktree-task skill conforms), `CHANGELOG.md`.
-- [ ] Phase 3 — releases through the `tag-release` skill, each as soon as
-  its phase merges (relais does not wait for greenbelay):
+- [x] Phase 3 — releases through the `tag-release` skill, each as soon as
+  its phase merges (relais does not wait for greenbelay). Done: relais
+  v0.69.0 (#492) and greenbelay 6.3.0 (greenharness/greenbelay#285), both
+  installed with brew; the machine now runs relais 0.69.0 and greenbelay 6.3.1:
   - relais: `Cargo.toml`, `Cargo.lock`;
   - greenbelay: `Cargo.toml`, `Cargo.lock`, `greenharness.toml`. This
     waits until session `32290a5c`'s 6.1.0 has landed; re-run `greenbelay
     board` first.
   - Install both with brew.
-- [ ] Phase 4 — live proof, in t05's Resolution, its `repos`, and the map
+- [x] Phase 4 — live proof (done 2026-11-17; the live `/clear` missed, see Verification and Outcome), in t05's Resolution, its `repos`, and the map
   (`decisions/docs/programmes/session-boundaries/t05-resume-on-clear.md`,
   `decisions/docs/programmes/session-boundaries/map.md`):
   - the installed binaries on a real SessionStart payload in decisions, once
@@ -275,8 +277,8 @@ elapsed ms.
 | budget (worst) | decisions, the checkout with the most linked worktrees (7 worktrees, 9 programmes) | under 1 s; at or over 3 s blocks the release | 0.53 s: met. relais (5 worktrees) 0.37 s |
 | output | the same hook, sequential build against the parallel one | byte-identical context | identical |
 | CI on Windows | relais#490, first push | the test matrix passes | 4 render tests failed: they expected `/`-joined directories. `Found::dir` joins one relative `docs/programmes/<slug>`, so on Windows only that join is a backslash (`/work/repo\docs/programmes/alpha`), and `shell_quote` then quotes it. The first fix guessed backslashes throughout and failed again on the second push. The test helper now joins exactly as `Found::dir` does |
-| piloted | the installed binaries, a SessionStart JSON per source, cwd decisions | the context quoted in t05 | Phase 4 |
-| live | the `/clear` at this session's boundary | the next session's first message quotes `relais/programmes: N ready`, due tickets first (t12 `[due 2026-11-24]` if ready), t11 listed, and the greenbelay inbox block, or no `greenbelay/inbox:` line when the inbox is empty | Phase 4 |
+| piloted | the installed binaries, a SessionStart JSON per source, cwd decisions | the context quoted in t05 | pass: `startup` and `clear` printed `relais/programmes: 14 ready`, due tickets first, in 0.48–0.49 s; `resume`, `compact` and `fork` printed nothing. A replay after t13–t18 were filed printed `21 ready`, led by t12 `[due 2026-11-24]`, with no `greenbelay/inbox:` line (the inbox is empty) |
+| live | the `/clear` at this session's boundary | the next session's first message quotes `relais/programmes: N ready`, due tickets first (t12 `[due 2026-11-24]` if ready), t11 listed, and the greenbelay inbox block, or no `greenbelay/inbox:` line when the inbox is empty | **missed:** session 8f33d4fe was cleared at `~/Developer/Perso`, which is not a repository. relais printed nothing, and greenbelay printed only its grep-shim (no plans or inbox line); both are silent outside a repository by design. clear-relay did submit the handoff's `next:` prompt. Filed as decisions session-boundaries t19 |
 
 ## Measure after release
 
@@ -296,5 +298,7 @@ elapsed ms.
 - unix: approve in round 1, carried to this tree (no rework). tui: approve-with-changes on both rounds. Filed as an inbox follow-up: the overflow command lists only the first programme. 48k + 70k.
 
 ## Outcome
+
+Shipped and installed: relais v0.69.0 names the ready programme tickets, with due ones first, at a `startup` or `clear` SessionStart, and greenbelay 6.3.0 names unfiled inbox lines. This is proven in decisions by a replay of the installed binaries for each source. The live `/clear` at the boundary missed, because that session started at the non-repository Perso root and neither hook reads anything outside a repository. Sessions often start there, so resuming from SessionStart alone does not yet hold in the common case: decisions session-boundaries t19. The 7-day measure above runs to 2026-11-24.
 
 <!-- panel: repos=relais,amont-agent,decisions adds=contract reviewers=backend,lang:rust,tui,unix,architect,po,codex body-sha=7bac5f528f09 -->
