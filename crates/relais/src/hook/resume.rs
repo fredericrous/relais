@@ -203,13 +203,11 @@ mod tests {
 
     use super::*;
 
-    /// A programme directory as `Found::dir` builds it: joined with the
-    /// platform's separator, so expectations hold on Windows too.
+    /// A programme directory as `Found::dir` builds it: the checkout joined
+    /// with the one relative `docs/programmes/<slug>`, so on Windows only the
+    /// join itself is a backslash (`/work/repo\docs/programmes/alpha`).
     fn programme_dir(checkout: &str, slug: &str) -> PathBuf {
-        Path::new(checkout)
-            .join("docs")
-            .join("programmes")
-            .join(slug)
+        Path::new(checkout).join(format!("docs/programmes/{slug}"))
     }
 
     /// The path as the text quotes it for a shell.
