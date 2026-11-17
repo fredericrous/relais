@@ -203,6 +203,20 @@ mod tests {
 
     use super::*;
 
+    /// A programme directory as `Found::dir` builds it: joined with the
+    /// platform's separator, so expectations hold on Windows too.
+    fn programme_dir(checkout: &str, slug: &str) -> PathBuf {
+        Path::new(checkout)
+            .join("docs")
+            .join("programmes")
+            .join(slug)
+    }
+
+    /// The path as the text quotes it for a shell.
+    fn quoted(path: &Path) -> String {
+        shell_quote(&path.display().to_string())
+    }
+
     fn day(year: i32, month: u32, date: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(year, month, date).expect("a real day")
     }
@@ -315,9 +329,10 @@ mod tests {
         assert_eq!(text.matches("Shown\n").count(), 8, "{text}");
         assert!(!text.contains("Hidden\n"), "{text}");
         assert!(
-            text.contains(
-                "- … and 2 more ready (2 programmes; relais programme frontier --no-fetch /work/repo/docs/programmes/alpha lists them)\n"
-            ),
+            text.contains(&format!(
+                "- … and 2 more ready (2 programmes; relais programme frontier --no-fetch {} lists them)\n",
+                quoted(&programme_dir("/work/repo", "alpha"))
+            )),
             "{text}"
         );
         assert!(
@@ -336,9 +351,10 @@ mod tests {
         rows.push(row(0, "alpha", "t9", "Hidden", None));
         let text = render_of(&ready_of(founds, rows), false);
         assert!(
-            text.contains(
-                "- … and 1 more ready (1 programme; relais programme frontier --no-fetch '/work/my repo/docs/programmes/alpha' lists them)\n"
-            ),
+            text.contains(&format!(
+                "- … and 1 more ready (1 programme; relais programme frontier --no-fetch {} lists them)\n",
+                quoted(&programme_dir("/work/my repo", "alpha"))
+            )),
             "{text}"
         );
     }
@@ -394,7 +410,10 @@ mod tests {
         );
         let text = render_of(&ready, false);
         assert!(
-            text.contains("- alpha: /work/repo/docs/programmes/alpha\n"),
+            text.contains(&format!(
+                "- alpha: {}\n",
+                programme_dir("/work/repo", "alpha").display()
+            )),
             "{text}"
         );
         assert!(
@@ -427,7 +446,10 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("- p0: the ## Handoff in /work/repo/docs/programmes/p0/map.md"),
+            text.contains(&format!(
+                "- p0: the ## Handoff in {}",
+                programme_dir("/work/repo", "p0").join("map.md").display()
+            )),
             "{text}"
         );
         assert!(
