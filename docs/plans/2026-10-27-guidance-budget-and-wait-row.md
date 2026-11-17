@@ -72,6 +72,7 @@ The person saw two runs side by side in the relais pane (2026-10-27): a replay a
 
 - D1 (2026-10-27, person) Fix both on a separate branch now: "Oui, branche à part (Recommandé)".
 - D2 (2026-10-27) Trim by aval's `score`, both lists merged, since each list is sorted by score and both come from one query; no new `GapCause` variant. Open: one query does not prove one scale (keys 81.26→18.78, rules 51.50→27.09); before merging, cite where aval computes both scores, else trim each list by its own rank in proportion to its bytes.
+- D3 (2026-11-17) D2 settled: not one scale. aval scores keys with text, path, mention and co-change terms over the key index (`aval/crates/greentopo/src/relevant.rs:563-568`) and rules with text and path terms over a separate rule index (`:622-623`). So the fallback applies: each list is cut from its own tail, the list keeping the larger share of its bytes losing the next entry, and no `score` field is added (the "keep the score" and "one ranked list" bullets fall). #323 (2026-10-28) had meanwhile made `fit_budget` trim from the end (rules first) with a `relevant partial` gap; this branch replaces that order with the proportional one and adds the code-rule skip and the wait row.
 
 
 <!-- panel: repos=relais adds= reviewers=backend,codex body-sha=94c6a5ab6e70 -->
