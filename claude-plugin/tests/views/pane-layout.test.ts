@@ -378,3 +378,48 @@ test('a folded failed run starts with FAIL in the error colour; an accepted one 
   expect(good.dim).toBe(true)
   expect(good.text.startsWith('FAIL')).toBe(false)
 })
+
+const slotEvent = (run: string, seq: number) => ({
+  relais: 'event',
+  run,
+  seq,
+  at: at(seq),
+  event: { kind: 'waiting_for_slot', class: 'heavy_local', position: 1, waited_s: 1260 },
+})
+const WAIT_TEXT = 'waiting for a heavy local slot, position 1 · 21m'
+const waitRowsOf = (rows: { text: string }[]) => rows.filter(r => r.text.includes(WAIT_TEXT))
+
+test('a live run waiting for a slot draws a spinner row with the wait text, once', () => {
+  const t = liveTimeline('run-w', 3)
+  t.events = t.events.slice(0, 2)
+  t.events.push(slotEvent('run-w', 50))
+  const rows = rowsOf([t], 40)
+  expect(waitRowsOf(rows).map(r => r.text)).toEqual([`  │ ⠋ ${WAIT_TEXT}`])
+  expect(rows.some(r => r.text === '  │ waiting for output')).toBe(false)
+})
+
+test('a waiting_for_slot event before any phase event draws the wait row, no waiting for output', () => {
+  const t = { run: 'run-e', revision: 1, events: [slotEvent('run-e', 1)], current: { state: 'running' } }
+  const rows = rowsOf([t], 40)
+  expect(waitRowsOf(rows)).toHaveLength(1)
+  expect(rows.some(r => r.text === '  │ waiting for output')).toBe(false)
+  expect(rows.findIndex(r => r.text.includes(WAIT_TEXT))).toBe(2)
+})
+
+test('a running check still draws running · last line Ns ago', () => {
+  const t = liveTimeline('run-c', 5)
+  t.events.push(slotEvent('run-c', 60))
+  const rows = rowsOf([t], 40)
+  expect(activityOf(rows)).toHaveLength(1)
+  expect(activityOf(rows)[0].text).toContain('running · ')
+})
+
+test('two live runs in 12 rows: the shrunk frame keeps its head and wait row', () => {
+  const waiting = liveAt('live-a', 0, 0, 1, 0, true)
+  waiting.events.push(slotEvent('live-a', 500))
+  const rows = run([waiting, liveAt('live-b', 100, 40)], 12)
+  expect(rows.length).toBeLessThanOrEqual(12)
+  const head = rows.findIndex(r => r.text.startsWith('relais · run live-a'))
+  expect(head).toBeGreaterThanOrEqual(0)
+  expect(rows[head + 1].text).toBe(`  │ ⠋ ${WAIT_TEXT}`)
+})

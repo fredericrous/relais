@@ -158,7 +158,7 @@ function frame(m: RunModel, room: Room, isLast: boolean): Frame {
     tail.push(hint)
   }
   tail.push({ text: `cost    ${formatCost(m.cost)}` })
-  if (m.wait && isLive(m)) tail.push({ text: m.wait, dim: true })
+  if (m.wait && isLive(m) && !waitInActivityRow(m)) tail.push({ text: m.wait, dim: true })
   if (m.stalled && isLive(m)) tail.push({ text: m.stalled, dim: true })
   if (m.outcome) {
 
@@ -222,7 +222,7 @@ function outputRows(m: RunModel, cap: number): Row[] {
   if (n <= 0) return []
   const current = m.steps.find(s => s.state === 'active') ?? m.steps[m.steps.length - 1]
   const lines = current ? stepOutput(current) : []
-  if (lines.length === 0) return live && !runningCheck(current) ? [{ text: '  │ waiting for output', dim: true }] : []
+  if (lines.length === 0) return live && !runningCheck(current) && !m.wait ? [{ text: '  │ waiting for output', dim: true }] : []
   return lines.slice(-n).map(text => ({ text: `  │ ${text}`, dim: true }))
 }
 
@@ -233,13 +233,20 @@ const runningCheck = (step: Step | undefined) => {
   return check?.running ? check : undefined
 }
 
+// A live run waiting on something while its active step runs no check: the
+// wait text rides the spinner row instead of a dim tail row.
+function waitInActivityRow(m: RunModel): boolean {
+  if (!m.wait || !isLive(m)) return false
+  return !runningCheck(m.steps.find(s => s.state === 'active'))
+}
+
 // The dim row after a running check's output: a spinner frame that advances
 // with each one-second redraw, and how long ago the check last wrote.
 function activityRow(m: RunModel, now: number): Row | undefined {
   const current = m.steps.find(s => s.state === 'active')
   const check = runningCheck(current)
-  if (!check) return undefined
   const frame = SPINNER_FRAMES[Math.floor(now / 1000) % SPINNER_FRAMES.length]
+  if (!check) return waitInActivityRow(m) ? { text: `  │ ${frame} ${m.wait}`, dim: true } : undefined
   const since =
     check.lastOutputAt === undefined
       ? 'no output yet'
@@ -296,6 +303,13 @@ type Drawn = { rows: Row[]; keep: Set<Row> }
 function drawFrame(f: Frame & { m: RunModel; now: number }, cap: number, trim: Trim): Drawn {
   const rows: Row[] = [...f.head]
   const keep = new Set<Row>([f.head[0]])
+  if (!f.m.steps.some(s => s.state === 'active')) {
+    const wait = activityRow(f.m, f.now)
+    if (wait) {
+      rows.push(wait)
+      keep.add(wait)
+    }
+  }
   for (const step of f.m.steps) {
     rows.push(stepRow(step))
     if (step.state === 'active') {
@@ -323,9 +337,10 @@ function drawFrame(f: Frame & { m: RunModel; now: number }, cap: number, trim: T
 }
 
 // A frame cut to its head, and the outcome row of a run awaiting a person.
-function minimalFrame(f: Frame & { m: RunModel }): Row[] {
+function minimalFrame(f: Frame & { m: RunModel; now: number }): Row[] {
   const outcome = awaitsAPerson(f.m) ? f.tail.find(r => r.text.startsWith('outcome ')) : undefined
-  return outcome ? [f.head[0], outcome] : [f.head[0]]
+  const wait = waitInActivityRow(f.m) ? activityRow(f.m, f.now) : undefined
+  return [f.head[0], ...(wait ? [wait] : []), ...(outcome ? [outcome] : [])]
 }
 
 // The lines a frame would draw if given all it wants.
