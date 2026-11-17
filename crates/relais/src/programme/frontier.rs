@@ -61,12 +61,25 @@ pub struct Ready {
 pub fn ready(found: Vec<Found>) -> Ready {
     let mut rows = Vec::new();
     let mut unreadable = Vec::new();
-    for (position, one) in found.iter().enumerate() {
-        let loaded = one
-            .load()
-            .and_then(|programme| programme.standings().map(|s| (programme, s)));
-        match loaded {
-            Ok((programme, standings)) => {
+    // Each load spawns several git processes (about 40 ms each); one thread
+    // per programme keeps a repository with many programmes inside the
+    // session-start deadline. Results are read back in `found`'s order.
+    let loads: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = found
+            .iter()
+            .map(|one| {
+                scope.spawn(move || {
+                    one.load()
+                        .and_then(|programme| programme.standings().map(|s| (programme, s)))
+                })
+            })
+            .collect();
+        handles.into_iter().map(|handle| handle.join()).collect()
+    });
+    for ((position, one), loaded) in found.iter().enumerate().zip(loads) {
+        // A load that panicked counts as one that failed.
+        match loaded.ok().and_then(Result::ok) {
+            Some((programme, standings)) => {
                 for ticket in programme.tickets.values() {
                     if matches!(standings.get(&ticket.id), Some(Standing::Frontier)) {
                         rows.push(ReadyRow {
@@ -79,7 +92,7 @@ pub fn ready(found: Vec<Found>) -> Ready {
                     }
                 }
             }
-            Err(_) => unreadable.push(one.dir()),
+            None => unreadable.push(one.dir()),
         }
     }
     order_frontier(&mut rows, |row| row.due);

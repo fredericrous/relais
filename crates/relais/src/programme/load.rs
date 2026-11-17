@@ -929,29 +929,67 @@ pub fn programmes_of(repo: &Path) -> Result<Listed, ProgrammeError> {
             notes,
         });
     }
-    let (view, note) = origin_view_noted(repo);
+    // Every step below spawns git processes (tens of ms each), and the
+    // session-start hook reads this under a deadline: the independent ones
+    // run on scoped threads, and their results are taken in input order, so
+    // the outcome is the same as a sequential read.
+    let linked = linked_worktrees(repo);
+    let ((view, note), main_state, linked_states) = std::thread::scope(|scope| {
+        let view = scope.spawn(|| origin_view_noted(repo));
+        let main_state = scope.spawn(|| checkout_state(repo));
+        let linked_states: Vec<_> = linked
+            .iter()
+            .map(|path| scope.spawn(move || checkout_state(path)))
+            .collect();
+        (
+            join_scoped(view),
+            join_scoped(main_state),
+            linked_states
+                .into_iter()
+                .map(join_scoped)
+                .collect::<Vec<_>>(),
+        )
+    });
     notes.extend(note);
-    let mut states = vec![checkout_state(repo)?];
-    for linked in linked_worktrees(repo) {
-        match checkout_state(&linked) {
+    let mut states = vec![main_state?];
+    for (path, state) in linked.iter().zip(linked_states) {
+        match state {
             Ok(state) => states.push(state),
-            Err(error) => notes.push(format!("{}: {error}; skipped", linked.display())),
+            Err(error) => notes.push(format!("{}: {error}; skipped", path.display())),
         }
     }
     let mut slugs: BTreeSet<String> = states.iter().flat_map(|s| local_slugs(&s.path)).collect();
     if let Some(view) = &view {
         slugs.extend(view.slugs.iter().cloned());
     }
+    let chosen: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = slugs
+            .iter()
+            .map(|slug| {
+                let (states, view) = (&states, view.as_ref());
+                scope.spawn(move || choose(repo, slug, states, view))
+            })
+            .collect();
+        handles.into_iter().map(join_scoped).collect()
+    });
     let mut found = Vec::new();
-    for slug in slugs {
+    for choice in chosen {
         // A copy set aside here is a stale branch among many: `list` is
         // quiet about it; `frontier`, `show` and `check` on its directory
         // say it.
-        if let Some(one) = choose(repo, &slug, &states, view.as_ref())?.found {
+        if let Some(one) = choice?.found {
             found.push(one);
         }
     }
     Ok(Listed { found, notes })
+}
+
+/// The value of a scoped thread; a panic in it is re-raised here, as it
+/// would have been had the work run on this thread.
+fn join_scoped<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 /// A programme directory as a command named it: the checkout that holds

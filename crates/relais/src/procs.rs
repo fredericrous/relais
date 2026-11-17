@@ -993,6 +993,11 @@ pub fn wait_for_exit(
     }
     let started = Instant::now();
     let mut reaped = None;
+    // The poll starts at 1 ms and doubles to 20 ms: a short git call (about
+    // 30 ms) is reaped within a few ms of its exit, which the session-start
+    // hook's dozens of calls add up, while a long check still costs one
+    // wakeup per 20 ms.
+    let mut tick = Duration::from_millis(1);
     let stopped = loop {
         if let Some(status) = child.try_wait()? {
             reaped = Some(status);
@@ -1004,7 +1009,8 @@ pub fn wait_for_exit(
         if started.elapsed() >= wall_timeout {
             break Stopped::TimedOut;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(tick);
+        tick = (tick * 2).min(Duration::from_millis(20));
     };
     let group = kill_group(child.id());
     let status = match reaped {
