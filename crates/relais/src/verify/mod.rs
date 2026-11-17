@@ -2760,6 +2760,9 @@ pub struct Verified {
     pub gate_coverage: BTreeMap<String, Result<bool, AttestError>>,
     /// What each holdout run established (ADR-0045).
     pub holdouts: Vec<HoldoutRun>,
+    /// A setup step timed out while a run budget was exhausted: the clock
+    /// cut it, so the candidate is kept and the run ends on that budget.
+    pub setup_cut_by_budget: bool,
 }
 
 /// The toolchain a profile's commands actually run on: for every program

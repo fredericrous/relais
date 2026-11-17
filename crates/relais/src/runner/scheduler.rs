@@ -495,6 +495,9 @@ fn execute_waves(
             // holdout criteria stay unsettled gaps (fail closed); ends
             // when the integration path runs resolved holdouts.
             holdouts: _,
+            // An assembled revision's setup cut by a budget is a gap here
+            // like any other (it is in `gaps`); there is no candidate to keep.
+            setup_cut_by_budget: _,
         } = match engine.verify_candidate(
             &assembly.head,
             root.authority,

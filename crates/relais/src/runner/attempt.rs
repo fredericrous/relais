@@ -1145,6 +1145,7 @@ impl<'a> RunEngine<'a> {
             amont_downgrades,
             gate_coverage,
             holdouts,
+            setup_cut_by_budget,
         } = match self.verify_candidate(
             &candidate.sha,
             authority,
@@ -1187,6 +1188,24 @@ impl<'a> RunEngine<'a> {
         };
         if let Some(outcome) = self.end_if_cancelled()? {
             return Ok(Step::Ended(outcome));
+        }
+        // A setup step the clock cut ran no check: the run ends on the
+        // budget with the candidate kept, not as a verification gap.
+        if setup_cut_by_budget {
+            if let Some(exhausted) = self.budgets.exhausted() {
+                ledger.finish_attempt(
+                    candidate.attempt_id,
+                    State::Blocked,
+                    Some(&held_worktree),
+                    Some(&candidate.sha),
+                )?;
+                let kept = self.kept_candidate(ctx.preflight, candidate.index, &candidate.sha);
+                return Ok(Step::Ended(self.end_on_exhausted(
+                    exhausted,
+                    &progress.budget,
+                    Some(&kept),
+                )?));
+            }
         }
         // A check that timed out because a budget ran out under it says
         // nothing about the code: the run ends on the budget (ADR-0010),
