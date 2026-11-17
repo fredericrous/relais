@@ -154,11 +154,11 @@ Resolution.
    repository. When the `worktree-task` skill is installed, follow its
    Handoff section. Otherwise:
    - file the follow-ups you noticed as `task` tickets in this map, and
-     the inbox when it exists:
-     `$(git rev-parse --path-format=absolute --git-common-dir)/greenharness/inbox.md`.
+     the inbox, when it exists, of every repository this session touched:
+     `inbox="$(git rev-parse --path-format=absolute --git-common-dir)/greenharness/inbox.md"`.
      A line reads `<date> <session8> <text>`, where `session8` is the
      first 8 characters of `CLAUDE_CODE_SESSION_ID`. Take the file first
-     (`mv inbox.md inbox.<session8>.filing`). File this session's lines
+     (`mv "$inbox" "${inbox%.md}.<session8>.filing"`). File this session's lines
      and those dated two or more days ago, append the others back with one
      `>>` each, then delete the taken file;
    - replace the map's `## Handoff` section: date, what merged, the live
