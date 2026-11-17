@@ -187,7 +187,7 @@ elapsed ms.
 
 ## Phases
 
-- [ ] Phase 1 — relais frontier at session start:
+- [x] Phase 1 — relais frontier at session start:
   `crates/relais/src/hook/event.rs` (source, cwd),
   `crates/relais/src/hook/decide.rs` (`HookAnswer::Context`, payload),
   `crates/relais/src/hook/respond.rs`, `crates/relais/src/hook/mod.rs`,
@@ -197,7 +197,7 @@ elapsed ms.
   run per source on a scratch repository), `docs/SPEC.md` (§23 hook,
   §31 programmes, which documents the map's `## Handoff` heading as relais's
   contract, with a version token), `CHANGELOG.md`.
-- [ ] Phase 2 — greenbelay inbox notice:
+- [x] Phase 2 — greenbelay inbox notice (greenharness/greenbelay#284, released in 6.3.0 with #285):
   `crates/greenbelay-process/src/inbox.rs` (new, with unit tests),
   `crates/greenbelay-process/src/lib.rs`, `src/hook.rs`, `src/main.rs`,
   `tests/hook.rs`
@@ -244,22 +244,39 @@ elapsed ms.
   line, and the Resolution says so. No line is written into a real inbox to
   stage the proof.
 
+- 2026-11-17 — The plan's figure of 0.02 s per programme came from a call
+  that failed on a wrong directory. The real cost was about 0.4 s per
+  programme, from git calls made one after another and a 20 ms poll per
+  child. A perf commit reads checkouts, source choices and loads on scoped
+  threads, with the results in input order, and starts the poll at 1 ms,
+  doubling to 20 ms. That took decisions from 2.7 s to 0.53 s.
+- 2026-11-17 — The two small budget misses (0.53 s against 0.5 s, and
+  0.07 s against 0.05 s) are accepted. The worst-checkout bar is met (0.53 s
+  against 1 s), and the deadline is 3 s. What remains is the chain of
+  dependent git calls itself.
+- 2026-11-17 — `GIT_OPTIONAL_LOCKS=0` and the doubling poll apply to every
+  relais git child, not only the hook path. A read-only status never needs
+  the optional index refresh, and a long check still wakes once per 20 ms.
+  Recorded here at implementation review's request, and documented in
+  `git_command` and in the changelog.
+
 ## Verification
 
-| Check | Input | Expected |
-| --- | --- | --- |
-| relais unit | programmes with closed/open blockers, due past/today/future, a `prog/` branch, a failing load | the set and order are `frontier --no-fetch`'s; marks; cap line; failure count; handoff pointer only outside a fence, at most 3 |
-| relais it | `relais hook` fed SessionStart `startup` and `clear`, on a scratch repo with a programme | stdout JSON with `additionalContext` naming the tickets |
-| relais it | `startup` on a scratch repo with a linked worktree | `.git/index` mtime unchanged; no `index.lock` taken |
-| relais it | the same with `resume`, `compact`, `fork`, without cwd, and in a repo with no programmes | empty stdout, exit 0 |
-| greenbelay unit | inbox lines dated 3 days ago, yesterday, today and malformed; a take 2 days old and one 1 h old | orphans: the 3-day line and the old take's lines; the young take not read |
-| greenbelay hook test | SessionStart `startup` and `clear` with an orphan | the block is present |
-| greenbelay hook test | `resume`, `compact`, `fork`; `observe` stance; no inbox | no block (observe: one journal line); the plans line unchanged |
-| gates | both repos' greengate pre-commit (test, clippy, fmt) | pass |
-| budget | `time relais hook` with a SessionStart `clear` in decisions and in a repo without `docs/programmes` | under 0.5 s and under 0.05 s, numbers quoted in t05 |
-| budget (worst) | the same in the checkout with the most linked worktrees (count quoted) | under 1 s; at or over 3 s blocks the release |
-| piloted | the installed binaries, a SessionStart JSON per source, cwd decisions | the context quoted in t05 |
-| live | the `/clear` at this session's boundary | the next session's first message quotes `relais/programmes: N ready`, due tickets first with their marks (t12 `[due 2026-11-24]` if ready), t11 listed, and the greenbelay inbox block or its stated absence (inbox empty) |
+| Check | Input | Expected | Actual |
+| --- | --- | --- | --- |
+| relais unit | programmes with closed/open blockers, due past/today/future, a `prog/` branch, a failing load | the set and order are `frontier --no-fetch`'s; marks; cap line; failure count; handoff pointer only outside a fence, at most 3 | pass (greengate pre-commit cargo-test on ed8bbcdd, 30 checks) |
+| relais it | `relais hook` fed SessionStart `startup` and `clear`, on a scratch repo with a programme | stdout JSON with `additionalContext` naming the tickets | pass |
+| relais it | `startup` on a scratch repo with a linked worktree | `.git/index` mtime unchanged | pass; the `index.lock` assertion was dropped in review, since git removes the lock on exit, so the mtime is the evidence |
+| relais it | the same with `resume`, `compact`, `fork`, without cwd, and in a repo with no programmes | empty stdout, exit 0 | pass |
+| relais it | conflicting main and linked-worktree copies; a programme only in origin | each locator, run as printed, returns the selected ticket and its handoff | pass |
+| greenbelay unit and hook tests | as in the rows above, plus an abandoned take beside a missing or empty inbox, a bad byte, and the stance | as Behaviour | pass (greenbelay#284 CI on macOS, Ubuntu and Windows); piloted: `startup` and `clear` show 2 orphans and 1 fresh line, `resume`/`compact`/`fork` show none |
+| gates | both repos' greengate pre-commit (test, clippy, fmt) | pass | pass |
+| budget | release build `relais hook`, SessionStart `clear`, in decisions and in a repo without `docs/programmes` | under 0.5 s and under 0.05 s | **missed by a little:** decisions 0.52–0.57 s, the repo without programmes 0.06–0.07 s (load 3.5). Before the perf commit, decisions took 2.7 s and `startup` hit the 3 s deadline and went silent |
+| budget (worst) | decisions, the checkout with the most linked worktrees (7 worktrees, 9 programmes) | under 1 s; at or over 3 s blocks the release | 0.53 s: met. relais (5 worktrees) 0.37 s |
+| output | the same hook, sequential build against the parallel one | byte-identical context | identical |
+| CI on Windows | relais#490, first push | the test matrix passes | 4 render tests failed: they expected `/`-joined directories. `Found::dir` joins one relative `docs/programmes/<slug>`, so on Windows only that join is a backslash (`/work/repo\docs/programmes/alpha`), and `shell_quote` then quotes it. The first fix guessed backslashes throughout and failed again on the second push. The test helper now joins exactly as `Found::dir` does |
+| piloted | the installed binaries, a SessionStart JSON per source, cwd decisions | the context quoted in t05 | Phase 4 |
+| live | the `/clear` at this session's boundary | the next session's first message quotes `relais/programmes: N ready`, due tickets first (t12 `[due 2026-11-24]` if ready), t11 listed, and the greenbelay inbox block, or no `greenbelay/inbox:` line when the inbox is empty | Phase 4 |
 
 ## Measure after release
 
@@ -270,6 +287,13 @@ elapsed ms.
   p95 exceeds 1,000 ms.
 - greenbelay: orphans named at a start and still unfiled a day later;
   target falling.
+
+## Implementation review
+
+- implementation-review: approve-with-changes, then approve-with-changes on the delta. The blocking `_ =>` over `HookEvent` and the `value` names are fixed; the plan ticks, the observed results and the budget misses are recorded here. 111k + 130k.
+- backend: approve-with-changes, then approve. Filed as inbox follow-ups: `skipped(error)` drops the error text, and the scoped threads are not panic-silenced. 80k + 104k.
+- lang:rust: approve-with-changes, then approve. Deliberate: the thread fan-out stays uncapped, with `holds-until` comments, and `GIT_OPTIONAL_LOCKS` stays global and documented. 80k + 103k.
+- unix: approve in round 1, carried to this tree (no rework). tui: approve-with-changes on both rounds. Filed as an inbox follow-up: the overflow command lists only the first programme. 48k + 70k.
 
 ## Outcome
 
