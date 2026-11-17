@@ -151,7 +151,7 @@ jobs:
       # attestation it accepts are read in one place (`plan`'s matrix).
       - id: attest
         if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
-        uses: fredericrous/attest@v1
+        uses: greenharness/greensummit@v2
         with:
           platform: ${{ matrix.platform }}
       - uses: actions/cache@v4
@@ -316,7 +316,7 @@ jobs:
           fi
       - name: sign pre-push-cargo-test for this platform
         if: ${{ steps.ran.outputs.sign == 'true' }}
-        uses: fredericrous/attest/sign@c5c61817f5a78c3a23d31c903c00ba1eef50cc39 # v1.7.0
+        uses: greenharness/greensummit/sign@9a54c1db68fc641e123f91fbb98a715bba5474ab # v2.0.0
         with:
           key: ${{ secrets.ATTEST_SIGNING_KEY }}
           gates: pre-push-cargo-test

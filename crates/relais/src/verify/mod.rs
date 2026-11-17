@@ -2608,7 +2608,7 @@ impl std::error::Error for AttestError {}
 /// port relais owns. The runner asks a `HookAttest`; only `AmontCli`
 /// knows the binary's name. The gate and its attestation stay amont's to
 /// own (SPEC §10, §18): this asks amont's own documented interface and
-/// nothing here reads `refs/notes/amont-attest`, parses an attestation
+/// nothing here reads `refs/notes/greensummit`, parses an attestation
 /// format, or verifies a signature.
 pub trait HookAttest {
     /// Whether `gate` is covered by a valid signed attestation on the

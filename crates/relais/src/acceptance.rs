@@ -72,7 +72,7 @@ pub enum Evidence {
     /// documented interface (`amont attest covered`), whether a valid
     /// signed attestation covers this gate on the candidate's own tree
     /// (SPEC §10, §18). The gate and its attestation stay amont's to
-    /// own — relais never reads `refs/notes/amont-attest`, parses an
+    /// own — relais never reads `refs/notes/greensummit`, parses an
     /// attestation format, or verifies a signature itself.
     AmontGate { gate: String },
     /// A holdout (ADR-0045): a test kept outside the candidate's
