@@ -1602,3 +1602,78 @@ fn the_printed_locators_retrieve_the_copy_each_programme_was_selected_from() {
         "{ghost_pointer}"
     );
 }
+
+/// A repository under `root` holding one programme, `demo`, with one ready
+/// ticket; its map is committed at `epoch` and carries a `## Handoff` when
+/// `handoff` is set.
+fn repository_with_programme(root: &Path, name: &str, handoff: bool, epoch: i64) {
+    let repo = root.join(name);
+    let programme = repo.join("docs/programmes/demo");
+    std::fs::create_dir_all(&programme).expect("programme dir");
+    git(&repo, &["init", "-q"]);
+    let map = if handoff {
+        format!("{MAP}\n## Handoff\n\nNext: B in {name}.\n")
+    } else {
+        MAP.to_string()
+    };
+    std::fs::write(programme.join("map.md"), map).expect("map");
+    std::fs::write(
+        programme.join("B.md"),
+        ticket("open", "[]", None, &format!("Ready in {name}"), None),
+    )
+    .expect("ticket");
+    git(&repo, &["add", "-A"]);
+    let date = format!("{epoch} +0000");
+    let out = git_command(&repo)
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "programme",
+        ])
+        .env("GIT_COMMITTER_DATE", &date)
+        .env("GIT_AUTHOR_DATE", &date)
+        .output()
+        .expect("git runs");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+}
+
+#[test]
+fn a_session_start_outside_a_repository_summarises_the_children_and_expands_the_latest_handoff() {
+    let world = World::new("hookoutside");
+    let scratch = short_temp_dir("prog-outside-root");
+    let root = scratch.to_path_buf();
+    repository_with_programme(&root, "older", true, 1_700_000_000);
+    repository_with_programme(&root, "newer", true, 1_700_100_000);
+    let (code, stdout) = world.hook(&start_payload(Some("clear"), Some(&root)));
+    assert_eq!(code, Some(0), "{stdout}");
+    let hook_output: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON line");
+    let context = hook_output["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("context text");
+    assert!(
+        context.contains("ready in 2 repositories under"),
+        "{context}"
+    );
+    assert!(context.contains("- newer: 1 ready; cd "), "{context}");
+    assert!(context.contains("- older: 1 ready; cd "), "{context}");
+    assert!(
+        context.contains("expanded: newer (latest ## Handoff among those read)\n"),
+        "{context}"
+    );
+    assert!(context.contains("- demo B: Ready in newer\n"), "{context}");
+    assert!(!context.contains("- demo B: Ready in older"), "{context}");
+    assert!(
+        context.contains("the ## Handoff in ")
+            && context.contains("newer/docs/programmes/demo/map.md"),
+        "{context}"
+    );
+}

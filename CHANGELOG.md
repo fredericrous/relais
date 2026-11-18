@@ -6,6 +6,19 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
+- `relais hook` now also answers a `SessionStart` of source `startup` or
+  `clear` whose cwd is not inside a git repository but holds repositories
+  (a projects root). It reads each child main checkout that has
+  `docs/programmes`, in parallel, under a 2.5 s cutoff, and prints one summary
+  line per repository with ready tickets plus the full block of the
+  repository whose map holds the latest `## Handoff`, naming any repository
+  it could not read in time. Inside a repository nothing changes. The
+  journal entry gains `gather_coverage` (`read N, unread M`) for this
+  gather. Programmes that exist only on origin or only in a linked worktree
+  are not seen from the root.
+
 ## v0.69.0
 
 - `relais hook` now answers a `SessionStart` of source `startup` or `clear`,
