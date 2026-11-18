@@ -111,6 +111,9 @@ impl From<String> for Gathered {
     }
 }
 
+/// The name of the gather thread, whose panics stay silent. Resume's
+/// per-repository readers reuse the name on purpose, so their panics stay
+/// silent too.
 pub(super) const GATHER_THREAD_NAME: &str = "relais-hook-gather";
 
 /// Keep a panic on the gather thread off stderr: it is caught there and

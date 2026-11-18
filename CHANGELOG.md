@@ -14,7 +14,7 @@ missing here.
   `docs/programmes`, in parallel, under a 2.5 s cutoff, and prints one summary
   line per repository with ready tickets plus the full block of the
   repository whose map holds the latest `## Handoff`, naming any repository
-  it could not read in time. Inside a repository nothing changes. The
+  it could not read in time or at all. Inside a repository nothing changes. The
   journal entry gains `gather_coverage` (`read N, unread M`) for this
   gather. Programmes that exist only on origin or only in a linked worktree
   are not seen from the root.

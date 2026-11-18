@@ -69,7 +69,14 @@ pub fn gather(cwd: &Path) -> Result<Gathered, SkipReason> {
 fn gather_outside(root: &Path, cutoff: Instant) -> Result<Gathered, SkipReason> {
     let repos = load::repositories_with_programmes(root).map_err(|_| SkipReason::Error)?;
     if repos.is_empty() {
-        return Err(SkipReason::Error);
+        // Child checkouts that hold no programme say nothing; no checkout at
+        // all is an error.
+        let children = load::repositories(root).map_err(|_| SkipReason::Error)?;
+        return Err(if children.is_empty() {
+            SkipReason::Error
+        } else {
+            SkipReason::Nothing
+        });
     }
     let collected = collect_within(repos, read_repository, cutoff);
     let today = chrono::Local::now().date_naive();
@@ -78,50 +85,51 @@ fn gather_outside(root: &Path, cutoff: Instant) -> Result<Gathered, SkipReason> 
         text,
         coverage: Some(Coverage {
             read: collected.read.len(),
-            unread: collected.unread.len(),
+            unread: collected.late.len() + collected.unreadable.len(),
         }),
     })
 }
 
 /// What one thread read of one child repository.
 #[derive(Debug)]
-pub struct RepoReading {
-    pub repo: PathBuf,
-    pub ready: Ready,
-    /// Whether each programme of `ready.found` has a `## Handoff`, read
-    /// where the thread ran so that nothing runs git after the cutoff.
-    pub handoffs: Vec<bool>,
+pub(crate) struct RepoReading {
+    pub(crate) repo: PathBuf,
+    pub(crate) ready: Ready,
+    /// The slugs of the programmes with a `## Handoff`, read where the
+    /// thread ran so that nothing runs git after the cutoff.
+    pub(crate) handoffs: BTreeSet<String>,
     /// The programme whose map was handed off last, when any was.
-    pub latest_handoff: Option<LatestHandoff>,
+    pub(crate) latest_handoff: Option<LatestHandoff>,
 }
 
-/// The newest `## Handoff` of a repository: its programme's position in
-/// `ready.found` and its map's time in Unix seconds.
-#[derive(Debug, Clone, Copy)]
-pub struct LatestHandoff {
-    pub programme: usize,
-    pub at: i64,
+/// The newest `## Handoff` of a repository: its programme's slug and its
+/// map's time in Unix seconds, `None` when no time could be read (which
+/// ranks below every known time).
+#[derive(Debug, Clone)]
+pub(crate) struct LatestHandoff {
+    pub(crate) slug: String,
+    pub(crate) at: Option<i64>,
 }
 
-/// `None` when the repository's programmes cannot be listed.
-fn read_repository(repo: &Path) -> Option<RepoReading> {
-    let listed = load::programmes_of(repo).ok()?;
-    let handoffs: Vec<bool> = listed
-        .found
-        .iter()
-        .map(|found| found.map_text().is_ok_and(|text| has_handoff(&text)))
-        .collect();
+/// Why the programmes of `repo` could not be read.
+fn read_repository(repo: &Path) -> Result<RepoReading, String> {
+    let listed = load::programmes_of(repo).map_err(|error| error.to_string())?;
+    let mut handoffs = BTreeSet::new();
     let mut latest_handoff: Option<LatestHandoff> = None;
-    for (programme, found) in listed.found.iter().enumerate() {
-        if !handoffs[programme] {
+    for found in &listed.found {
+        if !found.map_text().is_ok_and(|text| has_handoff(&text)) {
             continue;
         }
-        let at = load::map_time(found).unwrap_or(0);
-        if latest_handoff.is_none_or(|latest| at > latest.at) {
-            latest_handoff = Some(LatestHandoff { programme, at });
+        handoffs.insert(found.slug.clone());
+        let at = load::map_time(found);
+        if latest_handoff.as_ref().is_none_or(|latest| at > latest.at) {
+            latest_handoff = Some(LatestHandoff {
+                slug: found.slug.clone(),
+                at,
+            });
         }
     }
-    Some(RepoReading {
+    Ok(RepoReading {
         repo: repo.to_path_buf(),
         ready: frontier::ready(listed.found, listed.unreadable),
         handoffs,
@@ -131,55 +139,62 @@ fn read_repository(repo: &Path) -> Option<RepoReading> {
 
 /// What [`collect_within`] gathered by its cutoff.
 #[derive(Debug)]
-pub struct Collected<R> {
+pub(crate) struct Collected<R> {
     /// The repositories read in time, in the order they were given.
-    pub read: Vec<R>,
-    /// The repositories not read in time: still running at the cutoff,
-    /// failed to read, panicked, or whose thread could not start.
-    pub unread: Vec<PathBuf>,
+    pub(crate) read: Vec<R>,
+    /// The repositories still being read at the cutoff.
+    pub(crate) late: Vec<PathBuf>,
+    /// The repositories whose reading failed, panicked or could not start,
+    /// each with the reason.
+    pub(crate) unreadable: Vec<(PathBuf, String)>,
 }
 
 /// Read every repository of `repos` with `read`, each on its own detached
 /// thread, and take what has arrived by `cutoff`. Never `thread::scope`,
 /// which would join past the cutoff: a thread still running is left to
-/// finish, as in `respond::gather_within`. `read` answers `None` for a
+/// finish, as in `respond::gather_within`. `read` answers the reason for a
 /// repository it could not read.
 // holds-until: ~60 child repositories — a bounded pool once one thread each
 // outruns the cores of a machine that checks out many more
-pub fn collect_within<R, F>(repos: Vec<PathBuf>, read: F, cutoff: Instant) -> Collected<R>
+pub(crate) fn collect_within<R, F>(repos: Vec<PathBuf>, read: F, cutoff: Instant) -> Collected<R>
 where
     R: Send + 'static,
-    F: Fn(&Path) -> Option<R> + Send + Sync + 'static,
+    F: Fn(&Path) -> Result<R, String> + Send + Sync + 'static,
 {
     let read = Arc::new(read);
     let (sender, receiver) = mpsc::channel();
+    let mut arrived: Vec<Option<Result<R, String>>> = repos.iter().map(|_| None).collect();
     for (index, repo) in repos.iter().enumerate() {
         let (read, sender, owned) = (Arc::clone(&read), sender.clone(), repo.clone());
-        // A thread that cannot start leaves its repository unread.
-        let _ = std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name(GATHER_THREAD_NAME.into())
             .spawn(move || {
                 let outcome =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&owned)))
-                        .unwrap_or(None);
+                        .unwrap_or_else(|_| Err("its reader panicked".to_string()));
                 let _ = sender.send((index, outcome)); // the receiver is gone once the cutoff passed
             });
+        if spawned.is_err() {
+            // the repository is recorded unreadable and the others still run
+            arrived[index] = Some(Err("its reader thread could not start".to_string()));
+        }
     }
     drop(sender);
-    let mut arrived: Vec<Option<R>> = repos.iter().map(|_| None).collect();
     while let Ok((index, outcome)) =
         receiver.recv_timeout(cutoff.saturating_duration_since(Instant::now()))
     {
-        arrived[index] = outcome;
+        arrived[index] = Some(outcome);
     }
     let mut collected = Collected {
         read: Vec::new(),
-        unread: Vec::new(),
+        late: Vec::new(),
+        unreadable: Vec::new(),
     };
     for (repo, outcome) in repos.into_iter().zip(arrived) {
         match outcome {
-            Some(reading) => collected.read.push(reading),
-            None => collected.unread.push(repo),
+            Some(Ok(reading)) => collected.read.push(reading),
+            Some(Err(reason)) => collected.unreadable.push((repo, reason)),
+            None => collected.late.push(repo),
         }
     }
     collected
@@ -189,11 +204,24 @@ where
 /// repositories up to this many.
 const UNREAD_NAME_CAP: usize = 5;
 
+/// The repository names of `repos`, cut at [`UNREAD_NAME_CAP`] with `…`.
+fn name_list<'a>(repos: impl ExactSizeIterator<Item = &'a PathBuf>) -> String {
+    let total = repos.len();
+    let mut names: Vec<String> = repos
+        .take(UNREAD_NAME_CAP)
+        .map(|repo| repo_name(repo))
+        .collect();
+    if total > UNREAD_NAME_CAP {
+        names.push("…".into());
+    }
+    names.join(", ")
+}
+
 /// The text for a session that starts outside any repository, from what
 /// [`collect_within`] read under `root`: one summary line per repository
 /// with ready tickets, then the full block of the repository whose map
 /// holds the latest `## Handoff`.
-pub fn render_outside(
+pub(crate) fn render_outside(
     root: &Path,
     collected: &Collected<RepoReading>,
     today: NaiveDate,
@@ -218,76 +246,79 @@ pub fn render_outside(
     let latest = collected
         .read
         .iter()
-        .filter_map(|reading| reading.latest_handoff.map(|latest| (reading, latest)))
+        .filter_map(|reading| {
+            reading
+                .latest_handoff
+                .as_ref()
+                .map(|latest| (reading, latest))
+        })
         .fold(
-            None::<(&RepoReading, LatestHandoff)>,
+            None::<(&RepoReading, &LatestHandoff)>,
             |best, candidate| match best {
                 Some((_, held)) if held.at >= candidate.1.at => best,
                 _ => Some(candidate),
             },
         );
-    let (expanded, label) = match (latest, with_ready.first()) {
-        (Some((reading, _)), _) => (reading, "latest ## Handoff among those read"),
-        (None, Some(first)) => (*first, "no repository has a ## Handoff"),
+    let (expanded, label, pinned) = match (latest, with_ready.first()) {
+        (Some((reading, handoff)), _) => (
+            reading,
+            "latest ## Handoff among those read",
+            reading
+                .ready
+                .found
+                .iter()
+                .find(|found| found.slug == handoff.slug),
+        ),
+        (None, Some(first)) => (*first, "no repository has a ## Handoff", None),
         (None, None) => return Err(SkipReason::Nothing),
     };
+    let quoted_root = shell_quote(&printable(&root.display().to_string()));
 
     let mut text = String::new();
     if !with_ready.is_empty() {
         let total: usize = with_ready.iter().map(|r| r.ready.rows.len()).sum();
         text.push_str(&format!(
-            "relais/programmes: {total} ready in {} under {} (not a repository):\n",
+            "relais/programmes: {total} ready in {} under {quoted_root} (not a repository):\n",
             plural(with_ready.len(), "repository", "repositories"),
-            shell_quote(&printable(&root.display().to_string()))
         ));
         for reading in with_ready.iter().take(TICKET_LINE_CAP) {
             text.push_str(&summary_line(reading));
         }
         if with_ready.len() > TICKET_LINE_CAP {
+            let overflow = with_ready.len() - TICKET_LINE_CAP;
             text.push_str(&format!(
-                "- … and {} more repositories\n",
-                with_ready.len() - TICKET_LINE_CAP
+                "- … and {} more {} (relais programme list --no-fetch --root {quoted_root} lists them)\n",
+                overflow,
+                if overflow == 1 { "repository" } else { "repositories" },
             ));
         }
     }
-    if !collected.unread.is_empty() {
-        let mut names: Vec<String> = collected
-            .unread
-            .iter()
-            .take(UNREAD_NAME_CAP)
-            .map(|repo| repo_name(repo))
-            .collect();
-        if collected.unread.len() > UNREAD_NAME_CAP {
-            names.push("…".into());
-        }
-        let count = collected.unread.len();
+    if !collected.late.is_empty() {
+        let count = collected.late.len();
         text.push_str(&format!(
-            "({} not read in time: {}; relais programme list --no-fetch --root {} lists {})\n",
+            "({} not read in time: {}; relais programme list --no-fetch --root {quoted_root} lists {})\n",
             plural(count, "repository", "repositories"),
-            names.join(", "),
-            shell_quote(&printable(&root.display().to_string())),
+            name_list(collected.late.iter()),
             if count == 1 { "it" } else { "them" }
+        ));
+    }
+    if let Some((first, _)) = collected.unreadable.first() {
+        text.push_str(&format!(
+            "({} could not be read: {}; run relais programme check {} for why)\n",
+            plural(collected.unreadable.len(), "repository", "repositories"),
+            name_list(collected.unreadable.iter().map(|(repo, _)| repo)),
+            shell_quote(&printable(&first.display().to_string())),
         ));
     }
     text.push_str(&format!(
         "expanded: {} ({label})\n",
         repo_name(&expanded.repo)
     ));
-    let pinned = latest
-        .filter(|(reading, _)| std::ptr::eq(*reading, expanded))
-        .map(|(reading, handoff)| &reading.ready.found[handoff.programme]);
     let block = render(
         &expanded.repo,
         &expanded.ready,
         today,
-        |found| {
-            expanded
-                .ready
-                .found
-                .iter()
-                .position(|one| one.slug == found.slug)
-                .is_some_and(|position| expanded.handoffs[position])
-        },
+        |found| expanded.handoffs.contains(&found.slug),
         pinned,
     );
     text.push_str(&block.unwrap_or_default());
@@ -791,6 +822,12 @@ mod tests {
     }
 
     fn reading(name: &str, rows: Vec<ReadyRow>, handoff_at: Option<i64>) -> RepoReading {
+        reading_with(name, rows, handoff_at.map(Some))
+    }
+
+    /// `handoff`: `None` has no `## Handoff`, `Some(None)` has one whose map
+    /// time could not be read.
+    fn reading_with(name: &str, rows: Vec<ReadyRow>, handoff: Option<Option<i64>>) -> RepoReading {
         let repo = PathBuf::from(format!("/root/{name}"));
         let found = vec![Found {
             repo: repo.clone(),
@@ -801,8 +838,11 @@ mod tests {
         RepoReading {
             repo,
             ready: ready_of(found, rows),
-            handoffs: vec![handoff_at.is_some()],
-            latest_handoff: handoff_at.map(|at| LatestHandoff { programme: 0, at }),
+            handoffs: handoff.iter().map(|_| "prog".to_string()).collect(),
+            latest_handoff: handoff.map(|at| LatestHandoff {
+                slug: "prog".into(),
+                at,
+            }),
         }
     }
 
@@ -812,13 +852,14 @@ mod tests {
             .collect()
     }
 
-    fn collected_of(read: Vec<RepoReading>, unread: &[&str]) -> Collected<RepoReading> {
+    fn collected_of(read: Vec<RepoReading>, late: &[&str]) -> Collected<RepoReading> {
         Collected {
             read,
-            unread: unread
+            late: late
                 .iter()
                 .map(|n| PathBuf::from(format!("/root/{n}")))
                 .collect(),
+            unreadable: Vec::new(),
         }
     }
 
@@ -827,22 +868,31 @@ mod tests {
     }
 
     #[test]
-    fn collect_within_renders_a_partial_result_naming_the_unread_repository() {
-        let read = |repo: &Path| {
+    fn collect_within_renders_a_partial_result_naming_the_late_repository() {
+        // The slow reader blocks on a channel nothing sends to until the
+        // test ends, so only the cutoff decides that it is late.
+        let (hold, blocked) = mpsc::channel::<()>();
+        let blocked = std::sync::Mutex::new(blocked);
+        let read = move |repo: &Path| {
             let name = repo
                 .file_name()
                 .expect("name")
                 .to_string_lossy()
                 .to_string();
             if name == "slow" {
-                std::thread::sleep(Duration::from_millis(400));
+                assert!(
+                    blocked.lock().expect("lock").recv().is_err(),
+                    "nothing is sent"
+                );
             }
-            Some(reading(&name, rows_of(1, None), None))
+            Ok(reading(&name, rows_of(1, None), None))
         };
         let repos = vec![PathBuf::from("/root/fast"), PathBuf::from("/root/slow")];
-        let collected = collect_within(repos, read, Instant::now() + Duration::from_millis(50));
+        let collected = collect_within(repos, read, Instant::now() + Duration::from_secs(1));
+        drop(hold);
         assert_eq!(collected.read.len(), 1);
-        assert_eq!(collected.unread, [PathBuf::from("/root/slow")]);
+        assert_eq!(collected.late, [PathBuf::from("/root/slow")]);
+        assert!(collected.unreadable.is_empty());
         let text = outside(&collected).expect("partial result");
         assert!(
             text.contains(
@@ -854,17 +904,74 @@ mod tests {
     }
 
     #[test]
-    fn a_panicking_reader_counts_as_unread() {
+    fn a_panicking_or_failing_reader_is_unreadable_with_its_reason() {
         let read = |repo: &Path| {
             if repo.ends_with("bad") {
                 panic!("a reader that dies");
             }
-            Some(1)
+            if repo.ends_with("broken") {
+                return Err("no programmes".to_string());
+            }
+            Ok(1)
         };
-        let repos = vec![PathBuf::from("/root/good"), PathBuf::from("/root/bad")];
+        let repos = vec![
+            PathBuf::from("/root/good"),
+            PathBuf::from("/root/bad"),
+            PathBuf::from("/root/broken"),
+        ];
         let collected = collect_within(repos, read, Instant::now() + Duration::from_secs(5));
         assert_eq!(collected.read, [1]);
-        assert_eq!(collected.unread, [PathBuf::from("/root/bad")]);
+        assert!(collected.late.is_empty());
+        let unreadable: Vec<(&Path, &str)> = collected
+            .unreadable
+            .iter()
+            .map(|(repo, reason)| (repo.as_path(), reason.as_str()))
+            .collect();
+        assert_eq!(
+            unreadable,
+            [
+                (Path::new("/root/bad"), "its reader panicked"),
+                (Path::new("/root/broken"), "no programmes"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unreadable_repositories_get_their_own_line_with_the_command_to_run() {
+        let mut collected = collected_of(vec![reading("a", rows_of(1, None), None)], &["l1"]);
+        collected.unreadable = vec![(PathBuf::from("/root/my c"), "why".into())];
+        let text = outside(&collected).expect("text");
+        assert!(
+            text.contains("(1 repository could not be read: my c; run relais programme check '/root/my c' for why)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("(1 repository not read in time: l1; relais programme list --no-fetch --root /root lists it)\n"),
+            "{text}"
+        );
+        collected
+            .unreadable
+            .push((PathBuf::from("/root/d"), "why".into()));
+        let text = outside(&collected).expect("text");
+        assert!(
+            text.contains("(2 repositories could not be read: my c, d; run relais programme check '/root/my c' for why)\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_handoff_with_a_known_time_beats_one_with_none_whatever_the_order() {
+        for untimed_first in [true, false] {
+            let untimed = reading_with("untimed", rows_of(1, None), Some(None));
+            let timed = reading("timed", rows_of(1, None), Some(5));
+            let read = if untimed_first {
+                vec![untimed, timed]
+            } else {
+                vec![timed, untimed]
+            };
+            let text = outside(&collected_of(read, &[])).expect("text");
+            assert!(text.contains("expanded: timed ("), "{text}");
+        }
     }
 
     #[test]
@@ -924,7 +1031,21 @@ mod tests {
             TICKET_LINE_CAP,
             "{text}"
         );
-        assert!(text.contains("- … and 3 more repositories\n"), "{text}");
+        assert!(
+            text.contains(
+                "- … and 3 more repositories (relais programme list --no-fetch --root /root lists them)\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn one_more_summary_is_singular() {
+        let read: Vec<RepoReading> = (0..TICKET_LINE_CAP + 1)
+            .map(|n| reading(&format!("r{n:02}"), rows_of(1, None), None))
+            .collect();
+        let text = outside(&collected_of(read, &[])).expect("text");
+        assert!(text.contains("- … and 1 more repository (relais"), "{text}");
     }
 
     #[test]
@@ -977,7 +1098,6 @@ mod tests {
             slug: "other".into(),
             source: Source::WorkingTree,
         });
-        winner.handoffs.push(false);
         // Eight tickets of "other" fill the cap; the winning "prog" has none shown.
         winner.ready.rows = (0..TICKET_LINE_CAP)
             .map(|n| row(1, "other", &format!("t{n}"), "Name", None))
