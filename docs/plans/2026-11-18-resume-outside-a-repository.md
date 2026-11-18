@@ -179,7 +179,7 @@ advice (inbox.rs:178) is relative to that repository.
 
 ## Phases
 
-- [ ] Phase 1 — relais reads the child checkouts (relais, worktree from
+- [x] Phase 1 — relais reads the child checkouts (relais, worktree from
   origin/main; the plan lands first):
   `crates/relais/src/hook/resume.rs` (the non-repository branch of
   `gather`, the parallel collector, `render_outside` and unit tests),
@@ -188,7 +188,7 @@ advice (inbox.rs:178) is relative to that repository.
   run at a scratch root holding two repositories), `docs/SPEC.md` (§23 and
   §31: the non-repository cwd), `CHANGELOG.md`. PR → merge-when-green →
   `tag-release` (minor) → install.
-- [ ] Phase 2 — greenbelay reads the child inboxes (amont-agent, worktree
+- [x] Phase 2 — greenbelay reads the child inboxes (amont-agent, worktree
   from origin/main): `src/hook.rs` (`inbox_notice` at a non-repository cwd,
   `child_checkouts`, unit tests), `tests/hook.rs` (a SessionStart at a
   scratch root with two inboxes), `docs/index.md`, `CHANGELOG.md`. PR →
@@ -220,6 +220,46 @@ advice (inbox.rs:178) is relative to that repository.
   Perso root shows `relais/programmes: N ready`. That needs the released
   relais on PATH (`relais hook` is a command hook, so no plugin reinstall
   is needed for this path).
+
+## Decision log
+
+- 2026-11-18, implementation review: a reader that panics, fails or cannot
+  start is `unreadable`, apart from `late`. It gets its own line,
+  `(N repositor(y|ies) could not be read: <names> (first: <reason>); relais
+  programme list --no-fetch --root <root> says why)`. Child checkouts none
+  of which holds `docs/programmes` give `Nothing`, not `Error`. The
+  partial-result test blocks the slow reader on a channel with a 1 s cutoff
+  instead of sleeping with a 50 ms one. Behaviour lines 118 and 158 and
+  Verification line 208 read as approved; this entry supersedes them.
+
+## Verification results
+
+- Built-binary probe, SessionStart `clear` at `/Users/fredericrous/Developer/Perso`:
+  - expected: `ready in N repositories under`, the decisions block (newest
+    `## Handoff` map commit: greenrack-rename in decisions), under 3 s,
+    journal `context` with `unread 0`;
+  - actual: `63 ready in 5 repositories under …`, `expanded: decisions`,
+    greenrack-rename pinned as the first `handoff:` pointer. 1.28 s wall;
+    1.29 s after the review fixes, at load 10. Journal: `context`,
+    `read 6, unread 0`, `gather_ms` 1240.
+- In-repository output unchanged: the byte-for-byte unit test passes.
+- Integration (`a-older`/`z-newer`), `collect_within` partial, unreadable
+  line and render unit tests: pass in `cargo test` at each commit gate.
+  The `hook::` tests: 108 passed.
+- Phase 2 (greenbelay): see greenbelay #296; probe `in amont: cd …` + its
+  notice, in 1.06 s.
+- Cold-cache probe and the live `/clear` proof: after release, see the
+  Measure section.
+
+## Implementation review
+
+- implementation-review: approve-with-changes (2 blocking rule hits, fixed) → approve-with-changes → approve on the fix. 101k+53k+30k.
+- backend: approve-with-changes ×2 → approve. Fixed: time-independent integration test, blocking-channel test, `Option` map time, the unreadable line's command. Deliberate: the second root scan. 65k+44k+33k.
+- lang:rust: approve-with-changes ×2 → approve. Fixed: late/unreadable split, slug keys, `pub(crate)`, `Nothing`. Deliberate: reason kept as a shown `String`. 64k+36k+24k.
+- unix, tui: approve-with-changes, then approve-with-changes → approve on the fix. Deliberate: the `expanded:` label, lines over 80 columns, and no repository name in `(first: …)` (it is the first listed). 84k+53k+35k, 55k+49k+37k.
+- architect: approve-with-changes → approve. Fixed: slug keys, the documented thread name, the unread split. 54k+40k.
+
+Next: Phase 3 (decisions) after relais's release.
 
 ## Measure after release
 
