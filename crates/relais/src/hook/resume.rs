@@ -302,12 +302,15 @@ pub(crate) fn render_outside(
             if count == 1 { "it" } else { "them" }
         ));
     }
-    if let Some((first, _)) = collected.unreadable.first() {
+    // `relais programme check` takes one programme directory, not a
+    // repository, so the line carries the first reason itself and names the
+    // command that reads every repository under the root.
+    if let Some((_, first_reason)) = collected.unreadable.first() {
         text.push_str(&format!(
-            "({} could not be read: {}; run relais programme check {} for why)\n",
+            "({} could not be read: {} (first: {}); relais programme list --no-fetch --root {quoted_root} says why)\n",
             plural(collected.unreadable.len(), "repository", "repositories"),
             name_list(collected.unreadable.iter().map(|(repo, _)| repo)),
-            shell_quote(&printable(&first.display().to_string())),
+            printable(first_reason),
         ));
     }
     text.push_str(&format!(
@@ -942,7 +945,7 @@ mod tests {
         collected.unreadable = vec![(PathBuf::from("/root/my c"), "why".into())];
         let text = outside(&collected).expect("text");
         assert!(
-            text.contains("(1 repository could not be read: my c; run relais programme check '/root/my c' for why)\n"),
+            text.contains("(1 repository could not be read: my c (first: why); relais programme list --no-fetch --root /root says why)\n"),
             "{text}"
         );
         assert!(
@@ -954,7 +957,7 @@ mod tests {
             .push((PathBuf::from("/root/d"), "why".into()));
         let text = outside(&collected).expect("text");
         assert!(
-            text.contains("(2 repositories could not be read: my c, d; run relais programme check '/root/my c' for why)\n"),
+            text.contains("(2 repositories could not be read: my c, d (first: why); relais programme list --no-fetch --root /root says why)\n"),
             "{text}"
         );
     }
