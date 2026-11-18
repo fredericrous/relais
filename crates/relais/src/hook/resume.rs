@@ -1107,9 +1107,10 @@ mod tests {
             .collect();
         let text = outside(&collected_of(vec![winner], &[])).expect("text");
         assert!(
-            text.contains(
-                "handoff:\n- prog: the ## Handoff in /root/win/docs/programmes/prog/map.md"
-            ),
+            text.contains(&format!(
+                "handoff:\n- prog: the ## Handoff in {}",
+                programme_dir("/root/win", "prog").join("map.md").display()
+            )),
             "{text}"
         );
     }
