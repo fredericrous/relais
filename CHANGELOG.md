@@ -6,7 +6,7 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
-## Unreleased
+## v0.70.0
 
 - `relais hook` now also answers a `SessionStart` of source `startup` or
   `clear` whose cwd is not inside a git repository but holds repositories
