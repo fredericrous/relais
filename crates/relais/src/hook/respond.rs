@@ -76,6 +76,9 @@ pub enum Gather {
     NotAsked,
     Context {
         elapsed: Duration,
+        /// How many repositories were read and left unread, for a gather
+        /// outside any repository; `None` inside one.
+        coverage: Option<Coverage>,
     },
     Skipped {
         why: SkipReason,
@@ -83,7 +86,35 @@ pub enum Gather {
     },
 }
 
-const GATHER_THREAD_NAME: &str = "relais-hook-gather";
+/// What a gather outside a repository covered: the child repositories read
+/// in time and those not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Coverage {
+    pub read: usize,
+    pub unread: usize,
+}
+
+/// What a gatherer returns: the context text, and its coverage when it
+/// read several repositories.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gathered {
+    pub text: String,
+    pub coverage: Option<Coverage>,
+}
+
+impl From<String> for Gathered {
+    fn from(text: String) -> Self {
+        Gathered {
+            text,
+            coverage: None,
+        }
+    }
+}
+
+/// The name of the gather thread, whose panics stay silent. Resume's
+/// per-repository readers reuse the name on purpose, so their panics stay
+/// silent too.
+pub(super) const GATHER_THREAD_NAME: &str = "relais-hook-gather";
 
 /// Keep a panic on the gather thread off stderr: it is caught there and
 /// journalled as `skipped(failed)`, and a hook says nothing it was not
@@ -105,7 +136,7 @@ pub fn silence_gather_panics() {
 /// [`silence_gather_panics`] for keeping stderr clean.
 fn gather_within<G>(gatherer: G, cwd: &Path, deadline: Duration) -> (Option<String>, Gather)
 where
-    G: FnOnce(&Path) -> Result<String, SkipReason> + Send + 'static,
+    G: FnOnce(&Path) -> Result<Gathered, SkipReason> + Send + 'static,
 {
     let started = Instant::now();
     let (sender, receiver) = mpsc::channel();
@@ -131,10 +162,11 @@ where
         return skipped(SkipReason::Failed);
     }
     match receiver.recv_timeout(deadline) {
-        Ok(Ok(text)) => (
-            Some(text),
+        Ok(Ok(gathered)) => (
+            Some(gathered.text),
             Gather::Context {
                 elapsed: started.elapsed(),
+                coverage: gathered.coverage,
             },
         ),
         Ok(Err(why)) => skipped(why),
@@ -175,7 +207,7 @@ pub fn handle_with<G>(
     deadline: Duration,
 ) -> Handled
 where
-    G: FnOnce(&Path) -> Result<String, SkipReason> + Send + 'static,
+    G: FnOnce(&Path) -> Result<Gathered, SkipReason> + Send + 'static,
 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         handle_inner(payload, settings, gate, gatherer, deadline)
@@ -197,7 +229,7 @@ fn handle_inner<G>(
     deadline: Duration,
 ) -> Handled
 where
-    G: FnOnce(&Path) -> Result<String, SkipReason> + Send + 'static,
+    G: FnOnce(&Path) -> Result<Gathered, SkipReason> + Send + 'static,
 {
     let event = event::parse(payload);
     if let HookEvent::SessionStart(start) = &event {
@@ -553,9 +585,16 @@ pub fn journal_entry(payload: &[u8], handled: &Handled) -> serde_json::Value {
         },
         "gather_ms": match handled.gather {
             Gather::NotAsked => None,
-            Gather::Context { elapsed } | Gather::Skipped { elapsed, .. } => {
+            Gather::Context { elapsed, .. } | Gather::Skipped { elapsed, .. } => {
                 Some(elapsed.as_millis() as u64)
             }
+        },
+        "gather_coverage": match handled.gather {
+            Gather::Context {
+                coverage: Some(coverage),
+                ..
+            } => Some(format!("read {}, unread {}", coverage.read, coverage.unread)),
+            Gather::NotAsked | Gather::Context { .. } | Gather::Skipped { .. } => None,
         },
     })
 }
@@ -2195,25 +2234,25 @@ mod tests {
         .into_bytes()
     }
 
-    fn two_tickets(_: &Path) -> Result<String, SkipReason> {
-        Ok("relais/programmes: 2 ready".to_string())
+    fn two_tickets(_: &Path) -> Result<Gathered, SkipReason> {
+        Ok("relais/programmes: 2 ready".to_string().into())
     }
 
-    fn nothing(_: &Path) -> Result<String, SkipReason> {
+    fn nothing(_: &Path) -> Result<Gathered, SkipReason> {
         Err(SkipReason::Nothing)
     }
 
-    fn unreadable(_: &Path) -> Result<String, SkipReason> {
+    fn unreadable(_: &Path) -> Result<Gathered, SkipReason> {
         Err(SkipReason::Error)
     }
 
-    fn panics(_: &Path) -> Result<String, SkipReason> {
+    fn panics(_: &Path) -> Result<Gathered, SkipReason> {
         panic!("a gatherer that dies");
     }
 
     fn start_with<G>(source: &str, gatherer: G, deadline: Duration) -> Handled
     where
-        G: FnOnce(&Path) -> Result<String, SkipReason> + Send + 'static,
+        G: FnOnce(&Path) -> Result<Gathered, SkipReason> + Send + 'static,
     {
         handle_with(
             &start_payload(source),
@@ -2242,8 +2281,24 @@ mod tests {
     }
 
     #[test]
+    fn the_journal_records_how_many_repositories_were_read_and_left_unread() {
+        fn covering(_: &Path) -> Result<Gathered, SkipReason> {
+            Ok(Gathered {
+                text: "relais/programmes: 1 ready".into(),
+                coverage: Some(Coverage { read: 5, unread: 1 }),
+            })
+        }
+        let handled = start_with("clear", covering, Duration::from_secs(5));
+        let entry = journal_entry(&start_payload("clear"), &handled);
+        assert_eq!(entry["gather_coverage"], "read 5, unread 1");
+        let inside = start_with("clear", two_tickets, Duration::from_secs(5));
+        let entry = journal_entry(&start_payload("clear"), &inside);
+        assert!(entry["gather_coverage"].is_null(), "{entry}");
+    }
+
+    #[test]
     fn a_session_that_keeps_its_conversation_never_asks_the_gatherer() {
-        fn must_not_run(_: &Path) -> Result<String, SkipReason> {
+        fn must_not_run(_: &Path) -> Result<Gathered, SkipReason> {
             panic!("asked for a session that keeps its conversation");
         }
         for source in ["resume", "compact", "fork"] {
@@ -2269,7 +2324,7 @@ mod tests {
         let (never_sent, blocked) = mpsc::channel::<()>();
         let slow = move |_: &Path| {
             let _ = blocked.recv(); // blocks until the test ends; its Err then is the point, not a failure
-            Ok("too late".to_string())
+            Ok("too late".to_string().into())
         };
         let handled = start_with("clear", slow, Duration::from_millis(20));
         assert_eq!(handled.answer, HookAnswer::Silent);

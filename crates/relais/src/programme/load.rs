@@ -895,6 +895,57 @@ pub fn repositories(root: &Path) -> Result<Vec<PathBuf>, ProgrammeError> {
     Ok(repos)
 }
 
+/// The repositories directly under `root` that have a `docs/programmes`
+/// directory on disk: a filesystem test only, so no git runs for the many
+/// that hold none. A child that is a symlink is skipped. A programme that
+/// exists only on origin or only in a linked worktree is not found here.
+pub fn repositories_with_programmes(root: &Path) -> Result<Vec<PathBuf>, ProgrammeError> {
+    Ok(repositories(root)?
+        .into_iter()
+        .filter(|repo| {
+            let is_symlink = std::fs::symlink_metadata(repo)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(true);
+            !is_symlink && repo.join("docs/programmes").is_dir()
+        })
+        .collect())
+}
+
+/// When `found`'s map was handed off, as Unix seconds: the commit time of
+/// the last commit that touched it (git keeps no mtimes, so a pull would
+/// otherwise win), or the file's mtime for a checkout map with uncommitted
+/// changes. `None` when neither can be read.
+pub fn map_time(found: &Found) -> Option<i64> {
+    let map = format!("{}/{MAP_FILE}", programme_rel(&found.slug));
+    match &found.source {
+        Source::WorkingTree => {
+            let dirty = git_stdout(&found.checkout, &["status", "--porcelain", "--", &map])
+                .map(|printed| !printed.trim().is_empty())
+                .unwrap_or(true);
+            let committed = if dirty {
+                None
+            } else {
+                commit_time(&found.checkout, &["log", "-1", "--format=%ct", "--", &map])
+            };
+            committed.or_else(|| {
+                let modified = std::fs::metadata(found.dir().join(MAP_FILE))
+                    .and_then(|metadata| metadata.modified())
+                    .ok()?;
+                let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+                i64::try_from(since_epoch.as_secs()).ok()
+            })
+        }
+        Source::Ref(rev) => commit_time(
+            &found.repo,
+            &["log", "-1", "--format=%ct", rev.as_str(), "--", &map],
+        ),
+    }
+}
+
+fn commit_time(dir: &Path, args: &[&str]) -> Option<i64> {
+    git_stdout(dir, args).ok()?.trim().parse().ok()
+}
+
 /// The programmes of one repository, and what was skipped on the way: each
 /// note is a line for stderr, never a failure.
 pub struct Listed {
