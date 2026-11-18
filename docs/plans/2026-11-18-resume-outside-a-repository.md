@@ -259,6 +259,8 @@ advice (inbox.rs:178) is relative to that repository.
 - unix, tui: approve-with-changes, then approve-with-changes → approve on the fix. Deliberate: the `expanded:` label, lines over 80 columns, and no repository name in `(first: …)` (it is the first listed). 84k+53k+35k, 55k+49k+37k.
 - architect: approve-with-changes → approve. Fixed: slug keys, the documented thread name, the unread split. 54k+40k.
 
+- CI on #495: `test (windows-latest)` failed one new unit test that spelled the pinned map path with `/`. Fixed by building it with `Path::join` as the other tests do (fb74f1ef); `hook::resume` 30 passed.
+
 Next: Phase 3 (decisions) after relais's release.
 
 ## Measure after release
