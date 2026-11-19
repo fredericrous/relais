@@ -351,4 +351,44 @@ skill is relais's (harness.skills-source), so Phase 1 edits it:
   - the plugin journals rather than refuses;
   - N is measured in Phase 0.
 
+- 2026-11-19, the agent (Phase 0): N is **8 h**, the p99 gap between two
+  commits in one session over 14 days (7.51 h; p95 2.01 h; 2,223 gaps in 90
+  sessions), not the p95 session lifetime the plan named. Lifetime p95 is
+  65 h of mostly idle time and would have clamped N to the 24 h ceiling,
+  while a claim is refreshed at each commit. 27 of 770 sessions (3.5%) sent
+  no `SessionEnd`. Recorded with its query in decisions t26.
+- 2026-11-19, the agent (implementation review): the step-2 lookup trait the
+  architect suggested was not added; the ordering tests run against a
+  scratch store.
+
+## Verification record (Phase 1, 2026-11-19)
+
+Real binary (`target/debug/relais` at 6e4859b4), a scratch git repository
+with programmes `alpha` (t01 ready, t02 due 2026-12-30) and `beta` (t01
+ready), `RELAIS_STATE_DIR` a scratch directory.
+
+| Check | Input | Expected | Actual |
+|---|---|---|---|
+| own programme first | A: `next --from repo:alpha --claim` | alpha t01 | `repo alpha t01-one`, exit 0 |
+| idempotent | A again | the same ticket | `repo alpha t01-one`, exit 0 |
+| a programme no session is on | B, same `--from` | beta t01 | `repo beta t01-one`, exit 0 |
+| due later is skipped, park | C, `--json` | exit 22, next due 2026-12-30 | `{"next_due":"2026-12-30","parked":true}`, exit 22 |
+| takeover | D: `claim alpha t01-one --dir …` | work claim, names A | `took over repo alpha t01-one from aaaaaaaa`, exit 0 |
+| refusal | E: same claim | exit 3, `next:` and `--steal` | as expected, exit 3, stdout empty |
+| release refused | E: `release` | exit 3, a next step | `next: nothing to release; it ends …`, exit 3 |
+| ready list marks | `SessionStart` startup | held rows marked | `1 ready, 2 held`, `(held by dddddddd, 0m)` |
+| frontier | `frontier docs/programmes/alpha` | held left out | only t02 listed |
+| release at end | `SessionEnd` of D | work claim released | `log.jsonl`: `release … dddddddd-4` |
+| tests | `cargo test -p relais` (gate) | pass | pass; `programme::` 38, `programme_claims` 16 |
+
+Phases 2–4 are in their repositories (pointer plans); the live proof and
+the week's count follow the release.
+
+## Implementation review
+
+- implementation-review: approve-with-changes ×3 (round 1, delta, final delta); 6 + 1 blocking fixed; own-handoff `from` doc gap deliberate: no other holder to name. 94k + 105k + 44k, 245 + 53 + 96 s.
+- backend: approve after the delta (5 fixed). 85k + 101k, 180 + 78 s.
+- lang:rust: approve-with-changes ×3; 7 fixed; deliberate: the unreachable `(Stole, None)` arm keeps the match total. 82k + 97k + 29k.
+- unix, architect: approve after the delta (5 + 4 fixed; architect's lookup trait deliberate: scratch-store tests). tui: approve-with-changes ×3, 7 fixed; deliberate: the unreadable-claim release line (83 columns), a rare path.
+
 <!-- panel: repos=relais,greenharness-skills,amont-agent,decisions adds= reviewers=architect,backend,lang:rust,po,tui,unix,codex body-sha=2ac1da8868e3 -->
