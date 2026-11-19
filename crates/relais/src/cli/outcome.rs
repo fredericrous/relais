@@ -32,6 +32,8 @@
 //! | 18 | `StaleGrantKey` | `trust grant` refused: the key given is not this policy's; `relais trust show` prints the current one |
 //! | 19 | `NothingDetected` | `init --detect` found no verification command and none was typed; nothing was written |
 //! | 20 | `TrainingLeaseHeld` | `learn cycle`: another cycle holds the Training lease; the message names its pid and start time |
+//! | 21 | `StorageFull` | relais's own storage is full and the run could not be recorded; `relais resume <run>` reconciles |
+//! | 22 | `Parked` | `programme next`: no ticket is eligible; stdout says `parked: next due <date>` or `parked: nothing due` |
 //!
 //! `learn cycle` also ends 0 where it did nothing wrong and nothing was
 //! asked of the person: `deferred` (agents of other sessions are active and
@@ -101,6 +103,9 @@ pub(crate) enum CliOutcome {
     /// relais's own storage is full and the run could not be recorded;
     /// `relais resume <run>` reconciles from the last durable ledger state.
     StorageFull,
+    /// `programme next`: no ticket is both ready and unheld; the session
+    /// parks rather than being handed an open-ended next step.
+    Parked,
 }
 
 /// The one exit-code table. Pure, total, and exhaustive over
@@ -131,6 +136,7 @@ pub(crate) const fn exit_code(outcome: &CliOutcome) -> i32 {
         CliOutcome::NothingDetected => 19,
         CliOutcome::TrainingLeaseHeld => 20,
         CliOutcome::StorageFull => 21,
+        CliOutcome::Parked => 22,
     }
 }
 
@@ -307,12 +313,13 @@ mod tests {
         CliOutcome::NothingDetected,
         CliOutcome::TrainingLeaseHeld,
         CliOutcome::StorageFull,
+        CliOutcome::Parked,
     ];
 
     #[test]
     fn the_exit_code_table_is_total_and_injective() {
         let mut seen: Vec<i32> = ALL.iter().map(exit_code).collect();
-        assert_eq!(seen.len(), 22, "every documented outcome is listed");
+        assert_eq!(seen.len(), 23, "every documented outcome is listed");
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(

@@ -294,14 +294,20 @@ fn git_stdout(repo: &Path, args: &[&str]) -> Result<String, ProgrammeError> {
     Ok(output.stdout)
 }
 
-/// The main checkout of the repository `dir` belongs to: the parent of the
-/// git common directory, which a linked worktree shares with it.
-pub fn main_checkout(dir: &Path) -> Result<PathBuf, ProgrammeError> {
+/// The absolute git common directory of the repository `dir` belongs to,
+/// which a linked worktree shares with its main checkout.
+pub fn git_common_dir(dir: &Path) -> Result<PathBuf, ProgrammeError> {
     let printed = git_stdout(
         dir,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
-    let common = PathBuf::from(printed.trim());
+    Ok(PathBuf::from(printed.trim()))
+}
+
+/// The main checkout of the repository `dir` belongs to: the parent of the
+/// git common directory, which a linked worktree shares with it.
+pub fn main_checkout(dir: &Path) -> Result<PathBuf, ProgrammeError> {
+    let common = git_common_dir(dir)?;
     let is_dot_git = common.file_name().is_some_and(|name| name == ".git");
     match common.parent() {
         Some(parent) if is_dot_git => Ok(parent.to_path_buf()),

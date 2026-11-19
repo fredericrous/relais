@@ -45,9 +45,10 @@ use self::native::native_command;
 use self::outcome::{exit_code, CliError, CliOutcome};
 use self::plan::{plan_command, PlanFormat};
 use self::programme::{
-    check_command as programme_check_command, frontier_command as programme_frontier_command,
-    list_command as programme_list_command, show_command as programme_show_command, Fetch, Format,
-    Listing,
+    check_command as programme_check_command, claim_command as programme_claim_command,
+    frontier_command as programme_frontier_command, list_command as programme_list_command,
+    next_command as programme_next_command, release_command as programme_release_command,
+    show_command as programme_show_command, Fetch, Format, Listing,
 };
 use self::protocol::{announce_unstarted, open_protocol};
 use self::recipe::{
@@ -540,6 +541,64 @@ pub(crate) enum ProgrammeCommand {
         /// Read origin as of the last fetch instead of fetching it first
         #[arg(long)]
         no_fetch: bool,
+    },
+    /// Take a ticket for this session as `work`, so no handoff names it to
+    /// another; exit 3 when another live session holds it as `work`
+    ///
+    /// A `handoff` claim may be taken over, and the session's own claim is
+    /// refreshed. The session is `--session`, else `RELAIS_SESSION_ID`, else
+    /// `CLAUDE_CODE_SESSION_ID`; with none of them the command exits 2.
+    Claim {
+        /// The programme's slug
+        slug: String,
+        /// The ticket's id
+        id: String,
+        /// A directory inside the map's repository (default: the current one)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// The session id (default: from the environment)
+        #[arg(long)]
+        session: Option<String>,
+        /// Take the ticket over from a live session's `work` claim
+        #[arg(long)]
+        steal: bool,
+    },
+    /// Delete this session's claim on a ticket
+    Release {
+        /// The programme's slug
+        slug: String,
+        /// The ticket's id
+        id: String,
+        /// A directory inside the map's repository (default: the current one)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// The session id (default: from the environment)
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// The next ticket to hand off to: the first unheld ready ticket of the
+    /// `--from` programme, else of a programme with no ticket held; exit 22
+    /// and `parked: …` when there is none
+    ///
+    /// Tickets for the person (`hitl`) and tickets due later are never
+    /// chosen. With `--claim` the choice is reserved as a `handoff` claim.
+    Next {
+        /// The programme just left, as `<repo>:<slug>`
+        #[arg(long)]
+        from: Option<String>,
+        /// Reserve the chosen ticket as a `handoff` claim
+        #[arg(long)]
+        claim: bool,
+        /// Directory holding the repositories (default: the parent of the
+        /// current repository's main checkout, else the current directory)
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// The session id for `--claim` (default: from the environment)
+        #[arg(long)]
+        session: Option<String>,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1597,6 +1656,32 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 &dir,
                 Format::from_json_flag(json),
                 Fetch::from_no_fetch_flag(no_fetch),
+            ),
+            ProgrammeCommand::Claim {
+                slug,
+                id,
+                dir,
+                session,
+                steal,
+            } => programme_claim_command(&slug, &id, dir.as_deref(), session.as_deref(), steal),
+            ProgrammeCommand::Release {
+                slug,
+                id,
+                dir,
+                session,
+            } => programme_release_command(&slug, &id, dir.as_deref(), session.as_deref()),
+            ProgrammeCommand::Next {
+                from,
+                claim,
+                root,
+                session,
+                json,
+            } => programme_next_command(
+                from.as_deref(),
+                claim,
+                root.as_deref(),
+                session.as_deref(),
+                Format::from_json_flag(json),
             ),
         },
         Command::Evidence { cmd } => match cmd {
