@@ -46,17 +46,23 @@ taken before (t01) and after, shows the effect.
 - [How a wrong lesson is retired and a lasting one promoted](t07-wrong-lessons.md): retire by command, by contrary outcomes or a false-finding verdict; relais only proposes promotion, greenbelay or an ADR owns the rule
 - [What a relais review finding holds that a sibling could use](t02-finding-shape.md): only severity is parsed and no disposition is kept; a fixed line grammar, typed findings and a findings table with fixed/kept come first
 - [How often a sibling run repeats a finding or a failure today](t01-repeat-baseline.md): reviewer prose repeats 1/162, but code-rule violations repeat 89/162; failure repeats are a floor until workarounds are recorded
+- [Which review findings become lessons for siblings](t03-which-findings.md): rule-cited findings the repair fixed
+- [What the session records when it found a workaround](t05-workaround-record.md): symptom, fix, pinned paths, evidence; nudged after a repair
+- [Where a lesson appears in a sibling run](t06-where-lessons-go.md): worker block of about 8 KiB, and the reviewer reports a repeat
+- [When a lesson is a promotion candidate](t09-promotion-thresholds.md): 3 sessions, 7 days, one inbox line
 
 ## Handoff
 
-2026-11-19, charting: map and seven tickets written; research tickets t01,
-t02, t04 and t07 are next, afk and parallel; t03, t05 and t06 wait on them.
+2026-11-19, charting session: the map, research t01, t02, t04, t07 and the
+person's answers to t03, t05, t06, t09 are on branch
+`docs/programme-run-lessons`. Next: [Where lessons are stored](t10-lesson-storage.md),
+then one build plan in plan mode (review panel) covering t02's grammar and
+findings table, the lessons store, `relais lesson add|retire`, delivery to
+worker and reviewer, and the nudge hook. The after-count reruns
+`t01-repeat-baseline.py` 14 days after that release.
 
 ## Not yet specified
 
-- Where lessons are stored: the relais ledger (per machine) or a file in the
-  repository (shared by every machine and the homelab agent pods). Becomes
-  precise once t04 and t07 say what a lesson must carry.
 - Whether findings from reviews outside relais (implementation-review at
   worktree-task F4b, the plan review panel) feed the same channel.
 - How a lesson's effect is attributed in the after-count when routing, the
