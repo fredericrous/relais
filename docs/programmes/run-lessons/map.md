@@ -42,6 +42,11 @@ taken before (t01) and after, shows the effect.
 
 ## Decisions so far
 
+- [How a lesson knows the files it is about have changed](t04-invalidation.md): pin to blob ids of named files, prefiltered by one diff per run; 30-day backstop
+- [How a wrong lesson is retired and a lasting one promoted](t07-wrong-lessons.md): retire by command, by contrary outcomes or a false-finding verdict; relais only proposes promotion, greenbelay or an ADR owns the rule
+- [What a relais review finding holds that a sibling could use](t02-finding-shape.md): only severity is parsed and no disposition is kept; a fixed line grammar, typed findings and a findings table with fixed/kept come first
+- [How often a sibling run repeats a finding or a failure today](t01-repeat-baseline.md): reviewer prose repeats 1/162, but code-rule violations repeat 89/162; failure repeats are a floor until workarounds are recorded
+
 ## Handoff
 
 2026-11-19, charting: map and seven tickets written; research tickets t01,
