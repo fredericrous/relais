@@ -10,7 +10,7 @@ use std::process::{Command, Output};
 use std::sync::{Arc, Barrier};
 
 use chrono::NaiveDate;
-use relais::programme::claim::{self, ClaimKey, Next, ProgrammeState, ReadyTicket, Store};
+use relais::programme::claim::{self, ClaimKey, Intent, Next, ProgrammeState, ReadyTicket, Store};
 use relais::programme::model::Mode;
 use relais::test_support::{short_temp_dir, TempDir};
 use relais::workspace::git_command;
@@ -182,7 +182,8 @@ fn a_claim_on_the_first_candidate_makes_next_take_the_second() {
     assert_eq!(text(&parked.stdout), "parked: nothing due\n");
     let parked_json = world.next("me3", &["--from", "alpha:p", "--json"]);
     assert_eq!(parked_json.status.code(), Some(22));
-    assert!(text(&parked_json.stdout).contains("\"parked\""));
+    let shape: serde_json::Value = serde_json::from_slice(&parked_json.stdout).expect("json");
+    assert_eq!(shape, serde_json::json!({"parked": true, "next_due": null}));
 }
 
 #[test]
@@ -344,7 +345,10 @@ fn state_of(repo: &str, slug: &str, ids: &[&str]) -> ProgrammeState {
             repo_key: claim::repo_key(Path::new(repo)),
             slug: slug.to_string(),
         },
-        open: ready.iter().map(|t| t.id.clone()).collect(),
+        open: ready
+            .iter()
+            .map(|t| (t.id.clone(), t.name.clone()))
+            .collect(),
         ready,
         closed: BTreeSet::new(),
         branch_held: BTreeSet::new(),
@@ -376,7 +380,9 @@ fn eight_threads_over_fifty_rounds_never_hand_one_ticket_to_two_sessions() {
                         &[],
                         today(),
                         1_800_000_000,
-                        Some(&format!("s{n}")),
+                        Intent::Reserve {
+                            session: &format!("s{n}"),
+                        },
                     )
                     .expect("next")
                 })
@@ -424,7 +430,7 @@ fn two_callers_from_exhausted_programmes_reserve_at_most_one_ticket_in_one_empty
                         std::slice::from_ref(&*destination),
                         today(),
                         1_800_000_000,
-                        Some(name),
+                        Intent::Reserve { session: name },
                     )
                     .expect("next")
                 })
@@ -553,4 +559,139 @@ fn a_released_claim_lets_the_ticket_back_onto_the_frontier() {
         "{}",
         text(&ready.stdout)
     );
+}
+
+fn slug_lock_path(world: &World, slug: &str) -> PathBuf {
+    std::fs::read_dir(world.state.join("claims"))
+        .expect("claims dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .map(|path| path.join(slug).join(".lock"))
+        .find(|path| path.is_file())
+        .expect("the slug lock file")
+}
+
+#[test]
+fn a_claim_prints_the_ticket_as_repo_slug_id_on_stderr() {
+    let world = World::new("wording");
+    world.programme("alpha", "p", &[("t1", "afk", None)]);
+    let first = world.claim("alpha", "p", "t1", "s1");
+    assert!(
+        text(&first.stderr).contains("relais: claimed alpha p t1\n"),
+        "{}",
+        text(&first.stderr)
+    );
+    let again = world.claim("alpha", "p", "t1", "s1");
+    assert!(
+        text(&again.stderr).contains("relais: refreshed your claim on alpha p t1\n"),
+        "{}",
+        text(&again.stderr)
+    );
+    let refused = world.claim("alpha", "p", "t1", "s2");
+    let stderr = text(&refused.stderr);
+    assert!(
+        stderr.contains("relais: alpha p t1 is held by s1 ("),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "to take it over (only when the person says so):\nrelais programme claim p t1"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn next_claim_run_twice_by_one_session_names_the_same_ticket() {
+    let world = World::new("idempotent");
+    world.programme("alpha", "p", &[("t1", "afk", None), ("t2", "afk", None)]);
+    let first = world.next("me", &["--from", "alpha:p", "--claim"]);
+    let second = world.next("me", &["--from", "alpha:p", "--claim"]);
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first.stderr));
+    assert_eq!(text(&first.stdout), "alpha p t1\tt1\n");
+    assert_eq!(text(&second.stdout), text(&first.stdout));
+    let other = world.next("you", &["--from", "alpha:p", "--claim"]);
+    assert_eq!(text(&other.stdout), "alpha p t2\tt2\n");
+}
+
+#[test]
+fn a_busy_lock_in_another_programme_leaves_next_claim_at_exit_0_with_its_pick() {
+    let world = World::new("busy-refresh");
+    world.programme("alpha", "p", &[("t1", "afk", None)]);
+    world.programme("beta", "q", &[("b1", "afk", None)]);
+    let own = world.claim("beta", "q", "b1", "me");
+    assert_eq!(own.status.code(), Some(0), "{}", text(&own.stderr));
+    let _held = relais::procs::LockFile::try_acquire(&slug_lock_path(&world, "q"))
+        .expect("opens")
+        .expect("free");
+    let out = world.next("me", &["--from", "alpha:p", "--claim"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "alpha p t1\tt1\n");
+    assert!(
+        text(&out.stderr).contains("warning"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn a_from_programme_that_fails_to_load_exits_1_and_a_failed_load_never_parks() {
+    let world = World::new("broken");
+    world.programme("alpha", "p", &[("t1", "afk", None)]);
+    std::fs::write(
+        world.root.join("alpha/docs/programmes/p/t9.md"),
+        [0xff, 0xfe, 0xfd],
+    )
+    .expect("a ticket that does not read");
+    let from_broken = world.next("me", &["--from", "alpha:p"]);
+    assert_eq!(
+        from_broken.status.code(),
+        Some(1),
+        "{}",
+        text(&from_broken.stderr)
+    );
+    assert_eq!(text(&from_broken.stdout), "");
+
+    world.programme("beta", "q", &[("person", "hitl", None)]);
+    let would_park = world.next("me", &["--from", "beta:q"]);
+    assert_eq!(
+        would_park.status.code(),
+        Some(1),
+        "{}",
+        text(&would_park.stderr)
+    );
+    assert_eq!(text(&would_park.stdout), "");
+}
+
+#[test]
+fn two_next_claim_processes_started_together_print_different_tickets() {
+    for round in 0..5 {
+        let world = Arc::new(World::new(&format!("procs-{round}")));
+        world.programme("alpha", "alpha", &[("a1", "afk", None)]);
+        world.programme("beta", "beta", &[("b1", "afk", None)]);
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = ["racer-a", "racer-b"]
+            .into_iter()
+            .map(|session| {
+                let (world, barrier) = (Arc::clone(&world), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    world.next(session, &["--from", "alpha:alpha", "--claim"])
+                })
+            })
+            .collect();
+        let outputs: Vec<Output> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread"))
+            .collect();
+        for out in &outputs {
+            assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        }
+        assert_ne!(
+            text(&outputs[0].stdout),
+            text(&outputs[1].stdout),
+            "round {round}"
+        );
+    }
 }

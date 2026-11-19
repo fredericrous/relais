@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::claim::Hold;
+use super::claim::rules::Hold;
 use super::model::{MapDoc, Mode, Problem, Status, Ticket, MAP_FILE};
 
 /// Where a ticket stands against the others and the branches.
@@ -73,28 +73,30 @@ pub fn standings(
             let standing = match ticket.status {
                 Status::Closed => Standing::Closed,
                 Status::OutOfScope => Standing::OutOfScope,
-                Status::Open if working.contains_key(&ticket.id) => Standing::InFlight {
-                    holder: Holder::Branch {
-                        branch: branch_name(slug, &ticket.id),
-                        last_commit_unix: working[&ticket.id],
+                Status::Open => match (working.get(&ticket.id), claims.get(&ticket.id)) {
+                    (Some(last_commit_unix), _) => Standing::InFlight {
+                        holder: Holder::Branch {
+                            branch: branch_name(slug, &ticket.id),
+                            last_commit_unix: *last_commit_unix,
+                        },
                     },
-                },
-                Status::Open if claims.contains_key(&ticket.id) => Standing::InFlight {
-                    holder: Holder::Claim(claims[&ticket.id].clone()),
-                },
-                Status::Open => {
-                    let blockers: Vec<String> = ticket
-                        .blocked_by
-                        .iter()
-                        .filter(|id| tickets.get(*id).map(|t| t.status) != Some(Status::Closed))
-                        .cloned()
-                        .collect();
-                    if blockers.is_empty() {
-                        Standing::Frontier
-                    } else {
-                        Standing::Blocked(blockers)
+                    (None, Some(hold)) => Standing::InFlight {
+                        holder: Holder::Claim(hold.clone()),
+                    },
+                    (None, None) => {
+                        let blockers: Vec<String> = ticket
+                            .blocked_by
+                            .iter()
+                            .filter(|id| tickets.get(*id).map(|t| t.status) != Some(Status::Closed))
+                            .cloned()
+                            .collect();
+                        if blockers.is_empty() {
+                            Standing::Frontier
+                        } else {
+                            Standing::Blocked(blockers)
+                        }
                     }
-                }
+                },
             };
             (ticket.id.clone(), standing)
         })
@@ -306,7 +308,7 @@ fn members_of_cycle_through<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::programme::claim::Kind;
+    use crate::programme::claim::rules::{Holder as ClaimHolder, Kind};
     use crate::programme::model::{Mode, TicketType};
 
     fn ticket(id: &str, status: Status, blocked_by: &[&str]) -> Ticket {
@@ -349,24 +351,30 @@ mod tests {
             (
                 "B".to_string(),
                 Hold {
-                    session: "s1".to_string(),
-                    kind: Kind::Work,
+                    holder: ClaimHolder::Session {
+                        id: "s1".to_string(),
+                        kind: Kind::Work,
+                    },
                     since: 5,
                 },
             ),
             (
                 "D".to_string(),
                 Hold {
-                    session: "s2".to_string(),
-                    kind: Kind::Handoff,
+                    holder: ClaimHolder::Session {
+                        id: "s2".to_string(),
+                        kind: Kind::Handoff,
+                    },
                     since: 6,
                 },
             ),
             (
                 "A".to_string(),
                 Hold {
-                    session: "s3".to_string(),
-                    kind: Kind::Work,
+                    holder: ClaimHolder::Session {
+                        id: "s3".to_string(),
+                        kind: Kind::Work,
+                    },
                     since: 7,
                 },
             ),

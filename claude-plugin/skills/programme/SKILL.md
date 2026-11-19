@@ -142,9 +142,9 @@ Resolution.
      unheld ready ticket for a handoff and prints `<repo> <slug> <id>`. Then
      run `relais programme claim <slug> <id> --dir <map dir>` on what it
      names, and only after it exits 0 start any work: the reservation is a
-     handoff, not active work. If that claim exits 3 too, run
-     `relais programme release <slug> <id> --dir <map dir>` on the lost
-     reservation and select again, at most 3 selections in all, then park.
+     handoff, not active work. If that claim exits 3 too, another session
+     took the reservation over and it is theirs: do not release it. Select
+     again, at most 3 selections in all, then park.
    - 22 (from `next`): nothing is unheld and due. Park: end the answer with
      `safe to /clear; parked: next due <date>`, with the date `next` printed,
      and no `next:` prompt.

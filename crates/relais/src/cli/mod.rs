@@ -49,6 +49,7 @@ use self::programme::{
     frontier_command as programme_frontier_command, list_command as programme_list_command,
     next_command as programme_next_command, release_command as programme_release_command,
     show_command as programme_show_command, Fetch, Format, Listing,
+    Reservation as ProgrammeReservation,
 };
 use self::protocol::{announce_unstarted, open_protocol};
 use self::recipe::{
@@ -1663,7 +1664,13 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 dir,
                 session,
                 steal,
-            } => programme_claim_command(&slug, &id, dir.as_deref(), session.as_deref(), steal),
+            } => programme_claim_command(
+                &slug,
+                &id,
+                dir.as_deref(),
+                session.as_deref(),
+                relais::programme::claim::Contest::from_steal_flag(steal),
+            ),
             ProgrammeCommand::Release {
                 slug,
                 id,
@@ -1678,7 +1685,7 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 json,
             } => programme_next_command(
                 from.as_deref(),
-                claim,
+                ProgrammeReservation::from_claim_flag(claim),
                 root.as_deref(),
                 session.as_deref(),
                 Format::from_json_flag(json),

@@ -362,8 +362,11 @@ fn follow_agent_lifecycle(event: &HookEvent, gate: &dyn Gate, claims: Option<&cl
         }
         HookEvent::SessionEnd(end) => {
             if let Some(store) = claims {
-                let _ = store.end_session_once(end.session_id.as_str(), claim::now_unix());
-                // bookkeeping like the arms above: a hook cannot fail on it, and a claim left behind expires after N
+                // A hook cannot fail on bookkeeping, so a failure is one stderr
+                // line and the claim left behind expires after N.
+                report_claim_pass(
+                    store.end_session_once(end.session_id.as_str(), claim::now_unix()),
+                );
             }
         }
         HookEvent::SessionStart(_) | HookEvent::SubagentStart(_) | HookEvent::NotOurs => {}
@@ -384,8 +387,23 @@ fn refresh_claims_of_a_continued_session(
         Some(event::SessionSource::Resume | event::SessionSource::Compact)
     );
     if let (true, Some(store)) = (continued, claims) {
-        let _ = store.refresh_session_once(start.session_id.as_str(), claim::now_unix());
-        // a hook cannot fail on bookkeeping; the next claim, commit or resume refreshes it
+        // A hook cannot fail on bookkeeping, so a failure is one stderr line
+        // and the next claim, commit or resume refreshes the claim.
+        report_claim_pass(store.refresh_session_once(start.session_id.as_str(), claim::now_unix()));
+    }
+}
+
+/// Writes what went wrong in a hook's pass over a session's claims to the
+/// hook's stderr, one line per programme and one for a store that could not
+/// be read, each naming where and why.
+fn report_claim_pass(pass: Result<claim::Pass, claim::ClaimError>) {
+    match pass {
+        Ok(pass) => {
+            for line in pass.failure_lines() {
+                eprintln!("relais: {line}");
+            }
+        }
+        Err(error) => eprintln!("relais: claims: {error}"),
     }
 }
 
@@ -2395,7 +2413,7 @@ mod tests {
 
     mod claims {
         use super::*;
-        use crate::programme::claim::{ClaimKey, ClaimRecord, Kind, Store, LOCK_WAIT};
+        use crate::programme::claim::{ClaimKey, ClaimRecord, Contest, Kind, Store, LOCK_WAIT};
 
         const SESSION: &str = "session-aaaa";
 
@@ -2435,10 +2453,11 @@ mod tests {
             let scratch = crate::test_support::short_temp_dir(tag);
             let store = Store::in_state_dir(&scratch);
             let then = claim::now_unix() - refreshed_ago;
-            let lock = store.lock(&key(), LOCK_WAIT).unwrap();
-            lock.claim_work("t1", SESSION, "/r", false, then).unwrap();
+            let lock = store.lock(&key(), LOCK_WAIT, claim::now_unix()).unwrap();
+            lock.claim_work("t1", SESSION, "/r", Contest::Refuse, then)
+                .unwrap();
             assert!(lock.reserve_handoff("t2", SESSION, "/r", then).unwrap());
-            lock.claim_work("t3", "someone-else", "/r", false, then)
+            lock.claim_work("t3", "someone-else", "/r", Contest::Refuse, then)
                 .unwrap();
             drop(lock);
             (scratch, store)
@@ -2515,7 +2534,9 @@ mod tests {
             let state = scratch.to_path_buf();
             let holder = std::thread::spawn(move || {
                 let own_handle = Store::in_state_dir(&state);
-                let _lock = own_handle.lock(&key(), LOCK_WAIT).unwrap();
+                let _lock = own_handle
+                    .lock(&key(), LOCK_WAIT, claim::now_unix())
+                    .unwrap();
                 locked.send(()).unwrap();
                 let _ = release.recv(); // held until the main thread has measured
             });
@@ -2540,7 +2561,9 @@ mod tests {
             let (locked, locked_signal) = std::sync::mpsc::channel::<()>();
             let holder = std::thread::spawn(move || {
                 let own_handle = Store::in_state_dir(&state);
-                let _lock = own_handle.lock(&key(), LOCK_WAIT).unwrap();
+                let _lock = own_handle
+                    .lock(&key(), LOCK_WAIT, claim::now_unix())
+                    .unwrap();
                 locked.send(()).unwrap();
                 let _ = release.recv(); // held until the end has been handled
             });
@@ -2560,7 +2583,7 @@ mod tests {
                 .join("claims/ended")
                 .join(SESSION)
                 .exists());
-            drop(store.lock(&key(), LOCK_WAIT).unwrap());
+            drop(store.lock(&key(), LOCK_WAIT, claim::now_unix()).unwrap());
             assert_eq!(claim_ids(&store), ["t2", "t3"]);
         }
     }

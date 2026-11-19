@@ -15,9 +15,7 @@ use chrono::NaiveDate;
 
 use super::respond::{Coverage, Gathered, SkipReason, GATHER_THREAD_NAME};
 use crate::programme::claim::{self, Store};
-use crate::programme::frontier::{
-    self, due_mark, format_age, has_handoff, short_session, Ready, ReadyRow,
-};
+use crate::programme::frontier::{self, due_mark, format_age, has_handoff, Ready, ReadyRow};
 use crate::programme::load::{self, main_checkout, Found, Source};
 use crate::programme::model::MAP_FILE;
 
@@ -281,8 +279,8 @@ pub(crate) fn render_outside(
         .chain(collected.read.iter().filter(|r| r.ready.rows.is_empty()))
         .filter(|reading| reading.ready.unheld_count() == most_unheld)
         .filter(|reading| most_unheld > 0 || reading.latest_handoff.is_some())
-        .fold(None::<&RepoReading>, |best, candidate| match best {
-            Some(held) if handoff_rank(held) >= handoff_rank(candidate) => best,
+        .fold(None::<&RepoReading>, |kept, candidate| match kept {
+            Some(best) if handoff_rank(best) >= handoff_rank(candidate) => kept,
             _ => Some(candidate),
         });
     let first_with_ready = with_ready.first().copied();
@@ -538,7 +536,7 @@ fn held_mark(row: &ReadyRow) -> String {
     match &row.held {
         Some(held) => format!(
             " (held by {}, {})",
-            printable(&short_session(&held.session)),
+            printable(&held.holder.short()),
             format_age(held.age_secs)
         ),
         None => String::new(),
@@ -647,12 +645,16 @@ mod tests {
     }
 
     fn held_row(id: &str, session: &str, age_secs: u64) -> ReadyRow {
-        ReadyRow {
-            held: Some(HeldBy {
-                session: session.to_string(),
+        let holder = if session.is_empty() {
+            claim::Holder::Unreadable
+        } else {
+            claim::Holder::Session {
+                id: session.to_string(),
                 kind: claim::Kind::Work,
-                age_secs,
-            }),
+            }
+        };
+        ReadyRow {
+            held: Some(HeldBy { holder, age_secs }),
             ..row(0, "prog", id, "Held name", None)
         }
     }

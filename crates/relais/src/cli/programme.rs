@@ -11,9 +11,7 @@ use std::path::{Path, PathBuf};
 use chrono::NaiveDate;
 use relais::programme::analysis::{self, age_secs, Counts, Holder, Standing};
 use relais::programme::claim;
-use relais::programme::frontier::{
-    due_mark, format_age, is_overdue, is_ready, order_frontier, short_session,
-};
+use relais::programme::frontier::{due_mark, format_age, is_overdue, is_ready, order_frontier};
 use relais::programme::load::{self, main_checkout, Found, Programme, ProgrammeError, Source};
 use relais::programme::model::Ticket;
 use serde_json::{json, Value};
@@ -159,7 +157,7 @@ impl Tip<'_> {
         let age = format_age(self.age_secs);
         match self.holder {
             Holder::Branch { branch, .. } => format!("in-flight {branch} {age}"),
-            Holder::Claim(hold) => format!("claimed {} {age}", short_session(&hold.session)),
+            Holder::Claim(hold) => format!("claimed {} {age}", hold.holder.short()),
         }
     }
 
@@ -168,7 +166,7 @@ impl Tip<'_> {
         let age = format_age(self.age_secs);
         match self.holder {
             Holder::Branch { branch, .. } => format!("{branch} {age}"),
-            Holder::Claim(hold) => format!("claimed {} {age}", short_session(&hold.session)),
+            Holder::Claim(hold) => format!("claimed {} {age}", hold.holder.short()),
         }
     }
 
@@ -183,12 +181,20 @@ impl Tip<'_> {
             Some(Tip {
                 holder: Holder::Claim(hold),
                 age_secs,
-            }) => json!({
-                "holder": "claim",
-                "session": hold.session,
-                "kind": hold.kind.as_str(),
-                "age_secs": age_secs,
-            }),
+            }) => match &hold.holder {
+                claim::Holder::Session { id, kind } => json!({
+                    "holder": "claim",
+                    "session": id,
+                    "kind": kind.as_str(),
+                    "age_secs": age_secs,
+                }),
+                claim::Holder::Unreadable => json!({
+                    "holder": "claim",
+                    "session": null,
+                    "kind": null,
+                    "age_secs": age_secs,
+                }),
+            },
         }
     }
 }
@@ -199,6 +205,12 @@ fn now_unix() -> i64 {
         .ok()
         .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
         .unwrap_or(0) // only a clock before 1970 lands here; ages then clamp to 0 rather than fail a read-only listing
+}
+
+/// The claim store the read-only views look in, or `None` when there is no
+/// state directory.
+fn view_store() -> Option<claim::Store> {
+    claim_store().ok() // no home directory: no claim can have been written, so a listing marks nothing held
 }
 
 fn tip_of(standing: &Standing, now_unix: i64) -> Option<Tip<'_>> {
@@ -272,8 +284,10 @@ pub(crate) fn frontier_command(
         eprintln!("relais: reading {} from {rev}", dir.display());
     }
     let programme = found.load().map_err(programme_error)?;
-    let standings = programme.standings().map_err(programme_error)?;
     let now = now_unix();
+    let standings = programme
+        .standings(view_store().as_ref(), now)
+        .map_err(programme_error)?;
     let today = chrono::Local::now().date_naive();
     let mut shown: Vec<(&Ticket, Option<Tip<'_>>)> = programme
         .tickets
@@ -342,7 +356,10 @@ pub(crate) fn show_command(
 ) -> Result<CliOutcome, CliError> {
     let found = resolve_dir(dir, fetch)?;
     let programme = found.load().map_err(programme_error)?;
-    let standings = programme.standings().map_err(programme_error)?;
+    let now = now_unix();
+    let standings = programme
+        .standings(view_store().as_ref(), now)
+        .map_err(programme_error)?;
     let counts = analysis::counts(&standings);
     let blocked: Vec<(&Ticket, &Vec<String>)> = programme
         .tickets
@@ -355,7 +372,6 @@ pub(crate) fn show_command(
             | Standing::OutOfScope => None,
         })
         .collect();
-    let now = now_unix();
     let in_flight: Vec<(&Ticket, Tip<'_>)> = programme
         .tickets
         .values()
@@ -643,10 +659,14 @@ pub(crate) fn list_command(
             }
         }
     }
+    let store = view_store();
+    let now = now_unix();
     let loaded_all = par_map(&found_all, |found| {
-        found
-            .load()
-            .and_then(|programme| programme.standings().map(|s| (programme, s)))
+        found.load().and_then(|programme| {
+            programme
+                .standings(store.as_ref(), now)
+                .map(|s| (programme, s))
+        })
     });
     for (found, loaded) in found_all.iter().zip(loaded_all) {
         let dir = found.dir();
@@ -717,7 +737,8 @@ fn writing_session(explicit: Option<&str>) -> Result<String, CliError> {
     let resolved = resolve_session();
     match resolved.source {
         SessionSource::ParentPidFallback => Err(CliError::Usage {
-            detail: "no session id: pass --session <id>, or set CLAUDE_CODE_SESSION_ID".to_string(),
+            detail: "no session id: pass --session <id>, or set RELAIS_SESSION_ID or CLAUDE_CODE_SESSION_ID"
+                .to_string(),
         }),
         SessionSource::Override | SessionSource::ClaudeCode => Ok(resolved.id),
     }
@@ -744,7 +765,28 @@ fn claim_outcome(error: claim::ClaimError, retry: &str) -> Result<CliOutcome, Cl
             eprintln!("next: {retry}");
             Ok(CliOutcome::OperationalFailure)
         }
-        claim::ClaimError::Io { .. } => Err(claim_io(error)),
+        claim::ClaimError::Io { .. } | claim::ClaimError::Encode { .. } => Err(claim_io(error)),
+    }
+}
+
+/// Moves the session's other `work` claims to `now` after a claim command
+/// has done its own work. Best effort: each programme's lock is tried once,
+/// and a failure or a busy lock is a warning on stderr, never the command's
+/// exit status, because the claim the person asked for is already written.
+fn refresh_session_best_effort(store: &claim::Store, session: &str, now: i64) {
+    match store.refresh_session_once(session, now) {
+        Ok(pass) => {
+            for line in pass.failure_lines() {
+                eprintln!("relais: warning: {line}");
+            }
+            let busy = pass.skipped.saturating_sub(pass.failures.len());
+            if busy > 0 {
+                eprintln!(
+                    "relais: warning: {busy} programme(s) were busy; your other claims there refresh at your next claim"
+                );
+            }
+        }
+        Err(error) => eprintln!("relais: warning: claims: {error}"),
     }
 }
 
@@ -753,35 +795,53 @@ fn dir_name(path: &Path) -> String {
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
 }
 
-/// A programme read for selection and claiming.
-struct Loaded {
-    state: claim::ProgrammeState,
+/// `text` as one shell word: unchanged when it holds only characters a
+/// shell leaves alone, else single-quoted.
+fn shell_quote(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./:=@%+,".contains(c));
+    if plain {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
 }
 
-fn programme_state(found: &Found) -> Result<claim::ProgrammeState, CliError> {
+/// ` --dir <dir>` for a suggested command, or nothing without `--dir`.
+fn dir_argument(dir: Option<&Path>) -> String {
+    dir.map_or_else(String::new, |dir| {
+        format!(" --dir {}", shell_quote(&dir.to_string_lossy()))
+    })
+}
+
+/// A programme read for selection and claiming, with the directory it was
+/// read from.
+struct Loaded {
+    state: claim::ProgrammeState,
+    dir: PathBuf,
+}
+
+fn programme_state(
+    found: &Found,
+    store: &claim::Store,
+    now: i64,
+) -> Result<claim::ProgrammeState, CliError> {
     use relais::programme::model::Status;
     let programme = found.load().map_err(programme_error)?;
-    let standings = programme.standings().map_err(programme_error)?;
-    let common = load::git_common_dir(&programme.repo_dir).map_err(programme_error)?;
+    let standings = programme
+        .standings(Some(store), now)
+        .map_err(programme_error)?;
+    let key = programme.claim_key().map_err(programme_error)?;
     let mut ready: Vec<&Ticket> =
         relais::programme::frontier::ready_tickets(&programme, &standings).collect();
     order_frontier(&mut ready, |ticket| ticket.due);
-    let ids_where = |wanted: fn(Status) -> bool| -> std::collections::BTreeSet<String> {
-        programme
-            .tickets
-            .values()
-            .filter(|ticket| wanted(ticket.status))
-            .map(|ticket| ticket.id.clone())
-            .collect()
-    };
     Ok(claim::ProgrammeState {
         repo: dir_name(&programme.repo_dir),
         repo_path: programme.repo_dir.display().to_string(),
         slug: programme.slug.clone(),
-        key: claim::ClaimKey {
-            repo_key: claim::repo_key(&common),
-            slug: programme.slug.clone(),
-        },
+        key,
         ready: ready
             .into_iter()
             .map(|ticket| claim::ReadyTicket {
@@ -791,8 +851,18 @@ fn programme_state(found: &Found) -> Result<claim::ProgrammeState, CliError> {
                 mode: ticket.mode,
             })
             .collect(),
-        open: ids_where(|status| status == Status::Open),
-        closed: ids_where(|status| status != Status::Open),
+        open: programme
+            .tickets
+            .values()
+            .filter(|ticket| ticket.status == Status::Open)
+            .map(|ticket| (ticket.id.clone(), ticket.name.clone()))
+            .collect(),
+        closed: programme
+            .tickets
+            .values()
+            .filter(|ticket| ticket.status != Status::Open)
+            .map(|ticket| ticket.id.clone())
+            .collect(),
         branch_held: standings
             .iter()
             .filter(|(_, standing)| {
@@ -810,7 +880,12 @@ fn programme_state(found: &Found) -> Result<claim::ProgrammeState, CliError> {
 
 /// The programme `slug` of the repository `dir` is inside (default: the
 /// current directory), as the claim commands read it.
-fn claim_target(slug: &str, dir: Option<&Path>) -> Result<Loaded, CliError> {
+fn claim_target(
+    slug: &str,
+    dir: Option<&Path>,
+    store: &claim::Store,
+    now: i64,
+) -> Result<Loaded, CliError> {
     let base = match dir {
         Some(dir) => dir.to_path_buf(),
         None => std::env::current_dir().map_err(CliError::Cwd)?,
@@ -824,7 +899,8 @@ fn claim_target(slug: &str, dir: Option<&Path>) -> Result<Loaded, CliError> {
         .unwrap_or(&candidates[1]);
     let found = resolve_dir(programme_dir, Fetch::LastFetch)?;
     Ok(Loaded {
-        state: programme_state(&found)?,
+        state: programme_state(&found, store, now)?,
+        dir: programme_dir.clone(),
     })
 }
 
@@ -833,60 +909,75 @@ pub(crate) fn claim_command(
     id: &str,
     dir: Option<&Path>,
     session: Option<&str>,
-    steal: bool,
+    contest: claim::Contest,
 ) -> Result<CliOutcome, CliError> {
     let session = writing_session(session)?;
-    let Loaded { state } = claim_target(slug, dir)?;
-    if !state.open.contains(id) {
-        return Err(CliError::Usage {
-            detail: format!("{}/{slug} has no open ticket {id}", state.repo),
-        });
-    }
     let store = claim_store()?;
     let now = now_unix();
+    let Loaded {
+        state,
+        dir: programme_dir,
+    } = claim_target(slug, dir, &store, now)?;
+    let repo = &state.repo;
+    if !state.open.contains_key(id) {
+        return Err(CliError::Usage {
+            detail: format!(
+                "{repo} {slug} {id}: no open ticket\nsee: relais programme show {}",
+                shell_quote(&programme_dir.to_string_lossy())
+            ),
+        });
+    }
     store.forget_ended(&session).map_err(claim_io)?;
+    let steal_flag = match contest {
+        claim::Contest::Refuse => "",
+        claim::Contest::Steal => " --steal",
+    };
     let retry = format!(
-        "relais programme claim {slug} {id}{}{}",
-        dir.map_or_else(String::new, |d| format!(" --dir {}", d.display())),
-        if steal { " --steal" } else { "" }
+        "relais programme claim {slug} {id}{}{steal_flag}",
+        dir_argument(dir)
     );
     let taken = store
-        .lock(&state.key, claim::LOCK_WAIT)
+        .lock(&state.key, claim::LOCK_WAIT, now)
         .and_then(|lock| {
             lock.sweep(&state.closed, now)?;
-            lock.claim_work(id, &session, &state.repo_path, steal, now)
-        })
-        .and_then(|taken| store.refresh_session(&session, now).map(|_| taken));
+            lock.claim_work(id, &session, &state.repo_path, contest, now)
+        });
     match taken {
         Err(error) => claim_outcome(error, &retry),
-        Ok(claim::Taken::Claimed(event)) => {
-            eprintln!(
-                "relais: {} {} {slug} {id} ({})",
-                event.as_str(),
-                state.repo,
-                state.slug
-            );
+        Ok(claim::Taken::Claimed { how, from }) => {
+            let from = from.map(|session| claim::Holder::Session {
+                id: session,
+                kind: claim::Kind::Work,
+            });
+            let line = match (how, from) {
+                (claim::Acquired::Created, _) => format!("claimed {repo} {slug} {id}"),
+                (claim::Acquired::TookOver, Some(from)) => {
+                    format!("took over {repo} {slug} {id} from {}", from.short())
+                }
+                (claim::Acquired::TookOver, None) => format!("took over {repo} {slug} {id}"),
+                (claim::Acquired::Refreshed, _) => {
+                    format!("refreshed your claim on {repo} {slug} {id}")
+                }
+                (claim::Acquired::Stole, from) => format!(
+                    "took {repo} {slug} {id} from {} (--steal)",
+                    from.map_or_else(|| claim::Holder::Unreadable.short(), |from| from.short())
+                ),
+            };
+            eprintln!("relais: {line}");
+            refresh_session_best_effort(&store, &session, now);
             Ok(CliOutcome::Accepted)
         }
         Ok(claim::Taken::Refused { holder, age_secs }) => {
-            let holder: String = holder.chars().take(8).collect();
-            let holder = if holder.is_empty() {
-                "an unreadable claim".to_string()
-            } else {
-                holder
-            };
             eprintln!(
-                "relais: {}/{slug} {id} is held by {holder} ({} old)",
-                state.repo,
+                "relais: {repo} {slug} {id} is held by {} ({} old)",
+                holder.short(),
                 format_age(age_secs)
             );
+            eprintln!("next: relais programme next --from {repo}:{slug} --claim");
+            eprintln!("to take it over (only when the person says so):");
             eprintln!(
-                "next: relais programme next --from {}:{slug} --claim",
-                state.repo
-            );
-            eprintln!(
-                "to take it over when the person directs it: relais programme claim {slug} {id}{} --steal",
-                dir.map_or_else(String::new, |d| format!(" --dir {}", d.display()))
+                "relais programme claim {slug} {id}{} --steal",
+                dir_argument(dir)
             );
             Ok(CliOutcome::Blocked)
         }
@@ -900,38 +991,55 @@ pub(crate) fn release_command(
     session: Option<&str>,
 ) -> Result<CliOutcome, CliError> {
     let session = writing_session(session)?;
-    let Loaded { state } = claim_target(slug, dir)?;
     let store = claim_store()?;
     let now = now_unix();
-    let retry = format!(
-        "relais programme release {slug} {id}{}",
-        dir.map_or_else(String::new, |d| format!(" --dir {}", d.display()))
-    );
-    let released = store.lock(&state.key, claim::LOCK_WAIT).and_then(|lock| {
-        lock.sweep(&state.closed, now)?;
-        lock.release(id, &session, now)
-    });
+    let Loaded { state, .. } = claim_target(slug, dir, &store, now)?;
+    let repo = &state.repo;
+    let retry = format!("relais programme release {slug} {id}{}", dir_argument(dir));
+    let released = store
+        .lock(&state.key, claim::LOCK_WAIT, now)
+        .and_then(|lock| {
+            lock.sweep(&state.closed, now)?;
+            lock.release(id, &session, now)
+        });
     match released {
         Err(error) => claim_outcome(error, &retry),
         Ok(claim::Released::Released) => {
-            eprintln!("relais: released {} {slug} {id}", state.repo);
+            eprintln!("relais: released {repo} {slug} {id}");
             Ok(CliOutcome::Accepted)
         }
         Ok(claim::Released::Absent) => Ok(CliOutcome::Accepted),
         Ok(claim::Released::NotHolder { holder }) => {
-            let holder: String = holder.chars().take(8).collect();
             eprintln!(
-                "relais: {} {slug} {id} is held by {holder}, not this session",
-                state.repo
+                "relais: {repo} {slug} {id} is held by {}, not this session",
+                holder.short()
             );
+            eprintln!("next: nothing to release; it ends at its holder's SessionEnd or after 8 h");
             Ok(CliOutcome::Blocked)
+        }
+    }
+}
+
+/// Whether `next` only names a ticket or also claims it for the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reservation {
+    Look,
+    Claim,
+}
+
+impl Reservation {
+    pub(crate) fn from_claim_flag(claim: bool) -> Self {
+        if claim {
+            Self::Claim
+        } else {
+            Self::Look
         }
     }
 }
 
 pub(crate) fn next_command(
     from: Option<&str>,
-    reserve: bool,
+    reservation: Reservation,
     root: Option<&Path>,
     session: Option<&str>,
     format: Format,
@@ -945,18 +1053,23 @@ pub(crate) fn next_command(
                 })
         })
         .transpose()?;
-    let session = if reserve {
-        Some(writing_session(session)?)
-    } else {
-        None
+    let reserving = match reservation {
+        Reservation::Claim => Some(writing_session(session)?),
+        Reservation::Look => None,
     };
+    let intent =
+        reserving
+            .as_deref()
+            .map_or(claim::Intent::Look, |session| claim::Intent::Reserve {
+                session,
+            });
     let root = match root {
         Some(root) => root.to_path_buf(),
         None => default_root()?,
     };
     let store = claim_store()?;
     let now = now_unix();
-    if let Some(session) = &session {
+    if let Some(session) = &reserving {
         store.forget_ended(session).map_err(claim_io)?;
     }
     let today = chrono::Local::now().date_naive();
@@ -967,6 +1080,7 @@ pub(crate) fn next_command(
         .zip(holds)
         .filter_map(|(repo, holds)| holds.then_some(repo))
         .collect();
+    let mut load_failed = false;
     let mut founds = Vec::new();
     for (repo, listed) in repos
         .iter()
@@ -977,29 +1091,46 @@ pub(crate) fn next_command(
                 for note in &listed.notes {
                     eprintln!("relais: {note}");
                 }
+                load_failed |= !listed.unreadable.is_empty();
                 founds.extend(listed.found);
             }
-            Err(error) => eprintln!("relais: {}: {error}", repo.display()),
+            Err(error) => {
+                eprintln!("relais: {}: {error}", repo.display());
+                load_failed = true;
+            }
         }
     }
     let mut states = Vec::new();
-    for (found, state) in founds.iter().zip(par_map(&founds, programme_state)) {
+    for (found, state) in founds.iter().zip(par_map(&founds, |found| {
+        programme_state(found, &store, now)
+    })) {
         match state {
             Ok(state) => states.push(state),
-            Err(error) => eprintln!("relais: {}: {error}", found.dir().display()),
+            Err(error) => {
+                eprintln!("relais: {}: {error}", found.dir().display());
+                load_failed = true;
+            }
         }
     }
     let from_state = match from {
         Some((repo, slug)) => {
-            let position = states
+            let Some(position) = states
                 .iter()
                 .position(|state| state.repo == repo && state.slug == slug)
-                .ok_or_else(|| CliError::Usage {
+            else {
+                if load_failed {
+                    eprintln!(
+                        "relais: --from {repo}:{slug}: its programme failed to load (see above)"
+                    );
+                    return Ok(CliOutcome::OperationalFailure);
+                }
+                return Err(CliError::Usage {
                     detail: format!(
                         "--from {repo}:{slug}: no such programme under {}",
                         root.display()
                     ),
-                })?;
+                });
+            };
             Some(states.remove(position))
         }
         None => None,
@@ -1007,25 +1138,20 @@ pub(crate) fn next_command(
     let retry = format!(
         "relais programme next{}{} --root {}",
         from.map_or_else(String::new, |(repo, slug)| format!(" --from {repo}:{slug}")),
-        if reserve { " --claim" } else { "" },
-        root.display()
+        match reservation {
+            Reservation::Claim => " --claim",
+            Reservation::Look => "",
+        },
+        shell_quote(&root.to_string_lossy())
     );
-    let chosen = claim::next(
-        &store,
-        from_state.as_ref(),
-        &states,
-        today,
-        now,
-        session.as_deref(),
-    )
-    .and_then(|chosen| match &session {
-        Some(session) => store.refresh_session(session, now).map(|_| chosen),
-        None => Ok(chosen),
-    });
+    let chosen = claim::next(&store, from_state.as_ref(), &states, today, now, intent);
     let chosen = match chosen {
         Ok(chosen) => chosen,
         Err(error) => return claim_outcome(error, &retry),
     };
+    if let Some(session) = &reserving {
+        refresh_session_best_effort(&store, session, now);
+    }
     match chosen {
         claim::Next::Pick(pick) => {
             let out = match format {
@@ -1036,7 +1162,7 @@ pub(crate) fn next_command(
                         "slug": pick.slug,
                         "id": pick.id,
                         "name": pick.name,
-                        "claimed": reserve,
+                        "claimed": reservation == Reservation::Claim,
                     })
                 ),
                 Format::Text => format!("{} {} {}\t{}\n", pick.repo, pick.slug, pick.id, pick.name),
@@ -1044,17 +1170,20 @@ pub(crate) fn next_command(
             print_stdout(&out)?;
             Ok(CliOutcome::Accepted)
         }
+        claim::Next::Parked { .. } if load_failed => {
+            eprintln!("relais: not parking: a programme failed to load (see above)");
+            Ok(CliOutcome::OperationalFailure)
+        }
         claim::Next::Parked { next_due } => {
-            let line = claim::Next::parked_line(next_due);
             let out = match format {
                 Format::Json => format!(
                     "{}\n",
                     json!({
-                        "parked": line.trim_start_matches("parked: "),
+                        "parked": true,
                         "next_due": next_due.map(|date| date.to_string()),
                     })
                 ),
-                Format::Text => format!("{line}\n"),
+                Format::Text => format!("{}\n", claim::Next::parked_line(next_due)),
             };
             print_stdout(&out)?;
             Ok(CliOutcome::Parked)

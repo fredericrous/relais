@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use chrono::NaiveDate;
 
 use super::analysis::{age_secs, Holder, Standing};
-use super::claim::{self, Kind};
+use super::claim;
 use super::load::{Found, Programme};
 use super::model::{Status, Ticket};
 
@@ -72,21 +72,10 @@ pub fn format_age(secs: u64) -> String {
     }
 }
 
-/// The first 8 characters of a session id, the form a held mark names it in;
-/// `unreadable` for a claim file that does not parse.
-pub fn short_session(session: &str) -> String {
-    if session.is_empty() {
-        "unreadable".to_string()
-    } else {
-        session.chars().take(8).collect()
-    }
-}
-
 /// The session that holds a ready ticket by a claim, and for how long.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldBy {
-    pub session: String,
-    pub kind: Kind,
+    pub holder: claim::Holder,
     pub age_secs: u64,
 }
 
@@ -152,9 +141,7 @@ pub fn ready(
             .map(|one| {
                 scope.spawn(move || {
                     one.load().and_then(|programme| {
-                        programme
-                            .standings_with(claims, now)
-                            .map(|s| (programme, s))
+                        programme.standings(claims, now).map(|s| (programme, s))
                     })
                 })
             })
@@ -171,8 +158,7 @@ pub fn ready(
                         Some(Standing::InFlight {
                             holder: Holder::Claim(hold),
                         }) if is_unblocked(&programme, ticket) => Some(HeldBy {
-                            session: hold.session.clone(),
-                            kind: hold.kind,
+                            holder: hold.holder.clone(),
                             age_secs: age_secs(now, hold.since),
                         }),
                         Some(
@@ -238,13 +224,6 @@ mod tests {
         assert_eq!(format_age(300), "5m");
         assert_eq!(format_age(10_800), "3h");
         assert_eq!(format_age(2 * 86_400 + 5), "2d");
-    }
-
-    #[test]
-    fn a_session_is_named_by_its_first_eight_characters() {
-        assert_eq!(short_session("0123456789"), "01234567");
-        assert_eq!(short_session("abc"), "abc");
-        assert_eq!(short_session(""), "unreadable");
     }
 
     #[test]

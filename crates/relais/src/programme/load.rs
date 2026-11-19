@@ -269,15 +269,10 @@ impl Programme {
     }
 
     /// Where each ticket stands, reading the branches from git and the
-    /// claims from the state directory the environment names.
-    pub fn standings(&self) -> Result<BTreeMap<String, analysis::Standing>, ProgrammeError> {
-        self.standings_with(claim::Store::from_environment().as_ref(), claim::now_unix())
-    }
-
-    /// [`Programme::standings`] reading claims from `claims` as of `now`.
-    /// Read-only: a claim store that cannot be read marks nothing held and
-    /// fails nothing, so a listing never goes blank over it.
-    pub fn standings_with(
+    /// claims from `claims` as of `now`. Read-only: a claim store that cannot
+    /// be read marks nothing held and fails nothing, so a listing never goes
+    /// blank over it.
+    pub fn standings(
         &self,
         claims: Option<&claim::Store>,
         now: i64,
