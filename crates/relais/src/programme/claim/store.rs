@@ -224,7 +224,6 @@ impl Store {
         read_all(&self.slug_dir(key))
     }
 
-    /// Takes the programme's lock, retrying for up to `wait`.
     /// Takes the programme's lock, retrying for up to `wait`, and applies the
     /// tombstones of ended sessions as of `now`. A tombstone that cannot be
     /// applied is reported on stderr and does not keep the lock from the caller.
@@ -507,9 +506,9 @@ pub enum Taken {
     /// The claim was written; the event says how.
     Claimed {
         how: Acquired,
-        /// The session the ticket came from: the one that handed it off, or
-        /// the one it was stolen from (`None`: its claim did not parse).
-        from: Option<String>,
+        /// The holder the ticket came from: the handoff it took over, or the
+        /// claim it stole; `None` when it was created or refreshed.
+        from: Option<Holder>,
     },
     /// Another live session holds the ticket as `work`.
     Refused { holder: Holder, age_secs: u64 },
@@ -665,24 +664,35 @@ impl SlugLock<'_> {
             from,
             repo: repo_display.to_string(),
         };
-        let (claim, event) = match &existing {
-            None => (fresh(None, now), Event::Create),
+        // `previous` is the holder the ticket came from, as `Taken` reports it.
+        let (claim, event, previous) = match &existing {
+            None => (fresh(None, now), Event::Create, None),
             Some(record) if !held(record, now) => {
                 self.log_record(Event::Expire, id, record, now)?;
-                (fresh(None, now), Event::Create)
+                (fresh(None, now), Event::Create, None)
             }
             Some(ClaimRecord::Parsed(held_claim)) if held_claim.session == session => {
                 let event = match held_claim.kind {
                     Kind::Work => Event::Refresh,
                     Kind::Handoff => Event::Takeover,
                 };
-                (fresh(held_claim.from.clone(), held_claim.claimed_at), event)
+                (
+                    fresh(held_claim.from.clone(), held_claim.claimed_at),
+                    event,
+                    None,
+                )
             }
-            Some(ClaimRecord::Parsed(Claim {
-                kind: Kind::Handoff,
-                session: handed_by,
-                ..
-            })) => (fresh(Some(handed_by.clone()), now), Event::Takeover),
+            Some(
+                record @ ClaimRecord::Parsed(Claim {
+                    kind: Kind::Handoff,
+                    session: handed_by,
+                    ..
+                }),
+            ) => (
+                fresh(Some(handed_by.clone()), now),
+                Event::Takeover,
+                Some(record.holder()),
+            ),
             Some(record) => match contest {
                 Contest::Refuse => {
                     return Ok(Taken::Refused {
@@ -690,16 +700,14 @@ impl SlugLock<'_> {
                         age_secs: record.age_secs(now),
                     });
                 }
-                Contest::Steal => (
-                    fresh(
-                        match record.holder() {
-                            Holder::Session { id, .. } => Some(id),
-                            Holder::Unreadable => None,
-                        },
-                        now,
-                    ),
-                    Event::Steal,
-                ),
+                Contest::Steal => {
+                    let holder = record.holder();
+                    let from = match &holder {
+                        Holder::Session { id, .. } => Some(id.clone()),
+                        Holder::Unreadable => None,
+                    };
+                    (fresh(from, now), Event::Steal, Some(holder))
+                }
             },
         };
         self.write(id, &claim)?;
@@ -714,7 +722,7 @@ impl SlugLock<'_> {
         };
         Ok(Taken::Claimed {
             how,
-            from: claim.from,
+            from: previous,
         })
     }
 

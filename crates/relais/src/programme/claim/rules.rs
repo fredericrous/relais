@@ -11,7 +11,9 @@ use sha2::{Digest, Sha256};
 
 use crate::programme::model::Mode;
 
-/// How long a `work` claim holds a ticket after its last refresh (N).
+/// How long a `work` claim holds a ticket after its last refresh (N): the
+/// p99 gap between commits in one session over 14 days was 7.51 h
+/// (session-boundaries t26, Phase 0, 2026-11-19).
 pub const WORK_HOLD_SECS: i64 = 8 * 3600;
 /// How long a `handoff` claim holds a ticket after it was made (R): the
 /// relay delivers within seconds, and a person may clear by hand later.
@@ -288,9 +290,9 @@ pub(super) struct Destination<'a> {
     pub eligible: Vec<&'a ReadyTicket>,
 }
 
-/// Orders destinations like the root summary: soonest due, then most ready,
-/// then name.
-pub(super) fn order_destinations(destinations: &mut [Destination<'_>]) {
+/// The destinations ordered like the root summary: soonest due, then most
+/// ready, then name.
+pub(super) fn order_destinations(mut destinations: Vec<Destination<'_>>) -> Vec<Destination<'_>> {
     destinations.sort_by_key(|destination| {
         let soonest = destination.eligible.iter().filter_map(|t| t.due).min();
         (
@@ -301,6 +303,7 @@ pub(super) fn order_destinations(destinations: &mut [Destination<'_>]) {
             destination.state.slug.clone(),
         )
     });
+    destinations
 }
 
 /// The ticket a live `handoff` claim of `session` already holds in a

@@ -128,7 +128,7 @@ pub fn next(
             });
         }
     }
-    order_destinations(&mut destinations);
+    let destinations = order_destinations(destinations);
     for Destination { state, eligible } in &destinations {
         let first = eligible[0];
         let pick = |id: &str, name: &str| {
@@ -437,7 +437,10 @@ mod tests {
                 .unwrap(),
             Taken::Claimed {
                 how: Acquired::TookOver,
-                from: Some("old".into())
+                from: Some(Holder::Session {
+                    id: "old".into(),
+                    kind: Kind::Handoff
+                })
             }
         );
         assert_eq!(
@@ -456,7 +459,7 @@ mod tests {
                 .unwrap(),
             Taken::Claimed {
                 how: Acquired::Refreshed,
-                from: Some("old".into())
+                from: None
             }
         );
         assert_eq!(
@@ -464,7 +467,10 @@ mod tests {
                 .unwrap(),
             Taken::Claimed {
                 how: Acquired::Stole,
-                from: Some("a".into())
+                from: Some(Holder::Session {
+                    id: "a".into(),
+                    kind: Kind::Work
+                })
             }
         );
         assert_eq!(

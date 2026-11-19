@@ -945,10 +945,6 @@ pub(crate) fn claim_command(
     match taken {
         Err(error) => claim_outcome(error, &retry),
         Ok(claim::Taken::Claimed { how, from }) => {
-            let from = from.map(|session| claim::Holder::Session {
-                id: session,
-                kind: claim::Kind::Work,
-            });
             let line = match (how, from) {
                 (claim::Acquired::Created, _) => format!("claimed {repo} {slug} {id}"),
                 (claim::Acquired::TookOver, Some(from)) => {
@@ -958,10 +954,10 @@ pub(crate) fn claim_command(
                 (claim::Acquired::Refreshed, _) => {
                     format!("refreshed your claim on {repo} {slug} {id}")
                 }
-                (claim::Acquired::Stole, from) => format!(
-                    "took {repo} {slug} {id} from {} (--steal)",
-                    from.map_or_else(|| claim::Holder::Unreadable.short(), |from| from.short())
-                ),
+                (claim::Acquired::Stole, Some(from)) => {
+                    format!("took {repo} {slug} {id} from {} (--steal)", from.short())
+                }
+                (claim::Acquired::Stole, None) => format!("took {repo} {slug} {id} (--steal)"),
             };
             eprintln!("relais: {line}");
             refresh_session_best_effort(&store, &session, now);
@@ -1014,7 +1010,27 @@ pub(crate) fn release_command(
                 "relais: {repo} {slug} {id} is held by {}, not this session",
                 holder.short()
             );
-            eprintln!("next: nothing to release; it ends at its holder's SessionEnd or after 8 h");
+            let ends = match &holder {
+                claim::Holder::Session {
+                    kind: claim::Kind::Handoff,
+                    ..
+                } => format!(
+                    "when it is taken over or after {} h",
+                    claim::HANDOFF_HOLD_SECS / 3600
+                ),
+                claim::Holder::Session {
+                    kind: claim::Kind::Work,
+                    ..
+                } => format!(
+                    "at its holder's SessionEnd or after {} h",
+                    claim::WORK_HOLD_SECS / 3600
+                ),
+                claim::Holder::Unreadable => format!(
+                    "once its file is {} s old, when it stops counting",
+                    claim::UNPARSEABLE_HOLD_SECS
+                ),
+            };
+            eprintln!("next: nothing to release; it ends {ends}");
             Ok(CliOutcome::Blocked)
         }
     }
