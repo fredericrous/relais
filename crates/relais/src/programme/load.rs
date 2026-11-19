@@ -1027,11 +1027,11 @@ pub fn programmes_of(repo: &Path) -> Result<Listed, ProgrammeError> {
     // a repository's linked worktrees outnumber its cores by a wide margin
     let linked = linked_worktrees(repo);
     let ((view, note), main_state, linked_states) = std::thread::scope(|scope| {
-        let view = scope.spawn(|| origin_view_noted(repo));
-        let main_state = scope.spawn(|| checkout_state(repo));
+        let view = super::spawn_worker(scope, || origin_view_noted(repo));
+        let main_state = super::spawn_worker(scope, || checkout_state(repo));
         let linked_states: Vec<_> = linked
             .iter()
-            .map(|path| scope.spawn(move || checkout_state(path)))
+            .map(|path| super::spawn_worker(scope, move || checkout_state(path)))
             .collect();
         (
             join_scoped(view),
@@ -1061,7 +1061,7 @@ pub fn programmes_of(repo: &Path) -> Result<Listed, ProgrammeError> {
             .iter()
             .map(|slug| {
                 let (states, view) = (&states, view.as_ref());
-                scope.spawn(move || choose(repo, slug, states, view))
+                super::spawn_worker(scope, move || choose(repo, slug, states, view))
             })
             .collect();
         handles.into_iter().map(join_scoped).collect()
