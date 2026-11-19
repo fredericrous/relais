@@ -56,8 +56,17 @@ pub fn gather(cwd: &Path) -> Result<Gathered, Skip> {
 /// never writes one.
 pub fn gather_with(cwd: &Path, claims: Option<Store>) -> Result<Gathered, Skip> {
     let cutoff = Instant::now() + OUTSIDE_REPO_DEADLINE;
-    let Ok(repo) = main_checkout(cwd) else {
-        return gather_outside(cwd, cutoff, claims);
+    let repo = match main_checkout(cwd) {
+        Ok(repo) => repo,
+        Err(not_a_checkout) => {
+            return gather_outside(cwd, cutoff, claims).map_err(|mut skip| {
+                // A broken git looks like no checkout at all: keep its cause.
+                if let Some(error) = skip.error.as_mut() {
+                    error.push_str(&format!("; not a checkout: {not_a_checkout}"));
+                }
+                Skip::from_parts(skip.why, skip.error)
+            });
+        }
     };
     let listed = load::programmes_of(&repo).map_err(|error| Skip::error(error.to_string()))?;
     let ready = frontier::ready(
@@ -242,9 +251,19 @@ pub(crate) fn render_outside(
     root: &Path,
     collected: &Collected<RepoReading>,
     today: NaiveDate,
-) -> Result<String, SkipReason> {
+) -> Result<String, Skip> {
     if collected.read.is_empty() {
-        return Err(SkipReason::Deadline);
+        // Nothing read: a deadline when any repository was still being read,
+        // an error naming each reason when every one of them failed.
+        if !collected.late.is_empty() || collected.unreadable.is_empty() {
+            return Err(SkipReason::Deadline.into());
+        }
+        let reasons: Vec<String> = collected
+            .unreadable
+            .iter()
+            .map(|(repo, reason)| format!("{}: {reason}", repo.display()))
+            .collect();
+        return Err(Skip::error(reasons.join("; ")));
     }
     let mut with_ready: Vec<&RepoReading> = collected
         .read
@@ -300,7 +319,7 @@ pub(crate) fn render_outside(
                 }),
             )
         }
-        None => return Err(SkipReason::Nothing),
+        None => return Err(SkipReason::Nothing.into()),
     };
     let quoted_root = shell_quote(&printable(&root.display().to_string()));
 
@@ -898,12 +917,15 @@ mod tests {
     #[test]
     fn gather_says_why_it_said_nothing() {
         let outside = crate::test_support::short_temp_dir("gather-outside");
-        assert_eq!(
-            gather(&outside),
-            Err(Skip::error(format!(
-                "no git repository under {}",
+        let none = gather(&outside).expect_err("no repository");
+        assert_eq!(none.why, SkipReason::Error);
+        let text = none.error.expect("text");
+        assert!(
+            text.starts_with(&format!(
+                "no git repository under {}; not a checkout: ",
                 outside.display()
-            )))
+            )),
+            "{text}"
         );
         let missing = gather(&outside.join("missing")).expect_err("a missing directory");
         assert_eq!(missing.why, SkipReason::Error);
@@ -970,7 +992,7 @@ mod tests {
     }
 
     fn outside(collected: &Collected<RepoReading>) -> Result<String, SkipReason> {
-        render_outside(Path::new("/root"), collected, day(2026, 11, 18))
+        render_outside(Path::new("/root"), collected, day(2026, 11, 18)).map_err(|skip| skip.why)
     }
 
     #[test]
@@ -1084,6 +1106,24 @@ mod tests {
     fn nothing_read_in_time_is_a_deadline_skip() {
         let collected = collected_of(Vec::new(), &["a"]);
         assert_eq!(outside(&collected), Err(SkipReason::Deadline));
+    }
+
+    #[test]
+    fn every_repository_unreadable_is_an_error_naming_each_reason() {
+        let collected: Collected<RepoReading> = Collected {
+            read: Vec::new(),
+            late: Vec::new(),
+            unreadable: vec![
+                (PathBuf::from("/root/a"), "git broke".to_string()),
+                (PathBuf::from("/root/b"), "its reader panicked".to_string()),
+            ],
+        };
+        let skip = render_outside(Path::new("/root"), &collected, day(2026, 11, 18))
+            .expect_err("nothing was read");
+        assert_eq!(
+            skip,
+            Skip::error("/root/a: git broke; /root/b: its reader panicked")
+        );
     }
 
     #[test]

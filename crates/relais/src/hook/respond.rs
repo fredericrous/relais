@@ -80,13 +80,31 @@ pub struct Skip {
     pub error: Option<String>,
 }
 
+/// The longest `gather_error` a journal line keeps: git's stderr can run
+/// long, and one line is one write.
+pub const GATHER_ERROR_MAX: usize = 512;
+
 impl Skip {
     /// A [`SkipReason::Error`] carrying what failed.
     pub fn error(text: impl Into<String>) -> Self {
-        Skip {
-            why: SkipReason::Error,
-            error: Some(text.into()),
-        }
+        Skip::from_parts(SkipReason::Error, Some(text.into()))
+    }
+
+    /// A skip with its text cut to [`GATHER_ERROR_MAX`] bytes, on a char
+    /// boundary, ending `…` when cut.
+    pub fn from_parts(why: SkipReason, error: Option<String>) -> Self {
+        let error = error.map(|mut text| {
+            if text.len() > GATHER_ERROR_MAX {
+                let mut end = GATHER_ERROR_MAX;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                text.push('…');
+            }
+            text
+        });
+        Skip { why, error }
     }
 }
 
@@ -2448,6 +2466,15 @@ mod tests {
         let entry = journal_entry(&start_payload("startup"), &handled);
         assert_eq!(entry["outcome"], "skipped(failed)");
         assert!(entry["gather_error"].is_null(), "{entry}");
+    }
+
+    #[test]
+    fn a_long_gather_error_is_cut_on_a_char_boundary() {
+        let skip = Skip::error("é".repeat(GATHER_ERROR_MAX));
+        let text = skip.error.expect("text");
+        assert!(text.ends_with('…'), "{text}");
+        assert!(text.len() <= GATHER_ERROR_MAX + '…'.len_utf8());
+        assert_eq!(Skip::error("short").error.as_deref(), Some("short"));
     }
 
     mod claims {
