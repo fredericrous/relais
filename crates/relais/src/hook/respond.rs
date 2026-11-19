@@ -165,16 +165,28 @@ impl From<String> for Gathered {
 /// silent too.
 pub(super) const GATHER_THREAD_NAME: &str = "relais-hook-gather";
 
-/// Keep a panic on the gather thread off stderr: it is caught there and
-/// journalled as `skipped(failed)`, and a hook says nothing it was not
-/// asked to. Every other thread's panic still reaches the previous hook.
+/// Keep a panic on a gather thread off stderr: on the gather thread itself,
+/// on resume's per-repository readers (which share its name), and on the
+/// scoped programme workers they start ([`crate::programme::WORKER_THREAD_NAME`]).
+/// Each is caught, a worker's at its join and the gather thread's at its
+/// `catch_unwind`, and journalled as `skipped(failed)`; a hook says nothing
+/// it was not asked to. Every other thread's panic still reaches the
+/// previous hook.
 pub fn silence_gather_panics() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if std::thread::current().name() != Some(GATHER_THREAD_NAME) {
+        if !is_quiet_thread(std::thread::current().name()) {
             previous(info);
         }
     }));
+}
+
+/// Whether a panic on the thread of this name stays off stderr.
+fn is_quiet_thread(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some(GATHER_THREAD_NAME | crate::programme::WORKER_THREAD_NAME)
+    )
 }
 
 /// Run `gatherer` on a worker thread and wait at most `deadline` for it.
@@ -790,6 +802,88 @@ mod tests {
     use crate::admission::{LocalGate, RunRegistration};
     use crate::ids::{SessionId, ToolUseId};
     use crate::policy::{ConcurrencyLimits, CoordinatorUnreachableBehavior};
+
+    /// Set in the child run of [`a_panicking_programme_worker_writes_nothing_to_stderr`]:
+    /// `worker` panics on a programme worker, `unnamed` on a plain scoped
+    /// thread (the control).
+    const PANIC_CHILD_ENV: &str = "RELAIS_TEST_GATHER_PANIC_CHILD";
+
+    /// A load whose scoped worker panics, read on the gather thread the way
+    /// the session-start hook reads `programmes_of` and `frontier::ready`:
+    /// the worker panics, and its join re-raises the panic.
+    fn panicking_load(named: bool) -> Result<Gathered, Skip> {
+        std::thread::scope(|scope| {
+            let worker = if named {
+                crate::programme::spawn_worker(scope, || -> Gathered { panic!("a load broke") })
+            } else {
+                scope.spawn(|| -> Gathered { panic!("a load broke") })
+            };
+            Ok(worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+        })
+    }
+
+    // The panic hook is process-wide, so the check runs in a child copy of
+    // this test binary: installing it here would race every other test.
+    // `--nocapture` matters: libtest's capture would swallow the panic
+    // message and leave stderr empty whatever the hook did.
+    #[test]
+    fn a_panicking_programme_worker_writes_nothing_to_stderr() {
+        if let Ok(mode) = std::env::var(PANIC_CHILD_ENV) {
+            silence_gather_panics();
+            let named = mode == "worker";
+            let (text, gather) = gather_within(
+                move |_: &Path| panicking_load(named),
+                Path::new("."),
+                Duration::from_secs(10),
+            );
+            assert!(text.is_none());
+            assert!(
+                matches!(
+                    gather,
+                    Gather::Skipped {
+                        why: SkipReason::Failed,
+                        ..
+                    }
+                ),
+                "{gather:?}"
+            );
+            return;
+        }
+        let run = |mode: &str| {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "hook::respond::tests::a_panicking_programme_worker_writes_nothing_to_stderr",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(PANIC_CHILD_ENV, mode)
+                .output()
+                .expect("run the child");
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(output.status.success(), "{mode}: {stdout}\n{stderr}");
+            assert!(
+                stdout.contains("1 passed"),
+                "{mode}: the child ran no test: {stdout}"
+            );
+            stderr
+        };
+        let quiet = run("worker");
+        assert!(
+            !quiet.contains("panicked"),
+            "a worker's panic reached stderr: {quiet}"
+        );
+        // The control: the same panic on an unnamed scoped thread still
+        // reaches the previous hook, so the child's stderr is really read.
+        let control = run("unnamed");
+        assert!(
+            control.contains("panicked"),
+            "the control printed nothing: {control}"
+        );
+    }
 
     // Zero: every existing test here predates the wait and expects an
     // immediate refusal at a cap. The wait itself gets its own settings

@@ -139,7 +139,7 @@ pub fn ready(
         let handles: Vec<_> = found
             .iter()
             .map(|one| {
-                scope.spawn(move || {
+                super::spawn_worker(scope, move || {
                     one.load().and_then(|programme| {
                         programme.standings(claims, now).map(|s| (programme, s))
                     })
