@@ -59,12 +59,13 @@ pub fn gather_with(cwd: &Path, claims: Option<Store>) -> Result<Gathered, Skip> 
     let repo = match main_checkout(cwd) {
         Ok(repo) => repo,
         Err(not_a_checkout) => {
-            return gather_outside(cwd, cutoff, claims).map_err(|mut skip| {
-                // A broken git looks like no checkout at all: keep its cause.
-                if let Some(error) = skip.error.as_mut() {
-                    error.push_str(&format!("; not a checkout: {not_a_checkout}"));
-                }
-                Skip::from_parts(skip.why, skip.error)
+            return gather_outside(cwd, cutoff, claims).map_err(|skip| {
+                // A broken git looks like no checkout at all: keep its cause,
+                // first, so a cut of a long text keeps it.
+                let error = skip
+                    .error
+                    .map(|text| format!("not a checkout: {not_a_checkout}; {text}"));
+                Skip::from_parts(skip.why, error)
             });
         }
     };
@@ -254,16 +255,19 @@ pub(crate) fn render_outside(
 ) -> Result<String, Skip> {
     if collected.read.is_empty() {
         // Nothing read: a deadline when any repository was still being read,
-        // an error naming each reason when every one of them failed.
-        if !collected.late.is_empty() || collected.unreadable.is_empty() {
-            return Err(SkipReason::Deadline.into());
-        }
+        // an error when every one of them failed; either keeps the reasons.
         let reasons: Vec<String> = collected
             .unreadable
             .iter()
             .map(|(repo, reason)| format!("{}: {reason}", repo.display()))
             .collect();
-        return Err(Skip::error(reasons.join("; ")));
+        let reasons = (!reasons.is_empty()).then(|| reasons.join("; "));
+        let why = if collected.late.is_empty() && reasons.is_some() {
+            SkipReason::Error
+        } else {
+            SkipReason::Deadline
+        };
+        return Err(Skip::from_parts(why, reasons));
     }
     let mut with_ready: Vec<&RepoReading> = collected
         .read
@@ -921,10 +925,8 @@ mod tests {
         assert_eq!(none.why, SkipReason::Error);
         let text = none.error.expect("text");
         assert!(
-            text.starts_with(&format!(
-                "no git repository under {}; not a checkout: ",
-                outside.display()
-            )),
+            text.starts_with("not a checkout: ")
+                && text.ends_with(&format!("; no git repository under {}", outside.display())),
             "{text}"
         );
         let missing = gather(&outside.join("missing")).expect_err("a missing directory");
@@ -1124,6 +1126,19 @@ mod tests {
             skip,
             Skip::error("/root/a: git broke; /root/b: its reader panicked")
         );
+    }
+
+    #[test]
+    fn a_deadline_with_unreadable_repositories_keeps_their_reasons() {
+        let collected: Collected<RepoReading> = Collected {
+            read: Vec::new(),
+            late: vec![PathBuf::from("/root/slow")],
+            unreadable: vec![(PathBuf::from("/root/a"), "git broke".to_string())],
+        };
+        let skip = render_outside(Path::new("/root"), &collected, day(2026, 11, 18))
+            .expect_err("nothing was read");
+        assert_eq!(skip.why, SkipReason::Deadline);
+        assert_eq!(skip.error.as_deref(), Some("/root/a: git broke"));
     }
 
     #[test]

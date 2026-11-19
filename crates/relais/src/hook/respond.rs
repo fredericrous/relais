@@ -71,13 +71,14 @@ impl SkipReason {
 }
 
 /// Why a gatherer answered with no context: the reason, and for
-/// [`SkipReason::Error`], the text of what failed, which the journal keeps
-/// as `gather_error`. The text travels beside the reason so that the reason
+/// [`SkipReason::Error`] (or a deadline that met unreadable repositories),
+/// the text of what failed, which the journal keeps as `gather_error`. The text travels beside the reason so that the reason
 /// stays `Copy`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skip {
-    pub why: SkipReason,
-    pub error: Option<String>,
+    pub(crate) why: SkipReason,
+    /// Built only through [`Skip::from_parts`], which bounds it.
+    pub(crate) error: Option<String>,
 }
 
 /// The longest `gather_error` a journal line keeps: git's stderr can run
@@ -127,7 +128,8 @@ pub enum Gather {
     },
     Skipped {
         why: SkipReason,
-        /// What failed, for [`SkipReason::Error`]; `None` otherwise.
+        /// What failed, when known: always for [`SkipReason::Error`], and
+        /// for a deadline that also met unreadable repositories.
         error: Option<String>,
         elapsed: Duration,
     },
@@ -2470,10 +2472,11 @@ mod tests {
 
     #[test]
     fn a_long_gather_error_is_cut_on_a_char_boundary() {
-        let skip = Skip::error("é".repeat(GATHER_ERROR_MAX));
+        // Byte GATHER_ERROR_MAX falls inside a two-byte `é`.
+        let skip = Skip::error(format!("a{}", "é".repeat(GATHER_ERROR_MAX)));
         let text = skip.error.expect("text");
         assert!(text.ends_with('…'), "{text}");
-        assert!(text.len() <= GATHER_ERROR_MAX + '…'.len_utf8());
+        assert_eq!(text.len(), GATHER_ERROR_MAX - 1 + '…'.len_utf8());
         assert_eq!(Skip::error("short").error.as_deref(), Some("short"));
     }
 
