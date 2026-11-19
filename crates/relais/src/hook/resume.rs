@@ -462,17 +462,18 @@ pub fn render(
         held_count_suffix(ready.held_count()),
         printable(&repo.display().to_string())
     );
+    // `check` and `frontier` each take one programme directory, so with
+    // several programmes a line names them all and runs on the first.
     if let Some(first) = ready.unreadable.first() {
-        let count = ready.unreadable.len();
-        let noun = if count == 1 {
-            "programme"
-        } else {
-            "programmes"
-        };
-        text.push_str(&format!(
-            " ({count} {noun} could not be read; run relais programme check {} for why)",
-            shell_quote(&first.display().to_string())
-        ));
+        let first = shell_quote(&printable(&first.display().to_string()));
+        text.push_str(&match ready.unreadable.len() {
+            1 => format!(" (1 programme could not be read; run relais programme check {first} for why)"),
+            count => format!(
+                " ({count} programmes could not be read: {}; run relais programme check {first} for why on the first, {} more)",
+                name_list(ready.unreadable.iter()),
+                count - 1
+            ),
+        });
     }
     text.push_str(":\n");
 
@@ -492,19 +493,30 @@ pub fn render(
         ));
     }
     if !hidden.is_empty() {
-        let programmes: BTreeSet<usize> = hidden.iter().map(|row| row.programme).collect();
-        let noun = if programmes.len() == 1 {
-            "programme"
-        } else {
-            "programmes"
-        };
-        let first_hidden = ready.found[hidden[0].programme].dir();
-        text.push_str(&format!(
-            "- … and {} more ready ({} {noun}; relais programme frontier --no-fetch {} lists them)\n",
-            hidden.len(),
-            programmes.len(),
-            shell_quote(&first_hidden.display().to_string())
-        ));
+        // In order of first appearance, so "the first" is the first named.
+        let mut programmes: Vec<usize> = Vec::new();
+        for row in hidden {
+            if !programmes.contains(&row.programme) {
+                programmes.push(row.programme);
+            }
+        }
+        let dirs: Vec<PathBuf> = programmes
+            .iter()
+            .map(|&position| ready.found[position].dir())
+            .collect();
+        let first = shell_quote(&printable(&dirs[0].display().to_string()));
+        text.push_str(&match dirs.len() {
+            1 => format!(
+                "- … and {} more ready (1 programme; relais programme frontier --no-fetch {first} lists them)\n",
+                hidden.len()
+            ),
+            count => format!(
+                "- … and {} more ready ({count} programmes: {}; relais programme frontier --no-fetch {first} lists the first, {} more)\n",
+                hidden.len(),
+                name_list(dirs.iter()),
+                count - 1
+            ),
+        });
     }
 
     let shown_programmes = programmes_shown(shown);
@@ -779,7 +791,7 @@ mod tests {
         assert!(!text.contains("Hidden\n"), "{text}");
         assert!(
             text.contains(&format!(
-                "- … and 2 more ready (2 programmes; relais programme frontier --no-fetch {} lists them)\n",
+                "- … and 2 more ready (2 programmes: alpha, beta; relais programme frontier --no-fetch {} lists the first, 1 more)\n",
                 quoted(&programme_dir("/work/repo", "alpha"))
             )),
             "{text}"
@@ -787,6 +799,55 @@ mod tests {
         assert!(
             !text.contains("- beta:"),
             "a programme with no shown ticket has no locator: {text}"
+        );
+    }
+
+    #[test]
+    fn hidden_programmes_in_other_checkouts_name_the_first_hidden_one() {
+        let mut founds = two_programmes();
+        founds.push(found("gamma", Source::WorkingTree));
+        founds[1].checkout = PathBuf::from("/work/repo-wt");
+        founds[2].checkout = PathBuf::from("/work/other");
+        let mut rows: Vec<ReadyRow> = (0..8)
+            .map(|n| row(0, "alpha", &format!("t{n}"), "Shown", None))
+            .collect();
+        rows.push(row(2, "gamma", "t8", "Hidden", None));
+        rows.push(row(1, "beta", "t9", "Hidden", None));
+        rows.push(row(2, "gamma", "t10", "Hidden", None));
+        let text = render_of(&ready_of(founds, rows), false);
+        assert!(
+            text.contains(&format!(
+                "- … and 3 more ready (2 programmes: gamma, beta; relais programme frontier --no-fetch {} lists the first, 1 more)\n",
+                quoted(&programme_dir("/work/other", "gamma"))
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn many_hidden_programmes_cap_their_names() {
+        let slugs: Vec<String> = (0..=UNREAD_NAME_CAP).map(|n| format!("p{n}")).collect();
+        let mut founds = vec![found("shown", Source::WorkingTree)];
+        founds.extend(slugs.iter().map(|slug| found(slug, Source::WorkingTree)));
+        let mut rows: Vec<ReadyRow> = (0..8)
+            .map(|n| row(0, "shown", &format!("t{n}"), "Shown", None))
+            .collect();
+        rows.extend(
+            slugs
+                .iter()
+                .enumerate()
+                .map(|(n, slug)| row(n + 1, slug, "h", "Hidden", None)),
+        );
+        let text = render_of(&ready_of(founds, rows), false);
+        let named = slugs[..UNREAD_NAME_CAP].join(", ");
+        assert!(
+            text.contains(&format!(
+                "({} programmes: {named}, …; relais programme frontier --no-fetch {} lists the first, {} more)\n",
+                slugs.len(),
+                quoted(&programme_dir("/work/repo", "p0")),
+                slugs.len() - 1
+            )),
+            "{text}"
         );
     }
 
@@ -818,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failing_load_is_counted_and_names_the_first_directory_to_check() {
+    fn failing_loads_are_named_and_the_check_runs_on_the_first() {
         let mut ready = ready_of(two_programmes(), vec![row(0, "alpha", "t1", "Ready", None)]);
         ready.unreadable = vec![
             PathBuf::from("/work/repo/docs/programmes/broken"),
@@ -827,7 +888,7 @@ mod tests {
         let text = render_of(&ready, false);
         assert!(
             text.starts_with(
-                "relais/programmes: 1 ready in /work/repo (2 programmes could not be read; run relais programme check /work/repo/docs/programmes/broken for why):\n"
+                "relais/programmes: 1 ready in /work/repo (2 programmes could not be read: broken, worse; run relais programme check /work/repo/docs/programmes/broken for why on the first, 1 more):\n"
             ),
             "{text}"
         );
