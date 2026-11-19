@@ -418,7 +418,7 @@ impl Found {
     /// The working-tree path of its directory, which may be absent on disk
     /// when it is read from a ref.
     pub fn dir(&self) -> PathBuf {
-        self.checkout.join(programme_rel(&self.slug))
+        programme_path(&self.checkout, &self.slug)
     }
 
     pub fn load(&self) -> Result<Programme, ProgrammeError> {
@@ -446,8 +446,16 @@ impl Found {
     }
 }
 
+/// The programme's directory as git names it in a pathspec or a
+/// `rev:path`, where the separator is always `/`.
 fn programme_rel(slug: &str) -> String {
     format!("docs/programmes/{slug}")
+}
+
+/// The programme's directory under `base` on disk, joined one component at
+/// a time so the path carries the platform's one separator.
+fn programme_path(base: &Path, slug: &str) -> PathBuf {
+    base.join("docs").join("programmes").join(slug)
 }
 
 /// The remote-tracking ref of `origin`'s default branch: what
@@ -869,12 +877,7 @@ fn choose(
     let origin = origin_for(repo, view, slug)?;
     let mut best: Option<(i64, &CheckoutState)> = None;
     for state in states {
-        if !state
-            .path
-            .join(programme_rel(slug))
-            .join(MAP_FILE)
-            .is_file()
-        {
+        if !programme_path(&state.path, slug).join(MAP_FILE).is_file() {
             continue;
         }
         if let Some(at) = local_work(state, slug, &origin)? {
@@ -940,7 +943,7 @@ pub fn repositories_with_programmes(root: &Path) -> Result<Vec<PathBuf>, Program
             let is_symlink = std::fs::symlink_metadata(repo)
                 .map(|metadata| metadata.file_type().is_symlink())
                 .unwrap_or(true);
-            !is_symlink && repo.join("docs/programmes").is_dir()
+            !is_symlink && repo.join("docs").join("programmes").is_dir()
         })
         .collect())
 }
@@ -1091,7 +1094,7 @@ fn settle<'a>(
         match choice {
             Ok(choice) => found.extend(choice.found),
             Err(error) => {
-                let dir = repo.join(programme_rel(slug));
+                let dir = programme_path(repo, slug);
                 notes.push(format!("{}: {error}; skipped", dir.display()));
                 unreadable.push(dir);
             }
@@ -1177,10 +1180,7 @@ pub fn resolve(located: &Located) -> Result<Resolved, ProgrammeError> {
             located.dir.display()
         ));
     }
-    let files = located
-        .checkout
-        .join(programme_rel(&located.slug))
-        .join(MAP_FILE);
+    let files = programme_path(&located.checkout, &located.slug).join(MAP_FILE);
     let found = match choice.found {
         Some(found) => Found {
             checkout: located.checkout.clone(),
@@ -1403,6 +1403,19 @@ fn lock_files(repo: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_programme_dir_uses_the_platform_separator_only() {
+        let found = Found {
+            repo: PathBuf::from("work").join("repo"),
+            checkout: PathBuf::from("work").join("repo"),
+            slug: "alpha".to_owned(),
+            source: Source::WorkingTree,
+        };
+        let sep = std::path::MAIN_SEPARATOR_STR;
+        let want = ["work", "repo", "docs", "programmes", "alpha"].join(sep);
+        assert_eq!(found.dir().to_string_lossy(), want);
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let out = crate::workspace::git_command(dir)
