@@ -6,6 +6,30 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.71.0
+
+- A session can claim a programme ticket. `relais programme claim <slug> <id>
+  --dir <map dir>` holds it for this session (`work`), `release` lets it go,
+  and `relais programme next [--from <repo>:<slug>] [--claim]` names the first
+  unheld ready ticket of that programme, else of a programme no session is
+  on, and with `--claim` reserves it for the next session (`handoff`). A ticket
+  due later than today, or whose mode needs the person, is never chosen.
+  When nothing is left, `next` parks: it prints `parked: next due <date>` (or
+  `{"parked": true, "next_due": …}` with `--json`) and exits 22, a new code.
+  A claim held by another live session is refused with exit 3 and the
+  commands to run next.
+- Claims live under the relais state directory, `claims/<repo-key>/<slug>/`,
+  written under a per-programme lock, with every event in
+  `claims/log.jsonl`. A `work` claim ends at its session's `SessionEnd`, when
+  its ticket closes, or 8 hours after its last refresh; a `handoff` claim
+  after 2 hours unless taken over. A resumed session refreshes its claims.
+- The ready list at session start, `relais programme frontier` and `show`
+  mark or leave out held tickets (`held by <session>`; `held_by` in JSON;
+  `claimed <s8> <age>` under `frontier --all`). At a projects root the
+  repository shown in full is the one with the most unheld ready tickets.
+- The `programme` skill claims a ticket before working it, and recovers from
+  a refused claim through `next --claim`.
+
 ## v0.70.0
 
 - `relais hook` now also answers a `SessionStart` of source `startup` or
