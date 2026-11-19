@@ -8,9 +8,10 @@ use std::path::PathBuf;
 
 use chrono::NaiveDate;
 
-use super::analysis::Standing;
+use super::analysis::{age_secs, Holder, Standing};
+use super::claim;
 use super::load::{Found, Programme};
-use super::model::Ticket;
+use super::model::{Status, Ticket};
 
 /// Whether a ticket in this standing is ready: open and not blocked, in
 /// flight or out of scope. The one place that says so.
@@ -27,6 +28,16 @@ pub fn ready_tickets<'a>(
         .tickets
         .values()
         .filter(|ticket| standings.get(&ticket.id).is_some_and(is_ready))
+}
+
+/// Whether every ticket that blocks `ticket` is closed.
+fn is_unblocked(programme: &Programme, ticket: &Ticket) -> bool {
+    ticket.blocked_by.iter().all(|id| {
+        programme
+            .tickets
+            .get(id)
+            .is_some_and(|blocker| blocker.status == Status::Closed)
+    })
 }
 
 /// The frontier's order: tickets with a due date first, soonest first, then
@@ -52,8 +63,26 @@ pub fn due_mark(due: Option<NaiveDate>, today: NaiveDate) -> String {
     }
 }
 
+/// `5m`, `3h` or `2d`: the largest whole unit.
+pub fn format_age(secs: u64) -> String {
+    match secs {
+        0..=3599 => format!("{}m", secs / 60),
+        3600..=86399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
+}
+
+/// The session that holds a ready ticket by a claim, and for how long.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldBy {
+    pub holder: claim::Holder,
+    pub age_secs: u64,
+}
+
 /// One ready ticket, and which programme (by position in [`Ready::found`])
-/// it was read from.
+/// it was read from. A ticket a claim holds is listed with `held` set, so a
+/// session can see what it is passing over; a branch-held ticket is not
+/// listed at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyRow {
     pub programme: usize,
@@ -61,6 +90,7 @@ pub struct ReadyRow {
     pub id: String,
     pub name: String,
     pub due: Option<NaiveDate>,
+    pub held: Option<HeldBy>,
 }
 
 /// Every ready ticket of some programmes, ordered, with the source each
@@ -73,13 +103,30 @@ pub struct Ready {
     pub unreadable: Vec<PathBuf>,
 }
 
+impl Ready {
+    /// How many rows no claim holds.
+    pub fn unheld_count(&self) -> usize {
+        self.rows.iter().filter(|row| row.held.is_none()).count()
+    }
+
+    /// How many rows a claim holds.
+    pub fn held_count(&self) -> usize {
+        self.rows.len() - self.unheld_count()
+    }
+}
+
 /// The ready tickets of `found`, which are expected in slug order: the
 /// frontier of each loaded programme, due ones first across all of them,
 /// then the undated by programme and id. A programme that does not load
 /// is counted in [`Ready::unreadable`], never fatal; `unlisted` are the
 /// directories of programmes that could not even be selected, which are
 /// counted the same way, before the ones that failed to load.
-pub fn ready(found: Vec<Found>, unlisted: Vec<PathBuf>) -> Ready {
+pub fn ready(
+    found: Vec<Found>,
+    unlisted: Vec<PathBuf>,
+    claims: Option<&claim::Store>,
+    now: i64,
+) -> Ready {
     let mut rows = Vec::new();
     let mut unreadable = unlisted;
     // Each load spawns several git processes (about 40 ms each); one thread
@@ -93,8 +140,9 @@ pub fn ready(found: Vec<Found>, unlisted: Vec<PathBuf>) -> Ready {
             .iter()
             .map(|one| {
                 scope.spawn(move || {
-                    one.load()
-                        .and_then(|programme| programme.standings().map(|s| (programme, s)))
+                    one.load().and_then(|programme| {
+                        programme.standings(claims, now).map(|s| (programme, s))
+                    })
                 })
             })
             .collect();
@@ -104,13 +152,30 @@ pub fn ready(found: Vec<Found>, unlisted: Vec<PathBuf>) -> Ready {
         // A load that panicked counts as one that failed.
         match loaded.ok().and_then(Result::ok) {
             Some((programme, standings)) => {
-                for ticket in ready_tickets(&programme, &standings) {
+                for ticket in programme.tickets.values() {
+                    let held = match standings.get(&ticket.id) {
+                        Some(Standing::Frontier) => None,
+                        Some(Standing::InFlight {
+                            holder: Holder::Claim(hold),
+                        }) if is_unblocked(&programme, ticket) => Some(HeldBy {
+                            holder: hold.holder.clone(),
+                            age_secs: age_secs(now, hold.since),
+                        }),
+                        Some(
+                            Standing::InFlight { .. }
+                            | Standing::Blocked(_)
+                            | Standing::Closed
+                            | Standing::OutOfScope,
+                        )
+                        | None => continue,
+                    };
                     rows.push(ReadyRow {
                         programme: position,
                         slug: one.slug.clone(),
                         id: ticket.id.clone(),
                         name: ticket.name.clone(),
                         due: ticket.due,
+                        held,
                     });
                 }
             }
@@ -152,6 +217,14 @@ pub fn has_handoff(map_text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_age_is_written_in_its_largest_whole_unit() {
+        assert_eq!(format_age(0), "0m");
+        assert_eq!(format_age(300), "5m");
+        assert_eq!(format_age(10_800), "3h");
+        assert_eq!(format_age(2 * 86_400 + 5), "2d");
+    }
 
     #[test]
     fn a_handoff_heading_inside_a_fence_is_not_one() {

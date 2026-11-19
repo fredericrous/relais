@@ -21,6 +21,7 @@ use crate::admission::{
 };
 use crate::ids;
 use crate::policy::{HookAdmissionSettings, QueueBehaviour};
+use crate::programme::claim;
 use crate::runner::ADMISSION_POLL;
 
 /// What one hook firing did, end to end: the event a payload classified
@@ -189,28 +190,34 @@ where
 /// a real socket and a real clock, neither of which `decide` itself
 /// touches.
 pub fn handle(payload: &[u8], settings: &HookAdmissionSettings, gate: &dyn Gate) -> Handled {
+    let claims = claim::Store::from_environment();
+    let for_gather = claims.clone();
     handle_with(
         payload,
         settings,
         gate,
-        super::resume::gather,
+        move |cwd: &Path| super::resume::gather_with(cwd, for_gather),
         GATHER_DEADLINE,
+        claims.as_ref(),
     )
 }
 
-/// [`handle`] with the session-start gatherer and its deadline named.
+/// [`handle`] with the session-start gatherer and its deadline named, and
+/// the claim store the session's own claims are kept in (`None`: none is
+/// kept, so none is refreshed or deleted).
 pub fn handle_with<G>(
     payload: &[u8],
     settings: &HookAdmissionSettings,
     gate: &dyn Gate,
     gatherer: G,
     deadline: Duration,
+    claims: Option<&claim::Store>,
 ) -> Handled
 where
     G: FnOnce(&Path) -> Result<Gathered, SkipReason> + Send + 'static,
 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        handle_inner(payload, settings, gate, gatherer, deadline)
+        handle_inner(payload, settings, gate, gatherer, deadline, claims)
     }))
     .unwrap_or(Handled {
         event: HookEvent::NotOurs,
@@ -227,12 +234,14 @@ fn handle_inner<G>(
     gate: &dyn Gate,
     gatherer: G,
     deadline: Duration,
+    claims: Option<&claim::Store>,
 ) -> Handled
 where
     G: FnOnce(&Path) -> Result<Gathered, SkipReason> + Send + 'static,
 {
     let event = event::parse(payload);
     if let HookEvent::SessionStart(start) = &event {
+        refresh_claims_of_a_continued_session(start, claims);
         let Some(cwd) = start.fresh_session_cwd() else {
             return Handled {
                 event,
@@ -254,7 +263,7 @@ where
     }
     let (coordinator, waited) = ask_coordinator(&event, settings, gate);
     let answer = decide_or_silent(&event, settings, coordinator.clone(), waited);
-    follow_agent_lifecycle(&event, gate);
+    follow_agent_lifecycle(&event, gate, claims);
     if matches!(answer, HookAnswer::Refuse { .. }) {
         if let HookEvent::AgentToolCall(call) = &event {
             let dispatch_id = ids::derive_dispatch_id(&call.session_id, &call.tool_use_id);
@@ -315,7 +324,7 @@ where
 /// run uncertain, which is what not knowing looks like when it is
 /// recorded honestly. Zero would be a claim that the agent was free.
 /// Both ends together let the coordinator forget the entry.
-fn follow_agent_lifecycle(event: &HookEvent, gate: &dyn Gate) {
+fn follow_agent_lifecycle(event: &HookEvent, gate: &dyn Gate, claims: Option<&claim::Store>) {
     match event {
         HookEvent::AgentToolCall(call) => match &call.phase {
             ToolCallPhase::Post {
@@ -351,10 +360,50 @@ fn follow_agent_lifecycle(event: &HookEvent, gate: &dyn Gate) {
             // an agent relais never admitted ends like any other.
             let _ = gate.settle_by_agent(stop.session_id.as_str(), stop.agent_id.as_str(), None);
         }
-        HookEvent::SessionStart(_)
-        | HookEvent::SessionEnd(_)
-        | HookEvent::SubagentStart(_)
-        | HookEvent::NotOurs => {}
+        HookEvent::SessionEnd(end) => {
+            if let Some(store) = claims {
+                // A hook cannot fail on bookkeeping, so a failure is one stderr
+                // line and the claim left behind expires after N.
+                report_claim_pass(
+                    store.end_session_once(end.session_id.as_str(), claim::now_unix()),
+                );
+            }
+        }
+        HookEvent::SessionStart(_) | HookEvent::SubagentStart(_) | HookEvent::NotOurs => {}
+    }
+}
+
+/// A session that continues (`resume` or `compact`) is still working what
+/// it claimed: move its `work` claims' refresh time to now, before the
+/// early return a non-fresh start takes. Each programme's lock is tried
+/// once and a busy one is logged as skipped; this never waits, so it
+/// stays far inside [`GATHER_DEADLINE`].
+fn refresh_claims_of_a_continued_session(
+    start: &event::SessionStart,
+    claims: Option<&claim::Store>,
+) {
+    let continued = matches!(
+        start.source,
+        Some(event::SessionSource::Resume | event::SessionSource::Compact)
+    );
+    if let (true, Some(store)) = (continued, claims) {
+        // A hook cannot fail on bookkeeping, so a failure is one stderr line
+        // and the next claim, commit or resume refreshes the claim.
+        report_claim_pass(store.refresh_session_once(start.session_id.as_str(), claim::now_unix()));
+    }
+}
+
+/// Writes what went wrong in a hook's pass over a session's claims to the
+/// hook's stderr, one line per programme and one for a store that could not
+/// be read, each naming where and why.
+fn report_claim_pass(pass: Result<claim::Pass, claim::ClaimError>) {
+    match pass {
+        Ok(pass) => {
+            for line in pass.failure_lines() {
+                eprintln!("relais: {line}");
+            }
+        }
+        Err(error) => eprintln!("relais: claims: {error}"),
     }
 }
 
@@ -2260,6 +2309,7 @@ mod tests {
             &PanicsIfAsked,
             gatherer,
             deadline,
+            None,
         )
     }
 
@@ -2313,6 +2363,7 @@ mod tests {
             &PanicsIfAsked,
             must_not_run,
             Duration::from_secs(5),
+            None,
         );
         assert_eq!(handled.answer, HookAnswer::Silent);
     }
@@ -2358,5 +2409,182 @@ mod tests {
         assert_eq!(handled.answer, HookAnswer::Silent);
         let entry = journal_entry(&start_payload("startup"), &handled);
         assert_eq!(entry["outcome"], "skipped(failed)");
+    }
+
+    mod claims {
+        use super::*;
+        use crate::programme::claim::{ClaimKey, ClaimRecord, Contest, Kind, Store, LOCK_WAIT};
+
+        const SESSION: &str = "session-aaaa";
+
+        fn key() -> ClaimKey {
+            ClaimKey {
+                repo_key: "k".into(),
+                slug: "p".into(),
+            }
+        }
+
+        fn lifecycle(event: &str, source: Option<&str>, session: &str) -> Vec<u8> {
+            let source = source.map_or(String::new(), |s| {
+                format!(r#","source":"{s}","cwd":"/repo""#)
+            });
+            format!(r#"{{"hook_event_name":"{event}","session_id":"{session}"{source}}}"#)
+                .into_bytes()
+        }
+
+        fn run(payload: &[u8], store: &Store) -> Handled {
+            fn must_not_run(_: &Path) -> Result<Gathered, SkipReason> {
+                panic!("asked for a session that keeps its conversation");
+            }
+            handle_with(
+                payload,
+                &settings(),
+                &PanicsIfAsked,
+                must_not_run,
+                Duration::from_secs(5),
+                Some(store),
+            )
+        }
+
+        fn store_with_claims(
+            tag: &str,
+            refreshed_ago: i64,
+        ) -> (crate::test_support::TempDir, Store) {
+            let scratch = crate::test_support::short_temp_dir(tag);
+            let store = Store::in_state_dir(&scratch);
+            let then = claim::now_unix() - refreshed_ago;
+            let lock = store.lock(&key(), LOCK_WAIT, claim::now_unix()).unwrap();
+            lock.claim_work("t1", SESSION, "/r", Contest::Refuse, then)
+                .unwrap();
+            assert!(lock.reserve_handoff("t2", SESSION, "/r", then).unwrap());
+            lock.claim_work("t3", "someone-else", "/r", Contest::Refuse, then)
+                .unwrap();
+            drop(lock);
+            (scratch, store)
+        }
+
+        fn claim_ids(store: &Store) -> Vec<String> {
+            store.records(&key()).unwrap().into_keys().collect()
+        }
+
+        #[test]
+        fn a_session_end_deletes_the_sessions_work_claims_and_keeps_its_handoff_claims() {
+            let (_scratch, store) = store_with_claims("hook-end", 0);
+            let handled = run(&lifecycle("SessionEnd", None, SESSION), &store);
+            assert_eq!(handled.answer, HookAnswer::Silent);
+            assert_eq!(claim_ids(&store), ["t2", "t3"]);
+        }
+
+        #[test]
+        fn a_resume_or_compact_start_refreshes_the_sessions_work_claims_before_it_returns() {
+            for source in ["resume", "compact"] {
+                let (_scratch, store) = store_with_claims("hook-refresh", 3_600);
+                let handled = run(&lifecycle("SessionStart", Some(source), SESSION), &store);
+                assert_eq!(handled.gather, Gather::NotAsked, "{source}");
+                let records = store.records(&key()).unwrap();
+                let age = |id: &str| match &records[id] {
+                    ClaimRecord::Parsed(c) => claim::now_unix() - c.refreshed_at,
+                    ClaimRecord::Unparsed { .. } => panic!("claim {id} does not parse"),
+                };
+                assert!(
+                    age("t1") < 60,
+                    "{source}: the session's work claim is fresh"
+                );
+                assert!(
+                    age("t3") >= 3_600 - 5,
+                    "{source}: another session's claim is untouched"
+                );
+                assert!(
+                    matches!(&records["t2"], ClaimRecord::Parsed(c) if c.kind == Kind::Handoff)
+                );
+            }
+        }
+
+        #[test]
+        fn a_fresh_start_refreshes_nothing() {
+            let (_scratch, store) = store_with_claims("hook-fresh", 3_600);
+            let handled = run_fresh(&store);
+            assert!(
+                matches!(handled.gather, Gather::Skipped { .. }),
+                "{:?}",
+                handled.gather
+            );
+            let records = store.records(&key()).unwrap();
+            assert!(
+                matches!(&records["t1"], ClaimRecord::Parsed(c) if claim::now_unix() - c.refreshed_at >= 3_600 - 5)
+            );
+        }
+
+        fn run_fresh(store: &Store) -> Handled {
+            handle_with(
+                &lifecycle("SessionStart", Some("clear"), SESSION),
+                &settings(),
+                &PanicsIfAsked,
+                nothing,
+                Duration::from_secs(5),
+                Some(store),
+            )
+        }
+
+        #[test]
+        fn a_session_start_with_the_lock_held_elsewhere_returns_within_100_ms_and_logs_a_skip() {
+            let (scratch, store) = store_with_claims("hook-busy", 3_600);
+            let (held, release) = std::sync::mpsc::channel::<()>();
+            let (locked, locked_signal) = std::sync::mpsc::channel::<()>();
+            let state = scratch.to_path_buf();
+            let holder = std::thread::spawn(move || {
+                let own_handle = Store::in_state_dir(&state);
+                let _lock = own_handle
+                    .lock(&key(), LOCK_WAIT, claim::now_unix())
+                    .unwrap();
+                locked.send(()).unwrap();
+                let _ = release.recv(); // held until the main thread has measured
+            });
+            locked_signal.recv().unwrap();
+            let started = Instant::now();
+            run(&lifecycle("SessionStart", Some("resume"), SESSION), &store);
+            let elapsed = started.elapsed();
+            drop(held);
+            holder.join().unwrap();
+            assert!(elapsed < Duration::from_millis(100), "{elapsed:?}");
+            let log =
+                std::fs::read_to_string(scratch.to_path_buf().join("claims/log.jsonl")).unwrap();
+            assert!(log.contains("\"event\":\"skipped\""), "{log}");
+        }
+
+        #[test]
+        fn a_session_end_with_the_lock_held_elsewhere_leaves_a_tombstone_the_next_locked_write_applies(
+        ) {
+            let (scratch, store) = store_with_claims("hook-end-busy", 0);
+            let state = scratch.to_path_buf();
+            let (held, release) = std::sync::mpsc::channel::<()>();
+            let (locked, locked_signal) = std::sync::mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                let own_handle = Store::in_state_dir(&state);
+                let _lock = own_handle
+                    .lock(&key(), LOCK_WAIT, claim::now_unix())
+                    .unwrap();
+                locked.send(()).unwrap();
+                let _ = release.recv(); // held until the end has been handled
+            });
+            locked_signal.recv().unwrap();
+            let started = Instant::now();
+            run(&lifecycle("SessionEnd", None, SESSION), &store);
+            assert!(started.elapsed() < Duration::from_millis(100));
+            drop(held);
+            holder.join().unwrap();
+            assert_eq!(
+                claim_ids(&store),
+                ["t1", "t2", "t3"],
+                "nothing deleted under a busy lock"
+            );
+            assert!(scratch
+                .to_path_buf()
+                .join("claims/ended")
+                .join(SESSION)
+                .exists());
+            drop(store.lock(&key(), LOCK_WAIT, claim::now_unix()).unwrap());
+            assert_eq!(claim_ids(&store), ["t2", "t3"]);
+        }
     }
 }

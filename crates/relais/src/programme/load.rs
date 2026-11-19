@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::analysis;
+use super::claim;
 use super::model::{MapDoc, Problem, Ticket, MAP_FILE};
 use super::parse::{parse_map, parse_ticket};
 
@@ -267,10 +268,37 @@ impl Programme {
         problems
     }
 
-    /// Where each ticket stands, reading the branches from git.
-    pub fn standings(&self) -> Result<BTreeMap<String, analysis::Standing>, ProgrammeError> {
+    /// Where each ticket stands, reading the branches from git and the
+    /// claims from `claims` as of `now`. Read-only: a claim store that cannot
+    /// be read marks nothing held and fails nothing, so a listing never goes
+    /// blank over it.
+    pub fn standings(
+        &self,
+        claims: Option<&claim::Store>,
+        now: i64,
+    ) -> Result<BTreeMap<String, analysis::Standing>, ProgrammeError> {
         let working = branch_tips(&self.repo_dir, &self.slug)?;
-        Ok(analysis::standings(&self.tickets, &self.slug, &working))
+        let holds = claims
+            .and_then(|store| {
+                let key = self.claim_key().ok()?; // not a repository git can name: nothing was claimed under it
+                store.holds(&key, now).ok() // an unreadable claim store marks nothing held
+            })
+            .unwrap_or_default();
+        Ok(analysis::standings(
+            &self.tickets,
+            &self.slug,
+            &working,
+            &holds,
+        ))
+    }
+
+    /// The key that names this programme's claims.
+    pub fn claim_key(&self) -> Result<claim::ClaimKey, ProgrammeError> {
+        let common = git_common_dir(&self.repo_dir)?;
+        Ok(claim::ClaimKey {
+            repo_key: claim::repo_key(&common),
+            slug: self.slug.clone(),
+        })
     }
 }
 
@@ -294,14 +322,20 @@ fn git_stdout(repo: &Path, args: &[&str]) -> Result<String, ProgrammeError> {
     Ok(output.stdout)
 }
 
-/// The main checkout of the repository `dir` belongs to: the parent of the
-/// git common directory, which a linked worktree shares with it.
-pub fn main_checkout(dir: &Path) -> Result<PathBuf, ProgrammeError> {
+/// The absolute git common directory of the repository `dir` belongs to,
+/// which a linked worktree shares with its main checkout.
+pub fn git_common_dir(dir: &Path) -> Result<PathBuf, ProgrammeError> {
     let printed = git_stdout(
         dir,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
-    let common = PathBuf::from(printed.trim());
+    Ok(PathBuf::from(printed.trim()))
+}
+
+/// The main checkout of the repository `dir` belongs to: the parent of the
+/// git common directory, which a linked worktree shares with it.
+pub fn main_checkout(dir: &Path) -> Result<PathBuf, ProgrammeError> {
+    let common = git_common_dir(dir)?;
     let is_dot_git = common.file_name().is_some_and(|name| name == ".git");
     match common.parent() {
         Some(parent) if is_dot_git => Ok(parent.to_path_buf()),

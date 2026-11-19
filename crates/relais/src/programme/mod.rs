@@ -1,9 +1,11 @@
 //! Programme maps (SPEC §31): `docs/programmes/<slug>/map.md` plus one
 //! TOML-frontmatter ticket file per decision, read and queried, never
-//! written. Parsing and analysis are pure; only [`load`] touches the
+//! written; [`claim`] is the one store, kept in the state directory and
+//! never in a map. Parsing and analysis are pure; only [`load`] touches the
 //! filesystem and git, and nothing here opens the ledger.
 
 pub mod analysis;
+pub mod claim;
 pub mod frontier;
 pub mod load;
 pub mod model;

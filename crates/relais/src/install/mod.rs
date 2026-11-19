@@ -1444,6 +1444,38 @@ mod tests {
         );
     }
 
+    /// The programme skill's resume step is how a session keeps a ticket
+    /// another session holds from becoming a second session's work: each
+    /// phrase below is one decision of the claim plan.
+    #[test]
+    fn the_programme_skill_claims_first_and_recovers_from_a_refusal_by_the_plan() {
+        let body = plugin::embedded_text("skills/programme/SKILL.md").expect("the plugin ships it");
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        for phrase in [
+            "relais programme claim <slug> <id> --dir <map dir>",
+            "again at each commit on the ticket",
+            "relais programme next --from <repo>:<slug> --claim",
+            "only after it exits 0 start any work",
+            "another session took the reservation over",
+            "do not release it",
+            "at most 3 selections",
+            "then park",
+            "safe to /clear; parked: next due <date>",
+            "any other non-zero exit: report the stderr line and stop",
+            "Print no clear line",
+        ] {
+            assert!(flat.contains(phrase), "the skill lost `{phrase}`:\n{body}");
+        }
+        assert!(
+            flat.contains("- 3: another live session holds it."),
+            "exit 3 is the ownership refusal:\n{body}"
+        );
+        assert!(
+            flat.contains("- 22 (from `next`)"),
+            "exit 22 is the park:\n{body}"
+        );
+    }
+
     #[test]
     fn a_marker_installed_above_the_frontmatter_migrates_under_it() {
         let (root, dir) = temp_root();
