@@ -640,11 +640,13 @@ mod tests {
     use super::*;
     use crate::programme::frontier::HeldBy;
 
-    /// A programme directory as `Found::dir` builds it: the checkout joined
-    /// with the one relative `docs/programmes/<slug>`, so on Windows only the
-    /// join itself is a backslash (`/work/repo\docs/programmes/alpha`).
+    /// A programme directory as `Found::dir` builds it: one component at a
+    /// time, so on Windows every separator after the checkout is a backslash.
     fn programme_dir(checkout: &str, slug: &str) -> PathBuf {
-        Path::new(checkout).join(format!("docs/programmes/{slug}"))
+        Path::new(checkout)
+            .join("docs")
+            .join("programmes")
+            .join(slug)
     }
 
     /// The path as the text quotes it for a shell.
