@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use chrono::NaiveDate;
 
-use super::respond::{Coverage, Gathered, SkipReason, GATHER_THREAD_NAME};
+use super::respond::{Coverage, Gathered, Skip, SkipReason, GATHER_THREAD_NAME};
 use crate::programme::claim::{self, Store};
 use crate::programme::frontier::{self, due_mark, format_age, has_handoff, Ready, ReadyRow};
 use crate::programme::load::{self, main_checkout, Found, Source};
@@ -41,25 +41,35 @@ pub const OUTSIDE_REPO_DEADLINE: Duration = Duration::from_millis(2500);
 
 /// The context text for a session that starts in `cwd`, or why there is
 /// none: [`SkipReason::Nothing`] when its repository holds no programme or
-/// nothing is ready, [`SkipReason::Error`] when the repository or its
-/// programmes cannot be listed. A session start is never failed by this.
+/// nothing is ready, [`SkipReason::Error`] with what failed when the
+/// repository or its programmes cannot be listed. A session start is never failed by this.
 /// Reads checkouts and origin as the last fetch left them; fetches nothing
 /// and prints nothing.
 ///
 /// When `cwd` is not inside a repository, the child repositories under it
 /// are read instead (see [`render_outside`]).
-pub fn gather(cwd: &Path) -> Result<Gathered, SkipReason> {
+pub fn gather(cwd: &Path) -> Result<Gathered, Skip> {
     gather_with(cwd, Store::from_environment())
 }
 
 /// [`gather`] marking the tickets that `claims` holds. Reads claims and
 /// never writes one.
-pub fn gather_with(cwd: &Path, claims: Option<Store>) -> Result<Gathered, SkipReason> {
+pub fn gather_with(cwd: &Path, claims: Option<Store>) -> Result<Gathered, Skip> {
     let cutoff = Instant::now() + OUTSIDE_REPO_DEADLINE;
-    let Ok(repo) = main_checkout(cwd) else {
-        return gather_outside(cwd, cutoff, claims);
+    let repo = match main_checkout(cwd) {
+        Ok(repo) => repo,
+        Err(not_a_checkout) => {
+            return gather_outside(cwd, cutoff, claims).map_err(|skip| {
+                // A broken git looks like no checkout at all: keep its cause,
+                // first, so a cut of a long text keeps it.
+                let error = skip
+                    .error
+                    .map(|text| format!("not a checkout: {not_a_checkout}; {text}"));
+                Skip::from_parts(skip.why, error)
+            });
+        }
     };
-    let listed = load::programmes_of(&repo).map_err(|_| SkipReason::Error)?;
+    let listed = load::programmes_of(&repo).map_err(|error| Skip::error(error.to_string()))?;
     let ready = frontier::ready(
         listed.found,
         listed.unreadable,
@@ -75,23 +85,20 @@ pub fn gather_with(cwd: &Path, claims: Option<Store>) -> Result<Gathered, SkipRe
         None,
     )
     .map(Gathered::from)
-    .ok_or(SkipReason::Nothing)
+    .ok_or(SkipReason::Nothing.into())
 }
 
-fn gather_outside(
-    root: &Path,
-    cutoff: Instant,
-    claims: Option<Store>,
-) -> Result<Gathered, SkipReason> {
-    let repos = load::repositories_with_programmes(root).map_err(|_| SkipReason::Error)?;
+fn gather_outside(root: &Path, cutoff: Instant, claims: Option<Store>) -> Result<Gathered, Skip> {
+    let repos =
+        load::repositories_with_programmes(root).map_err(|error| Skip::error(error.to_string()))?;
     if repos.is_empty() {
         // Child checkouts that hold no programme say nothing; no checkout at
         // all is an error.
-        let children = load::repositories(root).map_err(|_| SkipReason::Error)?;
+        let children = load::repositories(root).map_err(|error| Skip::error(error.to_string()))?;
         return Err(if children.is_empty() {
-            SkipReason::Error
+            Skip::error(format!("no git repository under {}", root.display()))
         } else {
-            SkipReason::Nothing
+            SkipReason::Nothing.into()
         });
     }
     let collected = collect_within(
@@ -245,9 +252,22 @@ pub(crate) fn render_outside(
     root: &Path,
     collected: &Collected<RepoReading>,
     today: NaiveDate,
-) -> Result<String, SkipReason> {
+) -> Result<String, Skip> {
     if collected.read.is_empty() {
-        return Err(SkipReason::Deadline);
+        // Nothing read: a deadline when any repository was still being read,
+        // an error when every one of them failed; either keeps the reasons.
+        let reasons: Vec<String> = collected
+            .unreadable
+            .iter()
+            .map(|(repo, reason)| format!("{}: {reason}", repo.display()))
+            .collect();
+        let reasons = (!reasons.is_empty()).then(|| reasons.join("; "));
+        let why = if collected.late.is_empty() && reasons.is_some() {
+            SkipReason::Error
+        } else {
+            SkipReason::Deadline
+        };
+        return Err(Skip::from_parts(why, reasons));
     }
     let mut with_ready: Vec<&RepoReading> = collected
         .read
@@ -303,7 +323,7 @@ pub(crate) fn render_outside(
                 }),
             )
         }
-        None => return Err(SkipReason::Nothing),
+        None => return Err(SkipReason::Nothing.into()),
     };
     let quoted_root = shell_quote(&printable(&root.display().to_string()));
 
@@ -901,8 +921,23 @@ mod tests {
     #[test]
     fn gather_says_why_it_said_nothing() {
         let outside = crate::test_support::short_temp_dir("gather-outside");
-        assert_eq!(gather(&outside), Err(SkipReason::Error));
-        assert_eq!(gather(&outside.join("missing")), Err(SkipReason::Error));
+        let none = gather(&outside).expect_err("no repository");
+        assert_eq!(none.why, SkipReason::Error);
+        let text = none.error.expect("text");
+        assert!(
+            text.starts_with("not a checkout: ")
+                && text.ends_with(&format!("; no git repository under {}", outside.display())),
+            "{text}"
+        );
+        let missing = gather(&outside.join("missing")).expect_err("a missing directory");
+        assert_eq!(missing.why, SkipReason::Error);
+        assert!(
+            missing
+                .error
+                .as_deref()
+                .is_some_and(|text| text.contains("missing")),
+            "{missing:?}"
+        );
 
         let repo = crate::test_support::short_temp_dir("gather-empty");
         let git = |args: &[&str]| {
@@ -913,7 +948,7 @@ mod tests {
             assert!(out.status.success(), "git {args:?}");
         };
         git(&["init", "-q"]);
-        assert_eq!(gather(&repo), Err(SkipReason::Nothing));
+        assert_eq!(gather(&repo), Err(SkipReason::Nothing.into()));
     }
 
     fn reading(name: &str, rows: Vec<ReadyRow>, handoff_at: Option<i64>) -> RepoReading {
@@ -959,7 +994,7 @@ mod tests {
     }
 
     fn outside(collected: &Collected<RepoReading>) -> Result<String, SkipReason> {
-        render_outside(Path::new("/root"), collected, day(2026, 11, 18))
+        render_outside(Path::new("/root"), collected, day(2026, 11, 18)).map_err(|skip| skip.why)
     }
 
     #[test]
@@ -1073,6 +1108,37 @@ mod tests {
     fn nothing_read_in_time_is_a_deadline_skip() {
         let collected = collected_of(Vec::new(), &["a"]);
         assert_eq!(outside(&collected), Err(SkipReason::Deadline));
+    }
+
+    #[test]
+    fn every_repository_unreadable_is_an_error_naming_each_reason() {
+        let collected: Collected<RepoReading> = Collected {
+            read: Vec::new(),
+            late: Vec::new(),
+            unreadable: vec![
+                (PathBuf::from("/root/a"), "git broke".to_string()),
+                (PathBuf::from("/root/b"), "its reader panicked".to_string()),
+            ],
+        };
+        let skip = render_outside(Path::new("/root"), &collected, day(2026, 11, 18))
+            .expect_err("nothing was read");
+        assert_eq!(
+            skip,
+            Skip::error("/root/a: git broke; /root/b: its reader panicked")
+        );
+    }
+
+    #[test]
+    fn a_deadline_with_unreadable_repositories_keeps_their_reasons() {
+        let collected: Collected<RepoReading> = Collected {
+            read: Vec::new(),
+            late: vec![PathBuf::from("/root/slow")],
+            unreadable: vec![(PathBuf::from("/root/a"), "git broke".to_string())],
+        };
+        let skip = render_outside(Path::new("/root"), &collected, day(2026, 11, 18))
+            .expect_err("nothing was read");
+        assert_eq!(skip.why, SkipReason::Deadline);
+        assert_eq!(skip.error.as_deref(), Some("/root/a: git broke"));
     }
 
     #[test]
@@ -1388,7 +1454,10 @@ mod tests {
     fn a_non_repository_root_with_no_child_repository_is_an_error() {
         let root = crate::test_support::short_temp_dir("gather-no-children");
         std::fs::create_dir_all(root.join("plain")).expect("plain directory");
-        assert_eq!(gather(&root), Err(SkipReason::Error));
+        assert_eq!(
+            gather(&root).map_err(|skip| skip.why),
+            Err(SkipReason::Error)
+        );
     }
 
     #[test]
