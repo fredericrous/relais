@@ -38,6 +38,9 @@ pub const UNPARSEABLE_HOLD_SECS: i64 = 60;
 pub const LOCK_WAIT: Duration = Duration::from_secs(2);
 const LOCK_POLL: Duration = Duration::from_millis(10);
 const CLAIM_FILE_MODE: u32 = 0o600;
+/// Under `claims/`: one empty-ish file per session whose end could not delete
+/// its claims, named by the session id.
+const ENDED_DIR: &str = "ended";
 
 /// What a claim means for its holder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +127,44 @@ pub fn held(record: &ClaimRecord, now: i64) -> bool {
     now.saturating_sub(since) <= limit
 }
 
+/// The current time in Unix seconds; a clock before 1970 reads as 0.
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+        .unwrap_or(0) // only a clock before 1970 lands here; every claim then reads as just made
+}
+
+/// A claim that holds its ticket, as the programme views see it: who, in
+/// what capacity, and since when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hold {
+    /// The holder's session id; empty when the claim file does not parse.
+    pub session: String,
+    pub kind: Kind,
+    /// Unix seconds of the claim's last refresh, or of its file's last write
+    /// when it does not parse.
+    pub since: i64,
+}
+
+impl ClaimRecord {
+    fn hold(&self) -> Hold {
+        match self {
+            Self::Parsed(claim) => Hold {
+                session: claim.session.clone(),
+                kind: claim.kind,
+                since: claim.refreshed_at,
+            },
+            Self::Unparsed { modified_at } => Hold {
+                session: String::new(),
+                kind: Kind::Work,
+                since: *modified_at,
+            },
+        }
+    }
+}
+
 /// The first 12 hex characters of the SHA-256 of a repository's git common
 /// directory: the key that names the repository under `claims/`.
 pub fn repo_key(common_dir: &Path) -> String {
@@ -200,6 +241,8 @@ pub enum Event {
     Release,
     Sweep,
     Expire,
+    /// A hook found the programme's lock held and left the claim alone.
+    Skipped,
 }
 
 impl Event {
@@ -212,6 +255,7 @@ impl Event {
             Self::Release => "release",
             Self::Sweep => "sweep",
             Self::Expire => "expire",
+            Self::Skipped => "skipped",
         }
     }
 }
@@ -283,6 +327,14 @@ impl Store {
         }
     }
 
+    /// The store under the state directory the environment names, or `None`
+    /// when no state directory can be found.
+    pub fn from_environment() -> Option<Self> {
+        crate::paths::state_dir()
+            .ok() // no home directory: no claims can have been written, so none are read
+            .map(|state| Self::in_state_dir(&state))
+    }
+
     fn slug_dir(&self, key: &ClaimKey) -> PathBuf {
         self.dir.join(&key.repo_key).join(&key.slug)
     }
@@ -294,6 +346,16 @@ impl Store {
             .into_iter()
             .filter(|(_, record)| held(record, now))
             .map(|(id, _)| id)
+            .collect())
+    }
+
+    /// The claims of a programme that hold their tickets at `now`, by ticket
+    /// id, read without the lock.
+    pub fn holds(&self, key: &ClaimKey, now: i64) -> Result<BTreeMap<String, Hold>, ClaimError> {
+        Ok(read_all(&self.slug_dir(key))?
+            .into_iter()
+            .filter(|(_, record)| held(record, now))
+            .map(|(id, record)| (id, record.hold()))
             .collect())
     }
 
@@ -312,12 +374,14 @@ impl Store {
             if let Some(lock) =
                 LockFile::try_acquire_private(&path).map_err(io_error("locking", &path))?
             {
-                return Ok(SlugLock {
+                let locked = SlugLock {
                     _lock: lock,
                     store: self,
                     key: key.clone(),
                     dir,
-                });
+                };
+                locked.apply_tombstones(now_unix())?;
+                return Ok(locked);
             }
             if started.elapsed() >= wait {
                 return Err(ClaimError::LockTimeout { path });
@@ -360,30 +424,137 @@ impl Store {
     pub fn refresh_session(&self, session: &str, now: i64) -> Result<usize, ClaimError> {
         let mut refreshed = 0;
         for key in self.keys()? {
-            let mine = read_all(&self.slug_dir(&key))?
-                .into_iter()
-                .any(|(_, record)| matches!(&record, ClaimRecord::Parsed(c) if c.session == session && c.kind == Kind::Work));
-            if !mine {
+            if !self.has_work_claim_in(&key, session)? {
                 continue;
             }
             let lock = self.lock(&key, LOCK_WAIT)?;
-            for (id, record) in read_all(&lock.dir)? {
-                if let ClaimRecord::Parsed(claim) = record {
-                    if claim.session == session && claim.kind == Kind::Work {
-                        lock.write(
-                            &id,
-                            &Claim {
-                                refreshed_at: now,
-                                ..claim
-                            },
-                        )?;
-                        self.log(Event::Refresh, &key, &id, Some((session, Kind::Work)), now)?;
-                        refreshed += 1;
-                    }
-                }
-            }
+            refreshed += lock.refresh_work(session, now)?;
         }
         Ok(refreshed)
+    }
+
+    /// [`Store::refresh_session`] as a hook does it: each programme's lock
+    /// is tried once and never waited for, and a busy one is logged as
+    /// `skipped` and left for the next refresh. The session is alive, so a
+    /// tombstone left by an earlier end of the same session id is dropped.
+    pub fn refresh_session_once(&self, session: &str, now: i64) -> Result<Pass, ClaimError> {
+        self.forget_ended(session)?;
+        let mut pass = Pass::default();
+        for key in self.keys()? {
+            if !self.has_work_claim_in(&key, session)? {
+                continue;
+            }
+            match self.lock(&key, Duration::ZERO) {
+                Ok(lock) => pass.done += lock.refresh_work(session, now)?,
+                Err(ClaimError::LockTimeout { .. }) => {
+                    self.log(Event::Skipped, &key, "*", Some((session, Kind::Work)), now)?;
+                    pass.skipped += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(pass)
+    }
+
+    /// Deletes every `work` claim of an ended session and keeps its
+    /// `handoff` claims, trying each programme's lock once. When a lock was
+    /// busy the claims there stay, `ended/<session>` is written (without a
+    /// lock) and the next locked write in a programme applies it.
+    pub fn end_session_once(&self, session: &str, now: i64) -> Result<Pass, ClaimError> {
+        let mut pass = Pass::default();
+        for key in self.keys()? {
+            if !self.has_work_claim_in(&key, session)? {
+                continue;
+            }
+            match self.lock(&key, Duration::ZERO) {
+                Ok(lock) => pass.done += lock.remove_work(session, now)?,
+                Err(ClaimError::LockTimeout { .. }) => {
+                    self.log(Event::Skipped, &key, "*", Some((session, Kind::Work)), now)?;
+                    pass.skipped += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if pass.skipped > 0 {
+            self.mark_ended(session, now)?;
+        }
+        Ok(pass)
+    }
+
+    fn has_work_claim_in(&self, key: &ClaimKey, session: &str) -> Result<bool, ClaimError> {
+        Ok(read_all(&self.slug_dir(key))?
+            .values()
+            .any(|record| is_work_of(record, session)))
+    }
+
+    fn has_work_claim(&self, session: &str) -> Result<bool, ClaimError> {
+        for key in self.keys()? {
+            if self.has_work_claim_in(&key, session)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn ended_dir(&self) -> PathBuf {
+        self.dir.join(ENDED_DIR)
+    }
+
+    /// Writes `ended/<session>`: this session's `work` claims are to be
+    /// deleted by whichever locked write reaches their programme next.
+    pub fn mark_ended(&self, session: &str, now: i64) -> Result<(), ClaimError> {
+        if !is_file_name(session) {
+            return Ok(());
+        }
+        let dir = self.ended_dir();
+        std::fs::create_dir_all(&dir).map_err(io_error("creating", &dir))?;
+        let path = dir.join(session);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => file
+                .write_all(now.to_string().as_bytes())
+                .map_err(io_error("writing the tombstone", &path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(io_error("creating the tombstone", &path)(e)),
+        }
+    }
+
+    /// Deletes `ended/<session>`; there being none is not a failure.
+    pub fn forget_ended(&self, session: &str) -> Result<(), ClaimError> {
+        if !is_file_name(session) {
+            return Ok(());
+        }
+        let path = self.ended_dir().join(session);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io_error("deleting the tombstone", &path)(e)),
+        }
+    }
+
+    fn ended_sessions(&self) -> Result<Vec<String>, ClaimError> {
+        let dir = self.ended_dir();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io_error("listing the tombstones", &dir)(e)),
+        };
+        let mut sessions = Vec::new();
+        for entry in entries {
+            let name = entry
+                .map_err(io_error("listing the tombstones", &dir))?
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            if is_file_name(&name) {
+                sessions.push(name);
+            }
+        }
+        sessions.sort();
+        Ok(sessions)
     }
 
     fn keys(&self) -> Result<Vec<ClaimKey>, ClaimError> {
@@ -401,6 +572,9 @@ impl Store {
             let Some(repo_key) = repo.file_name().map(|n| n.to_string_lossy().into_owned()) else {
                 continue;
             };
+            if repo_key == ENDED_DIR {
+                continue;
+            }
             for slug in std::fs::read_dir(&repo).map_err(io_error("listing", &repo))? {
                 let slug = slug.map_err(io_error("listing", &repo))?.path();
                 if let (true, Some(name)) = (slug.is_dir(), slug.file_name()) {
@@ -414,6 +588,27 @@ impl Store {
         keys.sort_by(|a, b| (&a.repo_key, &a.slug).cmp(&(&b.repo_key, &b.slug)));
         Ok(keys)
     }
+}
+
+/// What a hook's pass over a session's claims came to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pass {
+    /// Claims refreshed or deleted.
+    pub done: usize,
+    /// Programmes whose lock was busy and were left alone.
+    pub skipped: usize,
+}
+
+fn is_work_of(record: &ClaimRecord, session: &str) -> bool {
+    matches!(record, ClaimRecord::Parsed(c) if c.session == session && c.kind == Kind::Work)
+}
+
+/// Whether a session id is safe to use as one file name.
+fn is_file_name(session: &str) -> bool {
+    !session.is_empty()
+        && session
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// A programme's claim lock, held: the only way to write a claim.
@@ -498,6 +693,53 @@ impl SlugLock<'_> {
             }
             ClaimRecord::Unparsed { .. } => self.log(event, id, None, now),
         }
+    }
+
+    /// Moves this programme's `work` claims of `session` to `now`.
+    fn refresh_work(&self, session: &str, now: i64) -> Result<usize, ClaimError> {
+        let mut refreshed = 0;
+        for (id, record) in read_all(&self.dir)? {
+            if let ClaimRecord::Parsed(claim) = record {
+                if claim.session == session && claim.kind == Kind::Work {
+                    self.write(
+                        &id,
+                        &Claim {
+                            refreshed_at: now,
+                            ..claim
+                        },
+                    )?;
+                    self.log(Event::Refresh, &id, Some((session, Kind::Work)), now)?;
+                    refreshed += 1;
+                }
+            }
+        }
+        Ok(refreshed)
+    }
+
+    /// Deletes this programme's `work` claims of `session`; its `handoff`
+    /// claims stay.
+    fn remove_work(&self, session: &str, now: i64) -> Result<usize, ClaimError> {
+        let mut removed = 0;
+        for (id, record) in read_all(&self.dir)? {
+            if is_work_of(&record, session) {
+                self.remove(&id)?;
+                self.log_record(Event::Release, &id, &record, now)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Applies `ended/<session>` for every ended session: its `work` claims
+    /// here go, and the tombstone with them once no programme holds one.
+    fn apply_tombstones(&self, now: i64) -> Result<(), ClaimError> {
+        for session in self.store.ended_sessions()? {
+            self.remove_work(&session, now)?;
+            if !self.store.has_work_claim(&session)? {
+                self.store.forget_ended(&session)?;
+            }
+        }
+        Ok(())
     }
 
     /// Deletes the claims of closed tickets and the ones that no longer hold.

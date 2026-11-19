@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::analysis;
+use super::claim;
 use super::model::{MapDoc, Problem, Ticket, MAP_FILE};
 use super::parse::{parse_map, parse_ticket};
 
@@ -267,10 +268,42 @@ impl Programme {
         problems
     }
 
-    /// Where each ticket stands, reading the branches from git.
+    /// Where each ticket stands, reading the branches from git and the
+    /// claims from the state directory the environment names.
     pub fn standings(&self) -> Result<BTreeMap<String, analysis::Standing>, ProgrammeError> {
+        self.standings_with(claim::Store::from_environment().as_ref(), claim::now_unix())
+    }
+
+    /// [`Programme::standings`] reading claims from `claims` as of `now`.
+    /// Read-only: a claim store that cannot be read marks nothing held and
+    /// fails nothing, so a listing never goes blank over it.
+    pub fn standings_with(
+        &self,
+        claims: Option<&claim::Store>,
+        now: i64,
+    ) -> Result<BTreeMap<String, analysis::Standing>, ProgrammeError> {
         let working = branch_tips(&self.repo_dir, &self.slug)?;
-        Ok(analysis::standings(&self.tickets, &self.slug, &working))
+        let holds = claims
+            .and_then(|store| {
+                let key = self.claim_key().ok()?; // not a repository git can name: nothing was claimed under it
+                store.holds(&key, now).ok() // an unreadable claim store marks nothing held
+            })
+            .unwrap_or_default();
+        Ok(analysis::standings(
+            &self.tickets,
+            &self.slug,
+            &working,
+            &holds,
+        ))
+    }
+
+    /// The key that names this programme's claims.
+    pub fn claim_key(&self) -> Result<claim::ClaimKey, ProgrammeError> {
+        let common = git_common_dir(&self.repo_dir)?;
+        Ok(claim::ClaimKey {
+            repo_key: claim::repo_key(&common),
+            slug: self.slug.clone(),
+        })
     }
 }
 

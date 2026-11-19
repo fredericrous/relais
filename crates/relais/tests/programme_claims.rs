@@ -446,3 +446,111 @@ fn two_callers_from_exhausted_programmes_reserve_at_most_one_ticket_in_one_empty
         assert_eq!(held.len(), 1, "round {round}: {held:?}");
     }
 }
+
+fn programme_dir(world: &World, repo: &str, slug: &str) -> String {
+    world
+        .root
+        .join(repo)
+        .join("docs/programmes")
+        .join(slug)
+        .to_str()
+        .expect("utf8")
+        .to_string()
+}
+
+fn claimed_world(tag: &str) -> World {
+    let world = World::new(tag);
+    world.programme("alpha", "p", &[("t1", "afk", None), ("t2", "afk", None)]);
+    let claimed = world.claim("alpha", "p", "t1", "abcdef0123456789");
+    assert_eq!(claimed.status.code(), Some(0), "{}", text(&claimed.stderr));
+    world
+}
+
+#[test]
+fn frontier_leaves_a_claimed_ticket_out_and_all_shows_it_as_the_fifth_field() {
+    let world = claimed_world("frontier-text");
+    let dir = programme_dir(&world, "alpha", "p");
+
+    let ready = world.run(&["frontier", &dir, "--no-fetch"]);
+    assert_eq!(ready.status.code(), Some(0), "{}", text(&ready.stderr));
+    let ready = text(&ready.stdout);
+    assert!(ready.contains("t2\t") && !ready.contains("t1\t"), "{ready}");
+
+    let all = world.run(&["frontier", &dir, "--no-fetch", "--all"]);
+    let all = text(&all.stdout);
+    let rows: Vec<Vec<&str>> = all.lines().map(|line| line.split('\t').collect()).collect();
+    assert_eq!(rows.len(), 2, "{all}");
+    assert!(rows.iter().all(|row| row.len() == 5), "five fields: {all}");
+    let t1 = rows.iter().find(|row| row[0] == "t1").expect("t1");
+    assert_eq!(t1[4], "claimed abcdef01 0m", "{all}");
+    let t2 = rows.iter().find(|row| row[0] == "t2").expect("t2");
+    assert_eq!(t2[4], "", "{all}");
+}
+
+#[test]
+fn frontier_and_show_json_keep_in_flight_and_add_held_by() {
+    let world = claimed_world("frontier-json");
+    let dir = programme_dir(&world, "alpha", "p");
+
+    let all = world.run(&["frontier", &dir, "--no-fetch", "--all", "--json"]);
+    let rows: serde_json::Value = serde_json::from_slice(&all.stdout).expect("json");
+    let by_id = |id: &str| {
+        rows.as_array()
+            .expect("array")
+            .iter()
+            .find(|row| row["id"] == id)
+            .expect("row")
+            .clone()
+    };
+    assert_eq!(by_id("t1")["held_by"]["holder"], "claim");
+    assert_eq!(by_id("t1")["held_by"]["session"], "abcdef0123456789");
+    assert_eq!(by_id("t1")["held_by"]["kind"], "work");
+    assert!(by_id("t1")["branch"].is_null());
+    assert!(by_id("t2")["held_by"].is_null());
+
+    let show = world.run(&["show", &dir, "--no-fetch", "--json"]);
+    let shown: serde_json::Value = serde_json::from_slice(&show.stdout).expect("json");
+    assert_eq!(shown["counts"]["in_flight"], 1);
+    assert_eq!(shown["in_flight"][0]["id"], "t1");
+    assert_eq!(
+        shown["in_flight"][0]["held_by"]["session"],
+        "abcdef0123456789"
+    );
+
+    let text_out = text(&world.run(&["show", &dir, "--no-fetch"]).stdout);
+    assert!(
+        text_out.contains("In flight\n  t1 (t1): claimed abcdef01 0m\n"),
+        "{text_out}"
+    );
+}
+
+#[test]
+fn a_released_claim_lets_the_ticket_back_onto_the_frontier() {
+    let world = claimed_world("release");
+    let dir = world.root.join("alpha");
+    let released = world.run(&[
+        "release",
+        "p",
+        "t1",
+        "--dir",
+        dir.to_str().expect("utf8"),
+        "--session",
+        "abcdef0123456789",
+    ]);
+    assert_eq!(
+        released.status.code(),
+        Some(0),
+        "{}",
+        text(&released.stderr)
+    );
+    let ready = world.run(&[
+        "frontier",
+        &programme_dir(&world, "alpha", "p"),
+        "--no-fetch",
+    ]);
+    assert!(
+        text(&ready.stdout).contains("t1\t"),
+        "{}",
+        text(&ready.stdout)
+    );
+}

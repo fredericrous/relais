@@ -131,7 +131,29 @@ Resolution.
    the file may be absent on disk. Then run `relais programme frontier <dir>`. Take the
    ticket the person named, or the first frontier ticket. Done when one
    ticket id is chosen.
-2. **Start** the `worktree-task` skill on branch `prog/<slug>/<id>` in the
+2. **Claim** the ticket before any work. Run
+   `relais programme claim <slug> <id> --dir <map dir>` (the map's directory
+   `docs/programmes/<slug>`, since the current directory may be another
+   repository's worktree), and run it again at each commit on the ticket: it
+   refreshes the claim, which the session's end deletes. Read its exit status:
+   - 0: the ticket is yours; go on.
+   - 3: another live session holds it. Run
+     `relais programme next --from <repo>:<slug> --claim`, which reserves one
+     unheld ready ticket for a handoff and prints `<repo> <slug> <id>`. Then
+     run `relais programme claim <slug> <id> --dir <map dir>` on what it
+     names, and only after it exits 0 start any work: the reservation is a
+     handoff, not active work. If that claim exits 3 too, run
+     `relais programme release <slug> <id> --dir <map dir>` on the lost
+     reservation and select again, at most 3 selections in all, then park.
+   - 22 (from `next`): nothing is unheld and due. Park: end the answer with
+     `safe to /clear; parked: next due <date>`, with the date `next` printed,
+     and no `next:` prompt.
+   - any other non-zero exit: report the stderr line and stop. Print no
+     clear line, and do not switch ticket or programme on a configuration or
+     I/O failure.
+
+   Done when the claim exits 0.
+3. **Start** the `worktree-task` skill on branch `prog/<slug>/<id>` in the
    map's repository. The branch tells every other session that the ticket
    is in flight, and the skill's board check shows who else works nearby.
    The `prog/<slug>/<id>` branch is created in the map's repository even
@@ -140,7 +162,7 @@ Resolution.
    ticket up unresolved, delete its `prog/` branch locally and on origin.
    An in-flight ticket whose branch has not moved for days is worth asking
    the person about.
-3. **Resolve** the ticket by its type (the table above). Then:
+4. **Resolve** the ticket by its type (the table above). Then:
    - write its `## Resolution` and set `status = "closed"`;
    - add its line to Decisions so far;
    - turn fog that the answer made precise into new tickets, and remove it
@@ -148,8 +170,8 @@ Resolution.
    - rule out tickets past the destination: `status = "out-of-scope"`, a
      line under Out of scope, and their open dependents ruled out too or
      their `blocked_by` changed;
-   - file this session's follow-ups as `task` tickets (step 4).
-4. **Write the handoff**, without being asked, in the ticket's closing
+   - file this session's follow-ups as `task` tickets (step 5).
+5. **Write the handoff**, without being asked, in the ticket's closing
    commit, before the merge; never in memory or a file outside the
    repository. When the `worktree-task` skill is installed, follow its
    Handoff section. Otherwise:
@@ -164,7 +186,7 @@ Resolution.
    - replace the map's `## Handoff` section: date, what merged, the live
      state, what is next by ticket name, accepted gaps, and any steps left
      to the person.
-5. **Done** when `relais programme check <dir>` exits 0 and the pull
+6. **Done** when `relais programme check <dir>` exits 0 and the pull
    request has merged. Then, once nothing of this session is in flight (no
    uncommitted or unpushed work, no run or background task still going, no
    question unanswered, no worktree left to remove), end the answer with

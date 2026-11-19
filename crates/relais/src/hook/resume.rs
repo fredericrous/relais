@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 use chrono::NaiveDate;
 
 use super::respond::{Coverage, Gathered, SkipReason, GATHER_THREAD_NAME};
-use crate::programme::frontier::{self, due_mark, has_handoff, Ready, ReadyRow};
+use crate::programme::claim::{self, Store};
+use crate::programme::frontier::{
+    self, due_mark, format_age, has_handoff, short_session, Ready, ReadyRow,
+};
 use crate::programme::load::{self, main_checkout, Found, Source};
 use crate::programme::model::MAP_FILE;
 
@@ -48,12 +51,23 @@ pub const OUTSIDE_REPO_DEADLINE: Duration = Duration::from_millis(2500);
 /// When `cwd` is not inside a repository, the child repositories under it
 /// are read instead (see [`render_outside`]).
 pub fn gather(cwd: &Path) -> Result<Gathered, SkipReason> {
+    gather_with(cwd, Store::from_environment())
+}
+
+/// [`gather`] marking the tickets that `claims` holds. Reads claims and
+/// never writes one.
+pub fn gather_with(cwd: &Path, claims: Option<Store>) -> Result<Gathered, SkipReason> {
     let cutoff = Instant::now() + OUTSIDE_REPO_DEADLINE;
     let Ok(repo) = main_checkout(cwd) else {
-        return gather_outside(cwd, cutoff);
+        return gather_outside(cwd, cutoff, claims);
     };
     let listed = load::programmes_of(&repo).map_err(|_| SkipReason::Error)?;
-    let ready = frontier::ready(listed.found, listed.unreadable);
+    let ready = frontier::ready(
+        listed.found,
+        listed.unreadable,
+        claims.as_ref(),
+        claim::now_unix(),
+    );
     let today = chrono::Local::now().date_naive();
     render(
         &repo,
@@ -66,7 +80,11 @@ pub fn gather(cwd: &Path) -> Result<Gathered, SkipReason> {
     .ok_or(SkipReason::Nothing)
 }
 
-fn gather_outside(root: &Path, cutoff: Instant) -> Result<Gathered, SkipReason> {
+fn gather_outside(
+    root: &Path,
+    cutoff: Instant,
+    claims: Option<Store>,
+) -> Result<Gathered, SkipReason> {
     let repos = load::repositories_with_programmes(root).map_err(|_| SkipReason::Error)?;
     if repos.is_empty() {
         // Child checkouts that hold no programme say nothing; no checkout at
@@ -78,7 +96,11 @@ fn gather_outside(root: &Path, cutoff: Instant) -> Result<Gathered, SkipReason> 
             SkipReason::Nothing
         });
     }
-    let collected = collect_within(repos, read_repository, cutoff);
+    let collected = collect_within(
+        repos,
+        move |repo| read_repository(repo, claims.as_ref()),
+        cutoff,
+    );
     let today = chrono::Local::now().date_naive();
     let text = render_outside(root, &collected, today)?;
     Ok(Gathered {
@@ -112,7 +134,7 @@ pub(crate) struct LatestHandoff {
 }
 
 /// Why the programmes of `repo` could not be read.
-fn read_repository(repo: &Path) -> Result<RepoReading, String> {
+fn read_repository(repo: &Path, claims: Option<&Store>) -> Result<RepoReading, String> {
     let listed = load::programmes_of(repo).map_err(|error| error.to_string())?;
     let mut handoffs = BTreeSet::new();
     let mut latest_handoff: Option<LatestHandoff> = None;
@@ -131,7 +153,7 @@ fn read_repository(repo: &Path) -> Result<RepoReading, String> {
     }
     Ok(RepoReading {
         repo: repo.to_path_buf(),
-        ready: frontier::ready(listed.found, listed.unreadable),
+        ready: frontier::ready(listed.found, listed.unreadable, claims, claim::now_unix()),
         handoffs,
         latest_handoff,
     })
@@ -235,50 +257,65 @@ pub(crate) fn render_outside(
         .filter(|reading| !reading.ready.rows.is_empty())
         .collect();
     with_ready.sort_by_key(|reading| {
-        let soonest = reading.ready.rows.iter().filter_map(|row| row.due).min();
+        let soonest = unheld_rows(&reading.ready).filter_map(|row| row.due).min();
         (
             soonest.is_none(),
             soonest,
-            std::cmp::Reverse(reading.ready.rows.len()),
+            std::cmp::Reverse(reading.ready.unheld_count()),
             repo_name(&reading.repo),
         )
     });
-    let latest = collected
+    // The expanded repository has the most unheld ready tickets; among
+    // those, the latest `## Handoff` wins, a known time over an unknown one.
+    let most_unheld = collected
         .read
         .iter()
-        .filter_map(|reading| {
-            reading
-                .latest_handoff
-                .as_ref()
-                .map(|latest| (reading, latest))
-        })
-        .fold(
-            None::<(&RepoReading, &LatestHandoff)>,
-            |best, candidate| match best {
-                Some((_, held)) if held.at >= candidate.1.at => best,
-                _ => Some(candidate),
-            },
-        );
-    let (expanded, label, pinned) = match (latest, with_ready.first()) {
-        (Some((reading, handoff)), _) => (
-            reading,
-            "latest ## Handoff among those read",
-            reading
-                .ready
-                .found
-                .iter()
-                .find(|found| found.slug == handoff.slug),
-        ),
-        (None, Some(first)) => (*first, "no repository has a ## Handoff", None),
-        (None, None) => return Err(SkipReason::Nothing),
+        .map(|reading| reading.ready.unheld_count())
+        .max()
+        .unwrap_or(0);
+    let handoff_rank =
+        |reading: &RepoReading| (reading.latest_handoff.is_some(), handoff_time(reading));
+    let expanded_choice = with_ready
+        .iter()
+        .copied()
+        .chain(collected.read.iter().filter(|r| r.ready.rows.is_empty()))
+        .filter(|reading| reading.ready.unheld_count() == most_unheld)
+        .filter(|reading| most_unheld > 0 || reading.latest_handoff.is_some())
+        .fold(None::<&RepoReading>, |best, candidate| match best {
+            Some(held) if handoff_rank(held) >= handoff_rank(candidate) => best,
+            _ => Some(candidate),
+        });
+    let first_with_ready = with_ready.first().copied();
+    let (expanded, label, pinned) = match expanded_choice.or(first_with_ready) {
+        Some(reading) => {
+            let handoff = reading.latest_handoff.as_ref();
+            (
+                reading,
+                if handoff.is_some() {
+                    "latest ## Handoff among those read"
+                } else {
+                    "no repository has a ## Handoff"
+                },
+                handoff.and_then(|handoff| {
+                    reading
+                        .ready
+                        .found
+                        .iter()
+                        .find(|found| found.slug == handoff.slug)
+                }),
+            )
+        }
+        None => return Err(SkipReason::Nothing),
     };
     let quoted_root = shell_quote(&printable(&root.display().to_string()));
 
     let mut text = String::new();
     if !with_ready.is_empty() {
-        let total: usize = with_ready.iter().map(|r| r.ready.rows.len()).sum();
+        let total: usize = with_ready.iter().map(|r| r.ready.unheld_count()).sum();
+        let held: usize = with_ready.iter().map(|r| r.ready.held_count()).sum();
         text.push_str(&format!(
-            "relais/programmes: {total} ready in {} under {quoted_root} (not a repository):\n",
+            "relais/programmes: {total} ready{} in {} under {quoted_root} (not a repository):\n",
+            held_count_suffix(held),
             plural(with_ready.len(), "repository", "repositories"),
         ));
         for reading in with_ready.iter().take(TICKET_LINE_CAP) {
@@ -328,17 +365,38 @@ pub(crate) fn render_outside(
     Ok(text)
 }
 
+/// The time a repository's latest `## Handoff` was written; `None` ranks
+/// below every known time.
+fn handoff_time(reading: &RepoReading) -> Option<i64> {
+    reading.latest_handoff.as_ref().and_then(|latest| latest.at)
+}
+
+fn unheld_rows(ready: &Ready) -> impl Iterator<Item = &ReadyRow> {
+    ready.rows.iter().filter(|row| row.held.is_none())
+}
+
+/// `, 2 held` after a ready count, nothing when no ticket is held.
+fn held_count_suffix(held: usize) -> String {
+    if held == 0 {
+        String::new()
+    } else {
+        format!(", {held} held")
+    }
+}
+
 fn summary_line(reading: &RepoReading) -> String {
-    let rows = &reading.ready.rows;
-    let dated: Vec<NaiveDate> = rows.iter().filter_map(|row| row.due).collect();
+    let dated: Vec<NaiveDate> = unheld_rows(&reading.ready)
+        .filter_map(|row| row.due)
+        .collect();
     let due = match dated.iter().min() {
         Some(first) => format!(", {} due (first {first})", dated.len()),
         None => String::new(),
     };
     format!(
-        "- {}: {} ready{due}; cd {}\n",
+        "- {}: {} ready{}{due}; cd {}\n",
         repo_name(&reading.repo),
-        rows.len(),
+        reading.ready.unheld_count(),
+        held_count_suffix(reading.ready.held_count()),
         shell_quote(&printable(&reading.repo.display().to_string()))
     )
 }
@@ -381,8 +439,9 @@ pub fn render(
         return None;
     }
     let mut text = format!(
-        "relais/programmes: {} ready in {}",
-        ready.rows.len(),
+        "relais/programmes: {} ready{} in {}",
+        ready.unheld_count(),
+        held_count_suffix(ready.held_count()),
         printable(&repo.display().to_string())
     );
     if let Some(first) = ready.unreadable.first() {
@@ -399,14 +458,19 @@ pub fn render(
     }
     text.push_str(":\n");
 
-    let (shown, hidden) = ready.rows.split_at(ready.rows.len().min(TICKET_LINE_CAP));
+    // Held rows come after unheld ones, before the cap is applied; the sort
+    // is stable, so each group keeps the frontier's order.
+    let mut ordered: Vec<&ReadyRow> = ready.rows.iter().collect();
+    ordered.sort_by_key(|row| row.held.is_some());
+    let (shown, hidden) = ordered.split_at(ordered.len().min(TICKET_LINE_CAP));
     for row in shown {
         text.push_str(&format!(
-            "- {} {}: {}{}\n",
+            "- {} {}: {}{}{}\n",
             row.slug,
             row.id,
             due_mark(row.due, today),
-            cut_name(&row.name)
+            cut_name(&row.name),
+            held_mark(row)
         ));
     }
     if !hidden.is_empty() {
@@ -459,13 +523,26 @@ pub fn render(
 
 /// The programmes with a shown ticket, in order of first appearance, each
 /// with the id of its first shown ticket.
-fn programmes_shown(shown: &[ReadyRow]) -> Vec<(usize, String)> {
+fn programmes_shown(shown: &[&ReadyRow]) -> Vec<(usize, String)> {
     let mut seen = BTreeSet::new();
     shown
         .iter()
         .filter(|row| seen.insert(row.programme))
         .map(|row| (row.programme, row.id.clone()))
         .collect()
+}
+
+/// ` (held by <s8>, <age>)` after the (possibly cut) name, so the mark is
+/// never cut; nothing for an unheld row.
+fn held_mark(row: &ReadyRow) -> String {
+    match &row.held {
+        Some(held) => format!(
+            " (held by {}, {})",
+            printable(&short_session(&held.session)),
+            format_age(held.age_secs)
+        ),
+        None => String::new(),
+    }
 }
 
 fn cut_name(name: &str) -> String {
@@ -531,6 +608,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::programme::frontier::HeldBy;
 
     /// A programme directory as `Found::dir` builds it: the checkout joined
     /// with the one relative `docs/programmes/<slug>`, so on Windows only the
@@ -564,6 +642,18 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             due,
+            held: None,
+        }
+    }
+
+    fn held_row(id: &str, session: &str, age_secs: u64) -> ReadyRow {
+        ReadyRow {
+            held: Some(HeldBy {
+                session: session.to_string(),
+                kind: claim::Kind::Work,
+                age_secs,
+            }),
+            ..row(0, "prog", id, "Held name", None)
         }
     }
 
@@ -1196,6 +1286,100 @@ mod tests {
         let first_pointer = pinned.split("handoff:\n").nth(1).expect("pointers");
         assert!(first_pointer.starts_with("- p1: "), "{pinned}");
         assert!(first_pointer.contains("- p0: "), "{pinned}");
+    }
+
+    #[test]
+    fn a_held_row_carries_its_mark_after_the_cut_name_and_sorts_after_unheld_rows() {
+        let long = "x".repeat(NAME_CAP + 5);
+        let mut held = held_row("h1", "0123456789abcdef", 7_300);
+        held.name = long.clone();
+        let rows = vec![
+            held,
+            row(0, "prog", "u1", "Open one", None),
+            held_row("h2", "", 90),
+        ];
+        let ready = ready_of(vec![found("prog", Source::WorkingTree)], rows);
+        let text = render_of(&ready, false);
+        assert!(
+            text.starts_with("relais/programmes: 1 ready, 2 held in /work/repo:\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "- prog h1: {}… (held by 01234567, 2h)\n",
+                "x".repeat(NAME_CAP)
+            )),
+            "the mark follows the cut name: {text}"
+        );
+        assert!(
+            text.contains("- prog h2: Held name (held by unreadable, 1m)\n"),
+            "{text}"
+        );
+        let order: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("- prog "))
+            .filter_map(|line| line.split(':').next())
+            .collect();
+        assert_eq!(&order[..3], ["u1", "h1", "h2"], "{text}");
+    }
+
+    #[test]
+    fn held_rows_fall_past_the_cap_before_unheld_ones_do() {
+        let mut rows: Vec<ReadyRow> = (0..3).map(|n| held_row(&format!("h{n}"), "s", 0)).collect();
+        rows.extend((0..TICKET_LINE_CAP).map(|n| row(0, "prog", &format!("u{n}"), "Open", None)));
+        let ready = ready_of(vec![found("prog", Source::WorkingTree)], rows);
+        let text = render_of(&ready, false);
+        assert!(text.contains("- prog u7: Open\n"), "{text}");
+        assert!(
+            !text.contains("- prog h0:"),
+            "held rows are the hidden ones: {text}"
+        );
+        assert!(text.contains("- … and 3 more ready"), "{text}");
+    }
+
+    #[test]
+    fn at_a_projects_root_the_repository_with_the_most_unheld_ready_is_expanded() {
+        // `busy` has the latest Handoff and the most rows, but all held but one.
+        let mut busy_rows = rows_of(1, None);
+        busy_rows.extend((0..4).map(|n| held_row(&format!("h{n}"), "s1", 0)));
+        let collected = collected_of(
+            vec![
+                reading("busy", busy_rows, Some(900)),
+                reading("free", rows_of(3, None), Some(100)),
+                reading("also_free", rows_of(3, None), Some(500)),
+            ],
+            &[],
+        );
+        let text = outside(&collected).expect("text");
+        assert!(
+            text.contains("expanded: also_free (latest ## Handoff"),
+            "most unheld first, then the latest Handoff: {text}"
+        );
+        assert!(
+            text.contains("- busy: 1 ready, 4 held; cd /root/busy\n"),
+            "{text}"
+        );
+        assert!(
+            text.starts_with(
+                "relais/programmes: 7 ready, 4 held in 3 repositories under /root (not a repository):\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn rendering_held_tickets_writes_no_claim_file() {
+        let state = crate::test_support::short_temp_dir("resume-readonly");
+        let before = std::fs::read_dir(&state).expect("state dir").count();
+        let ready = ready_of(
+            vec![found("prog", Source::WorkingTree)],
+            vec![held_row("h", "s1", 0)],
+        );
+        render_of(&ready, true);
+        assert_eq!(
+            std::fs::read_dir(&state).expect("state dir").count(),
+            before
+        );
     }
 
     #[test]

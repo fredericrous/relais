@@ -9,9 +9,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
-use relais::programme::analysis::{self, age_secs, Counts, Standing};
+use relais::programme::analysis::{self, age_secs, Counts, Holder, Standing};
 use relais::programme::claim;
-use relais::programme::frontier::{due_mark, is_overdue, is_ready, order_frontier};
+use relais::programme::frontier::{
+    due_mark, format_age, is_overdue, is_ready, order_frontier, short_session,
+};
 use relais::programme::load::{self, main_checkout, Found, Programme, ProgrammeError, Source};
 use relais::programme::model::Ticket;
 use serde_json::{json, Value};
@@ -144,10 +146,51 @@ fn fit_name(name: &str, prefix_width: usize, width: Option<usize>) -> String {
     format!("{kept}…")
 }
 
-/// A branch tip as `frontier --all` and `show` print it.
+/// What holds a ticket, and for how long, as `frontier --all` and `show`
+/// print it.
 struct Tip<'a> {
-    branch: &'a str,
+    holder: &'a Holder,
     age_secs: u64,
+}
+
+impl Tip<'_> {
+    /// `in-flight <branch> <age>` or `claimed <s8> <age>`.
+    fn label(&self) -> String {
+        let age = format_age(self.age_secs);
+        match self.holder {
+            Holder::Branch { branch, .. } => format!("in-flight {branch} {age}"),
+            Holder::Claim(hold) => format!("claimed {} {age}", short_session(&hold.session)),
+        }
+    }
+
+    /// `<branch> <age>` or `claimed <s8> <age>`, as `show` lists it.
+    fn holder_text(&self) -> String {
+        let age = format_age(self.age_secs);
+        match self.holder {
+            Holder::Branch { branch, .. } => format!("{branch} {age}"),
+            Holder::Claim(hold) => format!("claimed {} {age}", short_session(&hold.session)),
+        }
+    }
+
+    /// The holder as `held_by` in JSON: `null` when nothing holds the ticket.
+    fn json(tip: Option<&Self>) -> Value {
+        match tip {
+            None => Value::Null,
+            Some(Tip {
+                holder: Holder::Branch { branch, .. },
+                age_secs,
+            }) => json!({"holder": "branch", "branch": branch, "age_secs": age_secs}),
+            Some(Tip {
+                holder: Holder::Claim(hold),
+                age_secs,
+            }) => json!({
+                "holder": "claim",
+                "session": hold.session,
+                "kind": hold.kind.as_str(),
+                "age_secs": age_secs,
+            }),
+        }
+    }
 }
 
 fn now_unix() -> i64 {
@@ -160,23 +203,16 @@ fn now_unix() -> i64 {
 
 fn tip_of(standing: &Standing, now_unix: i64) -> Option<Tip<'_>> {
     match standing {
-        Standing::InFlight {
-            branch,
-            last_commit_unix,
-        } => Some(Tip {
-            branch,
-            age_secs: age_secs(now_unix, *last_commit_unix),
+        Standing::InFlight { holder } => Some(Tip {
+            holder,
+            age_secs: match holder {
+                Holder::Branch {
+                    last_commit_unix, ..
+                } => age_secs(now_unix, *last_commit_unix),
+                Holder::Claim(hold) => age_secs(now_unix, hold.since),
+            },
         }),
         Standing::Frontier | Standing::Blocked(_) | Standing::Closed | Standing::OutOfScope => None,
-    }
-}
-
-/// `5m`, `3h` or `2d`: the largest whole unit.
-fn format_age(secs: u64) -> String {
-    match secs {
-        0..=3599 => format!("{}m", secs / 60),
-        3600..=86399 => format!("{}h", secs / 3600),
-        _ => format!("{}d", secs / 86400),
     }
 }
 
@@ -200,8 +236,15 @@ fn ticket_json(
         "mode": ticket.mode.as_str(),
         "repos": programme.repos_of(ticket),
         "name": ticket.name,
-        "branch": tip.map(|t| t.branch),
-        "branch_age_secs": tip.map(|t| t.age_secs),
+        "branch": tip.and_then(|t| match t.holder {
+            Holder::Branch { branch, .. } => Some(branch.as_str()),
+            Holder::Claim(_) => None,
+        }),
+        "branch_age_secs": tip.and_then(|t| match t.holder {
+            Holder::Branch { .. } => Some(t.age_secs),
+            Holder::Claim(_) => None,
+        }),
+        "held_by": Tip::json(tip),
         "due": ticket.due.map(|date| date.to_string()),
         "overdue": ticket.due.map(|date| is_overdue(date, today)),
     })
@@ -278,9 +321,7 @@ pub(crate) fn frontier_command(
                 // Under --all every line has five fields: a ready ticket's
                 // fifth is empty, so `cut` and `awk` see one shape.
                 let label = match (tip, listing) {
-                    (Some(t), _) => {
-                        format!("\tin-flight {} {}", t.branch, format_age(t.age_secs))
-                    }
+                    (Some(t), _) => format!("\t{}", t.label()),
                     (None, Listing::WithInFlight) => "\t".to_string(),
                     (None, Listing::ReadyOnly) => String::new(),
                 };
@@ -331,8 +372,16 @@ pub(crate) fn show_command(
                     "id": t.id, "name": t.name, "blocked_by": by,
                 })).collect::<Vec<_>>(),
                 "in_flight": in_flight.iter().map(|(t, tip)| json!({
-                    "id": t.id, "name": t.name, "branch": tip.branch,
-                    "branch_age_secs": tip.age_secs,
+                    "id": t.id, "name": t.name,
+                    "branch": match tip.holder {
+                        Holder::Branch { branch, .. } => Some(branch.as_str()),
+                        Holder::Claim(_) => None,
+                    },
+                    "branch_age_secs": match tip.holder {
+                        Holder::Branch { .. } => Some(tip.age_secs),
+                        Holder::Claim(_) => None,
+                    },
+                    "held_by": Tip::json(Some(tip)),
                 })).collect::<Vec<_>>(),
             })
         ),
@@ -366,11 +415,10 @@ pub(crate) fn show_command(
                 text.push_str("\nIn flight\n");
                 for (ticket, tip) in &in_flight {
                     text.push_str(&format!(
-                        "  {} ({}): {} {}\n",
+                        "  {} ({}): {}\n",
                         ticket.name,
                         ticket.id,
-                        tip.branch,
-                        format_age(tip.age_secs)
+                        tip.holder_text()
                     ));
                 }
             }
@@ -747,7 +795,14 @@ fn programme_state(found: &Found) -> Result<claim::ProgrammeState, CliError> {
         closed: ids_where(|status| status != Status::Open),
         branch_held: standings
             .iter()
-            .filter(|(_, standing)| matches!(standing, Standing::InFlight { .. }))
+            .filter(|(_, standing)| {
+                matches!(
+                    standing,
+                    Standing::InFlight {
+                        holder: Holder::Branch { .. }
+                    }
+                )
+            })
             .map(|(id, _)| id.clone())
             .collect(),
     })
@@ -789,6 +844,7 @@ pub(crate) fn claim_command(
     }
     let store = claim_store()?;
     let now = now_unix();
+    store.forget_ended(&session).map_err(claim_io)?;
     let retry = format!(
         "relais programme claim {slug} {id}{}{}",
         dir.map_or_else(String::new, |d| format!(" --dir {}", d.display())),
@@ -900,6 +956,9 @@ pub(crate) fn next_command(
     };
     let store = claim_store()?;
     let now = now_unix();
+    if let Some(session) = &session {
+        store.forget_ended(session).map_err(claim_io)?;
+    }
     let today = chrono::Local::now().date_naive();
     let all = load::repositories(&root).map_err(programme_error)?;
     let holds = par_map(&all, |repo| load::may_hold_programmes(repo));
@@ -1068,14 +1127,6 @@ mod tests {
             due_mark(Some(day(2026, 11, 13)), today),
             "[due 2026-11-13] "
         );
-    }
-
-    #[test]
-    fn an_age_is_written_in_its_largest_whole_unit() {
-        assert_eq!(format_age(0), "0m");
-        assert_eq!(format_age(300), "5m");
-        assert_eq!(format_age(10_800), "3h");
-        assert_eq!(format_age(2 * 86_400 + 5), "2d");
     }
 
     #[test]

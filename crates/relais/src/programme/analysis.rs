@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::claim::Hold;
 use super::model::{MapDoc, Mode, Problem, Status, Ticket, MAP_FILE};
 
 /// Where a ticket stands against the others and the branches.
@@ -13,13 +14,25 @@ pub enum Standing {
     Frontier,
     /// Open, and these tickets (not closed, or not there) block it.
     Blocked(Vec<String>),
-    /// Open, and this branch works it; its tip was committed at that Unix time.
+    /// Open, and a branch or a live claim holds it.
     InFlight {
-        branch: String,
-        last_commit_unix: i64,
+        holder: Holder,
     },
     Closed,
     OutOfScope,
+}
+
+/// What holds an in-flight ticket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Holder {
+    /// A `prog/<slug>/<id>` branch works it; its tip was committed at that
+    /// Unix time.
+    Branch {
+        branch: String,
+        last_commit_unix: i64,
+    },
+    /// A live claim file holds it.
+    Claim(Hold),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -44,12 +57,15 @@ pub fn age_secs(now_unix: i64, last_commit_unix: i64) -> u64 {
 
 /// Every ticket's standing. `working` maps the ids that a
 /// `prog/<slug>/<id>` branch works to the latest committer date (Unix
-/// seconds) among that branch's local and `origin` refs; a branch wins over blockers because it
-/// is the stronger fact about the ticket.
+/// seconds) among that branch's local and `origin` refs; `claims` maps the
+/// ids that a live claim holds. Both arrive as values, read by the caller.
+/// A branch wins over a claim, and either wins over blockers, because it is
+/// the stronger fact about the ticket.
 pub fn standings(
     tickets: &BTreeMap<String, Ticket>,
     slug: &str,
     working: &BTreeMap<String, i64>,
+    claims: &BTreeMap<String, Hold>,
 ) -> BTreeMap<String, Standing> {
     tickets
         .values()
@@ -58,8 +74,13 @@ pub fn standings(
                 Status::Closed => Standing::Closed,
                 Status::OutOfScope => Standing::OutOfScope,
                 Status::Open if working.contains_key(&ticket.id) => Standing::InFlight {
-                    branch: branch_name(slug, &ticket.id),
-                    last_commit_unix: working[&ticket.id],
+                    holder: Holder::Branch {
+                        branch: branch_name(slug, &ticket.id),
+                        last_commit_unix: working[&ticket.id],
+                    },
+                },
+                Status::Open if claims.contains_key(&ticket.id) => Standing::InFlight {
+                    holder: Holder::Claim(claims[&ticket.id].clone()),
                 },
                 Status::Open => {
                     let blockers: Vec<String> = ticket
@@ -285,6 +306,7 @@ fn members_of_cycle_through<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::programme::claim::Kind;
     use crate::programme::model::{Mode, TicketType};
 
     fn ticket(id: &str, status: Status, blocked_by: &[&str]) -> Ticket {
@@ -323,20 +345,55 @@ mod tests {
             ticket("E", Status::OutOfScope, &[]),
         ]);
         let working = BTreeMap::from([("D".to_string(), 1_000)]);
-        let all = standings(&tickets, "demo", &working);
-        assert_eq!(all["B"], Standing::Frontier);
+        let claims = BTreeMap::from([
+            (
+                "B".to_string(),
+                Hold {
+                    session: "s1".to_string(),
+                    kind: Kind::Work,
+                    since: 5,
+                },
+            ),
+            (
+                "D".to_string(),
+                Hold {
+                    session: "s2".to_string(),
+                    kind: Kind::Handoff,
+                    since: 6,
+                },
+            ),
+            (
+                "A".to_string(),
+                Hold {
+                    session: "s3".to_string(),
+                    kind: Kind::Work,
+                    since: 7,
+                },
+            ),
+        ]);
+        let all = standings(&tickets, "demo", &working, &claims);
+        assert_eq!(
+            all["B"],
+            Standing::InFlight {
+                holder: Holder::Claim(claims["B"].clone())
+            }
+        );
         assert_eq!(all["C"], Standing::Blocked(vec!["D".to_string()]));
         assert_eq!(
             all["D"],
             Standing::InFlight {
-                branch: "prog/demo/D".to_string(),
-                last_commit_unix: 1_000
-            }
+                holder: Holder::Branch {
+                    branch: "prog/demo/D".to_string(),
+                    last_commit_unix: 1_000
+                }
+            },
+            "a branch wins over a claim"
         );
+        assert_eq!(all["A"], Standing::Closed, "a closed ticket keeps no claim");
         let total = counts(&all);
         assert_eq!(
             (total.open, total.frontier, total.blocked, total.in_flight),
-            (3, 1, 1, 1)
+            (3, 0, 1, 2)
         );
     }
 
