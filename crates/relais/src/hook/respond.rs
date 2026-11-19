@@ -70,8 +70,34 @@ impl SkipReason {
     }
 }
 
+/// Why a gatherer answered with no context: the reason, and for
+/// [`SkipReason::Error`], the text of what failed, which the journal keeps
+/// as `gather_error`. The text travels beside the reason so that the reason
+/// stays `Copy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skip {
+    pub why: SkipReason,
+    pub error: Option<String>,
+}
+
+impl Skip {
+    /// A [`SkipReason::Error`] carrying what failed.
+    pub fn error(text: impl Into<String>) -> Self {
+        Skip {
+            why: SkipReason::Error,
+            error: Some(text.into()),
+        }
+    }
+}
+
+impl From<SkipReason> for Skip {
+    fn from(why: SkipReason) -> Self {
+        Skip { why, error: None }
+    }
+}
+
 /// The record of one gather, for the journal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Gather {
     /// This event never asks: only a fresh session start does.
     NotAsked,
@@ -83,6 +109,8 @@ pub enum Gather {
     },
     Skipped {
         why: SkipReason,
+        /// What failed, for [`SkipReason::Error`]; `None` otherwise.
+        error: Option<String>,
         elapsed: Duration,
     },
 }
@@ -137,7 +165,7 @@ pub fn silence_gather_panics() {
 /// [`silence_gather_panics`] for keeping stderr clean.
 fn gather_within<G>(gatherer: G, cwd: &Path, deadline: Duration) -> (Option<String>, Gather)
 where
-    G: FnOnce(&Path) -> Result<Gathered, SkipReason> + Send + 'static,
+    G: FnOnce(&Path) -> Result<Gathered, Skip> + Send + 'static,
 {
     let started = Instant::now();
     let (sender, receiver) = mpsc::channel();
@@ -147,20 +175,21 @@ where
         .spawn(move || {
             let outcome =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gatherer(&directory)))
-                    .unwrap_or(Err(SkipReason::Failed));
+                    .unwrap_or(Err(SkipReason::Failed.into()));
             let _ = sender.send(outcome); // the receiver is gone once the deadline passed
         });
-    let skipped = |why| {
+    let skipped = |skip: Skip| {
         (
             None,
             Gather::Skipped {
-                why,
+                why: skip.why,
+                error: skip.error,
                 elapsed: started.elapsed(),
             },
         )
     };
     if spawned.is_err() {
-        return skipped(SkipReason::Failed);
+        return skipped(SkipReason::Failed.into());
     }
     match receiver.recv_timeout(deadline) {
         Ok(Ok(gathered)) => (
@@ -171,8 +200,8 @@ where
             },
         ),
         Ok(Err(why)) => skipped(why),
-        Err(mpsc::RecvTimeoutError::Timeout) => skipped(SkipReason::Deadline),
-        Err(mpsc::RecvTimeoutError::Disconnected) => skipped(SkipReason::Failed),
+        Err(mpsc::RecvTimeoutError::Timeout) => skipped(SkipReason::Deadline.into()),
+        Err(mpsc::RecvTimeoutError::Disconnected) => skipped(SkipReason::Failed.into()),
     }
 }
 
@@ -214,7 +243,7 @@ pub fn handle_with<G>(
     claims: Option<&claim::Store>,
 ) -> Handled
 where
-    G: FnOnce(&Path) -> Result<Gathered, SkipReason> + Send + 'static,
+    G: FnOnce(&Path) -> Result<Gathered, Skip> + Send + 'static,
 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         handle_inner(payload, settings, gate, gatherer, deadline, claims)
@@ -237,7 +266,7 @@ fn handle_inner<G>(
     claims: Option<&claim::Store>,
 ) -> Handled
 where
-    G: FnOnce(&Path) -> Result<Gathered, SkipReason> + Send + 'static,
+    G: FnOnce(&Path) -> Result<Gathered, Skip> + Send + 'static,
 {
     let event = event::parse(payload);
     if let HookEvent::SessionStart(start) = &event {
@@ -644,6 +673,10 @@ pub fn journal_entry(payload: &[u8], handled: &Handled) -> serde_json::Value {
                 ..
             } => Some(format!("read {}, unread {}", coverage.read, coverage.unread)),
             Gather::NotAsked | Gather::Context { .. } | Gather::Skipped { .. } => None,
+        },
+        "gather_error": match &handled.gather {
+            Gather::Skipped { error, .. } => error.clone(),
+            Gather::NotAsked | Gather::Context { .. } => None,
         },
     })
 }
@@ -2283,25 +2316,25 @@ mod tests {
         .into_bytes()
     }
 
-    fn two_tickets(_: &Path) -> Result<Gathered, SkipReason> {
+    fn two_tickets(_: &Path) -> Result<Gathered, Skip> {
         Ok("relais/programmes: 2 ready".to_string().into())
     }
 
-    fn nothing(_: &Path) -> Result<Gathered, SkipReason> {
-        Err(SkipReason::Nothing)
+    fn nothing(_: &Path) -> Result<Gathered, Skip> {
+        Err(SkipReason::Nothing.into())
     }
 
-    fn unreadable(_: &Path) -> Result<Gathered, SkipReason> {
-        Err(SkipReason::Error)
+    fn unreadable(_: &Path) -> Result<Gathered, Skip> {
+        Err(Skip::error("cannot read /repo/docs/programmes: denied"))
     }
 
-    fn panics(_: &Path) -> Result<Gathered, SkipReason> {
+    fn panics(_: &Path) -> Result<Gathered, Skip> {
         panic!("a gatherer that dies");
     }
 
     fn start_with<G>(source: &str, gatherer: G, deadline: Duration) -> Handled
     where
-        G: FnOnce(&Path) -> Result<Gathered, SkipReason> + Send + 'static,
+        G: FnOnce(&Path) -> Result<Gathered, Skip> + Send + 'static,
     {
         handle_with(
             &start_payload(source),
@@ -2332,7 +2365,7 @@ mod tests {
 
     #[test]
     fn the_journal_records_how_many_repositories_were_read_and_left_unread() {
-        fn covering(_: &Path) -> Result<Gathered, SkipReason> {
+        fn covering(_: &Path) -> Result<Gathered, Skip> {
             Ok(Gathered {
                 text: "relais/programmes: 1 ready".into(),
                 coverage: Some(Coverage { read: 5, unread: 1 }),
@@ -2348,7 +2381,7 @@ mod tests {
 
     #[test]
     fn a_session_that_keeps_its_conversation_never_asks_the_gatherer() {
-        fn must_not_run(_: &Path) -> Result<Gathered, SkipReason> {
+        fn must_not_run(_: &Path) -> Result<Gathered, Skip> {
             panic!("asked for a session that keeps its conversation");
         }
         for source in ["resume", "compact", "fork"] {
@@ -2399,16 +2432,22 @@ mod tests {
         assert_eq!(handled.answer, HookAnswer::Silent);
         let entry = journal_entry(&start_payload("startup"), &handled);
         assert_eq!(entry["outcome"], "skipped(nothing)");
+        assert!(entry["gather_error"].is_null(), "{entry}");
 
         let handled = start_with("startup", unreadable, Duration::from_secs(5));
         assert_eq!(handled.answer, HookAnswer::Silent);
         let entry = journal_entry(&start_payload("startup"), &handled);
         assert_eq!(entry["outcome"], "skipped(error)");
+        assert_eq!(
+            entry["gather_error"], "cannot read /repo/docs/programmes: denied",
+            "{entry}"
+        );
 
         let handled = start_with("startup", panics, Duration::from_secs(5));
         assert_eq!(handled.answer, HookAnswer::Silent);
         let entry = journal_entry(&start_payload("startup"), &handled);
         assert_eq!(entry["outcome"], "skipped(failed)");
+        assert!(entry["gather_error"].is_null(), "{entry}");
     }
 
     mod claims {
@@ -2433,7 +2472,7 @@ mod tests {
         }
 
         fn run(payload: &[u8], store: &Store) -> Handled {
-            fn must_not_run(_: &Path) -> Result<Gathered, SkipReason> {
+            fn must_not_run(_: &Path) -> Result<Gathered, Skip> {
                 panic!("asked for a session that keeps its conversation");
             }
             handle_with(
