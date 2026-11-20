@@ -395,7 +395,7 @@ fn text_mode_with_an_unreadable_map_prints_the_answer_line_and_exits_1() {
     assert!(
         stderr.contains("next: fix the map at ")
             && stderr.contains("/docs/programmes/p")
-            && stderr.contains("relais programme release p t2"),
+            && stderr.contains("relais programme release p t2 --session sess-own"),
         "{stderr}"
     );
 }
@@ -436,4 +436,21 @@ fn rewrite_timestamps(dir: &Path, seconds: i64) {
             std::fs::write(&path, rewritten.join("\n") + "\n").expect("rewritten");
         }
     }
+}
+
+#[test]
+fn text_mode_with_a_gone_repository_names_a_checkout_for_both_choices() {
+    let world = World::new("text-gone");
+    world.claim("t2", "sess-own");
+    let gone = world.root.join("moved-away");
+    std::fs::rename(world.repo(), &gone).expect("moved");
+    let out = world.session(&["--session", "sess-own"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "p t2 (work)\n");
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains("the repository is gone"), "{stderr}");
+    assert!(
+        stderr.contains("next: rerun with --dir <a checkout of alpha>, or relais programme release p t2 --session sess-own --dir <a checkout of alpha>"),
+        "{stderr}"
+    );
 }

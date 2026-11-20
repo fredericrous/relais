@@ -278,7 +278,8 @@ const OUTPUT_FLOOR = 8
 // row under it always stay.
 // The programme's current row and the tail's header row always stay too: the
 // runs give up rows for them, the `↑ N rows above` row first, then their plain
-// rows from the top, the agent Buttons last.
+// rows from the top (a frame's head and output included), the agent Buttons
+// last; so with those rows reserved only the Buttons are sure to stay.
 export function layoutPane(runs: RunModel[], room: Room, quiet: QuietPane = NO_QUIET, extra: PaneExtra = NO_EXTRA): Row[] {
   const down: Row[] = quiet.down ? [{ text: 'quiet watcher down', dim: true }] : []
   const hasExtra = extra.programme !== undefined || extra.tail !== undefined

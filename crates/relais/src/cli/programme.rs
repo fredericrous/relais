@@ -1325,20 +1325,28 @@ pub(crate) fn session_command(
                 Format::Text => {
                     print_stdout(&format!("{slug} {ticket} ({})\n", kind.as_str()))?;
                     eprintln!("relais: {repo} {slug}: {failure}");
+                    // The session is named, so the hint releases this
+                    // session's claim whatever the shell's environment holds.
                     let release = format!(
-                        "relais programme release {} {}",
+                        "relais programme release {} {} --session {}",
                         shell_quote(slug),
-                        shell_quote(ticket)
+                        shell_quote(ticket),
+                        shell_quote(&session)
                     );
-                    let map = shell_quote(&format!("{}/docs/programmes/{slug}", held.claim.repo));
+                    let map_dir =
+                        shell_quote(&format!("{}/docs/programmes/{slug}", held.claim.repo));
                     match &failure {
-                        MapFailure::RepoGone => {
-                            eprintln!("next: pass --dir <a checkout of {repo}>, or {release}")
-                        }
+                        // `release` finds the map through `--dir` too, so both
+                        // choices need a checkout of the repository.
+                        MapFailure::RepoGone => eprintln!(
+                            "next: rerun with --dir <a checkout of {repo}>, or {release} --dir <a checkout of {repo}>"
+                        ),
                         MapFailure::NotInMap { .. } => {
-                            eprintln!("next: fix the map at {map}, or {release}")
+                            eprintln!("next: fix the map at {map_dir}, or {release}")
                         }
-                        MapFailure::Programme(_) => eprintln!("next: relais programme show {map}"),
+                        MapFailure::Programme(_) => {
+                            eprintln!("next: relais programme show {map_dir}")
+                        }
                     }
                     Ok(CliOutcome::OperationalFailure)
                 }
