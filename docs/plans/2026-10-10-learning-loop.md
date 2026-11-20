@@ -13,7 +13,7 @@ adrs:
 ## Review panel
 
 👉 **Decide:** none — approve if strict labels, router evidence, seeded exploration and a homelab Laya experiment are how relais starts learning.
-📍 relais, homelab · Phases 1–6 done (homelab#1195, #1198, #1201; ADR-0023); Phase 7 ran 2026-11-12 and missed two bars · next: Phase 7 again at 6,000 parsed calls (3,727 at the 11-12 export), off-hours. Panel: architect, backend, go, python, rust, typescript, platform, po, tui, unix.
+📍 relais, homelab · Phases 1–6 done (homelab#1195, #1198, #1201; ADR-0023); Phase 7 ran 2026-11-12 and again 2026-11-20 (6,349 calls), missing the same two bars both times · next: the person's call (D32). Panel: architect, backend, go, python, rust, typescript, platform, po, tui, unix.
 **Changed by review:** amont gate read per tree after push, at task end; learn cycle gets a non-queuing lease, idle deferral, anti-flap and manual rollback; Laya trains from 3,000 calls in an emptyDir, during a standby window.
 **Verdicts:** round 1: 10 approve-with-changes (1 blocking, fixed); round 2 backend approve-with-changes, twice; 2 person decisions (strict salvages, GPU on standby); 6 findings carried into implementation.
 📄 Full reviews: [2026-10-10-learning-loop.reviews.md](2026-10-10-learning-loop.reviews.md)
@@ -104,7 +104,7 @@ The person also wants to try **Laya** (Convai, Apache-2.0, 2026-09-18): a 421M M
 - **Bars**, each a 95% Clopper–Pearson bound: tier agreement lower bound ≥ 95%; downgrades upper bound ≤ 1% (0 or 1 downgrade in 600 passes); ECE ≤ 0.10 on the worst field. Correction recall is gated only when the test split holds at least 20 corrections; otherwise it is reported as `not measurable (n=k)`.
 - Below a bar, the report says which, and the run repeats at 6,000 calls; the repeat's test split excludes inputs seen in train or calibration (D31).
 
-**Run 1 (2026-11-12, wk-3 GPU, 3 h 28 min):** export of 3,727 parsed calls (train 2,610, calibration 372, test 745; one prompt version, capability table v1); base `laya-typed-decisions` @ `1a793eb5` (fewer than 5% non-English or over 1,024 tokens), laya 0.4.19, fp16 autocast, seed 0, image `rocm/pytorch@sha256:099f59a3`, code homelab `b5b25fd7`. Reports kept outside the repository, in `~/.claude/amont-agent/attestations/laya-phase7/` on the laptop (smoke-idle, smoke-load, mini, phase7-train; kept by `.keep`; no prompt text in them).
+**Run 1 (2026-11-12, wk-3 GPU, 3 h 28 min):** export of 3,727 parsed calls (train 2,610, calibration 372, test 745; one prompt version, capability table v1); base `laya-typed-decisions` @ `1a793eb5` (fewer than 5% non-English or over 1,024 tokens), laya 0.4.19, fp16 autocast, seed 0, image `rocm/pytorch@sha256:099f59a3`, code homelab `b5b25fd7`. Reports kept outside the repository, in `~/.claude/greenbelay/attestations/laya-phase7/` on the laptop (smoke-idle, smoke-load, mini, phase7-train; kept by `.keep`; no prompt text in them).
 
 | Bar (95% Clopper–Pearson) | Needed | Measured | Verdict |
 | --- | --- | --- | --- |
@@ -114,6 +114,17 @@ The person also wants to try **Laya** (Convai, Apache-2.0, 2026-09-18): a 421M M
 | Correction recall | gated at ≥ 20 | 0 corrections in test | not measurable (n=0) |
 
 Per-field agreement with haiku (ECE): `explicit` 0.966 (0.068), `relation` 0.886 (0.037), `kind` 0.847 (0.050), `verifiable` 0.830 (0.054), `uncertainty` 0.758 (0.077), `scope` 0.628 (0.058), `difficulty` 0.624 (0.069). The tier rules read `difficulty`, `scope`, `uncertainty` and `verifiable`, the weakest fields, which is where tier agreement is lost. Refit temperatures 1.21–2.64 per (type, options), every group ≥ 372 (no fallback). The realised test split is 745 calls, not the ≈ 600 the bars were sized for. laya flagged 63 of its 5,215 test items (1.2%; about 9 of the 745 test prompts, an estimate from that ratio, not a count) as identical to training or calibration inputs: prompts repeated across the time splits. laya-lab scores the same test rows, so the bars above include them; the verdict does not rest on which way they lean: 9 rows cannot move tier agreement from 65.4% toward 95% or downgrades from 140 toward 1. CPU latency on wk-3 (8 cores, 50 calls, `system_one`, 7 questions): p50 27.9 s, p95 32.8 s (D31).
+
+**Run 2 (2026-11-20, wk-3 GPU with chat scaled to 0 by `LAYA_CHAT_OFF=1`, 5 h 02 min):** export of 6,362 parsed calls; the 13 test rows whose input also appears in train or calibration were dropped on the laptop before the upload (D31; laya-lab has no such filter), leaving 6,349 (train 4,454, calibration 636, test 1,259; one prompt version, capability table v1). Same base, revision, laya 0.4.19, fp16 autocast, seed 0, 4 epochs and image as run 1; code homelab `f7a3a5b7`. Report `phase7-run2.json` beside run 1's, in `~/.claude/greenbelay/attestations/laya-phase7/`. Model uploaded as `relais-classifier-train-20261120-f7a3a5b7102399dc092ea25d9ae95539bf7c1f67` in `s3://laya-models`.
+
+| Bar (95% Clopper–Pearson) | Needed | Measured | Verdict |
+| --- | --- | --- | --- |
+| Tier agreement, lower bound | ≥ 95% | 835/1,259 = 66.3%, lower 63.6% | below |
+| Downgrades, upper bound | ≤ 1% | 203/1,259, upper 18.3% | below |
+| Worst-field ECE | ≤ 0.10 | 0.083 (`difficulty`) | met |
+| Correction recall | gated at ≥ 20 | 7 corrections in test, 0 recalled | not measurable (n=7) |
+
+Per-field agreement (run 1 → run 2): `explicit` 0.966 → 0.987, `kind` 0.847 → 0.945, `relation` 0.886 → 0.835, `verifiable` 0.830 → 0.809, `uncertainty` 0.758 → 0.808, `scope` 0.628 → 0.678, `difficulty` 0.624 → 0.630. With 1.7× the training rows, the fields the tier rules read moved by 0–5 points and tier agreement by 0.9. Two things repeat in both runs and were never varied: the training loss rises after epoch 2 (run 1 0.505, 0.359, 0.638, 0.651; run 2 0.469, 0.357, 0.761, 0.759), and laya's own temperature fit ends at 5.0 for all three types. Wall time per training row 4.1 s against run 1's 4.8 s. CPU latency p50 27.1 s, p95 31.7 s (D32).
 
 ## Phase 8: the learner that chooses the model (relais, data-gated)
 
@@ -153,6 +164,7 @@ Per-field agreement with haiku (ECE): `explicit` 0.966 (0.068), `relation` 0.886
 - **D18** (2026-10-12) D17's latency claim is corrected: replacing haiku removes its 1.5–1.7 s wait only on a host that answers faster than haiku. Phase 4a of `2026-10-11-orchestrator-decides.md` measured Laya on this Mac, under load 26–198: 14.8 s to create the inference session and 19–33 s for one 1,024-token pass, so here it would add wait, not remove it, even held loaded (D17's 7.4 s cold load is the model card's figure, on another host). The resident model therefore runs where it answers in well under 1.5 s, the homelab service of that plan's 4b' being the candidate, and Phase 7's report already measures CPU latency p50/p95 on wk-3. D17's decision, Laya replacing haiku because cost saving is a priority, is unchanged.
 
 - **D31** (2026-11-12) Phase 7 run 1 is below the tier-agreement and downgrade bars, so per this plan the run repeats at 6,000 parsed calls (3,727 at the 11-12 export; at ~170 a day, about two weeks). Two findings change what the repeat must answer: (a) on wk-3's CPU Laya takes ~28 s a call (as on this Mac, 4a), so a resident replacement for haiku's 1.5 s classifier can only be a GPU-resident model, which competes with chat for the same iGPU (homelab plan D30); (b) a multi-hour run on that GPU degrades chat for its whole length, so the repeat runs off-hours or with chat scaled to 0. The repeat drops from the test split every input that also appears in train or calibration (or reports the bars on the non-overlapping subset beside the full one), so a pass cannot come from repeated prompts. Whether the 6,000-call repeat is worth it before deciding where a resident Laya would run is the person's call at that point.
+- **D32** (2026-11-20, person chose to run now with chat scaled to 0) Phase 7 run 2 (6,349 calls, overlaps dropped) is below the same two bars: tier agreement lower 63.6%, downgrades upper 18.3%. More data alone did not move `difficulty` or `scope`. The recipe (4 epochs, fp16 autocast, loss rising after epoch 2, laya temperature at its 5.0 bound) is untested, and so is whether haiku agrees with itself on the tier for a repeated input. This plan provides no step after the repeat; what follows is the person's call.
 
 ## Implementation review
 
