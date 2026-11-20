@@ -5,6 +5,7 @@
 import type { Fx } from './fx.ts'
 import { after, type Store } from './store.ts'
 import { paneTree } from './pane.ts'
+import { recordEvent } from './events.ts'
 import { drawnQuiet, hasLiveQuiet, quietStatus } from './quiet.ts'
 import { programmeState, programmeStatus } from './map.ts'
 import {
@@ -38,10 +39,13 @@ export const markDirty = (store: Store) => {
 const isAgentShown = (store: Store) => store.shown.kind === 'agent'
 
 // What the pane's state carries of the view: no generation, width or flags.
-const viewOf = (shown: Store['shown']) =>
+// A tail view with no tail left writes the runs view.
+const viewOf = (shown: Store['shown'], tail: Store['clearTail']) =>
   shown.kind === 'agent'
     ? { kind: 'agent', agentId: shown.agentId, run: shown.run, transcript: shown.transcript }
-    : { kind: 'runs' }
+    : shown.kind === 'tail' && tail !== undefined
+      ? { kind: 'tail' }
+      : { kind: 'runs' }
 
 export async function flush(fx: Fx, store: Store) {
   if (store.closed || (!store.isDirty && !hasLiveRun(store) && !isAgentShown(store))) return
@@ -53,7 +57,7 @@ export async function flush(fx: Fx, store: Store) {
   const quiet = { runs: drawnQuiet(store, now), down: store.quiet.watcher === 'down' }
   const tail = store.clearTail ? { at: store.clearTail.at, messages: store.clearTail.messages } : undefined
   await fx.pane.write(
-    asJson({ runs: runsOf(store), now, shown: viewOf(store.shown), quiet, programme: programmeState(store.programme), tail }),
+    asJson({ runs: runsOf(store), now, shown: viewOf(store.shown, store.clearTail), quiet, programme: programmeState(store.programme), tail }),
   )
   fx.ui.status(statusText(store, now))
 }
@@ -120,7 +124,19 @@ export async function renderPane(fx: Fx, store: Store, e: any, hide: () => unkno
     openAgent: (agentId, run, columns) => openAgent(fx, store, agentId, run, columns),
     back: () => back(fx, store),
     hide,
+    openTail: (rows, bodyRows) => openTail(fx, store, rows, bodyRows),
   })
+}
+
+// `[ open ]`: the tail view at once, as a new view (a pending agent read
+// belongs to an older one), and an `open` event for the count.
+export async function openTail(fx: Fx, store: Store, rows: number, bodyRows: number) {
+  store.generation += 1
+  store.shown = { kind: 'tail' }
+  store.transcriptDirty = false
+  markDirty(store)
+  await flush(fx, store)
+  await recordEvent(fx, store, { at: await fx.clock.now(), kind: 'open', rows, bodyRows })
 }
 
 // A press on an agent row: the view changes at once, the read follows on the

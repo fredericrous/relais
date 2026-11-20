@@ -3,10 +3,10 @@
 // with its live output, capped by the rows the pane gets.
 
 import type { Fx } from './fx.ts'
-import { transcriptRows, type TranscriptState } from './transcript.ts'
+import { tailRows, type TranscriptState } from './transcript.ts'
+import { MAX_TRANSCRIPT_ROWS, TAIL_CHARS } from './limits.ts'
 import { cutToCells, programmeLayers, type ProgrammeLayers, type ProgrammeView } from './map.ts'
 import type { TailMessage } from './store.ts'
-import { MAX_TRANSCRIPT_ROWS } from './limits.ts'
 import { MAX_QUIET_LINES, quietElapsed, type QuietRun } from './quiet.ts'
 import {
   type RunModel,
@@ -24,16 +24,19 @@ import {
 
 // What pressing a row's Button does.
 // What an agent row's press opens; `[ back ]` is drawn by `paneTree` itself.
-export type Press = { kind: 'agent'; agentId: string; run: string } | { kind: 'hide' }
+export type Press = { kind: 'agent'; agentId: string; run: string } | { kind: 'hide' } | { kind: 'open' }
 
-export type Row = {
-  text: string
-  color?: string
-  dim?: boolean
-  bold?: boolean
-  // A row drawn as a plain Button keyed `key`; `text` is its label.
-  button?: { key: string; press: Press }
-}
+// A button of the tail's header: it opens the tail view or hides the tail.
+export type RowButton = { key: string; label: string; press: Extract<Press, { kind: 'open' | 'hide' }> }
+
+type RowLook = { text: string; color?: string; dim?: boolean; bold?: boolean }
+
+// A row is plain text, one plain Button keyed `key` (`text` is its label), or
+// `text` then a few plain Buttons on one line (the tail's header); never both.
+export type Row = RowLook &
+  ({ button?: { key: string; press: Press }; buttons?: never } | { button?: never; buttons: RowButton[] })
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
 
 export type Room = { rows: number; columns: number; now: number }
 
@@ -287,9 +290,10 @@ export function layoutPane(runs: RunModel[], room: Room, quiet: QuietPane = NO_Q
     return [{ text: 'relais · waiting for the first event', dim: true }, ...down]
   }
   const limit = Math.max(room.rows, MIN_ROWS)
-  // The programme's current row and the tail's header are never given up:
-  // the runs and the quiet rows are laid out in what is left of them.
-  const reserved = (extra.programme ? 1 : 0) + (extra.tail ? 1 : 0)
+  // The programme's current row, the tail's header and its newest row are
+  // never given up: the runs and the quiet rows are laid out in what is left
+  // of them, so the newest tail row now outranks older runs' agent Buttons.
+  const reserved = (extra.programme ? 1 : 0) + tailReserve(extra)
   const relaisRoom = limit - down.length - reserved
   // The relais frames come first; the quiet runs get only the rows they leave.
   let relais = relaisRows(runs, room, relaisRoom)
@@ -321,21 +325,40 @@ function trimKeepingButtons(rows: Row[], room: number): Row[] {
 // The programme window and the pre-clear tail, drawn after the quiet rows.
 // What the runs leave is shared: the programme shrinks to head + current +
 // counts, then to the current row; the tail keeps its header row and its
-// newest rows.
-export type PaneExtra = { programme?: ProgrammeLayers; tail?: { header: Row; rows: Row[] } }
+// newest rows. A tail cut to fit gets `[ open ]` beside `[ hide ]`, and a
+// `… N earlier rows` row when at least 2 tail rows fit.
+export type PaneExtra = { programme?: ProgrammeLayers; tail?: { title: string; rows: Row[]; columns: number } }
 const NO_EXTRA: PaneExtra = {}
 
+// The header row and the newest tail row, when the tail has one.
+const tailReserve = (extra: PaneExtra) => (extra.tail ? 1 + (extra.tail.rows.length > 0 ? 1 : 0) : 0)
+
+const OPEN: RowButton = { key: 'open', label: '[ open ]', press: { kind: 'open' } }
+const HIDE: RowButton = { key: 'hide', label: '[ hide ]', press: { kind: 'hide' } }
+
+// The tail's header: the title cut so that the buttons, each after a space,
+// always fit; too narrow for a 2-cell title, the buttons alone.
+function tailHeader(title: string, buttons: RowButton[], columns: number): Row {
+  const room = columns - buttons.reduce((n, b) => n + 1 + b.label.length, 0)
+  return { text: room >= 2 ? cutToCells(title, room) : '', buttons }
+}
+
 function extraRows(extra: PaneExtra, room: number): Row[] {
-  const headerRows = extra.tail ? 1 : 0
+  const reserve = tailReserve(extra)
   let programme: Row[] = []
   if (extra.programme) {
-    const budget = Math.max(1, room - headerRows)
+    const budget = Math.max(1, room - reserve)
     const layers = extra.programme
     programme = layers.full.length <= budget ? layers.full : layers.reduced.length <= budget ? layers.reduced : layers.current
   }
   if (!extra.tail) return programme
+  const { title, rows, columns } = extra.tail
   const tailRoom = Math.max(0, room - programme.length - 1)
-  return [...programme, extra.tail.header, ...(tailRoom === 0 ? [] : extra.tail.rows.slice(-tailRoom))]
+  if (rows.length <= tailRoom) return [...programme, tailHeader(title, [HIDE], columns), ...rows]
+  const header = tailHeader(title, [OPEN, HIDE], columns)
+  if (tailRoom < 2) return [...programme, header, ...(tailRoom === 0 ? [] : rows.slice(-1))]
+  const shown = rows.slice(-(tailRoom - 1))
+  return [...programme, header, { text: `… ${plural(rows.length - shown.length, 'earlier row')}`, dim: true }, ...shown]
 }
 
 // `before /clear · hh:mm`, local time.
@@ -345,7 +368,22 @@ export function tailTitle(at: number): string {
   return `before /clear · ${two(date.getHours())}:${two(date.getMinutes())}`
 }
 
-const MAX_TAIL_ROWS = 60
+// The tail view (`[ open ]`): its title row, then every tail row, at most
+// MAX_TRANSCRIPT_ROWS, the newest kept behind `… K earlier rows`. The rows
+// are not fitted to the room: the engine scrolls the taller tree.
+export function layoutTailView(tail: NonNullable<PaneState['tail']>, columns: number): Row[] {
+  const rows: Row[] = tailRows(tail.messages, columns)
+  // `trimTail` cuts a message only to fill the budget: a front cut is a full
+  // tail whose first message starts with `…` (a message that merely begins
+  // with one is never a full tail as well, short of the exact 2000).
+  const chars = tail.messages.reduce((n, m) => n + Array.from(m.text).length, 0)
+  const isFrontCut = chars === TAIL_CHARS && tail.messages[0]?.text.startsWith('…') === true
+  const title = [tailTitle(tail.at), ...(isFrontCut ? [`last ${TAIL_CHARS} characters`] : []), plural(rows.length, 'row')].join(' · ')
+  const head: Row = { text: cutToCells(title, columns), bold: true }
+  if (rows.length <= MAX_TRANSCRIPT_ROWS) return [head, ...rows]
+  const kept = rows.slice(-(MAX_TRANSCRIPT_ROWS - 1))
+  return [head, { text: `… ${plural(rows.length - kept.length, 'earlier row')}`, dim: true }, ...kept]
+}
 
 function extraOf(state: PaneState | undefined, columns: number): PaneExtra {
   const note: Row | undefined = state?.programme?.note
@@ -359,12 +397,7 @@ function extraOf(state: PaneState | undefined, columns: number): PaneExtra {
   } else if (note) {
     programme = { full: [note], reduced: [note], current: [note] }
   }
-  const tail = state?.tail
-    ? {
-        header: { text: `${tailTitle(state.tail.at)} [ hide ]`, button: { key: 'hide', press: { kind: 'hide' as const } } },
-        rows: transcriptRows(state.tail.messages, columns, MAX_TAIL_ROWS),
-      }
-    : undefined
+  const tail = state?.tail ? { title: tailTitle(state.tail.at), rows: tailRows(state.tail.messages, columns), columns } : undefined
   return { programme, tail }
 }
 
@@ -550,7 +583,10 @@ function outputRowsOfFailed(m: RunModel, cap: number): Row[] {
 }
 
 // What the pane shows besides the runs: one agent's transcript.
-export type PaneShown = { kind: 'runs' } | { kind: 'agent'; agentId: string; run: string; transcript: TranscriptState }
+export type PaneShown =
+  | { kind: 'runs' }
+  | { kind: 'agent'; agentId: string; run: string; transcript: TranscriptState }
+  | { kind: 'tail' }
 
 export type PaneState = {
   runs: RunModel[]
@@ -565,9 +601,12 @@ export type PaneActions = {
   openAgent: (agentId: string, run: string, columns: number) => unknown
   back: () => unknown
   hide: () => unknown
+  // `[ open ]` on a cut tail: the tail view, with the rows it has and the body's rows.
+  openTail: (rows: number, bodyRows: number) => unknown
 }
 
 const BACK_HINT = '  Esc hands the keys back · ↓ to manage: full view'
+const TAIL_HINT = '  ↑↓ scroll (starts at the top) · Esc hands the keys to the prompt'
 
 // The agent view's rows under the `[ back ]` line: header, rule, transcript.
 export function layoutAgentView(shown: Extract<PaneShown, { kind: 'agent' }>, runs: RunModel[], room: Room): Row[] {
@@ -596,7 +635,9 @@ export function layoutAgentView(shown: Extract<PaneShown, { kind: 'agent' }>, ru
 }
 
 // The tree a `Pane` render draws: one `Text` a row, each cut at the end; the
-// agent rows and `[ back ]` are Buttons.
+// agent rows, `[ back ]`, `[ open ]` and `[ hide ]` are Buttons, each with its
+// text as `label`, never a Text child: Claude Code 2.1.291 (CI's
+// `CLAUDE_CODE_PIN`) refuses a Button with element children.
 export function paneTree(fx: Fx, e: any, state: PaneState | undefined, actions: PaneActions) {
   const { Box, Text, Button } = fx.ui.resolve(e)
   const columns = e.props?.bodyColumns ?? 80
@@ -612,32 +653,52 @@ export function paneTree(fx: Fx, e: any, state: PaneState | undefined, actions: 
       row.text,
     )
   const shown = state?.shown
+  const back = (hint: string) =>
+    h(
+      Box,
+      { key: 'top', flexDirection: 'row' },
+      h(Button, { key: 'back', autoFocus: true, label: 'back', onPress: () => actions.back() }),
+      h(Text, { key: 'keys', dimColor: true, wrap: 'truncate-end' }, hint),
+    )
+  // A tail view whose tail is gone (hidden, or never restored) draws the runs view.
+  if (shown?.kind === 'tail' && state?.tail) {
+    const rows = layoutTailView(state.tail, columns)
+    return h(Box, { flexDirection: 'column' }, back(TAIL_HINT), ...rows.map((row, i) => text(row, `row:${i}`)))
+  }
   if (shown?.kind === 'agent') {
     const rows = layoutAgentView(shown, state?.runs ?? [], room).slice(-ROWS_CAP)
-    return h(
-      Box,
-      { flexDirection: 'column' },
-      h(
-        Box,
-        { key: 'top', flexDirection: 'row' },
-        h(Button, { key: 'back', autoFocus: true, onPress: () => actions.back() }, 'back'),
-        h(Text, { key: 'keys', dimColor: true, wrap: 'truncate-end' }, BACK_HINT),
-      ),
-      ...rows.map((row, i) => text(row, `row:${i}`)),
-    )
+    return h(Box, { flexDirection: 'column' }, back(BACK_HINT), ...rows.map((row, i) => text(row, `row:${i}`)))
   }
-  const rows = layoutPane(state?.runs ?? [], room, state?.quiet, extraOf(state, columns))
+  const extra = extraOf(state, columns)
+  const rows = layoutPane(state?.runs ?? [], room, state?.quiet, extra)
+  const tailRowCount = extra.tail?.rows.length ?? 0
   return h(
     Box,
     { flexDirection: 'column' },
     ...rows.map((row, i) => {
+      if (row.buttons) {
+        const pressOf = (b: RowButton) => {
+          switch (b.press.kind) {
+            case 'open':
+              return () => actions.openTail(tailRowCount, room.rows)
+            case 'hide':
+              return () => actions.hide()
+          }
+        }
+        return h(
+          Box,
+          { key: `row:${i}`, flexDirection: 'row' },
+          h(Text, { key: 'title', color: row.color, dimColor: row.dim, bold: row.bold, wrap: 'truncate-end' }, row.text),
+          ...row.buttons.flatMap(b => [
+            h(Text, { key: `gap:${b.key}` }, ' '),
+            h(Button, { key: b.key, label: b.label, plain: true, onPress: pressOf(b) }),
+          ]),
+        )
+      }
       const press = row.button?.press
       if (row.button && press?.kind === 'agent') {
         return h(
           Button,
-          // The text as `label`, not a Text child: Claude Code 2.1.291 (CI's
-          // `CLAUDE_CODE_PIN`) refuses a Button with element children; 2.1.295
-          // accepts it.
           {
             key: row.button.key,
             label: row.text,
@@ -645,9 +706,6 @@ export function paneTree(fx: Fx, e: any, state: PaneState | undefined, actions: 
             onPress: () => actions.openAgent(press.agentId, press.run, columns),
           },
         )
-      }
-      if (row.button && press?.kind === 'hide') {
-        return h(Button, { key: row.button.key, label: row.text, plain: true, onPress: () => actions.hide() })
       }
       return text(row, `row:${i}`)
     }),

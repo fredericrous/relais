@@ -10,9 +10,10 @@ import type { TranscriptState } from './transcript.ts'
 import { createQuietMemory, type QuietMemory } from './quiet.ts'
 import type { ProgrammeView } from './map.ts'
 
-// What the pane shows: the runs, or one agent's transcript.
+// What the pane shows: the runs, one agent's transcript, or the pre-clear tail.
 export type Shown =
   | { kind: 'runs' }
+  | { kind: 'tail' }
   | {
       kind: 'agent'
       agentId: string

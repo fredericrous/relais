@@ -8,10 +8,10 @@ import type { Fx } from './fx.ts'
 import type { ClearTail, Store, TailMessage } from './store.ts'
 import { recordEvent, withinBound } from './events.ts'
 import { detach } from './store.ts'
+import { TAIL_CHARS } from './limits.ts'
 import { markDirty, openPane } from './ui.ts'
 
-export const TAIL_CHARS = 2000
-export const LAST_MESSAGES = 20
+export { TAIL_CHARS }
 // A turn's read is bounded like every other read of the session.
 export const LIVE_READ_BOUND_MS = 5000
 // The last read, at the clear, only has to be quick: the live tail stands in.
@@ -38,8 +38,11 @@ export function textMessages(messages: unknown): TailMessage[] {
 
 const lengthOf = (text: string) => Array.from(text).length
 
-// The messages trimmed from the front to `limit` characters, at a message
-// boundary; one message longer than that is cut from its front with `…`.
+// The messages trimmed from the front to `limit` characters (code points):
+// whole messages from the newest back, then the first older one that does
+// not fit whole, cut from its front with `…` to fill the budget. With fewer
+// than 2 characters left there is no room for `…` and a character, so that
+// message is dropped.
 export function trimTail(messages: readonly TailMessage[], limit = TAIL_CHARS): TailMessage[] {
   const out: TailMessage[] = []
   let used = 0
@@ -50,8 +53,9 @@ export function trimTail(messages: readonly TailMessage[], limit = TAIL_CHARS): 
       used += size
       continue
     }
-    if (out.length === 0) {
-      const cut = Array.from(messages[i].text).slice(-(limit - 1)).join('')
+    const room = limit - used
+    if (room >= 2) {
+      const cut = Array.from(messages[i].text).slice(-(room - 1)).join('')
       out.unshift({ role: messages[i].role, text: `${ELLIPSIS}${cut}` })
     }
     break
@@ -59,11 +63,11 @@ export function trimTail(messages: readonly TailMessage[], limit = TAIL_CHARS): 
   return out
 }
 
-// The newest LAST_MESSAGES entries are kept here, not asked of the engine:
-// `$.session.messages({ last })` is refused by Claude Code 2.1.291 (2.1.329 takes it), and
-// the plugin supports 2.1.291 (the Makefile's CLAUDE_CODE_MIN).
-export const tailOf = (messages: unknown): TailMessage[] =>
-  trimTail(textMessages(Array.isArray(messages) ? messages.slice(-LAST_MESSAGES) : messages))
+// Every text message of the read goes to `trimTail`: the character budget
+// alone bounds the tail, so neither tool turns nor many short messages can
+// push an older long answer out of it. The read is the whole session
+// (`$.session.messages({})`): Claude Code 2.1.291 refuses `{ last }`.
+export const tailOf = (messages: unknown): TailMessage[] => trimTail(textMessages(messages))
 
 export const charsOf = (messages: readonly TailMessage[]) => messages.reduce((total, message) => total + lengthOf(message.text), 0)
 
@@ -156,6 +160,8 @@ export async function hideTail(fx: Fx, store: Store, now: number) {
   if (tail === undefined) return
   store.clearTail = undefined
   store.tail.version += 1
+  // Every way a tail goes leaves its view too.
+  if (store.shown.kind === 'tail') store.shown = { kind: 'runs' }
   markDirty(store)
   const write = persist(fx, store, null)
   await recordEvent(fx, store, { at: now, kind: 'hide', seconds: Math.max(0, Math.round((now - tail.at) / 1000)) })
