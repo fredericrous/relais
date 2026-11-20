@@ -26,18 +26,17 @@ import {
 // What an agent row's press opens; `[ back ]` is drawn by `paneTree` itself.
 export type Press = { kind: 'agent'; agentId: string; run: string } | { kind: 'hide' } | { kind: 'open' }
 
-export type RowButton = { key: string; label: string; press: Press }
+// A button of the tail's header: it opens the tail view or hides the tail.
+export type RowButton = { key: string; label: string; press: Extract<Press, { kind: 'open' | 'hide' }> }
 
-export type Row = {
-  text: string
-  color?: string
-  dim?: boolean
-  bold?: boolean
-  // A row drawn as a plain Button keyed `key`; `text` is its label.
-  button?: { key: string; press: Press }
-  // A row drawn as `text` then these plain Buttons, in one line (the tail's header).
-  buttons?: RowButton[]
-}
+type RowLook = { text: string; color?: string; dim?: boolean; bold?: boolean }
+
+// A row is plain text, one plain Button keyed `key` (`text` is its label), or
+// `text` then a few plain Buttons on one line (the tail's header); never both.
+export type Row = RowLook &
+  ({ button?: { key: string; press: Press }; buttons?: never } | { button?: never; buttons: RowButton[] })
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
 
 export type Room = { rows: number; columns: number; now: number }
 
@@ -337,10 +336,11 @@ const tailReserve = (extra: PaneExtra) => (extra.tail ? 1 + (extra.tail.rows.len
 const OPEN: RowButton = { key: 'open', label: '[ open ]', press: { kind: 'open' } }
 const HIDE: RowButton = { key: 'hide', label: '[ hide ]', press: { kind: 'hide' } }
 
-// The tail's header: the title cut so that the buttons, each after a space, always fit.
+// The tail's header: the title cut so that the buttons, each after a space,
+// always fit; too narrow for a 2-cell title, the buttons alone.
 function tailHeader(title: string, buttons: RowButton[], columns: number): Row {
-  const room = Math.max(1, columns - buttons.reduce((n, b) => n + 1 + b.label.length, 0))
-  return { text: cutToCells(title, room), buttons }
+  const room = columns - buttons.reduce((n, b) => n + 1 + b.label.length, 0)
+  return { text: room >= 2 ? cutToCells(title, room) : '', buttons }
 }
 
 function extraRows(extra: PaneExtra, room: number): Row[] {
@@ -358,7 +358,7 @@ function extraRows(extra: PaneExtra, room: number): Row[] {
   const header = tailHeader(title, [OPEN, HIDE], columns)
   if (tailRoom < 2) return [...programme, header, ...(tailRoom === 0 ? [] : rows.slice(-1))]
   const shown = rows.slice(-(tailRoom - 1))
-  return [...programme, header, { text: `… ${rows.length - shown.length} earlier rows`, dim: true }, ...shown]
+  return [...programme, header, { text: `… ${plural(rows.length - shown.length, 'earlier row')}`, dim: true }, ...shown]
 }
 
 // `before /clear · hh:mm`, local time.
@@ -373,14 +373,16 @@ export function tailTitle(at: number): string {
 // are not fitted to the room: the engine scrolls the taller tree.
 export function layoutTailView(tail: NonNullable<PaneState['tail']>, columns: number): Row[] {
   const rows: Row[] = tailRows(tail.messages, columns)
-  const isFrontCut = tail.messages[0]?.text.startsWith('…') === true
-  const title = [tailTitle(tail.at), isFrontCut ? `last ${TAIL_CHARS} characters` : undefined, `${rows.length} rows`]
-    .filter(Boolean)
-    .join(' · ')
+  // `trimTail` cuts a message only to fill the budget: a front cut is a full
+  // tail whose first message starts with `…` (a message that merely begins
+  // with one is never a full tail as well, short of the exact 2000).
+  const chars = tail.messages.reduce((n, m) => n + Array.from(m.text).length, 0)
+  const isFrontCut = chars === TAIL_CHARS && tail.messages[0]?.text.startsWith('…') === true
+  const title = [tailTitle(tail.at), ...(isFrontCut ? [`last ${TAIL_CHARS} characters`] : []), plural(rows.length, 'row')].join(' · ')
   const head: Row = { text: cutToCells(title, columns), bold: true }
   if (rows.length <= MAX_TRANSCRIPT_ROWS) return [head, ...rows]
   const kept = rows.slice(-(MAX_TRANSCRIPT_ROWS - 1))
-  return [head, { text: `… ${rows.length - kept.length} earlier rows`, dim: true }, ...kept]
+  return [head, { text: `… ${plural(rows.length - kept.length, 'earlier row')}`, dim: true }, ...kept]
 }
 
 function extraOf(state: PaneState | undefined, columns: number): PaneExtra {
@@ -667,15 +669,22 @@ export function paneTree(fx: Fx, e: any, state: PaneState | undefined, actions: 
     const rows = layoutAgentView(shown, state?.runs ?? [], room).slice(-ROWS_CAP)
     return h(Box, { flexDirection: 'column' }, back(BACK_HINT), ...rows.map((row, i) => text(row, `row:${i}`)))
   }
-  const rows = layoutPane(state?.runs ?? [], room, state?.quiet, extraOf(state, columns))
+  const extra = extraOf(state, columns)
+  const rows = layoutPane(state?.runs ?? [], room, state?.quiet, extra)
+  const tailRowCount = extra.tail?.rows.length ?? 0
   return h(
     Box,
     { flexDirection: 'column' },
     ...rows.map((row, i) => {
       if (row.buttons) {
-        const tailRowCount = state?.tail ? tailRows(state.tail.messages, columns).length : 0
-        const pressOf = (b: RowButton) =>
-          b.press.kind === 'open' ? () => actions.openTail(tailRowCount, room.rows) : () => actions.hide()
+        const pressOf = (b: RowButton) => {
+          switch (b.press.kind) {
+            case 'open':
+              return () => actions.openTail(tailRowCount, room.rows)
+            case 'hide':
+              return () => actions.hide()
+          }
+        }
         return h(
           Box,
           { key: `row:${i}`, flexDirection: 'row' },

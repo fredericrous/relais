@@ -507,11 +507,24 @@ test('a tail that fits whole keeps only [ hide ] and draws every row', () => {
 
 test('with one tail row of room it is the newest row, and [ open ] alone marks the cut', () => {
   const timelines = [liveAt('live-a', 0, 20), liveAt('live-b', 1, 20), liveAt('live-c', 2, 20)]
+  // 6 rows, 3 live runs filling the 4 rows they get: 1 row left for the tail under its header.
   const rows = layoutPane(runsOf(timelines), room(6), undefined, { tail: tail(10) })
-  expect(rows.length).toBeLessThanOrEqual(6)
+  expect(rows.length).toBe(6)
   expect(rows[rows.length - 1].text).toBe('person │ message 9')
-  expect(rows.some(r => r.text.includes('earlier rows'))).toBe(rows[rows.length - 2]?.text.includes('earlier rows') === true)
-  expect(keysOf(rows.find(r => r.buttons !== undefined))).toEqual(['open', 'hide'])
+  expect(keysOf(rows[rows.length - 2])).toEqual(['open', 'hide'])
+  expect(rows.some(r => r.text.includes('earlier row'))).toBe(false)
+})
+
+test('below 20 columns the header keeps only its buttons', () => {
+  const rows = layoutPane([], { rows: 6, columns: 18, now: NOW }, undefined, { tail: { ...tail(10), columns: 18 } })
+  expect(rows[0].text).toBe('')
+  expect(keysOf(rows[0])).toEqual(['open', 'hide'])
+})
+
+test('one row too many hides two behind the marker, which takes a row itself', () => {
+  const rows = layoutPane([], room(6), undefined, { tail: tail(6) })
+  expect(rows[1]).toEqual({ text: '… 2 earlier rows', dim: true })
+  expect(rows.length).toBe(6)
 })
 
 test('the header title is cut so that both buttons fit at 38 columns', () => {

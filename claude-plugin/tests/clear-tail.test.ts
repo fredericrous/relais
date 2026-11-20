@@ -359,14 +359,19 @@ test('a new /clear while the tail view is open shows the new tail there', async 
   await settle(engine)
   const view = (await drawn($, engine)).texts
   expect(view).toContain('person │ the next conversation')
-  expect(view.some(t => /· 1 rows$/.test(t))).toBe(true)
+  expect(view.some(t => /· 1 row$/.test(t))).toBe(true)
 })
 
 test('a tail view past MAX_TRANSCRIPT_ROWS keeps the newest rows behind `… K earlier rows`, and says when the oldest was cut', () => {
-  const rows = layoutTailView({ at: 0, messages: [{ role: 'user', text: `…${'x\n'.repeat(999)}` }] }, 72)
-  expect(rows[0].text).toMatch(/^before \/clear · \d\d:\d\d · last 2000 characters · 999 rows$/)
-  expect(rows[1]).toEqual({ text: `… ${999 - (MAX_TRANSCRIPT_ROWS - 1)} earlier rows`, dim: true })
+  const rows = layoutTailView({ at: 0, messages: [{ role: 'user', text: `…${'x\n'.repeat(999)}y` }] }, 72)
+  expect(rows[0].text).toMatch(/^before \/clear · \d\d:\d\d · last 2000 characters · 1000 rows$/)
+  expect(rows[1]).toEqual({ text: `… ${1000 - (MAX_TRANSCRIPT_ROWS - 1)} earlier rows`, dim: true })
   expect(rows.length).toBe(MAX_TRANSCRIPT_ROWS + 1)
+})
+
+test('a 1999-character tail starting with `…` is not called cut', () => {
+  const rows = layoutTailView({ at: 0, messages: [{ role: 'user', text: `…${'x'.repeat(1998)}` }] }, 72)
+  expect(rows[0].text).not.toContain('last 2000 characters')
 })
 
 test('hiding the tail while its view is shown returns the pane to the runs view', async () => {
