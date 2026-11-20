@@ -40,10 +40,10 @@ const isAgentShown = (store: Store) => store.shown.kind === 'agent'
 
 // What the pane's state carries of the view: no generation, width or flags.
 // A tail view with no tail left writes the runs view.
-const viewOf = (shown: Store['shown'], hasTail: boolean) =>
+const viewOf = (shown: Store['shown'], tail: Store['clearTail']) =>
   shown.kind === 'agent'
     ? { kind: 'agent', agentId: shown.agentId, run: shown.run, transcript: shown.transcript }
-    : shown.kind === 'tail' && hasTail
+    : shown.kind === 'tail' && tail !== undefined
       ? { kind: 'tail' }
       : { kind: 'runs' }
 
@@ -57,7 +57,7 @@ export async function flush(fx: Fx, store: Store) {
   const quiet = { runs: drawnQuiet(store, now), down: store.quiet.watcher === 'down' }
   const tail = store.clearTail ? { at: store.clearTail.at, messages: store.clearTail.messages } : undefined
   await fx.pane.write(
-    asJson({ runs: runsOf(store), now, shown: viewOf(store.shown, store.clearTail !== undefined), quiet, programme: programmeState(store.programme), tail }),
+    asJson({ runs: runsOf(store), now, shown: viewOf(store.shown, store.clearTail), quiet, programme: programmeState(store.programme), tail }),
   )
   fx.ui.status(statusText(store, now))
 }
