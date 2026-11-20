@@ -140,6 +140,12 @@ view scrolled to its top, at 180 and at 100 columns.
   `admission_wait_exhausted` (no lease in 30 min each, host load 60+).
 - 2026-11-20 — the agent view's `[ back ]` now passes `label` too, as the
   2.1.291 floor needs; its text is unchanged.
+- 2026-11-21 — the tail view caps at `MAX_TRANSCRIPT_ROWS` rows plus its
+  title (401), not `ROWS_CAP` as the Behaviour says: the cap counts tail
+  rows, the title and `[ back ]` row ride above it (implementation review).
+- 2026-11-21 — the runs view's `… N earlier rows` always hides at least 2
+  rows (the marker takes a row itself); `plural` gives `1 earlier row` only
+  in the tail view's cap.
 
 ## Verification
 | Input | Expected | Actual |
@@ -158,5 +164,10 @@ view scrolled to its top, at 180 and at 100 columns.
 | live: tmux 180×40, `--plugin-dir claude-plugin` (2.1.329), a 150-line answer, `/clear` | the runs view ends on the answer's last line; `[ open ]` opens at the first row; arrows scroll; `[ back ]` returns | pass: `before /clear · 23:51 [ open ] [ hide ]`, `… 121 earlier rows`, ends `line 150`; the view opens on `[ back ]`, hint, `· 153 rows`, `person │ Reply with…`; ↓ moves, End shows `line 150`; Enter on `[ back ]` shows the runs view |
 | live: same at 100×30 (inline seat) | scrollable, the prompt on screen | pass: frame rows 16–25 (`bodyRows` 8), prompt on row 28; End reaches `line 150`; Esc keeps the tail view scrolled where it was |
 | `make plugin` (`claude plugin validate`, `scripts/plugin-test.sh`) | exit 0, the new tests listed as passed | pass: 481 pass, 0 fail; validate passes with the TypeScript notes main already has |
+
+## Implementation review
+- implementation-review (opus): approve-with-changes → approve on the Delta; fixed: exhaustive header-button switch [blocking], exact one-row test, full-tail front-cut check, cap noted in Decision log; candidates 3 fine (store actions). 75k, 56 s.
+- lang:typescript (opus): approve-with-changes → approve; fixed: narrowed `RowButton.press`, `Row` button/buttons union, rows laid out once, typed title parts, front-cut check. 69k, 55 s.
+- tui (opus): approve-with-changes → approve; fixed: `plural` counts, buttons-only header under 20 columns, front-cut check. 73k, 64 s.
 
 <!-- panel: repos=relais adds=screen reviewers=backend,lang:typescript,tui,unix,ux-research,game-ux,codex body-sha=7fd95644684c -->
