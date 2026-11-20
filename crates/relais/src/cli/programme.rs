@@ -9,11 +9,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
-use relais::programme::analysis::{self, age_secs, Counts, Holder, Standing};
+use relais::programme::analysis::{self, age_secs, Counts, Holder, Standing, StandingKind};
 use relais::programme::claim;
 use relais::programme::frontier::{due_mark, format_age, is_overdue, is_ready, order_frontier};
 use relais::programme::load::{self, main_checkout, Found, Programme, ProgrammeError, Source};
 use relais::programme::model::Ticket;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::outcome::{CliError, CliOutcome};
@@ -978,6 +979,232 @@ pub(crate) fn claim_command(
             Ok(CliOutcome::Blocked)
         }
     }
+}
+
+/// The answer of `programme session` when the session holds no claim.
+#[derive(Serialize)]
+struct NoProgrammeView {
+    programme: Option<()>,
+    reason: &'static str,
+}
+
+#[derive(Serialize)]
+struct SessionAnswer<T: Serialize> {
+    programme: T,
+}
+
+#[derive(Serialize)]
+struct TicketView {
+    id: String,
+    name: String,
+    status: StandingKind,
+    blocked_by: Vec<String>,
+    open_blockers: Vec<String>,
+    dependents: Vec<String>,
+    due: Option<String>,
+    held: bool,
+}
+
+/// A held claim whose map was read.
+#[derive(Serialize)]
+struct MapView {
+    repo: String,
+    slug: String,
+    ticket: String,
+    kind: &'static str,
+    holder: &'static str,
+    counts: Counts,
+    tickets: Vec<TicketView>,
+    ready: Vec<String>,
+}
+
+/// A held claim whose map could not be read.
+#[derive(Serialize)]
+struct FailedView {
+    repo: String,
+    slug: String,
+    ticket: String,
+    kind: &'static str,
+    error: String,
+}
+
+/// Where the map of a claimed programme is, in order: the programme under
+/// `dir` when `dir` is in the claim's repository (by repo key), else under
+/// the repository path the claim recorded when it still exists.
+fn session_map_dir(held: &claim::SessionClaim, dir: Option<&Path>) -> Option<PathBuf> {
+    let relative = Path::new("docs").join("programmes").join(&held.key.slug);
+    if let Some(dir) = dir {
+        let same_repo = load::git_common_dir(dir)
+            .is_ok_and(|common| claim::repo_key(&common) == held.key.repo_key);
+        if same_repo {
+            let main = main_checkout(dir).ok()?; // a repository whose main checkout git cannot name has no map to read
+            let here = dir.join(&relative);
+            return Some(if here.is_dir() {
+                here
+            } else {
+                main.join(relative)
+            });
+        }
+    }
+    let recorded = Path::new(&held.claim.repo);
+    (!held.claim.repo.is_empty() && recorded.exists()).then(|| recorded.join(relative))
+}
+
+fn session_map_view(
+    held: &claim::SessionClaim,
+    claimant: claim::Claimant,
+    programme_dir: &Path,
+    store: &claim::Store,
+    fetch: Fetch,
+    now: i64,
+) -> Result<MapView, String> {
+    let found = resolve_dir(programme_dir, fetch).map_err(|e| e.to_string())?;
+    let programme = found.load().map_err(|e| programme_error(e).to_string())?;
+    let standings = programme
+        .standings(Some(store), now)
+        .map_err(|e| programme_error(e).to_string())?;
+    if !programme.tickets.contains_key(&held.id) {
+        return Err(format!("ticket {} is not in the map", held.id));
+    }
+    let mut ready: Vec<&Ticket> =
+        relais::programme::frontier::ready_tickets(&programme, &standings).collect();
+    order_frontier(&mut ready, |ticket| ticket.due);
+    let tickets = programme
+        .tickets
+        .values()
+        .map(|ticket| {
+            let standing = &standings[&ticket.id];
+            TicketView {
+                id: ticket.id.clone(),
+                name: ticket.name.clone(),
+                status: StandingKind::from(standing),
+                blocked_by: ticket.blocked_by.clone(),
+                open_blockers: ticket
+                    .blocked_by
+                    .iter()
+                    .filter(|id| {
+                        programme.tickets.get(*id).map(|t| t.status)
+                            != Some(relais::programme::model::Status::Closed)
+                    })
+                    .cloned()
+                    .collect(),
+                dependents: programme
+                    .tickets
+                    .values()
+                    .filter(|other| other.blocked_by.contains(&ticket.id))
+                    .map(|other| other.id.clone())
+                    .collect(),
+                due: ticket.due.map(|date| date.to_string()),
+                held: matches!(standing, Standing::InFlight { .. }),
+            }
+        })
+        .collect();
+    Ok(MapView {
+        repo: dir_name(&programme.repo_dir),
+        slug: held.key.slug.clone(),
+        ticket: held.id.clone(),
+        kind: held.claim.kind.as_str(),
+        holder: match claimant {
+            claim::Claimant::Own => "self",
+            claim::Claimant::Previous => "previous",
+        },
+        counts: analysis::counts(&standings),
+        tickets,
+        ready: ready.iter().map(|ticket| ticket.id.clone()).collect(),
+    })
+}
+
+fn json_line<T: Serialize>(answer: &T) -> Result<String, CliError> {
+    serde_json::to_string(answer)
+        .map(|text| format!("{text}\n"))
+        .map_err(|cause| CliError::Operational {
+            operation: "programme session: encoding the answer",
+            cause: Box::new(cause),
+        })
+}
+
+/// `relais programme session`: which programme ticket `session` holds by
+/// claim, with the programme's tickets, for the plugin's pane. Read-only:
+/// no claim is swept, refreshed or written.
+pub(crate) fn session_command(
+    session: Option<&str>,
+    previous: Option<&str>,
+    dir: Option<&Path>,
+    format: Format,
+    fetch: Fetch,
+) -> Result<CliOutcome, CliError> {
+    let session = match writing_session(session) {
+        Ok(session) => session,
+        Err(CliError::Usage { .. }) => {
+            eprintln!("relais: no session id");
+            eprintln!("next: pass --session <id>");
+            return Ok(CliOutcome::InvalidInput);
+        }
+        Err(other) => return Err(other),
+    };
+    let store = claim_store().map_err(|e| CliError::Operational {
+        operation: "programme claims",
+        cause: Box::new(std::io::Error::other(e.to_string())),
+    })?;
+    let now = now_unix();
+    let own = store.claims_of(&session, now).map_err(claim_io)?;
+    let before = match previous.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(previous) => Some(store.claims_of(previous, now).map_err(claim_io)?),
+        None => None,
+    };
+    let (held, claimant) = match claim::resolve_session(&own, before.as_ref()) {
+        claim::Resolution::Claimed { claim, claimant } => (claim, claimant),
+        claim::Resolution::Nothing { expired } => {
+            let out = match format {
+                Format::Json => json_line(&NoProgrammeView {
+                    programme: None,
+                    reason: if expired { "expired" } else { "none" },
+                })?,
+                Format::Text => "no programme claim\n".to_string(),
+            };
+            print_stdout(&out)?;
+            return Ok(CliOutcome::Accepted);
+        }
+    };
+    let cwd = std::env::current_dir().ok(); // only locates the map: without it the claim's own path is tried
+    let dir = dir.map(Path::to_path_buf).or(cwd);
+    let map = session_map_dir(&held, dir.as_deref())
+        .ok_or_else(|| "the repository is gone".to_string())
+        .and_then(|programme_dir| {
+            session_map_view(&held, claimant, &programme_dir, &store, fetch, now)
+        });
+    match map {
+        Ok(view) => {
+            let out = match format {
+                Format::Json => json_line(&SessionAnswer { programme: &view })?,
+                Format::Text => format!("{} {} ({})\n", view.slug, view.ticket, view.kind),
+            };
+            print_stdout(&out)?;
+        }
+        Err(error) => {
+            let repo = dir_name(Path::new(&held.claim.repo));
+            let (slug, ticket) = (&held.key.slug, &held.id);
+            match format {
+                Format::Json => {
+                    let out = json_line(&SessionAnswer {
+                        programme: FailedView {
+                            repo,
+                            slug: slug.clone(),
+                            ticket: ticket.clone(),
+                            kind: held.claim.kind.as_str(),
+                            error,
+                        },
+                    })?;
+                    print_stdout(&out)?;
+                }
+                Format::Text => {
+                    eprintln!("relais: {repo} {slug}: {error}");
+                    eprintln!("next: relais programme claim {slug} {ticket}");
+                }
+            }
+        }
+    }
+    Ok(CliOutcome::Accepted)
 }
 
 pub(crate) fn release_command(

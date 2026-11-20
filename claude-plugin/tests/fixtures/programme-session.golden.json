@@ -1,0 +1,82 @@
+{
+  "programme": {
+    "counts": {
+      "blocked": 1,
+      "closed": 1,
+      "frontier": 1,
+      "in_flight": 1,
+      "open": 3,
+      "out_of_scope": 1
+    },
+    "holder": "self",
+    "kind": "work",
+    "ready": [
+      "t4"
+    ],
+    "repo": "alpha",
+    "slug": "p",
+    "ticket": "t2",
+    "tickets": [
+      {
+        "blocked_by": [],
+        "dependents": [
+          "t2"
+        ],
+        "due": null,
+        "held": false,
+        "id": "t1",
+        "name": "First",
+        "open_blockers": [],
+        "status": "closed"
+      },
+      {
+        "blocked_by": [
+          "t1"
+        ],
+        "dependents": [
+          "t3"
+        ],
+        "due": null,
+        "held": true,
+        "id": "t2",
+        "name": "Second",
+        "open_blockers": [],
+        "status": "in_flight"
+      },
+      {
+        "blocked_by": [
+          "t2"
+        ],
+        "dependents": [],
+        "due": null,
+        "held": false,
+        "id": "t3",
+        "name": "Third",
+        "open_blockers": [
+          "t2"
+        ],
+        "status": "blocked"
+      },
+      {
+        "blocked_by": [],
+        "dependents": [],
+        "due": "2026-12-01",
+        "held": false,
+        "id": "t4",
+        "name": "Fourth",
+        "open_blockers": [],
+        "status": "frontier"
+      },
+      {
+        "blocked_by": [],
+        "dependents": [],
+        "due": null,
+        "held": false,
+        "id": "t5",
+        "name": "Fifth",
+        "open_blockers": [],
+        "status": "out_of_scope"
+      }
+    ]
+  }
+}

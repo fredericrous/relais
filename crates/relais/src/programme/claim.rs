@@ -15,9 +15,9 @@ use std::collections::BTreeSet;
 use chrono::NaiveDate;
 
 pub use rules::{
-    held, repo_key, Claim, ClaimKey, ClaimRecord, Contest, Hold, Holder, Intent, Kind, Next, Pick,
-    ProgrammeState, ReadyTicket, FUTURE_SKEW_SECS, HANDOFF_HOLD_SECS, UNPARSEABLE_HOLD_SECS,
-    WORK_HOLD_SECS,
+    held, repo_key, resolve_session, Claim, ClaimKey, ClaimRecord, Claimant, Contest, Hold, Holder,
+    Intent, Kind, Next, Pick, ProgrammeState, ReadyTicket, Resolution, SessionClaim, SessionClaims,
+    FUTURE_SKEW_SECS, HANDOFF_HOLD_SECS, UNPARSEABLE_HOLD_SECS, WORK_HOLD_SECS,
 };
 pub use store::{
     now_unix, Acquired, ClaimError, Event, Pass, Released, SlugLock, Store, Taken, LOCK_WAIT,

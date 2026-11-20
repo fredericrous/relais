@@ -4,6 +4,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::Serialize;
+
 use super::claim::rules::Hold;
 use super::model::{MapDoc, Mode, Problem, Status, Ticket, MAP_FILE};
 
@@ -22,6 +24,29 @@ pub enum Standing {
     OutOfScope,
 }
 
+/// A [`Standing`] without its payload, as a machine-readable name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StandingKind {
+    Closed,
+    Frontier,
+    Blocked,
+    InFlight,
+    OutOfScope,
+}
+
+impl From<&Standing> for StandingKind {
+    fn from(standing: &Standing) -> Self {
+        match standing {
+            Standing::Frontier => Self::Frontier,
+            Standing::Blocked(_) => Self::Blocked,
+            Standing::InFlight { .. } => Self::InFlight,
+            Standing::Closed => Self::Closed,
+            Standing::OutOfScope => Self::OutOfScope,
+        }
+    }
+}
+
 /// What holds an in-flight ticket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Holder {
@@ -35,7 +60,7 @@ pub enum Holder {
     Claim(Hold),
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Counts {
     pub open: usize,
     pub frontier: usize,
