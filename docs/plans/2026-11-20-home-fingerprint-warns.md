@@ -153,10 +153,12 @@ Verification (input → expected → actual):
 - status report → heading, path line, two follow-up lines, all ≤ 80 columns → as expected.
 - `~/` in `extra_paths` expanded; a relative entry refused at load naming the key → as expected.
 - authority-hash pin test → unchanged, passes → passes.
+- CI windows-latest on the first push → pass → 5 path tests FAILED (`/x` not absolute on Windows, `~/` expected where Windows prints absolute, 80-column check on a path line, `/` in a suffix check); fixed in `fix: home fingerprint paths on Windows`, `~\` accepted as a tilde prefix on Windows; macOS home tests 29 passed, clippy exit 0; Windows proof is the next CI run.
 - Not done: a piloted `relais status` through the installed binary; the host was saturated (load 15–100 on 6 cores) and the fixture tests drive the real engine. First real run after release is the live check.
 
 ## Implementation review
 - implementation-review: approve-with-changes after 3 rounds; 14 fixed; `_` arm over `Result` in `expand_extra_paths` deliberate: not a domain enum (its own round-2 ruling). 154k tok.
+- Windows fix (delta): implementation-review, tui, architect approve; `is_valid_extra_path` doc to name `~\` carried (low).
 - backend approve; lang:rust approve; unix approve (run-end problem lines unprefixed: carried, low).
 - tui approve-with-changes: no-home line ~130 cols deliberate: shown only when HOME is unset.
 - architect approve-with-changes: run-end heading literal deliberate: one place, a different string by design; HomeWatch injection, absolute stored path, streaming hash carried to follow-ups.
