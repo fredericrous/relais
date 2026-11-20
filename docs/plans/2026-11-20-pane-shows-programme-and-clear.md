@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/pane-programme-and-clear-tail
 repos: [relais]
 plan-id: p-01M7V1BEK3NQ7D6VKEGB7ABVNV
@@ -229,7 +229,7 @@ The person's choices (AskUserQuestion, 2026-11-19):
 
 ## Code review
 
-- relais: backend, lang:rust, unix, tui, architect, lang:typescript
+- relais: none — markdown only (this closing docs PR; backend, lang:rust, unix, tui, architect and lang:typescript reviewed the code on #504)
 
 lang:typescript is added because TS is most of the change: the plugin's hooks.
 
@@ -273,6 +273,17 @@ lang:typescript is added because TS is most of the change: the plugin's hooks.
   each candidate passed every plugin test (458/458, then 466/466) at load
   10–40 and was committed by hand, recorded `salvaged`.
 
+- Closed with three gaps, each named (2026-11-20): (1) Phase 3's narrow-width
+  status hint shows only when the pane is unplaced at open; after a resize the
+  plugin does not learn it (live row "narrow"), tracked as follow-up f03;
+  (2) `relais programme session` took 1.24 s on this machine's real claim
+  store against the 300 ms guessed in Phase 4: the map load reads git, and the
+  plugin's bound is 5 s, so the guess is replaced by the measured 1.24 s;
+  (3) the Verification's `tsc -p claude-plugin` did not run: the repository
+  commits no `tsconfig.json` and the plugin's types are generated only when
+  Claude Code loads it, so `claude plugin validate` (per-module type check,
+  on 2.1.291 and 2.1.329) stands in.
+
 ## Verification record (Phases 1–3, 2026-11-20)
 
 | Check | Input | Expected | Actual |
@@ -288,7 +299,10 @@ lang:typescript is added because TS is most of the change: the plugin's hooks.
 | plugin validate | `claude plugin validate claude-plugin` | passes | passes with warnings of the kinds the base already has (`.ts` import extensions, possibly-undefined indexes); no separate `tsc -p` run |
 | gates | the pre-commit gate on each commit (fmt, clippy, cargo-test, plugin-test, cycles, ban-terms) | pass | passed on d6c8369d |
 | live, older relais | Claude Code 2.1.329 in tmux, 180×50, `--plugin-dir` this build, installed relais 0.71 | one dim row, no retry | `programme view needs a newer relais · relais install` in the pane; no read after a Bash claim (the plugin's `relais` is the one on its own PATH) |
-| live, happy path | the window map, then `next --claim` and `/clear` | Phase 4 | not run: needs the released relais as `relais` on the plugin's PATH |
+| live, happy path (Phase 4) | relais 0.72.0 (brew), Claude Code 2.1.329 in tmux 180×50, `--plugin-dir` the merged plugin, a scratch demo repo: `claim demo t03-handoff` | the window, `◀ you`, status `▶ demo t03-handoff` | the pane opened unasked with the window (`✓ 2 closed`, the blocker, `▶ t03-handoff … ◀ you`, two `·` dependents with `(needs …)`, the ready line, the counts); status `▶ demo t03-handoff` |
+| live, handoff + `/clear` | `next --from demo:demo --claim` (first parked `next due 2026-11-24`; after a ready ticket was added it reserved t08-count), then `/clear` | `◀ next` from the handoff, the tail | `▶ t08-count Count the handoffs ◀ next`, `before /clear · 07:01 [ hide ]` with the three exchanges, text only; status `▶ demo t08-count` |
+| live, narrow | the same session resized to 100 columns, then back to 180 | the pane hides; the status names the saved tail | the pane hid and came back at 180; the status kept `▶ demo t08-count` without `before /clear saved` (the plugin learns placement only when it opens the pane): follow-up f03 |
+| live, `[ hide ]` | — | — | not pressed live (tmux sends no click to the pane); covered by the plugin tests |
 
 ## Implementation review
 
@@ -297,6 +311,6 @@ lang:typescript is added because TS is most of the change: the plugin's hooks.
 - lang:rust, tui: approve; deliberate: `KindView::as_str`, `Nothing { expired }`, the failed-map row's short hint (the error wins the width).
 - architect, lang:typescript: approve after one Delta (opus).
 - 2.1.291 delta (read the tail without `last`): implementation-review and lang:typescript approve.
-- Next: Phase 4, release, reinstall, live proof; follow-up: claims record the common dir.
+- Phase 4: v0.72.0 released (#506, all six platform assets); brew upgraded to 0.72.0 here; live proof above. Refreshing the installed Claude plugin is the person's step: the relais plugin refuses its install command from the model. Follow-ups f01–f03 in `docs/programmes/follow-ups/`.
 
 <!-- panel: repos=relais adds= reviewers=architect,backend,lang:rust,po,tui,unix,codex body-sha=0e063360eeca -->
