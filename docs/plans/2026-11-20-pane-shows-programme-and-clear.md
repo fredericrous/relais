@@ -284,6 +284,7 @@ lang:typescript is added because TS is most of the change: the plugin's hooks.
 | no session id | no flag, no env | `relais: no session id`, `next: pass --session <id>`, exit 2 | as expected |
 | Rust tests | `cargo test -p relais --test programme_session` + the claim unit tests | pass | 15/15; resolution order, expiry, the tombstone guard and the gone-repository hint each tested |
 | plugin tests | `claude plugin test claude-plugin` | pass | 467/467 at load ~10 (the SessionStart-race test fails with its fix reverted: 466/1) |
+| plugin tests on the floor | the same under Claude Code 2.1.291 (the Makefile pin, CI's version) | pass | first CI run red: 12 clear-tail tests, as 2.1.291 refuses `messages({ last })`; with `messages({})` and a local slice, 468/468 on 2.1.291 and on 2.1.329 |
 | plugin validate | `claude plugin validate claude-plugin` | passes | passes with warnings of the kinds the base already has (`.ts` import extensions, possibly-undefined indexes); no separate `tsc -p` run |
 | gates | the pre-commit gate on each commit (fmt, clippy, cargo-test, plugin-test, cycles, ban-terms) | pass | passed on d6c8369d |
 | live, older relais | Claude Code 2.1.329 in tmux, 180×50, `--plugin-dir` this build, installed relais 0.71 | one dim row, no retry | `programme view needs a newer relais · relais install` in the pane; no read after a Bash claim (the plugin's `relais` is the one on its own PATH) |
@@ -295,6 +296,7 @@ lang:typescript is added because TS is most of the change: the plugin's hooks.
 - backend, unix: approve on the last Delta; deliberate: `resetLiveTail` after two awaits (a lost first read is re-read), the stale note's cause left to `relais programme session`.
 - lang:rust, tui: approve; deliberate: `KindView::as_str`, `Nothing { expired }`, the failed-map row's short hint (the error wins the width).
 - architect, lang:typescript: approve after one Delta (opus).
+- 2.1.291 delta (read the tail without `last`): implementation-review and lang:typescript approve.
 - Next: Phase 4, release, reinstall, live proof; follow-up: claims record the common dir.
 
 <!-- panel: repos=relais adds= reviewers=architect,backend,lang:rust,po,tui,unix,codex body-sha=0e063360eeca -->
