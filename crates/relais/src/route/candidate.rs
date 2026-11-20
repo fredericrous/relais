@@ -171,13 +171,26 @@ pub const TYPED_GATE_FLOOR_PERCENT: usize = 80;
 /// mid-gate keeps the bar it started under.
 pub const TYPED_GATE_FLOOR_FROM: &str = "2026-11-21T00:00:00+00:00";
 
-/// Whether a revision whose first trial was created at `first_trial_at`
-/// (RFC 3339, as the ledger writes it) is held to the validity floor. A
-/// stamp that does not parse is held to it: the stricter reading.
-pub fn validity_floor_applies(first_trial_at: &str) -> bool {
+/// Whether a revision is held to the validity floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorRule {
+    /// First trialled from [`TYPED_GATE_FLOOR_FROM`], or not yet trialled.
+    Applies,
+    /// First trialled before it: the bar the revision started under.
+    Grandfathered,
+}
+
+/// The floor rule for a revision whose first trial was created at
+/// `first_trial_at` (RFC 3339, as the ledger writes it). A stamp that does
+/// not parse is held to the floor: the stricter reading.
+pub fn validity_floor_rule(first_trial_at: &str) -> FloorRule {
+    // A literal of this file, pinned by the boundary test in `typed_gate`.
     let from = chrono::DateTime::parse_from_rfc3339(TYPED_GATE_FLOOR_FROM)
         .expect("the floor's cutoff is RFC 3339");
-    chrono::DateTime::parse_from_rfc3339(first_trial_at).map_or(true, |at| at >= from)
+    match chrono::DateTime::parse_from_rfc3339(first_trial_at) {
+        Ok(at) if at < from => FloorRule::Grandfathered,
+        Ok(_) | Err(_) => FloorRule::Applies,
+    }
 }
 
 /// The validity floor's reading of one arm.
@@ -238,7 +251,7 @@ impl TypedGateCount {
             {
                 Some(ValidityFloor::needs(valid, settled))
             }
-            _ => None,
+            ValidityFloor::Held { .. } | ValidityFloor::NotApplied | ValidityFloor::Met => None,
         }
     }
 

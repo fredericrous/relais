@@ -32,7 +32,7 @@ use crate::ids::{TaskId, TrialId};
 use crate::ledger::{GroundTruthVerdict, Ledger, LedgerError, TrialOutcome, TrialRow};
 use crate::policy::{RecipeSpec, RepoPolicy};
 use crate::route::{
-    is_typed_research_change, validity_floor_applies, TypedGateCount, TypedGateEvidence,
+    is_typed_research_change, validity_floor_rule, FloorRule, TypedGateCount, TypedGateEvidence,
     ValidityFloor, TYPED_GATE_TRIALS,
 };
 
@@ -146,21 +146,22 @@ fn in_arm(facts: &TrialFacts, spec: &RecipeSpec, task_type: TaskType) -> bool {
 
 /// The standing of `spec` for `task_type` among `trials` (oldest first).
 ///
-/// With `floor` (ADR-0006, a revision first trialled from
+/// Under [`FloorRule::Applies`] (ADR-0006, a revision first trialled from
 /// [`crate::route::TYPED_GATE_FLOOR_FROM`]), the gate reads only the closed
 /// prefix that ends before the arm's earliest unsettled trial, and the
 /// validity floor is read at the 15th qualifying trial: `settled` is the
 /// qualifying trials plus every in-arm errored trial up to it. Below the
 /// floor, it is read again at each later trial until a prefix reaches it,
-/// and a prefix that reaches it is final. Without `floor`, pending trials
+/// and a prefix that reaches it is final. Grandfathered, pending trials
 /// are skipped and the floor is not read: the bar the revision started under.
 pub fn standing(
     trials: &[TrialFacts],
     spec: &RecipeSpec,
     task_type: TaskType,
     research_model: Option<&str>,
-    floor: bool,
+    floor: FloorRule,
 ) -> TypeStanding {
+    let applies = floor == FloorRule::Applies;
     let mut seen: Vec<&TaskId> = Vec::new();
     let mut qualifying: Vec<(&TrialId, bool)> = Vec::new();
     let mut errored = 0usize;
@@ -168,7 +169,7 @@ pub fn standing(
     let mut waiting = None;
     for facts in trials {
         if facts.trial.outcome.is_none() {
-            if floor && in_arm(facts, spec, task_type) {
+            if applies && in_arm(facts, spec, task_type) {
                 waiting = Some(Waiting {
                     trial: facts.trial.trial_id.clone(),
                     since: facts.trial.created_at.clone(),
@@ -194,7 +195,7 @@ pub fn standing(
                 }
             }
         }
-        if floor && qualifying.len() >= TYPED_GATE_TRIALS && validity != ValidityFloor::Met {
+        if applies && qualifying.len() >= TYPED_GATE_TRIALS && validity != ValidityFloor::Met {
             let (valid, settled) = (qualifying.len(), qualifying.len() + errored);
             validity = if ValidityFloor::met_by(valid, settled) {
                 ValidityFloor::Met
@@ -260,9 +261,9 @@ pub fn assess(
         let trials = facts_of(ledger, &recipe_id)?;
         // The revision's first trial, settled or not, decides whether it is
         // held to the validity floor; one with none yet always is.
-        let floor = trials
-            .first()
-            .is_none_or(|first| validity_floor_applies(&first.trial.created_at));
+        let floor = trials.first().map_or(FloorRule::Applies, |first| {
+            validity_floor_rule(&first.trial.created_at)
+        });
         let research_model = arm_model(candidate, spec);
         let standings: Vec<TypeStanding> = spec
             .task_type
@@ -925,46 +926,46 @@ tier = "research"
 
     #[test]
     fn fifteen_of_eighteen_passes_the_floor() {
-        let w = world();
-        w.errored(100, 3);
-        w.qualifying(0, 15, 0);
-        assert_eq!(w.floor(), ValidityFloor::Met);
-        w.promote().expect("15/18 passes");
+        let world = world();
+        world.errored(100, 3);
+        world.qualifying(0, 15, 0);
+        assert_eq!(world.floor(), ValidityFloor::Met);
+        world.promote().expect("15/18 passes");
     }
 
     #[test]
     fn fifteen_of_nineteen_is_held_and_sixteen_of_twenty_clears_it() {
-        let w = world();
-        w.errored(100, 4);
-        w.qualifying(0, 15, 0);
+        let world = world();
+        world.errored(100, 4);
+        world.qualifying(0, 15, 0);
         assert_eq!(
-            w.floor(),
+            world.floor(),
             ValidityFloor::Held {
                 valid: 15,
                 settled: 19
             }
         );
         assert!(matches!(
-            w.promote(),
+            world.promote(),
             Err(CandidateRejection::TypedResearchGate { .. })
         ));
-        w.qualifying(15, 1, 0);
-        assert_eq!(w.floor(), ValidityFloor::Met);
-        w.promote().expect("16/20 clears the floor");
+        world.qualifying(15, 1, 0);
+        assert_eq!(world.floor(), ValidityFloor::Met);
+        world.promote().expect("16/20 clears the floor");
     }
 
     #[test]
     fn fifteen_of_twenty_is_held_with_the_pinned_line() {
-        let w = world();
-        w.errored(100, 5);
-        w.qualifying(0, 15, 0);
-        let refusal = w.promote().unwrap_err().to_string();
+        let world = world();
+        world.errored(100, 5);
+        world.qualifying(0, 15, 0);
+        let refusal = world.promote().unwrap_err().to_string();
         assert_eq!(
             refusal,
             "held: 15/20 valid (75%), below the 80% floor; needs 5 more valid trials"
         );
         assert!(refusal.chars().count() <= 80);
-        let assessment = assess(&w.ledger, &w.incumbent, &w.candidate).expect("reads");
+        let assessment = assess(&world.ledger, &world.incumbent, &world.candidate).expect("reads");
         assert!(
             assessment.authorisations.is_empty(),
             "held authorises nothing"
@@ -980,21 +981,21 @@ tier = "research"
 
     #[test]
     fn a_pass_is_final_and_later_errored_trials_never_move_it() {
-        let w = world();
-        w.errored(100, 3);
-        w.qualifying(0, 15, 0);
-        w.errored(200, 6);
-        assert_eq!(w.floor(), ValidityFloor::Met);
-        w.promote().expect("still passes");
+        let world = world();
+        world.errored(100, 3);
+        world.qualifying(0, 15, 0);
+        world.errored(200, 6);
+        assert_eq!(world.floor(), ValidityFloor::Met);
+        world.promote().expect("still passes");
     }
 
     #[test]
     fn a_pending_trial_is_a_barrier_never_a_denominator_entry() {
-        let w = world();
-        w.pending(300, "000-pending");
-        w.errored(100, 3);
-        w.qualifying(0, 15, 0);
-        let assessment = assess(&w.ledger, &w.incumbent, &w.candidate).expect("reads");
+        let world = world();
+        world.pending(300, "000-pending");
+        world.errored(100, 3);
+        world.qualifying(0, 15, 0);
+        let assessment = assess(&world.ledger, &world.incumbent, &world.candidate).expect("reads");
         let count = assessment.evidence.count_of("change-feature", 2);
         assert_eq!(
             count.qualifying, 0,
@@ -1008,7 +1009,8 @@ tier = "research"
             "waiting on trial trial-000-pending (pending since 2026-12-01)"
         );
         // The oldest trial settles errored: 15 of 19, held.
-        w.ledger
+        world
+            .ledger
             .settle_trial(
                 &TrialId::from_stored("trial-000-pending"),
                 TrialOutcome::Errored,
@@ -1018,56 +1020,56 @@ tier = "research"
             )
             .expect("settle");
         assert_eq!(
-            w.floor(),
+            world.floor(),
             ValidityFloor::Held {
                 valid: 15,
                 settled: 19
             }
         );
-        let assessment = assess(&w.ledger, &w.incumbent, &w.candidate).expect("reads");
+        let assessment = assess(&world.ledger, &world.incumbent, &world.candidate).expect("reads");
         assert!(assessment.waiting.is_empty());
     }
 
     #[test]
     fn a_held_arm_passes_at_the_earliest_prefix_that_reaches_the_floor() {
-        let w = world();
-        w.errored(100, 5);
-        w.qualifying(0, 15, 0);
-        assert!(w.promote().is_err(), "15/20 is held");
-        w.qualifying(15, 5, 0);
-        assert_eq!(w.floor(), ValidityFloor::Met, "20/25 reaches it");
-        w.errored(200, 5);
+        let world = world();
+        world.errored(100, 5);
+        world.qualifying(0, 15, 0);
+        assert!(world.promote().is_err(), "15/20 is held");
+        world.qualifying(15, 5, 0);
+        assert_eq!(world.floor(), ValidityFloor::Met, "20/25 reaches it");
+        world.errored(200, 5);
         assert_eq!(
-            w.floor(),
+            world.floor(),
             ValidityFloor::Met,
             "and later errors never move it"
         );
-        w.promote().expect("still passes");
+        world.promote().expect("still passes");
     }
 
     #[test]
     fn a_valid_repeat_enters_neither_count() {
-        let w = world();
-        w.qualifying(0, 7, 0);
+        let world = world();
+        world.qualifying(0, 7, 0);
         // A valid repeat of task-0 between the 1st and the 15th qualifying.
-        w.retrial(0, "500", |_| {});
-        w.qualifying(7, 8, 0);
-        let count = w.count();
+        world.retrial(0, "500", |_| {});
+        world.qualifying(7, 8, 0);
+        let count = world.count();
         assert_eq!(count.qualifying, 15);
         assert_eq!(count.floor, ValidityFloor::Met, "15/15, not 15/16");
-        w.promote().expect("passes");
+        world.promote().expect("passes");
     }
 
     #[test]
     fn errored_retries_on_one_task_each_enter_the_denominator() {
-        let w = world();
-        w.trial(100, |spec| spec.outcome = TrialOutcome::Errored);
+        let world = world();
+        world.trial(100, |spec| spec.outcome = TrialOutcome::Errored);
         for id in ["100b", "100c", "100d"] {
-            w.retrial(100, id, |spec| spec.outcome = TrialOutcome::Errored);
+            world.retrial(100, id, |spec| spec.outcome = TrialOutcome::Errored);
         }
-        w.qualifying(0, 15, 0);
+        world.qualifying(0, 15, 0);
         assert_eq!(
-            w.floor(),
+            world.floor(),
             ValidityFloor::Held {
                 valid: 15,
                 settled: 19
@@ -1079,22 +1081,25 @@ tier = "research"
     /// started under: no floor, and a pending trial bars nothing.
     #[test]
     fn a_revision_first_trialled_before_the_release_is_not_held() {
-        let w = world_from("2026-11-10T00:00:00+00:00");
-        w.pending(300, "000-pending");
-        w.errored(100, 8);
-        w.qualifying(0, 15, 1);
-        let assessment = assess(&w.ledger, &w.incumbent, &w.candidate).expect("reads");
+        let world = world_from("2026-11-10T00:00:00+00:00");
+        world.pending(300, "000-pending");
+        world.errored(100, 8);
+        world.qualifying(0, 15, 1);
+        let assessment = assess(&world.ledger, &world.incumbent, &world.candidate).expect("reads");
         let count = assessment.evidence.count_of("change-feature", 2);
         assert_eq!(count.floor, ValidityFloor::NotApplied);
         assert_eq!((count.qualifying, count.accepted), (15, 14));
         assert!(assessment.waiting.is_empty());
-        w.promote().expect("the old bar passes 14 of 15");
+        world.promote().expect("the old bar passes 14 of 15");
         // The cutoff's boundary is the cutoff itself.
-        assert!(crate::route::validity_floor_applies(
-            crate::route::TYPED_GATE_FLOOR_FROM
-        ));
-        assert!(!crate::route::validity_floor_applies(
-            "2026-11-20T23:59:59+00:00"
-        ));
+        assert_eq!(
+            validity_floor_rule(crate::route::TYPED_GATE_FLOOR_FROM),
+            FloorRule::Applies
+        );
+        assert_eq!(
+            validity_floor_rule("2026-11-20T23:59:59+00:00"),
+            FloorRule::Grandfathered
+        );
+        assert_eq!(validity_floor_rule("not a stamp"), FloorRule::Applies);
     }
 }

@@ -289,6 +289,15 @@ pub struct NewTrial<'a> {
 /// `insert_replay_trial` itself, because a replay is one deliberate
 /// re-run rather than a draw, and a caller that could name them could
 /// describe a sampled comparison that never happened.
+/// What a trial settled to: [`Ledger::settle_trial`]'s figures, together.
+#[derive(Debug, Clone, Copy)]
+pub struct TrialSettlement {
+    pub outcome: TrialOutcome,
+    pub accepted_without_escalation: bool,
+    pub cost: TrialCost,
+    pub duration_ms: i64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct NewReplayTrial<'a> {
     pub trial_id: &'a TrialId,
@@ -404,6 +413,27 @@ impl Ledger {
             arm_run_id: replay.arm_run_id,
             design_sha256: replay.design_sha256,
         })
+    }
+
+    /// Write a replay's trial already settled, in one transaction: a crash
+    /// between the insert and the settle can never leave a pending row,
+    /// which the typed-research gate would read as a barrier for good.
+    pub fn insert_settled_replay_trial(
+        &self,
+        replay: &NewReplayTrial<'_>,
+        settled: &TrialSettlement,
+    ) -> Result<()> {
+        let transaction = self.write_tx()?;
+        self.insert_replay_trial(replay)?;
+        self.settle_trial(
+            replay.trial_id,
+            settled.outcome,
+            settled.accepted_without_escalation,
+            settled.cost,
+            settled.duration_ms,
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Every arm recipe id a trial was drawn among, control first, or
@@ -1203,8 +1233,8 @@ mod tests {
         ledger
             .insert_run(&source_run, "/repo", None, &source_task, "rk")
             .expect("run");
-        let t = TrialId::from_stored("trial-p");
-        let trial = new_trial(&t, &source_task, &source_run);
+        let trial_id = TrialId::from_stored("trial-p");
+        let trial = new_trial(&trial_id, &source_task, &source_run);
         ledger.insert_trial(&trial).expect("insert trial");
         let ids = std::iter::once(trial.arm_recipe_id.to_string()).collect();
         let rows = ledger.trials_for_recipes(&ids).expect("rows");
@@ -1218,14 +1248,14 @@ mod tests {
             .conn
             .execute(
                 "UPDATE trials SET arm_index = -1 WHERE trial_id = ?1",
-                params![t.as_str()],
+                params![trial_id.as_str()],
             )
             .expect("hand-written arm index");
         let error = ledger
             .trials_for_recipes(&ids)
             .expect_err("a corrupt row is an error");
         assert!(matches!(error, LedgerError::Corrupt { .. }), "{error:?}");
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // a temp dir left behind is harmless
     }
 
     /// A trial settled with an actual, known cost reads that cost back

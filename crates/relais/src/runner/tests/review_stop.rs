@@ -721,12 +721,12 @@ impl Harness for Findings {
 
 impl Backend for Findings {
     fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
-        let mut result = self.0.launch(spec)?;
+        let mut launched = self.0.launch(spec)?;
         if spec.agent == AgentKind::Reviewer {
-            result.ended = Ended::Exited(0);
-            result.result_text = Some(self.1.to_string());
+            launched.ended = Ended::Exited(0);
+            launched.result_text = Some(self.1.to_string());
         }
-        Ok(result)
+        Ok(launched)
     }
 }
 
@@ -752,10 +752,22 @@ fn a_review_findings_stop_saves_its_snapshot_before_the_needs_review_transition(
     let transitions = fixture.ledger.transitions(&outcome.run_id).expect("rows");
     let stop = transitions
         .iter()
-        .find(|t| t.reason == Reason::ReviewFindings.as_str())
+        .find(|transition| transition.reason == Reason::ReviewFindings.as_str())
         .expect("the review_findings transition");
     assert_eq!(stop.to_state, State::NeedsReview);
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    // The snapshot is saved before the stop is recorded, never after it.
+    let saved_at = fixture
+        .ledger
+        .verification_snapshot_saved_at(&outcome.run_id)
+        .expect("read")
+        .expect("saved");
+    let instant = |stamp: &str| chrono::DateTime::parse_from_rfc3339(stamp).expect("a stamp");
+    assert!(
+        instant(&saved_at) < instant(&stop.at),
+        "the snapshot ({saved_at}) precedes the transition ({})",
+        stop.at
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // a temp dir left behind is harmless
 }
 
 #[test]
@@ -778,7 +790,7 @@ fn review_findings_sent_to_a_repair_attempt_save_no_snapshot() {
                     ..Default::default()
                 };
             }
-            std::fs::remove_file(spec.work_dir.join("src/main.rs")).ok();
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).ok(); // gone on the repair attempt already
             std::fs::write(spec.work_dir.join("src/note.txt"), "x\n").expect("write");
             MockOutcome {
                 result_text: Some("DONE".into()),
@@ -807,7 +819,7 @@ fn review_findings_sent_to_a_repair_attempt_save_no_snapshot() {
         .verification_snapshot(&outcome.run_id)
         .expect("read")
         .is_none());
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // a temp dir left behind is harmless
 }
 
 #[test]
@@ -830,7 +842,7 @@ fn a_decomposed_review_findings_stop_saves_a_snapshot() {
         .expect("read")
         .expect("the stop saved a snapshot");
     assert_eq!(snapshot.stop_reason, "review_findings");
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // a temp dir left behind is harmless
 }
 
 #[test]
@@ -877,5 +889,5 @@ fn a_review_findings_stop_is_not_reviewed_in_parts_and_its_approval_keeps_the_fi
     assert!(detail.contains("wrong result"), "{detail}");
     assert_eq!(receipt.review.reviewed(), review.reviewed());
     assert_eq!(receipt.review.reviewed(), Some(true));
-    std::fs::remove_dir_all(&fixture.dir).ok();
+    std::fs::remove_dir_all(&fixture.dir).ok(); // a temp dir left behind is harmless
 }

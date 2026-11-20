@@ -13,7 +13,9 @@ missing here.
   or unavailable review already did. The run saves a verification snapshot
   before it stops (never when the findings go to a repair attempt), and the
   receipt keeps the findings in a new `review: findings` record around the
-  review that found them. `relais dataset replay` can then replay such a
+  review that found them. A relais binary older than this one cannot read
+  such a receipt; relais reads only its own ledger, so upgrade every relais
+  that shares the state directory together. `relais dataset replay` can then replay such a
   run; its dry run prints `source settled by: decision (review_findings)` or
   `source settled by: runner`, and a source with no receipt is refused with
   `(source settled by: none)` and a `next:` line.
@@ -31,7 +33,9 @@ missing here.
   (`waiting on trial <id> (pending since <date>)`). Revisions first
   trialled before this release keep the bar they started under.
 - A `relais dataset replay` whose arm run fails with a runner error now
-  records one `errored` trial instead of none, so the floor sees it.
+  records one `errored` trial instead of none, so the floor sees it. A
+  replay's trial is now written already settled, in one transaction, so an
+  interrupted replay never leaves a pending trial the gate would wait on.
 
 ## v0.74.0
 

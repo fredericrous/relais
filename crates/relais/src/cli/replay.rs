@@ -525,7 +525,15 @@ pub(crate) fn replay_command(
                     );
                 }
                 None => {
-                    eprintln!("{}", log.end_line(&ReplayEnd::unrecorded("interrupted")));
+                    // Interrupted when no trial was owed; trial_write_failed
+                    // when one was and the ledger refused it.
+                    let end = if records_an_errored_trial(&e) {
+                        "trial_write_failed"
+                    } else {
+                        "interrupted"
+                    };
+                    eprintln!("{}", log.end_line(&ReplayEnd::unrecorded(end)));
+                    // The plugin's `done` names the run's own state.
                     announce_replay_done(&artifacts_dir, run_id.as_str(), "interrupted", None);
                 }
             }
@@ -654,14 +662,15 @@ pub(crate) fn record_replay_trial(
         live_trial::settled_figures(ledger, &outcome.run_id),
         "dataset replay",
     )?;
-    operational(ledger.insert_replay_trial(trial), "dataset replay")?;
     operational(
-        ledger.settle_trial(
-            trial.trial_id,
-            verdict.outcome,
-            verdict.accepted_without_escalation,
-            cost,
-            duration_ms,
+        ledger.insert_settled_replay_trial(
+            trial,
+            &relais::ledger::TrialSettlement {
+                outcome: verdict.outcome,
+                accepted_without_escalation: verdict.accepted_without_escalation,
+                cost,
+                duration_ms,
+            },
         ),
         "dataset replay",
     )?;
@@ -772,15 +781,23 @@ fn record_errored_replay_trial(
     ledger: &relais::ledger::Ledger,
     trial: &relais::ledger::NewReplayTrial<'_>,
 ) -> Result<ReplayEnd<'static>, relais::ledger::LedgerError> {
-    let (cost, duration_ms) = live_trial::settled_figures(ledger, trial.arm_run_id)
-        .unwrap_or((relais::ledger::TrialCost::UNKNOWN, 0));
-    ledger.insert_replay_trial(trial)?;
-    ledger.settle_trial(
-        trial.trial_id,
-        relais::ledger::TrialOutcome::Errored,
-        false,
-        cost,
-        duration_ms,
+    let (cost, duration_ms) = match live_trial::settled_figures(ledger, trial.arm_run_id) {
+        Ok(figures) => figures,
+        Err(cause) => {
+            // The trial is still the arm's errored result; only its figures
+            // are lost, and an unknown cost never reads as free.
+            eprintln!("relais dataset replay: the errored trial's cost is unknown: {cause}");
+            (relais::ledger::TrialCost::UNKNOWN, 0)
+        }
+    };
+    ledger.insert_settled_replay_trial(
+        trial,
+        &relais::ledger::TrialSettlement {
+            outcome: relais::ledger::TrialOutcome::Errored,
+            accepted_without_escalation: false,
+            cost,
+            duration_ms,
+        },
     )?;
     Ok(ReplayEnd {
         outcome: relais::ledger::TrialOutcome::Errored.as_str(),
