@@ -771,9 +771,10 @@ fn claim_outcome(error: claim::ClaimError, retry: &str) -> Result<CliOutcome, Cl
 }
 
 /// Moves the session's other `work` claims to `now` after a claim command
-/// has done its own work. Best effort: each programme's lock is tried once,
-/// and a failure or a busy lock is a warning on stderr, never the command's
-/// exit status, because the claim the person asked for is already written.
+/// has done its own work. Best effort: the programme locks are waited for
+/// up to `ONCE_GRACE` in total, and a failure or a lock still busy is a warning on
+/// stderr, never the command's exit status, because the claim the person
+/// asked for is already written.
 fn refresh_session_best_effort(store: &claim::Store, session: &str, now: i64) {
     match store.refresh_session_once(session, now) {
         Ok(pass) => {

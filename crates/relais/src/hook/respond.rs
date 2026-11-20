@@ -436,8 +436,8 @@ fn follow_agent_lifecycle(event: &HookEvent, gate: &dyn Gate, claims: Option<&cl
 
 /// A session that continues (`resume` or `compact`) is still working what
 /// it claimed: move its `work` claims' refresh time to now, before the
-/// early return a non-fresh start takes. Each programme's lock is tried
-/// once and a busy one is logged as skipped; this never waits, so it
+/// early return a non-fresh start takes. The pass waits for the programme
+/// locks up to `ONCE_GRACE` in total and logs one still busy as skipped, so it
 /// stays far inside [`GATHER_DEADLINE`].
 fn refresh_claims_of_a_continued_session(
     start: &event::SessionStart,

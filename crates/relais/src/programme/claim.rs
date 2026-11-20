@@ -571,7 +571,11 @@ mod tests {
         // A directory named like a claim file cannot be read as one: this programme errors.
         let bad = fixture.scratch.to_path_buf().join("claims/k/bad/x.toml");
         std::fs::create_dir_all(&bad).unwrap();
-        let pass = fixture.store.end_session_once("s1", NOW).unwrap();
+        // A wide grace: a concurrent fork may hold a copy of the lock for a moment.
+        let pass = fixture
+            .store
+            .end_session_within("s1", NOW, std::time::Duration::from_secs(2))
+            .unwrap();
         assert_eq!(pass.done, 1, "the good programme is still cleared");
         assert_eq!(pass.skipped, 1);
         let lines = pass.failure_lines();
@@ -583,6 +587,42 @@ mod tests {
             .to_path_buf()
             .join("claims/ended/s1")
             .is_file());
+    }
+
+    /// A lock that reads as held for a moment after its holder let go (a
+    /// concurrent fork copies the descriptor until it execs) is waited for,
+    /// not skipped: the session's claims are cleared and no tombstone is left.
+    #[test]
+    fn an_ending_session_waits_out_a_lock_held_for_a_moment() {
+        let fixture = fixture("end-brief");
+        {
+            let lock = fixture.store.lock(&key_of("p"), LOCK_WAIT, NOW).unwrap();
+            lock.claim_work("t1", "s1", "/r", Contest::Refuse, NOW)
+                .unwrap();
+        }
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let state_dir = fixture.scratch.to_path_buf();
+        let holder = std::thread::spawn(move || {
+            let store = Store::in_state_dir(&state_dir);
+            let _lock = store.lock(&key_of("p"), LOCK_WAIT, NOW).unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+        held_rx.recv().unwrap();
+        // A wide grace keeps this about waiting, not about timing; the hook
+        // tests hold the production grace to its 100 ms budget.
+        let pass = fixture
+            .store
+            .end_session_within("s1", NOW, std::time::Duration::from_secs(2))
+            .unwrap();
+        holder.join().unwrap();
+        assert_eq!((pass.done, pass.skipped), (1, 0));
+        assert!(fixture.store.records(&key_of("p")).unwrap().is_empty());
+        assert!(!fixture
+            .scratch
+            .to_path_buf()
+            .join("claims/ended/s1")
+            .exists());
     }
 
     #[test]

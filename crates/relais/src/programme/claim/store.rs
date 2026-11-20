@@ -23,6 +23,13 @@ use crate::procs::LockFile;
 /// How long a writer waits for a programme's claim lock.
 pub const LOCK_WAIT: Duration = Duration::from_secs(2);
 const LOCK_POLL: Duration = Duration::from_millis(10);
+/// How long one refresh or end pass waits, in total, for programme locks.
+/// A lock reads as held for a moment after its holder let go when a
+/// concurrent fork copied the descriptor and has not exec'd yet (see
+/// [`crate::procs::LockFile`]); a lock still held after this is skipped.
+/// Keep it well under the 100 ms the SessionStart and SessionEnd hooks are
+/// held to (`hook::respond` tests `…_with_the_lock_held_elsewhere_…`).
+const ONCE_GRACE: Duration = Duration::from_millis(30);
 const CLAIM_FILE_MODE: u32 = 0o600;
 /// Under `claims/`: one empty-ish file per session whose end could not delete
 /// its claims, named by the session id.
@@ -288,10 +295,12 @@ impl Store {
                 }
                 return Ok(locked);
             }
-            if started.elapsed() >= wait {
+            let elapsed = started.elapsed();
+            if elapsed >= wait {
                 return Err(ClaimError::LockTimeout { path });
             }
-            std::thread::sleep(LOCK_POLL);
+            // The last sleep stops at the deadline, so `wait` bounds the wait.
+            std::thread::sleep(LOCK_POLL.min(wait - elapsed));
         }
     }
 
@@ -324,24 +333,38 @@ impl Store {
             .map_err(io_error("appending to the claims log", &path))
     }
 
-    /// Moves every `work` claim of `session` to `now`, trying each
-    /// programme's lock once and never waiting for it: a busy one is logged
-    /// as `skipped` and left for the next refresh. A programme that fails is
-    /// recorded in [`Pass::failures`] and the others are still refreshed.
+    /// Moves every `work` claim of `session` to `now`, waiting for the
+    /// programme locks no longer than [`ONCE_GRACE`] for the whole pass: one
+    /// still busy is logged as `skipped` and left for the next refresh. A
+    /// programme that fails is recorded in [`Pass::failures`] and the others
+    /// are still refreshed.
     /// The session is alive, so a tombstone left by an earlier end of the
     /// same session id is dropped.
     pub fn refresh_session_once(&self, session: &str, now: i64) -> Result<Pass, ClaimError> {
         self.forget_ended(session)?;
-        self.once_per_programme(session, now, |lock| lock.refresh_work(session, now))
+        self.once_per_programme(session, now, ONCE_GRACE, |lock| {
+            lock.refresh_work(session, now)
+        })
     }
 
     /// Deletes every `work` claim of an ended session and keeps its
-    /// `handoff` claims, trying each programme's lock once. When a lock was
-    /// busy, or a programme failed, the claims there stay, `ended/<session>`
-    /// is written (without a lock) and the next locked write in a programme
-    /// applies it.
+    /// `handoff` claims, waiting for the programme locks no longer than
+    /// [`ONCE_GRACE`] for the whole pass. When a lock stayed busy, or a
+    /// programme failed, the claims there stay, `ended/<session>` is written
+    /// (without a lock) and the next locked write in a programme applies it.
     pub fn end_session_once(&self, session: &str, now: i64) -> Result<Pass, ClaimError> {
-        let pass = self.once_per_programme(session, now, |lock| lock.remove_work(session, now))?;
+        self.end_session_within(session, now, ONCE_GRACE)
+    }
+
+    /// [`Store::end_session_once`] with the pass's lock wait given.
+    pub(crate) fn end_session_within(
+        &self,
+        session: &str,
+        now: i64,
+        grace: Duration,
+    ) -> Result<Pass, ClaimError> {
+        let pass =
+            self.once_per_programme(session, now, grace, |lock| lock.remove_work(session, now))?;
         if pass.skipped > 0 {
             self.mark_ended(session, now)?;
         }
@@ -352,15 +375,18 @@ impl Store {
         &self,
         session: &str,
         now: i64,
+        grace: Duration,
         act: impl Fn(&SlugLock<'_>) -> Result<usize, ClaimError>,
     ) -> Result<Pass, ClaimError> {
         let mut pass = Pass::default();
+        let deadline = Instant::now() + grace;
         for key in self.keys()? {
             let step = || -> Result<Option<usize>, ClaimError> {
                 if !self.has_work_claim_in(&key, session)? {
                     return Ok(Some(0));
                 }
-                match self.lock(&key, Duration::ZERO, now) {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                match self.lock(&key, wait, now) {
                     Ok(lock) => act(&lock).map(Some),
                     Err(ClaimError::LockTimeout { .. }) => {
                         self.log(Event::Skipped, &key, "*", Some((session, Kind::Work)), now)?;
