@@ -950,6 +950,9 @@ pub enum PolicyError {
         field: &'static str,
         detail: String,
     },
+    /// A `[fingerprint] extra_paths` entry that is neither absolute nor
+    /// under `~/`.
+    InvalidFingerprintPath(String),
 }
 
 impl std::fmt::Display for PolicyError {
@@ -981,6 +984,10 @@ impl std::fmt::Display for PolicyError {
             Self::InvalidExecution { field, detail } => {
                 write!(f, "[execution] {field}: {detail}")
             }
+            Self::InvalidFingerprintPath(entry) => write!(
+                f,
+                "[fingerprint] extra_paths: `{entry}` is neither absolute nor under `~/`"
+            ),
         }
     }
 }
@@ -1162,13 +1169,13 @@ pub struct FingerprintSettings {
     #[serde(default = "FingerprintSettings::enabled_by_default")]
     pub enabled: bool,
     /// Files or directories watched in addition to the defaults, e.g.
-    /// `~/.config/relais`. Absolute paths.
+    /// `~/.config/relais`. Absolute paths, or `~/` under the home directory.
     #[serde(default)]
     pub extra_paths: Vec<std::path::PathBuf>,
     /// The home directory to watch instead of `HOME`. Not a machine.toml
     /// key: a test supplies one so no process-wide variable is set.
     #[serde(skip)]
-    pub home_override: Option<std::path::PathBuf>,
+    pub(crate) home_override: Option<std::path::PathBuf>,
 }
 
 impl FingerprintSettings {
@@ -2299,6 +2306,13 @@ impl MachineSettings {
         }
         self.session_routing.validate()?;
         self.learning.validate()?;
+        for entry in &self.fingerprint.extra_paths {
+            if !crate::homeprint::is_valid_extra_path(entry) {
+                return Err(PolicyError::InvalidFingerprintPath(
+                    entry.display().to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 }

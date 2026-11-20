@@ -324,26 +324,28 @@ pub(crate) fn refusal<T>(outcome: CliOutcome, message: impl Into<String>) -> Res
     })
 }
 
-/// The warning lines for the watched home files that changed while `run`
-/// was active (SPEC §8), empty when none did. A row whose file cannot be
-/// read is skipped: this only ever informs.
+/// The lines for the watched home files that changed while `run` was
+/// active (SPEC §8), for `status` and `explain` (stdout); empty when none
+/// did. A record that cannot be read is named, not skipped.
 pub(crate) fn home_drift_lines(ledger: &Ledger, run: &RunId) -> Vec<String> {
-    let Ok(rows) = ledger.evidence(run) else {
-        return Vec::new();
-    };
-    let drifts: Vec<relais::homeprint::Drift> = rows
-        .iter()
-        .filter(|row| row.kind == relais::ledger::EvidenceKind::HomeDrift)
-        .filter_map(|row| std::fs::read_to_string(&row.path).ok())
-        .filter_map(|body| serde_json::from_str(&body).ok())
-        .collect();
-    if drifts.is_empty() {
-        return Vec::new();
-    }
-    let mut lines: Vec<String> = drifts
-        .iter()
-        .map(|drift| drift.warning_line(run.as_str()))
-        .collect();
-    lines.push(relais::homeprint::FOLLOW_UP.to_string());
+    home_drift_report(ledger, run, "home files changed while the run was active:")
+}
+
+/// The same lines for the end of `relais run` (stderr), under a heading
+/// that names the command and the run.
+pub(crate) fn home_drift_warning_lines(ledger: &Ledger, run: &RunId) -> Vec<String> {
+    home_drift_report(
+        ledger,
+        run,
+        &format!(
+            "relais run: warning: home files changed while {run} was active:",
+            run = run.as_str()
+        ),
+    )
+}
+
+fn home_drift_report(ledger: &Ledger, run: &RunId, heading: &str) -> Vec<String> {
+    let (drifts, mut lines) = relais::runner::drifts_of_run(ledger, run);
+    lines.extend(relais::homeprint::report(&drifts, heading));
     lines
 }

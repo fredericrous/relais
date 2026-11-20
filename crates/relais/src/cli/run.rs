@@ -551,7 +551,7 @@ pub(crate) fn run_command(
             eprintln!("relais run: could not settle trial {trial_id}: {e}");
         }
     }
-    for line in super::ctx::home_drift_lines(&ledger, &outcome.run_id) {
+    for line in super::ctx::home_drift_warning_lines(&ledger, &outcome.run_id) {
         eprintln!("{line}");
     }
     let run_dir = artifacts_dir.join(outcome.run_id());

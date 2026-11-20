@@ -6,12 +6,14 @@
 //! warning. Nothing here decides anything: the result is a list of
 //! changed paths, and no caller changes a run's outcome because of it.
 //!
-//! [`snapshot`] and [`diff`] are calculations over a [`Watch`] and a read
-//! seam; the one action in this module is [`repo_config`], which asks git
-//! where a repository's shared config lives.
+//! [`diff`] and [`report`] are calculations over snapshots and drifts.
+//! [`snapshot`] is an action: it reads the filesystem (through a seam for
+//! file contents), as does [`repo_config`], which asks git where a
+//! repository's shared config lives.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -28,8 +30,8 @@ pub const MAX_FILES_PER_DIRECTORY: usize = 500;
 /// How long git may take to name the shared config directory.
 const GIT_WAIT: Duration = Duration::from_secs(10);
 
-/// The second line of every warning.
-pub const FOLLOW_UP: &str = "check these files; if the run caused it, see SPEC.md §sandbox";
+/// The last line of a warning that lists changed files.
+pub const FOLLOW_UP: &str = "check these files; if you did not change them, the run or its tests did: rerun them with HOME set to a temporary directory";
 
 /// Where the repository's `.git/config` is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,22 +81,32 @@ pub enum Change {
     Added,
     Removed,
     Modified,
-    /// A read failed on either side: the file was not checked.
+    /// A read failed on one side only: the file was not checked.
     Unreadable,
-    /// A directory passed the file cap on either side: part of it was not
-    /// checked.
+    /// A directory passed the file cap on one side only: part of it was
+    /// not checked.
     Truncated,
+    /// A read failed on both sides: nothing was compared, so nothing
+    /// drifted, and the path is reported apart from the changes.
+    NotWatched,
+    /// A directory passed the file cap on both sides: the files past the
+    /// cap are not compared. Reported apart from the changes.
+    NotFullyChecked,
 }
 
-impl Change {
-    fn label(self) -> String {
+impl fmt::Display for Change {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Added => "added".into(),
-            Self::Removed => "removed".into(),
-            Self::Modified => "modified".into(),
-            Self::Unreadable => "not checked: unreadable".into(),
+            Self::Added => f.write_str("added"),
+            Self::Removed => f.write_str("removed"),
+            Self::Modified => f.write_str("modified"),
+            Self::Unreadable => f.write_str("not checked: unreadable"),
             Self::Truncated => {
-                format!("not checked: more than {MAX_FILES_PER_DIRECTORY} files")
+                write!(f, "not checked: more than {MAX_FILES_PER_DIRECTORY} files")
+            }
+            Self::NotWatched => f.write_str("unreadable on both sides"),
+            Self::NotFullyChecked => {
+                write!(f, "more than {MAX_FILES_PER_DIRECTORY} files on both sides")
             }
         }
     }
@@ -109,14 +121,61 @@ pub struct Drift {
 }
 
 impl Drift {
-    /// The warning line for this drift while run `run` was active.
-    pub fn warning_line(&self, run: &str) -> String {
-        format!(
-            "relais run: warning: changed while run {run} was active: {} ({})",
-            self.path,
-            self.change.label()
-        )
+    /// The line for a path that was not compared at all; `None` for a
+    /// path that changed.
+    fn notice_line(&self) -> Option<String> {
+        match self.change {
+            Change::NotWatched => Some(format!("not watched (unreadable): {}", self.path)),
+            Change::NotFullyChecked => Some(format!(
+                "not fully checked: {} (more than {MAX_FILES_PER_DIRECTORY} files)",
+                self.path
+            )),
+            Change::Added
+            | Change::Removed
+            | Change::Modified
+            | Change::Unreadable
+            | Change::Truncated => None,
+        }
     }
+}
+
+/// The lines that report `drifts`: under `heading`, one indented line per
+/// changed path and the follow-up; then one line per path that was not
+/// compared. Empty when there is nothing to say.
+pub fn report(drifts: &[Drift], heading: &str) -> Vec<String> {
+    let changed: Vec<&Drift> = drifts
+        .iter()
+        .filter(|drift| drift.notice_line().is_none())
+        .collect();
+    let mut lines = Vec::new();
+    if !changed.is_empty() {
+        lines.push(heading.to_string());
+        lines.extend(
+            changed
+                .iter()
+                .map(|drift| format!("  {} ({})", drift.path, drift.change)),
+        );
+        lines.push(FOLLOW_UP.to_string());
+    }
+    lines.extend(drifts.iter().filter_map(Drift::notice_line));
+    lines
+}
+
+/// Whether `path` may be listed in `[fingerprint] extra_paths`: absolute,
+/// or under `~/`.
+pub fn is_valid_extra_path(path: &Path) -> bool {
+    path.is_absolute() || path.to_str().is_some_and(|text| text.starts_with("~/"))
+}
+
+/// `extra_paths` with a leading `~/` made relative to `home`.
+pub fn expand_extra_paths(paths: &[PathBuf], home: &Path) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .map(|path| match path.strip_prefix("~") {
+            Ok(rest) if is_valid_extra_path(path) => home.join(rest),
+            _ => path.clone(),
+        })
+        .collect()
 }
 
 /// How a path is printed: `~/…` under home on unix, absolute otherwise.
@@ -236,19 +295,32 @@ fn entry_of(path: &Path, read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) -> Option<
     })
 }
 
+/// What [`walk`] found under one directory.
+struct Walked {
+    entries: BTreeMap<PathBuf, Entry>,
+    /// Files counted so far, against [`MAX_FILES_PER_DIRECTORY`].
+    files: usize,
+    /// Whether more files remained past the cap.
+    truncated: bool,
+}
+
 /// The files of a directory in byte-sorted order, subdirectories walked
-/// depth first when `recursive`; stops at the cap. Returns whether more
-/// remained.
+/// depth first when `recursive`; stops at the cap. `files_so_far` is what
+/// the enclosing directories already counted.
 fn walk(
     target: &Target,
     dir: &Path,
-    entries: &mut BTreeMap<PathBuf, Entry>,
     read: &dyn Fn(&Path) -> io::Result<Vec<u8>>,
-    counted: &mut usize,
-) -> bool {
+    files_so_far: usize,
+) -> Walked {
+    let mut walked = Walked {
+        entries: BTreeMap::new(),
+        files: files_so_far,
+        truncated: false,
+    };
     let Ok(listing) = std::fs::read_dir(dir) else {
-        entries.insert(dir.to_path_buf(), Entry::Unreadable);
-        return false;
+        walked.entries.insert(dir.to_path_buf(), Entry::Unreadable);
+        return walked;
     };
     let mut names: Vec<OsString> = listing
         .filter_map(|item| item.ok())
@@ -256,57 +328,58 @@ fn walk(
         .collect();
     names.sort();
     for name in names {
-        let Some(text) = name.to_str() else { continue };
-        if !(target.keep)(text) {
+        if !(target.keep)(&name.to_string_lossy()) {
             continue;
         }
         let path = dir.join(&name);
         let is_dir = std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir());
         if is_dir {
-            if target.recursive && walk(target, &path, entries, read, counted) {
-                return true;
+            if target.recursive {
+                let inner = walk(target, &path, read, walked.files);
+                walked.entries.extend(inner.entries);
+                walked.files = inner.files;
+                if inner.truncated {
+                    walked.truncated = true;
+                    return walked;
+                }
             }
             continue;
         }
         let Some(entry) = entry_of(&path, read) else {
             continue;
         };
-        if *counted == MAX_FILES_PER_DIRECTORY {
-            return true;
+        if walked.files == MAX_FILES_PER_DIRECTORY {
+            walked.truncated = true;
+            return walked;
         }
-        *counted += 1;
-        entries.insert(path, entry);
+        walked.files += 1;
+        walked.entries.insert(path, entry);
     }
-    false
+    walked
 }
 
 /// Snapshot the watched files. `read` is the seam through which file
 /// contents arrive; a failure there is recorded as unreadable.
 pub fn snapshot(watch: &Watch<'_>, read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) -> Snapshot {
-    let mut result = Snapshot::default();
+    let mut taken = Snapshot::default();
     for target in targets(watch) {
         if matches!(&watch.repo_config, RepoConfig::Unresolved(path) if *path == target.path) {
-            result.entries.insert(target.path, Entry::Unreadable);
+            taken.entries.insert(target.path, Entry::Unreadable);
             continue;
         }
         let is_dir =
             std::fs::symlink_metadata(&target.path).is_ok_and(|metadata| metadata.is_dir());
         if is_dir {
-            let mut counted = 0;
-            if walk(
-                &target,
-                &target.path,
-                &mut result.entries,
-                read,
-                &mut counted,
-            ) {
-                result.truncated.insert(target.path);
+            let walked = walk(&target, &target.path, read, 0);
+            taken.entries.extend(walked.entries);
+            if walked.truncated {
+                taken.truncated.insert(target.path);
             }
         } else if let Some(entry) = entry_of(&target.path, read) {
-            result.entries.insert(target.path, entry);
+            taken.entries.insert(target.path, entry);
         }
     }
-    result
+    taken
 }
 
 /// What changed between two snapshots, in path order. A path one side
@@ -318,12 +391,14 @@ pub fn diff(before: &Snapshot, after: &Snapshot, home: &Path) -> Vec<Drift> {
         let was = before.entries.get(path).unwrap_or(&Entry::Absent);
         let is = after.entries.get(path).unwrap_or(&Entry::Absent);
         let change = match (was, is) {
+            (Entry::Unreadable, Entry::Unreadable) => Some(Change::NotWatched),
             (Entry::Unreadable, _) | (_, Entry::Unreadable) => Some(Change::Unreadable),
             (Entry::Absent, Entry::Absent) => None,
-            (Entry::Absent, _) => Some(Change::Added),
-            (_, Entry::Absent) => Some(Change::Removed),
-            (was, is) if was != is => Some(Change::Modified),
-            _ => None,
+            (Entry::Absent, Entry::File { .. } | Entry::Link { .. }) => Some(Change::Added),
+            (Entry::File { .. } | Entry::Link { .. }, Entry::Absent) => Some(Change::Removed),
+            (Entry::File { .. } | Entry::Link { .. }, Entry::File { .. } | Entry::Link { .. }) => {
+                (was != is).then_some(Change::Modified)
+            }
         };
         if let Some(change) = change {
             drifts.push(Drift {
@@ -332,10 +407,15 @@ pub fn diff(before: &Snapshot, after: &Snapshot, home: &Path) -> Vec<Drift> {
             });
         }
     }
-    for path in before.truncated.symmetric_difference(&after.truncated) {
+    for path in before.truncated.union(&after.truncated) {
+        let change = if before.truncated.contains(path) && after.truncated.contains(path) {
+            Change::NotFullyChecked
+        } else {
+            Change::Truncated
+        };
         drifts.push(Drift {
             path: shown(path, home),
-            change: Change::Truncated,
+            change,
         });
     }
     drifts
@@ -363,9 +443,8 @@ pub fn repo_config(root: &Path) -> RepoConfig {
             Ok(Some(status)) if status.success() => break,
             Ok(Some(_)) | Err(_) => return RepoConfig::Unresolved(guess),
             Ok(None) if Instant::now() >= deadline => {
-                // The child is being abandoned; a failed kill leaves nothing to do.
-                child.kill().ok();
-                child.wait().ok();
+                child.kill().ok(); // abandoning the child: a failed kill leaves nothing to do
+                child.wait().ok(); // reaping only; the exit status is not wanted
                 return RepoConfig::Unresolved(guess);
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
@@ -420,9 +499,9 @@ mod tests {
     fn an_unchanged_home_has_no_drift() {
         let home = crate::test_support::temp_dir("homeprint-same");
         std::fs::write(home.join(".gitconfig"), "[user]\n").expect("write");
-        let a = snapshot(&watch(&home, &no_env, &[]), &real_read);
-        let b = snapshot(&watch(&home, &no_env, &[]), &real_read);
-        assert_eq!(diff(&a, &b, &home), Vec::new());
+        let first = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        let second = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        assert_eq!(diff(&first, &second, &home), Vec::new());
     }
 
     #[test]
@@ -472,9 +551,14 @@ mod tests {
         let drifts = diff(&before, &after, &home);
         assert_eq!(drifts.len(), 1, "{drifts:?}");
         assert_eq!(drifts[0].change, Change::Unreadable);
-        assert!(drifts[0]
-            .warning_line("r1")
-            .ends_with("(not checked: unreadable)"));
+        assert_eq!(
+            report(&drifts, "heading"),
+            vec![
+                "heading".to_string(),
+                "  ~/.gitconfig (not checked: unreadable)".to_string(),
+                FOLLOW_UP.to_string()
+            ]
+        );
     }
 
     #[test]
@@ -501,16 +585,18 @@ mod tests {
             std::fs::write(extra.join(format!("f{index:04}")), "x").expect("write");
         }
         let extras = [extra];
-        let a = snapshot(&watch(&home, &no_env, &extras), &real_read);
-        let b = snapshot(&watch(&home, &no_env, &extras), &real_read);
-        let kept = a
+        let first = snapshot(&watch(&home, &no_env, &extras), &real_read);
+        let second = snapshot(&watch(&home, &no_env, &extras), &real_read);
+        let kept = first
             .entries
             .keys()
             .filter(|path| path.starts_with(home.join("many")))
             .count();
         assert_eq!(kept, MAX_FILES_PER_DIRECTORY);
-        assert!(a.truncated.contains(&home.join("many")));
-        assert_eq!(diff(&a, &b, &home), Vec::new());
+        assert!(first.truncated.contains(&home.join("many")));
+        let drifts = diff(&first, &second, &home);
+        assert_eq!(drifts.len(), 1, "{drifts:?}");
+        assert_eq!(drifts[0].change, Change::NotFullyChecked);
     }
 
     #[cfg(unix)]
@@ -587,14 +673,80 @@ mod tests {
     }
 
     #[test]
-    fn the_warning_line_names_run_path_and_change() {
-        let drift = Drift {
+    fn a_report_lists_changes_under_a_heading_then_the_follow_up() {
+        let drifts = [Drift {
             path: "~/.gitconfig".into(),
             change: Change::Modified,
-        };
+        }];
         assert_eq!(
-            drift.warning_line("run-1"),
-            "relais run: warning: changed while run run-1 was active: ~/.gitconfig (modified)"
+            report(&drifts, "home files changed:"),
+            vec![
+                "home files changed:".to_string(),
+                "  ~/.gitconfig (modified)".to_string(),
+                FOLLOW_UP.to_string()
+            ]
         );
+    }
+
+    #[test]
+    fn a_path_unreadable_on_both_sides_is_not_a_drift() {
+        let home = crate::test_support::temp_dir("homeprint-both-unreadable");
+        std::fs::write(home.join(".gitconfig"), "one").expect("write");
+        let failing = |path: &Path| -> io::Result<Vec<u8>> {
+            if path.ends_with(".gitconfig") {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected"))
+            } else {
+                std::fs::read(path)
+            }
+        };
+        let before = snapshot(&watch(&home, &no_env, &[]), &failing);
+        let after = snapshot(&watch(&home, &no_env, &[]), &failing);
+        let drifts = diff(&before, &after, &home);
+        assert_eq!(drifts.len(), 1, "{drifts:?}");
+        assert_eq!(drifts[0].change, Change::NotWatched);
+        let lines = report(&drifts, "heading");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("not watched (unreadable): "),
+            "{lines:?}"
+        );
+        assert!(lines[0].ends_with(".gitconfig"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_directory_cut_on_both_sides_is_reported_as_not_fully_checked() {
+        let home = PathBuf::from("/h");
+        let cut = Snapshot {
+            entries: BTreeMap::new(),
+            truncated: BTreeSet::from([home.join("many")]),
+        };
+        let drifts = diff(&cut, &cut, &home);
+        assert_eq!(
+            report(&drifts, "heading"),
+            vec![format!(
+                "not fully checked: {} (more than {MAX_FILES_PER_DIRECTORY} files)",
+                shown(&home.join("many"), &home)
+            )]
+        );
+    }
+
+    #[test]
+    fn a_leading_tilde_slash_is_expanded_against_the_home() {
+        let home = PathBuf::from("/h");
+        let paths = [
+            PathBuf::from("~/.config/relais"),
+            PathBuf::from("/abs/tool"),
+        ];
+        assert_eq!(
+            expand_extra_paths(&paths, &home),
+            vec![
+                PathBuf::from("/h/.config/relais"),
+                PathBuf::from("/abs/tool")
+            ]
+        );
+        assert!(is_valid_extra_path(Path::new("~/x")));
+        assert!(is_valid_extra_path(Path::new("/x")));
+        assert!(!is_valid_extra_path(Path::new("x/y")));
+        assert!(!is_valid_extra_path(Path::new("~other/x")));
     }
 }

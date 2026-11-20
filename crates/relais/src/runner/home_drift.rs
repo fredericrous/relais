@@ -5,8 +5,9 @@
 use std::ffi::OsString;
 
 use super::RunEngine;
-use crate::homeprint::{self, Snapshot, Watch};
-use crate::ledger::EvidenceKind;
+use crate::homeprint::{self, Drift, Snapshot, Watch};
+use crate::ids::RunId;
+use crate::ledger::{EvidenceKind, Ledger};
 
 /// A variable lookup, by name.
 type EnvLookup<'a> = Box<dyn Fn(&str) -> Option<OsString> + 'a>;
@@ -19,12 +20,16 @@ impl<'a> RunEngine<'a> {
         if !settings.enabled || self.parent.is_some() {
             return None;
         }
-        let (home, var) = self.home_and_env()?;
+        let Some((home, var)) = self.home_and_env() else {
+            eprintln!("relais: no home directory could be resolved; home files are not watched");
+            return None;
+        };
+        let extra_paths = homeprint::expand_extra_paths(&settings.extra_paths, &home);
         let watch = Watch {
             home: &home,
             var: &var,
             repo_config: homeprint::repo_config(self.config.repo_dir),
-            extra_paths: &settings.extra_paths,
+            extra_paths: &extra_paths,
         };
         Some(homeprint::snapshot(&watch, &|path| std::fs::read(path)))
     }
@@ -58,7 +63,9 @@ impl<'a> RunEngine<'a> {
                     continue;
                 }
             };
-            if let Err(error) = self.record_artifact(None, EvidenceKind::HomeDrift, &path, &body) {
+            if let Err(error) =
+                self.record_immutable_artifact(EvidenceKind::HomeDrift, &path, &body)
+            {
                 eprintln!("relais: home drift could not be recorded: {error}");
             }
         }
@@ -76,4 +83,36 @@ impl<'a> RunEngine<'a> {
         let home = crate::paths::resolve_home(|name| std::env::var_os(name)).ok()?;
         Some((home, Box::new(|name| std::env::var_os(name))))
     }
+}
+
+/// The drifts recorded for `run`, and one line for each record that could
+/// not be read, so a lost record is visible instead of silent.
+pub fn drifts_of_run(ledger: &Ledger, run: &RunId) -> (Vec<Drift>, Vec<String>) {
+    let rows = match ledger.evidence(run) {
+        Ok(rows) => rows,
+        Err(error) => {
+            return (
+                Vec::new(),
+                vec![format!("home drift records unreadable: {error}")],
+            )
+        }
+    };
+    let mut drifts = Vec::new();
+    let mut problems = Vec::new();
+    for row in rows
+        .iter()
+        .filter(|row| row.kind == EvidenceKind::HomeDrift)
+    {
+        let parsed = std::fs::read_to_string(&row.path)
+            .map_err(|error| error.to_string())
+            .and_then(|body| serde_json::from_str(&body).map_err(|error| error.to_string()));
+        match parsed {
+            Ok(drift) => drifts.push(drift),
+            Err(error) => problems.push(format!(
+                "home drift record {} unreadable: {error}",
+                row.path
+            )),
+        }
+    }
+    (drifts, problems)
 }

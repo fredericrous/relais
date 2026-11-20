@@ -20,7 +20,9 @@ missing here.
   A change by the person during the run shows too.
 - `[fingerprint]` in `machine.toml` takes `enabled` (default true) and
   `extra_paths`, files or directories watched in addition (`~/.config` as a
-  whole is not watched). Write the section only once every installed relais is
+  whole is not watched; entries are absolute or start with `~/`, anything else
+  is refused). A path unreadable on both sides prints as `not watched
+  (unreadable)`, not as a change. Write the section only once every installed relais is
   at or above this release: older versions reject an unknown section, and
   read a `home_drift` evidence row as corrupt.
 
