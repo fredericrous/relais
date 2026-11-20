@@ -1,6 +1,6 @@
 //! `relais status` and `relais explain`.
 
-use super::ctx::open_ledger;
+use super::ctx::{home_drift_lines, open_ledger};
 use super::outcome::operational;
 use super::outcome::CliError;
 use super::outcome::CliOutcome;
@@ -129,6 +129,9 @@ pub(crate) fn status_command(run_id: Option<&str>) -> Result<CliOutcome, CliErro
             let cost = operational(ledger.run_cost(&run_id), "status")?;
             let attempts = operational(ledger.attempt_count(&run_id), "status")?;
             println!("{run_id}: {state} (attempts: {attempts}, cost: {cost})");
+            for line in home_drift_lines(&ledger, &run_id) {
+                println!("{line}");
+            }
             if let Some(fence) = worker_fence_of_run(&ledger, &run_id) {
                 println!("{fence}");
             }
@@ -175,6 +178,9 @@ pub(crate) fn explain_command(run_id: &str) -> Result<CliOutcome, CliError> {
         {
             println!("      {detail}");
         }
+    }
+    for line in home_drift_lines(&ledger, &run) {
+        println!("{line}");
     }
     let children = operational(ledger.child_runs(&run), "explain")?;
     if !children.is_empty() {

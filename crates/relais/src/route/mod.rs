@@ -1228,6 +1228,7 @@ mod tests {
 
     fn machine_for(repo: &RepoPolicy) -> MachineSettings {
         let mut machine = MachineSettings {
+            fingerprint: Default::default(),
             holdouts: Default::default(),
             workspace: Default::default(),
             resources: Default::default(),
@@ -1592,6 +1593,7 @@ mod tests {
     fn authority_blockers_stop_routing_before_dispatch() {
         let repo = repo_policy();
         let machine = MachineSettings {
+            fingerprint: Default::default(),
             holdouts: Default::default(),
             workspace: Default::default(),
             resources: Default::default(),
@@ -2107,6 +2109,7 @@ mod tests {
     fn blocked_explanation_lists_codes() {
         let repo = repo_policy();
         let machine = MachineSettings {
+            fingerprint: Default::default(),
             holdouts: Default::default(),
             workspace: Default::default(),
             resources: Default::default(),

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use relais::backend::Harness;
 use relais::contract::TaskContract;
-use relais::ids::{IdSource, TaskId};
+use relais::ids::{IdSource, RunId, TaskId};
 use relais::ledger::Ledger;
 use relais::orchestration::PriceTable;
 use relais::policy::{MachineSettings, RepoPolicy};
@@ -322,4 +322,28 @@ pub(crate) fn refusal<T>(outcome: CliOutcome, message: impl Into<String>) -> Res
         outcome,
         message: message.into(),
     })
+}
+
+/// The warning lines for the watched home files that changed while `run`
+/// was active (SPEC §8), empty when none did. A row whose file cannot be
+/// read is skipped: this only ever informs.
+pub(crate) fn home_drift_lines(ledger: &Ledger, run: &RunId) -> Vec<String> {
+    let Ok(rows) = ledger.evidence(run) else {
+        return Vec::new();
+    };
+    let drifts: Vec<relais::homeprint::Drift> = rows
+        .iter()
+        .filter(|row| row.kind == relais::ledger::EvidenceKind::HomeDrift)
+        .filter_map(|row| std::fs::read_to_string(&row.path).ok())
+        .filter_map(|body| serde_json::from_str(&body).ok())
+        .collect();
+    if drifts.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = drifts
+        .iter()
+        .map(|drift| drift.warning_line(run.as_str()))
+        .collect();
+    lines.push(relais::homeprint::FOLLOW_UP.to_string());
+    lines
 }

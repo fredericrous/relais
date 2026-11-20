@@ -56,6 +56,7 @@ mod error;
 mod evidence;
 mod holdout_exposure;
 mod holdouts;
+mod home_drift;
 mod launch;
 pub mod live_trial;
 mod loop_text;

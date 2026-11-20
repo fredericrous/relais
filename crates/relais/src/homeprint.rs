@@ -1,0 +1,600 @@
+//! A fingerprint of the sensitive files in the home directory (SPEC §8).
+//!
+//! relais keeps no OS sandbox, and its scope check sees only the worktree
+//! diff, so a worker or a baseline test run that rewrites `~/.gitconfig`
+//! went unseen. A snapshot before and after a run turns that into a
+//! warning. Nothing here decides anything: the result is a list of
+//! changed paths, and no caller changes a run's outcome because of it.
+//!
+//! [`snapshot`] and [`diff`] are calculations over a [`Watch`] and a read
+//! seam; the one action in this module is [`repo_config`], which asks git
+//! where a repository's shared config lives.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use crate::ids::sha256_hex;
+
+/// A directory is expanded to at most this many files; past it the
+/// directory is recorded as truncated, not walked on.
+pub const MAX_FILES_PER_DIRECTORY: usize = 500;
+
+/// How long git may take to name the shared config directory.
+const GIT_WAIT: Duration = Duration::from_secs(10);
+
+/// The second line of every warning.
+pub const FOLLOW_UP: &str = "check these files; if the run caused it, see SPEC.md §sandbox";
+
+/// Where the repository's `.git/config` is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoConfig {
+    /// The shared config file, as git named it.
+    At(PathBuf),
+    /// Git could not say (no git, not a repository); the guessed path is
+    /// recorded as unreadable.
+    Unresolved(PathBuf),
+}
+
+/// Everything that decides which files are watched. Taken as values, so a
+/// test never sets a process-wide variable.
+pub struct Watch<'a> {
+    pub home: &'a Path,
+    pub var: &'a dyn Fn(&str) -> Option<OsString>,
+    pub repo_config: RepoConfig,
+    pub extra_paths: &'a [PathBuf],
+}
+
+/// What one watched path held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Entry {
+    Absent,
+    File {
+        sha256: String,
+        size: u64,
+        mode: Option<u32>,
+    },
+    Link {
+        target: PathBuf,
+    },
+    Unreadable,
+}
+
+/// The watched files at one moment: hashes only, never contents.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Snapshot {
+    entries: BTreeMap<PathBuf, Entry>,
+    truncated: BTreeSet<PathBuf>,
+}
+
+/// How a watched path differs between two snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Change {
+    Added,
+    Removed,
+    Modified,
+    /// A read failed on either side: the file was not checked.
+    Unreadable,
+    /// A directory passed the file cap on either side: part of it was not
+    /// checked.
+    Truncated,
+}
+
+impl Change {
+    fn label(self) -> String {
+        match self {
+            Self::Added => "added".into(),
+            Self::Removed => "removed".into(),
+            Self::Modified => "modified".into(),
+            Self::Unreadable => "not checked: unreadable".into(),
+            Self::Truncated => {
+                format!("not checked: more than {MAX_FILES_PER_DIRECTORY} files")
+            }
+        }
+    }
+}
+
+/// One drifted path, as stored on the run and printed. The path is
+/// already in its printed form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Drift {
+    pub path: String,
+    pub change: Change,
+}
+
+impl Drift {
+    /// The warning line for this drift while run `run` was active.
+    pub fn warning_line(&self, run: &str) -> String {
+        format!(
+            "relais run: warning: changed while run {run} was active: {} ({})",
+            self.path,
+            self.change.label()
+        )
+    }
+}
+
+/// How a path is printed: `~/…` under home on unix, absolute otherwise.
+fn shown(path: &Path, home: &Path) -> String {
+    if cfg!(unix) {
+        if let Ok(rest) = path.strip_prefix(home) {
+            return format!("~/{}", rest.display());
+        }
+    }
+    path.display().to_string()
+}
+
+/// A watched file or directory, and which names inside a directory count.
+struct Target {
+    path: PathBuf,
+    recursive: bool,
+    keep: fn(&str) -> bool,
+}
+
+fn keep_all(_: &str) -> bool {
+    true
+}
+
+/// `ssh` appends to `known_hosts*` in the normal course of work.
+fn keep_ssh(name: &str) -> bool {
+    !name.starts_with("known_hosts")
+}
+
+fn keep_claude_settings(name: &str) -> bool {
+    name.starts_with("settings") && name.ends_with(".json")
+}
+
+fn single(path: PathBuf) -> Target {
+    Target {
+        path,
+        recursive: false,
+        keep: keep_all,
+    }
+}
+
+/// The default watched set plus the machine's extras (SPEC §8).
+fn targets(watch: &Watch<'_>) -> Vec<Target> {
+    let home = watch.home;
+    let claude = (watch.var)("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| home.join(".claude"), PathBuf::from);
+    let xdg_config = (watch.var)("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| home.join(".config"), PathBuf::from);
+    let mut targets = vec![
+        single(home.join(".gitconfig")),
+        single(xdg_config.join("git").join("config")),
+        single(home.join(".netrc")),
+        Target {
+            path: claude.clone(),
+            recursive: false,
+            keep: keep_claude_settings,
+        },
+        single(claude.join("plugins").join("installed_plugins.json")),
+        single(claude.join("plugins").join("known_marketplaces.json")),
+        Target {
+            path: home.join(".ssh"),
+            recursive: true,
+            keep: keep_ssh,
+        },
+    ];
+    if cfg!(windows) {
+        targets.push(single(home.join("_netrc")));
+    }
+    match &watch.repo_config {
+        RepoConfig::At(path) | RepoConfig::Unresolved(path) => targets.push(single(path.clone())),
+    }
+    targets.extend(watch.extra_paths.iter().map(|path| Target {
+        path: path.clone(),
+        recursive: true,
+        keep: keep_all,
+    }));
+    targets
+}
+
+#[cfg(unix)]
+fn mode_of(metadata: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Some(metadata.permissions().mode() & 0o7777)
+}
+
+#[cfg(not(unix))]
+fn mode_of(_: &std::fs::Metadata) -> Option<u32> {
+    None
+}
+
+/// What a path holds, or `None` for what is not watched: a directory is
+/// walked by its caller, and a FIFO, socket or device is skipped, since
+/// opening a FIFO blocks and sockets come and go.
+fn entry_of(path: &Path, read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) -> Option<Entry> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(Entry::Absent),
+        Err(_) => return Some(Entry::Unreadable),
+    };
+    if metadata.is_symlink() {
+        return Some(match std::fs::read_link(path) {
+            Ok(target) => Entry::Link { target },
+            Err(_) => Entry::Unreadable,
+        });
+    }
+    if !metadata.is_file() {
+        return None;
+    }
+    Some(match read(path) {
+        Ok(bytes) => Entry::File {
+            sha256: sha256_hex(&bytes),
+            size: metadata.len(),
+            mode: mode_of(&metadata),
+        },
+        Err(_) => Entry::Unreadable,
+    })
+}
+
+/// The files of a directory in byte-sorted order, subdirectories walked
+/// depth first when `recursive`; stops at the cap. Returns whether more
+/// remained.
+fn walk(
+    target: &Target,
+    dir: &Path,
+    entries: &mut BTreeMap<PathBuf, Entry>,
+    read: &dyn Fn(&Path) -> io::Result<Vec<u8>>,
+    counted: &mut usize,
+) -> bool {
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        entries.insert(dir.to_path_buf(), Entry::Unreadable);
+        return false;
+    };
+    let mut names: Vec<OsString> = listing
+        .filter_map(|item| item.ok())
+        .map(|item| item.file_name())
+        .collect();
+    names.sort();
+    for name in names {
+        let Some(text) = name.to_str() else { continue };
+        if !(target.keep)(text) {
+            continue;
+        }
+        let path = dir.join(&name);
+        let is_dir = std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir());
+        if is_dir {
+            if target.recursive && walk(target, &path, entries, read, counted) {
+                return true;
+            }
+            continue;
+        }
+        let Some(entry) = entry_of(&path, read) else {
+            continue;
+        };
+        if *counted == MAX_FILES_PER_DIRECTORY {
+            return true;
+        }
+        *counted += 1;
+        entries.insert(path, entry);
+    }
+    false
+}
+
+/// Snapshot the watched files. `read` is the seam through which file
+/// contents arrive; a failure there is recorded as unreadable.
+pub fn snapshot(watch: &Watch<'_>, read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) -> Snapshot {
+    let mut result = Snapshot::default();
+    for target in targets(watch) {
+        if matches!(&watch.repo_config, RepoConfig::Unresolved(path) if *path == target.path) {
+            result.entries.insert(target.path, Entry::Unreadable);
+            continue;
+        }
+        let is_dir =
+            std::fs::symlink_metadata(&target.path).is_ok_and(|metadata| metadata.is_dir());
+        if is_dir {
+            let mut counted = 0;
+            if walk(
+                &target,
+                &target.path,
+                &mut result.entries,
+                read,
+                &mut counted,
+            ) {
+                result.truncated.insert(target.path);
+            }
+        } else if let Some(entry) = entry_of(&target.path, read) {
+            result.entries.insert(target.path, entry);
+        }
+    }
+    result
+}
+
+/// What changed between two snapshots, in path order. A path one side
+/// does not hold counts as absent there.
+pub fn diff(before: &Snapshot, after: &Snapshot, home: &Path) -> Vec<Drift> {
+    let paths: BTreeSet<&PathBuf> = before.entries.keys().chain(after.entries.keys()).collect();
+    let mut drifts = Vec::new();
+    for path in paths {
+        let was = before.entries.get(path).unwrap_or(&Entry::Absent);
+        let is = after.entries.get(path).unwrap_or(&Entry::Absent);
+        let change = match (was, is) {
+            (Entry::Unreadable, _) | (_, Entry::Unreadable) => Some(Change::Unreadable),
+            (Entry::Absent, Entry::Absent) => None,
+            (Entry::Absent, _) => Some(Change::Added),
+            (_, Entry::Absent) => Some(Change::Removed),
+            (was, is) if was != is => Some(Change::Modified),
+            _ => None,
+        };
+        if let Some(change) = change {
+            drifts.push(Drift {
+                path: shown(path, home),
+                change,
+            });
+        }
+    }
+    for path in before.truncated.symmetric_difference(&after.truncated) {
+        drifts.push(Drift {
+            path: shown(path, home),
+            change: Change::Truncated,
+        });
+    }
+    drifts
+}
+
+/// The repository's shared `.git/config`, by `git rev-parse
+/// --git-common-dir` (the bare form prints a relative `.git`), so a linked
+/// worktree watches the config it shares. Bounded by [`GIT_WAIT`].
+pub fn repo_config(root: &Path) -> RepoConfig {
+    let guess = root.join(".git").join("config");
+    let spawned = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = spawned else {
+        return RepoConfig::Unresolved(guess);
+    };
+    let deadline = Instant::now() + GIT_WAIT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) | Err(_) => return RepoConfig::Unresolved(guess),
+            Ok(None) if Instant::now() >= deadline => {
+                // The child is being abandoned; a failed kill leaves nothing to do.
+                child.kill().ok();
+                child.wait().ok();
+                return RepoConfig::Unresolved(guess);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    let mut output = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        if io::Read::read_to_string(&mut stdout, &mut output).is_err() {
+            return RepoConfig::Unresolved(guess);
+        }
+    }
+    let line = output.trim();
+    if line.is_empty() {
+        return RepoConfig::Unresolved(guess);
+    }
+    RepoConfig::At(PathBuf::from(line).join("config"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn watch<'a>(
+        home: &'a Path,
+        var: &'a dyn Fn(&str) -> Option<OsString>,
+        extra: &'a [PathBuf],
+    ) -> Watch<'a> {
+        Watch {
+            home,
+            var,
+            repo_config: RepoConfig::At(home.join("repo").join(".git").join("config")),
+            extra_paths: extra,
+        }
+    }
+
+    fn no_env(_: &str) -> Option<OsString> {
+        None
+    }
+
+    fn real_read(path: &Path) -> io::Result<Vec<u8>> {
+        std::fs::read(path)
+    }
+
+    fn change_of(drifts: &[Drift], path: &str) -> Option<Change> {
+        drifts
+            .iter()
+            .find(|drift| drift.path == path)
+            .map(|drift| drift.change)
+    }
+
+    #[test]
+    fn an_unchanged_home_has_no_drift() {
+        let home = crate::test_support::temp_dir("homeprint-same");
+        std::fs::write(home.join(".gitconfig"), "[user]\n").expect("write");
+        let a = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        let b = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        assert_eq!(diff(&a, &b, &home), Vec::new());
+    }
+
+    #[test]
+    fn modified_added_and_removed_files_are_named_with_a_tilde_path() {
+        let home = crate::test_support::temp_dir("homeprint-changes");
+        std::fs::write(home.join(".gitconfig"), "one").expect("write");
+        std::fs::write(home.join(".netrc"), "machine").expect("write");
+        let before = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        std::fs::write(home.join(".gitconfig"), "two").expect("write");
+        std::fs::remove_file(home.join(".netrc")).expect("remove");
+        std::fs::create_dir_all(home.join(".ssh")).expect("mkdir");
+        std::fs::write(home.join(".ssh").join("config"), "Host *").expect("write");
+        let after = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        let drifts = diff(&before, &after, &home);
+        if cfg!(unix) {
+            assert_eq!(change_of(&drifts, "~/.gitconfig"), Some(Change::Modified));
+            assert_eq!(change_of(&drifts, "~/.netrc"), Some(Change::Removed));
+            assert_eq!(change_of(&drifts, "~/.ssh/config"), Some(Change::Added));
+        }
+        assert_eq!(drifts.len(), 3, "{drifts:?}");
+    }
+
+    #[test]
+    fn known_hosts_is_not_watched() {
+        let home = crate::test_support::temp_dir("homeprint-known-hosts");
+        std::fs::create_dir_all(home.join(".ssh")).expect("mkdir");
+        let before = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        std::fs::write(home.join(".ssh").join("known_hosts"), "host key").expect("write");
+        std::fs::write(home.join(".ssh").join("known_hosts.old"), "host key").expect("write");
+        let after = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        assert_eq!(diff(&before, &after, &home), Vec::new());
+    }
+
+    #[test]
+    fn a_read_error_is_reported_as_not_checked() {
+        let home = crate::test_support::temp_dir("homeprint-unreadable");
+        std::fs::write(home.join(".gitconfig"), "one").expect("write");
+        let failing = |path: &Path| -> io::Result<Vec<u8>> {
+            if path.ends_with(".gitconfig") {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected"))
+            } else {
+                std::fs::read(path)
+            }
+        };
+        let before = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        let after = snapshot(&watch(&home, &no_env, &[]), &failing);
+        let drifts = diff(&before, &after, &home);
+        assert_eq!(drifts.len(), 1, "{drifts:?}");
+        assert_eq!(drifts[0].change, Change::Unreadable);
+        assert!(drifts[0]
+            .warning_line("r1")
+            .ends_with("(not checked: unreadable)"));
+    }
+
+    #[test]
+    fn an_extra_directory_is_walked() {
+        let home = crate::test_support::temp_dir("homeprint-extra");
+        let extra = home.join("tool");
+        std::fs::create_dir_all(extra.join("nested")).expect("mkdir");
+        std::fs::write(extra.join("nested").join("a.toml"), "a").expect("write");
+        let extras = [extra.clone()];
+        let before = snapshot(&watch(&home, &no_env, &extras), &real_read);
+        std::fs::write(extra.join("nested").join("a.toml"), "b").expect("write");
+        let after = snapshot(&watch(&home, &no_env, &extras), &real_read);
+        let drifts = diff(&before, &after, &home);
+        assert_eq!(drifts.len(), 1, "{drifts:?}");
+        assert_eq!(drifts[0].change, Change::Modified);
+    }
+
+    #[test]
+    fn a_directory_past_the_cap_is_cut_the_same_way_twice() {
+        let home = crate::test_support::temp_dir("homeprint-cap");
+        let extra = home.join("many");
+        std::fs::create_dir_all(&extra).expect("mkdir");
+        for index in 0..(MAX_FILES_PER_DIRECTORY + 100) {
+            std::fs::write(extra.join(format!("f{index:04}")), "x").expect("write");
+        }
+        let extras = [extra];
+        let a = snapshot(&watch(&home, &no_env, &extras), &real_read);
+        let b = snapshot(&watch(&home, &no_env, &extras), &real_read);
+        let kept = a
+            .entries
+            .keys()
+            .filter(|path| path.starts_with(home.join("many")))
+            .count();
+        assert_eq!(kept, MAX_FILES_PER_DIRECTORY);
+        assert!(a.truncated.contains(&home.join("many")));
+        assert_eq!(diff(&a, &b, &home), Vec::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_in_a_watched_directory_does_not_hang_the_snapshot() {
+        let home = crate::test_support::temp_dir("homeprint-fifo");
+        let extra = home.join("tool");
+        std::fs::create_dir_all(&extra).expect("mkdir");
+        let made = Command::new("mkfifo")
+            .arg(extra.join("pipe"))
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success());
+        std::fs::write(extra.join("plain"), "x").expect("write");
+        let extras = [extra.clone()];
+        let taken = snapshot(&watch(&home, &no_env, &extras), &real_read);
+        assert!(taken.entries.contains_key(&extra.join("plain")));
+        assert!(!taken.entries.contains_key(&extra.join("pipe")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_recorded_by_target_and_not_followed() {
+        let home = crate::test_support::temp_dir("homeprint-link");
+        let secret = home.join("elsewhere");
+        std::fs::write(&secret, "one").expect("write");
+        std::os::unix::fs::symlink(&secret, home.join(".gitconfig")).expect("symlink");
+        let before = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        std::fs::write(&secret, "two").expect("write");
+        let after = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        assert_eq!(diff(&before, &after, &home), Vec::new());
+        assert!(matches!(
+            before.entries.get(&home.join(".gitconfig")),
+            Some(Entry::Link { .. })
+        ));
+    }
+
+    #[test]
+    fn the_userprofile_home_and_the_environment_choose_the_watched_paths() {
+        let home = PathBuf::from("/h");
+        let var = |name: &str| match name {
+            "XDG_CONFIG_HOME" => Some(OsString::from("/xdg")),
+            "CLAUDE_CONFIG_DIR" => Some(OsString::from("/claude")),
+            _ => None,
+        };
+        let paths: Vec<PathBuf> = targets(&watch(&home, &var, &[]))
+            .into_iter()
+            .map(|target| target.path)
+            .collect();
+        assert!(paths.contains(&PathBuf::from("/xdg/git/config")));
+        assert!(paths.contains(&PathBuf::from("/claude/plugins/installed_plugins.json")));
+        assert!(paths.contains(&PathBuf::from("/h/.gitconfig")));
+        assert!(paths.contains(&PathBuf::from("/h/.ssh")));
+        let fallback: Vec<PathBuf> = targets(&watch(&home, &no_env, &[]))
+            .into_iter()
+            .map(|target| target.path)
+            .collect();
+        assert!(fallback.contains(&PathBuf::from("/h/.config/git/config")));
+        assert!(fallback.contains(&PathBuf::from("/h/.claude/plugins/known_marketplaces.json")));
+    }
+
+    #[test]
+    fn an_unresolved_repo_config_is_recorded_unreadable() {
+        let home = crate::test_support::temp_dir("homeprint-unresolved");
+        let guess = home.join("repo").join(".git").join("config");
+        let watching = Watch {
+            home: &home,
+            var: &no_env,
+            repo_config: RepoConfig::Unresolved(guess.clone()),
+            extra_paths: &[],
+        };
+        let taken = snapshot(&watching, &real_read);
+        assert_eq!(taken.entries.get(&guess), Some(&Entry::Unreadable));
+    }
+
+    #[test]
+    fn the_warning_line_names_run_path_and_change() {
+        let drift = Drift {
+            path: "~/.gitconfig".into(),
+            change: Change::Modified,
+        };
+        assert_eq!(
+            drift.warning_line("run-1"),
+            "relais run: warning: changed while run run-1 was active: ~/.gitconfig (modified)"
+        );
+    }
+}

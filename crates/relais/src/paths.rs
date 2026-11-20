@@ -45,7 +45,7 @@ impl std::error::Error for HomeUnset {}
 /// Resolve the home directory from a variable lookup. Taking the lookup
 /// as an argument keeps the unset case testable: `std::env::set_var` is
 /// process-global and racy under a threaded test runner.
-fn resolve_home(var: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, HomeUnset> {
+pub(crate) fn resolve_home(var: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, HomeUnset> {
     var("HOME")
         .or_else(|| var("USERPROFILE"))
         .filter(|value| !value.is_empty())

@@ -1147,6 +1147,48 @@ pub struct MachineSettings {
     /// flag or environment variable sets it, and it feeds no authority hash.
     #[serde(default, skip_serializing_if = "HoldoutSettings::is_default")]
     pub holdouts: HoldoutSettings,
+    /// `[fingerprint]`: the warn-only watch on sensitive files in the home
+    /// directory (SPEC §8). Machine-owned, so it feeds no authority hash.
+    #[serde(default, skip_serializing_if = "FingerprintSettings::is_default")]
+    pub fingerprint: FingerprintSettings,
+}
+
+/// `[fingerprint]` in machine.toml: whether a run snapshots the watched
+/// home files before and after, and which extra paths join the default
+/// set. The snapshot only ever produces warnings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FingerprintSettings {
+    #[serde(default = "FingerprintSettings::enabled_by_default")]
+    pub enabled: bool,
+    /// Files or directories watched in addition to the defaults, e.g.
+    /// `~/.config/relais`. Absolute paths.
+    #[serde(default)]
+    pub extra_paths: Vec<std::path::PathBuf>,
+    /// The home directory to watch instead of `HOME`. Not a machine.toml
+    /// key: a test supplies one so no process-wide variable is set.
+    #[serde(skip)]
+    pub home_override: Option<std::path::PathBuf>,
+}
+
+impl FingerprintSettings {
+    fn enabled_by_default() -> bool {
+        true
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl Default for FingerprintSettings {
+    fn default() -> Self {
+        Self {
+            enabled: Self::enabled_by_default(),
+            extra_paths: Vec::new(),
+            home_override: None,
+        }
+    }
 }
 
 /// `[holdouts]` in machine.toml (ADR-0045): the store every holdout is

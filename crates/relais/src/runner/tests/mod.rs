@@ -240,6 +240,11 @@ impl Fixture {
             },
         );
         MachineSettings {
+            // A scratch home: no test run reads the real one.
+            fingerprint: crate::policy::FingerprintSettings {
+                home_override: Some(self.dir.join("home")),
+                ..Default::default()
+            },
             holdouts: Default::default(),
             workspace: Default::default(),
             resources: crate::policy::ResourceSettings {
@@ -9798,6 +9803,7 @@ mod candidates;
 mod declared_tests;
 mod exhaustion;
 mod holdouts;
+mod home_drift;
 mod native;
 mod queue_recovery;
 mod review_parts;
