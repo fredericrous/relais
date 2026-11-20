@@ -56,6 +56,8 @@ mod error;
 mod evidence;
 mod holdout_exposure;
 mod holdouts;
+mod home_drift;
+pub use home_drift::drifts_of_run;
 mod launch;
 pub mod live_trial;
 mod loop_text;

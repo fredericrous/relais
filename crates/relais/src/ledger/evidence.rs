@@ -41,6 +41,9 @@ pub enum EvidenceKind {
     /// What relais did differently for a native worker than it asked
     /// (SPEC §23): a continuation keeps its agent's own effort.
     NativeNote,
+    /// One watched home file that changed while the run was active
+    /// (SPEC §8). A warning only: no state or decision follows from it.
+    HomeDrift,
 }
 
 impl EvidenceKind {
@@ -58,6 +61,7 @@ impl EvidenceKind {
             Self::JunitReport => "junit_report",
             Self::SandboxDenials => "sandbox_denials",
             Self::NativeNote => "native_note",
+            Self::HomeDrift => "home_drift",
         }
     }
 
@@ -75,6 +79,7 @@ impl EvidenceKind {
             "junit_report" => Some(Self::JunitReport),
             "sandbox_denials" => Some(Self::SandboxDenials),
             "native_note" => Some(Self::NativeNote),
+            "home_drift" => Some(Self::HomeDrift),
             _ => None,
         }
     }

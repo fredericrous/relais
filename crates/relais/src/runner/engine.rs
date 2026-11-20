@@ -521,7 +521,12 @@ impl<'a> RunEngine<'a> {
     }
 
     fn run_to_outcome(&mut self) -> Finish {
-        match self.run_inner() {
+        let home_before = self.home_snapshot();
+        let ended = self.run_inner();
+        if !ended.as_ref().is_err_and(RunError::is_storage_full) {
+            self.record_home_drift(home_before.as_ref());
+        }
+        match ended {
             Ok(outcome) => Finish::Own(outcome),
             Err(RunError::Superseded(_)) => Finish::Superseded(self.superseded_outcome()),
             Err(error) if error.is_storage_full() => self.on_storage_full(&error),

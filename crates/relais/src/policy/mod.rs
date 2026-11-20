@@ -950,6 +950,9 @@ pub enum PolicyError {
         field: &'static str,
         detail: String,
     },
+    /// A `[fingerprint] extra_paths` entry that is neither absolute nor
+    /// under `~/`.
+    InvalidFingerprintPath(String),
 }
 
 impl std::fmt::Display for PolicyError {
@@ -981,6 +984,10 @@ impl std::fmt::Display for PolicyError {
             Self::InvalidExecution { field, detail } => {
                 write!(f, "[execution] {field}: {detail}")
             }
+            Self::InvalidFingerprintPath(entry) => write!(
+                f,
+                "[fingerprint] extra_paths: `{entry}` is neither absolute nor under `~/`"
+            ),
         }
     }
 }
@@ -1147,6 +1154,48 @@ pub struct MachineSettings {
     /// flag or environment variable sets it, and it feeds no authority hash.
     #[serde(default, skip_serializing_if = "HoldoutSettings::is_default")]
     pub holdouts: HoldoutSettings,
+    /// `[fingerprint]`: the warn-only watch on sensitive files in the home
+    /// directory (SPEC §8). Machine-owned, so it feeds no authority hash.
+    #[serde(default, skip_serializing_if = "FingerprintSettings::is_default")]
+    pub fingerprint: FingerprintSettings,
+}
+
+/// `[fingerprint]` in machine.toml: whether a run snapshots the watched
+/// home files before and after, and which extra paths join the default
+/// set. The snapshot only ever produces warnings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FingerprintSettings {
+    #[serde(default = "FingerprintSettings::enabled_by_default")]
+    pub enabled: bool,
+    /// Files or directories watched in addition to the defaults, e.g.
+    /// `~/.config/relais`. Absolute paths, or `~/` under the home directory.
+    #[serde(default)]
+    pub extra_paths: Vec<std::path::PathBuf>,
+    /// The home directory to watch instead of `HOME`. Not a machine.toml
+    /// key: a test supplies one so no process-wide variable is set.
+    #[serde(skip)]
+    pub(crate) home_override: Option<std::path::PathBuf>,
+}
+
+impl FingerprintSettings {
+    fn enabled_by_default() -> bool {
+        true
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl Default for FingerprintSettings {
+    fn default() -> Self {
+        Self {
+            enabled: Self::enabled_by_default(),
+            extra_paths: Vec::new(),
+            home_override: None,
+        }
+    }
 }
 
 /// `[holdouts]` in machine.toml (ADR-0045): the store every holdout is
@@ -2257,6 +2306,13 @@ impl MachineSettings {
         }
         self.session_routing.validate()?;
         self.learning.validate()?;
+        for entry in &self.fingerprint.extra_paths {
+            if !crate::homeprint::is_valid_extra_path(entry) {
+                return Err(PolicyError::InvalidFingerprintPath(
+                    entry.display().to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 }

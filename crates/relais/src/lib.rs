@@ -19,6 +19,7 @@ pub mod exhaustion;
 pub mod fsclone;
 pub mod fsutil;
 pub mod holdout;
+pub mod homeprint;
 pub mod hook;
 pub mod ids;
 pub mod install;

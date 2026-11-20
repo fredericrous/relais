@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use relais::backend::Harness;
 use relais::contract::TaskContract;
-use relais::ids::{IdSource, TaskId};
+use relais::ids::{IdSource, RunId, TaskId};
 use relais::ledger::Ledger;
 use relais::orchestration::PriceTable;
 use relais::policy::{MachineSettings, RepoPolicy};
@@ -322,4 +322,30 @@ pub(crate) fn refusal<T>(outcome: CliOutcome, message: impl Into<String>) -> Res
         outcome,
         message: message.into(),
     })
+}
+
+/// The lines for the watched home files that changed while `run` was
+/// active (SPEC §8), for `status` and `explain` (stdout); empty when none
+/// did. A record that cannot be read is named, not skipped.
+pub(crate) fn home_drift_lines(ledger: &Ledger, run: &RunId) -> Vec<String> {
+    home_drift_report(ledger, run, relais::homeprint::STATUS_HEADING)
+}
+
+/// The same lines for the end of `relais run` (stderr), under a heading
+/// that names the command and the run.
+pub(crate) fn home_drift_warning_lines(ledger: &Ledger, run: &RunId) -> Vec<String> {
+    home_drift_report(
+        ledger,
+        run,
+        &format!(
+            "relais run: warning: home files changed while {run} was active:",
+            run = run.as_str()
+        ),
+    )
+}
+
+fn home_drift_report(ledger: &Ledger, run: &RunId, heading: &str) -> Vec<String> {
+    let (drifts, mut lines) = relais::runner::drifts_of_run(ledger, run);
+    lines.extend(relais::homeprint::report(&drifts, heading));
+    lines
 }

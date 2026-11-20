@@ -6,6 +6,26 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
+- A run now warns when a watched file in the home directory changed while it
+  was active. relais takes a snapshot (hashes only, never contents) of
+  `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`, `~/.claude/settings*.json`,
+  the plugin files `installed_plugins.json` and `known_marketplaces.json`,
+  `~/.ssh/**` (not `known_hosts*`), `~/.netrc` and the repository's shared
+  `.git/config`, at the start and at the end of the run, and records one
+  `home_drift` evidence row per file that differs. `relais run` prints the
+  warning on stderr; `relais status <run>` and `relais explain <run>` repeat
+  it. It is a warning only: it changes no run's state and asks no decision.
+  A change by the person during the run shows too.
+- `[fingerprint]` in `machine.toml` takes `enabled` (default true) and
+  `extra_paths`, files or directories watched in addition (`~/.config` as a
+  whole is not watched; entries are absolute or start with `~/`, anything else
+  is refused). A path unreadable on both sides prints as `not watched
+  (unreadable)`, not as a change. Write the section only once every installed relais is
+  at or above this release: older versions reject an unknown section, and
+  read a `home_drift` evidence row as corrupt.
+
 ## v0.72.0
 
 - The relais pane in Claude Code shows the programme this session runs. When
