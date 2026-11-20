@@ -6,6 +6,34 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.72.0
+
+- The relais pane in Claude Code shows the programme this session runs. When
+  the session holds a programme claim (or, right after `/clear`, the
+  previous session left a `handoff` claim), the pane draws a window of the
+  map: closed tickets as a count, the current ticket marked `◀ you` (or
+  `◀ next`), what it unblocks (`○` ready, `·` blocked with `(needs …)`),
+  the ready tickets in frontier order, and the counts. The status line says
+  `▶ <slug> <ticket>` when no run is live. A session with no claim spends no
+  row. A `/clear` in the middle of a ticket shows no programme, since
+  `SessionEnd` drops `work` claims; the Handoff step's `next --claim` does.
+- After a `/clear`, the pane shows "before /clear": the ended
+  conversation's last messages, text only, at most 2000 characters, until
+  `[ hide ]`. It survives a reload of the plugin and is replaced by the next
+  `/clear`; below the pane's width the status line says it is saved.
+- `relais programme session [--session <id>] [--previous <id>] [--dir
+  <path>] [--json] [--no-fetch]` answers which ticket a session holds (own
+  `work`, else own `handoff`, else the previous session's `handoff`) with
+  the programme's tickets, standings, open blockers, dependents and ready
+  order; with no claim, `{"programme": null, "reason": "none"|"expired"}`.
+  It only reads. A map it cannot read is an `error` field and exit 0 with
+  `--json`, and exit 1 with a `next:` line otherwise.
+- The projects-root scan at session start reads every repository in time on
+  a busy machine (complete reads 0/10 → 9/10 under load).
+- Session-start overflow lines name every programme; programme worker
+  panics stay off stderr; a gather that cannot read a repository journals
+  why (`gather_error`); programme paths join by component on Windows.
+
 ## v0.71.0
 
 - A session can claim a programme ticket. `relais programme claim <slug> <id>
