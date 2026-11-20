@@ -99,6 +99,10 @@ export function scriptedEngine(
     messagesDelay: 0,
     // The call never settles.
     messagesNever: false,
+    // The session id `$.session.id()` answers instead of `options.session`; a test changes it as /clear does.
+    sessionId: undefined as string | undefined,
+    // Holds each `process.run` until it settles: a test delays one reply. Null answers at once.
+    runGate: null as ((argv: string[]) => Promise<void> | undefined) | null,
   }
   const store: Record<string, { value: unknown; version: number }> = {}
   let nextAgent = 1
@@ -128,7 +132,7 @@ export function scriptedEngine(
   // The quiet watcher's own feed: protocol lines, one chunk at a time.
   const quietFeed = feed('quiet-watch')
 
-  on('session.id', () => ({ value: options.session ?? 'session-1' }))
+  on('session.id', () => ({ value: script.sessionId ?? options.session ?? 'session-1' }))
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
   on('session.end', (_$: any, e: any) => {
     // The host kills the module's children when the session ends for good:
@@ -138,9 +142,11 @@ export function scriptedEngine(
   })
   on('tool.register', (_$: any, e: any) => ({ value: { tool: `mcp__relais__${e.name}` } }))
   on('command.register', (_$: any, e: any) => ({ value: { command: e.name } }))
-  on('process.run', (_$: any, e: any) => {
+  on('process.run', async (_$: any, e: any) => {
     calls.run.push({ argv: [...e.argv], init: e.init })
-    return { value: script.runResult(e.argv, e.init) }
+    const answer = script.runResult(e.argv, e.init)
+    if (script.runGate) await script.runGate(e.argv)
+    return { value: answer }
   })
   on('process.spawn', async function* (_$: any, e: any) {
     if (e.argv[1] === 'learn') {

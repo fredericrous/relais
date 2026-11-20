@@ -16,13 +16,10 @@ const checkStarted = (seq: number, label: string) =>
 const output = (seq: number, label: string, text: string) =>
   event(RUN, seq, { kind: 'output', label, text, elided_bytes: 0 })
 
-// Feeds events, lets the 100 ms tick write the state, and mounts the pane.
-async function drawn($: any, engine: any, lines: string[], room: { bodyRows?: number; bodyColumns?: number } = {}) {
-  if (lines.length > 0) engine.stream.push('stdout', lines.join(''))
-  await settle(engine)
-  await engine.clock.advance(200)
-  await settle(engine)
-  const ui = await $.ui.mount({
+// The Pane is one instance: a second mount replaces the first.
+async function mountPane($: any, room: { bodyRows?: number; bodyColumns?: number }, previous?: any) {
+  await previous?.unmount()
+  return $.ui.mount({
     plugin: 'relais',
     surface: 'terminal',
     component: 'Pane',
@@ -37,11 +34,32 @@ async function drawn($: any, engine: any, lines: string[], room: { bodyRows?: nu
     },
     viewport: { columns: 100, rows: 40, isFullscreen: true },
   })
-  // The rows as drawn, in order: Text rows and the agent rows, which are
-  // Buttons whose label is their text.
-  const rows = (await ui.findAll({})).filter((e: any) => e.type === 'Text' || e.type === 'Button')
+}
+
+// The rows as drawn, in order: Text rows and the agent rows, which are
+// Buttons whose label is their text.
+const rowsOfPane = async (ui: any) =>
+  (await ui.findAll({})).filter((e: any) => e.type === 'Text' || e.type === 'Button')
+
+// Feeds events, lets the 100 ms tick write the state, and mounts the pane.
+async function drawn($: any, engine: any, lines: string[], room: { bodyRows?: number; bodyColumns?: number } = {}) {
+  if (lines.length > 0) engine.stream.push('stdout', lines.join(''))
+  await settle(engine)
+  await engine.clock.advance(200)
+  await settle(engine)
+  const ui = await mountPane($, room)
+  const rows = await rowsOfPane(ui)
   const texts = rows.map((t: any) => t.text as string)
-  return { ui, texts, rows }
+  // Presses `[ hide ]` and draws the pane again.
+  const rowsAfterHide = async () => {
+    await ui.press({ key: 'hide' })
+    await settle(engine)
+    await engine.clock.advance(200)
+    await settle(engine)
+    const again = await mountPane($, room, ui)
+    return (await rowsOfPane(again)).map((e: any) => e.text as string)
+  }
+  return { ui, texts, rows, rowsAfterHide }
 }
 
 const indexOf = (texts: string[], needle: string) => texts.findIndex(t => t.includes(needle))
@@ -398,4 +416,58 @@ test('a long multi-line detail is drawn as one line of at most 60 characters end
   expect(row).toContain(`${collapsed.slice(0, 59)}…`)
   expect(row).not.toContain(collapsed.slice(0, 61))
   expect(row).not.toContain('\n')
+})
+
+const claimed = {
+  repo: 'alpha',
+  slug: 'p',
+  ticket: 't2',
+  kind: 'work',
+  holder: 'self',
+  counts: { closed: 1, frontier: 1, blocked: 0, in_flight: 1, open: 2, out_of_scope: 0 },
+  tickets: [
+    { id: 't1', name: 'First', status: 'closed', blocked_by: [], open_blockers: [], dependents: ['t2'], due: null, held: false },
+    { id: 't2', name: 'Second', status: 'in_flight', blocked_by: ['t1'], open_blockers: [], dependents: [], due: null, held: true },
+    { id: 't3', name: 'Third', status: 'frontier', blocked_by: [], open_blockers: [], dependents: [], due: null, held: false },
+  ],
+  ready: ['t3'],
+}
+
+test('with no claim and no clear the pane gains no row', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  const { texts } = await drawn($, engine, [phase(0, 'running'), step(1, 'preflight')])
+  expect(texts.some(t => t.startsWith('programme') || t.startsWith('before /clear') || t.startsWith('▶ t'))).toBe(false)
+  expect(texts[texts.length - 1]).not.toContain('ready:')
+})
+
+test('a claim draws the programme under the run, and a clear draws its tail with [ hide ]', async ($: any, on: any) => {
+  on('classic.SessionStart', () => ({}))
+  const engine = await startedRun($, on)
+  engine.script.runResult = (argv: string[]) =>
+    argv[1] === 'programme'
+      ? { exitCode: 0, stdout: JSON.stringify({ programme: claimed }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+      : { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+  engine.script.messages = () => [
+    { role: 'user', text: 'hand off now' },
+    { role: 'assistant', text: 'safe to /clear' },
+  ]
+  await $.tool.call({ tool: 'Bash', command: 'relais programme claim p t2' })
+  await $.turn.complete({ turnId: 't', answer: 'x', durationMs: 1, isAborted: false, reason: 'answer', usage: {} })
+  await settle(engine)
+  await $.session.end({ reason: 'clear', sessionId: 'session-1' })
+  engine.script.sessionId = 'session-2'
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await settle(engine)
+  const first = await drawn($, engine, [phase(0, 'running'), step(1, 'preflight')])
+  const at = (needle: string) => indexOf(first.texts, needle)
+  expect(at('relais · run')).toBeGreaterThanOrEqual(0)
+  expect(at('programme p · alpha')).toBeGreaterThan(at('relais · run'))
+  expect(at('▶ t2 Second ◀ you')).toBeGreaterThan(at('programme p · alpha'))
+  expect(at('before /clear')).toBeGreaterThan(at('▶ t2 Second ◀ you'))
+  expect(first.texts[at('before /clear')]).toMatch(/^before \/clear · \d\d:\d\d \[ hide \]$/)
+  expect(at('person │ hand off now')).toBeGreaterThan(at('before /clear'))
+  expect(at('agent  │ safe to /clear')).toBeGreaterThan(at('person │ hand off now'))
+  const hidden = await first.rowsAfterHide()
+  expect(hidden.some(t => t.startsWith('before /clear') || t.includes('hand off now'))).toBe(false)
+  expect(hidden).toContain('▶ t2 Second ◀ you')
 })

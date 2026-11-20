@@ -424,3 +424,77 @@ test('two live runs in 12 rows: the shrunk frame keeps its head and wait row', (
   expect(head).toBeGreaterThanOrEqual(0)
   expect(rows[head + 1].text).toBe(`  │ ⠋ ${WAIT_TEXT}`)
 })
+
+// The programme and tail block, after the quiet rows.
+const runsOf = (timelines: any[]) =>
+  Object.values(rebuildRuns({ runs: timelines }, NOW)).sort((a: any, b: any) => a.startedAt - b.startedAt) as any
+const programme = {
+  full: [{ text: 'programme p · alpha', bold: true }, { text: '▶ t2 Second ◀ you', bold: true }, { text: 'ready: t4' }, { text: '3 open', dim: true }],
+  reduced: [{ text: 'programme p · alpha', bold: true }, { text: '▶ t2 Second ◀ you', bold: true }, { text: '3 open', dim: true }],
+  current: [{ text: '▶ t2 Second ◀ you', bold: true }],
+}
+const tail = (count: number) => ({
+  header: { text: 'before /clear · 12:00 [ hide ]', button: { key: 'hide', press: { kind: 'hide' as const } } },
+  rows: Array.from({ length: count }, (_, i) => ({ text: `person │ message ${i}` })),
+})
+const room = (rows: number) => ({ rows, columns: 72, now: NOW })
+
+test('no claim and no tail add zero rows, with runs and without', () => {
+  const timelines = [liveAt('live-a', 0, 20), doneTimeline('done-a', 1)]
+  for (const rows of [6, 12, 40]) {
+    expect(layoutPane(runsOf(timelines), room(rows), undefined, {})).toEqual(layoutPane(runsOf(timelines), room(rows)))
+  }
+  expect(layoutPane([], room(12), undefined, {})).toEqual(layoutPane([], room(12)))
+})
+
+test('a programme draws with no run, in place of the waiting row', () => {
+  const rows = layoutPane([], room(24), undefined, { programme })
+  expect(rows.map(r => r.text)).toEqual(programme.full.map(r => r.text))
+})
+
+test('with room to spare the programme draws whole, after the runs', () => {
+  const rows = layoutPane(runsOf([doneTimeline('done-a', 0)]), room(40), undefined, { programme })
+  expect(rows.slice(-4).map(r => r.text)).toEqual(programme.full.map(r => r.text))
+})
+
+test('6 rows of room with 3 runs: the programme is reduced to its current row', () => {
+  const timelines = [liveAt('live-a', 0, 20), liveAt('live-b', 1, 20), liveAt('live-c', 2, 20)]
+  const rows = layoutPane(runsOf(timelines), room(6), undefined, { programme })
+  expect(rows[rows.length - 1].text).toBe('▶ t2 Second ◀ you')
+  expect(rows.filter(r => r.text.startsWith('programme')).length).toBe(0)
+})
+
+test('the programme shrinks to head, current and counts before it shrinks to the current row', () => {
+  const timelines = [liveAt('live-a', 0, 0)]
+  let sizes: number[] = []
+  for (let rows = 6; rows <= 40; rows += 1) {
+    const out = layoutPane(runsOf(timelines), room(rows), undefined, { programme })
+    sizes = [...sizes, out.filter(r => programme.full.some(p => p.text === r.text)).length]
+  }
+  expect(sizes.includes(1)).toBe(true)
+  expect(sizes.includes(3)).toBe(true)
+  expect(sizes[sizes.length - 1]).toBe(4)
+  expect(sizes).toEqual([...sizes].sort((a, b) => a - b))
+})
+
+test('the tail always keeps its header row and its newest rows, behind the programme', () => {
+  const timelines = [liveAt('live-a', 0, 20), liveAt('live-b', 1, 20), liveAt('live-c', 2, 20)]
+  const squeezed = layoutPane(runsOf(timelines), room(6), undefined, { programme, tail: tail(10) })
+  expect(squeezed.map(r => r.text)).toContain('before /clear · 12:00 [ hide ]')
+  expect(squeezed.map(r => r.text)).toContain('▶ t2 Second ◀ you')
+  // The kept frame, the current row and the header are never given up: a
+  // pane this short may pass its rows by the one row the frame overshoots.
+  expect(squeezed.length).toBeLessThanOrEqual(7)
+  const roomy = layoutPane([], room(12), undefined, { tail: tail(30) })
+  expect(roomy[0].text).toBe('before /clear · 12:00 [ hide ]')
+  expect(roomy.length).toBe(12)
+  expect(roomy[roomy.length - 1].text).toBe('person │ message 29')
+})
+
+test('the runs keep their priority: a live run keeps its head and agents with a programme and a tail', () => {
+  const timelines = [liveAt('live-a', 0, 20)]
+  const without = layoutPane(runsOf(timelines), room(24))
+  const withBlock = layoutPane(runsOf(timelines), room(24), undefined, { programme, tail: tail(5) })
+  expect(withBlock.length).toBeLessThanOrEqual(24)
+  expect(withBlock.slice(0, 3)).toEqual(without.slice(0, 3))
+})

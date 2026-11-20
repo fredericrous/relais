@@ -3,7 +3,9 @@
 // with its live output, capped by the rows the pane gets.
 
 import type { Fx } from './fx.ts'
-import type { TranscriptState } from './transcript.ts'
+import { transcriptRows, type TranscriptState } from './transcript.ts'
+import { programmeLayers, type ProgrammeLayers, type ProgrammeView } from './map.ts'
+import type { TailMessage } from './store.ts'
 import { MAX_TRANSCRIPT_ROWS } from './limits.ts'
 import { MAX_QUIET_LINES, quietElapsed, type QuietRun } from './quiet.ts'
 import {
@@ -22,7 +24,7 @@ import {
 
 // What pressing a row's Button does.
 // What an agent row's press opens; `[ back ]` is drawn by `paneTree` itself.
-export type Press = { kind: 'agent'; agentId: string; run: string }
+export type Press = { kind: 'agent'; agentId: string; run: string } | { kind: 'hide' }
 
 export type Row = {
   text: string
@@ -274,16 +276,73 @@ const OUTPUT_FLOOR = 8
 // head (and outcome) row and the top is cut behind `↑ N rows above`. The kept
 // frame's head, its agent Buttons, its latest output line and the activity
 // row under it always stay.
-export function layoutPane(runs: RunModel[], room: Room, quiet: QuietPane = NO_QUIET): Row[] {
+// The programme's current row and the tail's header row always stay too, so
+// a pane too short for the kept frame and those rows passes its bound by
+// what the frame cannot give back.
+export function layoutPane(runs: RunModel[], room: Room, quiet: QuietPane = NO_QUIET, extra: PaneExtra = NO_EXTRA): Row[] {
   const down: Row[] = quiet.down ? [{ text: 'quiet watcher down', dim: true }] : []
-  if (runs.length === 0 && quiet.runs.length === 0) {
+  const hasExtra = extra.programme !== undefined || extra.tail !== undefined
+  if (runs.length === 0 && quiet.runs.length === 0 && !hasExtra) {
     return [{ text: 'relais · waiting for the first event', dim: true }, ...down]
   }
   const limit = Math.max(room.rows, MIN_ROWS)
+  // The programme's current row and the tail's header are never given up:
+  // the runs and the quiet rows are laid out in what is left of them.
+  const reserved = (extra.programme ? 1 : 0) + (extra.tail ? 1 : 0)
   // The relais frames come first; the quiet runs get only the rows they leave.
-  const relais = relaisRows(runs, room, limit - down.length)
-  const spare = Math.max(0, limit - down.length - relais.length)
-  return [...relais, ...quietRows(quiet.runs, room, spare).slice(0, spare), ...down]
+  const relais = relaisRows(runs, room, limit - down.length - reserved)
+  const spare = Math.max(0, limit - down.length - reserved - relais.length)
+  const quietDrawn = quietRows(quiet.runs, room, spare).slice(0, spare)
+  const left = limit - down.length - relais.length - quietDrawn.length
+  return [...relais, ...quietDrawn, ...extraRows(extra, left), ...down]
+}
+
+// The programme window and the pre-clear tail, drawn after the quiet rows.
+// What the runs leave is shared: the programme shrinks to head + current +
+// counts, then to the current row; the tail keeps its header row and its
+// newest rows.
+export type PaneExtra = { programme?: ProgrammeLayers; tail?: { header: Row; rows: Row[] } }
+const NO_EXTRA: PaneExtra = {}
+
+function extraRows(extra: PaneExtra, room: number): Row[] {
+  const headerRows = extra.tail ? 1 : 0
+  let programme: Row[] = []
+  if (extra.programme) {
+    const budget = Math.max(1, room - headerRows)
+    const layers = extra.programme
+    programme = layers.full.length <= budget ? layers.full : layers.reduced.length <= budget ? layers.reduced : layers.current
+  }
+  if (!extra.tail) return programme
+  const tailRoom = Math.max(0, room - programme.length - 1)
+  return [...programme, extra.tail.header, ...(tailRoom === 0 ? [] : extra.tail.rows.slice(-tailRoom))]
+}
+
+// `before /clear · hh:mm`, local time.
+export function tailTitle(at: number): string {
+  const date = new Date(at)
+  const two = (n: number) => String(n).padStart(2, '0')
+  return `before /clear · ${two(date.getHours())}:${two(date.getMinutes())}`
+}
+
+const MAX_TAIL_ROWS = 60
+
+function extraOf(state: PaneState | undefined, columns: number): PaneExtra {
+  const note: Row | undefined = state?.programme?.note ? { text: state.programme.note, dim: true } : undefined
+  const view = state?.programme?.view
+  let programme: ProgrammeLayers | undefined
+  if (view) {
+    const layers = programmeLayers(view, columns)
+    programme = note ? { ...layers, full: [...layers.full, note] } : layers
+  } else if (note) {
+    programme = { full: [note], reduced: [note], current: [note] }
+  }
+  const tail = state?.tail
+    ? {
+        header: { text: `${tailTitle(state.tail.at)} [ hide ]`, button: { key: 'hide', press: { kind: 'hide' as const } } },
+        rows: transcriptRows(state.tail.messages, columns, MAX_TAIL_ROWS),
+      }
+    : undefined
+  return { programme, tail }
 }
 
 // A finished run on one row: dim when accepted, else `FAIL` in the error colour.
@@ -470,11 +529,19 @@ function outputRowsOfFailed(m: RunModel, cap: number): Row[] {
 // What the pane shows besides the runs: one agent's transcript.
 export type PaneShown = { kind: 'runs' } | { kind: 'agent'; agentId: string; run: string; transcript: TranscriptState }
 
-export type PaneState = { runs: RunModel[]; now: number; shown?: PaneShown; quiet?: QuietPane }
+export type PaneState = {
+  runs: RunModel[]
+  now: number
+  shown?: PaneShown
+  quiet?: QuietPane
+  programme?: { view?: ProgrammeView; note?: string }
+  tail?: { at: number; messages: readonly TailMessage[] }
+}
 
 export type PaneActions = {
   openAgent: (agentId: string, run: string, columns: number) => unknown
   back: () => unknown
+  hide: () => unknown
 }
 
 const BACK_HINT = '  Esc hands the keys back · ↓ to manage: full view'
@@ -536,7 +603,7 @@ export function paneTree(fx: Fx, e: any, state: PaneState | undefined, actions: 
       ...rows.map((row, i) => text(row, `row:${i}`)),
     )
   }
-  const rows = layoutPane(state?.runs ?? [], room, state?.quiet)
+  const rows = layoutPane(state?.runs ?? [], room, state?.quiet, extraOf(state, columns))
   return h(
     Box,
     { flexDirection: 'column' },
@@ -555,6 +622,9 @@ export function paneTree(fx: Fx, e: any, state: PaneState | undefined, actions: 
             onPress: () => actions.openAgent(press.agentId, press.run, columns),
           },
         )
+      }
+      if (row.button && press?.kind === 'hide') {
+        return h(Button, { key: row.button.key, label: row.text, plain: true, onPress: () => actions.hide() })
       }
       return text(row, `row:${i}`)
     }),

@@ -6,6 +6,9 @@ import type { Fx } from './fx.ts'
 import { after, type Store } from './store.ts'
 import { paneTree } from './pane.ts'
 import { drawnQuiet, hasLiveQuiet, quietStatus } from './quiet.ts'
+import { hideTail } from './clear-tail.ts'
+import { programmeState } from './programme.ts'
+import { programmeStatus } from './map.ts'
 import {
   isLive,
   statusLine,
@@ -20,6 +23,7 @@ export const FLUSH_MS = 100
 // Redraw the elapsed time about once a second while a run is live.
 const CLOCK_REDRAW_MS = 1000
 const DECISION_MERGE_MS = 3000
+const TAIL_STATUS = 'before /clear saved · open the relais pane'
 
 // State is JSON data: a field left undefined is dropped.
 const asJson = (value: unknown) => JSON.parse(JSON.stringify(value))
@@ -49,16 +53,23 @@ export async function flush(fx: Fx, store: Store) {
   store.isDirty = false
   store.flushedAt = now
   const quiet = { runs: drawnQuiet(store, now), down: store.quiet.watcher === 'down' }
-  await fx.pane.write(asJson({ runs: runsOf(store), now, shown: viewOf(store.shown), quiet }))
+  const tail = store.clearTail ? { at: store.clearTail.at, messages: store.clearTail.messages } : undefined
+  await fx.pane.write(
+    asJson({ runs: runsOf(store), now, shown: viewOf(store.shown), quiet, programme: programmeState(store), tail }),
+  )
   fx.ui.status(statusText(store, now))
 }
 
-// The run's status and the router's, side by side; either may be absent.
+// The saved tail first, then the run's status and the router's, side by
+// side, then the session's ticket when no run is live; any may be absent.
 export function statusText(store: Store, now: number): string | undefined {
+  const shown = store.programme.shown
   const parts = [
+    store.clearTail ? TAIL_STATUS : undefined,
     statusLine(store.models, now, store.heldOutcome),
     quietStatus(drawnQuiet(store, now), now),
     store.router.status,
+    shown && 'view' in shown && !hasLiveRun(store) ? programmeStatus(shown.view) : undefined,
   ].filter(Boolean)
   return parts.length > 0 ? parts.join(' · ') : undefined
 }
@@ -108,6 +119,7 @@ export async function renderPane(fx: Fx, store: Store, e: any) {
   return paneTree(fx, e, value, {
     openAgent: (agentId, run, columns) => openAgent(fx, store, agentId, run, columns),
     back: () => back(fx, store),
+    hide: () => hide(fx, store),
   })
 }
 
@@ -137,5 +149,11 @@ export async function back(fx: Fx, store: Store) {
   store.shown = { kind: 'runs' }
   store.transcriptDirty = false
   markDirty(store)
+  await flush(fx, store)
+}
+
+// `[ hide ]` on the pre-clear tail: gone from the pane and the status line.
+export async function hide(fx: Fx, store: Store) {
+  await hideTail(fx, store, await fx.clock.now())
   await flush(fx, store)
 }
