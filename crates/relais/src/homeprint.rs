@@ -171,10 +171,14 @@ pub fn report(drifts: &[Drift], heading: &str) -> Vec<String> {
 /// Whether `path` may be listed in `[fingerprint] extra_paths`: absolute,
 /// or under `~/`.
 pub fn is_valid_extra_path(path: &Path) -> bool {
-    path.is_absolute() || path.to_str().is_some_and(|text| text.starts_with("~/"))
+    path.is_absolute()
+        || path.to_str().is_some_and(|text| {
+            text.starts_with("~/") || (cfg!(windows) && text.starts_with("~\\"))
+        })
 }
 
-/// `extra_paths` with a leading `~/` made relative to `home`.
+/// `extra_paths` with a leading `~/` (or `~\` on Windows) made relative
+/// to `home`.
 pub fn expand_extra_paths(paths: &[PathBuf], home: &Path) -> Vec<PathBuf> {
     paths
         .iter()
@@ -562,7 +566,7 @@ mod tests {
             report(&drifts, "heading"),
             vec![
                 "heading".to_string(),
-                "  ~/.gitconfig (not checked: unreadable)".to_string(),
+                format!("  {} (not checked: unreadable)", shown_gitconfig(&home)),
                 FOLLOW_UP[0].to_string(),
                 FOLLOW_UP[1].to_string()
             ]
@@ -742,20 +746,35 @@ mod tests {
     #[test]
     fn a_leading_tilde_slash_is_expanded_against_the_home() {
         let home = PathBuf::from("/h");
-        let paths = [
-            PathBuf::from("~/.config/relais"),
-            PathBuf::from("/abs/tool"),
-        ];
+        let absolute = absolute_tool_path();
+        let paths = [PathBuf::from("~/.config/relais"), absolute.clone()];
         assert_eq!(
             expand_extra_paths(&paths, &home),
-            vec![
-                PathBuf::from("/h/.config/relais"),
-                PathBuf::from("/abs/tool")
-            ]
+            vec![PathBuf::from("/h/.config/relais"), absolute.clone()]
         );
         assert!(is_valid_extra_path(Path::new("~/x")));
-        assert!(is_valid_extra_path(Path::new("/x")));
+        assert!(is_valid_extra_path(&absolute));
         assert!(!is_valid_extra_path(Path::new("x/y")));
         assert!(!is_valid_extra_path(Path::new("~other/x")));
+    }
+
+    /// An absolute path on this platform: `/abs/tool` is not absolute on
+    /// Windows, where a path needs a drive.
+    fn absolute_tool_path() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\abs\tool")
+        } else {
+            PathBuf::from("/abs/tool")
+        }
+    }
+
+    /// How `~/.gitconfig` under `home` prints: `~/…` on unix, absolute on
+    /// Windows, where a path is printed so it can be pasted.
+    fn shown_gitconfig(home: &Path) -> String {
+        if cfg!(unix) {
+            "~/.gitconfig".to_string()
+        } else {
+            home.join(".gitconfig").display().to_string()
+        }
     }
 }

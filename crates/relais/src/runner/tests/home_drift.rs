@@ -218,8 +218,12 @@ fn the_status_report_ends_with_the_follow_up() {
         status.last().map(String::as_str),
         Some(crate::homeprint::FOLLOW_UP[1])
     );
+    // The fixed lines fit 80 columns; a path line is as long as its path
+    // (absolute on Windows).
     assert!(
-        status.iter().all(|line| line.chars().count() <= 80),
+        std::iter::once(heading)
+            .chain(crate::homeprint::FOLLOW_UP)
+            .all(|line| line.chars().count() <= 80),
         "{status:?}"
     );
     assert_eq!(status.len(), 4, "{status:?}");
@@ -270,7 +274,10 @@ fn an_extra_path_under_tilde_is_watched_under_the_machines_home() {
     let drifts = drifts_of(&fixture, &outcome);
     assert_eq!(drifts.len(), 1, "{drifts:?}");
     assert_eq!(drifts[0].change, Change::Modified);
-    assert!(drifts[0].path.ends_with("tool/a.toml"), "{drifts:?}");
+    assert!(
+        Path::new(&drifts[0].path).ends_with(Path::new("tool").join("a.toml")),
+        "{drifts:?}"
+    );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
@@ -283,10 +290,11 @@ fn a_relative_extra_path_is_refused_when_machine_toml_loads() {
     let text = error.to_string();
     assert!(text.contains("[fingerprint] extra_paths"), "{text}");
     assert!(text.contains("tool/config"), "{text}");
-    assert!(MachineSettings::from_toml_str(
-        "schema_version = 1\n[fingerprint]\nextra_paths = [\"~/tool\", \"/abs\"]\n",
-    )
-    .is_ok());
+    let absolute = if cfg!(windows) { "C:/abs" } else { "/abs" };
+    let accepted = MachineSettings::from_toml_str(&format!(
+        "schema_version = 1\n[fingerprint]\nextra_paths = [\"~/tool\", \"{absolute}\"]\n"
+    ));
+    assert!(accepted.is_ok(), "{accepted:?}");
 }
 
 #[cfg(unix)]
