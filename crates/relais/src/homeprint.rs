@@ -30,8 +30,15 @@ pub const MAX_FILES_PER_DIRECTORY: usize = 500;
 /// How long git may take to name the shared config directory.
 const GIT_WAIT: Duration = Duration::from_secs(10);
 
-/// The last line of a warning that lists changed files.
-pub const FOLLOW_UP: &str = "check these files; if you did not change them, the run or its tests did: rerun them with HOME set to a temporary directory";
+/// The last lines of a warning that lists changed files, each short enough
+/// for an 80-column terminal.
+pub const FOLLOW_UP: [&str; 2] = [
+    "check these files; if you did not change them, the run or its tests did:",
+    "  rerun them with HOME set to a temporary directory",
+];
+
+/// The heading `status` and `explain` print above the changed files.
+pub const STATUS_HEADING: &str = "home files changed while the run was active:";
 
 /// Where the repository's `.git/config` is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,7 +162,7 @@ pub fn report(drifts: &[Drift], heading: &str) -> Vec<String> {
                 .iter()
                 .map(|drift| format!("  {} ({})", drift.path, drift.change)),
         );
-        lines.push(FOLLOW_UP.to_string());
+        lines.extend(FOLLOW_UP.iter().map(|line| (*line).to_string()));
     }
     lines.extend(drifts.iter().filter_map(Drift::notice_line));
     lines
@@ -556,7 +563,8 @@ mod tests {
             vec![
                 "heading".to_string(),
                 "  ~/.gitconfig (not checked: unreadable)".to_string(),
-                FOLLOW_UP.to_string()
+                FOLLOW_UP[0].to_string(),
+                FOLLOW_UP[1].to_string()
             ]
         );
     }
@@ -683,7 +691,8 @@ mod tests {
             vec![
                 "home files changed:".to_string(),
                 "  ~/.gitconfig (modified)".to_string(),
-                FOLLOW_UP.to_string()
+                FOLLOW_UP[0].to_string(),
+                FOLLOW_UP[1].to_string()
             ]
         );
     }

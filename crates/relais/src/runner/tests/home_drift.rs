@@ -211,14 +211,18 @@ fn the_status_report_ends_with_the_follow_up() {
     );
     let (drifts, problems) = crate::runner::drifts_of_run(&fixture.ledger, &outcome.run_id);
     assert_eq!(problems, Vec::<String>::new());
-    let heading = "home files changed while the run was active:";
+    let heading = crate::homeprint::STATUS_HEADING;
     let status = crate::homeprint::report(&drifts, heading);
     assert_eq!(status.first().map(String::as_str), Some(heading));
     assert_eq!(
         status.last().map(String::as_str),
-        Some(crate::homeprint::FOLLOW_UP)
+        Some(crate::homeprint::FOLLOW_UP[1])
     );
-    assert_eq!(status.len(), 3, "{status:?}");
+    assert!(
+        status.iter().all(|line| line.chars().count() <= 80),
+        "{status:?}"
+    );
+    assert_eq!(status.len(), 4, "{status:?}");
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 

@@ -328,7 +328,7 @@ pub(crate) fn refusal<T>(outcome: CliOutcome, message: impl Into<String>) -> Res
 /// active (SPEC §8), for `status` and `explain` (stdout); empty when none
 /// did. A record that cannot be read is named, not skipped.
 pub(crate) fn home_drift_lines(ledger: &Ledger, run: &RunId) -> Vec<String> {
-    home_drift_report(ledger, run, "home files changed while the run was active:")
+    home_drift_report(ledger, run, relais::homeprint::STATUS_HEADING)
 }
 
 /// The same lines for the end of `relais run` (stderr), under a heading
