@@ -116,7 +116,7 @@ test('the golden answer draws the window around the current ticket', () => {
     '▶ t2 Second ◀ you',
     '└─ · t3 Third (needs t2)',
     'ready: t4 (due 12-01)',
-    '3 open · 1 ready · 1 blocked · 1 in flight · 1 closed · 1 out of scope',
+    '3 open · 1 ready · 1 blocked · 1 in flight · 1 out of scope',
   ])
   expect(programmeStatus(golden())).toBe('▶ p t2')
 })
@@ -193,7 +193,7 @@ test('the ready list keeps relais order and wraps onto two rows at most', () => 
 
 test('an error-shape programme is one dim line', () => {
   const rows = programmeRows({ repo: 'alpha', slug: 'p', ticket: 't2', kind: 'work', error: 'repository gone' }, 60)
-  expect(rows).toEqual([{ text: 'programme p · repository gone', dim: true }])
+  expect(rows).toEqual([{ text: 'programme p · repository gone · relais programme session', dim: true }])
 })
 
 test('rows are cut in terminal cells, so wide text never passes the width', () => {

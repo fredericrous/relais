@@ -276,9 +276,8 @@ const OUTPUT_FLOOR = 8
 // head (and outcome) row and the top is cut behind `↑ N rows above`. The kept
 // frame's head, its agent Buttons, its latest output line and the activity
 // row under it always stay.
-// The programme's current row and the tail's header row always stay too, so
-// a pane too short for the kept frame and those rows passes its bound by
-// what the frame cannot give back.
+// The programme's current row and the tail's header row always stay too: the
+// runs give up rows for them, the `↑ N rows above` row first, then the top.
 export function layoutPane(runs: RunModel[], room: Room, quiet: QuietPane = NO_QUIET, extra: PaneExtra = NO_EXTRA): Row[] {
   const down: Row[] = quiet.down ? [{ text: 'quiet watcher down', dim: true }] : []
   const hasExtra = extra.programme !== undefined || extra.tail !== undefined
@@ -289,9 +288,14 @@ export function layoutPane(runs: RunModel[], room: Room, quiet: QuietPane = NO_Q
   // The programme's current row and the tail's header are never given up:
   // the runs and the quiet rows are laid out in what is left of them.
   const reserved = (extra.programme ? 1 : 0) + (extra.tail ? 1 : 0)
+  const relaisRoom = limit - down.length - reserved
   // The relais frames come first; the quiet runs get only the rows they leave.
-  const relais = relaisRows(runs, room, limit - down.length - reserved)
-  const spare = Math.max(0, limit - down.length - reserved - relais.length)
+  let relais = relaisRows(runs, room, relaisRoom)
+  if (reserved > 0 && relais.length > relaisRoom) {
+    const withoutIndicator = relais[0]?.text.startsWith('↑ ') ? relais.slice(1) : relais
+    relais = withoutIndicator.slice(Math.max(0, withoutIndicator.length - relaisRoom))
+  }
+  const spare = Math.max(0, relaisRoom - relais.length)
   const quietDrawn = quietRows(quiet.runs, room, spare).slice(0, spare)
   const left = limit - down.length - relais.length - quietDrawn.length
   return [...relais, ...quietDrawn, ...extraRows(extra, left), ...down]

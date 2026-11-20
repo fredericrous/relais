@@ -4,8 +4,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
-
 use super::claim::rules::Hold;
 use super::model::{MapDoc, Mode, Problem, Status, Ticket, MAP_FILE};
 
@@ -24,29 +22,6 @@ pub enum Standing {
     OutOfScope,
 }
 
-/// A [`Standing`] without its payload, as a machine-readable name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StandingKind {
-    Closed,
-    Frontier,
-    Blocked,
-    InFlight,
-    OutOfScope,
-}
-
-impl From<&Standing> for StandingKind {
-    fn from(standing: &Standing) -> Self {
-        match standing {
-            Standing::Frontier => Self::Frontier,
-            Standing::Blocked(_) => Self::Blocked,
-            Standing::InFlight { .. } => Self::InFlight,
-            Standing::Closed => Self::Closed,
-            Standing::OutOfScope => Self::OutOfScope,
-        }
-    }
-}
-
 /// What holds an in-flight ticket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Holder {
@@ -60,7 +35,7 @@ pub enum Holder {
     Claim(Hold),
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Counts {
     pub open: usize,
     pub frontier: usize,
@@ -141,6 +116,43 @@ pub fn counts(standings: &BTreeMap<String, Standing>) -> Counts {
     }
     counts.open = counts.frontier + counts.blocked + counts.in_flight;
     counts
+}
+
+/// How one ticket relates to the others.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Relations {
+    /// The tickets that still block it: those of a `Blocked` standing.
+    pub open_blockers: Vec<String>,
+    /// The tickets that list it in `blocked_by`.
+    pub dependents: Vec<String>,
+}
+
+/// The relations of every ticket, keyed by id.
+pub fn relations(
+    tickets: &BTreeMap<String, Ticket>,
+    standings: &BTreeMap<String, Standing>,
+) -> BTreeMap<String, Relations> {
+    tickets
+        .keys()
+        .map(|id| {
+            let open_blockers = match standings.get(id) {
+                Some(Standing::Blocked(blockers)) => blockers.clone(),
+                _ => Vec::new(),
+            };
+            let dependents = tickets
+                .values()
+                .filter(|other| other.blocked_by.contains(id))
+                .map(|other| other.id.clone())
+                .collect();
+            (
+                id.clone(),
+                Relations {
+                    open_blockers,
+                    dependents,
+                },
+            )
+        })
+        .collect()
 }
 
 fn problem(ticket: &Ticket, line: usize, message: String) -> Problem {

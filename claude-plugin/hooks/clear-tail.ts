@@ -6,7 +6,8 @@
 
 import type { Fx } from './fx.ts'
 import type { ClearTail, Store, TailMessage } from './store.ts'
-import { recordEvent, withinBound } from './programme.ts'
+import { recordEvent, withinBound } from './events.ts'
+import { detach } from './store.ts'
 import { markDirty, openPane } from './ui.ts'
 
 export const TAIL_CHARS = 2000
@@ -60,7 +61,7 @@ export function trimTail(messages: readonly TailMessage[], limit = TAIL_CHARS): 
 
 export const tailOf = (messages: unknown): TailMessage[] => trimTail(textMessages(messages))
 
-export const charsOf = (messages: readonly TailMessage[]) => messages.reduce((n, m) => n + lengthOf(m.text), 0)
+export const charsOf = (messages: readonly TailMessage[]) => messages.reduce((total, message) => total + lengthOf(message.text), 0)
 
 const readLast = (fx: Fx) => () => fx.session.messages({ last: LAST_MESSAGES })
 
@@ -78,9 +79,9 @@ export async function readLiveTail(fx: Fx, store: Store) {
   try {
     session = await fx.session.id()
   } catch {
-    return
+    return // Fail open: no session id, no live tail
   }
-  if (typeof session !== 'string' || session === '') return
+  if (typeof session !== 'string' || session === '') return // Fail open: no session id, no live tail
   const settled = await withinBound(fx, LIVE_READ_BOUND_MS, readLast(fx))
   if (settled.kind !== 'ok') return
   if (store.closed || memory.epoch !== epoch || memory.newest !== seq) return
@@ -89,10 +90,10 @@ export async function readLiveTail(fx: Fx, store: Store) {
 
 // The write of the frozen tail (or its removal) to the plugin's store, after
 // every write before it: a late write cannot bring back a hidden tail.
-function persist(fx: Fx, store: Store, value: ClearTail | null): Promise<void> {
+function persist(fx: Fx, store: Store, tail: ClearTail | null): Promise<void> {
   store.tail.chain = store.tail.chain
     .then(async () => {
-      await fx.kv.set(KEY, value)
+      await fx.kv.set(KEY, tail)
     })
     .catch(() => {
       // The tail in memory still shows; a reload would not find it.
@@ -119,14 +120,18 @@ export async function freezeTail(fx: Fx, store: Store, ended: string | undefined
   if (messages.length === 0 && live !== undefined && (ended === undefined || live.session === ended)) {
     messages = [...live.messages]
   }
-  await recordEvent(fx, store, { at: now, kind: 'freeze', chars: charsOf(messages) })
-  if (messages.length === 0 || store.closed) return
-  const tail = frozen(ended ?? live?.session ?? '', messages, now)
-  store.clearTail = tail
-  memory.version += 1
-  markDirty(store)
-  await persist(fx, store, tail)
-  await openPane(fx, store)
+  // Memory and the dirty mark come first; the event, the store write and the
+  // pane opening are detached, so the session's end waits on none of them.
+  const tail = messages.length > 0 && !store.closed ? frozen(ended ?? live?.session ?? '', messages, now) : undefined
+  if (tail !== undefined) {
+    store.clearTail = tail
+    memory.version += 1
+    markDirty(store)
+  }
+  detach(recordEvent(fx, store, { at: now, kind: 'freeze', chars: charsOf(messages) }))
+  if (tail === undefined) return
+  detach(persist(fx, store, tail))
+  detach(openPane(fx, store))
 }
 
 // A session transition: reads begun before it never update the live tail.
@@ -148,12 +153,12 @@ export async function hideTail(fx: Fx, store: Store, now: number) {
 }
 
 function restorable(raw: unknown): ClearTail | undefined {
-  const value: any = raw && typeof raw === 'object' && 'endedSession' in (raw as object) ? raw : (raw as any)?.value
-  if (!value || typeof value.endedSession !== 'string' || typeof value.at !== 'number' || !Array.isArray(value.messages)) {
+  const stored: any = raw && typeof raw === 'object' && 'endedSession' in (raw as object) ? raw : (raw as any)?.value
+  if (!stored || typeof stored.endedSession !== 'string' || typeof stored.at !== 'number' || !Array.isArray(stored.messages)) {
     return undefined
   }
-  const messages = textMessages(value.messages)
-  return messages.length > 0 ? frozen(value.endedSession, messages, value.at) : undefined
+  const messages = textMessages(stored.messages)
+  return messages.length > 0 ? frozen(stored.endedSession, messages, stored.at) : undefined
 }
 
 // After a module reload: the tail the plugin's store kept, unless one was

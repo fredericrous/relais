@@ -52,7 +52,7 @@ export type Child = {
 }
 
 // What the pane shows of the session's programme: the last answer relais gave.
-export type ProgrammeShown = { view: ProgrammeView; readAt: number; seq: number } | { error: string; seq: number }
+export type ProgrammeShown = { view: ProgrammeView; readAt: number; seq: number }
 
 export type ProgrammeMemory = {
   // The newest read's number, and the one a reply must carry to be kept.
@@ -178,6 +178,8 @@ export type Store = {
   tail: TailMemory
   // The `$.store` writes of the programme and tail event list, one after another.
   eventChain: Promise<void>
+  // Whether the last `ui.open` placed the pane: when not, the status line carries the saved tail.
+  isPanePlaced: boolean
 }
 
 // What an outcome message was built from, to rebuild it if the run's
@@ -256,6 +258,7 @@ export const createStore = (): Store => ({
   clearTail: undefined,
   tail: { epoch: 0, seq: 0, newest: 0, version: 0, chain: Promise.resolve() },
   eventChain: Promise.resolve(),
+  isPanePlaced: false,
 })
 
 // Timers go through here so that unloading can clear every one.

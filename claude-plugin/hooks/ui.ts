@@ -6,9 +6,7 @@ import type { Fx } from './fx.ts'
 import { after, type Store } from './store.ts'
 import { paneTree } from './pane.ts'
 import { drawnQuiet, hasLiveQuiet, quietStatus } from './quiet.ts'
-import { hideTail } from './clear-tail.ts'
-import { programmeState } from './programme.ts'
-import { programmeStatus } from './map.ts'
+import { programmeState, programmeStatus } from './map.ts'
 import {
   isLive,
   statusLine,
@@ -55,21 +53,22 @@ export async function flush(fx: Fx, store: Store) {
   const quiet = { runs: drawnQuiet(store, now), down: store.quiet.watcher === 'down' }
   const tail = store.clearTail ? { at: store.clearTail.at, messages: store.clearTail.messages } : undefined
   await fx.pane.write(
-    asJson({ runs: runsOf(store), now, shown: viewOf(store.shown), quiet, programme: programmeState(store), tail }),
+    asJson({ runs: runsOf(store), now, shown: viewOf(store.shown), quiet, programme: programmeState(store.programme), tail }),
   )
   fx.ui.status(statusText(store, now))
 }
 
-// The saved tail first, then the run's status and the router's, side by
-// side, then the session's ticket when no run is live; any may be absent.
+// The run's status and the router's, side by side, then the session's ticket
+// when no run is live, then the saved tail when the pane is not placed; any
+// may be absent.
 export function statusText(store: Store, now: number): string | undefined {
   const shown = store.programme.shown
   const parts = [
-    store.clearTail ? TAIL_STATUS : undefined,
     statusLine(store.models, now, store.heldOutcome),
     quietStatus(drawnQuiet(store, now), now),
     store.router.status,
-    shown && 'view' in shown && !hasLiveRun(store) ? programmeStatus(shown.view) : undefined,
+    shown && !hasLiveRun(store) ? programmeStatus(shown.view) : undefined,
+    store.clearTail && !store.isPanePlaced ? TAIL_STATUS : undefined,
   ].filter(Boolean)
   return parts.length > 0 ? parts.join(' · ') : undefined
 }
@@ -80,6 +79,7 @@ export async function openPane(fx: Fx, store: Store) {
   store.heldOutcome = undefined
   store.isDirty = true
   const opened = await fx.ui.open({ id: PANE_ID, title: PANE_TITLE })
+  store.isPanePlaced = opened.isPlaced === true
   return opened
 }
 
@@ -114,12 +114,12 @@ export function timelineLines(store: Store, now: number): string[] {
 }
 
 // `ui.render` for the pane: reads the state the flush wrote, writes nothing.
-export async function renderPane(fx: Fx, store: Store, e: any) {
+export async function renderPane(fx: Fx, store: Store, e: any, hide: () => unknown) {
   const { value } = await fx.pane.read()
   return paneTree(fx, e, value, {
     openAgent: (agentId, run, columns) => openAgent(fx, store, agentId, run, columns),
     back: () => back(fx, store),
-    hide: () => hide(fx, store),
+    hide,
   })
 }
 
@@ -149,11 +149,5 @@ export async function back(fx: Fx, store: Store) {
   store.shown = { kind: 'runs' }
   store.transcriptDirty = false
   markDirty(store)
-  await flush(fx, store)
-}
-
-// `[ hide ]` on the pre-clear tail: gone from the pane and the status line.
-export async function hide(fx: Fx, store: Store) {
-  await hideTail(fx, store, await fx.clock.now())
   await flush(fx, store)
 }

@@ -24,11 +24,11 @@ const mainTurn = () => {
 // What the plugin's store holds, by key: the test hands the engine this object.
 const kv: Record<string, unknown> = {}
 
-async function started($: any, on: any, seed: Record<string, unknown> = {}) {
+async function started($: any, on: any, seed: Record<string, unknown> = {}, isPlaced = true, hangWrites = false) {
   for (const key of Object.keys(kv)) delete kv[key]
   Object.assign(kv, seed)
   on('classic.SessionStart', () => ({}))
-  const engine = scriptedEngine(on, { store: kv })
+  const engine = scriptedEngine(on, { store: kv, isPlaced, hangStoreWrites: hangWrites })
   engine.script.messages = () => talk
   await $.session.start(START)
   await settle(engine)
@@ -93,7 +93,7 @@ test('each main turn reads the last 20 messages; a subagent turn reads nothing',
   expect(engine.calls.messages.length).toBe(1)
 })
 
-test('a /clear freezes the tail: rows, hour, a hide button, the status line and an unasked pane', async ($: any, on: any) => {
+test('a /clear freezes the tail: rows, hour, a hide button and an unasked pane', async ($: any, on: any) => {
   const engine = await started($, on)
   await $.turn.complete(mainTurn())
   await settle(engine)
@@ -105,7 +105,28 @@ test('a /clear freezes the tail: rows, hour, a hide button, the status line and 
   expect(texts).toContain('person │ hand off now')
   expect(texts).toContain('agent  │ safe to /clear')
   expect(texts.some(t => t.includes('task-notification') || t.includes('files'))).toBe(false)
+  expect(engine.calls.statuses.some(status => status?.includes('before /clear saved'))).toBe(false)
+})
+
+test('the status line carries the saved tail only where the pane is not placed, after the run status', async ($: any, on: any) => {
+  const engine = await started($, on, {}, false)
+  await $.turn.complete(mainTurn())
+  await settle(engine)
+  await clear($, engine)
+  await engine.clock.advance(200)
+  await settle(engine)
   expect(engine.calls.statuses[engine.calls.statuses.length - 1]).toBe('before /clear saved · open the relais pane')
+})
+
+test('session.end by clear waits on no store write', async ($: any, on: any) => {
+  const engine = await started($, on, {}, true, true)
+  await $.turn.complete(mainTurn())
+  await settle(engine)
+  await $.session.end({ reason: 'clear', sessionId: 'session-1' })
+  await engine.clock.advance(200)
+  await settle(engine)
+  const { texts } = await drawn($, engine)
+  expect(texts).toContain('person │ hand off now')
 })
 
 test('a read that settles after a newer one began does not replace it', async ($: any, on: any) => {

@@ -111,8 +111,8 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
   reason `clear` one last read (500 ms) or that live tail is frozen, in
   memory and in the plugin's store, so a module reload still shows it. An
   empty one keeps the tail already frozen; a later `/clear` replaces it.
-  `[ hide ]` removes it from both. While it is shown the status line starts
-  `before /clear saved · open the relais pane`. `/relais-status` prints one
+  `[ hide ]` removes it from both. While it is shown and the pane is not placed, the status line ends
+  with `before /clear saved · open the relais pane`. `/relais-status` prints one
   line counting programme reads (shown, none, failed), frozen tails and hides.
 - **An agent's transcript, in the pane.** Each known agent row is a Button,
   with a dim row under it naming the agent as Claude Code's tasks footer does

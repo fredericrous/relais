@@ -482,9 +482,8 @@ test('the tail always keeps its header row and its newest rows, behind the progr
   const squeezed = layoutPane(runsOf(timelines), room(6), undefined, { programme, tail: tail(10) })
   expect(squeezed.map(r => r.text)).toContain('before /clear · 12:00 [ hide ]')
   expect(squeezed.map(r => r.text)).toContain('▶ t2 Second ◀ you')
-  // The kept frame, the current row and the header are never given up: a
-  // pane this short may pass its rows by the one row the frame overshoots.
-  expect(squeezed.length).toBeLessThanOrEqual(7)
+  // The current row and the header are never given up, and the pane never passes its rows.
+  expect(squeezed.length).toBeLessThanOrEqual(6)
   const roomy = layoutPane([], room(12), undefined, { tail: tail(30) })
   expect(roomy[0].text).toBe('before /clear · 12:00 [ hide ]')
   expect(roomy.length).toBe(12)

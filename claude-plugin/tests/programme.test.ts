@@ -242,3 +242,33 @@ test('/relais-status counts the programme reads and the tails in one line', asyn
   const text = (await $.command.run({ command: 'relais-status' })).text as string
   expect(text).toContain('programme reads: 1 shown, 0 none, 0 failed · tails: 0 frozen, 0 non-empty, 0 hidden (0 within 60 s)')
 })
+
+const brokenReplies: [string, Record<string, unknown>][] = [
+  ['a kind that is neither work nor handoff', { kind: 'other' }],
+  ['a holder that is neither self nor previous', { holder: 'nobody' }],
+  ['counts with fields missing', { counts: { closed: 0 } }],
+  [
+    'a ticket status outside the set',
+    { tickets: [{ id: 't1', name: 'x', status: 'unknown', blocked_by: [], open_blockers: [], dependents: [], due: null, held: true }] },
+  ],
+  ['a ready list that is not a list', { ready: 't4' }],
+]
+
+for (const [what, extra] of brokenReplies) {
+  test(`a reply with ${what} is unreadable: the stale note, no view`, async ($: any, on: any) => {
+    const engine = await started($, on, view('t1', extra))
+    const { texts } = await paneTexts($, engine)
+    expect(texts.some(t => t.startsWith('programme view may be stale'))).toBe(true)
+    expect(texts).not.toContain('programme p · alpha')
+  })
+}
+
+test('an exit code other than 0, 1 or 2 sets the stale note', async ($: any, on: any) => {
+  const engine = await started($, on)
+  engine.script.runResult = (argv: string[]) => (argv[1] === 'programme' ? failure(101, 'panicked') : ok)
+  await $.tool.call({ tool: 'Bash', command: 'relais programme claim p t1' })
+  await settle(engine)
+  const { texts } = await paneTexts($, engine)
+  expect(texts).toContain('▶ t1 Ticket t1 ◀ you')
+  expect(texts.filter(t => t.startsWith('programme view may be stale')).length).toBe(1)
+})

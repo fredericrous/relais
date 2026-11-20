@@ -22,8 +22,9 @@ import { cancelRun, childOf, contractPath, onChunk, pump, reconcileIntents, relo
 import { onboardTool, onPersonPrompt, trustHoldoutsTool, trustTool, withRoutingSection } from './consent.ts'
 import { decideGuard, learningEnvelopeGuard, machineSettingsGuard, routerEnvelopeGuard } from './guards.ts'
 import { ensureWatcher } from './quiet-watch.ts'
-import { freezeTail, readLiveTail, resetLiveTail, restoreTail } from './clear-tail.ts'
-import { eventsLine, isProgrammeCommand, onProgrammeSessionEnd, readProgramme, type ReadSource } from './programme.ts'
+import { freezeTail, hideTail, readLiveTail, resetLiveTail, restoreTail } from './clear-tail.ts'
+import { eventsLine } from './events.ts'
+import { isProgrammeCommand, onProgrammeSessionEnd, readProgramme, type ReadSource } from './programme.ts'
 import { learningCommand, noteLastCycle, startCycle, startResumeSweep } from './learning.ts'
 import {
   afterStep,
@@ -40,7 +41,7 @@ import {
 } from './routing.ts'
 import { EDIT_TOOLS } from './router.ts'
 import { close, createStore, detach, every, type Store } from './store.ts'
-import { FLUSH_MS, markDirty, openPane, renderPane, timelineLines } from './ui.ts'
+import { FLUSH_MS, flush, markDirty, openPane, renderPane, timelineLines } from './ui.ts'
 
 const RUN_TOOL = 'mcp__relais__run'
 const REPLAY_TOOL = 'mcp__relais__replay'
@@ -284,7 +285,8 @@ export function register(on: any) {
 
   on('session.end', async ($: any, e: any, next: any) => {
     // The conversation's tail is frozen first, while its messages can still be
-    // read; the programme view of the ended session is dropped.
+    // read (one read bounded at 500 ms; every write is detached); the
+    // programme view of the ended session is dropped.
     try {
       const fx = effects($)
       const ended: string | undefined = typeof e.sessionId === 'string' && e.sessionId !== '' ? e.sessionId : await fx.session.id()
@@ -295,7 +297,7 @@ export function register(on: any) {
     } catch {
       // Fail open: the session ends whatever the pane could keep.
     }
-    // The router's open tasks and observations go first, at every reason.
+    // The router's open tasks and observations go right after, at every reason.
     try {
       const fx = effects($)
       await onSessionEnd(fx, store, String(e.reason), await fx.clock.now())
@@ -596,13 +598,19 @@ export function register(on: any) {
   })).catch(() => ({ text: 'relais could not flag the task (internal error).' }))
 
   on('ui.render', { component: 'Pane', requestId: 'relais' }, ($: any, e: any) =>
-    renderPane(effects($), store, e),
+    renderPane(effects($), store, e, async () => {
+      // `[ hide ]` on the pre-clear tail: gone from the pane and the status line.
+      const fx = effects($)
+      await hideTail(fx, store, await fx.clock.now())
+      await flush(fx, store)
+    }),
   )
 
   // After /clear, /resume or /branch the module's buffers may be gone or stale.
   on('classic.SessionStart', async ($: any, e: any, next: any) => {
     if (e.source === 'clear' || e.source === 'resume' || e.source === 'fork') {
       const fx = effects($)
+      resetLiveTail(store)
       detach(readProgramme(fx, store, e.source as ReadSource))
       await reloadTimeline(fx, store)
     }

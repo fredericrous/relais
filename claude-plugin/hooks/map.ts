@@ -28,12 +28,14 @@ export type ProgrammeCounts = {
   out_of_scope: number
 }
 
+export type ProgrammeKind = 'work' | 'handoff'
+
 // A claimed ticket whose map was read.
 export type ProgrammeMap = {
   repo: string
   slug: string
   ticket: string
-  kind: string
+  kind: ProgrammeKind
   holder: 'self' | 'previous'
   counts: ProgrammeCounts
   tickets: ProgrammeTicket[]
@@ -41,7 +43,7 @@ export type ProgrammeMap = {
 }
 
 // A claimed ticket whose map could not be read.
-export type ProgrammeFailed = { repo: string; slug: string; ticket: string; kind: string; error: string }
+export type ProgrammeFailed = { repo: string; slug: string; ticket: string; kind: ProgrammeKind; error: string }
 
 export type ProgrammeView = ProgrammeMap | ProgrammeFailed
 
@@ -61,9 +63,9 @@ export function cutToCells(text: string, width: number): string {
   let cells = 0
   let out = ''
   for (const ch of chars) {
-    const n = cellsOf(ch)
-    if (cells + n > Math.max(1, width - 1)) break
-    cells += n
+    const charCells = cellsOf(ch)
+    if (cells + charCells > Math.max(1, width - 1)) break
+    cells += charCells
     out += ch
   }
   return `${out}…`
@@ -79,6 +81,9 @@ function named(lead: string, name: string, tail: string, width: number): string 
   const body = room >= 2 ? cutToCells(name, room) : ''
   return `${lead}${body}${tail}`
 }
+
+// What to run to see the reason the map could not be read.
+export const FAILED_HINT = ' · relais programme session'
 
 const dueText = (due: string | null) => (due ? ` (due ${due.slice(5)})` : '')
 
@@ -125,16 +130,18 @@ function dependentRow(ticket: ProgrammeTicket, connector: string, width: number)
   }
 }
 
-function countsText(c: ProgrammeCounts): string {
-  const parts = [`${c.open} open`, `${c.frontier} ready`, `${c.blocked} blocked`, `${c.in_flight} in flight`, `${c.closed} closed`]
-  if (c.out_of_scope > 0) parts.push(`${c.out_of_scope} out of scope`)
+// The full window already has its `✓ N closed` row, so its counts line leaves closed out.
+function countsText(counts: ProgrammeCounts, withClosed: boolean): string {
+  const parts = [`${counts.open} open`, `${counts.frontier} ready`, `${counts.blocked} blocked`, `${counts.in_flight} in flight`]
+  if (withClosed) parts.push(`${counts.closed} closed`)
+  if (counts.out_of_scope > 0) parts.push(`${counts.out_of_scope} out of scope`)
   return parts.join(' · ')
 }
 
 export function programmeLayers(view: ProgrammeView, width: number): ProgrammeLayers {
   const columns = Math.max(8, width)
   if (isFailed(view)) {
-    const row: Row = { text: cutToCells(`programme ${view.slug} · ${view.error}`, columns), dim: true }
+    const row: Row = { text: named(`programme ${view.slug} · `, view.error, FAILED_HINT, columns), dim: true }
     return { full: [row], reduced: [row], current: [row] }
   }
   const head: Row = {
@@ -148,8 +155,8 @@ export function programmeLayers(view: ProgrammeView, width: number): ProgrammeLa
     text: named('▶ ', `${view.ticket} ${current?.name ?? ''}`.trim(), marker, columns),
     bold: true,
   }
-  const counts: Row = { text: cutToCells(countsText(view.counts), columns), dim: true }
-  const reduced = [head, currentRow, counts]
+  const reducedCounts: Row = { text: cutToCells(countsText(view.counts, true), columns), dim: true }
+  const reduced = [head, currentRow, reducedCounts]
 
   const rows: Row[] = [head]
   if (view.counts.closed > 0) rows.push({ text: `✓ ${view.counts.closed} closed`, dim: true })
@@ -173,7 +180,7 @@ export function programmeLayers(view: ProgrammeView, width: number): ProgrammeLa
   })
   if (more > 0) rows.push({ text: `└─ +${more} more`, dim: true })
   rows.push(...readyRows(view, columns))
-  rows.push(counts)
+  rows.push({ text: cutToCells(countsText(view.counts, false), columns), dim: true })
   return { full: rows, reduced, current: [currentRow] }
 }
 
@@ -181,3 +188,13 @@ export const programmeRows = (view: ProgrammeView, width: number): Row[] => prog
 
 // The status line's share of a programme.
 export const programmeStatus = (view: ProgrammeView): string => `▶ ${view.slug} ${view.ticket}`
+
+// What the pane's state carries of the programme, or nothing.
+export function programmeState(memory: {
+  shown: { view: ProgrammeView } | undefined
+  note: string | undefined
+}): { view?: ProgrammeView; note?: string } | undefined {
+  const view = memory.shown?.view
+  if (view === undefined && memory.note === undefined) return undefined
+  return { ...(view ? { view } : {}), ...(memory.note ? { note: memory.note } : {}) }
+}

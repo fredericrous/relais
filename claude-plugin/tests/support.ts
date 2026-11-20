@@ -35,16 +35,24 @@ export type Agents = { id: string; status: string; type?: string; name?: string;
 
 const ok = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 
+const noProgramme = { ...ok, stdout: '{"programme":null,"reason":"none"}' }
+
 export const RELAIS_AGENT_TYPE = 'relais:relais-worker-sonnet-medium'
 
 export const zeroUsage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 
 export function scriptedEngine(
   on: any,
-  options: { session?: string; isPlaced?: boolean; store?: Record<string, unknown>; quiet?: boolean } = {},
+  options: { session?: string; isPlaced?: boolean; store?: Record<string, unknown>; quiet?: boolean; hangStoreWrites?: boolean } = {},
 ) {
   const clock = mock.clock(on, { now: Date.parse('2026-10-06T12:00:00Z') })
-  mock.store(on, options.store ?? {})
+  if (options.hangStoreWrites) {
+    // The plugin's store answers reads with nothing and never settles a write.
+    on('store.get', () => ({ value: undefined }))
+    on('store.set', () => new Promise<never>(() => {}))
+  } else {
+    mock.store(on, options.store ?? {})
+  }
   mock.env(on, { HOME: '/Users/p' })
   const calls: Calls = {
     run: [],
@@ -68,7 +76,8 @@ export function scriptedEngine(
   // What a test changes to script the world: `relais native …` results, a
   // tool's answer, and a hook run inside a tool call.
   const script = {
-    runResult: (_argv: string[], _init: any): any => ok,
+    // A session with no programme claim, unless a test says otherwise.
+    runResult: (argv: string[], _init: any): any => (argv[1] === 'programme' ? noProgramme : ok),
     toolResult: (_e: any): any => ({ result: 'ok', text: 'ok' }),
     duringTool: async (_$: any, _e: any): Promise<void> => {},
     isPlaced: options.isPlaced ?? true,

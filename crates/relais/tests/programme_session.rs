@@ -117,6 +117,32 @@ impl World {
         assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     }
 
+    /// Rewrites the recorded repository path of every claim file.
+    fn record_repo(&self, recorded: &Path) {
+        fn walk(dir: &Path, recorded: &str) {
+            for entry in std::fs::read_dir(dir).expect("read dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    walk(&path, recorded);
+                } else if path.extension().is_some_and(|ext| ext == "toml") {
+                    let text = std::fs::read_to_string(&path).expect("claim");
+                    let rewritten: Vec<String> = text
+                        .lines()
+                        .map(|line| {
+                            if line.starts_with("repo = ") {
+                                format!("repo = {recorded:?}")
+                            } else {
+                                line.to_string()
+                            }
+                        })
+                        .collect();
+                    std::fs::write(&path, rewritten.join("\n") + "\n").expect("rewritten");
+                }
+            }
+        }
+        walk(&self.state.join("claims"), recorded.to_str().expect("utf8"));
+    }
+
     fn session(&self, extra: &[&str]) -> Output {
         let repo = self.repo();
         let mut args = vec![
@@ -153,13 +179,18 @@ fn a_work_claim_answers_with_the_programme_its_tickets_and_the_ready_list() {
     let answer = document(&world.session(&["--session", "sess-own", "--json"]));
 
     let path = golden_path();
-    if std::env::var_os("UPDATE_GOLDEN").is_some() || !path.exists() {
+    if std::env::var_os("UPDATE_GOLDEN").is_some() {
         let mut pretty = serde_json::to_string_pretty(&answer).expect("encodes");
         pretty.push('\n');
         std::fs::write(&path, pretty).expect("golden written");
     }
-    let golden: Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).expect("golden")).expect("json");
+    let golden_text = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        panic!(
+            "{} is missing: run with UPDATE_GOLDEN=1 to write it",
+            path.display()
+        )
+    });
+    let golden: Value = serde_json::from_str(&golden_text).expect("json");
     assert_eq!(answer, golden);
 
     let programme = &answer["programme"];
@@ -294,4 +325,113 @@ fn a_dir_in_another_repository_falls_through_to_the_claims_own_repository() {
     let answer = document(&out);
     assert_eq!(answer["programme"]["repo"], "alpha");
     assert_eq!(answer["programme"]["ready"], json!(["t4"]));
+}
+
+#[test]
+fn a_work_claim_wins_over_a_handoff_held_at_the_same_time() {
+    let world = World::new("both");
+    let root = world.root.to_str().expect("utf8");
+    let next = world.run(&["next", "--root", root, "--session", "sess-own", "--claim"]);
+    assert_eq!(next.status.code(), Some(0), "{}", text(&next.stderr));
+    assert!(text(&next.stdout).contains("t2"), "{}", text(&next.stdout));
+    world.claim("t4", "sess-own");
+    let answer = document(&world.session(&["--session", "sess-own", "--json"]));
+    assert_eq!(answer["programme"]["kind"], "work");
+    assert_eq!(answer["programme"]["ticket"], "t4");
+}
+
+#[test]
+fn a_recorded_worktree_without_the_map_resolves_to_the_main_checkout() {
+    let world = World::new("recorded-wt");
+    world.claim("t2", "sess-own");
+    let worktree = world.root.join("alpha-wt");
+    git(
+        &world.repo(),
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "-q",
+            worktree.to_str().expect("utf8"),
+        ],
+    );
+    std::fs::remove_dir_all(worktree.join("docs/programmes/p")).expect("map removed");
+    world.record_repo(&worktree);
+    let out = world.run(&[
+        "session",
+        "--no-fetch",
+        "--session",
+        "sess-own",
+        "--dir",
+        world.root.to_str().expect("utf8"),
+        "--json",
+    ]);
+    let answer = document(&out);
+    assert_eq!(answer["programme"]["ready"], json!(["t4"]), "{answer}");
+}
+
+#[test]
+fn a_removed_recorded_worktree_is_resolved_by_dir() {
+    let world = World::new("removed-wt");
+    world.claim("t2", "sess-own");
+    world.record_repo(&world.root.join("alpha-removed-wt"));
+    let answer = document(&world.session(&["--session", "sess-own", "--json"]));
+    assert_eq!(answer["programme"]["ready"], json!(["t4"]), "{answer}");
+}
+
+#[test]
+fn text_mode_with_an_unreadable_map_prints_the_answer_line_and_exits_1() {
+    let world = World::new("text-failed");
+    world.claim("t2", "sess-own");
+    std::fs::remove_file(world.repo().join("docs/programmes/p/t2.md")).expect("removed");
+    let out = world.session(&["--session", "sess-own"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "p t2 (work)\n");
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("relais: alpha p: ticket t2 is not in the map"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("next: relais programme show ") && stderr.contains("/docs/programmes/p"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn text_mode_says_when_the_claim_expired() {
+    let world = World::new("text-expired");
+    world.claim("t2", "sess-own");
+    let claims = world.state.join("claims");
+    rewrite_timestamps(&claims, STALE_UNIX_SECONDS);
+    let out = world.session(&["--session", "sess-own"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "programme claim expired\n");
+}
+
+/// Long past any hold: September 2001.
+const STALE_UNIX_SECONDS: i64 = 1_000_000_000;
+
+fn rewrite_timestamps(dir: &Path, seconds: i64) {
+    for entry in std::fs::read_dir(dir).expect("read dir") {
+        let path = entry.expect("entry").path();
+        if path.is_dir() {
+            rewrite_timestamps(&path, seconds);
+        } else if path.extension().is_some_and(|ext| ext == "toml") {
+            let text = std::fs::read_to_string(&path).expect("claim");
+            let rewritten: Vec<String> = text
+                .lines()
+                .map(|line| {
+                    if line.starts_with("claimed_at = ") {
+                        format!("claimed_at = {seconds}")
+                    } else if line.starts_with("refreshed_at = ") {
+                        format!("refreshed_at = {seconds}")
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect();
+            std::fs::write(&path, rewritten.join("\n") + "\n").expect("rewritten");
+        }
+    }
 }
