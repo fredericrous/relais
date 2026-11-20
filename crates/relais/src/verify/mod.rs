@@ -3309,6 +3309,7 @@ impl ReviewRecord {
             | Self::SuccessorOnly { .. }
             | Self::AgainstBase { .. }
             | Self::Parts { .. } => Some(true),
+            Self::Findings { review, .. } => review.reviewed(),
         }
     }
 }
@@ -3374,6 +3375,14 @@ pub enum ReviewRecord {
     Parts {
         same_model: bool,
         parts: Vec<ReviewPartRecord>,
+    },
+    /// The review found something, the run stopped `review_findings`, and a
+    /// person accepted the candidate anyway (`relais decide <run> approve`).
+    /// `detail` is the findings as the run recorded them; `review` is the
+    /// review that found them, with its independence, coverage or parts.
+    Findings {
+        detail: String,
+        review: Box<ReviewRecord>,
     },
 }
 
@@ -6638,6 +6647,62 @@ mod tests {
         assert_eq!(summary, Some(IndependenceSummary::PartlyIndependent));
         // A re-seal recomputes the same from what the receipt stores.
         assert_eq!(independence_summary(&criteria), summary);
+    }
+
+    /// A review-findings record keeps the review that found them, whatever
+    /// its shape, and answers `reviewed()` as that review does. Records
+    /// written before the variant still parse, and the new one round-trips.
+    #[test]
+    fn a_findings_record_wraps_the_review_that_found_them() {
+        let parts = ReviewRecord::Parts {
+            same_model: false,
+            parts: vec![ReviewPartRecord {
+                index: 1,
+                of: 1,
+                patch_sha256: "p".into(),
+                result_sha256: Some("r".into()),
+                verdict: "findings".into(),
+            }],
+        };
+        for inner in [
+            ReviewRecord::SameModel,
+            ReviewRecord::SuccessorOnly {
+                same_model: true,
+                cleared_by: "dispatch-1".into(),
+            },
+            parts,
+            ReviewRecord::NotRecorded,
+        ] {
+            let record = ReviewRecord::Findings {
+                detail: "FINDINGS:\n1. [high] a.rs:1 wrong. Fix.".into(),
+                review: Box::new(inner.clone()),
+            };
+            assert_eq!(record.reviewed(), inner.reviewed(), "{inner:?}");
+            let json = serde_json::to_value(&record).expect("serializes");
+            let back: ReviewRecord = serde_json::from_value(json.clone()).expect("parses");
+            assert_eq!(back, record, "{json}");
+        }
+        // The shapes older receipts stored still parse as they were.
+        for (stored, expected) in [
+            (serde_json::json!("same_model"), ReviewRecord::SameModel),
+            (serde_json::json!("not_recorded"), ReviewRecord::NotRecorded),
+            (
+                serde_json::json!({"unavailable": {"detail": "gone"}}),
+                ReviewRecord::Unavailable {
+                    detail: "gone".into(),
+                },
+            ),
+            (
+                serde_json::json!({"successor_only": {"same_model": false, "cleared_by": "d"}}),
+                ReviewRecord::SuccessorOnly {
+                    same_model: false,
+                    cleared_by: "d".into(),
+                },
+            ),
+        ] {
+            let parsed: ReviewRecord = serde_json::from_value(stored).expect("an older record");
+            assert_eq!(parsed, expected);
+        }
     }
 
     /// A criterion of a receipt written before `settled_via` is read off

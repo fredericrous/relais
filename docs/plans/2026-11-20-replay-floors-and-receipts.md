@@ -205,7 +205,7 @@ read a verdict from a trial set that is mostly infrastructure noise.
 
 ## Phases
 
-- [ ] Phase 1 — receipts for review-findings approvals:
+- [x] Phase 1 — receipts for review-findings approvals:
   `crates/relais/src/runner/scheduler.rs`, `crates/relais/src/cli/decide.rs`,
   `crates/relais/src/runner/successor.rs`, `crates/relais/src/verify/mod.rs`,
   `crates/relais/src/runner/engine.rs`,

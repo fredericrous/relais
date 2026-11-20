@@ -1129,7 +1129,10 @@ fn accept_integrated(
                         super::review::finding_severities(&detail),
                     ),
                     &|engine| {
-                        let review = super::review_record_of(ledger, &engine.run_id)?;
+                        let review = crate::verify::ReviewRecord::Findings {
+                            detail: detail.clone(),
+                            review: Box::new(super::review_record_of(ledger, &engine.run_id)?),
+                        };
                         integrated_receipt(
                             engine,
                             IntegratedReceiptInput {

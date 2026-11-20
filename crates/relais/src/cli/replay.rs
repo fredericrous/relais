@@ -146,9 +146,16 @@ pub(crate) fn replay_command(
         return Ok(CliOutcome::OperationalFailure);
     };
     let Some((receipt, _hash)) = operational(ledger.receipt(&source_run), "dataset replay")? else {
-        eprintln!("relais dataset replay: run {source_run} has no receipt to replay from");
+        eprintln!(
+            "relais dataset replay: run {source_run} has no receipt to replay from \
+             (source settled by: none)"
+        );
+        eprintln!("next: relais dataset replay --task <another task> --recipe <path>");
         return Ok(CliOutcome::OperationalFailure);
     };
+    let settled_by = settled_by_line(
+        operational(ledger.decision_of_run(&source_run), "dataset replay")?.as_ref(),
+    );
     let (Some(base_sha), Some(source_profile_hash), Some(contract_hash)) = (
         receipt["base_sha"].as_str(),
         receipt["verification_profile_hash"].as_str(),
@@ -263,6 +270,7 @@ pub(crate) fn replay_command(
     if dry_run {
         println!("dry run: nothing was dispatched, no trial was recorded, no usage was spent");
         println!("would replay source run: {source_run} (task {task_id})");
+        println!("{settled_by}");
         println!(
             "task type: {}",
             task_type.map_or("none", relais::contract::TaskType::as_str)
@@ -711,9 +719,53 @@ impl ReplayLog<'_> {
     }
 }
 
+/// The dry run's line naming what settled the source run's receipt: a
+/// person's approval of a stop (the receipt was sealed from the run's
+/// snapshot), or the runner's own acceptance.
+fn settled_by_line(decision: Option<&relais::ledger::DecisionRecord>) -> String {
+    match decision {
+        Some(decision) if decision.resolution == Some(relais::runner::Reason::DecisionApproved) => {
+            format!("source settled by: decision ({})", decision.raised_reason)
+        }
+        _ => "source settled by: runner".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decision(resolution: Option<relais::runner::Reason>) -> relais::ledger::DecisionRecord {
+        relais::ledger::DecisionRecord {
+            run: relais::ids::RunId::from_stored("run-a"),
+            task: TaskId::from_stored("task-abc"),
+            raised_at: "2026-11-20T00:00:00Z".into(),
+            raised_state: relais::runner::State::NeedsReview,
+            raised_reason: "review_findings".into(),
+            resolved_at: Some("2026-11-20T01:00:00Z".into()),
+            resolution,
+            actor: Some("orchestrator".into()),
+            note: None,
+            successor_run: None,
+            candidate_contained: None,
+            waited_seconds: 0,
+        }
+    }
+
+    #[test]
+    fn the_dry_run_names_what_settled_the_source() {
+        let approved = decision(Some(relais::runner::Reason::DecisionApproved));
+        assert_eq!(
+            settled_by_line(Some(&approved)),
+            "source settled by: decision (review_findings)"
+        );
+        assert_eq!(settled_by_line(None), "source settled by: runner");
+        let salvaged = decision(Some(relais::runner::Reason::DecisionSalvaged));
+        assert_eq!(
+            settled_by_line(Some(&salvaged)),
+            "source settled by: runner"
+        );
+    }
 
     /// The start and end lines carry the type, the task, the outcome, the
     /// dispatched model, the cost, the wall time and the load at start.

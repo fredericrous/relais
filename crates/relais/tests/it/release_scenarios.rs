@@ -5117,6 +5117,45 @@ fn a_dry_run_replay_needs_no_plugin() {
         .expect("relais runs");
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert!(text(&out.stdout).contains("dry run: nothing was dispatched"));
+    assert!(
+        text(&out.stdout)
+            .lines()
+            .any(|line| line == "source settled by: runner"),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
+fn a_replay_of_a_run_with_no_receipt_is_refused_and_says_so() {
+    let (world, task_id, recipe) = world_with_accepted_run("replay-no-receipt");
+    let conn = rusqlite::Connection::open(world.state.join("ledger.sqlite")).expect("conn");
+    conn.execute("DELETE FROM receipts", [])
+        .expect("drop the receipt");
+    drop(conn);
+    let out = world
+        .command(&[])
+        .args(["dataset", "replay", "--task", &task_id, "--recipe"])
+        .arg(&recipe)
+        .arg("--dry-run")
+        .output()
+        .expect("relais runs");
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("has no receipt to replay from (source settled by: none)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("next: relais dataset replay --task"),
+        "{stderr}"
+    );
+    for line in stderr.lines() {
+        assert!(
+            line.chars().count() <= 80 || line.contains("run-"),
+            "{line}"
+        );
+    }
 }
 
 #[test]

@@ -156,7 +156,13 @@ impl<'a> RunEngine<'a> {
                                 verified: &verified,
                                 verdict,
                                 outcome: State::NeedsDecision,
-                                review: review_record_of(engine.config.ledger, &engine.run_id)?,
+                                review: verify::ReviewRecord::Findings {
+                                    detail: detail.clone(),
+                                    review: Box::new(review_record_of(
+                                        engine.config.ledger,
+                                        &engine.run_id,
+                                    )?),
+                                },
                             })
                         },
                     )?;

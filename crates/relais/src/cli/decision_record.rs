@@ -22,6 +22,19 @@ pub(crate) struct Decided {
     /// The successor intent a `revise --widen-scope` or `--successor-
     /// contract` answer wrote (or, repeated, found).
     pub(crate) successor_intent: Option<serde_json::Value>,
+    /// An approval that resolved and left the run with no receipt: the stop
+    /// reason it answered, which saved no verification snapshot to seal one
+    /// from. Printed as one stderr line, or as `receipt_skipped` under `--json`.
+    pub(crate) receipt_skipped: Option<String>,
+}
+
+impl Decided {
+    /// The stderr line for an approval that wrote no receipt.
+    pub(crate) fn receipt_skipped_line(&self) -> Option<String> {
+        self.receipt_skipped.as_ref().map(|reason| {
+            format!("no receipt written: no verification snapshot for this {reason} stop")
+        })
+    }
 }
 
 pub(crate) type Decision = Result<Decided, Refusal>;

@@ -121,6 +121,7 @@ pub(crate) fn salvage_command(
         to_state: State::AcceptedByPerson,
         advice: operational(ledger.decision_advice(run), "decide")?,
         successor_intent: None,
+        receipt_skipped: None,
         sentence: format!(
             "recorded {} for {run} by {} (originally ended: {}; candidate contained: {})",
             Reason::DecisionSalvaged.as_str(),

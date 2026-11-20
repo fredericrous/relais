@@ -22,7 +22,7 @@ use relais::ids::RunId;
 use relais::ledger::Ledger;
 use relais::paths;
 use relais::runner::approval;
-use relais::runner::approval::seals_from_snapshot;
+use relais::runner::approval::seals_on_approve;
 use relais::runner::Reason;
 use relais::runner::State;
 use std::path::{Path, PathBuf};
@@ -49,20 +49,12 @@ pub(crate) fn decide_command(request: DecideRequest<'_>) -> Result<CliOutcome, C
     match decide_inner(&request) {
         Ok(Ok(done)) => {
             if json {
-                let mut printed = serde_json::json!({
-                    "run": done.run,
-                    "resolution": done.resolution.as_str(),
-                    "actor": done.actor.as_str(),
-                    "from_state": done.from_state.as_str(),
-                    "to_state": done.to_state.as_str(),
-                    "advice": done.advice,
-                });
-                if let Some(intent) = &done.successor_intent {
-                    printed["successor_intent"] = intent.clone();
-                }
-                println!("{printed}");
+                println!("{}", decided_json(&done));
             } else {
                 println!("{}", done.sentence);
+                if let Some(line) = done.receipt_skipped_line() {
+                    eprintln!("{line}");
+                }
             }
             Ok(CliOutcome::Accepted)
         }
@@ -93,6 +85,28 @@ pub(crate) fn decide_command(request: DecideRequest<'_>) -> Result<CliOutcome, C
             Err(e)
         }
     }
+}
+
+/// The one stdout object `relais decide --json` prints for an answer it
+/// recorded. An approval that wrote no receipt adds `"receipt": null` and
+/// `"receipt_skipped"`, the stop reason it answered.
+fn decided_json(done: &Decided) -> serde_json::Value {
+    let mut printed = serde_json::json!({
+        "run": done.run,
+        "resolution": done.resolution.as_str(),
+        "actor": done.actor.as_str(),
+        "from_state": done.from_state.as_str(),
+        "to_state": done.to_state.as_str(),
+        "advice": done.advice,
+    });
+    if let Some(intent) = &done.successor_intent {
+        printed["successor_intent"] = intent.clone();
+    }
+    if let Some(reason) = &done.receipt_skipped {
+        printed["receipt"] = serde_json::Value::Null;
+        printed["receipt_skipped"] = serde_json::json!(reason);
+    }
+    printed
 }
 
 /// Why a `person-via-orchestrator` sign-off without a live plugin nonce is
@@ -453,8 +467,7 @@ fn record_answer(
         // not be saved) is resolved as it always was.
         let open_review_stop = match operational(ledger.decision_of_run(&run), "decide")? {
             Some(decision)
-                if decision.resolved_at.is_none()
-                    && seals_from_snapshot(&decision.raised_reason) =>
+                if decision.resolved_at.is_none() && seals_on_approve(&decision.raised_reason) =>
             {
                 let has_snapshot =
                     operational(ledger.verification_snapshot(&run), "decide")?.is_some();
@@ -464,8 +477,7 @@ fn record_answer(
             // finds it matches the snapshot's receipt (exit 0, heals a missing
             // `receipt.json`) or refuses it by name.
             Some(decision)
-                if decision.resolved_at.is_some()
-                    && seals_from_snapshot(&decision.raised_reason) =>
+                if decision.resolved_at.is_some() && seals_on_approve(&decision.raised_reason) =>
             {
                 operational(ledger.receipt(&run), "decide")?.is_some()
                     && operational(ledger.verification_snapshot(&run), "decide")?.is_some()
@@ -568,6 +580,15 @@ fn record_answer(
     let successor_run = successor.map(RunId::from_stored);
     let resolution = answer.resolution();
     let to_state = answer.terminal_state();
+    // The stop an approval answers, read before it resolves: an approval
+    // that leaves the run with no receipt names it (`receipt_skipped`).
+    let raised_reason = if answer == DecideAnswer::Approve {
+        operational(ledger.decision_of_run(&run), "decide")?
+            .filter(|decision| decision.resolved_at.is_none())
+            .map(|decision| decision.raised_reason)
+    } else {
+        None
+    };
     let resolved = operational(
         ledger.resolve_decision(
             &run,
@@ -590,6 +611,10 @@ fn record_answer(
             format!("run {run_id} has no open decision on record"),
         ));
     }
+    let receipt_skipped = match raised_reason {
+        Some(reason) if operational(ledger.receipt(&run), "decide")?.is_none() => Some(reason),
+        _ => None,
+    };
     Ok(Ok(Decided {
         run: run_id.to_string(),
         resolution,
@@ -599,6 +624,7 @@ fn record_answer(
         advice: operational(ledger.decision_advice(&run), "decide")?,
         sentence: format!("recorded {} for {run_id} by {actor}", resolution.as_str()),
         successor_intent: None,
+        receipt_skipped,
     }))
 }
 
@@ -671,6 +697,7 @@ fn approve_stopped_review(
         advice: operational(ledger.decision_advice(run), "decide")?,
         sentence,
         successor_intent: None,
+        receipt_skipped: None,
     }))
 }
 
@@ -703,6 +730,7 @@ pub(crate) fn successor_decide(
                 advice: operational(ledger.decision_advice(run), "decide")?,
                 sentence,
                 successor_intent: Some(intent_json(ledger, &intent)),
+                receipt_skipped: None,
             }))
         };
     // Repeated: the decision is answered and its intent exists.
@@ -1086,6 +1114,115 @@ mod tests {
             None
         );
         assert!(!runs.join("run-old").exists());
+        let old = old.expect("resolved");
+        assert_eq!(old.receipt_skipped.as_deref(), Some("review_unavailable"));
+    }
+
+    #[test]
+    fn approving_a_review_findings_stop_seals_its_findings_or_says_none_was_written() {
+        let dir = relais::test_support::short_temp_dir("decide-findings");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let findings = "FINDINGS:\n1. [high] src/lib.rs:1 wrong result. Fix.";
+        waiting_run(
+            &ledger,
+            "run-found",
+            "/repo",
+            State::NeedsReview,
+            Reason::ReviewFindings,
+            None,
+            None,
+        );
+        // The snapshot a review-findings stop saves: its review is the
+        // findings, around the review that found them.
+        let mut saved = receipt("run-found");
+        saved.review = ReviewRecord::Findings {
+            detail: findings.into(),
+            review: Box::new(ReviewRecord::SameModel),
+        };
+        ledger
+            .save_verification_snapshot(
+                &RunId::from_stored("run-found"),
+                &VerificationSnapshot {
+                    candidate_sha: "cand".into(),
+                    base_sha: "base".into(),
+                    contract_hash: "ch".into(),
+                    policy_hash: "ph".into(),
+                    stop_reason: Reason::ReviewFindings.as_str().into(),
+                    receipt: serde_json::to_value(&saved).expect("receipt"),
+                },
+            )
+            .expect("snapshot");
+        waiting_run(
+            &ledger,
+            "run-bare",
+            "/repo",
+            State::NeedsReview,
+            Reason::ReviewFindings,
+            None,
+            None,
+        );
+        waiting_run(
+            &ledger,
+            "run-over",
+            "/repo",
+            State::NeedsDecision,
+            Reason::ReviewOverBudget,
+            None,
+            None,
+        );
+
+        // With a snapshot: sealed, accepted, the findings kept.
+        let sealed = approve(&dir, "run-found").expect("approved");
+        assert!(sealed.sentence.contains("sealed at"), "{}", sealed.sentence);
+        assert_eq!(sealed.receipt_skipped, None);
+        assert!(!decided_json(&sealed)
+            .as_object()
+            .expect("object")
+            .contains_key("receipt_skipped"));
+        let (row, _) = ledger
+            .receipt(&RunId::from_stored("run-found"))
+            .expect("read")
+            .expect("a receipt row");
+        let kept: Receipt = serde_json::from_value(row).expect("parses");
+        assert_eq!(kept.outcome, State::Accepted.as_str());
+        assert!(
+            matches!(
+                &kept.review,
+                ReviewRecord::Findings { detail, review }
+                    if detail == findings && **review == ReviewRecord::SameModel
+            ),
+            "{:?}",
+            kept.review
+        );
+
+        // With none: it resolves, writes no receipt, and says so.
+        let bare = approve(&dir, "run-bare");
+        assert_eq!(exit_of(&bare), 0);
+        let bare = bare.expect("resolved");
+        assert_eq!(
+            ledger
+                .receipt(&RunId::from_stored("run-bare"))
+                .expect("read"),
+            None
+        );
+        assert_eq!(
+            bare.receipt_skipped_line().as_deref(),
+            Some("no receipt written: no verification snapshot for this review_findings stop")
+        );
+        let printed = decided_json(&bare);
+        assert_eq!(printed["receipt"], serde_json::Value::Null);
+        assert_eq!(printed["receipt_skipped"], "review_findings");
+        assert!(printed.as_object().expect("object").contains_key("receipt"));
+
+        // An over-budget stop with no snapshot stays refused.
+        let over = approve(&dir, "run-over");
+        assert_eq!(exit_of(&over), 2);
+        assert_eq!(
+            ledger
+                .receipt(&RunId::from_stored("run-over"))
+                .expect("read"),
+            None
+        );
     }
 
     #[test]

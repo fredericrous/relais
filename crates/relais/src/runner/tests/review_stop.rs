@@ -832,3 +832,50 @@ fn a_decomposed_review_findings_stop_saves_a_snapshot() {
     assert_eq!(snapshot.stop_reason, "review_findings");
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
+
+#[test]
+fn a_review_findings_stop_is_not_reviewed_in_parts_and_its_approval_keeps_the_findings() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let backend = Findings(
+        big_patch_backend(0, 0, Arc::new(AtomicBool::new(false))),
+        REVIEW_HIGH,
+    );
+    let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+    assert!(
+        matches!(outcome.terminal, Terminal::NeedsReview { .. }),
+        "{outcome:?}"
+    );
+    let refused = crate::runner::successor::plan_review_parts(
+        &fixture.ledger,
+        &outcome.run_id,
+        &fixture.artifacts,
+    );
+    let Err(crate::runner::successor::PlanError::NotReviewable(why)) = refused else {
+        panic!("review-parts answers only a review it could not have: {refused:?}");
+    };
+    assert!(why.contains("waits on review_findings"), "{why}");
+
+    let sealed = approve_from_snapshot(
+        &fixture.ledger,
+        &fixture.artifacts,
+        &outcome.run_id,
+        &answer(State::NeedsReview),
+        &|| Ok(()),
+    )
+    .expect("approved");
+    assert!(sealed.written);
+    let (row, _) = reopened(&fixture)
+        .receipt(&outcome.run_id)
+        .expect("read")
+        .expect("a receipt row");
+    assert_eq!(row["outcome"], "accepted");
+    let receipt: crate::verify::Receipt = serde_json::from_value(row).expect("parses");
+    let ReviewRecord::Findings { detail, review } = &receipt.review else {
+        panic!("{:?}", receipt.review);
+    };
+    assert!(detail.contains("wrong result"), "{detail}");
+    assert_eq!(receipt.review.reviewed(), review.reviewed());
+    assert_eq!(receipt.review.reviewed(), Some(true));
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
