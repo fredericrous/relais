@@ -229,7 +229,7 @@ The person's choices (AskUserQuestion, 2026-11-19):
 
 ## Code review
 
-- relais: backend, lang:rust, unix, tui, architect, lang:typescript
+- relais: none — markdown only (this closing docs PR; backend, lang:rust, unix, tui, architect and lang:typescript reviewed the code on #504)
 
 lang:typescript is added because TS is most of the change: the plugin's hooks.
 
