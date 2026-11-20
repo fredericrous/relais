@@ -161,6 +161,53 @@ pub const TYPED_GATE_TRIALS: usize = 15;
 /// See [`TYPED_GATE_TRIALS`].
 pub const TYPED_GATE_ACCEPTED: usize = 14;
 
+/// The validity floor (ADR-0006): at least 80% of an arm's settled trials
+/// must be valid, so a verdict is never read from infrastructure noise. In
+/// integers, `valid / settled >= 4/5` is `5 * valid >= 4 * settled`.
+pub const TYPED_GATE_FLOOR_PERCENT: usize = 80;
+
+/// The floor applies to a recipe revision whose first trial was created at
+/// or after this instant, the release that shipped it; a revision already
+/// mid-gate keeps the bar it started under.
+pub const TYPED_GATE_FLOOR_FROM: &str = "2026-11-21T00:00:00+00:00";
+
+/// Whether a revision whose first trial was created at `first_trial_at`
+/// (RFC 3339, as the ledger writes it) is held to the validity floor. A
+/// stamp that does not parse is held to it: the stricter reading.
+pub fn validity_floor_applies(first_trial_at: &str) -> bool {
+    let from = chrono::DateTime::parse_from_rfc3339(TYPED_GATE_FLOOR_FROM)
+        .expect("the floor's cutoff is RFC 3339");
+    chrono::DateTime::parse_from_rfc3339(first_trial_at).map_or(true, |at| at >= from)
+}
+
+/// The validity floor's reading of one arm.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ValidityFloor {
+    /// Not read: a revision first trialled before [`TYPED_GATE_FLOOR_FROM`],
+    /// or one with fewer than [`TYPED_GATE_TRIALS`] qualifying trials.
+    #[default]
+    NotApplied,
+    /// Met at the 15th qualifying trial, or at the earliest later prefix
+    /// that reached it. Final: later trials never move it.
+    Met,
+    /// Below the floor over the arm's whole closed prefix: `valid`
+    /// qualifying trials of `settled` (qualifying plus in-arm errored).
+    Held { valid: usize, settled: usize },
+}
+
+impl ValidityFloor {
+    /// Whether `valid` of `settled` meets the floor.
+    pub fn met_by(valid: usize, settled: usize) -> bool {
+        5 * valid >= 4 * settled
+    }
+
+    /// The fewest further valid trials that reach the floor if they all
+    /// pass: `4s - 5q`.
+    pub fn needs(valid: usize, settled: usize) -> usize {
+        (4 * settled).saturating_sub(5 * valid)
+    }
+}
+
 /// One arm's qualifying trials, as the gate counted them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TypedGateCount {
@@ -170,17 +217,44 @@ pub struct TypedGateCount {
     /// were accepted without escalation. Later trials never move it: the
     /// bar is evaluated at n = 15 and never peeked at earlier.
     pub accepted: usize,
+    /// The validity floor's reading.
+    pub floor: ValidityFloor,
 }
 
 impl TypedGateCount {
-    /// Whether the bar is met.
+    /// Whether the bar is met, the validity floor included.
     pub fn passes(self) -> bool {
-        self.qualifying >= TYPED_GATE_TRIALS && self.accepted >= TYPED_GATE_ACCEPTED
+        self.qualifying >= TYPED_GATE_TRIALS
+            && self.accepted >= TYPED_GATE_ACCEPTED
+            && !matches!(self.floor, ValidityFloor::Held { .. })
+    }
+
+    /// When the streak passes and only the validity floor refuses: the
+    /// fewest further valid trials that clear it. `None` otherwise.
+    pub fn held_by_floor(self) -> Option<usize> {
+        match self.floor {
+            ValidityFloor::Held { valid, settled }
+                if self.qualifying >= TYPED_GATE_TRIALS && self.accepted >= TYPED_GATE_ACCEPTED =>
+            {
+                Some(ValidityFloor::needs(valid, settled))
+            }
+            _ => None,
+        }
     }
 
     /// The refusal for `name` at `revision`, naming the gate, the arm's
-    /// qualifying count and the bar.
+    /// qualifying count and the bar. An arm whose streak passes and that
+    /// the floor holds is refused by the floor alone (`held: …`).
     pub fn refusal(self, name: &str, revision: u32) -> String {
+        if let (Some(needs), ValidityFloor::Held { valid, settled }) =
+            (self.held_by_floor(), self.floor)
+        {
+            return format!(
+                "held: {valid}/{settled} valid ({}%), below the \
+                 {TYPED_GATE_FLOOR_PERCENT}% floor; needs {needs} more valid trials",
+                100 * valid / settled.max(1)
+            );
+        }
         let mut text = format!(
             "typed-research gate: {name}@{revision} has {} qualifying trials, needs \
              {TYPED_GATE_TRIALS} with at least {TYPED_GATE_ACCEPTED} accepted without escalation",
@@ -1630,6 +1704,7 @@ mod tests {
                 TypedGateCount {
                     qualifying,
                     accepted,
+                    floor: Default::default(),
                 },
             );
             validate_candidate(
@@ -1667,6 +1742,7 @@ mod tests {
             TypedGateCount {
                 qualifying: 7,
                 accepted: 7,
+                floor: Default::default(),
             },
         );
         let refusal = validate_candidate(
@@ -1694,6 +1770,7 @@ mod tests {
             TypedGateCount {
                 qualifying: 15,
                 accepted: 15,
+                floor: Default::default(),
             },
         );
         assert!(matches!(

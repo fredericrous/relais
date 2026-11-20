@@ -708,6 +708,29 @@ impl Ledger {
             .collect()
     }
 
+    /// Every trial of the given recipe ids, settled or not, oldest first
+    /// (`created_at`, then `trial_id`): what the typed-research gate reads
+    /// its closed prefix from, a pending row being the barrier that ends it.
+    /// A corrupt row is an error, as in [`Self::settled_trials_for_recipes`].
+    pub fn trials_for_recipes(
+        &self,
+        recipe_ids: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<TrialRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM trials ORDER BY created_at, trial_id",
+            Self::TRIAL_COLUMNS
+        ))?;
+        let rows = stmt.query_map([], Self::trial_columns)?;
+        let rows: Vec<TrialColumns> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(parse_trial_row)
+            .filter(|row| match row {
+                Ok(row) => recipe_ids.contains(&row.arm_recipe_id),
+                Err(_) => true,
+            })
+            .collect()
+    }
+
     /// Every SETTLED live (`live_worktree`) trial whose recorded arm list
     /// (`arms_json`, parsed as the JSON list it is) names one of the given
     /// recipe ids among its NON-control arms (`arms[1..]`; entry 0 is the
@@ -1167,6 +1190,41 @@ mod tests {
                 .expect_err("an impossible arm index is corrupt");
             assert!(matches!(error, LedgerError::Corrupt { .. }), "{error:?}");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The gate's reader returns a pending trial beside settled ones, and a
+    /// corrupt row is still an error, never skipped.
+    #[test]
+    fn trials_for_recipes_keeps_pending_rows_and_refuses_a_corrupt_one() {
+        let (ledger, dir) = temp_ledger();
+        let source_task = TaskId::from_stored("task-p");
+        let source_run = run("run-p");
+        ledger
+            .insert_run(&source_run, "/repo", None, &source_task, "rk")
+            .expect("run");
+        let t = TrialId::from_stored("trial-p");
+        let trial = new_trial(&t, &source_task, &source_run);
+        ledger.insert_trial(&trial).expect("insert trial");
+        let ids = std::iter::once(trial.arm_recipe_id.to_string()).collect();
+        let rows = ledger.trials_for_recipes(&ids).expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, None, "a pending row is returned");
+        assert!(ledger
+            .settled_trials_for_recipes(&ids)
+            .expect("rows")
+            .is_empty());
+        ledger
+            .conn
+            .execute(
+                "UPDATE trials SET arm_index = -1 WHERE trial_id = ?1",
+                params![t.as_str()],
+            )
+            .expect("hand-written arm index");
+        let error = ledger
+            .trials_for_recipes(&ids)
+            .expect_err("a corrupt row is an error");
+        assert!(matches!(error, LedgerError::Corrupt { .. }), "{error:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

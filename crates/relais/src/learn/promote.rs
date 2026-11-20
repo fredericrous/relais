@@ -420,6 +420,7 @@ mod tests {
                 TypedGateCount {
                     qualifying,
                     accepted,
+                    floor: Default::default(),
                 },
             );
             evidence

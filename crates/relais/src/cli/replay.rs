@@ -483,12 +483,52 @@ pub(crate) fn replay_command(
             eprintln!("relais dataset replay: could not remove the replay checkout: {e}");
         }
     }
+    let new_trial = relais::ledger::NewReplayTrial {
+        trial_id: &replay_id,
+        task_id: &task_id,
+        source_run_id: &source_run,
+        incumbent_recipe_id: &incumbent_recipe_id,
+        arm_recipe_id: &arm_recipe,
+        base_sha: &base_sha,
+        contract_hash: &contract_hash,
+        verification_profile_hash: &replay_profile_hash,
+        workspace_isolation: "fresh_checkout_no_accepted_answer",
+        arm_run_id: &run_id,
+        design_sha256: design_sha256.as_deref(),
+    };
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(e) => {
             eprintln!("relais dataset replay: {e}");
-            eprintln!("{}", log.end_line(&ReplayEnd::unrecorded("interrupted")));
-            announce_replay_done(&artifacts_dir, run_id.as_str(), "interrupted", None);
+            // An arm run that failed is infrastructure noise the typed gate's
+            // validity floor must see: one errored trial. An interrupt, a
+            // full disk or a ledger failure records nothing, as before.
+            let recorded = records_an_errored_trial(&e)
+                .then(|| record_errored_replay_trial(&ledger, &new_trial))
+                .and_then(|written| match written {
+                    Ok(end) => Some(end),
+                    Err(cause) => {
+                        eprintln!(
+                            "relais dataset replay: the errored trial was not written: {cause}"
+                        );
+                        None
+                    }
+                });
+            match recorded {
+                Some(end) => {
+                    eprintln!("{}", log.end_line(&end));
+                    announce_replay_done(
+                        &artifacts_dir,
+                        run_id.as_str(),
+                        "errored",
+                        Some(replay_id.as_str()),
+                    );
+                }
+                None => {
+                    eprintln!("{}", log.end_line(&ReplayEnd::unrecorded("interrupted")));
+                    announce_replay_done(&artifacts_dir, run_id.as_str(), "interrupted", None);
+                }
+            }
             return Ok(CliOutcome::OperationalFailure);
         }
     };
@@ -499,17 +539,8 @@ pub(crate) fn replay_command(
         &ledger,
         &outcome,
         &relais::ledger::NewReplayTrial {
-            trial_id: &replay_id,
-            task_id: &task_id,
-            source_run_id: &source_run,
-            incumbent_recipe_id: &incumbent_recipe_id,
-            arm_recipe_id: &arm_recipe,
-            base_sha: &base_sha,
-            contract_hash: &contract_hash,
-            verification_profile_hash: &replay_profile_hash,
-            workspace_isolation: "fresh_checkout_no_accepted_answer",
             arm_run_id: &outcome.run_id,
-            design_sha256: design_sha256.as_deref(),
+            ..new_trial
         },
         &arm,
     );
@@ -719,6 +750,45 @@ impl ReplayLog<'_> {
     }
 }
 
+/// Whether a replay whose arm run ended in `error` records an errored
+/// trial: only when the arm run itself failed. An operator interrupt or
+/// another process ending the run (`Superseded`), a full disk and a ledger
+/// failure record nothing.
+fn records_an_errored_trial(error: &relais::runner::RunError) -> bool {
+    use relais::runner::RunError;
+    match error {
+        RunError::Ledger(_) | RunError::StorageFull { .. } | RunError::Superseded(_) => false,
+        RunError::Io(_)
+        | RunError::Workspace(_)
+        | RunError::Verify(_)
+        | RunError::Id(_)
+        | RunError::Other(_) => true,
+    }
+}
+
+/// Write `trial` and settle it `errored`, with what figures the arm run
+/// left; the end line it logs.
+fn record_errored_replay_trial(
+    ledger: &relais::ledger::Ledger,
+    trial: &relais::ledger::NewReplayTrial<'_>,
+) -> Result<ReplayEnd<'static>, relais::ledger::LedgerError> {
+    let (cost, duration_ms) = live_trial::settled_figures(ledger, trial.arm_run_id)
+        .unwrap_or((relais::ledger::TrialCost::UNKNOWN, 0));
+    ledger.insert_replay_trial(trial)?;
+    ledger.settle_trial(
+        trial.trial_id,
+        relais::ledger::TrialOutcome::Errored,
+        false,
+        cost,
+        duration_ms,
+    )?;
+    Ok(ReplayEnd {
+        outcome: relais::ledger::TrialOutcome::Errored.as_str(),
+        dispatched_model: None,
+        cost: Some(cost),
+    })
+}
+
 /// The dry run's line naming what settled the source run's receipt: a
 /// person's approval of a stop (the receipt was sealed from the run's
 /// snapshot), or the runner's own acceptance.
@@ -750,6 +820,56 @@ mod tests {
             candidate_contained: None,
             waited_seconds: 0,
         }
+    }
+
+    /// An arm run that failed records one errored trial; an interrupt, a
+    /// full disk and a ledger failure record none.
+    #[test]
+    fn only_an_arm_failure_records_an_errored_trial() {
+        use relais::runner::RunError;
+        assert!(records_an_errored_trial(&RunError::Other(
+            "worker gone".into()
+        )));
+        assert!(records_an_errored_trial(&RunError::Io(
+            std::io::Error::other("x")
+        )));
+        assert!(!records_an_errored_trial(&RunError::Superseded(
+            relais::ids::RunId::from_stored("run-a")
+        )));
+        assert!(!records_an_errored_trial(&RunError::StorageFull {
+            volume: "/".into()
+        }));
+
+        let dir = relais::test_support::short_temp_dir("replay-errored");
+        let ledger = relais::ledger::Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let task = TaskId::from_stored("task-abc");
+        let source = relais::ids::RunId::from_stored("source-a");
+        ledger
+            .insert_run(&source, "/r", None, &task, "rk")
+            .expect("source run");
+        let trial_id = relais::ids::TrialId::from_stored("trial-e");
+        let arm_run = relais::ids::RunId::from_stored("arm-e");
+        let end = record_errored_replay_trial(
+            &ledger,
+            &relais::ledger::NewReplayTrial {
+                trial_id: &trial_id,
+                task_id: &task,
+                source_run_id: &source,
+                incumbent_recipe_id: "incumbent",
+                arm_recipe_id: "arm",
+                base_sha: "base",
+                contract_hash: "contract",
+                verification_profile_hash: "profile",
+                workspace_isolation: "fresh_checkout_no_accepted_answer",
+                arm_run_id: &arm_run,
+                design_sha256: None,
+            },
+        )
+        .expect("written");
+        assert_eq!(end.outcome, "errored");
+        let rows = ledger.trials_by_task(&task).expect("trials");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, Some(relais::ledger::TrialOutcome::Errored));
     }
 
     #[test]

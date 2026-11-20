@@ -225,7 +225,7 @@ read a verdict from a trial set that is mostly infrastructure noise.
     `receipt_skipped` under `--json`;
   - the dry run prints each of the two stdout source lines, and the
     receipt-less refusal prints its stderr line with `OperationalFailure`.
-- [ ] Phase 2 — Gate-f validity floor, started once both 🧑 decisions
+- [x] Phase 2 — Gate-f validity floor, started once both 🧑 decisions
   below are answered. It amends ADR-0006
   (`routing.task-type-research`, "at least 14 of the first 15 qualifying"):
   the floor is added to that record's decision, in its own commit, with
@@ -246,7 +246,7 @@ read a verdict from a trial set that is mostly infrastructure noise.
   - held at 15 of 20, reaching 80% at 20 of 25, then 5 errored trials:
     still passes;
   - an in-flight revision under the chosen grandfathering.
-- [ ] 🧑 decision: does the 80% floor apply to a revision already mid-gate
+- [x] 🧑 decision (a, 2026-11-20): does the 80% floor apply to a revision already mid-gate
   (`change-feature@2`, 11 of 19 valid, 58%)?
   - **(a) Recommended: only revisions whose first trial is after the
     release.** `@2` keeps today's bar, and a stricter rule never moves
@@ -259,7 +259,7 @@ read a verdict from a trial set that is mostly infrastructure noise.
     error.
   - (c) Every revision, with errored trials before the release left out
     of the denominator.
-- [ ] 🧑 decision: once a held revision reaches the floor, does it pass?
+- [x] 🧑 decision (a, 2026-11-20): once a held revision reaches the floor, does it pass?
   - **(a) Recommended: yes.** It passes at the earliest prefix that
     reaches 80%, and that pass is final.
   - (b) No. A held read is final, and the revision needs a new revision
