@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.74.0
+
 - The relais pane now keeps the whole pre-clear tail: the last 2000
   characters of the ended conversation, with the oldest message cut from its
   front to fill the budget. Long lines are no longer cut at 240 characters or
