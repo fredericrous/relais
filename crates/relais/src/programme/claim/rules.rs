@@ -180,6 +180,89 @@ pub(super) fn is_work_of(record: &ClaimRecord, session: &str) -> bool {
     matches!(record, ClaimRecord::Parsed(c) if c.session == session && c.kind == Kind::Work)
 }
 
+/// One claim of a session, with the programme and ticket it is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionClaim {
+    pub key: ClaimKey,
+    pub id: String,
+    pub claim: Claim,
+}
+
+/// The claims one session has written: those that still hold at the time
+/// of the read, and the kinds of those that no longer do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionClaims {
+    pub live: Vec<SessionClaim>,
+    pub expired: Vec<Kind>,
+}
+
+/// Whose claim answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claimant {
+    /// The asking session's own claim.
+    Own,
+    /// A handoff the session it replaced left behind.
+    Previous,
+}
+
+/// Which claim a session holds, and why there is none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    Claimed {
+        claim: SessionClaim,
+        claimant: Claimant,
+    },
+    Nothing {
+        /// A claim of the session (or a handoff of its predecessor) was
+        /// found, but it no longer holds.
+        expired: bool,
+    },
+}
+
+/// The claim a session holds: its own `work` claim, else its own `handoff`
+/// (each the most recently refreshed first), else a live `handoff` of the
+/// session it replaced. The replaced session's `work` claims are never
+/// read: they end with it, and one a tombstone has not yet removed is not
+/// the successor's.
+pub fn resolve_session(own: &SessionClaims, previous: Option<&SessionClaims>) -> Resolution {
+    let newest = |claims: &SessionClaims, kind: Kind| {
+        claims
+            .live
+            .iter()
+            .filter(|found| found.claim.kind == kind)
+            .max_by(|a, b| {
+                a.claim
+                    .refreshed_at
+                    .cmp(&b.claim.refreshed_at)
+                    .then_with(|| {
+                        (&b.key.repo_key, &b.key.slug, &b.id).cmp(&(
+                            &a.key.repo_key,
+                            &a.key.slug,
+                            &a.id,
+                        ))
+                    })
+            })
+            .cloned()
+    };
+    let own_claim = newest(own, Kind::Work).or_else(|| newest(own, Kind::Handoff));
+    if let Some(claim) = own_claim {
+        return Resolution::Claimed {
+            claim,
+            claimant: Claimant::Own,
+        };
+    }
+    if let Some(claim) = previous.and_then(|claims| newest(claims, Kind::Handoff)) {
+        return Resolution::Claimed {
+            claim,
+            claimant: Claimant::Previous,
+        };
+    }
+    Resolution::Nothing {
+        expired: !own.expired.is_empty()
+            || previous.is_some_and(|claims| claims.expired.contains(&Kind::Handoff)),
+    }
+}
+
 /// What to do when another live session already holds the ticket as `work`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Contest {

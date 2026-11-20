@@ -15,9 +15,9 @@ use std::collections::BTreeSet;
 use chrono::NaiveDate;
 
 pub use rules::{
-    held, repo_key, Claim, ClaimKey, ClaimRecord, Contest, Hold, Holder, Intent, Kind, Next, Pick,
-    ProgrammeState, ReadyTicket, FUTURE_SKEW_SECS, HANDOFF_HOLD_SECS, UNPARSEABLE_HOLD_SECS,
-    WORK_HOLD_SECS,
+    held, repo_key, resolve_session, Claim, ClaimKey, ClaimRecord, Claimant, Contest, Hold, Holder,
+    Intent, Kind, Next, Pick, ProgrammeState, ReadyTicket, Resolution, SessionClaim, SessionClaims,
+    FUTURE_SKEW_SECS, HANDOFF_HOLD_SECS, UNPARSEABLE_HOLD_SECS, WORK_HOLD_SECS,
 };
 pub use store::{
     now_unix, Acquired, ClaimError, Event, Pass, Released, SlugLock, Store, Taken, LOCK_WAIT,
@@ -628,5 +628,82 @@ mod tests {
                 holder: Holder::Unreadable
             }
         );
+    }
+
+    fn claimed_ticket(resolution: &Resolution) -> Option<(&str, Claimant)> {
+        match resolution {
+            Resolution::Claimed { claim, claimant } => Some((claim.id.as_str(), *claimant)),
+            Resolution::Nothing { .. } => None,
+        }
+    }
+
+    fn write_work(store: &Store, programme: &str, id: &str, session: &str, now: i64) {
+        let lock = store.lock(&key_of(programme), LOCK_WAIT, now).unwrap();
+        lock.claim_work(id, session, "/r", Contest::Refuse, now)
+            .unwrap();
+    }
+
+    fn write_handoff(store: &Store, programme: &str, id: &str, session: &str, now: i64) {
+        let lock = store.lock(&key_of(programme), LOCK_WAIT, now).unwrap();
+        assert!(lock.reserve_handoff(id, session, "/r", now).unwrap());
+    }
+
+    #[test]
+    fn own_work_beats_own_handoff() {
+        let fixture = fixture("resolve-work");
+        write_handoff(&fixture.store, "p", "t1", "s1", NOW);
+        write_work(&fixture.store, "p", "t2", "s1", NOW);
+        let own = fixture.store.claims_of("s1", NOW).unwrap();
+        let resolution = resolve_session(&own, None);
+        assert_eq!(claimed_ticket(&resolution), Some(("t2", Claimant::Own)));
+    }
+
+    #[test]
+    fn own_handoff_beats_a_previous_handoff() {
+        let fixture = fixture("resolve-handoff");
+        write_handoff(&fixture.store, "p", "t1", "s1", NOW);
+        write_handoff(&fixture.store, "q", "t9", "s0", NOW);
+        let own = fixture.store.claims_of("s1", NOW).unwrap();
+        let previous = fixture.store.claims_of("s0", NOW).unwrap();
+        let resolution = resolve_session(&own, Some(&previous));
+        assert_eq!(claimed_ticket(&resolution), Some(("t1", Claimant::Own)));
+        let only_previous = resolve_session(&SessionClaims::default(), Some(&previous));
+        assert_eq!(
+            claimed_ticket(&only_previous),
+            Some(("t9", Claimant::Previous))
+        );
+    }
+
+    #[test]
+    fn a_previous_work_claim_is_never_chosen() {
+        let fixture = fixture("resolve-previous-work");
+        write_work(&fixture.store, "p", "t1", "s0", NOW);
+        let previous = fixture.store.claims_of("s0", NOW).unwrap();
+        let resolution = resolve_session(&SessionClaims::default(), Some(&previous));
+        assert_eq!(resolution, Resolution::Nothing { expired: false });
+    }
+
+    #[test]
+    fn an_expired_claim_gives_nothing_with_the_expired_reason() {
+        let fixture = fixture("resolve-expired");
+        write_work(&fixture.store, "p", "t1", "s1", NOW - WORK_HOLD_SECS - 10);
+        let own = fixture.store.claims_of("s1", NOW).unwrap();
+        assert!(own.live.is_empty());
+        assert_eq!(
+            resolve_session(&own, None),
+            Resolution::Nothing { expired: true }
+        );
+    }
+
+    #[test]
+    fn a_work_claim_of_an_ended_session_is_ignored() {
+        let fixture = fixture("resolve-ended");
+        write_work(&fixture.store, "p", "t1", "s1", NOW);
+        write_handoff(&fixture.store, "p", "t2", "s1", NOW);
+        fixture.store.mark_ended("s1", NOW).unwrap();
+        let own = fixture.store.claims_of("s1", NOW).unwrap();
+        let kinds: Vec<Kind> = own.live.iter().map(|found| found.claim.kind).collect();
+        assert_eq!(kinds, vec![Kind::Handoff]);
+        assert!(own.expired.is_empty());
     }
 }

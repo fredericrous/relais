@@ -8,6 +8,7 @@ import type { RunModel } from './timeline.ts'
 import { createRouterMemory, type RouterMemory } from './router.ts'
 import type { TranscriptState } from './transcript.ts'
 import { createQuietMemory, type QuietMemory } from './quiet.ts'
+import type { ProgrammeView } from './map.ts'
 
 // What the pane shows: the runs, or one agent's transcript.
 export type Shown =
@@ -48,6 +49,45 @@ export type Child = {
   launched?: string[]
   // The last stderr lines, for that message.
   stderrTail?: string[]
+}
+
+// What the pane shows of the session's programme: the last answer relais gave.
+export type ProgrammeShown = { view: ProgrammeView; readAt: number; seq: number }
+
+export type ProgrammeMemory = {
+  // The newest read's number, and the one a reply must carry to be kept.
+  seq: number
+  newest: number
+  // The session the cached view and the pending reads belong to.
+  session: string | undefined
+  shown: ProgrammeShown | undefined
+  // A dim note kept beside the view: the last read failed.
+  note: string | undefined
+  // An older relais answered `session` with an unknown subcommand: never read again.
+  isOlder: boolean
+  // Sessions whose first programme read opened the pane.
+  opened: Set<string>
+  // The session a /clear just ended: `--previous` for its successor.
+  previous: string | undefined
+}
+
+export type TailMessage = { role: 'user' | 'assistant'; text: string }
+
+// The last messages of the current conversation, from the newest read.
+export type LiveTail = { session: string; seq: number; messages: readonly TailMessage[] }
+
+// The conversation a /clear ended, frozen: it never changes until hidden or replaced.
+export type ClearTail = { endedSession: string; messages: readonly TailMessage[]; at: number }
+
+export type TailMemory = {
+  // Bumped at each session transition: a read begun before one is dropped.
+  epoch: number
+  seq: number
+  newest: number
+  // Bumped when the frozen tail changes, so a slow restore cannot undo a hide.
+  version: number
+  // The `$.store` writes of the frozen tail, one after another.
+  chain: Promise<void>
 }
 
 export type Store = {
@@ -132,6 +172,14 @@ export type Store = {
   notedReasons: Set<string>
   // The quiet runs the watcher reported (quiet.ts).
   quiet: QuietMemory
+  programme: ProgrammeMemory
+  liveTail: LiveTail | undefined
+  clearTail: ClearTail | undefined
+  tail: TailMemory
+  // The `$.store` writes of the programme and tail event list, one after another.
+  eventChain: Promise<void>
+  // Whether the last `ui.open` placed the pane: when not, the status line carries the saved tail.
+  isPanePlaced: boolean
 }
 
 // What an outcome message was built from, to rebuild it if the run's
@@ -196,6 +244,21 @@ export const createStore = (): Store => ({
   pendingMessages: false,
   notedReasons: new Set(),
   quiet: createQuietMemory(),
+  programme: {
+    seq: 0,
+    newest: 0,
+    session: undefined,
+    shown: undefined,
+    note: undefined,
+    isOlder: false,
+    opened: new Set(),
+    previous: undefined,
+  },
+  liveTail: undefined,
+  clearTail: undefined,
+  tail: { epoch: 0, seq: 0, newest: 0, version: 0, chain: Promise.resolve() },
+  eventChain: Promise.resolve(),
+  isPanePlaced: false,
 })
 
 // Timers go through here so that unloading can clear every one.

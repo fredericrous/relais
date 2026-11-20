@@ -14,6 +14,7 @@ use relais::programme::claim;
 use relais::programme::frontier::{due_mark, format_age, is_overdue, is_ready, order_frontier};
 use relais::programme::load::{self, main_checkout, Found, Programme, ProgrammeError, Source};
 use relais::programme::model::Ticket;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::outcome::{CliError, CliOutcome};
@@ -976,6 +977,380 @@ pub(crate) fn claim_command(
                 dir_argument(dir)
             );
             Ok(CliOutcome::Blocked)
+        }
+    }
+}
+
+/// Why the null answer of `programme session` has no programme.
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum Absence {
+    None,
+    Expired,
+}
+
+/// The answer of `programme session` when the session holds no claim.
+#[derive(Serialize)]
+struct NoProgrammeView {
+    programme: Option<()>,
+    reason: Absence,
+}
+
+#[derive(Serialize)]
+struct SessionAnswer<T: Serialize> {
+    programme: T,
+}
+
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum StatusView {
+    Closed,
+    Frontier,
+    Blocked,
+    InFlight,
+    OutOfScope,
+}
+
+impl From<&Standing> for StatusView {
+    fn from(standing: &Standing) -> Self {
+        match standing {
+            Standing::Frontier => Self::Frontier,
+            Standing::Blocked(_) => Self::Blocked,
+            Standing::InFlight { .. } => Self::InFlight,
+            Standing::Closed => Self::Closed,
+            Standing::OutOfScope => Self::OutOfScope,
+        }
+    }
+}
+
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum KindView {
+    Work,
+    Handoff,
+}
+
+impl From<claim::Kind> for KindView {
+    fn from(kind: claim::Kind) -> Self {
+        match kind {
+            claim::Kind::Work => Self::Work,
+            claim::Kind::Handoff => Self::Handoff,
+        }
+    }
+}
+
+impl KindView {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Work => "work",
+            Self::Handoff => "handoff",
+        }
+    }
+}
+
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum HolderView {
+    #[serde(rename = "self")]
+    Own,
+    Previous,
+}
+
+impl From<claim::Claimant> for HolderView {
+    fn from(claimant: claim::Claimant) -> Self {
+        match claimant {
+            claim::Claimant::Own => Self::Own,
+            claim::Claimant::Previous => Self::Previous,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CountsView {
+    open: usize,
+    frontier: usize,
+    blocked: usize,
+    in_flight: usize,
+    closed: usize,
+    out_of_scope: usize,
+}
+
+impl From<Counts> for CountsView {
+    fn from(counts: Counts) -> Self {
+        Self {
+            open: counts.open,
+            frontier: counts.frontier,
+            blocked: counts.blocked,
+            in_flight: counts.in_flight,
+            closed: counts.closed,
+            out_of_scope: counts.out_of_scope,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TicketView {
+    id: String,
+    name: String,
+    status: StatusView,
+    blocked_by: Vec<String>,
+    open_blockers: Vec<String>,
+    dependents: Vec<String>,
+    due: Option<String>,
+    held: bool,
+}
+
+/// A held claim whose map was read.
+#[derive(Serialize)]
+struct MapView {
+    repo: String,
+    slug: String,
+    ticket: String,
+    kind: KindView,
+    holder: HolderView,
+    counts: CountsView,
+    tickets: Vec<TicketView>,
+    ready: Vec<String>,
+}
+
+/// A held claim whose map could not be read.
+#[derive(Serialize)]
+struct FailedView {
+    repo: String,
+    slug: String,
+    ticket: String,
+    kind: KindView,
+    error: String,
+}
+
+/// Why the map of a claimed programme could not be read.
+enum MapFailure {
+    RepoGone,
+    NotInMap { id: String },
+    Programme(CliError),
+}
+
+impl std::fmt::Display for MapFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RepoGone => f.write_str("the repository is gone"),
+            Self::NotInMap { id } => write!(f, "ticket {id} is not in the map"),
+            Self::Programme(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl From<CliError> for MapFailure {
+    fn from(error: CliError) -> Self {
+        Self::Programme(error)
+    }
+}
+
+impl From<ProgrammeError> for MapFailure {
+    fn from(error: ProgrammeError) -> Self {
+        Self::Programme(programme_error(error))
+    }
+}
+
+/// Where the map of a claimed programme is, in order: the programme under
+/// `dir` (or its main checkout) when `dir` is in the claim's repository (by
+/// repo key); else under the repository path the claim recorded, when it
+/// holds the programme; else under that path's main checkout.
+fn session_map_dir(held: &claim::SessionClaim, dir: Option<&Path>) -> Result<PathBuf, MapFailure> {
+    let relative = Path::new("docs").join("programmes").join(&held.key.slug);
+    if let Some(dir) = dir {
+        let same_repo = load::git_common_dir(dir)
+            .is_ok_and(|common| claim::repo_key(&common) == held.key.repo_key);
+        if same_repo {
+            let here = dir.join(&relative);
+            if here.is_dir() {
+                return Ok(here);
+            }
+            if let Ok(main) = main_checkout(dir) {
+                let in_main = main.join(&relative);
+                if in_main.is_dir() {
+                    return Ok(in_main);
+                }
+            }
+        }
+    }
+    let recorded = Path::new(&held.claim.repo);
+    if held.claim.repo.is_empty() || !recorded.exists() {
+        return Err(MapFailure::RepoGone);
+    }
+    let here = recorded.join(&relative);
+    if here.is_dir() {
+        return Ok(here);
+    }
+    Ok(main_checkout(recorded)?.join(relative))
+}
+
+fn session_map_view(
+    held: &claim::SessionClaim,
+    claimant: claim::Claimant,
+    programme_dir: &Path,
+    store: &claim::Store,
+    fetch: Fetch,
+    now: i64,
+) -> Result<MapView, MapFailure> {
+    let found = resolve_dir(programme_dir, fetch)?;
+    let programme = found.load()?;
+    let standings = programme.standings(Some(store), now)?;
+    if !programme.tickets.contains_key(&held.id) {
+        return Err(MapFailure::NotInMap {
+            id: held.id.clone(),
+        });
+    }
+    let mut ready: Vec<&Ticket> =
+        relais::programme::frontier::ready_tickets(&programme, &standings).collect();
+    order_frontier(&mut ready, |ticket| ticket.due);
+    let relations = analysis::relations(&programme.tickets, &standings);
+    let tickets = programme
+        .tickets
+        .values()
+        .map(|ticket| {
+            let standing = &standings[&ticket.id];
+            let related = relations.get(&ticket.id).cloned().unwrap_or_default();
+            TicketView {
+                id: ticket.id.clone(),
+                name: ticket.name.clone(),
+                status: StatusView::from(standing),
+                blocked_by: ticket.blocked_by.clone(),
+                open_blockers: related.open_blockers,
+                dependents: related.dependents,
+                due: ticket.due.map(|date| date.to_string()),
+                held: matches!(standing, Standing::InFlight { .. }),
+            }
+        })
+        .collect();
+    Ok(MapView {
+        repo: dir_name(&programme.repo_dir),
+        slug: held.key.slug.clone(),
+        ticket: held.id.clone(),
+        kind: held.claim.kind.into(),
+        holder: claimant.into(),
+        counts: analysis::counts(&standings).into(),
+        tickets,
+        ready: ready.iter().map(|ticket| ticket.id.clone()).collect(),
+    })
+}
+
+fn json_line<T: Serialize>(answer: &T) -> Result<String, CliError> {
+    serde_json::to_string(answer)
+        .map(|text| format!("{text}\n"))
+        .map_err(|cause| CliError::Operational {
+            operation: "programme session: encoding the answer",
+            cause: Box::new(cause),
+        })
+}
+
+/// `relais programme session`: which programme ticket `session` holds by
+/// claim, with the programme's tickets, for the plugin's pane. Read-only:
+/// no claim is swept, refreshed or written.
+pub(crate) fn session_command(
+    session: Option<&str>,
+    previous: Option<&str>,
+    dir: Option<&Path>,
+    format: Format,
+    fetch: Fetch,
+) -> Result<CliOutcome, CliError> {
+    let session = match writing_session(session) {
+        Ok(session) => session,
+        Err(CliError::Usage { .. }) => {
+            eprintln!("relais: no session id");
+            eprintln!("next: pass --session <id>");
+            return Ok(CliOutcome::InvalidInput);
+        }
+        Err(other) => return Err(other),
+    };
+    let store = claim_store()?;
+    let now = now_unix();
+    let own = store.claims_of(&session, now).map_err(claim_io)?;
+    let before = match previous.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(previous) => Some(store.claims_of(previous, now).map_err(claim_io)?),
+        None => None,
+    };
+    let (held, claimant) = match claim::resolve_session(&own, before.as_ref()) {
+        claim::Resolution::Claimed { claim, claimant } => (claim, claimant),
+        claim::Resolution::Nothing { expired } => {
+            let reason = if expired {
+                Absence::Expired
+            } else {
+                Absence::None
+            };
+            let out = match (format, reason) {
+                (Format::Json, reason) => json_line(&NoProgrammeView {
+                    programme: None,
+                    reason,
+                })?,
+                (Format::Text, Absence::Expired) => "programme claim expired\n".to_string(),
+                (Format::Text, Absence::None) => "no programme claim\n".to_string(),
+            };
+            print_stdout(&out)?;
+            return Ok(CliOutcome::Accepted);
+        }
+    };
+    let cwd = std::env::current_dir().ok(); // only locates the map: without it the claim's own path is tried
+    let dir = dir.map(Path::to_path_buf).or(cwd);
+    let map = session_map_dir(&held, dir.as_deref()).and_then(|programme_dir| {
+        session_map_view(&held, claimant, &programme_dir, &store, fetch, now)
+    });
+    match map {
+        Ok(view) => {
+            let out = match format {
+                Format::Json => json_line(&SessionAnswer { programme: &view })?,
+                Format::Text => format!("{} {} ({})\n", view.slug, view.ticket, view.kind.as_str()),
+            };
+            print_stdout(&out)?;
+            Ok(CliOutcome::Accepted)
+        }
+        Err(failure) => {
+            let repo = dir_name(Path::new(&held.claim.repo));
+            let (slug, ticket) = (&held.key.slug, &held.id);
+            let kind = KindView::from(held.claim.kind);
+            match format {
+                Format::Json => {
+                    let out = json_line(&SessionAnswer {
+                        programme: FailedView {
+                            repo,
+                            slug: slug.clone(),
+                            ticket: ticket.clone(),
+                            kind,
+                            error: failure.to_string(),
+                        },
+                    })?;
+                    print_stdout(&out)?;
+                    Ok(CliOutcome::Accepted)
+                }
+                Format::Text => {
+                    print_stdout(&format!("{slug} {ticket} ({})\n", kind.as_str()))?;
+                    eprintln!("relais: {repo} {slug}: {failure}");
+                    // The session is named, so the hint releases this
+                    // session's claim whatever the shell's environment holds.
+                    let release = format!(
+                        "relais programme release {} {} --session {}",
+                        shell_quote(slug),
+                        shell_quote(ticket),
+                        shell_quote(&session)
+                    );
+                    let map_dir =
+                        shell_quote(&format!("{}/docs/programmes/{slug}", held.claim.repo));
+                    match &failure {
+                        // `release` finds the map through `--dir` too, so both
+                        // choices need a checkout of the repository.
+                        MapFailure::RepoGone => eprintln!(
+                            "next: rerun with --dir <a checkout of {repo}>, or {release} --dir <a checkout of {repo}>"
+                        ),
+                        MapFailure::NotInMap { .. } => {
+                            eprintln!("next: fix the map at {map_dir}, or {release}")
+                        }
+                        MapFailure::Programme(_) => {
+                            eprintln!("next: relais programme show {map_dir}")
+                        }
+                    }
+                    Ok(CliOutcome::OperationalFailure)
+                }
+            }
         }
     }
 }

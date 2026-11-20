@@ -13,7 +13,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::rules::{held, is_work_of, Claim, ClaimKey, ClaimRecord, Contest, Hold, Holder, Kind};
+use super::rules::{
+    held, is_work_of, Claim, ClaimKey, ClaimRecord, Contest, Hold, Holder, Kind, SessionClaim,
+    SessionClaims,
+};
 use crate::fsutil::write_atomic_with_mode;
 use crate::procs::LockFile;
 
@@ -222,6 +225,36 @@ impl Store {
     /// Every claim of a programme, without the lock.
     pub fn records(&self, key: &ClaimKey) -> Result<BTreeMap<String, ClaimRecord>, ClaimError> {
         read_all(&self.slug_dir(key))
+    }
+
+    /// Every claim `session` wrote, across all programmes, read without the
+    /// lock and without sweeping or changing anything: those holding at
+    /// `now`, and the kinds of those that no longer do. A `work` claim of a
+    /// session that has an `ended/<session>` tombstone is ignored, as the
+    /// next locked write would delete it.
+    pub fn claims_of(&self, session: &str, now: i64) -> Result<SessionClaims, ClaimError> {
+        let ended = self.ended_sessions()?.iter().any(|name| name == session);
+        let mut found = SessionClaims::default();
+        for key in self.keys()? {
+            for (id, record) in read_all(&self.slug_dir(&key))? {
+                let ClaimRecord::Parsed(claim) = &record else {
+                    continue;
+                };
+                if claim.session != session || (ended && claim.kind == Kind::Work) {
+                    continue;
+                }
+                if held(&record, now) {
+                    found.live.push(SessionClaim {
+                        key: key.clone(),
+                        id,
+                        claim: claim.clone(),
+                    });
+                } else {
+                    found.expired.push(claim.kind);
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// Takes the programme's lock, retrying for up to `wait`, and applies the

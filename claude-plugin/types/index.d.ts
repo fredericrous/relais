@@ -12,6 +12,11 @@ export type RelaisPaneState = {
   shown: RelaisPaneShown
   // Quiet runs (hooks/quiet.ts): those to draw, and whether the watcher is down.
   quiet?: { runs: unknown[]; down: boolean }
+  // The programme the session holds (hooks/programme.ts): relais's answer,
+  // as hooks/map.ts lays it out, and a dim note when the last read failed.
+  programme?: { view?: unknown; note?: string }
+  // The conversation a /clear ended (hooks/clear-tail.ts), until `[ hide ]`.
+  tail?: { at: number; messages: { role: 'user' | 'assistant'; text: string }[] }
 }
 
 // A transcript row, laid out at the pane's width and sanitised before it is stored.

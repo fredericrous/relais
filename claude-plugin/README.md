@@ -80,6 +80,40 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
   (live first), the rest under `+n more quiet runs`, inside the rows the
   relais runs leave. The first run past 1 s (or a failure) opens the pane on
   a pump tick; the status line lists live and failed quiet runs.
+- **Programme.** When the session holds a programme claim, the pane shows
+  where it stands as a window around the current ticket, under the runs and
+  with or without one: `programme <slug> · <repo>`, `✓ N closed`, the last
+  closed blocker, `▶ <id> <name> ◀ you` (`◀ next` right after a `/clear`, when
+  the claim is the previous session's handoff), the ticket's dependents
+  (`○` ready, `·` blocked with what it needs, `▶ … (in flight)`, at most 4
+  then `+n more`), `ready: <id> (due MM-DD) · …` in relais's order, and a
+  counts line. The plugin draws the JSON of `relais programme session --json
+  --no-fetch --session <id> --dir <cwd>`; it reads no claim file and keeps no
+  map logic. That call runs on events only (never polled), outside the 100 ms
+  flush and bounded at 5 s: at `session.start`, after `/clear`, `/resume` and
+  `/branch`, and after a main-chain Bash call naming `relais programme claim`,
+  `release` or `next`. Each reply is bound to the session that asked and to
+  the newest read; an older one is dropped. `--previous <session>` is passed
+  only for the successor of a `/clear`, so only a handoff written by
+  `relais programme next --claim` survives it. An older relais (exit 2,
+  `unrecognized subcommand 'session'`) gives one dim row, `programme view needs
+  a newer relais · relais install`, and is not asked again; exit 1 keeps the
+  last view with one dim note. The first read of a session opens the pane
+  unasked; the status line carries `▶ <slug> <ticket>` when no run is live.
+  A session with no claim gets no new row. Under row pressure the window
+  shrinks to head, current and counts, then to the current row.
+- **Before /clear.** After a `/clear` the pane shows what the ended
+  conversation said: a `before /clear · hh:mm [ hide ]` row, then the last
+  messages as `person │` and `agent  │` rows, text only (no tool use, tool
+  result or task notification), at most 2000 characters, trimmed from the
+  front at a message boundary. Each main-chain turn reads the last 20 messages
+  (`$.session.messages({ last: 20 })`) into memory; at `session.end` with
+  reason `clear` one last read (500 ms) or that live tail is frozen, in
+  memory and in the plugin's store, so a module reload still shows it. An
+  empty one keeps the tail already frozen; a later `/clear` replaces it.
+  `[ hide ]` removes it from both. While it is shown and the pane is not placed, the status line ends
+  with `before /clear saved · open the relais pane`. `/relais-status` prints one
+  line counting programme reads (shown, none, failed), frozen tails and hides.
 - **An agent's transcript, in the pane.** Each known agent row is a Button,
   with a dim row under it naming the agent as Claude Code's tasks footer does
   (`relais:relais-worker-sonnet-medium`), and a hint under the last run's
@@ -110,7 +144,7 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
   (`claude plugin validate` follows `$` only inside a file).
 - `hooks/*.ts` — pure logic and small effectful modules that take that `fx`
   object: `lines` (splitter), `dispatches` (usage and the end signal),
-  `timeline` (the run model), `pane` (layout), `quiet` and `quiet-watch` (quiet runs), `transcript` (an agent's
+  `timeline` (the run model), `pane` (layout), `quiet` and `quiet-watch` (quiet runs), `programme` and `map` (the programme read and its window), `clear-tail` (the pre-clear tail), `transcript` (an agent's
   transcript as pane rows), `guards`, `callbacks`, `agents`, `runs`, `ui`,
   `store`.
 - `agents/relais-worker-<model>-<effort>.md` — one worker definition per

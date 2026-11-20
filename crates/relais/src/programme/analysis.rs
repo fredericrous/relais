@@ -118,6 +118,51 @@ pub fn counts(standings: &BTreeMap<String, Standing>) -> Counts {
     counts
 }
 
+/// How one ticket relates to the others.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Relations {
+    /// The tickets that still block it, read from a `Blocked` standing;
+    /// empty for a ticket of any other standing, even one with an open
+    /// `blocked_by` (an in-flight ticket is worked regardless).
+    pub open_blockers: Vec<String>,
+    /// The tickets that list it in `blocked_by`.
+    pub dependents: Vec<String>,
+}
+
+/// The relations of every ticket, keyed by id.
+pub fn relations(
+    tickets: &BTreeMap<String, Ticket>,
+    standings: &BTreeMap<String, Standing>,
+) -> BTreeMap<String, Relations> {
+    tickets
+        .keys()
+        .map(|id| {
+            let open_blockers = match standings.get(id) {
+                Some(Standing::Blocked(blockers)) => blockers.clone(),
+                Some(
+                    Standing::Frontier
+                    | Standing::InFlight { .. }
+                    | Standing::Closed
+                    | Standing::OutOfScope,
+                )
+                | None => Vec::new(),
+            };
+            let dependents = tickets
+                .values()
+                .filter(|other| other.blocked_by.contains(id))
+                .map(|other| other.id.clone())
+                .collect();
+            (
+                id.clone(),
+                Relations {
+                    open_blockers,
+                    dependents,
+                },
+            )
+        })
+        .collect()
+}
+
 fn problem(ticket: &Ticket, line: usize, message: String) -> Problem {
     Problem {
         file: format!("{}.md", ticket.id),

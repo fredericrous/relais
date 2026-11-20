@@ -35,16 +35,24 @@ export type Agents = { id: string; status: string; type?: string; name?: string;
 
 const ok = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 
+const noProgramme = { ...ok, stdout: '{"programme":null,"reason":"none"}' }
+
 export const RELAIS_AGENT_TYPE = 'relais:relais-worker-sonnet-medium'
 
 export const zeroUsage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 
 export function scriptedEngine(
   on: any,
-  options: { session?: string; isPlaced?: boolean; store?: Record<string, unknown>; quiet?: boolean } = {},
+  options: { session?: string; isPlaced?: boolean; store?: Record<string, unknown>; quiet?: boolean; hangStoreWrites?: boolean } = {},
 ) {
   const clock = mock.clock(on, { now: Date.parse('2026-10-06T12:00:00Z') })
-  mock.store(on, options.store ?? {})
+  if (options.hangStoreWrites) {
+    // The plugin's store answers reads with nothing and never settles a write.
+    on('store.get', () => ({ value: undefined }))
+    on('store.set', () => new Promise<never>(() => {}))
+  } else {
+    mock.store(on, options.store ?? {})
+  }
   mock.env(on, { HOME: '/Users/p' })
   const calls: Calls = {
     run: [],
@@ -68,7 +76,8 @@ export function scriptedEngine(
   // What a test changes to script the world: `relais native …` results, a
   // tool's answer, and a hook run inside a tool call.
   const script = {
-    runResult: (_argv: string[], _init: any): any => ok,
+    // A session with no programme claim, unless a test says otherwise.
+    runResult: (argv: string[], _init: any): any => (argv[1] === 'programme' ? noProgramme : ok),
     toolResult: (_e: any): any => ({ result: 'ok', text: 'ok' }),
     duringTool: async (_$: any, _e: any): Promise<void> => {},
     isPlaced: options.isPlaced ?? true,
@@ -99,6 +108,10 @@ export function scriptedEngine(
     messagesDelay: 0,
     // The call never settles.
     messagesNever: false,
+    // The session id `$.session.id()` answers instead of `options.session`; a test changes it as /clear does.
+    sessionId: undefined as string | undefined,
+    // Holds each `process.run` until it settles: a test delays one reply. Null answers at once.
+    runGate: null as ((argv: string[]) => Promise<void> | undefined) | null,
   }
   const store: Record<string, { value: unknown; version: number }> = {}
   let nextAgent = 1
@@ -128,7 +141,7 @@ export function scriptedEngine(
   // The quiet watcher's own feed: protocol lines, one chunk at a time.
   const quietFeed = feed('quiet-watch')
 
-  on('session.id', () => ({ value: options.session ?? 'session-1' }))
+  on('session.id', () => ({ value: script.sessionId ?? options.session ?? 'session-1' }))
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
   on('session.end', (_$: any, e: any) => {
     // The host kills the module's children when the session ends for good:
@@ -138,9 +151,11 @@ export function scriptedEngine(
   })
   on('tool.register', (_$: any, e: any) => ({ value: { tool: `mcp__relais__${e.name}` } }))
   on('command.register', (_$: any, e: any) => ({ value: { command: e.name } }))
-  on('process.run', (_$: any, e: any) => {
+  on('process.run', async (_$: any, e: any) => {
     calls.run.push({ argv: [...e.argv], init: e.init })
-    return { value: script.runResult(e.argv, e.init) }
+    const answer = script.runResult(e.argv, e.init)
+    if (script.runGate) await script.runGate(e.argv)
+    return { value: answer }
   })
   on('process.spawn', async function* (_$: any, e: any) {
     if (e.argv[1] === 'learn') {

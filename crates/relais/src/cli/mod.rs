@@ -48,8 +48,8 @@ use self::programme::{
     check_command as programme_check_command, claim_command as programme_claim_command,
     frontier_command as programme_frontier_command, list_command as programme_list_command,
     next_command as programme_next_command, release_command as programme_release_command,
-    show_command as programme_show_command, Fetch, Format, Listing,
-    Reservation as ProgrammeReservation,
+    session_command as programme_session_command, show_command as programme_show_command, Fetch,
+    Format, Listing, Reservation as ProgrammeReservation,
 };
 use self::protocol::{announce_unstarted, open_protocol};
 use self::recipe::{
@@ -576,6 +576,35 @@ pub(crate) enum ProgrammeCommand {
         /// The session id (default: from the environment)
         #[arg(long)]
         session: Option<String>,
+    },
+    /// Which programme ticket a session holds by claim, with that programme's
+    /// tickets and standings; read-only
+    ///
+    /// The session's own `work` claim, else its own `handoff`, else a live
+    /// `handoff` of the `--previous` session. With no claim the answer is
+    /// `{"programme": null, "reason": "none"|"expired"}`. The session is
+    /// `--session`, else `RELAIS_SESSION_ID`, else `CLAUDE_CODE_SESSION_ID`;
+    /// with none of them the command exits 2. A map that cannot be read is
+    /// `{"programme": {…, "error"}}` and exit 0 with `--json`; without it,
+    /// the answer line on stdout, the error on stderr, and exit 1. An
+    /// unreadable claim store exits 1.
+    Session {
+        /// The session id (default: from the environment)
+        #[arg(long)]
+        session: Option<String>,
+        /// The session this one replaced; only its `handoff` claims count
+        #[arg(long)]
+        previous: Option<String>,
+        /// A directory inside the map's repository (default: the current
+        /// one), used only to find the map
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+        /// Read origin as of the last fetch instead of fetching it first
+        #[arg(long)]
+        no_fetch: bool,
     },
     /// The next ticket to hand off to: the first unheld ready ticket of the
     /// `--from` programme, else of a programme with no ticket held; exit 22
@@ -1677,6 +1706,19 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 dir,
                 session,
             } => programme_release_command(&slug, &id, dir.as_deref(), session.as_deref()),
+            ProgrammeCommand::Session {
+                session,
+                previous,
+                dir,
+                json,
+                no_fetch,
+            } => programme_session_command(
+                session.as_deref(),
+                previous.as_deref(),
+                dir.as_deref(),
+                Format::from_json_flag(json),
+                Fetch::from_no_fetch_flag(no_fetch),
+            ),
             ProgrammeCommand::Next {
                 from,
                 claim,

@@ -22,6 +22,9 @@ import { cancelRun, childOf, contractPath, onChunk, pump, reconcileIntents, relo
 import { onboardTool, onPersonPrompt, trustHoldoutsTool, trustTool, withRoutingSection } from './consent.ts'
 import { decideGuard, learningEnvelopeGuard, machineSettingsGuard, routerEnvelopeGuard } from './guards.ts'
 import { ensureWatcher } from './quiet-watch.ts'
+import { freezeTail, hideTail, readLiveTail, resetLiveTail, restoreTail } from './clear-tail.ts'
+import { eventsLine } from './events.ts'
+import { isProgrammeCommand, onProgrammeSessionEnd, readProgramme, type ReadSource } from './programme.ts'
 import { learningCommand, noteLastCycle, startCycle, startResumeSweep } from './learning.ts'
 import {
   afterStep,
@@ -38,7 +41,7 @@ import {
 } from './routing.ts'
 import { EDIT_TOOLS } from './router.ts'
 import { close, createStore, detach, every, type Store } from './store.ts'
-import { FLUSH_MS, markDirty, openPane, renderPane, timelineLines } from './ui.ts'
+import { FLUSH_MS, flush, markDirty, openPane, renderPane, timelineLines } from './ui.ts'
 
 const RUN_TOOL = 'mcp__relais__run'
 const REPLAY_TOOL = 'mcp__relais__replay'
@@ -125,6 +128,9 @@ export function register(on: any) {
     // for it (routing.ts). Until then, and on any failure, nothing is routed.
     if (typeof e.cwd === 'string') store.router.cwd = e.cwd
     detach(refreshState(fx, store))
+    // The programme the session holds, and the tail a module reload kept.
+    detach(readProgramme(fx, store, 'start'))
+    detach(restoreTail(fx, store))
     // The previous cycle's row is noted before this session's own cycle
     // starts, so the new row can never hide a promotion or a rollback.
     detach(
@@ -278,7 +284,23 @@ export function register(on: any) {
   })
 
   on('session.end', async ($: any, e: any, next: any) => {
-    // The router's open tasks and observations go first, at every reason.
+    // The conversation's tail is frozen first, while its messages can still be
+    // read (one read bounded at 500 ms; every write is detached); the
+    // programme view of the ended session is dropped.
+    // The live tail is copied before any await: a SessionStart(clear) that
+    // runs during one resets it.
+    const live = store.liveTail
+    try {
+      const fx = effects($)
+      const ended: string | undefined = typeof e.sessionId === 'string' && e.sessionId !== '' ? e.sessionId : await fx.session.id()
+      const now = await fx.clock.now()
+      onProgrammeSessionEnd(store, String(e.reason), ended)
+      if (e.reason === 'clear') await freezeTail(fx, store, ended, now, live)
+      else resetLiveTail(store)
+    } catch {
+      // Fail open: the session ends whatever the pane could keep.
+    }
+    // The router's open tasks and observations go right after, at every reason.
     try {
       const fx = effects($)
       await onSessionEnd(fx, store, String(e.reason), await fx.clock.now())
@@ -401,9 +423,11 @@ export function register(on: any) {
     const fx = effects($)
     if (Object.keys(store.models).length === 0) await reloadTimeline(fx, store)
     const opened = await openPane(fx, store)
-    if (opened.isPlaced) return { text: 'relais pane opened.' }
+    const counts = await eventsLine(fx, store)
+    const withCounts = (text: string) => (counts ? `${text}\n${counts}` : text)
+    if (opened.isPlaced) return { text: withCounts('relais pane opened.') }
     const lines = timelineLines(store, await fx.clock.now())
-    return { text: lines.length > 0 ? lines.join('\n') : 'No relais run is known in this session.' }
+    return { text: withCounts(lines.length > 0 ? lines.join('\n') : 'No relais run is known in this session.') }
   })
 
   // The child's output passes through here, and what relais asks for in it
@@ -474,6 +498,7 @@ export function register(on: any) {
     try {
       const fx = effects($)
       onToolResult(fx, store, e, result, await fx.clock.now())
+      if (isProgrammeCommand(e)) detach(readProgramme(fx, store, 'command'))
     } catch {
       // Fail open.
     }
@@ -500,6 +525,7 @@ export function register(on: any) {
   on('turn.complete', async ($: any, e: any, next: any) => {
     const fx = effects($)
     onTurn(fx, store, e)
+    if (e.agentId === undefined) detach(readLiveTail(fx, store))
     try {
       onTurnComplete(fx, store, e, await fx.clock.now())
     } catch {
@@ -575,13 +601,21 @@ export function register(on: any) {
   })).catch(() => ({ text: 'relais could not flag the task (internal error).' }))
 
   on('ui.render', { component: 'Pane', requestId: 'relais' }, ($: any, e: any) =>
-    renderPane(effects($), store, e),
+    renderPane(effects($), store, e, async () => {
+      // `[ hide ]` on the pre-clear tail: gone from the pane and the status line.
+      const fx = effects($)
+      await hideTail(fx, store, await fx.clock.now())
+      await flush(fx, store)
+    }),
   )
 
   // After /clear, /resume or /branch the module's buffers may be gone or stale.
   on('classic.SessionStart', async ($: any, e: any, next: any) => {
     if (e.source === 'clear' || e.source === 'resume' || e.source === 'fork') {
-      await reloadTimeline(effects($), store)
+      const fx = effects($)
+      resetLiveTail(store)
+      detach(readProgramme(fx, store, e.source as ReadSource))
+      await reloadTimeline(fx, store)
     }
     return next(e)
   })
