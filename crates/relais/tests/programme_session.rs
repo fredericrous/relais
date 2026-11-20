@@ -393,7 +393,9 @@ fn text_mode_with_an_unreadable_map_prints_the_answer_line_and_exits_1() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("next: relais programme show ") && stderr.contains("/docs/programmes/p"),
+        stderr.contains("next: fix the map at ")
+            && stderr.contains("/docs/programmes/p")
+            && stderr.contains("relais programme release p t2"),
         "{stderr}"
     );
 }

@@ -584,7 +584,10 @@ pub(crate) enum ProgrammeCommand {
     /// `handoff` of the `--previous` session. With no claim the answer is
     /// `{"programme": null, "reason": "none"|"expired"}`. The session is
     /// `--session`, else `RELAIS_SESSION_ID`, else `CLAUDE_CODE_SESSION_ID`;
-    /// with none of them the command exits 2.
+    /// with none of them the command exits 2. A map that cannot be read is
+    /// `{"programme": {…, "error"}}` and exit 0 with `--json`; without it,
+    /// the answer line on stdout, the error on stderr, and exit 1. An
+    /// unreadable claim store exits 1.
     Session {
         /// The session id (default: from the environment)
         #[arg(long)]

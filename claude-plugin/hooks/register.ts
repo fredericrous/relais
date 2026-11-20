@@ -287,12 +287,15 @@ export function register(on: any) {
     // The conversation's tail is frozen first, while its messages can still be
     // read (one read bounded at 500 ms; every write is detached); the
     // programme view of the ended session is dropped.
+    // The live tail is copied before any await: a SessionStart(clear) that
+    // runs during one resets it.
+    const live = store.liveTail
     try {
       const fx = effects($)
       const ended: string | undefined = typeof e.sessionId === 'string' && e.sessionId !== '' ? e.sessionId : await fx.session.id()
       const now = await fx.clock.now()
       onProgrammeSessionEnd(store, String(e.reason), ended)
-      if (e.reason === 'clear') await freezeTail(fx, store, ended, now)
+      if (e.reason === 'clear') await freezeTail(fx, store, ended, now, live)
       else resetLiveTail(store)
     } catch {
       // Fail open: the session ends whatever the pane could keep.

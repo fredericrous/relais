@@ -121,7 +121,9 @@ pub fn counts(standings: &BTreeMap<String, Standing>) -> Counts {
 /// How one ticket relates to the others.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Relations {
-    /// The tickets that still block it: those of a `Blocked` standing.
+    /// The tickets that still block it, read from a `Blocked` standing;
+    /// empty for a ticket of any other standing, even one with an open
+    /// `blocked_by` (an in-flight ticket is worked regardless).
     pub open_blockers: Vec<String>,
     /// The tickets that list it in `blocked_by`.
     pub dependents: Vec<String>,
@@ -137,7 +139,13 @@ pub fn relations(
         .map(|id| {
             let open_blockers = match standings.get(id) {
                 Some(Standing::Blocked(blockers)) => blockers.clone(),
-                _ => Vec::new(),
+                Some(
+                    Standing::Frontier
+                    | Standing::InFlight { .. }
+                    | Standing::Closed
+                    | Standing::OutOfScope,
+                )
+                | None => Vec::new(),
             };
             let dependents = tickets
                 .values()

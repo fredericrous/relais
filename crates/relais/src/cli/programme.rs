@@ -1325,10 +1325,21 @@ pub(crate) fn session_command(
                 Format::Text => {
                     print_stdout(&format!("{slug} {ticket} ({})\n", kind.as_str()))?;
                     eprintln!("relais: {repo} {slug}: {failure}");
-                    eprintln!(
-                        "next: relais programme show {}/docs/programmes/{slug}",
-                        held.claim.repo
+                    let release = format!(
+                        "relais programme release {} {}",
+                        shell_quote(slug),
+                        shell_quote(ticket)
                     );
+                    let map = shell_quote(&format!("{}/docs/programmes/{slug}", held.claim.repo));
+                    match &failure {
+                        MapFailure::RepoGone => {
+                            eprintln!("next: pass --dir <a checkout of {repo}>, or {release}")
+                        }
+                        MapFailure::NotInMap { .. } => {
+                            eprintln!("next: fix the map at {map}, or {release}")
+                        }
+                        MapFailure::Programme(_) => eprintln!("next: relais programme show {map}"),
+                    }
                     Ok(CliOutcome::OperationalFailure)
                 }
             }

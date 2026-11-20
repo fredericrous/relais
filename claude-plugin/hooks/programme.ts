@@ -11,7 +11,7 @@ import { markDirty, openPane } from './ui.ts'
 
 export const PROGRAMME_BOUND_MS = 5000
 export const OLDER_RELAIS_ROW = 'programme view needs a newer relais · relais install'
-const STALE_NOTE = 'programme view may be stale · relais could not read the claim store · relais programme session'
+const STALE_NOTE = 'programme view may be stale · relais programme session --session <id>'
 
 // A main-chain Bash command that changes which ticket the session holds.
 const PROGRAMME_COMMAND = /\brelais\s+programme\s+(claim|release|next)\b/

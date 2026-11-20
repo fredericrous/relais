@@ -111,9 +111,15 @@ const frozen = (endedSession: string, messages: readonly TailMessage[], at: numb
 // The session `ended` ends by /clear: one last read, else its live tail, is
 // frozen as the pane's tail. An empty one keeps the tail already frozen.
 // The live tail is read before the transition resets it.
-export async function freezeTail(fx: Fx, store: Store, ended: string | undefined, now: number) {
+// `live` is the live tail as the session's end found it, before any await.
+export async function freezeTail(
+  fx: Fx,
+  store: Store,
+  ended: string | undefined,
+  now: number,
+  live: Store['liveTail'] = store.liveTail,
+) {
   const memory = store.tail
-  const live = store.liveTail
   resetLiveTail(store)
   const last = await withinBound(fx, FINAL_READ_BOUND_MS, readLast(fx))
   let messages = last.kind === 'ok' ? tailOf(last.value) : []

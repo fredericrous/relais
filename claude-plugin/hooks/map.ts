@@ -130,12 +130,22 @@ function dependentRow(ticket: ProgrammeTicket, connector: string, width: number)
   }
 }
 
-// The full window already has its `✓ N closed` row, so its counts line leaves closed out.
-function countsText(counts: ProgrammeCounts, withClosed: boolean): string {
-  const parts = [`${counts.open} open`, `${counts.frontier} ready`, `${counts.blocked} blocked`, `${counts.in_flight} in flight`]
-  if (withClosed) parts.push(`${counts.closed} closed`)
-  if (counts.out_of_scope > 0) parts.push(`${counts.out_of_scope} out of scope`)
-  return parts.join(' · ')
+const OPEN_PARTS = (counts: ProgrammeCounts) => [
+  `${counts.open} open`,
+  `${counts.frontier} ready`,
+  `${counts.blocked} blocked`,
+  `${counts.in_flight} in flight`,
+]
+const OUT_OF_SCOPE_PARTS = (counts: ProgrammeCounts) => (counts.out_of_scope > 0 ? [`${counts.out_of_scope} out of scope`] : [])
+
+// The open counts, for the full window, whose `✓ N closed` row already says closed.
+function openCountsText(counts: ProgrammeCounts): string {
+  return [...OPEN_PARTS(counts), ...OUT_OF_SCOPE_PARTS(counts)].join(' · ')
+}
+
+// Every count, for the reduced window, which has no closed row.
+function allCountsText(counts: ProgrammeCounts): string {
+  return [...OPEN_PARTS(counts), `${counts.closed} closed`, ...OUT_OF_SCOPE_PARTS(counts)].join(' · ')
 }
 
 export function programmeLayers(view: ProgrammeView, width: number): ProgrammeLayers {
@@ -155,7 +165,7 @@ export function programmeLayers(view: ProgrammeView, width: number): ProgrammeLa
     text: named('▶ ', `${view.ticket} ${current?.name ?? ''}`.trim(), marker, columns),
     bold: true,
   }
-  const reducedCounts: Row = { text: cutToCells(countsText(view.counts, true), columns), dim: true }
+  const reducedCounts: Row = { text: cutToCells(allCountsText(view.counts), columns), dim: true }
   const reduced = [head, currentRow, reducedCounts]
 
   const rows: Row[] = [head]
@@ -180,7 +190,7 @@ export function programmeLayers(view: ProgrammeView, width: number): ProgrammeLa
   })
   if (more > 0) rows.push({ text: `└─ +${more} more`, dim: true })
   rows.push(...readyRows(view, columns))
-  rows.push({ text: cutToCells(countsText(view.counts, false), columns), dim: true })
+  rows.push({ text: cutToCells(openCountsText(view.counts), columns), dim: true })
   return { full: rows, reduced, current: [currentRow] }
 }
 

@@ -484,6 +484,8 @@ test('the tail always keeps its header row and its newest rows, behind the progr
   expect(squeezed.map(r => r.text)).toContain('▶ t2 Second ◀ you')
   // The current row and the header are never given up, and the pane never passes its rows.
   expect(squeezed.length).toBeLessThanOrEqual(6)
+  // Plain rows go before the agent Buttons: the live run keeps its agent row.
+  expect(squeezed.some(r => r.button !== undefined && r.button.key !== 'hide')).toBe(true)
   const roomy = layoutPane([], room(12), undefined, { tail: tail(30) })
   expect(roomy[0].text).toBe('before /clear · 12:00 [ hide ]')
   expect(roomy.length).toBe(12)

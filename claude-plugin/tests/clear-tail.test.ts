@@ -178,6 +178,20 @@ test('the last read at the clear is bounded at 500 ms, and the live tail stands 
   expect(texts).toContain('person │ hand off now')
 })
 
+test('a SessionStart(clear) that runs while the end waits does not lose the live tail', async ($: any, on: any) => {
+  const engine = await started($, on)
+  await $.turn.complete(mainTurn())
+  await settle(engine)
+  engine.script.messagesNever = true
+  const ending = $.session.end({ reason: 'clear', sessionId: 'session-1' })
+  await $.classic.SessionStart({ source: 'clear' })
+  await engine.clock.advance(500)
+  await ending
+  await settle(engine)
+  const { texts } = await drawn($, engine)
+  expect(texts).toContain('person │ hand off now')
+})
+
 test('two clears with no turn between keep the tail the first one froze', async ($: any, on: any) => {
   const engine = await started($, on)
   await $.turn.complete(mainTurn())

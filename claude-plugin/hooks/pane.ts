@@ -4,7 +4,7 @@
 
 import type { Fx } from './fx.ts'
 import { transcriptRows, type TranscriptState } from './transcript.ts'
-import { programmeLayers, type ProgrammeLayers, type ProgrammeView } from './map.ts'
+import { cutToCells, programmeLayers, type ProgrammeLayers, type ProgrammeView } from './map.ts'
 import type { TailMessage } from './store.ts'
 import { MAX_TRANSCRIPT_ROWS } from './limits.ts'
 import { MAX_QUIET_LINES, quietElapsed, type QuietRun } from './quiet.ts'
@@ -277,7 +277,8 @@ const OUTPUT_FLOOR = 8
 // frame's head, its agent Buttons, its latest output line and the activity
 // row under it always stay.
 // The programme's current row and the tail's header row always stay too: the
-// runs give up rows for them, the `↑ N rows above` row first, then the top.
+// runs give up rows for them, the `↑ N rows above` row first, then their plain
+// rows from the top, the agent Buttons last.
 export function layoutPane(runs: RunModel[], room: Room, quiet: QuietPane = NO_QUIET, extra: PaneExtra = NO_EXTRA): Row[] {
   const down: Row[] = quiet.down ? [{ text: 'quiet watcher down', dim: true }] : []
   const hasExtra = extra.programme !== undefined || extra.tail !== undefined
@@ -293,12 +294,27 @@ export function layoutPane(runs: RunModel[], room: Room, quiet: QuietPane = NO_Q
   let relais = relaisRows(runs, room, relaisRoom)
   if (reserved > 0 && relais.length > relaisRoom) {
     const withoutIndicator = relais[0]?.text.startsWith('↑ ') ? relais.slice(1) : relais
-    relais = withoutIndicator.slice(Math.max(0, withoutIndicator.length - relaisRoom))
+    relais = trimKeepingButtons(withoutIndicator, relaisRoom)
   }
   const spare = Math.max(0, relaisRoom - relais.length)
   const quietDrawn = quietRows(quiet.runs, room, spare).slice(0, spare)
   const left = limit - down.length - relais.length - quietDrawn.length
   return [...relais, ...quietDrawn, ...extraRows(extra, left), ...down]
+}
+
+// `rows` cut to `room`, plain rows first, from the top: the agent Buttons
+// stay while a plain row is left to give up; only then is the top cut.
+function trimKeepingButtons(rows: Row[], room: number): Row[] {
+  let excess = rows.length - room
+  if (excess <= 0) return rows
+  const kept = rows.filter(row => {
+    if (excess > 0 && row.button === undefined) {
+      excess -= 1
+      return false
+    }
+    return true
+  })
+  return kept.slice(Math.max(0, kept.length - room))
 }
 
 // The programme window and the pre-clear tail, drawn after the quiet rows.
@@ -331,7 +347,9 @@ export function tailTitle(at: number): string {
 const MAX_TAIL_ROWS = 60
 
 function extraOf(state: PaneState | undefined, columns: number): PaneExtra {
-  const note: Row | undefined = state?.programme?.note ? { text: state.programme.note, dim: true } : undefined
+  const note: Row | undefined = state?.programme?.note
+    ? { text: cutToCells(state.programme.note, columns), dim: true }
+    : undefined
   const view = state?.programme?.view
   let programme: ProgrammeLayers | undefined
   if (view) {
