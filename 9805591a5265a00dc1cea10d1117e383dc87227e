@@ -1,0 +1,13 @@
+greensummit-v2
+tree c9a864fe144ac74d382cac34674e3a2e20c3019b
+gates pre-push-cargo-test
+platform aarch64-macos
+canon 6d4532c0ee78148f95c79d9379581f6e0a2dbbd1
+greengate attest-sign-macos-latest
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgwe+FHUie+0YKuEzx3YjiV6jyIC
+F0veynb1B9mEPADfwAAAALZ3JlZW5zdW1taXQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3No
+LWVkMjU1MTkAAABABahX89dvxovuraeWFsk7+cIv8ZFcrxlF5hoaX8+6wIgnRbAp0vjzJP
+JQnnLxAkHIhLGSlqwx/uUDDG8NzOBLBw==
+-----END SSH SIGNATURE-----
