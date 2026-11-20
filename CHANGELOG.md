@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.73.0
+
 - A run now warns when a watched file in the home directory changed while it
   was active. relais takes a snapshot (hashes only, never contents) of
   `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`, `~/.claude/settings*.json`,
