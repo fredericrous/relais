@@ -18,27 +18,32 @@ ticket here until it is resolved or moved into a programme of its own.
 - [f02](f02-claims-record-common-dir.md) (2026-11-20): claims do not
   record the git common dir. Their `repo` is already the main checkout
   (#430), which a worktree removal leaves in place; a test pins it.
+- [f03](f03-pane-placed-after-resize.md) (2026-11-20): no change. A
+  narrowing resize moves a placed pane inline above the prompt, never
+  hides it, and `$.ui.panes()` keeps `isPlaced` true; live in tmux on
+  Claude Code 2.1.329.
 
 ## Handoff
 
-2026-11-20, boundary 3 (a ticket closed, its PR merged): f02 closed,
-relais#509 merged (ad713f89).
+2026-11-20, boundary 4 (a ticket closed): f03 closed in the same PR as
+this handoff (docs only).
 
-- Done: f02 by hand (no relais run). The answer was "no new field": the
-  premise did not hold. Its test
-  (`a_claim_from_a_removed_worktree_still_finds_the_map`) passed on
-  unchanged main.
-- Live state: relais main ad713f89, live checkout fast-forwarded. The f02
-  worktree (`relais-wt-claims-common-dir`) is removed. No release is owed (test and docs only).
-- Next: f03 (the pre-clear status hint misses a resize), the only ready
-  ticket.
+- Done: f03 by hand (no relais run). The premise did not reproduce: at 100
+  columns the relais pane (programme window and `before /clear` tail) moved
+  inline above the prompt and stayed drawn; a probe mod read
+  `isPlaced: true` from `$.ui.panes()` through 180 → 100 → 180.
+- Live state: no code changed, no release owed. Scratch probe, demo repo
+  and tmux sessions removed.
+- Next: no ready ticket; the map waits for inbox lines filed at a boundary.
 - Lessons:
-  - Check a ticket's premise with a failing-first test before designing the
-    change.
-  - The plan's Decision log line came from a test that rewrites a claim's
-    `repo` (`record_repo`), not from a real claim.
-  - The push gate rehearsal for #509 took 27m10s (land output) under a
-    busy slot queue: run `greengate land --detach`, then wait on it.
+  - Reproduce a live observation in its exact state (here, a held
+    programme plus a tail) before treating it as a bug.
+  - A tmux repro of Claude Code needs `Down` then Enter on the trust dialog
+    (its default is `No, exit`), and a typed prompt sometimes needs a second
+    Enter.
+  - A `/relais-status` in a test session is an asked open of id `relais`:
+    the engine keeps it across sessions, so the unasked floor is 110, not
+    144, until the pane is closed by hand.
 - Your steps: none.
 
 ## Not yet specified
