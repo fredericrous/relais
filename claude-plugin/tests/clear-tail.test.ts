@@ -2,7 +2,10 @@
 // the clear, and `[ hide ]`.
 
 import { expect, test } from 'claude-code/testing'
-import { tailOf, textMessages, trimTail, TAIL_CHARS } from '../hooks/clear-tail.ts'
+import { hideTail, tailOf, textMessages, trimTail, TAIL_CHARS } from '../hooks/clear-tail.ts'
+import { layoutTailView } from '../hooks/pane.ts'
+import { MAX_TRANSCRIPT_ROWS } from '../hooks/limits.ts'
+import { createStore } from '../hooks/store.ts'
 import { scriptedEngine, settle, turn, type Engine } from './support.ts'
 
 const START = { cwd: '/repo', surface: 'terminal', isInteractive: true }
@@ -68,16 +71,46 @@ test('only user and assistant text is kept: no tool use, no notification, no emp
   expect(textMessages('nope')).toEqual([])
 })
 
-test('a tail is trimmed from the front at a message boundary to 2000 characters', () => {
+const chars = (messages: { text: string }[]) => messages.reduce((n, m) => n + Array.from(m.text).length, 0)
+
+test('a tail fills the 2000 characters: the oldest message that does not fit whole is cut from its front', () => {
   const messages = ['a', 'b', 'c'].map(text => ({ role: 'user' as const, text: text.repeat(900) }))
   const kept = trimTail(messages)
-  expect(kept.map(m => m.text[0])).toEqual(['b', 'c'])
-  expect(kept.reduce((n, m) => n + m.text.length, 0)).toBeLessThanOrEqual(TAIL_CHARS)
+  expect(kept.map(m => m.text.replace('…', '')[0])).toEqual(['a', 'b', 'c'])
+  expect(kept[0].text).toBe(`…${'a'.repeat(199)}`)
+  expect(chars(kept)).toBe(TAIL_CHARS)
 })
 
-test('only the newest 20 messages of a long session make the tail', () => {
-  const many = Array.from({ length: 30 }, (_, n) => ({ role: 'user', text: `m${n}` }))
-  expect(tailOf(many).map(m => m.text)).toEqual(Array.from({ length: 20 }, (_, n) => `m${n + 10}`))
+test('messages of 1500 and 800 characters keep the 1500 whole and the 800 cut to fill 2000', () => {
+  const kept = trimTail([
+    { role: 'user', text: 'o'.repeat(800) },
+    { role: 'assistant', text: 'n'.repeat(1500) },
+  ])
+  expect(kept[1].text).toBe('n'.repeat(1500))
+  expect(kept[0].text).toBe(`…${'o'.repeat(499)}`)
+  expect(chars(kept)).toBe(TAIL_CHARS)
+})
+
+test('with 0 or 1 character of room left no older message is added; with 2, an ellipsis and one character', () => {
+  const older = { role: 'user' as const, text: 'older' }
+  for (const room of [0, 1, 2]) {
+    const kept = trimTail([older, { role: 'assistant', text: 'x'.repeat(TAIL_CHARS - room) }])
+    expect(kept.length).toBe(room === 2 ? 2 : 1)
+    if (room === 2) expect(kept[0].text).toBe('…r')
+    expect(chars(kept)).toBeLessThanOrEqual(TAIL_CHARS)
+  }
+})
+
+test('an older long answer survives twenty short messages after it, and tool turns take no budget', () => {
+  const session = [
+    { role: 'assistant', text: 'A'.repeat(1800) },
+    ...Array.from({ length: 30 }, () => ({ role: 'assistant', text: '', toolUses: [{ tool: 'Bash', input: {}, text: 'out' }] })),
+    ...Array.from({ length: 20 }, () => ({ role: 'user', text: 's'.repeat(10) })),
+  ]
+  const kept = tailOf(session)
+  expect(kept.length).toBe(21)
+  expect(kept[0].text).toBe('A'.repeat(1800))
+  expect(chars(kept)).toBe(TAIL_CHARS)
 })
 
 test('one message longer than the limit is cut from its front with an ellipsis', () => {
@@ -107,7 +140,8 @@ test('a /clear freezes the tail: rows, hour, a hide button and an unasked pane',
   await clear($, engine)
   expect(engine.calls.opened.length).toBe(before + 1)
   const { texts } = await drawn($, engine)
-  expect(texts.some(t => /^before \/clear · \d\d:\d\d \[ hide \]$/.test(t))).toBe(true)
+  expect(texts.some(t => /^before \/clear · \d\d:\d\d$/.test(t))).toBe(true)
+  expect(texts).toContain('[ hide ]')
   expect(texts).toContain('person │ hand off now')
   expect(texts).toContain('agent  │ safe to /clear')
   expect(texts.some(t => t.includes('task-notification') || t.includes('files'))).toBe(false)
@@ -270,4 +304,80 @@ test('/relais-status counts the freezes and hides', async ($: any, on: any) => {
   await settle(engine)
   const text = (await $.command.run({ command: 'relais-status' })).text as string
   expect(text).toContain('tails: 1 frozen, 1 non-empty, 1 hidden (1 within 60 s)')
+})
+
+// A tail far taller than the pane: 200 short lines in one answer.
+const tall = Array.from({ length: 200 }, (_, n) => `line ${n}`).join('\n')
+
+async function clearedTall($: any, on: any) {
+  const engine = await started($, on)
+  engine.script.messages = () => [{ role: 'assistant', text: tall }]
+  await $.turn.complete(mainTurn())
+  await settle(engine)
+  await clear($, engine)
+  return engine
+}
+
+test('a tail too tall for the pane shows its newest rows behind `… N earlier rows`, with [ open ] and [ hide ]', async ($: any, on: any) => {
+  const engine = await clearedTall($, on)
+  const { texts } = await drawn($, engine)
+  expect(texts).toContain('[ open ]')
+  expect(texts).toContain('[ hide ]')
+  expect(texts.some(t => /^… \d+ earlier rows$/.test(t))).toBe(true)
+  expect(texts[texts.length - 1]).toBe('       │ line 199')
+})
+
+test('[ open ] shows every tail row under [ back ] and the scroll hint; [ back ] returns; the open is counted', async ($: any, on: any) => {
+  const engine = await clearedTall($, on)
+  const { ui } = await drawn($, engine)
+  await ui.press({ key: 'open' })
+  await settle(engine)
+  const view = (await drawn($, engine)).texts
+  expect(view).toContain('  ↑↓ scroll (starts at the top) · Esc hands the keys to the prompt')
+  expect(view.some(t => /^before \/clear · \d\d:\d\d · 200 rows$/.test(t))).toBe(true)
+  expect(view).toContain('agent  │ line 0')
+  expect(view[view.length - 1]).toBe('       │ line 199')
+  expect(view.some(t => t.includes('earlier rows'))).toBe(false)
+  const opened = (await drawn($, engine)).ui
+  await opened.press({ key: 'back' })
+  await settle(engine)
+  const back = (await drawn($, engine)).texts
+  expect(back).toContain('[ open ]')
+  expect(back).not.toContain('agent  │ line 0')
+  const text = (await $.command.run({ command: 'relais-status' })).text as string
+  expect(text).toContain('1 opened')
+})
+
+test('a new /clear while the tail view is open shows the new tail there', async ($: any, on: any) => {
+  const engine = await clearedTall($, on)
+  await (await drawn($, engine)).ui.press({ key: 'open' })
+  await settle(engine)
+  engine.script.messages = () => [{ role: 'user', text: 'the next conversation' }]
+  await $.turn.complete(mainTurn())
+  await settle(engine)
+  await $.session.end({ reason: 'clear', sessionId: 'session-2' })
+  await settle(engine)
+  const view = (await drawn($, engine)).texts
+  expect(view).toContain('person │ the next conversation')
+  expect(view.some(t => /· 1 rows$/.test(t))).toBe(true)
+})
+
+test('a tail view past MAX_TRANSCRIPT_ROWS keeps the newest rows behind `… K earlier rows`, and says when the oldest was cut', () => {
+  const rows = layoutTailView({ at: 0, messages: [{ role: 'user', text: `…${'x\n'.repeat(999)}` }] }, 72)
+  expect(rows[0].text).toMatch(/^before \/clear · \d\d:\d\d · last 2000 characters · 999 rows$/)
+  expect(rows[1]).toEqual({ text: `… ${999 - (MAX_TRANSCRIPT_ROWS - 1)} earlier rows`, dim: true })
+  expect(rows.length).toBe(MAX_TRANSCRIPT_ROWS + 1)
+})
+
+test('hiding the tail while its view is shown returns the pane to the runs view', async () => {
+  const store = createStore()
+  store.clearTail = { endedSession: 's', at: 0, messages: [{ role: 'user', text: 'x' }] }
+  store.shown = { kind: 'tail' }
+  const fx: any = {
+    kv: { get: async () => [], set: async () => undefined },
+    clock: { now: async () => 1000, after: () => ({ cancel: () => undefined }) },
+  }
+  await hideTail(fx, store, 1000)
+  expect(store.shown).toEqual({ kind: 'runs' })
+  expect(store.clearTail).toBeUndefined()
 })

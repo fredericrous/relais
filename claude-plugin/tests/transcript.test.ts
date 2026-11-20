@@ -1,7 +1,7 @@
 // transcriptRows: the pure layout of an agent's messages at the pane's width.
 
 import { expect, test } from 'claude-code/testing'
-import { refreshTranscript, transcriptRows, widthOf } from '../hooks/transcript.ts'
+import { refreshTranscript, tailRows, transcriptRows, widthOf } from '../hooks/transcript.ts'
 import { createStore } from '../hooks/store.ts'
 
 const lines = (n: number, prefix = 'line') => Array.from({ length: n }, (_, i) => `${prefix} ${i + 1}`).join('\n')
@@ -221,4 +221,35 @@ test('two overlapping refreshes make one read', async () => {
   releaseClock(1000)
   await Promise.all([first, second])
   expect(reads).toBe(1)
+})
+
+// The pre-clear tail: every row, no 12-row or 240-character cut, still sanitised.
+const words = Array.from({ length: 400 }, (_, n) => `w${n}`).join(' ')
+
+test('tailRows lays out a 2000-character answer on one line whole, its last row ending with the last word', () => {
+  const answer = words.slice(0, 2000)
+  const rows = tailRows([{ role: 'assistant', text: answer }], 40)
+  expect(rows.length).toBeGreaterThanOrEqual(50)
+  const body = rows.map(r => r.text.slice('agent  │ '.length)).join(' ')
+  expect(body).toBe(answer)
+  expect(rows[rows.length - 1].text.endsWith(answer.split(' ').pop()!)).toBe(true)
+  expect(rows.every(r => widthOf(r.text) <= 40)).toBe(true)
+})
+
+test('tailRows keeps no escape sequence and no control character', () => {
+  const esc = String.fromCharCode(27)
+  const bel = String.fromCharCode(7)
+  const rows = tailRows([{ role: 'user', text: `red ${esc}[31mtext${esc}[0m and a bell${bel}` }], 40)
+  expect(rows.map(r => r.text)).toEqual(['person │ red text and a bell'])
+  expect(rows.some(r => r.text.includes(esc) || r.text.includes(bel))).toBe(false)
+})
+
+test('tailRows draws every row of a long message: no `more rows` cut', () => {
+  const text = Array.from({ length: 40 }, (_, n) => `line ${n}`).join('\n')
+  const rows = tailRows([{ role: 'assistant', text }], 40)
+  expect(rows.length).toBe(40)
+  expect(rows[0].text).toBe('agent  │ line 0')
+  expect(rows[39].text).toBe('       │ line 39')
+  // The agent view keeps its 12-row cap.
+  expect(transcriptRows([{ role: 'assistant', text }], 40, 400).some(r => r.text.includes('more rows'))).toBe(true)
 })

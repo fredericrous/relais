@@ -4,7 +4,7 @@
 
 import type { Fx } from './fx.ts'
 import { activityText, note } from './agents.ts'
-import { cutLine, shortId } from './timeline.ts'
+import { cleanLine, cutLine, shortId } from './timeline.ts'
 import { detach, type Store } from './store.ts'
 import { flush, markDirty } from './ui.ts'
 import { MAX_TRANSCRIPT_ROWS } from './limits.ts'
@@ -210,6 +210,25 @@ export function transcriptRows(messages: readonly unknown[], columns: number, ca
     rows = [...messageRows(messages[i], width), ...rows]
   }
   return rows.slice(-cap).map(row => ({ ...row, text: cutBytes(row.text, width) }))
+}
+
+// The pre-clear tail laid out at `columns`: the leads and wrap of
+// `messageRows`, but every row of every message (the tail's 2000 characters
+// bound it), and lines only cleaned (`cleanLine`), never cut at MAX_LINE.
+// Each row still passes `cutBytes`. Pure.
+export function tailRows(messages: readonly { role: string; text: string }[], columns: number): TranscriptRow[] {
+  const width = Math.max(8, columns)
+  const rows: TranscriptRow[] = []
+  for (const m of messages) {
+    const lead = m.role === 'user' ? PERSON : AGENT
+    const room = Math.max(1, width - widthOf(lead))
+    const lines = m.text.split('\n').map(cleanLine)
+    while (lines.length > 0 && lines[lines.length - 1].trim() === '') lines.pop()
+    lines.flatMap(line => wrap(line, room)).forEach((row, i) => {
+      rows.push({ text: cutBytes((i === 0 ? lead : CONTINUED) + row, width) })
+    })
+  }
+  return rows
 }
 
 export type ReadResult =

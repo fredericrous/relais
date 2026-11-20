@@ -1,5 +1,5 @@
 // The programme and tail event list, kept in the plugin's own store: one
-// entry per read, freeze and hide, the last MAX_EVENTS, and the bounded wait
+// entry per read, freeze, hide and open, the last MAX_EVENTS, and the bounded wait
 // every one of those reads and writes goes through.
 
 import type { Fx } from './fx.ts'
@@ -12,6 +12,7 @@ export type ProgrammeEvent =
   | { at: number; kind: 'read'; result: 'shown' | 'null' | 'error' }
   | { at: number; kind: 'freeze'; chars: number }
   | { at: number; kind: 'hide'; seconds: number }
+  | { at: number; kind: 'open'; rows: number; bodyRows: number }
 
 export type Settled<T> = { kind: 'ok'; value: T } | { kind: 'late' } | { kind: 'failed'; reason: unknown }
 
@@ -69,8 +70,9 @@ export async function eventsLine(fx: Fx, store: Store): Promise<string | undefin
   const reads = (result: string) => events.filter(e => e.kind === 'read' && e.result === result).length
   const freezes = events.filter(e => e.kind === 'freeze')
   const hides = events.filter(e => e.kind === 'hide')
-  if (reads('shown') + freezes.length + hides.length === 0) return undefined
+  const opens = events.filter(e => e.kind === 'open').length
+  if (reads('shown') + freezes.length + hides.length + opens === 0) return undefined
   const kept = freezes.filter(e => e.kind === 'freeze' && e.chars > 0).length
   const quick = hides.filter(e => e.kind === 'hide' && e.seconds <= 60).length
-  return `programme reads: ${reads('shown')} shown, ${reads('null')} none, ${reads('error')} failed · tails: ${freezes.length} frozen, ${kept} non-empty, ${hides.length} hidden (${quick} within 60 s)`
+  return `programme reads: ${reads('shown')} shown, ${reads('null')} none, ${reads('error')} failed · tails: ${freezes.length} frozen, ${kept} non-empty, ${hides.length} hidden (${quick} within 60 s), ${opens} opened`
 }

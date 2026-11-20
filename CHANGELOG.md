@@ -8,6 +8,17 @@ missing here.
 
 ## Unreleased
 
+- The relais pane now keeps the whole pre-clear tail: the last 2000
+  characters of the ended conversation, with the oldest message cut from its
+  front to fill the budget. Long lines are no longer cut at 240 characters or
+  12 rows. Tool turns and many short messages no longer push an older long
+  answer out. When the pane is too short, the end of the last answer always
+  shows, under `… N earlier rows`, and the header gets `[ open ]` beside
+  `[ hide ]`. `[ open ]` shows every tail row in its own view. With the pane
+  focused, the arrow keys scroll it (it starts at the top), and `[ back ]`
+  returns to the runs. `/relais-status` counts the opens next to the freezes
+  and hides.
+
 ## v0.73.0
 
 - A run now warns when a watched file in the home directory changed while it

@@ -24,6 +24,9 @@ export type RelaisTranscriptRow = { text: string; dim?: boolean; color?: string 
 
 export type RelaisPaneShown =
   | { kind: 'runs' }
+  // The pre-clear tail opened whole (`[ open ]`); drawn as the runs view
+  // when `tail` is absent. A state written before 0.74 never holds it.
+  | { kind: 'tail' }
   | {
       kind: 'agent'
       agentId: string

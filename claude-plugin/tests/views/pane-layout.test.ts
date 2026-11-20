@@ -434,9 +434,11 @@ const programme = {
   current: [{ text: '▶ t2 Second ◀ you', bold: true }],
 }
 const tail = (count: number) => ({
-  header: { text: 'before /clear · 12:00 [ hide ]', button: { key: 'hide', press: { kind: 'hide' as const } } },
+  title: 'before /clear · 12:00',
   rows: Array.from({ length: count }, (_, i) => ({ text: `person │ message ${i}` })),
+  columns: 72,
 })
+const keysOf = (row: { buttons?: { key: string }[] } | undefined) => (row?.buttons ?? []).map(b => b.key)
 const room = (rows: number) => ({ rows, columns: 72, now: NOW })
 
 test('no claim and no tail add zero rows, with runs and without', () => {
@@ -480,16 +482,45 @@ test('the programme shrinks to head, current and counts before it shrinks to the
 test('the tail always keeps its header row and its newest rows, behind the programme', () => {
   const timelines = [liveAt('live-a', 0, 20), liveAt('live-b', 1, 20), liveAt('live-c', 2, 20)]
   const squeezed = layoutPane(runsOf(timelines), room(6), undefined, { programme, tail: tail(10) })
-  expect(squeezed.map(r => r.text)).toContain('before /clear · 12:00 [ hide ]')
+  const header = squeezed.find(r => r.text === 'before /clear · 12:00')
+  // Cut to fit: `[ open ]` comes first, then `[ hide ]`, in the header row.
+  expect(keysOf(header)).toEqual(['open', 'hide'])
   expect(squeezed.map(r => r.text)).toContain('▶ t2 Second ◀ you')
-  // The current row and the header are never given up, and the pane never passes its rows.
+  // The current row, the header and the newest tail row are never given up,
+  // and the pane never passes its rows.
+  expect(squeezed[squeezed.length - 1].text).toBe('person │ message 9')
   expect(squeezed.length).toBeLessThanOrEqual(6)
-  // Plain rows go before the agent Buttons: the live run keeps its agent row.
-  expect(squeezed.some(r => r.button !== undefined && r.button.key !== 'hide')).toBe(true)
   const roomy = layoutPane([], room(12), undefined, { tail: tail(30) })
-  expect(roomy[0].text).toBe('before /clear · 12:00 [ hide ]')
+  expect(roomy[0].text).toBe('before /clear · 12:00')
+  expect(keysOf(roomy[0])).toEqual(['open', 'hide'])
+  expect(roomy[1]).toEqual({ text: '… 20 earlier rows', dim: true })
   expect(roomy.length).toBe(12)
   expect(roomy[roomy.length - 1].text).toBe('person │ message 29')
+})
+
+test('a tail that fits whole keeps only [ hide ] and draws every row', () => {
+  const rows = layoutPane([], room(80), undefined, { tail: tail(30) })
+  expect(keysOf(rows[0])).toEqual(['hide'])
+  expect(rows.length).toBe(31)
+  expect(rows.some(r => r.text.includes('earlier rows'))).toBe(false)
+})
+
+test('with one tail row of room it is the newest row, and [ open ] alone marks the cut', () => {
+  const timelines = [liveAt('live-a', 0, 20), liveAt('live-b', 1, 20), liveAt('live-c', 2, 20)]
+  const rows = layoutPane(runsOf(timelines), room(6), undefined, { tail: tail(10) })
+  expect(rows.length).toBeLessThanOrEqual(6)
+  expect(rows[rows.length - 1].text).toBe('person │ message 9')
+  expect(rows.some(r => r.text.includes('earlier rows'))).toBe(rows[rows.length - 2]?.text.includes('earlier rows') === true)
+  expect(keysOf(rows.find(r => r.buttons !== undefined))).toEqual(['open', 'hide'])
+})
+
+test('the header title is cut so that both buttons fit at 38 columns', () => {
+  const narrow = { ...tail(10), columns: 38 }
+  const rows = layoutPane([], { rows: 6, columns: 38, now: NOW }, undefined, { tail: narrow })
+  const header = rows[0]
+  const width = Array.from(header.text).length + (header.buttons ?? []).reduce((n, b) => n + 1 + b.label.length, 0)
+  expect(width).toBeLessThanOrEqual(38)
+  expect(keysOf(header)).toEqual(['open', 'hide'])
 })
 
 test('the runs keep their priority: a live run keeps its head and agents with a programme and a tail', () => {
