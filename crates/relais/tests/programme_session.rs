@@ -156,6 +156,24 @@ impl World {
     }
 }
 
+/// The `repo` of every claim file under `dir`.
+fn recorded_repos(dir: &Path) -> Vec<String> {
+    let mut repos = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("read dir") {
+        let path = entry.expect("entry").path();
+        if path.is_dir() {
+            repos.extend(recorded_repos(&path));
+        } else if path.extension().is_some_and(|ext| ext == "toml") {
+            let claim: toml::Table = std::fs::read_to_string(&path)
+                .expect("claim")
+                .parse()
+                .expect("claim parses");
+            repos.push(claim["repo"].as_str().expect("repo").to_string());
+        }
+    }
+    repos
+}
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -357,6 +375,49 @@ fn a_recorded_worktree_without_the_map_resolves_to_the_main_checkout() {
     );
     std::fs::remove_dir_all(worktree.join("docs/programmes/p")).expect("map removed");
     world.record_repo(&worktree);
+    let out = world.run(&[
+        "session",
+        "--no-fetch",
+        "--session",
+        "sess-own",
+        "--dir",
+        world.root.to_str().expect("utf8"),
+        "--json",
+    ]);
+    let answer = document(&out);
+    assert_eq!(answer["programme"]["ready"], json!(["t4"]), "{answer}");
+}
+
+#[test]
+fn a_claim_from_a_removed_worktree_still_finds_the_map() {
+    let world = World::new("claimed-in-wt");
+    let worktree = world.root.join("alpha-task-wt");
+    let worktree_arg = worktree.to_str().expect("utf8");
+    git(
+        &world.repo(),
+        &["worktree", "add", "--detach", "-q", worktree_arg],
+    );
+    let out = world.run(&[
+        "claim",
+        "p",
+        "t2",
+        "--dir",
+        worktree_arg,
+        "--session",
+        "sess-own",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let main = world.repo().canonicalize().expect("main checkout");
+    assert_eq!(
+        recorded_repos(&world.state.join("claims")),
+        vec![main.to_string_lossy().into_owned()],
+        "the claim records the main checkout, not the worktree"
+    );
+    git(
+        &world.repo(),
+        &["worktree", "remove", "--force", worktree_arg],
+    );
+    assert!(!worktree.exists(), "the task worktree is gone");
     let out = world.run(&[
         "session",
         "--no-fetch",
