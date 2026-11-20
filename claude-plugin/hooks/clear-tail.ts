@@ -59,11 +59,15 @@ export function trimTail(messages: readonly TailMessage[], limit = TAIL_CHARS): 
   return out
 }
 
-export const tailOf = (messages: unknown): TailMessage[] => trimTail(textMessages(messages))
+// The newest LAST_MESSAGES entries are kept here, not asked of the engine:
+// `$.session.messages({ last })` is refused by Claude Code 2.1.291 (2.1.329 takes it), and
+// the plugin supports 2.1.291 (the Makefile's CLAUDE_CODE_MIN).
+export const tailOf = (messages: unknown): TailMessage[] =>
+  trimTail(textMessages(Array.isArray(messages) ? messages.slice(-LAST_MESSAGES) : messages))
 
 export const charsOf = (messages: readonly TailMessage[]) => messages.reduce((total, message) => total + lengthOf(message.text), 0)
 
-const readLast = (fx: Fx) => () => fx.session.messages({ last: LAST_MESSAGES })
+const readLast = (fx: Fx) => () => fx.session.messages({})
 
 // One read on a main turn. Only the newest read of the session that began it
 // updates the live tail: a reply that comes after a newer read began, after

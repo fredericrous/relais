@@ -2,7 +2,7 @@
 // the clear, and `[ hide ]`.
 
 import { expect, test } from 'claude-code/testing'
-import { textMessages, trimTail, TAIL_CHARS } from '../hooks/clear-tail.ts'
+import { tailOf, textMessages, trimTail, TAIL_CHARS } from '../hooks/clear-tail.ts'
 import { scriptedEngine, settle, turn, type Engine } from './support.ts'
 
 const START = { cwd: '/repo', surface: 'terminal', isInteractive: true }
@@ -75,6 +75,11 @@ test('a tail is trimmed from the front at a message boundary to 2000 characters'
   expect(kept.reduce((n, m) => n + m.text.length, 0)).toBeLessThanOrEqual(TAIL_CHARS)
 })
 
+test('only the newest 20 messages of a long session make the tail', () => {
+  const many = Array.from({ length: 30 }, (_, n) => ({ role: 'user', text: `m${n}` }))
+  expect(tailOf(many).map(m => m.text)).toEqual(Array.from({ length: 20 }, (_, n) => `m${n + 10}`))
+})
+
 test('one message longer than the limit is cut from its front with an ellipsis', () => {
   const kept = trimTail([{ role: 'assistant', text: `${'x'.repeat(3000)}END` }])
   expect(kept.length).toBe(1)
@@ -83,11 +88,12 @@ test('one message longer than the limit is cut from its front with an ellipsis',
   expect(Array.from(kept[0].text).length).toBe(TAIL_CHARS)
 })
 
-test('each main turn reads the last 20 messages; a subagent turn reads nothing', async ($: any, on: any) => {
+test('each main turn reads the session with no argument the oldest supported engine refuses; a subagent turn reads nothing', async ($: any, on: any) => {
   const engine = await started($, on)
   await $.turn.complete(mainTurn())
   await settle(engine)
-  expect(engine.calls.messages).toEqual([{ last: 20 }])
+  // `{ last }` is refused by Claude Code 2.1.291, the plugin's floor.
+  expect(engine.calls.messages).toEqual([{}])
   await $.turn.complete(turn('agent-9', {}))
   await settle(engine)
   expect(engine.calls.messages.length).toBe(1)
