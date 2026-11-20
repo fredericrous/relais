@@ -66,7 +66,7 @@ rewrote them, `$XDG_CONFIG_HOME/git/config` (else `~/.config/git/config`) and
 
 ## Phases
 
-### Phase 1: relais (one PR, worktree from origin/main)
+### Phase 1: relais (one PR, worktree from origin/main) — done 2026-11-20
 
 1. **New `crates/relais/src/homeprint.rs`**, pure, taking `home`, an env closure and the
    repo root (like `paths.rs` `resolve_home`, so tests never call `set_var`):
@@ -131,6 +131,35 @@ rewrote them, `$XDG_CONFIG_HOME/git/config` (else `~/.config/git/config`) and
    a `cargo test` whose test runs `git config --local x.y 1` yields advice naming
    `.git/config (modified)`; the same test without the write yields none; a replay of the
    11-15 rewrite of `~/.config/git/config` under a temp `HOME` set for the hook warns once.
+
+## Phase 1 record (2026-11-20)
+
+Behaviour as built (supersedes items 4-5 above, per the review fix list in the
+sidecar): drift is recorded with `record_immutable_artifact` (`EvidenceKind::HomeDrift`);
+`relais run` prints to stderr a heading `relais run: warning: home files changed while
+<run> was active:`, one indented `<path> (<change>)` line per file and a two-line
+follow-up; `status <run>` and `explain <run>` print the same block to stdout under
+`home files changed while the run was active:`; a path unreadable on both sides prints
+`not watched (unreadable)`, a directory over the cap on both sides `not fully checked`.
+No `(home changed)` mark in the list form (deliberate). `drifts_of_run` lives in
+`runner/home_drift.rs` (the module-cycle gate refused it in `homeprint`).
+
+Verification (input → expected → actual):
+- `cargo test --workspace` on the rebased tree → 0 failed → 2530+56+349+16+16+1 passed, 0 failed.
+- `cargo clippy --all-targets -- -D warnings` → exit 0 → exit 0; commit gate 32 checks passed.
+- mock worker writes a watched file under a scratch HOME → one HomeDrift row, run accepted → as expected (`a_worker_writing_a_watched_home_file_…`).
+- baseline check writes `.gitconfig`, candidate red → one drift row → as expected.
+- run reaped mid-flight → one drift row → as expected.
+- status report → heading, path line, two follow-up lines, all ≤ 80 columns → as expected.
+- `~/` in `extra_paths` expanded; a relative entry refused at load naming the key → as expected.
+- authority-hash pin test → unchanged, passes → passes.
+- Not done: a piloted `relais status` through the installed binary; the host was saturated (load 15–100 on 6 cores) and the fixture tests drive the real engine. First real run after release is the live check.
+
+## Implementation review
+- implementation-review: approve-with-changes after 3 rounds; 14 fixed; `_` arm over `Result` in `expand_extra_paths` deliberate: not a domain enum (its own round-2 ruling). 154k tok.
+- backend approve; lang:rust approve; unix approve (run-end problem lines unprefixed: carried, low).
+- tui approve-with-changes: no-home line ~130 cols deliberate: shown only when HOME is unset.
+- architect approve-with-changes: run-end heading literal deliberate: one place, a different string by design; HomeWatch injection, absolute stored path, streaming hash carried to follow-ups.
 
 ## Process
 
