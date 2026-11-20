@@ -74,6 +74,9 @@ pub struct Programme {
     pub tickets: BTreeMap<String, Ticket>,
     /// Ticket files that did not parse into a ticket.
     pub unreadable: BTreeSet<String>,
+    /// Whether the map has a `## Handoff` heading (SPEC §31), read from the
+    /// text this load already holds, so no caller reads the map again.
+    pub handoff: bool,
     file_problems: Vec<Problem>,
 }
 
@@ -192,6 +195,7 @@ impl Programme {
         ticket_texts: Vec<(String, String)>,
     ) -> Self {
         let (map, mut file_problems) = parse_map(map_text);
+        let handoff = super::frontier::has_handoff(map_text);
         let mut tickets = BTreeMap::new();
         let mut unreadable = BTreeSet::new();
         for (id, text) in ticket_texts {
@@ -215,6 +219,7 @@ impl Programme {
             map,
             tickets,
             unreadable,
+            handoff,
             file_problems,
         }
     }
@@ -508,6 +513,9 @@ fn programmes_at(repo: &Path, rev: &str) -> Result<BTreeSet<String>, ProgrammeEr
 struct OriginView {
     rev: String,
     slugs: BTreeSet<String>,
+    /// Every tree each `docs/programmes/<slug>` had in the history of `rev`,
+    /// by slug (see [`trees_by_slug`]).
+    history: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Origin's view of a repository: `None` when it has no default ref, an
@@ -517,7 +525,12 @@ fn origin_view(repo: &Path) -> Result<Option<OriginView>, ProgrammeError> {
         return Ok(None);
     };
     let slugs = programmes_at(repo, &rev)?;
-    Ok(Some(OriginView { rev, slugs }))
+    let history = trees_by_slug(repo, &rev)?;
+    Ok(Some(OriginView {
+        rev,
+        slugs,
+        history,
+    }))
 }
 
 /// What `git <args>` prints in `repo`, given `input` on stdin.
@@ -571,31 +584,71 @@ fn batch_contents(printed: &str) -> Vec<Option<String>> {
     contents
 }
 
-/// Every tree `docs/programmes/<slug>` had in the history of `rev`: a
-/// checkout whose tree is one of them has nothing origin lacks, even when
-/// its commits were squash- or rebase-merged and so are not in `rev`.
-fn trees_on(repo: &Path, rev: &str, slug: &str) -> Result<BTreeSet<String>, ProgrammeError> {
-    let rel = programme_rel(slug);
-    let commits = git_stdout(repo, &["rev-list", "--full-history", rev, "--", &rel])?;
-    let input: String = commits
-        .lines()
-        .filter(|c| !c.is_empty())
-        .map(|c| format!("{c}:{rel}\n"))
-        .collect();
-    if input.is_empty() {
-        return Ok(BTreeSet::new());
+/// Every tree each `docs/programmes/<slug>` had in the history of `rev`, by
+/// slug: a checkout whose tree is one of them has nothing origin lacks, even
+/// when its commits were squash- or rebase-merged and so are not in `rev`.
+///
+/// One `git log` for the whole directory: `-t` prints each changed tree,
+/// `-m` a merge's change against every parent, `--root` the first commit's,
+/// and `--no-renames` keeps one path per entry.
+/// A per-slug `rev-list` and `cat-file` gave the same sets, measured on 22
+/// programmes in 9 repositories, at two git processes per programme (t27).
+fn trees_by_slug(
+    repo: &Path,
+    rev: &str,
+) -> Result<BTreeMap<String, BTreeSet<String>>, ProgrammeError> {
+    let printed = git_stdout(
+        repo,
+        &[
+            "log",
+            "--full-history",
+            "-m",
+            "-t",
+            "--raw",
+            "--root",
+            "--no-abbrev",
+            "--no-renames",
+            "-z",
+            "--format=",
+            rev,
+            "--",
+            "docs/programmes/",
+        ],
+    )?;
+    Ok(raw_trees(&printed))
+}
+
+/// The trees of `docs/programmes/<slug>` that `git log --raw -t -z` entries
+/// name as a change's new side, by slug. Each entry is `:<meta>` then its
+/// path, NUL-separated. A deletion (an all-zero sha) names none.
+fn raw_trees(printed: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let mut trees: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut tokens = printed.split('\0');
+    while let Some(token) = tokens.next() {
+        // A commit's entries may follow a newline left by the empty format.
+        let Some(meta) = token.trim_start_matches('\n').strip_prefix(':') else {
+            continue;
+        };
+        let Some(path) = tokens.next() else {
+            break;
+        };
+        // `<old mode> <new mode> <old sha> <new sha> <status>`
+        let fields: Vec<&str> = meta.split(' ').collect();
+        let (Some(new_mode), Some(new_sha)) = (fields.get(1), fields.get(3)) else {
+            continue;
+        };
+        let Some(slug) = path.strip_prefix("docs/programmes/") else {
+            continue;
+        };
+        let deleted = new_sha.bytes().all(|b| b == b'0');
+        if *new_mode == "040000" && !deleted && !slug.is_empty() && !slug.contains('/') {
+            trees
+                .entry(slug.to_string())
+                .or_default()
+                .insert((*new_sha).to_string());
+        }
     }
-    let printed = git_stdout_with_input(repo, &["cat-file", "--batch-check"], input)?;
-    Ok(printed
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split(' ');
-            match (fields.next(), fields.next()) {
-                (Some(sha), Some("tree")) => Some(sha.to_string()),
-                _ => None, // `<object> missing`: the path did not exist there
-            }
-        })
-        .collect())
+    trees
 }
 
 /// What origin's default ref says about one programme.
@@ -653,7 +706,7 @@ fn origin_for<'a>(
         })?;
     Ok(Origin::Holds {
         rev: &view.rev,
-        trees: trees_on(repo, &view.rev, slug)?,
+        trees: view.history.get(slug).cloned().unwrap_or_default(),
         changed_at,
     })
 }
@@ -1436,6 +1489,79 @@ mod tests {
             out.status.success(),
             "git {args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn raw_trees_keep_each_slugs_new_trees_and_skip_blobs_nesting_and_deletions() {
+        let (a1, a2, b1) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let zero = "0".repeat(40);
+        let printed = [
+            format!(":040000 040000 {zero} {a1} M"),
+            "docs".to_string(),
+            format!(":040000 040000 {zero} {a1} M"),
+            "docs/programmes/alpha".to_string(),
+            format!(":100644 100644 {zero} {b1} M"),
+            "docs/programmes/alpha/map.md".to_string(),
+            format!("\n:040000 040000 {a1} {a2} M"),
+            "docs/programmes/alpha".to_string(),
+            format!(":040000 040000 {zero} {b1} A"),
+            "docs/programmes/beta/nested".to_string(),
+            format!(":040000 000000 {b1} {zero} D"),
+            "docs/programmes/gone".to_string(),
+            String::new(),
+        ]
+        .join("\0");
+        let trees = raw_trees(&printed);
+        assert_eq!(trees.keys().collect::<Vec<_>>(), vec!["alpha"]);
+        assert_eq!(trees["alpha"], BTreeSet::from([a1, a2]));
+    }
+
+    #[test]
+    fn a_load_records_the_handoff_from_either_source_and_ready_collects_it() {
+        let scratch = crate::test_support::short_temp_dir("load-handoff");
+        let repo = scratch.to_path_buf();
+        git(&repo, &["init", "-q"]);
+        for (slug, map) in [
+            (
+                "handed",
+                "# H\n\n## Destination\n\nx\n\n## Handoff\n\nnext\n",
+            ),
+            (
+                "plain",
+                "# P\n\n## Destination\n\nx\n\n```\n## Handoff\n```\n",
+            ),
+        ] {
+            let dir = programme_path(&repo, slug);
+            std::fs::create_dir_all(&dir).expect("dir");
+            std::fs::write(dir.join(MAP_FILE), map).expect("map");
+        }
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "maps"]);
+        let found = |slug: &str, source: Source| Found {
+            repo: repo.clone(),
+            checkout: repo.clone(),
+            slug: slug.to_string(),
+            source,
+        };
+        for source in [Source::WorkingTree, Source::Ref("HEAD".to_string())] {
+            let handed = found("handed", source.clone()).load().expect("loads");
+            let plain = found("plain", source.clone()).load().expect("loads");
+            assert!(handed.handoff, "{source:?}");
+            assert!(!plain.handoff, "a fenced heading is not one: {source:?}");
+        }
+        let ready = super::super::frontier::ready(
+            vec![
+                found("handed", Source::Ref("HEAD".to_string())),
+                found("plain", Source::WorkingTree),
+            ],
+            Vec::new(),
+            None,
+            0,
+        );
+        assert_eq!(
+            ready.handoffs.into_iter().collect::<Vec<_>>(),
+            vec!["handed".to_string()]
         );
     }
 

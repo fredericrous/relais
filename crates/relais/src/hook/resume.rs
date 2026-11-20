@@ -15,7 +15,7 @@ use chrono::NaiveDate;
 
 use super::respond::{Coverage, Gathered, Skip, SkipReason, GATHER_THREAD_NAME};
 use crate::programme::claim::{self, Store};
-use crate::programme::frontier::{self, due_mark, format_age, has_handoff, Ready, ReadyRow};
+use crate::programme::frontier::{self, due_mark, format_age, Ready, ReadyRow};
 use crate::programme::load::{self, main_checkout, Found, Source};
 use crate::programme::model::MAP_FILE;
 
@@ -81,7 +81,7 @@ pub fn gather_with(cwd: &Path, claims: Option<Store>) -> Result<Gathered, Skip> 
         &repo,
         &ready,
         today,
-        |found| found.map_text().is_ok_and(|text| has_handoff(&text)),
+        |found| ready.handoffs.contains(&found.slug),
         None,
     )
     .map(Gathered::from)
@@ -141,14 +141,30 @@ pub(crate) struct LatestHandoff {
 /// Why the programmes of `repo` could not be read.
 fn read_repository(repo: &Path, claims: Option<&Store>) -> Result<RepoReading, String> {
     let listed = load::programmes_of(repo).map_err(|error| error.to_string())?;
-    let mut handoffs = BTreeSet::new();
+    // The handoff flag comes from the parallel loads in `ready`; a map read
+    // per programme here, one after another, kept the repository with the
+    // most programmes past the cutoff (t27).
+    let ready = frontier::ready(listed.found, listed.unreadable, claims, claim::now_unix());
+    let handoffs = ready.handoffs.clone();
+    let handed_off: Vec<&Found> = ready
+        .found
+        .iter()
+        .filter(|found| handoffs.contains(&found.slug))
+        .collect();
+    // Each map time is a git log or two: one scoped worker per handed-off
+    // programme, taken back in slug order so a tie keeps the first.
+    let times: Vec<Option<i64>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = handed_off
+            .iter()
+            .map(|found| crate::programme::spawn_worker(scope, move || load::map_time(found)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().ok().flatten())
+            .collect()
+    });
     let mut latest_handoff: Option<LatestHandoff> = None;
-    for found in &listed.found {
-        if !found.map_text().is_ok_and(|text| has_handoff(&text)) {
-            continue;
-        }
-        handoffs.insert(found.slug.clone());
-        let at = load::map_time(found);
+    for (found, at) in handed_off.into_iter().zip(times) {
         if latest_handoff.as_ref().is_none_or(|latest| at > latest.at) {
             latest_handoff = Some(LatestHandoff {
                 slug: found.slug.clone(),
@@ -158,7 +174,7 @@ fn read_repository(repo: &Path, claims: Option<&Store>) -> Result<RepoReading, S
     }
     Ok(RepoReading {
         repo: repo.to_path_buf(),
-        ready: frontier::ready(listed.found, listed.unreadable, claims, claim::now_unix()),
+        ready,
         handoffs,
         latest_handoff,
     })
@@ -698,6 +714,7 @@ mod tests {
             found: founds,
             rows,
             unreadable: Vec::new(),
+            handoffs: BTreeSet::new(),
         }
     }
 
