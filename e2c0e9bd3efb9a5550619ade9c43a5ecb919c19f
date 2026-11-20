@@ -1,0 +1,18 @@
+greengate-provenance-v1
+commit e2c0e9bd3efb9a5550619ade9c43a5ecb919c19f
+tree 214430b05fc89fa9fe2cb6a8b959ffca955f4355
+canon f49c80a5ace5a501b598d69bc960622ad894824a
+patch b33c608780669e6bbe7c73de49e5bc4ba11b8be7
+plan docs/plans/2026-11-20-pane-shows-whole-tail.md a841cf80800cf6984ec7c2f3be5a5cbc8414cc88d29f84c2d13d7390e950af7b
+review reviewed 0404f815aefcff7d5610eab2d20be2a522d452afcdbc6a78075d8a45e24defbe
+code-review lang:typescript reviewed 0404f815aefcff7d5610eab2d20be2a522d452afcdbc6a78075d8a45e24defbe
+code-review tui reviewed 0404f815aefcff7d5610eab2d20be2a522d452afcdbc6a78075d8a45e24defbe
+preview not-required
+producer greenbelay 6.5.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABAqH3So5m+Tq1FEy4kbGnW19g8maVBa0RevHUIV9kmXQ
+xl97LhqzNBMaTJ1ZPsifKY8jQNgdayfzXpesV06GMlDw==
+-----END SSH SIGNATURE-----
