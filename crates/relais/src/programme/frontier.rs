@@ -3,7 +3,7 @@
 //! command and by the SessionStart hook, so the two never disagree about
 //! which ticket comes first. Nothing here prints.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use chrono::NaiveDate;
@@ -101,6 +101,8 @@ pub struct Ready {
     pub rows: Vec<ReadyRow>,
     /// The directory of each programme that failed to load, in order.
     pub unreadable: Vec<PathBuf>,
+    /// The slugs of the loaded programmes whose map has a `## Handoff`.
+    pub handoffs: BTreeSet<String>,
 }
 
 impl Ready {
@@ -129,6 +131,7 @@ pub fn ready(
 ) -> Ready {
     let mut rows = Vec::new();
     let mut unreadable = unlisted;
+    let mut handoffs = BTreeSet::new();
     // Each load spawns several git processes (about 40 ms each); one thread
     // per programme keeps a repository with many programmes inside the
     // session-start deadline. Results are read back in `found`'s order.
@@ -152,6 +155,9 @@ pub fn ready(
         // A load that panicked counts as one that failed.
         match loaded.ok().and_then(Result::ok) {
             Some((programme, standings)) => {
+                if programme.handoff {
+                    handoffs.insert(one.slug.clone());
+                }
                 for ticket in programme.tickets.values() {
                     let held = match standings.get(&ticket.id) {
                         Some(Standing::Frontier) => None,
@@ -187,6 +193,7 @@ pub fn ready(
         found,
         rows,
         unreadable,
+        handoffs,
     }
 }
 
