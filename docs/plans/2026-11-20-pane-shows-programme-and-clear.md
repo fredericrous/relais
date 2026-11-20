@@ -273,6 +273,17 @@ lang:typescript is added because TS is most of the change: the plugin's hooks.
   each candidate passed every plugin test (458/458, then 466/466) at load
   10–40 and was committed by hand, recorded `salvaged`.
 
+- Closed with three gaps, each named (2026-11-20): (1) Phase 3's narrow-width
+  status hint shows only when the pane is unplaced at open; after a resize the
+  plugin does not learn it (live row "narrow"), tracked as follow-up f03;
+  (2) `relais programme session` took 1.24 s on this machine's real claim
+  store against the 300 ms guessed in Phase 4: the map load reads git, and the
+  plugin's bound is 5 s, so the guess is replaced by the measured 1.24 s;
+  (3) the Verification's `tsc -p claude-plugin` did not run: the repository
+  commits no `tsconfig.json` and the plugin's types are generated only when
+  Claude Code loads it, so `claude plugin validate` (per-module type check,
+  on 2.1.291 and 2.1.329) stands in.
+
 ## Verification record (Phases 1–3, 2026-11-20)
 
 | Check | Input | Expected | Actual |
