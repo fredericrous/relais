@@ -145,9 +145,20 @@ impl<'a> RunEngine<'a> {
                         self.config.ledger,
                         &self.run_id,
                     )?;
-                    let next = self.decide(
+                    let next = self.decide_with_snapshot(
                         &budget,
                         Observation::ReviewFindings(detail.clone(), severities),
+                        &|engine| {
+                            engine.candidate_receipt(CandidateReceiptInput {
+                                attempt: ctx,
+                                progress,
+                                candidate,
+                                verified: &verified,
+                                verdict,
+                                outcome: State::NeedsDecision,
+                                review: review_record_of(engine.config.ledger, &engine.run_id)?,
+                            })
+                        },
                     )?;
                     if matches!(next, Next::Attempt { .. }) {
                         progress.review_findings = Some(detail);
@@ -412,6 +423,16 @@ impl<'a> RunEngine<'a> {
         reason: Reason,
         observation: Observation,
     ) -> Result<RunOutcome, RunError> {
+        self.save_review_snapshot(build, reason);
+        self.stop(budget, observation)
+    }
+
+    /// The snapshot half of a stop for review.
+    pub(super) fn save_review_snapshot(
+        &mut self,
+        build: &dyn Fn(&Self) -> Result<Receipt, RunError>,
+        reason: Reason,
+    ) {
         // Best effort: the stop is the run's outcome, the snapshot only
         // lets an approval seal a receipt. Building the receipt is inside the
         // same block, so a failure there is a step, never the run's end.
@@ -439,7 +460,6 @@ impl<'a> RunEngine<'a> {
                 format!("the verification snapshot could not be saved: {e}"),
             );
         }
-        self.stop(budget, observation)
     }
 
     /// Settle the contract's criteria against a report, reading the
