@@ -261,5 +261,40 @@ lang:typescript is added because TS is most of the change: the plugin's hooks.
   engine does not promise the old messages are still readable at that moment.
 - 2000 characters, text only, message boundaries preferred — the person's
   "last 2000 characters or last messages".
+- Phases 2–3 also keep a capped event list in the plugin store
+  (`hooks/events.ts`: one entry per programme read, freeze and hide), counted
+  on `/relais-status`: the After-release measure reads it.
+- The map lookup keeps the common-dir hop the review asked for (the recorded
+  worktree's main checkout when it lacks the map); a removed worktree with no
+  `--dir` in its repository still reads "the repository is gone" until claims
+  record the common dir (follow-up).
+- Two relais runs (Phases 2–3, then the review fixes) stopped `blocked
+  (env_missing)` only on plugin tests hitting their 5 s timeout at load 50–70;
+  each candidate passed every plugin test (458/458, then 466/466) at load
+  10–40 and was committed by hand, recorded `salvaged`.
+
+## Verification record (Phases 1–3, 2026-11-20)
+
+| Check | Input | Expected | Actual |
+| --- | --- | --- | --- |
+| no claim | `relais programme session --session nobody --json --no-fetch` | `{"programme":null,"reason":"none"}`, exit 0 | as expected, 0.09 s |
+| live handoff claim | a real `handoff` claim on decisions `session-boundaries`, `--dir` its repo | the ticket, `holder:"self"`, every ticket | t23, 28 tickets, 6 ready, 1.24 s (not the guessed 300 ms; inside the 5 s bound) |
+| previous session | `--session newone --previous <that session>` | `holder:"previous"` | `previous t23…` |
+| expired | the same claim past its 2 h hold, text mode | `programme claim expired` | as expected |
+| no session id | no flag, no env | `relais: no session id`, `next: pass --session <id>`, exit 2 | as expected |
+| Rust tests | `cargo test -p relais --test programme_session` + the claim unit tests | pass | 15/15; resolution order, expiry, the tombstone guard and the gone-repository hint each tested |
+| plugin tests | `claude plugin test claude-plugin` | pass | 467/467 at load ~10 (the SessionStart-race test fails with its fix reverted: 466/1) |
+| plugin validate | `claude plugin validate claude-plugin` | passes | passes with warnings of the kinds the base already has (`.ts` import extensions, possibly-undefined indexes); no separate `tsc -p` run |
+| gates | the pre-commit gate on each commit (fmt, clippy, cargo-test, plugin-test, cycles, ban-terms) | pass | passed on d6c8369d |
+| live, older relais | Claude Code 2.1.329 in tmux, 180×50, `--plugin-dir` this build, installed relais 0.71 | one dim row, no retry | `programme view needs a newer relais · relais install` in the pane; no read after a Bash claim (the plugin's `relais` is the one on its own PATH) |
+| live, happy path | the window map, then `next --claim` and `/clear` | Phase 4 | not run: needs the released relais as `relais` on the plugin's PATH |
+
+## Implementation review
+
+- implementation-review: approve after round 1 and 3 Deltas (opus); 2 blocking, 5 medium fixed; 12 candidates ruled; ~280k tok.
+- backend, unix: approve on the last Delta; deliberate: `resetLiveTail` after two awaits (a lost first read is re-read), the stale note's cause left to `relais programme session`.
+- lang:rust, tui: approve; deliberate: `KindView::as_str`, `Nothing { expired }`, the failed-map row's short hint (the error wins the width).
+- architect, lang:typescript: approve after one Delta (opus).
+- Next: Phase 4, release, reinstall, live proof; follow-up: claims record the common dir.
 
 <!-- panel: repos=relais adds= reviewers=architect,backend,lang:rust,po,tui,unix,codex body-sha=0e063360eeca -->
