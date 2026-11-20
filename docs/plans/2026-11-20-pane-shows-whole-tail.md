@@ -112,7 +112,7 @@ tmux `capture-pane` of the runs view before and after, and of the tail
 view scrolled to its top, at 180 and at 100 columns.
 
 ## Phases
-- [ ] Phase 1 — first a live tmux spike that arrows scroll with `[ back ]` focused (2.1.291 and 2.1.329), and that at 100×30 (inline seat) a 120-row tree keeps the prompt on screen; record the frame height against `scroll.bodyRows`. If the frame grows past the terminal, stop and bring the plan back to review (a cap would end scrolling), then capture and layout: `claude-plugin/hooks/clear-tail.ts`
+- [x] Phase 1 — first a live tmux spike that arrows scroll with `[ back ]` focused (2.1.291 and 2.1.329), and that at 100×30 (inline seat) a 120-row tree keeps the prompt on screen; record the frame height against `scroll.bodyRows`. If the frame grows past the terminal, stop and bring the plan back to review (a cap would end scrolling), then capture and layout: `claude-plugin/hooks/clear-tail.ts`
   (`trimTail` fills the budget), `claude-plugin/hooks/transcript.ts`
   (`tailRows`), `claude-plugin/hooks/pane.ts` (`extraOf`/`extraRows`:
   `[ open ]` and `… N earlier rows` when cut, no 60-row cap; `paneTree`
@@ -132,25 +132,31 @@ view scrolled to its top, at 180 and at 100 columns.
   cannot grow itself (the engine owns its seat and height).
 - 2026-11-20 — the runs view keeps the newest rows when cut, because the
   end of the last answer is what the person resumes from.
+- 2026-11-20 — Phase 1 also touched `claude-plugin/hooks/events.ts` (the
+  `open` event, carried from backend's round-2 finding A) and
+  `claude-plugin/hooks/limits.ts` (`TAIL_CHARS` moved there, so `pane.ts`
+  reads it without an import cycle through `clear-tail.ts` → `ui.ts`).
+- 2026-11-20 — Phase 1 was done by hand: two relais runs ended
+  `admission_wait_exhausted` (no lease in 30 min each, host load 60+).
+- 2026-11-20 — the agent view's `[ back ]` now passes `label` too, as the
+  2.1.291 floor needs; its text is unchanged.
 
 ## Verification
 | Input | Expected | Actual |
 | --- | --- | --- |
-| `trimTail` on messages of 1500 and 800 characters | 2000 characters: the 1500 whole, the 800 cut from its front with `…` |
-| `trimTail` with 0, 1 and 2 characters of room left before an older message | no partial message for 0 and 1 (`slice(-0)` would keep it whole); `…` plus 1 character for 2; total ≤ 2000 each time |
-| `tailOf` on 30 tool messages after 3 text messages of 900 characters | 2000 characters, all 3 text messages present (the third cut) |
-| `tailRows` on one 2000-character answer at 40 columns | ≥ 50 rows, the last row ends with the answer's last word |
-| `tailRows` on one 2000-character line with no newline, then a message holding `ESC[31m` and a BEL | the rows joined equal the input (no 240-character cut); no ESC or BEL in any row |
-| pane layout, 3 runs, room 20, tail of 60 rows | header has `[ open ]` and `[ hide ]`; `… N earlier rows`; the last tail row is the answer's last row |
-| pane layout, no runs, room 80, same tail | header `[ hide ]` only; every tail row shown |
-| tail view tree, 60 rows, bodyRows 20 | `[ back ]`, hint, title, all 60 rows (the tree is taller than the body) |
-| press `[ open ]`, then `[ back ]`; `[ hide ]` while in the tail view | shown `tail`, then `runs`; hide → `runs`, no tail |
-| live: tmux 180 cols, `--plugin-dir claude-plugin`, a 1800-character last answer, `/clear` | pane shows the answer's last line; `[ open ]` opens the view at its first row (the engine's offset 0; the runs view already shows the end); arrows scroll to the last row; `[ back ]` returns |
-| live: same at 100 cols × 30 rows (inline seat) | the tail view stays scrollable and the prompt stays on screen, as the Phase 1 spike found; record the frame height |
-| Esc in the tail view | keys go back to the prompt; the pane state stays `tail`; `[ back ]` still returns |
-| runs-view header at 45 and 38 columns with a cut tail | `[ open ] [ hide ]` does not wrap mid-button; `[ open ]` comes first |
-| tail view opened after a front cut | the title says `last 2000 characters` |
-| tail view open, a new `/clear` freezes another tail | the view shows the new tail's title time and rows |
-| `make check` in claude-plugin, `cargo test -p relais --lib install::` | exit 0; the new test names listed as passed |
+| spike: a 120-row tree under an autoFocus `[ back ]`, tmux, 2.1.329 and 2.1.291 | arrows scroll with `[ back ]` focused; inline at 100×30 the prompt stays on screen | pass on both: docked body 33 rows, ↓/Home/End move the window one row a press (ctrl+x tab to focus), Esc keeps the offset; inline at 100×30 the frame stays at `bodyRows` 8 and scrolls, prompt on screen |
+| `trimTail` on messages of 1500 and 800 characters | 2000 characters: the 1500 whole, the 800 cut from its front with `…` | pass (`clear-tail.test.ts`) |
+| `trimTail` with 0, 1 and 2 characters of room left before an older message | no partial message for 0 and 1; `…` plus 1 character for 2; total ≤ 2000 | pass |
+| `tailOf`: an 1800-character answer, 30 tool turns, then twenty 10-character messages | all 2000 characters, the answer whole | pass (the `LAST_MESSAGES` cutoff is gone) |
+| `tailRows` on one 2000-character line at 40 columns | ≥ 50 rows, joined back equal to the input, last row ends with the last word | pass (`transcript.test.ts`) |
+| `tailRows` on a message holding `ESC[31m` and a BEL | no ESC or BEL in any row | pass |
+| pane layout, 3 runs, room 6, programme, tail of 10 rows | header with `[ open ]` then `[ hide ]`, programme row, newest tail row, ≤ 6 rows | pass (`pane-layout.test.ts`) |
+| pane layout, no runs, room 12 and room 80, tail of 30 rows | 12: `… 20 earlier rows`, newest last; 80: `[ hide ]` only, all rows | pass |
+| header at 38 columns | title cut, both buttons fit | pass |
+| tail view tree past `MAX_TRANSCRIPT_ROWS`, a front-cut tail | title `last 2000 characters · 999 rows`, `… 600 earlier rows`, 401 rows | pass |
+| press `[ open ]`, then `[ back ]`; hide while the tail view is shown; a new `/clear` with the view open | tail view with hint and every row; runs again; `hideTail` resets to runs; the new tail shows | pass (`clear-tail.test.ts`), `/relais-status` says `1 opened` |
+| live: tmux 180×40, `--plugin-dir claude-plugin` (2.1.329), a 150-line answer, `/clear` | the runs view ends on the answer's last line; `[ open ]` opens at the first row; arrows scroll; `[ back ]` returns | pass: `before /clear · 23:51 [ open ] [ hide ]`, `… 121 earlier rows`, ends `line 150`; the view opens on `[ back ]`, hint, `· 153 rows`, `person │ Reply with…`; ↓ moves, End shows `line 150`; Enter on `[ back ]` shows the runs view |
+| live: same at 100×30 (inline seat) | scrollable, the prompt on screen | pass: frame rows 16–25 (`bodyRows` 8), prompt on row 28; End reaches `line 150`; Esc keeps the tail view scrolled where it was |
+| `make plugin` (`claude plugin validate`, `scripts/plugin-test.sh`) | exit 0, the new tests listed as passed | pass: 481 pass, 0 fail; validate passes with the TypeScript notes main already has |
 
 <!-- panel: repos=relais adds=screen reviewers=backend,lang:typescript,tui,unix,ux-research,game-ux,codex body-sha=7fd95644684c -->
