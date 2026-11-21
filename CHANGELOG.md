@@ -47,8 +47,8 @@ missing here.
   grilling and prototype tickets with their recommendation, reopenably. At
   each wave boundary the driver merges its Handoff and ends with
   ``safe to /clear; next: `resume <repo> <slug> drive: <ids>` ``, which the
-  clear-relay acts on. "One ticket per session" now applies only to a
-  session that is not a driver.
+  clear-relay acts on. A session that is not a driver still works one
+  ticket, research fanned out excepted.
 - At the end of `relais run`, a home drift record that cannot be read is
   now named under the same `relais run: warning:` prefix as the drifts
   themselves. The line printed when no home directory resolves is split in

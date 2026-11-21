@@ -226,14 +226,15 @@ fn a_diamond_frees_both_branches_then_their_join() {
         &ticket("open", "[\"B\", \"D\"]", None, "Name of C", None),
     );
     world.write("D.md", &ticket("open", "[\"A\"]", None, "Name of D", None));
-    let decided = |ids: &[&str]| {
+    let decided = |closed: &[&str]| {
         let mut lines = String::from("- [Choose the store](A.md)\n");
-        for id in ids {
+        for id in closed {
             lines.push_str(&format!("- [Name of {id}]({id}.md)\n"));
         }
         MAP.replace("- [Choose the store](A.md)\n", &lines)
     };
 
+    assert_eq!(world.programme(&["check"]).status.code(), Some(0));
     let out = world.programme(&["frontier"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(

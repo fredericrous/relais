@@ -197,8 +197,9 @@ Resolution.
    safe to /clear; next: `<the next session's first prompt>`
    ```
 
-A single-ticket session works one ticket. Steps 4–6 are its close; a
-driver closes its tickets as the next section says.
+A single-ticket session works one ticket, except research, which may be
+fanned out. Steps 4–6 are its close; a driver closes its tickets as the
+next section says.
 
 ## Drive a programme
 
@@ -227,13 +228,16 @@ recorded verdicts are the audit record.
    `greengate slots --json`; an agent waiting on a review still holds its
    slot. Claim only that many, each with
    `relais programme claim <slug> <id> --dir <dir>`. One session may hold
-   several claims. Read each exit status:
+   several claims. Read each exit status, and its stderr, since exits 1 and
+   3 each carry more than one cause:
    - 0: start its agent.
-   - 3: another live session holds it; skip it.
-   - 1: the lock timed out; retry once, then skip it this round.
+   - 3 with `is held by` on stderr: another live session holds it; skip it.
+   - 1 with `stayed held for` on stderr: the lock timed out; retry once,
+     then skip it this round.
    - 2: no session id, or the ticket is not open; stop the loop and report
      it.
-   - any other: report the stderr line and stop.
+   - any other exit, or a 1 or 3 without those words: report the stderr
+     line and stop.
 
    Never start a ticket whose claim did not exit 0. With capacity 0 and
    ready tickets left, wait (recheck every 2 minutes, at most 30 minutes,
@@ -254,13 +258,12 @@ recorded verdicts are the audit record.
    in flight; relaunch an agent on that branch. A restarted driver takes
    over only open tickets whose `prog/` branch has no live claim, no commit
    in the last 8 hours, and no `held` line in the Handoff, and claims each
-   before relaunching; it re-claims at once the tickets the Handoff lists
-   as its own in flight.
+   before relaunching.
 6. **Wave boundary.** When nothing is in flight (every agent started has
    reported, no PR of the driver's is open) and work is left, do not start
    the next wave in this context:
    - reconcile the reports (below) and write the map's `## Handoff` (the
-     held tickets and why, and any still running) in one PR, in a
+     held tickets and why) in one PR, in a
      `worktree-task` worktree, never the main checkout;
    - merge it with `merge-when-green`, run step 1 again to name the next
      wave;
@@ -275,8 +278,9 @@ recorded verdicts are the audit record.
    The clear-relay clears and submits it; the fresh session starts this
    loop at step 0 and claims the wave again. Take the boundary every time,
    whatever the context size. When agents always overlap and no boundary
-   comes, hand off the same way once the context passes 200k tokens, with
-   the running tickets listed in the Handoff as the driver's own.
+   comes, stop starting agents once the context passes 200k tokens: the
+   ones running report, and that makes the boundary. Never hand off with an
+   agent of the driver still running.
 7. **Stop** when nothing is running and nothing ready is left, after the
    reconcile. Write the Handoff in one PR, then send **one** summary: the
    decisions agents took, the held tickets and why, the steps only the
@@ -337,4 +341,5 @@ specified, tickets past the Destination ruled out with their dependents
 updated. A new ticket within the Destination runs in this drive, at most 5
 per drive; the rest are filed and listed in the summary. Then
 `relais programme check <dir>` exits 0, and step 1 runs again. An empty
-frontier does not end the drive while fog or follow-ups are unfiled.
+frontier does not end the drive while fog or follow-ups are unfiled:
+fog that stays unresolved is held or ruled out of scope, with its reason.
