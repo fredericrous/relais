@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/budget-stop-by-cause
 repos: [relais]
 adrs: [ADR-0006, ADR-0010]
@@ -256,6 +256,14 @@ bar it started under.
 - 2026-11-21: `TYPED_GATE_BUDGET_CAUSE_FROM` is `2026-11-22T00:00:00Z` on
   the branch. The release sets it to its own instant, as the floor's
   cutoff was.
+
+## Implementation review
+
+- implementation-review (opus): approve after 4 rounds (49k, 43k, 38k, 42k). Fixed: helper names, the changelog's stop, process statics in one documented exemption, the output parameter.
+- backend (opus): approve after 3 rounds. Fixed: one clock source, a real-clock test, the tested fallback. Deliberate: the cutover is set in the release PR; no clock warning.
+- lang:rust (opus): approve after 3 rounds. Fixed: `WorkBound` enum, `Option<Mark>`, an exhaustive match, imports, saturating maths. Deliberate: `first_trial_at` stays a String; `suspended_ms` stays u64 ms.
+- unix (opus): approve after 2 rounds. Fixed: the changelog names `outcome=`. Answered with a measurement: darwin `CLOCK_MONOTONIC` counts sleep (5,253 s ahead of `CLOCK_UPTIME_RAW`).
+- tui (opus): approve after 2 rounds. Fixed: next steps on the work-budget line. Deliberate: minutes there, seconds on the repair-floor line.
 
 ## Verification
 
