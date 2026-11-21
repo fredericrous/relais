@@ -55,6 +55,8 @@ struct Fixture {
     /// this process, one source per fixture so two fixtures never
     /// share a sequence.
     ids: crate::ids::IdSource,
+    /// A scratch home, `dir/home`: no test run reads the real one.
+    home: crate::homeprint::HomeWatch,
     /// Where `execute_presented` runs; `Isolated` unless a test says so.
     workspace: crate::workspace::reuse::Workspace,
 }
@@ -88,6 +90,7 @@ impl Fixture {
         std::fs::create_dir_all(&artifacts).expect("mkdir");
         let ledger = Ledger::open_with_clock(&dir.join("ledger.sqlite"), clock).expect("ledger");
         Self {
+            home: crate::homeprint::HomeWatch::fixed(dir.join("home")),
             dir,
             repo,
             artifacts,
@@ -240,11 +243,7 @@ impl Fixture {
             },
         );
         MachineSettings {
-            // A scratch home: no test run reads the real one.
-            fingerprint: crate::policy::FingerprintSettings {
-                home_override: Some(self.dir.join("home")),
-                ..Default::default()
-            },
+            fingerprint: Default::default(),
             holdouts: Default::default(),
             workspace: Default::default(),
             resources: crate::policy::ResourceSettings {
@@ -316,6 +315,7 @@ impl Fixture {
             machine: &machine,
             ledger: &self.ledger,
             ids: &self.ids,
+            home: &self.home,
             backend,
             git: &crate::workspace::SystemGit,
             hooks: &crate::verify::FixedInventory(None),
@@ -372,6 +372,7 @@ impl Fixture {
             machine: &machine,
             ledger: &self.ledger,
             ids: &self.ids,
+            home: &self.home,
             backend,
             git: &crate::workspace::SystemGit,
             hooks: &crate::verify::FixedInventory(None),
@@ -410,6 +411,7 @@ impl Fixture {
             machine: &machine,
             ledger: &self.ledger,
             ids: &self.ids,
+            home: &self.home,
             backend,
             git: &crate::workspace::SystemGit,
             hooks: &crate::verify::FixedInventory(None),
@@ -447,6 +449,7 @@ impl Fixture {
             machine: &machine,
             ledger: &self.ledger,
             ids: &self.ids,
+            home: &self.home,
             backend,
             git: &crate::workspace::SystemGit,
             hooks: &crate::verify::FixedInventory(None),
@@ -504,6 +507,7 @@ impl Fixture {
             machine,
             ledger: &self.ledger,
             ids: &self.ids,
+            home: &self.home,
             backend,
             git: &crate::workspace::SystemGit,
             hooks: &crate::verify::FixedInventory(None),
@@ -548,6 +552,7 @@ impl Fixture {
             machine: &machine,
             ledger: &self.ledger,
             ids: &self.ids,
+            home: &self.home,
             backend,
             git: &crate::workspace::SystemGit,
             hooks: &crate::verify::FixedInventory(None),
@@ -611,6 +616,7 @@ impl Fixture {
             machine,
             ledger: &self.ledger,
             ids: &self.ids,
+            home: &self.home,
             backend,
             git: &crate::workspace::SystemGit,
             hooks: &crate::verify::FixedInventory(None),
@@ -914,6 +920,7 @@ fn a_driver_whose_run_was_ended_elsewhere_stops_without_writing() {
         machine: &machine,
         ledger: &fixture.ledger,
         ids: &fixture.ids,
+        home: &fixture.home,
         backend: &backend,
         git: &crate::workspace::SystemGit,
         hooks: &crate::verify::FixedInventory(None),
@@ -2098,6 +2105,7 @@ fn an_unreadable_working_tree_blocks_like_a_dirty_one() {
         machine: &machine,
         ledger: &fixture.ledger,
         ids: &fixture.ids,
+        home: &fixture.home,
         backend: &backend,
         git: &crate::workspace::SystemGit,
         hooks: &crate::verify::FixedInventory(None),
@@ -8046,6 +8054,7 @@ fn guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_g
         machine: &machine,
         ledger: &fixture.ledger,
         ids: &fixture.ids,
+        home: &fixture.home,
         backend: &backend,
         git: &crate::workspace::SystemGit,
         hooks: &crate::verify::FixedInventory(None),

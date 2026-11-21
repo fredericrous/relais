@@ -880,6 +880,7 @@ fn ended_on(fixture: &Fixture, exhausted: Exhausted) -> RunOutcome {
         machine: &machine,
         ledger: &fixture.ledger,
         ids: &fixture.ids,
+        home: &fixture.home,
         backend: &backend,
         git: &crate::workspace::SystemGit,
         hooks: &crate::verify::FixedInventory(None),

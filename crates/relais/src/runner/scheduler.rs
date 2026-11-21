@@ -782,6 +782,7 @@ fn run_package(
     let child_config = RunConfig {
         workspace: crate::workspace::reuse::Workspace::Isolated,
         ids: engine.config.ids,
+        home: engine.config.home,
         repo_dir: engine.config.repo_dir,
         contract: &child_contract,
         repo_policy: engine.config.repo_policy,

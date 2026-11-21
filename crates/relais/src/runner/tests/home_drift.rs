@@ -12,9 +12,7 @@ fn machine_with_home(fixture: &Fixture, repo: &RepoPolicy) -> (MachineSettings, 
     let home = fixture.dir.join("home");
     std::fs::create_dir_all(&home).expect("mkdir");
     std::fs::write(home.join(".gitconfig"), "[user]\nname = before\n").expect("write");
-    let mut machine = fixture.machine_for(repo);
-    machine.fingerprint.home_override = Some(home.clone());
-    (machine, home)
+    (fixture.machine_for(repo), home)
 }
 
 /// A worker that deletes `src/main.rs`, as the contract asks, and writes

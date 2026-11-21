@@ -382,6 +382,7 @@ fn run_to_the_end(fill: &Fill, run_id: Option<RunId>) -> Result<RunOutcome, RunE
         machine: &machine,
         ledger: &fixture.ledger,
         ids: &fixture.ids,
+        home: &fixture.home,
         backend: &backend,
         git: &crate::workspace::SystemGit,
         hooks: &crate::verify::FixedInventory(None),

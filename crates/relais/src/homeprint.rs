@@ -50,6 +50,37 @@ pub enum RepoConfig {
     Unresolved(PathBuf),
 }
 
+/// A variable lookup, by name.
+pub type EnvLookup = Box<dyn Fn(&str) -> Option<OsString> + Send + Sync>;
+
+/// The home directory and the variable lookup the run engine watches,
+/// built once at the CLI root and carried on `RunConfig`.
+pub struct HomeWatch {
+    /// `None` when no home directory could be resolved.
+    pub home: Option<PathBuf>,
+    pub env: EnvLookup,
+}
+
+impl HomeWatch {
+    /// The process's own home and environment.
+    pub fn from_process() -> Self {
+        Self {
+            home: crate::paths::resolve_home(|name| std::env::var_os(name)).ok(),
+            env: Box::new(|name| std::env::var_os(name)),
+        }
+    }
+
+    /// A fixed home: `HOME` answers with it and every other variable is
+    /// unset, so a test reads nothing from the process.
+    pub fn fixed(home: PathBuf) -> Self {
+        let answer = home.clone().into_os_string();
+        Self {
+            home: Some(home),
+            env: Box::new(move |name| (name == "HOME").then(|| answer.clone())),
+        }
+    }
+}
+
 /// Everything that decides which files are watched. Taken as values, so a
 /// test never sets a process-wide variable.
 pub struct Watch<'a> {

@@ -1157,6 +1157,7 @@ fn execute_predicted(
         machine: &machine,
         ledger: &fixture.ledger,
         ids: &fixture.ids,
+        home: &fixture.home,
         backend,
         git: &crate::workspace::SystemGit,
         hooks: &crate::verify::FixedInventory(None),
