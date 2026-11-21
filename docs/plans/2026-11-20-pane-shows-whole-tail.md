@@ -123,8 +123,9 @@ view scrolled to its top, at 180 and at 100 columns.
   `claude-plugin/tests/transcript.test.ts`,
   `claude-plugin/tests/views/pane-layout.test.ts`,
   `claude-plugin/tests/views/relais-pane.test.ts`; `CHANGELOG.md`.
-- [x] Phase 2 — release (tag-release, next minor), reinstall the plugin on
-  this machine, live check in tmux: `CHANGELOG.md`.
+- [x] Phase 2 — release (tag-release, next minor) and the CLI upgrade on
+  this machine; the live check ran in tmux on the branch's plugin, and the
+  plugin reinstall is handed to the person (Your steps): `CHANGELOG.md`.
 
 ### 🧑 Your steps
 - `relais install --claude --write` — because the relais plugin refuses a plugin install from the agent; `relais doctor` (with the 0.74.0 CLI) says the installed plugin is still 0.72.0, two releases behind, since 0.73.0's was never installed here
