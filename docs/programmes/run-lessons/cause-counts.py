@@ -41,6 +41,7 @@ artifacts or fingerprint file unreadable, or the helper fails to load; 2 usage;
 """
 
 import argparse
+import contextlib
 import datetime as dt
 import importlib.util
 import json
@@ -106,10 +107,6 @@ REVIEW_RULE = ("reviewed = a dispatch_started with agent_kind reviewer in "
                "<artifacts>/<run>/events.jsonl")
 
 
-class Usage(Exception):
-    pass
-
-
 class Unreadable(Exception):
     pass
 
@@ -134,7 +131,8 @@ def classify(reason, detail_json):
                 return ["criteria_unmet"]
             return ["behavioral_failure:unclassified"]
         out = []
-        for gap in detail.get("gaps") or [None]:
+        gaps = detail.get("gaps")
+        for gap in gaps if isinstance(gaps, list) and gaps else [None]:
             text = gap if isinstance(gap, str) else ""
             hit = next((c for p, c in GAP_RULES if text.startswith(p)), None)
             out.append(hit or "verification_gap:unclassified")
@@ -162,8 +160,19 @@ def monday(when):
     return day - dt.timedelta(days=day.weekday())
 
 
+FRACTION = re.compile(r"(\.\d{6})\d+")
+
+
 def parse_ts(text):
-    return dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    """An aware UTC datetime, or None for a missing, malformed or naive value.
+    relais writes nine fractional digits; older Pythons read at most six."""
+    if not isinstance(text, str):
+        return None
+    try:
+        when = dt.datetime.fromisoformat(FRACTION.sub(r"\1", text.replace("Z", "+00:00")))
+    except ValueError:
+        return None
+    return when if when.tzinfo else None
 
 
 def window(today, weeks, include_current):
@@ -182,19 +191,19 @@ def open_ledger(path):
         con.execute("select 1 from runs limit 1")
         return con
     except sqlite3.Error as err:
-        raise Unreadable(f"cannot read the ledger {path} ({err}); try --ledger PATH")
+        raise Unreadable(f"cannot read the ledger {path} ({err}); try --ledger PATH") from err
 
 
 def reviewed(artifacts, run):
     """True, False, or None when the run has no events file."""
     path = artifacts / run / "events.jsonl"
     try:
-        with open(path, errors="replace") as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             return any(REVIEWER in line and "dispatch_started" in line for line in fh)
     except FileNotFoundError:
         return None
     except OSError as err:
-        raise Unreadable(f"cannot read {path} ({err}); try --artifacts PATH")
+        raise Unreadable(f"cannot read {path} ({err}); try --artifacts PATH") from err
 
 
 def count(con, artifacts, today, weeks, include_current):
@@ -202,10 +211,16 @@ def count(con, artifacts, today, weeks, include_current):
     mondays, current = window(today, weeks, include_current)
     keep = set(mondays)
     runs = {}
+    bad_time = []
+    con.execute("begin")  # one read snapshot for both queries
     for rid, repo, created in con.execute("select id, repo_path, created_at from runs"):
         if REPLAY in (repo or ""):
             continue
-        week = monday(parse_ts(created))
+        when = parse_ts(created)
+        if when is None:
+            bad_time.append(rid)
+            continue
+        week = monday(when)
         if week in keep:
             runs[rid] = week
     causes = {r: set() for r in runs}
@@ -218,6 +233,7 @@ def count(con, artifacts, today, weeks, include_current):
         seen[rid].add(reason)
         reasons.add(reason)
         causes[rid].update(classify(reason, detail))
+    con.execute("commit")
     sides = {}
     unknown = []
     for rid, week in runs.items():
@@ -268,6 +284,7 @@ def count(con, artifacts, today, weeks, include_current):
         "review_runs": len(review_runs),
         "unreviewed": unreviewed,
         "outside": outside,
+        "bad_time": bad_time,
         "runs": len(runs),
     }
     return rows, notes
@@ -301,26 +318,25 @@ def load_helper(path):
     return module
 
 
+NEED_HELPER = ("cause-counts: --fingerprint needs the greenbelay helper: give "
+               "`--helper PATH` or `MEASURE_FINGERPRINT=PATH` "
+               "(greenbelay's tools/measure_fingerprint.py)")
+
+
 def fingerprint(args, coverage):
     """None when recorded, else the exit code."""
     where = args.helper or os.environ.get("MEASURE_FINGERPRINT")
-    if not where:
-        print("cause-counts: --fingerprint needs the greenbelay helper: give "
-              "`--helper PATH` or `MEASURE_FINGERPRINT=PATH` "
-              "(greenbelay's tools/measure_fingerprint.py)", file=sys.stderr)
-        return 2
     try:
         helper = load_helper(pathlib.Path(where).expanduser())
-    except (OSError, ImportError, SyntaxError) as err:
+        wanted = recipe(helper, args.ledger, args.artifacts, args.weeks,
+                        args.include_current)
+    except Exception as err:  # any failure to load the helper or build its recipe
         print(f"cause-counts: cannot load the fingerprint helper {where} ({err})",
               file=sys.stderr)
         return 1
     record = helper.rebaseline if args.rebaseline else helper.check
     try:
-        outcome = record(args.fingerprint,
-                         recipe(helper, args.ledger, args.artifacts, args.weeks,
-                                args.include_current),
-                         coverage)
+        outcome = record(args.fingerprint, wanted, coverage)
     except helper.Refused as refused:
         print(refused.render(helper.accept_command()), file=sys.stderr)
         return 3
@@ -334,6 +350,10 @@ def fingerprint(args, coverage):
 
 
 def warn(notes, quiet):
+    if notes["bad_time"]:
+        print(f"warning: {len(notes['bad_time'])} runs have a missing, malformed or "
+              "naive created_at and are left out: " + " ".join(notes["bad_time"][:5]),
+              file=sys.stderr)
     if notes["unclassified"]:
         names = ", ".join(notes["unclassified_names"])
         print(f"warning: {notes['unclassified']} unclassified rows; see "
@@ -391,14 +411,16 @@ def valid_sample(cause):
 def sample(con, args, now):
     since = (now - dt.timedelta(days=args.since)).isoformat()
     out = []
+    sampled = set()
     for rid, repo, at, reason, detail in con.execute(
             "select t.run_id, r.repo_path, t.at, t.reason, t.detail_json "
             "from transitions t join runs r on r.id = t.run_id "
             "where t.at >= ? order by t.at desc", (since,)):
         if REPLAY in (repo or "") or args.sample not in classify(reason, detail):
             continue
-        if any(s["run"] == rid for s in out):  # one row per run, its latest
+        if rid in sampled:  # one row per run, its latest
             continue
+        sampled.add(rid)
         out.append({"run": rid, "repo": repo_name(repo), "at": at,
                     "reason": reason, "detail": detail or ""})
         if len(out) >= args.n:
@@ -418,8 +440,8 @@ def sample(con, args, now):
 
 def parser():
     ap = argparse.ArgumentParser(
-        prog="cause-counts.py",
-        description="Weekly relais run failures by cause (see the module docstring).")
+        prog="cause-counts.py", description=__doc__, allow_abbrev=False,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ledger", type=pathlib.Path, default=STATE / "ledger.sqlite")
     ap.add_argument("--artifacts", type=pathlib.Path,
                     help="run directories (default: runs/ beside the ledger)")
@@ -430,14 +452,15 @@ def parser():
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--no-header", action="store_true")
     ap.add_argument("-q", "--quiet", action="store_true")
-    ap.add_argument("--sample", metavar="CAUSE")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--sample", metavar="CAUSE")
     ap.add_argument("-n", type=int, default=3)
     ap.add_argument("--since", type=int, default=28, metavar="DAYS")
-    ap.add_argument("--list-causes", action="store_true")
+    mode.add_argument("--list-causes", action="store_true")
     ap.add_argument("--fingerprint", type=pathlib.Path, metavar="FILE")
     ap.add_argument("--rebaseline", action="store_true")
     ap.add_argument("--helper", metavar="PATH")
-    ap.add_argument("--self-test", action="store_true")
+    mode.add_argument("--self-test", action="store_true")
     return ap
 
 
@@ -448,6 +471,10 @@ def run(argv=None, now=None):
         return self_test()
     if args.rebaseline and args.fingerprint is None:
         ap.error("--rebaseline needs --fingerprint FILE")
+    if (args.sample or args.list_causes) and args.fingerprint is not None:
+        ap.error("--fingerprint applies to the weekly counts, not --sample or --list-causes")
+    if args.list_causes and args.json:
+        ap.error("--list-causes prints `cause class` lines; it has no --json")
     if args.weeks < 1 or args.n < 1 or args.since < 1:
         ap.error("--weeks, -n and --since take a positive number")
     if args.list_causes:
@@ -462,19 +489,23 @@ def run(argv=None, now=None):
               file=sys.stderr)
         return 2
     if args.fingerprint is not None and not (args.helper or os.environ.get("MEASURE_FINGERPRINT")):
-        fingerprint(args, {})  # prints the usage message
+        print(NEED_HELPER, file=sys.stderr)
         return 2
     args.artifacts = args.artifacts or args.ledger.parent / "runs"
     now = now or dt.datetime.now(dt.timezone.utc)
     try:
-        con = open_ledger(args.ledger)
-        if args.sample:
-            sample(con, args, now)
-            return 0
-        rows, notes = count(con, args.artifacts, now.date(), args.weeks,
-                            args.include_current)
+        with contextlib.closing(open_ledger(args.ledger)) as con:
+            if args.sample:
+                sample(con, args, now)
+                return 0
+            rows, notes = count(con, args.artifacts, now.date(), args.weeks,
+                                args.include_current)
     except Unreadable as err:
         print(f"cause-counts: {err}", file=sys.stderr)
+        return 1
+    except sqlite3.Error as err:
+        print(f"cause-counts: cannot read the ledger {args.ledger} ({err}); "
+              "try --ledger PATH", file=sys.stderr)
         return 1
     if args.fingerprint is not None:
         code = fingerprint(args, {"runs": notes["runs"], "weeks": args.weeks,
@@ -489,8 +520,6 @@ def run(argv=None, now=None):
     return 0
 
 
-# ---------------------------------------------------------------- self-test
-
 class _Failed(Exception):
     pass
 
@@ -504,17 +533,17 @@ def _eq(label, got, want, tally):
 def self_test():
     tally = [0]
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            _self_cases(pathlib.Path(tmp), tally)
+        with tempfile.TemporaryDirectory() as scratch:
+            _self_cases(pathlib.Path(scratch), tally)
     except _Failed as err:
         print(f"self-test failed: {err}", file=sys.stderr)
         return 4
-    print(f"ok: {tally[0]} assertions")
+    print(f"ok: {tally[0]} assertions", file=sys.stderr)
     return 0
 
 
-def _self_cases(tmp, tally):
-    ledger = tmp / "ledger.sqlite"
+def _self_cases(scratch_dir, tally):
+    ledger = scratch_dir / "ledger.sqlite"
     con = sqlite3.connect(ledger)
     con.executescript(
         "create table runs (id text, repo_path text, created_at text);"
@@ -548,9 +577,18 @@ def _self_cases(tmp, tally):
         "n": ("/r/x", w1, [("worker_dispatched", {}), ("verification_started", {}),
                            ("review_findings", {})]),  # no events file
         "p": ("/r/x", w1, [("scope_exceeded", {})]),  # a candidate run, no worker
+        "q": ("/r/x", w1, [("worker_dispatched", {}), ("verification_started", {}),
+                           ("review_findings", {})]),  # findings, worker-only events
+        "r": ("/r/x", "2026-11-10T09:00:00.123456789+00:00",  # nine fractional digits
+              [("worker_dispatched", {}), ("verification_started", {}),
+               ("verification_gap", {"gaps": ["verification setup did not complete"]})]),
+        "s": ("/r/x", w1, [("worker_dispatched", {}), ("verification_started", {}),
+                           ("verification_gap", {"gaps": "not a list"})]),
+        "t": ("/r/x", "2026-11-10T09:00:00", [("scope_exceeded", {})]),  # naive time
     }
     events = {"f": "reviewer", "g": "reviewer", "i": "reviewer", "b": "worker",
-              "c": "worker", "d": "worker", "e": "worker", "h": "worker"}
+              "c": "worker", "d": "worker", "e": "worker", "h": "worker",
+              "q": "worker", "r": "worker", "s": "worker"}
     for rid, (repo, created, trs) in runs.items():
         con.execute("insert into runs values (?,?,?)", (rid, repo, created))
         for reason, detail in trs:
@@ -558,7 +596,7 @@ def _self_cases(tmp, tally):
                         "values (?,?,?,?)", (rid, reason, json.dumps(detail), created))
     con.commit()
     con.close()
-    art = tmp / "runs"
+    art = scratch_dir / "runs"
     for rid, kind in events.items():
         (art / rid).mkdir(parents=True)
         (art / rid / "events.jsonl").write_text(
@@ -576,10 +614,10 @@ def _self_cases(tmp, tally):
     _eq("partial", cell("scope_exceeded", "partial", "2026-11-16"), "yes", tally)
     _eq("complete", cell("scope_exceeded", "partial"), "no", tally)
     _eq("replay excluded", cell("scope_exceeded", "runs"), 1, tally)
-    _eq("dispatched", cell("scope_exceeded", "denominator"), 10, tally)
+    _eq("dispatched", cell("scope_exceeded", "denominator"), 13, tally)
     _eq("current week", cell("scope_exceeded", "runs", "2026-11-16"), 1, tally)
     _eq("check_failed", cell("check_failed", "runs"), 1, tally)
-    _eq("verified", cell("check_failed", "denominator"), 9, tally)
+    _eq("verified", cell("check_failed", "denominator"), 12, tally)
     _eq("criteria split", cell("criteria_unmet", "runs"), 1, tally)
     _eq("unclassified", cell("behavioral_failure:unclassified", "runs"), 1, tally)
     _eq("unclassified class", cell("behavioral_failure:unclassified", "class"),
@@ -590,17 +628,22 @@ def _self_cases(tmp, tally):
     _eq("reviewed (skipped review out)", cell("review_findings", "denominator"), 3, tally)
     _eq("review rate", cell("review_findings", "rate"), round(2 / 3, 4), tally)
     _eq("infra", cell("blocked_preflight", "runs"), 1, tally)
-    _eq("created", cell("blocked_preflight", "denominator"), 12, tally)
+    _eq("created", cell("blocked_preflight", "denominator"), 15, tally)
     _eq("unlisted", cell("repair_exhausted:unlisted", "runs"), 1, tally)
     _eq("unlisted class", cell("repair_exhausted:unlisted", "class"), "unlisted", tally)
     _eq("zero denominator", cell("scope_exceeded", "rate", "2026-10-19"), None, tally)
     _eq("zero-row reasons", "same_failure_recurrence" in notes["zero"], True, tally)
     _eq("zero-row mapped only", "worker_dispatched" in notes["zero"], False, tally)
     _eq("review unknown", notes["unknown"], ["n"], tally)
-    _eq("review check", notes["unreviewed"], [], tally)
+    _eq("findings without a reviewer dispatch", notes["unreviewed"], ["q"], tally)
+    _eq("setup_incomplete", cell("setup_incomplete", "runs"), 1, tally)
+    _eq("nine-digit fraction kept", cell("setup_incomplete", "denominator"), 12, tally)
+    _eq("gaps not a list: one row", cell("verification_gap:unclassified", "runs"), 1, tally)
+    _eq("naive created_at left out", notes["bad_time"], ["t"], tally)
     _eq("outside its stage", notes["outside"].get("scope_exceeded"), ["p"], tally)
-    _eq("outside: review unknown", notes["outside"].get("review_findings"), ["n"], tally)
-    _eq("unreviewed skips unknown", notes["review_runs"], 3, tally)
+    _eq("outside: not reviewed", sorted(notes["outside"].get("review_findings")),
+        ["n", "q"], tally)
+    _eq("review runs (unknown n not unreviewed)", notes["review_runs"], 4, tally)
     _eq("guidance list", [c for c, k, _ in CAUSES if k == "guidance"],
         ["scope_exceeded", "check_failed", "criteria_unmet", "criterion_unreported",
          "same_failure_recurrence", "review_findings"], tally)
@@ -616,9 +659,11 @@ def main():
     except BrokenPipeError:
         try:
             os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        except OSError:
+        except OSError:  # stdout is already gone; nothing is left to tell
             pass
         return 0
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == "__main__":
