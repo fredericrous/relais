@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/pane-tail-whole
 repos: [relais]
 adrs: []
@@ -123,8 +123,11 @@ view scrolled to its top, at 180 and at 100 columns.
   `claude-plugin/tests/transcript.test.ts`,
   `claude-plugin/tests/views/pane-layout.test.ts`,
   `claude-plugin/tests/views/relais-pane.test.ts`; `CHANGELOG.md`.
-- [ ] Phase 2 — release (tag-release, next minor), reinstall the plugin on
+- [x] Phase 2 — release (tag-release, next minor), reinstall the plugin on
   this machine, live check in tmux: `CHANGELOG.md`.
+
+### 🧑 Your steps
+- `relais install --claude --write` — because the relais plugin refuses a plugin install from the agent; `relais doctor` still says the plugin is at 0.72.0
 
 ## Decision log
 - 2026-11-20 — expand is a view of its own with `[ back ]` (unbacked by UX research: SAP Fiori and ServiceTitan favour expanding in place, which a pane cannot do), scrolled by
@@ -164,6 +167,14 @@ view scrolled to its top, at 180 and at 100 columns.
 | live: tmux 180×40, `--plugin-dir claude-plugin` (2.1.329), a 150-line answer, `/clear` | the runs view ends on the answer's last line; `[ open ]` opens at the first row; arrows scroll; `[ back ]` returns | pass: `before /clear · 23:51 [ open ] [ hide ]`, `… 121 earlier rows`, ends `line 150`; the view opens on `[ back ]`, hint, `· 153 rows`, `person │ Reply with…`; ↓ moves, End shows `line 150`; Enter on `[ back ]` shows the runs view |
 | live: same at 100×30 (inline seat) | scrollable, the prompt on screen | pass: frame rows 16–25 (`bodyRows` 8), prompt on row 28; End reaches `line 150`; Esc keeps the tail view scrolled where it was |
 | `make plugin` (`claude plugin validate`, `scripts/plugin-test.sh`) | exit 0, the new tests listed as passed | pass: 481 pass, 0 fail; validate passes with the TypeScript notes main already has |
+
+## Outcome
+- 2026-11-21 — shipped in relais v0.74.0 (PR #515, release #516, tag at
+  acbd1561). The release workflow passed every job, published 6 platform
+  archives and the Homebrew tap, and `brew upgrade relais` gives
+  `relais 0.74.0` here. The live tmux checks ran on the branch, whose plugin
+  code is the release's (the release only bumps versions). The plugin
+  refresh is the person's step above, and it applies from the next session.
 
 ## Implementation review
 - implementation-review (opus): approve-with-changes → approve on the Delta; fixed: exhaustive header-button switch [blocking], exact one-row test, full-tail front-cut check, cap noted in Decision log; candidates 3 fine (store actions). 75k, 56 s.
