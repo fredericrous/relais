@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.76.0
+
 - A trial whose run ran out of budget now settles by the cause. Running
   out of attempts, or of the work budget with the host awake, is the arm's
   failure: `rejected`, counted in the typed-research streak and the
