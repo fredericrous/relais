@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/pane-tail-whole
 repos: [relais]
 adrs: []
@@ -96,7 +96,7 @@ the person scrolls with the arrow keys.
 - **Tail view.** `[ open ]` sets the pane's shown view to
   `{ kind: 'tail' }`: a top row `[ back ]` (autoFocus, a Button with `label: 'back'` for 2.1.291, as in the agent
   view) with the dim hint `  ↑↓ scroll (starts at the top) · Esc hands the keys to the prompt`, then the
-  title row `before /clear · hh:mm · N rows` and every tail row (at most `ROWS_CAP`, newest kept), not fitted to the
+  title row `before /clear · hh:mm · N rows` and every tail row (at most `ROWS_CAP`, newest kept; shipped as `MAX_TRANSCRIPT_ROWS`, see the 2026-11-21 Decision log entry), not fitted to the
   room. The engine scrolls a tree taller than the body while the pane is
   focused (`Pane.scroll`, Claude Code types). `[ back ]` returns to the
   runs view. `[ hide ]` from the runs view, or a tail hidden by any path
@@ -123,8 +123,12 @@ view scrolled to its top, at 180 and at 100 columns.
   `claude-plugin/tests/transcript.test.ts`,
   `claude-plugin/tests/views/pane-layout.test.ts`,
   `claude-plugin/tests/views/relais-pane.test.ts`; `CHANGELOG.md`.
-- [ ] Phase 2 — release (tag-release, next minor), reinstall the plugin on
-  this machine, live check in tmux: `CHANGELOG.md`.
+- [x] Phase 2 — release (tag-release, next minor) and the CLI upgrade on
+  this machine; the live check ran in tmux on the branch's plugin, and the
+  plugin reinstall is handed to the person (Your steps): `CHANGELOG.md`.
+
+### 🧑 Your steps
+- `relais install --claude --write` — because the relais plugin refuses a plugin install from the agent; `relais doctor` (with the 0.74.0 CLI) says the installed plugin is still 0.72.0, two releases behind, since 0.73.0's was never installed here
 
 ## Decision log
 - 2026-11-20 — expand is a view of its own with `[ back ]` (unbacked by UX research: SAP Fiori and ServiceTitan favour expanding in place, which a pane cannot do), scrolled by
@@ -164,6 +168,14 @@ view scrolled to its top, at 180 and at 100 columns.
 | live: tmux 180×40, `--plugin-dir claude-plugin` (2.1.329), a 150-line answer, `/clear` | the runs view ends on the answer's last line; `[ open ]` opens at the first row; arrows scroll; `[ back ]` returns | pass: `before /clear · 23:51 [ open ] [ hide ]`, `… 121 earlier rows`, ends `line 150`; the view opens on `[ back ]`, hint, `· 153 rows`, `person │ Reply with…`; ↓ moves, End shows `line 150`; Enter on `[ back ]` shows the runs view |
 | live: same at 100×30 (inline seat) | scrollable, the prompt on screen | pass: frame rows 16–25 (`bodyRows` 8), prompt on row 28; End reaches `line 150`; Esc keeps the tail view scrolled where it was |
 | `make plugin` (`claude plugin validate`, `scripts/plugin-test.sh`) | exit 0, the new tests listed as passed | pass: 481 pass, 0 fail; validate passes with the TypeScript notes main already has |
+
+## Outcome
+- 2026-11-21 — shipped in relais v0.74.0 (PR #515, release #516, tag at
+  acbd1561). The release workflow passed every job, published 6 platform
+  archives and the Homebrew tap, and `brew upgrade relais` gives
+  `relais 0.74.0` here. The live tmux checks ran on the branch, whose plugin
+  code is the release's (the release only bumps versions). The plugin
+  refresh is the person's step above, and it applies from the next session.
 
 ## Implementation review
 - implementation-review (opus): approve-with-changes → approve on the Delta; fixed: exhaustive header-button switch [blocking], exact one-row test, full-tail front-cut check, cap noted in Decision log; candidates 3 fine (store actions). 75k, 56 s.
