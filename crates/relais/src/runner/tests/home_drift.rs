@@ -38,9 +38,10 @@ fn drifts_of(fixture: &Fixture, outcome: &RunOutcome) -> Vec<Drift> {
     drifts
 }
 
-fn modified_gitconfig() -> Drift {
+/// The record for a modified `.gitconfig` under `home`: stored absolute.
+fn modified_gitconfig(home: &Path) -> Drift {
     Drift {
-        path: "~/.gitconfig".into(),
+        path: home.join(".gitconfig").display().to_string(),
         change: Change::Modified,
     }
 }
@@ -60,17 +61,10 @@ fn a_worker_writing_a_watched_home_file_leaves_a_drift_row_and_the_run_is_accept
         matches!(outcome.terminal, Terminal::Accepted(_)),
         "drift never changes the outcome: {outcome:?}"
     );
-    if cfg!(unix) {
-        assert_eq!(
-            drifts_of(&fixture, &outcome),
-            vec![Drift {
-                path: "~/.gitconfig".into(),
-                change: Change::Modified,
-            }]
-        );
-    } else {
-        assert_eq!(drifts_of(&fixture, &outcome).len(), 1);
-    }
+    assert_eq!(
+        drifts_of(&fixture, &outcome),
+        vec![modified_gitconfig(&home)]
+    );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
@@ -125,7 +119,7 @@ fn a_baseline_check_writing_a_watched_home_file_leaves_one_drift_row() {
         home.join(".gitconfig").display()
     ));
     let repo = fixture.repo_policy(vec![writes_at_the_base], 1);
-    let (machine, _home) = machine_with_home(&fixture, &repo);
+    let (machine, home) = machine_with_home(&fixture, &repo);
     let outcome = fixture.execute_with_machine(
         &fixture.contract(Review::Optional),
         &repo,
@@ -136,11 +130,10 @@ fn a_baseline_check_writing_a_watched_home_file_leaves_one_drift_row() {
         !matches!(outcome.terminal, Terminal::Accepted(_)),
         "{outcome:?}"
     );
-    if cfg!(unix) {
-        assert_eq!(drifts_of(&fixture, &outcome), vec![modified_gitconfig()]);
-    } else {
-        assert_eq!(drifts_of(&fixture, &outcome).len(), 1);
-    }
+    assert_eq!(
+        drifts_of(&fixture, &outcome),
+        vec![modified_gitconfig(&home)]
+    );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
@@ -188,11 +181,10 @@ fn a_superseded_run_still_records_the_home_drift() {
         !matches!(outcome.terminal, Terminal::Accepted(_)),
         "the reaped run is not accepted: {outcome:?}"
     );
-    if cfg!(unix) {
-        assert_eq!(drifts_of(&fixture, &outcome), vec![modified_gitconfig()]);
-    } else {
-        assert_eq!(drifts_of(&fixture, &outcome).len(), 1);
-    }
+    assert_eq!(
+        drifts_of(&fixture, &outcome),
+        vec![modified_gitconfig(&home)]
+    );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
@@ -210,7 +202,7 @@ fn the_status_report_ends_with_the_follow_up() {
     let (drifts, problems) = crate::runner::drifts_of_run(&fixture.ledger, &outcome.run_id);
     assert_eq!(problems, Vec::<String>::new());
     let heading = crate::homeprint::STATUS_HEADING;
-    let status = crate::homeprint::report(&drifts, heading);
+    let status = crate::homeprint::report(&drifts, heading, Some(&home));
     assert_eq!(status.first().map(String::as_str), Some(heading));
     assert_eq!(
         status.last().map(String::as_str),
@@ -319,7 +311,7 @@ fn a_path_unreadable_before_and_after_prints_the_not_watched_line() {
     );
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).ok(); // so the cleanup below can remove it
     let drifts = drifts_of(&fixture, &outcome);
-    let lines = crate::homeprint::report(&drifts, "heading");
+    let lines = crate::homeprint::report(&drifts, "heading", Some(&home));
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(
         lines[0].starts_with("not watched (unreadable): "),

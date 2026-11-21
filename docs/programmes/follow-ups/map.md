@@ -34,18 +34,23 @@ ticket here until it is resolved or moved into a programme of its own.
   output findings of #512 all held and are fixed: run-end problem lines
   carry `relais run: warning:`, the doc names `~\`, the no-home line is
   split under 80 columns.
+- [f06](f06-homeprint-stream-and-absolute-paths.md) (2026-11-21): the
+  home fingerprint does not read a file over 1 MiB (size, mtime and mode
+  instead, as greenbelay#306 does); it caps the read and does not stream.
+  `home_drift` records hold the absolute path, and `~/` is applied when
+  they print.
 
 ## Handoff
 
-2026-11-21, boundary 3 (f07 closed): three home drift output fixes; the
-fix and this closing note ride one PR.
+2026-11-21, boundary 4 (f06 closed): the home fingerprint caps its read
+at 1 MiB and stores absolute paths (unreleased, in `## Unreleased`).
 
-- Done: f07 (unreleased), and earlier today f05 (a refactor) and f04 (a
-  decision); relais v0.75.0 is out.
-- Next: f06 is in flight in another session (worktree
-  `relais-wt-f06-homeprint`); Measure the home fingerprint warnings (f08)
-  is due 2026-11-27; the claims hook lock tests' CI flake (f09, filed
-  when it held the v0.75.0 release gate) is ready for an agent.
+- Done: f06 and f07 (both unreleased), f05 (`HomeWatch` injected, no
+  behaviour change); earlier today f04 closed as a decision, and relais
+  v0.75.0 is out.
+- Next: Measure the home fingerprint warnings (f08) is due 2026-11-27;
+  the claims hook lock tests' CI flake (f09, filed when it held the
+  v0.75.0 release gate) is ready for an agent.
 - Lessons:
   - A relais run can wait out its whole admission budget (30 min) on a
     host at load 40+ and launch nothing; three times now. Then apply its

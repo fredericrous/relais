@@ -335,7 +335,8 @@ pub(crate) fn home_drift_lines(ledger: &Ledger, run: &RunId) -> Vec<String> {
 /// that names the command and the run.
 pub(crate) fn home_drift_warning_lines(ledger: &Ledger, run: &RunId) -> Vec<String> {
     let (drifts, problems) = relais::runner::drifts_of_run(ledger, run);
-    home_drift_warning_report(&drifts, problems, run)
+    let home = relais::homeprint::print_home();
+    home_drift_warning_report(&drifts, problems, run, home.as_deref())
 }
 
 /// What `relais run` prints on stderr: every line, a record it could not
@@ -344,6 +345,7 @@ fn home_drift_warning_report(
     drifts: &[relais::homeprint::Drift],
     problems: Vec<String>,
     run: &RunId,
+    home: Option<&std::path::Path>,
 ) -> Vec<String> {
     const PREFIX: &str = "relais run: warning: ";
     let mut lines: Vec<String> = problems
@@ -356,13 +358,15 @@ fn home_drift_warning_report(
             "{PREFIX}home files changed while {run} was active:",
             run = run.as_str()
         ),
+        home,
     ));
     lines
 }
 
 fn home_drift_report(ledger: &Ledger, run: &RunId, heading: &str) -> Vec<String> {
     let (drifts, mut lines) = relais::runner::drifts_of_run(ledger, run);
-    lines.extend(relais::homeprint::report(&drifts, heading));
+    let home = relais::homeprint::print_home();
+    lines.extend(relais::homeprint::report(&drifts, heading, home.as_deref()));
     lines
 }
 
@@ -377,10 +381,35 @@ mod home_drift_warning_tests {
             &[],
             vec!["home drift record /a/b unreadable: gone".to_string()],
             &run,
+            None,
         );
         assert_eq!(
             lines,
             vec!["relais run: warning: home drift record /a/b unreadable: gone".to_string()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stored_absolute_path_under_home_prints_with_a_tilde_at_run_end() {
+        let run = RunId::from_stored("run_x");
+        let drifts = [relais::homeprint::Drift {
+            path: "/home/u/.gitconfig".to_string(),
+            change: relais::homeprint::Change::Modified,
+        }];
+        let lines = home_drift_warning_report(
+            &drifts,
+            Vec::new(),
+            &run,
+            Some(std::path::Path::new("/home/u")),
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("~/.gitconfig")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("/home/u/")),
+            "{lines:?}"
         );
     }
 }

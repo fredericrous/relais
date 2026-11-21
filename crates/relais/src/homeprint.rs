@@ -27,6 +27,11 @@ use crate::ids::sha256_hex;
 /// directory is recorded as truncated, not walked on.
 pub const MAX_FILES_PER_DIRECTORY: usize = 500;
 
+/// A regular file over this many bytes is never read: it is recorded by
+/// its size, modification time and mode instead (greenbelay#306 chose the
+/// same), so a large file in `extra_paths` costs one `stat`, not a read.
+pub const HASH_LIMIT: u64 = 1024 * 1024;
+
 /// How long git may take to name the shared config directory.
 const GIT_WAIT: Duration = Duration::from_secs(10);
 
@@ -99,6 +104,13 @@ enum Entry {
         size: u64,
         mode: Option<u32>,
     },
+    /// A regular file over [`HASH_LIMIT`], never read. One whose
+    /// modification time cannot be read is recorded as unreadable.
+    Large {
+        modified_ns: u128,
+        size: u64,
+        mode: Option<u32>,
+    },
     Link {
         target: PathBuf,
     },
@@ -150,8 +162,9 @@ impl fmt::Display for Change {
     }
 }
 
-/// One drifted path, as stored on the run and printed. The path is
-/// already in its printed form.
+/// One drifted path, as stored on the run. The path is absolute; [`report`]
+/// shortens it to `~/…` when it prints. A record an older relais wrote
+/// already holds the `~/…` form, which prints unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Drift {
     pub path: String,
@@ -180,7 +193,19 @@ impl Drift {
 /// The lines that report `drifts`: under `heading`, one indented line per
 /// changed path and the follow-up; then one line per path that was not
 /// compared. Empty when there is nothing to say.
-pub fn report(drifts: &[Drift], heading: &str) -> Vec<String> {
+/// A path under `home` prints as `~/…` on unix; with no `home`, every
+/// path prints as stored.
+pub fn report(drifts: &[Drift], heading: &str, home: Option<&Path>) -> Vec<String> {
+    let drifts: Vec<Drift> = drifts
+        .iter()
+        .map(|drift| Drift {
+            path: home.map_or_else(
+                || drift.path.clone(),
+                |home| shown(Path::new(&drift.path), home),
+            ),
+            change: drift.change,
+        })
+        .collect();
     let changed: Vec<&Drift> = drifts
         .iter()
         .filter(|drift| drift.notice_line().is_none())
@@ -218,6 +243,12 @@ pub fn expand_extra_paths(paths: &[PathBuf], home: &Path) -> Vec<PathBuf> {
             _ => path.clone(),
         })
         .collect()
+}
+
+/// The home directory paths print relative to: the process's `HOME`
+/// (else `USERPROFILE`); `None` when neither is set.
+pub fn print_home() -> Option<PathBuf> {
+    crate::paths::resolve_home(|name| std::env::var_os(name)).ok()
 }
 
 /// How a path is printed: `~/…` under home on unix, absolute otherwise.
@@ -327,6 +358,20 @@ fn entry_of(path: &Path, read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) -> Option<
     if !metadata.is_file() {
         return None;
     }
+    if metadata.len() > HASH_LIMIT {
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+        return Some(match modified {
+            Some(since) => Entry::Large {
+                modified_ns: since.as_nanos(),
+                size: metadata.len(),
+                mode: mode_of(&metadata),
+            },
+            None => Entry::Unreadable,
+        });
+    }
     Some(match read(path) {
         Ok(bytes) => Entry::File {
             sha256: sha256_hex(&bytes),
@@ -426,7 +471,7 @@ pub fn snapshot(watch: &Watch<'_>, read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) 
 
 /// What changed between two snapshots, in path order. A path one side
 /// does not hold counts as absent there.
-pub fn diff(before: &Snapshot, after: &Snapshot, home: &Path) -> Vec<Drift> {
+pub fn diff(before: &Snapshot, after: &Snapshot) -> Vec<Drift> {
     let paths: BTreeSet<&PathBuf> = before.entries.keys().chain(after.entries.keys()).collect();
     let mut drifts = Vec::new();
     for path in paths {
@@ -436,15 +481,13 @@ pub fn diff(before: &Snapshot, after: &Snapshot, home: &Path) -> Vec<Drift> {
             (Entry::Unreadable, Entry::Unreadable) => Some(Change::NotWatched),
             (Entry::Unreadable, _) | (_, Entry::Unreadable) => Some(Change::Unreadable),
             (Entry::Absent, Entry::Absent) => None,
-            (Entry::Absent, Entry::File { .. } | Entry::Link { .. }) => Some(Change::Added),
-            (Entry::File { .. } | Entry::Link { .. }, Entry::Absent) => Some(Change::Removed),
-            (Entry::File { .. } | Entry::Link { .. }, Entry::File { .. } | Entry::Link { .. }) => {
-                (was != is).then_some(Change::Modified)
-            }
+            (Entry::Absent, _) => Some(Change::Added),
+            (_, Entry::Absent) => Some(Change::Removed),
+            _ => (was != is).then_some(Change::Modified),
         };
         if let Some(change) = change {
             drifts.push(Drift {
-                path: shown(path, home),
+                path: path.display().to_string(),
                 change,
             });
         }
@@ -456,7 +499,7 @@ pub fn diff(before: &Snapshot, after: &Snapshot, home: &Path) -> Vec<Drift> {
             Change::Truncated
         };
         drifts.push(Drift {
-            path: shown(path, home),
+            path: path.display().to_string(),
             change,
         });
     }
@@ -543,11 +586,11 @@ mod tests {
         std::fs::write(home.join(".gitconfig"), "[user]\n").expect("write");
         let first = snapshot(&watch(&home, &no_env, &[]), &real_read);
         let second = snapshot(&watch(&home, &no_env, &[]), &real_read);
-        assert_eq!(diff(&first, &second, &home), Vec::new());
+        assert_eq!(diff(&first, &second), Vec::new());
     }
 
     #[test]
-    fn modified_added_and_removed_files_are_named_with_a_tilde_path() {
+    fn modified_added_and_removed_files_are_stored_absolute_and_printed_with_a_tilde() {
         let home = crate::test_support::temp_dir("homeprint-changes");
         std::fs::write(home.join(".gitconfig"), "one").expect("write");
         std::fs::write(home.join(".netrc"), "machine").expect("write");
@@ -557,13 +600,26 @@ mod tests {
         std::fs::create_dir_all(home.join(".ssh")).expect("mkdir");
         std::fs::write(home.join(".ssh").join("config"), "Host *").expect("write");
         let after = snapshot(&watch(&home, &no_env, &[]), &real_read);
-        let drifts = diff(&before, &after, &home);
-        if cfg!(unix) {
-            assert_eq!(change_of(&drifts, "~/.gitconfig"), Some(Change::Modified));
-            assert_eq!(change_of(&drifts, "~/.netrc"), Some(Change::Removed));
-            assert_eq!(change_of(&drifts, "~/.ssh/config"), Some(Change::Added));
-        }
+        let drifts = diff(&before, &after);
+        let stored = |path: PathBuf| path.display().to_string();
+        assert_eq!(
+            change_of(&drifts, &stored(home.join(".gitconfig"))),
+            Some(Change::Modified)
+        );
+        assert_eq!(
+            change_of(&drifts, &stored(home.join(".netrc"))),
+            Some(Change::Removed)
+        );
+        assert_eq!(
+            change_of(&drifts, &stored(home.join(".ssh").join("config"))),
+            Some(Change::Added)
+        );
         assert_eq!(drifts.len(), 3, "{drifts:?}");
+        let lines = report(&drifts, "heading", Some(&home));
+        assert!(
+            lines.contains(&format!("  {} (modified)", shown_gitconfig(&home))),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -574,7 +630,7 @@ mod tests {
         std::fs::write(home.join(".ssh").join("known_hosts"), "host key").expect("write");
         std::fs::write(home.join(".ssh").join("known_hosts.old"), "host key").expect("write");
         let after = snapshot(&watch(&home, &no_env, &[]), &real_read);
-        assert_eq!(diff(&before, &after, &home), Vec::new());
+        assert_eq!(diff(&before, &after), Vec::new());
     }
 
     #[test]
@@ -590,11 +646,11 @@ mod tests {
         };
         let before = snapshot(&watch(&home, &no_env, &[]), &real_read);
         let after = snapshot(&watch(&home, &no_env, &[]), &failing);
-        let drifts = diff(&before, &after, &home);
+        let drifts = diff(&before, &after);
         assert_eq!(drifts.len(), 1, "{drifts:?}");
         assert_eq!(drifts[0].change, Change::Unreadable);
         assert_eq!(
-            report(&drifts, "heading"),
+            report(&drifts, "heading", Some(&home)),
             vec![
                 "heading".to_string(),
                 format!("  {} (not checked: unreadable)", shown_gitconfig(&home)),
@@ -614,7 +670,7 @@ mod tests {
         let before = snapshot(&watch(&home, &no_env, &extras), &real_read);
         std::fs::write(extra.join("nested").join("a.toml"), "b").expect("write");
         let after = snapshot(&watch(&home, &no_env, &extras), &real_read);
-        let drifts = diff(&before, &after, &home);
+        let drifts = diff(&before, &after);
         assert_eq!(drifts.len(), 1, "{drifts:?}");
         assert_eq!(drifts[0].change, Change::Modified);
     }
@@ -637,7 +693,7 @@ mod tests {
             .count();
         assert_eq!(kept, MAX_FILES_PER_DIRECTORY);
         assert!(first.truncated.contains(&home.join("many")));
-        let drifts = diff(&first, &second, &home);
+        let drifts = diff(&first, &second);
         assert_eq!(drifts.len(), 1, "{drifts:?}");
         assert_eq!(drifts[0].change, Change::NotFullyChecked);
     }
@@ -670,7 +726,7 @@ mod tests {
         let before = snapshot(&watch(&home, &no_env, &[]), &real_read);
         std::fs::write(&secret, "two").expect("write");
         let after = snapshot(&watch(&home, &no_env, &[]), &real_read);
-        assert_eq!(diff(&before, &after, &home), Vec::new());
+        assert_eq!(diff(&before, &after), Vec::new());
         assert!(matches!(
             before.entries.get(&home.join(".gitconfig")),
             Some(Entry::Link { .. })
@@ -716,13 +772,14 @@ mod tests {
     }
 
     #[test]
-    fn a_report_lists_changes_under_a_heading_then_the_follow_up() {
+    fn a_record_stored_with_a_tilde_prints_unchanged() {
+        // A record an older relais wrote holds the printed `~/…` form.
         let drifts = [Drift {
             path: "~/.gitconfig".into(),
             change: Change::Modified,
         }];
         assert_eq!(
-            report(&drifts, "home files changed:"),
+            report(&drifts, "home files changed:", Some(Path::new("/h"))),
             vec![
                 "home files changed:".to_string(),
                 "  ~/.gitconfig (modified)".to_string(),
@@ -745,10 +802,10 @@ mod tests {
         };
         let before = snapshot(&watch(&home, &no_env, &[]), &failing);
         let after = snapshot(&watch(&home, &no_env, &[]), &failing);
-        let drifts = diff(&before, &after, &home);
+        let drifts = diff(&before, &after);
         assert_eq!(drifts.len(), 1, "{drifts:?}");
         assert_eq!(drifts[0].change, Change::NotWatched);
-        let lines = report(&drifts, "heading");
+        let lines = report(&drifts, "heading", Some(&home));
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
             lines[0].starts_with("not watched (unreadable): "),
@@ -764,13 +821,94 @@ mod tests {
             entries: BTreeMap::new(),
             truncated: BTreeSet::from([home.join("many")]),
         };
-        let drifts = diff(&cut, &cut, &home);
+        let drifts = diff(&cut, &cut);
         assert_eq!(
-            report(&drifts, "heading"),
+            report(&drifts, "heading", Some(&home)),
             vec![format!(
                 "not fully checked: {} (more than {MAX_FILES_PER_DIRECTORY} files)",
                 shown(&home.join("many"), &home)
             )]
+        );
+    }
+
+    #[test]
+    fn with_no_home_a_report_prints_the_stored_path() {
+        let stored = absolute_tool_path()
+            .join(".gitconfig")
+            .display()
+            .to_string();
+        let drifts = [Drift {
+            path: stored.clone(),
+            change: Change::Modified,
+        }];
+        assert_eq!(
+            report(&drifts, "heading", None)[1],
+            format!("  {stored} (modified)")
+        );
+    }
+
+    #[test]
+    fn a_file_over_the_hash_limit_is_never_read_and_its_change_still_shows() {
+        let home = crate::test_support::temp_dir("homeprint-large");
+        let extra = home.join("tool");
+        std::fs::create_dir_all(&extra).expect("mkdir");
+        let big = extra.join("big.bin");
+        let size = usize::try_from(HASH_LIMIT).expect("fits") + 1;
+        std::fs::write(&big, vec![b'a'; size]).expect("write");
+        std::fs::write(extra.join("small"), "x").expect("write");
+        let refusing = |path: &Path| -> io::Result<Vec<u8>> {
+            assert!(!path.ends_with("big.bin"), "a large file was read");
+            std::fs::read(path)
+        };
+        let extras = [extra.clone()];
+        let before = snapshot(&watch(&home, &no_env, &extras), &refusing);
+        assert!(matches!(
+            before.entries.get(&big),
+            Some(Entry::Large { size: s, .. }) if *s == HASH_LIMIT + 1
+        ));
+        assert!(matches!(
+            before.entries.get(&extra.join("small")),
+            Some(Entry::File { .. })
+        ));
+        std::fs::write(&big, vec![b'b'; size + 1]).expect("rewrite");
+        let after = snapshot(&watch(&home, &no_env, &extras), &refusing);
+        assert_eq!(
+            diff(&before, &after),
+            vec![Drift {
+                path: big.display().to_string(),
+                change: Change::Modified,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_large_file_touched_with_the_same_content_shows_as_modified() {
+        let home = crate::test_support::temp_dir("homeprint-large-touch");
+        let extra = home.join("tool");
+        std::fs::create_dir_all(&extra).expect("mkdir");
+        let big = extra.join("big.bin");
+        let size = usize::try_from(HASH_LIMIT).expect("fits") + 1;
+        std::fs::write(&big, vec![b'a'; size]).expect("write");
+        let extras = [extra.clone()];
+        let before = snapshot(&watch(&home, &no_env, &extras), &real_read);
+        let later = std::fs::metadata(&big)
+            .expect("stat")
+            .modified()
+            .expect("mtime")
+            + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&big)
+            .expect("open")
+            .set_modified(later)
+            .expect("touch");
+        let after = snapshot(&watch(&home, &no_env, &extras), &real_read);
+        assert_eq!(
+            diff(&before, &after),
+            vec![Drift {
+                path: big.display().to_string(),
+                change: Change::Modified,
+            }]
         );
     }
 
