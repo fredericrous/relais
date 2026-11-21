@@ -8,6 +8,11 @@ missing here.
 
 ## Unreleased
 
+- At the end of `relais run`, a home drift record that cannot be read is
+  now named under the same `relais run: warning:` prefix as the drifts
+  themselves. The line printed when no home directory resolves is split in
+  two, the problem then the fix, each under 80 columns.
+
 ## v0.75.0
 
 - `relais decide <run> approve` on a run that stopped `needs_review` for

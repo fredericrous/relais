@@ -1,7 +1,7 @@
 +++
 type = "task"
 mode = "afk"
-status = "open"
+status = "closed"
 blocked_by = []
 repos = ["relais"]
 +++
@@ -18,3 +18,16 @@ Do the three low output findings carried from #512 still hold, and are they wort
 ## Answer looks like
 
 One small PR fixing each that still holds, or a line per finding saying why it stays.
+
+## Resolution
+
+2026-11-21: all three held, all three fixed in one PR.
+
+- `relais run` stderr: a record `drifts_of_run` cannot read now prints as
+  `relais run: warning: home drift record … unreadable: …`, the prefix
+  of the heading under it; a unit test pins it. `status` and `explain`
+  (stdout) keep the bare line, as their own report does.
+- `is_valid_extra_path` doc names `~\` on Windows, as the code accepts it.
+- The no-home line (128 columns) is two lines of 71 and 70: the problem,
+  then the fix. Deliberate on #512 because it is rare, but splitting it
+  costs nothing.

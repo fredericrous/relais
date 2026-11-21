@@ -30,17 +30,21 @@ ticket here until it is resolved or moved into a programme of its own.
 - [f05](f05-homewatch-injected.md) (2026-11-21): the engine gets its
   home as a `HomeWatch` on `RunConfig`, built at the CLI root;
   `home_override` is removed.
+- [f07](f07-home-drift-output-lows.md) (2026-11-21): the three low
+  output findings of #512 all held and are fixed: run-end problem lines
+  carry `relais run: warning:`, the doc names `~\`, the no-home line is
+  split under 80 columns.
 
 ## Handoff
 
-2026-11-21, boundary 3 (f05 closed): `HomeWatch` injected into the
-engine; the refactor and this closing note ride one PR.
+2026-11-21, boundary 3 (f07 closed): three home drift output fixes; the
+fix and this closing note ride one PR.
 
-- Done: f05, a refactor with no behaviour change. Earlier today f04
-  closed as a decision, and relais v0.74.0 shipped the pane's whole
-  pre-clear tail (#515, #516, #517).
-- Next: f06 (another session held it on 2026-11-21), then f07; Measure
-  the home fingerprint warnings (f08) is due 2026-11-27.
+- Done: f07 (unreleased), and earlier today f05 (a refactor) and f04 (a
+  decision); relais v0.75.0 is out.
+- Next: f06 is in flight in another session (worktree
+  `relais-wt-f06-homeprint`); Measure the home fingerprint warnings (f08)
+  is due 2026-11-27.
 - Lessons:
   - A relais run can wait out its whole admission budget (30 min) on a
     host at load 40+ and launch nothing; three times now. Then apply its
