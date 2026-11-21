@@ -13,6 +13,10 @@ use super::{Ledger, Result};
 
 /// The `outcome_source` migration v45 marks the rows it backfilled with.
 const BACKFILL_V45_SOURCE: &str = "backfill_v45";
+/// The `outcome_source` of an outcome the plugin observed itself: the
+/// upsert's default, and the one source `router::explore` counts a
+/// question's `answered` under.
+pub const OWN_SOURCE: &str = "own";
 
 /// The most unmatched check commands a task keeps.
 pub const UNMATCHED_CHECKS_MAX: usize = 5;
@@ -670,7 +674,7 @@ impl Ledger {
                             merged.completed_at_end,
                             files,
                             now,
-                            merged.outcome_source.as_deref().unwrap_or("own"),
+                            merged.outcome_source.as_deref().unwrap_or(OWN_SOURCE),
                             checks,
                             merged.parent_task_id,
                             merged.parent_link_recorded,

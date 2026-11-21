@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use super::outcome::TaskOutcome;
 pub use crate::ledger::ExplorationTask;
+use crate::ledger::OWN_SOURCE;
 
 /// Drawn tasks with a strong outcome the stop rule waits for, and the
 /// count a stratum must reach before the learner may use it (Phase 8).
@@ -24,6 +25,9 @@ pub const STOP_MARGIN: f64 = 0.15;
 /// report. Version 1: every outcome but `unknown` and `answered` is strong.
 /// Version 2: also a question task's own `answered` (`outcome_source` is
 /// `own`, never a backfilled or parent-derived one), as a positive.
+// holds-until: the first stop row written under policy 2, or a rollback to
+// a v1 binary; then `router_exploration_stops` gains `label_policy_version`,
+// with no default for existing rows, and the stop dedup keys on it.
 pub const ROUTER_LABEL_POLICY_VERSION: u32 = 2;
 
 /// The difficulty band a stratum is keyed by.
@@ -41,7 +45,7 @@ fn strong(task: &ExplorationTask) -> Option<TaskOutcome> {
     let outcome = TaskOutcome::parse(&task.outcome)?;
     let own_answered_question = outcome == TaskOutcome::Answered
         && task.kind == "question"
-        && task.outcome_source.as_deref() == Some("own");
+        && task.outcome_source.as_deref() == Some(OWN_SOURCE);
     (outcome.is_strong() || own_answered_question).then_some(outcome)
 }
 
@@ -363,13 +367,13 @@ mod tests {
     }
 
     #[test]
-    fn an_answered_edit_is_no_evidence() {
-        assert!(strata(&[answered(true, "edit", "own")]).is_empty());
+    fn a_parent_derived_answered_question_is_no_evidence() {
+        assert!(strata(&[answered(true, "question", "parent")]).is_empty());
     }
 
     #[test]
-    fn the_router_label_policy_is_version_two() {
-        assert_eq!(ROUTER_LABEL_POLICY_VERSION, 2);
+    fn an_answered_edit_is_no_evidence() {
+        assert!(strata(&[answered(true, "edit", "own")]).is_empty());
     }
 
     #[test]

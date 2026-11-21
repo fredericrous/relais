@@ -309,6 +309,9 @@ pub fn session_routing(
             let mut priced_completed = 0usize;
             let mut excluded_sessions = 0usize;
             let mut unpriced_models: BTreeSet<String> = BTreeSet::new();
+            // holds-until: a window of about 10,000 sessions; the loop rescans
+            // `window.usage` and `tasks` once per session, then group them by
+            // session first.
             for session in &sessions {
                 let (session_cost, session_unpriced) = total(
                     window
@@ -511,23 +514,15 @@ impl SessionRoutingReport {
             };
             let excluded = arm.excluded_sessions > 0;
             let figure = match (arm.cost_per_completed_task, arm.cost) {
+                // No session prices: the models follow, one per line, never cut.
                 (_, None) => {
-                    let unknown = unknown_cost(&arm.unpriced_models);
-                    let line = format!("cost per completed task {unknown}");
-                    if 4 + line.chars().count() <= LINE_COLUMNS {
-                        line
-                    } else {
-                        // Model ids are never cut: the clause moves to its own line.
-                        format!(
-                            "cost per completed task unknown\n      {}",
-                            &unknown["unknown ".len()..]
-                        )
-                    }
+                    "cost per completed task unknown, no [pricing.models] entry for:".to_string()
                 }
                 (None, Some(_)) if excluded => {
-                    "cost per completed task: no completed task among priced sessions".to_string()
+                    "cost per completed task none (no completed task among priced sessions)"
+                        .to_string()
                 }
-                (None, Some(_)) => "cost per completed task: no completed task".to_string(),
+                (None, Some(_)) => "cost per completed task none (no completed task)".to_string(),
                 (Some(per_task), Some(_)) => match arm.interval {
                     Some([lo, hi]) => {
                         format!("cost per completed task {per_task} (95% interval {lo} to {hi})")
@@ -544,6 +539,8 @@ impl SessionRoutingReport {
                     "    excluded {} session(s) from cost, no [pricing.models] entry for:\n",
                     arm.excluded_sessions
                 ));
+            }
+            if excluded || arm.cost.is_none() {
                 for model in &arm.unpriced_models {
                     out.push_str(&format!("      {model}\n"));
                 }
@@ -729,7 +726,7 @@ mod tests {
         let text = report.render();
         assert!(text.contains("API-equivalent estimate"), "{text}");
         assert!(
-            text.contains("held out: 1 session(s), 1 task(s), 1 completed\n    cost per completed task unknown\n      (no [pricing.models] entry for claude-opus-5-5)\n"),
+            text.contains("held out: 1 session(s), 1 task(s), 1 completed\n    cost per completed task unknown, no [pricing.models] entry for:\n      claude-opus-5-5\n"),
             "{text}"
         );
         assert!(!text.contains("excluded 1 session(s)"), "{text}");
@@ -810,16 +807,33 @@ mod tests {
         let ids = ["gpt-6.1-sol", "qwen3.6:35b-a3b"];
         report.arms[0].excluded_sessions = 9999;
         report.arms[0].unpriced_models = ids.iter().map(|id| id.to_string()).collect();
+        // An arm no session of which prices lists the same ids under its
+        // unknown figure, one per line.
+        let long = [
+            "claude-opus-5-5-with-a-deliberately-long-alias",
+            "gpt-6.1-sol",
+        ];
+        report.arms[1].cost = None;
+        report.arms[1].cost_per_completed_task = None;
+        report.arms[1].interval = None;
+        report.arms[1].excluded_sessions = 9999;
+        report.arms[1].unpriced_models = long.iter().map(|id| id.to_string()).collect();
         let text = report.render();
         for line in text.lines() {
             assert!(line.chars().count() <= 80, "{line}");
         }
-        for id in ids {
+        for id in ids.iter().chain(long.iter()) {
             assert!(text.contains(&format!("\n      {id}\n")), "{text}");
         }
         assert!(
             text.contains(
                 "    excluded 9999 session(s) from cost, no [pricing.models] entry for:\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "    cost per completed task unknown, no [pricing.models] entry for:\n      claude-opus-5-5-with-a-deliberately-long-alias\n"
             ),
             "{text}"
         );
@@ -876,9 +890,9 @@ mod tests {
             (routed.priced_completed, routed.cost_per_completed_task),
             (0, None)
         );
-        assert!(report
-            .render()
-            .contains("    cost per completed task: no completed task among priced sessions\n"),);
+        assert!(report.render().contains(
+            "    cost per completed task none (no completed task among priced sessions)\n"
+        ));
     }
 
     /// An unknown subagent task recorded with the parent link captured.
