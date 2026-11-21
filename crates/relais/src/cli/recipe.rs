@@ -329,11 +329,12 @@ pub(crate) fn recipe_diff_command(candidate_path: &Path) -> Result<CliOutcome, C
 /// the validity floor holds ends the prefix's line before `held:` and names
 /// the command to re-run, and one a pending trial bars names that trial.
 pub(crate) fn refusal_lines(
-    command: &str,
+    command: RecipeCommand,
     rejection: &route::CandidateRejection,
     gate: &typed_gate::Assessment,
     candidate_path: &Path,
 ) -> Vec<String> {
+    let command = command.as_str();
     let prefix = format!("relais recipe {command}: candidate refused:");
     let route::CandidateRejection::TypedResearchGate {
         name,
@@ -375,8 +376,31 @@ fn shell_word(word: &str) -> String {
     }
 }
 
+/// The two commands that read the typed-research gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecipeCommand {
+    Evaluate,
+    Promote,
+}
+
+impl RecipeCommand {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Evaluate => "evaluate",
+            Self::Promote => "promote",
+        }
+    }
+
+    fn context(self) -> &'static str {
+        match self {
+            Self::Evaluate => "recipe evaluate",
+            Self::Promote => "recipe promote",
+        }
+    }
+}
+
 /// A candidate the typed-research gate and the admission door refused: the
-/// stderr lines to print and the exit, always `Blocked`.
+/// stderr lines to print and the exit the command returns (`Blocked`).
 pub(crate) struct GateRefusal {
     pub(crate) lines: Vec<String>,
     pub(crate) outcome: CliOutcome,
@@ -387,7 +411,7 @@ pub(crate) struct GateRefusal {
 /// promote` both run it first: the admitted candidate with the gate's
 /// assessment, or the refusal.
 pub(crate) fn gated_candidate(
-    command: &str,
+    command: RecipeCommand,
     ledger: &relais::ledger::Ledger,
     incumbent: &RepoPolicy,
     candidate_policy: &RepoPolicy,
@@ -396,11 +420,7 @@ pub(crate) fn gated_candidate(
 ) -> Result<Result<(route::CandidateRecipe, typed_gate::Assessment), GateRefusal>, CliError> {
     let gate = operational(
         typed_gate::assess(ledger, incumbent, candidate_policy),
-        if command == "promote" {
-            "recipe promote"
-        } else {
-            "recipe evaluate"
-        },
+        command.context(),
     )?;
     Ok(
         match route::validate_candidate(
@@ -437,7 +457,7 @@ pub(crate) fn recipe_evaluate_command(candidate_path: &Path) -> Result<CliOutcom
     let bounds = tuning_bounds(&incumbent);
     let ledger = open_ledger()?;
     let (candidate, _assessment) = match gated_candidate(
-        "evaluate",
+        RecipeCommand::Evaluate,
         &ledger,
         &incumbent,
         &candidate_policy,
@@ -590,7 +610,7 @@ pub(crate) fn recipe_promote_command(
     // count, and the generic gates below cannot stand in for it.
     let ledger = open_ledger()?;
     let (candidate, gate) = match gated_candidate(
-        "promote",
+        RecipeCommand::Promote,
         &ledger,
         &incumbent,
         &candidate_policy,
@@ -778,7 +798,7 @@ tier = "research"
                 .expect("settle");
         }
         let refused = gated_candidate(
-            "evaluate",
+            RecipeCommand::Evaluate,
             &ledger,
             &incumbent,
             &candidate,
@@ -790,6 +810,7 @@ tier = "research"
             panic!("held is refused");
         };
         assert_eq!(refused.outcome, CliOutcome::Blocked);
+        assert_eq!(super::super::outcome::exit_code(&refused.outcome), 3);
         assert_eq!(
             refused.lines,
             [
@@ -815,7 +836,7 @@ tier = "research"
             },
         );
         let lines = refusal_lines(
-            "evaluate",
+            RecipeCommand::Evaluate,
             &held,
             &typed_gate::Assessment::default(),
             Path::new("cand.toml"),
@@ -830,7 +851,7 @@ tier = "research"
         );
         assert!(lines.iter().all(|line| line.chars().count() <= 80));
         let quoted = refusal_lines(
-            "evaluate",
+            RecipeCommand::Evaluate,
             &held,
             &typed_gate::Assessment::default(),
             Path::new("my dir/it's.toml"),
@@ -842,7 +863,7 @@ tier = "research"
 
         // 11 of 19, floored to 57%, needs 21.
         let lines = refusal_lines(
-            "promote",
+            RecipeCommand::Promote,
             &gate_refusal(
                 15,
                 14,
@@ -869,7 +890,7 @@ tier = "research"
             },
         );
         let lines = refusal_lines(
-            "evaluate",
+            RecipeCommand::Evaluate,
             &gate_refusal(11, 11, route::ValidityFloor::NotApplied),
             &gate,
             Path::new("c.toml"),

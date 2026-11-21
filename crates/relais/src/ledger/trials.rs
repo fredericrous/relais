@@ -289,15 +289,6 @@ pub struct NewTrial<'a> {
 /// `insert_replay_trial` itself, because a replay is one deliberate
 /// re-run rather than a draw, and a caller that could name them could
 /// describe a sampled comparison that never happened.
-/// What a trial settled to: [`Ledger::settle_trial`]'s figures, together.
-#[derive(Debug, Clone, Copy)]
-pub struct TrialSettlement {
-    pub outcome: TrialOutcome,
-    pub accepted_without_escalation: bool,
-    pub cost: TrialCost,
-    pub duration_ms: i64,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct NewReplayTrial<'a> {
     pub trial_id: &'a TrialId,
@@ -313,6 +304,15 @@ pub struct NewReplayTrial<'a> {
     pub arm_run_id: &'a RunId,
     /// SHA-256 of the design `dataset replay --design` handed the arm.
     pub design_sha256: Option<&'a str>,
+}
+
+/// What a trial settled to: [`Ledger::settle_trial`]'s figures, together.
+#[derive(Debug, Clone, Copy)]
+pub struct TrialSettlement {
+    pub outcome: TrialOutcome,
+    pub accepted_without_escalation: bool,
+    pub cost: TrialCost,
+    pub duration_ms: i64,
 }
 
 /// What recording a recipe promotion's provenance needs.
@@ -1221,6 +1221,54 @@ mod tests {
             assert!(matches!(error, LedgerError::Corrupt { .. }), "{error:?}");
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A replay's trial is written already settled, in one write; the same
+    /// trial written twice is refused and leaves the first row as it was.
+    #[test]
+    fn a_settled_replay_trial_is_written_once_and_never_pending() {
+        let (ledger, dir) = temp_ledger();
+        let source_task = TaskId::from_stored("task-s");
+        let source_run = run("run-s");
+        ledger
+            .insert_run(&source_run, "/repo", None, &source_task, "rk")
+            .expect("run");
+        let trial_id = TrialId::from_stored("trial-s");
+        let arm_run = run("arm-s");
+        let replay = NewReplayTrial {
+            trial_id: &trial_id,
+            task_id: &source_task,
+            source_run_id: &source_run,
+            incumbent_recipe_id: "incumbent",
+            arm_recipe_id: "arm",
+            base_sha: "base",
+            contract_hash: "contract",
+            verification_profile_hash: "profile",
+            workspace_isolation: "fresh_checkout_no_accepted_answer",
+            arm_run_id: &arm_run,
+            design_sha256: None,
+        };
+        let errored = TrialSettlement {
+            outcome: TrialOutcome::Errored,
+            accepted_without_escalation: false,
+            cost: TrialCost::UNKNOWN,
+            duration_ms: 7,
+        };
+        ledger
+            .insert_settled_replay_trial(&replay, &errored)
+            .expect("written");
+        let accepted = TrialSettlement {
+            outcome: TrialOutcome::Accepted,
+            ..errored
+        };
+        ledger
+            .insert_settled_replay_trial(&replay, &accepted)
+            .expect_err("the same trial is refused");
+        let rows = ledger.trials_by_task(&source_task).expect("rows");
+        assert_eq!(rows.len(), 1, "no second row");
+        assert_eq!(rows[0].outcome, Some(TrialOutcome::Errored));
+        assert_eq!(rows[0].duration_ms, Some(7));
+        std::fs::remove_dir_all(&dir).ok(); // a temp dir left behind is harmless
     }
 
     /// The gate's reader returns a pending trial beside settled ones, and a

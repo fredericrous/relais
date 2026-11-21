@@ -786,7 +786,10 @@ fn record_errored_replay_trial(
         Err(cause) => {
             // The trial is still the arm's errored result; only its figures
             // are lost, and an unknown cost never reads as free.
-            eprintln!("relais dataset replay: the errored trial's cost is unknown: {cause}");
+            eprintln!(
+                "relais dataset replay: the errored trial's cost is unknown: {cause}; \
+                 the trial is recorded as errored"
+            );
             (relais::ledger::TrialCost::UNKNOWN, 0)
         }
     };
