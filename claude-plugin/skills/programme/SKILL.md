@@ -197,4 +197,144 @@ Resolution.
    safe to /clear; next: `<the next session's first prompt>`
    ```
 
-One ticket per session, except research, which may be fanned out.
+A single-ticket session works one ticket. Steps 4–6 are its close; a
+driver closes its tickets as the next section says.
+
+## Drive a programme
+
+Once the person approves a programme, that approval covers its tickets: no
+ticket plan is approved again, and no `next:` prompt waits for the person
+(ADR-0080). One **driver** session runs the map: it claims, starts one agent
+per ready ticket, closes what they report, and clears itself between waves.
+The panel and the implementation review still run on every ticket; their
+recorded verdicts are the audit record.
+
+### The loop
+
+0. **Check the source.** Run `relais programme list --json`. The map's
+   `source` must be a ref, not `working-tree`: a checkout with local
+   programme work ignores the closures on origin. Otherwise stop with one
+   line, `cannot drive <map dir>: local programme work in <checkout>; land
+   or push it, then drive again`.
+1. **Read the frontier.** Run `relais programme frontier <dir> --json`,
+   without `--no-fetch`, and parse stdout only (`[]` is nothing ready).
+   Keep the open tickets with every `blocked_by` closed, no `prog/` branch
+   and no live claim. Skip a ticket whose `due` is after today (compare the
+   date; `overdue: false` does not tell today from later), and one the
+   map's `## Handoff` lists as held.
+2. **Claim what can start now.** Capacity is 3 minus this driver's
+   unfinished ticket agents, capped by the free slots in
+   `greengate slots --json`; an agent waiting on a review still holds its
+   slot. Claim only that many, each with
+   `relais programme claim <slug> <id> --dir <dir>`. One session may hold
+   several claims. Read each exit status:
+   - 0: start its agent.
+   - 3: another live session holds it; skip it.
+   - 1: the lock timed out; retry once, then skip it this round.
+   - 2: no session id, or the ticket is not open; stop the loop and report
+     it.
+   - any other: report the stderr line and stop.
+
+   Never start a ticket whose claim did not exit 0. With capacity 0 and
+   ready tickets left, wait (recheck every 2 minutes, at most 30 minutes,
+   printing `waiting: <n> ready, 0 slots free`), then report: no capacity
+   is not the end of the programme.
+3. **Start the agents** in one message: one background `general-purpose`
+   agent per claimed ticket, never a fork (a fork carries the driver's
+   whole context and inherits its plan mode). Its brief is the ticket file,
+   the map's Destination, the ticket protocol below, and the driver's
+   session id for `relais programme claim`. Never enter plan mode while a
+   drive runs: a running agent inherits it and stops.
+4. **Report and refill.** Print one status line, never a question, at each
+   change: `<ticket name>: started | closed <PR> | held: <reason>`. When an
+   agent reports, close it as its type says, run step 1 again and start
+   what became ready. A ticket never waits for a slower sibling: each
+   closure frees its own dependents.
+5. **Resume.** A ticket whose agent died keeps its `prog/` branch and reads
+   in flight; relaunch an agent on that branch. A restarted driver takes
+   over only open tickets whose `prog/` branch has no live claim, no commit
+   in the last 8 hours, and no `held` line in the Handoff, and claims each
+   before relaunching; it re-claims at once the tickets the Handoff lists
+   as its own in flight.
+6. **Wave boundary.** When nothing is in flight (every agent started has
+   reported, no PR of the driver's is open) and work is left, do not start
+   the next wave in this context:
+   - reconcile the reports (below) and write the map's `## Handoff` (the
+     held tickets and why, and any still running) in one PR, in a
+     `worktree-task` worktree, never the main checkout;
+   - merge it with `merge-when-green`, run step 1 again to name the next
+     wave;
+   - when the session started less than 2 minutes ago, wait until it is
+     2 minutes old: the clear-relay does not fire twice within 120 s;
+   - end the answer with the line, last:
+
+     ```
+     safe to /clear; next: `resume <repo> <slug> drive: <the next wave's ticket ids>`
+     ```
+
+   The clear-relay clears and submits it; the fresh session starts this
+   loop at step 0 and claims the wave again. Take the boundary every time,
+   whatever the context size. When agents always overlap and no boundary
+   comes, hand off the same way once the context passes 200k tokens, with
+   the running tickets listed in the Handoff as the driver's own.
+7. **Stop** when nothing is running and nothing ready is left, after the
+   reconcile. Write the Handoff in one PR, then send **one** summary: the
+   decisions agents took, the held tickets and why, the steps only the
+   person can run, the tickets waiting on a due date. Each line names the
+   ticket by its `# ` name, its file (`docs/programmes/<slug>/<id>.md`),
+   and the exact command or edit the person runs. End with exactly one
+   closing line: work left for the person → `safe to /clear; next:`; only
+   tickets not yet due → `safe to /clear; parked: next due <date>`; the
+   map done → none.
+
+### The ticket protocol
+
+What each agent does, by the ticket's type:
+
+- **research**: an inspect run; the agent returns the Resolution text. The
+  driver lands it with `status = "closed"` and the ticket's Decisions line
+  in its own PR (a `worktree-task` worktree, `merge-when-green`), then runs
+  step 1, so the dependents start in this drive.
+- **a code or config change**: the agent runs the whole `worktree-task`
+  loop itself, in its own transcript, and messages the driver only at the
+  end:
+  1. starts `worktree-task` on `prog/<slug>/<id>` and writes the plan as
+     `docs/plans/<date>-<slug>.md`, without plan mode;
+  2. runs the `plan-review` skill on that file. A `rework` that survives
+     round 2 holds the ticket;
+  3. lands the plan commit, implements, verifies, and writes the ticket's
+     Resolution with `status = "closed"` and its own `(<id>.md)` line under
+     Decisions so far, so the reviewed tree is the pushed tree;
+  4. runs F4b itself: `greenbelay tree-sha --block`, then
+     `implementation-review` and the declared profiles. The push check reads
+     them from the session's side transcripts. A rework that survives its
+     delta holds the ticket;
+  5. pushes with `amont land` and runs `merge-when-green`. When a sibling
+     merged first and the rebase changes the tree, it runs step 4 again on
+     the new tree before the push;
+  6. reports once: `DONE <PR>` or `HELD <reason>`, the fog its answer made
+     precise, its follow-ups, and anything now outside the Destination.
+- **grilling**: the agent takes its recommended option and returns the
+  decision and why; the driver closes it as research.
+- **prototype**: the agent picks its recommended approach, then builds the
+  artifact or runs the experiment the ticket asks for: a recommendation does
+  not answer an empirical question. A code change goes through the code
+  protocol, an evidence-only result through research's. A prerequisite only
+  the person can give holds it.
+- A grilling or prototype Resolution reads
+  `decided-by: agent (ADR-0080); reopen: set status = "open" in docs/programmes/<slug>/<id>.md`.
+- **Held, not failed**: a ticket is held when it needs a secret, `sudo` or
+  a physical step, when a rework survives its delta, or when a UI change has
+  no `evidence:` preview. Its dependents wait; the rest of the map runs.
+
+### Who writes the map
+
+A ticket agent writes only its ticket file and its own Decisions line; a
+sibling's line in conflict is a rebase (protocol step 5). The driver writes
+every other section. It **reconciles** each report in its own worktree:
+new tickets for the follow-ups, clarified fog removed from Not yet
+specified, tickets past the Destination ruled out with their dependents
+updated. A new ticket within the Destination runs in this drive, at most 5
+per drive; the rest are filed and listed in the summary. Then
+`relais programme check <dir>` exits 0, and step 1 runs again. An empty
+frontier does not end the drive while fog or follow-ups are unfiled.

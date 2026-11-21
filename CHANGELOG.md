@@ -38,6 +38,17 @@ missing here.
   this release, a script reading `relais dataset replay`'s end line sees
   `outcome=rejected` for an attempts stop or a work stop with the host
   awake, where it used to read `outcome=errored`.
+- The programme skill can drive an approved programme to its end (ADR-0080).
+  Its new "Drive a programme" section has one session claim every ready
+  ticket it can start (at most 3, within `greengate slots`), start one agent
+  per ticket that plans, reviews and merges its own work, and close what they
+  report, so on A→B, A→D, B→C, D→C the tickets B and D run together. The
+  person approves the programme once and no ticket plan again; agents decide
+  grilling and prototype tickets with their recommendation, reopenably. At
+  each wave boundary the driver merges its Handoff and ends with
+  ``safe to /clear; next: `resume <repo> <slug> drive: <ids>` ``, which the
+  clear-relay acts on. "One ticket per session" now applies only to a
+  session that is not a driver.
 - At the end of `relais run`, a home drift record that cannot be read is
   now named under the same `relais run: warning:` prefix as the drifts
   themselves. The line printed when no home directory resolves is split in
