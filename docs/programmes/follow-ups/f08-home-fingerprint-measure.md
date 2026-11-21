@@ -14,7 +14,7 @@ Seven days after each phase is installed, how many home fingerprint warnings wer
 
 ## Look at
 
-The "Measure after release" section of `docs/plans/2026-11-20-home-fingerprint-warns.md`. relais: `home_drift` evidence rows since the v0.73.0 install (due 2026-11-27). greenbelay: `home-fingerprint-drift` journal lines from 7 days after the first greenbelay release carrying #306 (not released on 2026-11-21).
+The "Measure after release" section of `docs/plans/2026-11-20-home-fingerprint-warns.md`. relais: `home_drift` evidence rows since the v0.73.0 install (due 2026-11-27). greenbelay: `home-fingerprint-drift` journal lines from 7 days after the first greenbelay release carrying #306: greenbelay v6.6.0, released 2026-11-21 (tag eb07f717, #307), so its 7 days end 2026-11-28, a day after the relais due date.
 
 ## Answer looks like
 
