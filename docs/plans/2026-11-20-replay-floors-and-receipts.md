@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/replay-floors
 repos: [relais]
 adrs: [ADR-0006]
@@ -279,14 +279,25 @@ read a verdict from a trial set that is mostly infrastructure noise.
 
 ## Verification
 
-| Check | Input | Expected |
-|---|---|---|
-| Receipt sealed | `cargo test -p relais approval::` plus a new runner test driving a `review_findings` stop then `decide approve` | the receipt row exists; its outcome is `accepted`; its findings are kept |
-| No invented receipt | the same test with a `review_findings` stop that saved no snapshot | the decision resolves, writes no receipt row, and prints the `no receipt written` line |
-| Gate-f | `cargo test -p relais typed_gate::` | 15/18 passes; 15/19 and 15/20 are held; 16/20 clears the floor; a pending trial is a barrier; nothing is authorised when held |
-| Piloted replay | `relais dataset replay --dry-run --task task-0fb5e5ecf89e059c --recipe <rebuilt candidate>` from the worktree build | prints `source settled by: runner` and the profile hash `7030f36d…` |
-| Piloted gate | `relais recipe evaluate <rebuilt candidate>` from the worktree build | under (a): `change-feature@2`'s count and no `held:` line; under (b): `held: 11/19 valid (57%), below the 80% floor; needs 21 more valid trials` |
-| Live snapshots | 7 days after release: compare the ledger's review-findings stops with the snapshot rows where `stop_reason = review_findings`, and count `verification_snapshot_failed` steps | one snapshot per stopping run; 0 failed steps |
-| Full suite | `greengate run` at commit | exit 0, and the new tests named in Phases 1–2 appear in its run list |
+| Check | Input | Expected | Actual (2026-11-20/21) |
+|---|---|---|---|
+| Receipt sealed | `cargo test -p relais approval::` plus a new runner test driving a `review_findings` stop then `decide approve` | the receipt row exists; its outcome is `accepted`; its findings are kept | pass: `a_review_findings_stop_is_not_reviewed_in_parts_and_its_approval_keeps_the_findings`, and `approving_a_review_findings_stop_seals_its_findings_or_says_none_was_written` through `decide_in` |
+| No invented receipt | the same test with a `review_findings` stop that saved no snapshot | resolves, exit 0, no receipt row, the `no receipt written` line on stderr; `receipt: null`, `receipt_skipped: "review_findings"` under `--json` | pass, the same `decide` test; an over-budget stop with no snapshot stays refused (exit 2) |
+| Gate-f | `cargo test -p relais typed_gate::` | 15/18 passes; 15/19 and 15/20 are held; 16/20 clears the floor; a pending trial is a barrier; nothing is authorised when held | pass, 23 tests, including 20/25 then 5 errored still passing, a valid repeat at 15/15, and a grandfathered revision; `evaluate_refuses_a_held_arm_with_blocked` drives `gated_candidate` to `Blocked` with the pinned lines |
+| Piloted replay | `relais dataset replay --dry-run --task task-0fb5e5ecf89e059c --recipe <rebuilt candidate>` from the worktree build, on a copy of the live ledger | prints `source settled by: runner` and the profile hash `7030f36d…` | pass: both lines printed, exit 0, recipe `b8c0c36e…` |
+| Piloted gate | `relais recipe evaluate <rebuilt candidate>` from the worktree build, on the same copy | carried #1: today's count refusal (`TypedResearchGate`), exit `Blocked`, no `held:` line | pass: `change-feature@2 has 11 qualifying trials, needs 15 …`, exit 3, no `held:` |
+| Live snapshots | 7 days after release | one snapshot per stopping run; 0 failed steps | moved to the blue-factory follow-up ticket (dated recount 7 days after the release) |
+| Full suite | `greengate run` at each commit | exit 0 | pass: 32 checks at each code commit; touched suites 322 lib + 22 bin after the review fixes |
+
+## Implementation review
+
+- implementation-review: approve-with-changes ×2, then approve; 9 + 1 fixed (FloorRule, logged cost error, Blocked driven via `gated_candidate`, order test); deliberate: no arm-failure scenario (no fixture makes `execute` err), same-tick flake. 129k+54k+33k, 155+29+18 s.
+- backend: approve-with-changes ×2, then approve; fixed one-transaction settled write (+ test), snapshot only on `review_findings`, CHANGELOG forward-compat note; deliberate: cutoff set in the release commit. 87k+54k+28k.
+- lang:rust: approve-with-changes ×2, then approve; fixed write atomicity, `trial_write_failed`, `RecipeCommand`, doc placement; deliberate: `Held{valid}`, string stamps, `receipt_skipped` string, nested Findings. 81k+51k+28k.
+- unix: approve-with-changes, then approve; fixed Ctrl-C barrier, shell-quoted `next:` path, exit 3 pinned. 69k+48k. tui: approve-with-changes, then approve; fixed `more valid trials settle` (plan body keeps its wording), `waiting` before `next:`; deliberate: the pinned `no receipt written` string. 56k+46k.
+
+## Outcome
+
+Both phases shipped on `feat/replay-floors`. Next: the release (v0.74.0) sets `TYPED_GATE_FLOOR_FROM` to the release instant in its own commit, with the boundary test updated, then close blue-factory t18 with the Resolution and follow-ups in the reviews sidecar's Handoff.
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix,codex body-sha=6acb9e15baf2 -->
