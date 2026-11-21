@@ -329,12 +329,13 @@ mod tests {
         assert!(!check.stop, "{check:?}");
     }
 
-    fn answered(drawn: bool, kind: &str, source: &str) -> ExplorationTask {
+    /// A drawn task that ended `answered`.
+    fn answered(kind: &str, source: &str) -> ExplorationTask {
         ExplorationTask {
             kind: kind.into(),
             outcome: "answered".into(),
             outcome_source: Some(source.into()),
-            ..task(drawn, false)
+            ..task(true, false)
         }
     }
 
@@ -343,19 +344,23 @@ mod tests {
         let mut tasks = fixture(4);
         tasks.remove(19);
         assert!(!stop_check(&strata(&tasks)).stop, "19 drawn");
-        tasks.push(answered(true, "question", "own"));
+        tasks.push(answered("question", "own"));
         let check = stop_check(&strata(&tasks));
         assert!(check.stop, "{check:?}");
         assert_eq!((check.drawn, check.drawn_bad), (20, 4));
         // An undrawn one is counted on the undrawn side, not bad.
-        let counts = strata(&[answered(false, "question", "own")]);
+        let counts = strata(&[ExplorationTask {
+            drawn: false,
+            undrawn: true,
+            ..answered("question", "own")
+        }]);
         assert_eq!((counts[0].undrawn, counts[0].undrawn_bad), (1, 0));
         assert_eq!(counts[0].drawn, 0);
     }
 
     #[test]
     fn a_backfilled_answered_question_is_no_evidence() {
-        assert!(strata(&[answered(true, "question", "backfill_v45")]).is_empty());
+        assert!(strata(&[answered("question", "backfill_v45")]).is_empty());
     }
 
     #[test]
@@ -368,12 +373,12 @@ mod tests {
 
     #[test]
     fn a_parent_derived_answered_question_is_no_evidence() {
-        assert!(strata(&[answered(true, "question", "parent")]).is_empty());
+        assert!(strata(&[answered("question", "parent")]).is_empty());
     }
 
     #[test]
     fn an_answered_edit_is_no_evidence() {
-        assert!(strata(&[answered(true, "edit", "own")]).is_empty());
+        assert!(strata(&[answered("edit", "own")]).is_empty());
     }
 
     #[test]

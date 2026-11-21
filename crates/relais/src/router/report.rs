@@ -540,7 +540,9 @@ impl SessionRoutingReport {
                     arm.excluded_sessions
                 ));
             }
-            if excluded || arm.cost.is_none() {
+            // `cost` is `None` only when no session priced, which is `excluded`
+            // too: one guard lists the models under either figure.
+            if excluded {
                 for model in &arm.unpriced_models {
                     out.push_str(&format!("      {model}\n"));
                 }
