@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 plan-id: p-01M7W0WBH0ABNE7ZWF4JH0S6RN
 branch: feat/home-fingerprint
 repos: [relais, greenbelay]
@@ -103,7 +103,7 @@ rewrote them, `$XDG_CONFIG_HOME/git/config` (else `~/.config/git/config`) and
 8. **Verification:** `cargo test -p relais` passes; a mock worker writing a fake-`HOME`
    file gives one line in `relais status <run>`; with no write, none.
 
-### Phase 2: greenbelay (separate PR; starts once Phase 1 is merged, no release wait)
+### Phase 2: greenbelay (separate PR; starts once Phase 1 is merged, no release wait) — done 2026-11-21
 
 1. **Assertion `home-fingerprint-drift`** in `crates/greenbelay-guard/src/assertions/`,
    listed in `ASSERTIONS` and `AFTER_FAILURE` (`assertions/mod.rs:135`, `:143`),
@@ -155,6 +155,18 @@ Verification (input → expected → actual):
 - authority-hash pin test → unchanged, passes → passes.
 - CI windows-latest on the first push → pass → 5 path tests FAILED (`/x` not absolute on Windows, `~/` expected where Windows prints absolute, 80-column check on a path line, `/` in a suffix check); fixed in `fix: home fingerprint paths on Windows`, `~\` accepted as a tilde prefix on Windows; macOS home tests 29 passed, clippy exit 0; Windows proof is the next CI run.
 - Not done: a piloted `relais status` through the installed binary; the host was saturated (load 15–100 on 6 cores) and the fixture tests drive the real engine. First real run after release is the live check.
+
+## Phase 2 record (2026-11-21)
+
+Merged as greenbelay#306 (`7f2589ad`); the pointer plan there carries the full verification and review record. As built: the advise-only assertion `home-fingerprint-drift`, in `ASSERTIONS` and `AFTER_FAILURE`, keeping a `homeprint/1` record per `tool_use_id` under `previews/home`. Deviations: the shared git dir is read from `.git`/`gitdir:`/`commondir` on disk, since `git rev-parse` alone measured 46 ms p50; outside a repository the `.git/config` root is dropped; files over 1 MiB are fingerprinted by size and mtime; corpus cases are replayed by the assertion's own test.
+
+Verification (input → expected → actual):
+- piloted, release binary: a scratch crate's `cargo test` writing `git config --local` → one advice line naming `.git/config (modified)` → as expected; without the write → silent.
+- budget → ≤ 20 ms p95 per hook side → in-process p50 3.6 ms, p95 9.5 ms over 100 runs on the real home.
+- firing rate → 38.0 per 1,000 Bash calls (1,221 of 32,123).
+- CI on #306, every OS → green after a test-only Windows path-spelling fix.
+
+Next: a greenbelay release, then "Measure after release" for both phases.
 
 ## Implementation review
 - implementation-review: approve-with-changes after 3 rounds; 14 fixed; `_` arm over `Result` in `expand_extra_paths` deliberate: not a domain enum (its own round-2 ruling). 154k tok.
