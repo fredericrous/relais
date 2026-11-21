@@ -1,5 +1,8 @@
 //! The ledger's clocks: where its timestamps come from.
 
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::OnceLock;
+
 /// Where the ledger's timestamps come from. The wall clock in
 /// production; a fixed or scripted clock in tests, so a transition's
 /// `at`, a dispatch's `created_at` and the dataset's temporal splits are
@@ -45,7 +48,7 @@ impl Clock for SystemClock {
             crate::procs::sleep_counting_millis().is_some_and(|continuous| {
                 PROCESS_CLOCKS
                     .last_gap
-                    .store(continuous - awake, std::sync::atomic::Ordering::Relaxed);
+                    .store(continuous.saturating_sub(awake), Ordering::Relaxed);
                 true
             })
         });
@@ -54,7 +57,10 @@ impl Clock for SystemClock {
         } else {
             SleepCounting::Unavailable
         };
-        continuous_reading(reading, awake, &PROCESS_CLOCKS.last_gap)
+        let last_gap = PROCESS_CLOCKS.last_gap.load(Ordering::Relaxed);
+        let (continuous, gap) = continuous_reading(reading, awake, last_gap);
+        PROCESS_CLOCKS.last_gap.store(gap, Ordering::Relaxed);
+        continuous
     }
 }
 
@@ -66,15 +72,15 @@ impl Clock for SystemClock {
 /// `SystemClock`, and callers reach `SystemClock` only through the injected
 /// [`Clock`] trait, so a test scripts its clock instead.
 struct ProcessClocks {
-    anchor: std::sync::OnceLock<std::time::Instant>,
-    sleep_counting: std::sync::OnceLock<bool>,
-    last_gap: std::sync::atomic::AtomicI64,
+    anchor: OnceLock<std::time::Instant>,
+    sleep_counting: OnceLock<bool>,
+    last_gap: AtomicI64,
 }
 
 static PROCESS_CLOCKS: ProcessClocks = ProcessClocks {
-    anchor: std::sync::OnceLock::new(),
-    sleep_counting: std::sync::OnceLock::new(),
-    last_gap: std::sync::atomic::AtomicI64::new(0),
+    anchor: OnceLock::new(),
+    sleep_counting: OnceLock::new(),
+    last_gap: AtomicI64::new(0),
 };
 
 /// What the sleep-counting clock answered: unavailable for the life of the
@@ -85,24 +91,17 @@ enum SleepCounting {
     Read(Option<i64>),
 }
 
-/// The continuous reading from what the clocks answered. With no
-/// sleep-counting clock it is the awake reading: no suspend is ever seen.
-/// A successful read is the reading, and records the gap to the awake one.
-/// A failed later read keeps the last gap, so it reports no new sleep
-/// instead of mixing two scales with unrelated origins.
-fn continuous_reading(
-    reading: SleepCounting,
-    awake: i64,
-    last_gap: &std::sync::atomic::AtomicI64,
-) -> i64 {
-    use std::sync::atomic::Ordering;
+/// The continuous reading from what the clocks answered, and the gap to
+/// keep for the next one. With no sleep-counting clock it is the awake
+/// reading: no suspend is ever seen. A successful read is the reading, and
+/// its gap to the awake one is kept. A failed later read keeps `last_gap`,
+/// so it reports no new sleep instead of mixing two scales with unrelated
+/// origins.
+fn continuous_reading(reading: SleepCounting, awake: i64, last_gap: i64) -> (i64, i64) {
     match reading {
-        SleepCounting::Unavailable => awake,
-        SleepCounting::Read(Some(continuous)) => {
-            last_gap.store(continuous - awake, Ordering::Relaxed);
-            continuous
-        }
-        SleepCounting::Read(None) => awake + last_gap.load(Ordering::Relaxed),
+        SleepCounting::Unavailable => (awake, last_gap),
+        SleepCounting::Read(Some(continuous)) => (continuous, continuous.saturating_sub(awake)),
+        SleepCounting::Read(None) => (awake.saturating_add(last_gap), last_gap),
     }
 }
 
@@ -147,31 +146,25 @@ pub fn now_rfc3339() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicI64;
-
     use super::{continuous_reading, Clock, SleepCounting, SystemClock};
 
     #[test]
     fn with_no_sleep_counting_clock_the_reading_is_the_awake_one() {
-        let last_gap = AtomicI64::new(7_000);
         assert_eq!(
-            continuous_reading(SleepCounting::Unavailable, 1_000, &last_gap),
-            1_000
+            continuous_reading(SleepCounting::Unavailable, 1_000, 7_000),
+            (1_000, 7_000)
         );
     }
 
     #[test]
     fn a_read_records_its_gap_and_a_later_failed_read_keeps_it() {
-        let last_gap = AtomicI64::new(0);
-        assert_eq!(
-            continuous_reading(SleepCounting::Read(Some(5_000)), 1_000, &last_gap),
-            5_000
-        );
+        let (reading, gap) = continuous_reading(SleepCounting::Read(Some(5_000)), 1_000, 0);
+        assert_eq!((reading, gap), (5_000, 4_000));
         // The host stayed awake for 2 s, and the read then failed: the
         // reading moves with the awake clock, reporting no new sleep.
         assert_eq!(
-            continuous_reading(SleepCounting::Read(None), 3_000, &last_gap),
-            7_000
+            continuous_reading(SleepCounting::Read(None), 3_000, gap),
+            (7_000, 4_000)
         );
     }
 
