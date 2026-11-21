@@ -125,6 +125,22 @@ Expected: arm lines carry a priced `cost per completed task $…` followed by ` 
 
 Release: `tag-release` skill after merge (report schema 20 is user-visible; no ledger step, so rollback is reinstalling 0.75.0); plugin reinstall is the person's step as before. Then Phase 4.
 
+### Results (2026-11-21, tree 1813525b)
+
+Gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test -p relais` green on each phase's tree (full suite 350 tests, 936 s on the busy host); the pre-commit hook deferred clippy and the tests to CI twice because no host slot freed, so they were run by hand each time. Manual check on a `.backup` copy of the live ledger (integrity `ok`), baseline with installed 0.75.0 first, then `target/debug/relais` at 1813525b, both with `RELAIS_STATE_DIR` on the copy; the branch binary never opened the live ledger. The scratch copy's `-readonly` open fails until SQLite has written its `-shm`; the oracle ran without the flag.
+
+| input | expected | actual |
+|---|---|---|
+| SQL oracle, `main question d1-2 unknown` | v1 = baseline row; v2 = branch row | v1 drawn 5, undrawn 56 = baseline `drawn 5 (40%), undrawn 56 (7%)`; v2 drawn 12, undrawn 94 = branch `drawn 12 (17%), undrawn 94 (4%)`, projection 2027-03-10 → 2026-12-15 |
+| oracle, all question strata | drawn delta = 11 own `answered` explored questions; backfilled rows add nothing | drawn 5→12, 1→2, 0→2, 0→1 across four strata = +11; 4 `backfill_v45` rows absent from both policies |
+| `sub review d3 module`, `sub review d4-5 cross-cutting` | 30 / 24 unchanged | 30 (10%) / 24 (4%), `20 drawn reached` |
+| exploration header | third line `   an answered question counts as a positive unless backfilled; policy v2):`, second ends `;` | verbatim |
+| arm lines | own cost line; `excluded N session(s) …` + full ids; excluded sums to the unpriced sessions (≤ 4) | routed `$19.841499 (95% interval $14.560013 to $28.461619)`, excluded 1 (`gpt-6.1-sol`); held out `$21.387365`, excluded 1; shadow `no completed task among priced sessions`, excluded 2 (`qwen3.6:35b-a3b`); 1+1+2 = 4 = distinct unpriced sessions on the copy |
+| section width | 0 lines over 80 columns | 0 |
+| `--json` | `schema_version` 20, `label_policy_version` 2, three `excluded_sessions`, `priced_completed` per arm | 20, 2, [1, 1, 2]; priced_completed 955 / 114 / 0 against completed 1012 / 119 / 0 |
+
+Relais: Phase 1's worker (sonnet) produced a complete candidate but its focused test run returned no result in its budget (`blocked env_missing`); a `kind: verify` run on it answered `candidate_missing` although `candidate-final.patch` was on disk (filed in the inbox), so the patch was applied by `git apply` and checked by hand. Phase 2's first run exhausted the 1800 s admission wait with nothing launched (host slots held by other worktrees' test runs); the second produced a kept candidate whose verification lease also exhausted; the candidate was applied by hand and checked. One pre-existing integration test (`tests/it/session_router.rs`) asserted the single-line arm format and was updated.
+
 ## Person's optional step
 
 Price the two foreign models so their sessions rejoin the headline, in `~/.config/relais/machine.toml` (shape in `docs/INTEGRATIONS.md:286`); the local qwen can be priced at 0:
