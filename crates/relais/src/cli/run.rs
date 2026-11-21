@@ -611,7 +611,7 @@ pub(crate) fn run_command(
             eprintln!("the preserved candidate is under {}", run_dir.display());
             Ok(CliOutcome::Failed)
         }
-        Terminal::BudgetExhausted { detail } => {
+        Terminal::BudgetExhausted { detail, .. } => {
             eprintln!("budget_exhausted: {detail}");
             eprintln!(
                 "the patch and evidence are preserved under {}",

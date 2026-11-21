@@ -1077,6 +1077,60 @@ tier = "research"
         );
     }
 
+    /// A trial of the plain candidate on `task-<n>` that ended on a work
+    /// stop with no suspend, settled through the live settle path.
+    fn work_stop_settled_live(world: &World, task: usize) {
+        world.pending(task, &format!("{task:03}"));
+        // The research model dispatched first, as a qualifying trial's is.
+        world
+            .ledger
+            .record_dispatch_intent(
+                &crate::ids::DispatchId::from_stored(format!("d-{task:03}")),
+                &RunId::from_stored(format!("arm-{task:03}")),
+                None,
+                &serde_json::json!({ "model": Spec::tweaked(|_| {}).model }),
+                0,
+                crate::route::RoutedBy::DeterministicRecipe,
+            )
+            .expect("dispatch");
+        let outcome = crate::runner::RunOutcome {
+            run_id: RunId::from_stored(format!("arm-{task:03}")),
+            terminal: crate::runner::Terminal::BudgetExhausted {
+                detail: "the work budget is exhausted (spent by the run)".into(),
+                cause: crate::runner::BudgetCause::Work { suspended_ms: 0 },
+            },
+        };
+        crate::runner::live_trial::settle(
+            &world.ledger,
+            &TrialId::from_stored(format!("trial-{task:03}")),
+            &outcome,
+        )
+        .expect("settles");
+    }
+
+    #[test]
+    fn a_work_stop_breaks_the_streak_under_the_cause_rule_and_only_costs_validity_before_it() {
+        let by_cause = world();
+        by_cause.qualifying(0, 14, 0);
+        work_stop_settled_live(&by_cause, 100);
+        let count = by_cause.count();
+        assert_eq!(
+            (count.qualifying, count.accepted),
+            (15, 14),
+            "the work stop is a qualifying failure"
+        );
+
+        let grandfathered = world_from("2026-11-20T00:00:00+00:00");
+        grandfathered.qualifying(0, 14, 0);
+        work_stop_settled_live(&grandfathered, 100);
+        let count = grandfathered.count();
+        assert_eq!(
+            (count.qualifying, count.accepted),
+            (14, 14),
+            "before the cutoff the stop stays errored: it is no failure"
+        );
+    }
+
     /// A revision first trialled before the release keeps the bar it
     /// started under: no floor, and a pending trial bars nothing.
     #[test]

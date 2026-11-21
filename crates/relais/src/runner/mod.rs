@@ -83,8 +83,8 @@ pub use error::RunError;
 pub use holdouts::sweep_ended_holdouts;
 use launch::admission_block;
 pub use machine::{
-    decide, AttemptKind, Budget, FloorKind, HoldoutStop, Limit, Next, Observation, OverBudget,
-    Terminal, WorktreeEnd,
+    decide, AttemptKind, Budget, BudgetCause, FloorKind, HoldoutStop, Limit, Next, Observation,
+    OverBudget, Terminal, WorktreeEnd, SUSPEND_THRESHOLD_MS,
 };
 use prompt::{build_prompt, build_review_repair_prompt, conflict_block, RepairFailure};
 pub(crate) use prompt::{data_block, data_list_block, relevant_block};
@@ -204,10 +204,31 @@ pub fn execute_child(
     parent_run: &RunId,
     package_id: &PackageId,
     role: PackageRole,
+    work_bound: WorkBound,
 ) -> Result<RunOutcome, RunError> {
-    let outcome =
-        RunEngine::new(config, Some((parent_run.clone(), package_id.clone(), role)))?.run()?;
+    let mut engine = RunEngine::new(config, Some((parent_run.clone(), package_id.clone(), role)))?;
+    engine.work_bound = work_bound;
+    let outcome = engine.run()?;
     Ok(finished(config, outcome))
+}
+
+/// What bounds a package's work budget, taken from the root's budgets, so
+/// its stop is named for the budget that really bound it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkBound {
+    /// The package's own work budget, carrying the host sleep the root
+    /// already saw inside its work window.
+    Own { suspended_ms: u64 },
+    /// The root's total, not its work budget, capped the package's wall
+    /// time: the package's work stop is the run's `Total`, not an arm's
+    /// `Work`.
+    RootTotal,
+}
+
+impl Default for WorkBound {
+    fn default() -> Self {
+        Self::Own { suspended_ms: 0 }
+    }
 }
 
 /// Tell the coordinator the run is over, whatever its end: a registered
@@ -262,6 +283,8 @@ pub(crate) struct RunEngine<'a> {
     /// What this run may still spend of time (ADR-0010). Unbounded until
     /// preflight has the authority that sizes it.
     pub(crate) budgets: Budgets,
+    /// What this run inherits from its root's budgets (a package run).
+    pub(in crate::runner) work_bound: WorkBound,
     /// Which try of each command's heavy lease this is, so a rerun gets a
     /// lease id the coordinator has not seen (SPEC §23, C8).
     pub(in crate::runner) heavy_tries: verify::Tries,

@@ -36,9 +36,9 @@ use crate::verify::{self, Receipt, VerificationReport};
 use crate::workspace::{self, WorkspaceError};
 
 use super::{
-    data_block, data_list_block, effort_str, execute_child, AttemptLabel, Budget, Limit,
+    data_block, data_list_block, effort_str, execute_child, AttemptLabel, Budget, Exhausted, Limit,
     ManagedDispatch, Next, Observation, Reason, ReviewOutcome, RunConfig, RunEngine, RunError,
-    RunOutcome, State, Terminal, VerifyFailure,
+    RunOutcome, State, Terminal, VerifyFailure, WorkBound,
 };
 
 /// The patch an accepted decomposed run exports its assembled revision
@@ -676,9 +676,10 @@ fn run_package(
 
     // Aggregate limits, checked before every package (SPEC §19).
     let remaining_wall = engine.budgets.remaining();
+    let binding = engine.budgets.binding();
     if remaining_wall < Duration::from_secs(1) {
         return Ok(PackageEnd::Stop(
-            engine.stop(&budget, Observation::LimitReached(Limit::WallClock))?,
+            engine.end_on_exhausted(binding, &budget, None)?,
         ));
     }
     let spent = ledger.run_cost(&engine.run_id)?;
@@ -825,6 +826,15 @@ fn run_package(
         &engine.run_id,
         &crate::ids::PackageId::from_stored(package.id.clone()),
         run.role,
+        match (engine.work_bound, binding) {
+            (WorkBound::RootTotal, _) | (_, Exhausted::Total) => WorkBound::RootTotal,
+            (
+                WorkBound::Own { suspended_ms },
+                Exhausted::Work | Exhausted::AdmissionWait | Exhausted::DiskWait,
+            ) => WorkBound::Own {
+                suspended_ms: suspended_ms.saturating_add(engine.budgets.suspended_ms()),
+            },
+        },
     )?;
     let child_run = outcome.run_id.clone();
     assembly.attempts_total += ledger.attempt_count(&child_run)? as u32;
@@ -921,10 +931,11 @@ fn mirror(
                 detail: with_prefix(detail),
             },
         ),
-        Terminal::BudgetExhausted { detail } => (
+        Terminal::BudgetExhausted { detail, cause } => (
             Reason::LimitReached,
             Terminal::BudgetExhausted {
                 detail: with_prefix(detail),
+                cause,
             },
         ),
         Terminal::Interrupted { detail } => (

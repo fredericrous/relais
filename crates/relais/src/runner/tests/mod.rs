@@ -1838,7 +1838,7 @@ fn a_budget_ending_on_the_last_repair_ends_on_the_attempt_limit() {
             |_| {},
             Catalog::Known,
         );
-        let Terminal::BudgetExhausted { detail } = &run.outcome.terminal else {
+        let Terminal::BudgetExhausted { detail, .. } = &run.outcome.terminal else {
             panic!(
                 "{repair_effort:?}: expected the attempt limit, got {:?}",
                 run.outcome
@@ -2695,7 +2695,7 @@ fn spend_ceiling_exhausts_the_budget_with_evidence_preserved() {
     let outcome = fixture.execute_with_machine(&contract, &repo, &machine, &backend);
     let RunOutcome {
         run_id,
-        terminal: Terminal::BudgetExhausted { detail },
+        terminal: Terminal::BudgetExhausted { detail, .. },
     } = outcome
     else {
         panic!("expected budget_exhausted, got {outcome:?}");
@@ -8350,7 +8350,7 @@ fn the_daily_ceiling_counts_the_whole_machine_and_stops_dispatch() {
     let outcome = fixture.execute_with_machine(&contract, &repo, &machine, &backend);
     let RunOutcome {
         run_id,
-        terminal: Terminal::BudgetExhausted { detail },
+        terminal: Terminal::BudgetExhausted { detail, .. },
     } = outcome
     else {
         panic!("expected budget_exhausted, got {outcome:?}");

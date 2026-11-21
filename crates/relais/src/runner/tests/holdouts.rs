@@ -2808,7 +2808,7 @@ fn a_holdout_retry_that_exhausts_the_budget_ends_on_that_budget() {
     let backend = counting_worker(Arc::default(), Arc::default());
     let outcome = fixture.execute_with_holdouts(settings, &contract, &repo, &backend);
     assert!(
-        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail } if detail.contains("total")),
+        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail, .. } if detail.contains("total")),
         "{:?}",
         outcome.terminal
     );

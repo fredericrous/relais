@@ -22,6 +22,20 @@ use std::time::Duration;
 /// Where the budgets read the time: milliseconds on any one fixed scale.
 pub trait BudgetClock: Send + Sync {
     fn now_millis(&self) -> i64;
+
+    /// A monotonic reading that stops while the host sleeps. The default
+    /// is a constant: no suspend is ever read from it.
+    fn awake_millis(&self) -> i64 {
+        0
+    }
+
+    /// A monotonic reading that counts the host's sleep. Only its
+    /// difference to [`BudgetClock::awake_millis`] over a window means
+    /// anything: that difference is the sleep inside the window. The wall
+    /// clock is never used for it, so a clock step is never a suspend.
+    fn continuous_millis(&self) -> i64 {
+        0
+    }
 }
 
 /// The wall clock.
@@ -109,7 +123,8 @@ impl BudgetLimits {
 #[derive(Debug)]
 struct Spent {
     run_started: i64,
-    work_started: Option<i64>,
+    /// When work began, on both scales: `None` until the baseline ends.
+    work_started: Option<Mark>,
     admission_waited: i64,
     disk_waited: i64,
     /// Waits charged since `work_started`: excluded from the work budget.
@@ -119,6 +134,17 @@ struct Spent {
     base_in_work: i64,
     /// Time added to the work budget at launch (a repair's floor).
     work_extension: i64,
+    /// Of the sleep since work began, what fell inside a charged wait or a
+    /// base run: already outside the work budget.
+    gap_in_waits: i64,
+}
+
+/// A moment on both scales: the budget clock's reading and the host-sleep
+/// gap there. A wait is charged from one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mark {
+    at: i64,
+    gap: i64,
 }
 
 /// Which budgets a command draws on.
@@ -169,6 +195,7 @@ impl Budgets {
                 waited_in_work: 0,
                 base_in_work: 0,
                 work_extension: 0,
+                gap_in_waits: 0,
             })),
             draws: Draws::WorkAndTotal,
         }
@@ -194,6 +221,17 @@ impl Budgets {
         self.clock.now_millis()
     }
 
+    fn gap(&self) -> i64 {
+        self.clock.continuous_millis() - self.clock.awake_millis()
+    }
+
+    fn mark(&self) -> Mark {
+        Mark {
+            at: self.now(),
+            gap: self.gap(),
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Spent> {
         // A poisoned account is still an account: the panic that
         // poisoned it is its thrower's to report.
@@ -205,20 +243,21 @@ impl Budgets {
     /// The baseline is over: work begins now. Time spent so far counts
     /// against `total` only.
     pub fn begin_work(&self) {
-        let now = self.now();
+        let at = self.mark();
         let mut spent = self.lock();
         if spent.work_started.is_none() {
-            spent.work_started = Some(now);
+            spent.work_started = Some(at);
             spent.waited_in_work = 0;
+            spent.gap_in_waits = 0;
         }
     }
 
     /// Charge `from..now` to a wait budget, and return the new mark.
     /// A wait consumes its own budget and `total` (which reads the clock
     /// and so needs no charge), and is taken out of `work`.
-    pub fn charge_wait(&self, kind: WaitKind, from: i64) -> i64 {
-        let now = self.now();
-        let waited = (now - from).max(0);
+    fn charge_wait(&self, kind: WaitKind, from: Mark) -> Mark {
+        let now = self.mark();
+        let waited = (now.at - from.at).max(0);
         let mut spent = self.lock();
         match kind {
             WaitKind::Admission => spent.admission_waited += waited,
@@ -226,6 +265,7 @@ impl Budgets {
         }
         if spent.work_started.is_some() {
             spent.waited_in_work += waited;
+            spent.gap_in_waits += (now.gap - from.gap).max(0);
         }
         now
     }
@@ -236,7 +276,7 @@ impl Budgets {
         Wait {
             budgets: self.clone(),
             kind,
-            mark: self.now(),
+            mark: self.mark(),
         }
     }
 
@@ -256,7 +296,7 @@ impl Budgets {
         match spent.work_started {
             None => self.limits.work,
             Some(started) => {
-                let worked = (now - started - spent.waited_in_work).max(0);
+                let worked = (now - started.at - spent.waited_in_work).max(0);
                 let allowed = self
                     .limits
                     .work
@@ -281,14 +321,16 @@ impl Budgets {
     /// wait, and the admission budget is not charged again.
     #[must_use = "dropping the guard ends the base run's timing"]
     pub fn base_run(&self) -> BaseRun {
-        let at = self.now();
+        let at = self.mark();
+        let spent = self.lock();
         BaseRun {
             view: Self {
                 draws: Draws::TotalOnly,
                 ..self.clone()
             },
             at,
-            waited_in_work: self.lock().waited_in_work,
+            waited_in_work: spent.waited_in_work,
+            gap_in_waits: spent.gap_in_waits,
         }
     }
 
@@ -374,12 +416,38 @@ impl Budgets {
         })
     }
 
+    /// Host sleep inside the work window, in milliseconds: the continuous
+    /// elapsed minus the awake elapsed since work began, less the sleep
+    /// inside charged waits (already outside work), floored at 0. Zero
+    /// before work begins.
+    pub fn suspended_ms(&self) -> u64 {
+        let gap = self.gap();
+        let spent = self.lock();
+        let Some(started) = spent.work_started else {
+            return 0;
+        };
+        let asleep = gap - started.gap - spent.gap_in_waits;
+        u64::try_from(asleep).unwrap_or(0)
+    }
+
+    /// The budget that binds a command now: the total when it is the
+    /// smaller of what remains (or when no work budget applies), else work.
+    pub fn binding(&self) -> Exhausted {
+        let total = self.total_remaining();
+        let work_applies = self.draws == Draws::WorkAndTotal && self.lock().work_started.is_some();
+        if work_applies && self.work_remaining() < total {
+            Exhausted::Work
+        } else {
+            Exhausted::Total
+        }
+    }
+
     /// Time spent working (waits excluded); zero before work begins.
     pub fn worked(&self) -> Duration {
         let now = self.now();
         let spent = self.lock();
         spent.work_started.map_or(Duration::ZERO, |started| {
-            from_millis(now - started - spent.waited_in_work)
+            from_millis(now - started.at - spent.waited_in_work)
         })
     }
 }
@@ -389,8 +457,9 @@ impl Budgets {
 #[must_use = "dropping the guard ends the base run's timing"]
 pub struct BaseRun {
     view: Budgets,
-    at: i64,
+    at: Mark,
     waited_in_work: i64,
+    gap_in_waits: i64,
 }
 
 impl BaseRun {
@@ -402,15 +471,17 @@ impl BaseRun {
 
 impl Drop for BaseRun {
     fn drop(&mut self) {
-        let now = self.view.now();
+        let now = self.view.mark();
         let mut spent = self.view.lock();
         if spent.work_started.is_none() {
             return;
         }
         let waited_within = spent.waited_in_work - self.waited_in_work;
-        let ran = ((now - self.at) - waited_within).max(0);
+        let ran = ((now.at - self.at.at) - waited_within).max(0);
         spent.waited_in_work += ran;
         spent.base_in_work += ran;
+        let slept_within = spent.gap_in_waits - self.gap_in_waits;
+        spent.gap_in_waits += ((now.gap - self.at.gap) - slept_within).max(0);
     }
 }
 
@@ -418,7 +489,7 @@ impl Drop for BaseRun {
 pub struct Wait {
     budgets: Budgets,
     kind: WaitKind,
-    mark: i64,
+    mark: Mark,
 }
 
 impl Wait {
@@ -646,5 +717,148 @@ mod tests {
             budgets.clip(Duration::from_secs(1000)),
             Duration::from_secs(60)
         );
+    }
+
+    /// A clock the test moves, with a host that can sleep: the awake scale
+    /// lags the continuous one by what `sleep` was told, and the wall clock
+    /// can be stepped on its own.
+    struct SleepingClock {
+        wall: std::sync::atomic::AtomicI64,
+        continuous: std::sync::atomic::AtomicI64,
+        awake: std::sync::atomic::AtomicI64,
+    }
+
+    impl SleepingClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                wall: std::sync::atomic::AtomicI64::new(1_000_000),
+                continuous: std::sync::atomic::AtomicI64::new(50_000_000),
+                awake: std::sync::atomic::AtomicI64::new(7_000),
+            })
+        }
+
+        /// Time passes awake.
+        fn advance(&self, seconds: i64) {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.wall.fetch_add(seconds * 1000, SeqCst);
+            self.continuous.fetch_add(seconds * 1000, SeqCst);
+            self.awake.fetch_add(seconds * 1000, SeqCst);
+        }
+
+        /// The host sleeps: the wall and continuous scales move, awake does not.
+        fn sleep(&self, seconds: i64) {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.wall.fetch_add(seconds * 1000, SeqCst);
+            self.continuous.fetch_add(seconds * 1000, SeqCst);
+        }
+
+        /// The wall clock is stepped (NTP): nothing else moves.
+        fn step_wall(&self, seconds: i64) {
+            self.wall
+                .fetch_add(seconds * 1000, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl BudgetClock for SleepingClock {
+        fn now_millis(&self) -> i64 {
+            self.wall.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn awake_millis(&self) -> i64 {
+            self.awake.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn continuous_millis(&self) -> i64 {
+            self.continuous.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn a_host_sleep_inside_work_is_read_as_suspended_time() {
+        let clock = SleepingClock::new();
+        let budgets = Budgets::start(clock.clone(), limits(1000, 500, 500, 3000));
+        clock.sleep(30);
+        budgets.begin_work();
+        clock.advance(10);
+        clock.sleep(120);
+        assert_eq!(budgets.suspended_ms(), 120_000);
+    }
+
+    #[test]
+    fn a_sleep_before_work_began_is_not_suspended_work() {
+        let clock = SleepingClock::new();
+        let budgets = Budgets::start(clock.clone(), limits(1000, 500, 500, 3000));
+        clock.sleep(300);
+        assert_eq!(budgets.suspended_ms(), 0, "work has not begun");
+        budgets.begin_work();
+        clock.advance(5);
+        assert_eq!(budgets.suspended_ms(), 0);
+    }
+
+    #[test]
+    fn a_wall_clock_step_with_no_suspend_reads_zero() {
+        let clock = SleepingClock::new();
+        let budgets = Budgets::start(clock.clone(), limits(1000, 500, 500, 3000));
+        budgets.begin_work();
+        clock.advance(10);
+        clock.step_wall(120);
+        assert_eq!(budgets.suspended_ms(), 0);
+    }
+
+    #[test]
+    fn a_default_clock_reads_zero_suspend() {
+        let clock = ManualClock::new();
+        let budgets = Budgets::start(clock.clone(), limits(100, 50, 50, 300));
+        budgets.begin_work();
+        clock.advance(200);
+        assert_eq!(budgets.suspended_ms(), 0);
+    }
+
+    #[test]
+    fn a_sleep_inside_an_admission_wait_is_not_suspended_work() {
+        let clock = SleepingClock::new();
+        let budgets = Budgets::start(clock.clone(), limits(1000, 500, 500, 3000));
+        budgets.begin_work();
+        clock.advance(5);
+        {
+            let mut wait = budgets.wait(WaitKind::Admission);
+            clock.sleep(120);
+            wait.tick();
+        }
+        assert_eq!(budgets.suspended_ms(), 0);
+        clock.sleep(70);
+        assert_eq!(
+            budgets.suspended_ms(),
+            70_000,
+            "a sleep after the wait counts"
+        );
+    }
+
+    #[test]
+    fn a_sleep_inside_a_base_run_is_not_suspended_work() {
+        let clock = SleepingClock::new();
+        let budgets = Budgets::start(clock.clone(), limits(1000, 500, 500, 3000));
+        budgets.begin_work();
+        {
+            let _base = budgets.base_run();
+            clock.sleep(90);
+        }
+        assert_eq!(budgets.suspended_ms(), 0);
+    }
+
+    #[test]
+    fn the_total_binds_when_it_is_the_smaller_remainder() {
+        let clock = ManualClock::new();
+        let budgets = Budgets::start(clock.clone(), limits(100, 50, 50, 60));
+        assert_eq!(budgets.binding(), Exhausted::Total, "before work: total");
+        budgets.begin_work();
+        assert_eq!(
+            budgets.binding(),
+            Exhausted::Total,
+            "60 s of total, 100 of work"
+        );
+        let roomy = Budgets::start(clock, limits(100, 50, 50, 300));
+        roomy.begin_work();
+        assert_eq!(roomy.binding(), Exhausted::Work);
     }
 }

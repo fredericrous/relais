@@ -163,6 +163,48 @@ fn deliver(pid: u32, signal: SignalKind) -> Result<(), SignalError> {
     })
 }
 
+/// The monotonic clock that counts sleep: `CLOCK_MONOTONIC` on darwin (it
+/// is `mach_continuous_time` there) and `CLOCK_BOOTTIME` on Linux. `None`
+/// elsewhere or when the read fails, where no suspend is detected.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android"
+))]
+pub fn sleep_counting_millis() -> Option<i64> {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    const SLEEP_COUNTING: libc::clockid_t = libc::CLOCK_MONOTONIC;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const SLEEP_COUNTING: libc::clockid_t = libc::CLOCK_BOOTTIME;
+
+    let mut reading = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `reading` is a valid, writable `timespec` for the whole call,
+    // and `clock_gettime` writes only through that pointer.
+    let status = unsafe { libc::clock_gettime(SLEEP_COUNTING, &mut reading) };
+    if status != 0 {
+        return None;
+    }
+    let since_origin = std::time::Duration::new(
+        u64::try_from(reading.tv_sec).ok()?,
+        u32::try_from(reading.tv_nsec).ok()?,
+    );
+    i64::try_from(since_origin.as_millis()).ok()
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android"
+)))]
+pub fn sleep_counting_millis() -> Option<i64> {
+    None
+}
+
 /// The uid this process runs as: who the coordinator serves.
 #[cfg(unix)]
 pub fn uid() -> u32 {

@@ -24,9 +24,9 @@ use crate::ledger::{
 use crate::money::CostCompleteness;
 use crate::policy::{grant_key, MachineSettings, RepoIdentity, RepoPolicy, TrialEnvelope};
 use crate::route::trial::{assign_trial, CandidateArm, DailyUsage, TrialAssignment, TrialInputs};
-use crate::route::{self, CandidateRecipe};
+use crate::route::{self, budget_rule, BudgetRule, CandidateRecipe};
 
-use super::machine::Terminal;
+use super::machine::{BudgetCause, Terminal, SUSPEND_THRESHOLD_MS};
 use super::{utc_day_start, RunOutcome};
 
 /// A candidate the envelope named and admission refused, and why.
@@ -421,18 +421,56 @@ pub fn decide(env: &Environment<'_>) -> Result<Decision, LedgerError> {
 /// live arm share: an infrastructure end is `Errored`, never a failure
 /// of the arm. `escalated` is whether any attempt ran on the escalation
 /// tier (`Ledger::escalation_attempted`); a same-tier repair is not one.
-pub fn trial_outcome_of(terminal: &Terminal, escalated: bool) -> (TrialOutcome, bool) {
+///
+/// A budget stop settles by its cause under [`BudgetRule::ByCause`]: the
+/// arm's own (the attempt ceiling, work with no host suspend of
+/// [`SUSPEND_THRESHOLD_MS`] or more) is `Rejected`, a queue, host or
+/// configuration stop is `Errored`. Under [`BudgetRule::Grandfathered`]
+/// every budget stop is `Errored`.
+pub fn trial_outcome_of(
+    terminal: &Terminal,
+    escalated: bool,
+    rule: BudgetRule,
+) -> (TrialOutcome, bool) {
     match terminal {
         Terminal::Accepted(_) => (TrialOutcome::Accepted, !escalated),
         Terminal::Failed { .. } | Terminal::NeedsReview { .. } | Terminal::NeedsDecision { .. } => {
             (TrialOutcome::Rejected, false)
         }
+        Terminal::BudgetExhausted { cause, .. } => (budget_outcome(*cause, rule), false),
         Terminal::Blocked { .. }
         | Terminal::BlockedBy { .. }
-        | Terminal::BudgetExhausted { .. }
         | Terminal::Interrupted { .. }
         | Terminal::Cancelled { .. } => (TrialOutcome::Errored, false),
     }
+}
+
+fn budget_outcome(cause: BudgetCause, rule: BudgetRule) -> TrialOutcome {
+    match (rule, cause) {
+        (BudgetRule::Grandfathered, _) => TrialOutcome::Errored,
+        (BudgetRule::ByCause, BudgetCause::Attempts) => TrialOutcome::Rejected,
+        (BudgetRule::ByCause, BudgetCause::Work { suspended_ms })
+            if suspended_ms < SUSPEND_THRESHOLD_MS =>
+        {
+            TrialOutcome::Rejected
+        }
+        (
+            BudgetRule::ByCause,
+            BudgetCause::Work { .. }
+            | BudgetCause::Spend
+            | BudgetCause::Admission
+            | BudgetCause::Total
+            | BudgetCause::RepairFloor,
+        ) => TrialOutcome::Errored,
+    }
+}
+
+/// The budget rule of the revision an arm recipe id names: from its oldest
+/// trial, or the new rule when it was never trialled.
+pub fn budget_rule_of_recipe(ledger: &Ledger, recipe_id: &str) -> Result<BudgetRule, LedgerError> {
+    Ok(ledger
+        .first_trial_at_for_recipe(recipe_id)?
+        .map_or(BudgetRule::ByCause, |first| budget_rule(&first)))
 }
 
 /// What a replay checks about itself before its result counts as its
@@ -552,8 +590,12 @@ pub fn settle(
     outcome: &RunOutcome,
 ) -> Result<TrialOutcome, LedgerError> {
     let escalated = ledger.escalation_attempted(&outcome.run_id)?;
+    let rule = match ledger.trial(trial_id)? {
+        Some(row) => budget_rule_of_recipe(ledger, &row.arm_recipe_id)?,
+        None => BudgetRule::ByCause,
+    };
     let (trial_outcome, accepted_without_escalation) =
-        trial_outcome_of(&outcome.terminal, escalated);
+        trial_outcome_of(&outcome.terminal, escalated, rule);
     let (cost, duration_ms) = settled_figures(ledger, &outcome.run_id)?;
     ledger.settle_trial(
         trial_id,
@@ -611,6 +653,59 @@ pub fn status(
 mod tests {
     use super::*;
     use crate::test_support::{short_temp_dir, TempDir};
+
+    fn budget_stop(cause: BudgetCause) -> Terminal {
+        Terminal::BudgetExhausted {
+            detail: "stopped".into(),
+            cause,
+        }
+    }
+
+    /// Every budget cause under both rules: the cause decides only under
+    /// `ByCause`, and the exit code (not read here) is 5 for all of them.
+    #[test]
+    fn a_budget_stop_settles_by_its_cause_under_the_new_rule_and_errored_under_the_old() {
+        use BudgetCause::{Admission, Attempts, RepairFloor, Spend, Total, Work};
+        use TrialOutcome::{Errored, Rejected};
+        let table = [
+            (Attempts, Rejected),
+            (Work { suspended_ms: 0 }, Rejected),
+            (
+                Work {
+                    suspended_ms: SUSPEND_THRESHOLD_MS - 1,
+                },
+                Rejected,
+            ),
+            (
+                Work {
+                    suspended_ms: SUSPEND_THRESHOLD_MS,
+                },
+                Errored,
+            ),
+            (
+                Work {
+                    suspended_ms: 38 * 60_000,
+                },
+                Errored,
+            ),
+            (Spend, Errored),
+            (Admission, Errored),
+            (Total, Errored),
+            (RepairFloor, Errored),
+        ];
+        for (cause, by_cause) in table {
+            assert_eq!(
+                trial_outcome_of(&budget_stop(cause), false, BudgetRule::ByCause),
+                (by_cause, false),
+                "{cause:?} under ByCause"
+            );
+            assert_eq!(
+                trial_outcome_of(&budget_stop(cause), false, BudgetRule::Grandfathered),
+                (Errored, false),
+                "{cause:?} under the grandfathered rule"
+            );
+        }
+    }
 
     fn research_check(dispatched: &str) -> ReplayCheck<'_> {
         ReplayCheck {

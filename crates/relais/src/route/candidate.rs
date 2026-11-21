@@ -193,6 +193,33 @@ pub fn validity_floor_rule(first_trial_at: &str) -> FloorRule {
     }
 }
 
+/// A budget stop settles by its cause for a revision first trialled at or
+/// after this instant, the release that shipped it; a revision already
+/// mid-gate keeps the bar it started under.
+pub const TYPED_GATE_BUDGET_CAUSE_FROM: &str = "2026-11-22T00:00:00+00:00";
+
+/// How a trial's `budget_exhausted` end settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetRule {
+    /// First trialled from [`TYPED_GATE_BUDGET_CAUSE_FROM`], or not yet
+    /// trialled: the cause decides (`Rejected` or `Errored`).
+    ByCause,
+    /// First trialled before it: every budget stop settles `Errored`.
+    Grandfathered,
+}
+
+/// The budget rule for a revision whose first trial was created at
+/// `first_trial_at` (RFC 3339, as the ledger writes it). A stamp that does
+/// not parse follows the new rule, as the floor does.
+pub fn budget_rule(first_trial_at: &str) -> BudgetRule {
+    let from = chrono::DateTime::parse_from_rfc3339(TYPED_GATE_BUDGET_CAUSE_FROM)
+        .expect("the budget cutoff is RFC 3339");
+    match chrono::DateTime::parse_from_rfc3339(first_trial_at) {
+        Ok(at) if at < from => BudgetRule::Grandfathered,
+        Ok(_) | Err(_) => BudgetRule::ByCause,
+    }
+}
+
 /// The validity floor's reading of one arm.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ValidityFloor {
@@ -1567,6 +1594,19 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn the_budget_rule_changes_at_the_cutoff_itself() {
+        assert_eq!(
+            budget_rule(TYPED_GATE_BUDGET_CAUSE_FROM),
+            BudgetRule::ByCause
+        );
+        assert_eq!(
+            budget_rule("2026-11-21T23:59:59+00:00"),
+            BudgetRule::Grandfathered
+        );
+        assert_eq!(budget_rule("not a stamp"), BudgetRule::ByCause);
+    }
 
     fn effort(name: &str) -> EffortId {
         EffortId::parse(name).expect("a valid effort identifier")
