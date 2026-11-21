@@ -8,6 +8,35 @@ missing here.
 
 ## Unreleased
 
+- `relais decide <run> approve` on a run that stopped `needs_review` for
+  `review_findings` now seals a receipt, as an approval of an over-budget
+  or unavailable review already did. The run saves a verification snapshot
+  before it stops (never when the findings go to a repair attempt), and the
+  receipt keeps the findings in a new `review: findings` record around the
+  review that found them. A relais binary older than this one cannot read
+  such a receipt; relais reads only its own ledger, so upgrade every relais
+  that shares the state directory together. `relais dataset replay` can then replay such a
+  run; its dry run prints `source settled by: decision (review_findings)` or
+  `source settled by: runner`, and a source with no receipt is refused with
+  `(source settled by: none)` and a `next:` line.
+- An approval that resolves a run without writing a receipt (no snapshot
+  was saved) now says so: `no receipt written: no verification snapshot for
+  this <stop reason> stop` on stderr, exit 0; under `--json`, `"receipt":
+  null` and `"receipt_skipped": "<stop reason>"`.
+- The typed-research gate has a validity floor (ADR-0006, amended): at its
+  15th qualifying trial at least 80% of the arm's settled trials must be
+  valid, counting every errored trial of the arm. Below that the revision
+  is held, which `recipe evaluate` and `recipe promote` print as `held: q/s
+  valid (p%), below the 80% floor; needs n more valid trials` with a
+  `next:` line, exit 3; it passes at the first later point that reaches
+  80%, and a pass is final. A pending trial is a barrier the gate waits on
+  (`waiting on trial <id> (pending since <date>)`). Revisions first
+  trialled before this release keep the bar they started under.
+- A `relais dataset replay` whose arm run fails with a runner error now
+  records one `errored` trial instead of none, so the floor sees it. A
+  replay's trial is now written already settled, in one transaction, so an
+  interrupted replay never leaves a pending trial the gate would wait on.
+
 ## v0.74.0
 
 - The relais pane now keeps the whole pre-clear tail: the last 2000

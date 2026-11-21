@@ -32,7 +32,8 @@ use crate::ids::{TaskId, TrialId};
 use crate::ledger::{GroundTruthVerdict, Ledger, LedgerError, TrialOutcome, TrialRow};
 use crate::policy::{RecipeSpec, RepoPolicy};
 use crate::route::{
-    is_typed_research_change, TypedGateCount, TypedGateEvidence, TYPED_GATE_TRIALS,
+    is_typed_research_change, validity_floor_rule, FloorRule, TypedGateCount, TypedGateEvidence,
+    ValidityFloor, TYPED_GATE_TRIALS,
 };
 
 /// The gate's name, as the ledger records it beside the trials it counted.
@@ -114,28 +115,94 @@ pub struct TypeStanding {
     /// The first [`TYPED_GATE_TRIALS`] qualifying trials, in order: what
     /// the bar was read from, and what authorises a promotion that passes.
     pub counted: Vec<TrialId>,
+    /// The arm's earliest unsettled trial, which ends the closed prefix the
+    /// gate reads: its id and when it was created. `None` when no pending
+    /// trial bars the read, or the floor does not apply.
+    pub waiting: Option<Waiting>,
+}
+
+/// A pending trial the gate waits on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Waiting {
+    pub trial: TrialId,
+    pub since: String,
+}
+
+impl Waiting {
+    /// `waiting on trial <id> (pending since <date>)`.
+    pub fn line(&self) -> String {
+        let date = self.since.get(..10).unwrap_or(&self.since);
+        format!("waiting on trial {} (pending since {date})", self.trial)
+    }
+}
+
+/// Is `facts` in the recipe's arm for `task_type`: its recipe, type and
+/// design, whatever model ran it and whatever its outcome?
+fn in_arm(facts: &TrialFacts, spec: &RecipeSpec, task_type: TaskType) -> bool {
+    facts.trial.arm_recipe_id == spec.recipe_id()
+        && facts.task_type == Some(task_type)
+        && spec.requires_design == facts.trial.design_sha256.is_some()
 }
 
 /// The standing of `spec` for `task_type` among `trials` (oldest first).
+///
+/// Under [`FloorRule::Applies`] (ADR-0006, a revision first trialled from
+/// [`crate::route::TYPED_GATE_FLOOR_FROM`]), the gate reads only the closed
+/// prefix that ends before the arm's earliest unsettled trial, and the
+/// validity floor is read at the 15th qualifying trial: `settled` is the
+/// qualifying trials plus every in-arm errored trial up to it. Below the
+/// floor, it is read again at each later trial until a prefix reaches it,
+/// and a prefix that reaches it is final. Grandfathered, pending trials
+/// are skipped and the floor is not read: the bar the revision started under.
 pub fn standing(
     trials: &[TrialFacts],
     spec: &RecipeSpec,
     task_type: TaskType,
     research_model: Option<&str>,
+    floor: FloorRule,
 ) -> TypeStanding {
+    let applies = floor == FloorRule::Applies;
     let mut seen: Vec<&TaskId> = Vec::new();
     let mut qualifying: Vec<(&TrialId, bool)> = Vec::new();
+    let mut errored = 0usize;
+    let mut validity = ValidityFloor::NotApplied;
+    let mut waiting = None;
     for facts in trials {
-        let success = match judge(facts, spec, task_type, research_model) {
-            Judgement::NotCounted => continue,
-            Judgement::Success => true,
-            Judgement::Failure => false,
-        };
-        if seen.contains(&&facts.trial.task_id) {
+        if facts.trial.outcome.is_none() {
+            if applies && in_arm(facts, spec, task_type) {
+                waiting = Some(Waiting {
+                    trial: facts.trial.trial_id.clone(),
+                    since: facts.trial.created_at.clone(),
+                });
+                break;
+            }
             continue;
         }
-        seen.push(&facts.trial.task_id);
-        qualifying.push((&facts.trial.trial_id, success));
+        match judge(facts, spec, task_type, research_model) {
+            Judgement::NotCounted => {
+                if facts.trial.outcome == Some(TrialOutcome::Errored)
+                    && in_arm(facts, spec, task_type)
+                {
+                    errored += 1;
+                }
+            }
+            judged => {
+                // A valid repeat on a task already counted enters neither
+                // count.
+                if !seen.contains(&&facts.trial.task_id) {
+                    seen.push(&facts.trial.task_id);
+                    qualifying.push((&facts.trial.trial_id, judged == Judgement::Success));
+                }
+            }
+        }
+        if applies && qualifying.len() >= TYPED_GATE_TRIALS && validity != ValidityFloor::Met {
+            let (valid, settled) = (qualifying.len(), qualifying.len() + errored);
+            validity = if ValidityFloor::met_by(valid, settled) {
+                ValidityFloor::Met
+            } else {
+                ValidityFloor::Held { valid, settled }
+            };
+        }
     }
     let read = &qualifying[..qualifying.len().min(TYPED_GATE_TRIALS)];
     TypeStanding {
@@ -143,8 +210,10 @@ pub fn standing(
         count: TypedGateCount {
             qualifying: qualifying.len(),
             accepted: read.iter().filter(|(_, success)| *success).count(),
+            floor: validity,
         },
         counted: read.iter().map(|(id, _)| (*id).clone()).collect(),
+        waiting,
     }
 }
 
@@ -164,6 +233,16 @@ pub struct Authorisation {
 pub struct Assessment {
     pub evidence: TypedGateEvidence,
     pub authorisations: Vec<Authorisation>,
+    /// For a recipe the gate refuses while a pending trial bars its read,
+    /// keyed by recipe name and revision: the trial it waits on.
+    pub waiting: std::collections::BTreeMap<(String, u32), Waiting>,
+}
+
+impl Assessment {
+    /// The pending trial that bars the read of `name` at `revision`.
+    pub fn waiting_on(&self, name: &str, revision: u32) -> Option<&Waiting> {
+        self.waiting.get(&(name.to_string(), revision))
+    }
 }
 
 /// The gate's reading of the recipes `candidate` adds beyond `incumbent`
@@ -180,11 +259,16 @@ pub fn assess(
     for spec in added.filter(|spec| is_typed_research_change(spec)) {
         let recipe_id = spec.recipe_id();
         let trials = facts_of(ledger, &recipe_id)?;
+        // The revision's first trial, settled or not, decides whether it is
+        // held to the validity floor; one with none yet always is.
+        let floor = trials.first().map_or(FloorRule::Applies, |first| {
+            validity_floor_rule(&first.trial.created_at)
+        });
         let research_model = arm_model(candidate, spec);
         let standings: Vec<TypeStanding> = spec
             .task_type
             .iter()
-            .map(|task_type| standing(&trials, spec, *task_type, research_model))
+            .map(|task_type| standing(&trials, spec, *task_type, research_model, floor))
             .collect();
         let representative = standings
             .iter()
@@ -194,6 +278,13 @@ pub fn assess(
             assessment
                 .evidence
                 .insert(&spec.name, spec.revision, representative.count);
+            if !representative.count.passes() {
+                if let Some(waiting) = &representative.waiting {
+                    assessment
+                        .waiting
+                        .insert((spec.name.clone(), spec.revision), waiting.clone());
+                }
+            }
         }
         if standings.iter().all(|standing| standing.count.passes()) {
             assessment
@@ -210,12 +301,12 @@ pub fn assess(
     Ok(assessment)
 }
 
-/// Every settled trial of `recipe_id`, oldest first, with its task's type
-/// and its arm run's first dispatched model.
+/// Every trial of `recipe_id`, settled or pending, oldest first, with its
+/// task's type and its arm run's first dispatched model.
 fn facts_of(ledger: &Ledger, recipe_id: &str) -> Result<Vec<TrialFacts>, LedgerError> {
     let ids = std::iter::once(recipe_id.to_string()).collect();
     ledger
-        .settled_trials_for_recipes(&ids)?
+        .trials_for_recipes(&ids)?
         .into_iter()
         .map(|trial| {
             let task_type = ledger
@@ -316,9 +407,34 @@ tier = "research"
         _dir: crate::test_support::TempDir,
     }
 
+    /// A clock one second further on at every read, from `start`: trials
+    /// are created in the order a test writes them, on either side of the
+    /// floor's cutoff.
+    struct Ticking {
+        start: chrono::DateTime<chrono::FixedOffset>,
+        reads: std::sync::atomic::AtomicI64,
+    }
+
+    impl crate::ledger::Clock for Ticking {
+        fn now_rfc3339(&self) -> String {
+            let n = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (self.start + chrono::Duration::seconds(n)).to_rfc3339()
+        }
+    }
+
+    /// A world whose trials are first created after the floor's cutoff.
     fn world() -> World {
+        world_from("2026-12-01T00:00:00+00:00")
+    }
+
+    fn world_from(start: &str) -> World {
         let dir = crate::test_support::short_temp_dir("typed-gate");
-        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
+        let clock = Ticking {
+            start: chrono::DateTime::parse_from_rfc3339(start).expect("a start"),
+            reads: std::sync::atomic::AtomicI64::new(0),
+        };
+        let ledger = Ledger::open_with_clock(&dir.join("ledger.sqlite"), Box::new(clock))
+            .expect("ledger opens");
         World {
             ledger,
             incumbent: RepoPolicy::from_toml_str(INCUMBENT).expect("incumbent parses"),
@@ -473,7 +589,8 @@ tier = "research"
             w.count(),
             TypedGateCount {
                 qualifying: 15,
-                accepted: 14
+                accepted: 14,
+                floor: ValidityFloor::Met,
             }
         );
         w.promote().expect("14/15 promotes");
@@ -506,7 +623,8 @@ tier = "research"
             w.count(),
             TypedGateCount {
                 qualifying: 25,
-                accepted: 13
+                accepted: 13,
+                floor: ValidityFloor::Met,
             }
         );
         assert!(w.promote().is_err(), "ten later successes do not rescue it");
@@ -533,7 +651,8 @@ tier = "research"
             w.count(),
             TypedGateCount {
                 qualifying: 15,
-                accepted: 15
+                accepted: 15,
+                floor: ValidityFloor::Met,
             }
         );
         let assessment = assess(&w.ledger, &w.incumbent, &w.candidate).expect("reads");
@@ -578,7 +697,8 @@ tier = "research"
             w.count(),
             TypedGateCount {
                 qualifying: 15,
-                accepted: 14
+                accepted: 14,
+                floor: ValidityFloor::Met,
             }
         );
         let w = world();
@@ -596,7 +716,8 @@ tier = "research"
             w.count(),
             TypedGateCount {
                 qualifying: 15,
-                accepted: 13
+                accepted: 13,
+                floor: ValidityFloor::Met,
             }
         );
         assert!(w.promote().is_err());
@@ -624,7 +745,8 @@ tier = "research"
             w.count(),
             TypedGateCount {
                 qualifying: 15,
-                accepted: 14
+                accepted: 14,
+                floor: ValidityFloor::Met,
             }
         );
         w.promote().expect("14/15 authorises");
@@ -698,7 +820,8 @@ tier = "research"
             assessment.evidence.count_of("change-feature-designed", 2),
             TypedGateCount {
                 qualifying: 15,
-                accepted: 15
+                accepted: 15,
+                floor: ValidityFloor::Met,
             }
         );
         assert_eq!(
@@ -752,5 +875,231 @@ tier = "research"
         candidate.recipes.push(untyped);
         let assessment = assess(&w.ledger, &w.incumbent, &candidate).expect("reads");
         assert_eq!(assessment, Assessment::default());
+    }
+
+    impl World {
+        /// `n` in-arm errored trials on tasks `from..from + n`.
+        fn errored(&self, from: usize, n: usize) {
+            for k in 0..n {
+                self.trial(from + k, |spec| spec.outcome = TrialOutcome::Errored);
+            }
+        }
+
+        /// A trial of the plain candidate on `task-<n>` that has not settled.
+        fn pending(&self, n: usize, id: &str) {
+            let task = TaskId::from_stored(format!("task-{n}"));
+            let source = RunId::from_stored(format!("source-{n}"));
+            self.ledger
+                .insert_typed_run(&source, "/r", None, &task, "rk", Some(TaskType::Feature))
+                .expect("task");
+            self.ledger
+                .insert_replay_trial(&NewReplayTrial {
+                    trial_id: &TrialId::from_stored(format!("trial-{id}")),
+                    task_id: &task,
+                    source_run_id: &source,
+                    incumbent_recipe_id: "incumbent",
+                    arm_recipe_id: &self.recipe_id(3),
+                    base_sha: "base",
+                    contract_hash: "contract",
+                    verification_profile_hash: "profile",
+                    workspace_isolation: "fresh_checkout_no_accepted_answer",
+                    arm_run_id: &RunId::from_stored(format!("arm-{id}")),
+                    design_sha256: None,
+                })
+                .expect("trial");
+        }
+
+        fn floor(&self) -> ValidityFloor {
+            self.count().floor
+        }
+    }
+
+    #[test]
+    fn the_floor_is_whole_numbers_and_pins_its_boundaries() {
+        assert_eq!(ValidityFloor::needs(11, 19), 21, "an f64 0.8 x 19 gives 22");
+        assert!(ValidityFloor::met_by(16, 20));
+        assert!(ValidityFloor::met_by(20, 25));
+        assert!(!ValidityFloor::met_by(15, 19));
+        assert_eq!(ValidityFloor::needs(15, 20), 5);
+        assert_eq!(ValidityFloor::needs(16, 20), 0);
+    }
+
+    #[test]
+    fn fifteen_of_eighteen_passes_the_floor() {
+        let world = world();
+        world.errored(100, 3);
+        world.qualifying(0, 15, 0);
+        assert_eq!(world.floor(), ValidityFloor::Met);
+        world.promote().expect("15/18 passes");
+    }
+
+    #[test]
+    fn fifteen_of_nineteen_is_held_and_sixteen_of_twenty_clears_it() {
+        let world = world();
+        world.errored(100, 4);
+        world.qualifying(0, 15, 0);
+        assert_eq!(
+            world.floor(),
+            ValidityFloor::Held {
+                valid: 15,
+                settled: 19
+            }
+        );
+        assert!(matches!(
+            world.promote(),
+            Err(CandidateRejection::TypedResearchGate { .. })
+        ));
+        world.qualifying(15, 1, 0);
+        assert_eq!(world.floor(), ValidityFloor::Met);
+        world.promote().expect("16/20 clears the floor");
+    }
+
+    #[test]
+    fn fifteen_of_twenty_is_held_with_the_pinned_line() {
+        let world = world();
+        world.errored(100, 5);
+        world.qualifying(0, 15, 0);
+        let refusal = world.promote().unwrap_err().to_string();
+        assert_eq!(
+            refusal,
+            "held: 15/20 valid (75%), below the 80% floor; needs 5 more valid trials"
+        );
+        assert!(refusal.chars().count() <= 80);
+        let assessment = assess(&world.ledger, &world.incumbent, &world.candidate).expect("reads");
+        assert!(
+            assessment.authorisations.is_empty(),
+            "held authorises nothing"
+        );
+        assert_eq!(
+            assessment
+                .evidence
+                .count_of("change-feature", 2)
+                .held_by_floor(),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn a_pass_is_final_and_later_errored_trials_never_move_it() {
+        let world = world();
+        world.errored(100, 3);
+        world.qualifying(0, 15, 0);
+        world.errored(200, 6);
+        assert_eq!(world.floor(), ValidityFloor::Met);
+        world.promote().expect("still passes");
+    }
+
+    #[test]
+    fn a_pending_trial_is_a_barrier_never_a_denominator_entry() {
+        let world = world();
+        world.pending(300, "000-pending");
+        world.errored(100, 3);
+        world.qualifying(0, 15, 0);
+        let assessment = assess(&world.ledger, &world.incumbent, &world.candidate).expect("reads");
+        let count = assessment.evidence.count_of("change-feature", 2);
+        assert_eq!(
+            count.qualifying, 0,
+            "nothing after the pending trial is read"
+        );
+        assert!(!count.passes());
+        let waiting = assessment.waiting_on("change-feature", 2).expect("waits");
+        assert_eq!(waiting.trial.as_str(), "trial-000-pending");
+        assert_eq!(
+            waiting.line(),
+            "waiting on trial trial-000-pending (pending since 2026-12-01)"
+        );
+        // The oldest trial settles errored: 15 of 19, held.
+        world
+            .ledger
+            .settle_trial(
+                &TrialId::from_stored("trial-000-pending"),
+                TrialOutcome::Errored,
+                false,
+                TrialCost::UNKNOWN,
+                1,
+            )
+            .expect("settle");
+        assert_eq!(
+            world.floor(),
+            ValidityFloor::Held {
+                valid: 15,
+                settled: 19
+            }
+        );
+        let assessment = assess(&world.ledger, &world.incumbent, &world.candidate).expect("reads");
+        assert!(assessment.waiting.is_empty());
+    }
+
+    #[test]
+    fn a_held_arm_passes_at_the_earliest_prefix_that_reaches_the_floor() {
+        let world = world();
+        world.errored(100, 5);
+        world.qualifying(0, 15, 0);
+        assert!(world.promote().is_err(), "15/20 is held");
+        world.qualifying(15, 5, 0);
+        assert_eq!(world.floor(), ValidityFloor::Met, "20/25 reaches it");
+        world.errored(200, 5);
+        assert_eq!(
+            world.floor(),
+            ValidityFloor::Met,
+            "and later errors never move it"
+        );
+        world.promote().expect("still passes");
+    }
+
+    #[test]
+    fn a_valid_repeat_enters_neither_count() {
+        let world = world();
+        world.qualifying(0, 7, 0);
+        // A valid repeat of task-0 between the 1st and the 15th qualifying.
+        world.retrial(0, "500", |_| {});
+        world.qualifying(7, 8, 0);
+        let count = world.count();
+        assert_eq!(count.qualifying, 15);
+        assert_eq!(count.floor, ValidityFloor::Met, "15/15, not 15/16");
+        world.promote().expect("passes");
+    }
+
+    #[test]
+    fn errored_retries_on_one_task_each_enter_the_denominator() {
+        let world = world();
+        world.trial(100, |spec| spec.outcome = TrialOutcome::Errored);
+        for id in ["100b", "100c", "100d"] {
+            world.retrial(100, id, |spec| spec.outcome = TrialOutcome::Errored);
+        }
+        world.qualifying(0, 15, 0);
+        assert_eq!(
+            world.floor(),
+            ValidityFloor::Held {
+                valid: 15,
+                settled: 19
+            }
+        );
+    }
+
+    /// A revision first trialled before the release keeps the bar it
+    /// started under: no floor, and a pending trial bars nothing.
+    #[test]
+    fn a_revision_first_trialled_before_the_release_is_not_held() {
+        let world = world_from("2026-11-10T00:00:00+00:00");
+        world.pending(300, "000-pending");
+        world.errored(100, 8);
+        world.qualifying(0, 15, 1);
+        let assessment = assess(&world.ledger, &world.incumbent, &world.candidate).expect("reads");
+        let count = assessment.evidence.count_of("change-feature", 2);
+        assert_eq!(count.floor, ValidityFloor::NotApplied);
+        assert_eq!((count.qualifying, count.accepted), (15, 14));
+        assert!(assessment.waiting.is_empty());
+        world.promote().expect("the old bar passes 14 of 15");
+        // The cutoff's boundary is the cutoff itself.
+        assert_eq!(
+            validity_floor_rule(crate::route::TYPED_GATE_FLOOR_FROM),
+            FloorRule::Applies
+        );
+        assert_eq!(
+            validity_floor_rule("2026-11-20T23:59:59+00:00"),
+            FloorRule::Grandfathered
+        );
+        assert_eq!(validity_floor_rule("not a stamp"), FloorRule::Applies);
     }
 }

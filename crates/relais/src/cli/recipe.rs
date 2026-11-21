@@ -324,6 +324,120 @@ pub(crate) fn recipe_diff_command(candidate_path: &Path) -> Result<CliOutcome, C
 /// reports; it never promotes, writes a policy, or issues a grant —
 /// `relais promote` is the only thing in this crate that activates
 /// anything, and it takes a learned artifact id, not a recipe.
+/// The stderr lines of a candidate `recipe evaluate` or `recipe promote`
+/// refuses. A refusal is one line, except the typed-research gate's: one
+/// the validity floor holds ends the prefix's line before `held:` and names
+/// the command to re-run, and one a pending trial bars names that trial.
+pub(crate) fn refusal_lines(
+    command: RecipeCommand,
+    rejection: &route::CandidateRejection,
+    gate: &typed_gate::Assessment,
+    candidate_path: &Path,
+) -> Vec<String> {
+    let command = command.as_str();
+    let prefix = format!("relais recipe {command}: candidate refused:");
+    let route::CandidateRejection::TypedResearchGate {
+        name,
+        revision,
+        count,
+    } = rejection
+    else {
+        return vec![format!("{prefix} {rejection}")];
+    };
+    let waiting = gate
+        .waiting_on(name, *revision)
+        .map(typed_gate::Waiting::line);
+    match count.held_by_floor() {
+        Some(needs) => [prefix, rejection.to_string()]
+            .into_iter()
+            .chain(waiting)
+            .chain(std::iter::once(format!(
+                "next: re-run relais recipe {command} {} after {needs} more valid trials settle",
+                shell_word(&candidate_path.display().to_string())
+            )))
+            .collect(),
+        None => std::iter::once(format!("{prefix} {rejection}"))
+            .chain(waiting)
+            .collect(),
+    }
+}
+
+/// `word` as one shell word: as it is when every character is plain,
+/// else in single quotes, a `'` inside written as `'\''`.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-'));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+/// The two commands that read the typed-research gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecipeCommand {
+    Evaluate,
+    Promote,
+}
+
+impl RecipeCommand {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Evaluate => "evaluate",
+            Self::Promote => "promote",
+        }
+    }
+
+    fn context(self) -> &'static str {
+        match self {
+            Self::Evaluate => "recipe evaluate",
+            Self::Promote => "recipe promote",
+        }
+    }
+}
+
+/// A candidate the typed-research gate and the admission door refused: the
+/// stderr lines to print and the exit the command returns (`Blocked`).
+pub(crate) struct GateRefusal {
+    pub(crate) lines: Vec<String>,
+    pub(crate) outcome: CliOutcome,
+}
+
+/// The typed-research gate's reading of `candidate_policy` and its
+/// admission through the promotion door, as `recipe evaluate` and `recipe
+/// promote` both run it first: the admitted candidate with the gate's
+/// assessment, or the refusal.
+pub(crate) fn gated_candidate(
+    command: RecipeCommand,
+    ledger: &relais::ledger::Ledger,
+    incumbent: &RepoPolicy,
+    candidate_policy: &RepoPolicy,
+    bounds: &route::TuningBounds,
+    candidate_path: &Path,
+) -> Result<Result<(route::CandidateRecipe, typed_gate::Assessment), GateRefusal>, CliError> {
+    let gate = operational(
+        typed_gate::assess(ledger, incumbent, candidate_policy),
+        command.context(),
+    )?;
+    Ok(
+        match route::validate_candidate(
+            incumbent,
+            candidate_policy,
+            bounds,
+            route::CandidateAdmission::PromoteGated(&gate.evidence),
+        ) {
+            Ok(candidate) => Ok((candidate, gate)),
+            Err(rejection) => Err(GateRefusal {
+                lines: refusal_lines(command, &rejection, &gate, candidate_path),
+                outcome: CliOutcome::Blocked,
+            }),
+        },
+    )
+}
+
 pub(crate) fn recipe_evaluate_command(candidate_path: &Path) -> Result<CliOutcome, CliError> {
     let (_root, incumbent) = load_repo_policy()?;
     let candidate_text =
@@ -342,20 +456,20 @@ pub(crate) fn recipe_evaluate_command(candidate_path: &Path) -> Result<CliOutcom
     // candidate, is — never a second, looser one for evaluation.
     let bounds = tuning_bounds(&incumbent);
     let ledger = open_ledger()?;
-    let gate = operational(
-        typed_gate::assess(&ledger, &incumbent, &candidate_policy),
-        "recipe evaluate",
-    )?;
-    let candidate = match route::validate_candidate(
+    let (candidate, _assessment) = match gated_candidate(
+        RecipeCommand::Evaluate,
+        &ledger,
         &incumbent,
         &candidate_policy,
         &bounds,
-        route::CandidateAdmission::PromoteGated(&gate.evidence),
-    ) {
-        Ok(candidate) => candidate,
-        Err(rejection) => {
-            eprintln!("relais recipe evaluate: candidate refused: {rejection}");
-            return Ok(CliOutcome::Blocked);
+        candidate_path,
+    )? {
+        Ok(admitted) => admitted,
+        Err(refused) => {
+            for line in &refused.lines {
+                eprintln!("{line}");
+            }
+            return Ok(refused.outcome);
         }
     };
 
@@ -495,20 +609,20 @@ pub(crate) fn recipe_promote_command(
     // gate comes first: a research-tier change is admitted only on its
     // count, and the generic gates below cannot stand in for it.
     let ledger = open_ledger()?;
-    let gate = operational(
-        typed_gate::assess(&ledger, &incumbent, &candidate_policy),
-        "recipe promote",
-    )?;
-    let candidate = match route::validate_candidate(
+    let (candidate, gate) = match gated_candidate(
+        RecipeCommand::Promote,
+        &ledger,
         &incumbent,
         &candidate_policy,
         &bounds,
-        route::CandidateAdmission::PromoteGated(&gate.evidence),
-    ) {
-        Ok(candidate) => candidate,
-        Err(rejection) => {
-            eprintln!("relais recipe promote: candidate refused: {rejection}");
-            return Ok(CliOutcome::Blocked);
+        candidate_path,
+    )? {
+        Ok(admitted) => admitted,
+        Err(refused) => {
+            for line in &refused.lines {
+                eprintln!("{line}");
+            }
+            return Ok(refused.outcome);
         }
     };
     let report = operational(
@@ -573,6 +687,224 @@ pub(crate) fn recipe_rollback_command(name: &str, mode: AmendMode) -> Result<Cli
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gate_refusal(
+        qualifying: usize,
+        accepted: usize,
+        floor: route::ValidityFloor,
+    ) -> route::CandidateRejection {
+        route::CandidateRejection::TypedResearchGate {
+            name: "change-feature".into(),
+            revision: 2,
+            count: route::TypedGateCount {
+                qualifying,
+                accepted,
+                floor,
+            },
+        }
+    }
+
+    const INCUMBENT: &str = r#"schema_version = 1
+[models.research]
+id = "haiku"
+[models.implementation]
+id = "sonnet"
+[[recipes]]
+name = "change-feature"
+revision = 1
+kind = "change"
+scope_within = ["**"]
+task_type = ["feature"]
+tier = "implementation"
+"#;
+
+    const CANDIDATE: &str = r#"
+[[recipes]]
+name = "change-feature"
+revision = 2
+kind = "change"
+scope_within = ["**"]
+task_type = ["feature"]
+tier = "research"
+"#;
+
+    /// `recipe evaluate`'s gate on a ledger whose arm has 15 qualifying
+    /// successes and 5 errored trials, all after the floor's cutoff: held,
+    /// printed as pinned, exit `Blocked`.
+    #[test]
+    fn evaluate_refuses_a_held_arm_with_blocked() {
+        use relais::ids::{DispatchId, RunId, TaskId, TrialId};
+        use relais::ledger::{NewReplayTrial, TrialCost, TrialOutcome};
+        let dir = relais::test_support::short_temp_dir("recipe-held");
+        let ledger = relais::ledger::Ledger::open_with_clock(
+            &dir.join("ledger.sqlite"),
+            Box::new(relais::ledger::FixedClock::new([
+                "2026-12-01T00:00:00+00:00",
+            ])),
+        )
+        .expect("ledger");
+        let incumbent = RepoPolicy::from_toml_str(INCUMBENT).expect("incumbent");
+        let candidate =
+            RepoPolicy::from_toml_str(&format!("{INCUMBENT}{CANDIDATE}")).expect("candidate");
+        let arm = candidate.recipes[1].recipe_id();
+        for n in 0..20 {
+            let task = TaskId::from_stored(format!("task-{n:02}"));
+            let source = RunId::from_stored(format!("source-{n:02}"));
+            let trial_id = TrialId::from_stored(format!("trial-{n:02}"));
+            let arm_run = RunId::from_stored(format!("arm-{n:02}"));
+            ledger
+                .insert_typed_run(
+                    &source,
+                    "/r",
+                    None,
+                    &task,
+                    "rk",
+                    Some(relais::contract::TaskType::Feature),
+                )
+                .expect("task");
+            ledger
+                .insert_replay_trial(&NewReplayTrial {
+                    trial_id: &trial_id,
+                    task_id: &task,
+                    source_run_id: &source,
+                    incumbent_recipe_id: "incumbent",
+                    arm_recipe_id: &arm,
+                    base_sha: "base",
+                    contract_hash: "contract",
+                    verification_profile_hash: "profile",
+                    workspace_isolation: "fresh_checkout_no_accepted_answer",
+                    arm_run_id: &arm_run,
+                    design_sha256: None,
+                })
+                .expect("trial");
+            ledger
+                .record_dispatch_intent(
+                    &DispatchId::from_stored(format!("d-{n:02}")),
+                    &arm_run,
+                    None,
+                    &serde_json::json!({ "model": "haiku" }),
+                    0,
+                    route::RoutedBy::DeterministicRecipe,
+                )
+                .expect("dispatch");
+            // The first five errored, the fifteen after them accepted.
+            let outcome = if n < 5 {
+                TrialOutcome::Errored
+            } else {
+                TrialOutcome::Accepted
+            };
+            ledger
+                .settle_trial(&trial_id, outcome, true, TrialCost::UNKNOWN, 1)
+                .expect("settle");
+        }
+        let refused = gated_candidate(
+            RecipeCommand::Evaluate,
+            &ledger,
+            &incumbent,
+            &candidate,
+            &super::super::ctx::tuning_bounds(&incumbent),
+            Path::new("cand.toml"),
+        )
+        .expect("the gate reads");
+        let Err(refused) = refused else {
+            panic!("held is refused");
+        };
+        assert_eq!(refused.outcome, CliOutcome::Blocked);
+        assert_eq!(super::super::outcome::exit_code(&refused.outcome), 3);
+        assert_eq!(
+            refused.lines,
+            [
+                "relais recipe evaluate: candidate refused:",
+                "held: 15/20 valid (75%), below the 80% floor; needs 5 more valid trials",
+                "next: re-run relais recipe evaluate cand.toml after 5 more valid trials settle",
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok(); // a temp dir left behind is harmless
+    }
+
+    /// The held refusal ends the prefix's line before `held:`, names a
+    /// command that exists, and keeps every line within 80 columns but the
+    /// user's path; a pending trial adds its own line.
+    #[test]
+    fn a_held_refusal_prints_its_pinned_lines() {
+        let held = gate_refusal(
+            15,
+            15,
+            route::ValidityFloor::Held {
+                valid: 15,
+                settled: 20,
+            },
+        );
+        let lines = refusal_lines(
+            RecipeCommand::Evaluate,
+            &held,
+            &typed_gate::Assessment::default(),
+            Path::new("cand.toml"),
+        );
+        assert_eq!(
+            lines,
+            [
+                "relais recipe evaluate: candidate refused:",
+                "held: 15/20 valid (75%), below the 80% floor; needs 5 more valid trials",
+                "next: re-run relais recipe evaluate cand.toml after 5 more valid trials settle",
+            ]
+        );
+        assert!(lines.iter().all(|line| line.chars().count() <= 80));
+        let quoted = refusal_lines(
+            RecipeCommand::Evaluate,
+            &held,
+            &typed_gate::Assessment::default(),
+            Path::new("my dir/it's.toml"),
+        );
+        assert_eq!(
+            quoted[2],
+            "next: re-run relais recipe evaluate 'my dir/it'\\''s.toml' after 5 more valid trials settle"
+        );
+
+        // 11 of 19, floored to 57%, needs 21.
+        let lines = refusal_lines(
+            RecipeCommand::Promote,
+            &gate_refusal(
+                15,
+                14,
+                route::ValidityFloor::Held {
+                    valid: 11,
+                    settled: 19,
+                },
+            ),
+            &typed_gate::Assessment::default(),
+            Path::new("c.toml"),
+        );
+        assert_eq!(
+            lines[1],
+            "held: 11/19 valid (57%), below the 80% floor; needs 21 more valid trials"
+        );
+
+        // A count refusal stays one line, with the trial a pending row bars.
+        let mut gate = typed_gate::Assessment::default();
+        gate.waiting.insert(
+            ("change-feature".into(), 2),
+            typed_gate::Waiting {
+                trial: relais::ids::TrialId::from_stored("trial-7"),
+                since: "2026-12-01T00:00:00+00:00".into(),
+            },
+        );
+        let lines = refusal_lines(
+            RecipeCommand::Evaluate,
+            &gate_refusal(11, 11, route::ValidityFloor::NotApplied),
+            &gate,
+            Path::new("c.toml"),
+        );
+        assert_eq!(
+            lines,
+            [
+                "relais recipe evaluate: candidate refused: typed-research gate: \
+                 change-feature@2 has 11 qualifying trials, needs 15 with at least 14 accepted \
+                 without escalation",
+                "waiting on trial trial-7 (pending since 2026-12-01)",
+            ]
+        );
+    }
 
     fn probe_recipe_spec() -> RecipeSpec {
         RecipeSpec {

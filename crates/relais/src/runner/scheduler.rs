@@ -1121,13 +1121,33 @@ fn accept_integrated(
         match review {
             ReviewOutcome::NoFindings => {}
             ReviewOutcome::Findings(detail) => {
-                return engine.stop(
+                let assembly = &*assembly;
+                let next = engine.decide_with_snapshot(
                     &budget,
                     Observation::ReviewFindings(
                         detail.clone(),
                         super::review::finding_severities(&detail),
                     ),
-                );
+                    &|engine| {
+                        let review = crate::verify::ReviewRecord::Findings {
+                            detail: detail.clone(),
+                            review: Box::new(super::review_record_of(ledger, &engine.run_id)?),
+                        };
+                        integrated_receipt(
+                            engine,
+                            IntegratedReceiptInput {
+                                root,
+                                assembled: &assembled,
+                                assembly,
+                                spend: &spend,
+                                verification_inputs_changed: &verification_inputs_changed,
+                                outcome: State::NeedsDecision,
+                                review,
+                            },
+                        )
+                    },
+                )?;
+                return engine.outcome_of_stop(next);
             }
             ReviewOutcome::Unavailable(detail) => {
                 let assembly = &*assembly;

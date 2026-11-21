@@ -306,6 +306,15 @@ pub struct NewReplayTrial<'a> {
     pub design_sha256: Option<&'a str>,
 }
 
+/// What a trial settled to: [`Ledger::settle_trial`]'s figures, together.
+#[derive(Debug, Clone, Copy)]
+pub struct TrialSettlement {
+    pub outcome: TrialOutcome,
+    pub accepted_without_escalation: bool,
+    pub cost: TrialCost,
+    pub duration_ms: i64,
+}
+
 /// What recording a recipe promotion's provenance needs.
 #[derive(Debug, Clone, Copy)]
 pub struct NewRecipePromotion<'a> {
@@ -404,6 +413,27 @@ impl Ledger {
             arm_run_id: replay.arm_run_id,
             design_sha256: replay.design_sha256,
         })
+    }
+
+    /// Write a replay's trial already settled, in one transaction: a crash
+    /// between the insert and the settle can never leave a pending row,
+    /// which the typed-research gate would read as a barrier for good.
+    pub fn insert_settled_replay_trial(
+        &self,
+        replay: &NewReplayTrial<'_>,
+        settled: &TrialSettlement,
+    ) -> Result<()> {
+        let transaction = self.write_tx()?;
+        self.insert_replay_trial(replay)?;
+        self.settle_trial(
+            replay.trial_id,
+            settled.outcome,
+            settled.accepted_without_escalation,
+            settled.cost,
+            settled.duration_ms,
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Every arm recipe id a trial was drawn among, control first, or
@@ -695,6 +725,29 @@ impl Ledger {
     ) -> Result<Vec<TrialRow>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {} FROM trials WHERE outcome IS NOT NULL ORDER BY created_at, trial_id",
+            Self::TRIAL_COLUMNS
+        ))?;
+        let rows = stmt.query_map([], Self::trial_columns)?;
+        let rows: Vec<TrialColumns> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(parse_trial_row)
+            .filter(|row| match row {
+                Ok(row) => recipe_ids.contains(&row.arm_recipe_id),
+                Err(_) => true,
+            })
+            .collect()
+    }
+
+    /// Every trial of the given recipe ids, settled or not, oldest first
+    /// (`created_at`, then `trial_id`): what the typed-research gate reads
+    /// its closed prefix from, a pending row being the barrier that ends it.
+    /// A corrupt row is an error, as in [`Self::settled_trials_for_recipes`].
+    pub fn trials_for_recipes(
+        &self,
+        recipe_ids: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<TrialRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM trials ORDER BY created_at, trial_id",
             Self::TRIAL_COLUMNS
         ))?;
         let rows = stmt.query_map([], Self::trial_columns)?;
@@ -1168,6 +1221,89 @@ mod tests {
             assert!(matches!(error, LedgerError::Corrupt { .. }), "{error:?}");
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A replay's trial is written already settled, in one write; the same
+    /// trial written twice is refused and leaves the first row as it was.
+    #[test]
+    fn a_settled_replay_trial_is_written_once_and_never_pending() {
+        let (ledger, dir) = temp_ledger();
+        let source_task = TaskId::from_stored("task-s");
+        let source_run = run("run-s");
+        ledger
+            .insert_run(&source_run, "/repo", None, &source_task, "rk")
+            .expect("run");
+        let trial_id = TrialId::from_stored("trial-s");
+        let arm_run = run("arm-s");
+        let replay = NewReplayTrial {
+            trial_id: &trial_id,
+            task_id: &source_task,
+            source_run_id: &source_run,
+            incumbent_recipe_id: "incumbent",
+            arm_recipe_id: "arm",
+            base_sha: "base",
+            contract_hash: "contract",
+            verification_profile_hash: "profile",
+            workspace_isolation: "fresh_checkout_no_accepted_answer",
+            arm_run_id: &arm_run,
+            design_sha256: None,
+        };
+        let errored = TrialSettlement {
+            outcome: TrialOutcome::Errored,
+            accepted_without_escalation: false,
+            cost: TrialCost::UNKNOWN,
+            duration_ms: 7,
+        };
+        ledger
+            .insert_settled_replay_trial(&replay, &errored)
+            .expect("written");
+        let accepted = TrialSettlement {
+            outcome: TrialOutcome::Accepted,
+            ..errored
+        };
+        ledger
+            .insert_settled_replay_trial(&replay, &accepted)
+            .expect_err("the same trial is refused");
+        let rows = ledger.trials_by_task(&source_task).expect("rows");
+        assert_eq!(rows.len(), 1, "no second row");
+        assert_eq!(rows[0].outcome, Some(TrialOutcome::Errored));
+        assert_eq!(rows[0].duration_ms, Some(7));
+        std::fs::remove_dir_all(&dir).ok(); // a temp dir left behind is harmless
+    }
+
+    /// The gate's reader returns a pending trial beside settled ones, and a
+    /// corrupt row is still an error, never skipped.
+    #[test]
+    fn trials_for_recipes_keeps_pending_rows_and_refuses_a_corrupt_one() {
+        let (ledger, dir) = temp_ledger();
+        let source_task = TaskId::from_stored("task-p");
+        let source_run = run("run-p");
+        ledger
+            .insert_run(&source_run, "/repo", None, &source_task, "rk")
+            .expect("run");
+        let trial_id = TrialId::from_stored("trial-p");
+        let trial = new_trial(&trial_id, &source_task, &source_run);
+        ledger.insert_trial(&trial).expect("insert trial");
+        let ids = std::iter::once(trial.arm_recipe_id.to_string()).collect();
+        let rows = ledger.trials_for_recipes(&ids).expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, None, "a pending row is returned");
+        assert!(ledger
+            .settled_trials_for_recipes(&ids)
+            .expect("rows")
+            .is_empty());
+        ledger
+            .conn
+            .execute(
+                "UPDATE trials SET arm_index = -1 WHERE trial_id = ?1",
+                params![trial_id.as_str()],
+            )
+            .expect("hand-written arm index");
+        let error = ledger
+            .trials_for_recipes(&ids)
+            .expect_err("a corrupt row is an error");
+        assert!(matches!(error, LedgerError::Corrupt { .. }), "{error:?}");
+        std::fs::remove_dir_all(&dir).ok(); // a temp dir left behind is harmless
     }
 
     /// A trial settled with an actual, known cost reads that cost back

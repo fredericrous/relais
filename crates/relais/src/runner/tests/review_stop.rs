@@ -703,3 +703,191 @@ fn a_failure_building_the_stops_receipt_still_ends_the_run_at_its_stop() {
     assert!(events.contains("verification_snapshot_failed"), "{events}");
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
+
+const REVIEW_HIGH: &str = "FINDINGS:\n1. [high] src/lib.rs:1 wrong result. Fix.\n";
+const REVIEW_LOW: &str = "FINDINGS:\n1. [low] src/lib.rs:1 stale comment. Fix.\n";
+
+/// A backend whose reviewer dispatches answer `text` as their findings.
+struct Findings(MockBackend, &'static str);
+
+impl Harness for Findings {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+    fn probe(&self) -> Option<crate::backend::Capabilities> {
+        self.0.probe()
+    }
+}
+
+impl Backend for Findings {
+    fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
+        let mut launched = self.0.launch(spec)?;
+        if spec.agent == AgentKind::Reviewer {
+            launched.ended = Ended::Exited(0);
+            launched.result_text = Some(self.1.to_string());
+        }
+        Ok(launched)
+    }
+}
+
+#[test]
+fn a_review_findings_stop_saves_its_snapshot_before_the_needs_review_transition() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let backend = Findings(
+        big_patch_backend(0, 0, Arc::new(AtomicBool::new(false))),
+        REVIEW_HIGH,
+    );
+    let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+    assert!(
+        matches!(outcome.terminal, Terminal::NeedsReview { .. }),
+        "{outcome:?}"
+    );
+    let snapshot = fixture
+        .ledger
+        .verification_snapshot(&outcome.run_id)
+        .expect("read")
+        .expect("the snapshot was saved before the run stopped");
+    assert_eq!(snapshot.stop_reason, "review_findings");
+    let transitions = fixture.ledger.transitions(&outcome.run_id).expect("rows");
+    let stop = transitions
+        .iter()
+        .find(|transition| transition.reason == Reason::ReviewFindings.as_str())
+        .expect("the review_findings transition");
+    assert_eq!(stop.to_state, State::NeedsReview);
+    // The snapshot is saved before the stop is recorded, never after it.
+    let saved_at = fixture
+        .ledger
+        .verification_snapshot_saved_at(&outcome.run_id)
+        .expect("read")
+        .expect("saved");
+    let instant = |stamp: &str| chrono::DateTime::parse_from_rfc3339(stamp).expect("a stamp");
+    assert!(
+        instant(&saved_at) < instant(&stop.at),
+        "the snapshot ({saved_at}) precedes the transition ({})",
+        stop.at
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // a temp dir left behind is harmless
+}
+
+#[test]
+fn review_findings_sent_to_a_repair_attempt_save_no_snapshot() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    // Low findings are repaired once; the repaired candidate's review then
+    // answers `FINDINGS: none` through the inner mock, so the run accepts.
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let inner = {
+        let seen = Arc::clone(&seen);
+        MockBackend::new(move |spec| {
+            if spec.prompt.contains("semantic reviewer") {
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                let text = if n == 0 { REVIEW_LOW } else { "FINDINGS: none" };
+                return MockOutcome {
+                    result_text: Some(text.into()),
+                    exit_code: Some(0),
+                    usage: Some(usage(10)),
+                    ..Default::default()
+                };
+            }
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).ok(); // gone on the repair attempt already
+            std::fs::write(spec.work_dir.join("src/note.txt"), "x\n").expect("write");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        })
+    };
+    let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &inner);
+    assert!(
+        matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    assert!(
+        fixture
+            .ledger
+            .transitions(&outcome.run_id)
+            .expect("rows")
+            .iter()
+            .any(|t| t.reason == Reason::ReviewRepair.as_str()),
+        "the findings were repaired"
+    );
+    assert!(fixture
+        .ledger
+        .verification_snapshot(&outcome.run_id)
+        .expect("read")
+        .is_none());
+    std::fs::remove_dir_all(&fixture.dir).ok(); // a temp dir left behind is harmless
+}
+
+#[test]
+fn a_decomposed_review_findings_stop_saves_a_snapshot() {
+    let fixture = Fixture::new();
+    let repo = repo_policy_reviewing_only_the_root(&fixture);
+    let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let backend = Findings(package_worker(launches), REVIEW_HIGH);
+    let contract = decomposed_contract(&fixture, plan_json(false));
+    let RunOutcome {
+        run_id,
+        terminal: Terminal::NeedsReview { .. },
+    } = fixture.execute(&contract, &repo, &backend)
+    else {
+        panic!("findings on the assembled candidate are needs_review");
+    };
+    let snapshot = fixture
+        .ledger
+        .verification_snapshot(&run_id)
+        .expect("read")
+        .expect("the stop saved a snapshot");
+    assert_eq!(snapshot.stop_reason, "review_findings");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // a temp dir left behind is harmless
+}
+
+#[test]
+fn a_review_findings_stop_is_not_reviewed_in_parts_and_its_approval_keeps_the_findings() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let backend = Findings(
+        big_patch_backend(0, 0, Arc::new(AtomicBool::new(false))),
+        REVIEW_HIGH,
+    );
+    let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+    assert!(
+        matches!(outcome.terminal, Terminal::NeedsReview { .. }),
+        "{outcome:?}"
+    );
+    let refused = crate::runner::successor::plan_review_parts(
+        &fixture.ledger,
+        &outcome.run_id,
+        &fixture.artifacts,
+    );
+    let Err(crate::runner::successor::PlanError::NotReviewable(why)) = refused else {
+        panic!("review-parts answers only a review it could not have: {refused:?}");
+    };
+    assert!(why.contains("waits on review_findings"), "{why}");
+
+    let sealed = approve_from_snapshot(
+        &fixture.ledger,
+        &fixture.artifacts,
+        &outcome.run_id,
+        &answer(State::NeedsReview),
+        &|| Ok(()),
+    )
+    .expect("approved");
+    assert!(sealed.written);
+    let (row, _) = reopened(&fixture)
+        .receipt(&outcome.run_id)
+        .expect("read")
+        .expect("a receipt row");
+    assert_eq!(row["outcome"], "accepted");
+    let receipt: crate::verify::Receipt = serde_json::from_value(row).expect("parses");
+    let ReviewRecord::Findings { detail, review } = &receipt.review else {
+        panic!("{:?}", receipt.review);
+    };
+    assert!(detail.contains("wrong result"), "{detail}");
+    assert_eq!(receipt.review.reviewed(), review.reviewed());
+    assert_eq!(receipt.review.reviewed(), Some(true));
+    std::fs::remove_dir_all(&fixture.dir).ok(); // a temp dir left behind is harmless
+}

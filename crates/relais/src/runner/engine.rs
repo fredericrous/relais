@@ -202,6 +202,25 @@ impl<'a> RunEngine<'a> {
         self.record_decision(decision)
     }
 
+    /// Like `decide`, but a decision that stops the run for
+    /// `review_findings` saves the verification snapshot first, so that stop
+    /// never exists without it and the machine decides once. A decision that
+    /// continues, or stops for another reason, saves none.
+    pub(crate) fn decide_with_snapshot(
+        &mut self,
+        budget: &Budget,
+        observation: Observation,
+        build: &dyn Fn(&Self) -> Result<crate::verify::Receipt, RunError>,
+    ) -> Result<Next, RunError> {
+        let decision = decide(budget, observation);
+        // Only a stop for the findings themselves can be approved from its
+        // snapshot; any other stop would keep one it never seals.
+        if matches!(decision.next, Next::Stop(_)) && decision.reason == Reason::ReviewFindings {
+            self.save_review_snapshot(build, decision.reason);
+        }
+        self.record_decision(decision)
+    }
+
     /// Record a decision the machine made and hand back its step.
     fn record_decision(&mut self, decision: super::machine::Decision) -> Result<Next, RunError> {
         let what = match &decision.next {
@@ -256,7 +275,7 @@ impl<'a> RunEngine<'a> {
     }
 
     /// The run's outcome for a recorded `Next` that must be a stop.
-    fn outcome_of_stop(&self, next: Next) -> Result<RunOutcome, RunError> {
+    pub(super) fn outcome_of_stop(&self, next: Next) -> Result<RunOutcome, RunError> {
         match next {
             Next::Stop(terminal) => Ok(RunOutcome {
                 run_id: self.run_id.clone(),

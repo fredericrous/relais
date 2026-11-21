@@ -1,7 +1,8 @@
-//! Approving a run that stopped for a review it could not have (SPEC §10).
+//! Approving a run that stopped for a review it could not have, or whose
+//! review found something (SPEC §10).
 //!
-//! `relais decide <run> approve` on a run that ended `review_over_budget`
-//! or `review_unavailable` seals a receipt from the verification snapshot
+//! `relais decide <run> approve` on a run that ended `review_over_budget`,
+//! `review_unavailable` or `review_findings` seals a receipt from the verification snapshot
 //! the run saved before it stopped. Publication order: the receipt artifact
 //! is written to a content-addressed path, then the receipt row, its
 //! evidence row and the resolution are one ledger transaction. A retry that
@@ -22,6 +23,14 @@ pub fn seals_from_snapshot(raised_reason: &str) -> bool {
     [Reason::ReviewOverBudget, Reason::ReviewUnavailable]
         .iter()
         .any(|reason| reason.as_str() == raised_reason)
+}
+
+/// The reasons whose approval seals a receipt from a snapshot when the run
+/// saved one: the reviews that could not be had, and a review that found
+/// something. Only the first two may be reviewed in parts
+/// ([`seals_from_snapshot`]).
+pub fn seals_on_approve(raised_reason: &str) -> bool {
+    seals_from_snapshot(raised_reason) || raised_reason == Reason::ReviewFindings.as_str()
 }
 
 /// Why an approval could not be sealed.

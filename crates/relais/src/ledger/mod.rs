@@ -69,8 +69,8 @@ pub use transitions::{
 };
 pub use trials::{
     GroundTruth, GroundTruthVerdict, JudgeRefusal, Judged, NewRecipePromotion, NewReplayTrial,
-    NewTrial, RecipePromotion, TrialCost, TrialCostError, TrialOutcome, TrialRow, TrialUsage,
-    LIVE_WORKTREE,
+    NewTrial, RecipePromotion, TrialCost, TrialCostError, TrialOutcome, TrialRow, TrialSettlement,
+    TrialUsage, LIVE_WORKTREE,
 };
 pub use trust::{StoredDeclaration, TrustGrantRecord};
 pub use usage::{Booking, DispatchBooking, LiveDispatch, PhaseCost, UnitUsage, UsageEvent};

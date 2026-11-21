@@ -82,6 +82,20 @@ impl Ledger {
         Ok(())
     }
 
+    /// When the run's snapshot was saved: what a test orders it by against
+    /// the run's transitions.
+    #[cfg(test)]
+    pub(crate) fn verification_snapshot_saved_at(&self, run_id: &RunId) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT saved_at FROM verification_snapshots WHERE run_id = ?1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// The run's saved snapshot, if it saved one.
     pub fn verification_snapshot(&self, run_id: &RunId) -> Result<Option<VerificationSnapshot>> {
         let row: Option<(String, String, String, String, String, String)> = self
