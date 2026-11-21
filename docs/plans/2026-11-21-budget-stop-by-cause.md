@@ -180,7 +180,7 @@ bar it started under.
 
 ## Phases
 
-- [ ] Phase 1 — a structured budget cause and the suspended time, in
+- [x] Phase 1 — a structured budget cause and the suspended time, in
   `crates/relais/src/runner/machine.rs`,
   `crates/relais/src/runner/scheduler.rs`,
   `crates/relais/src/runner/engine.rs`,
@@ -207,7 +207,7 @@ bar it started under.
   - a 120 s suspend inside an admission wait yields 0;
   - an engine run (`runner/tests/budgets.rs`) whose ledger clock's awake reading lags stops with evidence `suspended_ms` >= 60000, and the existing `SkewClock` work stop reports `suspended_ms: 0`;
   - each `Limit` maps to its cause.
-- [ ] Phase 2 — the mapping and the cutover, in
+- [x] Phase 2 — the mapping and the cutover, in
   `crates/relais/src/runner/live_trial.rs`,
   `crates/relais/src/route/candidate.rs`, `crates/relais/src/route/mod.rs`,
   `crates/relais/src/cli/replay.rs`, `crates/relais/src/cli/run.rs`,
@@ -223,7 +223,7 @@ bar it started under.
     `errored`, through the new `Ledger` first-trial query;
   - the bindings of `Terminal::BudgetExhausted { detail }` in `cli/run.rs`
     and `runner/tests/mod.rs` follow the new field.
-- [ ] Phase 3 — ADR-0006 §1 amendment, the spec and the release notes:
+- [x] Phase 3 — ADR-0006 §1 amendment, the spec and the release notes:
   `.adr/records/0006-a-change-runs-below-implementation-only-on-evidence.md`,
   `docs/SPEC.md` and `CHANGELOG.md`.
   - §1 gains one sentence: from `TYPED_GATE_BUDGET_CAUSE_FROM`, a budget stop
@@ -245,18 +245,29 @@ bar it started under.
 - 2026-11-21: the 60 s suspend threshold. The check skews measured were
   either 0 s or 58 s and more; native `SUSPEND_GAP` is 10 s, but work also
   holds short scheduler stalls.
+- 2026-11-21: Phases 1–2 came from relais run `run-660ca667b0445-5b52`
+  (sonnet). Its worker hit its one-hour wall time with the candidate whole
+  but unverified. A verify run then found two failures, and both were fixed
+  by hand:
+  - the sleep-counting clock read now lives in `procs.rs`, the one module
+    that may name `libc` (`check-module-cycles`);
+  - the `typed_gate` test's trial now records the research model's
+    dispatch, without which the gate never counts it.
+- 2026-11-21: `TYPED_GATE_BUDGET_CAUSE_FROM` is `2026-11-22T00:00:00Z` on
+  the branch. The release sets it to its own instant, as the floor's
+  cutoff was.
 
 ## Verification
 
 | Check | Input | Expected |
 |---|---|---|
-| Unit | `cargo test -p relais --lib live_trial:: route::candidate:: policy::budgets:: runner::machine::` | green, with the new table and boundary tests |
-| Gate | `cargo test -p relais --lib learn::typed_gate::` | green: a `Work` stop breaks the streak under `ByCause` |
-| Suite | `make check` | green |
-| Piloted | the branch binary with `RELAIS_STATE_DIR` set to a scratch directory (never the live ledger), running `relais dataset replay` of one task against a recipe revision with no earlier trial, with `limits.wall_seconds` low enough to stop in work | a stop with evidence `{"limit":"wall_clock","suspended_ms":0}`, the trial row `outcome = rejected`, the end line `outcome=rejected`, and a detail line that names the cause; read with `NO_COLOR=1` and wrapped at 80 columns |
-| Ledger | `sqlite3 -readonly` over `trials` | the five old trials are still `errored` |
-| Suspend | engine test with a scripted clock whose awake scale skips 120 s inside work | evidence `suspended_ms >= 60000`, trial `errored`; a 120 s skip inside an admission wait gives `suspended_ms` 0 and `rejected` |
-| Observe, 7 days after release | `sqlite3 -readonly`: trials since the release whose run ended `budget_exhausted`, by outcome and by `suspended_ms >= 60000` | rejected about 80%, suspended about 10%; a ratio far off is a mapping bug |
+| Unit | `cargo test -p relais --lib -- learn::typed_gate:: live_trial:: route::candidate:: policy::budgets:: runner::tests::budgets::` | green, with the new table and boundary tests. **Actual:** 116 passed, 0 failed |
+| Gate | `cargo test -p relais --lib learn::typed_gate::` | green: a `Work` stop breaks the streak under `ByCause`. **Actual:** passed (in the run above), after the dispatch fix |
+| Suite | `make check` | green. **Actual:** the pre-commit gate on `f5b5e04f` passed 33 checks, the full Rust and plugin suites included |
+| Piloted | the branch binary with `RELAIS_STATE_DIR` set to a scratch directory (never the live ledger), running `relais dataset replay` of one task against a recipe revision with no earlier trial, with `limits.wall_seconds` low enough to stop in work | a stop with evidence `{"limit":"wall_clock","suspended_ms":0}`, the trial row `outcome = rejected`, the end line `outcome=rejected`, and a detail line that names the cause; read with `NO_COLOR=1` and wrapped at 80 columns. **Actual:** not run. A scratch ledger holds no replayable source task, and `relais run` is refused outside the plugin. The engine tests (`a_work_stop_with_no_suspend_reports_none`, `a_work_stop_after_a_host_suspend_names_the_suspend`) pin the evidence and the detail line; the 7-day recount (blue-factory t25) observes it live |
+| Ledger | `sqlite3 -readonly` over `trials` | the five old trials are still `errored`. **Actual:** 5 errored |
+| Suspend | engine test with a scripted clock whose awake scale skips 120 s inside work | evidence `suspended_ms >= 60000`, trial `errored`; a 120 s skip inside an admission wait gives `suspended_ms` 0 and `rejected`. **Actual:** passed (`a_host_sleep_inside_work_is_read_as_suspended_time`, `a_sleep_inside_an_admission_wait_is_not_suspended_work`) |
+| Observe, 7 days after release (blue-factory t25) | `sqlite3 -readonly`: trials since the release whose run ended `budget_exhausted`, by outcome and by `suspended_ms >= 60000` | rejected about 80%, suspended about 10%; a ratio far off is a mapping bug |
 
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix,codex body-sha=5a529fff8124 -->
