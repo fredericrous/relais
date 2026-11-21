@@ -27,19 +27,24 @@ ticket here until it is resolved or moved into a programme of its own.
   SessionEnd depend on the network; `frontier` already reads
   `origin/prog/*` with `--prune`, and the lasting fix is claims on the
   primary (homelab an-t02).
+- [f05](f05-homewatch-injected.md) (2026-11-21): the engine gets its
+  home as a `HomeWatch` on `RunConfig`, built at the CLI root;
+  `home_override` is removed.
 
 ## Handoff
 
-2026-11-21, boundary 3 (f04 closed): no code change. `relais programme
-claim` stays local; f04's Resolution gives the reasons and when to reopen.
+2026-11-21, boundary 3 (f05 closed): `HomeWatch` injected into the
+engine; the refactor and this closing note ride one PR.
 
-- Done: f04 resolved as a decision, docs only. Earlier today relais
-  v0.74.0 shipped the pane's whole pre-clear tail (#515, #516, #517).
-- Next: Inject the home watch into the engine (f05), then f06 and f07;
-  Measure the home fingerprint warnings (f08) is due 2026-11-27.
+- Done: f05, a refactor with no behaviour change. Earlier today f04
+  closed as a decision, and relais v0.74.0 shipped the pane's whole
+  pre-clear tail (#515, #516, #517).
+- Next: f06 (another session held it on 2026-11-21), then f07; Measure
+  the home fingerprint warnings (f08) is due 2026-11-27.
 - Lessons:
   - A relais run can wait out its whole admission budget (30 min) on a
-    host at load 60+ and launch nothing; twice here. Then do it by hand.
+    host at load 40+ and launch nothing; three times now. Then apply its
+    kept `candidate-1.patch` and run the checks by hand.
   - The relais plugin refuses a Bash call whose text names its own
     install command, even inside a heredoc: edit such text with the Edit
     tool.

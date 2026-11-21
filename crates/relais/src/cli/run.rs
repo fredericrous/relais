@@ -309,6 +309,7 @@ pub(crate) fn run_command(
         .as_ref()
         .map(|registry| RegistryPredictor::new(registry, &repo, harness.as_deref()));
     let ids = id_source();
+    let home = relais::homeprint::HomeWatch::from_process();
     let run_id = match ids.run_id() {
         Ok(run_id) => run_id,
         Err(e) => {
@@ -501,6 +502,7 @@ pub(crate) fn run_command(
         machine: &machine,
         ledger: &ledger,
         ids: &ids,
+        home: &home,
         backend: run_backend,
         git: &git,
         hooks: &hooks,

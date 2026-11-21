@@ -337,6 +337,7 @@ pub(crate) fn replay_command(
         }
     }
     let ids = id_source();
+    let home = relais::homeprint::HomeWatch::from_process();
     let run_id = match ids.run_id() {
         Ok(run_id) => run_id,
         Err(e) => {
@@ -436,6 +437,7 @@ pub(crate) fn replay_command(
         machine: &machine,
         ledger: &ledger,
         ids: &ids,
+        home: &home,
         backend: &native_backend,
         git: &git,
         hooks: &hooks,

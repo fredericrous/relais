@@ -2,15 +2,10 @@
 //! files before the run and another after it, and one evidence row per
 //! file that differs. A warning only: nothing here changes a run's state.
 
-use std::ffi::OsString;
-
 use super::RunEngine;
 use crate::homeprint::{self, Drift, Snapshot, Watch};
 use crate::ids::RunId;
 use crate::ledger::{EvidenceKind, Ledger};
-
-/// A variable lookup, by name.
-type EnvLookup<'a> = Box<dyn Fn(&str) -> Option<OsString> + 'a>;
 
 impl<'a> RunEngine<'a> {
     /// The watched files now, for a root run on a machine that has the
@@ -20,17 +15,17 @@ impl<'a> RunEngine<'a> {
         if !settings.enabled || self.parent.is_some() {
             return None;
         }
-        let Some((home, var)) = self.home_and_env() else {
+        let Some(home) = self.config.home.home.as_deref() else {
             eprintln!(
                 "relais: no home directory could be resolved; home files are not watched \
                  (set HOME, or set [fingerprint] enabled = false in machine.toml)"
             );
             return None;
         };
-        let extra_paths = homeprint::expand_extra_paths(&settings.extra_paths, &home);
+        let extra_paths = homeprint::expand_extra_paths(&settings.extra_paths, home);
         let watch = Watch {
-            home: &home,
-            var: &var,
+            home,
+            var: &*self.config.home.env,
             repo_config: homeprint::repo_config(self.config.repo_dir),
             extra_paths: &extra_paths,
         };
@@ -44,10 +39,10 @@ impl<'a> RunEngine<'a> {
         let Some(after) = self.home_snapshot() else {
             return;
         };
-        let Some((home, _)) = self.home_and_env() else {
+        let Some(home) = self.config.home.home.as_deref() else {
             return;
         };
-        let drifts = homeprint::diff(before, &after, &home);
+        let drifts = homeprint::diff(before, &after, home);
         if drifts.is_empty() {
             return;
         }
@@ -72,19 +67,6 @@ impl<'a> RunEngine<'a> {
                 eprintln!("relais: home drift could not be recorded: {error}");
             }
         }
-    }
-
-    /// The home directory and the variable lookup that goes with it: the
-    /// machine's override alone (nothing else is read from the process),
-    /// or the process environment.
-    fn home_and_env(&self) -> Option<(std::path::PathBuf, EnvLookup<'_>)> {
-        if let Some(home) = &self.config.machine.fingerprint.home_override {
-            let owned = home.clone();
-            let var = move |name: &str| (name == "HOME").then(|| owned.clone().into_os_string());
-            return Some((home.clone(), Box::new(var)));
-        }
-        let home = crate::paths::resolve_home(|name| std::env::var_os(name)).ok()?;
-        Some((home, Box::new(|name| std::env::var_os(name))))
     }
 }
 

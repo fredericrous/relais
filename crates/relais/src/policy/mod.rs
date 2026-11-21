@@ -1172,10 +1172,6 @@ pub struct FingerprintSettings {
     /// `~/.config/relais`. Absolute paths, or `~/` under the home directory.
     #[serde(default)]
     pub extra_paths: Vec<std::path::PathBuf>,
-    /// The home directory to watch instead of `HOME`. Not a machine.toml
-    /// key: a test supplies one so no process-wide variable is set.
-    #[serde(skip)]
-    pub(crate) home_override: Option<std::path::PathBuf>,
 }
 
 impl FingerprintSettings {
@@ -1193,7 +1189,6 @@ impl Default for FingerprintSettings {
         Self {
             enabled: Self::enabled_by_default(),
             extra_paths: Vec::new(),
-            home_override: None,
         }
     }
 }

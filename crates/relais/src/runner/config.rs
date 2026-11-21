@@ -16,6 +16,9 @@ pub struct RunConfig<'a> {
     /// Where run and dispatch identifiers come from (clock, process id,
     /// sequence), built once at a boundary and passed in.
     pub ids: &'a crate::ids::IdSource,
+    /// The home directory and variable lookup the home fingerprint
+    /// watches, built once at a boundary.
+    pub home: &'a crate::homeprint::HomeWatch,
     pub backend: &'a dyn Backend,
     /// Git, as a port: every repository fact a run reads goes through
     /// it, so a test supplies one and production supplies
