@@ -334,18 +334,53 @@ pub(crate) fn home_drift_lines(ledger: &Ledger, run: &RunId) -> Vec<String> {
 /// The same lines for the end of `relais run` (stderr), under a heading
 /// that names the command and the run.
 pub(crate) fn home_drift_warning_lines(ledger: &Ledger, run: &RunId) -> Vec<String> {
-    home_drift_report(
-        ledger,
-        run,
+    let (drifts, problems) = relais::runner::drifts_of_run(ledger, run);
+    home_drift_warning_report(&drifts, problems, run)
+}
+
+/// What `relais run` prints on stderr: every line, a record it could not
+/// read included, starts with `relais run: warning: `.
+fn home_drift_warning_report(
+    drifts: &[relais::homeprint::Drift],
+    problems: Vec<String>,
+    run: &RunId,
+) -> Vec<String> {
+    const PREFIX: &str = "relais run: warning: ";
+    let mut lines: Vec<String> = problems
+        .into_iter()
+        .map(|problem| format!("{PREFIX}{problem}"))
+        .collect();
+    lines.extend(relais::homeprint::report(
+        drifts,
         &format!(
-            "relais run: warning: home files changed while {run} was active:",
+            "{PREFIX}home files changed while {run} was active:",
             run = run.as_str()
         ),
-    )
+    ));
+    lines
 }
 
 fn home_drift_report(ledger: &Ledger, run: &RunId, heading: &str) -> Vec<String> {
     let (drifts, mut lines) = relais::runner::drifts_of_run(ledger, run);
     lines.extend(relais::homeprint::report(&drifts, heading));
     lines
+}
+
+#[cfg(test)]
+mod home_drift_warning_tests {
+    use super::*;
+
+    #[test]
+    fn an_unreadable_record_line_carries_the_run_prefix() {
+        let run = RunId::from_stored("run_x");
+        let lines = home_drift_warning_report(
+            &[],
+            vec!["home drift record /a/b unreadable: gone".to_string()],
+            &run,
+        );
+        assert_eq!(
+            lines,
+            vec!["relais run: warning: home drift record /a/b unreadable: gone".to_string()]
+        );
+    }
 }

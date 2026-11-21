@@ -16,10 +16,8 @@ impl<'a> RunEngine<'a> {
             return None;
         }
         let Some(home) = self.config.home.home.as_deref() else {
-            eprintln!(
-                "relais: no home directory could be resolved; home files are not watched \
-                 (set HOME, or set [fingerprint] enabled = false in machine.toml)"
-            );
+            eprintln!("relais: no home directory could be resolved; home files are not watched");
+            eprintln!("relais: set HOME, or set [fingerprint] enabled = false in machine.toml");
             return None;
         };
         let extra_paths = homeprint::expand_extra_paths(&settings.extra_paths, home);

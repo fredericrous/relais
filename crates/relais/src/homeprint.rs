@@ -200,7 +200,7 @@ pub fn report(drifts: &[Drift], heading: &str) -> Vec<String> {
 }
 
 /// Whether `path` may be listed in `[fingerprint] extra_paths`: absolute,
-/// or under `~/`.
+/// or under `~/` (or `~\` on Windows).
 pub fn is_valid_extra_path(path: &Path) -> bool {
     path.is_absolute()
         || path.to_str().is_some_and(|text| {
