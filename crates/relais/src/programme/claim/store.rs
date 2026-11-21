@@ -27,9 +27,17 @@ const LOCK_POLL: Duration = Duration::from_millis(10);
 /// A lock reads as held for a moment after its holder let go when a
 /// concurrent fork copied the descriptor and has not exec'd yet (see
 /// [`crate::procs::LockFile`]); a lock still held after this is skipped.
-/// Keep it well under the 100 ms the SessionStart and SessionEnd hooks are
-/// held to (`hook::respond` tests `…_with_the_lock_held_elsewhere_…`).
+/// It is the only wait a SessionStart or SessionEnd hook spends on a busy
+/// lock, so it is kept well under 100 ms (checked at compile time below);
+/// the pass's file writes come on top and are not bounded by it. The hook
+/// itself is killed only at `install::settings::OTHER_HANDLER_TIMEOUT`.
+/// The `hook::respond` tests `…_with_the_lock_held_elsewhere_…` check that
+/// a busy lock costs the grace and not [`LOCK_WAIT`].
 const ONCE_GRACE: Duration = Duration::from_millis(30);
+const _: () = assert!(
+    ONCE_GRACE.as_millis() < 100,
+    "a hook's lock wait stays well under 100 ms"
+);
 const CLAIM_FILE_MODE: u32 = 0o600;
 /// Under `claims/`: one empty-ish file per session whose end could not delete
 /// its claims, named by the session id.
