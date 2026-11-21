@@ -96,7 +96,7 @@ the person scrolls with the arrow keys.
 - **Tail view.** `[ open ]` sets the pane's shown view to
   `{ kind: 'tail' }`: a top row `[ back ]` (autoFocus, a Button with `label: 'back'` for 2.1.291, as in the agent
   view) with the dim hint `  ↑↓ scroll (starts at the top) · Esc hands the keys to the prompt`, then the
-  title row `before /clear · hh:mm · N rows` and every tail row (at most `ROWS_CAP`, newest kept), not fitted to the
+  title row `before /clear · hh:mm · N rows` and every tail row (at most `ROWS_CAP`, newest kept; shipped as `MAX_TRANSCRIPT_ROWS`, see the 2026-11-21 Decision log entry), not fitted to the
   room. The engine scrolls a tree taller than the body while the pane is
   focused (`Pane.scroll`, Claude Code types). `[ back ]` returns to the
   runs view. `[ hide ]` from the runs view, or a tail hidden by any path
@@ -127,7 +127,7 @@ view scrolled to its top, at 180 and at 100 columns.
   this machine, live check in tmux: `CHANGELOG.md`.
 
 ### 🧑 Your steps
-- `relais install --claude --write` — because the relais plugin refuses a plugin install from the agent; `relais doctor` still says the plugin is at 0.72.0
+- `relais install --claude --write` — because the relais plugin refuses a plugin install from the agent; `relais doctor` (with the 0.74.0 CLI) says the installed plugin is still 0.72.0, two releases behind, since 0.73.0's was never installed here
 
 ## Decision log
 - 2026-11-20 — expand is a view of its own with `[ back ]` (unbacked by UX research: SAP Fiori and ServiceTitan favour expanding in place, which a pane cannot do), scrolled by
