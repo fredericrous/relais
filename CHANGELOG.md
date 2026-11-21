@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.75.0
+
 - `relais decide <run> approve` on a run that stopped `needs_review` for
   `review_findings` now seals a receipt, as an approval of an over-budget
   or unavailable review already did. The run saves a verification snapshot

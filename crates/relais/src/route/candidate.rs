@@ -169,7 +169,7 @@ pub const TYPED_GATE_FLOOR_PERCENT: usize = 80;
 /// The floor applies to a recipe revision whose first trial was created at
 /// or after this instant, the release that shipped it; a revision already
 /// mid-gate keeps the bar it started under.
-pub const TYPED_GATE_FLOOR_FROM: &str = "2026-11-21T00:00:00+00:00";
+pub const TYPED_GATE_FLOOR_FROM: &str = "2026-11-21T02:05:00+00:00";
 
 /// Whether a revision is held to the validity floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

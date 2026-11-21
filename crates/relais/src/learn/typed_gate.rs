@@ -1097,7 +1097,7 @@ tier = "research"
             FloorRule::Applies
         );
         assert_eq!(
-            validity_floor_rule("2026-11-20T23:59:59+00:00"),
+            validity_floor_rule("2026-11-21T02:04:59+00:00"),
             FloorRule::Grandfathered
         );
         assert_eq!(validity_floor_rule("not a stamp"), FloorRule::Applies);
