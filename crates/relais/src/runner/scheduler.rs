@@ -38,7 +38,7 @@ use crate::workspace::{self, WorkspaceError};
 use super::{
     data_block, data_list_block, effort_str, execute_child, AttemptLabel, Budget, Exhausted, Limit,
     ManagedDispatch, Next, Observation, Reason, ReviewOutcome, RunConfig, RunEngine, RunError,
-    RunOutcome, State, Terminal, VerifyFailure,
+    RunOutcome, State, Terminal, VerifyFailure, WorkBound,
 };
 
 /// The patch an accepted decomposed run exports its assembled revision
@@ -827,8 +827,11 @@ fn run_package(
         &crate::ids::PackageId::from_stored(package.id.clone()),
         run.role,
         match (engine.work_bound, binding) {
-            (super::WorkBound::RootTotal, _) | (_, Exhausted::Total) => super::WorkBound::RootTotal,
-            (super::WorkBound::Own { suspended_ms }, _) => super::WorkBound::Own {
+            (WorkBound::RootTotal, _) | (_, Exhausted::Total) => WorkBound::RootTotal,
+            (
+                WorkBound::Own { suspended_ms },
+                Exhausted::Work | Exhausted::AdmissionWait | Exhausted::DiskWait,
+            ) => WorkBound::Own {
                 suspended_ms: suspended_ms.saturating_add(engine.budgets.suspended_ms()),
             },
         },

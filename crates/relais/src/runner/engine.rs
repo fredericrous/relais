@@ -10,7 +10,7 @@ use super::{
     Event, Events, EvidenceKind, Exhausted, Finish, Gate, Instant, KeptCandidate, Limit, Next,
     Observation, Ordering, PackageId, PackageRole, PathBuf, Phase, Reason, Refusal, Request,
     RunConfig, RunEngine, RunError, RunId, RunOutcome, State, Summary, Terminal, Transition,
-    UsagePhase, ADMISSION_POLL,
+    UsagePhase, WorkBound, ADMISSION_POLL,
 };
 
 impl<'a> RunEngine<'a> {
@@ -93,7 +93,7 @@ impl<'a> RunEngine<'a> {
             worker_code_rules_gap: None,
             cancel_asked: Arc::new(AtomicBool::new(false)),
             budgets: Budgets::unbounded(),
-            work_bound: super::WorkBound::default(),
+            work_bound: WorkBound::default(),
             heavy_tries: verify::Tries::for_epoch(epoch),
             growth: crate::ledger::LedgerGrowth::of(config.ledger),
             registration: None,
@@ -1153,10 +1153,8 @@ impl<'a> RunEngine<'a> {
         let limits = self.budgets.limits();
         match exhausted {
             Exhausted::Work => match self.work_bound {
-                super::WorkBound::RootTotal => {
-                    self.stop(budget, Observation::LimitReached(Limit::Total))
-                }
-                super::WorkBound::Own {
+                WorkBound::RootTotal => self.stop(budget, Observation::LimitReached(Limit::Total)),
+                WorkBound::Own {
                     suspended_ms: inherited,
                 } => {
                     let suspended_ms = inherited.saturating_add(self.budgets.suspended_ms());
