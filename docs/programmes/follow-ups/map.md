@@ -22,19 +22,21 @@ ticket here until it is resolved or moved into a programme of its own.
   narrowing resize moves a placed pane inline above the prompt, never
   hides it, and `$.ui.panes()` keeps `isPlaced` true; live in tmux on
   Claude Code 2.1.329.
+- [f04](f04-claim-pushes-branch.md) (2026-11-21): a claim does not push
+  its `prog/` branch. A branch never expires and would make release and
+  SessionEnd depend on the network; `frontier` already reads
+  `origin/prog/*` with `--prune`, and the lasting fix is claims on the
+  primary (homelab an-t02).
 
 ## Handoff
 
-2026-11-21, boundary 4 (a release verified and swept): relais v0.74.0
-shipped the pane's whole pre-clear tail (plan
-`docs/plans/2026-11-20-pane-shows-whole-tail.md`, done; #515, #516, #517).
+2026-11-21, boundary 3 (f04 closed): no code change. `relais programme
+claim` stays local; f04's Resolution gives the reasons and when to reopen.
 
-- Done: the tail keeps all 2000 characters and every row; a cut tail shows
-  its newest row, `… N earlier rows` and `[ open ]`, a view the arrow keys
-  scroll. Live-checked in tmux at 180×40 and 100×30.
-- Inbox: one orphan line (2026-11-19) filed as
-  [f04](f04-claim-pushes-branch.md).
-- Next: f04.
+- Done: f04 resolved as a decision, docs only. Earlier today relais
+  v0.74.0 shipped the pane's whole pre-clear tail (#515, #516, #517).
+- Next: Inject the home watch into the engine (f05), then f06 and f07;
+  Measure the home fingerprint warnings (f08) is due 2026-11-27.
 - Lessons:
   - A relais run can wait out its whole admission budget (30 min) on a
     host at load 60+ and launch nothing; twice here. Then do it by hand.
