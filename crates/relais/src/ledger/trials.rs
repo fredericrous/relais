@@ -738,6 +738,18 @@ impl Ledger {
             .collect()
     }
 
+    /// When the oldest trial that ran under this arm recipe id was created
+    /// (RFC 3339), or `None` for a recipe never trialled: the one column the
+    /// settle paths need, without loading every fact.
+    pub fn first_trial_at_for_recipe(&self, recipe_id: &str) -> Result<Option<String>> {
+        let first: Option<String> = self.conn.query_row(
+            "SELECT MIN(created_at) FROM trials WHERE arm_recipe_id = ?1",
+            [recipe_id],
+            |row| row.get(0),
+        )?;
+        Ok(first)
+    }
+
     /// Every trial of the given recipe ids, settled or not, oldest first
     /// (`created_at`, then `trial_id`): what the typed-research gate reads
     /// its closed prefix from, a pending row being the barrier that ends it.

@@ -196,7 +196,7 @@ fn the_total_ends_a_queued_run_before_its_wait_budget_does() {
     let outcome =
         fixture.execute_managed(&contract, &repo, &machine, &conditional_worker(""), &gate);
     assert!(
-        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail } if detail.contains("total")),
+        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail, .. } if detail.contains("total")),
         "{outcome:?}"
     );
 }
@@ -215,7 +215,7 @@ fn wall_seconds_caps_the_work_and_nothing_else() {
     repo.execution.min_repair_seconds = 0;
     let outcome = fixture.execute(&contract, &repo, &slow_idle_worker(1_200));
     assert!(
-        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail } if detail.contains("work budget")),
+        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail, .. } if detail.contains("work budget")),
         "{outcome:?}"
     );
     let events = std::fs::read_to_string(
@@ -332,6 +332,217 @@ fn floored_repo_checking(fixture: &Fixture, check: CommandSpec) -> RepoPolicy {
     repo
 }
 
+/// A ledger clock on which the host can sleep: `skew` moves every scale,
+/// `asleep` is the part of it the awake scale does not count.
+struct SleepingClock {
+    skew: Arc<std::sync::atomic::AtomicI64>,
+    asleep: Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl crate::ledger::Clock for SleepingClock {
+    fn now_rfc3339(&self) -> String {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-09-20T12:00:00+00:00")
+            .expect("a fixed instant");
+        (base + chrono::Duration::seconds(self.skew.load(Ordering::SeqCst))).to_rfc3339()
+    }
+
+    fn awake_millis(&self) -> i64 {
+        (self.skew.load(Ordering::SeqCst) - self.asleep.load(Ordering::SeqCst)) * 1000
+    }
+
+    fn continuous_millis(&self) -> i64 {
+        self.skew.load(Ordering::SeqCst) * 1000
+    }
+}
+
+/// A run whose one worker takes `elapsed` seconds on the ledger's clock, of
+/// which the host slept `slept`, against a 100 s work budget and no repair
+/// floor; the check stays red, so the work budget refuses the repair.
+fn work_stop_after(elapsed: i64, slept: i64) -> RunOutcome {
+    let skew = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let asleep = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let fixture = Fixture::with_clock(Box::new(SleepingClock {
+        skew: Arc::clone(&skew),
+        asleep: Arc::clone(&asleep),
+    }));
+    let mut repo = floored_repo(&fixture);
+    repo.execution.min_repair_seconds = 0;
+    let backend = MockBackend::new(move |spec| {
+        skew.fetch_add(elapsed, Ordering::SeqCst);
+        asleep.fetch_add(slept, Ordering::SeqCst);
+        std::fs::write(spec.work_dir.join("src/try.txt"), "try\n")
+            .expect("the worker writes its attempt's change");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    fixture.execute(&fixture.contract(Review::Off), &repo, &backend)
+}
+
+#[test]
+fn a_work_stop_after_a_host_suspend_names_the_suspend() {
+    let outcome = work_stop_after(120, 120);
+    let Terminal::BudgetExhausted { detail, cause } = &outcome.terminal else {
+        panic!("{outcome:?}");
+    };
+    let BudgetCause::Work { suspended_ms } = cause else {
+        panic!("{outcome:?}");
+    };
+    assert!(*suspended_ms >= 60_000, "{suspended_ms}");
+    assert!(detail.contains("host suspended 2 min"), "{detail}");
+}
+
+#[test]
+fn a_work_stop_with_no_suspend_reports_none() {
+    let outcome = work_stop_after(120, 0);
+    assert!(
+        matches!(
+            &outcome.terminal,
+            Terminal::BudgetExhausted {
+                cause: BudgetCause::Work { suspended_ms: 0 },
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_skew_clock_work_stop_reports_no_suspend() {
+    let (fixture, skew) = skewed_fixture();
+    let mut repo = floored_repo(&fixture);
+    repo.execution.min_repair_seconds = 0;
+    let (backend, _walls) = skewing_worker(skew, vec![120, 0], 99);
+    let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+    assert!(
+        matches!(
+            &outcome.terminal,
+            Terminal::BudgetExhausted {
+                cause: BudgetCause::Work { suspended_ms: 0 },
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// A decomposed run of packages `a` and `b` on a clock the host can sleep
+/// on: package `a`'s worker takes `a_secs` (of which `a_slept` asleep),
+/// package `b`'s takes `b_secs` and sleeps not at all.
+fn decomposed_run_on_a_sleeping_clock(
+    contract_limits: impl FnOnce(&mut TaskContract),
+    a_secs: i64,
+    a_slept: i64,
+    b_secs: i64,
+) -> RunOutcome {
+    let skew = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let asleep = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let fixture = Fixture::with_clock(Box::new(SleepingClock {
+        skew: Arc::clone(&skew),
+        asleep: Arc::clone(&asleep),
+    }));
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let backend = MockBackend::new(move |spec| {
+        let (name, secs, slept) = if spec.prompt.contains("work package `a`") {
+            ("a", a_secs, a_slept)
+        } else {
+            ("b", b_secs, 0)
+        };
+        skew.fetch_add(secs, Ordering::SeqCst);
+        asleep.fetch_add(slept, Ordering::SeqCst);
+        std::fs::create_dir_all(spec.work_dir.join(format!("src/{name}"))).expect("mkdir");
+        std::fs::write(spec.work_dir.join(format!("src/{name}/lib.rs")), "").expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let mut contract = decomposed_contract(&fixture, plan_json(false));
+    contract_limits(&mut contract);
+    fixture.execute(&contract, &repo, &backend)
+}
+
+#[test]
+fn a_package_stop_under_the_roots_total_is_a_total_stop_not_the_arms_work() {
+    let outcome = decomposed_run_on_a_sleeping_clock(
+        |contract| contract.limits.total_seconds = Some(100),
+        200,
+        0,
+        0,
+    );
+    assert!(
+        matches!(
+            &outcome.terminal,
+            Terminal::BudgetExhausted {
+                cause: BudgetCause::Total,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_total_spent_by_one_package_stops_the_next_as_a_total_stop() {
+    let outcome = decomposed_run_on_a_sleeping_clock(
+        |contract| contract.limits.total_seconds = Some(100),
+        100,
+        0,
+        0,
+    );
+    assert!(
+        matches!(
+            &outcome.terminal,
+            Terminal::BudgetExhausted {
+                cause: BudgetCause::Total,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_package_run_out_of_the_roots_work_budget_is_the_arms_work_stop() {
+    let outcome = decomposed_run_on_a_sleeping_clock(
+        |contract| contract.limits.wall_seconds = Some(100),
+        10,
+        0,
+        200,
+    );
+    assert!(
+        matches!(
+            &outcome.terminal,
+            Terminal::BudgetExhausted {
+                cause: BudgetCause::Work { suspended_ms: 0 },
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_package_inherits_the_roots_suspend_so_far() {
+    let outcome = decomposed_run_on_a_sleeping_clock(|_| {}, 150, 150, 3000);
+    let Terminal::BudgetExhausted {
+        cause: BudgetCause::Work { suspended_ms },
+        ..
+    } = &outcome.terminal
+    else {
+        panic!("{outcome:?}");
+    };
+    assert!(
+        *suspended_ms >= 150_000,
+        "package b slept not at all, the root's {suspended_ms} ms of sleep carries"
+    );
+}
+
 #[test]
 fn a_repair_after_a_slow_first_attempt_is_extended_to_its_floor() {
     let (fixture, skew) = skewed_fixture();
@@ -368,7 +579,7 @@ fn a_repair_whose_floor_exceeds_the_total_is_not_launched() {
     let mut contract = fixture.contract(Review::Off);
     contract.limits.total_seconds = Some(90);
     let outcome = fixture.execute(&contract, &repo, &backend);
-    let Terminal::BudgetExhausted { detail } = &outcome.terminal else {
+    let Terminal::BudgetExhausted { detail, .. } = &outcome.terminal else {
         panic!("{outcome:?}");
     };
     assert!(detail.contains("limits.total_seconds"), "{detail}");
@@ -743,7 +954,7 @@ fn total_seconds_caps_the_run_end_to_end() {
     contract.limits.total_seconds = Some(1);
     let outcome = fixture.execute(&contract, &repo, &slow_idle_worker(1_200));
     assert!(
-        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail } if detail.contains("total")),
+        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail, .. } if detail.contains("total")),
         "{outcome:?}"
     );
 }
@@ -767,7 +978,7 @@ fn a_base_check_cut_off_by_the_total_ends_on_the_total() {
     contract.limits.total_seconds = Some(1);
     let outcome = fixture.execute(&contract, &repo, &conditional_worker(""));
     assert!(
-        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail } if detail.contains("total")),
+        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail, .. } if detail.contains("total")),
         "{outcome:?}"
     );
 }
@@ -796,7 +1007,7 @@ fn a_base_setup_step_cut_off_by_the_total_ends_on_the_total() {
     let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let outcome = fixture.execute(&contract, &repo, &changing_worker(launches));
     assert!(
-        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail } if detail.contains("total")),
+        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail, .. } if detail.contains("total")),
         "{outcome:?}"
     );
     let logs = fixture.artifacts.join(outcome.run_id.as_str()).join("logs");
@@ -820,7 +1031,7 @@ fn a_task_worktree_setup_step_cut_off_by_the_total_ends_on_the_total() {
     contract.limits.total_seconds = Some(1);
     let outcome = fixture.execute(&contract, &repo, &conditional_worker(""));
     assert!(
-        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail } if detail.contains("total")),
+        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail, .. } if detail.contains("total")),
         "{outcome:?}"
     );
     assert_eq!(
@@ -844,7 +1055,7 @@ fn a_candidate_setup_step_cut_off_by_the_total_ends_on_the_total() {
     contract.limits.total_seconds = Some(8);
     let outcome = fixture.execute(&contract, &repo, &conditional_worker(""));
     assert!(
-        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail } if detail.contains("total")),
+        matches!(&outcome.terminal, Terminal::BudgetExhausted { detail, .. } if detail.contains("total")),
         "{outcome:?}"
     );
     // The attempt closes blocked with its candidate kept.
@@ -938,14 +1149,14 @@ fn each_exhausted_budget_ends_the_run_under_its_own_name() {
     let work = ended_on(&fixture, Exhausted::Work);
     assert_eq!(work.state(), State::BudgetExhausted);
     assert!(
-        matches!(&work.terminal, Terminal::BudgetExhausted { detail } if detail.contains("work budget")),
+        matches!(&work.terminal, Terminal::BudgetExhausted { detail, .. } if detail.contains("work budget")),
         "{work:?}"
     );
 
     let total = ended_on(&fixture, Exhausted::Total);
     assert_eq!(total.state(), State::BudgetExhausted);
     assert!(
-        matches!(&total.terminal, Terminal::BudgetExhausted { detail } if detail.contains("total")),
+        matches!(&total.terminal, Terminal::BudgetExhausted { detail, .. } if detail.contains("total")),
         "{total:?}"
     );
 

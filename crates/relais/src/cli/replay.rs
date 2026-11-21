@@ -653,13 +653,21 @@ pub(crate) fn record_replay_trial(
         ledger.escalation_attempted(&outcome.run_id),
         "dataset replay",
     )?;
+    let budget_rule = operational(
+        live_trial::budget_rule_of_recipe(ledger, trial.arm_recipe_id),
+        "dataset replay",
+    )?;
     let verdict = live_trial::ReplayCheck {
         arm_model: arm.model.unwrap_or_default(),
         dispatched_model: dispatched_model.as_deref(),
         requires_design: arm.spec.requires_design,
         design_sha256: trial.design_sha256,
     }
-    .settle(live_trial::trial_outcome_of(&outcome.terminal, escalated));
+    .settle(live_trial::trial_outcome_of(
+        &outcome.terminal,
+        escalated,
+        budget_rule,
+    ));
     let (cost, duration_ms) = operational(
         live_trial::settled_figures(ledger, &outcome.run_id),
         "dataset replay",

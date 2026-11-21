@@ -83,8 +83,8 @@ pub use error::RunError;
 pub use holdouts::sweep_ended_holdouts;
 use launch::admission_block;
 pub use machine::{
-    decide, AttemptKind, Budget, FloorKind, HoldoutStop, Limit, Next, Observation, OverBudget,
-    Terminal, WorktreeEnd,
+    decide, AttemptKind, Budget, BudgetCause, FloorKind, HoldoutStop, Limit, Next, Observation,
+    OverBudget, Terminal, WorktreeEnd, SUSPEND_THRESHOLD_MS,
 };
 use prompt::{build_prompt, build_review_repair_prompt, conflict_block, RepairFailure};
 pub(crate) use prompt::{data_block, data_list_block, relevant_block};
@@ -204,10 +204,24 @@ pub fn execute_child(
     parent_run: &RunId,
     package_id: &PackageId,
     role: PackageRole,
+    inheritance: BudgetInheritance,
 ) -> Result<RunOutcome, RunError> {
-    let outcome =
-        RunEngine::new(config, Some((parent_run.clone(), package_id.clone(), role)))?.run()?;
+    let mut engine = RunEngine::new(config, Some((parent_run.clone(), package_id.clone(), role)))?;
+    engine.budget_inheritance = inheritance;
+    let outcome = engine.run()?;
     Ok(finished(config, outcome))
+}
+
+/// What a package's run takes from the root's budgets, so its stop is
+/// named for the budget that really bound it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BudgetInheritance {
+    /// Host sleep the root already saw inside its work window.
+    pub suspended_ms: u64,
+    /// The root's total, not its work budget, capped the package's wall
+    /// time: the package's work stop is the run's `Total`, not an arm's
+    /// `Work`.
+    pub work_capped_by_total: bool,
 }
 
 /// Tell the coordinator the run is over, whatever its end: a registered
@@ -262,6 +276,8 @@ pub(crate) struct RunEngine<'a> {
     /// What this run may still spend of time (ADR-0010). Unbounded until
     /// preflight has the authority that sizes it.
     pub(crate) budgets: Budgets,
+    /// What this run inherits from its root's budgets (a package run).
+    pub(in crate::runner) budget_inheritance: BudgetInheritance,
     /// Which try of each command's heavy lease this is, so a rerun gets a
     /// lease id the coordinator has not seen (SPEC §23, C8).
     pub(in crate::runner) heavy_tries: verify::Tries,

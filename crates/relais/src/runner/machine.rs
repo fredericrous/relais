@@ -79,6 +79,7 @@ pub enum Terminal {
     },
     BudgetExhausted {
         detail: String,
+        cause: BudgetCause,
     },
     Interrupted {
         detail: String,
@@ -100,7 +101,7 @@ impl Terminal {
             Self::BlockedBy { reason, detail } => (Some(reason.to_string()), Some(detail)),
             Self::NeedsReview { detail }
             | Self::Failed { detail }
-            | Self::BudgetExhausted { detail }
+            | Self::BudgetExhausted { detail, .. }
             | Self::Interrupted { detail }
             | Self::Cancelled { detail } => (None, Some(detail)),
         }
@@ -147,7 +148,7 @@ impl Terminal {
             | Self::Blocked { detail, .. }
             | Self::BlockedBy { detail, .. }
             | Self::Failed { detail }
-            | Self::BudgetExhausted { detail }
+            | Self::BudgetExhausted { detail, .. }
             | Self::Interrupted { detail }
             | Self::Cancelled { detail } => detail,
         }
@@ -194,6 +195,24 @@ impl Budget {
     }
 }
 
+/// Why a run's budget ran out, as a trial's settlement reads it: who spent
+/// the budget, not which sentence the stop printed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetCause {
+    /// The attempt ceiling was reached with failures.
+    Attempts,
+    /// The work budget ran out; `suspended_ms` is the host's sleep inside
+    /// the work window (waits already excluded).
+    Work {
+        suspended_ms: u64,
+    },
+    Spend,
+    Admission,
+    /// The end-to-end limit, wherever it bound.
+    Total,
+    RepairFloor,
+}
+
 /// Which ceiling a run hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Limit {
@@ -201,7 +220,10 @@ pub enum Limit {
         max: u32,
         last_failures: Vec<String>,
     },
-    WallClock,
+    /// The work budget; `suspended_ms` is the host's sleep within it.
+    WallClock {
+        suspended_ms: u64,
+    },
     Spend {
         spent: String,
         ceiling: String,
@@ -223,6 +245,23 @@ pub enum Limit {
         floor_s: u64,
         total_left_s: u64,
     },
+}
+
+impl Limit {
+    /// The cause this ceiling settles under; exhaustive, so a new limit
+    /// names its side before it compiles.
+    pub fn cause(&self) -> BudgetCause {
+        match self {
+            Self::Attempts { .. } => BudgetCause::Attempts,
+            Self::WallClock { suspended_ms } => BudgetCause::Work {
+                suspended_ms: *suspended_ms,
+            },
+            Self::Spend { .. } => BudgetCause::Spend,
+            Self::Admission { .. } => BudgetCause::Admission,
+            Self::Total => BudgetCause::Total,
+            Self::RepairFloor { .. } => BudgetCause::RepairFloor,
+        }
+    }
 }
 
 /// An attempt kind that is owed a wall-time floor.
@@ -861,9 +900,9 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
                     format!("attempt ceiling reached ({max}) with failures: {last_failures:?}"),
                     serde_json::json!({ "limit": "attempts", "max": max }),
                 ),
-                Limit::WallClock => (
-                    "the work budget (wall clock after the baseline) is exhausted".to_string(),
-                    serde_json::json!({ "limit": "wall_clock" }),
+                Limit::WallClock { suspended_ms } => (
+                    work_budget_detail(*suspended_ms),
+                    serde_json::json!({ "limit": "wall_clock", "suspended_ms": suspended_ms }),
                 ),
                 // Both rendered amounts name themselves ("$0.02 per run",
                 // "$0.03 today"): there is more than one spending
@@ -905,15 +944,34 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
                     )
                 }
             };
+            let cause = limit.cause();
             Decision::stop(
                 State::BudgetExhausted,
                 Reason::LimitReached,
                 evidence,
-                Terminal::BudgetExhausted { detail },
+                Terminal::BudgetExhausted { detail, cause },
             )
         }
     }
 }
+
+/// The work budget's stop line: it names the cause only, never a trial
+/// outcome, which is known at settle. Durations are whole minutes.
+fn work_budget_detail(suspended_ms: u64) -> String {
+    if suspended_ms >= SUSPEND_THRESHOLD_MS {
+        format!(
+            "the work budget is exhausted (host suspended {} min)",
+            suspended_ms / 60_000
+        )
+    } else {
+        "the work budget is exhausted (spent by the run)".to_string()
+    }
+}
+
+/// A host sleep of at least this long inside the work window makes a work
+/// stop the host's, not the arm's. Measured skews were 0 s or 58 s and
+/// more; short scheduler stalls stay under it.
+pub const SUSPEND_THRESHOLD_MS: u64 = 60_000;
 
 #[cfg(test)]
 mod tests {
@@ -1252,30 +1310,71 @@ mod tests {
             .reason,
             Reason::UnapprovedSubstitution
         );
-        for limit in [
-            Limit::Attempts {
-                max: 3,
-                last_failures: vec![],
-            },
-            Limit::WallClock,
-            Limit::Spend {
-                spent: "$1".into(),
-                ceiling: "$1".into(),
-            },
-            Limit::Admission {
-                code: "run_agent_cap".into(),
-                detail: "".into(),
-            },
-            Limit::Total,
-            Limit::RepairFloor {
-                kind: FloorKind::Repair,
-                floor_s: 600,
-                total_left_s: 212,
-            },
-        ] {
+        let table: [(Limit, BudgetCause, Option<&str>); 7] = [
+            (
+                Limit::Attempts {
+                    max: 3,
+                    last_failures: vec![],
+                },
+                BudgetCause::Attempts,
+                None,
+            ),
+            (
+                Limit::WallClock { suspended_ms: 0 },
+                BudgetCause::Work { suspended_ms: 0 },
+                Some("the work budget is exhausted (spent by the run)"),
+            ),
+            (
+                Limit::WallClock {
+                    suspended_ms: 38 * 60_000 + 5_000,
+                },
+                BudgetCause::Work {
+                    suspended_ms: 38 * 60_000 + 5_000,
+                },
+                Some("the work budget is exhausted (host suspended 38 min)"),
+            ),
+            (
+                Limit::Spend {
+                    spent: "$1".into(),
+                    ceiling: "$1".into(),
+                },
+                BudgetCause::Spend,
+                None,
+            ),
+            (
+                Limit::Admission {
+                    code: "run_agent_cap".into(),
+                    detail: "".into(),
+                },
+                BudgetCause::Admission,
+                None,
+            ),
+            (Limit::Total, BudgetCause::Total, None),
+            (
+                Limit::RepairFloor {
+                    kind: FloorKind::Repair,
+                    floor_s: 600,
+                    total_left_s: 212,
+                },
+                BudgetCause::RepairFloor,
+                None,
+            ),
+        ];
+        for (limit, cause, sentence) in table {
             let d = decide(&b, Observation::LimitReached(limit));
             assert_eq!(d.state, State::BudgetExhausted);
             assert_eq!(d.reason, Reason::LimitReached);
+            let Next::Stop(Terminal::BudgetExhausted {
+                detail,
+                cause: reached,
+            }) = d.next
+            else {
+                panic!("a limit stops the run");
+            };
+            assert_eq!(reached, cause);
+            if let Some(sentence) = sentence {
+                assert_eq!(detail, sentence);
+            }
         }
     }
 
@@ -1319,7 +1418,10 @@ mod tests {
                 detail: detail(),
             },
             Terminal::Failed { detail: detail() },
-            Terminal::BudgetExhausted { detail: detail() },
+            Terminal::BudgetExhausted {
+                detail: detail(),
+                cause: BudgetCause::Total,
+            },
             Terminal::Cancelled { detail: detail() },
         ] {
             assert_eq!(retired.worktree_end(), WorktreeEnd::Retire, "{retired:?}");

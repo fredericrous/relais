@@ -1148,6 +1148,7 @@ mod tests {
             crate::runner::live_trial::trial_outcome_of(
                 &crate::runner::Terminal::Accepted(Box::new(accepted_receipt("run-rep"))),
                 escalated,
+                crate::route::BudgetRule::ByCause,
             );
         assert_eq!(trial_outcome, TrialOutcome::Accepted);
         fixture

@@ -6,11 +6,11 @@ use super::{
     admission_block, baseline_summary, decide, exhaustion, fresh_progress, kept_sentence,
     scheduler, setup_failure_detail, state_sibling, sweep_ended_verify_dirs, verify, verify_root,
     workspace, worktree_root, Arc, AtomicBool, AttemptContext, AttemptKind, BaseMemo, BlockCode,
-    Budget, BudgetClock, BudgetLimits, Budgets, Candidate, CostKind, Duration, EffectiveAuthority,
-    Event, Events, EvidenceKind, Exhausted, Finish, Gate, Instant, KeptCandidate, Limit, Next,
-    Observation, Ordering, PackageId, PackageRole, PathBuf, Phase, Reason, Refusal, Request,
-    RunConfig, RunEngine, RunError, RunId, RunOutcome, State, Summary, Terminal, Transition,
-    UsagePhase, ADMISSION_POLL,
+    Budget, BudgetClock, BudgetInheritance, BudgetLimits, Budgets, Candidate, CostKind, Duration,
+    EffectiveAuthority, Event, Events, EvidenceKind, Exhausted, Finish, Gate, Instant,
+    KeptCandidate, Limit, Next, Observation, Ordering, PackageId, PackageRole, PathBuf, Phase,
+    Reason, Refusal, Request, RunConfig, RunEngine, RunError, RunId, RunOutcome, State, Summary,
+    Terminal, Transition, UsagePhase, ADMISSION_POLL,
 };
 
 impl<'a> RunEngine<'a> {
@@ -93,6 +93,7 @@ impl<'a> RunEngine<'a> {
             worker_code_rules_gap: None,
             cancel_asked: Arc::new(AtomicBool::new(false)),
             budgets: Budgets::unbounded(),
+            budget_inheritance: BudgetInheritance::default(),
             heavy_tries: verify::Tries::for_epoch(epoch),
             growth: crate::ledger::LedgerGrowth::of(config.ledger),
             registration: None,
@@ -1131,7 +1132,7 @@ impl<'a> RunEngine<'a> {
         candidate: Option<&KeptCandidate>,
     ) -> Result<RunOutcome, RunError> {
         let mut decision = decide(budget, Observation::LimitReached(limit));
-        if let (Some(kept), Next::Stop(Terminal::BudgetExhausted { detail })) =
+        if let (Some(kept), Next::Stop(Terminal::BudgetExhausted { detail, .. })) =
             (candidate, &mut decision.next)
         {
             detail.push_str(&format!("; {}", kept_sentence(kept)));
@@ -1151,7 +1152,19 @@ impl<'a> RunEngine<'a> {
     ) -> Result<RunOutcome, RunError> {
         let limits = self.budgets.limits();
         match exhausted {
-            Exhausted::Work => self.stop(budget, Observation::LimitReached(Limit::WallClock)),
+            Exhausted::Work if self.budget_inheritance.work_capped_by_total => {
+                self.stop(budget, Observation::LimitReached(Limit::Total))
+            }
+            Exhausted::Work => {
+                let suspended_ms = self
+                    .budget_inheritance
+                    .suspended_ms
+                    .saturating_add(self.budgets.suspended_ms());
+                self.stop(
+                    budget,
+                    Observation::LimitReached(Limit::WallClock { suspended_ms }),
+                )
+            }
             Exhausted::Total => self.stop(budget, Observation::LimitReached(Limit::Total)),
             Exhausted::AdmissionWait => {
                 let mut detail = format!(
@@ -1213,6 +1226,14 @@ impl BudgetClock for LedgerBudgetClock {
             |_| chrono::Utc::now().timestamp_millis(),
             |at| at.timestamp_millis(),
         )
+    }
+
+    fn awake_millis(&self) -> i64 {
+        self.0.awake_millis()
+    }
+
+    fn continuous_millis(&self) -> i64 {
+        self.0.continuous_millis()
     }
 }
 

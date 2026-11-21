@@ -6,6 +6,22 @@
 /// assertable values rather than "whenever the test ran".
 pub trait Clock: Send + Sync {
     fn now_rfc3339(&self) -> String;
+
+    /// Milliseconds on a monotonic scale that does NOT advance while the
+    /// host sleeps. The default is a constant that reads no timestamp, so a
+    /// scripted clock reports no suspend unless a test overrides both
+    /// readings.
+    fn awake_millis(&self) -> i64 {
+        0
+    }
+
+    /// Milliseconds on a monotonic scale that keeps counting through a
+    /// host sleep and never jumps. Only the difference to
+    /// [`Clock::awake_millis`] over a window means anything: the scales
+    /// have unrelated origins.
+    fn continuous_millis(&self) -> i64 {
+        0
+    }
 }
 
 pub struct SystemClock;
@@ -13,6 +29,16 @@ pub struct SystemClock;
 impl Clock for SystemClock {
     fn now_rfc3339(&self) -> String {
         chrono::Utc::now().to_rfc3339()
+    }
+
+    fn awake_millis(&self) -> i64 {
+        static ANCHOR: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let anchor = ANCHOR.get_or_init(std::time::Instant::now);
+        i64::try_from(anchor.elapsed().as_millis()).unwrap_or(i64::MAX)
+    }
+
+    fn continuous_millis(&self) -> i64 {
+        crate::procs::sleep_counting_millis().unwrap_or_else(|| self.awake_millis())
     }
 }
 
