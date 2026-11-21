@@ -8,6 +8,17 @@ missing here.
 
 ## Unreleased
 
+- A trial whose run ran out of budget now settles by the cause. Running
+  out of attempts, or of the work budget with the host awake, is the arm's
+  failure: `rejected`, counted in the typed-research streak and the
+  validity floor. A spend, admission, total or repair-floor stop, or work
+  lost to a host sleep of a minute or more, stays `errored`. This applies
+  to recipe revisions first trialled from this release; older ones keep
+  every budget stop `errored`. A `budget_exhausted (wall_clock)` stop now
+  says whether the host slept ("host suspended 38 min") or the run spent
+  it, and its evidence carries `suspended_ms`. A decomposed run's package
+  stop capped by the root's total now ends `budget_exhausted (total)`, not
+  `wall_clock`. The exit code stays 5.
 - At the end of `relais run`, a home drift record that cannot be read is
   now named under the same `relais run: warning:` prefix as the drifts
   themselves. The line printed when no home directory resolves is split in
