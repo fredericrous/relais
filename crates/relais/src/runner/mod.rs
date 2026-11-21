@@ -204,24 +204,31 @@ pub fn execute_child(
     parent_run: &RunId,
     package_id: &PackageId,
     role: PackageRole,
-    inheritance: BudgetInheritance,
+    work_bound: WorkBound,
 ) -> Result<RunOutcome, RunError> {
     let mut engine = RunEngine::new(config, Some((parent_run.clone(), package_id.clone(), role)))?;
-    engine.budget_inheritance = inheritance;
+    engine.work_bound = work_bound;
     let outcome = engine.run()?;
     Ok(finished(config, outcome))
 }
 
-/// What a package's run takes from the root's budgets, so its stop is
-/// named for the budget that really bound it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BudgetInheritance {
-    /// Host sleep the root already saw inside its work window.
-    pub suspended_ms: u64,
+/// What bounds a package's work budget, taken from the root's budgets, so
+/// its stop is named for the budget that really bound it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkBound {
+    /// The package's own work budget, carrying the host sleep the root
+    /// already saw inside its work window.
+    Own { suspended_ms: u64 },
     /// The root's total, not its work budget, capped the package's wall
     /// time: the package's work stop is the run's `Total`, not an arm's
     /// `Work`.
-    pub work_capped_by_total: bool,
+    RootTotal,
+}
+
+impl Default for WorkBound {
+    fn default() -> Self {
+        Self::Own { suspended_ms: 0 }
+    }
 }
 
 /// Tell the coordinator the run is over, whatever its end: a registered
@@ -277,7 +284,7 @@ pub(crate) struct RunEngine<'a> {
     /// preflight has the authority that sizes it.
     pub(crate) budgets: Budgets,
     /// What this run inherits from its root's budgets (a package run).
-    pub(in crate::runner) budget_inheritance: BudgetInheritance,
+    pub(in crate::runner) work_bound: WorkBound,
     /// Which try of each command's heavy lease this is, so a rerun gets a
     /// lease id the coordinator has not seen (SPEC §23, C8).
     pub(in crate::runner) heavy_tries: verify::Tries,

@@ -960,11 +960,14 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
 fn work_budget_detail(suspended_ms: u64) -> String {
     if suspended_ms >= SUSPEND_THRESHOLD_MS {
         format!(
-            "the work budget is exhausted (host suspended {} min)",
+            "the work budget is exhausted (host suspended {} min); \
+             keep the host awake and run it again",
             suspended_ms / 60_000
         )
     } else {
-        "the work budget is exhausted (spent by the run)".to_string()
+        "the work budget is exhausted (spent by the run); raise \
+         `limits.wall_seconds` or the repository's `max_wall_seconds`"
+            .to_string()
     }
 }
 
@@ -1322,7 +1325,10 @@ mod tests {
             (
                 Limit::WallClock { suspended_ms: 0 },
                 BudgetCause::Work { suspended_ms: 0 },
-                Some("the work budget is exhausted (spent by the run)"),
+                Some(
+                    "the work budget is exhausted (spent by the run); raise \
+                     `limits.wall_seconds` or the repository's `max_wall_seconds`",
+                ),
             ),
             (
                 Limit::WallClock {
@@ -1331,7 +1337,10 @@ mod tests {
                 BudgetCause::Work {
                     suspended_ms: 38 * 60_000 + 5_000,
                 },
-                Some("the work budget is exhausted (host suspended 38 min)"),
+                Some(
+                    "the work budget is exhausted (host suspended 38 min); \
+                     keep the host awake and run it again",
+                ),
             ),
             (
                 Limit::Spend {

@@ -36,9 +36,9 @@ use crate::verify::{self, Receipt, VerificationReport};
 use crate::workspace::{self, WorkspaceError};
 
 use super::{
-    data_block, data_list_block, effort_str, execute_child, AttemptLabel, Budget,
-    BudgetInheritance, Exhausted, Limit, ManagedDispatch, Next, Observation, Reason, ReviewOutcome,
-    RunConfig, RunEngine, RunError, RunOutcome, State, Terminal, VerifyFailure,
+    data_block, data_list_block, effort_str, execute_child, AttemptLabel, Budget, Exhausted, Limit,
+    ManagedDispatch, Next, Observation, Reason, ReviewOutcome, RunConfig, RunEngine, RunError,
+    RunOutcome, State, Terminal, VerifyFailure,
 };
 
 /// The patch an accepted decomposed run exports its assembled revision
@@ -826,13 +826,11 @@ fn run_package(
         &engine.run_id,
         &crate::ids::PackageId::from_stored(package.id.clone()),
         run.role,
-        BudgetInheritance {
-            suspended_ms: engine
-                .budget_inheritance
-                .suspended_ms
-                .saturating_add(engine.budgets.suspended_ms()),
-            work_capped_by_total: engine.budget_inheritance.work_capped_by_total
-                || binding == Exhausted::Total,
+        match (engine.work_bound, binding) {
+            (super::WorkBound::RootTotal, _) | (_, Exhausted::Total) => super::WorkBound::RootTotal,
+            (super::WorkBound::Own { suspended_ms }, _) => super::WorkBound::Own {
+                suspended_ms: suspended_ms.saturating_add(engine.budgets.suspended_ms()),
+            },
         },
     )?;
     let child_run = outcome.run_id.clone();

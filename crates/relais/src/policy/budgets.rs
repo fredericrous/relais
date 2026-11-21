@@ -123,7 +123,8 @@ impl BudgetLimits {
 #[derive(Debug)]
 struct Spent {
     run_started: i64,
-    work_started: Option<i64>,
+    /// When work began, on both scales: `None` until the baseline ends.
+    work_started: Option<Mark>,
     admission_waited: i64,
     disk_waited: i64,
     /// Waits charged since `work_started`: excluded from the work budget.
@@ -133,8 +134,6 @@ struct Spent {
     base_in_work: i64,
     /// Time added to the work budget at launch (a repair's floor).
     work_extension: i64,
-    /// The host-sleep gap (continuous minus awake) when work began.
-    gap_at_work_start: i64,
     /// Of the sleep since work began, what fell inside a charged wait or a
     /// base run: already outside the work budget.
     gap_in_waits: i64,
@@ -196,7 +195,6 @@ impl Budgets {
                 waited_in_work: 0,
                 base_in_work: 0,
                 work_extension: 0,
-                gap_at_work_start: 0,
                 gap_in_waits: 0,
             })),
             draws: Draws::WorkAndTotal,
@@ -248,8 +246,7 @@ impl Budgets {
         let at = self.mark();
         let mut spent = self.lock();
         if spent.work_started.is_none() {
-            spent.work_started = Some(at.at);
-            spent.gap_at_work_start = at.gap;
+            spent.work_started = Some(at);
             spent.waited_in_work = 0;
             spent.gap_in_waits = 0;
         }
@@ -299,7 +296,7 @@ impl Budgets {
         match spent.work_started {
             None => self.limits.work,
             Some(started) => {
-                let worked = (now - started - spent.waited_in_work).max(0);
+                let worked = (now - started.at - spent.waited_in_work).max(0);
                 let allowed = self
                     .limits
                     .work
@@ -426,10 +423,10 @@ impl Budgets {
     pub fn suspended_ms(&self) -> u64 {
         let gap = self.gap();
         let spent = self.lock();
-        if spent.work_started.is_none() {
+        let Some(started) = spent.work_started else {
             return 0;
-        }
-        let asleep = gap - spent.gap_at_work_start - spent.gap_in_waits;
+        };
+        let asleep = gap - started.gap - spent.gap_in_waits;
         u64::try_from(asleep).unwrap_or(0)
     }
 
@@ -450,7 +447,7 @@ impl Budgets {
         let now = self.now();
         let spent = self.lock();
         spent.work_started.map_or(Duration::ZERO, |started| {
-            from_millis(now - started - spent.waited_in_work)
+            from_millis(now - started.at - spent.waited_in_work)
         })
     }
 }

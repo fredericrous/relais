@@ -37,8 +37,31 @@ impl Clock for SystemClock {
         i64::try_from(anchor.elapsed().as_millis()).unwrap_or(i64::MAX)
     }
 
+    /// One source for the life of the process: the sleep-counting clock
+    /// when the first read succeeds, else the awake clock (no suspend is
+    /// ever seen). A later failed read keeps the last gap, so it reports no
+    /// new sleep instead of mixing two scales with unrelated origins.
     fn continuous_millis(&self) -> i64 {
-        crate::procs::sleep_counting_millis().unwrap_or_else(|| self.awake_millis())
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static LAST_GAP: AtomicI64 = AtomicI64::new(0);
+        static SLEEP_COUNTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let awake = self.awake_millis();
+        let available = *SLEEP_COUNTING.get_or_init(|| {
+            crate::procs::sleep_counting_millis().is_some_and(|continuous| {
+                LAST_GAP.store(continuous - awake, Ordering::Relaxed);
+                true
+            })
+        });
+        if !available {
+            return awake;
+        }
+        match crate::procs::sleep_counting_millis() {
+            Some(continuous) => {
+                LAST_GAP.store(continuous - awake, Ordering::Relaxed);
+                continuous
+            }
+            None => awake + LAST_GAP.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -79,4 +102,30 @@ impl Clock for FixedClock {
 /// `report --since` default, dataset build time).
 pub fn now_rfc3339() -> String {
     SystemClock.now_rfc3339()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Clock, SystemClock};
+
+    /// The real clocks, not a script: on darwin and Linux the
+    /// sleep-counting clock reads, and with no sleep between two readings
+    /// the gap between it and the awake clock barely moves.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_real_clocks_read_and_report_no_sleep_when_the_host_is_awake() {
+        assert!(
+            crate::procs::sleep_counting_millis().is_some(),
+            "the sleep-counting clock reads on this platform"
+        );
+        let clock = SystemClock;
+        let gap_before = clock.continuous_millis() - clock.awake_millis();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let gap_after = clock.continuous_millis() - clock.awake_millis();
+        assert!(
+            (gap_after - gap_before).abs() < 50,
+            "the gap moved {} ms with the host awake",
+            gap_after - gap_before
+        );
+    }
 }

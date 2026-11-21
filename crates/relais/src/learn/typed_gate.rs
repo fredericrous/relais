@@ -1079,13 +1079,14 @@ tier = "research"
 
     /// A trial of the plain candidate on `task-<n>` that ended on a work
     /// stop with no suspend, settled through the live settle path.
-    fn work_stop_settled_live(w: &World, n: usize) {
-        w.pending(n, &format!("{n:03}"));
+    fn work_stop_settled_live(world: &World, task: usize) {
+        world.pending(task, &format!("{task:03}"));
         // The research model dispatched first, as a qualifying trial's is.
-        w.ledger
+        world
+            .ledger
             .record_dispatch_intent(
-                &crate::ids::DispatchId::from_stored(format!("d-{n:03}")),
-                &RunId::from_stored(format!("arm-{n:03}")),
+                &crate::ids::DispatchId::from_stored(format!("d-{task:03}")),
+                &RunId::from_stored(format!("arm-{task:03}")),
                 None,
                 &serde_json::json!({ "model": Spec::tweaked(|_| {}).model }),
                 0,
@@ -1093,15 +1094,15 @@ tier = "research"
             )
             .expect("dispatch");
         let outcome = crate::runner::RunOutcome {
-            run_id: RunId::from_stored(format!("arm-{n:03}")),
+            run_id: RunId::from_stored(format!("arm-{task:03}")),
             terminal: crate::runner::Terminal::BudgetExhausted {
                 detail: "the work budget is exhausted (spent by the run)".into(),
                 cause: crate::runner::BudgetCause::Work { suspended_ms: 0 },
             },
         };
         crate::runner::live_trial::settle(
-            &w.ledger,
-            &TrialId::from_stored(format!("trial-{n:03}")),
+            &world.ledger,
+            &TrialId::from_stored(format!("trial-{task:03}")),
             &outcome,
         )
         .expect("settles");

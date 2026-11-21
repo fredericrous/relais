@@ -18,7 +18,9 @@ missing here.
   says whether the host slept ("host suspended 38 min") or the run spent
   it, and its evidence carries `suspended_ms`. A decomposed run's package
   stop capped by the root's total now ends `budget_exhausted (total)`, not
-  `wall_clock`. The exit code stays 5.
+  `wall_clock`. The exit code stays 5. A script reading `relais dataset
+  replay`'s end line sees `outcome=rejected` where such a stop used to read
+  `outcome=errored`.
 - At the end of `relais run`, a home drift record that cannot be read is
   now named under the same `relais run: warning:` prefix as the drifts
   themselves. The line printed when no home directory resolves is split in
