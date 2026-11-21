@@ -610,7 +610,7 @@ mod tests {
         });
         held_rx.recv().unwrap();
         // A wide grace keeps this about waiting, not about timing; the hook
-        // tests hold the production grace to its 100 ms budget.
+        // tests check that a busy lock costs the production grace, not LOCK_WAIT.
         let pass = fixture
             .store
             .end_session_within("s1", NOW, std::time::Duration::from_secs(2))

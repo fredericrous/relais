@@ -39,19 +39,27 @@ ticket here until it is resolved or moved into a programme of its own.
   instead, as greenbelay#306 does); it caps the read and does not stream.
   `home_drift` records hold the absolute path, and `~/` is applied when
   they print.
+- [f09](f09-claims-hook-lock-flake.md) (2026-11-21): the two claims hook
+  tests bound a busy lock at 1 s, not 100 ms. The pass waits its 30 ms
+  grace exactly; the overrun was the log append and tombstone write after
+  it, which a loaded disk stretches to 25–95 ms. `ONCE_GRACE < 100 ms` is
+  a compile-time check; the hook's real limit is 10 s.
 
 ## Handoff
 
-2026-11-21, boundary 4 (f06 closed): the home fingerprint caps its read
-at 1 MiB and stores absolute paths (unreleased, in `## Unreleased`).
+2026-11-21, boundary 3 (f09 closed): the claims hook lock tests bound a
+busy lock at 1 s and no longer flake on a loaded disk (test-only change).
 
-- Done: f06 and f07 (both unreleased), f05 (`HomeWatch` injected, no
-  behaviour change); earlier today f04 closed as a decision, and relais
-  v0.75.0 is out.
-- Next: Measure the home fingerprint warnings (f08) is due 2026-11-27;
-  the claims hook lock tests' CI flake (f09, filed when it held the
-  v0.75.0 release gate) is ready for an agent.
+- Done: f09; earlier today f06 and f07 (both unreleased), f05
+  (`HomeWatch` injected, no behaviour change), f04 closed as a decision,
+  and relais v0.75.0 is out.
+- Next: Measure the home fingerprint warnings (f08) is due 2026-11-27.
 - Lessons:
+  - A timing flake that CPU burners alone do not reproduce (0/200) may be
+    the disk: 12 `/usr/bin/true` spawn loops and 4 `dd`+`sync` loops gave
+    4–7/200. Put tagged probes around each phase before choosing a fix.
+  - `hook::respond`'s `a_zero_queue_wait_refuses_at_once_with_no_wait`
+    keeps a 100 ms wall-clock bound too; it has not flaked yet.
   - A relais run can wait out its whole admission budget (30 min) on a
     host at load 40+ and launch nothing; three times now. Then apply its
     kept `candidate-1.patch` and run the checks by hand.

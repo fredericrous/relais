@@ -2689,8 +2689,18 @@ mod tests {
             )
         }
 
+        /// What a busy lock may cost a hook here: far above the pass's
+        /// grace, half of [`LOCK_WAIT`]. The pass's file writes are not
+        /// bounded by the grace, and on a loaded CI disk an append or a
+        /// create took 25–95 ms (f09: 110 and 124 ms against a 100 ms bound),
+        /// so a bound near 100 ms tests the disk, not the hook. The grace's
+        /// own limit is checked at compile time in `claim::store`.
+        const BUSY_LOCK_BOUND: Duration = Duration::from_millis(1_000);
+        const _: () = assert!(BUSY_LOCK_BOUND.as_millis() < LOCK_WAIT.as_millis());
+
         #[test]
-        fn a_session_start_with_the_lock_held_elsewhere_returns_within_100_ms_and_logs_a_skip() {
+        fn a_session_start_with_the_lock_held_elsewhere_returns_before_the_lock_wait_and_logs_a_skip(
+        ) {
             let (scratch, store) = store_with_claims("hook-busy", 3_600);
             let (held, release) = std::sync::mpsc::channel::<()>();
             let (locked, locked_signal) = std::sync::mpsc::channel::<()>();
@@ -2709,7 +2719,7 @@ mod tests {
             let elapsed = started.elapsed();
             drop(held);
             holder.join().unwrap();
-            assert!(elapsed < Duration::from_millis(100), "{elapsed:?}");
+            assert!(elapsed < BUSY_LOCK_BOUND, "{elapsed:?}");
             let log =
                 std::fs::read_to_string(scratch.to_path_buf().join("claims/log.jsonl")).unwrap();
             assert!(log.contains("\"event\":\"skipped\""), "{log}");
@@ -2733,7 +2743,8 @@ mod tests {
             locked_signal.recv().unwrap();
             let started = Instant::now();
             run(&lifecycle("SessionEnd", None, SESSION), &store);
-            assert!(started.elapsed() < Duration::from_millis(100));
+            let elapsed = started.elapsed();
+            assert!(elapsed < BUSY_LOCK_BOUND, "{elapsed:?}");
             drop(held);
             holder.join().unwrap();
             assert_eq!(
