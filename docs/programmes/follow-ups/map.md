@@ -44,7 +44,8 @@ fix and this closing note ride one PR.
   decision); relais v0.75.0 is out.
 - Next: f06 is in flight in another session (worktree
   `relais-wt-f06-homeprint`); Measure the home fingerprint warnings (f08)
-  is due 2026-11-27.
+  is due 2026-11-27; the claims hook lock tests' CI flake (f09, filed
+  when it held the v0.75.0 release gate) is ready for an agent.
 - Lessons:
   - A relais run can wait out its whole admission budget (30 min) on a
     host at load 40+ and launch nothing; three times now. Then apply its
