@@ -141,6 +141,14 @@ Gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `carg
 
 Relais: Phase 1's worker (sonnet) produced a complete candidate but its focused test run returned no result in its budget (`blocked env_missing`); a `kind: verify` run on it answered `candidate_missing` although `candidate-final.patch` was on disk (filed in the inbox), so the patch was applied by `git apply` and checked by hand. Phase 2's first run exhausted the 1800 s admission wait with nothing launched (host slots held by other worktrees' test runs); the second produced a kept candidate whose verification lease also exhausted; the candidate was applied by hand and checked. One pre-existing integration test (`tests/it/session_router.rs`) asserted the single-line arm format and was updated.
 
+## Implementation review
+
+- **approve** (implementation-review, round 1 88k/73 s, delta 28k/31 s, re-bind 32k/23 s on tree f1e48ef0): round-1 plan-text mismatch fixed; delta's blocking `drawn: bool` flag on the `answered` fixture fixed; optional `debug_assert` on the list guard kept as `deliberate: the comment states the invariant, and `cost` is computed three lines above it`.
+- **approve** (code-review backend, 69k/60 s, delta 25k/27 s): shared `OWN_SOURCE`, `holds-until:` on the deferred stop column and the per-session loop, parent-source test all fixed; keeping a version-pin test kept as `deliberate: the Rust seat asked to delete the tautology; the holds-until note names the change`.
+- **approve** (code-review lang:rust, 66k/44 s, delta 28k/53 s): `OWN_SOURCE`, byte-slice removed, one-id-per-line list for a fully unpriced arm, tautological test deleted, stray comma, guard simplified: all fixed; the `OutcomeSource` enum kept as `deliberate: the shared constant was the seat's stated minimum`.
+- **approve** (code-review tui, 49k/20 s, delta 28k/49 s): one arm-figure form and one unpriced phrasing fixed; "add one to machine.toml" and the header wording kept as `deliberate: 80-column budget and the setting's own name; wording settled by the plan panel's tui seat` (the seat accepted both).
+- Phase 4 (chart the Phase 8 programme) follows the merge and release; `status` stays `active` until it is charted.
+
 ## Person's optional step
 
 Price the two foreign models so their sessions rejoin the headline, in `~/.config/relais/machine.toml` (shape in `docs/INTEGRATIONS.md:286`); the local qwen can be priced at 0:
