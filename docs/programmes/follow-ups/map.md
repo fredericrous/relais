@@ -25,26 +25,27 @@ ticket here until it is resolved or moved into a programme of its own.
 
 ## Handoff
 
-2026-11-20, boundary 4 (a ticket closed): f03 closed in the same PR as
-this handoff (docs only).
+2026-11-21, boundary 4 (a release verified and swept): relais v0.74.0
+shipped the pane's whole pre-clear tail (plan
+`docs/plans/2026-11-20-pane-shows-whole-tail.md`, done; #515, #516, #517).
 
-- Done: f03 by hand (no relais run). The premise did not reproduce: at 100
-  columns the relais pane (programme window and `before /clear` tail) moved
-  inline above the prompt and stayed drawn; a probe mod read
-  `isPlaced: true` from `$.ui.panes()` through 180 → 100 → 180.
-- Live state: no code changed, no release owed. Scratch probe, demo repo
-  and tmux sessions removed.
-- Next: no ready ticket; the map waits for inbox lines filed at a boundary.
+- Done: the tail keeps all 2000 characters and every row; a cut tail shows
+  its newest row, `… N earlier rows` and `[ open ]`, a view the arrow keys
+  scroll. Live-checked in tmux at 180×40 and 100×30.
+- Inbox: one orphan line (2026-11-19) filed as
+  [f04](f04-claim-pushes-branch.md).
+- Next: f04.
 - Lessons:
-  - Reproduce a live observation in its exact state (here, a held
-    programme plus a tail) before treating it as a bug.
+  - A relais run can wait out its whole admission budget (30 min) on a
+    host at load 60+ and launch nothing; twice here. Then do it by hand.
+  - The relais plugin refuses a Bash call whose text names its own
+    install command, even inside a heredoc: edit such text with the Edit
+    tool.
   - A tmux repro of Claude Code needs `Down` then Enter on the trust dialog
-    (its default is `No, exit`), and a typed prompt sometimes needs a second
-    Enter.
-  - A `/relais-status` in a test session is an asked open of id `relais`:
-    the engine keeps it across sessions, so the unasked floor is 110, not
-    144, until the pane is closed by hand.
-- Your steps: none.
+    (its default is `No, exit`); a `/clear` typed while an answer still
+    streams is queued into the prompt instead of run.
+- Your steps: `relais install --claude --write` (the plugin is at 0.72.0
+  here; it applies from the next session).
 
 ## Not yet specified
 
