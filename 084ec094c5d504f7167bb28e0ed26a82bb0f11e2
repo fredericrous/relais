@@ -1,0 +1,20 @@
+greengate-provenance-v1
+commit c20ace1393b492770d90b3fd0ac0d558b72caac3
+tree 084ec094c5d504f7167bb28e0ed26a82bb0f11e2
+canon bd0b6ce8c1b8d1eea26af12b4bdc7148c3dd3cfa
+patch 9faa1e70dcda3068b7f4d21b01cab07f241b0b30
+plan docs/plans/2026-11-20-replay-floors-and-receipts.md 0592938380131066c7bb077504f787cbea639b4fa98a21cae66c3fc3b92b1ffe
+review reviewed f0c0dc4ce2ca3924e6cdbd5818b442103f8d4899df9393eba31ae57643c0ace7
+code-review backend reviewed f0c0dc4ce2ca3924e6cdbd5818b442103f8d4899df9393eba31ae57643c0ace7
+code-review lang:rust reviewed f0c0dc4ce2ca3924e6cdbd5818b442103f8d4899df9393eba31ae57643c0ace7
+code-review unix reviewed f0c0dc4ce2ca3924e6cdbd5818b442103f8d4899df9393eba31ae57643c0ace7
+code-review tui reviewed f0c0dc4ce2ca3924e6cdbd5818b442103f8d4899df9393eba31ae57643c0ace7
+preview not-required
+producer greenbelay 6.5.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABAntu1bQHiOxraiKE/UBj+V/QgS1p6Y1h0yYAw9QWj2C
+6Ac6s2R7cQhNUKDW22CRO4U1yNP0D66wDlVkVAqHYPCg==
+-----END SSH SIGNATURE-----
