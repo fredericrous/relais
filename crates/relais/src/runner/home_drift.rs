@@ -37,10 +37,7 @@ impl<'a> RunEngine<'a> {
         let Some(after) = self.home_snapshot() else {
             return;
         };
-        let Some(home) = self.config.home.home.as_deref() else {
-            return;
-        };
-        let drifts = homeprint::diff(before, &after, home);
+        let drifts = homeprint::diff(before, &after);
         if drifts.is_empty() {
             return;
         }

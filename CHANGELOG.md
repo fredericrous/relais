@@ -12,6 +12,13 @@ missing here.
   now named under the same `relais run: warning:` prefix as the drifts
   themselves. The line printed when no home directory resolves is split in
   two, the problem then the fix, each under 80 columns.
+- The home fingerprint no longer reads a file over 1 MiB: such a file in
+  `[fingerprint] extra_paths` is recorded by its size, modification time
+  and mode, so a large file costs one `stat`, and touching it without
+  changing its content shows as `modified`. `home_drift` records now hold
+  the absolute path; `relais run`, `status` and `explain` print `~/…` for
+  a path under the current home. Records an older relais wrote print as
+  before.
 
 ## v0.75.0
 
