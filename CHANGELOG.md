@@ -8,6 +8,14 @@ missing here.
 
 ## Unreleased
 
+- A question task's own `answered` outcome (`outcome_source = own`, never a
+  backfilled one) now counts as a positive strong outcome in the exploration
+  strata and the stop rule, so main-session question strata can accumulate
+  evidence. The rule is `ROUTER_LABEL_POLICY_VERSION` 2, printed in the
+  exploration header and as `session_routing.exploration.label_policy_version`
+  (report schema 20). `is_completed`, rank and the ledger schema are
+  unchanged.
+
 ## v0.76.0
 
 - A trial whose run ran out of budget now settles by the cause. Running

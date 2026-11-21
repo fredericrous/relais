@@ -80,7 +80,8 @@ pub struct SessionRoutingReport {
     pub corrected: usize,
     pub unknown: usize,
     /// Tasks that edited no file and could not have: reported apart from
-    /// `unknown`, never a learning label.
+    /// `unknown`. Not a learning label, except a question's own `answered`
+    /// (label policy 2).
     pub answered: usize,
     /// `answered` tasks per class kind, by kind.
     pub answered_by_class_kind: Vec<(String, usize)>,
@@ -124,6 +125,9 @@ pub struct StratumRow {
 /// Exploration's evidence: the busiest strata first and the stop, if any.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ExplorationReport {
+    /// The label policy the strata count under
+    /// ([`explore::ROUTER_LABEL_POLICY_VERSION`]).
+    pub label_policy_version: u32,
     pub strata: Vec<StratumRow>,
     /// Strata beyond [`STRATA_SHOWN`].
     pub more: usize,
@@ -151,6 +155,7 @@ pub fn exploration(
         projection: explore::project(s, now),
     };
     ExplorationReport {
+        label_policy_version: explore::ROUTER_LABEL_POLICY_VERSION,
         strata: all.iter().take(STRATA_SHOWN).map(row).collect(),
         more: all.len().saturating_sub(STRATA_SHOWN),
         stop,
@@ -168,8 +173,9 @@ impl ExplorationReport {
         if self.strata.is_empty() && self.stop.is_none() {
             return String::new();
         }
-        let mut out = String::from(
-            "  exploration (strata: kind, difficulty band, scope; rates: corrected share;\n   main = the person's session, sub = subagent spawn):\n",
+        let mut out = format!(
+            "  exploration (strata: kind, difficulty band, scope; rates: corrected share;\n   main = the person's session, sub = subagent spawn;\n   an answered question counts as a positive unless backfilled; policy v{}):\n",
+            self.label_policy_version
         );
         for row in &self.strata {
             out.push_str(&format!(
@@ -508,7 +514,7 @@ impl SessionRoutingReport {
             self.completed, self.corrected, self.unknown
         ));
         out.push_str(&format!(
-            "  answered (no file edited, never a label): {}\n",
+            "  answered (no file edited; questions count unless backfilled): {}\n",
             self.answered
         ));
         if !self.answered_by_class_kind.is_empty() {
@@ -741,7 +747,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("  answered (no file edited, never a label): 2\n"),
+            text.contains("  answered (no file edited; questions count unless backfilled): 2\n"),
             "{text}"
         );
         assert!(text.contains("  answered by class kind:\n    question 1\n"));
@@ -890,6 +896,7 @@ mod tests {
             difficulty,
             scope: scope.into(),
             outcome: "completed_verified".into(),
+            outcome_source: Some("own".into()),
             started_at: "2026-10-01T00:00:00Z".into(),
             drawn,
             undrawn: !drawn,
@@ -922,6 +929,27 @@ mod tests {
         let text = report.render();
         assert!(text.contains("    +5 more"), "{text}");
         let widest = text.lines().map(|l| l.chars().count()).max().unwrap();
+        assert!(widest <= 80, "{widest} columns:\n{text}");
+    }
+
+    #[test]
+    fn the_exploration_section_names_its_label_policy() {
+        let tasks = vec![
+            explored("question", 2, "local", true),
+            explored("question", 2, "local", false),
+        ];
+        let report = exploration(&tasks, None, now());
+        assert!(!report.strata.is_empty());
+        let text = report.render();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].ends_with(';'), "{text}");
+        assert_eq!(
+            lines[2],
+            "   an answered question counts as a positive unless backfilled; policy v2):"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["label_policy_version"], 2);
+        let widest = lines.iter().map(|l| l.chars().count()).max().unwrap();
         assert!(widest <= 80, "{widest} columns:\n{text}");
     }
 

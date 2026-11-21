@@ -20,6 +20,12 @@ pub const MIN_DRAWN: usize = 20;
 /// undrawn tasks' by more than this (a fraction: 15 points).
 pub const STOP_MARGIN: f64 = 0.15;
 
+/// The label policy the exploration strata count under, printed by the
+/// report. Version 1: every outcome but `unknown` and `answered` is strong.
+/// Version 2: also a question task's own `answered` (`outcome_source` is
+/// `own`, never a backfilled or parent-derived one), as a positive.
+pub const ROUTER_LABEL_POLICY_VERSION: u32 = 2;
+
 /// The difficulty band a stratum is keyed by.
 pub fn band(difficulty: u8) -> &'static str {
     match difficulty {
@@ -29,10 +35,14 @@ pub fn band(difficulty: u8) -> &'static str {
     }
 }
 
-/// Whether an outcome counts as strong evidence (every one but `unknown`
-/// and `answered`).
-fn strong(outcome: &str) -> Option<TaskOutcome> {
-    TaskOutcome::parse(outcome).filter(|o| o.is_strong())
+/// The task's outcome when it counts as strong evidence: every one but
+/// `unknown` and `answered`, plus a question's own `answered`.
+fn strong(task: &ExplorationTask) -> Option<TaskOutcome> {
+    let outcome = TaskOutcome::parse(&task.outcome)?;
+    let own_answered_question = outcome == TaskOutcome::Answered
+        && task.kind == "question"
+        && task.outcome_source.as_deref() == Some("own");
+    (outcome.is_strong() || own_answered_question).then_some(outcome)
 }
 
 /// Strong-outcome counts of one stratum.
@@ -92,7 +102,7 @@ pub fn strata(tasks: &[ExplorationTask]) -> Vec<StratumCounts> {
     let mut by_key: BTreeMap<(String, String, &'static str, String), StratumCounts> =
         BTreeMap::new();
     for task in tasks {
-        let Some(outcome) = strong(&task.outcome) else {
+        let Some(outcome) = strong(task) else {
             continue;
         };
         if !(task.drawn || task.undrawn) {
@@ -255,6 +265,7 @@ mod tests {
                 "completed_verified"
             }
             .into(),
+            outcome_source: Some("own".into()),
             started_at: "2026-10-01T00:00:00Z".into(),
             drawn,
             undrawn: !drawn,
@@ -300,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn an_answered_outcome_is_no_evidence_for_the_stop() {
+    fn an_answered_edit_is_no_evidence_for_the_stop() {
         // 19 drawn tasks with strong outcomes, 4 of them corrected: 21
         // points over the clean undrawn arm, but one short of twenty.
         let mut tasks = fixture(4);
@@ -312,6 +323,53 @@ mod tests {
         tasks.push(answered);
         let check = stop_check(&strata(&tasks));
         assert!(!check.stop, "{check:?}");
+    }
+
+    fn answered(drawn: bool, kind: &str, source: &str) -> ExplorationTask {
+        ExplorationTask {
+            kind: kind.into(),
+            outcome: "answered".into(),
+            outcome_source: Some(source.into()),
+            ..task(drawn, false)
+        }
+    }
+
+    #[test]
+    fn an_answered_question_from_its_own_record_is_a_positive() {
+        let mut tasks = fixture(4);
+        tasks.remove(19);
+        assert!(!stop_check(&strata(&tasks)).stop, "19 drawn");
+        tasks.push(answered(true, "question", "own"));
+        let check = stop_check(&strata(&tasks));
+        assert!(check.stop, "{check:?}");
+        assert_eq!((check.drawn, check.drawn_bad), (20, 4));
+        // An undrawn one is counted on the undrawn side, not bad.
+        let counts = strata(&[answered(false, "question", "own")]);
+        assert_eq!((counts[0].undrawn, counts[0].undrawn_bad), (1, 0));
+        assert_eq!(counts[0].drawn, 0);
+    }
+
+    #[test]
+    fn a_backfilled_answered_question_is_no_evidence() {
+        assert!(strata(&[answered(true, "question", "backfill_v45")]).is_empty());
+    }
+
+    #[test]
+    fn an_unknown_question_is_no_evidence() {
+        let mut unknown = task(true, false);
+        unknown.kind = "question".into();
+        unknown.outcome = "unknown".into();
+        assert!(strata(&[unknown]).is_empty());
+    }
+
+    #[test]
+    fn an_answered_edit_is_no_evidence() {
+        assert!(strata(&[answered(true, "edit", "own")]).is_empty());
+    }
+
+    #[test]
+    fn the_router_label_policy_is_version_two() {
+        assert_eq!(ROUTER_LABEL_POLICY_VERSION, 2);
     }
 
     #[test]

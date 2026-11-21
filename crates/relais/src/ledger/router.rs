@@ -212,6 +212,8 @@ pub struct ExplorationTask {
     pub difficulty: u8,
     pub scope: String,
     pub outcome: String,
+    /// Where the outcome came from (`own`, `parent`, `backfill_v45`, ...).
+    pub outcome_source: Option<String>,
     pub started_at: String,
     /// The draw lowered the tier (`explored`) and the switch was applied.
     pub drawn: bool,
@@ -853,7 +855,7 @@ impl Ledger {
     pub fn router_exploration_tasks(&self) -> Result<Vec<ExplorationTask>> {
         let mut stmt = self.conn.prepare(
             "SELECT d.relation, t.class_kind, t.difficulty, t.scope, t.outcome, t.started_at,
-                    d.explored, d.applied, d.propensity, d.holdout
+                    d.explored, d.applied, d.propensity, d.holdout, t.outcome_source
                FROM router_tasks t
                JOIN router_decisions d
                  ON d.session = t.session AND d.task_id = t.task_id
@@ -862,7 +864,7 @@ impl Ledger {
                 AND t.difficulty IS NOT NULL
              UNION ALL
              SELECT d.relation, t.class_kind, t.difficulty, t.scope, t.outcome, t.started_at,
-                    d.explored, d.applied, d.propensity, d.holdout
+                    d.explored, d.applied, d.propensity, d.holdout, t.outcome_source
                FROM router_tasks t
                JOIN router_decisions d
                  ON d.session = t.session AND d.task_id = t.task_id
@@ -883,6 +885,7 @@ impl Ledger {
                 scope: row.get(3)?,
                 outcome: row.get(4)?,
                 started_at: row.get(5)?,
+                outcome_source: row.get(10)?,
                 drawn: explored && applied && !holdout,
                 undrawn: !explored && propensity.is_some() && !holdout,
             })
@@ -1165,6 +1168,75 @@ mod tests {
             cache_creation_input_tokens: 0,
             at: "2026-10-07T10:00:01Z".into(),
         }
+    }
+
+    #[test]
+    fn exploration_tasks_carry_their_outcome_source() {
+        let (ledger, _dir) = ledger();
+        let class = Some(RouterClass {
+            kind: "question".into(),
+            difficulty: 2,
+            scope: "local".into(),
+            uncertainty: "low".into(),
+            verifiable: false,
+            confidence: 0.9,
+        });
+        let decision = |relation: &str, agent: Option<&str>| RouterDecisionRow {
+            task_id: "t1".into(),
+            turn_id: None,
+            agent_id: agent.map(String::from),
+            relation: relation.into(),
+            class: class.clone(),
+            tier: "research".into(),
+            model: "claude-haiku-5-5".into(),
+            effort: None,
+            reason: "table".into(),
+            mode_effective: "shadow".into(),
+            holdout: false,
+            applied: true,
+            explored: true,
+            propensity: Some(0.1),
+            draw: Some(0.05),
+            would_pass_gate: true,
+            table_version: Some(3),
+            at: "2026-10-07T10:00:00Z".into(),
+        };
+        let answered = |source: &str, agent: Option<&str>| RouterTaskRow {
+            agent_id: agent.map(String::from),
+            class: class.clone(),
+            outcome_source: Some(source.into()),
+            ..task("answered", 1)
+        };
+        ledger
+            .record_router_batch(
+                "main",
+                &[
+                    RouterRecord::Decision(decision("new_task", None)),
+                    RouterRecord::Task(answered("backfill_v45", None)),
+                ],
+            )
+            .unwrap();
+        ledger
+            .record_router_batch(
+                "spawn",
+                &[
+                    RouterRecord::Decision(decision("subagent", Some("a1"))),
+                    RouterRecord::Task(answered("own", Some("a1"))),
+                ],
+            )
+            .unwrap();
+        let tasks = ledger.router_exploration_tasks().unwrap();
+        let sources: Vec<(&str, Option<&str>)> = tasks
+            .iter()
+            .map(|t| (t.relation.as_str(), t.outcome_source.as_deref()))
+            .collect();
+        assert_eq!(
+            sources,
+            [
+                ("new_task", Some("backfill_v45")),
+                ("subagent", Some("own"))
+            ]
+        );
     }
 
     #[test]

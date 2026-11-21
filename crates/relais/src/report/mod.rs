@@ -78,8 +78,8 @@ fn accepted_by_person(
 /// status` prints, so its JSON agrees with the sentence a person sees),
 /// so a downstream parser can tell an old shape from a new one instead of
 /// guessing from key presence. 9: `never_shipped_tasks`. 10:
-/// `repair_outcomes`. 11: `advisor_data`. 12: `advisor_data` becomes `decision_labels`. 13: `harness`. 14: `holdouts`. 15: `answered`, the unknown subagents by parent and the unmatched check commands in session routing. 16: `holdouts.by_source`. 17: `harness.steps[].models[]` gains cost and tokens. 18: `auto_settled`. 19: `runs[]` gains `verification_inputs_changed`, `reviewed` and `review_level`.
-pub const REPORT_SCHEMA_VERSION: u32 = 19;
+/// `repair_outcomes`. 11: `advisor_data`. 12: `advisor_data` becomes `decision_labels`. 13: `harness`. 14: `holdouts`. 15: `answered`, the unknown subagents by parent and the unmatched check commands in session routing. 16: `holdouts.by_source`. 17: `harness.steps[].models[]` gains cost and tokens. 18: `auto_settled`. 19: `runs[]` gains `verification_inputs_changed`, `reviewed` and `review_level`. 20: `session_routing.exploration.label_policy_version`, `session_routing.arms[].excluded_sessions` and `session_routing.arms[].priced_completed`.
+pub const REPORT_SCHEMA_VERSION: u32 = 20;
 
 /// A dimension `relais report --by` groups the window's tasks over (SPEC
 /// §11: "compare like task classes and policy versions"). Total over the
