@@ -8,6 +8,20 @@ missing here.
 
 ## Unreleased
 
+- `relais report`'s session routing no longer blanks an arm's cost per
+  completed task because one session used an unpriced model: such sessions are
+  left out of the arm's cost, its denominator and its interval, and listed
+  with the full model ids to price in `[pricing.models]`; an arm where no
+  session prices still reads unknown. The figure moved to its own line under
+  the arm line. JSON arms gain `excluded_sessions` and `priced_completed`.
+- A question task's own `answered` outcome (`outcome_source = own`, never a
+  backfilled one) now counts as a positive strong outcome in the exploration
+  strata and the stop rule, so main-session question strata can accumulate
+  evidence. The rule is `ROUTER_LABEL_POLICY_VERSION` 2, printed in the
+  exploration header and as `session_routing.exploration.label_policy_version`
+  (report schema 20). `is_completed`, rank and the ledger schema are
+  unchanged.
+
 ## v0.76.0
 
 - A trial whose run ran out of budget now settles by the cause. Running

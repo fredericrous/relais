@@ -80,7 +80,7 @@ pub use review_parts::{PartResult, PartStatus, PlannedPart, ReviewPartRow};
 pub use router::{
     ExplorationTask, RouterCheck, RouterClass, RouterClassificationRow, RouterDecisionRow,
     RouterExplorationStop, RouterProvenance, RouterReassessRow, RouterRecord, RouterTaskOutcomeRow,
-    RouterTaskRow, RouterUsageRow, RouterWindow, UNMATCHED_CHECKS_MAX,
+    RouterTaskRow, RouterUsageRow, RouterWindow, OWN_SOURCE, UNMATCHED_CHECKS_MAX,
 };
 pub use task_types::{
     ExportedTasks, ImportedTaskTypes, StoredTaskType, TaskExportRow, TaskTypeSource,

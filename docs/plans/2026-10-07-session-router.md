@@ -195,9 +195,9 @@ Only **escalating evidence** raises the tier: a failed verification **after an e
 **Learning** (Rust, `relais::router`, a pure module):
 - It compares drawn and not-drawn tasks among exploration-eligible, gate-passing tasks of the same (kind, difficulty band, scope).
 - A learned adjustment (for example "difficulty 3 local verifiable → research") **activates only if all of these hold:**
-  1. ≥ 20 drawn tasks in the stratum, with strong outcomes only (completed-verified, completed-accepted or corrected; unknowns excluded and their rate ≤ 0.5);
+  1. ≥ 20 drawn tasks in the stratum, with strong outcomes only (completed-verified, completed-accepted or corrected, and, since D34 of `2026-10-10-learning-loop.md`, a question's own `answered`; unknowns excluded and their rate ≤ 0.5);
   2. **success:** the 5% lower credible bound of the drawn arm's success rate ≥ `quality_floor` (0.85), and it is not more than 0.05 below the undrawn arm's;
-  3. **savings:** the drawn arm's **total cost per successfully completed task** is lower than the undrawn arm's. The total includes the classifier calls, cache rewrites, subagents and recovery escalations, all priced from `router_usage`. The 90% interval of the difference must exclude zero;
+  3. **savings:** the drawn arm's **total cost per successfully completed task** is lower than the undrawn arm's. The total includes the classifier calls, cache rewrites, subagents and recovery escalations, all priced from `router_usage`. The 90% interval of the difference must exclude zero; the spend headline excludes sessions with unpriced usage, but this gate is inconclusive whenever either compared arm contains an unpriced session, and pricing the model in machine.toml is what makes the arm readable again;
   4. **label quality, automatic** (no hand labels, R1b): only strong outcomes count (verification results, accepted relais runs, explicit acceptance or correction); the stratum's missed-failure rate (above) has a 95% upper bound ≤ 0.1, and the stratum has no `/relais-flag` or revert miss; an activated stratum rolls back per the early trigger above.
 - `relais router evaluate [--json]` shows every stratum and why it passes or fails. Activations and rollbacks are recorded in `router_activations`.
 

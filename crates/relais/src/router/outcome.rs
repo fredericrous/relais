@@ -16,7 +16,8 @@ pub enum TaskOutcome {
     /// The person corrected the work, or flagged it.
     Corrected,
     /// Nothing was edited and nothing could have been: a question, a
-    /// review. Never a learning label.
+    /// review. Not a learning label on its own: `router::explore` also
+    /// counts a question's own `answered` as a positive (label policy 2).
     Answered,
     Unknown,
 }
@@ -61,8 +62,9 @@ impl TaskOutcome {
         matches!(self, Self::CompletedVerified | Self::CompletedAccepted)
     }
 
-    /// An outcome learning may count (plan §5): every
-    /// one but `unknown` and `answered`.
+    /// An outcome learning may count (plan §5): every one but `unknown`
+    /// and `answered`. The kind-aware rule for a question's own `answered`
+    /// lives in `router::explore`.
     pub fn is_strong(self) -> bool {
         !matches!(self, Self::Unknown | Self::Answered)
     }

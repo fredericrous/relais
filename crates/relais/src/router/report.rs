@@ -2,8 +2,10 @@
 //! headline"): the total cost per completed task in routed sessions
 //! against held-out ones, priced from `[pricing]` at read time, with a
 //! cluster-bootstrap interval over sessions. Every figure is an
-//! API-equivalent estimate; an unpriced model makes its arm's cost
-//! unknown, never zero (SPEC §11). Pure.
+//! API-equivalent estimate. A session with any unpriced usage row is left
+//! out of its arm's cost, its cost-per-task denominator and its bootstrap
+//! clusters and is counted apart, with the models to price; an arm where
+//! no session prices reads unknown, never zero (SPEC §11). Pure.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -33,12 +35,20 @@ pub struct Arm {
     pub sessions: usize,
     pub tasks: usize,
     pub completed: usize,
-    /// All of the arm's router usage, completed or not. `None` when any
-    /// of it is unpriced.
+    /// Completed tasks of the sessions that price: the denominator of
+    /// `cost_per_completed_task`.
+    pub priced_completed: usize,
+    /// Sessions with any unpriced usage row, left out of `cost`, the ratio's
+    /// denominator and the bootstrap clusters; `sessions`, `tasks` and
+    /// `completed` still count them.
+    pub excluded_sessions: usize,
+    /// The router usage, completed or not, of the arm's priced sessions.
+    /// `None` when the arm has sessions and none of them prices.
     pub cost: Option<MicroUsd>,
     pub cost_per_completed_task: Option<MicroUsd>,
     /// The 95% cluster-bootstrap interval of `cost_per_completed_task`.
     pub interval: Option<[MicroUsd; 2]>,
+    /// The unpriced models of the excluded sessions, sorted.
     pub unpriced_models: Vec<String>,
 }
 
@@ -80,7 +90,8 @@ pub struct SessionRoutingReport {
     pub corrected: usize,
     pub unknown: usize,
     /// Tasks that edited no file and could not have: reported apart from
-    /// `unknown`, never a learning label.
+    /// `unknown`. Not a learning label, except a question's own `answered`
+    /// (label policy 2).
     pub answered: usize,
     /// `answered` tasks per class kind, by kind.
     pub answered_by_class_kind: Vec<(String, usize)>,
@@ -124,6 +135,9 @@ pub struct StratumRow {
 /// Exploration's evidence: the busiest strata first and the stop, if any.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ExplorationReport {
+    /// The label policy the strata count under
+    /// ([`explore::ROUTER_LABEL_POLICY_VERSION`]).
+    pub label_policy_version: u32,
     pub strata: Vec<StratumRow>,
     /// Strata beyond [`STRATA_SHOWN`].
     pub more: usize,
@@ -151,6 +165,7 @@ pub fn exploration(
         projection: explore::project(s, now),
     };
     ExplorationReport {
+        label_policy_version: explore::ROUTER_LABEL_POLICY_VERSION,
         strata: all.iter().take(STRATA_SHOWN).map(row).collect(),
         more: all.len().saturating_sub(STRATA_SHOWN),
         stop,
@@ -168,8 +183,9 @@ impl ExplorationReport {
         if self.strata.is_empty() && self.stop.is_none() {
             return String::new();
         }
-        let mut out = String::from(
-            "  exploration (strata: kind, difficulty band, scope; rates: corrected share;\n   main = the person's session, sub = subagent spawn):\n",
+        let mut out = format!(
+            "  exploration (strata: kind, difficulty band, scope; rates: corrected share;\n   main = the person's session, sub = subagent spawn;\n   an answered question counts as a positive unless backfilled; policy v{}):\n",
+            self.label_policy_version
         );
         for row in &self.strata {
             out.push_str(&format!(
@@ -288,51 +304,65 @@ pub fn session_routing(
                 .iter()
                 .filter(|(_, task)| outcome(&task.outcome).is_completed())
                 .count();
-            let usage = || {
-                window
-                    .usage
-                    .iter()
-                    .filter(|(session, _)| sessions.contains(&session.as_str()))
-            };
-            let (cost, unpriced_models) = total(usage().map(|(_, row)| row), pricing);
-            let per_task = cost
-                .filter(|_| completed > 0)
-                .map(|cost| MicroUsd::from_micros(cost.to_micros() / completed as i64));
-            let interval = cost.and_then(|_| {
-                let clusters: Vec<(f64, f64)> = sessions
-                    .iter()
-                    .map(|session| {
-                        let (cost, _) = total(
-                            usage().filter(|(s, _)| s == session).map(|(_, row)| row),
-                            pricing,
-                        );
+            let mut priced_cost = MicroUsd::ZERO;
+            let mut priced_clusters: Vec<(f64, f64)> = Vec::new();
+            let mut priced_completed = 0usize;
+            let mut excluded_sessions = 0usize;
+            let mut unpriced_models: BTreeSet<String> = BTreeSet::new();
+            // holds-until: a window of about 10,000 sessions; the loop rescans
+            // `window.usage` and `tasks` once per session, then group them by
+            // session first.
+            for session in &sessions {
+                let (session_cost, session_unpriced) = total(
+                    window
+                        .usage
+                        .iter()
+                        .filter(|(s, _)| s == session)
+                        .map(|(_, row)| row),
+                    pricing,
+                );
+                match session_cost {
+                    Some(session_cost) => {
                         let done = tasks
                             .iter()
                             .filter(|(s, task)| {
                                 s == session && outcome(&task.outcome).is_completed()
                             })
                             .count();
-                        (cost.map_or(0.0, |c| c.to_micros() as f64), done as f64)
-                    })
-                    .collect();
-                cluster_bootstrap_ratio(&clusters, BOOTSTRAP_SEED, BOOTSTRAP_RESAMPLES, 0.05).map(
-                    |(lo, hi)| {
+                        priced_cost = priced_cost.saturating_add(session_cost);
+                        priced_completed += done;
+                        priced_clusters.push((session_cost.to_micros() as f64, done as f64));
+                    }
+                    None => {
+                        excluded_sessions += 1;
+                        unpriced_models.extend(session_unpriced);
+                    }
+                }
+            }
+            let cost = (sessions.is_empty() || !priced_clusters.is_empty()).then_some(priced_cost);
+            let per_task = cost
+                .filter(|_| priced_completed > 0)
+                .map(|cost| MicroUsd::from_micros(cost.to_micros() / priced_completed as i64));
+            let interval = per_task.and_then(|_| {
+                cluster_bootstrap_ratio(&priced_clusters, BOOTSTRAP_SEED, BOOTSTRAP_RESAMPLES, 0.05)
+                    .map(|(lo, hi)| {
                         [
                             MicroUsd::from_micros(lo.round() as i64),
                             MicroUsd::from_micros(hi.round() as i64),
                         ]
-                    },
-                )
+                    })
             });
             Arm {
                 arm: name,
                 sessions: sessions.len(),
                 tasks: tasks.len(),
                 completed,
+                priced_completed,
+                excluded_sessions,
                 cost,
                 cost_per_completed_task: per_task,
-                interval: per_task.and(interval),
-                unpriced_models,
+                interval,
+                unpriced_models: unpriced_models.into_iter().collect(),
             }
         })
         .collect();
@@ -482,12 +512,17 @@ impl SessionRoutingReport {
                 "held_out" => "held out",
                 other => other,
             };
+            let excluded = arm.excluded_sessions > 0;
             let figure = match (arm.cost_per_completed_task, arm.cost) {
-                (_, None) => format!(
-                    "cost per completed task {}",
-                    unknown_cost(&arm.unpriced_models)
-                ),
-                (None, Some(_)) => "cost per completed task: no completed task".to_string(),
+                // No session prices: the models follow, one per line, never cut.
+                (_, None) => {
+                    "cost per completed task unknown, no [pricing.models] entry for:".to_string()
+                }
+                (None, Some(_)) if excluded => {
+                    "cost per completed task none (no completed task among priced sessions)"
+                        .to_string()
+                }
+                (None, Some(_)) => "cost per completed task none (no completed task)".to_string(),
                 (Some(per_task), Some(_)) => match arm.interval {
                     Some([lo, hi]) => {
                         format!("cost per completed task {per_task} (95% interval {lo} to {hi})")
@@ -496,9 +531,22 @@ impl SessionRoutingReport {
                 },
             };
             out.push_str(&format!(
-                "  {label}: {} session(s), {} task(s), {} completed; {figure}\n",
+                "  {label}: {} session(s), {} task(s), {} completed\n    {figure}\n",
                 arm.sessions, arm.tasks, arm.completed
             ));
+            if excluded && arm.cost.is_some() {
+                out.push_str(&format!(
+                    "    excluded {} session(s) from cost, no [pricing.models] entry for:\n",
+                    arm.excluded_sessions
+                ));
+            }
+            // `cost` is `None` only when no session priced, which is `excluded`
+            // too: one guard lists the models under either figure.
+            if excluded {
+                for model in &arm.unpriced_models {
+                    out.push_str(&format!("      {model}\n"));
+                }
+            }
         }
         let rate = self
             .unknown_rate
@@ -508,7 +556,7 @@ impl SessionRoutingReport {
             self.completed, self.corrected, self.unknown
         ));
         out.push_str(&format!(
-            "  answered (no file edited, never a label): {}\n",
+            "  answered (no file edited; questions count unless backfilled): {}\n",
             self.answered
         ));
         if !self.answered_by_class_kind.is_empty() {
@@ -675,15 +723,17 @@ mod tests {
         let held = &report.arms[1];
         assert_eq!(held.arm, "held_out");
         assert_eq!(held.cost, None);
+        assert_eq!((held.excluded_sessions, held.priced_completed), (1, 0));
         assert_eq!(held.unpriced_models, vec!["claude-opus-5-5".to_string()]);
         let text = report.render();
         assert!(text.contains("API-equivalent estimate"), "{text}");
         assert!(
-            text.contains("held out: 1 session(s), 1 task(s), 1 completed; cost per completed task unknown (no [pricing.models] entry for claude-opus-5-5)"),
+            text.contains("held out: 1 session(s), 1 task(s), 1 completed\n    cost per completed task unknown, no [pricing.models] entry for:\n      claude-opus-5-5\n"),
             "{text}"
         );
+        assert!(!text.contains("excluded 1 session(s)"), "{text}");
         assert!(
-            text.contains("routed: 1 session(s), 2 task(s), 1 completed; cost per completed task $2 (95% interval"),
+            text.contains("routed: 1 session(s), 2 task(s), 1 completed\n    cost per completed task $2 (95% interval"),
             "{text}"
         );
     }
@@ -741,7 +791,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("  answered (no file edited, never a label): 2\n"),
+            text.contains("  answered (no file edited; questions count unless backfilled): 2\n"),
             "{text}"
         );
         assert!(text.contains("  answered by class kind:\n    question 1\n"));
@@ -756,13 +806,95 @@ mod tests {
         report.answered = 9999;
         report.unknown_rate = Some(1.0);
         report.answered_by_class_kind = vec![("question".into(), 9999), ("review".into(), 9999)];
-        for line in report
-            .render()
-            .lines()
-            .filter(|l| l.contains("outcomes:") || l.contains("answered") || l.starts_with("    "))
-        {
+        let ids = ["gpt-6.1-sol", "qwen3.6:35b-a3b"];
+        report.arms[0].excluded_sessions = 9999;
+        report.arms[0].unpriced_models = ids.iter().map(|id| id.to_string()).collect();
+        // An arm no session of which prices lists the same ids under its
+        // unknown figure, one per line.
+        let long = [
+            "claude-opus-5-5-with-a-deliberately-long-alias",
+            "gpt-6.1-sol",
+        ];
+        report.arms[1].cost = None;
+        report.arms[1].cost_per_completed_task = None;
+        report.arms[1].interval = None;
+        report.arms[1].excluded_sessions = 9999;
+        report.arms[1].unpriced_models = long.iter().map(|id| id.to_string()).collect();
+        let text = report.render();
+        for line in text.lines() {
             assert!(line.chars().count() <= 80, "{line}");
         }
+        for id in ids.iter().chain(long.iter()) {
+            assert!(text.contains(&format!("\n      {id}\n")), "{text}");
+        }
+        assert!(
+            text.contains(
+                "    excluded 9999 session(s) from cost, no [pricing.models] entry for:\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "    cost per completed task unknown, no [pricing.models] entry for:\n      claude-opus-5-5-with-a-deliberately-long-alias\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_unpriced_session_is_left_out_of_its_arms_cost_and_denominator() {
+        let mut fixture = window();
+        fixture
+            .tasks
+            .push(("routed-2".into(), task("e", "completed_verified")));
+        fixture
+            .usage
+            .push(("routed-2".into(), usage("e", 0, "gpt-6.1-sol", "step", 0)));
+        fixture.decisions.push(("routed-2".into(), false, true));
+        let report = session_routing(&fixture, &pricing(), ExplorationReport::default());
+        let routed = &report.arms[0];
+        assert_eq!((routed.sessions, routed.tasks, routed.completed), (2, 3, 2));
+        assert_eq!((routed.priced_completed, routed.excluded_sessions), (1, 1));
+        assert_eq!(routed.unpriced_models, vec!["gpt-6.1-sol".to_string()]);
+        assert_eq!(routed.cost, Some(MicroUsd::from_micros(2_000_000)));
+        assert_eq!(
+            routed.cost_per_completed_task,
+            Some(MicroUsd::from_micros(2_000_000))
+        );
+        assert_eq!(
+            routed.interval,
+            Some([
+                MicroUsd::from_micros(2_000_000),
+                MicroUsd::from_micros(2_000_000)
+            ])
+        );
+        let text = report.render();
+        assert!(
+            text.contains("  routed: 2 session(s), 3 task(s), 2 completed\n    cost per completed task $2 (95% interval $2 to $2)\n    excluded 1 session(s) from cost, no [pricing.models] entry for:\n      gpt-6.1-sol\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_priced_arm_with_no_completed_priced_task_says_so() {
+        let mut fixture = window();
+        fixture
+            .tasks
+            .push(("routed-2".into(), task("e", "completed_verified")));
+        fixture
+            .usage
+            .push(("routed-2".into(), usage("e", 0, "gpt-6.1-sol", "step", 0)));
+        fixture.decisions.push(("routed-2".into(), false, true));
+        fixture.tasks[0].1.outcome = "corrected".into();
+        let report = session_routing(&fixture, &pricing(), ExplorationReport::default());
+        let routed = &report.arms[0];
+        assert_eq!(
+            (routed.priced_completed, routed.cost_per_completed_task),
+            (0, None)
+        );
+        assert!(report.render().contains(
+            "    cost per completed task none (no completed task among priced sessions)\n"
+        ));
     }
 
     /// An unknown subagent task recorded with the parent link captured.
@@ -890,6 +1022,7 @@ mod tests {
             difficulty,
             scope: scope.into(),
             outcome: "completed_verified".into(),
+            outcome_source: Some("own".into()),
             started_at: "2026-10-01T00:00:00Z".into(),
             drawn,
             undrawn: !drawn,
@@ -922,6 +1055,27 @@ mod tests {
         let text = report.render();
         assert!(text.contains("    +5 more"), "{text}");
         let widest = text.lines().map(|l| l.chars().count()).max().unwrap();
+        assert!(widest <= 80, "{widest} columns:\n{text}");
+    }
+
+    #[test]
+    fn the_exploration_section_names_its_label_policy() {
+        let tasks = vec![
+            explored("question", 2, "local", true),
+            explored("question", 2, "local", false),
+        ];
+        let report = exploration(&tasks, None, now());
+        assert!(!report.strata.is_empty());
+        let text = report.render();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].ends_with(';'), "{text}");
+        assert_eq!(
+            lines[2],
+            "   an answered question counts as a positive unless backfilled; policy v2):"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["label_policy_version"], 2);
+        let widest = lines.iter().map(|l| l.chars().count()).max().unwrap();
         assert!(widest <= 80, "{widest} columns:\n{text}");
     }
 

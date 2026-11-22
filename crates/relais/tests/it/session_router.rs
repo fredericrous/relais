@@ -598,11 +598,11 @@ fn the_report_prices_routing_spend_and_says_unknown_for_an_unpriced_model() {
         "{text}"
     );
     assert!(
-        text.contains("routed: 1 session(s), 1 task(s), 1 completed; cost per completed task $1.00103 (95% interval"),
+        text.contains("routed: 1 session(s), 1 task(s), 1 completed\n    cost per completed task $1.00103 (95% interval"),
         "{text}"
     );
     assert!(
-        text.contains("held out: 1 session(s), 1 task(s), 1 completed; cost per completed task unknown (no [pricing.models] entry for claude-mystery-9)"),
+        text.contains("held out: 1 session(s), 1 task(s), 1 completed\n    cost per completed task unknown, no [pricing.models] entry for:\n      claude-mystery-9\n"),
         "{text}"
     );
     let json = world.relais(&["report", "--since", "2026-10-01", "--no-import", "--json"]);
