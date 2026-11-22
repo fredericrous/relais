@@ -92,11 +92,13 @@ What the measure cannot see (blind channels):
   miss only.
 - **Runs:** `learn::revert` runs have no task join.
 
-Before gate 4 can mean anything, the plugin fixes ship in this order:
-1. resolve revert paths;
-2. drop out-of-repository paths;
-3. key hashes by repository;
-4. record correction files.
+Before gate 4 can mean anything, the plugin fixes ship in this order, now
+filed as tickets:
+1. **Recorded reverts name the files they revert** (t10): resolve revert
+   paths.
+2. **Task file hashes are scoped to one repository** (t11): drop
+   out-of-repository paths and key hashes by repository.
+3. **A correction records its files and charges one task** (t12).
 
 Next: t03, which now also takes two questions:
 - whether gate 4 counts parents for review strata;

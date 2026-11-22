@@ -87,8 +87,14 @@ FROM s LEFT JOIN router_tasks p
 WHERE stratum IS NOT NULL AND (drawn OR undrawn)
   AND s.outcome IN ('completed_verified', 'completed_accepted');
 
--- stop: hashes of paths outside every repository (see "cannot see", 1)
+-- stop: hashes of paths outside every repository (see "cannot see", 1),
+-- filled from memhashes.txt, built in the shell beforehand:
+--   for f in ~/.claude/projects/-Users-fredericrous-Developer-Perso/memory/*.md ~/.claude/CLAUDE.md; do
+--     printf %s "$f" | shasum -a 256 | cut -c1-16; done > memhashes.txt
 CREATE TEMP TABLE stop(h TEXT PRIMARY KEY);
+.mode csv
+.import memhashes.txt stop
+.mode list
 
 CREATE TEMP VIEW m AS
 SELECT c.*,
@@ -130,8 +136,11 @@ files to check and would count as clean.
 ### The figures
 
 With the stop list (668 hashes: the absolute paths of every file in the
-memory directory and `~/.claude/CLAUDE.md`; 153 of them occur in task
-records):
+memory directory and `~/.claude/CLAUDE.md` as listed today; 153 of them
+occur in task records. Deleted or renamed memory files and other
+projects' memory directories are not in it: a wider list only removes
+matches, so the 0 stands. The block above, run as written, gives 45 with
+`stop` empty and 0 with it filled):
 
 | Stratum | Arm | Completed | Unlinked | Measured | Missed | Bound (per review) | Parents | Missed parents | Bound (per parent) |
 |---|---|---|---|---|---|---|---|---|---|
@@ -150,8 +159,9 @@ on one hash, `1ed8db4facf41d44`, the absolute path of the memory index
 `MEMORY.md`, which 84 main tasks in 55 sessions edited. The fifth
 overlaps on another memory file. All 45 are false.
 
-**Misses cluster on parents.** A parent spawns 4 to 11 reviews; one parent
-miss marks all of them. A per-review binomial bound counts them as
+**Misses cluster on parents.** The five parents behind the false misses
+spawned 4 to 11 reviews each, and one parent miss marks all of them. The
+measured drawn arms run 24 reviews over 19 parents and 14 over 11. A per-review binomial bound counts them as
 independent and overstates n by 1.3–4.1× here. For a review stratum, gate
 4's "≥ 36 completed drawn" should read 36 distinct parents, with the bound
 on parents. The same holds for attribution: a review that found the defect
@@ -189,7 +199,7 @@ note, that goes to t03.
 4. **A correction as a new task.** The classifier reads `correction`
    only against an active task. A complaint after a `/clear`, in a new
    session, or after the task closed with no task open is a `new_task`
-   and never a correction. Of 12,966 main-session classified turns, 26 are
+   and never a correction. Of 12,946 main-session classified turns, 26 are
    corrections and 840 start new tasks.
 5. **Correction rows carry no files.** `router_reassess` `correction` rows
    have `files_json = '[]'`, so the overlap uses all of B's files, those
