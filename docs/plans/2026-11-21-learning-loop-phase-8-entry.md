@@ -123,7 +123,7 @@ rm -rf "$scratch"
 
 Expected: arm lines carry a priced `cost per completed task $…` followed by `    excluded N session(s) from cost, no [pricing.models] entry for:` and one full-id line per model where it applies; the exploration header's third line reads `   an answered question counts as a positive unless backfilled; policy v2):`; baseline first: compare every displayed `main question …` row from installed 0.75.0 against the SQL oracle's v1 counts, and every displayed branch row against its v2 counts, keyed by band and scope. Exploration uses the whole ledger despite `--since`; both text and JSON retain only five strata, so do not compare displayed sums or require identical membership. Confirm backfilled answers contribute nothing (the 4 `backfill_v45` rows); the review strata remain at 30 and 24 drawn wherever displayed; JSON gives `20`, `2`, and three `excluded_sessions` summing to the distinct sessions with gpt-6.1-sol or qwen3.6:35b-a3b usage on the copy (≤ 4). The cargo block is the gate, not a check. `--no-import` keeps the report from importing transcripts; the live ledger is never opened by the branch binary.
 
-Release: `tag-release` skill after merge (report schema 20 is user-visible; no ledger step, so rollback is reinstalling 0.75.0); plugin reinstall is the person's step as before. Then Phase 4.
+Release: `tag-release` skill after merge (report schema 20 is user-visible; no ledger step, so rollback is reinstalling the previous release, 0.76.0 after the rebase; neither 0.75.0 nor 0.76.0 adds a ledger step); plugin reinstall is the person's step as before. Then Phase 4.
 
 ### Results (2026-11-21, tree 1813525b)
 
@@ -147,6 +147,7 @@ Relais: Phase 1's worker (sonnet) produced a complete candidate but its focused 
 - **approve** (code-review backend, 69k/60 s, delta 25k/27 s): shared `OWN_SOURCE`, `holds-until:` on the deferred stop column and the per-session loop, parent-source test all fixed; keeping a version-pin test kept as `deliberate: the Rust seat asked to delete the tautology; the holds-until note names the change`.
 - **approve** (code-review lang:rust, 66k/44 s, delta 28k/53 s): `OWN_SOURCE`, byte-slice removed, one-id-per-line list for a fully unpriced arm, tautological test deleted, stray comma, guard simplified: all fixed; the `OutcomeSource` enum kept as `deliberate: the shared constant was the seat's stated minimum`.
 - **approve** (code-review tui, 49k/20 s, delta 28k/49 s): one arm-figure form and one unpriced phrasing fixed; "add one to machine.toml" and the header wording kept as `deliberate: 80-column budget and the setting's own name; wording settled by the plan panel's tui seat` (the seat accepted both).
+- Rebased onto v0.76.0 (#534) before the push: the vendored pack refresh dropped out as empty and the CHANGELOG bullets moved above `## v0.76.0`; the rule pack changed, so a fresh round ran on tree b8712a32: implementation-review **approve** (57k/24 s), backend **approve** (68k/36 s; rollback target corrected to 0.76.0), lang:rust **approve** (40k/15 s), tui **approve** (76k/22 s; CHANGELOG wording for `none (no completed task)` kept as `deliberate: the JSON is the machine interface, and no plugin, script or doc greps the old line`).
 - Phase 4 (chart the Phase 8 programme) follows the merge and release; `status` stays `active` until it is charted.
 
 ## Person's optional step
