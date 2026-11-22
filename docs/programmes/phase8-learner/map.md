@@ -71,7 +71,7 @@ is inconclusive under the session rule (one `gpt-6.1-sol` session holds 1
 drawn and 50 undrawn strata tasks) though every strata task's own usage is
 priced. Findings for the next tickets: every strong outcome on these
 strata is inherited from the parent (`outcome_source = parent`), reviews
-edit no files (file-overlap misses are vacuous), and no `flag` reassess
+edit no files (file-overlap misses are vacuous), and `/relais-flag`, though wired, has never been used: no `flag` reassess
 event has ever been written (t02); which "unknown" gate 1 counts and
 whether the cost gate reads sessions or tasks (t03). Next: t02 (missed
 failure), then t03. Earlier entry:
