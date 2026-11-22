@@ -1476,6 +1476,49 @@ mod tests {
         );
     }
 
+    /// The programme skill's drive (ADR-0080): an approved programme runs to
+    /// its end. Each phrase below is one decision of the driver plan; losing
+    /// one would bring back the per-ticket stop or the per-ticket approval.
+    #[test]
+    fn the_programme_skill_drives_an_approved_map_to_its_end() {
+        let body = plugin::embedded_text("skills/programme/SKILL.md").expect("the plugin ships it");
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        for phrase in [
+            "## Drive a programme",
+            "no ticket plan is approved again",
+            "The map's `source` must be a ref, not `working-tree`",
+            "Skip a ticket whose `due` is after today",
+            "Capacity is 3 minus this driver's unfinished ticket agents",
+            "Never start a ticket whose claim did not exit 0.",
+            "3 with `is held by` on stderr",
+            "1 with `stayed held for` on stderr",
+            "a 1 or 3 without those words: report the stderr line and stop",
+            "Never hand off with an agent of the driver still running.",
+            "no capacity is not the end of the programme",
+            "never a fork",
+            "Never enter plan mode while a drive runs",
+            "A ticket never waits for a slower sibling",
+            "no `held` line in the Handoff",
+            "safe to /clear; next: `resume <repo> <slug> drive: <the next wave's ticket ids>`",
+            "the clear-relay does not fire twice within 120 s",
+            "Take the boundary every time, whatever the context size.",
+            "the agent runs the whole `worktree-task` loop itself",
+            "runs F4b itself",
+            "so the reviewed tree is the pushed tree",
+            "a recommendation does not answer an empirical question",
+            "decided-by: agent (ADR-0080)",
+            "A ticket agent writes only its ticket file and its own Decisions line",
+            "at most 5 per drive",
+            "An empty frontier does not end the drive",
+        ] {
+            assert!(flat.contains(phrase), "the skill lost `{phrase}`:\n{body}");
+        }
+        assert!(
+            !flat.contains("One ticket per session"),
+            "a driver runs several tickets; the old one-ticket rule is gone:\n{body}"
+        );
+    }
+
     #[test]
     fn a_marker_installed_above_the_frontmatter_migrates_under_it() {
         let (root, dir) = temp_root();

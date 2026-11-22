@@ -215,6 +215,53 @@ fn the_frontier_lists_ready_tickets_and_follows_branches_and_resolutions() {
     assert_eq!(world.programme(&["check"]).status.code(), Some(0));
 }
 
+/// The diamond a drive runs (ADR-0080): A→B, A→D, B→C, D→C. Once A is
+/// closed, B and D are ready together and run in parallel; C waits for
+/// both. A regression pin: the frontier already behaves this way.
+#[test]
+fn a_diamond_frees_both_branches_then_their_join() {
+    let world = World::new("diamond");
+    world.write(
+        "C.md",
+        &ticket("open", "[\"B\", \"D\"]", None, "Name of C", None),
+    );
+    world.write("D.md", &ticket("open", "[\"A\"]", None, "Name of D", None));
+    let decided = |closed: &[&str]| {
+        let mut lines = String::from("- [Choose the store](A.md)\n");
+        for id in closed {
+            lines.push_str(&format!("- [Name of {id}]({id}.md)\n"));
+        }
+        MAP.replace("- [Choose the store](A.md)\n", &lines)
+    };
+
+    assert_eq!(world.programme(&["check"]).status.code(), Some(0));
+    let out = world.programme(&["frontier"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        ids(&out.stdout),
+        ["B", "D"],
+        "after A, both branches are ready"
+    );
+
+    world.write(
+        "B.md",
+        &ticket("closed", "[\"A\"]", None, "Name of B", Some("Decided.")),
+    );
+    world.write("map.md", &decided(&["B"]));
+    let out = world.programme(&["frontier"]);
+    assert_eq!(ids(&out.stdout), ["D"], "C still waits for D");
+    assert_eq!(world.programme(&["check"]).status.code(), Some(0));
+
+    world.write(
+        "D.md",
+        &ticket("closed", "[\"A\"]", None, "Name of D", Some("Decided.")),
+    );
+    world.write("map.md", &decided(&["B", "D"]));
+    let out = world.programme(&["frontier"]);
+    assert_eq!(ids(&out.stdout), ["C"], "the join is ready once both close");
+    assert_eq!(world.programme(&["check"]).status.code(), Some(0));
+}
+
 #[test]
 fn an_empty_frontier_says_why_on_stderr_and_exits_zero() {
     let world = World::new("empty");
