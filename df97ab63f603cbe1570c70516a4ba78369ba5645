@@ -1,0 +1,18 @@
+greengate-provenance-v1
+commit 0f056bad20cfae0c28db20deddad3817b2d318b3
+tree df97ab63f603cbe1570c70516a4ba78369ba5645
+canon eb1464f87155665d6f36ca08d0e4f3446e7a204c
+patch 25e69dd9054635c26515803c9510ca78583422f0
+plan docs/plans/2026-11-21-approved-programmes-run-without-person.md 7fd95493ec45c960d25b2cd8a5664dbf2070059089c620769575ba66cea15f96
+review reviewed 213dc6dfb940ef8fe2b29b4328865d107d4e18128ac9fc18b287da7915ec3261
+code-review backend reviewed 213dc6dfb940ef8fe2b29b4328865d107d4e18128ac9fc18b287da7915ec3261
+code-review lang:rust reviewed 213dc6dfb940ef8fe2b29b4328865d107d4e18128ac9fc18b287da7915ec3261
+preview not-required
+producer greenbelay 6.6.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABApHVNv2+cDO7NJC93GOQ8DOM3G/ElSA5bisNoZRV0tR
+7czrkeR0/4J6ZJQ0azFa1vflX1Nkij0Tf0zuONcpk0Dw==
+-----END SSH SIGNATURE-----
