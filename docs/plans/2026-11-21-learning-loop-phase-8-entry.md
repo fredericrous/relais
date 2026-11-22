@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 plan-id: p-01M7ZD5ZMFEF3XH7HYATDANGVA
 branch: feat/phase8-entry
 repos: [relais]
@@ -148,7 +148,12 @@ Relais: Phase 1's worker (sonnet) produced a complete candidate but its focused 
 - **approve** (code-review lang:rust, 66k/44 s, delta 28k/53 s): `OWN_SOURCE`, byte-slice removed, one-id-per-line list for a fully unpriced arm, tautological test deleted, stray comma, guard simplified: all fixed; the `OutcomeSource` enum kept as `deliberate: the shared constant was the seat's stated minimum`.
 - **approve** (code-review tui, 49k/20 s, delta 28k/49 s): one arm-figure form and one unpriced phrasing fixed; "add one to machine.toml" and the header wording kept as `deliberate: 80-column budget and the setting's own name; wording settled by the plan panel's tui seat` (the seat accepted both).
 - Rebased onto v0.76.0 (#534) before the push: the vendored pack refresh dropped out as empty and the CHANGELOG bullets moved above `## v0.76.0`; the rule pack changed, so a fresh round ran on tree b8712a32: implementation-review **approve** (57k/24 s), backend **approve** (68k/36 s; rollback target corrected to 0.76.0), lang:rust **approve** (40k/15 s), tui **approve** (76k/22 s; CHANGELOG wording for `none (no completed task)` kept as `deliberate: the JSON is the machine interface, and no plugin, script or doc greps the old line`).
-- Phase 4 (chart the Phase 8 programme) follows the merge and release; `status` stays `active` until it is charted.
+- Phase 4's docs branch: implementation-review **approve-with-changes** (56k/30 s): the Outcome's release wording corrected (release in flight, not shipped), `repos` added to every ticket, the build items named as plans that follow the decisions; re-bound after the fixes. Profiles on that branch: backend **approve-with-changes** (67k/33 s: D34–D36 listed in the map, the Destination no longer states the first passing strata, the stop-row check gained preconditions, a dated release-check ticket owns the v0.77.0 verification), lang:rust **approve** (43k/20 s: `typed_gate.rs`, `promote.rs`, `typed_rollback.rs` added to the tickets' reading lists), tui **approve-with-changes** (48k/37 s: a ticket title without a decision id, `pipefail` on the report command, the person's ticket named in the Handoff, the `[[pricing.models]]` wording and follow-up f11, a rollback-naming point under Not yet specified). Re-bound: all four **approve**; carried: the stop-row check could list the release check in `blocked_by` (backend, low; its preconditions already stop a false zero).
+- Phase 4 done 2026-11-22: the programme `docs/programmes/phase8-learner/` is charted (9 tickets: three research, two grilling, three dated checks, one person's step), so `status: done`.
+
+## Outcome
+
+2026-11-22. Phases 1–3 merged in relais#533 (squash 49c5091f); the v0.77.0 release branch was landing when Phase 4 was charted, and Phase 4 does not depend on it; Phase 4 charted the programme **relais learns which model a stratum needs** (`docs/programmes/phase8-learner/`), whose frontier starts with the two research tickets on the gate inputs and the missed-failure measure. The relais follow-up (a blocked run's unregistered candidate) is `docs/programmes/follow-ups/f10`. The `router evaluate` first slice and `router rollback` are builds, not decisions: they follow as plans once the tickets on the adjustment's shape, the activations ledger and the decision record close; Laya's second-job comparison stays under the map's Not yet specified until D35's fallout is decided. The person's step below is also the programme's ticket **Price the two foreign models so their sessions rejoin the headline**.
 
 ## Person's optional step
 
