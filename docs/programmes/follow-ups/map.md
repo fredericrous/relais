@@ -44,6 +44,10 @@ ticket here until it is resolved or moved into a programme of its own.
   grace exactly; the overrun was the log append and tombstone write after
   it, which a loaded disk stretches to 25–95 ms. `ONCE_GRACE < 100 ms` is
   a compile-time check; the hook's real limit is 10 s.
+- [f10](f10-blocked-run-candidate-missing.md) (2026-11-22, open): a run
+  blocked `env_missing` kept `candidate-final.patch` on disk but a `verify`
+  run on it answered `candidate_missing`; filed from the learning-loop
+  entry session, salvaged by `git apply` that night.
 
 ## Handoff
 

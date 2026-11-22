@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 plan-id: p-01M7ZD5ZMFEF3XH7HYATDANGVA
 branch: feat/phase8-entry
 repos: [relais]
@@ -148,7 +148,11 @@ Relais: Phase 1's worker (sonnet) produced a complete candidate but its focused 
 - **approve** (code-review lang:rust, 66k/44 s, delta 28k/53 s): `OWN_SOURCE`, byte-slice removed, one-id-per-line list for a fully unpriced arm, tautological test deleted, stray comma, guard simplified: all fixed; the `OutcomeSource` enum kept as `deliberate: the shared constant was the seat's stated minimum`.
 - **approve** (code-review tui, 49k/20 s, delta 28k/49 s): one arm-figure form and one unpriced phrasing fixed; "add one to machine.toml" and the header wording kept as `deliberate: 80-column budget and the setting's own name; wording settled by the plan panel's tui seat` (the seat accepted both).
 - Rebased onto v0.76.0 (#534) before the push: the vendored pack refresh dropped out as empty and the CHANGELOG bullets moved above `## v0.76.0`; the rule pack changed, so a fresh round ran on tree b8712a32: implementation-review **approve** (57k/24 s), backend **approve** (68k/36 s; rollback target corrected to 0.76.0), lang:rust **approve** (40k/15 s), tui **approve** (76k/22 s; CHANGELOG wording for `none (no completed task)` kept as `deliberate: the JSON is the machine interface, and no plugin, script or doc greps the old line`).
-- Phase 4 (chart the Phase 8 programme) follows the merge and release; `status` stays `active` until it is charted.
+- Phase 4 done 2026-11-22: the programme `docs/programmes/phase8-learner/` is charted (8 tickets: two research, two grilling, one on the activations ledger, two dated checks, one person's step), so `status: done`.
+
+## Outcome
+
+2026-11-22. Phases 1–3 merged in relais#533 (squash 49c5091f) and released as v0.77.0; Phase 4 charted the programme **relais learns which model a stratum needs** (`docs/programmes/phase8-learner/`), whose frontier starts with the two research tickets on the gate inputs and the missed-failure measure. The relais follow-up (a blocked run's unregistered candidate) is `docs/programmes/follow-ups/f10`. The person's step below is also the programme's ticket **Price the two foreign models so their sessions rejoin the headline**.
 
 ## Person's optional step
 
