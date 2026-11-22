@@ -61,7 +61,48 @@ Inherited from `docs/plans/2026-11-21-learning-loop-phase-8-entry.md`
   charted as this programme; ε stays 0.1. Watch item: `main question d1-2
   unknown` drawn corrected share (40% of 5 on 11-21).
 
+From this programme's research tickets:
+
+- [t01](t01-gate-inputs.md): neither review stratum can activate. Gates 2
+  and 4 fail on both. Gate 1 hangs on what "unknown" means, and gate 3 on
+  whether cost is read per session or per task (both go to t03).
+- [t02](t02-missed-failure.md): a review's miss is measured on its parent's
+  files and end. Today the measure reads 0, but the revert channel and
+  cross-session matches are blind. Four plugin fixes come before gate 4
+  can mean anything. Whether to count parents goes to t03.
+
 ## Handoff
+
+2026-11-22, t02 closed (missed failure). A review's miss is measured on its
+parent: in the 24 h after the parent ends, a correction or a revert that
+touches the parent's files. The SQL is in the ticket. Result: 0 misses on
+both strata once a stop list masks the memory files. Without it the query
+finds 45 false misses: absolute paths outside the session cwd collide
+across sessions. Gate 4 still fails on sample size: 24 and 14 linked drawn
+reviews, from 19 and 11 distinct parents. Reviews cluster on parents, so
+the bound should count parents.
+
+What the measure cannot see (blind channels):
+- **Reverts:** none of the 93 recorded reverts can match any task's files
+  (a literal `$P`, paths resolved against the session cwd instead of the
+  `cd` target, `.`).
+- **Repository:** hashes carry no repository key.
+- **Correction files:** correction rows carry no files.
+- **Plan vs hook:** the hook marks B `corrected` where the plan says A's
+  miss only.
+- **Runs:** `learn::revert` runs have no task join.
+
+Before gate 4 can mean anything, the plugin fixes ship in this order:
+1. resolve revert paths;
+2. drop out-of-repository paths;
+3. key hashes by repository;
+4. record correction files.
+
+Next: t03, which now also takes two questions:
+- whether gate 4 counts parents for review strata;
+- whether a parent's miss is a review's miss at all.
+
+Earlier entry:
 
 2026-11-22, t01 closed (gate inputs). Neither review stratum can activate:
 gates 2 and 4 fail on both (best 5% bound 0.848 on d4-5; 27 and 23
