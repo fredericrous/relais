@@ -196,7 +196,7 @@ pub fn validity_floor_rule(first_trial_at: &str) -> FloorRule {
 /// A budget stop settles by its cause for a revision first trialled at or
 /// after this instant, the release that shipped it; a revision already
 /// mid-gate keeps the bar it started under.
-pub const TYPED_GATE_BUDGET_CAUSE_FROM: &str = "2026-11-22T00:00:00+00:00";
+pub const TYPED_GATE_BUDGET_CAUSE_FROM: &str = "2026-11-21T21:30:00+00:00";
 
 /// How a trial's `budget_exhausted` end settles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1602,7 +1602,7 @@ mod tests {
             BudgetRule::ByCause
         );
         assert_eq!(
-            budget_rule("2026-11-21T23:59:59+00:00"),
+            budget_rule("2026-11-21T21:29:59+00:00"),
             BudgetRule::Grandfathered
         );
         assert_eq!(budget_rule("not a stamp"), BudgetRule::ByCause);
