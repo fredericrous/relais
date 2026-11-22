@@ -20,3 +20,4 @@ Part of [Approved programmes run without the person](https://github.com/frederic
 - implementation-review: approve-with-changes, then delta approve; fixed: plan record, ADR-0079 exemption logged, research exception kept, fog disposition; 79k + 86k.
 - backend: approve-with-changes, then approve; fixed: claim stderr words for exits 1 and 3, no handoff mid-run; deliberate: `stayed held for` pin filed as a follow-up; 67k + 72k.
 - lang:rust: approve-with-changes, then approve; fixed: closure parameter renamed; 48k + 54k.
+- Rebased onto main (v0.76.0, #532, #533): the redundant pack-refresh commit was dropped; all three seats re-read the rebased tree (lang:rust approve; implementation-review and backend caught the CHANGELOG entry landing under v0.76.0, moved back under Unreleased); 91k, 76k, 58k.
