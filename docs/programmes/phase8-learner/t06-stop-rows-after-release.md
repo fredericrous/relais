@@ -18,6 +18,10 @@ the `label_policy_version` column is owed now (see the ticket on
 
 ## Look at
 
+- First the preconditions: `relais --version` reads 0.77.0 and a Claude
+  Code session has started since it was installed (`router-state` writes
+  the stop at session start). Without both, the answer is "no evidence",
+  not 0.
 - `sqlite3 -readonly ~/.local/state/relais/ledger.sqlite "select * from router_exploration_stops"`
   (the installed binary writes it at session start through `router-state`).
 

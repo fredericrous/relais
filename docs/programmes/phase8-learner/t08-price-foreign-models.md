@@ -18,8 +18,11 @@ person edits machine.toml.
 
 ## Look at
 
-- `docs/INTEGRATIONS.md:278-300`, the `excluded N session(s)` lines of
-  `relais report`'s session-routing section.
+- `docs/INTEGRATIONS.md:278-300`; in `relais report`'s session-routing
+  section the line reads `excluded N session(s) from cost, no
+  [pricing.models] entry for:` followed by the ids, while the TOML entry
+  is written `[[pricing.models]]` (an array of tables); follow-up f11 asks
+  the message to match.
 
 ## Answer looks like
 

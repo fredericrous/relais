@@ -48,6 +48,10 @@ ticket here until it is resolved or moved into a programme of its own.
   blocked `env_missing` kept `candidate-final.patch` on disk but a `verify`
   run on it answered `candidate_missing`; filed from the learning-loop
   entry session, salvaged by `git apply` that night.
+- [f11](f11-pricing-message-matches-toml.md) (2026-11-22, open): the
+  unpriced-model messages print `[pricing.models]` while the TOML entry is
+  `[[pricing.models]]`; one wording that a person can paste (from the
+  phase8-learner charting review).
 
 ## Handoff
 

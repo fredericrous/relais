@@ -10,8 +10,9 @@ tier adjustment through `router-state` for every stratum that passes all
 four, and rolls it back on the early trigger. `relais router evaluate
 [--json]` shows every stratum and why it passes or fails; `relais router
 rollback` undoes an activation; `router_activations` records both. The
-first strata to pass are the review-subagent ones (30 and 24 drawn on
-2026-11-21), and the person can read, in `relais report`, what each
+review-subagent strata (30 and 24 drawn on 2026-11-21) are the expected
+first candidates; whether they pass gate 3 is open (the gate-inputs and
+pricing tickets). The person can read, in `relais report`, what each
 activation saved per completed task.
 
 ## Notes
@@ -49,7 +50,16 @@ activation saved per completed task.
 
 ## Decisions so far
 
-(none yet)
+Inherited from `docs/plans/2026-11-21-learning-loop-phase-8-entry.md`
+(person, 2026-11-21), recorded in `docs/plans/2026-10-10-learning-loop.md`:
+
+- D34: a question's own `answered` (source `own`, never backfilled) is a
+  positive strong outcome; `ROUTER_LABEL_POLICY_VERSION` 2.
+- D35: Phase 7 closed, no run 3; Laya replacing haiku dropped as a cost
+  project; Laya's second job stays a research comparison.
+- D36: Phase 8's start condition met on the review-subagent strata;
+  charted as this programme; ε stays 0.1. Watch item: `main question d1-2
+  unknown` drawn corrected share (40% of 5 on 11-21).
 
 ## Handoff
 
@@ -64,8 +74,9 @@ the adjustment's shape and the decision record. The research runs were not
 started at charting: the host was saturated (two relais admission waits
 exhausted that night), so the next session starts them. Dated checks: the
 stop-row count on 2026-11-23 and the question stratum's corrected rate on
-2026-11-29. The person's step: price the two foreign models in
-machine.toml (its own ticket).
+2026-11-29, and **Confirm v0.77.0 shipped and is installed** on
+2026-11-23. The person's step: **Price the two foreign models so their
+sessions rejoin the headline** (hitl).
 
 ## Not yet specified
 
@@ -78,6 +89,8 @@ machine.toml (its own ticket).
   `model` preference and the person's pins (session-router plan §6).
 - Whether the learner's evaluation runs at session start in `router-state`
   (latency budget) or only on demand and at `relais report`.
+- How `router rollback` names the activation it undoes, and whether it
+  takes `--dry-run` or `--yes` (the activations-ledger ticket reads this).
 
 ## Out of scope
 

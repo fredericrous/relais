@@ -21,8 +21,10 @@ same ledger step (48 → 49)?
 
 - `crates/relais/src/ledger/schema/migrations.rs` (`router_exploration_stops`,
   the v45–v48 steps), `crates/relais/src/ledger/learning.rs` and
-  `learn/registry.rs` (how artifact activations and rollbacks are
-  recorded), `.adr/records/0003-*.md`.
+  `learn/registry.rs`, `learn/promote.rs` and `learn/typed_rollback.rs`
+  (how artifact activations and rollbacks are recorded and undone),
+  `.adr/records/0003-*.md`; the map's open point on how `router rollback`
+  names what it undoes.
 
 ## Answer looks like
 

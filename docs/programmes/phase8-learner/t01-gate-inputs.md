@@ -29,6 +29,8 @@ strata pass today?
   (`router_exploration_tasks`, `router_window`, `router_task_token_totals`).
 - The ledger schema for `router_tasks`, `router_decisions`, `router_usage`
   (`crates/relais/src/ledger/schema/migrations.rs`).
+- `crates/relais/src/learn/typed_gate.rs`: the artifact learner's gate
+  evaluation, the likely precedent for `router evaluate`.
 - A read-only query on a `.backup` copy of `~/.local/state/relais/ledger.sqlite`
   for the two ready strata: drawn and undrawn tasks, their sessions, and
   whether their usage rows are priced.
