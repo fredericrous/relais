@@ -1,0 +1,19 @@
+greengate-provenance-v1
+commit bcb72f26fdca02ded67b522669bb0ea59ea8dd9d
+tree 2e677a190b4323212c0c52675d2a22a94ac37411
+canon 4be1e9f372fe1a19462beed9fdd810fa12909bac
+patch d222a904655f5c2d06c91d15becf3dc4e6e2f2bf
+plan docs/plans/2026-10-07-session-router.md 54adb083dfc9ce93fdd125f2a569454294e4666a24f6888b5f1ed25817f96190
+review reviewed b8712a32510710936ead7ed5179854ad2b09af8d1e5c68f0eef239671e29fd34
+code-review backend reviewed b8712a32510710936ead7ed5179854ad2b09af8d1e5c68f0eef239671e29fd34
+code-review lang:rust reviewed b8712a32510710936ead7ed5179854ad2b09af8d1e5c68f0eef239671e29fd34
+code-review tui reviewed b8712a32510710936ead7ed5179854ad2b09af8d1e5c68f0eef239671e29fd34
+preview not-required
+producer greenbelay 6.6.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABALYiXlP7s2faaGys+HLA1/5lQeXMbMaDLzoGk/qNDJP
+wHDiHuvhgEt3yw5yCt2ZRigfSsIEk/C/TgsjFplftSBw==
+-----END SSH SIGNATURE-----
