@@ -63,6 +63,20 @@ Inherited from `docs/plans/2026-11-21-learning-loop-phase-8-entry.md`
 
 ## Handoff
 
+2026-11-22, t01 closed (gate inputs). Neither review stratum can activate:
+gates 2 and 4 fail on both (best 5% bound 0.848 on d4-5; 27 and 23
+completed drawn, short of 36), gate 1 passes only if "unknown" means the
+literal outcome (a review's own `answered` makes 67% and 62% weak), gate 3
+is inconclusive under the session rule (one `gpt-6.1-sol` session holds 1
+drawn and 50 undrawn strata tasks) though every strata task's own usage is
+priced. Findings for the next tickets: every strong outcome on these
+strata is inherited from the parent (`outcome_source = parent`), reviews
+edit no files (file-overlap misses are vacuous), and `/relais-flag`,
+though wired, has never been used: no `flag` reassess event has ever
+been written (t02); which "unknown" gate 1 counts and
+whether the cost gate reads sessions or tasks (t03). Next: t02 (missed
+failure), then t03. Earlier entry:
+
 2026-11-22, charted (the entry plan's Phase 4). Merged: relais#533 (the
 entry plan: label policy 2, honest cost headline, D34–D36); release
 v0.77.0 in flight at charting time. Live state: two review-subagent strata
