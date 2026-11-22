@@ -52,6 +52,15 @@ ticket here until it is resolved or moved into a programme of its own.
   unpriced-model messages print `[pricing.models]` while the TOML entry is
   `[[pricing.models]]`; one wording that a person can paste (from the
   phase8-learner charting review).
+- [f12](f12-claim-takeover-live-session.md) (2026-11-21, open): a work
+  claim was taken over from a live session after a `/clear` relay, and two
+  sessions edited one worktree (filed from the inbox, orphan of 0f2c38ac).
+- [f13](f13-lease-width-keys-shared.md) (2026-11-21, open): the lease's
+  width variables are hand-listed in `verify/heavy.rs`. Build them from
+  `greenharness_slots::width_env` once it ships (orphan of edf02f7e).
+- [f14](f14-claim-lock-stderr-pinned.md) (2026-11-21, open): pin the
+  `stayed held for` wording that the driver's retry matches with a claim
+  CLI test (orphan of 4bca21ec).
 
 ## Handoff
 
