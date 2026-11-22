@@ -3,6 +3,7 @@ type = "research"
 mode = "afk"
 status = "open"
 blocked_by = []
+repos = ["relais"]
 +++
 # How a missed failure is detected for a drawn task
 

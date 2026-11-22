@@ -3,6 +3,7 @@ type = "research"
 mode = "afk"
 status = "open"
 blocked_by = []
+repos = ["relais"]
 +++
 # What each activation gate needs that the ledger does not yet hold
 

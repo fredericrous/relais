@@ -3,6 +3,7 @@ type = "grilling"
 mode = "hitl"
 status = "open"
 blocked_by = ["t01-gate-inputs"]
+repos = ["relais"]
 +++
 # What a learned adjustment is, and how the plugin applies it
 

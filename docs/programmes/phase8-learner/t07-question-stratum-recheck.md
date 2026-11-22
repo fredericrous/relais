@@ -3,6 +3,7 @@ type = "task"
 mode = "afk"
 status = "open"
 blocked_by = []
+repos = ["relais"]
 due = "2026-11-29"
 +++
 # The question stratum's corrected rate a week after D34

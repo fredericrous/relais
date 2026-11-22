@@ -3,6 +3,7 @@ type = "task"
 mode = "afk"
 status = "open"
 blocked_by = []
+repos = ["relais"]
 due = "2026-11-23"
 +++
 # The stop-row count a day after label policy 2 went live

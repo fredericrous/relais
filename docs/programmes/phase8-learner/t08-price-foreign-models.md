@@ -3,6 +3,7 @@ type = "task"
 mode = "hitl"
 status = "open"
 blocked_by = []
+repos = ["relais"]
 +++
 # Price the two foreign models so their sessions rejoin the headline
 

@@ -3,6 +3,7 @@ type = "grilling"
 mode = "hitl"
 status = "open"
 blocked_by = ["t03-adjustment-shape", "t04-activations-ledger"]
+repos = ["relais"]
 +++
 # The decision record for learned routing
 

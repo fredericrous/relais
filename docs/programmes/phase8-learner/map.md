@@ -38,6 +38,11 @@ activation saved per completed task.
   needs a relais ADR amending SPEC §16; exploration ε stays 0.1 unless a
   ticket here changes it on data; whether automatic activation is on is the
   person's switch, never the agent's.
+- **Builds follow decisions:** `relais router evaluate` (read-only first
+  slice over the two ready strata), `router rollback`, the served
+  `adjustments` and the plugin's application are plans written after the
+  tickets on the adjustment's shape, the activations ledger and the
+  decision record close; no ticket here is a deliverable.
 - **Skills every session reads:** `worktree-task`, `relais`, this
   programme; a plan built for a ticket here goes through plan mode and
   `/plan-review`.

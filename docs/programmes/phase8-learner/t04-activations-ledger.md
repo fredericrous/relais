@@ -3,6 +3,7 @@ type = "research"
 mode = "afk"
 status = "open"
 blocked_by = ["t01-gate-inputs"]
+repos = ["relais"]
 +++
 # What `router_activations` records, and how rollback reads it
 
