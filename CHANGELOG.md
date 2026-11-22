@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.77.0
+
 - `relais report`'s session routing no longer blanks an arm's cost per
   completed task because one session used an unpriced model: such sessions are
   left out of the arm's cost, its denominator and its interval, and listed
