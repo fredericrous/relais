@@ -77,6 +77,13 @@ From this programme's research tickets:
 
 ## Handoff
 
+2026-11-23, t09 closed (release check): v0.77.0 shipped. relais#537 merged
+as `50736d58`, and the Release run concluded `success` with 7 assets. The
+installed `relais` reads 0.77.0. The plugin is still at 0.72.0 (the
+person's reinstall), and its hooks already use the 0.77.0 binary on
+`PATH`. Next is still t03, with t02's two questions, then t07
+(2026-11-29). Earlier entry:
+
 2026-11-23, t06 closed (stop rows after release): `router_exploration_stops`
 holds 0 rows under v0.77.0. Exploration is on (probe ε 0.1). The pooled
 gap is −1.0 point against the 15-point margin (drawn 125 at 6.4%, undrawn
