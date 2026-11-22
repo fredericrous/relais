@@ -70,8 +70,19 @@ From this programme's research tickets:
   files and end. Today the measure reads 0, but the revert channel and
   cross-session matches are blind. Four plugin fixes come before gate 4
   can mean anything. Whether to count parents goes to t03.
+- [t06](t06-stop-rows-after-release.md): no stop row under v0.77.0.
+  The pooled gap is −1.0 point against 15, so the label-policy
+  `holds-until:` has not fired and the `label_policy_version` column is
+  not owed yet.
 
 ## Handoff
+
+2026-11-23, t06 closed (stop rows after release): `router_exploration_stops`
+holds 0 rows under v0.77.0. Exploration is on (probe ε 0.1). The pooled
+gap is −1.0 point against the 15-point margin (drawn 125 at 6.4%, undrawn
+1,197 at 7.4%), so the `holds-until:` on the label-policy version has not
+fired. Next is still t03, with t02's two questions. Then t09 (release
+check, due today) and t07 (2026-11-29). Earlier entry:
 
 2026-11-22, t02 closed (missed failure). A review's miss is measured on its
 parent: in the 24 h after the parent ends, a correction or a revert that
