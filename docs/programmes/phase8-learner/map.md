@@ -100,8 +100,21 @@ From this programme's research tickets:
   charge is decided at read time: an earlier completed main task within
   24 h sharing a file is charged, and a B whose every correction is
   charged (and never flagged) counts with its `outcome_uncorrected`.
+- [The correction charge read rule's fallbacks are tested and visible](t14-charge-read-fallbacks.md):
+  an unreadable correction row reads `unparsed` (apart from `legacy`,
+  which now means files that parse but are empty), and candidates skipped
+  for damage are counted in `CorrectionCharges::skipped_candidates`.
 
 ## Handoff
+
+2026-11-23, t14 closed (the charge read rule's fallbacks are tested and
+visible). The read-path change is in the PR that closes this ticket, with
+its plan and panel; t14's Resolution has the rules and the panel's notes
+for t05. It needs no release of its own: nothing outside tests reads
+`CorrectionCharge` until t05, so it ships with the next release. The live
+state is unchanged from the t12 entry below: v0.80.0 installed, ledger
+v50, and the plugin still 0.79.0 until the person reinstalls it. Next: t03.
+Earlier entry:
 
 2026-11-23, t12 closed (a correction records its files and charges one
 task). Plugin and ledger changes are on

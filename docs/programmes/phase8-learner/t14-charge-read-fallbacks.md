@@ -1,7 +1,7 @@
 +++
 type = "task"
 mode = "afk"
-status = "open"
+status = "closed"
 blocked_by = []
 repos = ["relais"]
 +++
@@ -43,3 +43,42 @@ Then one of these two, decided before t05 reads the struct:
 
 Also either a warning per skipped row, or a count returned with the
 charges.
+
+## Resolution
+
+Both: the fallbacks are tested, `legacy` is split from `unparsed`, and the
+skips are counted. Decided by agent (ADR-0080); the plan is
+`docs/plans/2026-11-23-charge-read-fallbacks.md`.
+
+- `CorrectionCharge` gains `unparsed: bool`: the row's `at` or `files_json`
+  does not parse. The row is kept with nothing charged, so its task stays
+  `corrected`. `legacy` now means only that both parse and the files are
+  empty. The two are never both true.
+- `Ledger::router_correction_charges` returns `CorrectionCharges { charges,
+  skipped_candidates }`. `skipped_candidates` counts the candidate tasks
+  skipped because their `ended_at` or `files_json` does not parse. It is a
+  count, not a warning, so a test can tell a skipped candidate from one
+  that did not match, and the read path writes nothing to stderr. The count
+  is ledger-wide, not per correction row: t05 reads a non-zero count as
+  "some charges may be missing".
+- New tests:
+  - `a_row_with_unreadable_files_is_kept_unparsed_and_keeps_its_task`: a
+    good row plus a corrupted one. The test fails if the row is dropped,
+    because b would then be charged away.
+  - `a_candidate_with_unreadable_files_is_skipped_and_counted`: two matching
+    candidates, one corrupted. The other one is charged, and the count is 1.
+- Tightened tests: the unparseable-time test and the legacy test now also
+  assert the flag split.
+- Mutation checks:
+  - with `unparsed` forced to `false`, both unparsed-row tests fail;
+  - without the skip increment, the candidate test fails.
+- The schema and the ledger version are unchanged, and there is no release
+  of its own: only tests read the struct until t05.
+
+Notes for t05 from the panel:
+- When the count or `unparsed` reaches a person, seat tui and unix. The
+  message goes to stderr, names the damaged task and the command to
+  inspect it, and has a documented exit status.
+- t05 decides whether the skipped task keys should be returned, not just
+  the count.
+- The enum alternative to the two bools stays open for t05.

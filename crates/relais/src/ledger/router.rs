@@ -797,13 +797,15 @@ impl Ledger {
     /// accepted at its end, ended within 24 hours before the row's `at`
     /// (any session, compared as UTC instants), and shares a file hash with
     /// the row's files outside `stop`. `stop` is filtered here, not bound to
-    /// SQL. A candidate whose end time or files do not parse is skipped; a
-    /// correction row whose time or files do not parse is kept with nothing
+    /// SQL. A candidate whose end time or files do not parse is skipped and
+    /// counted in [`CorrectionCharges::skipped_candidates`]; a correction row
+    /// whose time or files do not parse is kept `unparsed` with nothing
     /// charged, so its task stays `corrected`.
     // holds-until: ~10k main tasks in the ledger — every correction row scans every candidate; index by end time after
-    pub fn router_correction_charges(&self, stop: &[String]) -> Result<Vec<CorrectionCharge>> {
+    pub fn router_correction_charges(&self, stop: &[String]) -> Result<CorrectionCharges> {
         let stop: BTreeSet<&str> = stop.iter().map(String::as_str).collect();
         let mut candidates = Vec::new();
+        let mut skipped_candidates = 0;
         let mut statement = self.conn.prepare(
             "SELECT session, task_id, ended_at, files_json FROM router_tasks
               WHERE agent_id = '' AND ended_at IS NOT NULL
@@ -822,6 +824,7 @@ impl Ledger {
             let (Some(ended_at), Ok(files)) =
                 (parse_utc(&ended_at), files_from_json(&files_json, 3))
             else {
+                skipped_candidates += 1;
                 continue;
             };
             candidates.push(ChargeCandidate {
@@ -859,7 +862,8 @@ impl Ledger {
         for correction_row in correction_rows {
             let (session, task_id, at, files_json) = correction_row?;
             let parsed = parse_utc(&at).zip(files_from_json(&files_json, 3).ok());
-            let legacy = parsed.as_ref().is_none_or(|(_, files)| files.is_empty());
+            let unparsed = parsed.is_none();
+            let legacy = parsed.as_ref().is_some_and(|(_, files)| files.is_empty());
             let mut charged: Vec<TaskKey> = match &parsed {
                 None => Vec::new(),
                 Some((at_instant, files)) => {
@@ -892,9 +896,13 @@ impl Ledger {
                 at,
                 charged,
                 legacy,
+                unparsed,
             });
         }
-        Ok(charges)
+        Ok(CorrectionCharges {
+            charges,
+            skipped_candidates,
+        })
     }
 
     /// One task as stored, for tests and diagnostics.
@@ -1302,9 +1310,25 @@ pub struct CorrectionCharge {
     pub charged: Vec<TaskKey>,
     /// Task B holds a main-session `flag` reassess row.
     pub flagged: bool,
-    /// The row's files are empty (written before the plugin sent them), so
-    /// an empty `charged` means unknown, not no overlap.
+    /// The row's time and files parse and the files are empty (written
+    /// before the plugin sent them), so an empty `charged` means unknown, not
+    /// no overlap. Never true with `unparsed`.
     pub legacy: bool,
+    /// The row's `at` or `files_json` does not parse: nothing is charged and
+    /// its task stays `corrected`. Never true with `legacy`.
+    pub unparsed: bool,
+}
+
+/// What [`Ledger::router_correction_charges`] read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrectionCharges {
+    /// One per main-session correction row.
+    pub charges: Vec<CorrectionCharge>,
+    /// Candidate tasks skipped because their `ended_at` or `files_json` does
+    /// not parse. Ledger-wide, not per correction row: a non-zero count
+    /// means some charges may be missing (a missed charge leaves its task
+    /// `corrected`).
+    pub skipped_candidates: usize,
 }
 
 /// The tasks B every one of whose correction rows is charged to an earlier
@@ -1911,7 +1935,7 @@ mod tests {
     ) -> (Vec<CorrectionCharge>, BTreeSet<TaskKey>) {
         let (ledger, _dir) = ledger();
         ledger.record_router_batch("s1", records).unwrap();
-        let charges = ledger.router_correction_charges(stop).unwrap();
+        let charges = ledger.router_correction_charges(stop).unwrap().charges;
         let away = corrections_charged_away(&charges);
         (charges, away)
     }
@@ -1936,7 +1960,7 @@ mod tests {
                 &[reassess("b", "correction", row_files, CORRECTION_AT)],
             )
             .unwrap();
-        let charges = ledger.router_correction_charges(&[]).unwrap();
+        let charges = ledger.router_correction_charges(&[]).unwrap().charges;
         corrections_charged_away(&charges).contains(&key_of("s1", "b"))
     }
 
@@ -1997,19 +2021,23 @@ mod tests {
         ledger
             .record_router_batch("s1", &[reassess("b", "correction", &["x"], CORRECTION_AT)])
             .unwrap();
-        let charges = ledger.router_correction_charges(&[]).unwrap();
+        let read = ledger.router_correction_charges(&[]).unwrap();
         assert_eq!(
-            charges,
-            vec![CorrectionCharge {
-                session: "s1".into(),
-                task_id: "b".into(),
-                at: CORRECTION_AT.into(),
-                charged: vec![key_of("other", "a")],
-                flagged: false,
-                legacy: false,
-            }]
+            read,
+            CorrectionCharges {
+                charges: vec![CorrectionCharge {
+                    session: "s1".into(),
+                    task_id: "b".into(),
+                    at: CORRECTION_AT.into(),
+                    charged: vec![key_of("other", "a")],
+                    flagged: false,
+                    legacy: false,
+                    unparsed: false,
+                }],
+                skipped_candidates: 0,
+            }
         );
-        assert!(corrections_charged_away(&charges).contains(&key_of("s1", "b")));
+        assert!(corrections_charged_away(&read.charges).contains(&key_of("s1", "b")));
     }
 
     #[test]
@@ -2093,7 +2121,7 @@ mod tests {
             ],
             &[],
         );
-        assert!(charges[0].legacy && charges[0].charged.is_empty());
+        assert!(charges[0].legacy && !charges[0].unparsed && charges[0].charged.is_empty());
         assert!(away.is_empty());
     }
 
@@ -2155,8 +2183,82 @@ mod tests {
         assert_eq!(charges.len(), 2);
         assert!(charges
             .iter()
-            .any(|c| c.at == "soon" && c.charged.is_empty()));
+            .any(|c| c.at == "soon" && c.unparsed && !c.legacy && c.charged.is_empty()));
         assert!(away.is_empty());
+    }
+
+    #[test]
+    fn a_row_with_unreadable_files_is_kept_unparsed_and_keeps_its_task() {
+        let (ledger, _dir) = ledger();
+        let later = "2026-10-07T12:30:00.000Z";
+        ledger
+            .record_router_batch(
+                "other",
+                &[ended_task(
+                    "a",
+                    "2026-10-07T10:00:00.000Z",
+                    "completed_verified",
+                    &["x"],
+                    None,
+                )],
+            )
+            .unwrap();
+        ledger
+            .record_router_batch(
+                "s1",
+                &[
+                    reassess("b", "correction", &["x"], CORRECTION_AT),
+                    reassess("b", "correction", &["x"], later),
+                ],
+            )
+            .unwrap();
+        let changed = ledger
+            .conn
+            .execute(
+                "UPDATE router_reassess SET files_json = 'not json' WHERE at = ?1",
+                [later],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        let charges = ledger.router_correction_charges(&[]).unwrap().charges;
+        assert_eq!(charges.len(), 2);
+        assert!(!charges[0].unparsed && !charges[0].legacy);
+        assert_eq!(charges[0].charged, vec![key_of("other", "a")]);
+        assert_eq!(charges[1].at, later);
+        assert!(charges[1].unparsed && !charges[1].legacy && charges[1].charged.is_empty());
+        assert!(!corrections_charged_away(&charges).contains(&key_of("s1", "b")));
+    }
+
+    #[test]
+    fn a_candidate_with_unreadable_files_is_skipped_and_counted() {
+        let (ledger, _dir) = ledger();
+        let ended = "2026-10-07T10:00:00.000Z";
+        let verified = "completed_verified";
+        ledger
+            .record_router_batch(
+                "other",
+                &[
+                    ended_task("a1", ended, verified, &["x"], None),
+                    ended_task("a2", ended, verified, &["x"], None),
+                ],
+            )
+            .unwrap();
+        ledger
+            .record_router_batch("s1", &[reassess("b", "correction", &["x"], CORRECTION_AT)])
+            .unwrap();
+        let changed = ledger
+            .conn
+            .execute(
+                "UPDATE router_tasks SET files_json = 'not json' WHERE task_id = 'a1'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        let read = ledger.router_correction_charges(&[]).unwrap();
+        assert_eq!(read.skipped_candidates, 1);
+        assert_eq!(read.charges.len(), 1);
+        assert_eq!(read.charges[0].charged, vec![key_of("other", "a2")]);
+        assert!(!read.charges[0].unparsed && !read.charges[0].legacy);
     }
 
     #[test]
