@@ -179,9 +179,10 @@ pub(crate) fn release_intent(
 ) {
     if let RunSource::Intent(intent) = source {
         let released = match super::ctx::shared_state() {
-            Ok(state) => state
-                .release_claim(ledger, intent, run_id, refusal)
-                .map_err(|e| e.to_string()),
+            Ok(state) => {
+                relais::shared_state::node::release_claim(&*state, ledger, intent, run_id, refusal)
+                    .map_err(|e| e.to_string())
+            }
             Err(e) => Err(e.to_string()),
         };
         if let Err(e) = released {
@@ -327,8 +328,13 @@ pub(crate) fn run_command(
     // so a second launch of the same intent finds the first run instead of
     // making another (plan A5).
     if let RunSource::Intent(intent) = source {
-        let claimed =
-            super::ctx::shared_state()?.claim_intent(&ledger, intent, &run_id, &successor_process);
+        let claimed = relais::shared_state::node::claim_intent(
+            &*super::ctx::shared_state()?,
+            &ledger,
+            intent,
+            &run_id,
+            &successor_process,
+        );
         match claimed {
             Ok(relais::ledger::Claim::Claimed(_)) => {}
             Ok(relais::ledger::Claim::AlreadyClaimed { run }) => {

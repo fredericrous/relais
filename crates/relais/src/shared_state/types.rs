@@ -1,8 +1,11 @@
 //! The plain public types the [`super::SharedState`] trait speaks: who
 //! holds a thing, which thing, the fence that proves the hold is current,
-//! and the spend and publish records an external primary keeps.
+//! the shared half's answers, and the spend and publish records an
+//! external primary keeps. None of them is a handle or borrows one.
 
+use crate::ids::RunId;
 use crate::money::MicroUsd;
+use crate::programme::claim::Contest;
 
 /// What kind of caller a [`Principal`] is (an-t12): the person's own
 /// machine, a long-lived node with its own certificate, or one task's pod.
@@ -135,6 +138,72 @@ pub struct PublishRow {
     pub seq: u64,
     pub table: String,
     pub payload: String,
+}
+
+/// One request for a programme ticket, as the primary keys it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketRequest {
+    pub repo_key: String,
+    pub slug: String,
+    pub id: String,
+    pub holder: Principal,
+    pub contest: Contest,
+}
+
+impl TicketRequest {
+    /// The resource the request names.
+    pub fn resource(&self) -> ResourceId {
+        ResourceId::Ticket {
+            repo_key: self.repo_key.clone(),
+            slug: self.slug.clone(),
+            id: self.id.clone(),
+        }
+    }
+}
+
+/// The shared half's answer to a ticket request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TicketAnswer {
+    /// No shared half: the node's claim file decides, and
+    /// [`super::SharedState::grant_ticket`] fences a claim it wrote.
+    NodeDecides,
+    /// The primary granted the hold; the node writes its claim file next.
+    Granted(LeaseToken),
+    /// Another holder has it.
+    Held { holder: Principal, age_secs: u64 },
+}
+
+/// The shared half's answer to an intent claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntentAnswer {
+    /// This run may claim it; the node's ledger writes the claim next.
+    Granted,
+    /// Another run holds it.
+    HeldBy { run: RunId },
+}
+
+/// The shared half's answer to answering a decision (keyed by its run).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionGrant {
+    Granted,
+    AlreadyAnswered,
+}
+
+/// The learned registry's active pointer, as the shared half knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pointer {
+    /// No shared pointer: the node's pointer files are the truth.
+    NodeDecides,
+    Shared(Option<String>),
+}
+
+/// What a shared pointer swap came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Swap {
+    /// No shared pointer: the node compares and swaps its own files.
+    NodeDecides,
+    /// The shared pointer moved; the node promotes locally next.
+    Swapped,
 }
 
 /// What a publish came to: rows taken now, rows already known (a replay),

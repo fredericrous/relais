@@ -5,25 +5,22 @@
 //! after [`super::LocalState`]: the conformance suite runs both, so a
 //! property that holds for one only would show.
 //!
-//! Node-local writes (the ledger's decision and intent rows, the registry's
-//! artifact files) still go to the handles the caller passes, as a real
-//! client's would; the fake keeps the shared half in memory.
+//! It is the shared half only, as the trait is: the node-local writes (the
+//! ledger's decision and intent rows, the claim files, the registry's
+//! pointer files) are [`super::node`]'s, on the caller's handles.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::types::{
-    LeaseToken, Mode, Principal, PublishReceipt, PublishRow, Reservation, ResourceId, Settlement,
-    Slice,
+    DecisionGrant, IntentAnswer, LeaseToken, Mode, Pointer, Principal, PublishReceipt, PublishRow,
+    Reservation, ResourceId, Settlement, Slice, Swap, TicketAnswer, TicketRequest,
 };
-use super::{Selection, SharedState, SharedStateError, TicketClaim, TicketGrant};
+use super::{Selection, SharedState, SharedStateError};
 use crate::ids::RunId;
-use crate::learn::registry::{EvaluatedArtifact, Registry};
-use crate::ledger::{Claim, DecisionAnswer, Ledger, NewIntent, SuccessorIntent, SuccessorProcess};
 use crate::money::MicroUsd;
 use crate::policy::MachineSettings;
-use crate::programme::claim::{Acquired, Holder, Kind, Store, Taken};
 
 /// A seat lease's time to live (an-t11's first value).
 pub const SEAT_TTL_SECS: i64 = 90;
@@ -51,6 +48,12 @@ struct Inner {
     queue: Vec<PublishRow>,
     pointer: Option<String>,
     schema: BTreeMap<String, u64>,
+    /// Successor intents: which run holds each.
+    intents: HashMap<String, RunId>,
+    /// Decisions answered, by run.
+    answered: BTreeSet<String>,
+    /// When set, every release is refused with this reason (a test knob).
+    releases_fail: Option<String>,
 }
 
 /// The in-memory primary and its client in one.
@@ -100,6 +103,17 @@ impl FakeState {
         }
     }
 
+    /// Refuse (`Some(reason)`) or allow (`None`) every release from now on,
+    /// so a test sees what a release that fails after a local refusal does.
+    pub fn set_releases_fail(&self, reason: Option<&str>) {
+        self.lock().releases_fail = reason.map(str::to_string);
+    }
+
+    /// The run holding `intent_id`, if any.
+    pub fn intent_holder(&self, intent_id: &str) -> Option<RunId> {
+        self.lock().intents.get(intent_id).cloned()
+    }
+
     /// Rows the sink holds.
     pub fn published_count(&self) -> usize {
         self.lock().published.len()
@@ -116,6 +130,17 @@ impl FakeState {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Online, and releases are not refused by the test knob.
+    fn may_release(&self) -> Result<(), SharedStateError> {
+        self.online()?;
+        match &self.lock().releases_fail {
+            Some(reason) => Err(SharedStateError::Refused {
+                reason: reason.clone(),
+            }),
+            None => Ok(()),
+        }
     }
 
     fn online(&self) -> Result<(), SharedStateError> {
@@ -197,12 +222,8 @@ impl SharedState for FakeState {
         })
     }
 
-    fn daily_spent(
-        &self,
-        _ledger: &Ledger,
-        _day_start: &str,
-    ) -> Result<MicroUsd, SharedStateError> {
-        Ok(self.spent())
+    fn daily_spent(&self, _day_start: &str) -> Result<Option<MicroUsd>, SharedStateError> {
+        Ok(Some(self.spent()))
     }
 
     fn slice(&self) -> Result<Slice, SharedStateError> {
@@ -295,98 +316,96 @@ impl SharedState for FakeState {
         Ok(())
     }
 
-    fn claim_ticket(
-        &self,
-        _store: &Store,
-        claim: &TicketClaim<'_>,
-    ) -> Result<TicketGrant, SharedStateError> {
+    fn claim_ticket(&self, request: &TicketRequest) -> Result<TicketAnswer, SharedStateError> {
         self.online()?;
-        let resource = ResourceId::Ticket {
-            repo_key: claim.key.repo_key.clone(),
-            slug: claim.key.slug.clone(),
-            id: claim.id.to_string(),
-        };
+        let resource = request.resource();
         let now = self.now();
         let before = self.lock().rows.get(&resource).cloned();
-        let refreshed = matches!(
-            &before,
-            Some(row) if row.holder.as_ref() == Some(claim.holder) && row.expires_at > now
-        );
-        match self.acquire(resource, claim.holder, TICKET_TTL_SECS) {
-            Ok(lease) => Ok(TicketGrant {
-                taken: Taken::Claimed {
-                    how: if refreshed {
-                        Acquired::Refreshed
-                    } else {
-                        Acquired::Created
-                    },
-                    from: None,
-                },
-                lease: Some(lease),
-            }),
+        match self.acquire(resource, &request.holder, TICKET_TTL_SECS) {
+            Ok(lease) => Ok(TicketAnswer::Granted(lease)),
             Err(SharedStateError::ClaimLost { .. }) => {
                 let row = before.expect("a refused claim has a holder");
-                let holder = row.holder.expect("a refused claim has a holder");
-                Ok(TicketGrant {
-                    taken: Taken::Refused {
-                        holder: Holder::Session {
-                            id: holder.id,
-                            kind: Kind::Work,
-                        },
-                        age_secs: (now - row.claimed_at).max(0) as u64,
-                    },
-                    lease: None,
+                Ok(TicketAnswer::Held {
+                    holder: row.holder.expect("a refused claim has a holder"),
+                    age_secs: (now - row.claimed_at).max(0) as u64,
                 })
             }
             Err(other) => Err(other),
         }
     }
 
+    fn grant_ticket(&self, request: &TicketRequest) -> Result<LeaseToken, SharedStateError> {
+        // A primary never answers `NodeDecides`, so nothing calls this; it
+        // grants as a claim would.
+        self.acquire(request.resource(), &request.holder, TICKET_TTL_SECS)
+    }
+
+    fn release_ticket(&self, lease: &LeaseToken) -> Result<(), SharedStateError> {
+        self.may_release()?;
+        self.fence(lease)?;
+        if let Some(row) = self.lock().rows.get_mut(&lease.resource) {
+            row.holder = None;
+            row.expires_at = 0;
+        }
+        Ok(())
+    }
+
     fn claim_intent(
         &self,
-        ledger: &Ledger,
         intent_id: &str,
         run: &RunId,
-        alive: &dyn Fn(u32) -> SuccessorProcess,
-    ) -> Result<Claim, SharedStateError> {
+        replacing: Option<&RunId>,
+    ) -> Result<IntentAnswer, SharedStateError> {
         // Fails closed offline: two nodes must not both launch it (an-t10).
         self.online()?;
-        Ok(ledger.claim_intent(intent_id, run, alive)?)
+        let mut inner = self.lock();
+        match inner.intents.get(intent_id) {
+            Some(holder) if holder != run && Some(holder) != replacing => {
+                Ok(IntentAnswer::HeldBy {
+                    run: holder.clone(),
+                })
+            }
+            _ => {
+                inner.intents.insert(intent_id.to_string(), run.clone());
+                Ok(IntentAnswer::Granted)
+            }
+        }
     }
 
-    fn release_claim(
-        &self,
-        ledger: &Ledger,
-        intent_id: &str,
-        run: &RunId,
-        refusal: &str,
-    ) -> Result<bool, SharedStateError> {
+    fn release_intent(&self, intent_id: &str, run: &RunId) -> Result<(), SharedStateError> {
+        self.may_release()?;
+        let mut inner = self.lock();
+        if inner.intents.get(intent_id) == Some(run) {
+            inner.intents.remove(intent_id);
+        }
+        Ok(())
+    }
+
+    fn answer_decision(&self, run: &RunId) -> Result<DecisionGrant, SharedStateError> {
         self.online()?;
-        Ok(ledger.release_claim(intent_id, run, refusal)?)
+        Ok(if self.lock().answered.insert(run.to_string()) {
+            DecisionGrant::Granted
+        } else {
+            DecisionGrant::AlreadyAnswered
+        })
     }
 
-    fn resolve_decision_with_intent(
-        &self,
-        ledger: &Ledger,
-        run: &RunId,
-        answer: &DecisionAnswer<'_>,
-        intent: &NewIntent,
-    ) -> Result<Option<SuccessorIntent>, SharedStateError> {
-        self.online()?;
-        Ok(ledger.resolve_decision_with_intent(run, answer, intent)?)
+    fn release_decision(&self, run: &RunId) -> Result<(), SharedStateError> {
+        self.may_release()?;
+        self.lock().answered.remove(run.as_str());
+        Ok(())
     }
 
-    fn registry_pointer(&self, _registry: &Registry) -> Result<Option<String>, SharedStateError> {
+    fn registry_pointer(&self) -> Result<Pointer, SharedStateError> {
         // A cached read is served offline (an-t10).
-        Ok(self.lock().pointer.clone())
+        Ok(Pointer::Shared(self.lock().pointer.clone()))
     }
 
     fn swap_registry_pointer(
         &self,
-        _registry: &Registry,
         expected: Option<&str>,
-        evaluated: &EvaluatedArtifact,
-    ) -> Result<(), SharedStateError> {
+        to: Option<&str>,
+    ) -> Result<Swap, SharedStateError> {
         self.online()?;
         let mut inner = self.lock();
         if inner.pointer.as_deref() != expected {
@@ -395,8 +414,8 @@ impl SharedState for FakeState {
                 found: inner.pointer.clone(),
             });
         }
-        inner.pointer = Some(evaluated.artifact_id().to_string());
-        Ok(())
+        inner.pointer = to.map(str::to_string);
+        Ok(Swap::Swapped)
     }
 
     fn announce_schema(&self, node: &str, version: u64) -> Result<(), SharedStateError> {
@@ -523,5 +542,242 @@ mod tests {
         let again = state.publish(&rows).expect("replay");
         assert_eq!(again.duplicates, 2);
         assert_eq!(state.published_count(), 2);
+    }
+
+    // The node half against the fake: shared first, then local, then one
+    // release when the local step refuses.
+
+    use super::super::node;
+    use crate::ledger::{
+        Actor, Claim, Clock, DecisionAnswer, Ledger, NewIntent, RecordedVia, SuccessorProcess,
+        Transition, CLAIM_GRACE_SECONDS,
+    };
+    use crate::lifecycle::{Reason, State};
+    use std::sync::atomic::AtomicI64;
+
+    /// A ledger clock a test moves by hand.
+    struct Tick(Arc<AtomicI64>);
+
+    impl Clock for Tick {
+        fn now_rfc3339(&self) -> String {
+            chrono::DateTime::from_timestamp(1_800_000_000 + self.0.load(Ordering::SeqCst), 0)
+                .expect("a time")
+                .to_rfc3339()
+        }
+    }
+
+    fn run(id: &str) -> RunId {
+        RunId::from_stored(id)
+    }
+
+    /// A ledger on a hand clock with `run-a` waiting on a decision.
+    fn waiting(label: &str) -> (Ledger, Arc<AtomicI64>, crate::test_support::TempDir) {
+        let dir = crate::test_support::temp_dir(&format!("fake-node-{label}"));
+        let seconds = Arc::new(AtomicI64::new(0));
+        let ledger = Ledger::open_with_clock(
+            &dir.join("ledger.sqlite"),
+            Box::new(Tick(Arc::clone(&seconds))),
+        )
+        .expect("ledger");
+        ledger
+            .insert_run(
+                &run("run-a"),
+                "/r",
+                None,
+                &crate::ids::TaskId::from_stored("task-a"),
+                "rk",
+            )
+            .expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: run("run-a"),
+                attempt_id: None,
+                from_state: None,
+                to_state: State::NeedsDecision,
+                reason: "scope_exceeded".into(),
+                detail: None,
+                at: ledger.now(),
+            })
+            .expect("waiting");
+        (ledger, seconds, dir)
+    }
+
+    fn answer() -> DecisionAnswer<'static> {
+        DecisionAnswer {
+            resolution: Reason::DecisionRevised,
+            actor: Actor::Orchestrator,
+            person_quote: None,
+            recorded_via: RecordedVia::Cli,
+            note: None,
+            successor_run: None,
+            from_state: State::NeedsDecision,
+            to_state: State::Failed,
+        }
+    }
+
+    fn intent() -> NewIntent {
+        NewIntent {
+            predecessor: run("run-a"),
+            contract_digest: "digest".into(),
+            contract_json: "{}".into(),
+            scope_delta: Vec::new(),
+            candidate: None,
+            review: None,
+        }
+    }
+
+    fn up(_: u32) -> SuccessorProcess {
+        SuccessorProcess::Alive { started: None }
+    }
+
+    /// The decision answered on `ledger` through the fake: its intent id.
+    fn answered(state: &FakeState, ledger: &Ledger) -> String {
+        node::resolve_decision_with_intent(state, ledger, &run("run-a"), &answer(), &intent())
+            .expect("written")
+            .expect("open")
+            .intent_id
+    }
+
+    #[test]
+    fn a_local_refusal_after_a_shared_grant_leaves_the_intent_free() {
+        let (ledger, _seconds, _dir) = waiting("unknown");
+        let state = FakeState::new();
+        assert_eq!(
+            node::claim_intent(&state, &ledger, "intent-nowhere", &run("run-1"), &up)
+                .expect("answered"),
+            Claim::Unknown
+        );
+        assert_eq!(state.intent_holder("intent-nowhere"), None);
+    }
+
+    #[test]
+    fn a_claim_held_by_a_gone_run_moves_to_the_new_run() {
+        let (ledger, seconds, _dir) = waiting("takeover");
+        let state = FakeState::new();
+        let id = answered(&state, &ledger);
+        assert!(matches!(
+            node::claim_intent(&state, &ledger, &id, &run("run-1"), &up).expect("claim"),
+            Claim::Claimed(_)
+        ));
+        // run-1 never got a run row: past the grace, it is abandoned.
+        seconds.store(CLAIM_GRACE_SECONDS + 1, Ordering::SeqCst);
+        assert!(matches!(
+            node::claim_intent(&state, &ledger, &id, &run("run-2"), &up).expect("claim"),
+            Claim::Claimed(intent) if intent.run_id == Some(run("run-2"))
+        ));
+        assert_eq!(state.intent_holder(&id), Some(run("run-2")));
+    }
+
+    #[test]
+    fn a_shared_holder_this_ledger_never_saw_stays_the_holder() {
+        let (ledger, seconds, _dir) = waiting("elsewhere");
+        let state = FakeState::new();
+        let id = answered(&state, &ledger);
+        // Another node's run holds it; this ledger's row is still pending.
+        state
+            .claim_intent(&id, &run("run-elsewhere"), None)
+            .expect("claimed elsewhere");
+        seconds.store(CLAIM_GRACE_SECONDS + 1, Ordering::SeqCst);
+        assert_eq!(
+            node::claim_intent(&state, &ledger, &id, &run("run-2"), &up).expect("answered"),
+            Claim::AlreadyClaimed {
+                run: run("run-elsewhere")
+            }
+        );
+        assert_eq!(state.intent_holder(&id), Some(run("run-elsewhere")));
+        let local = ledger
+            .successor_intent(&id)
+            .expect("read")
+            .expect("the intent");
+        assert_eq!(local.run_id, None, "no local write");
+    }
+
+    #[test]
+    fn a_decision_is_answered_once_and_a_local_none_frees_it() {
+        let (ledger, _seconds, _dir) = waiting("decision");
+        let state = FakeState::new();
+        // Another node answered run-a first: nothing is written here.
+        assert_eq!(
+            state.answer_decision(&run("run-a")).expect("granted"),
+            DecisionGrant::Granted
+        );
+        assert_eq!(
+            node::resolve_decision_with_intent(
+                &state,
+                &ledger,
+                &run("run-a"),
+                &answer(),
+                &intent()
+            )
+            .expect("answered"),
+            None
+        );
+        assert!(
+            ledger
+                .resolve_decision_with_intent(&run("run-a"), &answer(), &intent())
+                .expect("read")
+                .is_some(),
+            "the ledger is untouched: its decision is still open"
+        );
+        // A run with no open decision here gives the grant back.
+        assert_eq!(
+            node::resolve_decision_with_intent(
+                &state,
+                &ledger,
+                &run("run-z"),
+                &answer(),
+                &intent()
+            )
+            .expect("answered"),
+            None
+        );
+        assert_eq!(
+            state.answer_decision(&run("run-z")).expect("free again"),
+            DecisionGrant::Granted
+        );
+    }
+
+    #[test]
+    fn a_failed_release_after_a_local_refusal_returns_the_refusal() {
+        let (ledger, _seconds, _dir) = waiting("release-fails");
+        let state = FakeState::new();
+        state.set_releases_fail(Some("primary refused the release"));
+        assert_eq!(
+            node::claim_intent(&state, &ledger, "intent-nowhere", &run("run-1"), &up)
+                .expect("the refusal, not the release failure"),
+            Claim::Unknown
+        );
+        // The hold the release could not give back is still there.
+        assert_eq!(state.intent_holder("intent-nowhere"), Some(run("run-1")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_local_promote_puts_the_shared_pointer_back() {
+        use crate::learn::fixtures::{artifact, evaluation};
+        use crate::learn::registry::Registry;
+        let dir = crate::test_support::temp_dir("fake-node-promote");
+        let registry_dir = dir.join("registry");
+        let registry = Registry::open(&registry_dir).expect("registry");
+        registry
+            .store(&artifact("art-a", Some(evaluation("art-a", true))))
+            .expect("store");
+        let evaluated = registry.evaluated("art-a").expect("evidence");
+        let state = FakeState::new();
+        // The pointer files cannot be written: the local promote fails.
+        let read_only = |mode: u32| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&registry_dir, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+        };
+        read_only(0o555);
+        let result = node::swap_registry_pointer(&state, &registry, None, &evaluated);
+        read_only(0o755);
+        assert!(result.is_err(), "the promote failed: {result:?}");
+        assert_eq!(
+            state.registry_pointer().expect("read"),
+            Pointer::Shared(None),
+            "the shared pointer is back where it was"
+        );
     }
 }

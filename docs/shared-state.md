@@ -12,7 +12,7 @@ the schema version, and the append-only rows other nodes read. The
 
 | `machine.toml` | Implementation | What it does |
 |---|---|---|
-| no `shared_state` key, or `shared_state = "local"` | `LocalState` | Today's behaviour: the file, the node's ledger, the claim store, the registry's pointer files. Seats are always granted, the spend slice is unbounded, publish is a no-op and the node is always online. |
+| no `shared_state` key, or `shared_state = "local"` | `LocalState` | Today's behaviour: the file, then the node's ledger, claim files and the registry's pointer files decide (relais writes them in `shared_state::node`). Seats are always granted, the spend slice is unbounded, publish is a no-op and the node is always online. |
 | `shared_state = "external"` | a closed client a private build registers | Talks to a shared primary. A public build has no client, so it refuses (below). |
 
 `shared_state` is a top-level key. Any other value is an invalid
@@ -59,6 +59,25 @@ Under `relais run --protocol`, the `done` line names it `shared_state_absent`.
 
 ## For a closed client
 
+- The trait is the shared half only, in plain values: no `Ledger`, claim
+  store, registry, callback or borrowed request crosses it, so each call can
+  go to a primary on another node as it is. relais keeps the node half
+  (`relais::shared_state::node`): for each operation it asks the shared half
+  first, then writes the node's ledger, claim file or pointer file, and gives
+  the shared hold back once when that local step refuses. An operation with
+  no shared half answers "the node decides" (`TicketAnswer::NodeDecides`,
+  `Pointer::NodeDecides`, `Swap::NodeDecides`, `None` from `daily_spent`) or
+  grants; that is all `LocalState` does. `node` is public only because the
+  CLI is a separate binary target: a client implements the trait, never
+  `node`.
+- A failed give-back never hides the local answer: a refusal comes back as
+  it is, and a local error comes back as `Compensation { local, release }`.
+  A hold left behind ends by its TTL (tickets) or when a later claim
+  replaces it (intents: `claim_intent(.., replacing)`, asked only when this
+  node's own ledger saw the old run's claim and judged it abandoned). A
+  `relais promote` killed between the shared swap and the local one leaves
+  the shared pointer ahead of the node's; the next `relais promote` or
+  rollback brings them back together.
 - Implement `SharedState` and give its factory to the CLI: public relais
   builds the implementation in one place, `cli/ctx.rs`, from
   `EXTERNAL_CLIENT` (`None` here), and a private build replaces that one
@@ -76,7 +95,6 @@ Under `relais run --protocol`, the `done` line names it `shared_state_absent`.
   ships in a minor release, and the client pins the exact public version.
 - `LocalState` fences seats and tickets within one instance only; fencing
   across processes and nodes is the external client's job.
-- The trait's parameters are relais's own node-local types (`Ledger`,
-  `Store`, `Registry`, `EvaluatedArtifact`), so a client builds against one
-  exact relais version; replacing them with plain owned values is the step
-  before the trait is frozen.
+- The trait still speaks a few relais value types (`MachineSettings`,
+  `MicroUsd`, `RunId`, `Contest`), so a client builds against one exact
+  relais version, as an-t13's build plan pins it.

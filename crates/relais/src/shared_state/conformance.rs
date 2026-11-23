@@ -3,7 +3,9 @@
 //! repository through the `conformance` feature (an-t06, an-t13).
 //!
 //! [`run_all`] runs every check, each on a fresh implementation from
-//! `make` and a fresh [`Fixture`] of node-local handles. Each check is also
+//! `make` and a fresh [`Fixture`] of node-local handles. The checks that
+//! write locally go through [`super::node`], as relais does: the trait
+//! sees plain values, the fixture's handles stay with the check. Each check is also
 //! public, so a failing one can be run alone. The properties are the ones
 //! both a single node and a primary must hold; what only a primary does
 //! (expiry, a degraded mode) is tested on the fake itself.
@@ -12,7 +14,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::types::{Principal, PublishRow, Slice};
-use super::{SharedState, SharedStateError, TicketClaim};
+use super::{node, SharedState, SharedStateError, TicketClaim};
 use crate::ids::{RunId, TaskId};
 use crate::learn::fixtures::{artifact, evaluation};
 use crate::learn::registry::Registry;
@@ -206,22 +208,26 @@ pub fn a_ticket_has_one_holder(state: &dyn SharedState, fixture: &Fixture) {
         }
     }
     let now = crate::programme::claim::now_unix();
-    let first = state
-        .claim_ticket(&fixture.store, &claim(&key, &closed, &me, now))
+    let first = node::claim_ticket(state, &fixture.store, &claim(&key, &closed, &me, now))
         .expect("first claim");
     assert!(matches!(first.taken, Taken::Claimed { .. }));
     let first_lease = first.lease.expect("a claim carries its lease");
-    let refused = state
-        .claim_ticket(&fixture.store, &claim(&key, &closed, &other, now + 1))
-        .expect("answered");
+    let refused = node::claim_ticket(
+        state,
+        &fixture.store,
+        &claim(&key, &closed, &other, now + 1),
+    )
+    .expect("answered");
     assert!(
         matches!(refused.taken, Taken::Refused { .. }),
         "another holder is refused, got {:?}",
         refused.taken
     );
     assert!(refused.lease.is_none());
-    let again = state
-        .claim_ticket(&fixture.store, &claim(&key, &closed, &me, now + 2))
+    state
+        .release_ticket(&first_lease)
+        .expect("a refused claim leaves the holder's lease current");
+    let again = node::claim_ticket(state, &fixture.store, &claim(&key, &closed, &me, now + 2))
         .expect("refresh");
     assert!(matches!(again.taken, Taken::Claimed { .. }));
     assert!(again.lease.expect("lease").epoch > first_lease.epoch);
@@ -256,45 +262,44 @@ pub fn an_intent_is_claimed_once(state: &dyn SharedState, fixture: &Fixture) {
         from_state: State::NeedsDecision,
         to_state: State::Failed,
     };
-    let intent = state
-        .resolve_decision_with_intent(
-            ledger,
-            &decided,
-            &answer,
-            &NewIntent {
-                predecessor: decided.clone(),
-                contract_digest: "digest".into(),
-                contract_json: "{}".into(),
-                scope_delta: Vec::new(),
-                candidate: None,
-                review: None,
-            },
-        )
-        .expect("written")
-        .expect("the decision was open");
+    let intent = node::resolve_decision_with_intent(
+        state,
+        ledger,
+        &decided,
+        &answer,
+        &NewIntent {
+            predecessor: decided.clone(),
+            contract_digest: "digest".into(),
+            contract_json: "{}".into(),
+            scope_delta: Vec::new(),
+            candidate: None,
+            review: None,
+        },
+    )
+    .expect("written")
+    .expect("the decision was open");
     let gone = |_: u32| SuccessorProcess::Gone;
     let first = RunId::from_stored("run-first");
     assert!(matches!(
-        state
-            .claim_intent(ledger, &intent.intent_id, &first, &gone)
-            .expect("claim"),
+        node::claim_intent(state, ledger, &intent.intent_id, &first, &gone).expect("claim"),
         Claim::Claimed(_)
     ));
-    match state
-        .claim_intent(
-            ledger,
-            &intent.intent_id,
-            &RunId::from_stored("run-second"),
-            &gone,
-        )
-        .expect("answered")
+    match node::claim_intent(
+        state,
+        ledger,
+        &intent.intent_id,
+        &RunId::from_stored("run-second"),
+        &gone,
+    )
+    .expect("answered")
     {
         Claim::AlreadyClaimed { run } => assert_eq!(run, first),
         other => panic!("a second run must be told the holder, got {other:?}"),
     }
-    assert!(state
-        .release_claim(ledger, &intent.intent_id, &first, "never started")
-        .expect("release"));
+    assert!(
+        node::release_claim(state, ledger, &intent.intent_id, &first, "never started")
+            .expect("release")
+    );
 }
 
 /// The pointer swaps only from the value the caller expected.
@@ -307,22 +312,22 @@ pub fn a_registry_swap_compares_first(state: &dyn SharedState, fixture: &Fixture
     }
     let a = registry.evaluated("art-a").expect("evidence holds");
     let b = registry.evaluated("art-b").expect("evidence holds");
-    let start = state.registry_pointer(registry).expect("read");
-    state
-        .swap_registry_pointer(registry, start.as_deref(), &a)
+    let start = node::registry_pointer(state, registry).expect("read");
+    node::swap_registry_pointer(state, registry, start.as_deref(), &a)
         .expect("swap from what was read");
     assert_eq!(
-        state.registry_pointer(registry).expect("read").as_deref(),
+        node::registry_pointer(state, registry)
+            .expect("read")
+            .as_deref(),
         Some("art-a")
     );
-    match state.swap_registry_pointer(registry, start.as_deref(), &b) {
+    match node::swap_registry_pointer(state, registry, start.as_deref(), &b) {
         Err(SharedStateError::CasConflict { found, .. }) => {
             assert_eq!(found.as_deref(), Some("art-a"))
         }
         other => panic!("a stale expectation must be cas_conflict, got {other:?}"),
     }
-    state
-        .swap_registry_pointer(registry, Some("art-a"), &b)
+    node::swap_registry_pointer(state, registry, Some("art-a"), &b)
         .expect("swap from the current value");
 }
 
@@ -358,9 +363,7 @@ pub fn a_fresh_state_is_online_and_empty(state: &dyn SharedState, fixture: &Fixt
     assert_eq!(state.mode(), super::Mode::Online);
     assert_eq!(state.queued().expect("depth"), 0);
     assert_eq!(
-        state
-            .daily_spent(&fixture.ledger, "2000-01-01T00:00:00+00:00")
-            .expect("spent"),
+        node::daily_spent(state, &fixture.ledger, "2000-01-01T00:00:00+00:00").expect("spent"),
         MicroUsd::ZERO
     );
 }
@@ -403,8 +406,12 @@ mod tests {
                     let registry = Registry::open(&registry_dir).expect("registry");
                     let evaluated = registry.evaluated(id).expect("evidence");
                     barrier.wait();
-                    super::super::LocalState::new()
-                        .swap_registry_pointer(&registry, None, &evaluated)
+                    node::swap_registry_pointer(
+                        &super::super::LocalState::new(),
+                        &registry,
+                        None,
+                        &evaluated,
+                    )
                 })
             })
             .collect();

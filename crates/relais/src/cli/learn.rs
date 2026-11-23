@@ -382,9 +382,14 @@ pub(crate) fn promote_command(artifact_id: &str) -> Result<CliOutcome, CliError>
     // Compare-and-set through the shared-state seam: the swap lands only
     // if the active pointer still names what was read here.
     let state = super::ctx::shared_state()?;
-    let swapped = state
-        .registry_pointer(&reg)
-        .and_then(|active| state.swap_registry_pointer(&reg, active.as_deref(), &evaluated));
+    let swapped = relais::shared_state::node::registry_pointer(&*state, &reg).and_then(|active| {
+        relais::shared_state::node::swap_registry_pointer(
+            &*state,
+            &reg,
+            active.as_deref(),
+            &evaluated,
+        )
+    });
     match swapped {
         Ok(()) => {
             println!(
