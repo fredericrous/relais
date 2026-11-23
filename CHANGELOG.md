@@ -34,7 +34,7 @@ missing here.
   global counter and this node's ledger, and a settle answers the decision
   once through the shared half. A shared read that fails stops the run
   before dispatch; a settle another node already answered leaves the
-  decision to that node, with a step line saying so. Nothing changes for a
+  decision to that node, with a step line carrying the refusal. Nothing changes for a
   single node: `LocalState` keeps no counter and grants every answer.
   Library callers building a `RunConfig` add the field.
 
