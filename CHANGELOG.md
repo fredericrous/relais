@@ -8,6 +8,14 @@ missing here.
 
 ## Unreleased
 
+- The `relais-review` agent that `relais install` writes for Claude says
+  `model: inherit` and `preferred-model: opus` (was `model: opus`), so it can
+  fall back to the session's model when Opus is unavailable. Launch it with
+  `model: "opus"`. Without greenbelay's `agent-preferred-model` rule nothing
+  holds a launch to that preference, and a launch without a model runs on the
+  session model. An installed file you edited is kept and reported, not
+  overwritten.
+
 ## v0.78.0
 
 - A repair or an escalation that returns the sha the previous attempt verified
