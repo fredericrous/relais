@@ -8,6 +8,17 @@ missing here.
 
 ## Unreleased
 
+- A repair or an escalation that returns the sha the previous attempt verified
+  no longer re-runs every check: relais runs again the commands up to the last
+  one that failed there (with the profile's setup) and carries the passes after
+  it, marked `carried_from` in the receipt and in `check_timings` (ledger schema
+  v49, an added nullable column), announced by a new `check_carried` event the
+  pane draws as `carried from attempt1`, and counted apart as `(carried)` in
+  `relais report`. In-place runs, a changed sha, a changed profile and holdouts
+  and reviews are never carried; an in-place run says why in a
+  `checks_not_carried` decision. `relais report --json` check timings gain a
+  `carried` field.
+
 ## v0.77.0
 
 - `relais report`'s session routing no longer blanks an arm's cost per
