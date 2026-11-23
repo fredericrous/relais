@@ -55,7 +55,7 @@ plan's rule is kept; the charge is decided when the ledger is read.
   no `flag` row. For gate 2 such a B, and its parent-sourced subagent
   tasks, count with B's `outcome_uncorrected`: the outcome the plugin
   computed without the correction, on ended records only, first value
-  kept (ledger step v49). A flag is never charged away.
+  kept (ledger step v50). A flag is never charged away.
 - **Wire.** `outcome_uncorrected` is gated on router-state's `accepts`, as
   `answered` is: an older relais refuses unknown fields.
 

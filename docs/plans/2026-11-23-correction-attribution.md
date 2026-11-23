@@ -254,6 +254,10 @@ Decision log:
   `BEGIN IMMEDIATE` (the batch's write transaction serializes writers);
   the first-8 cap (the last 8 are kept; a dropped entry's row was already
   sent with the files it had then).
+- The migration is ledger step v50, not v49: the carry-passes PR (#546)
+  merged its own v49 (`check_timings.carried_from`) during this branch;
+  resolved at the rebase. The pilot above ran before the rebase, as v49;
+  the step's SQL is unchanged.
 - `greengate run --raw pre-commit-plugin-test` exited 0 without running
   the suite: check the plugin with `claude plugin test`.
 
