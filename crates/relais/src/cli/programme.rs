@@ -939,23 +939,46 @@ pub(crate) fn claim_command(
         dir_argument(dir)
     );
     let holder = relais::shared_state::Principal::operator(session.clone());
-    let taken = super::ctx::shared_state()?
-        .claim_ticket(
-            &store,
-            &relais::shared_state::TicketClaim {
-                key: &state.key,
-                closed: &state.closed,
-                id,
-                holder: &holder,
-                repo_display: &state.repo_path,
-                contest,
-                now,
-            },
-        )
-        .map(|grant| grant.taken);
+    let taken = relais::shared_state::node::claim_ticket(
+        &*super::ctx::shared_state()?,
+        &store,
+        &relais::shared_state::TicketClaim {
+            key: &state.key,
+            closed: &state.closed,
+            id,
+            holder: &holder,
+            repo_display: &state.repo_path,
+            contest,
+            now,
+        },
+    )
+    .map(|grant| grant.taken);
     let taken = match taken {
         Ok(taken) => Ok(taken),
         Err(relais::shared_state::SharedStateError::Claim(error)) => Err(error),
+        // The claim file failed after a shared grant and the grant could
+        // not be given back: the claim's own outcome still prints, with its
+        // retry command, and the release failure is one more line.
+        Err(relais::shared_state::SharedStateError::Compensation { local, release }) => {
+            match *local {
+                relais::shared_state::SharedStateError::Claim(error) => {
+                    eprintln!(
+                        "relais programme claim: the shared hold could not be given back: {release}"
+                    );
+                    Err(error)
+                }
+                local => {
+                    let joined = relais::shared_state::SharedStateError::Compensation {
+                        local: Box::new(local),
+                        release,
+                    };
+                    return Err(super::ctx::shared_state_error(
+                        "claiming the ticket",
+                        joined,
+                    ));
+                }
+            }
+        }
         Err(other) => return Err(super::ctx::shared_state_error("claiming the ticket", other)),
     };
     match taken {

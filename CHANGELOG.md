@@ -8,6 +8,20 @@ missing here.
 
 ## Unreleased
 
+- `relais::shared_state::SharedState` takes and answers plain values only:
+  no `Ledger`, claim `Store`, `Registry`, `EvaluatedArtifact`, pid-probe
+  callback or borrowed request is left in its signatures, so a closed
+  client can carry each call to a primary on another node. The local write
+  moved to `relais::shared_state::node` (one function per operation: shared
+  half first, then the node's ledger, claim file or pointer file, then one
+  release when the local step refuses). New trait methods `grant_ticket`,
+  `release_ticket`, `release_intent` (was `release_claim`),
+  `answer_decision` and `release_decision` (was
+  `resolve_decision_with_intent`), and `SharedStateError::Compensation`.
+  Nothing changes for a single node: `LocalState` grants or lets the node
+  decide, and every command prints what it printed before. The trait is
+  still unstable; a client pins the exact version.
+
 ## v0.80.0
 
 - A correction now records the files it touched. The plugin keeps, for each

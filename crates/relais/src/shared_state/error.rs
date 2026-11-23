@@ -58,6 +58,13 @@ pub enum SharedStateError {
     Claim(crate::programme::claim::ClaimError),
     /// The learned-artifact registry.
     Registry(crate::learn::registry::ArtifactError),
+    /// The local step failed after a shared grant, and giving the shared
+    /// hold back failed too. `local` is what the caller would have seen
+    /// alone; `release` is why the shared hold is still there.
+    Compensation {
+        local: Box<SharedStateError>,
+        release: Box<SharedStateError>,
+    },
 }
 
 impl std::fmt::Display for SharedStateError {
@@ -111,6 +118,10 @@ impl std::fmt::Display for SharedStateError {
             SharedStateError::Ledger(e) => write!(f, "{e}"),
             SharedStateError::Claim(e) => write!(f, "{e}"),
             SharedStateError::Registry(e) => write!(f, "{e}"),
+            SharedStateError::Compensation { local, release } => write!(
+                f,
+                "{local} (and the shared hold could not be given back: {release})"
+            ),
         }
     }
 }
@@ -126,6 +137,7 @@ impl std::error::Error for SharedStateError {
             SharedStateError::Ledger(e) => Some(e),
             SharedStateError::Claim(e) => Some(e),
             SharedStateError::Registry(e) => Some(e),
+            SharedStateError::Compensation { local, .. } => Some(local.as_ref()),
             SharedStateError::LeaseLost { .. }
             | SharedStateError::ClaimLost { .. }
             | SharedStateError::CasConflict { .. }

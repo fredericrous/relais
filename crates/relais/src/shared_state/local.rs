@@ -1,9 +1,10 @@
 //! [`LocalState`]: today's single-node behaviour behind [`SharedState`].
 //!
-//! Every operation delegates to the code that did the work before the
-//! trait existed: `machine.toml` read from the config directory, the
-//! node's ledger, the claim store's files, the registry's pointer files.
-//! What a single node never needed (seats shared with other nodes, a spend
+//! A single node has no shared half: `machine.toml` is read from the
+//! config directory as before, and for every operation the node's own
+//! ledger, claim files and pointer files decide ([`super::node`] runs them).
+//! So this implementation grants, says the node decides, or does nothing;
+//! what a single node never needed (seats shared with other nodes, a spend
 //! slice, a publish sink) is granted, unbounded or a no-op, so nothing a
 //! single-node user did before is refused now.
 
@@ -11,26 +12,19 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::types::{
-    LeaseToken, Mode, Principal, PublishReceipt, PublishRow, Reservation, ResourceId, Settlement,
-    Slice,
+    DecisionGrant, IntentAnswer, LeaseToken, Mode, Pointer, Principal, PublishReceipt, PublishRow,
+    Reservation, ResourceId, Settlement, Slice, Swap, TicketAnswer, TicketRequest,
 };
-use super::{Selection, SharedState, SharedStateError, TicketClaim, TicketGrant};
+use super::{Selection, SharedState, SharedStateError};
 use crate::ids::RunId;
-use crate::learn::registry::{EvaluatedArtifact, Registry};
-use crate::ledger::{Claim, DecisionAnswer, Ledger, NewIntent, SuccessorIntent, SuccessorProcess};
 use crate::money::MicroUsd;
 use crate::policy::MachineSettings;
-use crate::procs::LockFile;
-use crate::programme::claim::{Store, Taken, LOCK_WAIT};
 
 /// Each resource's current epoch and holder (`None` once released).
 type EpochTable = HashMap<ResourceId, (u64, Option<Principal>)>;
 
 /// The node name a single node's seats are kept under.
 const THIS_NODE: &str = "local";
-
-/// How long a registry swap waits for another swap's lock.
-const REGISTRY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Today's behaviour: paths resolve from the environment at each call, as
 /// they always did. The only state is the epoch of each lease this
@@ -108,8 +102,9 @@ impl SharedState for LocalState {
         })
     }
 
-    fn daily_spent(&self, ledger: &Ledger, day_start: &str) -> Result<MicroUsd, SharedStateError> {
-        Ok(ledger.spend_since(day_start)?)
+    fn daily_spent(&self, _day_start: &str) -> Result<Option<MicroUsd>, SharedStateError> {
+        // No global counter: the node's ledger is the count.
+        Ok(None)
     }
 
     fn slice(&self) -> Result<Slice, SharedStateError> {
@@ -176,114 +171,58 @@ impl SharedState for LocalState {
         Ok(())
     }
 
-    fn claim_ticket(
-        &self,
-        store: &Store,
-        claim: &TicketClaim<'_>,
-    ) -> Result<TicketGrant, SharedStateError> {
-        let lock = store.lock(claim.key, LOCK_WAIT, claim.now)?;
-        lock.sweep(claim.closed, claim.now)?;
-        let taken = lock.claim_work(
-            claim.id,
-            &claim.holder.id,
-            claim.repo_display,
-            claim.contest,
-            claim.now,
-        )?;
-        let lease = match &taken {
-            Taken::Claimed { .. } => Some(self.grant(
-                ResourceId::Ticket {
-                    repo_key: claim.key.repo_key.clone(),
-                    slug: claim.key.slug.clone(),
-                    id: claim.id.to_string(),
-                },
-                claim.holder,
-            )),
-            Taken::Refused { .. } => None,
-        };
-        Ok(TicketGrant { taken, lease })
+    fn claim_ticket(&self, _request: &TicketRequest) -> Result<TicketAnswer, SharedStateError> {
+        // The claim file decides; `grant_ticket` fences what it wrote.
+        Ok(TicketAnswer::NodeDecides)
+    }
+
+    fn grant_ticket(&self, request: &TicketRequest) -> Result<LeaseToken, SharedStateError> {
+        Ok(self.grant(request.resource(), &request.holder))
+    }
+
+    fn release_ticket(&self, lease: &LeaseToken) -> Result<(), SharedStateError> {
+        self.fence(lease)?;
+        let mut table = self.epochs();
+        if let Some(entry) = table.get_mut(&lease.resource) {
+            entry.1 = None;
+        }
+        Ok(())
     }
 
     fn claim_intent(
         &self,
-        ledger: &Ledger,
-        intent_id: &str,
-        run: &RunId,
-        alive: &dyn Fn(u32) -> SuccessorProcess,
-    ) -> Result<Claim, SharedStateError> {
-        Ok(ledger.claim_intent(intent_id, run, alive)?)
+        _intent_id: &str,
+        _run: &RunId,
+        _replacing: Option<&RunId>,
+    ) -> Result<IntentAnswer, SharedStateError> {
+        // The ledger's own compare-and-set is the whole claim.
+        Ok(IntentAnswer::Granted)
     }
 
-    fn release_claim(
-        &self,
-        ledger: &Ledger,
-        intent_id: &str,
-        run: &RunId,
-        refusal: &str,
-    ) -> Result<bool, SharedStateError> {
-        Ok(ledger.release_claim(intent_id, run, refusal)?)
+    fn release_intent(&self, _intent_id: &str, _run: &RunId) -> Result<(), SharedStateError> {
+        Ok(())
     }
 
-    fn resolve_decision_with_intent(
-        &self,
-        ledger: &Ledger,
-        run: &RunId,
-        answer: &DecisionAnswer<'_>,
-        intent: &NewIntent,
-    ) -> Result<Option<SuccessorIntent>, SharedStateError> {
-        Ok(ledger.resolve_decision_with_intent(run, answer, intent)?)
+    fn answer_decision(&self, _run: &RunId) -> Result<DecisionGrant, SharedStateError> {
+        // The ledger transaction finds whether the decision is still open.
+        Ok(DecisionGrant::Granted)
     }
 
-    fn registry_pointer(&self, registry: &Registry) -> Result<Option<String>, SharedStateError> {
-        Ok(registry.active_id()?)
+    fn release_decision(&self, _run: &RunId) -> Result<(), SharedStateError> {
+        Ok(())
+    }
+
+    fn registry_pointer(&self) -> Result<Pointer, SharedStateError> {
+        Ok(Pointer::NodeDecides)
     }
 
     fn swap_registry_pointer(
         &self,
-        registry: &Registry,
-        expected: Option<&str>,
-        evaluated: &EvaluatedArtifact,
-    ) -> Result<(), SharedStateError> {
-        // `Registry::promote` takes no lock; this one makes compare and
-        // swap one step against every other swap through the trait.
-        // holds-until: the learning cycle's automatic promote and rollback
-        // (`learn/cycle.rs`) go through `SharedState`; until then they
-        // write the pointer without this lock and can race a swap. It is
-        // an flock, released by the kernel when the process dies, and the
-        // file is never deleted, so a killed promote leaves nothing stale.
-        // Beside the pointer files, outside `artifacts/`, which `list` reads.
-        let artifacts = registry.artifacts_dir();
-        let path = artifacts
-            .parent()
-            .unwrap_or(artifacts)
-            .join(".pointer.lock");
-        let started = std::time::Instant::now();
-        let _lock = loop {
-            match LockFile::try_acquire(&path) {
-                Ok(Some(lock)) => break lock,
-                Ok(None) if started.elapsed() < REGISTRY_LOCK_WAIT => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Ok(None) => {
-                    return Err(SharedStateError::Refused {
-                        reason: format!(
-                            "another promotion held {} for {}s",
-                            path.display(),
-                            REGISTRY_LOCK_WAIT.as_secs()
-                        ),
-                    })
-                }
-                Err(cause) => return Err(SharedStateError::Lock { path, cause }),
-            }
-        };
-        let found = registry.active_id()?;
-        if found.as_deref() != expected {
-            return Err(SharedStateError::CasConflict {
-                expected: expected.map(str::to_string),
-                found,
-            });
-        }
-        Ok(registry.promote(evaluated)?)
+        _expected: Option<&str>,
+        _to: Option<&str>,
+    ) -> Result<Swap, SharedStateError> {
+        // The node compares and swaps its pointer files under their flock.
+        Ok(Swap::NodeDecides)
     }
 
     fn announce_schema(&self, _node: &str, _version: u64) -> Result<(), SharedStateError> {

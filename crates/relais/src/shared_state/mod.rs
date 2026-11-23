@@ -25,6 +25,7 @@
 
 mod error;
 mod local;
+pub mod node;
 mod types;
 
 #[cfg(any(test, feature = "conformance"))]
@@ -32,59 +33,38 @@ pub mod conformance;
 #[cfg(any(test, feature = "conformance"))]
 pub mod fake;
 
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
 pub use crate::policy::SharedStateSelection as Selection;
 pub use error::SharedStateError;
 pub use local::LocalState;
+pub use node::{TicketClaim, TicketGrant};
 pub use types::{
-    LeaseToken, Mode, Principal, PrincipalKind, PublishReceipt, PublishRow, Reservation,
-    ResourceId, Settlement, Slice,
+    DecisionGrant, IntentAnswer, LeaseToken, Mode, Pointer, Principal, PrincipalKind,
+    PublishReceipt, PublishRow, Reservation, ResourceId, Settlement, Slice, Swap, TicketAnswer,
+    TicketRequest,
 };
 
 use crate::ids::RunId;
-use crate::learn::registry::{EvaluatedArtifact, Registry};
-use crate::ledger::{Claim, DecisionAnswer, Ledger, NewIntent, SuccessorIntent, SuccessorProcess};
 use crate::money::MicroUsd;
 use crate::policy::MachineSettings;
-use crate::programme::claim::{ClaimKey, Contest, Store, Taken};
-
-/// One request to take a programme ticket as `work`.
-#[derive(Debug, Clone)]
-pub struct TicketClaim<'a> {
-    pub key: &'a ClaimKey,
-    /// The programme's closed tickets: their stale claims are swept first.
-    pub closed: &'a BTreeSet<String>,
-    pub id: &'a str,
-    /// The session taking it; its id is the claim file's `session`.
-    pub holder: &'a Principal,
-    /// How the repository is shown in the claim file.
-    pub repo_display: &'a str,
-    pub contest: Contest,
-    /// Unix seconds.
-    pub now: i64,
-}
-
-/// A ticket claim's answer, and the fence of the hold when it was taken.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TicketGrant {
-    pub taken: Taken,
-    /// `Some` when [`Taken::Claimed`]; `None` when refused.
-    pub lease: Option<LeaseToken>,
-}
 
 /// The single-owner operations nodes share (an-t01's list), shaped by
 /// an-t10 (slice, degraded mode, publish queue), an-t11 (an epoch in every
 /// [`LeaseToken`], [`SharedStateError::LeaseLost`] on fenced calls) and
 /// an-t12 (a [`Principal`] holder).
 ///
-/// Node-local handles (the ledger, the claim store, the registry) are
-/// parameters, not state: they stay on the node, and an external
-/// implementation adds the shared half around them. They tie an
-/// implementation to relais's own types, which is why the trait is
-/// unstable until a closed client consumes it.
+/// The trait is the shared half only, in plain values: no handle (the
+/// ledger, the claim store, the registry), no callback and no borrowed
+/// request crosses it, so a client can carry every call to a primary on
+/// another node. The node half (the local write on those handles) is
+/// relais's own, in [`node`]: shared first, then local, then one release
+/// when the local step refuses after a shared grant. An implementation with
+/// no shared half for an operation answers "the node decides"
+/// ([`TicketAnswer::NodeDecides`], [`Pointer::NodeDecides`],
+/// [`Swap::NodeDecides`], `None` from [`SharedState::daily_spent`]) or
+/// grants.
 ///
 /// A fence is only as wide as its implementation: `LocalState` fences
 /// within one instance, an external client across nodes. A caller never
@@ -98,9 +78,9 @@ pub trait SharedState: Send + Sync {
     fn machine_settings(&self) -> Result<MachineSettings, SharedStateError>;
 
     /// What has been spent since `day_start` (RFC 3339, the start of the
-    /// UTC day): this node's ledger alone for a single node, the global
-    /// counter for an external primary.
-    fn daily_spent(&self, ledger: &Ledger, day_start: &str) -> Result<MicroUsd, SharedStateError>;
+    /// UTC day) by the global counter; `None` when there is none, and the
+    /// node's own ledger is the count ([`node::daily_spent`]).
+    fn daily_spent(&self, day_start: &str) -> Result<Option<MicroUsd>, SharedStateError>;
 
     /// The part of the daily cap this node may spend without asking.
     fn slice(&self) -> Result<Slice, SharedStateError>;
@@ -135,53 +115,50 @@ pub trait SharedState: Send + Sync {
     /// Give a seat back. Fenced.
     fn release_seat(&self, lease: &LeaseToken) -> Result<(), SharedStateError>;
 
-    /// Take a programme ticket as `work` (the rules of
-    /// [`crate::programme::claim::SlugLock::claim_work`]).
-    fn claim_ticket(
-        &self,
-        store: &Store,
-        claim: &TicketClaim<'_>,
-    ) -> Result<TicketGrant, SharedStateError>;
+    /// The shared half of taking a programme ticket as `work`; the claim
+    /// file's rules ([`crate::programme::claim::SlugLock::claim_work`]) run
+    /// on the node in [`node::claim_ticket`].
+    fn claim_ticket(&self, request: &TicketRequest) -> Result<TicketAnswer, SharedStateError>;
 
-    /// Claim a successor intent for the run minted for it.
+    /// Fence a claim the node's claim file granted under
+    /// [`TicketAnswer::NodeDecides`]; every grant bumps the epoch.
+    fn grant_ticket(&self, request: &TicketRequest) -> Result<LeaseToken, SharedStateError>;
+
+    /// Give a ticket hold back. Fenced.
+    fn release_ticket(&self, lease: &LeaseToken) -> Result<(), SharedStateError>;
+
+    /// The shared half of claiming a successor intent for `run`.
+    /// `replacing` names the run this claim takes over, as a compare-and-set:
+    /// granted only when that run is still the holder.
     fn claim_intent(
         &self,
-        ledger: &Ledger,
         intent_id: &str,
         run: &RunId,
-        alive: &dyn Fn(u32) -> SuccessorProcess,
-    ) -> Result<Claim, SharedStateError>;
+        replacing: Option<&RunId>,
+    ) -> Result<IntentAnswer, SharedStateError>;
 
-    /// Give an intent claim back when its run never started.
-    fn release_claim(
-        &self,
-        ledger: &Ledger,
-        intent_id: &str,
-        run: &RunId,
-        refusal: &str,
-    ) -> Result<bool, SharedStateError>;
+    /// Give an intent claim back (its run never started, or the node's
+    /// ledger refused it).
+    fn release_intent(&self, intent_id: &str, run: &RunId) -> Result<(), SharedStateError>;
 
-    /// Answer a decision and write its successor intent, as one operation:
-    /// the answer and the intent never exist one without the other.
-    fn resolve_decision_with_intent(
-        &self,
-        ledger: &Ledger,
-        run: &RunId,
-        answer: &DecisionAnswer<'_>,
-        intent: &NewIntent,
-    ) -> Result<Option<SuccessorIntent>, SharedStateError>;
+    /// The shared half of answering `run`'s decision: one answer per
+    /// decision, compare-and-set. The answer and its intent are written on
+    /// the node, in one ledger transaction ([`node::resolve_decision_with_intent`]).
+    fn answer_decision(&self, run: &RunId) -> Result<DecisionGrant, SharedStateError>;
 
-    /// The id the active pointer names.
-    fn registry_pointer(&self, registry: &Registry) -> Result<Option<String>, SharedStateError>;
+    /// Give a decision grant back when the node had no open decision.
+    fn release_decision(&self, run: &RunId) -> Result<(), SharedStateError>;
 
-    /// Point the registry at `evaluated` when the active pointer still
-    /// names `expected`; else [`SharedStateError::CasConflict`].
+    /// The id the shared active pointer names.
+    fn registry_pointer(&self) -> Result<Pointer, SharedStateError>;
+
+    /// Point the shared pointer at `to` when it still names `expected`;
+    /// else [`SharedStateError::CasConflict`].
     fn swap_registry_pointer(
         &self,
-        registry: &Registry,
         expected: Option<&str>,
-        evaluated: &EvaluatedArtifact,
-    ) -> Result<(), SharedStateError>;
+        to: Option<&str>,
+    ) -> Result<Swap, SharedStateError>;
 
     /// Say which ledger schema version this node runs.
     fn announce_schema(&self, node: &str, version: u64) -> Result<(), SharedStateError>;
