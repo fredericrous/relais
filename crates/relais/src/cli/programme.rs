@@ -14,6 +14,7 @@ use relais::programme::claim;
 use relais::programme::frontier::{due_mark, format_age, is_overdue, is_ready, order_frontier};
 use relais::programme::load::{self, main_checkout, Found, Programme, ProgrammeError, Source};
 use relais::programme::model::Ticket;
+use relais::shared_state::node::NodeError;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -955,31 +956,26 @@ pub(crate) fn claim_command(
     .map(|grant| grant.taken);
     let taken = match taken {
         Ok(taken) => Ok(taken),
-        Err(relais::shared_state::SharedStateError::Claim(error)) => Err(error),
+        Err(NodeError::Claim(error)) => Err(error),
         // The claim file failed after a shared grant and the grant could
         // not be given back: the claim's own outcome still prints, with its
         // retry command, and the release failure is one more line.
-        Err(relais::shared_state::SharedStateError::Compensation { local, release }) => {
-            match *local {
-                relais::shared_state::SharedStateError::Claim(error) => {
-                    eprintln!(
-                        "relais programme claim: the shared hold could not be given back: {release}"
-                    );
-                    Err(error)
-                }
-                local => {
-                    let joined = relais::shared_state::SharedStateError::Compensation {
-                        local: Box::new(local),
-                        release,
-                    };
-                    return Err(super::ctx::shared_state_error(
-                        "claiming the ticket",
-                        joined,
-                    ));
-                }
+        Err(NodeError::Compensation { local, release }) => match *local {
+            NodeError::Claim(error) => {
+                eprintln!(
+                    "relais programme claim: the shared hold could not be given back: {release}"
+                );
+                Err(error)
             }
-        }
-        Err(other) => return Err(super::ctx::shared_state_error("claiming the ticket", other)),
+            local => {
+                let joined = NodeError::Compensation {
+                    local: Box::new(local),
+                    release,
+                };
+                return Err(super::ctx::node_error("claiming the ticket", joined));
+            }
+        },
+        Err(other) => return Err(super::ctx::node_error("claiming the ticket", other)),
     };
     match taken {
         Err(error) => claim_outcome(error, &retry),

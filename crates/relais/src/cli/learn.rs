@@ -18,6 +18,7 @@ use relais::ids::RunId;
 use relais::ledger::Ledger;
 use relais::paths;
 use relais::policy::MachineSettings;
+use relais::shared_state::node::NodeError;
 use std::path::Path;
 /// The registry, when learned routing is on and the registry opens; a
 /// missing or unreadable registry is the conservative baseline, not an
@@ -397,7 +398,10 @@ pub(crate) fn promote_command(artifact_id: &str) -> Result<CliOutcome, CliError>
             );
             Ok(CliOutcome::Accepted)
         }
-        Err(relais::shared_state::SharedStateError::CasConflict { found, .. }) => {
+        Err(NodeError::Shared(relais::shared_state::SharedStateError::CasConflict {
+            found,
+            ..
+        })) => {
             eprintln!(
                 "relais promote: another promotion made {} active while this one ran; \
                  nothing changed — run `relais promote {artifact_id}` again to replace it",

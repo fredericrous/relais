@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use super::types::{
     DecisionGrant, IntentAnswer, LeaseToken, Mode, Pointer, Principal, PublishReceipt, PublishRow,
     Reservation, ResourceId, Settlement, Slice, Swap, TicketAnswer, TicketRequest,
+    DECISION_GRANT_TTL_SECS,
 };
 use super::{Selection, SharedState, SharedStateError};
 use crate::ids::RunId;
@@ -26,9 +27,6 @@ use crate::policy::MachineSettings;
 pub const SEAT_TTL_SECS: i64 = 90;
 /// A ticket claim's time to live for a pod (an-t11).
 pub const TICKET_TTL_SECS: i64 = 30 * 60;
-/// How long a decision grant holds the decision for one answerer: a node
-/// that died between the grant and its ledger write leaves it for no longer.
-pub const DECISION_TTL_SECS: i64 = 10 * 60;
 
 #[derive(Debug, Clone)]
 struct Row {
@@ -54,7 +52,7 @@ struct Inner {
     /// Successor intents: which run holds each.
     intents: HashMap<String, RunId>,
     /// Decision grants by run, with the time each was granted: a grant
-    /// whose answer never landed lapses after [`DECISION_TTL_SECS`].
+    /// whose answer never landed lapses after [`DECISION_GRANT_TTL_SECS`].
     answered: HashMap<String, i64>,
     /// When set, every release is refused with this reason (a test knob).
     releases_fail: Option<String>,
@@ -395,7 +393,7 @@ impl SharedState for FakeState {
         let now = self.now();
         let mut inner = self.lock();
         match inner.answered.get(run.as_str()) {
-            Some(at) if now < at + DECISION_TTL_SECS => Ok(DecisionGrant::AlreadyAnswered),
+            Some(at) if now < at + DECISION_GRANT_TTL_SECS => Ok(DecisionGrant::HeldElsewhere),
             _ => {
                 inner.answered.insert(run.to_string(), now);
                 Ok(DecisionGrant::Granted)
@@ -560,7 +558,7 @@ mod tests {
     // The node half against the fake: shared first, then local, then one
     // release when the local step refuses.
 
-    use super::super::node;
+    use super::super::node::{self, NodeError};
     use crate::ledger::{
         Actor, Claim, Clock, DecisionAnswer, Ledger, NewIntent, RecordedVia, SuccessorProcess,
         Transition, CLAIM_GRACE_SECONDS,
@@ -723,12 +721,12 @@ mod tests {
                     &answer(),
                     &intent()
                 ),
-                Err(SharedStateError::Refused { .. })
+                Err(NodeError::Shared(SharedStateError::Refused { .. }))
             ),
             "held elsewhere, said as such"
         );
         // Its grant lapses; this node's answer is then written.
-        state.advance(DECISION_TTL_SECS + 1);
+        state.advance(DECISION_GRANT_TTL_SECS + 1);
         assert!(
             node::resolve_decision_with_intent(
                 &state,

@@ -12,12 +12,14 @@
 //! A failed release never replaces the local answer: a refusal is returned
 //! as it is (the release failure is one line on stderr), and a local error
 //! comes back as
-//! [`SharedStateError::Compensation`] with the release failure beside it.
+//! [`NodeError::Compensation`] with the release failure beside it.
 //! An unreleased shared hold ends by its TTL (tickets) or a `replacing`
 //! claim (intents).
 //!
 //! This module is public because the CLI is a separate binary target. It
 //! is relais's own: a closed client implements [`SharedState`], never these.
+
+use std::path::PathBuf;
 
 use super::types::{
     DecisionGrant, IntentAnswer, LeaseToken, Pointer, Principal, Swap, TicketAnswer, TicketRequest,
@@ -32,6 +34,92 @@ use crate::money::MicroUsd;
 use crate::procs::LockFile;
 use crate::programme::claim::{ClaimKey, Contest, Holder, Kind, Store, Taken, LOCK_WAIT};
 use std::collections::BTreeSet;
+
+/// Why a node function did not do what it was asked: the shared
+/// half's own refusal, or a failure of the node's own files and ledger.
+///
+/// This is relais's type, not the closed client's: a client implements
+/// [`SharedState`] and returns [`SharedStateError`] only. The ledger,
+/// claim and registry errors below are what the node half adds around it.
+#[derive(Debug)]
+pub enum NodeError {
+    /// The shared half answered with an error. Transparent: it displays and
+    /// chains as the wrapped error does.
+    Shared(SharedStateError),
+    /// A local lock could not be taken (not held by another: it failed).
+    Lock {
+        path: PathBuf,
+        cause: std::io::Error,
+    },
+    /// The node's own ledger.
+    Ledger(crate::ledger::LedgerError),
+    /// The programme claim store.
+    Claim(crate::programme::claim::ClaimError),
+    /// The learned-artifact registry.
+    Registry(crate::learn::registry::ArtifactError),
+    /// The local step failed after a shared grant, and giving the shared
+    /// hold back failed too. `local` is what the caller would have seen
+    /// alone; `release` is why the shared hold is still there.
+    Compensation {
+        local: Box<NodeError>,
+        release: Box<NodeError>,
+    },
+}
+
+impl std::fmt::Display for NodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeError::Shared(e) => write!(f, "{e}"),
+            NodeError::Lock { path, cause } => {
+                write!(f, "cannot lock {}: {cause}", path.display())
+            }
+            NodeError::Ledger(e) => write!(f, "{e}"),
+            NodeError::Claim(e) => write!(f, "{e}"),
+            NodeError::Registry(e) => write!(f, "{e}"),
+            NodeError::Compensation { local, release } => write!(
+                f,
+                "{local} (and the shared hold could not be given back: {release})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            NodeError::Shared(e) => e.source(),
+            NodeError::Lock { cause, .. } => Some(cause),
+            NodeError::Ledger(e) => Some(e),
+            NodeError::Claim(e) => Some(e),
+            NodeError::Registry(e) => Some(e),
+            NodeError::Compensation { local, .. } => Some(local.as_ref()),
+        }
+    }
+}
+
+impl From<SharedStateError> for NodeError {
+    fn from(e: SharedStateError) -> Self {
+        NodeError::Shared(e)
+    }
+}
+
+impl From<crate::ledger::LedgerError> for NodeError {
+    fn from(e: crate::ledger::LedgerError) -> Self {
+        NodeError::Ledger(e)
+    }
+}
+
+impl From<crate::programme::claim::ClaimError> for NodeError {
+    fn from(e: crate::programme::claim::ClaimError) -> Self {
+        NodeError::Claim(e)
+    }
+}
+
+impl From<crate::learn::registry::ArtifactError> for NodeError {
+    fn from(e: crate::learn::registry::ArtifactError) -> Self {
+        NodeError::Registry(e)
+    }
+}
 
 /// One request to take a programme ticket as `work`: the input of
 /// [`claim_ticket`], which turns it into a [`TicketRequest`] for the
@@ -65,19 +153,19 @@ pub struct TicketGrant {
 const REGISTRY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// `local` as the caller sees it, with a failed release joined to it.
-fn compensated(local: SharedStateError, release: Result<(), SharedStateError>) -> SharedStateError {
+fn compensated<E: Into<NodeError>>(local: NodeError, release: Result<(), E>) -> NodeError {
     match release {
         Ok(()) => local,
-        Err(release) => SharedStateError::Compensation {
+        Err(release) => NodeError::Compensation {
             local: Box::new(local),
-            release: Box::new(release),
+            release: Box::new(release.into()),
         },
     }
 }
 
 /// A release after a local refusal: the refusal stays the answer, so a
 /// failed release is said on stderr, never dropped.
-fn give_back(what: &str, release: Result<(), SharedStateError>) {
+fn give_back<E: std::fmt::Display>(what: &str, release: Result<(), E>) {
     if let Err(e) = release {
         eprintln!("relais: the shared hold on {what} could not be given back: {e}");
     }
@@ -89,7 +177,7 @@ pub fn daily_spent(
     state: &dyn SharedState,
     ledger: &Ledger,
     day_start: &str,
-) -> Result<MicroUsd, SharedStateError> {
+) -> Result<MicroUsd, NodeError> {
     match state.daily_spent(day_start)? {
         Some(spent) => Ok(spent),
         None => Ok(ledger.spend_since(day_start)?),
@@ -98,7 +186,7 @@ pub fn daily_spent(
 
 /// The claim file's rules: sweep the programme's closed tickets, then
 /// claim `claim.id` as `work`.
-fn claim_in_store(store: &Store, claim: &TicketClaim<'_>) -> Result<Taken, SharedStateError> {
+fn claim_in_store(store: &Store, claim: &TicketClaim<'_>) -> Result<Taken, NodeError> {
     let lock = store.lock(claim.key, LOCK_WAIT, claim.now)?;
     lock.sweep(claim.closed, claim.now)?;
     Ok(lock.claim_work(
@@ -116,7 +204,7 @@ pub fn claim_ticket(
     state: &dyn SharedState,
     store: &Store,
     claim: &TicketClaim<'_>,
-) -> Result<TicketGrant, SharedStateError> {
+) -> Result<TicketGrant, NodeError> {
     let request = TicketRequest {
         repo_key: claim.key.repo_key.clone(),
         slug: claim.key.slug.clone(),
@@ -171,7 +259,7 @@ pub fn claim_intent(
     intent_id: &str,
     run: &RunId,
     alive: &dyn Fn(u32) -> SuccessorProcess,
-) -> Result<Claim, SharedStateError> {
+) -> Result<Claim, NodeError> {
     match state.claim_intent(intent_id, run, None)? {
         IntentAnswer::Granted => match ledger.claim_intent(intent_id, run, alive) {
             Ok(claimed @ Claim::Claimed(_)) => Ok(claimed),
@@ -203,7 +291,7 @@ fn take_over_intent(
     run: &RunId,
     old: &RunId,
     alive: &dyn Fn(u32) -> SuccessorProcess,
-) -> Result<Claim, SharedStateError> {
+) -> Result<Claim, NodeError> {
     let held_here = ledger.successor_intent(intent_id)?.is_some_and(|intent| {
         intent.state == IntentState::Claimed && intent.run_id.as_ref() == Some(old)
     });
@@ -218,7 +306,7 @@ fn take_over_intent(
         ledger
             .release_claim(intent_id, run, why)
             .map(|_| ())
-            .map_err(SharedStateError::from)
+            .map_err(NodeError::from)
     };
     match state.claim_intent(intent_id, run, Some(old)) {
         Ok(IntentAnswer::Granted) => Ok(Claim::Claimed(claimed)),
@@ -234,7 +322,7 @@ fn take_over_intent(
         }
         Err(shared) => {
             let released = release_local(&format!("the shared claim failed: {shared}"));
-            Err(compensated(shared, released))
+            Err(compensated(shared.into(), released))
         }
     }
 }
@@ -247,7 +335,7 @@ pub fn release_claim(
     intent_id: &str,
     run: &RunId,
     refusal: &str,
-) -> Result<bool, SharedStateError> {
+) -> Result<bool, NodeError> {
     let shared = state.release_intent(intent_id, run);
     let released = match ledger.release_claim(intent_id, run, refusal) {
         Ok(released) => released,
@@ -265,13 +353,14 @@ pub fn resolve_decision_with_intent(
     run: &RunId,
     answer: &DecisionAnswer<'_>,
     intent: &NewIntent,
-) -> Result<Option<SuccessorIntent>, SharedStateError> {
+) -> Result<Option<SuccessorIntent>, NodeError> {
     match state.answer_decision(run)? {
         // Another answerer holds the decision: said as such, never as "no
         // open decision", which this node's ledger may contradict.
-        DecisionGrant::AlreadyAnswered => Err(SharedStateError::Refused {
+        DecisionGrant::HeldElsewhere => Err(SharedStateError::Refused {
             reason: format!("the decision of run {run} is being answered elsewhere"),
-        }),
+        }
+        .into()),
         DecisionGrant::Granted => match ledger.resolve_decision_with_intent(run, answer, intent) {
             Ok(Some(written)) => Ok(Some(written)),
             Ok(None) => {
@@ -287,7 +376,7 @@ pub fn resolve_decision_with_intent(
 pub fn registry_pointer(
     state: &dyn SharedState,
     registry: &Registry,
-) -> Result<Option<String>, SharedStateError> {
+) -> Result<Option<String>, NodeError> {
     match state.registry_pointer()? {
         Pointer::Shared(pointer) => Ok(pointer),
         Pointer::NodeDecides => Ok(registry.active_id()?),
@@ -301,7 +390,7 @@ pub fn swap_registry_pointer(
     registry: &Registry,
     expected: Option<&str>,
     evaluated: &EvaluatedArtifact,
-) -> Result<(), SharedStateError> {
+) -> Result<(), NodeError> {
     let to = evaluated.artifact_id();
     match state.swap_registry_pointer(expected, Some(to))? {
         Swap::NodeDecides => swap_locally(registry, expected, evaluated),
@@ -325,7 +414,7 @@ fn swap_locally(
     registry: &Registry,
     expected: Option<&str>,
     evaluated: &EvaluatedArtifact,
-) -> Result<(), SharedStateError> {
+) -> Result<(), NodeError> {
     // `Registry::promote` takes no lock; this one makes compare and
     // swap one step against every other swap through the trait.
     // holds-until: the learning cycle's automatic promote and rollback
@@ -353,9 +442,10 @@ fn swap_locally(
                         path.display(),
                         REGISTRY_LOCK_WAIT.as_secs()
                     ),
-                })
+                }
+                .into())
             }
-            Err(cause) => return Err(SharedStateError::Lock { path, cause }),
+            Err(cause) => return Err(NodeError::Lock { path, cause }),
         }
     };
     let found = registry.active_id()?;
@@ -363,7 +453,8 @@ fn swap_locally(
         return Err(SharedStateError::CasConflict {
             expected: expected.map(str::to_string),
             found,
-        });
+        }
+        .into());
     }
     Ok(registry.promote(evaluated)?)
 }

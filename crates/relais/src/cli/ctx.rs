@@ -10,6 +10,7 @@ use relais::ids::{IdSource, RunId, TaskId};
 use relais::ledger::Ledger;
 use relais::orchestration::PriceTable;
 use relais::policy::{MachineSettings, RepoPolicy};
+use relais::shared_state::node::NodeError;
 use relais::shared_state::{SharedState, SharedStateError};
 use relais::{paths, route};
 
@@ -90,6 +91,23 @@ pub(crate) fn shared_state_error(what: &'static str, e: SharedStateError) -> Cli
         other => CliError::Operational {
             operation: what,
             cause: Box::new(other),
+        },
+    }
+}
+
+/// A node-half failure as the CLI reports it: the shared half's own error
+/// goes through [`shared_state_error`] unchanged, the node's ledger, claim,
+/// registry and lock errors are operational failures of `what`.
+pub(crate) fn node_error(what: &'static str, e: NodeError) -> CliError {
+    match e {
+        NodeError::Shared(e) => shared_state_error(what, e),
+        e @ (NodeError::Lock { .. }
+        | NodeError::Ledger(_)
+        | NodeError::Claim(_)
+        | NodeError::Registry(_)
+        | NodeError::Compensation { .. }) => CliError::Operational {
+            operation: what,
+            cause: Box::new(e),
         },
     }
 }
@@ -420,5 +438,140 @@ mod home_drift_warning_tests {
             !lines.iter().any(|line| line.contains("/home/u/")),
             "{lines:?}"
         );
+    }
+
+    /// `node_error` keeps every line and exit class the CLI printed when
+    /// these errors were one `SharedStateError`: the shared half's own go
+    /// through `shared_state_error`, the node's are `Operational` under the
+    /// caller's own `what`.
+    #[test]
+    fn a_node_error_prints_and_exits_as_the_shared_state_error_did() {
+        use relais::shared_state::SharedStateError as S;
+        let io = || std::io::Error::other("disk");
+        let cases: Vec<(NodeError, String, CliOutcome)> = vec![
+            (
+                NodeError::Shared(S::ExternalAbsent {
+                    machine_toml: "/m.toml".into(),
+                }),
+                "machine.toml /m.toml sets shared_state = \"external\", but this relais build \
+                 has no shared-state client; set shared_state = \"local\" or install the \
+                 build that has one"
+                    .to_string(),
+                CliOutcome::Blocked,
+            ),
+            (
+                NodeError::Shared(S::Home(relais::paths::HomeUnset)),
+                relais::paths::HomeUnset.to_string(),
+                CliOutcome::Blocked,
+            ),
+            (
+                NodeError::Shared(S::Read {
+                    path: "/m.toml".into(),
+                    cause: io(),
+                }),
+                "cannot read claiming /m.toml: disk".to_string(),
+                CliOutcome::InvalidInput,
+            ),
+            (
+                NodeError::Shared(S::Invalid {
+                    path: "/m.toml".into(),
+                    cause: "bad key".into(),
+                }),
+                "claiming /m.toml is invalid: bad key".to_string(),
+                CliOutcome::InvalidInput,
+            ),
+            (
+                NodeError::Claim(relais::programme::claim::ClaimError::LockTimeout {
+                    path: "/p/.lock".into(),
+                }),
+                format!(
+                    "claiming: {}",
+                    relais::programme::claim::ClaimError::LockTimeout {
+                        path: "/p/.lock".into()
+                    }
+                ),
+                CliOutcome::OperationalFailure,
+            ),
+            (
+                NodeError::Registry(relais::learn::registry::ArtifactError::Malformed(
+                    "no json".into(),
+                )),
+                format!(
+                    "claiming: {}",
+                    relais::learn::registry::ArtifactError::Malformed("no json".into())
+                ),
+                CliOutcome::OperationalFailure,
+            ),
+            (
+                NodeError::Shared(S::CasConflict {
+                    expected: None,
+                    found: Some("a".into()),
+                }),
+                "claiming: cas_conflict: expected nothing, found a".to_string(),
+                CliOutcome::OperationalFailure,
+            ),
+            (
+                NodeError::Lock {
+                    path: "/p/.pointer.lock".into(),
+                    cause: io(),
+                },
+                "claiming: cannot lock /p/.pointer.lock: disk".to_string(),
+                CliOutcome::OperationalFailure,
+            ),
+            (
+                NodeError::Ledger(relais::ledger::LedgerError::Io(io())),
+                format!(
+                    "claiming: {}",
+                    relais::ledger::LedgerError::Io(io())
+                ),
+                CliOutcome::OperationalFailure,
+            ),
+            (
+                NodeError::Compensation {
+                    local: Box::new(NodeError::Lock {
+                        path: "/p/.pointer.lock".into(),
+                        cause: io(),
+                    }),
+                    release: Box::new(NodeError::Shared(S::Refused {
+                        reason: "gone".into(),
+                    })),
+                },
+                "claiming: cannot lock /p/.pointer.lock: disk (and the shared hold could not be given back: refused: gone)".to_string(),
+                CliOutcome::OperationalFailure,
+            ),
+        ];
+        for (error, line, outcome) in cases {
+            let cli = node_error("claiming", error);
+            assert_eq!(cli.to_string(), line);
+            assert_eq!(cli.outcome(), outcome, "{cli}");
+        }
+        // The shared half's own errors keep their own `CliError` variants.
+        assert!(matches!(
+            node_error(
+                "claiming",
+                NodeError::Shared(S::Read {
+                    path: "/m.toml".into(),
+                    cause: io()
+                })
+            ),
+            CliError::Read { .. }
+        ));
+        assert!(matches!(
+            node_error(
+                "claiming",
+                NodeError::Shared(S::Invalid {
+                    path: "/m.toml".into(),
+                    cause: "bad key".into()
+                })
+            ),
+            CliError::Invalid { .. }
+        ));
+        assert!(matches!(
+            node_error(
+                "claiming",
+                NodeError::Shared(S::Home(relais::paths::HomeUnset))
+            ),
+            CliError::Home(_)
+        ));
     }
 }

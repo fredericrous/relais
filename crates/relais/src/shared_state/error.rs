@@ -7,10 +7,10 @@ use crate::money::MicroUsd;
 
 /// Why a shared-state call did not do what it was asked.
 ///
-/// The first group is the shared layer's own (an-t10, an-t11). The
-/// pass-through group carries today's local errors unchanged, so a call
-/// site routed through [`super::LocalState`] says exactly what it said
-/// before.
+/// This is all a [`super::SharedState`] implementation returns: the shared
+/// layer's own errors (an-t10, an-t11) and the three a local read of
+/// `machine.toml` can raise (`Home`, `Read`, `Invalid`). What the node's own
+/// ledger, claim files and registry add is [`super::node::NodeError`].
 #[derive(Debug)]
 pub enum SharedStateError {
     /// The fence moved: the hold expired or another acquire bumped the
@@ -42,28 +42,10 @@ pub enum SharedStateError {
         path: PathBuf,
         cause: std::io::Error,
     },
-    /// A local lock could not be taken (not held by another: it failed).
-    Lock {
-        path: PathBuf,
-        cause: std::io::Error,
-    },
     /// A local file was read and is not valid.
     Invalid {
         path: PathBuf,
         cause: Box<dyn std::error::Error + Send + Sync>,
-    },
-    /// The node's own ledger.
-    Ledger(crate::ledger::LedgerError),
-    /// The programme claim store.
-    Claim(crate::programme::claim::ClaimError),
-    /// The learned-artifact registry.
-    Registry(crate::learn::registry::ArtifactError),
-    /// The local step failed after a shared grant, and giving the shared
-    /// hold back failed too. `local` is what the caller would have seen
-    /// alone; `release` is why the shared hold is still there.
-    Compensation {
-        local: Box<SharedStateError>,
-        release: Box<SharedStateError>,
     },
 }
 
@@ -109,19 +91,9 @@ impl std::fmt::Display for SharedStateError {
             SharedStateError::Read { path, cause } => {
                 write!(f, "cannot read {}: {cause}", path.display())
             }
-            SharedStateError::Lock { path, cause } => {
-                write!(f, "cannot lock {}: {cause}", path.display())
-            }
             SharedStateError::Invalid { path, cause } => {
                 write!(f, "{} is invalid: {cause}", path.display())
             }
-            SharedStateError::Ledger(e) => write!(f, "{e}"),
-            SharedStateError::Claim(e) => write!(f, "{e}"),
-            SharedStateError::Registry(e) => write!(f, "{e}"),
-            SharedStateError::Compensation { local, release } => write!(
-                f,
-                "{local} (and the shared hold could not be given back: {release})"
-            ),
         }
     }
 }
@@ -130,14 +102,8 @@ impl std::error::Error for SharedStateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             SharedStateError::Home(e) => Some(e),
-            SharedStateError::Read { cause, .. } | SharedStateError::Lock { cause, .. } => {
-                Some(cause)
-            }
+            SharedStateError::Read { cause, .. } => Some(cause),
             SharedStateError::Invalid { cause, .. } => Some(cause.as_ref()),
-            SharedStateError::Ledger(e) => Some(e),
-            SharedStateError::Claim(e) => Some(e),
-            SharedStateError::Registry(e) => Some(e),
-            SharedStateError::Compensation { local, .. } => Some(local.as_ref()),
             SharedStateError::LeaseLost { .. }
             | SharedStateError::ClaimLost { .. }
             | SharedStateError::CasConflict { .. }
@@ -146,23 +112,5 @@ impl std::error::Error for SharedStateError {
             | SharedStateError::Refused { .. }
             | SharedStateError::ExternalAbsent { .. } => None,
         }
-    }
-}
-
-impl From<crate::ledger::LedgerError> for SharedStateError {
-    fn from(e: crate::ledger::LedgerError) -> Self {
-        SharedStateError::Ledger(e)
-    }
-}
-
-impl From<crate::programme::claim::ClaimError> for SharedStateError {
-    fn from(e: crate::programme::claim::ClaimError) -> Self {
-        SharedStateError::Claim(e)
-    }
-}
-
-impl From<crate::learn::registry::ArtifactError> for SharedStateError {
-    fn from(e: crate::learn::registry::ArtifactError) -> Self {
-        SharedStateError::Registry(e)
     }
 }

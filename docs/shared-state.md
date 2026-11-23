@@ -73,7 +73,7 @@ Under `relais run --protocol`, the `done` line names it `shared_state_absent`.
 - A failed give-back never hides the local answer: a refusal comes back as
   it is, with one `relais: the shared hold on … could not be given back`
   line on stderr, and a local error comes back as
-  `Compensation { local, release }`.
+  `NodeError::Compensation { local, release }`.
   A hold left behind ends by its TTL (tickets) or when a later claim
   replaces it (intents: `claim_intent(.., replacing)`, asked only when this
   node's own ledger saw the old run's claim and judged it abandoned). A
@@ -93,6 +93,19 @@ Under `relais run --protocol`, the `done` line names it `shared_state_absent`.
   idempotently by node and sequence, and a fresh state is online and empty.
   `relais::shared_state::fake::FakeState` is the in-memory reference with a
   primary's semantics (expiry, degraded mode, a queue).
+- A failure of the node's own files comes back as `node::NodeError`
+  (`Shared(SharedStateError)`, `Lock`, `Ledger`, `Claim`, `Registry`,
+  `Compensation`); a client returns `SharedStateError` only.
+- A decision grant is exclusive and lapses. While a grant is held,
+  `answer_decision` answers `DecisionGrant::HeldElsewhere` to another ask;
+  an unreleased grant lapses `DECISION_GRANT_TTL_SECS` (10 minutes) after it
+  was given, so an answerer that died before its ledger write does not hold
+  the decision for good. `LocalState` holds none: the node's ledger decides.
+  The ledger fences a late answer only within one ledger, so a client with
+  several answerers adds its own fence (an-t13 owns it).
+  `conformance::run_all_with_clock(make, advance)` runs the lapse check; a
+  client whose test primary has an injectable clock must pass it, and
+  `run_all` alone does not cover the lapse.
 - The trait is unstable: until a closed client consumes it, a change to it
   ships in a minor release, and the client pins the exact public version.
 - `LocalState` fences seats and tickets within one instance only; fencing

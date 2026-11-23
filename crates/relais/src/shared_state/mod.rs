@@ -43,7 +43,7 @@ pub use node::{TicketClaim, TicketGrant};
 pub use types::{
     DecisionGrant, IntentAnswer, LeaseToken, Mode, Pointer, Principal, PrincipalKind,
     PublishReceipt, PublishRow, Reservation, ResourceId, Settlement, Slice, Swap, TicketAnswer,
-    TicketRequest,
+    TicketRequest, DECISION_GRANT_TTL_SECS,
 };
 
 use crate::ids::RunId;
@@ -144,6 +144,15 @@ pub trait SharedState: Send + Sync {
     /// The shared half of answering `run`'s decision: one answer per
     /// decision, compare-and-set. The answer and its intent are written on
     /// the node, in one ledger transaction ([`node::resolve_decision_with_intent`]).
+    ///
+    /// An implementation that holds the grant answers
+    /// [`DecisionGrant::HeldElsewhere`] to a second ask, and lets the grant
+    /// lapse [`DECISION_GRANT_TTL_SECS`] after it was given unless
+    /// [`SharedState::release_decision`] gave it back, so an answerer that
+    /// died before its ledger write does not hold the decision for good.
+    /// `LocalState` holds none: the node's ledger decides. The lapse is
+    /// checked by `conformance::a_decision_grant_lapses`. The node's ledger
+    /// fences a late answer only within that one ledger.
     fn answer_decision(&self, run: &RunId) -> Result<DecisionGrant, SharedStateError>;
 
     /// Give a decision grant back when the node had no open decision.

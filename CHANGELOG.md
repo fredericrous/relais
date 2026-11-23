@@ -8,6 +8,18 @@ missing here.
 
 ## Unreleased
 
+- Breaking, for a client of `relais::shared_state`: the error and grant types
+  are settled before a closed client is built. `SharedStateError` no longer
+  has `Lock`, `Ledger`, `Claim`, `Registry` or `Compensation`; the `node`
+  functions return the new `relais::shared_state::node::NodeError` instead
+  (`Shared(SharedStateError)`, `Lock`, `Ledger`, `Claim`, `Registry`,
+  `Compensation`), so a client implements the trait with
+  `SharedStateError` alone. `DecisionGrant::AlreadyAnswered` is now
+  `HeldElsewhere`. The trait states that a held decision grant lapses after
+  `DECISION_GRANT_TTL_SECS` (10 minutes), and `conformance::run_all_with_clock`
+  runs the new `a_decision_grant_lapses` check for an implementation with an
+  injectable clock. Nothing changes for a single node: every command prints
+  what it printed before.
 - `relais::shared_state::SharedState` takes and answers plain values only:
   no `Ledger`, claim `Store`, `Registry`, `EvaluatedArtifact`, pid-probe
   callback or borrowed request is left in its signatures, so a closed
@@ -17,7 +29,8 @@ missing here.
   release when the local step refuses). New trait methods `grant_ticket`,
   `release_ticket`, `release_intent` (was `release_claim`),
   `answer_decision` and `release_decision` (was
-  `resolve_decision_with_intent`), and `SharedStateError::Compensation`.
+  `resolve_decision_with_intent`), and an error variant `Compensation` (now
+  `node::NodeError::Compensation`, see the entry above).
   Nothing changes for a single node: `LocalState` grants or lets the node
   decide, and every command prints what it printed before. The trait is
   still unstable; a client pins the exact version.
