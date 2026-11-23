@@ -33,7 +33,9 @@ Counted in three groups:
 
 Also run t02's miss query on task rows written after the reinstall (t11's
 scoped hashes), without the memory-file stop list. Expected: 0 false
-misses from out-of-repository paths (t02 found 45).
+misses from out-of-repository paths (t02 found 45). If every new task row
+with edits carries `files: []`, suspect the `env -u … git` spawn t11 added
+(the first non-`git`/`relais` binary the hooks run) before anything else.
 
 If too few rows exist yet, re-date the ticket instead. If the overlap is
 still zero, name the shape that misses.
