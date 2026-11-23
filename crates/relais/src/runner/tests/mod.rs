@@ -46,6 +46,14 @@ struct Presented {
     wire: Wire,
 }
 
+/// The shared half a test runs with, the id of the run it names ahead, and
+/// where the run works.
+struct Shared<'a> {
+    state: &'a dyn crate::shared_state::SharedState,
+    run_id: Option<RunId>,
+    workspace: crate::workspace::reuse::Workspace,
+}
+
 struct Fixture {
     dir: crate::test_support::TempDir,
     repo: PathBuf,
@@ -499,9 +507,11 @@ impl Fixture {
         backend: &dyn Backend,
     ) -> RunOutcome {
         self.execute_shared(
-            &crate::shared_state::LocalState::new(),
-            None,
-            workspace,
+            Shared {
+                state: &crate::shared_state::LocalState::new(),
+                run_id: None,
+                workspace,
+            },
             contract,
             repo,
             machine,
@@ -511,17 +521,19 @@ impl Fixture {
 
     /// `execute_in` with the shared half and the run's id chosen by the
     /// test (a test answers the decision of a run it names ahead).
-    #[allow(clippy::too_many_arguments)]
     fn execute_shared(
         &self,
-        shared_state: &dyn crate::shared_state::SharedState,
-        run_id: Option<RunId>,
-        workspace: crate::workspace::reuse::Workspace,
+        shared: Shared<'_>,
         contract: &TaskContract,
         repo: &RepoPolicy,
         machine: &MachineSettings,
         backend: &dyn Backend,
     ) -> RunOutcome {
+        let Shared {
+            state: shared_state,
+            run_id,
+            workspace,
+        } = shared;
         let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
             adr: "ADR-0001".into(),
             choice: None,

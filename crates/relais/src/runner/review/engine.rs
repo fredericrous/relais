@@ -108,6 +108,8 @@ impl<'a> RunEngine<'a> {
         if let Some(ceiling) = spending.per_day_micros {
             let today = match self.spent_today(self.config.ledger) {
                 Ok(today) => today,
+                // A shared failure already says what could not be read.
+                Err(RunError::Other(said)) => return Some(said),
                 Err(e) => return Some(format!("the day's spend could not be read: {e}")),
             };
             if today >= ceiling {
@@ -993,7 +995,9 @@ fn inherited_block(request: &ReviewRequest<'_>) -> String {
 /// stays `RunError::Ledger` (its "ledger:" prefix and the storage-full
 /// check are unchanged under `LocalState`); anything else is the shared
 /// half's, said with what could not be read.
-pub(crate) fn spend_read_failure(e: crate::shared_state::SharedStateError) -> RunError {
+fn spend_read_failure(e: crate::shared_state::SharedStateError) -> RunError {
+    // holds-until: an-t19 settles the error types; this becomes a typed
+    // `RunError` variant carrying the `SharedStateError`.
     match e {
         crate::shared_state::SharedStateError::Ledger(e) => RunError::Ledger(e),
         other => RunError::Other(format!("the day's spend could not be read: {other}")),
