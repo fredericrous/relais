@@ -169,7 +169,7 @@ plan and the protocol.
   `router_correction_charges`, `corrections_charged_away`, with tests:
   `crates/relais/src/router/wire.rs`, `crates/relais/src/ledger/router.rs`,
   `crates/relais/src/ledger/schema/migrations.rs` (and schema tests)
-- [ ] Phase 3 — docs and close t12 (Resolution, Decisions line, Handoff
+- [x] Phase 3 — docs and close t12 (Resolution, Decisions line, Handoff
   naming the joint release): `docs/plans/2026-10-07-session-router.md`,
   `docs/router-protocol.md`, `docs/programmes/phase8-learner/`
 
@@ -224,5 +224,37 @@ plan and the protocol.
   count and the query time; the live ledger's sha256 is unchanged.
 
 ## Outcome
+
+Phases 1–3 done 2026-11-23. Both relais runs lost their verify to the
+1800 s admission wait on a jammed host (load 84 on 6 cores); each kept
+candidate was read in full against its contract, applied and checked
+in-session (Phase 1 salvaged as `01c90452`, Phase 2 committed as
+`443d7d4b`).
+
+| Check | Expected | Actual |
+|---|---|---|
+| `claude plugin test` (from `claude-plugin/`) | the new tests pass | all 9 new or changed tests pass in two runs; other failures differ per run (1, then 7), each a 5 s hook-budget timeout under load, none in routing |
+| `cargo test -p relais --lib -- ledger:: router::` | the new tests pass | 279 passed, 0 failed (13 new) |
+| `cargo fmt --check` | clean | clean |
+| clippy | clean | deferred by the commit gate (no slot); CI runs it |
+| pilot: `.backup` of the live ledger, branch binary, `RELAIS_STATE_DIR` on a scratch dir | v49 applies, live untouched | the copy reads v49 with `outcome_uncorrected` (4,643 tasks, all `null`); its 26 main correction rows are all `[]`, so all legacy, `charged = []`; the live ledger still reads v48. `relais report` took 3 min 29 s under load |
+
+Decision log:
+- The wire gate (found while writing the protocol doc): `router-state`
+  lists `outcome_uncorrected` in `accepts`, and the plugin drops the field
+  for a relais that does not list it, as it does for `answered`. The panel's
+  skew finding (unix 1) was right; its rejection rested on the plugin being
+  embedded, but the plugin may reach a binary other than the one that
+  installed it (`runFallingBackHome`).
+- Carried into implementation and done: per-entry `hashFiles` under
+  `Promise.all`; the session captured before any await; `flagged` on
+  `CorrectionCharge`; a subagent-edit test; millisecond parse with
+  unparsable rows skipped; `stop` filtered in Rust.
+- Carried and not done: `files_present` (`legacy` stays "files empty");
+  `BEGIN IMMEDIATE` (the batch's write transaction serializes writers);
+  the first-8 cap (the last 8 are kept; a dropped entry's row was already
+  sent with the files it had then).
+- `greengate run --raw pre-commit-plugin-test` exited 0 without running
+  the suite: check the plugin with `claude plugin test`.
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,lang:typescript,tui,unix body-sha=265bd8800120 -->
