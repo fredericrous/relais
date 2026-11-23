@@ -14,8 +14,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::node::{self, NodeError};
-use super::types::{DecisionGrant, DECISION_GRANT_TTL_SECS};
-use super::types::{Principal, PublishRow, Slice};
+use super::types::{DecisionGrant, Principal, PublishRow, Slice, DECISION_GRANT_TTL_SECS};
 use super::{SharedState, SharedStateError, TicketClaim};
 use crate::ids::{RunId, TaskId};
 use crate::learn::fixtures::{artifact, evaluation};
@@ -381,6 +380,41 @@ pub fn a_fresh_state_is_online_and_empty(state: &dyn SharedState, fixture: &Fixt
     );
 }
 
+/// A decision grant that is held is exclusive until [`DECISION_GRANT_TTL_SECS`]
+/// have passed, and lapses then when its answer never lands. This is for an
+/// implementation that holds grants (a primary): [`super::LocalState`]
+/// holds none and is not run through it. `advance` moves the
+/// implementation's clock forward by that many seconds. The primary is
+/// fresh for each check (`run_all_with_clock` calls `make`); a check that
+/// panics leaves its grant held.
+pub fn a_decision_grant_lapses(state: &dyn SharedState, fixture: &Fixture, advance: &dyn Fn(i64)) {
+    let run = RunId::from_stored(format!("run-grant-{}", fixture.name));
+    assert_eq!(
+        state.answer_decision(&run).expect("first ask"),
+        DecisionGrant::Granted
+    );
+    assert_eq!(
+        state.answer_decision(&run).expect("second ask"),
+        DecisionGrant::HeldElsewhere,
+        "a held grant is exclusive until it is released or lapses"
+    );
+    advance(DECISION_GRANT_TTL_SECS - 1);
+    assert_eq!(
+        state
+            .answer_decision(&run)
+            .expect("ask just before the lapse"),
+        DecisionGrant::HeldElsewhere,
+        "a grant is held until {DECISION_GRANT_TTL_SECS} s have passed"
+    );
+    advance(2);
+    assert_eq!(
+        state.answer_decision(&run).expect("ask after the lapse"),
+        DecisionGrant::Granted,
+        "a grant whose answer never landed lapses after {DECISION_GRANT_TTL_SECS} s"
+    );
+    state.release_decision(&run).expect("release");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +444,16 @@ mod tests {
     fn the_lapse_check_fails_an_implementation_that_never_holds() {
         let fixture = Fixture::new("never-holds");
         a_decision_grant_lapses(&super::super::LocalState::new(), &fixture, &|_| {});
+    }
+
+    /// Nor by lapsing early: a clock that runs twice as fast ends the grant
+    /// before its TTL.
+    #[test]
+    #[should_panic(expected = "held until")]
+    fn the_lapse_check_fails_a_grant_that_lapses_early() {
+        let fixture = Fixture::new("lapses-early");
+        let fake = super::super::fake::FakeState::new();
+        a_decision_grant_lapses(&fake, &fixture, &|secs| fake.advance(secs * 2));
     }
 
     /// Nor by holding forever: a clock that does not move never lapses.
@@ -470,29 +514,4 @@ mod tests {
             .count();
         assert_eq!((landed, conflicts), (1, 1), "{results:?}");
     }
-}
-
-/// A decision grant that is held is exclusive, and lapses after
-/// [`DECISION_GRANT_TTL_SECS`] when its answer never lands. This is for an
-/// implementation that holds grants (a primary): [`super::LocalState`]
-/// holds none and is not run through it. `advance` moves the
-/// implementation's clock forward by that many seconds.
-pub fn a_decision_grant_lapses(state: &dyn SharedState, fixture: &Fixture, advance: &dyn Fn(i64)) {
-    let run = RunId::from_stored(format!("run-grant-{}", fixture.name));
-    assert_eq!(
-        state.answer_decision(&run).expect("first ask"),
-        DecisionGrant::Granted
-    );
-    assert_eq!(
-        state.answer_decision(&run).expect("second ask"),
-        DecisionGrant::HeldElsewhere,
-        "a held grant is exclusive until it is released or lapses"
-    );
-    advance(DECISION_GRANT_TTL_SECS + 1);
-    assert_eq!(
-        state.answer_decision(&run).expect("ask after the lapse"),
-        DecisionGrant::Granted,
-        "a grant whose answer never landed lapses after {DECISION_GRANT_TTL_SECS} s"
-    );
-    state.release_decision(&run).expect("release");
 }

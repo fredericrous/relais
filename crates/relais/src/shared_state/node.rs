@@ -19,7 +19,8 @@
 //! This module is public because the CLI is a separate binary target. It
 //! is relais's own: a closed client implements [`SharedState`], never these.
 
-pub use super::error::NodeError;
+use std::path::PathBuf;
+
 use super::types::{
     DecisionGrant, IntentAnswer, LeaseToken, Pointer, Principal, Swap, TicketAnswer, TicketRequest,
 };
@@ -33,6 +34,92 @@ use crate::money::MicroUsd;
 use crate::procs::LockFile;
 use crate::programme::claim::{ClaimKey, Contest, Holder, Kind, Store, Taken, LOCK_WAIT};
 use std::collections::BTreeSet;
+
+/// Why a node function did not do what it was asked: the shared
+/// half's own refusal, or a failure of the node's own files and ledger.
+///
+/// This is relais's type, not the closed client's: a client implements
+/// [`SharedState`] and returns [`SharedStateError`] only. The ledger,
+/// claim and registry errors below are what the node half adds around it.
+#[derive(Debug)]
+pub enum NodeError {
+    /// The shared half answered with an error. Transparent: it displays and
+    /// chains as the wrapped error does.
+    Shared(SharedStateError),
+    /// A local lock could not be taken (not held by another: it failed).
+    Lock {
+        path: PathBuf,
+        cause: std::io::Error,
+    },
+    /// The node's own ledger.
+    Ledger(crate::ledger::LedgerError),
+    /// The programme claim store.
+    Claim(crate::programme::claim::ClaimError),
+    /// The learned-artifact registry.
+    Registry(crate::learn::registry::ArtifactError),
+    /// The local step failed after a shared grant, and giving the shared
+    /// hold back failed too. `local` is what the caller would have seen
+    /// alone; `release` is why the shared hold is still there.
+    Compensation {
+        local: Box<NodeError>,
+        release: Box<NodeError>,
+    },
+}
+
+impl std::fmt::Display for NodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeError::Shared(e) => write!(f, "{e}"),
+            NodeError::Lock { path, cause } => {
+                write!(f, "cannot lock {}: {cause}", path.display())
+            }
+            NodeError::Ledger(e) => write!(f, "{e}"),
+            NodeError::Claim(e) => write!(f, "{e}"),
+            NodeError::Registry(e) => write!(f, "{e}"),
+            NodeError::Compensation { local, release } => write!(
+                f,
+                "{local} (and the shared hold could not be given back: {release})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            NodeError::Shared(e) => e.source(),
+            NodeError::Lock { cause, .. } => Some(cause),
+            NodeError::Ledger(e) => Some(e),
+            NodeError::Claim(e) => Some(e),
+            NodeError::Registry(e) => Some(e),
+            NodeError::Compensation { local, .. } => Some(local.as_ref()),
+        }
+    }
+}
+
+impl From<SharedStateError> for NodeError {
+    fn from(e: SharedStateError) -> Self {
+        NodeError::Shared(e)
+    }
+}
+
+impl From<crate::ledger::LedgerError> for NodeError {
+    fn from(e: crate::ledger::LedgerError) -> Self {
+        NodeError::Ledger(e)
+    }
+}
+
+impl From<crate::programme::claim::ClaimError> for NodeError {
+    fn from(e: crate::programme::claim::ClaimError) -> Self {
+        NodeError::Claim(e)
+    }
+}
+
+impl From<crate::learn::registry::ArtifactError> for NodeError {
+    fn from(e: crate::learn::registry::ArtifactError) -> Self {
+        NodeError::Registry(e)
+    }
+}
 
 /// One request to take a programme ticket as `work`: the input of
 /// [`claim_ticket`], which turns it into a [`TicketRequest`] for the

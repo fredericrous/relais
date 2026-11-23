@@ -101,9 +101,13 @@ pub(crate) fn shared_state_error(what: &'static str, e: SharedStateError) -> Cli
 pub(crate) fn node_error(what: &'static str, e: NodeError) -> CliError {
     match e {
         NodeError::Shared(e) => shared_state_error(what, e),
-        other => CliError::Operational {
+        e @ (NodeError::Lock { .. }
+        | NodeError::Ledger(_)
+        | NodeError::Claim(_)
+        | NodeError::Registry(_)
+        | NodeError::Compensation { .. }) => CliError::Operational {
             operation: what,
-            cause: Box::new(other),
+            cause: Box::new(e),
         },
     }
 }
@@ -473,7 +477,7 @@ mod home_drift_warning_tests {
                     path: "/m.toml".into(),
                     cause: "bad key".into(),
                 }),
-                "bad key".to_string(),
+                "claiming /m.toml is invalid: bad key".to_string(),
                 CliOutcome::InvalidInput,
             ),
             (
@@ -538,11 +542,36 @@ mod home_drift_warning_tests {
         ];
         for (error, line, outcome) in cases {
             let cli = node_error("claiming", error);
-            assert!(
-                cli.to_string().contains(&line),
-                "{cli} should contain {line}"
-            );
+            assert_eq!(cli.to_string(), line);
             assert_eq!(cli.outcome(), outcome, "{cli}");
         }
+        // The shared half's own errors keep their own `CliError` variants.
+        assert!(matches!(
+            node_error(
+                "claiming",
+                NodeError::Shared(S::Read {
+                    path: "/m.toml".into(),
+                    cause: io()
+                })
+            ),
+            CliError::Read { .. }
+        ));
+        assert!(matches!(
+            node_error(
+                "claiming",
+                NodeError::Shared(S::Invalid {
+                    path: "/m.toml".into(),
+                    cause: "bad key".into()
+                })
+            ),
+            CliError::Invalid { .. }
+        ));
+        assert!(matches!(
+            node_error(
+                "claiming",
+                NodeError::Shared(S::Home(relais::paths::HomeUnset))
+            ),
+            CliError::Home(_)
+        ));
     }
 }

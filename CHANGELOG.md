@@ -29,7 +29,8 @@ missing here.
   release when the local step refuses). New trait methods `grant_ticket`,
   `release_ticket`, `release_intent` (was `release_claim`),
   `answer_decision` and `release_decision` (was
-  `resolve_decision_with_intent`), and the error variant `Compensation` (see the next entry: it is `node::NodeError::Compensation`).
+  `resolve_decision_with_intent`), and an error variant `Compensation` (now
+  `node::NodeError::Compensation`, see the entry above).
   Nothing changes for a single node: `LocalState` grants or lets the node
   decide, and every command prints what it printed before. The trait is
   still unstable; a client pins the exact version.
