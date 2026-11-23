@@ -116,7 +116,12 @@ rows with files and their charges. The host was jammed again: both relais
 runs lost their verify to the 1800 s admission wait, and their candidates
 were applied and checked in-session; `greengate run --raw` exited 0
 without running the plugin suite, so run `claude plugin test` from
-`claude-plugin/` to check it. Next: t03. Earlier entry:
+`claude-plugin/` to check it. v0.80.0 is released and verified: the Release
+run concluded `success` with 7 assets, the macOS archive reports `relais
+0.80.0`, the installed binary is 0.80.0, and the live ledger reads v50. The
+plugin is still 0.79.0 until the person reinstalls it. The t12 review's
+fallback items are filed as [t14](t14-charge-read-fallbacks.md), to be
+settled before t05 reads `CorrectionCharge`. Next: t03. Earlier entry:
 
 2026-11-23, t11 closed (file hashes scoped to a repository). The plugin
 fix is on `prog/phase8-learner/t11-file-hash-repo-scope` with its plan and
