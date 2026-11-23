@@ -10,9 +10,9 @@ use std::path::PathBuf;
 use super::setup_gate;
 use super::workspace_ops::SetupWithin;
 use super::{
-    AttemptContext, BaseSource, Baseline, BlockCode, Budget, Candidate, Ended, Event, EvidenceKind,
-    Exhausted, KeptCandidate, Path, Phase, Preflight, Reason, RunEngine, RunError, RunOutcome,
-    State, Terminal, VerificationProfile,
+    kept_sentence, AttemptContext, BaseSource, Baseline, BlockCode, Budget, Candidate, Ended,
+    Event, EvidenceKind, Exhausted, KeptCandidate, Path, Phase, Preflight, Reason, RunEngine,
+    RunError, RunOutcome, State, Terminal, VerificationProfile,
 };
 use crate::policy::Budgets;
 use crate::verify;
@@ -679,16 +679,6 @@ fn checks_summary(checks: Option<usize>, red: usize) -> String {
         Some(n) => format!("{n} checks · {red}"),
         None => red,
     }
-}
-
-/// What a kept candidate's ending says of it: it is kept, and how to
-/// verify it again without a worker.
-pub(super) fn kept_sentence(kept: &KeptCandidate) -> String {
-    format!(
-        "the candidate is kept: verify it again without a worker with a `kind: verify` run, \
-         `candidate {{run: {}, index: {}}}`",
-        kept.run, kept.index
-    )
 }
 
 /// What a failed setup command says on the run's record: which command,

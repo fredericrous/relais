@@ -605,9 +605,9 @@ impl<'a> RunEngine<'a> {
 
     /// What the worker left behind, turned into a candidate: the
     /// immutable snapshot, its name, its patch and its scope (SPEC §8).
-    /// The ways an attempt ends without one — cancelled, interrupted,
-    /// blocked, a tree still being written, a scope violation — end the
-    /// run here.
+    /// The ways an attempt ends before verification — cancelled,
+    /// interrupted, blocked (its changed tree kept as the candidate), a tree
+    /// still being written, a scope violation — end the run here.
     fn snapshot_attempt(
         &mut self,
         ctx: &AttemptContext<'_>,
@@ -643,9 +643,9 @@ impl<'a> RunEngine<'a> {
         if result.terminal_result_missing() {
             let timed_out = result.ended == Ended::TimedOut;
             let (candidate, note) = if timed_out && result.timed_out_stop.is_some() {
-                match self.snapshot_timed_out(ctx, attempt_id, index)? {
-                    TimedOutTree::Candidate(sha, note) => (Some(sha), note),
-                    TimedOutTree::NoCandidate(note) => (None, note),
+                match self.snapshot_stopped(ctx, attempt_id, index, State::Interrupted)? {
+                    StoppedTree::Candidate(sha, note) => (Some(sha), note),
+                    StoppedTree::NoCandidate(note) => (None, note),
                 }
             } else {
                 (None, None)
@@ -684,13 +684,30 @@ impl<'a> RunEngine<'a> {
 
         // A worker blockage proposal is recorded as evidence and the
         // runner assigns blocked — the environment is never escalated
-        // to a stronger model (SPEC §9).
+        // to a stronger model (SPEC §9). The tree it left is kept as the
+        // blocked attempt's candidate, as a timed-out worker's is, so a
+        // `kind: verify` run can check it once the environment is back.
         let claimed_blockage = result.worker_claims_blockage;
         if claimed_blockage {
-            ledger.finish_attempt(attempt_id, State::Blocked, None, None)?;
+            let mut claim = result.result_text.unwrap_or_default();
+            let candidate = match self.snapshot_stopped(ctx, attempt_id, index, State::Blocked)? {
+                StoppedTree::Candidate(sha, note) => {
+                    claim = with_note(claim, note);
+                    Some(super::KeptCandidate {
+                        run: self.run_id.as_str().to_string(),
+                        index,
+                        sha,
+                    })
+                }
+                StoppedTree::NoCandidate(note) => {
+                    claim = with_note(claim, note);
+                    ledger.finish_attempt(attempt_id, State::Blocked, None, None)?;
+                    None
+                }
+            };
             return Ok(Snapshot::Ended(self.stop(
                 &progress.budget,
-                Observation::WorkerBlockage(result.result_text.unwrap_or_default()),
+                Observation::WorkerBlockage { claim, candidate },
             )?));
         }
 
@@ -719,21 +736,23 @@ impl<'a> RunEngine<'a> {
     }
 
     /// The tree a worker left after its wall time, once its stop is
-    /// confirmed: published as the interrupted attempt's candidate when it
-    /// differs from its floor and nothing else holds it. It runs no scope
+    /// confirmed, or after it claimed a blockage: published as the attempt's
+    /// candidate, ending it `end`, when it differs from its floor and
+    /// nothing else holds it. It runs no scope
     /// check, holdout collision or verification: the verify successor does,
     /// from the base. A full disk propagates; a held tree, an unresolved conflict,
     /// an unchanged tree and any other failure end with no candidate, and the
     /// failures say why.
-    fn snapshot_timed_out(
+    fn snapshot_stopped(
         &mut self,
         ctx: &AttemptContext<'_>,
         attempt_id: i64,
         index: u32,
-    ) -> Result<TimedOutTree, RunError> {
+        end: State,
+    ) -> Result<StoppedTree, RunError> {
         let worktree_path = ctx.worktree_path;
         if let Some(holder) = self.wait_for_writers(worktree_path)? {
-            return Ok(TimedOutTree::NoCandidate(Some(format!(
+            return Ok(StoppedTree::NoCandidate(Some(format!(
                 "no candidate: the tree was still held by {holder:?}"
             ))));
         }
@@ -743,14 +762,14 @@ impl<'a> RunEngine<'a> {
         ) {
             Ok(sha) => sha,
             Err(WorkspaceError::UnresolvedConflict(paths)) => {
-                return Ok(TimedOutTree::NoCandidate(Some(format!(
+                return Ok(StoppedTree::NoCandidate(Some(format!(
                     "no candidate: an unresolved conflict at snapshot ({})",
                     paths.join(", ")
                 ))));
             }
             Err(e) if e.is_storage_full() => return Err(e.into()),
             Err(e) => {
-                return Ok(TimedOutTree::NoCandidate(Some(format!(
+                return Ok(StoppedTree::NoCandidate(Some(format!(
                     "the tree could not be snapshotted ({e})"
                 ))));
             }
@@ -766,27 +785,27 @@ impl<'a> RunEngine<'a> {
             .worktree
             .changed_paths_from(floor.revision(ctx.worktree), &sha)
         {
-            Ok(changed) if changed.is_empty() => return Ok(TimedOutTree::NoCandidate(None)),
+            Ok(changed) if changed.is_empty() => return Ok(StoppedTree::NoCandidate(None)),
             Ok(_) => {}
             Err(e) if e.is_storage_full() => return Err(e.into()),
             Err(e) => {
-                return Ok(TimedOutTree::NoCandidate(Some(format!(
+                return Ok(StoppedTree::NoCandidate(Some(format!(
                     "the tree could not be compared with its floor ({e})"
                 ))));
             }
         }
-        match self.publish_snapshot(ctx, attempt_id, index, State::Interrupted, &sha) {
-            Ok(_) => Ok(TimedOutTree::Candidate(sha, None)),
+        match self.publish_snapshot(ctx, attempt_id, index, end, &sha) {
+            Ok(_) => Ok(StoppedTree::Candidate(sha, None)),
             Err(e) if e.is_storage_full() => Err(e),
             // The ledger already holds the candidate when only the latest
             // patch could not be written: the detail says so too.
             Err(e) if self.last_snapshot.as_ref() == Some(&(index, sha.clone())) => {
-                Ok(TimedOutTree::Candidate(
+                Ok(StoppedTree::Candidate(
                     sha,
                     Some(format!("candidate-latest.patch could not be written ({e})")),
                 ))
             }
-            Err(e) => Ok(TimedOutTree::NoCandidate(Some(format!(
+            Err(e) => Ok(StoppedTree::NoCandidate(Some(format!(
                 "the candidate could not be published ({e})"
             )))),
         }
@@ -1543,8 +1562,8 @@ impl<'a> RunEngine<'a> {
     }
 }
 
-/// What a timed-out worker's tree came to.
-enum TimedOutTree {
+/// What a stopped worker's tree came to: timed out, or blocked.
+enum StoppedTree {
     /// The published candidate, and a note when part of its publication
     /// failed after the ledger already held it.
     Candidate(String, Option<String>),

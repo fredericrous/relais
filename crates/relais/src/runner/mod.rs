@@ -76,7 +76,7 @@ mod workspace_ops;
 
 pub use crate::prune::sweep_ended_verify_dirs;
 pub use crate::workspace::OutOfScope;
-use baseline::{baseline_summary, kept_sentence, setup_failure_detail, BaseMemo};
+use baseline::{baseline_summary, setup_failure_detail, BaseMemo};
 pub use config::{holdout_root, verify_root, worktree_root, DesignSource, RunConfig};
 use config::{retirement_detail, state_sibling};
 use error::Finish;
@@ -84,8 +84,8 @@ pub use error::RunError;
 pub use holdouts::sweep_ended_holdouts;
 use launch::admission_block;
 pub use machine::{
-    decide, AttemptKind, Budget, BudgetCause, FloorKind, HoldoutStop, Limit, Next, Observation,
-    OverBudget, Terminal, WorktreeEnd, SUSPEND_THRESHOLD_MS,
+    decide, kept_sentence, AttemptKind, Budget, BudgetCause, FloorKind, HoldoutStop, KeptCandidate,
+    Limit, Next, Observation, OverBudget, Terminal, WorktreeEnd, SUSPEND_THRESHOLD_MS,
 };
 use prompt::{build_prompt, build_review_repair_prompt, conflict_block, RepairFailure};
 pub(crate) use prompt::{data_block, data_list_block, relevant_block};
@@ -99,7 +99,7 @@ use types::{
     AttemptContext, Attempted, BaseSource, Baseline, Candidate, CandidateConflicts, Dispatched,
     InPlaceRun, PendingEvidence, Preflight, PreparedCandidate, Snapshot, Step, Verified,
 };
-pub(crate) use types::{AttemptLabel, KeptCandidate, ManagedDispatch, Phase};
+pub(crate) use types::{AttemptLabel, ManagedDispatch, Phase};
 
 /// The lifecycle vocabulary lives in `crate::lifecycle`, a leaf module
 /// the ledger, the report and the learning dataset can name without

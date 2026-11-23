@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use super::{AttemptKind, Budget, Launched, RunOutcome};
+use super::{AttemptKind, Budget, KeptCandidate, Launched, RunOutcome};
 use crate::backend::{LaunchResult, LaunchSpec};
 use crate::context::ContextManifest;
 use crate::ledger::UsageEvent;
@@ -38,15 +38,6 @@ impl PackageRole {
             Self::IntegrationRepair => UsagePhase::Integration,
         }
     }
-}
-
-/// A candidate that is kept when a queue ends the run around it: the run
-/// and attempt index a `kind: verify` run names, and its commit.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct KeptCandidate {
-    pub(crate) run: String,
-    pub(crate) index: u32,
-    pub(crate) sha: String,
 }
 
 /// One dispatch as admission and the launch need it: the spec, its place
