@@ -527,6 +527,8 @@ function noteRevert(fx: Fx, store: Store, state: RouterState, task: TaskState, e
   if (reverted === undefined) return
   const session = r.session
   const cwd = r.cwd
+  // Not `queue()`: it reads `r.session` now, and a lookup may end after a
+  // /clear moved the module to another session.
   const queueRow = (paths: string[]) => {
     if (session) r.queue.push({ session, record: reassessRecord(task, revertRecord(state, task, paths, cwd), now) })
   }
@@ -534,10 +536,17 @@ function noteRevert(fx: Fx, store: Store, state: RouterState, task: TaskState, e
     queueRow(reverted.paths)
     return
   }
-  const pending: Promise<void> = Promise.all(reverted.lookups.map(lookup => lookupRevertedFiles(fx, lookup))).then(found => {
-    queueRow([...reverted.paths, ...found.flat()])
-    r.reverts.delete(pending)
-  })
+  // A failure costs this row's looked-up files, never the session's final send.
+  const pending: Promise<void> = Promise.all(reverted.lookups.map(lookup => lookupRevertedFiles(fx, lookup)))
+    .then(found => queueRow([...reverted.paths, ...found.flat()]))
+    .catch(() => {
+      try {
+        queueRow(reverted.paths)
+      } catch {
+        // Fail open (ADR-0001): the row is lost, the hook and the batch are not.
+      }
+    })
+    .finally(() => r.reverts.delete(pending))
   r.reverts.add(pending)
 }
 
@@ -559,6 +568,7 @@ async function lookupRevertedFiles(fx: Fx, lookup: RevertLookup): Promise<string
       .filter(file => file !== '')
       .map(file => normalizeJoined(lookup.directory, root, file))
   }
+  // A spawn that throws is a failed lookup: the row is queued with no files (t13 counts them).
   const got = await within(fx, read().catch(() => []), GATE_TIMEOUT_MS)
   return got === TIMEOUT ? [] : got
 }
@@ -566,7 +576,7 @@ async function lookupRevertedFiles(fx: Fx, lookup: RevertLookup): Promise<string
 // Waits for the revert lookups still running, each of which ends within the
 // gate timeout, so their rows are queued before the task's own.
 async function settleReverts(store: Store) {
-  await Promise.all([...store.router.reverts])
+  await Promise.allSettled([...store.router.reverts])
 }
 
 // The pinned decision follows the task from the next request on.

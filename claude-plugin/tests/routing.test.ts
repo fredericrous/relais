@@ -614,6 +614,19 @@ test('a lookup that never resolves delays the session end by the gate timeout at
   expect(observed(engine, 'task').length).toBe(1)
 })
 
+test('a lookup whose spawn throws queues the row with no files, and the session end still sends the task', async ($: any, on: any) => {
+  const engine = await taskEditing($, on)
+  const base = engine.script.runResult
+  engine.script.runResult = (argv: string[], init: any) => {
+    if (argv[0] === 'git' && argv.includes('show')) throw new Error('spawn refused')
+    return base(argv, init)
+  }
+  await toolCall($, engine, bash('git revert abc'), { result: {}, text: '' })
+  await endSession($, engine)
+  expect(revertRows(engine).map((r: any) => r.files)).toEqual([[]])
+  expect(observed(engine, 'task').length).toBe(1)
+})
+
 test('a classifier answer that fails to parse, or no router-state, routes nothing', async ($: any, on: any) => {
   const engine = await routedSession($, on)
   engine.fallback = () => ({ isAnswered: true, text: 'not json', usage: answered({}).usage })

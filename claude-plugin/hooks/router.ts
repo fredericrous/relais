@@ -1038,13 +1038,13 @@ function shellItems(command: string): ShellItem[] | undefined {
   }
   let at = 0
   while (at < command.length) {
-    const c = command[at]
+    const char = command[at]
     const next = command[at + 1]
-    if (c === "'") {
+    if (char === "'") {
       const end = command.indexOf("'", at + 1)
       append(command.slice(at + 1, end < 0 ? command.length : end))
       at = end < 0 ? command.length : end + 1
-    } else if (c === '"') {
+    } else if (char === '"') {
       inWord = true
       at++
       while (at < command.length && command[at] !== '"') {
@@ -1054,13 +1054,13 @@ function shellItems(command: string): ShellItem[] | undefined {
         } else append(command[at++])
       }
       at++
-    } else if (c === '\\') {
+    } else if (char === '\\') {
       if (next === '\n') at += 2
       else {
         append(next ?? '')
         at += 2
       }
-    } else if (c === '$' && next === '(') {
+    } else if (char === '$' && next === '(') {
       let depth = 0
       const from = at
       while (at < command.length) {
@@ -1069,14 +1069,14 @@ function shellItems(command: string): ShellItem[] | undefined {
         at++
       }
       append(command.slice(from, ++at))
-    } else if (c === '`') {
+    } else if (char === '`') {
       const end = command.indexOf('`', at + 1)
       append(command.slice(at, end < 0 ? command.length : end + 1))
       at = end < 0 ? command.length : end + 1
-    } else if (c === '#' && !inWord) {
+    } else if (char === '#' && !inWord) {
       while (at < command.length && command[at] !== '\n') at++
-    } else if (c === '<' || c === '>' || (c === '&' && next === '>')) {
-      if (c === '<' && next === '<') return undefined
+    } else if (char === '<' || char === '>' || (char === '&' && next === '>')) {
+      if (char === '<' && next === '<') return undefined
       if (inWord && /^\d+$/.test(word)) {
         word = ''
         inWord = false
@@ -1086,11 +1086,11 @@ function shellItems(command: string): ShellItem[] | undefined {
       if (command[at - 1] === '&' && command[at] !== undefined) {
         while (/[0-9-]/.test(command[at] ?? '')) at++
       } else dropNextWord = true
-    } else if (c === '&') {
+    } else if (char === '&') {
       if (next !== '&') return undefined
       operator('&&')
       at += 2
-    } else if (c === '|') {
+    } else if (char === '|') {
       if (next === '|') {
         operator('||')
         at += 2
@@ -1098,20 +1098,20 @@ function shellItems(command: string): ShellItem[] | undefined {
         operator('|')
         at++
       }
-    } else if (c === ';' || c === '\n') {
+    } else if (char === ';' || char === '\n') {
       operator(';')
       at++
-    } else if (c === '(' && !inWord) {
+    } else if (char === '(' && !inWord) {
       operator('(')
       at++
-    } else if (c === ')') {
+    } else if (char === ')') {
       operator(')')
       at++
-    } else if (c === ' ' || c === '\t') {
+    } else if (char === ' ' || char === '\t') {
       endWord()
       at++
     } else {
-      append(c)
+      append(char)
       at++
     }
   }
