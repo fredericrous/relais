@@ -285,7 +285,8 @@ fn agent_review() -> String {
 name: relais-review
 description: Semantic reviewer (relais advisory default). Reports findings; cannot edit or waive anything.
 tools: Read, Grep, Glob, LSP, mcp__aval__aval_rule
-model: opus
+model: inherit
+preferred-model: opus
 ---
 
 You are the semantic reviewer of the relais advisory set. You review a
@@ -1034,6 +1035,43 @@ mod tests {
             "{}",
             agent_review()
         );
+    }
+
+    #[test]
+    fn the_review_agent_inherits_with_opus_preferred() {
+        let agent = agent_review();
+        assert!(
+            agent.contains("\nmodel: inherit\npreferred-model: opus\n---\n"),
+            "{agent}"
+        );
+        assert!(!agent.lines().any(|line| line == "model: opus"), "{agent}");
+    }
+
+    #[test]
+    fn a_pinned_review_agent_upgrades_to_the_inheriting_one() {
+        let (root, dir) = temp_root();
+        let agent = root.claude_dir.join("agents/relais-review.md");
+        install_older_template(
+            &agent,
+            "---\nname: relais-review\nmodel: opus\n---\n\nYou are the semantic reviewer.\n",
+        );
+
+        let plan = root.plan();
+        assert!(
+            plan.actions.iter().any(|action| matches!(
+                action,
+                Action::Update { relative } if relative == Path::new("agents/relais-review.md")
+            )),
+            "an untouched pinned reviewer is an update: {:?}",
+            plan.actions
+        );
+        root.apply(&plan).expect("apply");
+        let after = std::fs::read_to_string(&agent).expect("read");
+        assert!(
+            after.contains("model: inherit\npreferred-model: opus"),
+            "{after}"
+        );
+        std::fs::remove_dir_all(&dir).ok(); // temp-dir cleanup: a leftover dir only costs disk
     }
 
     fn temp_root() -> (InstallRoot, crate::test_support::TempDir) {

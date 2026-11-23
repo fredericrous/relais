@@ -335,7 +335,10 @@ or the reason it was kept, and a scorecard re-measured afterwards.
   the explicit way to accept an unverified binary.
 
 `relais install --claude` writes the three advisory agents
-(`relais-research`, `relais-implementation`, `relais-review`), and installs the
+(`relais-research`, `relais-implementation`, `relais-review`; the reviewer
+says `model: inherit` and `preferred-model: opus`, so launch it with
+`model: "opus"`: without greenbelay's `agent-preferred-model` rule a launch
+with no model runs on the session model), and installs the
 relais plugin, `relais@relais-local`, which carries the mod, the agent
 definitions (`relais-worker-<model>-<effort>` and the reviewer and planner ones)
 and the `/relais` skill. The plugin is embedded in the `relais` binary, so a
