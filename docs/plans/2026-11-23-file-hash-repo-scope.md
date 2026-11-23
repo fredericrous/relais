@@ -235,6 +235,7 @@ Checks (input → expected → actual):
 - **implementation-review:** approve-with-changes, then approve-with-changes on the delta. Fixed: the banner, `resolveRepository` inside the `Promise.all`, and the Outcome notes; `status: done` is set here. 100k+37k tokens.
 - **lang:typescript:** approve-with-changes, then approve on the delta. Fixed: the `RootAnswer` union, `settled` replacing `isNone`, the timer armed only when cached, and `_init`. Deliberate: unresolved carries no reason, since nothing reads one. 67k+27k tokens.
 - **backend:** approve-with-changes, then approve on the delta. Fixed: the holds-until line on the 512 cap. Deliberate: real git runs only as a piloted check, because the sandbox spawns nothing; no drop count, as rejected at plan review. 69k+29k tokens.
+- **implementation-review delta 2:** approve. It covered the t13 note added after the close (if new rows come back with empty `files`, suspect the `env` spawn). 22k tokens.
 - **unix:** approve. Deliberate: no marker for the cutover (documented in the protocol), and the timer runs in the long-lived hook module, as `within` does. 46k tokens.
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:typescript,tui,unix body-sha=b54f8ff2dcf0 -->
