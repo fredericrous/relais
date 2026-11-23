@@ -492,7 +492,7 @@ impl<'a> RunEngine<'a> {
             Ok(Some(stored)) => stored,
             Ok(None) => return None,
             Err(e) => {
-                self.step("widen_scope", format!("not widened: {}", e));
+                self.step("widen_scope", format!("not widened: {e}"));
                 return None;
             }
         };
@@ -946,7 +946,7 @@ impl<'a> RunEngine<'a> {
             Ok(Some(stored)) => stored,
             Ok(None) => return None,
             Err(e) => {
-                self.step("verify_timed_out", format!("not settled: {}", e));
+                self.step("verify_timed_out", format!("not settled: {e}"));
                 return None;
             }
         };

@@ -993,11 +993,9 @@ fn inherited_block(request: &ReviewRequest<'_>) -> String {
 /// stays `RunError::Ledger` (its "ledger:" prefix and the storage-full
 /// check are unchanged under `LocalState`); anything else is the shared
 /// half's, said with what could not be read.
-fn spend_read_failure(e: crate::shared_state::SharedStateError) -> RunError {
-    // holds-until: an-t19 settles the error types; this becomes a typed
-    // `RunError` variant carrying the `SharedStateError`.
+fn spend_read_failure(e: crate::shared_state::node::NodeError) -> RunError {
     match e {
-        crate::shared_state::SharedStateError::Ledger(e) => RunError::Ledger(e),
+        crate::shared_state::node::NodeError::Ledger(e) => RunError::Ledger(e),
         other => RunError::Other(format!("the shared spend count is unavailable: {other}")),
     }
 }
@@ -1005,25 +1003,24 @@ fn spend_read_failure(e: crate::shared_state::SharedStateError) -> RunError {
 #[cfg(test)]
 mod spend_read_tests {
     use super::*;
+    use crate::shared_state::node::NodeError;
     use crate::shared_state::SharedStateError;
 
     #[test]
     fn a_ledger_failure_stays_a_ledger_error() {
-        let failure = spend_read_failure(SharedStateError::Ledger(
-            crate::ledger::LedgerError::Corrupt {
-                what: "usage".into(),
-                detail: "disk".into(),
-            },
-        ));
+        let failure = spend_read_failure(NodeError::Ledger(crate::ledger::LedgerError::Corrupt {
+            what: "usage".into(),
+            detail: "disk".into(),
+        }));
         assert!(matches!(failure, RunError::Ledger(_)), "{failure:?}");
         assert!(failure.to_string().starts_with("ledger: "), "{failure}");
     }
 
     #[test]
     fn a_shared_failure_says_what_could_not_be_read() {
-        let failure = spend_read_failure(SharedStateError::Refused {
+        let failure = spend_read_failure(NodeError::Shared(SharedStateError::Refused {
             reason: "primary unreachable".into(),
-        });
+        }));
         let text = failure.to_string();
         assert!(
             text.contains("the shared spend count is unavailable") && text.contains("unreachable"),

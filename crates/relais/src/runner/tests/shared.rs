@@ -111,7 +111,7 @@ fn the_same_settle_under_a_free_decision_is_written_through_the_shared_half() {
         .is_some());
     assert_eq!(
         state.answer_decision(&run).expect("held"),
-        crate::shared_state::DecisionGrant::AlreadyAnswered,
+        crate::shared_state::DecisionGrant::HeldElsewhere,
         "the settle took the shared grant and kept it"
     );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
