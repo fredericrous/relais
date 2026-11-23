@@ -352,6 +352,8 @@ struct Task {
     #[serde(default)]
     completed_at_end: Option<TaskOutcome>,
     #[serde(default)]
+    outcome_uncorrected: Option<TaskOutcome>,
+    #[serde(default)]
     inferred: Vec<String>,
     #[serde(default)]
     files: Vec<String>,
@@ -687,6 +689,7 @@ fn task(t: Task) -> Result<RouterRecord, String> {
         outcome: t.outcome.as_str().into(),
         outcome_rank: t.outcome.rank(),
         completed_at_end: t.completed_at_end.map(|o| o.as_str().to_string()),
+        outcome_uncorrected: t.outcome_uncorrected.map(|o| o.as_str().to_string()),
         files: file_hashes(t.files)?,
         task_id: t.task_id,
         agent_id: t.agent_id,
@@ -947,6 +950,18 @@ mod tests {
             parse_batch(&value.to_string()).unwrap_err().record,
             Some((3, "task".into()))
         );
+    }
+
+    #[test]
+    fn outcome_uncorrected_parses_and_defaults_to_none() {
+        let mut value: serde_json::Value = serde_json::from_str(&sample_batch("s1")).unwrap();
+        let batch = parse_batch(&value.to_string()).unwrap();
+        assert!(matches!(&batch.records[3], RouterRecord::Task(t)
+            if t.outcome_uncorrected.is_none()));
+        value["records"][3]["outcome_uncorrected"] = serde_json::json!("completed_verified");
+        let batch = parse_batch(&value.to_string()).unwrap();
+        assert!(matches!(&batch.records[3], RouterRecord::Task(t)
+            if t.outcome_uncorrected.as_deref() == Some("completed_verified")));
     }
 
     /// What the plugin sent before this step: none of the new fields.

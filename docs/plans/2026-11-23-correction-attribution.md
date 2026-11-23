@@ -165,7 +165,7 @@ plan and the protocol.
   `outcome_uncorrected`, with tests: `claude-plugin/hooks/router.ts`,
   `claude-plugin/hooks/routing.ts`, `claude-plugin/tests/router.test.ts`,
   `claude-plugin/tests/routing.test.ts`
-- [ ] Phase 2 — Rust: migration v49, wire field, merge, correction upsert,
+- [x] Phase 2 — Rust: migration v49, wire field, merge, correction upsert,
   `router_correction_charges`, `corrections_charged_away`, with tests:
   `crates/relais/src/router/wire.rs`, `crates/relais/src/ledger/router.rs`,
   `crates/relais/src/ledger/schema/migrations.rs` (and schema tests)
