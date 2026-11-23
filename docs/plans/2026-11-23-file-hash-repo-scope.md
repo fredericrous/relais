@@ -142,7 +142,7 @@ older relais stores the new hashes as it stores the old.
 
 ## Phases
 
-- [ ] Phase 1 — scoped hashes in the plugin, with tests:
+- [x] Phase 1 — scoped hashes in the plugin, with tests:
   `claude-plugin/hooks/router.ts`, `claude-plugin/hooks/routing.ts`,
   `claude-plugin/tests/router.test.ts`, `claude-plugin/tests/routing.test.ts`,
   `claude-plugin/tests/routing-support.ts`, `docs/router-protocol.md`

@@ -584,7 +584,7 @@ export type ReassessRecord = {
   tier_to: Tier
   effort_to: Effort | null
   escalating: boolean
-  // A revert's files, hashed (fileHash).
+  // A revert's files, hashed (scopedFileHash).
   files?: string[]
 }
 
@@ -991,17 +991,9 @@ export function explorationDraw(seed: string, session: string, task: string): nu
   return Number(splitMix64First(u) >> 11n) * 2 ** -53
 }
 
-// A path as the repository names it: relative to the session's cwd, no
-// leading `./`.
-export function repoRelative(file: string, cwd: string | undefined): string {
-  const root = cwd ? cwd.replace(/\/+$/, '') + '/' : ''
-  const rel = root && file.startsWith(root) ? file.slice(root.length) : file
-  return rel.replace(/^(\.\/)+/, '')
-}
-
 // The contract's file hash: the first 16 hex digits of the sha256 of the
-// repo-relative path.
-export const fileHash = (file: string, cwd: string | undefined) => sha256Hex(repoRelative(file, cwd)).slice(0, 16)
+// git common dir, a NUL byte and the path from the repository root.
+export const scopedFileHash = (commonDir: string, repoRelativePath: string) => sha256Hex(`${commonDir}\0${repoRelativePath}`).slice(0, 16)
 
 // --- the paths a Bash command reverts (resolved the way task rows are hashed) ---
 
@@ -1130,9 +1122,6 @@ function normalizePath(absolute: string): string {
   return '/' + parts.join('/')
 }
 
-// `directory`, the way up to the repository root and a file below it, as one absolute path.
-export const normalizeJoined = (directory: string, root: string, file: string) => normalizePath(`${directory}/${root}/${file}`)
-
 const UNKNOWN_PATH = /[$`]/
 
 // A directory named by `cd` or `git -C`, relative to `base`; undefined when it
@@ -1145,7 +1134,7 @@ function resolveDirectory(base: string | undefined, target: string): string | un
 
 export type RevertLookup = { directory: string; commits: string[]; firstParent: boolean }
 export type RevertCommand = {
-  // Absolute paths, the form `fileHash` takes.
+  // Absolute paths, the form `hashFiles` takes.
   paths: string[]
   // `git revert` commits whose files are read from git, off the hook's critical path.
   lookups: RevertLookup[]
@@ -1219,7 +1208,7 @@ function revertedCommits(args: string[]): { commits: string[]; firstParent: bool
 // call's success shows: `git checkout [<ref>] -- <paths>`, `git restore
 // <paths>` (unless it only unstages) and `git revert <commits>`. Paths are
 // made absolute against the command's own directory (`cd`, a `( … )`
-// subshell, `git -C`), so `fileHash` gives what the task's edits give;
+// subshell, `git -C`), so they hash as the task's edits do;
 // `.`, a directory or a trailing-slash path stands for the task's files
 // beneath it.
 export function revertedPaths(command: string, cwd: string | undefined, taskFiles: string[]): RevertCommand | undefined {
@@ -1296,14 +1285,14 @@ export function revertedPaths(command: string, cwd: string | undefined, taskFile
 }
 
 // A revert's reassessment: no escalation, the tier kept, the files hashed.
-export function revertRecord(state: RouterState, task: TaskState, paths: string[], cwd: string | undefined): ReassessRecord {
+export function revertRecord(state: RouterState, task: TaskState, hashes: string[]): ReassessRecord {
   return {
     event: 'revert',
     tier_from: task.tier,
     tier_to: task.tier,
     effort_to: effortOf(state, task),
     escalating: false,
-    files: [...new Set(paths.map(path => fileHash(path, cwd)))].sort(),
+    files: [...new Set(hashes)].sort(),
   }
 }
 
@@ -1566,7 +1555,7 @@ export function reassessRecord(task: TaskState, r: ReassessRecord, now: number) 
   return { kind: 'reassess', task_id: task.id, agent_id: task.agentId, ...r, at: iso(now) }
 }
 
-export function taskRecord(task: TaskState, endedAt: number | null, cwd: string | undefined, repository?: string) {
+export function taskRecord(task: TaskState, endedAt: number | null, files: string[], repository?: string) {
   const repositoryOfTask = repository ?? ''
   const outcome = outcomeOf(task)
   return {
@@ -1581,7 +1570,7 @@ export function taskRecord(task: TaskState, endedAt: number | null, cwd: string 
     // a later correction is measured against it (plan §5, missed failures).
     completed_at_end: endedAt === null ? null : outcome,
     inferred: task.inferred,
-    files: [...new Set(task.files.map(file => fileHash(file, cwd)))].sort(),
+    files: [...new Set(files)].sort(),
     escalations: task.escalations,
     exhausted: task.exhausted,
     turns: task.turns,
@@ -1646,6 +1635,13 @@ export function gateChecks(stamp: GateStamp, startedAt: number, endedAt: number)
 
 // --- the module's memory (Store.router) ----------------------------------------------
 
+// A directory's repository: its git common dir, work tree root and the path
+// from the root down to the directory ('' at the root).
+export type Root = { common: string; toplevel: string; prefix: string }
+// A cached answer: the promise is shared by concurrent callers; `isNone` marks
+// a directory git called "not a git repository".
+export type RootEntry = { promise: Promise<Root | null | undefined>; isNone: boolean }
+
 export type RouterMemory = {
   // `relais native router-state`, or undefined (shadow, nothing decided).
   state: RouterState | undefined
@@ -1671,6 +1667,10 @@ export type RouterMemory = {
   status: string | undefined
   // The git-root name of `cwd` once asked, for the unmatched checks.
   repository: { cwd: string; name: string } | undefined
+  // Per directory, what git says of its repository (routing.ts `resolveRoot`).
+  roots: Map<string, RootEntry>
+  // The session cwd `roots` was filled under.
+  rootsCwd: string | undefined
   // Revert lookups (`git show`) not yet queued; each ends within the gate timeout.
   reverts: Set<Promise<void>>
 }
@@ -1694,6 +1694,8 @@ export const createRouterMemory = (): RouterMemory => ({
   queue: [],
   status: undefined,
   repository: undefined,
+  roots: new Map(),
+  rootsCwd: undefined,
   reverts: new Set(),
 })
 

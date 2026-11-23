@@ -36,10 +36,12 @@ import {
   parseRouterState,
   reassessRecord,
   rerun,
-  normalizeJoined,
   revertedPaths,
   type RevertLookup,
+  type Root,
+  type RootEntry,
   revertRecord,
+  scopedFileHash,
   routeStatus,
   spawnPrompt,
   taskOutcomeRecord,
@@ -62,6 +64,9 @@ const OBSERVE_TIMEOUT_MS = 20_000
 // The amont gate stamp is read at task end, and never holds it up longer.
 const GATE_TIMEOUT_MS = 1000
 const GATE_REPOSITORIES = 5
+// Past this many directories, answers are asked again, not cached.
+const ROOTS_MAX = 512
+const NO_REPOSITORY_TTL_MS = 60_000
 // The first request of a turn waits this long for the classifier at most,
 // and leaves 500 ms of the hook's own budget.
 const PIN_WAIT_MS = 2000
@@ -505,6 +510,10 @@ export function onToolResult(fx: Fx, store: Store, e: any, result: any, now: num
   }
   const evidence = evidenceOf(String(e.tool), e, result, state.checks, state.check_kinds)
   if (!evidence) return
+  if (evidence.kind === 'edit' && evidence.file) {
+    const directory = directoryOf(evidence.file, r.cwd)
+    if (directory) warmRoot(fx, store, directory)
+  }
   const out = onEvidence(state, counted, evidence, r.cwd)
   if (agentId) r.subtasks[agentId] = out.task
   else r.task = out.task
@@ -517,8 +526,8 @@ export function onToolResult(fx: Fx, store: Store, e: any, result: any, now: num
 // A Bash command that succeeded in reverting files (`git revert`, `git
 // checkout -- …`, `git restore …`): recorded against the task in progress,
 // with the files hashed as the task's own are, so R2 can match it to the task
-// that edited them. A `git revert`'s files come from git: the row is queued
-// when the lookup ends, with the task, state and session of this call.
+// that edited them. The row is queued when the hashing and the lookups end,
+// with the task, state and session of this call, and the task's end waits for it.
 function noteRevert(fx: Fx, store: Store, state: RouterState, task: TaskState, e: any, result: any, now: number) {
   if (String(e.tool) !== 'Bash' || e.run_in_background === true) return
   if (!result || result.deny !== undefined || result.isError) return
@@ -526,22 +535,20 @@ function noteRevert(fx: Fx, store: Store, state: RouterState, task: TaskState, e
   const reverted = revertedPaths(typeof e.command === 'string' ? e.command : '', r.cwd, task.files)
   if (reverted === undefined) return
   const session = r.session
-  const cwd = r.cwd
   // Not `queue()`: it reads `r.session` now, and a lookup may end after a
   // /clear moved the module to another session.
-  const queueRow = (paths: string[]) => {
-    if (session) r.queue.push({ session, record: reassessRecord(task, revertRecord(state, task, paths, cwd), now) })
+  const queueRow = (hashes: string[]) => {
+    if (session) r.queue.push({ session, record: reassessRecord(task, revertRecord(state, task, hashes), now) })
   }
-  if (reverted.lookups.length === 0) {
-    queueRow(reverted.paths)
-    return
-  }
-  // A failure costs this row's looked-up files, never the session's final send.
-  const pending: Promise<void> = Promise.all(reverted.lookups.map(lookup => lookupRevertedFiles(fx, lookup)))
-    .then(found => queueRow([...reverted.paths, ...found.flat()]))
+  // A failure costs this row's files, never the session's final send.
+  const pending: Promise<void> = Promise.all([
+    hashFiles(fx, store, reverted.paths),
+    ...reverted.lookups.map(lookup => lookupRevertedFiles(fx, lookup)),
+  ])
+    .then(([hashed, ...found]) => queueRow([...hashed, ...found.flat()]))
     .catch(() => {
       try {
-        queueRow(reverted.paths)
+        queueRow([])
       } catch {
         // Fail open (ADR-0001): the row is lost, the hook and the batch are not.
       }
@@ -550,15 +557,20 @@ function noteRevert(fx: Fx, store: Store, state: RouterState, task: TaskState, e
   r.reverts.add(pending)
 }
 
-// The files `git revert` of these commits touches, absolute; none when git
-// fails or takes longer than the gate timeout.
+// The hashes of the files `git revert` of these commits touches; none when
+// git fails or takes longer than the gate timeout. The names git prints are
+// already repository-relative, so they are hashed with the lookup directory's
+// common dir and no directory is resolved by name (it may be gone).
 async function lookupRevertedFiles(fx: Fx, lookup: RevertLookup): Promise<string[]> {
-  const init = { cwd: lookup.directory, env: { GIT_TERMINAL_PROMPT: '0' }, timeoutMs: GATE_TIMEOUT_MS }
+  // The same scrubbed environment as `resolveRoot`, so a lookup names the
+  // repository an edit's hash names.
+  const init = { cwd: lookup.directory, env: { GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C' }, timeoutMs: GATE_TIMEOUT_MS }
   const read = async (): Promise<string[]> => {
-    const cdup = await fx.process.run(['git', '--no-pager', 'rev-parse', '--show-cdup'], init)
-    if (cdup?.exitCode !== 0) return []
-    const root = String(cdup.stdout ?? '').trim()
-    const argv = ['git', '--no-pager', 'show', '-z', '--name-only', '--no-renames', '--no-relative', '--format=']
+    const located = await fx.process.run([...UNSET_GIT_ENV, 'git', '--no-pager', 'rev-parse', '--path-format=absolute', '--git-common-dir'], init)
+    if (located?.exitCode !== 0) return []
+    const common = String(located.stdout ?? '').replace(/\r?\n$/, '')
+    if (common === '') return []
+    const argv = [...UNSET_GIT_ENV, 'git', '--no-pager', 'show', '-z', '--name-only', '--no-renames', '--no-relative', '--format=']
     if (lookup.firstParent) argv.push('--diff-merges=first-parent')
     argv.push('--end-of-options', ...lookup.commits)
     const shown = await fx.process.run(argv, init)
@@ -566,7 +578,7 @@ async function lookupRevertedFiles(fx: Fx, lookup: RevertLookup): Promise<string
     return String(shown.stdout ?? '')
       .split('\0')
       .filter(file => file !== '')
-      .map(file => normalizeJoined(lookup.directory, root, file))
+      .map(file => scopedFileHash(common, file))
   }
   // A spawn that throws is a failed lookup: the row is queued with no files (t13 counts them).
   const got = await within(fx, read().catch(() => []), GATE_TIMEOUT_MS)
@@ -626,8 +638,8 @@ export function onTurnComplete(fx: Fx, store: Store, e: any, now: number) {
 // The repository name is resolved first: a name guessed from a subdirectory
 // would be stored with the unmatched checks.
 async function queueCorrected(fx: Fx, store: Store, task: TaskState) {
-  const repository = await resolveRepository(fx, store).catch(() => undefined)
-  queue(store, taskRecord(task, null, store.router.cwd, repository))
+  const [repository, files] = await Promise.all([resolveRepository(fx, store).catch(() => undefined), hashFiles(fx, store, task.files)])
+  queue(store, taskRecord(task, null, files, repository))
 }
 
 // The task ends: the amont stamp on the trees it edited is read (bounded,
@@ -635,11 +647,11 @@ async function queueCorrected(fx: Fx, store: Store, task: TaskState) {
 // subagent task it spawned is amended with its outcome.
 async function endTask(fx: Fx, store: Store, task: TaskState, now: number) {
   await settleReverts(store)
-  const gate = await gateEvidence(fx, store, task, now).catch(() => [])
+  const [gate, files] = await Promise.all([gateEvidence(fx, store, task, now).catch(() => []), hashFiles(fx, store, task.files)])
   const ended: TaskState =
     gate.length === 0 ? task : { ...task, verifications: [...task.verifications, ...gate].slice(-20) }
   const repository = await resolveRepository(fx, store).catch(() => undefined)
-  queue(store, taskRecord(ended, now, store.router.cwd, repository))
+  queue(store, taskRecord(ended, now, files, repository))
   const outcome = outcomeOf(ended)
   if (outcome === 'unknown' || outcome === 'answered') return
   for (const sub of ended.subagentTasks ?? []) {
@@ -660,6 +672,100 @@ async function resolveRepository(fx: Fx, store: Store): Promise<string | undefin
   const name = repositoryName(toplevel)
   router.repository = { cwd, name }
   return name
+}
+
+// `env` overlays cannot unset a variable, so git runs under `env -u`: an
+// inherited GIT_DIR would name one repository for every directory.
+const UNSET_GIT_ENV = ['env', '-u', 'GIT_DIR', '-u', 'GIT_WORK_TREE', '-u', 'GIT_COMMON_DIR']
+const ROOT_ARGV = [...UNSET_GIT_ENV, 'git', 'rev-parse', '--path-format=absolute', '--git-common-dir', '--show-toplevel', '--show-prefix']
+
+type Probe = { kind: 'root'; root: Root } | { kind: 'none' } | { kind: 'unresolved' }
+
+// What git says of `dir`'s repository: the three lines are read untrimmed (the
+// prefix is empty at the root). Exit 129 (git before 2.31) and every other
+// failure leave the directory unresolved.
+async function probeRoot(fx: Fx, dir: string): Promise<Probe> {
+  const unresolved: Probe = { kind: 'unresolved' }
+  const init = { cwd: dir, env: { GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C' }, timeoutMs: GATE_TIMEOUT_MS }
+  const run = await within(fx, Promise.resolve(fx.process.run(ROOT_ARGV, init)).catch(() => undefined), GATE_TIMEOUT_MS)
+  if (run === TIMEOUT || !run) return unresolved
+  if (run.exitCode === 0) {
+    const text = String(run.stdout ?? '')
+    const lines = (text.endsWith('\n') ? text.slice(0, -1) : text).split('\n')
+    if (lines.length !== 3 || lines[0] === '') return unresolved
+    return { kind: 'root', root: { common: lines[0], toplevel: lines[1], prefix: lines[2] } }
+  }
+  if (run.exitCode === 129) return unresolved
+  return String(run.stderr ?? '').includes('not a git repository') ? { kind: 'none' } : unresolved
+}
+
+// The repository of a directory, asked once per directory per session cwd:
+// null when it is in no repository, undefined when git could not say (not cached).
+export function resolveRoot(fx: Fx, store: Store, dir: string): Promise<Root | null | undefined> {
+  const r = store.router
+  if (r.rootsCwd !== r.cwd) {
+    r.roots.clear()
+    r.rootsCwd = r.cwd
+  }
+  const known = r.roots.get(dir)
+  if (known) return known.promise
+  const forget = () => {
+    if (r.roots.get(dir) === entry) r.roots.delete(dir)
+  }
+  const entry: RootEntry = {
+    isNone: false,
+    promise: probeRoot(fx, dir).then(
+      probe => {
+        if (probe.kind === 'unresolved') {
+          forget()
+          return undefined
+        }
+        if (probe.kind === 'none') {
+          entry.isNone = true
+          fx.clock.after(NO_REPOSITORY_TTL_MS, forget)
+          return null
+        }
+        return probe.root
+      },
+      () => {
+        forget()
+        return undefined
+      },
+    ),
+  }
+  if (r.roots.size < ROOTS_MAX) r.roots.set(dir, entry)
+  return entry.promise
+}
+
+// An edit landed in `dir`: a "not a repository" answer is dropped (a `git init`
+// may have run since) and the directory is resolved in the background.
+function warmRoot(fx: Fx, store: Store, dir: string) {
+  const r = store.router
+  if (r.roots.get(dir)?.isNone) r.roots.delete(dir)
+  detach(resolveRoot(fx, store, dir))
+}
+
+// The sorted, unique hashes of `paths`, each scoped to its repository. A path
+// in no repository, or whose repository git could not name within one gate
+// timeout in total, is left out.
+export async function hashFiles(fx: Fx, store: Store, paths: string[]): Promise<string[]> {
+  const cwd = store.router.cwd
+  const located = paths.flatMap(path => {
+    const directory = directoryOf(path, cwd)
+    return directory ? [{ directory, name: path.slice(path.lastIndexOf('/') + 1) }] : []
+  })
+  const roots = new Map<string, Root>()
+  const asked = [...new Set(located.map(file => file.directory))].map(dir =>
+    resolveRoot(fx, store, dir).then(root => {
+      if (root) roots.set(dir, root)
+    }),
+  )
+  await within(fx, Promise.all(asked), GATE_TIMEOUT_MS)
+  const hashes = located.flatMap(file => {
+    const root = roots.get(file.directory)
+    return root ? [scopedFileHash(root.common, root.prefix + file.name)] : []
+  })
+  return [...new Set(hashes)].sort()
 }
 
 // The directory a path lies in, the session's cwd for a bare name.
@@ -683,13 +789,8 @@ async function gateEvidence(fx: Fx, store: Store, task: TaskState, now: number):
 async function readGateChecks(fx: Fx, store: Store, task: TaskState, now: number) {
   const cwd = store.router.cwd
   const directories = [...new Set(task.files.map(file => directoryOf(file, cwd)).filter((d): d is string => !!d))]
-  const toplevels = await Promise.all(
-    directories.map(async dir => {
-      const result = await fx.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd: dir, timeoutMs: GATE_TIMEOUT_MS }).catch(() => undefined)
-      return result?.exitCode === 0 ? String(result.stdout ?? '').trim() : ''
-    }),
-  )
-  const repositories = [...new Set(toplevels.filter(t => t !== ''))].slice(0, GATE_REPOSITORIES)
+  const roots = await Promise.all(directories.map(dir => resolveRoot(fx, store, dir)))
+  const repositories = [...new Set(roots.flatMap(root => (root ? [root.toplevel] : [])).filter(t => t !== ''))].slice(0, GATE_REPOSITORIES)
   const stamps = await Promise.all(
     repositories.map(async repository => {
       const result = await fx.process

@@ -6,6 +6,18 @@ import { nativeCalls, scriptedEngine, settle, zeroUsage, type Engine } from './s
 
 const ok = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 
+// What `git rev-parse --path-format=absolute --git-common-dir --show-toplevel
+// --show-prefix` answers in `cwd` when `repository` is a repository whose git
+// directory is `<repository>/.git`; "not a git repository" elsewhere.
+export function rootProbe(cwd: string | undefined, repository = '/repo', common = `${repository}/.git`) {
+  const inside = cwd === repository || (cwd !== undefined && cwd.startsWith(`${repository}/`))
+  if (!inside) return { ...ok, exitCode: 128, stderr: 'fatal: not a git repository (or any of the parent directories): .git\n' }
+  const prefix = cwd === repository ? '' : `${cwd.slice(repository.length + 1)}/`
+  return { ...ok, stdout: `${common}\n${repository}\n${prefix}\n` }
+}
+
+export const isRootProbe = (argv: string[]) => argv.includes('--show-toplevel') && argv.includes('--git-common-dir')
+
 // Micro-USD per million tokens; `cache_write` is the 1-hour rate.
 export const ROUTER_STATE = {
   schema: 1,
@@ -84,12 +96,13 @@ export async function routedSession(
   engine.observeExits = []
   const state: Record<string, unknown> = { ...ROUTER_STATE, ...(options.state ?? {}) }
   engine.state = state
-  engine.script.runResult = (argv: string[]) => {
+  engine.script.runResult = (argv: string[], _init: any) => {
     if (argv[1] === 'native' && argv[2] === 'router-state') return { ...ok, stdout: JSON.stringify(state) }
     if (argv[1] === 'native' && argv[2] === 'router-observe') {
       const code = engine.observeExits.length > 0 ? engine.observeExits.shift()! : 0
       return { ...ok, exitCode: code, stderr: code === 0 ? '' : `exit ${code}` }
     }
+    if (isRootProbe(argv)) return rootProbe(_init?.cwd)
     return ok
   }
   engine.script.complete = (e: any) => {
@@ -167,4 +180,17 @@ export const observed = (engine: Engine, kind?: string) =>
 export async function endSession($: any, engine: Engine, reason = 'other') {
   await $.session.end({ reason, sessionId: 'session-1', resume: { command: 'claude --resume session-1' } })
   await settle(engine)
+}
+
+// Git answers the root probe for the given repositories: each is a work tree
+// path and, optionally, its common dir (a worktree names its main checkout's).
+// Any other directory is in no repository.
+export function repositoriesAt(engine: Engine, repositories: { path: string; common?: string }[]) {
+  const base = engine.script.runResult
+  engine.script.runResult = (argv: string[], init: any) => {
+    if (!isRootProbe(argv)) return base(argv, init)
+    const cwd: string | undefined = init?.cwd
+    const found = repositories.find(r => cwd === r.path || (cwd !== undefined && cwd.startsWith(`${r.path}/`)))
+    return found ? rootProbe(cwd, found.path, found.common) : rootProbe(undefined)
+  }
 }
