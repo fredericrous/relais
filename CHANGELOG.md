@@ -29,9 +29,10 @@ missing here.
   `candidate_missing`.
 - `Ledger::router_correction_charges` now returns `CorrectionCharges`. Its
   `skipped_candidates` counts the candidate tasks whose end time or files do
-  not parse. A correction row whose time or files do not parse is now marked
-  `unparsed` instead of `legacy`, and `legacy` keeps only rows whose files
-  parse but are empty.
+  not parse. `CorrectionCharge`'s `charged` and `legacy` become one `read:
+  ChargeRead` field: `Charged(tasks)`, `Legacy` (files that parse but are
+  empty), or `Unparsed` (a time or files that do not parse, which used to read
+  as legacy).
 
 ## v0.80.0
 

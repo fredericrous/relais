@@ -101,9 +101,9 @@ From this programme's research tickets:
   24 h sharing a file is charged, and a B whose every correction is
   charged (and never flagged) counts with its `outcome_uncorrected`.
 - [The correction charge read rule's fallbacks are tested and visible](t14-charge-read-fallbacks.md):
-  an unreadable correction row reads `unparsed` (apart from `legacy`,
-  which now means files that parse but are empty), and candidates skipped
-  for damage are counted in `CorrectionCharges::skipped_candidates`.
+  a correction row reads as one `ChargeRead`: `Charged`, `Legacy` (files
+  that parse but are empty) or `Unparsed`. Candidates skipped for damage
+  are counted in `CorrectionCharges::skipped_candidates`.
 
 ## Handoff
 

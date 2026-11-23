@@ -799,7 +799,7 @@ impl Ledger {
     /// the row's files outside `stop`. `stop` is filtered here, not bound to
     /// SQL. A candidate whose end time or files do not parse is skipped and
     /// counted in [`CorrectionCharges::skipped_candidates`]; a correction row
-    /// whose time or files do not parse is kept `unparsed` with nothing
+    /// whose time or files do not parse is kept as [`ChargeRead::Unparsed`] with nothing
     /// charged, so its task stays `corrected`.
     // holds-until: ~10k main tasks in the ledger — every correction row scans every candidate; index by end time after
     pub fn router_correction_charges(&self, stop: &[String]) -> Result<CorrectionCharges> {
@@ -862,17 +862,16 @@ impl Ledger {
         for correction_row in correction_rows {
             let (session, task_id, at, files_json) = correction_row?;
             let parsed = parse_utc(&at).zip(files_from_json(&files_json, 3).ok());
-            let unparsed = parsed.is_none();
-            let legacy = parsed.as_ref().is_some_and(|(_, files)| files.is_empty());
-            let mut charged: Vec<TaskKey> = match &parsed {
-                None => Vec::new(),
+            let read = match &parsed {
+                None => ChargeRead::Unparsed,
+                Some((_, files)) if files.is_empty() => ChargeRead::Legacy,
                 Some((at_instant, files)) => {
                     let fixed: Vec<&String> = files
                         .iter()
                         .filter(|hash| !stop.contains(hash.as_str()))
                         .collect();
                     let window_start = *at_instant - Duration::hours(CORRECTION_LOOKBACK_HOURS);
-                    candidates
+                    let mut charged: Vec<TaskKey> = candidates
                         .iter()
                         .filter(|a| {
                             !(a.key.session == session && a.key.task_id == task_id)
@@ -881,10 +880,11 @@ impl Ledger {
                                 && fixed.iter().any(|hash| a.files.contains(*hash))
                         })
                         .map(|a| a.key.clone())
-                        .collect()
+                        .collect();
+                    charged.sort();
+                    ChargeRead::Charged(charged)
                 }
             };
-            charged.sort();
             let task = TaskKey {
                 session: session.clone(),
                 task_id: task_id.clone(),
@@ -894,9 +894,7 @@ impl Ledger {
                 session,
                 task_id,
                 at,
-                charged,
-                legacy,
-                unparsed,
+                read,
             });
         }
         Ok(CorrectionCharges {
@@ -1306,17 +1304,24 @@ pub struct CorrectionCharge {
     pub session: String,
     pub task_id: String,
     pub at: String,
-    /// The earlier tasks A whose files the correction fixes.
-    pub charged: Vec<TaskKey>,
+    /// What the row's time and files gave.
+    pub read: ChargeRead,
     /// Task B holds a main-session `flag` reassess row.
     pub flagged: bool,
-    /// The row's time and files parse and the files are empty (written
-    /// before the plugin sent them), so an empty `charged` means unknown, not
-    /// no overlap. Never true with `unparsed`.
-    pub legacy: bool,
-    /// The row's `at` or `files_json` does not parse: nothing is charged and
-    /// its task stays `corrected`. Never true with `legacy`.
-    pub unparsed: bool,
+}
+
+/// How one correction row read. Only `Charged` with a task in it charges
+/// the correction away; the other cases keep its task `corrected`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChargeRead {
+    /// The earlier tasks A whose files the correction fixes, sorted; empty
+    /// when none overlaps.
+    Charged(Vec<TaskKey>),
+    /// The time and files parse and the files are empty (written before the
+    /// plugin sent them): unknown, not no overlap.
+    Legacy,
+    /// The row's `at` or `files_json` does not parse: nothing is charged.
+    Unparsed,
 }
 
 /// What [`Ledger::router_correction_charges`] read.
@@ -1345,7 +1350,8 @@ pub fn corrections_charged_away(charges: &[CorrectionCharge]) -> BTreeSet<TaskKe
             task_id: charge.task_id.clone(),
         };
         let all_so_far = away.entry(task).or_insert(true);
-        *all_so_far = *all_so_far && !charge.charged.is_empty() && !charge.flagged;
+        let charged = matches!(&charge.read, ChargeRead::Charged(tasks) if !tasks.is_empty());
+        *all_so_far = *all_so_far && charged && !charge.flagged;
     }
     away.into_iter()
         .filter_map(|(task, charged_away)| charged_away.then_some(task))
@@ -2029,10 +2035,8 @@ mod tests {
                     session: "s1".into(),
                     task_id: "b".into(),
                     at: CORRECTION_AT.into(),
-                    charged: vec![key_of("other", "a")],
+                    read: ChargeRead::Charged(vec![key_of("other", "a")]),
                     flagged: false,
-                    legacy: false,
-                    unparsed: false,
                 }],
                 skipped_candidates: 0,
             }
@@ -2121,7 +2125,7 @@ mod tests {
             ],
             &[],
         );
-        assert!(charges[0].legacy && !charges[0].unparsed && charges[0].charged.is_empty());
+        assert_eq!(charges[0].read, ChargeRead::Legacy);
         assert!(away.is_empty());
     }
 
@@ -2183,7 +2187,7 @@ mod tests {
         assert_eq!(charges.len(), 2);
         assert!(charges
             .iter()
-            .any(|c| c.at == "soon" && c.unparsed && !c.legacy && c.charged.is_empty()));
+            .any(|c| c.at == "soon" && c.read == ChargeRead::Unparsed));
         assert!(away.is_empty());
     }
 
@@ -2222,10 +2226,12 @@ mod tests {
         assert_eq!(changed, 1);
         let charges = ledger.router_correction_charges(&[]).unwrap().charges;
         assert_eq!(charges.len(), 2);
-        assert!(!charges[0].unparsed && !charges[0].legacy);
-        assert_eq!(charges[0].charged, vec![key_of("other", "a")]);
+        assert_eq!(
+            charges[0].read,
+            ChargeRead::Charged(vec![key_of("other", "a")])
+        );
         assert_eq!(charges[1].at, later);
-        assert!(charges[1].unparsed && !charges[1].legacy && charges[1].charged.is_empty());
+        assert_eq!(charges[1].read, ChargeRead::Unparsed);
         assert!(!corrections_charged_away(&charges).contains(&key_of("s1", "b")));
     }
 
@@ -2240,6 +2246,7 @@ mod tests {
                 &[
                     ended_task("a1", ended, verified, &["x"], None),
                     ended_task("a2", ended, verified, &["x"], None),
+                    ended_task("a3", ended, verified, &["x"], None),
                 ],
             )
             .unwrap();
@@ -2254,11 +2261,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(changed, 1);
+        let changed = ledger
+            .conn
+            .execute(
+                "UPDATE router_tasks SET ended_at = 'soon' WHERE task_id = 'a3'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
         let read = ledger.router_correction_charges(&[]).unwrap();
-        assert_eq!(read.skipped_candidates, 1);
+        assert_eq!(read.skipped_candidates, 2);
         assert_eq!(read.charges.len(), 1);
-        assert_eq!(read.charges[0].charged, vec![key_of("other", "a2")]);
-        assert!(!read.charges[0].unparsed && !read.charges[0].legacy);
+        assert_eq!(
+            read.charges[0].read,
+            ChargeRead::Charged(vec![key_of("other", "a2")])
+        );
     }
 
     #[test]
