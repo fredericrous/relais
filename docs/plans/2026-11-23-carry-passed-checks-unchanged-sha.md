@@ -164,7 +164,7 @@ the failures they would see after a full run whose passes held.
 
 ## Phases
 
-- [ ] Phase 1 — receipt and ledger shape (all 25 `CheckOutcome` literals in `verify/mod.rs`, `verify/stamps.rs`, `verify/holdout_run.rs` updated; serde default + skip): `crates/relais/src/verify/mod.rs`
+- [x] Phase 1 — receipt and ledger shape (all 25 `CheckOutcome` literals in `verify/mod.rs`, `verify/stamps.rs`, `verify/holdout_run.rs` updated; serde default + skip): `crates/relais/src/verify/mod.rs`
   (`carried_from`, `CheckOutcome::carried(from)`, a carried receipt
   fixture beside the pinned `PRE_FIELD_RECEIPT_*`/`TIMED_RECEIPT_6`),
   `crates/relais/src/ledger/check_timings.rs` (`CheckTimingRow.carried_from`),
@@ -175,7 +175,7 @@ the failures they would see after a full run whose passes held.
   `(reused)`), `crates/relais/src/protocol.rs` (`CheckCarried`),
   `claude-plugin/hooks/timeline.ts` (a `check_carried` case beside
   `check_started`, building a non-running `Check` with `exit: 0` and a `carried` field, leaving `detail` and `wait` alone; an older pane skips the kind in its `default:` arm), `claude-plugin/hooks/pane.ts` (renders `carried from <attempt>`) and the `Check` type.
-- [ ] Phase 2 — the carry: `crates/relais/src/runner/spend.rs`
+- [x] Phase 2 — the carry: `crates/relais/src/runner/spend.rs`
   (`Progress.last_verified`: sha, phase, profile fingerprint, inputs list,
   outcomes), `crates/relais/src/runner/verification.rs` (the `reuse`
   argument becomes an enum `CheckReuse { None, Base(&[..]), Carry(..) }`;
@@ -184,12 +184,12 @@ the failures they would see after a full run whose passes held.
   `crates/relais/src/runner/attempt.rs` (decide the carry next to
   `unchanged`, store `last_verified` after the commands ran, emit
   `checks_carried` / `checks_not_carried`).
-- [ ] Phase 3 — tests: the timeline/pane test file under `claude-plugin/` (carried check not running, order, no-step no-op, unknown kind skipped), `crates/relais/src/runner/tests/mod.rs`
+- [x] Phase 3 — tests: the timeline/pane test file under `claude-plugin/` (carried check not running, order, no-step no-op, unknown kind skipped), `crates/relais/src/runner/tests/mod.rs`
   (scenarios below), `crates/relais/src/verify/mod.rs` (receipt round
   trips), `crates/relais/src/ledger/check_timings.rs` (column).
-- [ ] Phase 4 — docs and release: `docs/SPEC.md` (§10 verification, the
-  reuse paragraph by the baseline cache text), `CHANGELOG.md` (unreleased),
-  then a release through `tag-release`.
+- [x] Phase 4a — docs: `docs/SPEC.md` (§10 verification, the reuse
+  paragraph by the baseline cache text), `CHANGELOG.md` (unreleased).
+- [ ] Phase 4b — release through `tag-release`: `CHANGELOG.md`.
 
 ## Decision log
 
@@ -262,5 +262,32 @@ the failures they would see after a full run whose passes held.
   (6.2 min a run). It works if run minutes spent re-running passes on
   unchanged candidates fall to about half per pair (t27: 58.6 run-min,
   30.1 of them after the last failure).
+
+## Observed (2026-11-23, before the push)
+
+- Scenario tests, `runner/tests/carry.rs` (8, real `sh` commands in the
+  engine's fixture repository, each counting its runs in a file outside
+  the tree), `runner/carry.rs` (8 unit), `ledger/check_timings.rs`,
+  `ledger/schema` (v48 → v49), `protocol` (pinned `check_carried` line),
+  `verify` (old receipts byte-identical, carried round trip): every bullet
+  of the list above passed. `cargo test -p relais --lib runner::` after the
+  review fixes: 547 passed, 0 failed; the full workspace run before them:
+  2601 + 351 + 63 + 16 + 16 + 1 passed, 0 failed.
+- Plugin: `make plugin` 492 passed, 0 failed (carried check not running,
+  five carried rows in profile order, no label or no source dropped, no
+  step is a no-op, the output shown after a carry is the re-run check's).
+- Real-input check of the migration: a copy of the live v48 ledger
+  (2,836 `check_timings` rows) opened with the branch binary and
+  `RELAIS_STATE_DIR` on the copy: `carried_from` added, 0 non-NULL,
+  `integrity_check` ok, `relais report` ran. The live ledger was not opened.
+- Pilot: not run as a plugin-launched `relais run` on a scratch repository
+  (`relais run` is refused outside the plugin). The scenario fixture drives
+  the same engine path with real shell commands; the first
+  command failing once, the repair on the same sha, one command re-run, one
+  carried with `carried_from = "attempt1"`, accepted: passed.
+- `make lint` (fmt, clippy -D warnings, module and child cycles): exit 0.
+  `make check`'s msrv and audit steps ran in CI only; the three heavy
+  pre-commit gates were deferred to CI by the busy host.
+
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,lang:typescript,tui,unix body-sha=dfb5bd60c8ae -->
