@@ -1003,35 +1003,295 @@ export function repoRelative(file: string, cwd: string | undefined): string {
 // repo-relative path.
 export const fileHash = (file: string, cwd: string | undefined) => sha256Hex(repoRelative(file, cwd)).slice(0, 16)
 
-// The paths a Bash command reverts, or undefined when it reverts nothing:
-// `git revert …` (its files unknown here: []), `git checkout [<ref>] --
-// <paths>`, and `git restore <paths>` unless it only unstages.
-// holds-until: R2 computes missed failures. Until then a `git revert` (no
-// paths) and a pathspec like `.` are recorded but can never overlap a
-// task's files. R2 resolves them: the reverted commit's files via `git
-// show --name-only`, and `.` as every file the task touched.
-export function revertedPaths(command: string): string[] | undefined {
-  let found: string[] | undefined
-  for (const segment of command.split(/&&|\|\||;|\||\n/)) {
-    const argv = words(segment.trim())
-    while (argv.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[0])) argv.shift()
-    if (argv[0] !== 'git') continue
-    const sub = argv[1]
-    const rest = argv.slice(2)
-    let paths: string[] | undefined
-    if (sub === 'revert') paths = []
-    else if (sub === 'checkout') {
-      const dash = rest.indexOf('--')
-      if (dash >= 0) paths = rest.slice(dash + 1)
-    } else if (sub === 'restore') {
-      const dash = rest.indexOf('--')
-      const flags = dash >= 0 ? rest.slice(0, dash) : rest.filter(a => a.startsWith('-'))
-      const onlyStaged =
-        flags.some(f => f === '--staged' || f === '-S') && !flags.some(f => f === '--worktree' || f === '-W')
-      if (!onlyStaged) paths = dash >= 0 ? rest.slice(dash + 1) : rest.filter(a => !a.startsWith('-'))
-    }
-    if (paths !== undefined) found = [...(found ?? []), ...paths]
+// --- the paths a Bash command reverts (resolved the way task rows are hashed) ---
+
+type ShellItem = { kind: 'op'; op: '&&' | '||' | ';' | '|' | '(' | ')' } | { kind: 'words'; words: string[] }
+
+// A shell command as words and operators, split outside quotes only. Redirections
+// are dropped. Undefined when the command holds a heredoc or a lone `&`, whose
+// effect on the call's success this cannot read.
+function shellItems(command: string): ShellItem[] | undefined {
+  const items: ShellItem[] = []
+  let current: string[] = []
+  let word = ''
+  let inWord = false
+  let dropNextWord = false
+  const endWord = () => {
+    if (!inWord) return
+    if (dropNextWord) dropNextWord = false
+    else current.push(word)
+    word = ''
+    inWord = false
   }
+  const endSegment = () => {
+    endWord()
+    if (current.length > 0) items.push({ kind: 'words', words: current })
+    current = []
+  }
+  const operator = (op: Extract<ShellItem, { kind: 'op' }>['op']) => {
+    endSegment()
+    items.push({ kind: 'op', op })
+  }
+  const append = (text: string) => {
+    word += text
+    inWord = true
+  }
+  let at = 0
+  while (at < command.length) {
+    const c = command[at]
+    const next = command[at + 1]
+    if (c === "'") {
+      const end = command.indexOf("'", at + 1)
+      append(command.slice(at + 1, end < 0 ? command.length : end))
+      at = end < 0 ? command.length : end + 1
+    } else if (c === '"') {
+      inWord = true
+      at++
+      while (at < command.length && command[at] !== '"') {
+        if (command[at] === '\\' && at + 1 < command.length) {
+          append('"\\$`'.includes(command[at + 1]) ? command[at + 1] : command.slice(at, at + 2))
+          at += 2
+        } else append(command[at++])
+      }
+      at++
+    } else if (c === '\\') {
+      if (next === '\n') at += 2
+      else {
+        append(next ?? '')
+        at += 2
+      }
+    } else if (c === '$' && next === '(') {
+      let depth = 0
+      const from = at
+      while (at < command.length) {
+        if (command[at] === '(') depth++
+        else if (command[at] === ')' && --depth === 0) break
+        at++
+      }
+      append(command.slice(from, ++at))
+    } else if (c === '`') {
+      const end = command.indexOf('`', at + 1)
+      append(command.slice(at, end < 0 ? command.length : end + 1))
+      at = end < 0 ? command.length : end + 1
+    } else if (c === '#' && !inWord) {
+      while (at < command.length && command[at] !== '\n') at++
+    } else if (c === '<' || c === '>' || (c === '&' && next === '>')) {
+      if (c === '<' && next === '<') return undefined
+      if (inWord && /^\d+$/.test(word)) {
+        word = ''
+        inWord = false
+      }
+      endWord()
+      while (command[at] === '&' || command[at] === '<' || command[at] === '>') at++
+      if (command[at - 1] === '&' && command[at] !== undefined) {
+        while (/[0-9-]/.test(command[at] ?? '')) at++
+      } else dropNextWord = true
+    } else if (c === '&') {
+      if (next !== '&') return undefined
+      operator('&&')
+      at += 2
+    } else if (c === '|') {
+      if (next === '|') {
+        operator('||')
+        at += 2
+      } else {
+        operator('|')
+        at++
+      }
+    } else if (c === ';' || c === '\n') {
+      operator(';')
+      at++
+    } else if (c === '(' && !inWord) {
+      operator('(')
+      at++
+    } else if (c === ')') {
+      operator(')')
+      at++
+    } else if (c === ' ' || c === '\t') {
+      endWord()
+      at++
+    } else {
+      append(c)
+      at++
+    }
+  }
+  endSegment()
+  return items
+}
+
+// An absolute path with `.`, `..`, repeated and trailing `/` taken out.
+function normalizePath(absolute: string): string {
+  const parts: string[] = []
+  for (const part of absolute.split('/')) {
+    if (part === '' || part === '.') continue
+    if (part === '..') parts.pop()
+    else parts.push(part)
+  }
+  return '/' + parts.join('/')
+}
+
+// `directory`, the way up to the repository root and a file below it, as one absolute path.
+export const normalizeJoined = (directory: string, root: string, file: string) => normalizePath(`${directory}/${root}/${file}`)
+
+const UNKNOWN_PATH = /[$`]/
+
+// A directory named by `cd` or `git -C`, relative to `base`; undefined when it
+// cannot be known (no base, or a `$`, `~` or backtick in the name).
+function resolveDirectory(base: string | undefined, target: string): string | undefined {
+  if (/[$`~]/.test(target)) return undefined
+  if (target.startsWith('/')) return normalizePath(target)
+  return base === undefined ? undefined : normalizePath(`${base}/${target}`)
+}
+
+export type RevertLookup = { directory: string; commits: string[]; firstParent: boolean }
+export type RevertCommand = {
+  // Absolute paths, the form `fileHash` takes.
+  paths: string[]
+  // `git revert` commits whose files are read from git, off the hook's critical path.
+  lookups: RevertLookup[]
+}
+
+const REVERT_VALUE_OPTIONS = ['-m', '--mainline', '--strategy', '-X', '--strategy-option', '--cleanup']
+const GIT_GLOBAL_VALUE_OPTIONS = ['-c', '--config-env', '--namespace', '--super-prefix', '--exec-path']
+
+// The paths a git `checkout -- …` or `restore …` segment names, raw; undefined
+// when it reverts nothing (a branch switch, or `restore` that only unstages).
+function restoredPathspecs(sub: string, rest: string[]): string[] | undefined {
+  const dash = rest.indexOf('--')
+  if (sub === 'checkout') return dash >= 0 ? rest.slice(dash + 1) : undefined
+  const before = dash >= 0 ? rest.slice(0, dash) : rest
+  const operands: string[] = []
+  const flags: string[] = []
+  for (let i = 0; i < before.length; i++) {
+    const word = before[i]
+    if (!word.startsWith('-') || word === '-') operands.push(word)
+    else {
+      flags.push(word)
+      if (word === '-s' || word === '--source') i++
+    }
+  }
+  const onlyStaged = flags.some(f => f === '--staged' || f === '-S') && !flags.some(f => f === '--worktree' || f === '-W')
+  if (onlyStaged) return undefined
+  return dash >= 0 ? rest.slice(dash + 1) : operands
+}
+
+type TaskPath = { file: string; absolute: string }
+
+// Each raw pathspec made absolute against `directory` and, when it is (or
+// holds) a directory, expanded to the task's files beneath it.
+function resolvePathspecs(raw: string[], directory: string | undefined, taskPaths: TaskPath[]): string[] {
+  if (raw.some(spec => spec.startsWith(':'))) return []
+  const out: string[] = []
+  for (const spec of raw) {
+    if (UNKNOWN_PATH.test(spec) || spec.startsWith('~')) continue
+    const absolute = spec.startsWith('/') ? normalizePath(spec) : directory === undefined ? undefined : normalizePath(`${directory}/${spec}`)
+    if (absolute === undefined) continue
+    const prefix = absolute === '/' ? '/' : absolute + '/'
+    const beneath = taskPaths.filter(path => path.absolute.startsWith(prefix))
+    if (/(^|\/)\.\.?$/.test(spec) || spec.endsWith('/') || beneath.length > 0) out.push(...beneath.map(path => path.file))
+    else out.push(absolute)
+  }
+  return out
+}
+
+// What `git revert <args>` names, or undefined for `--abort`/`--quit`.
+function revertedCommits(args: string[]): { commits: string[]; firstParent: boolean; resolvable: boolean } | undefined {
+  if (args.includes('--abort') || args.includes('--quit')) return undefined
+  const noCommit = args.includes('-n') || args.includes('--no-commit')
+  let mainline: string | undefined
+  const commits: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    const word = args[i]
+    if (REVERT_VALUE_OPTIONS.includes(word)) {
+      if (word === '-m' || word === '--mainline') mainline = args[i + 1]
+      i++
+    } else if (word.startsWith('--mainline=')) mainline = word.slice('--mainline='.length)
+    else if (word.startsWith('-m') && /^-m\d+$/.test(word)) mainline = word.slice(2)
+    else if (word.startsWith('-')) continue
+    else if (UNKNOWN_PATH.test(word)) continue
+    else if (!noCommit && word !== 'HEAD' && word !== '@' && /(^|[^\w])(HEAD|@)/.test(word)) continue
+    else commits.push(word)
+  }
+  return { commits, firstParent: mainline === '1', resolvable: mainline === undefined || mainline === '1' }
+}
+
+// The paths a Bash command reverts, or undefined when it reverts nothing the
+// call's success shows: `git checkout [<ref>] -- <paths>`, `git restore
+// <paths>` (unless it only unstages) and `git revert <commits>`. Paths are
+// made absolute against the command's own directory (`cd`, a `( … )`
+// subshell, `git -C`), so `fileHash` gives what the task's edits give;
+// `.`, a directory or a trailing-slash path stands for the task's files
+// beneath it.
+export function revertedPaths(command: string, cwd: string | undefined, taskFiles: string[]): RevertCommand | undefined {
+  const items = shellItems(command)
+  if (!items) return undefined
+  const start = cwd === undefined ? undefined : normalizePath(cwd)
+  const taskPaths: TaskPath[] = []
+  for (const file of taskFiles) {
+    const absolute = file.startsWith('/') ? normalizePath(file) : start === undefined ? undefined : normalizePath(`${start}/${file}`)
+    if (absolute !== undefined) taskPaths.push({ file, absolute })
+  }
+  let directory = start
+  const saved: (string | undefined)[] = []
+  let found: RevertCommand | undefined
+  items.forEach((item, index) => {
+    if (item.kind === 'op') {
+      if (item.op === '(') saved.push(directory)
+      else if (item.op === ')' && saved.length > 0) directory = saved.pop()
+      return
+    }
+    const argv = [...item.words]
+    let hasGitEnvironment = false
+    while (argv.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[0])) {
+      if (/^GIT_(DIR|WORK_TREE)=/.test(argv[0])) hasGitEnvironment = true
+      argv.shift()
+    }
+    const before = items[index - 1]
+    const after = items[index + 1]
+    const inPipeline = (before?.kind === 'op' && before.op === '|') || (after?.kind === 'op' && after.op === '|')
+    if (argv[0] === 'cd') {
+      if (inPipeline) return
+      const target = argv.slice(1).find(word => !word.startsWith('-') || word === '-')
+      directory = target === undefined || target === '-' ? undefined : resolveDirectory(directory, target)
+      return
+    }
+    if (argv[0] !== 'git') return
+    let segmentDirectory = directory
+    let isUnresolved = hasGitEnvironment
+    let at = 1
+    while (at < argv.length && argv[at].startsWith('-')) {
+      const option = argv[at]
+      if (option === '-C') {
+        segmentDirectory = at + 1 < argv.length ? resolveDirectory(segmentDirectory, argv[at + 1]) : segmentDirectory
+        at += 2
+      } else if (option.startsWith('--git-dir') || option.startsWith('--work-tree')) {
+        isUnresolved = true
+        at += option.includes('=') ? 1 : 2
+      } else if (GIT_GLOBAL_VALUE_OPTIONS.includes(option)) at += 2
+      else at++
+    }
+    const sub = argv[at]
+    const rest = argv.slice(at + 1)
+    if (sub !== 'revert' && sub !== 'checkout' && sub !== 'restore') return
+    const isAttributed =
+      !(before?.kind === 'op' && (before.op === '||' || before.op === '|')) &&
+      items.slice(index + 1).every(later => later.kind === 'words' || later.op === '&&' || later.op === '(' || later.op === ')')
+    if (!isAttributed) return
+    const entry = found ?? { paths: [], lookups: [] }
+    if (sub === 'revert') {
+      const reverted = revertedCommits(rest)
+      if (!reverted) return
+      found = entry
+      if (reverted.commits.length > 0 && reverted.resolvable && segmentDirectory !== undefined && !isUnresolved) {
+        entry.lookups.push({ directory: segmentDirectory, commits: reverted.commits, firstParent: reverted.firstParent })
+      }
+      return
+    }
+    const pathspecs = restoredPathspecs(sub, rest)
+    if (!pathspecs) return
+    found = entry
+    if (!isUnresolved) entry.paths.push(...resolvePathspecs(pathspecs, segmentDirectory, taskPaths))
+  })
   return found
 }
 
@@ -1411,6 +1671,8 @@ export type RouterMemory = {
   status: string | undefined
   // The git-root name of `cwd` once asked, for the unmatched checks.
   repository: { cwd: string; name: string } | undefined
+  // Revert lookups (`git show`) not yet queued; each ends within the gate timeout.
+  reverts: Set<Promise<void>>
 }
 
 export const createRouterMemory = (): RouterMemory => ({
@@ -1432,6 +1694,7 @@ export const createRouterMemory = (): RouterMemory => ({
   queue: [],
   status: undefined,
   repository: undefined,
+  reverts: new Set(),
 })
 
 // The status line's routing part.

@@ -36,7 +36,9 @@ import {
   parseRouterState,
   reassessRecord,
   rerun,
+  normalizeJoined,
   revertedPaths,
+  type RevertLookup,
   revertRecord,
   routeStatus,
   spawnPrompt,
@@ -487,7 +489,7 @@ export function onToolResult(fx: Fx, store: Store, e: any, result: any, now: num
   const agentId: string | undefined = e.agentId
   const task = agentId ? r.subtasks[agentId] : r.task
   if (!task) return
-  noteRevert(store, state, task, e, result, now)
+  noteRevert(fx, store, state, task, e, result, now)
   const wrote = String(e.tool) === 'Bash' && typeof e.command === 'string' && mayWrite(e.command)
   const noted = wrote && !task.maybeWrote ? { ...task, maybeWrote: true } : task
   if (noted !== task) {
@@ -514,13 +516,57 @@ export function onToolResult(fx: Fx, store: Store, e: any, result: any, now: num
 
 // A Bash command that succeeded in reverting files (`git revert`, `git
 // checkout -- …`, `git restore …`): recorded against the task in progress,
-// with the files hashed, so R2 can match it to the task that edited them.
-function noteRevert(store: Store, state: RouterState, task: TaskState, e: any, result: any, now: number) {
+// with the files hashed as the task's own are, so R2 can match it to the task
+// that edited them. A `git revert`'s files come from git: the row is queued
+// when the lookup ends, with the task, state and session of this call.
+function noteRevert(fx: Fx, store: Store, state: RouterState, task: TaskState, e: any, result: any, now: number) {
   if (String(e.tool) !== 'Bash' || e.run_in_background === true) return
   if (!result || result.deny !== undefined || result.isError) return
-  const paths = revertedPaths(typeof e.command === 'string' ? e.command : '')
-  if (paths === undefined) return
-  queue(store, reassessRecord(task, revertRecord(state, task, paths, store.router.cwd), now))
+  const r = store.router
+  const reverted = revertedPaths(typeof e.command === 'string' ? e.command : '', r.cwd, task.files)
+  if (reverted === undefined) return
+  const session = r.session
+  const cwd = r.cwd
+  const queueRow = (paths: string[]) => {
+    if (session) r.queue.push({ session, record: reassessRecord(task, revertRecord(state, task, paths, cwd), now) })
+  }
+  if (reverted.lookups.length === 0) {
+    queueRow(reverted.paths)
+    return
+  }
+  const pending: Promise<void> = Promise.all(reverted.lookups.map(lookup => lookupRevertedFiles(fx, lookup))).then(found => {
+    queueRow([...reverted.paths, ...found.flat()])
+    r.reverts.delete(pending)
+  })
+  r.reverts.add(pending)
+}
+
+// The files `git revert` of these commits touches, absolute; none when git
+// fails or takes longer than the gate timeout.
+async function lookupRevertedFiles(fx: Fx, lookup: RevertLookup): Promise<string[]> {
+  const init = { cwd: lookup.directory, env: { GIT_TERMINAL_PROMPT: '0' }, timeoutMs: GATE_TIMEOUT_MS }
+  const read = async (): Promise<string[]> => {
+    const cdup = await fx.process.run(['git', '--no-pager', 'rev-parse', '--show-cdup'], init)
+    if (cdup?.exitCode !== 0) return []
+    const root = String(cdup.stdout ?? '').trim()
+    const argv = ['git', '--no-pager', 'show', '-z', '--name-only', '--no-renames', '--no-relative', '--format=']
+    if (lookup.firstParent) argv.push('--diff-merges=first-parent')
+    argv.push('--end-of-options', ...lookup.commits)
+    const shown = await fx.process.run(argv, init)
+    if (shown?.exitCode !== 0) return []
+    return String(shown.stdout ?? '')
+      .split('\0')
+      .filter(file => file !== '')
+      .map(file => normalizeJoined(lookup.directory, root, file))
+  }
+  const got = await within(fx, read().catch(() => []), GATE_TIMEOUT_MS)
+  return got === TIMEOUT ? [] : got
+}
+
+// Waits for the revert lookups still running, each of which ends within the
+// gate timeout, so their rows are queued before the task's own.
+async function settleReverts(store: Store) {
+  await Promise.all([...store.router.reverts])
 }
 
 // The pinned decision follows the task from the next request on.
@@ -578,6 +624,7 @@ async function queueCorrected(fx: Fx, store: Store, task: TaskState) {
 // failing open) and folded in as checks, the task is recorded, and each
 // subagent task it spawned is amended with its outcome.
 async function endTask(fx: Fx, store: Store, task: TaskState, now: number) {
+  await settleReverts(store)
   const gate = await gateEvidence(fx, store, task, now).catch(() => [])
   const ended: TaskState =
     gate.length === 0 ? task : { ...task, verifications: [...task.verifications, ...gate].slice(-20) }
@@ -665,6 +712,7 @@ export function onRunDone(store: Store, outcome: string) {
 // /clear or a resume the module goes on under another session: a new task.
 export async function onSessionEnd(fx: Fx, store: Store, reason: string, now: number) {
   const r = store.router
+  await settleReverts(store)
   // The subagents first, so the parent's outcome amends the ones still open.
   await Promise.all(Object.values(r.subtasks).map(task => endTask(fx, store, task, now)))
   if (r.task) await endTask(fx, store, r.task, now)
