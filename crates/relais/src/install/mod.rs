@@ -1048,6 +1048,14 @@ mod tests {
     }
 
     #[test]
+    fn the_router_reads_the_review_agent_as_pinned_to_opus() {
+        assert_eq!(
+            crate::router::pins::parse_definition("relais-review", &agent_review()),
+            Ok(Some(("relais-review".to_string(), "opus".to_string())))
+        );
+    }
+
+    #[test]
     fn a_pinned_review_agent_upgrades_to_the_inheriting_one() {
         let (root, dir) = temp_root();
         let agent = root.claude_dir.join("agents/relais-review.md");

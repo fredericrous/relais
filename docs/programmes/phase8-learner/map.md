@@ -60,6 +60,13 @@ Inherited from `docs/plans/2026-11-21-learning-loop-phase-8-entry.md`
 - D36: Phase 8's start condition met on the review-subagent strata;
   charted as this programme; ε stays 0.1. Watch item: `main question d1-2
   unknown` drawn corrected share (40% of 5 on 11-21).
+- D37 (person, 2026-11-23): an agent whose definition declares
+  `preferred-model:` is pinned by relais (`router/pins.rs`), so its spawns
+  are never routed and add no draws: the first-party reviewers leave the
+  review-subagent strata (other review-kind subagents still feed them).
+  Their usage is booked to the parent task, which is marked `maybeWrote`,
+  so a parent with reviews can label `unknown`. Plan
+  `docs/plans/2026-11-23-router-keeps-preferred-model.md`.
 
 From this programme's research tickets:
 
@@ -257,7 +264,9 @@ sessions rejoin the headline** (hitl).
 - Whether an activated stratum changes the exploration draw inside it
   (explore around the new tier, or freeze it), and whether ε moves.
 - How an adjustment on a subagent stratum interacts with the parent's
-  `model` preference and the person's pins (session-router plan §6).
+  `model` preference and the person's pins (session-router plan §6):
+  answered for agents declaring `preferred-model` by D37 (pinned, never
+  adjusted); open for a parent's `model` on other agents.
 - Whether the learner's evaluation runs at session start in `router-state`
   (latency budget) or only on demand and at `relais report`.
 

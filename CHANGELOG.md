@@ -52,6 +52,14 @@ missing here.
   ChargeRead` field: `Charged(tasks)`, `Legacy` (files that parse but are
   empty), or `Unparsed` (a time or files that do not parse, which used to read
   as legacy).
+- The session router treats an agent definition's `preferred-model:` as a
+  pin when the definition says `model: inherit` (or names no model): such a
+  spawn is never re-routed, so a reviewer launched with `model: "opus"` runs
+  on Opus, and a `model-fallback:` relaunch with no model runs on the
+  session's model. Its `router_decisions` row records the preferred model,
+  not necessarily the one that ran. Pinned spawns add no exploration draws
+  and count on the parent task. The pins load when a session's router state
+  is read: start, `/clear` or resume.
 
 ## v0.80.0
 

@@ -547,4 +547,25 @@ mod tests {
             vec![("good".to_string(), "opus".to_string())]
         );
     }
+
+    #[test]
+    fn a_preference_only_definition_is_served_as_a_pin() {
+        let dir = crate::test_support::temp_dir("router-pins-preferred");
+        let agents = dir.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("implementation-review.md"),
+            "---\nname: implementation-review\nmodel: inherit\npreferred-model: opus\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agents.join("general.md"),
+            "---\nname: general\nmodel: inherit\n---\n",
+        )
+        .unwrap();
+        assert_eq!(
+            definition_pins(&[agents]),
+            vec![("implementation-review".to_string(), "opus".to_string())]
+        );
+    }
 }
