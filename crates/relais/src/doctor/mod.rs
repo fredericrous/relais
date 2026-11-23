@@ -1469,6 +1469,12 @@ pub fn doctor(
     let mut effort_settings = EffortSettings::default();
     let mut max_effort = crate::policy::RoutingSettings::default().max_effort;
     let mut machine_workspace = crate::policy::WorkspaceMode::default();
+    if let Some(finding) = paths::machine_settings_path()
+        .ok()
+        .and_then(|path| shared_state_finding(&path))
+    {
+        findings.push(finding);
+    }
     match paths::machine_settings_path() {
         Err(e) => findings.push(Finding {
             component: "machine.toml",
@@ -1603,6 +1609,25 @@ pub(crate) struct LeftoverScan {
     /// `(run, worktree)`.
     pub runs: Vec<(String, PathBuf)>,
     pub unreadable: Vec<String>,
+}
+
+/// A failing finding when `machine.toml` selects an external shared-state
+/// layer this build does not have; `None` otherwise, so a single node's
+/// report is unchanged. The commands that read the machine settings refuse
+/// in that state, and this is where it is explained.
+pub(crate) fn shared_state_finding(machine_toml: &Path) -> Option<Finding> {
+    use crate::shared_state::{external_registered, selection_at, Selection, SharedStateError};
+    if selection_at(machine_toml) != Selection::External || external_registered() {
+        return None;
+    }
+    Some(Finding {
+        component: "shared_state",
+        level: Level::Fail,
+        detail: SharedStateError::ExternalAbsent {
+            machine_toml: machine_toml.to_path_buf(),
+        }
+        .to_string(),
+    })
 }
 
 pub(crate) fn workspace_finding(

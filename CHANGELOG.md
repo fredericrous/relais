@@ -21,6 +21,26 @@ missing here.
   verification, either a base reuse (`carried: false`) or a carry
   (`carried: true`): count base reuses as `cached && !carried`.
 
+- New public `relais::shared_state` module: a `SharedState` trait over the
+  operations several nodes would have to agree on (machine settings, daily
+  spend, seats, programme-ticket and successor-intent claims, decision
+  answers, the learned registry's pointer, schema announce, a publish sink),
+  with `LocalState`, today's single-node behaviour, as the default. The
+  machine settings read, the daily spend check, `relais programme claim`,
+  successor-intent claims and releases, decision answers with an intent and
+  `relais promote` now go through it; a single node sees no change. The
+  trait is unstable until a closed client consumes it. A `conformance` cargo
+  feature exports the suite such a client must pass. See
+  `docs/shared-state.md`.
+- `machine.toml` accepts a top-level `shared_state = "local"` (the default)
+  or `"external"`. `external` needs a relais build with a shared-state client;
+  this public build has none, so the commands that use the seam refuse with
+  exit 3 and `relais doctor` reports a failing `shared_state` finding. A relais
+  older than this release refuses a `machine.toml` that sets the key.
+- `relais promote` now refuses (`cas_conflict`) when another promotion moved
+  the active pointer between its read and its swap, instead of silently
+  overwriting it; the two take a lock beside the pointer files.
+
 ## v0.77.0
 
 - `relais report`'s session routing no longer blanks an arm's cost per

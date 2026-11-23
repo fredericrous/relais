@@ -2,6 +2,7 @@
 //! and the handles it opens.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use relais::backend::Harness;
 use relais::contract::TaskContract;
@@ -9,6 +10,7 @@ use relais::ids::{IdSource, RunId, TaskId};
 use relais::ledger::Ledger;
 use relais::orchestration::PriceTable;
 use relais::policy::{MachineSettings, RepoPolicy};
+use relais::shared_state::{SharedState, SharedStateError};
 use relais::{paths, route};
 
 use super::outcome::{operational, CliError, CliOutcome};
@@ -54,35 +56,36 @@ pub(crate) fn load_repo_policy() -> Result<(PathBuf, RepoPolicy), CliError> {
     Ok((root, policy))
 }
 
+/// The machine's settings, through the shared-state implementation
+/// `machine.toml` selects (`LocalState`: the file, read as it always was).
 pub(crate) fn load_machine() -> Result<MachineSettings, CliError> {
-    let path = paths::machine_settings_path().map_err(CliError::Home)?;
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        // Absent is empty: no ceilings, no grants. A fresh machine then
-        // reaches the trust check and is told `missing_trust_grant`,
-        // which names the way out, instead of failing on a read before
-        // any run exists (SPEC §5).
-        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
-            format!(
-                "schema_version = {}\n",
-                relais::policy::MACHINE_SCHEMA_VERSION
-            )
+    shared_state()?
+        .machine_settings()
+        .map_err(|e| shared_state_error("the machine settings", e))
+}
+
+/// The shared-state implementation the machine selects; refused when it
+/// names an external layer this build does not have.
+pub(crate) fn shared_state() -> Result<Arc<dyn SharedState>, CliError> {
+    relais::shared_state::current().map_err(|e| shared_state_error("shared state", e))
+}
+
+/// A shared-state failure as the CLI reports it. The local errors keep the
+/// variants they had before the trait existed, so the lines and exit codes
+/// a single node prints do not change.
+pub(crate) fn shared_state_error(what: &'static str, e: SharedStateError) -> CliError {
+    match e {
+        SharedStateError::ExternalAbsent { machine_toml } => {
+            CliError::SharedStateAbsent { machine_toml }
         }
-        // Unreadable is not absent: ceilings and grants the file states
-        // would silently not apply.
-        Err(cause) => {
-            return Err(CliError::Read {
-                what: "the machine settings",
-                path,
-                cause,
-            })
-        }
-    };
-    MachineSettings::from_toml_str(&text).map_err(|cause| CliError::Invalid {
-        what: "the machine settings",
-        path,
-        cause: Box::new(cause),
-    })
+        SharedStateError::Home(e) => CliError::Home(e),
+        SharedStateError::Read { path, cause } => CliError::Read { what, path, cause },
+        SharedStateError::Invalid { path, cause } => CliError::Invalid { what, path, cause },
+        other => CliError::Operational {
+            operation: what,
+            cause: Box::new(other),
+        },
+    }
 }
 
 /// The bounds a candidate recipe is admitted under: the incumbent's own,

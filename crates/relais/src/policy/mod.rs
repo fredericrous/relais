@@ -2264,8 +2264,79 @@ impl Default for RoutingSettings {
     }
 }
 
+/// Which implementation `machine.toml` selects with its top-level
+/// `shared_state` key. Absent means [`SharedStateSelection::Local`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SharedStateSelection {
+    /// Today's single-node behaviour: the shared-state module's `LocalState`.
+    #[default]
+    Local,
+    /// A closed shared-state client linked into a private build (an-t06).
+    External,
+}
+
+impl SharedStateSelection {
+    /// The value as `machine.toml` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SharedStateSelection::Local => "local",
+            SharedStateSelection::External => "external",
+        }
+    }
+
+    /// The value `machine.toml` gives, or a sentence saying why it is not
+    /// one of the two.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "local" => Ok(SharedStateSelection::Local),
+            "external" => Ok(SharedStateSelection::External),
+            other => Err(format!(
+                "shared_state = {other:?}: expected \"local\" or \"external\""
+            )),
+        }
+    }
+}
+
+/// `text` without its top-level `shared_state` key, once its value is
+/// known to be one the selector accepts; `None` when the key is not at the
+/// top level (a table may hold a key of that name, which stays and is
+/// judged by the strict parse).
+fn strip_shared_state(text: &str) -> Result<Option<String>, PolicyError> {
+    let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
+        // Not TOML: the strict parse names the error as it always did.
+        return Ok(None);
+    };
+    let Some(item) = doc.remove("shared_state") else {
+        return Ok(None);
+    };
+    let value = item.as_str().ok_or_else(|| {
+        PolicyError::MalformedToml(format!(
+            "shared_state = {}: expected \"local\" or \"external\"",
+            item.to_string().trim()
+        ))
+    })?;
+    SharedStateSelection::parse(value).map_err(PolicyError::MalformedToml)?;
+    Ok(Some(doc.to_string()))
+}
+
 impl MachineSettings {
     pub fn from_toml_str(text: &str) -> Result<Self, PolicyError> {
+        // `shared_state` selects the shared-state implementation before
+        // these settings are read (the shared-state module's `current`), so it
+        // is not one of them: checked here, then left out of the strict
+        // parse. A file without it parses exactly as before.
+        let without_selector;
+        let text = if text.contains("shared_state") {
+            match strip_shared_state(text)? {
+                Some(stripped) => {
+                    without_selector = stripped;
+                    without_selector.as_str()
+                }
+                None => text,
+            }
+        } else {
+            text
+        };
         let settings: MachineSettings =
             toml::from_str(text).map_err(|e| PolicyError::MalformedToml(e.to_string()))?;
         if settings.schema_version != MACHINE_SCHEMA_VERSION {
