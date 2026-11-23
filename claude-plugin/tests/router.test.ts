@@ -9,7 +9,6 @@ import {
   decisionRecord,
   evidenceOf,
   explorationDraw,
-  fileHash,
   gateChecks,
   matchesCheck,
   mayWrite,
@@ -24,6 +23,7 @@ import {
   revertedPaths,
   sha256Hex,
   tableTier,
+  scopedFileHash,
   taskRecord,
   type Class,
 } from '../hooks/router.ts'
@@ -212,7 +212,7 @@ test('lint, vet and test commands are passing checks, each with its kind; a fail
   for (const command of ['golangci-lint run ./...', 'go vet ./...', 'go test ./...']) {
     task = onEvidence(state, task, run(command, ok)!, '/repo').task
   }
-  expect(taskRecord(task, 1000, '/repo').checks).toEqual([
+  expect(taskRecord(task, 1000, []).checks).toEqual([
     { name: 'golangci-lint run ./...', kind: 'lint', passed: true },
     { name: 'go vet ./...', kind: 'lint', passed: true },
     { name: 'go test ./...', kind: 'test', passed: true },
@@ -258,17 +258,18 @@ test('mode_effective is router-state’s mode, and shadow without a state', () =
   expect(modeEffective(undefined)).toBe('shadow')
 })
 
-test('file hashes are the first 16 hex of the sha256 of the repo-relative path', () => {
+test('file hashes are the first 16 hex of the sha256 of the common dir, a NUL and the repo-relative path', () => {
   expect(sha256Hex('')).toBe('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
   expect(sha256Hex('abc')).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
   expect(sha256Hex('a'.repeat(1000)).length).toBe(64)
-  expect(fileHash('/repo/src/lib.rs', '/repo')).toBe('b1a35a68f14e6962')
-  expect(fileHash('./src/lib.rs', '/repo')).toBe('b1a35a68f14e6962')
+  // printf '/r/.git\0src/lib.rs' | shasum -a 256, cut to 16 characters
+  expect(scopedFileHash('/r/.git', 'src/lib.rs')).toBe('993d02558e57e026')
+  expect(scopedFileHash('/r/.git', 'src/lib.rs')).not.toBe(scopedFileHash('/q/.git', 'src/lib.rs'))
   const task = { ...newTask('t', null, 'x', asClass(), 'research', 0), files: ['/repo/src/lib.rs', 'src/lib.rs'] }
-  const record = taskRecord(task, 1000, '/repo')
-  expect(record.files).toEqual(['b1a35a68f14e6962'])
+  const record = taskRecord(task, 1000, ['b', 'a', 'b'])
+  expect(record.files).toEqual(['a', 'b'])
   expect(record.completed_at_end).toBe('unknown')
-  expect(taskRecord(task, null, '/repo').completed_at_end).toBe(null)
+  expect(taskRecord(task, null, []).completed_at_end).toBe(null)
 })
 
 const reverted = (command: string, cwd = '/w', taskFiles: string[] = []) => revertedPaths(command, cwd, taskFiles)
@@ -288,12 +289,11 @@ test('reverts: checkout -- paths and restore are found; a branch switch or unsta
   expect(pathsOf('git restore /abs/x')).toEqual(['/abs/x'])
 })
 
-test('reverts: the hash of a resolved path is the hash of the edit of that file (the t02 case)', () => {
+test('reverts: a restored path resolves to the absolute path of the edit (the t02 case)', () => {
   const edited = '/Users/p/Developer/Perso/relais-wt-replay-floors/docs/plans/x.md'
   const cwd = '/Users/p/Developer/Perso'
   const paths = pathsOf('cd /Users/p/Developer/Perso/relais-wt-replay-floors && git restore docs/plans/x.md', cwd)
   expect(paths).toEqual([edited])
-  expect(fileHash(paths![0], cwd)).toBe(fileHash(edited, cwd))
   expect(pathsOf('cd /Users/p/Developer/Perso/relais-wt-replay-floors && git restore $P', cwd)).toEqual([])
 })
 

@@ -3,19 +3,21 @@
 
 import { expect, test } from 'claude-code/testing'
 import { nativeCalls, settle, spawnLine, startQueued } from './support.ts'
-import { CLASSIFIER_SYSTEM, createRouterMemory, fileHash, newTask, outcomeOf, sha256Hex, unmatchedChecksOf, withUnmatchedChecks } from '../hooks/router.ts'
-import { noteRelaisLaunch } from '../hooks/routing.ts'
+import { CLASSIFIER_SYSTEM, createRouterMemory, newTask, outcomeOf, scopedFileHash, sha256Hex, unmatchedChecksOf, withUnmatchedChecks } from '../hooks/router.ts'
+import { hashFiles, noteRelaisLaunch, resolveRoot } from '../hooks/routing.ts'
 import {
   answered,
   bash,
   edit,
   endSession,
   failingCheck,
+  isRootProbe,
   label,
   nextStep,
   observed,
   passingCheck,
   personTurn,
+  repositoriesAt,
   routedSession,
   step,
   toolCall,
@@ -486,6 +488,8 @@ test('the model’s Bash calls of router-envelope and relais install --claude ar
   expect(await refused('Write', { file_path: '/Users/p/.claude/plugins/store/relais_x.json', content: '{}' })).not.toBe('deny')
 })
 
+const LIB_HASH = scopedFileHash('/repo/.git', 'src/lib.rs')
+
 test('a revert is recorded with the hashed files, and the task carries its files hashed', async ($: any, on: any) => {
   const engine = await routedSession($, on)
   await personTurn($, engine, 'rename foo to bar, tests exist')
@@ -495,30 +499,32 @@ test('a revert is recorded with the hashed files, and the task carries its files
   await endSession($, engine)
   const reverts = observed(engine, 'reassess').filter((r: any) => r.event === 'revert')
   expect(reverts.length).toBe(1)
-  expect(reverts[0].files).toEqual(['b1a35a68f14e6962'])
+  expect(reverts[0].files).toEqual([LIB_HASH])
   expect(reverts[0].escalating).toBe(false)
   const [task] = observed(engine, 'task')
-  expect(task.files).toEqual(['b1a35a68f14e6962'])
+  expect(task.files).toEqual([LIB_HASH])
   expect(task.completed_at_end).toBe(task.outcome)
 })
 
-// `git revert` through a fake git: `--show-cdup` answers `cdup`, `show` answers `files`
+const UNSET = ['env', '-u', 'GIT_DIR', '-u', 'GIT_WORK_TREE', '-u', 'GIT_COMMON_DIR']
+
+// `git revert` through a fake git: `--git-common-dir` answers `common`, `show` answers `files`
 // (NUL-separated), or both fail. Returns the git calls made.
-function gitWithRevertedFiles(engine: any, cdup: string, files: string[] | undefined) {
+function gitWithRevertedFiles(engine: any, common: string, files: string[] | undefined) {
   const base = engine.script.runResult
   const calls: { argv: string[]; init: any }[] = []
   engine.script.runResult = (argv: string[], init: any) => {
-    if (argv[0] !== 'git') return base(argv, init)
+    if (!argv.includes('--no-pager')) return base(argv, init)
     calls.push({ argv, init })
     if (files === undefined) return { ...succeeded, exitCode: 128, stdout: '', stderr: 'fatal' }
-    if (argv.includes('--show-cdup')) return { ...succeeded, stdout: `${cdup}\n` }
+    if (argv.includes('--git-common-dir')) return { ...succeeded, stdout: `${common}\n` }
     if (argv.includes('show')) return { ...succeeded, stdout: files.map(file => `${file}\0`).join('') }
     return base(argv, init)
   }
   return calls
 }
 
-const hashes = (files: string[]) => files.map(file => fileHash(file, '/repo')).sort()
+const hashes = (files: string[]) => files.map(file => scopedFileHash('/repo/.git', file.replace('/repo/', ''))).sort()
 const revertRows = (engine: any) => observed(engine, 'reassess').filter((r: any) => r.event === 'revert')
 
 async function taskEditing($: any, on: any) {
@@ -541,25 +547,25 @@ test('a revert resolves paths against the command directory, to the hash the edi
 
 test('git revert reads the commit files in the command directory, off the hook, and records them', async ($: any, on: any) => {
   const engine = await taskEditing($, on)
-  const calls = gitWithRevertedFiles(engine, '../', ['src/lib.rs', 'docs/a.md'])
+  const calls = gitWithRevertedFiles(engine, '/repo/.git', ['src/lib.rs', 'docs/a.md'])
   await toolCall($, engine, bash('cd /repo/sub && git revert --no-edit abc123'), { result: {}, text: '' })
   await settle(engine)
   expect(calls.map(c => c.argv)).toEqual([
-    ['git', '--no-pager', 'rev-parse', '--show-cdup'],
-    ['git', '--no-pager', 'show', '-z', '--name-only', '--no-renames', '--no-relative', '--format=', '--end-of-options', 'abc123'],
+    [...UNSET, 'git', '--no-pager', 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+    [...UNSET, 'git', '--no-pager', 'show', '-z', '--name-only', '--no-renames', '--no-relative', '--format=', '--end-of-options', 'abc123'],
   ])
-  for (const call of calls) expect(call.init).toEqual({ cwd: '/repo/sub', env: { GIT_TERMINAL_PROMPT: '0' }, timeoutMs: 1000 })
+  for (const call of calls) expect(call.init).toEqual({ cwd: '/repo/sub', env: { GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C' }, timeoutMs: 1000 })
   await endSession($, engine)
   expect(revertRows(engine).map((r: any) => r.files)).toEqual([hashes(['/repo/src/lib.rs', '/repo/docs/a.md'])])
 })
 
 test('git revert -m 1 reads the first-parent diff; another mainline and a HEAD~1 read nothing', async ($: any, on: any) => {
   const engine = await taskEditing($, on)
-  const calls = gitWithRevertedFiles(engine, '', ['src/lib.rs'])
+  const calls = gitWithRevertedFiles(engine, '/repo/.git', ['src/lib.rs'])
   await toolCall($, engine, bash('git revert -m 1 abc'), { result: {}, text: '' })
   await settle(engine)
   expect(calls[1].argv).toContain('--diff-merges=first-parent')
-  const lookups = () => calls.filter(c => c.argv.includes('show') || c.argv.includes('--show-cdup')).length
+  const lookups = () => calls.filter(c => c.argv.includes('show') || c.argv.includes('--git-common-dir')).length
   const before = lookups()
   await toolCall($, engine, bash('git revert -m 2 abc'), { result: {}, text: '' })
   await toolCall($, engine, bash('git revert HEAD~1'), { result: {}, text: '' })
@@ -571,7 +577,7 @@ test('git revert -m 1 reads the first-parent diff; another mainline and a HEAD~1
 
 test('a failing git still queues the revert row, with no files', async ($: any, on: any) => {
   const engine = await taskEditing($, on)
-  gitWithRevertedFiles(engine, '', undefined)
+  gitWithRevertedFiles(engine, '/repo/.git', undefined)
   await toolCall($, engine, bash('git revert abc'), { result: {}, text: '' })
   await endSession($, engine)
   expect(revertRows(engine).map((r: any) => r.files)).toEqual([[]])
@@ -579,7 +585,7 @@ test('a failing git still queues the revert row, with no files', async ($: any, 
 
 test('a lookup that resolves after the session end starts is in the final batch, under its session', async ($: any, on: any) => {
   const engine = await taskEditing($, on)
-  gitWithRevertedFiles(engine, '', ['src/lib.rs'])
+  gitWithRevertedFiles(engine, '/repo/.git', ['src/lib.rs'])
   let release: () => void = () => {}
   engine.script.runGate = (argv: string[]) => (argv.includes('show') ? new Promise<void>(resolve => (release = resolve)) : undefined)
   await toolCall($, engine, bash('git revert abc'), { result: {}, text: '' })
@@ -597,7 +603,7 @@ test('a lookup that resolves after the session end starts is in the final batch,
 
 test('a lookup that never resolves delays the session end by the gate timeout at most, and queues no files', async ($: any, on: any) => {
   const engine = await taskEditing($, on)
-  gitWithRevertedFiles(engine, '', ['src/lib.rs'])
+  gitWithRevertedFiles(engine, '/repo/.git', ['src/lib.rs'])
   engine.script.runGate = (argv: string[]) => (argv.includes('show') ? new Promise<void>(() => {}) : undefined)
   await toolCall($, engine, bash('git revert abc'), { result: {}, text: '' })
   await settle(engine)
@@ -618,7 +624,7 @@ test('a lookup whose spawn throws queues the row with no files, and the session 
   const engine = await taskEditing($, on)
   const base = engine.script.runResult
   engine.script.runResult = (argv: string[], init: any) => {
-    if (argv[0] === 'git' && argv.includes('show')) throw new Error('spawn refused')
+    if (argv.includes('--no-pager') && argv.includes('show')) throw new Error('spawn refused')
     return base(argv, init)
   }
   await toolCall($, engine, bash('git revert abc'), { result: {}, text: '' })
@@ -1071,4 +1077,218 @@ test('a router-state whose accepts lacks answered receives none of the parent or
     expect('parent_link_recorded' in record).toBe(false)
     expect('unmatched_checks' in record).toBe(false)
   }
+})
+
+// File hashes scoped to one repository.
+
+const ROOT_ARGV = [
+  'env', '-u', 'GIT_DIR', '-u', 'GIT_WORK_TREE', '-u', 'GIT_COMMON_DIR',
+  'git', 'rev-parse', '--path-format=absolute', '--git-common-dir', '--show-toplevel', '--show-prefix',
+]
+const NOT_A_REPOSITORY = { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository (or any of the parent directories): .git\n' }
+const stdoutOf = (stdout: string) => ({ exitCode: 0, stdout, stderr: '' })
+
+// The effects `resolveRoot` and `hashFiles` take, with a clock the test moves.
+function fakeFx(answer: (argv: string[], init: any) => unknown) {
+  const timers: { at: number; callback: () => void; live: boolean }[] = []
+  let now = 0
+  const calls: { argv: string[]; init: any }[] = []
+  const fx: any = {
+    process: {
+      run: async (argv: string[], init: any) => {
+        calls.push({ argv, init })
+        return answer(argv, init)
+      },
+    },
+    clock: {
+      now: async () => now,
+      after: (ms: number, callback: () => void) => {
+        const timer = { at: now + ms, callback, live: true }
+        timers.push(timer)
+        return { cancel: () => (timer.live = false) }
+      },
+    },
+  }
+  const flush = () => new Promise<void>(resolve => setTimeout(resolve, 0))
+  const advance = async (ms: number) => {
+    now += ms
+    for (const timer of timers) {
+      if (timer.live && timer.at <= now) {
+        timer.live = false
+        timer.callback()
+      }
+    }
+    await flush()
+  }
+  const store: any = { router: createRouterMemory() }
+  store.router.cwd = '/repo'
+  return { fx, store, calls, advance, flush }
+}
+
+test('resolveRoot asks git once, with the scrubbed environment, and reads the prefix untrimmed', async () => {
+  const world = fakeFx(() => stdoutOf('/r/.git\n/r\nsrc/\n'))
+  const [first, second] = await Promise.all([resolveRoot(world.fx, world.store, '/r/src'), resolveRoot(world.fx, world.store, '/r/src')])
+  expect(first).toEqual({ kind: 'root', root: { common: '/r/.git', toplevel: '/r', prefix: 'src/' } })
+  expect(second).toBe(first)
+  expect(world.calls.length).toBe(1)
+  expect(world.calls[0].argv).toEqual(ROOT_ARGV)
+  expect(world.calls[0].init).toEqual({ cwd: '/r/src', env: { GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C' }, timeoutMs: 1000 })
+  expect(await resolveRoot(world.fx, world.store, '/r/src')).toBe(first)
+  expect(world.calls.length).toBe(1)
+})
+
+test('resolveRoot at the repository root has an empty prefix', async () => {
+  const world = fakeFx(() => stdoutOf('/r/.git\n/r\n\n'))
+  expect(await resolveRoot(world.fx, world.store, '/r')).toEqual({ kind: 'root', root: { common: '/r/.git', toplevel: '/r', prefix: '' } })
+})
+
+test('"not a git repository" is cached as null for 60 s, then asked again', async () => {
+  const world = fakeFx(() => NOT_A_REPOSITORY)
+  expect(await resolveRoot(world.fx, world.store, '/n')).toEqual({ kind: 'none' })
+  expect(await resolveRoot(world.fx, world.store, '/n')).toEqual({ kind: 'none' })
+  expect(world.calls.length).toBe(1)
+  await world.advance(59_000)
+  expect(await resolveRoot(world.fx, world.store, '/n')).toEqual({ kind: 'none' })
+  expect(world.calls.length).toBe(1)
+  await world.advance(1000)
+  expect(await resolveRoot(world.fx, world.store, '/n')).toEqual({ kind: 'none' })
+  expect(world.calls.length).toBe(2)
+})
+
+test('any other answer is unresolved and not cached: another exit, 129, a wrong shape, a throw, a timeout', async () => {
+  const answers: unknown[] = [
+    { exitCode: 128, stdout: '', stderr: 'fatal: detected dubious ownership in repository' },
+    { exitCode: 128, stdout: '', stderr: "fatal: cannot change to '/gone': No such file or directory" },
+    { exitCode: 129, stdout: '', stderr: "error: unknown option `path-format=absolute'\nnot a git repository" },
+    stdoutOf('/r/.git\n/r\n'),
+    stdoutOf('/r/.git\n/r\nsrc/\nextra\n'),
+    stdoutOf(''),
+  ]
+  for (const answer of answers) {
+    const world = fakeFx(() => answer)
+    expect(await resolveRoot(world.fx, world.store, '/d')).toEqual({ kind: 'unresolved' })
+    expect(await resolveRoot(world.fx, world.store, '/d')).toEqual({ kind: 'unresolved' })
+    expect(world.calls.length).toBe(2)
+  }
+  const throwing = fakeFx(() => {
+    throw new Error('spawn refused')
+  })
+  expect(await resolveRoot(throwing.fx, throwing.store, '/d')).toEqual({ kind: 'unresolved' })
+  expect(await resolveRoot(throwing.fx, throwing.store, '/d')).toEqual({ kind: 'unresolved' })
+  expect(throwing.calls.length).toBe(2)
+  const hanging = fakeFx(() => new Promise(() => {}))
+  const first = resolveRoot(hanging.fx, hanging.store, '/d')
+  await hanging.flush()
+  await hanging.advance(1000)
+  expect(await first).toEqual({ kind: 'unresolved' })
+  const second = resolveRoot(hanging.fx, hanging.store, '/d')
+  await hanging.flush()
+  await hanging.advance(1000)
+  expect(await second).toEqual({ kind: 'unresolved' })
+  expect(hanging.calls.length).toBe(2)
+})
+
+test('the root cache holds 512 directories and is cleared when the session cwd changes', async () => {
+  const world = fakeFx(() => stdoutOf('/r/.git\n/r\n\n'))
+  for (let index = 0; index < 513; index++) await resolveRoot(world.fx, world.store, `/r/d${index}`)
+  expect(world.store.router.roots.size).toBe(512)
+  await resolveRoot(world.fx, world.store, '/r/d0')
+  expect(world.calls.length).toBe(513)
+  await resolveRoot(world.fx, world.store, '/r/d512')
+  expect(world.calls.length).toBe(514)
+  world.store.router.cwd = '/elsewhere'
+  await resolveRoot(world.fx, world.store, '/r/d0')
+  expect(world.calls.length).toBe(515)
+  expect(world.store.router.roots.size).toBe(1)
+})
+
+test('hashFiles: a path in no repository gives no hash; the same path under two common dirs gives two', async () => {
+  const world = fakeFx((_argv, init) => {
+    if (init.cwd.startsWith('/a/')) return stdoutOf(`/a/.git\n/a\n${init.cwd.slice(3)}/\n`)
+    if (init.cwd.startsWith('/b/')) return stdoutOf(`/b/.git\n/b\n${init.cwd.slice(3)}/\n`)
+    return NOT_A_REPOSITORY
+  })
+  const within = await hashFiles(world.fx, world.store, ['/a/src/lib.rs', '/home/p/.claude/memory/a.md'])
+  expect(within).toEqual([scopedFileHash('/a/.git', 'src/lib.rs')])
+  const both = await hashFiles(world.fx, world.store, ['/b/src/lib.rs', '/a/src/lib.rs', '/a/src/lib.rs'])
+  expect(both.length).toBe(2)
+  expect(both).toEqual([scopedFileHash('/a/.git', 'src/lib.rs'), scopedFileHash('/b/.git', 'src/lib.rs')].sort())
+  expect(await hashFiles(world.fx, world.store, ['/nowhere/x.md'])).toEqual([])
+})
+
+test('hashFiles: a worktree and its main checkout sharing a common dir hash one file once', async () => {
+  const world = fakeFx((_argv, init) => {
+    const prefix = init.cwd.replace(/^\/(main|wt)/, '').replace(/^\//, '')
+    return stdoutOf(`/main/.git\n${init.cwd.startsWith('/wt') ? '/wt' : '/main'}\n${prefix === '' ? '' : `${prefix}/`}\n`)
+  })
+  expect(await hashFiles(world.fx, world.store, ['/main/src/lib.rs', '/wt/src/lib.rs'])).toEqual([scopedFileHash('/main/.git', 'src/lib.rs')])
+})
+
+test('hashFiles: a timeout returns the hashes of the directories that answered', async () => {
+  const world = fakeFx((_argv, init) => (init.cwd === '/a/src' ? stdoutOf('/a/.git\n/a\nsrc/\n') : new Promise(() => {})))
+  const pending = hashFiles(world.fx, world.store, ['/a/src/lib.rs', '/slow/x.rs'])
+  await world.flush()
+  await world.advance(1000)
+  expect(await pending).toEqual([scopedFileHash('/a/.git', 'src/lib.rs')])
+})
+
+test('an edit outside any repository gives no hash on the task; one inside and one outside give exactly one', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  await toolCall($, engine, edit('/repo/src/lib.rs'), { result: 'ok', text: 'ok' })
+  await toolCall($, engine, edit('/Users/p/.claude/memory/a.md'), { result: 'ok', text: 'ok' })
+  await endSession($, engine)
+  const [task] = observed(engine, 'task')
+  expect(task.files).toEqual([LIB_HASH])
+  const probes = engine.calls.run.filter(c => isRootProbe(c.argv))
+  expect(probes.map(c => c.argv)).toEqual([ROOT_ARGV, ROOT_ARGV])
+  expect(probes.map(c => c.init.cwd)).toEqual(['/repo/src', '/Users/p/.claude/memory'])
+})
+
+test('the same relative path in two repositories hashes twice; a worktree shares its main checkout’s hash', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  repositoriesAt(engine, [{ path: '/repo' }, { path: '/other' }, { path: '/repo-wt-x', common: '/repo/.git' }])
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  await toolCall($, engine, edit('/repo/src/lib.rs'), { result: 'ok', text: 'ok' })
+  await toolCall($, engine, edit('/other/src/lib.rs'), { result: 'ok', text: 'ok' })
+  await toolCall($, engine, edit('/repo-wt-x/src/lib.rs'), { result: 'ok', text: 'ok' })
+  await endSession($, engine)
+  const [task] = observed(engine, 'task')
+  expect(task.files).toEqual([LIB_HASH, scopedFileHash('/other/.git', 'src/lib.rs')].sort())
+})
+
+test('a not-a-repository answer is dropped when a later edit lands in that directory', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  await toolCall($, engine, edit('/fresh/a.rs'), { result: 'ok', text: 'ok' })
+  await settle(engine)
+  repositoriesAt(engine, [{ path: '/fresh' }])
+  await toolCall($, engine, edit('/fresh/b.rs'), { result: 'ok', text: 'ok' })
+  await endSession($, engine)
+  const [task] = observed(engine, 'task')
+  expect(task.files).toEqual([scopedFileHash('/fresh/.git', 'a.rs'), scopedFileHash('/fresh/.git', 'b.rs')].sort())
+})
+
+test('a revert with paths only is queued before its task row, inside the final batch', async ($: any, on: any) => {
+  const engine = await taskEditing($, on)
+  await toolCall($, engine, bash('git restore src/lib.rs'), { result: {}, text: '' })
+  await endSession($, engine)
+  const batches = nativeCalls(engine.calls, 'router-observe')
+  const last = batches[batches.length - 1].payload.records
+  const revertAt = last.findIndex((r: any) => r.event === 'revert')
+  const taskAt = last.findIndex((r: any) => r.kind === 'task')
+  expect(revertAt).toBeGreaterThanOrEqual(0)
+  expect(revertAt).toBeLessThan(taskAt)
+  expect(last[revertAt].files).toEqual([LIB_HASH])
+  expect(last[taskAt].files).toEqual([LIB_HASH])
+})
+
+test('a git revert lookup hashes from the common dir and resolves no directory by the file’s name', async ($: any, on: any) => {
+  const engine = await taskEditing($, on)
+  gitWithRevertedFiles(engine, '/repo/.git', ['removed-dir/gone.rs', 'src/lib.rs'])
+  await toolCall($, engine, bash('cd /repo/sub && git revert abc'), { result: {}, text: '' })
+  await endSession($, engine)
+  expect(revertRows(engine).map((r: any) => r.files)).toEqual([hashes(['/repo/removed-dir/gone.rs', '/repo/src/lib.rs'])])
+  const probed = engine.calls.run.filter(c => isRootProbe(c.argv)).map(c => c.init.cwd)
+  expect(probed).toEqual(['/repo/src'])
 })
