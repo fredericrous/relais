@@ -1071,7 +1071,7 @@ mod tests {
             after.contains("model: inherit\npreferred-model: opus"),
             "{after}"
         );
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // temp-dir cleanup: a leftover dir only costs disk
     }
 
     fn temp_root() -> (InstallRoot, crate::test_support::TempDir) {
