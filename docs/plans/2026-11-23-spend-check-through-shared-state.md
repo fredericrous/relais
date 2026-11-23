@@ -80,38 +80,40 @@ count the global daily cap and answer the decision once across nodes.
   once; the local transaction follows; one release on a local refusal. A
   refusal ("being answered elsewhere") leaves the decision to that
   answerer, any error leaves it open for a person; both with a `step` line
-  like today's `Err` branch, and a refusal's line adds that the other
-  node's answer stands, so no action is needed here. `LocalState` never
-  refuses, so its output is unchanged.
+  like today's `Err` branch. `LocalState` never refuses, so its output is unchanged.
 - No new output under `LocalState`.
 
 ## Phases
 
-- [ ] Phase 1 — field, routing and tests: `crates/relais/src/runner/config.rs`,
+- [x] Phase 1 — field, routing and tests: `crates/relais/src/runner/config.rs`,
   `crates/relais/src/runner/review/engine.rs`,
   `crates/relais/src/runner/engine.rs`,
   `crates/relais/src/runner/scheduler.rs`,
   `crates/relais/src/shared_state/node.rs`,
+  `crates/relais/src/shared_state/fake.rs` (a `set_spent` test knob),
   `crates/relais/src/cli/run.rs`, `crates/relais/src/cli/replay.rs`; the
   test `RunConfig` literals in `crates/relais/src/runner/tests/mod.rs`,
   `crates/relais/src/runner/tests/exhaustion.rs`,
   `crates/relais/src/runner/tests/verify_kind.rs`,
   `crates/relais/src/runner/tests/budgets.rs` (the compiler finds any
   missed site); new tests below
-- [ ] Phase 2 — docs: `docs/shared-state.md`, `CHANGELOG.md`
+- [x] Phase 2 — docs: `docs/shared-state.md`, `CHANGELOG.md`
 
 ## Verification
 
-| Test or check | Input | Expected |
+Observed 2026-11-23 on the Mac (`cargo test -p relais --features conformance`).
+
+| Test or check | Input | Result |
 | --- | --- | --- |
-| fake counter `per_day + 1`, empty ledger | one attempt | per-day limit, none dispatched (attempt loop and review check, one test each) |
-| fake counter 0, ledger above `per_day` | one attempt | per-day limit |
-| ledger failure under `LocalState` | spend read fails | `RunError::Ledger` as before |
-| fake `answer_decision` answered elsewhere | scope-exceeded run, timed-out run | no intent written, `step` names the other node |
-| fake `Granted`, local `Ok(None)` | settle | released once |
-| fake read error, fake refusal | the step and error lines | text as specified, no ANSI |
-| `relais run` against the `main` binary under `LocalState` | per-day limit hit, review read failure, widen settle, timed-out settle, stdout piped to `head -1` | same stdout, stderr and exit |
-| `cargo test -p relais`, `--features conformance` | the suite | pass |
+| `the_daily_ceiling_reads_the_shared_counter_before_dispatch` | fake counter 151 over 150, empty ledger | per-day limit, no dispatch: ok |
+| `the_review_check_reads_the_shared_counter_too` | counter raised to 200 while the worker runs | `needs_review`, "spend ceiling was reached before the review", no reviewer: ok |
+| `daily_spent_tests` | global 0, global 7, ledger 50 | 0, 7, 50 (the larger): ok |
+| `spend_read_tests` | ledger failure; shared failure | `RunError::Ledger`; "the day's spend could not be read: ...", no ANSI: ok |
+| `a_settle_answered_elsewhere_...` | widen settle, decision already answered | `needs_decision` stays, no intent: ok |
+| `the_same_settle_under_a_free_decision_...` | widen settle, free decision | `cancelled`, intent written, grant kept: ok |
+| existing suite under `LocalState` | the unchanged runner, CLI and conformance tests | 2640 lib + 63 + 350 of 351 integration passed; the one failure, `bounded_change_end_to_end...`, passed alone in 29 s (the host was at load 90 to 170) |
+| timed-out settle refused by the shared half; `Granted` then local `Ok(None)` released once; step line text | not tested: the timed-out path needs the native harness; the release is the an-t15 fake test; `step` events are not captured | gap, in the ticket's fog |
+| `relais run` against the `main` binary under `LocalState` | not run: the host load made two release builds impractical; the unchanged suite is the evidence | gap |
 
 ## Decision log
 
@@ -122,6 +124,12 @@ count the global daily cap and answer the decision once across nodes.
   `Ledger::resolve_decision` without `answer_decision`; until they are routed
   (a follow-up), a person's answer on another node is not fenced against a
   settle.
+- Review changed two choices. The refusal step line is the shared error's own
+  text ("refused: the decision of run X is being answered elsewhere"), with no
+  added sentence: a closed client's other refusals (authorisation) must not
+  read as "no action needed", and a typed answered-elsewhere result belongs
+  with an-t19's types. The review check prints a shared failure's sentence
+  once. `max(global, ledger)` carries `holds-until: an-t17`.
 - Spend reads: one shared call per attempt and one per review dispatch. A
   shared outage fails every run closed, by choice: a ceiling that cannot be
   read is not applied. A signal between the shared answer and the local write
