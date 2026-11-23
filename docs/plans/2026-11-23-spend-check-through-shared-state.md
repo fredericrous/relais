@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/spend-through-shared-state
 repos: [relais]
 adrs: []
@@ -129,11 +129,16 @@ Observed 2026-11-23 on the Mac (`cargo test -p relais --features conformance`).
   text ("refused: the decision of run X is being answered elsewhere"), with no
   added sentence: a closed client's other refusals (authorisation) must not
   read as "no action needed", and a typed answered-elsewhere result belongs
-  with an-t19's types. The review check prints a shared failure's sentence
-  once. `max(global, ledger)` carries `holds-until: an-t17`.
+  with an-t19's types. The review check prefixes a shared failure's sentence once, as for any read error. `max(global, ledger)` carries `holds-until: an-t17`.
 - Spend reads: one shared call per attempt and one per review dispatch. A
   shared outage fails every run closed, by choice: a ceiling that cannot be
   read is not applied. A signal between the shared answer and the local write
   is the lease's TTL to repair, not this plan's.
+
+## Implementation review
+
+- implementation-review: approve-with-changes (3 passes). Fixed: lint allow, swallowed write, missing review-check and ledger-above tests, wording. Kept as gaps: timed-out settle test, step text, `main` comparison.
+- backend: approve-with-changes. Fixed: double prefix, `max` direction test, holds-until. Kept: release-once and timed-out settle tests, named gaps.
+- lang:rust: approve. Fixed: refusal wording left to an-t19's types, error arm, visibility.
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix body-sha=7b90edc3bb7b -->
