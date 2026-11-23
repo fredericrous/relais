@@ -58,7 +58,8 @@ count the global daily cap and answer the decision once across nodes.
 ## Behaviour
 
 - `RunConfig` gains `shared_state: &'a dyn SharedState`. The CLI builds it
-  once at its composition root (`ctx::shared_state()`, an `Arc` kept alive
+  once at its composition root (`ctx::shared_state()`, right after
+  `load_machine` and before the intent claim and trial row, an `Arc` kept alive
   across `execute` and passed as `&*state`), for `relais run` and
   `relais dataset replay`, after `load_machine`, which already refuses an absent external client
   (`ExternalAbsent`), so that refusal changes nothing else. A child run (package) inherits its
@@ -69,13 +70,14 @@ count the global daily cap and answer the decision once across nodes.
   taken as `max(global, ledger.spend_since)`: nothing feeds the global
   counter until `settle_spend` is wired (an-t17), and local spend is a lower
   bound of global spend, so the cap never counts less than today.
-- A shared read error maps by variant: `SharedStateError::Ledger(e)` to
-  `RunError::Ledger(e)` (the "ledger:" prefix and `is_storage_full` stay as
-  today under `LocalState`), every other variant to `RunError::Other("the
-  shared spend count is unavailable: {e}")` (the review check prefixes "the
-  day's spend could not be read:" as it does for any read error) (no `From` impl:
-  `error.rs` is an-t19's). The run stops before dispatch (fails closed),
-  through the existing `RunError` exit path, no new code.
+- A shared read error maps by variant (after an-t19, `node` returns
+  `NodeError`): `NodeError::Ledger(e)` to `RunError::Ledger(e)` (the
+  "ledger:" prefix and `is_storage_full` stay as today under `LocalState`),
+  `NodeError::Shared(e)` to `RunError::Other("the shared spend count is
+  unavailable: {e}")` (the review check prefixes "the day's spend could not
+  be read:" as it does for any read error), and the variants `daily_spent`
+  cannot produce named one by one. The run stops before dispatch (fails
+  closed), through the existing `RunError` exit path, no new code.
 - `settle_scope_overflow` and `settle_timed_out` write through
   `node::resolve_decision_with_intent`. The shared half answers the decision
   once; the local transaction follows; one release on a local refusal. A
