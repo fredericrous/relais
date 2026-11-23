@@ -102,6 +102,14 @@ The tests are the Verification rows. In the corrupt-row test the good row's
 - 2026-11-23 — `unparsed` split from `legacy`, and a count rather than a
   warning, because t05 will read the struct and a count is testable; decided
   by agent (ADR-0080) in the t14 ticket.
+- 2026-11-23 — the fleet pack refresh (`.adr/packs/decisions.pack`,
+  `HEADS.md`) rides this branch, as worktree-task's Start step requires.
+- 2026-11-23 — scope change from the code review (lang:rust, high,
+  `types.variants-as-unions`): `charged`, `legacy` and the planned
+  `unparsed: bool` become one `read: ChargeRead` field (`Charged(tasks)`,
+  `Legacy`, `Unparsed`), so the "never both true" rule is enforced by the type,
+  not by asserts. The Behaviour bullets on `unparsed`/`legacy` read as this
+  enum. The candidate test also damages an `ended_at` (backend, lang:rust).
 
 ## Outcome
 
