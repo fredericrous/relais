@@ -178,7 +178,13 @@ pub(crate) fn release_intent(
     refusal: &str,
 ) {
     if let RunSource::Intent(intent) = source {
-        if let Err(e) = ledger.release_claim(intent, run_id, refusal) {
+        let released = match super::ctx::shared_state() {
+            Ok(state) => state
+                .release_claim(ledger, intent, run_id, refusal)
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        if let Err(e) = released {
             eprintln!("relais run: intent {intent} could not be released: {e}");
         }
     }
@@ -321,7 +327,9 @@ pub(crate) fn run_command(
     // so a second launch of the same intent finds the first run instead of
     // making another (plan A5).
     if let RunSource::Intent(intent) = source {
-        match ledger.claim_intent(intent, &run_id, &successor_process) {
+        let claimed =
+            super::ctx::shared_state()?.claim_intent(&ledger, intent, &run_id, &successor_process);
+        match claimed {
             Ok(relais::ledger::Claim::Claimed(_)) => {}
             Ok(relais::ledger::Claim::AlreadyClaimed { run }) => {
                 return Ok(refuse_run(

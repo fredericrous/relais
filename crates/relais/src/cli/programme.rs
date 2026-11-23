@@ -938,12 +938,26 @@ pub(crate) fn claim_command(
         "relais programme claim {slug} {id}{}{steal_flag}",
         dir_argument(dir)
     );
-    let taken = store
-        .lock(&state.key, claim::LOCK_WAIT, now)
-        .and_then(|lock| {
-            lock.sweep(&state.closed, now)?;
-            lock.claim_work(id, &session, &state.repo_path, contest, now)
-        });
+    let holder = relais::shared_state::Principal::operator(session.clone());
+    let taken = super::ctx::shared_state()?
+        .claim_ticket(
+            &store,
+            &relais::shared_state::TicketClaim {
+                key: &state.key,
+                closed: &state.closed,
+                id,
+                holder: &holder,
+                repo_display: &state.repo_path,
+                contest,
+                now,
+            },
+        )
+        .map(|grant| grant.taken);
+    let taken = match taken {
+        Ok(taken) => Ok(taken),
+        Err(relais::shared_state::SharedStateError::Claim(error)) => Err(error),
+        Err(other) => return Err(super::ctx::shared_state_error("claiming the ticket", other)),
+    };
     match taken {
         Err(error) => claim_outcome(error, &retry),
         Ok(claim::Taken::Claimed { how, from }) => {

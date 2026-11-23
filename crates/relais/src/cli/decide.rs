@@ -805,7 +805,8 @@ pub(crate) fn successor_decide(
         Err(e) => return Ok(refusal(CliOutcome::InvalidInput, e.to_string())),
     };
     let written = operational(
-        ledger.resolve_decision_with_intent(
+        super::ctx::shared_state()?.resolve_decision_with_intent(
+            ledger,
             run,
             &relais::ledger::DecisionAnswer {
                 resolution: Reason::DecisionRevised,
