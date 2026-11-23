@@ -508,6 +508,7 @@ pub(crate) fn run_command(
     // The ballast is made at start when space allows, and made again on
     // the next start after a full disk freed it (SPEC §10).
     keep_ballast(&artifacts_dir);
+    let shared = super::ctx::shared_state()?;
     let outcome = match execute(&RunConfig {
         workspace,
         repo_dir: &root,
@@ -540,6 +541,7 @@ pub(crate) fn run_command(
         // Only `run` consumes a pending change to the repository's
         // commands (ADR-0007).
         declarations: &relais::trust::Recorder(&ledger),
+        shared_state: &*shared,
     }) {
         Ok(outcome) => outcome,
         Err(e) => {

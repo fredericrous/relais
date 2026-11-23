@@ -429,6 +429,7 @@ pub(crate) fn replay_command(
         started: std::time::Instant::now(),
     };
     eprintln!("{}", log.start_line());
+    let shared = super::ctx::shared_state()?;
     let outcome = execute(&RunConfig {
         workspace: relais::workspace::reuse::Workspace::Isolated,
         repo_dir: &checkout_dir,
@@ -461,6 +462,7 @@ pub(crate) fn replay_command(
         // runner skips it for a replay, and `plan`, `doctor` and `trust
         // show` report it.
         declarations: &relais::trust::NoHistory,
+        shared_state: &*shared,
     });
     // Bring the replay's own refs into the live repository BEFORE the
     // checkout goes. The runner names its candidate and snapshot refs in

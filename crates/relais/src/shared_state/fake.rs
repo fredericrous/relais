@@ -121,6 +121,12 @@ impl FakeState {
         self.lock().published.len()
     }
 
+    /// Set the global counter, as if other nodes had settled that much
+    /// (a test knob: nothing in the runner feeds it until an-t17).
+    pub fn set_spent(&self, amount: MicroUsd) {
+        self.lock().spent = amount.to_micros();
+    }
+
     /// What every settle booked against the global counter.
     pub fn spent(&self) -> MicroUsd {
         MicroUsd::from_micros(self.lock().spent)

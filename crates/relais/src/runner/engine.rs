@@ -472,7 +472,9 @@ impl<'a> RunEngine<'a> {
             }
         };
         let note = rule.note();
-        let written = config.ledger.resolve_decision_with_intent(
+        let written = crate::shared_state::node::resolve_decision_with_intent(
+            config.shared_state,
+            config.ledger,
             &self.run_id,
             &crate::ledger::DecisionAnswer {
                 resolution: Reason::DecisionRevised,
@@ -490,7 +492,10 @@ impl<'a> RunEngine<'a> {
             Ok(Some(stored)) => stored,
             Ok(None) => return None,
             Err(e) => {
-                self.step("widen_scope", format!("not widened: {e}"));
+                self.step(
+                    "widen_scope",
+                    format!("not widened: {}", settle_refusal(&e)),
+                );
                 return None;
             }
         };
@@ -924,7 +929,9 @@ impl<'a> RunEngine<'a> {
                 return None;
             }
         };
-        let written = config.ledger.resolve_decision_with_intent(
+        let written = crate::shared_state::node::resolve_decision_with_intent(
+            config.shared_state,
+            config.ledger,
             &self.run_id,
             &crate::ledger::DecisionAnswer {
                 resolution: Reason::DecisionRevised,
@@ -942,7 +949,10 @@ impl<'a> RunEngine<'a> {
             Ok(Some(stored)) => stored,
             Ok(None) => return None,
             Err(e) => {
-                self.step("verify_timed_out", format!("not settled: {e}"));
+                self.step(
+                    "verify_timed_out",
+                    format!("not settled: {}", settle_refusal(&e)),
+                );
                 return None;
             }
         };
@@ -1389,5 +1399,17 @@ mod host_slot_dir_tests {
             host_slot_dir(Some("/run/slots")),
             Some(PathBuf::from("/run/slots"))
         );
+    }
+}
+
+/// A settle the shared half refused, said for a person: another node holds
+/// the decision, so its answer stands and nothing is left to do here. Every
+/// other error reads as it did.
+fn settle_refusal(e: &crate::shared_state::SharedStateError) -> String {
+    match e {
+        crate::shared_state::SharedStateError::Refused { .. } => {
+            format!("{e}; the other node's answer stands, no action is needed here")
+        }
+        other => other.to_string(),
     }
 }
