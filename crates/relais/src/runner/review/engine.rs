@@ -108,8 +108,6 @@ impl<'a> RunEngine<'a> {
         if let Some(ceiling) = spending.per_day_micros {
             let today = match self.spent_today(self.config.ledger) {
                 Ok(today) => today,
-                // A shared failure already says what could not be read.
-                Err(RunError::Other(said)) => return Some(said),
                 Err(e) => return Some(format!("the day's spend could not be read: {e}")),
             };
             if today >= ceiling {
@@ -1000,7 +998,7 @@ fn spend_read_failure(e: crate::shared_state::SharedStateError) -> RunError {
     // `RunError` variant carrying the `SharedStateError`.
     match e {
         crate::shared_state::SharedStateError::Ledger(e) => RunError::Ledger(e),
-        other => RunError::Other(format!("the day's spend could not be read: {other}")),
+        other => RunError::Other(format!("the shared spend count is unavailable: {other}")),
     }
 }
 
@@ -1028,7 +1026,7 @@ mod spend_read_tests {
         });
         let text = failure.to_string();
         assert!(
-            text.contains("the day's spend could not be read") && text.contains("unreachable"),
+            text.contains("the shared spend count is unavailable") && text.contains("unreachable"),
             "{text}"
         );
         assert!(!text.contains('\u{1b}'), "no escape codes: {text}");
