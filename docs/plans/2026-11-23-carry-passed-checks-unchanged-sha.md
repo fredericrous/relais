@@ -290,4 +290,12 @@ the failures they would see after a full run whose passes held.
   pre-commit gates were deferred to CI by the busy host.
 
 
+## Implementation review
+
+- implementation-review: approve-with-changes → Delta approve; plan ticks and observed results recorded, banner and flag helper fixed; deliberate: flaky carry covered at unit level. ~230k, ~3 min.
+- backend: approve (one low fixed: empty `from` falls back to the plan's source attempt). ~72k, ~1 min.
+- lang:rust: approve-with-changes → Delta approve; deliberate: `expect` in the fingerprint mirrors `VerificationProfile::hash`; clones left. ~130k, ~40 s.
+- lang:typescript: approve-with-changes → approve; malformed events dropped, output skips carried rows; deliberate: carried check keeps `exit: 0` as the plan decided. ~150k, ~1 min.
+- unix, tui: approve; `cached` meaning noted in CHANGELOG, all-carried step shows agent activity; pane row collapse and report wording filed in the relais inbox. ~260k, ~2 min.
+
 <!-- panel: repos=relais reviewers=backend,lang:rust,lang:typescript,tui,unix body-sha=dfb5bd60c8ae -->
