@@ -31,5 +31,9 @@ Counted in three groups:
 - `git revert` rows with no files. Pair these with their commands to give
   the share whose lookup failed (expected under 10%).
 
+Also run t02's miss query on task rows written after the reinstall (t11's
+scoped hashes), without the memory-file stop list. Expected: 0 false
+misses from out-of-repository paths (t02 found 45).
+
 If too few rows exist yet, re-date the ticket instead. If the overlap is
 still zero, name the shape that misses.

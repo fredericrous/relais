@@ -90,8 +90,26 @@ From this programme's research tickets:
   `git revert` reads its files from `git show`. Only a revert the call's
   success proves is recorded. The live count is t13, after a release and
   the plugin reinstall.
+- [t11](t11-file-hash-repo-scope.md): a file hash is sha256(git common dir,
+  NUL, path from the work tree root), so a worktree and its checkout agree
+  and two repositories never collide; paths in no repository are not
+  recorded. Older rows keep the cwd-relative hash (the t02 stop list stays
+  for them).
 
 ## Handoff
+
+2026-11-23, t11 closed (file hashes scoped to a repository). The plugin
+fix is on `prog/phase8-learner/t11-file-hash-repo-scope` with its plan and
+panel, in the PR that closes this ticket; t11's Resolution has the hash
+bytes and the cache rules. It is not released: t10 and t11 wait for t12
+(a correction records its files and charges one task), which should hash
+its files with `hashFiles` from `claude-plugin/hooks/routing.ts`. Then
+release all three; the person reinstalls the plugin (the commands are in
+the t11 plan's Your steps). [t13](t13-revert-overlap-live-count.md) (due
+2026-12-01) counts the overlap after that and runs the t02 miss query on
+the new rows (expected 0 false misses from out-of-repository paths). The
+host was jammed today: two relais verify runs waited out their 1800 s
+admission budget. Next: t12, then t03. Earlier entry:
 
 2026-11-23, t10 closed (revert paths). The plugin fix is committed on
 `fix/revert-paths` with its plan and panel; it is in the PR that closes this
