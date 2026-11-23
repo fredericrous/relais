@@ -1638,9 +1638,12 @@ export function gateChecks(stamp: GateStamp, startedAt: number, endedAt: number)
 // A directory's repository: its git common dir, work tree root and the path
 // from the root down to the directory ('' at the root).
 export type Root = { common: string; toplevel: string; prefix: string }
-// A cached answer: the promise is shared by concurrent callers; `isNone` marks
-// a directory git called "not a git repository".
-export type RootEntry = { promise: Promise<Root | null | undefined>; isNone: boolean }
+// What git says of a directory: its repository, in none ("not a git
+// repository"), or nothing it could say (a failure, a timeout; never cached).
+export type RootAnswer = { kind: 'root'; root: Root } | { kind: 'none' } | { kind: 'unresolved' }
+// A cached answer: the promise is shared by concurrent callers; `settled` is
+// the answer once it arrives.
+export type RootEntry = { promise: Promise<RootAnswer>; settled?: RootAnswer }
 
 export type RouterMemory = {
   // `relais native router-state`, or undefined (shadow, nothing decided).

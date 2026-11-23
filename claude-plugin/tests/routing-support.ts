@@ -96,13 +96,13 @@ export async function routedSession(
   engine.observeExits = []
   const state: Record<string, unknown> = { ...ROUTER_STATE, ...(options.state ?? {}) }
   engine.state = state
-  engine.script.runResult = (argv: string[], _init: any) => {
+  engine.script.runResult = (argv: string[], init: any) => {
     if (argv[1] === 'native' && argv[2] === 'router-state') return { ...ok, stdout: JSON.stringify(state) }
     if (argv[1] === 'native' && argv[2] === 'router-observe') {
       const code = engine.observeExits.length > 0 ? engine.observeExits.shift()! : 0
       return { ...ok, exitCode: code, stderr: code === 0 ? '' : `exit ${code}` }
     }
-    if (isRootProbe(argv)) return rootProbe(_init?.cwd)
+    if (isRootProbe(argv)) return rootProbe(init?.cwd)
     return ok
   }
   engine.script.complete = (e: any) => {

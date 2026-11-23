@@ -1079,7 +1079,7 @@ test('a router-state whose accepts lacks answered receives none of the parent or
   }
 })
 
-// --- file hashes are scoped to one repository (t11) ---------------------------------------
+// File hashes scoped to one repository.
 
 const ROOT_ARGV = [
   'env', '-u', 'GIT_DIR', '-u', 'GIT_WORK_TREE', '-u', 'GIT_COMMON_DIR',
@@ -1128,7 +1128,7 @@ function fakeFx(answer: (argv: string[], init: any) => unknown) {
 test('resolveRoot asks git once, with the scrubbed environment, and reads the prefix untrimmed', async () => {
   const world = fakeFx(() => stdoutOf('/r/.git\n/r\nsrc/\n'))
   const [first, second] = await Promise.all([resolveRoot(world.fx, world.store, '/r/src'), resolveRoot(world.fx, world.store, '/r/src')])
-  expect(first).toEqual({ common: '/r/.git', toplevel: '/r', prefix: 'src/' })
+  expect(first).toEqual({ kind: 'root', root: { common: '/r/.git', toplevel: '/r', prefix: 'src/' } })
   expect(second).toBe(first)
   expect(world.calls.length).toBe(1)
   expect(world.calls[0].argv).toEqual(ROOT_ARGV)
@@ -1139,19 +1139,19 @@ test('resolveRoot asks git once, with the scrubbed environment, and reads the pr
 
 test('resolveRoot at the repository root has an empty prefix', async () => {
   const world = fakeFx(() => stdoutOf('/r/.git\n/r\n\n'))
-  expect(await resolveRoot(world.fx, world.store, '/r')).toEqual({ common: '/r/.git', toplevel: '/r', prefix: '' })
+  expect(await resolveRoot(world.fx, world.store, '/r')).toEqual({ kind: 'root', root: { common: '/r/.git', toplevel: '/r', prefix: '' } })
 })
 
 test('"not a git repository" is cached as null for 60 s, then asked again', async () => {
   const world = fakeFx(() => NOT_A_REPOSITORY)
-  expect(await resolveRoot(world.fx, world.store, '/n')).toBe(null)
-  expect(await resolveRoot(world.fx, world.store, '/n')).toBe(null)
+  expect(await resolveRoot(world.fx, world.store, '/n')).toEqual({ kind: 'none' })
+  expect(await resolveRoot(world.fx, world.store, '/n')).toEqual({ kind: 'none' })
   expect(world.calls.length).toBe(1)
   await world.advance(59_000)
-  expect(await resolveRoot(world.fx, world.store, '/n')).toBe(null)
+  expect(await resolveRoot(world.fx, world.store, '/n')).toEqual({ kind: 'none' })
   expect(world.calls.length).toBe(1)
   await world.advance(1000)
-  expect(await resolveRoot(world.fx, world.store, '/n')).toBe(null)
+  expect(await resolveRoot(world.fx, world.store, '/n')).toEqual({ kind: 'none' })
   expect(world.calls.length).toBe(2)
 })
 
@@ -1166,25 +1166,25 @@ test('any other answer is unresolved and not cached: another exit, 129, a wrong 
   ]
   for (const answer of answers) {
     const world = fakeFx(() => answer)
-    expect(await resolveRoot(world.fx, world.store, '/d')).toBe(undefined)
-    expect(await resolveRoot(world.fx, world.store, '/d')).toBe(undefined)
+    expect(await resolveRoot(world.fx, world.store, '/d')).toEqual({ kind: 'unresolved' })
+    expect(await resolveRoot(world.fx, world.store, '/d')).toEqual({ kind: 'unresolved' })
     expect(world.calls.length).toBe(2)
   }
   const throwing = fakeFx(() => {
     throw new Error('spawn refused')
   })
-  expect(await resolveRoot(throwing.fx, throwing.store, '/d')).toBe(undefined)
-  expect(await resolveRoot(throwing.fx, throwing.store, '/d')).toBe(undefined)
+  expect(await resolveRoot(throwing.fx, throwing.store, '/d')).toEqual({ kind: 'unresolved' })
+  expect(await resolveRoot(throwing.fx, throwing.store, '/d')).toEqual({ kind: 'unresolved' })
   expect(throwing.calls.length).toBe(2)
   const hanging = fakeFx(() => new Promise(() => {}))
   const first = resolveRoot(hanging.fx, hanging.store, '/d')
   await hanging.flush()
   await hanging.advance(1000)
-  expect(await first).toBe(undefined)
+  expect(await first).toEqual({ kind: 'unresolved' })
   const second = resolveRoot(hanging.fx, hanging.store, '/d')
   await hanging.flush()
   await hanging.advance(1000)
-  expect(await second).toBe(undefined)
+  expect(await second).toEqual({ kind: 'unresolved' })
   expect(hanging.calls.length).toBe(2)
 })
 

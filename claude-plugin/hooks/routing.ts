@@ -39,6 +39,7 @@ import {
   revertedPaths,
   type RevertLookup,
   type Root,
+  type RootAnswer,
   type RootEntry,
   revertRecord,
   scopedFileHash,
@@ -64,7 +65,10 @@ const OBSERVE_TIMEOUT_MS = 20_000
 // The amont gate stamp is read at task end, and never holds it up longer.
 const GATE_TIMEOUT_MS = 1000
 const GATE_REPOSITORIES = 5
-// Past this many directories, answers are asked again, not cached.
+// Past this many directories, answers are asked again, not cached: an edit
+// there is no longer warmed, so a directory removed before the task ends
+// drops its file. holds-until: a session edits in more than 512 directories
+// under one cwd; then evict the oldest settled entry instead.
 const ROOTS_MAX = 512
 const NO_REPOSITORY_TTL_MS = 60_000
 // The first request of a turn waits this long for the classifier at most,
@@ -647,10 +651,13 @@ async function queueCorrected(fx: Fx, store: Store, task: TaskState) {
 // subagent task it spawned is amended with its outcome.
 async function endTask(fx: Fx, store: Store, task: TaskState, now: number) {
   await settleReverts(store)
-  const [gate, files] = await Promise.all([gateEvidence(fx, store, task, now).catch(() => []), hashFiles(fx, store, task.files)])
+  const [gate, files, repository] = await Promise.all([
+    gateEvidence(fx, store, task, now).catch(() => []),
+    hashFiles(fx, store, task.files),
+    resolveRepository(fx, store).catch(() => undefined),
+  ])
   const ended: TaskState =
     gate.length === 0 ? task : { ...task, verifications: [...task.verifications, ...gate].slice(-20) }
-  const repository = await resolveRepository(fx, store).catch(() => undefined)
   queue(store, taskRecord(ended, now, files, repository))
   const outcome = outcomeOf(ended)
   if (outcome === 'unknown' || outcome === 'answered') return
@@ -679,13 +686,11 @@ async function resolveRepository(fx: Fx, store: Store): Promise<string | undefin
 const UNSET_GIT_ENV = ['env', '-u', 'GIT_DIR', '-u', 'GIT_WORK_TREE', '-u', 'GIT_COMMON_DIR']
 const ROOT_ARGV = [...UNSET_GIT_ENV, 'git', 'rev-parse', '--path-format=absolute', '--git-common-dir', '--show-toplevel', '--show-prefix']
 
-type Probe = { kind: 'root'; root: Root } | { kind: 'none' } | { kind: 'unresolved' }
-
 // What git says of `dir`'s repository: the three lines are read untrimmed (the
 // prefix is empty at the root). Exit 129 (git before 2.31) and every other
 // failure leave the directory unresolved.
-async function probeRoot(fx: Fx, dir: string): Promise<Probe> {
-  const unresolved: Probe = { kind: 'unresolved' }
+async function probeRoot(fx: Fx, dir: string): Promise<RootAnswer> {
+  const unresolved: RootAnswer = { kind: 'unresolved' }
   const init = { cwd: dir, env: { GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C' }, timeoutMs: GATE_TIMEOUT_MS }
   const run = await within(fx, Promise.resolve(fx.process.run(ROOT_ARGV, init)).catch(() => undefined), GATE_TIMEOUT_MS)
   if (run === TIMEOUT || !run) return unresolved
@@ -699,9 +704,9 @@ async function probeRoot(fx: Fx, dir: string): Promise<Probe> {
   return String(run.stderr ?? '').includes('not a git repository') ? { kind: 'none' } : unresolved
 }
 
-// The repository of a directory, asked once per directory per session cwd:
-// null when it is in no repository, undefined when git could not say (not cached).
-export function resolveRoot(fx: Fx, store: Store, dir: string): Promise<Root | null | undefined> {
+// The repository of a directory, asked once per directory per session cwd. A
+// `none` answer is kept 60 s; an `unresolved` one is never kept.
+export function resolveRoot(fx: Fx, store: Store, dir: string): Promise<RootAnswer> {
   const r = store.router
   if (r.rootsCwd !== r.cwd) {
     r.roots.clear()
@@ -713,23 +718,16 @@ export function resolveRoot(fx: Fx, store: Store, dir: string): Promise<Root | n
     if (r.roots.get(dir) === entry) r.roots.delete(dir)
   }
   const entry: RootEntry = {
-    isNone: false,
     promise: probeRoot(fx, dir).then(
-      probe => {
-        if (probe.kind === 'unresolved') {
-          forget()
-          return undefined
-        }
-        if (probe.kind === 'none') {
-          entry.isNone = true
-          fx.clock.after(NO_REPOSITORY_TTL_MS, forget)
-          return null
-        }
-        return probe.root
+      answer => {
+        entry.settled = answer
+        if (answer.kind === 'unresolved') forget()
+        else if (answer.kind === 'none' && r.roots.get(dir) === entry) fx.clock.after(NO_REPOSITORY_TTL_MS, forget)
+        return answer
       },
-      () => {
+      (): RootAnswer => {
         forget()
-        return undefined
+        return { kind: 'unresolved' }
       },
     ),
   }
@@ -741,7 +739,7 @@ export function resolveRoot(fx: Fx, store: Store, dir: string): Promise<Root | n
 // may have run since) and the directory is resolved in the background.
 function warmRoot(fx: Fx, store: Store, dir: string) {
   const r = store.router
-  if (r.roots.get(dir)?.isNone) r.roots.delete(dir)
+  if (r.roots.get(dir)?.settled?.kind === 'none') r.roots.delete(dir)
   detach(resolveRoot(fx, store, dir))
 }
 
@@ -756,8 +754,8 @@ export async function hashFiles(fx: Fx, store: Store, paths: string[]): Promise<
   })
   const roots = new Map<string, Root>()
   const asked = [...new Set(located.map(file => file.directory))].map(dir =>
-    resolveRoot(fx, store, dir).then(root => {
-      if (root) roots.set(dir, root)
+    resolveRoot(fx, store, dir).then(answer => {
+      if (answer.kind === 'root') roots.set(dir, answer.root)
     }),
   )
   await within(fx, Promise.all(asked), GATE_TIMEOUT_MS)
@@ -789,8 +787,8 @@ async function gateEvidence(fx: Fx, store: Store, task: TaskState, now: number):
 async function readGateChecks(fx: Fx, store: Store, task: TaskState, now: number) {
   const cwd = store.router.cwd
   const directories = [...new Set(task.files.map(file => directoryOf(file, cwd)).filter((d): d is string => !!d))]
-  const roots = await Promise.all(directories.map(dir => resolveRoot(fx, store, dir)))
-  const repositories = [...new Set(roots.flatMap(root => (root ? [root.toplevel] : [])).filter(t => t !== ''))].slice(0, GATE_REPOSITORIES)
+  const answers = await Promise.all(directories.map(dir => resolveRoot(fx, store, dir)))
+  const repositories = [...new Set(answers.flatMap(answer => (answer.kind === 'root' ? [answer.root.toplevel] : [])).filter(t => t !== ''))].slice(0, GATE_REPOSITORIES)
   const stamps = await Promise.all(
     repositories.map(async repository => {
       const result = await fx.process
