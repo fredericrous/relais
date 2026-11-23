@@ -64,10 +64,16 @@ pub(crate) fn load_machine() -> Result<MachineSettings, CliError> {
         .map_err(|e| shared_state_error("the machine settings", e))
 }
 
-/// The shared-state implementation the machine selects; refused when it
-/// names an external layer this build does not have.
+/// The closed shared-state client this build links. Public relais links
+/// none; a private build (an-t13) replaces this one line with its factory.
+pub(crate) const EXTERNAL_CLIENT: Option<relais::shared_state::ExternalFactory> = None;
+
+/// The shared-state implementation the machine selects, built here at the
+/// composition root and nowhere else; refused when it names an external
+/// layer this build does not have.
 pub(crate) fn shared_state() -> Result<Arc<dyn SharedState>, CliError> {
-    relais::shared_state::current().map_err(|e| shared_state_error("shared state", e))
+    relais::shared_state::current_with(EXTERNAL_CLIENT)
+        .map_err(|e| shared_state_error("shared state", e))
 }
 
 /// A shared-state failure as the CLI reports it. The local errors keep the

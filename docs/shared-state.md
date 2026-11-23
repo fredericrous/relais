@@ -25,14 +25,16 @@ back to an older relais.
 | Operation | Where |
 |---|---|
 | machine settings | every command that reads them through the CLI's `load_machine` (`relais run`, `trust`, `plan`, `replay`, `learn`, ...) |
-| daily spend | the per-day ceiling check before a dispatch and before a review |
 | programme ticket claim | `relais programme claim` |
 | successor intent claim and release | `relais run --intent` |
-| decision answer with a successor intent | `relais decide` with the revise answer, and the runner's widen and timed-out settles |
+| decision answer with a successor intent | `relais decide` with the revise answer |
 | registry pointer read and swap | `relais promote` |
 
 Not routed yet, so under `external` they still read or write the node's own
-files: the other direct readers of `machine.toml` (`tuning_bounds` and two
+files: the daily spend ceiling check and the runner's widen and timed-out
+settles (the runner would have to look the implementation up itself, since
+`RunConfig` cannot gain a field without editing the tests that build it; it
+gains one in a later change); the other direct readers of `machine.toml` (`tuning_bounds` and two
 more in `cli/ctx.rs`, `cli/coordinator.rs`, `doctor/mod.rs`,
 `router/mod.rs`, `holdout.rs`, `runner/attempt.rs`, `cli/learn.rs`,
 `cli/native.rs`); the coordinator's own seats (`AdmissionState` behind the
@@ -57,10 +59,10 @@ Under `relais run --protocol`, the `done` line names it `shared_state_absent`.
 
 ## For a closed client
 
-- Implement `SharedState` and register its factory with
-  `relais::shared_state::register_external` before any command runs. The
-  CLI is private to the `relais` binary, so how a private build's `main`
-  reaches that call is the private build plan's to settle.
+- Implement `SharedState` and give its factory to the CLI: public relais
+  builds the implementation in one place, `cli/ctx.rs`, from
+  `EXTERNAL_CLIENT` (`None` here), and a private build replaces that one
+  line. Library code never builds one itself.
 - Run the suite: build `relais` with `--features conformance` and call
   `relais::shared_state::conformance::run_all(make)`. It checks what both a
   single node and a primary must hold: the epoch rises on every acquire, a
@@ -72,5 +74,9 @@ Under `relais run --protocol`, the `done` line names it `shared_state_absent`.
   primary's semantics (expiry, degraded mode, a queue).
 - The trait is unstable: until a closed client consumes it, a change to it
   ships in a minor release, and the client pins the exact public version.
-- `LocalState` fences seats and tickets with a process-wide epoch table
-  only; fencing across processes and nodes is the external client's job.
+- `LocalState` fences seats and tickets within one instance only; fencing
+  across processes and nodes is the external client's job.
+- The trait's parameters are relais's own node-local types (`Ledger`,
+  `Store`, `Registry`, `EvaluatedArtifact`), so a client builds against one
+  exact relais version; replacing them with plain owned values is the step
+  before the trait is frozen.

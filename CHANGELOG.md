@@ -26,9 +26,9 @@ missing here.
   spend, seats, programme-ticket and successor-intent claims, decision
   answers, the learned registry's pointer, schema announce, a publish sink),
   with `LocalState`, today's single-node behaviour, as the default. The
-  machine settings read, the daily spend check, `relais programme claim`,
-  successor-intent claims and releases, decision answers with an intent and
-  `relais promote` now go through it; a single node sees no change. The
+  machine settings read, `relais programme claim`, successor-intent claims
+  and releases, `relais decide`'s answers with an intent and `relais
+  promote` now go through it; a single node sees no change. The
   trait is unstable until a closed client consumes it. A `conformance` cargo
   feature exports the suite such a client must pass. See
   `docs/shared-state.md`.

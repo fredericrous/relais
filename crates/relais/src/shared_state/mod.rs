@@ -12,10 +12,11 @@
 //!
 //! `machine.toml` selects the implementation with a top-level key:
 //! `shared_state = "local"` (or no key) or `"external"`. External means a
-//! private build of relais that links a closed client and registers it
-//! with [`register_external`]; a build without one refuses the routed
-//! operations with [`SharedStateError::ExternalAbsent`] rather than fall
-//! back, since a silent fallback would split the daily cap and the claims.
+//! private build of relais that links a closed client and hands its
+//! factory to [`current_with`] at the CLI's composition root; a build
+//! without one refuses the routed operations with
+//! [`SharedStateError::ExternalAbsent`] rather than fall back, since a
+//! silent fallback would split the daily cap and the claims.
 //!
 //! The trait is public and unstable: it changes with a minor release until
 //! the closed build (an-t13) consumes it. The conformance suite
@@ -33,7 +34,7 @@ pub mod fake;
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 pub use crate::policy::SharedStateSelection as Selection;
 pub use error::SharedStateError;
@@ -81,18 +82,20 @@ pub struct TicketGrant {
 ///
 /// Node-local handles (the ledger, the claim store, the registry) are
 /// parameters, not state: they stay on the node, and an external
-/// implementation adds the shared half around them.
+/// implementation adds the shared half around them. They tie an
+/// implementation to relais's own types, which is why the trait is
+/// unstable until a closed client consumes it.
+///
+/// A fence is only as wide as its implementation: `LocalState` fences
+/// within one instance, an external client across nodes. A caller never
+/// reads `lease_lost` from `LocalState` as proof that another node lost.
 pub trait SharedState: Send + Sync {
     /// Which implementation this is.
     fn selection(&self) -> Selection;
 
-    // --- config --------------------------------------------------------
-
     /// The machine's settings: trust grants, `[spending]` ceilings and the
     /// rest of `machine.toml`.
     fn machine_settings(&self) -> Result<MachineSettings, SharedStateError>;
-
-    // --- spend ---------------------------------------------------------
 
     /// What has been spent since `day_start` (RFC 3339, the start of the
     /// UTC day): this node's ledger alone for a single node, the global
@@ -119,8 +122,6 @@ pub trait SharedState: Send + Sync {
         actual: MicroUsd,
     ) -> Result<Settlement, SharedStateError>;
 
-    // --- seats ---------------------------------------------------------
-
     /// Take the seat for `dispatch`; every acquire bumps the epoch.
     fn acquire_seat(
         &self,
@@ -133,8 +134,6 @@ pub trait SharedState: Send + Sync {
 
     /// Give a seat back. Fenced.
     fn release_seat(&self, lease: &LeaseToken) -> Result<(), SharedStateError>;
-
-    // --- claims --------------------------------------------------------
 
     /// Take a programme ticket as `work` (the rules of
     /// [`crate::programme::claim::SlugLock::claim_work`]).
@@ -172,8 +171,6 @@ pub trait SharedState: Send + Sync {
         intent: &NewIntent,
     ) -> Result<Option<SuccessorIntent>, SharedStateError>;
 
-    // --- registry ------------------------------------------------------
-
     /// The id the active pointer names.
     fn registry_pointer(&self, registry: &Registry) -> Result<Option<String>, SharedStateError>;
 
@@ -185,8 +182,6 @@ pub trait SharedState: Send + Sync {
         expected: Option<&str>,
         evaluated: &EvaluatedArtifact,
     ) -> Result<(), SharedStateError>;
-
-    // --- schema, publish, mode ----------------------------------------
 
     /// Say which ledger schema version this node runs.
     fn announce_schema(&self, node: &str, version: u64) -> Result<(), SharedStateError>;
@@ -201,21 +196,9 @@ pub trait SharedState: Send + Sync {
     fn mode(&self) -> Mode;
 }
 
-/// Builds the closed client. Registered by a private build (an-t13).
+/// Builds the closed client. A private build passes one to
+/// [`current_with`] from the CLI's composition root (an-t13).
 pub type ExternalFactory = fn() -> Result<Arc<dyn SharedState>, SharedStateError>;
-
-static EXTERNAL: OnceLock<ExternalFactory> = OnceLock::new();
-
-/// Register the closed client's factory, once, before any command runs.
-/// Returns `false` when one was already registered (the first stays).
-pub fn register_external(factory: ExternalFactory) -> bool {
-    EXTERNAL.set(factory).is_ok()
-}
-
-/// Whether this build has a shared-state client registered.
-pub fn external_registered() -> bool {
-    EXTERNAL.get().is_some()
-}
 
 /// The `shared_state` value `machine.toml` text gives: `Ok(None)` when the
 /// key is absent, `Err` with a sentence when it is not one of the two
@@ -242,10 +225,13 @@ pub fn selection_at(path: &Path) -> Selection {
         .unwrap_or_default()
 }
 
-/// The implementation the machine selects. Built per call: `LocalState`
-/// holds nothing, so a test that points `HOME` elsewhere gets the new
-/// paths.
-pub fn current() -> Result<Arc<dyn SharedState>, SharedStateError> {
+/// The implementation the machine selects, given the closed client this
+/// build links (`None` in public relais). Built per call: `LocalState`
+/// resolves its paths at each call, so a test that points `HOME` elsewhere
+/// gets the new paths.
+pub fn current_with(
+    external: Option<ExternalFactory>,
+) -> Result<Arc<dyn SharedState>, SharedStateError> {
     let path = crate::paths::machine_settings_path().map_err(SharedStateError::Home);
     let selection = match &path {
         Ok(path) => selection_at(path),
@@ -254,7 +240,7 @@ pub fn current() -> Result<Arc<dyn SharedState>, SharedStateError> {
     };
     match selection {
         Selection::Local => Ok(Arc::new(LocalState::new())),
-        Selection::External => match EXTERNAL.get() {
+        Selection::External => match external {
             Some(factory) => factory(),
             None => Err(SharedStateError::ExternalAbsent {
                 machine_toml: path?,

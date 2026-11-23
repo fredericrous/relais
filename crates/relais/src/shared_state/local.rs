@@ -8,7 +8,7 @@
 //! single-node user did before is refused now.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use super::types::{
     LeaseToken, Mode, Principal, PublishReceipt, PublishRow, Reservation, ResourceId, Settlement,
@@ -26,33 +26,33 @@ use crate::programme::claim::{Store, Taken, LOCK_WAIT};
 /// Each resource's current epoch and holder (`None` once released).
 type EpochTable = HashMap<ResourceId, (u64, Option<Principal>)>;
 
-/// The epoch of every resource this process has handed a lease for. One
-/// table for the process, since a `LocalState` is built per call; fencing
-/// across processes is an external implementation's job.
-fn epochs() -> &'static Mutex<EpochTable> {
-    static EPOCHS: OnceLock<Mutex<EpochTable>> = OnceLock::new();
-    EPOCHS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// The node name a single node's seats are kept under.
 const THIS_NODE: &str = "local";
 
 /// How long a registry swap waits for another swap's lock.
 const REGISTRY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Today's behaviour, holding nothing: paths resolve from the environment
-/// at each call, as they always did.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct LocalState;
+/// Today's behaviour: paths resolve from the environment at each call, as
+/// they always did. The only state is the epoch of each lease this
+/// instance handed out, so its fences hold within the instance; fencing
+/// across processes and nodes is an external implementation's job.
+#[derive(Debug, Clone, Default)]
+pub struct LocalState {
+    epochs: Arc<Mutex<EpochTable>>,
+}
 
 impl LocalState {
     pub fn new() -> Self {
-        LocalState
+        Self::default()
+    }
+
+    fn epochs(&self) -> std::sync::MutexGuard<'_, EpochTable> {
+        self.epochs.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Bump `resource`'s epoch and record `holder` as its holder.
     fn grant(&self, resource: ResourceId, holder: &Principal) -> LeaseToken {
-        let mut table = epochs().lock().unwrap_or_else(|p| p.into_inner());
+        let mut table = self.epochs();
         let entry = table.entry(resource.clone()).or_insert((0, None));
         entry.0 += 1;
         entry.1 = Some(holder.clone());
@@ -66,7 +66,7 @@ impl LocalState {
 
     /// Whether `lease` is still the current hold of its resource.
     fn fence(&self, lease: &LeaseToken) -> Result<(), SharedStateError> {
-        let table = epochs().lock().unwrap_or_else(|p| p.into_inner());
+        let table = self.epochs();
         match table.get(&lease.resource) {
             Some((epoch, Some(holder))) if *epoch == lease.epoch && *holder == lease.holder => {
                 Ok(())
@@ -169,7 +169,7 @@ impl SharedState for LocalState {
 
     fn release_seat(&self, lease: &LeaseToken) -> Result<(), SharedStateError> {
         self.fence(lease)?;
-        let mut table = epochs().lock().unwrap_or_else(|p| p.into_inner());
+        let mut table = self.epochs();
         if let Some(entry) = table.get_mut(&lease.resource) {
             entry.1 = None;
         }
@@ -245,7 +245,10 @@ impl SharedState for LocalState {
         evaluated: &EvaluatedArtifact,
     ) -> Result<(), SharedStateError> {
         // `Registry::promote` takes no lock; this one makes compare and
-        // swap one step against every other swap through the trait. It is
+        // swap one step against every other swap through the trait.
+        // holds-until: the learning cycle's automatic promote and rollback
+        // (`learn/cycle.rs`) go through `SharedState`; until then they
+        // write the pointer without this lock and can race a swap. It is
         // an flock, released by the kernel when the process dies, and the
         // file is never deleted, so a killed promote leaves nothing stale.
         // Beside the pointer files, outside `artifacts/`, which `list` reads.
@@ -270,7 +273,7 @@ impl SharedState for LocalState {
                         ),
                     })
                 }
-                Err(cause) => return Err(SharedStateError::Read { path, cause }),
+                Err(cause) => return Err(SharedStateError::Lock { path, cause }),
             }
         };
         let found = registry.active_id()?;

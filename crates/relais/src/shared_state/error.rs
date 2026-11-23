@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use super::types::ResourceId;
+use crate::money::MicroUsd;
 
 /// Why a shared-state call did not do what it was asked.
 ///
@@ -25,7 +26,10 @@ pub enum SharedStateError {
     /// The primary cannot be reached; the operation fails closed (an-t10).
     Unreachable { detail: String },
     /// The node's spend slice cannot cover the reservation (an-t10).
-    SliceExhausted { requested: i64, remaining: i64 },
+    SliceExhausted {
+        requested: MicroUsd,
+        remaining: MicroUsd,
+    },
     /// The primary refused the call for a stated reason.
     Refused { reason: String },
     /// `machine.toml` selects `external`, and this build has no shared-state
@@ -35,6 +39,11 @@ pub enum SharedStateError {
     Home(crate::paths::HomeUnset),
     /// A local file could not be read.
     Read {
+        path: PathBuf,
+        cause: std::io::Error,
+    },
+    /// A local lock could not be taken (not held by another: it failed).
+    Lock {
         path: PathBuf,
         cause: std::io::Error,
     },
@@ -55,7 +64,10 @@ impl std::fmt::Display for SharedStateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SharedStateError::LeaseLost { resource, epoch } => {
-                write!(f, "lease_lost: {resource} is no longer held at epoch {epoch}")
+                write!(
+                    f,
+                    "lease_lost: {resource} is no longer held at epoch {epoch}"
+                )
             }
             SharedStateError::ClaimLost { resource } => {
                 write!(f, "claim_lost: {resource} is held by another holder")
@@ -74,7 +86,9 @@ impl std::fmt::Display for SharedStateError {
                 remaining,
             } => write!(
                 f,
-                "slice_exhausted: {requested} micro-USD requested, {remaining} left in this node's slice"
+                "slice_exhausted: {} micro-USD requested, {} left in this node's slice",
+                requested.to_micros(),
+                remaining.to_micros()
             ),
             SharedStateError::Refused { reason } => write!(f, "refused: {reason}"),
             SharedStateError::ExternalAbsent { machine_toml } => write!(
@@ -87,6 +101,9 @@ impl std::fmt::Display for SharedStateError {
             SharedStateError::Home(e) => write!(f, "{e}"),
             SharedStateError::Read { path, cause } => {
                 write!(f, "cannot read {}: {cause}", path.display())
+            }
+            SharedStateError::Lock { path, cause } => {
+                write!(f, "cannot lock {}: {cause}", path.display())
             }
             SharedStateError::Invalid { path, cause } => {
                 write!(f, "{} is invalid: {cause}", path.display())
@@ -102,12 +119,20 @@ impl std::error::Error for SharedStateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             SharedStateError::Home(e) => Some(e),
-            SharedStateError::Read { cause, .. } => Some(cause),
+            SharedStateError::Read { cause, .. } | SharedStateError::Lock { cause, .. } => {
+                Some(cause)
+            }
             SharedStateError::Invalid { cause, .. } => Some(cause.as_ref()),
             SharedStateError::Ledger(e) => Some(e),
             SharedStateError::Claim(e) => Some(e),
             SharedStateError::Registry(e) => Some(e),
-            _ => None,
+            SharedStateError::LeaseLost { .. }
+            | SharedStateError::ClaimLost { .. }
+            | SharedStateError::CasConflict { .. }
+            | SharedStateError::Unreachable { .. }
+            | SharedStateError::SliceExhausted { .. }
+            | SharedStateError::Refused { .. }
+            | SharedStateError::ExternalAbsent { .. } => None,
         }
     }
 }

@@ -1469,12 +1469,6 @@ pub fn doctor(
     let mut effort_settings = EffortSettings::default();
     let mut max_effort = crate::policy::RoutingSettings::default().max_effort;
     let mut machine_workspace = crate::policy::WorkspaceMode::default();
-    if let Some(finding) = paths::machine_settings_path()
-        .ok()
-        .and_then(|path| shared_state_finding(&path))
-    {
-        findings.push(finding);
-    }
     match paths::machine_settings_path() {
         Err(e) => findings.push(Finding {
             component: "machine.toml",
@@ -1612,12 +1606,13 @@ pub(crate) struct LeftoverScan {
 }
 
 /// A failing finding when `machine.toml` selects an external shared-state
-/// layer this build does not have; `None` otherwise, so a single node's
-/// report is unchanged. The commands that read the machine settings refuse
-/// in that state, and this is where it is explained.
-pub(crate) fn shared_state_finding(machine_toml: &Path) -> Option<Finding> {
-    use crate::shared_state::{external_registered, selection_at, Selection, SharedStateError};
-    if selection_at(machine_toml) != Selection::External || external_registered() {
+/// layer and this build links no client (`client_linked`); `None`
+/// otherwise, so a single node's report is unchanged. The commands that
+/// read the machine settings refuse in that state, and this is where it is
+/// explained.
+pub fn shared_state_finding(machine_toml: &Path, client_linked: bool) -> Option<Finding> {
+    use crate::shared_state::{selection_at, Selection, SharedStateError};
+    if selection_at(machine_toml) != Selection::External || client_linked {
         return None;
     }
     Some(Finding {

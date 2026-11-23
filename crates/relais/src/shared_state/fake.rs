@@ -223,8 +223,8 @@ impl SharedState for FakeState {
         let requested = amount.to_micros();
         if requested > inner.slice {
             return Err(SharedStateError::SliceExhausted {
-                requested,
-                remaining: inner.slice,
+                requested: amount,
+                remaining: MicroUsd::from_micros(inner.slice),
             });
         }
         inner.slice -= requested;
