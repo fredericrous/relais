@@ -26,6 +26,11 @@ mod error;
 mod local;
 mod types;
 
+#[cfg(any(test, feature = "conformance"))]
+pub mod conformance;
+#[cfg(any(test, feature = "conformance"))]
+pub mod fake;
+
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
