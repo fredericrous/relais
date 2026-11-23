@@ -22,3 +22,11 @@ Part of [Reviewers get their preferred model wherever they are launched](https:/
   `relais-review`. With session routing on, the router may override an
   explicit `model: "opus"` on any unpinned agent, the 20 workflow reviewers
   included. That predates this change and is left to its own decision.
+
+## Implementation review
+
+- implementation-review: approve-with-changes → delta approve; 2 fixed (template tests, Observed record); 54k+25k, 51+20 s.
+- backend: approve-with-changes → delta approve; 2 fixed (frontmatter test, upgrade test); 1 low left (substring check); 46k+24k, 31+17 s.
+- lang:rust: approve-with-changes → delta approve; 2 fixed; 42k+28k, 27+16 s.
+
+Next: release after greenbelay's rule is live, then the user-scope install (the person's: the relais plugin refuses an agent-run install for Claude).
