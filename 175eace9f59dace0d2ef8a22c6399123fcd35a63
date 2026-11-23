@@ -1,0 +1,21 @@
+greengate-provenance-v1
+commit 175eace9f59dace0d2ef8a22c6399123fcd35a63
+tree 5f8f43379be4049896aba28bd856ad0ecfdd5587
+canon eb324c86cb4dd4561a968ca9d55b5e9039b4d452
+patch ffd60ea615281223c814685f12e483874e2d076d
+plan docs/plans/2026-11-23-carry-passed-checks-unchanged-sha.md 98e77ae635316ca30cfb5150dd53d08d6600012bb60670a9dcebda9d96740e0d
+review reviewed 9f7ec3e03423d15f2cca9d0c9b9b426c8de55a8a3f586c4915e2b2cf03435b12
+code-review backend carried 2a1f6cd6a68443aa84ed877afa3a989a5b446eef1e5a1c6b114a9f5dcb1e9420
+code-review lang:rust carried 56f696f2417036b5ca30867097fc67ce89e9500f3064930376317ea1c3cc811e
+code-review lang:typescript reviewed 9f7ec3e03423d15f2cca9d0c9b9b426c8de55a8a3f586c4915e2b2cf03435b12
+code-review unix carried 56f696f2417036b5ca30867097fc67ce89e9500f3064930376317ea1c3cc811e
+code-review tui reviewed 9f7ec3e03423d15f2cca9d0c9b9b426c8de55a8a3f586c4915e2b2cf03435b12
+preview not-required
+producer greenbelay 6.8.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABAZc9VkdOu5CsgHIAn10y7fvpQHShn/PRNxUCIww/B+9
+LMI+QHaxUeYmac/PydD95P1RCyp8Tcnk/Od/wEDLIEBw==
+-----END SSH SIGNATURE-----
