@@ -26,6 +26,9 @@ pub struct CheckTimingRow<'a> {
     pub run_ms: u64,
     /// Reused, not run now: a report never counts it as work.
     pub cached: bool,
+    /// Carried from the attempt that ran it (its log prefix), not run in
+    /// this phase: a report counts it apart from a base reuse.
+    pub carried_from: Option<&'a str>,
 }
 
 /// Per-label aggregate of the timings since a date: what `relais report`
@@ -34,6 +37,9 @@ pub struct CheckTimingRow<'a> {
 pub struct CheckTimingStats {
     pub label: String,
     pub cached: bool,
+    /// The rows were carried from an earlier attempt on the same candidate
+    /// (always `cached` too), not reused from the base.
+    pub carried: bool,
     pub runs: u64,
     /// Rows with `attempt_index > 0`.
     pub retries: u64,
@@ -50,8 +56,8 @@ impl Ledger {
         self.conn.execute(
             "INSERT OR REPLACE INTO check_timings
                 (run_id, phase, label, attempt_index, queued_at, admitted_at, started_at,
-                 ended_at, slot_wait_ms, run_ms, cached)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 ended_at, slot_wait_ms, run_ms, cached, carried_from)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 run_id.as_str(),
                 row.phase,
@@ -64,6 +70,7 @@ impl Ledger {
                 i64::try_from(row.slot_wait_ms).unwrap_or(i64::MAX),
                 i64::try_from(row.run_ms).unwrap_or(i64::MAX),
                 i64::from(row.cached),
+                row.carried_from,
             ],
         )?;
         Ok(())
@@ -84,40 +91,63 @@ impl Ledger {
         Ok(rows)
     }
 
+    /// The (phase, label, `carried_from`) of every timing row of one run, by
+    /// phase, label and attempt index: what a test of a carried row reads.
+    #[cfg(test)]
+    pub(crate) fn check_timing_carries(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Vec<(String, String, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT phase, label, carried_from FROM check_timings
+              WHERE run_id = ?1 ORDER BY phase, label, attempt_index",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Per-label, per-`cached` aggregates of every row whose run ended at or
     /// after `since` (RFC 3339), sorted by label then cached. Percentiles are
     /// nearest-rank over the rows of the group.
     pub fn check_timing_stats(&self, since: &str) -> Result<Vec<CheckTimingStats>> {
         let mut stmt = self.conn.prepare(
-            "SELECT label, cached, attempt_index, run_ms, slot_wait_ms
+            "SELECT label, cached, carried_from IS NOT NULL, attempt_index, run_ms, slot_wait_ms
                FROM check_timings
               WHERE ended_at >= ?1
-              ORDER BY label, cached",
+              ORDER BY label, cached, carried_from IS NOT NULL",
         )?;
         let rows = stmt
             .query_map(params![since], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)? != 0,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(2)? != 0,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        // (label, cached) -> (attempt index, run ms, slot wait ms) per row.
-        type Group = ((String, bool), Vec<(i64, u64, u64)>);
+        // (label, cached, carried) -> (attempt index, run ms, slot wait ms)
+        // per row.
+        type Group = ((String, bool, bool), Vec<(i64, u64, u64)>);
         let mut groups: Vec<Group> = Vec::new();
-        for (label, cached, attempt, run_ms, wait_ms) in rows {
+        for (label, cached, carried, attempt, run_ms, wait_ms) in rows {
             let entry = (attempt, run_ms.max(0) as u64, wait_ms.max(0) as u64);
             match groups.last_mut() {
-                Some((key, items)) if key.0 == label && key.1 == cached => items.push(entry),
-                _ => groups.push(((label, cached), vec![entry])),
+                Some((key, items)) if key.0 == label && key.1 == cached && key.2 == carried => {
+                    items.push(entry)
+                }
+                _ => groups.push(((label, cached, carried), vec![entry])),
             }
         }
         Ok(groups
             .into_iter()
-            .map(|((label, cached), items)| {
+            .map(|((label, cached, carried), items)| {
                 let mut run: Vec<u64> = items.iter().map(|i| i.1).collect();
                 let mut wait: Vec<u64> = items.iter().map(|i| i.2).collect();
                 run.sort_unstable();
@@ -125,6 +155,7 @@ impl Ledger {
                 CheckTimingStats {
                     label,
                     cached,
+                    carried,
                     runs: items.len() as u64,
                     retries: items.iter().filter(|i| i.0 > 0).count() as u64,
                     run_ms_p50: nearest_rank(&run, 50),
@@ -184,6 +215,7 @@ mod tests {
             slot_wait_ms: 1000,
             run_ms,
             cached,
+            carried_from: None,
         }
     }
 
@@ -221,6 +253,44 @@ mod tests {
             .check_timing_stats("2026-11-02T00:00:00Z")
             .expect("later")
             .is_empty());
+    }
+
+    /// A carried row names the attempt that ran it, a rewrite keeps the
+    /// name, and the stats count it apart from a base reuse.
+    #[test]
+    fn a_carried_row_keeps_carried_from_and_is_counted_apart_from_a_reuse() {
+        let (ledger, run, _dir) = ledger_with_run();
+        let carried = CheckTimingRow {
+            phase: "attempt2",
+            carried_from: Some("attempt1"),
+            ..row("make test", 0, 100, true)
+        };
+        ledger.record_check_timing(&run, &carried).expect("row");
+        ledger.record_check_timing(&run, &carried).expect("again");
+        let reused = CheckTimingRow {
+            phase: "base",
+            ..row("make test", 0, 50, true)
+        };
+        ledger.record_check_timing(&run, &reused).expect("reused");
+        assert_eq!(
+            ledger.check_timing_carries(&run).expect("rows"),
+            vec![
+                (
+                    "attempt2".into(),
+                    "make test".into(),
+                    Some("attempt1".into())
+                ),
+                ("base".into(), "make test".into(), None),
+            ]
+        );
+        let stats = ledger
+            .check_timing_stats("2026-11-01T00:00:00Z")
+            .expect("stats");
+        let flags: Vec<(bool, bool, u64)> = stats
+            .iter()
+            .map(|stat| (stat.cached, stat.carried, stat.runs))
+            .collect();
+        assert_eq!(flags, vec![(true, false, 1), (true, true, 1)]);
     }
 
     #[test]

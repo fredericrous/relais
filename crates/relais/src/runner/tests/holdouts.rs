@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 const STATEMENT: &str = "the escaping holdout passes";
-const STORE_PATH_IN_STORE: &str = "secret-store-path/escaping.rs";
-const OVERLAY: &str = "src/holdout_escaping.rs";
+pub(super) const STORE_PATH_IN_STORE: &str = "secret-store-path/escaping.rs";
+pub(super) const OVERLAY: &str = "src/holdout_escaping.rs";
 const RUNNER_CONFIG: &str = "secret-store-path/runner.toml";
 
 fn declaration(junit: Option<&str>, overlay: &str) -> HoldoutDecl {
@@ -28,7 +28,11 @@ fn declaration(junit: Option<&str>, overlay: &str) -> HoldoutDecl {
     }
 }
 
-fn settings_for(fixture: &Fixture, store: &str, declared: HoldoutDecl) -> HoldoutSettings {
+pub(super) fn settings_for(
+    fixture: &Fixture,
+    store: &str,
+    declared: HoldoutDecl,
+) -> HoldoutSettings {
     let repo_name = crate::repo::main_checkout_name(&fixture.repo).expect("repo name");
     let mut settings = HoldoutSettings {
         store: Some(store.into()),
@@ -42,7 +46,7 @@ fn settings_for(fixture: &Fixture, store: &str, declared: HoldoutDecl) -> Holdou
     settings
 }
 
-fn holdout_contract(fixture: &Fixture, mandatory: bool) -> TaskContract {
+pub(super) fn holdout_contract(fixture: &Fixture, mandatory: bool) -> TaskContract {
     let mut contract = fixture.contract(Review::Off);
     contract.acceptance = vec![crate::acceptance::AcceptanceEntry::Declared(
         crate::acceptance::DeclaredCriterion {
@@ -63,7 +67,7 @@ fn local_store(fixture: &Fixture) -> (String, String) {
 }
 
 /// The same, holding `files` (path, content) in its one commit.
-fn store_with(fixture: &Fixture, files: &[(&str, &str)]) -> (String, String) {
+pub(super) fn store_with(fixture: &Fixture, files: &[(&str, &str)]) -> (String, String) {
     store_with_links(fixture, files, &[])
 }
 
@@ -260,17 +264,17 @@ fn a_resolved_holdout_is_recorded_without_its_location_and_stays_a_gap() {
 }
 
 const SCRIPT_MARKER: &str = "SECRET-SCRIPT-LINE";
-const PASSING: &str =
+pub(super) const PASSING: &str =
     r#"<testsuite tests="1" failures="0"><testcase classname="h" name="escapes"/></testsuite>"#;
 const FAILING: &str = r#"<testsuite tests="1" failures="1"><testcase classname="h" name="escapes"><failure message="m"/></testcase></testsuite>"#;
 const SKIPPED: &str = r#"<testsuite tests="1" failures="0"><testcase classname="h" name="escapes"><skipped/></testcase></testsuite>"#;
 
 /// A holdout script that writes `report` where the declaration expects it.
-fn writes(report: &str) -> String {
+pub(super) fn writes(report: &str) -> String {
     format!("#!/bin/sh\n# {SCRIPT_MARKER}\ncat > j.xml <<'EOF'\n{report}\nEOF\n")
 }
 
-fn script_declaration(argv: &[&str], config: Option<&str>) -> HoldoutDecl {
+pub(super) fn script_declaration(argv: &[&str], config: Option<&str>) -> HoldoutDecl {
     HoldoutDecl {
         path: STORE_PATH_IN_STORE.into(),
         overlay: OVERLAY.into(),

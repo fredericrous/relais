@@ -9809,6 +9809,7 @@ fn dependency_enum_used() {
 
 mod budgets;
 mod candidates;
+mod carry;
 mod declared_tests;
 mod exhaustion;
 mod holdouts;

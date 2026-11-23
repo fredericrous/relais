@@ -50,6 +50,7 @@ pub mod approval;
 mod attempt;
 mod baseline;
 mod candidate;
+mod carry;
 mod config;
 mod engine;
 mod error;

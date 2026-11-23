@@ -98,6 +98,9 @@ pub(super) struct Progress {
     /// Set while the last verification failed on holdout gaps alone; an
     /// attempt ceiling reached then ends for a person (ADR-0045).
     pub(super) holdout_stop: Option<super::HoldoutStop>,
+    /// The last verification that ran the profile's commands, for carrying
+    /// its passes to an unchanged candidate.
+    pub(super) last_verified: Option<super::carry::LastVerified>,
 }
 
 /// `budget` with `review_repairs_used` counted from the run's recorded
@@ -147,5 +150,6 @@ pub(super) fn fresh_progress(preflight: &Preflight) -> Progress {
         models_used: Vec::new(),
         unpriced_model: None,
         holdout_stop: None,
+        last_verified: None,
     }
 }

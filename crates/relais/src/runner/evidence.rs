@@ -95,6 +95,7 @@ impl<'a> RunEngine<'a> {
                         slot_wait_ms: timing.slot_wait_ms,
                         run_ms: timing.run_ms,
                         cached: timing.cached,
+                        carried_from: outcome.carried_from.as_deref(),
                     },
                 )?;
             }

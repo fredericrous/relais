@@ -35,6 +35,7 @@ use crate::route::{Recipe, Route, RungIndex};
 use crate::verify::{self, Receipt, VerificationReport};
 use crate::workspace::{self, WorkspaceError};
 
+use super::carry::CheckReuse;
 use super::{
     data_block, data_list_block, effort_str, execute_child, AttemptLabel, Budget, Exhausted, Limit,
     ManagedDispatch, Next, Observation, Reason, ReviewOutcome, RunConfig, RunEngine, RunError,
@@ -503,7 +504,7 @@ fn execute_waves(
             root.authority,
             root.logs_dir,
             AttemptLabel::Integration(integration_repairs),
-            None,
+            CheckReuse::None,
             &[],
         ) {
             Ok(result) => result,

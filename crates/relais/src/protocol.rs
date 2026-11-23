@@ -134,6 +134,14 @@ pub enum Event {
         exit: Option<i32>,
         duration_ms: u64,
     },
+    /// A check this verification did not run: its pass is carried over from
+    /// attempt `from` (its log prefix), which ran it on the same candidate.
+    /// Sent once per carried check, in profile order, after the last check
+    /// that did run has ended.
+    CheckCarried {
+        label: String,
+        from: String,
+    },
     /// The run chose to repair, escalate, review or stop.
     Decision {
         what: String,
@@ -233,6 +241,7 @@ impl Event {
             | Self::CheckStarted { .. }
             | Self::Output { .. }
             | Self::CheckEnded { .. }
+            | Self::CheckCarried { .. }
             | Self::Decision { .. }
             | Self::EnvironmentWarning { .. }
             | Self::WaitingForSlot { .. }
@@ -1059,6 +1068,19 @@ mod tests {
             signal: None,
         };
         assert!(serde_json::to_value(&none).expect("serialises")["signal"].is_null());
+    }
+
+    #[test]
+    fn a_carried_check_is_a_protocol_line_with_a_pinned_shape() {
+        let event = Event::CheckCarried {
+            label: "make@1a2b3c4d".into(),
+            from: "attempt1".into(),
+        };
+        assert!(event.is_protocol_line());
+        assert_eq!(
+            serde_json::to_string(&event).expect("serialises"),
+            r#"{"kind":"check_carried","label":"make@1a2b3c4d","from":"attempt1"}"#
+        );
     }
 
     #[test]

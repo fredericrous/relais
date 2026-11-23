@@ -39,6 +39,9 @@ export type Check = {
   lineCount: number
   // Whether the open line's text so far ended in a bare carriage return.
   pendingCr: boolean
+  // The attempt that ran this check when its pass was carried over to this
+  // verification instead of run again (`attempt1`).
+  carried?: string
 }
 
 export type NumberedLine = { no: number; text: string }
@@ -439,6 +442,31 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
       m = { ...m, wait: undefined }
       m = mapLast(m, s => ({ ...s, checks: [...s.checks, check], detail: (event.argv ?? []).join(' ') }))
       return withEntry(m, at, 'check', `start · ${event.label}`)
+    }
+    case 'check_carried': {
+      // A carried pass belongs to the verification still open; one that
+      // arrives with no such step has nothing to join and never reopens a
+      // closed step.
+      const step = lastStep(m)
+      if (!step || step.state !== 'active' || step.phase !== 'verifying') return m
+      const check: Check = {
+        label: event.label,
+        argv: [],
+        running: false,
+        exit: 0,
+        durationMs: undefined,
+        output: [],
+        isOpen: false,
+        elidedBytes: 0,
+        lastOutputAt: undefined,
+        failures: [],
+        trailing: 0,
+        lineCount: 0,
+        pendingCr: false,
+        carried: String(event.from ?? ''),
+      }
+      m = mapLast(m, s => ({ ...s, checks: [...s.checks, check] }))
+      return withEntry(m, at, 'check', `carried · ${event.label} · from ${event.from}`)
     }
     case 'output': {
       const elided = typeof event.elided_bytes === 'number' ? event.elided_bytes : 0

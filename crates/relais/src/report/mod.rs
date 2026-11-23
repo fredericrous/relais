@@ -1712,7 +1712,11 @@ fn render_check_timings(timings: &[crate::ledger::CheckTimingStats]) -> String {
         out.push_str(&format!(
             "  {}{}: {} run(s), {} retr{} · run {}/{} · wait {}/{}\n",
             t.label,
-            if t.cached { " (reused)" } else { "" },
+            match (t.carried, t.cached) {
+                (true, _) => " (carried)",
+                (false, true) => " (reused)",
+                (false, false) => "",
+            },
             t.runs,
             t.retries,
             if t.retries == 1 { "y" } else { "ies" },
@@ -1782,6 +1786,7 @@ mod tests {
         let stats = crate::ledger::CheckTimingStats {
             label: "make test".into(),
             cached: true,
+            carried: false,
             runs: 3,
             retries: 1,
             run_ms_p50: 950,
@@ -1789,7 +1794,20 @@ mod tests {
             slot_wait_ms_p50: 12_300,
             slot_wait_ms_p90: 61_000,
         };
-        let text = super::render_check_timings(&[stats]);
+        let carried = crate::ledger::CheckTimingStats {
+            label: "make build".into(),
+            carried: true,
+            runs: 1,
+            retries: 0,
+            ..stats.clone()
+        };
+        let text = super::render_check_timings(&[stats, carried]);
+        assert!(
+            text.contains("make build (carried): 1 run(s), 0 retries"),
+            "{text}"
+        );
+        assert_eq!(text.matches("(carried)").count(), 1, "{text}");
+        assert_eq!(text.matches("(reused)").count(), 1, "{text}");
         assert!(
             text.contains(
                 "make test (reused): 3 run(s), 1 retry · run 950ms/4m05s · wait 12.3s/1m01s"

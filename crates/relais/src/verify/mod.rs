@@ -161,6 +161,13 @@ pub struct CheckOutcome {
     /// recorded, and for an outcome that never ran here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<CheckTiming>,
+    /// The log prefix of the attempt that actually ran this check
+    /// (`attempt1`) when this verification carried the pass over from it
+    /// instead of running it: same candidate, nothing to learn from a
+    /// second run. Absent for a check run here, and in every receipt written
+    /// before carrying existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_from: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -244,6 +251,17 @@ impl CheckOutcome {
             mark(&mut attempt.timing);
         }
         self
+    }
+
+    /// The same pass, carried from the attempt `from` that ran it rather
+    /// than run now: marked `cached` like a reuse, and naming that attempt.
+    /// A pass already carried keeps the attempt that ran it, so a chain of
+    /// carries names the origin and never an intermediate attempt.
+    pub fn carried(mut self, from: &str) -> Self {
+        let origin = self.carried_from.take().unwrap_or_else(|| from.to_string());
+        let mut carried = self.reused();
+        carried.carried_from = Some(origin);
+        carried
     }
 
     pub fn failed(&self) -> bool {
@@ -1566,6 +1584,7 @@ fn run_attempt(run: ObservedRun<'_>) -> Result<CheckOutcome, VerifyError> {
         None => None,
     };
     Ok(CheckOutcome {
+        carried_from: None,
         label: label.to_string(),
         argv: spec.argv.clone(),
         ended: CheckEnd::new(ended),
@@ -3586,6 +3605,9 @@ mod tests {
     /// `timing` on the check and on each attempt, one of them `cached`.
     const TIMED_RECEIPT_6: &str = r#"{"run_id":"run-65c083902dd9a-32f2","candidate_sha":"7b9f24ce9926e47b778a4d540a8ac48219352406","base_sha":"39c47ef1dbe697735bdcab01dfa9152a767c17cc","contract_hash":"ad3f611a09986544da26aa298fc6aedfa620007f690296934331a5a434c12937","policy_hash":"3c3bf4f67d5379c8e3c14e213bee58945a09b49d4ace905db74d3c8167702bce","outcome":"accepted","verification":{"candidate_sha":"7b9f24ce9926e47b778a4d540a8ac48219352406","base_sha":"39c47ef1dbe697735bdcab01dfa9152a767c17cc","contract_hash":"ad3f611a09986544da26aa298fc6aedfa620007f690296934331a5a434c12937","policy_hash":"3c3bf4f67d5379c8e3c14e213bee58945a09b49d4ace905db74d3c8167702bce","checks":[{"label":"make@c1c4713f","argv":["make","check"],"ended":{"exited":0},"log_path":"/Users/fredericrous/.local/state/relais/runs/run-65c083902dd9a-32f2/logs/base-cmd0.log","log_sha256":"2e11fa60569dca14ddc5b04bd11036193f5cdf4d914ce28ef1eb354ed1d6d573","timing":{"queued_at":"2026-11-01T10:00:00.000Z","admitted_at":"2026-11-01T10:00:02.000Z","started_at":"2026-11-01T10:00:02.000Z","ended_at":"2026-11-01T10:05:00.000Z","slot_wait_ms":2000,"run_ms":298000},"attempts":[{"ended":{"exited":0},"log_path":"/Users/fredericrous/.local/state/relais/runs/run-65c083902dd9a-32f2/logs/base-cmd0.log","log_sha256":"2e11fa60569dca14ddc5b04bd11036193f5cdf4d914ce28ef1eb354ed1d6d573","applied_limit_ms":0,"clipped":false,"timing":{"queued_at":"2026-11-01T10:00:00.000Z","admitted_at":"2026-11-01T10:00:02.000Z","started_at":"2026-11-01T10:00:02.000Z","ended_at":"2026-11-01T10:05:00.000Z","slot_wait_ms":2000,"run_ms":298000}},{"ended":{"exited":0},"log_path":"/Users/fredericrous/.local/state/relais/runs/run-65c083902dd9a-32f2/logs/base-cmd0.log","log_sha256":"2e11fa60569dca14ddc5b04bd11036193f5cdf4d914ce28ef1eb354ed1d6d573","applied_limit_ms":0,"clipped":false,"timing":{"queued_at":"2026-11-01T10:00:00.000Z","admitted_at":"2026-11-01T10:00:02.000Z","started_at":"2026-11-01T10:00:02.000Z","ended_at":"2026-11-01T10:05:00.000Z","slot_wait_ms":2000,"run_ms":298000,"cached":true}}]}],"gaps":[],"baseline_failures":[],"amont_bypasses":[],"amont_downgrades":[],"verification_inputs_changed":[],"integration_gaps":[],"baseline_cached":false,"baseline_cache_refused":null},"models_used":["claude-haiku-4-5"],"attempts":1,"cost_completeness":"actual","cost":76325}"#;
 
+    /// A receipt of a verification that carried a pass from attempt 1.
+    const CARRIED_RECEIPT_7: &str = r#"{"run_id":"run-65c083902dd9a-32f2","candidate_sha":"7b9f24ce9926e47b778a4d540a8ac48219352406","base_sha":"39c47ef1dbe697735bdcab01dfa9152a767c17cc","contract_hash":"ad3f611a09986544da26aa298fc6aedfa620007f690296934331a5a434c12937","policy_hash":"3c3bf4f67d5379c8e3c14e213bee58945a09b49d4ace905db74d3c8167702bce","outcome":"accepted","verification":{"candidate_sha":"7b9f24ce9926e47b778a4d540a8ac48219352406","base_sha":"39c47ef1dbe697735bdcab01dfa9152a767c17cc","contract_hash":"ad3f611a09986544da26aa298fc6aedfa620007f690296934331a5a434c12937","policy_hash":"3c3bf4f67d5379c8e3c14e213bee58945a09b49d4ace905db74d3c8167702bce","checks":[{"label":"make@c1c4713f","argv":["make","check"],"ended":{"exited":0},"log_path":"/Users/fredericrous/.local/state/relais/runs/run-65c083902dd9a-32f2/logs/base-cmd0.log","log_sha256":"2e11fa60569dca14ddc5b04bd11036193f5cdf4d914ce28ef1eb354ed1d6d573","timing":{"queued_at":"2026-11-01T10:00:00.000Z","admitted_at":"2026-11-01T10:00:02.000Z","started_at":"2026-11-01T10:00:02.000Z","ended_at":"2026-11-01T10:05:00.000Z","slot_wait_ms":2000,"run_ms":298000,"cached":true},"carried_from":"attempt1"}],"gaps":[],"baseline_failures":[],"amont_bypasses":[],"amont_downgrades":[],"verification_inputs_changed":[],"integration_gaps":[],"baseline_cached":false,"baseline_cache_refused":null},"models_used":["claude-haiku-4-5"],"attempts":1,"cost_completeness":"actual","cost":76325}"#;
+
     /// The receipts actually on this machine's disk, verbatim, all parse.
     ///
     /// The first two predate `CheckOutcome::ended` (#24), which had no
@@ -3682,6 +3704,56 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&timed).expect("serializes"))
                 .expect("round-trips");
         assert_eq!(again, timed);
+    }
+
+    /// A receipt written before carrying existed reads `carried_from` as
+    /// absent and writes it back absent (no `carried_from` key), so the
+    /// pinned receipts stay what they were; the pinned carried receipt names
+    /// its attempt, round-trips and serializes to the same bytes.
+    #[test]
+    fn carried_from_is_absent_in_old_receipts_and_round_trips_when_present() {
+        for json in [
+            PRE_FIELD_RECEIPT_1,
+            PRE_FIELD_RECEIPT_2,
+            PRE_FIELD_RECEIPT_3,
+            PRE_FIELD_RECEIPT_4,
+            PRE_FIELD_RECEIPT_5,
+            TIMED_RECEIPT_6,
+        ] {
+            let receipt: Receipt = serde_json::from_str(json).expect("parses");
+            assert!(receipt
+                .verification
+                .checks
+                .iter()
+                .all(|check| check.carried_from.is_none()));
+            let written = serde_json::to_string(&receipt).expect("serializes");
+            assert!(!written.contains("carried_from"), "{written}");
+            let again: Receipt = serde_json::from_str(&written).expect("round-trips");
+            assert_eq!(again, receipt);
+        }
+        let carried: Receipt = serde_json::from_str(CARRIED_RECEIPT_7).expect("parses");
+        let check = &carried.verification.checks[0];
+        assert_eq!(check.carried_from.as_deref(), Some("attempt1"));
+        assert!(check.timing.as_ref().is_some_and(|timing| timing.cached));
+        let written = serde_json::to_string(&carried).expect("serializes");
+        assert!(
+            written.contains(r#""carried_from":"attempt1""#),
+            "{written}"
+        );
+        let again: Receipt = serde_json::from_str(&written).expect("round-trips");
+        assert_eq!(again, carried);
+        assert_eq!(
+            serde_json::to_string(&again).expect("serializes"),
+            written,
+            "the carried receipt serializes to the same bytes"
+        );
+        let mut built: Receipt = serde_json::from_str(PRE_FIELD_RECEIPT_3).expect("parses");
+        let ran = built.verification.checks.remove(0);
+        built.verification.checks.push(ran.carried("attempt1"));
+        assert_eq!(
+            built.verification.checks[0].carried_from.as_deref(),
+            Some("attempt1")
+        );
     }
 
     /// A receipt written with timings: a check's and each attempt's timing
@@ -4436,6 +4508,7 @@ mod tests {
         std::fs::create_dir_all(dir).expect("mkdir");
         std::fs::write(&path, bytes).expect("log");
         CheckOutcome {
+            carried_from: None,
             label: format!("check@{name}"),
             argv: vec!["true".into()],
             ended: CheckEnd::new(Ended::Exited(0)),
@@ -5438,6 +5511,7 @@ mod tests {
             contract_hash: "ch".into(),
             policy_hash: "ph".into(),
             checks: vec![CheckOutcome {
+                carried_from: None,
                 label: "cmd0".into(),
                 argv: vec!["make".into(), "check".into()],
                 ended: Ended::Exited(0).into(),
@@ -5535,6 +5609,7 @@ mod tests {
         // The profile's own commands all ran and passed; `security-scan`
         // is simply not among them.
         let checks = vec![CheckOutcome {
+            carried_from: None,
             label: check_label(&profile.commands[0]),
             argv: profile.commands[0].argv.clone(),
             ended: Ended::Exited(0).into(),
@@ -5606,6 +5681,7 @@ mod tests {
             cache_baseline: false,
         };
         let checks = vec![CheckOutcome {
+            carried_from: None,
             label: check_label(&profile.commands[0]),
             argv: profile.commands[0].argv.clone(),
             ended: Ended::Exited(0).into(),
@@ -5755,6 +5831,7 @@ mod tests {
     /// what its report turned out to be.
     fn ran_ok(spec: &CommandSpec, junit: Option<JunitReport>) -> CheckOutcome {
         CheckOutcome {
+            carried_from: None,
             label: check_label(spec),
             argv: spec.argv.clone(),
             ended: Ended::Exited(0).into(),
@@ -6100,6 +6177,7 @@ mod tests {
             cache_baseline: false,
         };
         let checks = vec![CheckOutcome {
+            carried_from: None,
             label: check_label(&profile.commands[0]),
             argv: profile.commands[0].argv.clone(),
             ended: Ended::Exited(0).into(),
@@ -6194,6 +6272,7 @@ mod tests {
             cache_baseline: false,
         };
         let checks = vec![CheckOutcome {
+            carried_from: None,
             label: check_label(&profile.commands[0]),
             argv: profile.commands[0].argv.clone(),
             ended: Ended::Exited(0).into(),
@@ -6312,6 +6391,7 @@ mod tests {
             cache_baseline: false,
         };
         let checks = vec![CheckOutcome {
+            carried_from: None,
             label: check_label(&profile.commands[0]),
             argv: profile.commands[0].argv.clone(),
             ended: Ended::Exited(0).into(),
@@ -6407,6 +6487,7 @@ mod tests {
             cache_baseline: false,
         };
         let checks = vec![CheckOutcome {
+            carried_from: None,
             label: check_label(&profile.commands[0]),
             argv: profile.commands[0].argv.clone(),
             ended: Ended::Exited(0).into(),
@@ -6614,6 +6695,7 @@ mod tests {
             cache_baseline: false,
         };
         let red = CheckOutcome {
+            carried_from: None,
             label: check_label(&profile.commands[0]),
             argv: profile.commands[0].argv.clone(),
             ended: Ended::Exited(1).into(),
@@ -6880,6 +6962,7 @@ mod tests {
     #[test]
     fn baseline_failures_are_visible_but_not_waived() {
         let failing_check = CheckOutcome {
+            carried_from: None,
             label: "flaky".into(),
             argv: vec![],
             ended: Ended::Exited(1).into(),
@@ -7070,6 +7153,7 @@ mod tests {
             contract_hash: "ch".into(),
             policy_hash: "ph".into(),
             checks: vec![CheckOutcome {
+                carried_from: None,
                 label: check_label(&profile.commands[0]),
                 argv: profile.commands[0].argv.clone(),
                 ended: Ended::Exited(0).into(),
