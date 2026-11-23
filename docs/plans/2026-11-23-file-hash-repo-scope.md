@@ -146,7 +146,7 @@ older relais stores the new hashes as it stores the old.
   `claude-plugin/hooks/router.ts`, `claude-plugin/hooks/routing.ts`,
   `claude-plugin/tests/router.test.ts`, `claude-plugin/tests/routing.test.ts`,
   `claude-plugin/tests/routing-support.ts`, `docs/router-protocol.md`
-- [ ] Phase 2 — close t11 (Resolution, Decisions line, Handoff naming t12
+- [x] Phase 2 — close t11 (Resolution, Decisions line, Handoff naming t12
   next and the joint release): `docs/programmes/phase8-learner/`
 
 ### 🧑 Your steps
@@ -188,5 +188,37 @@ older relais stores the new hashes as it stores the old.
   query run on rows after the cutover returns 0 false misses from absolute
   out-of-cwd paths (t02 found 45), with no stop list for memory files
   (folded into t13's report, no new ticket).
+
+## Outcome
+
+Phase 1 was written by relais (`run-660e7d22ce063-e296`, feature task). Its
+two verify runs hit `admission_wait_exhausted` on a jammed host (1800 s
+each). The candidate was applied by hand and recorded as `salvaged`. Added
+by hand: `env -u GIT_DIR …` and `LC_ALL=C` on the revert lookup's git
+calls, so a lookup names the same repository that an edit's hash names.
+
+Checks (input → expected → actual):
+
+- `scripts/plugin-test.sh` on the committed tree → all pass → 512 pass,
+  0 fail. The commit gate deferred plugin-test to CI because no host slot
+  was free.
+- Pinned vector: `printf '/r/.git\0src/lib.rs' | shasum -a 256` →
+  `993d02558e57e026` → the test pins the same value.
+- Real git, piloted in a scratch repository with `git worktree add`:
+  - `main/src`, `wt/src` and `/private/tmp/…/wt/src` → one common dir and
+    prefix `src/` → all three hash to `16b97e2787543b51`.
+  - The repository root → an empty third line → empty, exit 0.
+  - A directory outside any repository → exit 128, "not a git repository"
+    → as expected.
+  - An inherited `GIT_DIR` under `env -u` → ignored → "not a git
+    repository".
+- Cost: `git rev-parse` cold, 5 runs → about 5–10 ms → 30–40 ms with
+  process start (macOS). A warm directory is a map lookup and spawns
+  nothing. This is above the estimate, but each directory pays it once per
+  session and edits pay it in the background.
+- Deliberate: the real-git worktree test is a piloted check, not a suite
+  test. `claude plugin test` runs in a sandbox with no real processes, so
+  the suite covers the same rules through the fake process.
+- Live: folded into t13, due 2026-12-01, after the release and reinstall.
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:typescript,tui,unix body-sha=b54f8ff2dcf0 -->
