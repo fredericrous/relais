@@ -84,8 +84,23 @@ From this programme's research tickets:
   tasks after a rollback. The command is `router rollback <stratum>`, which
   prints by default and acts on `--write`. The stop-row column is added in
   the same ledger step (it releases the `holds-until:` early).
+- [t10](t10-revert-paths-resolved.md): a revert's files are now resolved
+  against the command's own directory and hashed as edits are. `$` words
+  and unknown directories are skipped. `.` expands to the task's files.
+  `git revert` reads its files from `git show`. Only a revert the call's
+  success proves is recorded. The live count is t13, after a release and
+  the plugin reinstall.
 
 ## Handoff
+
+2026-11-23, t10 closed (revert paths). The plugin fix is committed on
+`fix/revert-paths` with its plan and panel; it is in the PR that closes this
+ticket. See t10's Resolution for the rules. It is not released: the hooks
+run from the installed plugin (0.72.0), so live revert rows still come from
+the old code. Release it with t11 and t12, the two other plugin fixes from
+t02, then the person reinstalls the plugin. [t13](t13-revert-overlap-live-count.md)
+(due 2026-12-01) counts the overlap after that. Next: t11, then t12, then
+t03. Earlier entry:
 
 2026-11-23, t04 closed (activations ledger). The answer is in the ticket:
 - the `router_activations` table, with its unique index on the active row;
