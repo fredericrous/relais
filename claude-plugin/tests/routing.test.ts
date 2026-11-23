@@ -3,7 +3,7 @@
 
 import { expect, test } from 'claude-code/testing'
 import { nativeCalls, settle, spawnLine, startQueued } from './support.ts'
-import { CLASSIFIER_SYSTEM, createRouterMemory, newTask, outcomeOf, sha256Hex, unmatchedChecksOf, withUnmatchedChecks } from '../hooks/router.ts'
+import { CLASSIFIER_SYSTEM, createRouterMemory, fileHash, newTask, outcomeOf, sha256Hex, unmatchedChecksOf, withUnmatchedChecks } from '../hooks/router.ts'
 import { noteRelaisLaunch } from '../hooks/routing.ts'
 import {
   answered,
@@ -500,6 +500,131 @@ test('a revert is recorded with the hashed files, and the task carries its files
   const [task] = observed(engine, 'task')
   expect(task.files).toEqual(['b1a35a68f14e6962'])
   expect(task.completed_at_end).toBe(task.outcome)
+})
+
+// `git revert` through a fake git: `--show-cdup` answers `cdup`, `show` answers `files`
+// (NUL-separated), or both fail. Returns the git calls made.
+function gitWithRevertedFiles(engine: any, cdup: string, files: string[] | undefined) {
+  const base = engine.script.runResult
+  const calls: { argv: string[]; init: any }[] = []
+  engine.script.runResult = (argv: string[], init: any) => {
+    if (argv[0] !== 'git') return base(argv, init)
+    calls.push({ argv, init })
+    if (files === undefined) return { ...succeeded, exitCode: 128, stdout: '', stderr: 'fatal' }
+    if (argv.includes('--show-cdup')) return { ...succeeded, stdout: `${cdup}\n` }
+    if (argv.includes('show')) return { ...succeeded, stdout: files.map(file => `${file}\0`).join('') }
+    return base(argv, init)
+  }
+  return calls
+}
+
+const hashes = (files: string[]) => files.map(file => fileHash(file, '/repo')).sort()
+const revertRows = (engine: any) => observed(engine, 'reassess').filter((r: any) => r.event === 'revert')
+
+async function taskEditing($: any, on: any) {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  await toolCall($, engine, edit('/repo/src/lib.rs'), { result: 'ok', text: 'ok' })
+  return engine
+}
+
+test('a revert resolves paths against the command directory, to the hash the edit has', async ($: any, on: any) => {
+  const engine = await taskEditing($, on)
+  await toolCall($, engine, bash('cd /repo/src && git restore lib.rs'), { result: {}, text: '' })
+  await toolCall($, engine, bash('cd /repo && git restore $P docs/new.md .'), { result: {}, text: '' })
+  await endSession($, engine)
+  const [first, second] = revertRows(engine)
+  expect(first.files).toEqual(hashes(['/repo/src/lib.rs']))
+  expect(second.files).toEqual(hashes(['/repo/docs/new.md', '/repo/src/lib.rs']))
+  expect(first.files).toEqual(observed(engine, 'task')[0].files)
+})
+
+test('git revert reads the commit files in the command directory, off the hook, and records them', async ($: any, on: any) => {
+  const engine = await taskEditing($, on)
+  const calls = gitWithRevertedFiles(engine, '../', ['src/lib.rs', 'docs/a.md'])
+  await toolCall($, engine, bash('cd /repo/sub && git revert --no-edit abc123'), { result: {}, text: '' })
+  await settle(engine)
+  expect(calls.map(c => c.argv)).toEqual([
+    ['git', '--no-pager', 'rev-parse', '--show-cdup'],
+    ['git', '--no-pager', 'show', '-z', '--name-only', '--no-renames', '--no-relative', '--format=', '--end-of-options', 'abc123'],
+  ])
+  for (const call of calls) expect(call.init).toEqual({ cwd: '/repo/sub', env: { GIT_TERMINAL_PROMPT: '0' }, timeoutMs: 1000 })
+  await endSession($, engine)
+  expect(revertRows(engine).map((r: any) => r.files)).toEqual([hashes(['/repo/src/lib.rs', '/repo/docs/a.md'])])
+})
+
+test('git revert -m 1 reads the first-parent diff; another mainline and a HEAD~1 read nothing', async ($: any, on: any) => {
+  const engine = await taskEditing($, on)
+  const calls = gitWithRevertedFiles(engine, '', ['src/lib.rs'])
+  await toolCall($, engine, bash('git revert -m 1 abc'), { result: {}, text: '' })
+  await settle(engine)
+  expect(calls[1].argv).toContain('--diff-merges=first-parent')
+  const lookups = () => calls.filter(c => c.argv.includes('show') || c.argv.includes('--show-cdup')).length
+  const before = lookups()
+  await toolCall($, engine, bash('git revert -m 2 abc'), { result: {}, text: '' })
+  await toolCall($, engine, bash('git revert HEAD~1'), { result: {}, text: '' })
+  await toolCall($, engine, bash('git revert --abort'), { result: {}, text: '' })
+  await endSession($, engine)
+  expect(lookups()).toBe(before)
+  expect(revertRows(engine).map((r: any) => r.files)).toEqual([hashes(['/repo/src/lib.rs']), [], []])
+})
+
+test('a failing git still queues the revert row, with no files', async ($: any, on: any) => {
+  const engine = await taskEditing($, on)
+  gitWithRevertedFiles(engine, '', undefined)
+  await toolCall($, engine, bash('git revert abc'), { result: {}, text: '' })
+  await endSession($, engine)
+  expect(revertRows(engine).map((r: any) => r.files)).toEqual([[]])
+})
+
+test('a lookup that resolves after the session end starts is in the final batch, under its session', async ($: any, on: any) => {
+  const engine = await taskEditing($, on)
+  gitWithRevertedFiles(engine, '', ['src/lib.rs'])
+  let release: () => void = () => {}
+  engine.script.runGate = (argv: string[]) => (argv.includes('show') ? new Promise<void>(resolve => (release = resolve)) : undefined)
+  await toolCall($, engine, bash('git revert abc'), { result: {}, text: '' })
+  await settle(engine)
+  const ending = $.session.end({ reason: 'other', sessionId: 'session-1', resume: { command: 'claude --resume session-1' } })
+  await Promise.resolve()
+  release()
+  await ending
+  await settle(engine)
+  const batches = nativeCalls(engine.calls, 'router-observe')
+  const last = batches[batches.length - 1]
+  expect(last.payload.records.filter((r: any) => r.event === 'revert').map((r: any) => r.files)).toEqual([hashes(['/repo/src/lib.rs'])])
+  expect(last.payload.records.some((r: any) => r.kind === 'task')).toBe(true)
+})
+
+test('a lookup that never resolves delays the session end by the gate timeout at most, and queues no files', async ($: any, on: any) => {
+  const engine = await taskEditing($, on)
+  gitWithRevertedFiles(engine, '', ['src/lib.rs'])
+  engine.script.runGate = (argv: string[]) => (argv.includes('show') ? new Promise<void>(() => {}) : undefined)
+  await toolCall($, engine, bash('git revert abc'), { result: {}, text: '' })
+  await settle(engine)
+  let ended = false
+  const ending = $.session
+    .end({ reason: 'other', sessionId: 'session-1', resume: { command: 'claude --resume session-1' } })
+    .then(() => (ended = true))
+  await settle(engine)
+  expect(ended).toBe(false)
+  await engine.clock.advance(1000)
+  await ending
+  await settle(engine)
+  expect(revertRows(engine).map((r: any) => r.files)).toEqual([[]])
+  expect(observed(engine, 'task').length).toBe(1)
+})
+
+test('a lookup whose spawn throws queues the row with no files, and the session end still sends the task', async ($: any, on: any) => {
+  const engine = await taskEditing($, on)
+  const base = engine.script.runResult
+  engine.script.runResult = (argv: string[], init: any) => {
+    if (argv[0] === 'git' && argv.includes('show')) throw new Error('spawn refused')
+    return base(argv, init)
+  }
+  await toolCall($, engine, bash('git revert abc'), { result: {}, text: '' })
+  await endSession($, engine)
+  expect(revertRows(engine).map((r: any) => r.files)).toEqual([[]])
+  expect(observed(engine, 'task').length).toBe(1)
 })
 
 test('a classifier answer that fails to parse, or no router-state, routes nothing', async ($: any, on: any) => {

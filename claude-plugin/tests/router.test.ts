@@ -271,17 +271,121 @@ test('file hashes are the first 16 hex of the sha256 of the repo-relative path',
   expect(taskRecord(task, null, '/repo').completed_at_end).toBe(null)
 })
 
-test('reverts: git revert, checkout -- paths and restore are found; a branch switch or unstaging is not', () => {
-  expect(revertedPaths('git restore src/lib.rs')).toEqual(['src/lib.rs'])
-  expect(revertedPaths('git restore --source=HEAD~1 -- a b')).toEqual(['a', 'b'])
-  expect(revertedPaths('git restore --staged src/lib.rs')).toBe(undefined)
-  expect(revertedPaths('git restore -S -W src/lib.rs')).toEqual(['src/lib.rs'])
-  expect(revertedPaths('git checkout -- a.rs')).toEqual(['a.rs'])
-  expect(revertedPaths('git checkout HEAD~2 -- a.rs b.rs')).toEqual(['a.rs', 'b.rs'])
-  expect(revertedPaths('git checkout main')).toBe(undefined)
-  expect(revertedPaths('git revert --no-edit abc123')).toEqual([])
-  expect(revertedPaths('cargo test && git restore x.rs')).toEqual(['x.rs'])
-  expect(revertedPaths('echo git restore x')).toBe(undefined)
+const reverted = (command: string, cwd = '/w', taskFiles: string[] = []) => revertedPaths(command, cwd, taskFiles)
+const pathsOf = (command: string, cwd = '/w', taskFiles: string[] = []) => reverted(command, cwd, taskFiles)?.paths
+
+test('reverts: checkout -- paths and restore are found; a branch switch or unstaging is not', () => {
+  expect(pathsOf('git restore src/lib.rs')).toEqual(['/w/src/lib.rs'])
+  expect(pathsOf('git restore --source=HEAD~1 -- a b')).toEqual(['/w/a', '/w/b'])
+  expect(pathsOf('git restore -s HEAD~1 a')).toEqual(['/w/a'])
+  expect(pathsOf('git restore --staged src/lib.rs')).toBe(undefined)
+  expect(pathsOf('git restore -S -W src/lib.rs')).toEqual(['/w/src/lib.rs'])
+  expect(pathsOf('git checkout -- a.rs')).toEqual(['/w/a.rs'])
+  expect(pathsOf('git checkout HEAD~2 -- a.rs b.rs')).toEqual(['/w/a.rs', '/w/b.rs'])
+  expect(pathsOf('git checkout main')).toBe(undefined)
+  expect(pathsOf('cargo test && git restore x.rs')).toEqual(['/w/x.rs'])
+  expect(pathsOf('echo git restore x')).toBe(undefined)
+  expect(pathsOf('git restore /abs/x')).toEqual(['/abs/x'])
+})
+
+test('reverts: the hash of a resolved path is the hash of the edit of that file (the t02 case)', () => {
+  const edited = '/Users/p/Developer/Perso/relais-wt-replay-floors/docs/plans/x.md'
+  const cwd = '/Users/p/Developer/Perso'
+  const paths = pathsOf('cd /Users/p/Developer/Perso/relais-wt-replay-floors && git restore docs/plans/x.md', cwd)
+  expect(paths).toEqual([edited])
+  expect(fileHash(paths![0], cwd)).toBe(fileHash(edited, cwd))
+  expect(pathsOf('cd /Users/p/Developer/Perso/relais-wt-replay-floors && git restore $P', cwd)).toEqual([])
+})
+
+test('reverts: cd, subshells and git -C give the directory a path is resolved in', () => {
+  expect(pathsOf('cd a && git restore x')).toEqual(['/w/a/x'])
+  expect(pathsOf('cd a && cd ../b && git restore x')).toEqual(['/w/b/x'])
+  expect(pathsOf('(cd a && git restore x)')).toEqual(['/w/a/x'])
+  expect(pathsOf('(cd a && git restore x) && git restore y')).toEqual(['/w/a/x', '/w/y'])
+  expect(pathsOf('(cd a); git restore y')).toEqual(['/w/y'])
+  expect(pathsOf('(cd a) && git restore y')).toEqual(['/w/y'])
+  expect(pathsOf('git -C a restore x')).toEqual(['/w/a/x'])
+  expect(pathsOf('git -C a -C b restore x')).toEqual(['/w/a/b/x'])
+  expect(pathsOf('git -C /r -c core.x=1 --no-pager restore x')).toEqual(['/r/x'])
+  expect(pathsOf('cd a && git -C b restore x')).toEqual(['/w/a/b/x'])
+  expect(pathsOf('cd a | cat && git restore x')).toEqual(['/w/x'])
+  expect(pathsOf('cd -P /abs && git restore x')).toEqual(['/abs/x'])
+})
+
+test('reverts: an unknown directory skips relative paths, an absolute one is kept', () => {
+  for (const unknown of ['cd', 'cd -', 'cd $X', 'cd ~', 'cd ~/x', 'cd `pwd`']) {
+    expect(pathsOf(`${unknown} && git restore x /abs/y`)).toEqual(['/abs/y'])
+  }
+  expect(pathsOf('cd $X && cd /abs && git restore x')).toEqual(['/abs/x'])
+  expect(pathsOf('git -C $X restore x')).toEqual([])
+  expect(revertedPaths('git restore x /abs/y', undefined, [])?.paths).toEqual(['/abs/y'])
+})
+
+test('reverts: a word holding $ or a backtick is never hashed', () => {
+  expect(pathsOf('git restore $P a "$Q/b" `f` $(g) \'${H}\'')).toEqual(['/w/a'])
+  expect(pathsOf("git restore 'a$b'")).toEqual([])
+})
+
+test('reverts: a directory expands to the task files beneath it, and is never hashed itself', () => {
+  const files = ['/w/src/a.rs', '/w/src/b.rs', '/w/docs/c.md', '/other/d.rs']
+  expect(pathsOf('git restore .', '/w', files)).toEqual(['/w/src/a.rs', '/w/src/b.rs', '/w/docs/c.md'])
+  expect(pathsOf('cd src && git restore .', '/w', files)).toEqual(['/w/src/a.rs', '/w/src/b.rs'])
+  expect(pathsOf('cd src && git restore ..', '/w', files)).toEqual(['/w/src/a.rs', '/w/src/b.rs', '/w/docs/c.md'])
+  expect(pathsOf('git restore src/', '/w', files)).toEqual(['/w/src/a.rs', '/w/src/b.rs'])
+  expect(pathsOf('git restore src', '/w', files)).toEqual(['/w/src/a.rs', '/w/src/b.rs'])
+  expect(pathsOf('git restore empty/ other', '/w', files)).toEqual(['/w/other'])
+  expect(pathsOf('git restore .', '/w', [])).toEqual([])
+  expect(pathsOf('git checkout -- .', '/w', files).length).toBe(3)
+  expect(pathsOf('git restore src//./a.rs', '/w', files)).toEqual(['/w/src/a.rs'])
+})
+
+test('reverts: magic pathspecs leave the segment unresolved, source values are not paths', () => {
+  expect(pathsOf('git restore a :(exclude)b')).toEqual([])
+  expect(pathsOf('git restore :/ a')).toEqual([])
+  expect(pathsOf('git restore --source main a')).toEqual(['/w/a'])
+  expect(pathsOf('GIT_DIR=/x git restore a')).toEqual([])
+  expect(pathsOf('git --git-dir=/x restore a')).toEqual([])
+  expect(pathsOf('git --work-tree /x restore a')).toEqual([])
+})
+
+test('reverts: operators split outside quotes only, and a revert is attributed only at the end of an && chain', () => {
+  expect(pathsOf('echo "a; git restore x"')).toBe(undefined)
+  expect(pathsOf("git restore 'a;b' && echo '|'")).toEqual(['/w/a;b'])
+  expect(pathsOf('git restore x; echo')).toBe(undefined)
+  expect(pathsOf('git restore x\necho')).toBe(undefined)
+  expect(pathsOf('git restore x\ngit restore y')).toEqual(['/w/y'])
+  expect(pathsOf('git restore x || echo')).toBe(undefined)
+  expect(pathsOf('true || git restore x')).toBe(undefined)
+  expect(pathsOf('git restore x | cat')).toBe(undefined)
+  expect(pathsOf('cat | git restore x')).toBe(undefined)
+  expect(pathsOf('git restore x && echo ok')).toEqual(['/w/x'])
+  expect(pathsOf('git restore x 2>&1 && echo ok')).toEqual(['/w/x'])
+  expect(pathsOf('git restore x > /dev/null')).toEqual(['/w/x'])
+  expect(pathsOf('git restore x &')).toBe(undefined)
+  expect(pathsOf('git restore x <<EOF\nEOF')).toBe(undefined)
+  expect(pathsOf('cat <<EOF\n x\nEOF\ngit restore y')).toBe(undefined)
+})
+
+test('reverts: git revert yields its commits and the directory, not options or relative HEADs', () => {
+  const lookups = (command: string, cwd = '/w') => reverted(command, cwd)?.lookups
+  expect(lookups('git revert --no-edit abc123')).toEqual([{ directory: '/w', commits: ['abc123'], firstParent: false }])
+  expect(pathsOf('git revert abc123')).toEqual([])
+  expect(lookups('cd /r && git revert a b')).toEqual([{ directory: '/r', commits: ['a', 'b'], firstParent: false }])
+  expect(lookups('git -C r revert HEAD')).toEqual([{ directory: '/w/r', commits: ['HEAD'], firstParent: false }])
+  expect(lookups('git revert @')).toEqual([{ directory: '/w', commits: ['@'], firstParent: false }])
+  expect(lookups('git revert -m 1 abc')).toEqual([{ directory: '/w', commits: ['abc'], firstParent: true }])
+  expect(lookups('git revert --mainline=1 abc')).toEqual([{ directory: '/w', commits: ['abc'], firstParent: true }])
+  expect(lookups('git revert -m 2 abc')).toEqual([])
+  expect(lookups('git revert -X ours --strategy recursive abc')).toEqual([{ directory: '/w', commits: ['abc'], firstParent: false }])
+  expect(lookups('git revert HEAD~1')).toEqual([])
+  expect(lookups('git revert @^ abc')).toEqual([{ directory: '/w', commits: ['abc'], firstParent: false }])
+  expect(lookups('git revert -n HEAD~1')).toEqual([{ directory: '/w', commits: ['HEAD~1'], firstParent: false }])
+  expect(lookups('git revert $SHA `x` abc')).toEqual([{ directory: '/w', commits: ['abc'], firstParent: false }])
+  expect(lookups('cd $X && git revert abc')).toEqual([])
+  expect(lookups('GIT_DIR=/x git revert abc')).toEqual([])
+  expect(reverted('git revert --abort')).toBe(undefined)
+  expect(reverted('git revert --quit')).toBe(undefined)
+  expect(reverted('git revert --continue')).toEqual({ paths: [], lookups: [] })
 })
 
 test('outcomes: corrected outranks verified; an accept is completed_accepted; inferred signals are no outcome', () => {
