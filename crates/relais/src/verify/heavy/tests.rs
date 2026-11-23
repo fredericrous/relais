@@ -1151,10 +1151,22 @@ mod host_slots {
             "\"cap\":4",
             "\"cores\":8",
             "\"outcome\":\"admitted\"",
+            // The line counts its own lease (greenharness-slots 4.13).
+            "\"holders\":1",
+            "\"holder_jobs\":2",
         ] {
             assert!(line.contains(part), "{part} in {line}");
         }
         drop(lease);
+        // The dropped lease appends one release line, with its hold time.
+        let journal = std::fs::read_to_string(slots.join("waits.jsonl")).expect("waits.jsonl");
+        let released: Vec<&str> = journal
+            .lines()
+            .filter(|l| l.contains("\"outcome\":\"released\""))
+            .collect();
+        assert_eq!(released.len(), 1, "{journal}");
+        assert!(released[0].contains("\"tool\":\"relais\""), "{journal}");
+        assert!(released[0].contains("\"held_ms\":"), "{journal}");
         std::fs::remove_dir_all(&scratch).ok(); // best-effort: a scratch dir
     }
 
