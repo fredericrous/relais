@@ -994,9 +994,18 @@ fn inherited_block(request: &ReviewRequest<'_>) -> String {
 /// check are unchanged under `LocalState`); anything else is the shared
 /// half's, said with what could not be read.
 fn spend_read_failure(e: crate::shared_state::node::NodeError) -> RunError {
+    use crate::shared_state::node::NodeError;
     match e {
-        crate::shared_state::node::NodeError::Ledger(e) => RunError::Ledger(e),
-        other => RunError::Other(format!("the shared spend count is unavailable: {other}")),
+        NodeError::Ledger(e) => RunError::Ledger(e),
+        NodeError::Shared(e) => {
+            RunError::Other(format!("the shared spend count is unavailable: {e}"))
+        }
+        // `daily_spent` touches no lock, claim file or registry; named so a
+        // new variant is a compile error here, not a "shared" sentence.
+        e @ (NodeError::Lock { .. }
+        | NodeError::Claim(_)
+        | NodeError::Registry(_)
+        | NodeError::Compensation { .. }) => RunError::Other(e.to_string()),
     }
 }
 

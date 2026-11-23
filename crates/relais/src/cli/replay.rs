@@ -300,6 +300,8 @@ pub(crate) fn replay_command(
     };
 
     let machine = load_machine()?;
+    // Built once, before any checkout or start line (an-t16).
+    let shared = super::ctx::shared_state()?;
     let artifacts_dir = paths::runs_dir().map_err(CliError::Home)?;
     let backend = match relais::adapter::claude::ClaudeBackend::discover() {
         Ok(backend) => std::sync::Arc::from(backend),
@@ -429,7 +431,6 @@ pub(crate) fn replay_command(
         started: std::time::Instant::now(),
     };
     eprintln!("{}", log.start_line());
-    let shared = super::ctx::shared_state()?;
     let outcome = execute(&RunConfig {
         workspace: relais::workspace::reuse::Workspace::Isolated,
         repo_dir: &checkout_dir,

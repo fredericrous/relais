@@ -28,7 +28,8 @@ missing here.
   [[pricing.models]] entry for:` (`relais report`), so the header can be
   pasted as is. A script that matched the single-bracket text must match
   the double-bracket form.
-- `RunConfig` carries a `shared_state: &dyn SharedState`, and the runner's
+- Breaking, for a library caller building a `RunConfig`: it carries a
+  `shared_state: &dyn SharedState`, and the runner's
   daily spend check and its two automatic settles (scope widening and
   timed-out verify) go through it: the ceiling reads the larger of the
   global counter and this node's ledger, and a settle answers the decision
