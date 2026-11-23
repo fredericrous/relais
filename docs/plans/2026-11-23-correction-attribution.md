@@ -236,7 +236,7 @@ in-session (Phase 1 salvaged as `01c90452`, Phase 2 committed as
 | `claude plugin test` (from `claude-plugin/`) | the new tests pass | before review: all 9 new or changed tests pass in two runs; other failures differ per run (1, then 7), each a 5 s hook-budget timeout under load, none in routing. On the reviewed tree: 529 pass, 0 fail |
 | `cargo test -p relais --lib -- ledger:: router::` | the new tests pass | 279 passed before the rebase; on the reviewed tree (v50, review fixes) 282 passed, 0 failed |
 | `cargo fmt --check` | clean | clean |
-| clippy | clean | not run locally: no host slot freed in 1500 s (8 waiting); the push gate and CI run it |
+| clippy `-D warnings` | clean | CI lint failed on the first push: `corrections_charged_away` unused (a `pub fn` in a `pub(crate)` module). Fixed by re-exporting it, `CorrectionCharge` and `TaskKey` from `ledger/mod.rs`; local `cargo clippy -p relais --all-targets -- -D warnings` then exited 0 |
 | pilot: `.backup` of the live ledger, branch binary, `RELAIS_STATE_DIR` on a scratch dir | v49 applies, live untouched | the copy reads v49 with `outcome_uncorrected` (4,643 tasks, all `null`); its 26 main correction rows are all `[]`, so all legacy, `charged = []`; the live ledger still reads v48. `relais report` took 3 min 29 s under load |
 
 Decision log:
@@ -267,6 +267,7 @@ Decision log:
 - implementation-review: approve (Delta; round 1 approve-with-changes: the corrupt stored files list now errors, one parser, plan text fixed). 52k + 32k, 21 s + 27 s.
 - backend: approve-with-changes; unparseable correction rows kept uncharged, fixed; deliberate: corrupt rows read as legacy and silent skips (nothing reads `legacy` yet; inbox follow-up). 54k + 29k.
 - lang:rust: approve-with-changes; parser, bound event names, test name fixed; deliberate: read-path fallback tests and warnings (inbox follow-up), the pre-existing wire.rs line. 44k + 29k.
+- CI fix (export of the charge rule): implementation-review and lang:rust re-ran on the one-commit Delta: implementation-review approve (31k); lang:rust approve-with-changes, deliberate: the three names are public like the other router rows, and their reader is the in-crate gate code of t03/t05 (25k).
 - lang:typescript: approve (Delta); `CorrectionWindow`, no `as any`, correction hashing beside the task's own, `flagged` comment. 56k + 24k, 55 s + 22 s.
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,lang:typescript,tui,unix body-sha=265bd8800120 -->
