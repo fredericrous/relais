@@ -52,7 +52,7 @@ export const ROUTER_STATE = {
   checks: [['cargo', 'test'], ['npm', 'test'], ['go', 'test'], ['go', 'vet'], ['golangci-lint', 'run']],
   check_kinds: ['test', 'test', 'test', 'lint', 'lint'],
   adjustments: [],
-  accepts: ['answered', 'parent_task_id', 'unmatched_checks'],
+  accepts: ['answered', 'parent_task_id', 'unmatched_checks', 'outcome_uncorrected'],
 }
 
 // The classifier's JSON for one request.

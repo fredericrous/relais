@@ -37,5 +37,12 @@ misses from out-of-repository paths (t02 found 45). If every new task row
 with edits carries `files: []`, suspect the `env -u … git` spawn t11 added
 (the first non-`git`/`relais` binary the hooks run) before anything else.
 
+In that query, the correction leg joins on the correction row's own
+`files_json` (t12: the files edited after the correction) for rows written
+after the reinstall, and keeps t02's join on B's whole `files_json` only for
+older rows, whose correction files are `[]`. Report how many new correction
+rows carry files, and `Ledger::router_correction_charges` over them: rows
+charged, and tasks in `corrections_charged_away`.
+
 If too few rows exist yet, re-date the ticket instead. If the overlap is
 still zero, name the shape that misses.

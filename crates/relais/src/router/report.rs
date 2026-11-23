@@ -640,6 +640,7 @@ mod tests {
             outcome: outcome.into(),
             outcome_rank: 0,
             completed_at_end: None,
+            outcome_uncorrected: None,
             inferred: vec![],
             files: vec![],
             escalations: 0,

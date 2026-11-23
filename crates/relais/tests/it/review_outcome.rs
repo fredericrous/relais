@@ -433,6 +433,7 @@ fn seed_router_task(ledger: &Ledger, session: &str, task_id: &str, agent_id: &st
                 outcome: "unknown".into(),
                 outcome_rank: 0,
                 completed_at_end: None,
+                outcome_uncorrected: None,
                 inferred: vec![],
                 files: vec![],
                 escalations: 0,

@@ -95,8 +95,28 @@ From this programme's research tickets:
   and two repositories never collide; paths in no repository are not
   recorded. Older rows keep the cwd-relative hash (the t02 stop list stays
   for them).
+- [t12](t12-correction-attribution.md): a correction row carries the files
+  edited after it, re-sent at the task's end and merged by union. The
+  charge is decided at read time: an earlier completed main task within
+  24 h sharing a file is charged, and a B whose every correction is
+  charged (and never flagged) counts with its `outcome_uncorrected`.
 
 ## Handoff
+
+2026-11-23, t12 closed (a correction records its files and charges one
+task). Plugin and ledger changes are on
+`prog/phase8-learner/t12-correction-attribution` with plan and panel, in the
+PR that closes this ticket; t12's Resolution has the rules. t10, t11 and
+t12 are all on main once it merges: release them together (tag-release),
+then the person reinstalls the plugin (`relais install --claude --user
+--write`, then `relais coordinator stop`; check `relais doctor`'s `plugin`
+finding names the release). [t13](t13-revert-overlap-live-count.md) (due
+2026-12-01) counts reverts, the t02 miss query, and now the correction
+rows with files and their charges. The host was jammed again: both relais
+runs lost their verify to the 1800 s admission wait, and their candidates
+were applied and checked in-session; `greengate run --raw` exited 0
+without running the plugin suite, so run `claude plugin test` from
+`claude-plugin/` to check it. Next: the release, then t03. Earlier entry:
 
 2026-11-23, t11 closed (file hashes scoped to a repository). The plugin
 fix is on `prog/phase8-learner/t11-file-hash-repo-scope` with its plan and

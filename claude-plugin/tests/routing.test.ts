@@ -900,6 +900,20 @@ test('a router-state from a relais that predates accepts (0.38.0 and older) gets
   }
 })
 
+test('a router-state whose accepts lacks outcome_uncorrected (0.77.0) gets task records without it', async ($: any, on: any) => {
+  const engine = await routedSession($, on, { state: { accepts: ['answered', 'parent_task_id', 'unmatched_checks'] } })
+  await personTurn($, engine, 'fix the parser, tests exist')
+  await toolCall($, engine, edit('/repo/src/x.rs'), { result: {}, text: 'ok' })
+  engine.labels.set('still wrong', label({ relation: 'correction', explicit: { value: 'correct', quote: 'still wrong' } }))
+  await personTurn($, engine, 'still wrong')
+  await toolCall($, engine, edit('/repo/src/z.rs'), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  const tasks = observed(engine, 'task')
+  expect(tasks.length).toBeGreaterThan(0)
+  expect(tasks.every((r: any) => !('outcome_uncorrected' in r))).toBe(true)
+  expect(observed(engine, 'reassess').filter((r: any) => r.event === 'correction' && r.files).length).toBe(1)
+})
+
 test('a parent whose outcome is unknown sends no task_outcome', async ($: any, on: any) => {
   const engine = await routedSession($, on)
   await personTurn($, engine, 'rename foo to bar, tests exist')
@@ -1291,4 +1305,64 @@ test('a git revert lookup hashes from the common dir and resolves no directory b
   expect(revertRows(engine).map((r: any) => r.files)).toEqual([hashes(['/repo/removed-dir/gone.rs', '/repo/src/lib.rs'])])
   const probed = engine.calls.run.filter(c => isRootProbe(c.argv)).map(c => c.init.cwd)
   expect(probed).toEqual(['/repo/src'])
+})
+
+const correctionRows = (engine: any) => observed(engine, 'reassess').filter((r: any) => r.event === 'correction')
+const hashOf = (file: string) => scopedFileHash('/repo/.git', file.replace('/repo/', ''))
+
+test('a correction row is sent again at the end with the files edited since it', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'fix the parser, tests exist')
+  await toolCall($, engine, edit('/repo/src/x.rs'), { result: {}, text: 'ok' })
+  engine.labels.set('still wrong', label({ relation: 'correction', explicit: { value: 'correct', quote: 'still wrong' } }))
+  await personTurn($, engine, 'still wrong')
+  await toolCall($, engine, edit('/repo/src/x.rs'), { result: {}, text: 'ok' })
+  await toolCall($, engine, edit('/repo/src/z.rs'), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  const [early, late] = correctionRows(engine)
+  expect(correctionRows(engine).length).toBe(2)
+  expect(early.files).toBe(undefined)
+  expect(late.at).toBe(early.at)
+  expect(late.files).toEqual([hashOf('/repo/src/x.rs'), hashOf('/repo/src/z.rs')].sort())
+  const [snapshot, ended] = observed(engine, 'task')
+  expect(snapshot.outcome_uncorrected).toBe(null)
+  expect(ended.outcome_uncorrected).not.toBe(null)
+})
+
+test('two corrections: the first row holds both windows, the second its own', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'fix the parser, tests exist')
+  engine.labels.set('wrong one', label({ relation: 'correction', explicit: { value: 'correct', quote: 'wrong one' } }))
+  engine.labels.set('wrong two', label({ relation: 'correction', explicit: { value: 'correct', quote: 'wrong two' } }))
+  await personTurn($, engine, 'wrong one')
+  await toolCall($, engine, edit('/repo/src/x.rs'), { result: {}, text: 'ok' })
+  await personTurn($, engine, 'wrong two')
+  await toolCall($, engine, edit('/repo/src/z.rs'), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  // The test clock is fixed, so both corrections share an `at`; the end sends the entries in order, last.
+  const [first, second] = correctionRows(engine).slice(-2)
+  expect(first.files).toEqual([hashOf('/repo/src/x.rs'), hashOf('/repo/src/z.rs')].sort())
+  expect(second.files).toEqual([hashOf('/repo/src/z.rs')])
+})
+
+test('no correction means no correction row; a flag leaves outcome_uncorrected null', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'fix the parser, tests exist')
+  await toolCall($, engine, edit('/repo/src/x.rs'), { result: {}, text: 'ok' })
+  await toolCall($, engine, bash('cargo test'), passingCheck)
+  await $.command.run({ command: 'relais-flag', args: '', origin: { kind: 'composer' }, presentation: { layout: 'main', columns: 120 } })
+  await endSession($, engine)
+  expect(correctionRows(engine)).toEqual([])
+  expect(observed(engine, 'task').every((t: any) => t.outcome_uncorrected === null)).toBe(true)
+})
+
+test('a subagent edit during a correction window is not in the main task’s corrections', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  engine.labels.set('still wrong', label({ relation: 'correction', explicit: { value: 'correct', quote: 'still wrong' } }))
+  await personTurn($, engine, 'still wrong')
+  await $.agent.spawn({ prompt: 'rename in the module', description: 'rename foo', subagentType: 'general-purpose' })
+  await toolCall($, engine, edit('/repo/src/sub.rs', 'agent-1'), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  expect(correctionRows(engine).filter((r: any) => r.files)).toEqual([])
 })

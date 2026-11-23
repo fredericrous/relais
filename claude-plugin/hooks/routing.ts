@@ -609,7 +609,7 @@ export async function flag(fx: Fx, store: Store): Promise<string> {
   const r = store.router
   if (!r.state || !r.task) return 'No routed task is in progress: nothing to flag.'
   const now = await fx.clock.now()
-  const corrected = { ...r.task, corrected: true }
+  const corrected = { ...r.task, corrected: true, flagged: true }
   const out = escalate(r.state, corrected, 'flag')
   r.task = out.task
   queue(store, reassessRecord(out.task, out.record, now))
@@ -642,23 +642,52 @@ export function onTurnComplete(fx: Fx, store: Store, e: any, now: number) {
 // The repository name is resolved first: a name guessed from a subdirectory
 // would be stored with the unmatched checks.
 async function queueCorrected(fx: Fx, store: Store, task: TaskState) {
-  const [repository, files] = await Promise.all([resolveRepository(fx, store).catch(() => undefined), hashFiles(fx, store, task.files)])
+  const session = store.router.session
+  const [repository, files, corrections] = await Promise.all([
+    resolveRepository(fx, store).catch(() => undefined),
+    hashFiles(fx, store, task.files),
+    hashCorrections(fx, store, task),
+  ])
   queue(store, taskRecord(task, null, files, repository))
+  queueCorrectionRows(store, task, session, corrections)
+}
+
+// Each correction's files hashed, one `hashFiles` call per entry (it returns
+// no path-to-hash map), all at once: when git is slow the wait is one gate
+// timeout, not one per entry.
+function hashCorrections(fx: Fx, store: Store, task: TaskState): Promise<string[][]> {
+  return Promise.all((task.corrections ?? []).map(entry => hashFiles(fx, store, entry.files)))
+}
+
+// Each correction's row again, same key, with the hashes of the files edited
+// since it: relais merges the files into the row sent at the correction. The
+// session is the one taken before any await, as noteRevert does. An edit made
+// while these were hashed is in the end's send, and relais keeps the union.
+function queueCorrectionRows(store: Store, task: TaskState, session: string | null | undefined, hashed: string[][]) {
+  if (!session) return
+  ;(task.corrections ?? []).forEach((entry, index) => {
+    const files = hashed[index] ?? []
+    if (files.length === 0) return
+    store.router.queue.push({ session, record: { ...reassessRecord(task, entry.record, entry.at), files } })
+  })
 }
 
 // The task ends: the amont stamp on the trees it edited is read (bounded,
 // failing open) and folded in as checks, the task is recorded, and each
 // subagent task it spawned is amended with its outcome.
 async function endTask(fx: Fx, store: Store, task: TaskState, now: number) {
+  const session = store.router.session
   await settleReverts(store)
-  const [gate, files, repository] = await Promise.all([
+  const [gate, files, repository, corrections] = await Promise.all([
     gateEvidence(fx, store, task, now).catch(() => []),
     hashFiles(fx, store, task.files),
     resolveRepository(fx, store).catch(() => undefined),
+    hashCorrections(fx, store, task),
   ])
   const ended: TaskState =
     gate.length === 0 ? task : { ...task, verifications: [...task.verifications, ...gate].slice(-20) }
   queue(store, taskRecord(ended, now, files, repository))
+  queueCorrectionRows(store, ended, session, corrections)
   const outcome = outcomeOf(ended)
   if (outcome === 'unknown' || outcome === 'answered') return
   for (const sub of ended.subagentTasks ?? []) {
@@ -852,9 +881,11 @@ export async function flushObservations(fx: Fx, store: Store, options: { isFinal
   const batch = r.queue
   r.queue = []
   const understandsAnswered = supportsAnswered(store)
+  const understandsUncorrected = (store.router.state?.accepts ?? []).includes('outcome_uncorrected')
   const bySession = new Map<string, unknown[]>()
   for (const { session, record } of batch) {
-    const sent = understandsAnswered ? record : withoutAnswered(record)
+    const formed = understandsAnswered ? record : withoutAnswered(record)
+    const sent = understandsUncorrected ? formed : withoutUncorrected(formed)
     bySession.set(session, [...(bySession.get(session) ?? []), sent])
   }
   for (const [session, records] of bySession) {
@@ -884,6 +915,15 @@ function withoutAnswered(record: any): unknown {
   delete out.unmatched_checks
   if (out.outcome === 'answered') out.outcome = 'unknown'
   if (out.completed_at_end === 'answered') out.completed_at_end = 'unknown'
+  return out
+}
+
+// A task record for a relais whose router-state does not list
+// `outcome_uncorrected` (0.77.0 and older): it refuses the field.
+function withoutUncorrected(record: any): unknown {
+  if (!record || typeof record !== 'object' || !('outcome_uncorrected' in record)) return record
+  const out = { ...record }
+  delete out.outcome_uncorrected
   return out
 }
 

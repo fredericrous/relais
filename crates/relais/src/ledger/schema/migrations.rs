@@ -1276,4 +1276,13 @@ pub(in crate::ledger) const MIGRATIONS: &[(&str, &str)] = &[
     ALTER TABLE check_timings ADD COLUMN carried_from TEXT;
     "#,
     ),
+    (
+        // The outcome a corrected task had before its correction was
+        // charged away (correction-attribution plan, phase 2). Expand-only:
+        // one nullable column nothing older reads.
+        "v50",
+        r#"
+    ALTER TABLE router_tasks ADD COLUMN outcome_uncorrected TEXT;
+    "#,
+    ),
 ];

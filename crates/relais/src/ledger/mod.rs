@@ -78,9 +78,10 @@ mod task_types;
 pub use review::{MergeTotals, ReviewBasis, ReviewClassTotals, ReviewOutcomeRow};
 pub use review_parts::{PartResult, PartStatus, PlannedPart, ReviewPartRow};
 pub use router::{
-    ExplorationTask, RouterCheck, RouterClass, RouterClassificationRow, RouterDecisionRow,
-    RouterExplorationStop, RouterProvenance, RouterReassessRow, RouterRecord, RouterTaskOutcomeRow,
-    RouterTaskRow, RouterUsageRow, RouterWindow, OWN_SOURCE, UNMATCHED_CHECKS_MAX,
+    corrections_charged_away, CorrectionCharge, ExplorationTask, RouterCheck, RouterClass,
+    RouterClassificationRow, RouterDecisionRow, RouterExplorationStop, RouterProvenance,
+    RouterReassessRow, RouterRecord, RouterTaskOutcomeRow, RouterTaskRow, RouterUsageRow,
+    RouterWindow, TaskKey, OWN_SOURCE, UNMATCHED_CHECKS_MAX,
 };
 pub use task_types::{
     ExportedTasks, ImportedTaskTypes, StoredTaskType, TaskExportRow, TaskTypeSource,

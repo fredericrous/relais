@@ -200,10 +200,15 @@ fn file_hashes(files: Vec<String>) -> Result<Vec<String>, String> {
 
 /// What this relais accepts on the wire beyond the v0.35 form: the
 /// `answered` outcome, a task's `parent_task_id` and `parent_link_recorded`,
-/// and its `unmatched_checks`. `router-state` serves the list as `accepts`,
+/// its `unmatched_checks`, and its `outcome_uncorrected`. `router-state` serves the list as `accepts`,
 /// so the plugin sends the new form only to a relais that lists it, whatever
 /// its version number.
-pub const WIRE_ACCEPTS: [&str; 3] = ["answered", "parent_task_id", "unmatched_checks"];
+pub const WIRE_ACCEPTS: [&str; 4] = [
+    "answered",
+    "parent_task_id",
+    "unmatched_checks",
+    "outcome_uncorrected",
+];
 
 /// The build and test runners whose argv prefix may be stored; the plugin's
 /// list, checked again here because the wire is the trust boundary.
@@ -351,6 +356,8 @@ struct Task {
     outcome: TaskOutcome,
     #[serde(default)]
     completed_at_end: Option<TaskOutcome>,
+    #[serde(default)]
+    outcome_uncorrected: Option<TaskOutcome>,
     #[serde(default)]
     inferred: Vec<String>,
     #[serde(default)]
@@ -687,6 +694,7 @@ fn task(t: Task) -> Result<RouterRecord, String> {
         outcome: t.outcome.as_str().into(),
         outcome_rank: t.outcome.rank(),
         completed_at_end: t.completed_at_end.map(|o| o.as_str().to_string()),
+        outcome_uncorrected: t.outcome_uncorrected.map(|o| o.as_str().to_string()),
         files: file_hashes(t.files)?,
         task_id: t.task_id,
         agent_id: t.agent_id,
@@ -947,6 +955,18 @@ mod tests {
             parse_batch(&value.to_string()).unwrap_err().record,
             Some((3, "task".into()))
         );
+    }
+
+    #[test]
+    fn outcome_uncorrected_parses_and_defaults_to_none() {
+        let mut value: serde_json::Value = serde_json::from_str(&sample_batch("s1")).unwrap();
+        let batch = parse_batch(&value.to_string()).unwrap();
+        assert!(matches!(&batch.records[3], RouterRecord::Task(t)
+            if t.outcome_uncorrected.is_none()));
+        value["records"][3]["outcome_uncorrected"] = serde_json::json!("completed_verified");
+        let batch = parse_batch(&value.to_string()).unwrap();
+        assert!(matches!(&batch.records[3], RouterRecord::Task(t)
+            if t.outcome_uncorrected.as_deref() == Some("completed_verified")));
     }
 
     /// What the plugin sent before this step: none of the new fields.
