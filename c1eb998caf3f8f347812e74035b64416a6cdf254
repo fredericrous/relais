@@ -1,0 +1,19 @@
+greengate-provenance-v1
+commit c1eb998caf3f8f347812e74035b64416a6cdf254
+tree 3614ee8b7009abb4de884558fc89a3ce4b5b102c
+canon f6949aeaa9d06e5c3016e79aec1fd2427d3dc4ea
+patch 6322275770544838b4d2c97099cf80ac72f11aec
+plan docs/plans/2026-11-23-file-hash-repo-scope.md 609c1f1bc06558d7b95d3f0454b0138cb17e6cbd3219a6e34ec472c3f82b0ed7
+review reviewed 0fa5cc5bfb910eab579518da801f25af30c942d83e511da46b933eeb8e4c4b63
+code-review lang:typescript carried baa3b0ced1b8030b6f4a0611ec70214c54c1edc73180a809a6d45f237fadea3c
+code-review unix carried 255ae4ee860fe895433613dc4fe2e11c65d016948e2275081b7fd99773fd91ee
+code-review backend carried baa3b0ced1b8030b6f4a0611ec70214c54c1edc73180a809a6d45f237fadea3c
+preview not-required
+producer greenbelay 6.8.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABA+9yAEQu5mHrGTQPJpUkuvALzG9AEw90XrjDdvq4cS4
+G7u6BUgDyjsXzsAEddncGXKKoOHOQ4deFC63XS8ZPBCg==
+-----END SSH SIGNATURE-----
