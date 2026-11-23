@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: fix/revert-paths
 repos: [relais]
 adrs: []
@@ -121,13 +121,13 @@ file the task edited yields the same hash as the edit.
 
 ## Phases
 
-- [ ] Phase 1 — resolve revert paths, with plugin tests for every shape
+- [x] Phase 1 — resolve revert paths, with plugin tests for every shape
   (`$P`, `cd X &&`, `(cd X && …)`, `git -C X`, nested `-C`, `.`, `dir/`,
   `git revert <sha>` through a fake `fx.process.run`, a failing git still
   queuing the row, `git revert -m 1 <sha>`, `git revert HEAD~1`, `--abort`,
   `--staged` alone, a subshell `cd` not leaking, an unknown `cd`): `claude-plugin/hooks/router.ts`, `claude-plugin/hooks/routing.ts`,
   `claude-plugin/tests/router.test.ts`, `claude-plugin/tests/routing.test.ts`
-- [ ] Phase 2 — close the ticket and file the live count as a dated check
+- [x] Phase 2 — close the ticket and file the live count as a dated check
   after the release and the plugin reinstall:
   `docs/programmes/phase8-learner/t10-revert-paths-resolved.md`,
   `docs/programmes/phase8-learner/map.md`,
@@ -153,5 +153,32 @@ file the task edited yields the same hash as the edit.
   `.`/directory expansion reported apart (they overlap by construction), and
   `git revert` rows with no files paired with their transcript commands to
   give the share whose lookup failed (expected: under 10%).
+
+## Outcome
+
+Phase 1 ran through relais (`run-660e6ac42c953-6975`, accepted, 1 attempt,
+every profile check green); its patch was read before commit. Checks,
+input → expected → actual:
+
+- `amont run --stamp plugin-test` (relais verify, then the commit gate) →
+  pass → pass; 16 new or changed tests assert exact hash lists per shape.
+- t02 worked case: session cwd `/Users/p/Developer/Perso`, `cd
+  …/relais-wt-replay-floors && git restore docs/plans/x.md` → the Edit's
+  hash → equal (router.test.ts); `… && git restore $P` → no path → `[]`.
+- `git revert` lookup through a fake run: argv carries `--no-pager`, `-z`,
+  `--no-renames --no-relative`, `--end-of-options`, env
+  `GIT_TERMINAL_PROMPT=0` → as specified → as specified; resolving after
+  `onSessionEnd` starts → row in the final batch under its session → yes;
+  never resolving → session end waits at most the gate timeout, row with no
+  files → yes.
+- Live count: filed as t13 (due 2026-12-01), after a release and the plugin
+  reinstall.
+
+## Implementation review
+
+- implementation-review: approve-with-changes → delta approve; fixed: catch reason, `c`→`char`, throwing-spawn test. 47k+27k, 38 s.
+- lang:typescript: approve-with-changes → delta approve; fixed: lookup catch/finally, allSettled, queue comment; deliberate: union return and forEach (style, one call site). 61k+24k.
+- unix: approve-with-changes → delta approve; fixed: a failed lookup no longer blocks session end; env merge checked (learning.ts:37). 60k+24k.
+- backend: approve-with-changes → delta approve-with-changes; deliberate: no second-session test (harness has one id), no failure log (t13 pairs transcripts), delta test pins the inner catch (the outer branch is defence: nothing throws there today). 68k+26k.
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:typescript,tui,unix,codex body-sha=bc249e7651e5 -->
