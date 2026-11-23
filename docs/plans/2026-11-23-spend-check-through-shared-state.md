@@ -72,7 +72,8 @@ count the global daily cap and answer the decision once across nodes.
 - A shared read error maps by variant: `SharedStateError::Ledger(e)` to
   `RunError::Ledger(e)` (the "ledger:" prefix and `is_storage_full` stay as
   today under `LocalState`), every other variant to `RunError::Other("the
-  day's spend could not be read: {e}")` at both call sites (no `From` impl:
+  shared spend count is unavailable: {e}")` (the review check prefixes "the
+  day's spend could not be read:" as it does for any read error) (no `From` impl:
   `error.rs` is an-t19's). The run stops before dispatch (fails closed),
   through the existing `RunError` exit path, no new code.
 - `settle_scope_overflow` and `settle_timed_out` write through
@@ -108,7 +109,7 @@ Observed 2026-11-23 on the Mac (`cargo test -p relais --features conformance`).
 | `the_daily_ceiling_reads_the_shared_counter_before_dispatch` | fake counter 151 over 150, empty ledger | per-day limit, no dispatch: ok |
 | `the_review_check_reads_the_shared_counter_too` | counter raised to 200 while the worker runs | `needs_review`, "spend ceiling was reached before the review", no reviewer: ok |
 | `daily_spent_tests` | global 0, global 7, ledger 50 | 0, 7, 50 (the larger): ok |
-| `spend_read_tests` | ledger failure; shared failure | `RunError::Ledger`; "the day's spend could not be read: ...", no ANSI: ok |
+| `spend_read_tests` | ledger failure; shared failure | `RunError::Ledger`; "the shared spend count is unavailable: ...", no ANSI: ok |
 | `a_settle_answered_elsewhere_...` | widen settle, decision already answered | `needs_decision` stays, no intent: ok |
 | `the_same_settle_under_a_free_decision_...` | widen settle, free decision | `cancelled`, intent written, grant kept: ok |
 | existing suite under `LocalState` | the unchanged runner, CLI and conformance tests | 2640 lib + 63 + 350 of 351 integration passed; the one failure, `bounded_change_end_to_end...`, passed alone in 29 s (the host was at load 90 to 170) |
