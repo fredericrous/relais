@@ -140,5 +140,6 @@ Observed 2026-11-23 on the Mac (`cargo test -p relais --features conformance`).
 - implementation-review: approve-with-changes (3 passes). Fixed: lint allow, swallowed write, missing review-check and ledger-above tests, wording. Kept as gaps: timed-out settle test, step text, `main` comparison.
 - backend: approve-with-changes. Fixed: double prefix, `max` direction test, holds-until. Kept: release-once and timed-out settle tests, named gaps.
 - lang:rust: approve. Fixed: refusal wording left to an-t19's types, error arm, visibility.
+- Rebased onto an-t19 (relais #558): `node` returns `NodeError`, so the spend mapping matches `NodeError::Ledger`; the shared half answers `HeldElsewhere`, which `node::resolve_decision_with_intent` already turns into the "being answered elsewhere" refusal the settles show. Delta review on the rebased tree.
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix body-sha=7b90edc3bb7b -->
