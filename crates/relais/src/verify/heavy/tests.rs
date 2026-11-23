@@ -1152,8 +1152,8 @@ mod host_slots {
             "\"cores\":8",
             "\"outcome\":\"admitted\"",
             // The line counts its own lease (greenharness-slots 4.13).
-            "\"holders\":1",
-            "\"holder_jobs\":2",
+            "\"holders\":1,",
+            "\"holder_jobs\":2,",
         ] {
             assert!(line.contains(part), "{part} in {line}");
         }
@@ -1167,6 +1167,10 @@ mod host_slots {
         assert_eq!(released.len(), 1, "{journal}");
         assert!(released[0].contains("\"tool\":\"relais\""), "{journal}");
         assert!(released[0].contains("\"held_ms\":"), "{journal}");
+        // The run's id is the holder's session, so the release names the run.
+        for part in ["\"session\":\"run-w2\"", "\"weight\":1,", "\"jobs\":2,"] {
+            assert!(released[0].contains(part), "{part} in {journal}");
+        }
         std::fs::remove_dir_all(&scratch).ok(); // best-effort: a scratch dir
     }
 
