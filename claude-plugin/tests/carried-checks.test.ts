@@ -77,3 +77,9 @@ test('the output shown after a carry is the re-run check, not a carried pass', (
   expect(stepOutput(step).join('\n')).toContain('lint failed')
   expect(latestOutput(m, 5).join('\n')).toContain('lint failed')
 })
+
+test('a step whose every check was carried shows its agent activity, not an empty row', () => {
+  const m = fold([verifying, carried('make@2'), carried('test@3')])
+  const step = m.steps[m.steps.length - 1]
+  expect(stepOutput(step)).toBe(step.activity)
+})

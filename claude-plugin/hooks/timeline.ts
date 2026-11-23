@@ -699,7 +699,6 @@ function failureFirst(check: Check, limit: number): string[] {
   return renderWindows(chosen)
 }
 
-// A step's own lines: its last check's output, else its agent's activity.
 // The last check that ran in this step: a carried pass ran nothing here, so
 // the output of what just failed is not its empty one.
 function lastRanCheck(step: Step): Check | undefined {
@@ -709,9 +708,10 @@ function lastRanCheck(step: Step): Check | undefined {
   return undefined
 }
 
+// A step's own lines: the output of the last check that ran in it, else its
+// agent's activity (a step with no check, or only carried ones).
 export function stepOutput(step: Step): string[] {
-  if (step.checks.length === 0) return step.activity
-  return lastRanCheck(step)?.output ?? []
+  return lastRanCheck(step)?.output ?? step.activity
 }
 
 // What a run's candidate changed, from relais's summary object
