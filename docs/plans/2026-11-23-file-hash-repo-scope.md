@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: prog/phase8-learner/t11-file-hash-repo-scope
 repos: [relais]
 adrs: []
@@ -196,6 +196,15 @@ two verify runs hit `admission_wait_exhausted` on a jammed host (1800 s
 each). The candidate was applied by hand and recorded as `salvaged`. Added
 by hand: `env -u GIT_DIR …` and `LC_ALL=C` on the revert lookup's git
 calls, so a lookup names the same repository that an edit's hash names.
+Two more changes ride along:
+
+- **`env -u`.** `$.process.run` takes `env` as an overlay and cannot unset
+  a variable. The code therefore wraps git in `env -u GIT_DIR -u
+  GIT_WORK_TREE -u GIT_COMMON_DIR` instead of dropping the clause, as
+  backend's carried plan-review finding asked.
+- **The fleet pack refresh** (`chore(adr): refresh the fleet pack`).
+  worktree-task refreshes the vendored decisions pack on the task branch.
+  The change was only UI keys (ADR-0081), and none apply here.
 
 Checks (input → expected → actual):
 
@@ -220,5 +229,12 @@ Checks (input → expected → actual):
   test. `claude plugin test` runs in a sandbox with no real processes, so
   the suite covers the same rules through the fake process.
 - Live: folded into t13, due 2026-12-01, after the release and reinstall.
+
+## Implementation review
+
+- **implementation-review:** approve-with-changes, then approve-with-changes on the delta. Fixed: the banner, `resolveRepository` inside the `Promise.all`, and the Outcome notes; `status: done` is set here. 100k+37k tokens.
+- **lang:typescript:** approve-with-changes, then approve on the delta. Fixed: the `RootAnswer` union, `settled` replacing `isNone`, the timer armed only when cached, and `_init`. Deliberate: unresolved carries no reason, since nothing reads one. 67k+27k tokens.
+- **backend:** approve-with-changes, then approve on the delta. Fixed: the holds-until line on the 512 cap. Deliberate: real git runs only as a piloted check, because the sandbox spawns nothing; no drop count, as rejected at plan review. 69k+29k tokens.
+- **unix:** approve. Deliberate: no marker for the cutover (documented in the protocol), and the timer runs in the long-lived hook module, as `within` does. 46k tokens.
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:typescript,tui,unix body-sha=b54f8ff2dcf0 -->
