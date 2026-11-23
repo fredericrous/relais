@@ -184,14 +184,14 @@ fn micros_for(tokens: u64, rate_per_million_micros: i64) -> MicroUsd {
 /// fast-mode record. `None` when the record prices.
 pub fn unpriced_reason(record: &UsageRecord, table: &PriceTable) -> Option<String> {
     let Some(rate) = table.rate_for(&record.model) else {
-        return Some(format!("{} has no [pricing.models] entry", record.model));
+        return Some(format!("{} has no [[pricing.models]] entry", record.model));
     };
     match &record.speed {
         Speed::Standard => None,
         Speed::Other(_) => match (rate.fast_input, rate.fast_output) {
             (Some(_), Some(_)) => None,
             _ => Some(format!(
-                "{}'s [pricing.models] entry has no fast-mode rate (fast_input, fast_output)",
+                "{}'s [[pricing.models]] entry has no fast-mode rate (fast_input, fast_output)",
                 record.model
             )),
         },

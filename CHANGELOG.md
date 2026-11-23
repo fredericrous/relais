@@ -8,6 +8,12 @@ missing here.
 
 ## Unreleased
 
+- The unpriced-model messages name the price table the way machine.toml
+  writes it: `<model> has no [[pricing.models]] entry` (the runner, the
+  `native_unpriced` refusal and the plugin's cost line) and `no
+  [[pricing.models]] entry for:` (`relais report`), so the header can be
+  pasted as is. A script that matched the single-bracket text must match
+  the double-bracket form.
 - Breaking, for a client of `relais::shared_state`: the error and grant types
   are settled before a closed client is built. `SharedStateError` no longer
   has `Lock`, `Ledger`, `Claim`, `Registry` or `Compensation`; the `node`

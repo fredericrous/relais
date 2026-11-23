@@ -1346,7 +1346,7 @@ fn an_unpriced_model_that_fails_verification_ends_blocked_with_no_second_dispatc
     assert_eq!(*code, BlockCode::NativeUnpriced);
     assert!(detail.contains("native_unpriced"), "{detail}");
     assert!(detail.contains("claude-sonnet-5"), "{detail}");
-    assert!(detail.contains("[pricing.models]"), "{detail}");
+    assert!(detail.contains("[[pricing.models]]"), "{detail}");
     assert!(
         matches!(run.seen(), [Seen::Spawn { .. }]),
         "no request line after the first: {:?}",
@@ -1441,13 +1441,13 @@ fn an_attempt_with_no_booked_record_has_no_unpriced_model() {
     );
     let booked = LaunchResult {
         booked_message_ids: vec!["m1".into()],
-        unpriced: vec!["claude-sonnet-5 has no [pricing.models] entry".into()],
+        unpriced: vec!["claude-sonnet-5 has no [[pricing.models]] entry".into()],
         ..result
     };
     assert_eq!(
         unpriced_native_model(&booked),
         Some(vec![
-            "claude-sonnet-5 has no [pricing.models] entry".to_string()
+            "claude-sonnet-5 has no [[pricing.models]] entry".to_string()
         ])
     );
 }

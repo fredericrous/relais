@@ -493,7 +493,7 @@ fn counted_line(entry: &str, count: usize) -> String {
 
 fn unknown_cost(unpriced: &[String]) -> String {
     format!(
-        "unknown (no [pricing.models] entry for {})",
+        "unknown (no [[pricing.models]] entry for {})",
         unpriced.join(", ")
     )
 }
@@ -516,7 +516,7 @@ impl SessionRoutingReport {
             let figure = match (arm.cost_per_completed_task, arm.cost) {
                 // No session prices: the models follow, one per line, never cut.
                 (_, None) => {
-                    "cost per completed task unknown, no [pricing.models] entry for:".to_string()
+                    "cost per completed task unknown, no [[pricing.models]] entry for:".to_string()
                 }
                 (None, Some(_)) if excluded => {
                     "cost per completed task none (no completed task among priced sessions)"
@@ -536,7 +536,7 @@ impl SessionRoutingReport {
             ));
             if excluded && arm.cost.is_some() {
                 out.push_str(&format!(
-                    "    excluded {} session(s) from cost, no [pricing.models] entry for:\n",
+                    "    excluded {} session(s) from cost, no [[pricing.models]] entry for:\n",
                     arm.excluded_sessions
                 ));
             }
@@ -729,7 +729,7 @@ mod tests {
         let text = report.render();
         assert!(text.contains("API-equivalent estimate"), "{text}");
         assert!(
-            text.contains("held out: 1 session(s), 1 task(s), 1 completed\n    cost per completed task unknown, no [pricing.models] entry for:\n      claude-opus-5-5\n"),
+            text.contains("held out: 1 session(s), 1 task(s), 1 completed\n    cost per completed task unknown, no [[pricing.models]] entry for:\n      claude-opus-5-5\n"),
             "{text}"
         );
         assert!(!text.contains("excluded 1 session(s)"), "{text}");
@@ -830,13 +830,13 @@ mod tests {
         }
         assert!(
             text.contains(
-                "    excluded 9999 session(s) from cost, no [pricing.models] entry for:\n"
+                "    excluded 9999 session(s) from cost, no [[pricing.models]] entry for:\n"
             ),
             "{text}"
         );
         assert!(
             text.contains(
-                "    cost per completed task unknown, no [pricing.models] entry for:\n      claude-opus-5-5-with-a-deliberately-long-alias\n"
+                "    cost per completed task unknown, no [[pricing.models]] entry for:\n      claude-opus-5-5-with-a-deliberately-long-alias\n"
             ),
             "{text}"
         );
@@ -871,7 +871,7 @@ mod tests {
         );
         let text = report.render();
         assert!(
-            text.contains("  routed: 2 session(s), 3 task(s), 2 completed\n    cost per completed task $2 (95% interval $2 to $2)\n    excluded 1 session(s) from cost, no [pricing.models] entry for:\n      gpt-6.1-sol\n"),
+            text.contains("  routed: 2 session(s), 3 task(s), 2 completed\n    cost per completed task $2 (95% interval $2 to $2)\n    excluded 1 session(s) from cost, no [[pricing.models]] entry for:\n      gpt-6.1-sol\n"),
             "{text}"
         );
     }

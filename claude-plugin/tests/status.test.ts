@@ -158,7 +158,7 @@ test('onTurn sends the dispatch’s cumulative usage to native usage', async ($:
 })
 
 test('formatCost shows unpriced (<model>) when the cost event carries an unpriced reason', () => {
-  const m = applyEvent(emptyRun('r', 0), { kind: 'cost', booked: null, completeness: 'unknown', unpriced_reason: 'gpt-x has no [pricing.models] entry' }, 1)
+  const m = applyEvent(emptyRun('r', 0), { kind: 'cost', booked: null, completeness: 'unknown', unpriced_reason: 'gpt-x has no [[pricing.models]] entry' }, 1)
   expect(formatCost(m.cost)).toBe('unpriced (gpt-x)')
   const hostile = applyEvent(emptyRun('r', 0), { kind: 'cost', booked: null, completeness: 'unknown', unpriced_reason: `\u001b[31m${'m'.repeat(60)} has no entry` }, 1)
   expect(formatCost(hostile.cost)).toBe(`unpriced (${'m'.repeat(40)})`)

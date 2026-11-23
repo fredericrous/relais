@@ -2451,7 +2451,7 @@ pub enum BlockCode {
     SandboxWeakened,
     /// Nothing produces this any more; the ledger may still hold it.
     SandboxUnverified,
-    /// A native worker's model has no `[pricing.models]` entry, so its cost
+    /// A native worker's model has no `[[pricing.models]]` entry, so its cost
     /// is unknown and settles as the attempt's whole reservation: the run
     /// is refused up front, or ends after the attempt that showed it,
     /// rather than on a budget refusal it did not earn (SPEC §11).

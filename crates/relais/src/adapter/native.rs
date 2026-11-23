@@ -2324,7 +2324,7 @@ mod tests {
         let mut backend = backend_in(&harness, &gate, projects).with_advisor_ledger(db.clone());
         backend.prices = Some(table());
         let notes = backend.book_advisors("d1", "a1").expect("booked");
-        assert_eq!(notes, ["opus-x has no [pricing.models] entry"]);
+        assert_eq!(notes, ["opus-x has no [[pricing.models]] entry"]);
         assert_eq!(advisor_rows(&db), (1, 0, 1000));
     }
 
@@ -2380,7 +2380,7 @@ mod tests {
         assert_eq!(
             booked.unpriced,
             vec![
-                "sonnet-x's [pricing.models] entry has no fast-mode rate (fast_input, fast_output)"
+                "sonnet-x's [[pricing.models]] entry has no fast-mode rate (fast_input, fast_output)"
                     .to_string()
             ]
         );
@@ -2389,7 +2389,7 @@ mod tests {
         assert_eq!(booked.effective_model.as_deref(), Some("sonnet-x"));
         assert_eq!(
             booked.unpriced,
-            vec!["other has no [pricing.models] entry".to_string()]
+            vec!["other has no [[pricing.models]] entry".to_string()]
         );
         let priced = usage_of(&[record("m1", "sonnet-x", 10, 5)], Some(&table()));
         assert!(priced.unpriced.is_empty());
