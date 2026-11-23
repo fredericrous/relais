@@ -132,7 +132,14 @@ export type TaskState = {
   // The task started one tier below the table's choice, by the exploration
   // draw: its floor stays one below the table's for the whole task.
   exploredDown: boolean
+  // Each correction of this task and the files edited since it (paths, not
+  // hashes), the last CORRECTIONS_MAX. Absent on a task stored by 0.72.0.
+  corrections?: { at: number; record: ReassessRecord; files: string[] }[]
+  // Set by /flag: a flag is never charged away, so no `outcome_uncorrected`.
+  flagged?: boolean
 }
+
+export const CORRECTIONS_MAX = 8
 
 // What the exploration draw decided for a task start: a main-session new
 // task or a table-routed subagent spawn. Absent on a decision the draw did
@@ -625,6 +632,7 @@ export function decideMain(input: MainInput): MainOutput {
     task.explicitQuote = cls.explicit.quote ?? task.explicitQuote
     const { task: up, record } = escalate(state, task, 'correction')
     task = up
+    task.corrections = [...(task.corrections ?? []), { at: input.now, record, files: [] }].slice(-CORRECTIONS_MAX)
     reassess.push(record)
     reason = 'recovery'
   }
@@ -1325,6 +1333,10 @@ export function onEvidence(
     t.hasEdit = true
     t.editedSinceCheck = true
     if (evidence.file && !t.files.includes(evidence.file)) t.files.push(evidence.file)
+    const edited = evidence.file
+    if (edited && t.corrections) {
+      for (const entry of t.corrections) if (!entry.files.includes(edited)) entry.files.push(edited)
+    }
     const scope = grownScope(t.class.scope, t.files, cwd)
     if (scope === t.class.scope) return { task: t, reassess: undefined }
     t.class = { ...t.class, scope }
@@ -1558,6 +1570,7 @@ export function reassessRecord(task: TaskState, r: ReassessRecord, now: number) 
 export function taskRecord(task: TaskState, endedAt: number | null, files: string[], repository?: string) {
   const repositoryOfTask = repository ?? ''
   const outcome = outcomeOf(task)
+  const uncorrected = endedAt !== null && task.corrected && !task.flagged ? outcomeOf({ ...task, corrected: false }) : null
   return {
     kind: 'task',
     task_id: task.id,
@@ -1569,6 +1582,7 @@ export function taskRecord(task: TaskState, endedAt: number | null, files: strin
     // The outcome as the task ended: relais keeps the first one it gets, so
     // a later correction is measured against it (plan §5, missed failures).
     completed_at_end: endedAt === null ? null : outcome,
+    outcome_uncorrected: uncorrected,
     inferred: task.inferred,
     files: [...new Set(files)].sort(),
     escalations: task.escalations,

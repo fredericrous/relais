@@ -161,7 +161,7 @@ plan and the protocol.
 
 ## Phases
 
-- [ ] Phase 1 — plugin: `corrections`, `queueCorrectionFiles`,
+- [x] Phase 1 — plugin: `corrections`, `queueCorrectionFiles`,
   `outcome_uncorrected`, with tests: `claude-plugin/hooks/router.ts`,
   `claude-plugin/hooks/routing.ts`, `claude-plugin/tests/router.test.ts`,
   `claude-plugin/tests/routing.test.ts`

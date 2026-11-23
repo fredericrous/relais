@@ -608,3 +608,39 @@ test('10,000 seeded task starts at epsilon 0.1 explore 10% +/- 1%', () => {
   expect(explored).toBeGreaterThanOrEqual(900)
   expect(explored).toBeLessThanOrEqual(1100)
 })
+
+const correctionCls = () => cls({ relation: 'correction' })
+const correctAt = (task: any, now: number) => main({ task, cls: correctionCls(), now })
+
+test('a correction appends an entry with no files, kept to the last 8; a 0.72.0 task has none', () => {
+  let task = main().task!
+  expect(task.corrections).toBe(undefined)
+  for (let at = 1; at <= 10; at++) task = correctAt(task, at).task!
+  expect(task.corrections!.map(entry => entry.at)).toEqual([3, 4, 5, 6, 7, 8, 9, 10])
+  expect(task.corrections!.every(entry => entry.files.length === 0 && entry.record.event === 'correction')).toBe(true)
+  const plain = onEvidence(state, main().task!, { kind: 'edit', file: '/repo/a.rs' }, '/repo')
+  expect(plain.task.corrections).toBe(undefined)
+})
+
+test('an edit goes to every correction that lacks it, and the task files are not consulted', () => {
+  let task = main().task!
+  task = onEvidence(state, task, { kind: 'edit', file: '/repo/x.rs' }, '/repo').task
+  task = correctAt(task, 1).task!
+  task = onEvidence(state, task, { kind: 'edit', file: '/repo/x.rs' }, '/repo').task
+  task = correctAt(task, 2).task!
+  task = onEvidence(state, task, { kind: 'edit', file: '/repo/z.rs' }, '/repo').task
+  expect(task.corrections!.map(entry => entry.files)).toEqual([['/repo/x.rs', '/repo/z.rs'], ['/repo/z.rs']])
+  const stored = JSON.parse(JSON.stringify(task))
+  expect(stored.corrections).toEqual(task.corrections)
+})
+
+test('outcome_uncorrected: the outcome without the correction, on an ended corrected task, never for a flag', () => {
+  let task = main().task!
+  task = onEvidence(state, task, { kind: 'edit', file: '/repo/x.rs' }, '/repo').task
+  task = onEvidence(state, task, { kind: 'check', command: 'cargo test', passed: true } as any, '/repo').task
+  expect((taskRecord(task, 5, []) as any).outcome_uncorrected).toBe(null)
+  const corrected = correctAt(task, 1).task!
+  expect((taskRecord(corrected, 5, []) as any).outcome_uncorrected).toBe('completed_verified')
+  expect((taskRecord(corrected, null, []) as any).outcome_uncorrected).toBe(null)
+  expect((taskRecord({ ...corrected, flagged: true }, 5, []) as any).outcome_uncorrected).toBe(null)
+})
