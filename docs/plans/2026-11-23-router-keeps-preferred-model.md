@@ -75,6 +75,17 @@ Board checked: phase8-learner's t12 runs in `relais-wt-t12-correction` (correcti
 - After the live launch: read `router_decisions` directly (reason `pin`, model `opus` as the alias the definition wrote; `router.ts:1399` stores it unresolved) and check `relais report`'s pricing against the models in `router_usage` for those agent ids; the report's routing section reads usage models, not decision reasons, so it cannot show pin rows.
 - After 7 days: build the reviewer cohort from transcripts (Agent/Task `tool_use` whose `subagent_type` declares `preferred-model`, sessions started after install, the returned `agentId`), correlate by session and agent id with `router_decisions` subagent rows, and report cohort size, matched `pin`, matched `table` and unmatched rows apart. Zero matched `table` is the pass; unmatched rows are not proof.
 
+### Observed (Phase 1)
+- `cargo test -p relais --lib -- router:: install::`: 224 passed, incl. the 6 new tests (preference pins an inheriting definition, in any line order and quoted; own `model` outranks it; `inherit`/empty preference is no pin; `definition_pins` serves a preference-only file; the shipped `agent_review()` parses to `relais-review = opus`).
+- Pending after release: router-state pins and stderr, the live ledger rows, the 7-day cohort (pass needs ≥80% of the cohort matched, else inconclusive).
+
+## Implementation review
+- implementation-review: approve, no findings; 47k, 45 s.
+- backend: approve; 1 low to the plugin follow-up (an unchecked pin value only reaches telemetry); 66k, 78 s.
+- lang:rust: approve; 2 low left (pin source could be an enum for the follow-up; one `inherit` filter closure); 46k, 36 s.
+
+Next: release (after v0.80.0, which another session is cutting), `brew upgrade relais`, then the post-install checks.
+
 ## Non-goals
 No plugin change in this plan (recording the call's model on a pinned row is a filed follow-up); no change to `decideSpawn`, the capability table, ε, or how a person-named subagent model works; no change to relais's own run agents; Codex unaffected.
 
