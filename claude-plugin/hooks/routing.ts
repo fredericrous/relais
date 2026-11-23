@@ -643,21 +643,32 @@ export function onTurnComplete(fx: Fx, store: Store, e: any, now: number) {
 // would be stored with the unmatched checks.
 async function queueCorrected(fx: Fx, store: Store, task: TaskState) {
   const session = store.router.session
-  const [repository, files] = await Promise.all([resolveRepository(fx, store).catch(() => undefined), hashFiles(fx, store, task.files)])
+  const [repository, files, corrections] = await Promise.all([
+    resolveRepository(fx, store).catch(() => undefined),
+    hashFiles(fx, store, task.files),
+    hashCorrections(fx, store, task),
+  ])
   queue(store, taskRecord(task, null, files, repository))
-  await queueCorrectionFiles(fx, store, task, session)
+  queueCorrectionRows(store, task, session, corrections)
+}
+
+// Each correction's files hashed, one `hashFiles` call per entry (it returns
+// no path-to-hash map), all at once: when git is slow the wait is one gate
+// timeout, not one per entry.
+function hashCorrections(fx: Fx, store: Store, task: TaskState): Promise<string[][]> {
+  return Promise.all((task.corrections ?? []).map(entry => hashFiles(fx, store, entry.files)))
 }
 
 // Each correction's row again, same key, with the hashes of the files edited
 // since it: relais merges the files into the row sent at the correction. The
-// session is taken before any await, as noteRevert does.
-async function queueCorrectionFiles(fx: Fx, store: Store, task: TaskState, session: string | null | undefined) {
-  const entries = task.corrections ?? []
-  if (entries.length === 0 || !session) return
-  const hashed = await Promise.all(entries.map(entry => hashFiles(fx, store, entry.files)))
-  entries.forEach((entry, index) => {
-    if (hashed[index].length === 0) return
-    store.router.queue.push({ session, record: { ...reassessRecord(task, entry.record, entry.at), files: hashed[index] } })
+// session is the one taken before any await, as noteRevert does. An edit made
+// while these were hashed is in the end's send, and relais keeps the union.
+function queueCorrectionRows(store: Store, task: TaskState, session: string | null | undefined, hashed: string[][]) {
+  if (!session) return
+  ;(task.corrections ?? []).forEach((entry, index) => {
+    const files = hashed[index] ?? []
+    if (files.length === 0) return
+    store.router.queue.push({ session, record: { ...reassessRecord(task, entry.record, entry.at), files } })
   })
 }
 
@@ -667,15 +678,16 @@ async function queueCorrectionFiles(fx: Fx, store: Store, task: TaskState, sessi
 async function endTask(fx: Fx, store: Store, task: TaskState, now: number) {
   const session = store.router.session
   await settleReverts(store)
-  const [gate, files, repository] = await Promise.all([
+  const [gate, files, repository, corrections] = await Promise.all([
     gateEvidence(fx, store, task, now).catch(() => []),
     hashFiles(fx, store, task.files),
     resolveRepository(fx, store).catch(() => undefined),
+    hashCorrections(fx, store, task),
   ])
   const ended: TaskState =
     gate.length === 0 ? task : { ...task, verifications: [...task.verifications, ...gate].slice(-20) }
   queue(store, taskRecord(ended, now, files, repository))
-  await queueCorrectionFiles(fx, store, ended, session)
+  queueCorrectionRows(store, ended, session, corrections)
   const outcome = outcomeOf(ended)
   if (outcome === 'unknown' || outcome === 'answered') return
   for (const sub of ended.subagentTasks ?? []) {

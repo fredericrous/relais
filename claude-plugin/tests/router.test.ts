@@ -638,9 +638,9 @@ test('outcome_uncorrected: the outcome without the correction, on an ended corre
   let task = main().task!
   task = onEvidence(state, task, { kind: 'edit', file: '/repo/x.rs' }, '/repo').task
   task = onEvidence(state, task, { kind: 'check', command: 'cargo test', passed: true } as any, '/repo').task
-  expect((taskRecord(task, 5, []) as any).outcome_uncorrected).toBe(null)
+  expect(taskRecord(task, 5, []).outcome_uncorrected).toBe(null)
   const corrected = correctAt(task, 1).task!
-  expect((taskRecord(corrected, 5, []) as any).outcome_uncorrected).toBe('completed_verified')
-  expect((taskRecord(corrected, null, []) as any).outcome_uncorrected).toBe(null)
-  expect((taskRecord({ ...corrected, flagged: true }, 5, []) as any).outcome_uncorrected).toBe(null)
+  expect(taskRecord(corrected, 5, []).outcome_uncorrected).toBe('completed_verified')
+  expect(taskRecord(corrected, null, []).outcome_uncorrected).toBe(null)
+  expect(taskRecord({ ...corrected, flagged: true }, 5, []).outcome_uncorrected).toBe(null)
 })

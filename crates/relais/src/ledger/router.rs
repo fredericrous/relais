@@ -23,6 +23,8 @@ pub const OWN_SOURCE: &str = "own";
 
 /// The reassess event of a correction.
 const CORRECTION_EVENT: &str = "correction";
+/// The reassess event of a `/relais-flag`.
+const FLAG_EVENT: &str = "flag";
 /// The most a correction is charged back from its time: 24 hours.
 const CORRECTION_LOOKBACK_HOURS: i64 = 24;
 
@@ -618,7 +620,7 @@ impl Ledger {
                             )
                             .optional()?;
                         let stored_files: Vec<String> = match stored {
-                            Some(text) => serde_json::from_str(&text).unwrap_or_default(),
+                            Some(text) => files_from_json(&text, 0)?,
                             None => Vec::new(),
                         };
                         union(stored_files, &r.files)
@@ -633,7 +635,7 @@ impl Ledger {
                              escalating, files_json, at, recorded_at)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                          ON CONFLICT (session, task_id, agent_id, event, at) DO UPDATE SET
-                            files_json = CASE WHEN excluded.event = 'correction'
+                            files_json = CASE WHEN excluded.event = ?12
                                               THEN excluded.files_json
                                               ELSE router_reassess.files_json END",
                         params![
@@ -648,6 +650,7 @@ impl Ledger {
                             files,
                             r.at,
                             now,
+                            CORRECTION_EVENT,
                         ],
                     )?;
                 }
@@ -792,9 +795,11 @@ impl Ledger {
     /// tasks it is charged to (see [`CorrectionCharge`]). A task A is
     /// charged when it is a main task other than B, completed verified or
     /// accepted at its end, ended within 24 hours before the row's `at`
-    /// (any session, compared as UTC instants; a row whose time does not
-    /// parse is skipped), and shares a file hash with the row's files
-    /// outside `stop`. `stop` is filtered here, not bound to SQL.
+    /// (any session, compared as UTC instants), and shares a file hash with
+    /// the row's files outside `stop`. `stop` is filtered here, not bound to
+    /// SQL. A candidate whose end time or files do not parse is skipped; a
+    /// correction row whose time or files do not parse is kept with nothing
+    /// charged, so its task stays `corrected`.
     // holds-until: ~10k main tasks in the ledger — every correction row scans every candidate; index by end time after
     pub fn router_correction_charges(&self, stop: &[String]) -> Result<Vec<CorrectionCharge>> {
         let stop: BTreeSet<&str> = stop.iter().map(String::as_str).collect();
@@ -814,16 +819,11 @@ impl Ledger {
         })?;
         for task_row in task_rows {
             let (session, task_id, ended_at, files_json) = task_row?;
-            let Some(ended_at) = parse_utc(&ended_at) else {
+            let (Some(ended_at), Ok(files)) =
+                (parse_utc(&ended_at), files_from_json(&files_json, 3))
+            else {
                 continue;
             };
-            let files: Vec<String> = serde_json::from_str(&files_json).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    3,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })?;
             candidates.push(ChargeCandidate {
                 key: TaskKey { session, task_id },
                 ended_at,
@@ -832,10 +832,10 @@ impl Ledger {
         }
         let mut statement = self.conn.prepare(
             "SELECT DISTINCT session, task_id FROM router_reassess
-              WHERE agent_id = '' AND event = 'flag'",
+              WHERE agent_id = '' AND event = ?1",
         )?;
         let flagged: BTreeSet<TaskKey> = statement
-            .query_map([], |row| {
+            .query_map([FLAG_EVENT], |row| {
                 Ok(TaskKey {
                     session: row.get(0)?,
                     task_id: row.get(1)?,
@@ -844,10 +844,10 @@ impl Ledger {
             .collect::<rusqlite::Result<_>>()?;
         let mut statement = self.conn.prepare(
             "SELECT session, task_id, at, files_json FROM router_reassess
-              WHERE agent_id = '' AND event = 'correction'
+              WHERE agent_id = '' AND event = ?1
               ORDER BY session, task_id, at",
         )?;
-        let correction_rows = statement.query_map([], |row| {
+        let correction_rows = statement.query_map([CORRECTION_EVENT], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -858,32 +858,28 @@ impl Ledger {
         let mut charges = Vec::new();
         for correction_row in correction_rows {
             let (session, task_id, at, files_json) = correction_row?;
-            let Some(at_instant) = parse_utc(&at) else {
-                continue;
+            let parsed = parse_utc(&at).zip(files_from_json(&files_json, 3).ok());
+            let legacy = parsed.as_ref().is_none_or(|(_, files)| files.is_empty());
+            let mut charged: Vec<TaskKey> = match &parsed {
+                None => Vec::new(),
+                Some((at_instant, files)) => {
+                    let fixed: Vec<&String> = files
+                        .iter()
+                        .filter(|hash| !stop.contains(hash.as_str()))
+                        .collect();
+                    let window_start = *at_instant - Duration::hours(CORRECTION_LOOKBACK_HOURS);
+                    candidates
+                        .iter()
+                        .filter(|a| {
+                            !(a.key.session == session && a.key.task_id == task_id)
+                                && a.ended_at >= window_start
+                                && a.ended_at < *at_instant
+                                && fixed.iter().any(|hash| a.files.contains(*hash))
+                        })
+                        .map(|a| a.key.clone())
+                        .collect()
+                }
             };
-            let files: Vec<String> = serde_json::from_str(&files_json).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    3,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })?;
-            let legacy = files.is_empty();
-            let fixed: Vec<&String> = files
-                .iter()
-                .filter(|hash| !stop.contains(hash.as_str()))
-                .collect();
-            let window_start = at_instant - Duration::hours(CORRECTION_LOOKBACK_HOURS);
-            let mut charged: Vec<TaskKey> = candidates
-                .iter()
-                .filter(|a| {
-                    !(a.key.session == session && a.key.task_id == task_id)
-                        && a.ended_at >= window_start
-                        && a.ended_at < at_instant
-                        && fixed.iter().any(|hash| a.files.contains(*hash))
-                })
-                .map(|a| a.key.clone())
-                .collect();
             charged.sort();
             let task = TaskKey {
                 session: session.clone(),
@@ -1330,6 +1326,13 @@ pub fn corrections_charged_away(charges: &[CorrectionCharge]) -> BTreeSet<TaskKe
     away.into_iter()
         .filter_map(|(task, charged_away)| charged_away.then_some(task))
         .collect()
+}
+
+/// A stored `files_json` list; `column` names it in the error.
+fn files_from_json(text: &str, column: usize) -> rusqlite::Result<Vec<String>> {
+    serde_json::from_str(text).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(e))
+    })
 }
 
 fn parse_utc(text: &str) -> Option<DateTime<Utc>> {
@@ -2010,7 +2013,7 @@ mod tests {
     }
 
     #[test]
-    fn a_correction_stays_with_its_task_in_the_kept_cases() {
+    fn the_charge_window_and_end_outcome_cases() {
         let ok = "2026-10-07T10:00:00.000Z";
         let verified = "completed_verified";
         assert!(charge_case(ok, verified, &["x"], &["x"]));
@@ -2134,9 +2137,41 @@ mod tests {
     }
 
     #[test]
-    fn a_row_with_an_unparseable_time_is_skipped() {
-        let (charges, _) = correction_charges(&[reassess("b", "correction", &["x"], "soon")], &[]);
-        assert!(charges.is_empty());
+    fn a_row_with_an_unparseable_time_is_kept_uncharged_and_keeps_its_task() {
+        let (charges, away) = correction_charges(
+            &[
+                ended_task(
+                    "a",
+                    "2026-10-07T10:00:00.000Z",
+                    "completed_verified",
+                    &["x"],
+                    None,
+                ),
+                reassess("b", "correction", &["x"], CORRECTION_AT),
+                reassess("b", "correction", &["x"], "soon"),
+            ],
+            &[],
+        );
+        assert_eq!(charges.len(), 2);
+        assert!(charges
+            .iter()
+            .any(|c| c.at == "soon" && c.charged.is_empty()));
+        assert!(away.is_empty());
+    }
+
+    #[test]
+    fn a_corrupt_stored_correction_files_list_is_an_error_not_a_replacement() {
+        let (ledger, _dir) = ledger();
+        ledger
+            .record_router_batch("s1", &[reassess("b", "correction", &["x"], CORRECTION_AT)])
+            .unwrap();
+        ledger
+            .conn
+            .execute("UPDATE router_reassess SET files_json = 'not json'", [])
+            .unwrap();
+        let resent = reassess("b", "correction", &["z"], CORRECTION_AT);
+        assert!(ledger.record_router_batch("s1", &[resent]).is_err());
+        assert_eq!(stored_reassess_files(&ledger, "correction"), "not json");
     }
 
     fn uncorrected(ended_at: Option<&str>, value: Option<&str>) -> RouterRecord {

@@ -134,12 +134,17 @@ export type TaskState = {
   exploredDown: boolean
   // Each correction of this task and the files edited since it (paths, not
   // hashes), the last CORRECTIONS_MAX. Absent on a task stored by 0.72.0.
-  corrections?: { at: number; record: ReassessRecord; files: string[] }[]
-  // Set by /flag: a flag is never charged away, so no `outcome_uncorrected`.
+  corrections?: CorrectionWindow[]
+  // Set by /flag, which also sets `corrected`: a flag is never charged away,
+  // so it has no `outcome_uncorrected`.
   flagged?: boolean
 }
 
 export const CORRECTIONS_MAX = 8
+
+// One correction: its reassess row's key (`at`) and record, and the files
+// edited since it, until the task ends.
+export type CorrectionWindow = { at: number; record: ReassessRecord; files: string[] }
 
 // What the exploration draw decided for a task start: a main-session new
 // task or a table-routed subagent spawn. Absent on a decision the draw did

@@ -128,8 +128,8 @@ ledger, which task each correction is charged to. A charged-away B is not
 `charged: Vec<TaskKey>`, `legacy: bool` (the row's files are empty, so
 `charged = []` means unknown, not no overlap). `stop` is the caller's list
 of hashes to ignore (t02's memory-file hashes for rows before t11; scoped
-hashes already drop paths outside a repository), bound through a temp
-table, not an `IN (…)` list. A task A is charged
+hashes already drop paths outside a repository), filtered in Rust, not
+bound to SQL (no `IN (…)` list, no variable limit). A task A is charged
 when all of these hold:
 - A is a main task (`agent_id = ''`) and not B itself (same session and
   task id);
