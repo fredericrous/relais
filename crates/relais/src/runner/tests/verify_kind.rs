@@ -2249,3 +2249,103 @@ fn a_cleared_successor_reviewed_in_parts_reads_the_full_patch_against_the_base()
     );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort cleanup of a test temp dir
 }
+
+/// A source run whose worker rewrites `src/main.rs` (or, with `edit`
+/// false, changes nothing) and then claims a blockage.
+fn blocked_source(fixture: &Fixture, edit: bool) -> RunOutcome {
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let backend = MockBackend::new(move |spec| {
+        if edit {
+            std::fs::write(
+                spec.work_dir.join("src/main.rs"),
+                "fn main() { /* blocked */ }\n",
+            )
+            .expect("the worker rewrites the file");
+        }
+        MockOutcome {
+            result_text: Some("relais-blocked: the focused test run has no result yet".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    fixture.execute(&fixture.contract(Review::Off), &repo, &backend)
+}
+
+/// f10: a run blocked `env_missing` keeps the tree its worker left as the
+/// blocked attempt's candidate, names it, and a `kind: verify` run finds
+/// and applies it.
+#[test]
+fn a_blocked_worker_that_edited_leaves_a_candidate_verify_applies() {
+    let fixture = Fixture::new();
+    let outcome = blocked_source(&fixture, true);
+    let source = outcome.run_id.clone();
+    let Terminal::Blocked { code, detail } = &outcome.terminal else {
+        panic!("expected blocked, got {outcome:?}");
+    };
+    assert_eq!(*code, BlockCode::EnvMissing);
+    assert!(
+        detail.contains(&format!("candidate {{run: {}, index: 1}}", source.as_str())),
+        "{detail}"
+    );
+    let candidates = fixture
+        .ledger
+        .candidate_attempts(&source)
+        .expect("candidates");
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+    let endings = fixture.ledger.attempt_endings(&source).expect("endings");
+    assert!(
+        endings
+            .iter()
+            .any(|(_, state, sha)| state == "blocked" && sha.is_some()),
+        "{endings:?}"
+    );
+    let stop = fixture
+        .ledger
+        .transitions(&source)
+        .expect("history")
+        .into_iter()
+        .find(|transition| transition.reason == "env_missing")
+        .and_then(|transition| transition.detail)
+        .expect("an env_missing detail");
+    assert_eq!(stop["candidate"]["index"], 1, "{stop}");
+    assert_eq!(stop["candidate"]["sha"], candidates[0].1.as_str(), "{stop}");
+
+    let seen = launches();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let RunOutcome {
+        terminal: Terminal::Accepted(receipt),
+        ..
+    } = fixture.execute(
+        &verify_contract(&source, None),
+        &repo,
+        &counting_worker(Arc::clone(&seen)),
+    )
+    else {
+        panic!("the blocked run's candidate is verified");
+    };
+    assert_eq!(seen.load(Ordering::SeqCst), 0, "no worker was dispatched");
+    let content = git(
+        &fixture.repo,
+        &["show", &format!("{}:src/main.rs", receipt.candidate_sha)],
+    );
+    assert_eq!(content, "fn main() { /* blocked */ }\n");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
+}
+
+/// A blocked worker that changed nothing leaves no candidate and says none.
+#[test]
+fn a_blocked_worker_that_changed_nothing_leaves_no_candidate() {
+    let fixture = Fixture::new();
+    let outcome = blocked_source(&fixture, false);
+    let Terminal::Blocked { detail, .. } = &outcome.terminal else {
+        panic!("expected blocked, got {outcome:?}");
+    };
+    assert!(!detail.contains("candidate is kept"), "{detail}");
+    assert!(fixture
+        .ledger
+        .candidate_attempts(&outcome.run_id)
+        .expect("candidates")
+        .is_empty());
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort scratch cleanup; the test has already decided its result
+}

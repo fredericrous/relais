@@ -342,6 +342,25 @@ impl HoldoutStop {
     }
 }
 
+/// A candidate that is kept when a queue or a worker's blockage ends the run around it: the run
+/// and attempt index a `kind: verify` run names, and its commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptCandidate {
+    pub run: String,
+    pub index: u32,
+    pub sha: String,
+}
+
+/// What a kept candidate's ending says of it: it is kept, and how to
+/// verify it again without a worker.
+pub(super) fn kept_sentence(kept: &KeptCandidate) -> String {
+    format!(
+        "the candidate is kept: verify it again without a worker with a `kind: verify` run, \
+         `candidate {{run: {}, index: {}}}`",
+        kept.run, kept.index
+    )
+}
+
 /// One row's worth of input: what the runner observed about the
 /// candidate or the dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,7 +405,12 @@ pub enum Observation {
     /// The diff leaves the contract's write scope.
     ScopeViolation(Vec<OutOfScope>),
     /// The worker proposed that something outside the task blocks it.
-    WorkerBlockage(String),
+    /// `candidate` is the tree it left, published as the blocked
+    /// attempt's candidate when it changed from its floor.
+    WorkerBlockage {
+        claim: String,
+        candidate: Option<KeptCandidate>,
+    },
     /// The reviewer reported findings.
     ReviewFindings(String, Option<Vec<Severity>>),
     /// Required review could not be obtained.
@@ -767,15 +791,25 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
         }
 
         // The environment is never escalated to a stronger model.
-        Observation::WorkerBlockage(claim) => {
-            let detail = format!(
+        Observation::WorkerBlockage { claim, candidate } => {
+            let mut detail = format!(
                 "worker blockage: {}",
                 claim.lines().last().unwrap_or(&claim)
             );
+            let evidence = match &candidate {
+                Some(kept) => {
+                    detail.push_str(&format!("; {}", kept_sentence(kept)));
+                    serde_json::json!({
+                        "claim": claim,
+                        "candidate": { "run": kept.run, "index": kept.index, "sha": kept.sha },
+                    })
+                }
+                None => serde_json::json!({ "claim": claim }),
+            };
             Decision::stop(
                 State::Blocked,
                 Reason::EnvMissing,
-                serde_json::json!({ "claim": claim }),
+                evidence,
                 Terminal::Blocked {
                     code: BlockCode::EnvMissing,
                     detail,
@@ -1224,7 +1258,10 @@ mod tests {
     fn the_environment_is_blocked_never_escalated() {
         let d = decide(
             &budget(0, Some(Tier::Escalation)),
-            Observation::WorkerBlockage("relais-blocked: no network".into()),
+            Observation::WorkerBlockage {
+                claim: "relais-blocked: no network".into(),
+                candidate: None,
+            },
         );
         assert_eq!(d.state, State::Blocked);
         assert!(matches!(

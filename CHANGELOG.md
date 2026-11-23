@@ -21,6 +21,12 @@ missing here.
   Nothing changes for a single node: `LocalState` grants or lets the node
   decide, and every command prints what it printed before. The trait is
   still unstable; a client pins the exact version.
+- A run that ends `blocked (env_missing)` because its worker claimed a
+  blockage keeps the tree the worker left as the attempt's candidate, when it
+  changed: the message ends with `candidate {run: …, index: …}`, and a
+  `kind: verify` run (or `from_candidate`) finds it. Before, the tree was only
+  exported as `candidate-final.patch`, and `verify` answered
+  `candidate_missing`.
 
 ## v0.80.0
 

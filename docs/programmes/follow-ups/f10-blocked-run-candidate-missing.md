@@ -1,7 +1,7 @@
 +++
 type = "task"
 mode = "afk"
-status = "open"
+status = "closed"
 blocked_by = []
 repos = ["relais"]
 +++
@@ -34,3 +34,14 @@ Either `verify` on such a run applies the final patch (with a test that a
 blocked-with-patch run yields a candidate), or the `env_missing` message
 says the candidate is not kept and the skill's recovery text matches; one
 of the two merged.
+
+## Resolution
+
+The final patch of a blocked run is registered. A worker that claims a
+blockage has its changed tree published as the blocked attempt's candidate
+by the path a confirmed-stopped timed-out worker takes (`snapshot_stopped`):
+`candidate-N.patch`, `candidate_sha` on the attempt, and a message that
+names `candidate {run, index}`, as `admission_wait_exhausted` does. A
+worker that changed nothing still leaves none. Tests:
+`a_blocked_worker_that_edited_leaves_a_candidate_verify_applies` and
+`a_blocked_worker_that_changed_nothing_leaves_no_candidate`.
