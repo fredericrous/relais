@@ -8,6 +8,31 @@ missing here.
 
 ## Unreleased
 
+## v0.80.0
+
+- A correction now records the files it touched. The plugin keeps, for each
+  correction in a task, the files edited after it, and sends the same
+  `correction` reassess row again (same `at`) when the task ends, with those
+  files hashed; relais stores the union of every send. Correction rows written
+  before this keep `files: []`.
+- Ended task records carry `outcome_uncorrected`, the outcome the task would
+  have had without its corrections (`null` for a task that was
+  `/relais-flag`ged), stored in `router_tasks.outcome_uncorrected` (ledger
+  schema v50, an added nullable column; the first value from an ended record is
+  kept). The plugin sends it only to a relais whose `router-state` lists it in
+  `accepts`.
+- `Ledger::router_correction_charges` and `corrections_charged_away` decide,
+  when the ledger is read, which task a correction is charged to: an earlier
+  main task, in any session, that ended verified or accepted within 24 hours
+  before it and shares a file with it. A task whose every correction is
+  charged elsewhere, and that was never flagged, counts for gate 2 with its
+  `outcome_uncorrected` (session-router plan §5). The router gates that read it
+  come later.
+
+Reinstall the plugin after upgrading (`relais install --claude --user
+--write`, then `relais coordinator stop`): only the new plugin sends
+correction files and `outcome_uncorrected`.
+
 ## v0.79.0
 
 - The `relais-review` agent that `relais install` writes for Claude says

@@ -106,9 +106,9 @@ From this programme's research tickets:
 2026-11-23, t12 closed (a correction records its files and charges one
 task). Plugin and ledger changes are on
 `prog/phase8-learner/t12-correction-attribution` with plan and panel, in the
-PR that closes this ticket; t12's Resolution has the rules. t10, t11 and
-t12 are all on main once it merges: release them together (tag-release),
-then the person reinstalls the plugin (`relais install --claude --user
+PR that closes this ticket (relais#550, merged); t12's Resolution has the
+rules. t10 and t11 shipped in v0.78.0 and t12 in v0.80.0 (its ledger step is
+v50: #546 took v49). The person reinstalls the plugin (`relais install --claude --user
 --write`, then `relais coordinator stop`; check `relais doctor`'s `plugin`
 finding names the release). [t13](t13-revert-overlap-live-count.md) (due
 2026-12-01) counts reverts, the t02 miss query, and now the correction
@@ -116,7 +116,7 @@ rows with files and their charges. The host was jammed again: both relais
 runs lost their verify to the 1800 s admission wait, and their candidates
 were applied and checked in-session; `greengate run --raw` exited 0
 without running the plugin suite, so run `claude plugin test` from
-`claude-plugin/` to check it. Next: the release, then t03. Earlier entry:
+`claude-plugin/` to check it. Next: t03. Earlier entry:
 
 2026-11-23, t11 closed (file hashes scoped to a repository). The plugin
 fix is on `prog/phase8-learner/t11-file-hash-repo-scope` with its plan and
