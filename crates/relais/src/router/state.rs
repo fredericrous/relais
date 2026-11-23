@@ -480,7 +480,12 @@ mod tests {
         let machine = machine("");
         assert_eq!(
             build(inputs(&machine, None)).accepts,
-            ["answered", "parent_task_id", "unmatched_checks"]
+            [
+                "answered",
+                "parent_task_id",
+                "unmatched_checks",
+                "outcome_uncorrected"
+            ]
         );
     }
 

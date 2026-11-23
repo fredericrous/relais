@@ -869,9 +869,11 @@ export async function flushObservations(fx: Fx, store: Store, options: { isFinal
   const batch = r.queue
   r.queue = []
   const understandsAnswered = supportsAnswered(store)
+  const understandsUncorrected = (store.router.state?.accepts ?? []).includes('outcome_uncorrected')
   const bySession = new Map<string, unknown[]>()
   for (const { session, record } of batch) {
-    const sent = understandsAnswered ? record : withoutAnswered(record)
+    const formed = understandsAnswered ? record : withoutAnswered(record)
+    const sent = understandsUncorrected ? formed : withoutUncorrected(formed)
     bySession.set(session, [...(bySession.get(session) ?? []), sent])
   }
   for (const [session, records] of bySession) {
@@ -901,6 +903,15 @@ function withoutAnswered(record: any): unknown {
   delete out.unmatched_checks
   if (out.outcome === 'answered') out.outcome = 'unknown'
   if (out.completed_at_end === 'answered') out.completed_at_end = 'unknown'
+  return out
+}
+
+// A task record for a relais whose router-state does not list
+// `outcome_uncorrected` (0.77.0 and older): it refuses the field.
+function withoutUncorrected(record: any): unknown {
+  if (!record || typeof record !== 'object' || !('outcome_uncorrected' in record)) return record
+  const out = { ...record }
+  delete out.outcome_uncorrected
   return out
 }
 

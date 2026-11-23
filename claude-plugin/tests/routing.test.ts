@@ -900,6 +900,20 @@ test('a router-state from a relais that predates accepts (0.38.0 and older) gets
   }
 })
 
+test('a router-state whose accepts lacks outcome_uncorrected (0.77.0) gets task records without it', async ($: any, on: any) => {
+  const engine = await routedSession($, on, { state: { accepts: ['answered', 'parent_task_id', 'unmatched_checks'] } })
+  await personTurn($, engine, 'fix the parser, tests exist')
+  await toolCall($, engine, edit('/repo/src/x.rs'), { result: {}, text: 'ok' })
+  engine.labels.set('still wrong', label({ relation: 'correction', explicit: { value: 'correct', quote: 'still wrong' } }))
+  await personTurn($, engine, 'still wrong')
+  await toolCall($, engine, edit('/repo/src/z.rs'), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  const tasks = observed(engine, 'task')
+  expect(tasks.length).toBeGreaterThan(0)
+  expect(tasks.every((r: any) => !('outcome_uncorrected' in r))).toBe(true)
+  expect(observed(engine, 'reassess').filter((r: any) => r.event === 'correction' && r.files).length).toBe(1)
+})
+
 test('a parent whose outcome is unknown sends no task_outcome', async ($: any, on: any) => {
   const engine = await routedSession($, on)
   await personTurn($, engine, 'rename foo to bar, tests exist')
