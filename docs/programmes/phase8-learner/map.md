@@ -74,8 +74,33 @@ From this programme's research tickets:
   The pooled gap is −1.0 point against 15, so the label-policy
   `holds-until:` has not fired and the `label_policy_version` column is
   not owed yet.
+- [t09](t09-release-check.md): v0.77.0 shipped (relais#537), and the
+  installed binary reads 0.77.0. The plugin is still at 0.72.0 (the
+  person's reinstall).
+- [t04](t04-activations-ledger.md): `router_activations` is one row per
+  activation, rollback columns included, with one active row per stratum
+  enforced by an index. `router_decisions` gains `activation_id`, which the
+  plugin must echo back. Dedup is by evidence fingerprint plus 10 new drawn
+  tasks after a rollback. The command is `router rollback <stratum>`, which
+  prints by default and acts on `--write`. The stop-row column is added in
+  the same ledger step (it releases the `holds-until:` early).
 
 ## Handoff
+
+2026-11-23, t04 closed (activations ledger). The answer is in the ticket:
+- the `router_activations` table, with its unique index on the active row;
+- `router_decisions.activation_id`, which `router-state` serves and the
+  plugin echoes;
+- the accessor signatures;
+- the fingerprint-plus-floor dedup;
+- `router rollback <stratum> [--write]`;
+- the stop-row `label_policy_version`, added in the same step.
+
+The live ledger has never held a stop row, so nothing needs a backfill. Two
+points go to t03's ADR: the echo of the id, and the rule that `adjustments`
+are withheld from a plugin that cannot echo it. Next: t03, which takes t02's
+two questions plus the wire points above; t05 waits on it. Then t07
+(2026-11-29). Earlier entry:
 
 2026-11-23, t09 closed (release check): v0.77.0 shipped. relais#537 merged
 as `50736d58`, and the Release run concluded `success` with 7 assets. The
@@ -164,8 +189,6 @@ sessions rejoin the headline** (hitl).
   `model` preference and the person's pins (session-router plan §6).
 - Whether the learner's evaluation runs at session start in `router-state`
   (latency budget) or only on demand and at `relais report`.
-- How `router rollback` names the activation it undoes, and whether it
-  takes `--dry-run` or `--yes` (the activations-ledger ticket reads this).
 
 ## Out of scope
 
