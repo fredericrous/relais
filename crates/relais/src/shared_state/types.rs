@@ -186,8 +186,16 @@ pub enum IntentAnswer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionGrant {
     Granted,
-    AlreadyAnswered,
+    /// Another answerer holds the decision: said as such, never as "no
+    /// open decision".
+    HeldElsewhere,
 }
+
+/// How long an implementation that holds a decision grant keeps it when
+/// the answer never lands (the holder died before releasing). After this
+/// many seconds the next [`DecisionGrant`] request is `Granted` again.
+/// `LocalState` holds no grant, so it never lapses one.
+pub const DECISION_GRANT_TTL_SECS: i64 = 10 * 60;
 
 /// The learned registry's active pointer, as the shared half knows it.
 #[derive(Debug, Clone, PartialEq, Eq)]

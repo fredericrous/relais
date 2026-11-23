@@ -13,8 +13,10 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::node::{self, NodeError};
+use super::types::{DecisionGrant, DECISION_GRANT_TTL_SECS};
 use super::types::{Principal, PublishRow, Slice};
-use super::{node, SharedState, SharedStateError, TicketClaim};
+use super::{SharedState, SharedStateError, TicketClaim};
 use crate::ids::{RunId, TaskId};
 use crate::learn::fixtures::{artifact, evaluation};
 use crate::learn::registry::Registry;
@@ -92,6 +94,17 @@ pub fn run_all<S: SharedState>(make: impl Fn() -> S) {
         let fixture = Fixture::new(name);
         check(&state, &fixture);
     }
+}
+
+/// [`run_all`] and the checks that need the implementation's clock. A
+/// client whose test primary has an injectable clock passes `advance`,
+/// which moves the clock of the state it is given forward by that many
+/// seconds; an implementation that holds decision grants must pass it.
+pub fn run_all_with_clock<S: SharedState>(make: impl Fn() -> S, advance: impl Fn(&S, i64)) {
+    run_all(&make);
+    let state = make();
+    let fixture = Fixture::new("a_decision_grant_lapses");
+    a_decision_grant_lapses(&state, &fixture, &|secs| advance(&state, secs));
 }
 
 fn holder(fixture: &Fixture, who: &str) -> Principal {
@@ -322,7 +335,7 @@ pub fn a_registry_swap_compares_first(state: &dyn SharedState, fixture: &Fixture
         Some("art-a")
     );
     match node::swap_registry_pointer(state, registry, start.as_deref(), &b) {
-        Err(SharedStateError::CasConflict { found, .. }) => {
+        Err(NodeError::Shared(SharedStateError::CasConflict { found, .. })) => {
             assert_eq!(found.as_deref(), Some("art-a"))
         }
         other => panic!("a stale expectation must be cas_conflict, got {other:?}"),
@@ -382,6 +395,32 @@ mod tests {
         run_all(super::super::fake::FakeState::new);
     }
 
+    #[test]
+    fn the_fake_conforms_with_its_clock() {
+        run_all_with_clock(
+            super::super::fake::FakeState::new,
+            |state: &super::super::fake::FakeState, secs| state.advance(secs),
+        );
+    }
+
+    /// The check is not satisfied by holding nothing: `LocalState` grants
+    /// every ask, so the second ask is not `HeldElsewhere`.
+    #[test]
+    #[should_panic(expected = "a held grant is exclusive")]
+    fn the_lapse_check_fails_an_implementation_that_never_holds() {
+        let fixture = Fixture::new("never-holds");
+        a_decision_grant_lapses(&super::super::LocalState::new(), &fixture, &|_| {});
+    }
+
+    /// Nor by holding forever: a clock that does not move never lapses.
+    #[test]
+    #[should_panic(expected = "lapses after")]
+    fn the_lapse_check_fails_a_grant_that_never_lapses() {
+        let fixture = Fixture::new("never-lapses");
+        let fake = super::super::fake::FakeState::new();
+        a_decision_grant_lapses(&fake, &fixture, &|_| {});
+    }
+
     /// Two swaps racing from the same expectation: exactly one lands. Each
     /// thread opens its own lock file description, as two processes would.
     #[test]
@@ -422,8 +461,38 @@ mod tests {
         let landed = results.iter().filter(|r| r.is_ok()).count();
         let conflicts = results
             .iter()
-            .filter(|r| matches!(r, Err(SharedStateError::CasConflict { .. })))
+            .filter(|r| {
+                matches!(
+                    r,
+                    Err(NodeError::Shared(SharedStateError::CasConflict { .. }))
+                )
+            })
             .count();
         assert_eq!((landed, conflicts), (1, 1), "{results:?}");
     }
+}
+
+/// A decision grant that is held is exclusive, and lapses after
+/// [`DECISION_GRANT_TTL_SECS`] when its answer never lands. This is for an
+/// implementation that holds grants (a primary): [`super::LocalState`]
+/// holds none and is not run through it. `advance` moves the
+/// implementation's clock forward by that many seconds.
+pub fn a_decision_grant_lapses(state: &dyn SharedState, fixture: &Fixture, advance: &dyn Fn(i64)) {
+    let run = RunId::from_stored(format!("run-grant-{}", fixture.name));
+    assert_eq!(
+        state.answer_decision(&run).expect("first ask"),
+        DecisionGrant::Granted
+    );
+    assert_eq!(
+        state.answer_decision(&run).expect("second ask"),
+        DecisionGrant::HeldElsewhere,
+        "a held grant is exclusive until it is released or lapses"
+    );
+    advance(DECISION_GRANT_TTL_SECS + 1);
+    assert_eq!(
+        state.answer_decision(&run).expect("ask after the lapse"),
+        DecisionGrant::Granted,
+        "a grant whose answer never landed lapses after {DECISION_GRANT_TTL_SECS} s"
+    );
+    state.release_decision(&run).expect("release");
 }
