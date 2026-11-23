@@ -1,0 +1,18 @@
+greengate-provenance-v1
+commit 7fbec35594ed4e86d1a4c17d1b2a83deeade9c18
+tree a0692ec81e262b3f985264950215b33dedcc4e79
+canon 9a5306b9b61dd05c9f88b46734752b728fa95dfb
+patch 6fbe080eb614eb2033c09c723d088c2c9a6bb285
+plan docs/plans/2026-11-23-router-keeps-preferred-model.md 256ab2880b61310ca1c3e4afecdb4b69f263a41f090ba3bf9448ce526cc43926
+review reviewed eed49081e9d89f69080eb0e6325d4e57ce225aa901816dfc75915e1a6a9b5f2d
+code-review backend reviewed eed49081e9d89f69080eb0e6325d4e57ce225aa901816dfc75915e1a6a9b5f2d
+code-review lang:rust reviewed eed49081e9d89f69080eb0e6325d4e57ce225aa901816dfc75915e1a6a9b5f2d
+preview not-required
+producer greenbelay 6.9.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABAfx/JhUWDp8Ss2hrKD7+oSG5HrIOQpSEoNIK1//KfJu
+RqiiZlVN7JuMFcqGjAfrpEb8U9tA7boWfWp72dMwlMAw==
+-----END SSH SIGNATURE-----
