@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.78.0
+
 - A repair or an escalation that returns the sha the previous attempt verified
   no longer re-runs every check: relais runs again the commands up to the last
   one that failed there (with the profile's setup) and carries the passes after
@@ -20,6 +22,17 @@ missing here.
   `carried` field. `cached: true` means the outcome was not run in this
   verification, either a base reuse (`carried: false`) or a carry
   (`carried: true`): count base reuses as `cached && !carried`.
+- relais's host-slot lines in `waits.jsonl` say how busy the host was and how
+  long relais held a slot: wait lines carry `holders` and `holder_jobs`, and
+  every slot lease relais drops appends one `"outcome":"released"` line with
+  `granted_ms` and `held_ms`, its session the run id. This comes from
+  greenharness-slots 4.13, now the required version; amont's
+  `docs/host-slots.md` ("The journal") says how to read them.
+- The plugin's revert rows hash the files they revert: paths resolve against
+  the command's own directory (`cd`, subshells, `git -C`), unexpanded `$`
+  words are skipped, `.` expands to the task's files, and `git revert` reads
+  its files from `git show`. A failed revert lookup keeps the batch.
+- The plugin's file hashes are scoped to a repository.
 
 ## v0.77.0
 
