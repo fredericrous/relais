@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/shared-state-trait
 repos: [relais, homelab]
 adrs: []
@@ -179,22 +179,22 @@ schema announce and publish (no caller exists today: nothing publishes).
 
 ## Phases
 
-- [ ] Phase 1 — types, errors, trait, selection and refusal:
+- [x] Phase 1 — types, errors, trait, selection and refusal:
   `crates/relais/src/shared_state/mod.rs`, `crates/relais/src/shared_state/types.rs`,
   `crates/relais/src/shared_state/error.rs`, `crates/relais/src/shared_state/local.rs`,
   `crates/relais/src/lib.rs`, `crates/relais/src/policy/mod.rs`,
   `crates/relais/src/cli/outcome.rs`, `crates/relais/src/doctor/mod.rs`,
   `crates/relais/Cargo.toml`
-- [ ] Phase 2 — fake and conformance suite: `crates/relais/src/shared_state/fake.rs`,
+- [x] Phase 2 — fake and conformance suite: `crates/relais/src/shared_state/fake.rs`,
   `crates/relais/src/shared_state/conformance.rs`
-- [ ] Phase 3 — config reads routed: `crates/relais/src/cli/ctx.rs`
-- [ ] Phase 4 — spend routed: `crates/relais/src/runner/review/engine.rs`
-- [ ] Phase 5 — claims routed: `crates/relais/src/cli/programme.rs`,
+- [x] Phase 3 — config reads routed: `crates/relais/src/cli/ctx.rs`
+- [x] Phase 4 — narrowed, not routed (Decision log): spend routed: `crates/relais/src/runner/review/engine.rs`
+- [x] Phase 5 — (the `runner/engine.rs` settles narrowed, Decision log) claims routed: `crates/relais/src/cli/programme.rs`,
   `crates/relais/src/cli/run.rs`, `crates/relais/src/cli/decide.rs`,
   `crates/relais/src/runner/engine.rs`
-- [ ] Phase 6 — registry routed: `crates/relais/src/cli/learn.rs`
-- [ ] Phase 7 — docs and changelog: `CHANGELOG.md`, `docs/shared-state.md`
-- [ ] Phase 8 — ticket closure in homelab (Resolution, `status = "closed"`,
+- [x] Phase 6 — registry routed: `crates/relais/src/cli/learn.rs`
+- [x] Phase 7 — docs and changelog: `CHANGELOG.md`, `docs/shared-state.md`
+- [x] Phase 8 — ticket closure in homelab (Resolution, `status = "closed"`,
   the Decisions line): `docs/programmes/agents-many-nodes/an-t14-shared-state-trait.md`,
   `docs/programmes/agents-many-nodes/map.md`
 
@@ -217,6 +217,26 @@ schema announce and publish (no caller exists today: nothing publishes).
   `docs/shared-state.md` marks it unstable until an-t13 consumes it, and an
   older relais refuses a machine.toml that sets the key
   (`deny_unknown_fields`), which the doc and CHANGELOG say.
+- 2026-11-23 — Implementation review (round 1, `dependencies.explicit`):
+  no global factory and no global epoch table. `register_external` and
+  `current()` are replaced by `current_with(external)`, called only from
+  the CLI's composition root (`cli/ctx.rs`, `EXTERNAL_CLIENT`, `None` in
+  public relais: the line a private build replaces); `LocalState` holds its
+  own epoch table; the doctor finding takes `client_linked` from the CLI.
+  This supersedes the Behaviour's `register_external`, `OnceLock` and
+  process-wide table wording, kept as reviewed.
+- 2026-11-23 — Narrowed with it: the daily spend check
+  (`runner/review/engine.rs`) and the runner's widen and timed-out settles
+  (`runner/engine.rs`) stay on the ledger, because library code may not
+  build a `SharedState` itself and `RunConfig` cannot gain a field without
+  editing the runner tests that build it as a struct literal. holds-until:
+  a change that may edit those tests gives `RunConfig` a `shared_state`
+  field; until then the global cap (an-t10's slices) is not enforced
+  through the seam, and the node's own `[spending]` ceiling applies as
+  today.
+- 2026-11-23 — The selector type lives in `policy` (`SharedStateSelection`,
+  re-exported as `shared_state::Selection`): `policy` importing
+  `shared_state` closed a module cycle the cycle check refused.
 
 ## Verification
 
@@ -226,21 +246,52 @@ scratch `relais programme claim` are saved outside the worktree.
 
 - Phase 1: scratch `XDG_CONFIG_HOME` with `shared_state = "external"`:
   `echo '{}' | relais hook` → exit 0; `relais doctor` → a failing finding
-  naming the key; `relais trust grant` on that file → key kept → <result>
+  naming the key; `relais trust grant` on that file → key kept → hook exit
+  0; doctor exit 3 with one `✗ shared_state` line; under external every
+  `load_machine` command refuses, so the key-kept check runs with
+  `shared_state = "local"`: kept, and a file without the key gets none
+  (also `tests/shared_state_cli.rs`)
 - Phase 3: same scratch file: `relais trust list >out 2>err; echo $?`
   (`trust_command` reads through `load_machine` first, `cli/trust.rs:21`)
-  → exit 3, empty stdout, one `relais:` line → <result>
+  → `trust show` (the subcommand is `show`, not `list`) and `programme
+  claim`: exit 3, 0 bytes on stdout, one `relais:` line naming the file and
+  the fix; `shared_state = "bogus"` → exit 2, `... is invalid: ...
+  shared_state = "bogus": expected "local" or "external"`
 - Phases 3–6: with no key, and with a mode-000 machine.toml (as a non-root
   user), the baseline
-  commands → byte-identical output and exit codes → <result>; `cargo test
-  --workspace` → passes, with no test file modified (`git diff origin/main
-  --diff-filter=MD --name-only`) and no removed line inside an existing
-  `#[cfg(test)]` module → <result>
+  commands → byte-identical output and exit codes → no key: `--help`,
+  `status`, `trust show`, `programme claim`, `hook` byte-identical; `doctor`
+  differs only by facts outside this change (ledger schema v48 → v49 from
+  main's #546, the installed greengate version, other sessions' runs);
+  mode-000: `trust show` gives the same `cannot read the machine settings`
+  line and exit 2 from both binaries; `cargo test --workspace` (macOS) →
+  2610 lib + 63 + 351 `it` + 16 + 16 + 3 new CLI tests pass; no existing
+  test file modified (`git diff origin/main... --diff-filter=MD
+  --name-only` lists no test file), and every removed line is in a
+  production function
 - Phase 2: `cargo test -p relais shared_state` → conformance passes for
-  `LocalState` and the fake → <result>; `cargo build -p relais --features
-  conformance` → builds → <result>
+  `LocalState` and the fake → 9 passed (both conform, three fake-only
+  expiry and degraded tests, selector tests); `cargo clippy -p relais
+  --features conformance --lib -D warnings` → clean
 - Phase 6: two concurrent `LocalState` swaps from threads in a test → one
-  succeeds, one `CasConflict` → <result>
-- Linux and macOS: CI's cargo-test matrix on the PR → green → (PR checks)
+  succeeds, one `CasConflict` → passes (each thread opens its own registry
+  and lock description)
+- Linux and macOS: CI's cargo-test matrix runs on the PR.
+
+## Implementation review
+
+- implementation-review: rework → Delta approve-with-changes; fixed the two globals and six banners; deliberate: the reviewed Behaviour stays, the Decision log records the change. 91k+56k, 67+24 s.
+- architect: approve-with-changes → Delta approve; fixed the runner locating its own service (reverted, narrowed); deliberate: node-local types (an-t06), text pre-filter (test literals). 57k+43k, 23+33 s.
+- backend: approve-with-changes → Delta approve; fixed holds-until, CLI refusal test, promote conflict exit 3; global epoch table gone. 67k+45k, 84+30 s.
+- lang:rust: approve-with-changes → Delta approve-with-changes; fixed MicroUsd, exhaustive source, Lock variant; deliberate: TicketGrant fields, String selector error, boxed cause, release_intent string. 67k+37k, 52+11 s.
+
+## Outcome
+
+Shipped the trait, `LocalState`, the selector and its refusal, the fake
+and the conformance suite, and routing for config, ticket and intent
+claims, `relais decide` and `relais promote`. Not shipped: spend and the
+runner's settles through the seam (`RunConfig` first), coordinator seats,
+the other direct machine-settings readers. Surprise: `policy` importing
+`shared_state` closed a crate-wide module cycle.
 
 <!-- panel: repos=relais,homelab adds=contract reviewers=architect,backend,lang:rust,po,tui,unix body-sha=c9cc3dc6c48f -->
