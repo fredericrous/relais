@@ -17,7 +17,9 @@ missing here.
   `relais report`. In-place runs, a changed sha, a changed profile and holdouts
   and reviews are never carried; an in-place run says why in a
   `checks_not_carried` decision. `relais report --json` check timings gain a
-  `carried` field.
+  `carried` field. `cached: true` means the outcome was not run in this
+  verification, either a base reuse (`carried: false`) or a carry
+  (`carried: true`): count base reuses as `cached && !carried`.
 
 ## v0.77.0
 

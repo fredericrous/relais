@@ -751,7 +751,10 @@ impl<'a> RunEngine<'a> {
         for outcome in &carried {
             self.events.emit(crate::protocol::Event::CheckCarried {
                 label: outcome.label.clone(),
-                from: outcome.carried_from.clone().unwrap_or_default(),
+                from: outcome
+                    .carried_from
+                    .clone()
+                    .unwrap_or_else(|| plan.from.to_owned()),
             });
         }
         if let Some(origin) = carried

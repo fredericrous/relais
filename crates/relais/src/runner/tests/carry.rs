@@ -1,18 +1,18 @@
-// -- passed checks carried to an unchanged candidate -----------------------
-//
-// docs/plans/2026-11-23-carry-passed-checks-unchanged-sha.md: a repair that
-// returns the sha the previous attempt verified runs again the commands up
-// to the last one that failed there, and carries the passes after it.
-//
-// Each command counts its own runs in a file outside the tree, and fails
-// when it runs in the verification worktree of an attempt the test names
-// (`verify-<n>`): the base run, which happens elsewhere, never fails.
+//! Passed checks carried to an unchanged candidate
+//! (docs/plans/2026-11-23-carry-passed-checks-unchanged-sha.md): a repair
+//! that returns the sha the previous attempt verified runs again the
+//! commands up to the last one that failed there, and carries the passes
+//! after it.
+//!
+//! Each command counts its own runs in a file outside the tree, and fails
+//! when it runs in the verification worktree of an attempt the test names
+//! (`verify-<n>`): the base run, which happens elsewhere, never fails.
 
 use std::sync::atomic::AtomicUsize;
 
 use super::holdouts::{
-    holdout_contract, script_declaration, settings_for, store_with, writes, OVERLAY, PASSING,
-    STORE_PATH_IN_STORE,
+    mandatory_holdout_contract, script_declaration, settings_for, store_with, writes, OVERLAY,
+    PASSING, STORE_PATH_IN_STORE,
 };
 use super::*;
 
@@ -303,7 +303,7 @@ fn a_review_sending_back_an_all_green_sha_runs_no_command_but_makes_the_tree_and
     let repo = fixture.repo_policy_with_setup(vec![setup], vec![make, test], 3);
     let (store, _) = store_with(&fixture, &[(STORE_PATH_IN_STORE, &writes(PASSING))]);
     let holdouts = settings_for(&fixture, &store, script_declaration(&["sh", OVERLAY], None));
-    let mut contract = holdout_contract(&fixture, true);
+    let mut contract = mandatory_holdout_contract(&fixture);
     contract.review = Review::Required;
     let outcome = fixture.execute_with_holdouts(
         holdouts,

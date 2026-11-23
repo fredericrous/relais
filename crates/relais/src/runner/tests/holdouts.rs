@@ -46,6 +46,10 @@ pub(super) fn settings_for(
     settings
 }
 
+pub(super) fn mandatory_holdout_contract(fixture: &Fixture) -> TaskContract {
+    holdout_contract(fixture, true)
+}
+
 pub(super) fn holdout_contract(fixture: &Fixture, mandatory: bool) -> TaskContract {
     let mut contract = fixture.contract(Review::Off);
     contract.acceptance = vec![crate::acceptance::AcceptanceEntry::Declared(
