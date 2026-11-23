@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: prog/agents-many-nodes/an-t19-freeze-shared-state-errors
 repos: [relais, homelab]
 adrs: []
@@ -88,13 +88,13 @@ behaviour changes for one node.
 
 ## Phases
 
-- [ ] Phase 1 — types and errors (committed with Phase 2: Phase 1 alone does not build): `crates/relais/src/shared_state/error.rs`,
+- [x] Phase 1 — types and errors (committed with Phase 2: Phase 1 alone does not build): `crates/relais/src/shared_state/error.rs`,
   `crates/relais/src/shared_state/types.rs`, `crates/relais/src/shared_state/mod.rs`,
   `crates/relais/src/shared_state/node.rs`, `crates/relais/src/shared_state/local.rs`,
   `crates/relais/src/shared_state/fake.rs`
-- [ ] Phase 2 (same commit as Phase 1) — CLI call sites: `crates/relais/src/cli/ctx.rs`,
+- [x] Phase 2 (same commit as Phase 1) — CLI call sites: `crates/relais/src/cli/ctx.rs`,
   `crates/relais/src/cli/programme.rs`, `crates/relais/src/cli/learn.rs`, `crates/relais/src/cli/run.rs`, `crates/relais/src/cli/decide.rs`
-- [ ] Phase 3 — conformance and docs (CHANGELOG entry marked breaking, with an old-to-new mapping for the moved variants and the rename; confirm an-t13 has no merged code against the trait before merge): `crates/relais/src/shared_state/conformance.rs`,
+- [x] Phase 3 — conformance and docs (CHANGELOG entry marked breaking, with an old-to-new mapping for the moved variants and the rename; confirm an-t13 has no merged code against the trait before merge): `crates/relais/src/shared_state/conformance.rs`,
   `docs/shared-state.md`, `CHANGELOG.md` (a breaking entry: the removed `SharedStateError` variants and `AlreadyAnswered` to `HeldElsewhere`; minor bump, an-t13's pin follows)
 
 ### 🧑 Your steps
@@ -124,6 +124,17 @@ none
 
 ## Implementation review
 
+- implementation-review: round 1 approve-with-changes (test rows, `contains`, phases, doc drift) all fixed or `deliberate`; delta approve. 14 candidates ruled fine.
+- architect: moved `NodeError` into `node.rs` so `error.rs` no longer imports the node's stores; delta approve.
+- backend: lapse check now bounds the TTL on both sides with an early-lapse negative test; promote and Compensation arms `deliberate: unreachable under LocalState`; delta approve.
+- lang:rust: lapse check above the tests module, `node_error` exhaustive, merged imports; delta approve.
+
 ## Outcome
+
+Built as planned in the relais PR. Observed: `cargo test -p relais --features conformance --lib --bins` lapse, conformance and `node_error` tests pass, including three `should_panic` negatives (never holds, never lapses, lapses early); `local_state_conforms` and `the_fake_conforms` unchanged; the pre-commit gates passed on the plan and code commits.
+
+Deviations, all recorded: `Compensation.release` is `Box<NodeError>` (the intent path's local release fails with a ledger error, so `compensated` and `give_back` take any release error that converts to `NodeError`); `NodeError` lives in `node.rs` at `shared_state::node::NodeError`; the "CLI lines" row is `deliberate: unreachable under LocalState` (a release never fails there, the CAS needs a race), the arms are renamed one for one and the `node_error` table test pins every variant's line and exit class; the `run`, `learn` and `decide` call sites needed no edit beyond `learn.rs`'s `CasConflict` arm.
+
+Carried: a client with several answerers adds its own late-answer fence (an-t13); nothing pins `promote`'s `CasConflict` arm under a primary.
 
 <!-- panel: repos=relais,homelab adds=contract reviewers=architect,backend,lang:rust,po,tui,unix body-sha=318dca23cc47 -->
