@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: prog/phase8-learner/t14-charge-read-fallbacks
 repos: [relais]
 adrs: []
@@ -78,7 +78,7 @@ The tests are the Verification rows. In the corrupt-row test the good row's
 
 ## Phases
 
-- [ ] Phase 1 — split the flag, count the skips, add the two tests and
+- [x] Phase 1 — split the flag, count the skips, add the two tests and
   tighten two existing ones: `crates/relais/src/ledger/router.rs`,
   `crates/relais/src/ledger/mod.rs` (re-export `CorrectionCharges` at line 81).
   Call sites move to `.charges`: the `correction_charges` helper, `charge_case`,
@@ -113,6 +113,21 @@ The tests are the Verification rows. In the corrupt-row test the good row's
 
 ## Outcome
 
+Phase 1 is shipped on this branch. The flags became one `ChargeRead` enum (Decision log), so the Behaviour bullets on `unparsed`/`legacy` read as its `Unparsed`/`Legacy` cases. Each check is input → expected → actual:
+
+- corrupt correction row → kept and uncharged, b stays corrected → `a_row_with_unreadable_files_is_kept_unparsed_and_keeps_its_task` passes.
+- corrupt candidate (files on one, `ended_at` on another) → the third is charged, count 2 → `a_candidate_with_unreadable_files_is_skipped_and_counted` passes.
+- flag split → unparseable time reads `Unparsed`, empty files read `Legacy` → passes.
+- `cargo test -p relais --lib ledger::router` → all pass → 33 passed, 0 failed.
+- mutation `None => Legacy` → unparsed-row tests fail → 2 failed, rc 101.
+- mutation with no skip increment → candidate test fails → 1 failed, rc 101.
+- `cargo clippy -p relais --all-targets -- -D warnings` → clean → rc 0.
+- pre-commit gate → passes → passed. On the second commit the host was full, so it deferred clippy and cargo-test to CI; the runs above are on that same code.
+
 ## Implementation review
+
+- implementation-review: approve-with-changes, then the delta: approve-with-changes. Phase tick and Outcome fixed here; the pack refresh is in the Decision log. 45k + 54k.
+- backend: approve. The `ended_at` skip case was fixed. Deliberate, left to t05: a read snapshot across the three SELECTs, and naming the damaged tasks. 62k.
+- lang:rust: approve-with-changes, then the delta: approve. Fixed: the bools became the `ChargeRead` enum, and the `ended_at` case was added. Deliberate: the failing column (t05 decides it) and a doc-wrap nit. 48k + 52k.
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:rust,tui,unix body-sha=242d44b50714 -->
