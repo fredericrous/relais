@@ -84,7 +84,9 @@ Board checked: phase8-learner's t12 runs in `relais-wt-t12-correction` (correcti
 - backend: approve; 1 low to the plugin follow-up (an unchecked pin value only reaches telemetry); 66k, 78 s.
 - lang:rust: approve; 2 low left (pin source could be an enum for the follow-up; one `inherit` filter closure); 46k, 36 s.
 
-Next: release (after v0.80.0, which another session is cutting), `brew upgrade relais`, then the post-install checks.
+- After the rebase on 4e43fbb6 (CHANGELOG conflict, both kept): implementation-review approve, 43k, 24 s; lang:rust approve, 40k, 19 s; backend approve-with-changes, 59k, 38 s: deliberate: an unknown `preferred-model` value is not validated, as `model:` pins never were (same follow-up); deliberate: a parent-written model on a pinned call is the documented row-records-the-preference caveat; deliberate: SPEC line 40 "beside `model: inherit`" is short of "or no `model:`", which §30 states in full.
+
+Next: release v0.81.0 (v0.80.0 was cut by another session), `brew upgrade relais`, then the post-install checks.
 
 ## Non-goals
 No plugin change in this plan (recording the call's model on a pinned row is a filed follow-up); no change to `decideSpawn`, the capability table, ε, or how a person-named subagent model works; no change to relais's own run agents; Codex unaffected.
