@@ -61,6 +61,10 @@ ticket here until it is resolved or moved into a programme of its own.
 - [f14](f14-claim-lock-stderr-pinned.md) (2026-11-21, open): pin the
   `stayed held for` wording that the driver's retry matches with a claim
   CLI test (orphan of 4bca21ec).
+- [f15](f15-loop-breaker-wider-fingerprint.md) (2026-11-23, open): replay
+  Lumina's no-progress rule (every tool, normalized results, failures
+  stale) over the wall-timeout transcripts the #418 Bash rule found no
+  loop in; widen the shadow fingerprint, add a warn rung, or no change.
 
 ## Handoff
 
