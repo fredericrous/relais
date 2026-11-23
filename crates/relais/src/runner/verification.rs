@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use super::carry::{carried_reason, CarryPlan, CheckReuse};
 use super::setup_gate;
 use super::workspace_ops::SetupWithin;
 use super::{
@@ -730,6 +731,51 @@ impl<'a> RunEngine<'a> {
         }
     }
 
+    /// The outcomes of a carrying verification in profile order: the
+    /// commands that ran again, then the passes carried from the attempt
+    /// that ran them. Each carried pass is announced once, after the last
+    /// check that ran has ended, and the decision says what ran and what
+    /// did not.
+    fn merge_carried(
+        &self,
+        mut fresh: Vec<verify::CheckOutcome>,
+        plan: &CarryPlan<'_>,
+    ) -> Vec<verify::CheckOutcome> {
+        let carried: Vec<verify::CheckOutcome> = plan
+            .outcomes
+            .iter()
+            .skip(plan.rerun)
+            .cloned()
+            .map(|outcome| outcome.carried(plan.from))
+            .collect();
+        for outcome in &carried {
+            self.events.emit(crate::protocol::Event::CheckCarried {
+                label: outcome.label.clone(),
+                from: outcome
+                    .carried_from
+                    .clone()
+                    .unwrap_or_else(|| plan.from.to_owned()),
+            });
+        }
+        if let Some(origin) = carried
+            .first()
+            .and_then(|first| first.carried_from.as_deref())
+        {
+            let carried_labels: Vec<&str> = carried
+                .iter()
+                .map(|outcome| outcome.label.as_str())
+                .collect();
+            let rerun_labels: Vec<&str> =
+                fresh.iter().map(|outcome| outcome.label.as_str()).collect();
+            self.events.emit(crate::protocol::Event::Decision {
+                what: "checks_carried".to_string(),
+                reason: carried_reason(origin, &carried_labels, &rerun_labels),
+            });
+        }
+        fresh.extend(carried);
+        fresh
+    }
+
     /// Verify the immutable candidate copy: a throwaway worktree at the
     /// candidate SHA, profile commands with logged, hashed evidence, and
     /// amont's inventory when the integration is on.
@@ -739,7 +785,7 @@ impl<'a> RunEngine<'a> {
         authority: &EffectiveAuthority,
         logs_dir: &Path,
         label: AttemptLabel,
-        reuse: Option<&[verify::CheckOutcome]>,
+        reuse: CheckReuse<'_>,
         resolved_holdouts: &[crate::holdout::ResolvedHoldout],
     ) -> Result<verify::Verified, VerifyFailure> {
         // amont's effective inventory (SPEC §10): consulted whenever the
@@ -766,9 +812,16 @@ impl<'a> RunEngine<'a> {
         // asked the same way, against the same tree, for the same
         // reason. So the throwaway worktree is created whenever the
         // checks, the inventory or a named gate needs it.
-        let mut holder = match (reuse.is_none(), amont_on || !gate_names.is_empty()) {
-            (false, false) => None,
-            _ => {
+        let needs_tree = match reuse {
+            CheckReuse::Base(_) => amont_on || !gate_names.is_empty(),
+            // A carry still reads the set-up tree: amont's inventory, stamp
+            // and gate answers, and the holdouts, are about this candidate's
+            // own tree, whatever the commands there did or did not run.
+            CheckReuse::None | CheckReuse::Carry(_) => true,
+        };
+        let mut holder = match needs_tree {
+            false => None,
+            true => {
                 let verify_path = self
                     .verify_dir
                     .join(format!("verify-{}", label.worktree_suffix()));
@@ -785,16 +838,16 @@ impl<'a> RunEngine<'a> {
         };
         let mut setup_gap: Option<String> = None;
         let mut setup_cut = false;
-        let checks = match (reuse, holder.as_ref()) {
+        let checks = match (&reuse, holder.as_ref()) {
             // The candidate is the base tree: the baseline's outcomes are
             // its outcomes, by identity — and the base's setup already
             // proved the setup, so it is not spent again either.
-            (Some(outcomes), _) => outcomes
+            (CheckReuse::Base(outcomes), _) => outcomes
                 .iter()
                 .cloned()
                 .map(verify::CheckOutcome::reused)
                 .collect(),
-            (None, Some(holder)) => {
+            (CheckReuse::None | CheckReuse::Carry(_), Some(holder)) => {
                 let setup = self
                     .while_watching_cancel(|cancel| {
                         self.setup_tree(
@@ -854,22 +907,38 @@ impl<'a> RunEngine<'a> {
                         ));
                         Vec::new()
                     }
-                    None => self
-                        .while_watching_cancel(|cancel| {
-                            verify::run_profile_within(
-                                holder.path(),
-                                &authority.verification_profile,
-                                logs_dir,
-                                &label.log_prefix(),
-                                &self.events,
-                                cancel,
-                                &self.heavy(),
-                            )
-                        })
-                        .map_err(VerifyFailure::from)?,
+                    None => {
+                        let rerun = match &reuse {
+                            CheckReuse::Carry(plan) => plan.rerun,
+                            CheckReuse::None | CheckReuse::Base(_) => usize::MAX,
+                        };
+                        let commands = authority
+                            .verification_profile
+                            .commands
+                            .iter()
+                            .enumerate()
+                            .take(rerun);
+                        let fresh = self
+                            .while_watching_cancel(|cancel| {
+                                verify::run_indexed_within(
+                                    holder.path(),
+                                    commands,
+                                    logs_dir,
+                                    &label.log_prefix(),
+                                    &self.events,
+                                    cancel,
+                                    &self.heavy(),
+                                )
+                            })
+                            .map_err(VerifyFailure::from)?;
+                        match &reuse {
+                            CheckReuse::Carry(plan) => self.merge_carried(fresh, plan),
+                            CheckReuse::None | CheckReuse::Base(_) => fresh,
+                        }
+                    }
                 }
             }
-            (None, None) => {
+            (CheckReuse::None | CheckReuse::Carry(_), None) => {
                 return Err(VerifyFailure::Unavailable(
                     "a candidate to verify but no worktree to verify it in".to_string(),
                 ))
@@ -901,9 +970,10 @@ impl<'a> RunEngine<'a> {
                 )
                 .map_err(|e| format!("the ledger refused a check-log evidence row: {e}"))?;
             // A reused baseline outcome's report was already recorded when
-            // the baseline ran; recording it again would add an identical
+            // the baseline ran, and a carried one's when the attempt that
+            // ran it did; recording either again would add an identical
             // row the ledger has no constraint against.
-            if reuse.is_none() {
+            if !matches!(reuse, CheckReuse::Base(_)) && check.carried_from.is_none() {
                 self.record_junit_report(check)
                     .map_err(|e| format!("the ledger refused a junit-report evidence row: {e}"))?;
             }

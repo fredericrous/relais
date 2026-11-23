@@ -215,6 +215,17 @@ function agentRows(m: RunModel): AgentLine[] {
   return rows
 }
 
+// A step's own lines as the pane draws them: the last check that ran, then a
+// row for each pass carried over from an earlier attempt, which ran nothing
+// here and wrote no output.
+function paneStepLines(step: Step): string[] {
+  const carried = step.checks.filter(c => c.carried !== undefined)
+  if (carried.length === 0) return stepOutput(step)
+  const ran = step.checks.filter(c => c.carried === undefined)
+  const own = ran.length > 0 ? ran[ran.length - 1].output : []
+  return [...own, ...carried.map(c => `${c.label} · carried from ${c.carried}`)]
+}
+
 // The output a run shows, `cap` lines at most: the last ones, so the
 // extra (earlier) lines are dropped, not wrapped. A step running no check
 // shows what its agent does instead. A live run's active step always shows
@@ -226,7 +237,7 @@ function outputRows(m: RunModel, cap: number): Row[] {
   const n = live ? Math.max(cap, 1) : cap
   if (n <= 0) return []
   const current = m.steps.find(s => s.state === 'active') ?? m.steps[m.steps.length - 1]
-  const lines = current ? stepOutput(current) : []
+  const lines = current ? paneStepLines(current) : []
   if (lines.length === 0) return live && !runningCheck(current) && !m.wait ? [{ text: '  │ waiting for output', dim: true }] : []
   return lines.slice(-n).map(text => ({ text: `  │ ${text}`, dim: true }))
 }
@@ -461,7 +472,7 @@ function minimalFrame(f: Frame & { m: RunModel; now: number }): Row[] {
 // The lines a frame would draw if given all it wants.
 function wantedLines(m: RunModel): number {
   const current = m.steps.find(s => s.state === 'active')
-  const active = current ? stepOutput(current).length : 0
+  const active = current ? paneStepLines(current).length : 0
   const failed = m.steps.find(s => s.state === 'fail' && s.checks.some(c => c.exit !== 0 && c.exit !== undefined))
   const failedLines = !isLive(m) && failed ? (failed.checks.filter(c => c.exit !== 0)[0]?.output.length ?? 0) : 0
   return Math.max(isLive(m) && current ? 1 : 0, active, failedLines)

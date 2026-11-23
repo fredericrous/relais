@@ -1266,4 +1266,14 @@ pub(in crate::ledger) const MIGRATIONS: &[(&str, &str)] = &[
     );
     "#,
     ),
+    (
+        // A check carried over from an earlier attempt on the same candidate
+        // (carry passed checks): the log prefix of the attempt that ran it,
+        // NULL for a check run in its own phase. Expand-only: a nullable
+        // column nothing older reads.
+        "v49",
+        r#"
+    ALTER TABLE check_timings ADD COLUMN carried_from TEXT;
+    "#,
+    ),
 ];

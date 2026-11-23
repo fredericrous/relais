@@ -183,6 +183,7 @@ mod tests {
 
     fn check(ended: Ended, junit: Option<JunitReport>) -> CheckOutcome {
         CheckOutcome {
+            carried_from: None,
             label: "sh@00000000".into(),
             argv: vec!["sh".into()],
             ended: CheckEnd::new(ended),

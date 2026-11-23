@@ -1,5 +1,8 @@
 //! The attempt loop: dispatch, snapshot, verify and judge each attempt.
 
+use super::carry::{
+    decide_carry, profile_fingerprint, Carry, CarryQuery, CheckReuse, LastVerified, Placement,
+};
 use super::holdouts::split_holdout_gaps;
 use super::loop_text;
 use super::{
@@ -1127,16 +1130,43 @@ impl<'a> RunEngine<'a> {
             Reason::VerificationStarted,
             serde_json::json!({ "candidate": candidate.sha, "attempt": candidate.index }),
         )?;
+        let profile = &authority.verification_profile;
         let reuse = if identical {
             self.transition(
                 State::Verifying,
                 Reason::CandidateIdenticalToBase,
                 serde_json::json!({ "candidate": candidate.sha }),
             )?;
-            ctx.baseline.checks()
+            ctx.baseline
+                .checks()
+                .map_or(CheckReuse::None, CheckReuse::Base)
         } else {
-            None
+            let placement = if self.inplace.is_some() {
+                Placement::InPlace
+            } else {
+                Placement::Isolated
+            };
+            match decide_carry(
+                progress.last_verified.as_ref(),
+                &CarryQuery {
+                    candidate_sha: &candidate.sha,
+                    placement,
+                    profile,
+                    inputs_changed: &verification_inputs_changed,
+                },
+            ) {
+                Carry::Plan(plan) => CheckReuse::Carry(plan),
+                Carry::Refused(why) => {
+                    self.events.emit(crate::protocol::Event::Decision {
+                        what: "checks_not_carried".to_string(),
+                        reason: why.reason(),
+                    });
+                    CheckReuse::None
+                }
+                Carry::Nothing => CheckReuse::None,
+            }
         };
+        let ran_commands = !matches!(reuse, CheckReuse::Base(_));
         let verify::Verified {
             checks,
             mut gaps,
@@ -1188,6 +1218,18 @@ impl<'a> RunEngine<'a> {
         };
         if let Some(outcome) = self.end_if_cancelled()? {
             return Ok(Step::Ended(outcome));
+        }
+        // What this verification ran, for the next one on this candidate: a
+        // setup gap, a lease stop or a cancel ran no commands and leaves
+        // nothing to carry.
+        if ran_commands && !checks.is_empty() && checks.len() == profile.commands.len() {
+            progress.last_verified = Some(LastVerified {
+                sha: candidate.sha.clone(),
+                phase: AttemptLabel::Attempt(candidate.index).log_prefix(),
+                fingerprint: profile_fingerprint(profile),
+                inputs_changed: verification_inputs_changed.clone(),
+                outcomes: checks.clone(),
+            });
         }
         // A setup step the clock cut ran no check: the run ends on the
         // budget with the candidate kept, not as a verification gap.

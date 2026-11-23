@@ -335,6 +335,7 @@ mod tests {
 
     fn stamp_check(gate: &str, ended: Ended) -> super::super::CheckOutcome {
         super::super::CheckOutcome {
+            carried_from: None,
             label: format!("amont@{gate}"),
             argv: names(&["amont", "run", "--stamp", gate]),
             ended: super::super::CheckEnd::new(ended),
