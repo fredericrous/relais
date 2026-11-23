@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/shared-state-owned-values
 repos: [relais, homelab]
 adrs: []
@@ -162,7 +162,7 @@ degraded release after a local refusal returns the refusal.
 
 ## Phases
 
-- [ ] Phase 1 — the trait in owned values, the node half, LocalState, the
+- [x] Phase 1 — the trait in owned values, the node half, LocalState, the
   fake, conformance and callers: `crates/relais/src/shared_state/mod.rs`,
   `crates/relais/src/shared_state/node.rs`,
   `crates/relais/src/shared_state/local.rs`,
@@ -170,7 +170,7 @@ degraded release after a local refusal returns the refusal.
   `crates/relais/src/shared_state/conformance.rs`,
   `crates/relais/src/cli/run.rs`, `crates/relais/src/cli/decide.rs`,
   `crates/relais/src/cli/learn.rs`, `crates/relais/src/cli/programme.rs`
-- [ ] Phase 2 — docs: `docs/shared-state.md` (the "For a closed client"
+- [x] Phase 2 — docs: `docs/shared-state.md` (the "For a closed client"
   section: the trait takes plain values, the node half is relais's; replace
   the bullet that lists `Ledger`, `Store`, `Registry`, `EvaluatedArtifact`
   as parameters),
@@ -189,19 +189,47 @@ degraded release after a local refusal returns the refusal.
 - 2026-11-23: shared first, then local, with one release on a local refusal;
   the same order for every operation, so an external client never sees a
   local write it did not grant.
+- 2026-11-23 (implementation review): `answer_decision`'s `AlreadyAnswered`
+  is a `Refused` error ("being answered elsewhere"), not `None`, and a
+  primary's decision grant lapses (the fake: 10 minutes), so a node that died
+  between the grant and its ledger write does not hold the decision for ever.
+- 2026-11-23: deliberate: `SharedStateError` keeps its `Ledger`, `Claim`
+  and `Registry` pass-through variants, produced only by `node`; splitting a
+  `NodeError` out changes every CLI error mapping the routed commands use,
+  which an-t16 to an-t18 rework. Filed as a programme follow-up, to decide
+  before the trait is frozen.
+- 2026-11-23: deliberate: a give-back that fails after a local refusal is
+  one `relais: the shared hold on … could not be given back` line printed by
+  the library: the answers it would ride on are the ledger's `Claim` and the
+  store's `Taken`, shared by every caller, and the line only appears under
+  an external client.
+- 2026-11-23: the fleet pack refresh (`.adr/packs/decisions.pack`) rides
+  this branch, as worktree-task's Start step does.
 
 ## Verification
 
-| Check | Input | Expected |
-|---|---|---|
-| no handle in the trait | `awk '/^pub trait SharedState/,/^}/' crates/relais/src/shared_state/mod.rs` piped to `grep -nE` on `Ledger`, `Store`, `Registry`, `EvaluatedArtifact`, `dyn Fn`, `<'` | no line |
-| conformance | `cargo test -p relais --lib shared_state::` | the 9 properties pass for LocalState and the fake; the race and the four new fake tests pass |
-| existing suite unchanged | `git diff origin/main -- ':!crates/relais/src/shared_state'` | no added or removed `#[test]`, `assert` or `mod tests` line; `cargo test --workspace` passes with main's passed count plus only new `shared_state::` tests |
-| piloted CLI | the `main` binary and the branch binary, each on its own scratch `RELAIS_STATE_DIR`: `relais programme claim` (fresh, then refused for a second session), `relais promote` (success, a CAS conflict, `.pointer.lock` held by another process), `relais run --intent` on an unknown intent; stdout, stderr and `$?` captured | `diff` of each is empty |
-| feature build | `cargo build -p relais --features conformance` | builds |
+| Check | Input | Expected | Actual |
+|---|---|---|---|
+| no handle in the trait | `awk '/^pub trait SharedState/,/^}/' crates/relais/src/shared_state/mod.rs` piped to `grep -nE` on `Ledger`, `Store`, `Registry`, `EvaluatedArtifact`, `dyn Fn`, `<'` | no line | no line (grep exit 1) |
+| conformance | `cargo test -p relais --lib shared_state::` | the 9 properties for LocalState and the fake; the race and the new fake tests | 16 `shared_state::` tests pass inside the workspace run on the final tree |
+| existing suite unchanged | `git diff origin/main -- ':!crates/relais/src/shared_state'` | no added or removed `#[test]`, `assert` or `mod tests` line; `cargo test --workspace` passes | no such line; workspace: lib 2619 passed, 0 failed, 5 ignored (main's lib had 7 fewer `shared_state::` tests), other binaries 63, 351, 16, 16, 3, 1 passed; commit gate 30 checks passed |
+| piloted CLI | `main` and branch binaries on one scratch `RELAIS_STATE_DIR`, recreated per case: `programme claim` fresh and held by another session, `promote` of an unknown artifact, `run --intent` | identical stdout, stderr and `$?` | identical: claim fresh rc 0, held rc 3 (retry lines), promote rc 3, run rc 2. Not run: promote success, CAS conflict and held lock (an evaluated artifact needs a training run to seed) and a claimed intent (`run --intent` refuses before the claim outside a plugin session); those paths are covered by the conformance properties, the LocalState race test and the fake tests |
+| feature build and lint | `cargo build -p relais --features conformance`; `cargo clippy -p relais --all-targets --features conformance -- -D warnings` | builds, no warning | both clean |
 
 ## Implementation review
 
+- implementation-review: approve (Delta; round 1 approve-with-changes, 2 blocking fixed: fake race, a placeholder name); 88k+34k, 280+25 s.
+- backend: approve-with-changes; decision-grant lapse fixed in node and fake; deliberate: the lapse goes in the trait doc and conformance with the closed client (follow-up); 69k+38k.
+- architect: approve-with-changes; TicketClaim moved; deliberate: NodeError split, library stderr line, `AlreadyAnswered` rename and lapse doc (follow-ups); 59k+37k.
+- lang:rust: approve (Delta); race fixed, closure renamed; deliberate: the stderr line, an `i64` add on the fake's own clock; 76k+29k.
+
 ## Outcome
+
+The trait carries plain values only; relais's `shared_state::node` composes
+the shared half and the local write; one node sees no change (pilot
+identical, workspace suite green). Follow-ups for the programme, before the
+trait is frozen: split a `NodeError` out of `SharedStateError`; state the
+decision-grant lapse in the trait doc and the conformance suite, and rename
+`DecisionGrant::AlreadyAnswered` to what it means (held elsewhere).
 
 <!-- panel: repos=relais,homelab adds=contract reviewers=architect,backend,lang:rust,po,tui,unix body-sha=4e1c775f4278 -->
