@@ -71,7 +71,9 @@ Under `relais run --protocol`, the `done` line names it `shared_state_absent`.
   CLI is a separate binary target: a client implements the trait, never
   `node`.
 - A failed give-back never hides the local answer: a refusal comes back as
-  it is, and a local error comes back as `Compensation { local, release }`.
+  it is, with one `relais: the shared hold on … could not be given back`
+  line on stderr, and a local error comes back as
+  `Compensation { local, release }`.
   A hold left behind ends by its TTL (tickets) or when a later claim
   replaces it (intents: `claim_intent(.., replacing)`, asked only when this
   node's own ledger saw the old run's claim and judged it abandoned). A

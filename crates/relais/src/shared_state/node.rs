@@ -10,7 +10,8 @@
 //! ran before it lost its handles.
 //!
 //! A failed release never replaces the local answer: a refusal is returned
-//! as it is, and a local error comes back as
+//! as it is (the release failure is one line on stderr), and a local error
+//! comes back as
 //! [`SharedStateError::Compensation`] with the release failure beside it.
 //! An unreleased shared hold ends by its TTL (tickets) or a `replacing`
 //! claim (intents).
@@ -40,6 +41,14 @@ fn compensated(local: SharedStateError, release: Result<(), SharedStateError>) -
             local: Box::new(local),
             release: Box::new(release),
         },
+    }
+}
+
+/// A release after a local refusal: the refusal stays the answer, so a
+/// failed release is said on stderr, never dropped.
+fn give_back(what: &str, release: Result<(), SharedStateError>) {
+    if let Err(e) = release {
+        eprintln!("relais: the shared hold on {what} could not be given back: {e}");
     }
 }
 
@@ -113,7 +122,7 @@ pub fn claim_ticket(
             Ok(refused) => {
                 // The refusal is the answer; a hold that cannot be given
                 // back ends by its TTL.
-                let _ = state.release_ticket(&lease);
+                give_back(&lease.resource.to_string(), state.release_ticket(&lease));
                 Ok(TicketGrant {
                     taken: refused,
                     lease: None,
@@ -136,7 +145,10 @@ pub fn claim_intent(
         IntentAnswer::Granted => match ledger.claim_intent(intent_id, run, alive) {
             Ok(claimed @ Claim::Claimed(_)) => Ok(claimed),
             Ok(refused) => {
-                let _ = state.release_intent(intent_id, run);
+                give_back(
+                    &format!("intent:{intent_id}"),
+                    state.release_intent(intent_id, run),
+                );
                 Ok(refused)
             }
             Err(local) => Err(compensated(
@@ -221,7 +233,7 @@ pub fn resolve_decision_with_intent(
         DecisionGrant::Granted => match ledger.resolve_decision_with_intent(run, answer, intent) {
             Ok(Some(written)) => Ok(Some(written)),
             Ok(None) => {
-                let _ = state.release_decision(run);
+                give_back(&format!("decision:{run}"), state.release_decision(run));
                 Ok(None)
             }
             Err(local) => Err(compensated(local.into(), state.release_decision(run))),
