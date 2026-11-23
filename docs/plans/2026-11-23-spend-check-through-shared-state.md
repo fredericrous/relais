@@ -60,8 +60,8 @@ count the global daily cap and answer the decision once across nodes.
 - `RunConfig` gains `shared_state: &'a dyn SharedState`. The CLI builds it
   once at its composition root (`ctx::shared_state()`, an `Arc` kept alive
   across `execute` and passed as `&*state`), for `relais run` and
-  `relais dataset replay`, before any ledger write, so a `CliError` such as
-  `ExternalAbsent` changes nothing else. A child run (package) inherits its
+  `relais dataset replay`, after `load_machine`, which already refuses an absent external client
+  (`ExternalAbsent`), so that refusal changes nothing else. A child run (package) inherits its
   parent's reference. Tests pass `&LocalState::new()`.
 - `spent_today` (the attempt loop and the review spend check) calls
   `node::daily_spent(state, ledger, day_start)`. `LocalState` returns
