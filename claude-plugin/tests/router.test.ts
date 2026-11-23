@@ -442,7 +442,7 @@ test('router-state that does not parse, or names no tier models, is none', () =>
 })
 
 test('router-state accepts keeps its strings, and is empty from a relais that predates it', () => {
-  expect(state.accepts).toEqual(['answered', 'parent_task_id', 'unmatched_checks'])
+  expect(state.accepts).toEqual(['answered', 'parent_task_id', 'unmatched_checks', 'outcome_uncorrected'])
   const { accepts: _, ...older } = ROUTER_STATE
   expect(parseRouterState(JSON.stringify(older))!.accepts).toEqual([])
   expect(parseRouterState(JSON.stringify({ ...ROUTER_STATE, accepts: ['answered', 3, null] }))!.accepts).toEqual(['answered'])
