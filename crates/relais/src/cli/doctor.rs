@@ -277,6 +277,12 @@ pub(crate) fn doctor_command(json: bool) -> Result<CliOutcome, CliError> {
     report.findings.extend(holdouts_finding());
     report.findings.extend(purge_finding());
     report.findings.extend(backups_finding());
+    if let Ok(machine_toml) = relais::paths::machine_settings_path() {
+        report.findings.extend(doctor::shared_state_finding(
+            &machine_toml,
+            super::ctx::EXTERNAL_CLIENT.is_some(),
+        ));
+    }
     if json {
         print_document(&DoctorDocument {
             report: &report,

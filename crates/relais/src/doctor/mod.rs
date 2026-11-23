@@ -1605,6 +1605,26 @@ pub(crate) struct LeftoverScan {
     pub unreadable: Vec<String>,
 }
 
+/// A failing finding when `machine.toml` selects an external shared-state
+/// layer and this build links no client (`client_linked`); `None`
+/// otherwise, so a single node's report is unchanged. The commands that
+/// read the machine settings refuse in that state, and this is where it is
+/// explained.
+pub fn shared_state_finding(machine_toml: &Path, client_linked: bool) -> Option<Finding> {
+    use crate::shared_state::{selection_at, Selection, SharedStateError};
+    if selection_at(machine_toml) != Selection::External || client_linked {
+        return None;
+    }
+    Some(Finding {
+        component: "shared_state",
+        level: Level::Fail,
+        detail: SharedStateError::ExternalAbsent {
+            machine_toml: machine_toml.to_path_buf(),
+        }
+        .to_string(),
+    })
+}
+
 pub(crate) fn workspace_finding(
     facts: &WorkspaceFacts,
     cow: &CowProbe,

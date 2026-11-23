@@ -85,6 +85,7 @@ impl CliError {
                 _ => "invalid_input",
             },
             CliError::Home(_) | CliError::Cwd(_) => "environment",
+            CliError::SharedStateAbsent { .. } => "shared_state_absent",
             CliError::Usage { .. } => "refused",
             CliError::NoDataset { .. }
             | CliError::Amend(_)

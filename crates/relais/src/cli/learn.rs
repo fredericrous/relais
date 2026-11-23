@@ -379,12 +379,26 @@ pub(crate) fn promote_command(artifact_id: &str) -> Result<CliOutcome, CliError>
             return Ok(CliOutcome::Blocked);
         }
     };
-    match reg.promote(&evaluated) {
+    // Compare-and-set through the shared-state seam: the swap lands only
+    // if the active pointer still names what was read here.
+    let state = super::ctx::shared_state()?;
+    let swapped = state
+        .registry_pointer(&reg)
+        .and_then(|active| state.swap_registry_pointer(&reg, active.as_deref(), &evaluated));
+    match swapped {
         Ok(()) => {
             println!(
                 "promoted {artifact_id}; the previous artifact stays for `relais promote` rollback"
             );
             Ok(CliOutcome::Accepted)
+        }
+        Err(relais::shared_state::SharedStateError::CasConflict { found, .. }) => {
+            eprintln!(
+                "relais promote: another promotion made {} active while this one ran; \
+                 nothing changed — run `relais promote {artifact_id}` again to replace it",
+                found.as_deref().unwrap_or("nothing")
+            );
+            Ok(CliOutcome::Blocked)
         }
         Err(e) => {
             eprintln!("relais promote: {e}");

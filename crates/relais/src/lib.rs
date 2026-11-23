@@ -49,6 +49,7 @@ pub mod route;
 pub mod router;
 pub mod runner;
 pub mod seed;
+pub mod shared_state;
 pub mod storage_full;
 pub mod task_labels;
 /// Scratch-directory test helpers. `pub`, not `#[cfg(test)]`: the

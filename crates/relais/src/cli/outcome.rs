@@ -186,6 +186,9 @@ pub(crate) enum CliError {
         path: PathBuf,
         cause: std::io::Error,
     },
+    /// machine.toml selects an external shared-state layer this build does
+    /// not have (an-t06): refused rather than split the cap and claims.
+    SharedStateAbsent { machine_toml: PathBuf },
 }
 
 impl std::fmt::Display for CliError {
@@ -221,6 +224,13 @@ impl std::fmt::Display for CliError {
                 "no dataset under {} — run `relais dataset build` first",
                 dir.display()
             ),
+            CliError::SharedStateAbsent { machine_toml } => write!(
+                f,
+                "{}",
+                relais::shared_state::SharedStateError::ExternalAbsent {
+                    machine_toml: machine_toml.clone()
+                }
+            ),
         }
     }
 }
@@ -236,7 +246,9 @@ impl std::error::Error for CliError {
                 Some(cause.as_ref())
             }
             CliError::Amend(e) => Some(e),
-            CliError::Usage { .. } | CliError::NoDataset { .. } => None,
+            CliError::Usage { .. }
+            | CliError::NoDataset { .. }
+            | CliError::SharedStateAbsent { .. } => None,
         }
     }
 }
@@ -248,7 +260,9 @@ impl CliError {
         match self {
             // Nowhere to keep settings or state is an environment
             // problem, not a malformed invocation.
-            CliError::Home(_) | CliError::Cwd(_) => CliOutcome::Blocked,
+            CliError::Home(_) | CliError::Cwd(_) | CliError::SharedStateAbsent { .. } => {
+                CliOutcome::Blocked
+            }
             CliError::Locate(_)
             | CliError::Read { .. }
             | CliError::Invalid { .. }

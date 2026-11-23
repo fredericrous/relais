@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# Builds `relais::shared_state::conformance` and its in-memory fake outside
+# tests, so a closed shared-state client can run the same suite (an-t06).
+conformance = []
+
 [dependencies]
 # Validated boundaries: contract schema, policy, context manifest, learning
 # artifacts. Contracts REJECT unknown fields, so serde's deny_unknown_fields
