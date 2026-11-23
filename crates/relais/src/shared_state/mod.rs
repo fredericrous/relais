@@ -33,13 +33,13 @@ pub mod conformance;
 #[cfg(any(test, feature = "conformance"))]
 pub mod fake;
 
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
 pub use crate::policy::SharedStateSelection as Selection;
 pub use error::SharedStateError;
 pub use local::LocalState;
+pub use node::{TicketClaim, TicketGrant};
 pub use types::{
     DecisionGrant, IntentAnswer, LeaseToken, Mode, Pointer, Principal, PrincipalKind,
     PublishReceipt, PublishRow, Reservation, ResourceId, Settlement, Slice, Swap, TicketAnswer,
@@ -49,35 +49,6 @@ pub use types::{
 use crate::ids::RunId;
 use crate::money::MicroUsd;
 use crate::policy::MachineSettings;
-use crate::programme::claim::{ClaimKey, Contest, Taken};
-
-/// One request to take a programme ticket as `work`: the input of
-/// [`node::claim_ticket`], which turns it into a [`TicketRequest`] for the
-/// shared half and keeps the claim file's own fields (`closed`,
-/// `repo_display`, `now`) on the node.
-#[derive(Debug, Clone)]
-pub struct TicketClaim<'a> {
-    pub key: &'a ClaimKey,
-    /// The programme's closed tickets: their stale claims are swept first.
-    pub closed: &'a BTreeSet<String>,
-    pub id: &'a str,
-    /// The session taking it; its id is the claim file's `session`.
-    pub holder: &'a Principal,
-    /// How the repository is shown in the claim file.
-    pub repo_display: &'a str,
-    pub contest: Contest,
-    /// Unix seconds.
-    pub now: i64,
-}
-
-/// A ticket claim's answer ([`node::claim_ticket`]), and the fence of the
-/// hold when it was taken.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TicketGrant {
-    pub taken: Taken,
-    /// `Some` when [`Taken::Claimed`]; `None` when refused.
-    pub lease: Option<LeaseToken>,
-}
 
 /// The single-owner operations nodes share (an-t01's list), shaped by
 /// an-t10 (slice, degraded mode, publish queue), an-t11 (an epoch in every

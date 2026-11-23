@@ -26,6 +26,9 @@ use crate::policy::MachineSettings;
 pub const SEAT_TTL_SECS: i64 = 90;
 /// A ticket claim's time to live for a pod (an-t11).
 pub const TICKET_TTL_SECS: i64 = 30 * 60;
+/// How long a decision grant holds the decision for one answerer: a node
+/// that died between the grant and its ledger write leaves it for no longer.
+pub const DECISION_TTL_SECS: i64 = 10 * 60;
 
 #[derive(Debug, Clone)]
 struct Row {
@@ -50,8 +53,9 @@ struct Inner {
     schema: BTreeMap<String, u64>,
     /// Successor intents: which run holds each.
     intents: HashMap<String, RunId>,
-    /// Decisions answered, by run.
-    answered: BTreeSet<String>,
+    /// Decision grants by run, with the time each was granted: a grant
+    /// whose answer never landed lapses after [`DECISION_TTL_SECS`].
+    answered: HashMap<String, i64>,
     /// When set, every release is refused with this reason (a test knob).
     releases_fail: Option<String>,
 }
@@ -160,6 +164,20 @@ impl FakeState {
         holder: &Principal,
         ttl: i64,
     ) -> Result<LeaseToken, SharedStateError> {
+        match self.try_acquire(resource.clone(), holder, ttl)? {
+            Ok(lease) => Ok(lease),
+            Err(_held) => Err(SharedStateError::ClaimLost { resource }),
+        }
+    }
+
+    /// [`Self::acquire`], answering the live holder and its age when
+    /// refused, read under the same lock as the refusal.
+    fn try_acquire(
+        &self,
+        resource: ResourceId,
+        holder: &Principal,
+        ttl: i64,
+    ) -> Result<Result<LeaseToken, (Principal, u64)>, SharedStateError> {
         self.online()?;
         let now = self.now();
         let mut inner = self.lock();
@@ -171,7 +189,7 @@ impl FakeState {
         });
         if let Some(current) = &row.holder {
             if current != holder && row.expires_at > now {
-                return Err(SharedStateError::ClaimLost { resource });
+                return Ok(Err((current.clone(), (now - row.claimed_at).max(0) as u64)));
             }
         }
         if row.holder.as_ref() != Some(holder) || row.expires_at <= now {
@@ -180,12 +198,12 @@ impl FakeState {
         row.epoch += 1;
         row.holder = Some(holder.clone());
         row.expires_at = now + ttl;
-        Ok(LeaseToken {
+        Ok(Ok(LeaseToken {
             resource,
             holder: holder.clone(),
             epoch: row.epoch,
             expires_at: Some(row.expires_at),
-        })
+        }))
     }
 
     fn fence(&self, lease: &LeaseToken) -> Result<(), SharedStateError> {
@@ -317,21 +335,12 @@ impl SharedState for FakeState {
     }
 
     fn claim_ticket(&self, request: &TicketRequest) -> Result<TicketAnswer, SharedStateError> {
-        self.online()?;
-        let resource = request.resource();
-        let now = self.now();
-        let before = self.lock().rows.get(&resource).cloned();
-        match self.acquire(resource, &request.holder, TICKET_TTL_SECS) {
-            Ok(lease) => Ok(TicketAnswer::Granted(lease)),
-            Err(SharedStateError::ClaimLost { .. }) => {
-                let row = before.expect("a refused claim has a holder");
-                Ok(TicketAnswer::Held {
-                    holder: row.holder.expect("a refused claim has a holder"),
-                    age_secs: (now - row.claimed_at).max(0) as u64,
-                })
-            }
-            Err(other) => Err(other),
-        }
+        Ok(
+            match self.try_acquire(request.resource(), &request.holder, TICKET_TTL_SECS)? {
+                Ok(lease) => TicketAnswer::Granted(lease),
+                Err((holder, age_secs)) => TicketAnswer::Held { holder, age_secs },
+            },
+        )
     }
 
     fn grant_ticket(&self, request: &TicketRequest) -> Result<LeaseToken, SharedStateError> {
@@ -383,11 +392,15 @@ impl SharedState for FakeState {
 
     fn answer_decision(&self, run: &RunId) -> Result<DecisionGrant, SharedStateError> {
         self.online()?;
-        Ok(if self.lock().answered.insert(run.to_string()) {
-            DecisionGrant::Granted
-        } else {
-            DecisionGrant::AlreadyAnswered
-        })
+        let now = self.now();
+        let mut inner = self.lock();
+        match inner.answered.get(run.as_str()) {
+            Some(at) if now < at + DECISION_TTL_SECS => Ok(DecisionGrant::AlreadyAnswered),
+            _ => {
+                inner.answered.insert(run.to_string(), now);
+                Ok(DecisionGrant::Granted)
+            }
+        }
     }
 
     fn release_decision(&self, run: &RunId) -> Result<(), SharedStateError> {
@@ -693,15 +706,30 @@ mod tests {
     }
 
     #[test]
-    fn a_decision_is_answered_once_and_a_local_none_frees_it() {
+    fn a_decision_held_elsewhere_is_refused_until_its_grant_lapses() {
         let (ledger, _seconds, _dir) = waiting("decision");
         let state = FakeState::new();
-        // Another node answered run-a first: nothing is written here.
+        // Another answerer took the decision and never wrote its answer.
         assert_eq!(
             state.answer_decision(&run("run-a")).expect("granted"),
             DecisionGrant::Granted
         );
-        assert_eq!(
+        assert!(
+            matches!(
+                node::resolve_decision_with_intent(
+                    &state,
+                    &ledger,
+                    &run("run-a"),
+                    &answer(),
+                    &intent()
+                ),
+                Err(SharedStateError::Refused { .. })
+            ),
+            "held elsewhere, said as such"
+        );
+        // Its grant lapses; this node's answer is then written.
+        state.advance(DECISION_TTL_SECS + 1);
+        assert!(
             node::resolve_decision_with_intent(
                 &state,
                 &ledger,
@@ -709,15 +737,9 @@ mod tests {
                 &answer(),
                 &intent()
             )
-            .expect("answered"),
-            None
-        );
-        assert!(
-            ledger
-                .resolve_decision_with_intent(&run("run-a"), &answer(), &intent())
-                .expect("read")
-                .is_some(),
-            "the ledger is untouched: its decision is still open"
+            .expect("written")
+            .is_some(),
+            "the decision was still open on this node"
         );
         // A run with no open decision here gives the grant back.
         assert_eq!(
@@ -751,6 +773,56 @@ mod tests {
         assert_eq!(state.intent_holder("intent-nowhere"), Some(run("run-1")));
     }
 
+    #[test]
+    fn a_claim_file_refusal_after_a_shared_grant_gives_the_ticket_back() {
+        use crate::programme::claim::{ClaimKey, Contest, Store, Taken, LOCK_WAIT};
+        let dir = crate::test_support::temp_dir("fake-node-ticket");
+        let store = Store::in_state_dir(&dir);
+        let key = ClaimKey {
+            repo_key: "rk".into(),
+            slug: "programme".into(),
+        };
+        let now = crate::programme::claim::now_unix();
+        // Another session on this node holds the claim file; the shared
+        // half has never heard of it.
+        store
+            .lock(&key, LOCK_WAIT, now)
+            .expect("lock")
+            .claim_work("t1", "session-local", "/r", Contest::Refuse, now)
+            .expect("claimed locally");
+        let state = FakeState::new();
+        let me = Principal::operator("session-me");
+        let closed = BTreeSet::new();
+        let grant = node::claim_ticket(
+            &state,
+            &store,
+            &super::super::TicketClaim {
+                key: &key,
+                closed: &closed,
+                id: "t1",
+                holder: &me,
+                repo_display: "/r",
+                contest: Contest::Refuse,
+                now: now + 1,
+            },
+        )
+        .expect("answered");
+        assert!(matches!(grant.taken, Taken::Refused { .. }), "{grant:?}");
+        assert!(grant.lease.is_none());
+        // The shared hold was given back: another holder gets it at once.
+        let other = TicketRequest {
+            repo_key: "rk".into(),
+            slug: "programme".into(),
+            id: "t1".into(),
+            holder: Principal::operator("session-other"),
+            contest: Contest::Refuse,
+        };
+        assert!(matches!(
+            state.claim_ticket(&other).expect("answered"),
+            TicketAnswer::Granted(_)
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_failed_local_promote_puts_the_shared_pointer_back() {
@@ -771,9 +843,9 @@ mod tests {
                 .expect("chmod");
         };
         read_only(0o555);
-        let result = node::swap_registry_pointer(&state, &registry, None, &evaluated);
+        let swap = node::swap_registry_pointer(&state, &registry, None, &evaluated);
         read_only(0o755);
-        assert!(result.is_err(), "the promote failed: {result:?}");
+        assert!(swap.is_err(), "the promote failed: {swap:?}");
         assert_eq!(
             state.registry_pointer().expect("read"),
             Pointer::Shared(None),

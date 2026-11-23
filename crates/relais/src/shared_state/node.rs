@@ -19,8 +19,10 @@
 //! This module is public because the CLI is a separate binary target. It
 //! is relais's own: a closed client implements [`SharedState`], never these.
 
-use super::types::{DecisionGrant, IntentAnswer, Pointer, Swap, TicketAnswer, TicketRequest};
-use super::{SharedState, SharedStateError, TicketClaim, TicketGrant};
+use super::types::{
+    DecisionGrant, IntentAnswer, LeaseToken, Pointer, Principal, Swap, TicketAnswer, TicketRequest,
+};
+use super::{SharedState, SharedStateError};
 use crate::ids::RunId;
 use crate::learn::registry::{EvaluatedArtifact, Registry};
 use crate::ledger::{
@@ -28,7 +30,36 @@ use crate::ledger::{
 };
 use crate::money::MicroUsd;
 use crate::procs::LockFile;
-use crate::programme::claim::{Holder, Kind, Store, Taken, LOCK_WAIT};
+use crate::programme::claim::{ClaimKey, Contest, Holder, Kind, Store, Taken, LOCK_WAIT};
+use std::collections::BTreeSet;
+
+/// One request to take a programme ticket as `work`: the input of
+/// [`claim_ticket`], which turns it into a [`TicketRequest`] for the
+/// shared half and keeps the claim file's own fields (`closed`,
+/// `repo_display`, `now`) on the node.
+#[derive(Debug, Clone)]
+pub struct TicketClaim<'a> {
+    pub key: &'a ClaimKey,
+    /// The programme's closed tickets: their stale claims are swept first.
+    pub closed: &'a BTreeSet<String>,
+    pub id: &'a str,
+    /// The session taking it; its id is the claim file's `session`.
+    pub holder: &'a Principal,
+    /// How the repository is shown in the claim file.
+    pub repo_display: &'a str,
+    pub contest: Contest,
+    /// Unix seconds.
+    pub now: i64,
+}
+
+/// A ticket claim's answer ([`claim_ticket`]), and the fence of the
+/// hold when it was taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketGrant {
+    pub taken: Taken,
+    /// `Some` when [`Taken::Claimed`]; `None` when refused.
+    pub lease: Option<LeaseToken>,
+}
 
 /// How long a registry swap waits for another swap's lock.
 const REGISTRY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -183,19 +214,26 @@ fn take_over_intent(
         Claim::Claimed(intent) => intent,
         other => return Ok(other),
     };
-    let give_back = |why: &str| ledger.release_claim(intent_id, run, why);
+    let release_local = |why: &str| {
+        ledger
+            .release_claim(intent_id, run, why)
+            .map(|_| ())
+            .map_err(SharedStateError::from)
+    };
     match state.claim_intent(intent_id, run, Some(old)) {
         Ok(IntentAnswer::Granted) => Ok(Claim::Claimed(claimed)),
         Ok(IntentAnswer::HeldBy { run: holder }) => {
             // The row is left pending; the next claim is refused by the
-            // shared half again while `holder` holds it.
-            give_back(&format!("the shared claim is held by run {holder}"))?;
+            // shared half again while `holder` holds it. The refusal stays
+            // the answer even when the local claim cannot be given back.
+            give_back(
+                &format!("intent:{intent_id} (local claim of run {run})"),
+                release_local(&format!("the shared claim is held by run {holder}")),
+            );
             Ok(Claim::AlreadyClaimed { run: holder })
         }
         Err(shared) => {
-            let released = give_back(&format!("the shared claim failed: {shared}"))
-                .map(|_| ())
-                .map_err(SharedStateError::from);
+            let released = release_local(&format!("the shared claim failed: {shared}"));
             Err(compensated(shared, released))
         }
     }
@@ -229,7 +267,11 @@ pub fn resolve_decision_with_intent(
     intent: &NewIntent,
 ) -> Result<Option<SuccessorIntent>, SharedStateError> {
     match state.answer_decision(run)? {
-        DecisionGrant::AlreadyAnswered => Ok(None),
+        // Another answerer holds the decision: said as such, never as "no
+        // open decision", which this node's ledger may contradict.
+        DecisionGrant::AlreadyAnswered => Err(SharedStateError::Refused {
+            reason: format!("the decision of run {run} is being answered elsewhere"),
+        }),
         DecisionGrant::Granted => match ledger.resolve_decision_with_intent(run, answer, intent) {
             Ok(Some(written)) => Ok(Some(written)),
             Ok(None) => {
@@ -264,8 +306,10 @@ pub fn swap_registry_pointer(
     match state.swap_registry_pointer(expected, Some(to))? {
         Swap::NodeDecides => swap_locally(registry, expected, evaluated),
         // The shared compare-and-set decided; the local promote follows.
-        // A promote killed between the two leaves the shared pointer ahead
-        // until the next promote or rollback.
+        // holds-until: an-t18 routes the learning cycle's promote and
+        // rollback through `SharedState`; until then a promote killed
+        // between the two halves leaves the shared pointer ahead, and only
+        // the next `relais promote` brings the two back together.
         Swap::Swapped => match registry.promote(evaluated) {
             Ok(()) => Ok(()),
             Err(local) => {
