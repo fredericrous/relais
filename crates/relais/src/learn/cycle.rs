@@ -361,7 +361,8 @@ impl std::fmt::Display for CycleError {
             Self::Pointer(e) => write!(f, "{e}"),
             Self::Compensated { local, release } => write!(
                 f,
-                "{local} (and the shared pointer could not be put back: {release})"
+                "{local} (and the shared pointer could not be put back: {release}); the next \
+                 promote or rollback on this node takes the shared pointer's artifact"
             ),
         }
     }
@@ -1117,7 +1118,7 @@ pub fn promote_candidate(
                     report,
                     format!(
                         "promotion of {artifact_id} withheld: {} is active now{}; \
-                         nothing changed; {note}",
+                         the shared pointer was not moved; {note}",
                         found.as_deref().unwrap_or("nothing"),
                         judged.map(|a| format!(", not {a}")).unwrap_or_default()
                     ),
@@ -1984,7 +1985,7 @@ argv = ["true"]
         let world = World::new("superseded");
         two_artifacts(&world);
         // A person's promote made art-b active after art-a was judged.
-        let result = roll_back_active(
+        let rolled_back = roll_back_active(
             &world.pointers,
             &world.ledger,
             &world.registry,
@@ -1995,14 +1996,14 @@ argv = ["true"]
         )
         .unwrap();
         assert_eq!(
-            result,
+            rolled_back,
             Err(NothingToRollBack::Superseded {
                 judged: "art-a".into(),
                 active: Some("art-b".into()),
             })
         );
         assert_eq!(
-            result.unwrap_err().to_string(),
+            rolled_back.unwrap_err().to_string(),
             "another promotion made art-b active while this ran; nothing changed — \
              run `relais rollback` again if art-b should go"
         );
@@ -2075,7 +2076,10 @@ argv = ["true"]
         );
         assert_eq!(
             report.note.as_deref(),
-            Some("promotion of art-new withheld: art-other is active now; nothing changed; note")
+            Some(
+                "promotion of art-new withheld: art-other is active now; the shared pointer was \
+                 not moved; note"
+            )
         );
         assert_eq!(
             world.registry.active_id().unwrap().as_deref(),

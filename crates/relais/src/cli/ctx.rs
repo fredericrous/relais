@@ -92,7 +92,10 @@ pub(crate) fn shared_state_for_hook() -> relais::hook::respond::SharedClaims {
             // One line, whatever the error's own text holds.
             warning: Some(format!(
                 "relais: shared claims skipped, the local claims were updated: {}",
-                e.to_string().replace('\n', " ")
+                e.to_string()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
             )),
         },
     }

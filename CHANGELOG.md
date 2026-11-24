@@ -24,7 +24,11 @@ prints `make: 1 carried` with no timings, which are the source attempt's.
   X`, or withholds its promote (`promotion of B withheld: X is active now,
   not A; nothing changed`) and waits for `relais promote B`. A lock another
   relais process held past 2 s is refused the same way, `relais promote`
-  included (exit 3, where it used to exit 1).
+  included (exit 3, where it used to exit 1). Under `relais rollback
+  --json` a lost race or a refusal is also said on stderr beside the
+  document; a shared pointer this node cannot follow is refused with a
+  sentence that names the artifact, and the cycle then sets no promote
+  hint.
 - Breaking, for a client of `relais::shared_state`: the trait gains
   `reserve_handoff`, `renew_tickets` and `release_tickets`, which
   `relais programme next --claim` and the session hooks (a resumed

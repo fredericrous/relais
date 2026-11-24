@@ -979,9 +979,9 @@ mod tests {
         (registry, dir)
     }
 
-    fn is_conflict(result: &Result<impl std::fmt::Debug, node::NodeError>) -> bool {
+    fn is_conflict(attempt: &Result<impl std::fmt::Debug, node::NodeError>) -> bool {
         matches!(
-            result,
+            attempt,
             Err(node::NodeError::Shared(
                 SharedStateError::CasConflict { .. }
             ))
@@ -1044,16 +1044,16 @@ mod tests {
         let local = super::super::LocalState::new();
         for state in [&fake as &dyn SharedState, &local] {
             let no_wait = std::time::Duration::ZERO;
-            for result in [
+            for refused in [
                 node::swap_within(state, &registry, Some("art-a"), &b, no_wait).map(|_| None),
                 node::roll_back_within(state, &registry, "art-a", no_wait),
             ] {
                 assert!(
                     matches!(
-                        result,
+                        refused,
                         Err(node::NodeError::Shared(SharedStateError::Refused { .. }))
                     ),
-                    "{result:?}"
+                    "{refused:?}"
                 );
             }
         }
