@@ -1,8 +1,8 @@
-// adr-lint's candidates in the reviewer's prompt.
+// greenspotter's candidates in the reviewer's prompt.
 //
 // docs/plans/2026-10-24-code-rules-reach-the-reviewer.md, behaviour 3: the
 // reviewer rules on each candidate line, the receipt counts the rulings, and
-// each ruling is an `adr-lint.ruling/1` line in `rulings.jsonl`.
+// each ruling is a `greenspotter.ruling/1` line in `rulings.jsonl`.
 
 use std::sync::Mutex;
 
@@ -26,7 +26,7 @@ fn candidate_on(path: &str, seed: char) -> Candidate {
     }
 }
 
-/// A resolver whose adr-lint answer is given, counting the calls and keeping
+/// A resolver whose greenspotter answer is given, counting the calls and keeping
 /// the base and head it was asked about.
 struct Listing {
     answer: Result<CandidateList, GuidanceGap>,
@@ -217,7 +217,7 @@ fn the_reviewer_lists_the_candidates_and_the_receipt_counts_the_rulings() {
                 "tree"
             ]
         );
-        assert_eq!(line["format"], "adr-lint.ruling/1");
+        assert_eq!(line["format"], "greenspotter.ruling/1");
         assert_eq!(line["tool"], "relais");
         assert!(is_hex64(line["candidate"].as_str().expect("candidate")));
         assert_eq!(line["tree"], crate::ids::sha256_hex(&patch));
@@ -261,7 +261,9 @@ fn no_candidates_adds_nothing_to_the_prompt() {
     let prompts = prompts.lock().expect("prompts");
     let prompt = prompts.first().expect("the reviewer was dispatched");
     assert!(
-        !prompt.contains("CANDIDATES") && !prompt.contains("adr-lint"),
+        !prompt.contains("CANDIDATES")
+            && !prompt.contains("greenspotter")
+            && !prompt.contains("adr-lint"),
         "{prompt}"
     );
     assert_eq!(
@@ -282,11 +284,11 @@ fn no_candidates_adds_nothing_to_the_prompt() {
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
-/// A resolver that asks the real adapter for adr-lint's candidates, with
-/// `program` standing in for adr-lint.
-struct SpawningAdrLint(AvalCli);
+/// A resolver that asks the real adapter for greenspotter's candidates, with
+/// `program` standing in for greenspotter.
+struct SpawningGreenspotter(AvalCli);
 
-impl crate::context::DecisionResolver for SpawningAdrLint {
+impl crate::context::DecisionResolver for SpawningGreenspotter {
     fn resolve(&self, _key: &str, _scope: Option<&str>) -> AvalVerdict {
         AvalVerdict::Unknown
     }
@@ -297,9 +299,9 @@ impl crate::context::DecisionResolver for SpawningAdrLint {
 }
 
 #[cfg(unix)]
-fn fake_adr_lint(fixture: &Fixture, body: &str) -> String {
+fn fake_greenspotter(fixture: &Fixture, body: &str) -> String {
     use std::os::unix::fs::PermissionsExt;
-    let path = fixture.dir.join("fake-adr-lint");
+    let path = fixture.dir.join("fake-greenspotter");
     std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write the script");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     // The adapter's 5 s guidance timeout must not pay a fresh script's first exec.
@@ -307,14 +309,15 @@ fn fake_adr_lint(fixture: &Fixture, body: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// Runs a reviewed task whose adr-lint is the one `program` names, and checks
+/// Runs a reviewed task whose greenspotter is the one `program` names, and checks
 /// that it gave no candidates: a `candidates missing (<detail>…` receipt note,
 /// the reviewer still dispatched and told no ruling is needed.
 fn the_review_runs_without_candidates(program: impl FnOnce(&Fixture) -> String, detail: &str) {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
     let program = program(&fixture);
-    let resolver = SpawningAdrLint(AvalCli::new(fixture.repo.clone()).with_adr_lint(program));
+    let resolver =
+        SpawningGreenspotter(AvalCli::new(fixture.repo.clone()).with_greenspotter(program));
     let (backend, prompts) = ruling_backend(conditional_worker("relais task"), |_| String::new());
     let receipt = accepted(fixture.execute_as_resolving(
         &resolver,
@@ -334,7 +337,7 @@ fn the_review_runs_without_candidates(program: impl FnOnce(&Fixture) -> String, 
     let prompts = prompts.lock().expect("prompts");
     let prompt = prompts.first().expect("the reviewer was still dispatched");
     assert!(
-        prompt.contains("adr-lint's candidates are unavailable (")
+        prompt.contains("greenspotter's candidates are unavailable (")
             && prompt.contains("): no ruling is needed"),
         "{prompt}"
     );
@@ -346,35 +349,36 @@ fn the_review_runs_without_candidates(program: impl FnOnce(&Fixture) -> String, 
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
-#[cfg(unix)] // the fake adr-lint is a shell script
+#[cfg(unix)] // the fake greenspotter is a shell script
 #[test]
-fn an_adr_lint_that_fails_is_a_receipt_note_and_the_review_still_runs() {
+fn a_greenspotter_that_fails_is_a_receipt_note_and_the_review_still_runs() {
     the_review_runs_without_candidates(
-        |fixture| fake_adr_lint(fixture, "exit 3"),
-        "adr-lint exit 3",
+        |fixture| fake_greenspotter(fixture, "exit 3"),
+        "greenspotter exit 3",
     );
 }
 
 #[test]
-fn a_missing_adr_lint_is_a_receipt_note_and_the_review_still_runs() {
+fn a_missing_greenspotter_is_a_receipt_note_and_the_review_still_runs() {
     the_review_runs_without_candidates(
-        |_| "/nonexistent/relais-adr-lint".to_string(),
-        "adr-lint could not be launched",
+        |_| "/nonexistent/relais-greenspotter".to_string(),
+        "greenspotter could not be launched",
     );
 }
 
-#[cfg(unix)] // the fake adr-lint is a shell script
+#[cfg(unix)] // the fake greenspotter is a shell script
 #[test]
-fn the_real_adapter_spawns_adr_lint_with_the_runs_base_and_the_candidate() {
+fn the_real_adapter_spawns_greenspotter_with_the_runs_base_and_the_candidate() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
     let argv = fixture.dir.join("argv.txt");
-    let json = r#"{"format":"adr-lint.candidates/1","candidates":[],"overflow":{"names.reveal-intent":2}}"#;
-    let program = fake_adr_lint(
+    let json = r#"{"format":"greenspotter.candidates/1","candidates":[],"overflow":{"names.reveal-intent":2}}"#;
+    let program = fake_greenspotter(
         &fixture,
         &format!("echo \"$@\" > '{}'\nprintf '%s' '{json}'", argv.display()),
     );
-    let resolver = SpawningAdrLint(AvalCli::new(fixture.repo.clone()).with_adr_lint(program));
+    let resolver =
+        SpawningGreenspotter(AvalCli::new(fixture.repo.clone()).with_greenspotter(program));
     let (backend, _) = ruling_backend(conditional_worker("relais task"), |_| String::new());
     let receipt = accepted(fixture.execute_as_resolving(
         &resolver,
@@ -404,7 +408,7 @@ fn the_real_adapter_spawns_adr_lint_with_the_runs_base_and_the_candidate() {
 }
 
 #[test]
-fn a_review_in_two_parts_asks_adr_lint_once_and_lists_each_candidate_in_one_part() {
+fn a_review_in_two_parts_asks_greenspotter_once_and_lists_each_candidate_in_one_part() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
     let run = run_stopped_over_budget(&fixture, 2, 2300);
@@ -560,7 +564,7 @@ fn sample_receipt() -> crate::verify::Receipt {
 const FLEET_RULES_JSON: &str = r#"{"rules":[{"active":true,"adopts":"ADR-0011","body":"BODY-OF-NAMES-REVEAL-INTENT","file":"aval.pack","governs":"code","id":"names.reveal-intent","level":"constraint","pack":"decisions","source":"x","statement":"STATEMENT-OF-NAMES-REVEAL-INTENT"}]}"#;
 
 /// A repository with no decisions corpus (aval exits 3 there) whose code
-/// rules come from the fleet decisions directory, and whose adr-lint lists
+/// rules come from the fleet decisions directory, and whose greenspotter lists
 /// a candidate; every call is logged in order.
 struct NoCorpus {
     log: Arc<Mutex<Vec<&'static str>>>,

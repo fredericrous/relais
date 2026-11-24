@@ -8,6 +8,13 @@ missing here.
 
 ## Unreleased
 
+relais spawns `greenspotter` (0.20.0 or later) where it spawned `adr-lint`, reads
+only `greenspotter.candidates/1`, and writes `greenspotter.ruling/1` lines to
+`rulings.jsonl`. `RELAIS_ADR_LINT` is removed with no alias: set
+`RELAIS_GREENSPOTTER` to name another program. Rulings written as
+`adr-lint.ruling/1` stay in old ledgers as history. Install greenspotter
+before upgrading; without it a review runs with a candidates gap.
+
 - The coordinator's seats go through `relais::shared_state` (an-t17). The
   daemon builds the implementation at start (`external` without a client
   exits 3 before anything is bound) and mirrors every agent dispatch that

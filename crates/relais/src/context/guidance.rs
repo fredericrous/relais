@@ -44,7 +44,7 @@ pub enum GuidanceSource {
     /// `aval relevant` for the paths the candidate patch changes: the
     /// decisions the reviewer is given.
     Decisions,
-    /// `adr-lint candidates`: the lines the reviewer is asked to rule on.
+    /// `greenspotter candidates`: the lines the reviewer is asked to rule on.
     Candidates,
     /// Decision keys the task depends on that were not checked because
     /// aval is not installed.
@@ -196,7 +196,7 @@ impl CodeRule {
 }
 
 /// Who checks a code rule (ADR-0066): a reviewer's judgement, at least in
-/// part, or only a tool — the adr-lint candidate pass or an exact check (a
+/// part, or only a tool — the greenspotter candidate pass or an exact check (a
 /// compiler, a formatter, a lint). A tool-only rule can be an index line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Checker {
