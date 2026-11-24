@@ -261,8 +261,8 @@ pub struct CommandSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<u32>,
     /// Environment this command sets itself, after relais's own parallelism
-    /// bounds (`MAKEFLAGS`, `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS`,
-    /// `NEXTEST_TEST_THREADS`): a key named here wins. Omitted when empty.
+    /// bounds (`greenharness_slots::WIDTH_KEYS`: `MAKEFLAGS`,
+    /// `CARGO_BUILD_JOBS`, …): a key named here wins. Omitted when empty.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
 }

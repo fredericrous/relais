@@ -59,9 +59,9 @@ ticket here until it is resolved or moved into a programme of its own.
   successor's `work`; the board clause is not built (accepted gap).
 - [f16](f16-adopt-week-count.md) (2026-11-24, open, due 2026-12-02): a
   week of relays after the plugin reinstall adopts every handoff.
-- [f13](f13-lease-width-keys-shared.md) (2026-11-21, open): the lease's
-  width variables are hand-listed in `verify/heavy.rs`. Build them from
-  `greenharness_slots::width_env` once it ships (orphan of edf02f7e).
+- [f13](f13-lease-width-keys-shared.md) (2026-11-21, closed 2026-11-24):
+  the lease env is built from `greenharness_slots::width_env`; a test pins
+  its keys to `WIDTH_KEYS`. vitest/Go keys arrive with the next bump.
 - [f14](f14-claim-lock-stderr-pinned.md) (2026-11-21, open): pin the
   `stayed held for` wording that the driver's retry matches with a claim
   CLI test (orphan of 4bca21ec).
