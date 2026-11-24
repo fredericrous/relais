@@ -1,7 +1,7 @@
 +++
 type = "task"
 mode = "afk"
-status = "open"
+status = "closed"
 blocked_by = []
 repos = ["relais"]
 +++
@@ -49,3 +49,29 @@ A plugin change where a pin row records the model the call ran (the call's
 as an added `router-state` field (the string map kept), or a reasoned
 no-change; and whether
 an unknown preference value is validated, with the test that pins it.
+
+## Resolution
+
+Closed 2026-11-24 by the plan
+`docs/plans/2026-11-24-pin-row-records-call-model.md`.
+
+- **The row.** A pin row's `model` and `tier` are now the model the router
+  infers the call ran. The order is the call's own `model`; else an own
+  `model:` pin; else, for a preference or a machine pin, the session's model;
+  with no source served (an older relais), the value recorded before. When
+  nothing resolves, the pin's string is kept. The field and the wire are
+  unchanged, so no `accepts` entry and no migration: no Rust code reads a
+  pin row's `model`. Aliases expand by `DEFAULT_MODEL_IDS`, never the tiers'
+  configured versions, and a `[1m]` suffix is dropped. The session model is
+  asked for before `next(e)` without being awaited, then collected bounded,
+  so the spawn never waits on it.
+- **The source.** `router-state` serves `pin_sources` (`own`, `preferred`,
+  `machine`) beside the unchanged `pins` map. `parse_definition` returns a
+  `DefinitionPin` with its source. Retiring `pins` waits for a plugin floor.
+- **An unknown preference is not validated.** A preferred pin's row records
+  the session model, so a typo such as `opsu` cannot reach the row while the
+  session model is known. It stays a pin, so the call is left untouched.
+  `a_mistyped_preference_is_served_as_a_preferred_pin` (pins.rs) and the
+  plugin case "a mistyped preference never reaches the row" pin this.
+- **Still owed:** the live check after the plugin reinstall,
+  [f22](f22-pin-row-live-check.md).
