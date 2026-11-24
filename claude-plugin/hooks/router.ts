@@ -361,14 +361,14 @@ export function parseRouterState(text: unknown): RouterState | undefined {
   }
 }
 
-export type PinSource = 'own' | 'preferred' | 'machine'
-const PIN_SOURCES: readonly string[] = ['own', 'preferred', 'machine']
+const PIN_SOURCES = ['own', 'preferred', 'machine'] as const
+export type PinSource = (typeof PIN_SOURCES)[number]
 
 function parsePinSources(raw: unknown): Record<string, PinSource> {
   if (!raw || typeof raw !== 'object') return {}
   return Object.fromEntries(
     Object.entries(raw as Record<string, unknown>).filter(
-      (entry): entry is [string, PinSource] => typeof entry[1] === 'string' && PIN_SOURCES.includes(entry[1]),
+      (entry): entry is [string, PinSource] => typeof entry[1] === 'string' && (PIN_SOURCES as readonly string[]).includes(entry[1]),
     ),
   )
 }
@@ -1396,50 +1396,70 @@ export type SpawnDecision = {
 }
 
 // A model id as a pinned call names it, for the decision row: a full
-// `claude-*` id as it is, a bare alias by the default ids. Never through the
-// tiers' configured models: a pinned call is not rewritten, so their version
-// is not the one it runs. Undefined for anything else.
-function pinnedCallModel(named: string | null | undefined): string | undefined {
+// `claude-*` id as it is (a context suffix such as `[1m]` dropped), a bare
+// alias by the default ids. Never through the tiers' configured models: a
+// pinned call is not rewritten, so their version is not the one it runs.
+// Undefined for anything else.
+function pinnedCallModel(named: string | undefined): string | undefined {
   if (!named) return undefined
-  const n = named.toLowerCase()
-  if (/^claude-[a-z0-9-]+$/.test(n)) return n
-  return Object.prototype.hasOwnProperty.call(DEFAULT_MODEL_IDS, n) ? DEFAULT_MODEL_IDS[n] : undefined
+  const lowered = named.toLowerCase().replace(/\[[^\]]*\]$/, '')
+  if (/^claude-[a-z0-9-]+$/.test(lowered)) return lowered
+  return Object.prototype.hasOwnProperty.call(DEFAULT_MODEL_IDS, lowered) ? DEFAULT_MODEL_IDS[lowered] : undefined
 }
 
-// Whether the row of a pinned spawn of `type` needs the session's model: no
-// call model resolves, and the pin's source runs the parent's model.
-export function pinNeedsSessionModel(state: RouterState, type: string, callModel: string | null | undefined): boolean {
-  if (pinnedCallModel(callModel)) return false
-  const source = state.pin_sources[type]
-  if (source === 'own') return false
-  return source !== undefined || state.pins[type] === 'inherit'
+// Where a pinned spawn's row takes its model from, before the session's
+// model is read: the call's own model, the pin (an own `model:`, or the
+// value recorded before by a relais that serves no sources), or the
+// session's model (a preference, a machine pin, or `inherit`).
+// `resolve` says whether the pin's value names the model run (an own
+// `model:`) or is only the value recorded before (no source served).
+export type PinRowSource = { kind: 'call'; model: string } | { kind: 'pin'; resolve: boolean } | { kind: 'session' }
+
+export function pinRowSource(state: RouterState, type: string, callModel: string | undefined): PinRowSource {
+  const called = pinnedCallModel(callModel)
+  if (called) return { kind: 'call', model: called }
+  const source: PinSource | undefined = state.pin_sources[type]
+  switch (source) {
+    case 'own':
+      return { kind: 'pin', resolve: true }
+    case 'preferred':
+    case 'machine':
+      return { kind: 'session' }
+    case undefined:
+      return state.pins[type] === 'inherit' ? { kind: 'session' } : { kind: 'pin', resolve: false }
+    default:
+      return assertNever(source)
+  }
+}
+
+function assertNever(value: never): never {
+  throw new Error(`unexpected pin source ${String(value)}`)
 }
 
 // The decision a pinned spawn's row records: the model the router infers the
-// call ran, never the pin's value. (1) The call's own `model`; (2) else an
-// own `model:` pin; (3) else, for a preference or a machine pin, the
-// session's model; (4) with no source (a relais that predates them), the
-// value recorded before: the pin, or the session's model for `inherit`.
-// When nothing resolves, the pin's string is kept. Inferred, not observed:
-// a spawn made by a subagent on another model, or after `/model`, can differ.
+// call ran, never the pin's value (`pinRowSource` says from where). An own
+// pin that does not resolve, and a relais that serves no sources, keep the
+// pin's string; so does a session model that is unknown. Inferred, not
+// observed: a spawn made by a subagent on another model, or after `/model`,
+// can differ.
 export function pinRowDecision(
   state: RouterState,
   type: string,
   decision: Decision,
-  callModel: string | null | undefined,
-  sessionModel: string | null | undefined,
+  callModel: string | undefined,
+  sessionModel: string | undefined,
 ): Decision {
   const pin = state.pins[type] ?? decision.model
-  const source = state.pin_sources[type]
-  const fromSession = () => pinnedCallModel(sessionModel)
-  const model =
-    pinnedCallModel(callModel) ??
-    (source === 'own'
-      ? pinnedCallModel(pin)
-      : source !== undefined || pin === 'inherit'
-        ? fromSession()
-        : undefined) ??
-    pin
+  const from = pinRowSource(state, type, callModel)
+  const resolved =
+    from.kind === 'call'
+      ? from.model
+      : from.kind === 'session'
+        ? pinnedCallModel(sessionModel)
+        : from.resolve
+          ? pinnedCallModel(pin)
+          : undefined
+  const model = resolved ?? pin
   return { ...decision, model, tier: tierOfModel(state, model) ?? 'implementation' }
 }
 

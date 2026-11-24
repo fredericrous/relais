@@ -34,8 +34,8 @@ import {
   parseClassification,
   parseGateStamp,
   parseRouterState,
-  pinNeedsSessionModel,
   pinRowDecision,
+  pinRowSource,
   reassessRecord,
   rerun,
   revertedPaths,
@@ -102,6 +102,13 @@ async function within<T>(fx: Fx, promise: Promise<T>, ms: number): Promise<T | t
   } finally {
     timer?.cancel()
   }
+}
+
+// As `within`, but a promise that has already settled is taken even when no
+// time is left: the session model asked for before the spawn is often in.
+async function settledWithin<T>(fx: Fx, promise: Promise<T>, ms: number): Promise<T | typeof TIMEOUT> {
+  if (ms > 0) return within(fx, promise, ms)
+  return Promise.race([promise, Promise.resolve().then(() => TIMEOUT)])
 }
 
 const waitFor = (remainingMs: number) => Math.min(PIN_WAIT_MS, remainingMs - BUDGET_MARGIN_MS)
@@ -393,6 +400,7 @@ export async function routeSpawn(fx: Fx, store: Store, e: any, next: any, remain
   const type = String(e.subagentType ?? e.subagent_type ?? '')
   const description = String(e.description ?? '')
   const prompt = String(e.prompt ?? '')
+  const callModel = typeof e.model === 'string' ? e.model : undefined
   let classified: Awaited<ReturnType<typeof classify>> | undefined
   let cls: Classification | undefined
   if (!state.pins[type]) {
@@ -407,11 +415,23 @@ export async function routeSpawn(fx: Fx, store: Store, e: any, next: any, remain
   const taskId = `task-${await fx.clock.now()}-${++r.seq}`
   const spawn = decideSpawn({ state, type, cls, personModel: r.task?.subagentModel ?? null, session: r.session, taskId })
   const applied = !!spawn.decision?.override && isApplying(r)
+  // A pin's row records the model the call ran. The session's model is asked
+  // for now and not awaited, so the spawn never waits on it; afterSpawn
+  // collects it, bounded.
+  const sessionRead =
+    spawn.decision?.reason === 'pin' && pinRowSource(state, type, callModel).kind === 'session'
+      ? Promise.resolve()
+          .then(() => fx.session.model())
+          .then(
+            model => (typeof model === 'string' ? model : undefined),
+            () => undefined, // no session model: the row keeps the pin
+          )
+      : undefined
   const result = await next(applied && spawn.decision ? { ...e, model: spawn.decision.model } : e)
   // The subagent is started: nothing below may throw, or the hook's error
   // handler would see a failure after `next` and the spawn could repeat.
   try {
-    await afterSpawn(fx, store, { state, spawn, applied, classified, description, prompt, result, taskId, type, callModel: e.model, deadline })
+    await afterSpawn(fx, store, { state, spawn, applied, classified, description, prompt, result, taskId, type, callModel, sessionRead, deadline })
   } catch (reason) {
     await note(fx, store, undefined, `relais router: the spawn's bookkeeping failed: ${String((reason as any)?.message ?? reason).slice(0, 200)}`).catch(() => {})
   }
@@ -431,26 +451,18 @@ async function afterSpawn(
     result: any
     taskId: string
     type: string
-    callModel: unknown
+    callModel: string | undefined
+    sessionRead: Promise<string | undefined> | undefined
     deadline: number
   },
 ) {
   const r = store.router
   const { state, spawn, applied, classified, description, prompt, result, taskId } = input
   const now = await fx.clock.now()
-  // A pin's row records the model the call ran, read after the spawn has
-  // started so the spawn never waits on it.
-  const callModel = typeof input.callModel === 'string' ? input.callModel : null
   if (spawn.decision?.reason === 'pin') {
-    let sessionModel: string | undefined
-    if (pinNeedsSessionModel(state, input.type, callModel)) {
-      const read = Promise.resolve()
-        .then(() => fx.session.model())
-        .catch(() => undefined)
-      const got = await within(fx, read, waitFor(input.deadline - now))
-      sessionModel = got === TIMEOUT || typeof got !== 'string' ? undefined : got
-    }
-    spawn.decision = pinRowDecision(state, input.type, spawn.decision, callModel, sessionModel)
+    const got = input.sessionRead ? await settledWithin(fx, input.sessionRead, waitFor(input.deadline - now)) : undefined
+    const sessionModel = got === TIMEOUT ? undefined : got
+    spawn.decision = pinRowDecision(state, input.type, spawn.decision, input.callModel, sessionModel)
   }
   const agentId: string | undefined = typeof result?.agentId === 'string' ? result.agentId : undefined
   let owner: TaskState | undefined = r.task

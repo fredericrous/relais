@@ -329,6 +329,7 @@ const PIN_ROW_CASES: [string, Parameters<typeof pinRow>[2], string, string][] = 
   ['a relais that serves no pin sources gets the value recorded before', { pins: { rev: 'opus' }, sessionModel: SONNET }, 'opus', 'escalation'],
   ['a pin source the plugin does not know is dropped', { pins: { rev: 'opus' }, pin_sources: { rev: 'someday' }, sessionModel: SONNET }, 'opus', 'escalation'],
   ['with no session model and no call model the pin’s string is kept', { ...PREFERRED, sessionModel: undefined }, 'opus', 'escalation'],
+  ['a session model with a context suffix is recorded without it', { ...PREFERRED, sessionModel: `${SONNET}[1m]` }, SONNET, 'implementation'],
   ['a call model that does not resolve falls through to the source’s rule', { ...PREFERRED, sessionModel: HAIKU, callModel: 'opsu' }, HAIKU, 'research'],
 ]
 
@@ -342,9 +343,9 @@ for (const [name, setup, model, tier] of PIN_ROW_CASES) {
 }
 
 const SONNET_5_TIERS = {
-    research: { model: HAIKU, effort: null },
-    implementation: { model: 'claude-sonnet-5', effort: null },
-    escalation: { model: OPUS, effort: null },
+  research: { model: HAIKU, effort: null },
+  implementation: { model: 'claude-sonnet-5', effort: null },
+  escalation: { model: OPUS, effort: null },
 }
 
 test('a pin row resolves an alias by the default ids, not a tier’s configured model', async ($: any, on: any) => {

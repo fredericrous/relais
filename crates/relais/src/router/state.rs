@@ -476,12 +476,20 @@ mod tests {
     fn pins_join_definitions_and_machine_pins() {
         let machine = machine("[session_routing]\npinned_agents = [\"keep-me\", \"both\"]\n");
         let mut inputs = inputs(&machine, None);
-        inputs.definition_pins = vec![DefinitionPin {
-            agent: "both".into(),
-            model: "opus".into(),
-            source: PinSource::Preferred,
-        }];
+        inputs.definition_pins = vec![
+            DefinitionPin {
+                agent: "both".into(),
+                model: "opus".into(),
+                source: PinSource::Preferred,
+            },
+            DefinitionPin {
+                agent: "mine".into(),
+                model: "sonnet".into(),
+                source: PinSource::Own,
+            },
+        ];
         let state = build(inputs);
+        assert!(state.pins.keys().eq(state.pin_sources.keys()));
         assert_eq!(state.pins["keep-me"], "inherit");
         assert_eq!(state.pins["both"], "opus");
         assert_eq!(state.pin_sources["keep-me"], PinSource::Machine);
@@ -489,6 +497,7 @@ mod tests {
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(json["pin_sources"]["both"], "preferred");
         assert_eq!(json["pin_sources"]["keep-me"], "machine");
+        assert_eq!(json["pin_sources"]["mine"], "own");
     }
 
     #[test]

@@ -127,22 +127,15 @@ Facts checked:
   one `kind: change`, acceptance `cargo test -p relais --lib router::` and
   `cargo test -p relais --lib install::`.
 - [x] Phase 2 — the row records the model run. `claude-plugin/hooks/router.ts`
-  (the `pin_sources` type and its parse; `decideSpawn` takes `callModel` and
-  `sessionModel` and records the model run in its pin branch);
-  `claude-plugin/hooks/routing.ts` (`routeSpawn` passes `e.model`, and
-  `fx.session.model()` only when the type is pinned, read as
-  `Promise.resolve().then(() => fx.session.model()).catch(() => undefined)`,
-  bounded with `within(fx, …, waitFor(remainingMs))` as the spawn
-  classifier is (`routing.ts:395`); a timeout means no session model, so
-  the read can neither throw nor stall `next(e)`. A `routedSession` test
-  with a never-settling `session.model` sees `next(e)` run once with the
-  unchanged call and the row keep the pin's string);
-  `claude-plugin/tests/router.test.ts`, `claude-plugin/tests/routing.test.ts`,
-  `claude-plugin/tests/routing-support.ts` (the cases under Verification);
-  `docs/router-protocol.md` (the `pin_sources` field, what a pin row's
-  `model` holds), `docs/SPEC.md` (§30's pin sentence), `CHANGELOG.md`
-  (Unreleased). Done through relais: one `kind: change`, acceptance
-  `make plugin`.
+  (the `pin_sources` type and its parse; `pinRowSource`, an exhaustive switch
+  on the source, and `pinRowDecision`, which rewrites the pin row);
+  `claude-plugin/hooks/routing.ts` (`routeSpawn` narrows `e.model`, asks for
+  the session model before `next(e)` without awaiting it, and `afterSpawn`
+  collects it bounded by the hook budget, taking an already settled answer
+  even when no time is left, then rewrites the row); `claude-plugin/tests/routing.test.ts`,
+  `claude-plugin/tests/support.ts` (`sessionModelThrows`, `sessionModelNever`);
+  `docs/router-protocol.md`, `docs/SPEC.md` §30, `CHANGELOG.md`. Written in
+  session (see the Decision log); acceptance `make plugin`.
 
 ### 🧑 Your steps
 - Reinstall the relais plugin with relais's own install command for Claude — the plugin half records the model run only once the installed plugin carries it (installed: 0.72.0).
@@ -216,7 +209,7 @@ date.
 |---|---|---|---|
 | `cargo test -p relais --lib router::`, `install::` | Phase 1 candidate | pass | pass (47.6 s, 2.2 s); clippy `-D warnings` and `cargo fmt --check` clean |
 | `make plugin` | Phase 2 | pass | 555 pass, 0 fail (the script's one rerun: an unrelated chunk-matching test timed out at 5 s under load) |
-| Red check | the row rewrite disabled | the new cases fail | 8 fail; the 4 whose expected value is today's still pass, as they should |
+| Red check | the row rewrite disabled | the new cases fail | 8 of the 14 new tests fail; the 6 whose expected value is today's still pass, as they should |
 | Pilot | scratch `typo.md` (`opsu`), `rev.md` (`opus`), isolated `CLAUDE_CONFIG_DIR`/`RELAIS_STATE_DIR` | exit 0, pins and sources as planned, empty stderr | exit 0; `pins` {rev: opus, typo: opsu}; `pin_sources` both `preferred`; stderr 0 lines; the scratch state directory stayed empty |
 
 ## Decision log

@@ -3,7 +3,8 @@
 //! definitions the person maintains and serves the pins. Pure: the caller
 //! reads the files.
 
-/// The pin a definition states: its subagent type and its model. A
+/// The pin a definition states: its subagent type, its model and where the
+/// pin came from (`PinSource`; an own `model:` wins in any line order). A
 /// definition's own `model:` pins it; one with no `model:`, or
 /// `model: inherit`, is pinned by its `preferred-model:` when it declares one
 /// (the router then leaves the spawn's call as the parent made it). `None`
