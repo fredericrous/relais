@@ -428,7 +428,8 @@ test('two reads started together after a clear spawn one adopt', async () => {
     ui: { open: async () => undefined },
   }
   const both = Promise.all([readProgramme(fx, store, 'start'), readProgramme(fx, store, 'clear')])
-  await new Promise(resolve => setTimeout(resolve, 0))
+  // Microtask turns only: both reads reach the held clock before it answers.
+  for (let turn = 0; turn < 10; turn++) await Promise.resolve()
   release()
   await both
   expect(runs.filter(argv => argv[2] === 'adopt').length).toBe(1)

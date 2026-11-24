@@ -123,7 +123,10 @@ async function adoptPrevious(fx: Fx, store: Store, session: string, ms: number) 
   } catch {
     // An effect that throws must not leave the adoption running forever:
     // it is retried at the next read, like any other failure.
-    if (memory.adopt === running) memory.adopt = { state: 'failed', previous: running.previous, session, since: running.since ?? 0 }
+    const current = memory.adopt
+    if (current?.state === 'running' && current.session === session) {
+      memory.adopt = { state: 'failed', previous: current.previous, session, since: current.since ?? 0 }
+    }
   }
 }
 
@@ -135,7 +138,8 @@ async function adoptOnce(fx: Fx, store: Store, running: Extract<Adoption, { stat
   if (store.closed || memory.adopt !== running) return
   // Bound at the successor's first read, seconds after the clear.
   const since = running.since ?? now
-  running.since = since
+  const bound: Extract<Adoption, { state: 'running' }> = { ...running, since }
+  memory.adopt = bound
   if (now - since > ADOPT_GIVE_UP_MS) {
     // No more retries; the note stays for this session.
     memory.adopt = { state: 'gaveUp', previous, session }
@@ -148,7 +152,7 @@ async function adoptOnce(fx: Fx, store: Store, running: Extract<Adoption, { stat
       timeoutMs: ms,
     }),
   )
-  if (store.closed || memory.adopt !== running) return // A clear came meanwhile
+  if (store.closed || memory.adopt !== bound) return // A clear came meanwhile
   const at = await fx.clock.now()
   const exited = reply.kind === 'ok' ? reply.value : undefined
   const exitCode = exited?.exitCode
