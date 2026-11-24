@@ -409,11 +409,46 @@ pub(crate) fn promote_command(artifact_id: &str) -> Result<CliOutcome, CliError>
             );
             Ok(CliOutcome::Blocked)
         }
+        Err(NodeError::Shared(relais::shared_state::SharedStateError::Refused { reason })) => {
+            eprintln!("relais promote: {reason}");
+            Ok(CliOutcome::Blocked)
+        }
+        Err(NodeError::Compensation { local, release }) => {
+            compensation_lines("promote", &local, &release, &reg, &*state);
+            Ok(CliOutcome::OperationalFailure)
+        }
         Err(e) => {
             eprintln!("relais promote: {e}");
             Ok(CliOutcome::OperationalFailure)
         }
     }
+}
+
+/// The local pointer write failed after the shared swap won, and putting
+/// the shared pointer back failed too: the two pointers disagree until the
+/// next promote or rollback on this node heals the local one.
+fn compensation_lines(
+    command: &str,
+    local: &dyn std::fmt::Display,
+    release: &dyn std::fmt::Display,
+    registry: &relais::learn::registry::Registry,
+    state: &dyn relais::shared_state::SharedState,
+) {
+    let here = registry.active_id().ok().flatten();
+    let shared = match state.registry_pointer() {
+        Ok(relais::shared_state::Pointer::Shared(pointer)) => pointer,
+        Ok(relais::shared_state::Pointer::NodeDecides) | Err(_) => here.clone(),
+    };
+    let name = |id: &Option<String>| id.clone().unwrap_or_else(|| "nothing".to_string());
+    eprintln!("relais {command}: the registry's pointer files could not be written: {local}");
+    eprintln!(
+        "relais {command}: the shared pointer names {} and this node's names {}, and the \
+         shared one could not be put back ({release}); run `relais {command}` again once the \
+         registry is writable, and this node takes {}",
+        name(&shared),
+        name(&here),
+        name(&shared)
+    );
 }
 
 /// Where a learning cycle's lines go: stdout and stderr, or, with `--log`,
@@ -614,9 +649,11 @@ pub(crate) fn learn_cycle_command(
     };
     let registry = registry()?;
     let datasets = datasets_dir()?;
+    let pointers = relais::shared_state::node::NodePointers(super::ctx::shared_state()?);
     let inputs = relais::learn::cycle::CycleInputs {
         ledger: &ledger,
         registry: &registry,
+        pointers: &pointers,
         repo: &repo,
         datasets_dir: &datasets,
         gates: relais::learn::cycle::GateSettings {
@@ -1107,17 +1144,24 @@ pub(crate) fn judge_trial_command(
 pub(crate) fn rollback_command(json: bool) -> Result<CliOutcome, CliError> {
     let reg = registry()?;
     let ledger = open_ledger()?;
-    let result = operational(
-        relais::learn::cycle::roll_back_active(
-            &ledger,
-            &reg,
-            relais::ledger::LearningSource::Person,
-            "rolled back by a person",
-            None,
-        ),
-        "rollback",
-    )?;
-    match result {
+    let pointers = relais::shared_state::node::NodePointers(super::ctx::shared_state()?);
+    let outcome = relais::learn::cycle::roll_back_active(
+        &pointers,
+        &ledger,
+        &reg,
+        relais::ledger::LearningSource::Person,
+        "rolled back by a person",
+        None,
+        None,
+    );
+    let rolled_back = match outcome {
+        Err(relais::learn::cycle::CycleError::Compensated { local, release }) => {
+            compensation_lines("rollback", &local, &release, &reg, &*pointers.0);
+            return Ok(CliOutcome::OperationalFailure);
+        }
+        other => operational(other, "rollback")?,
+    };
+    match rolled_back {
         Ok(rolled) => {
             if json {
                 print_document(&serde_json::json!({ "schema": 1, "rolled_back": rolled }))?;
@@ -1127,11 +1171,21 @@ pub(crate) fn rollback_command(json: bool) -> Result<CliOutcome, CliError> {
             Ok(CliOutcome::Accepted)
         }
         Err(nothing) => {
+            use relais::learn::cycle::NothingToRollBack;
+            // A lost race or a refusal is said on stderr under `--json`
+            // too: the document carries the reason, the person reads it.
+            let said_under_json = match &nothing {
+                NothingToRollBack::Superseded { .. } | NothingToRollBack::Refused { .. } => true,
+                NothingToRollBack::NoActiveArtifact | NothingToRollBack::NoPreviousArtifact => {
+                    false
+                }
+            };
             if json {
                 print_document(
                     &serde_json::json!({ "schema": 1, "rolled_back": null, "reason": nothing.to_string() }),
                 )?;
-            } else {
+            }
+            if !json || said_under_json {
                 eprintln!("relais rollback: {nothing}");
             }
             Ok(CliOutcome::Blocked)

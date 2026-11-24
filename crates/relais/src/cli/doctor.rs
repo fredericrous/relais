@@ -1,6 +1,5 @@
 //! `relais doctor`, `relais hook` and `relais init`.
 
-use super::ctx::hook_admission_settings;
 use super::ctx::load_machine;
 use super::ctx::load_repo_policy;
 use super::ctx::print_document;
@@ -352,7 +351,8 @@ pub(crate) fn hook_respond() {
     // make sense of (`HookEvent::NotOurs`), so the hook still answers.
     let _ = std::io::stdin().lock().read_to_end(&mut payload);
 
-    let settings = hook_admission_settings();
+    let shared = super::ctx::shared_state_for_hook();
+    let settings = super::ctx::hook_admission_settings_from(&shared.state);
 
     let Ok(socket) = relais::coordinator::socket_path() else {
         // No home directory: nothing to connect to and nowhere to
@@ -373,7 +373,7 @@ pub(crate) fn hook_respond() {
         return;
     };
     let gate = relais::coordinator::RemoteGate::new(socket);
-    let handled = relais::hook::respond::handle(&payload, &settings, &gate);
+    let handled = relais::hook::respond::handle(&payload, &settings, &gate, &shared);
     if let Some(text) = handled.answer.stdout_payload() {
         print_hook_answer(&text);
     }

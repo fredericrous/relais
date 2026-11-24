@@ -23,6 +23,8 @@ use crate::ids;
 use crate::policy::{HookAdmissionSettings, QueueBehaviour};
 use crate::programme::claim;
 use crate::runner::ADMISSION_POLL;
+use crate::shared_state::node::{self, SessionPass};
+use crate::shared_state::SharedState;
 
 /// What one hook firing did, end to end: the event a payload classified
 /// as, whatever the coordinator answered (only ever `Some` for a
@@ -44,6 +46,21 @@ pub struct Handled {
 /// How long a session start waits for the ready tickets before it starts
 /// without them: the hook's own timeout must never be the limit.
 pub const GATHER_DEADLINE: Duration = Duration::from_secs(3);
+
+/// How long a claim pass waits for the shared state before it goes on with
+/// the claim files alone: well inside [`GATHER_DEADLINE`], so a primary that
+/// does not answer never holds a session's start or end.
+pub const SHARED_CLAIM_DEADLINE: Duration = Duration::from_secs(1);
+
+/// The shared state the hook's claim passes go through, built by the CLI
+/// (the hook never picks an implementation itself).
+#[derive(Clone)]
+pub struct SharedClaims {
+    pub state: std::sync::Arc<dyn SharedState>,
+    /// One stderr line said on each claim event: the CLI fell back to the
+    /// claim files alone, and why.
+    pub warning: Option<String>,
+}
 
 /// Why a session start went without context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,7 +267,12 @@ where
 /// it was watching unanswered, and this is the one place that reaches
 /// a real socket and a real clock, neither of which `decide` itself
 /// touches.
-pub fn handle(payload: &[u8], settings: &HookAdmissionSettings, gate: &dyn Gate) -> Handled {
+pub fn handle(
+    payload: &[u8],
+    settings: &HookAdmissionSettings,
+    gate: &dyn Gate,
+    shared: &SharedClaims,
+) -> Handled {
     let claims = claim::Store::from_environment();
     let for_gather = claims.clone();
     handle_with(
@@ -260,6 +282,7 @@ pub fn handle(payload: &[u8], settings: &HookAdmissionSettings, gate: &dyn Gate)
         move |cwd: &Path| super::resume::gather_with(cwd, for_gather),
         GATHER_DEADLINE,
         claims.as_ref(),
+        shared,
     )
 }
 
@@ -273,12 +296,13 @@ pub fn handle_with<G>(
     gatherer: G,
     deadline: Duration,
     claims: Option<&claim::Store>,
+    shared: &SharedClaims,
 ) -> Handled
 where
     G: FnOnce(&Path) -> Result<Gathered, Skip> + Send + 'static,
 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        handle_inner(payload, settings, gate, gatherer, deadline, claims)
+        handle_inner(payload, settings, gate, gatherer, deadline, claims, shared)
     }))
     .unwrap_or(Handled {
         event: HookEvent::NotOurs,
@@ -296,13 +320,14 @@ fn handle_inner<G>(
     gatherer: G,
     deadline: Duration,
     claims: Option<&claim::Store>,
+    shared: &SharedClaims,
 ) -> Handled
 where
     G: FnOnce(&Path) -> Result<Gathered, Skip> + Send + 'static,
 {
     let event = event::parse(payload);
     if let HookEvent::SessionStart(start) = &event {
-        refresh_claims_of_a_continued_session(start, claims);
+        refresh_claims_of_a_continued_session(start, claims, shared);
         let Some(cwd) = start.fresh_session_cwd() else {
             return Handled {
                 event,
@@ -324,7 +349,7 @@ where
     }
     let (coordinator, waited) = ask_coordinator(&event, settings, gate);
     let answer = decide_or_silent(&event, settings, coordinator.clone(), waited);
-    follow_agent_lifecycle(&event, gate, claims);
+    follow_agent_lifecycle(&event, gate, claims, shared);
     if matches!(answer, HookAnswer::Refuse { .. }) {
         if let HookEvent::AgentToolCall(call) = &event {
             let dispatch_id = ids::derive_dispatch_id(&call.session_id, &call.tool_use_id);
@@ -385,7 +410,12 @@ where
 /// run uncertain, which is what not knowing looks like when it is
 /// recorded honestly. Zero would be a claim that the agent was free.
 /// Both ends together let the coordinator forget the entry.
-fn follow_agent_lifecycle(event: &HookEvent, gate: &dyn Gate, claims: Option<&claim::Store>) {
+fn follow_agent_lifecycle(
+    event: &HookEvent,
+    gate: &dyn Gate,
+    claims: Option<&claim::Store>,
+    shared: &SharedClaims,
+) {
     match event {
         HookEvent::AgentToolCall(call) => match &call.phase {
             ToolCallPhase::Post {
@@ -426,7 +456,14 @@ fn follow_agent_lifecycle(event: &HookEvent, gate: &dyn Gate, claims: Option<&cl
                 // A hook cannot fail on bookkeeping, so a failure is one stderr
                 // line and the claim left behind expires after N.
                 report_claim_pass(
-                    store.end_session_once(end.session_id.as_str(), claim::now_unix()),
+                    node::end_session(
+                        &shared.state,
+                        store,
+                        end.session_id.as_str(),
+                        claim::now_unix(),
+                        Some(SHARED_CLAIM_DEADLINE),
+                    ),
+                    shared,
                 );
             }
         }
@@ -442,6 +479,7 @@ fn follow_agent_lifecycle(event: &HookEvent, gate: &dyn Gate, claims: Option<&cl
 fn refresh_claims_of_a_continued_session(
     start: &event::SessionStart,
     claims: Option<&claim::Store>,
+    shared: &SharedClaims,
 ) {
     let continued = matches!(
         start.source,
@@ -450,15 +488,31 @@ fn refresh_claims_of_a_continued_session(
     if let (true, Some(store)) = (continued, claims) {
         // A hook cannot fail on bookkeeping, so a failure is one stderr line
         // and the next claim, commit or resume refreshes the claim.
-        report_claim_pass(store.refresh_session_once(start.session_id.as_str(), claim::now_unix()));
+        report_claim_pass(
+            node::refresh_session(
+                &shared.state,
+                store,
+                start.session_id.as_str(),
+                claim::now_unix(),
+                Some(SHARED_CLAIM_DEADLINE),
+            ),
+            shared,
+        );
     }
 }
 
 /// Writes what went wrong in a hook's pass over a session's claims to the
 /// hook's stderr, one line per programme and one for a store that could not
-/// be read, each naming where and why.
-fn report_claim_pass(pass: Result<claim::Pass, claim::ClaimError>) {
-    match pass {
+/// be read, each naming where and why; before them the CLI's fallback line
+/// and the shared half's failure, when there is one.
+fn report_claim_pass(pass: SessionPass, shared: &SharedClaims) {
+    if let Some(warning) = &shared.warning {
+        eprintln!("{warning}");
+    }
+    if let Err(error) = pass.shared {
+        eprintln!("relais: shared claims: {error}; the local claims were updated");
+    }
+    match pass.local {
         Ok(pass) => {
             for line in pass.failure_lines() {
                 eprintln!("relais: {line}");
@@ -799,6 +853,19 @@ fn open_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The claim passes through `LocalState`, as the CLI builds them on a
+    /// machine with no `shared_state` key.
+    fn local_claims() -> SharedClaims {
+        SharedClaims {
+            state: std::sync::Arc::new(crate::shared_state::LocalState::new()),
+            warning: None,
+        }
+    }
+
+    fn handle(payload: &[u8], settings: &HookAdmissionSettings, gate: &dyn Gate) -> Handled {
+        super::handle(payload, settings, gate, &local_claims())
+    }
     use crate::admission::{LocalGate, RunRegistration};
     use crate::ids::{SessionId, ToolUseId};
     use crate::policy::{ConcurrencyLimits, CoordinatorUnreachableBehavior};
@@ -2457,6 +2524,7 @@ mod tests {
             gatherer,
             deadline,
             None,
+            &local_claims(),
         )
     }
 
@@ -2511,6 +2579,7 @@ mod tests {
             must_not_run,
             Duration::from_secs(5),
             None,
+            &local_claims(),
         );
         assert_eq!(handled.answer, HookAnswer::Silent);
     }
@@ -2606,6 +2675,7 @@ mod tests {
                 must_not_run,
                 Duration::from_secs(5),
                 Some(store),
+                &local_claims(),
             )
         }
 
@@ -2628,6 +2698,37 @@ mod tests {
 
         fn claim_ids(store: &Store) -> Vec<String> {
             store.records(&key()).unwrap().into_keys().collect()
+        }
+
+        #[test]
+        fn a_shared_state_that_does_not_answer_never_holds_the_session_end() {
+            let (_scratch, store) = store_with_claims("hook-slow", 0);
+            let fake = crate::shared_state::fake::FakeState::new();
+            fake.set_slow(Some(Duration::from_secs(10)));
+            let shared = SharedClaims {
+                state: std::sync::Arc::new(fake),
+                warning: None,
+            };
+            fn must_not_run(_: &Path) -> Result<Gathered, Skip> {
+                panic!("a session end gathers nothing");
+            }
+            let started = Instant::now();
+            let handled = handle_with(
+                &lifecycle("SessionEnd", None, SESSION),
+                &settings(),
+                &PanicsIfAsked,
+                must_not_run,
+                Duration::from_secs(5),
+                Some(&store),
+                &shared,
+            );
+            assert!(
+                started.elapsed() < SHARED_CLAIM_DEADLINE + Duration::from_secs(1),
+                "{:?}",
+                started.elapsed()
+            );
+            assert_eq!(handled.answer, HookAnswer::Silent);
+            assert_eq!(claim_ids(&store), ["t2", "t3"], "the local pass still ran");
         }
 
         #[test]
@@ -2686,6 +2787,7 @@ mod tests {
                 nothing,
                 Duration::from_secs(5),
                 Some(store),
+                &local_claims(),
             )
         }
 

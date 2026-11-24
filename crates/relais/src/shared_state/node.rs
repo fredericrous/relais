@@ -26,14 +26,20 @@ use super::types::{
 };
 use super::{SharedState, SharedStateError};
 use crate::ids::RunId;
-use crate::learn::registry::{EvaluatedArtifact, Registry};
+use crate::learn::cycle::{PointerRefusal, PointerWrites};
+use crate::learn::registry::{ArtifactError, EvaluatedArtifact, Registry};
 use crate::ledger::{
     Claim, DecisionAnswer, IntentState, Ledger, NewIntent, SuccessorIntent, SuccessorProcess,
 };
 use crate::money::MicroUsd;
 use crate::procs::LockFile;
-use crate::programme::claim::{ClaimKey, Contest, Holder, Kind, Store, Taken, LOCK_WAIT};
+use crate::programme::claim::{
+    ClaimError, ClaimKey, Contest, EmptyProgramme, Holder, Kind, Pass, Reservations, SlugLock,
+    Store, Taken, LOCK_WAIT,
+};
 use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Why a node function did not do what it was asked: the shared
 /// half's own refusal, or a failure of the node's own files and ledger.
@@ -258,6 +264,226 @@ pub fn claim_ticket(
     }
 }
 
+/// The request the shared half sees for `id` in `key`'s programme.
+fn ticket_request(key: &ClaimKey, id: &str, holder: &Principal) -> TicketRequest {
+    TicketRequest {
+        repo_key: key.repo_key.clone(),
+        slug: key.slug.clone(),
+        id: id.to_string(),
+        holder: holder.clone(),
+        contest: Contest::Refuse,
+    }
+}
+
+/// Reserve `id` as a `handoff` claim for `holder`'s next session (the
+/// rules of [`SlugLock::reserve_handoff`]), the shared half first; whether
+/// it was reserved. A ticket the shared half says is held is not reserved,
+/// as a ticket the claim file holds is not. A crash between the shared
+/// grant and the claim file leaves a shared hold that ends at
+/// [`crate::programme::claim::HANDOFF_HOLD_SECS`].
+pub fn reserve_handoff(
+    state: &dyn SharedState,
+    lock: &SlugLock<'_>,
+    key: &ClaimKey,
+    id: &str,
+    holder: &Principal,
+    repo_display: &str,
+    now: i64,
+) -> Result<bool, NodeError> {
+    let request = ticket_request(key, id, holder);
+    match state.reserve_handoff(&request)? {
+        TicketAnswer::NodeDecides => Ok(lock.reserve_handoff(id, &holder.id, repo_display, now)?),
+        TicketAnswer::Held { .. } => Ok(false),
+        TicketAnswer::Granted(lease) => {
+            match lock.reserve_handoff(id, &holder.id, repo_display, now) {
+                Ok(true) => Ok(true),
+                Ok(false) => {
+                    give_back(&lease.resource.to_string(), state.release_ticket(&lease));
+                    Ok(false)
+                }
+                Err(local) => Err(compensated(local.into(), state.release_ticket(&lease))),
+            }
+        }
+    }
+}
+
+/// Reserve the first of the candidates as a `handoff` claim, only when the
+/// programme is empty (the rules of [`SlugLock::reserve_in_empty_programme`]),
+/// the shared half first for that ticket.
+pub fn reserve_in_empty_programme(
+    state: &dyn SharedState,
+    lock: &SlugLock<'_>,
+    programme: &EmptyProgramme<'_>,
+    holder: &Principal,
+) -> Result<Option<String>, NodeError> {
+    let Some(first) = programme.candidates.first() else {
+        return Ok(None);
+    };
+    let local = |lock: &SlugLock<'_>| {
+        lock.reserve_in_empty_programme(
+            programme.candidates,
+            programme.open,
+            programme.branch_held,
+            &holder.id,
+            programme.repo_display,
+            programme.now,
+        )
+    };
+    match state.reserve_handoff(&ticket_request(programme.key, first, holder))? {
+        TicketAnswer::NodeDecides => Ok(local(lock)?),
+        TicketAnswer::Held { .. } => Ok(None),
+        TicketAnswer::Granted(lease) => match local(lock) {
+            Ok(Some(reserved)) => Ok(Some(reserved)),
+            Ok(None) => {
+                give_back(&lease.resource.to_string(), state.release_ticket(&lease));
+                Ok(None)
+            }
+            Err(local) => Err(compensated(local.into(), state.release_ticket(&lease))),
+        },
+    }
+}
+
+/// `relais programme next --claim`'s reservations through the shared
+/// state: the CLI hands one to [`crate::programme::claim::next`]. The
+/// session reserving is the holder, as `relais programme claim` names it.
+pub struct NodeReservations<'a>(pub &'a dyn SharedState);
+
+impl Reservations for NodeReservations<'_> {
+    type Error = NodeError;
+
+    fn handoff(
+        &self,
+        lock: &SlugLock<'_>,
+        key: &ClaimKey,
+        id: &str,
+        session: &str,
+        repo_display: &str,
+        now: i64,
+    ) -> Result<bool, NodeError> {
+        let holder = Principal::operator(session);
+        reserve_handoff(self.0, lock, key, id, &holder, repo_display, now)
+    }
+
+    fn in_empty_programme(
+        &self,
+        lock: &SlugLock<'_>,
+        programme: &EmptyProgramme<'_>,
+    ) -> Result<Option<String>, NodeError> {
+        let holder = Principal::operator(programme.session);
+        reserve_in_empty_programme(self.0, lock, programme, &holder)
+    }
+}
+
+/// What a pass over a session's claims did: the shared half's answer and
+/// the claim files' pass. Both always run, so neither hides the other.
+#[derive(Debug)]
+pub struct SessionPass {
+    pub shared: Result<(), SharedStateError>,
+    pub local: Result<Pass, ClaimError>,
+}
+
+/// A session-wide shared call, bounded by `deadline` when one is given:
+/// the call runs on a thread of its own that owns an [`Arc`] of the state
+/// and prints nothing, and a caller past its deadline leaves it behind
+/// (the hold it was renewing or giving back ends by its TTL).
+fn session_call(
+    state: &Arc<dyn SharedState>,
+    holder: &Principal,
+    deadline: Option<Duration>,
+    call: fn(&dyn SharedState, &Principal) -> Result<(), SharedStateError>,
+) -> Result<(), SharedStateError> {
+    let Some(deadline) = deadline else {
+        return call(&**state, holder);
+    };
+    let holder = holder.clone();
+    within(state, deadline, move |state| call(state, &holder)).unwrap_or_else(|unanswered| {
+        Err(SharedStateError::Unreachable {
+            detail: unanswered.to_string(),
+        })
+    })
+}
+
+/// Why [`within`] has no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unanswered {
+    /// The call was still running at the deadline; it is left behind.
+    Deadline(Duration),
+    /// The call's thread ended without an answer (it panicked).
+    Died,
+    /// No thread could be started for it.
+    NoThread,
+}
+
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unanswered::Deadline(deadline) => write!(
+                f,
+                "the shared state did not answer within {} ms",
+                deadline.as_millis()
+            ),
+            Unanswered::Died => write!(f, "the call to the shared state died"),
+            Unanswered::NoThread => write!(f, "no thread could be started for the shared state"),
+        }
+    }
+}
+
+/// Run `call` on the state on a thread of its own, which owns an [`Arc`]
+/// of it and prints nothing, and wait for its answer at most `deadline`.
+/// A caller past its deadline leaves the call behind: it ends with the
+/// process, and a hold it was renewing or giving back ends by its TTL.
+pub fn within<T: Send + 'static>(
+    state: &Arc<dyn SharedState>,
+    deadline: Duration,
+    call: impl FnOnce(&dyn SharedState) -> T + Send + 'static,
+) -> Result<T, Unanswered> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let owned = Arc::clone(state);
+    std::thread::Builder::new()
+        .name("relais-shared-state".into())
+        .spawn(move || {
+            let _ = sender.send(call(&*owned)); // after its deadline nobody waits for it
+        })
+        .map_err(|_| Unanswered::NoThread)?;
+    receiver.recv_timeout(deadline).map_err(|e| match e {
+        std::sync::mpsc::RecvTimeoutError::Timeout => Unanswered::Deadline(deadline),
+        std::sync::mpsc::RecvTimeoutError::Disconnected => Unanswered::Died,
+    })
+}
+
+/// A session is still working: renew its shared `work` holds, then move
+/// its claim files' refresh time to `now` ([`Store::refresh_session_once`]).
+pub fn refresh_session(
+    state: &Arc<dyn SharedState>,
+    store: &Store,
+    session: &str,
+    now: i64,
+    deadline: Option<Duration>,
+) -> SessionPass {
+    let holder = Principal::operator(session);
+    SessionPass {
+        shared: session_call(state, &holder, deadline, |s, h| s.renew_tickets(h)),
+        local: store.refresh_session_once(session, now),
+    }
+}
+
+/// A session ended: give back its shared `work` holds, then delete its
+/// `work` claim files and keep its `handoff` ones
+/// ([`Store::end_session_once`]).
+pub fn end_session(
+    state: &Arc<dyn SharedState>,
+    store: &Store,
+    session: &str,
+    now: i64,
+    deadline: Option<Duration>,
+) -> SessionPass {
+    let holder = Principal::operator(session);
+    SessionPass {
+        shared: session_call(state, &holder, deadline, |s, h| s.release_tickets(h)),
+        local: store.end_session_once(session, now),
+    }
+}
+
 /// Claim a successor intent for the run minted for it.
 pub fn claim_intent(
     state: &dyn SharedState,
@@ -391,20 +617,37 @@ pub fn registry_pointer(
 
 /// Point the registry at `evaluated` when the active pointer still names
 /// `expected`; else [`SharedStateError::CasConflict`].
+///
+/// Under the node's pointer lock, taken before any pointer is read and
+/// held across the shared compare-and-set and the local write: two
+/// writers on one node never interleave, and a shared swap's local half
+/// always lands on the pointers it was judged against.
 pub fn swap_registry_pointer(
     state: &dyn SharedState,
     registry: &Registry,
     expected: Option<&str>,
     evaluated: &EvaluatedArtifact,
 ) -> Result<(), NodeError> {
+    swap_within(state, registry, expected, evaluated, REGISTRY_LOCK_WAIT)
+}
+
+/// [`swap_registry_pointer`] with the lock wait given.
+pub(crate) fn swap_within(
+    state: &dyn SharedState,
+    registry: &Registry,
+    expected: Option<&str>,
+    evaluated: &EvaluatedArtifact,
+    wait: Duration,
+) -> Result<(), NodeError> {
+    let _lock = pointer_lock(registry, wait)?;
+    heal(state, registry)?;
     let to = evaluated.artifact_id();
     match state.swap_registry_pointer(expected, Some(to))? {
-        Swap::NodeDecides => swap_locally(registry, expected, evaluated),
+        Swap::NodeDecides => {
+            compare_locally(registry, expected)?;
+            Ok(registry.promote(evaluated)?)
+        }
         // The shared compare-and-set decided; the local promote follows.
-        // holds-until: an-t18 routes the learning cycle's promote and
-        // rollback through `SharedState`; until then a promote killed
-        // between the two halves leaves the shared pointer ahead, and only
-        // the next `relais promote` brings the two back together.
         Swap::Swapped => match registry.promote(evaluated) {
             Ok(()) => Ok(()),
             Err(local) => {
@@ -415,45 +658,96 @@ pub fn swap_registry_pointer(
     }
 }
 
-/// Compare and promote the node's own pointer files, under an flock.
-fn swap_locally(
+/// Make the registry's previous artifact active again when the active
+/// pointer still names `expected` (the artifact the caller judged): the
+/// id restored, `None` when there is no previous artifact to return to
+/// (none, or it is `expected` itself), else
+/// [`SharedStateError::CasConflict`]. Under the same lock as
+/// [`swap_registry_pointer`], so a rollback and a promote judged against
+/// the same artifact cannot both land.
+pub fn roll_back_registry(
+    state: &dyn SharedState,
     registry: &Registry,
-    expected: Option<&str>,
-    evaluated: &EvaluatedArtifact,
-) -> Result<(), NodeError> {
-    // `Registry::promote` takes no lock; this one makes compare and
-    // swap one step against every other swap through the trait.
-    // holds-until: the learning cycle's automatic promote and rollback
-    // (`learn/cycle.rs`) go through `SharedState`; until then they
-    // write the pointer without this lock and can race a swap. It is
-    // an flock, released by the kernel when the process dies, and the
-    // file is never deleted, so a killed promote leaves nothing stale.
-    // Beside the pointer files, outside `artifacts/`, which `list` reads.
-    let artifacts = registry.artifacts_dir();
-    let path = artifacts
-        .parent()
-        .unwrap_or(artifacts)
-        .join(".pointer.lock");
-    let started = std::time::Instant::now();
-    let _lock = loop {
-        match LockFile::try_acquire(&path) {
-            Ok(Some(lock)) => break lock,
-            Ok(None) if started.elapsed() < REGISTRY_LOCK_WAIT => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Ok(None) => {
-                return Err(SharedStateError::Refused {
-                    reason: format!(
-                        "another promotion held {} for {}s",
-                        path.display(),
-                        REGISTRY_LOCK_WAIT.as_secs()
-                    ),
-                }
-                .into())
-            }
-            Err(cause) => return Err(NodeError::Lock { path, cause }),
-        }
+    expected: &str,
+) -> Result<Option<String>, NodeError> {
+    roll_back_within(state, registry, expected, REGISTRY_LOCK_WAIT)
+}
+
+/// [`roll_back_registry`] with the lock wait given.
+pub(crate) fn roll_back_within(
+    state: &dyn SharedState,
+    registry: &Registry,
+    expected: &str,
+    wait: Duration,
+) -> Result<Option<String>, NodeError> {
+    let _lock = pointer_lock(registry, wait)?;
+    heal(state, registry)?;
+    compare_locally(registry, Some(expected))?;
+    let Some(previous) = registry.previous_id()?.filter(|id| id != expected) else {
+        return Ok(None);
     };
+    match state.swap_registry_pointer(Some(expected), Some(&previous))? {
+        Swap::NodeDecides => Ok(registry.rollback()?),
+        Swap::Swapped => match registry.rollback() {
+            Ok(restored) => Ok(restored),
+            Err(local) => {
+                let back = state
+                    .swap_registry_pointer(Some(&previous), Some(expected))
+                    .map(|_| ());
+                Err(compensated(local.into(), back))
+            }
+        },
+    }
+}
+
+/// The learning cycle's and `relais rollback`'s pointer writes, through
+/// [`swap_registry_pointer`] and [`roll_back_registry`]: the CLI builds one
+/// around the state it selected and hands it to `learn::cycle`.
+pub struct NodePointers(pub Arc<dyn SharedState>);
+
+impl NodePointers {
+    fn refusal(e: NodeError) -> PointerRefusal {
+        match e {
+            NodeError::Shared(SharedStateError::CasConflict { found, .. }) => {
+                PointerRefusal::Superseded { found }
+            }
+            NodeError::Shared(SharedStateError::Refused { reason }) => {
+                PointerRefusal::Refused(reason)
+            }
+            NodeError::Compensation { local, release } => PointerRefusal::Compensated {
+                local: local.to_string(),
+                release: release.to_string(),
+            },
+            e @ (NodeError::Shared(_)
+            | NodeError::Lock { .. }
+            | NodeError::Ledger(_)
+            | NodeError::Claim(_)
+            | NodeError::Registry(_)) => PointerRefusal::Failed(Box::new(e)),
+        }
+    }
+}
+
+impl PointerWrites for NodePointers {
+    fn promote(
+        &self,
+        registry: &Registry,
+        expected: Option<&str>,
+        evaluated: &EvaluatedArtifact,
+    ) -> Result<(), PointerRefusal> {
+        swap_registry_pointer(&*self.0, registry, expected, evaluated).map_err(Self::refusal)
+    }
+
+    fn roll_back(
+        &self,
+        registry: &Registry,
+        expected: &str,
+    ) -> Result<Option<String>, PointerRefusal> {
+        roll_back_registry(&*self.0, registry, expected).map_err(Self::refusal)
+    }
+}
+
+/// The node's own active pointer must name `expected`.
+fn compare_locally(registry: &Registry, expected: Option<&str>) -> Result<(), NodeError> {
     let found = registry.active_id()?;
     if found.as_deref() != expected {
         return Err(SharedStateError::CasConflict {
@@ -462,7 +756,93 @@ fn swap_locally(
         }
         .into());
     }
-    Ok(registry.promote(evaluated)?)
+    Ok(())
+}
+
+/// Complete a promote that died between its shared swap and its local
+/// one: when the shared pointer names an artifact the node's own active
+/// pointer does not, and this node holds that artifact with its evidence,
+/// it becomes active here too (one stderr note says so). An artifact this
+/// node does not hold, or whose evidence does not check, is a
+/// [`SharedStateError::CasConflict`] naming it: the node never guesses.
+/// "The node decides" never heals, so one node behaves as it always did.
+/// The caller holds the pointer lock.
+fn heal(state: &dyn SharedState, registry: &Registry) -> Result<(), NodeError> {
+    let Pointer::Shared(Some(shared)) = state.registry_pointer()? else {
+        return Ok(());
+    };
+    let local = registry.active_id()?;
+    if local.as_deref() == Some(shared.as_str()) {
+        return Ok(());
+    }
+    let evaluated = match registry.evaluated(&shared) {
+        Ok(evaluated) => evaluated,
+        // The node cannot read its own files: that is the error, not the
+        // shared pointer.
+        Err(e @ ArtifactError::Io(_)) => return Err(e.into()),
+        Err(
+            why @ (ArtifactError::Malformed(_)
+            | ArtifactError::IncompatibleSchema { .. }
+            | ArtifactError::DimensionMismatch { .. }
+            | ArtifactError::NonFinite
+            | ArtifactError::Unknown { .. }
+            | ArtifactError::NoEvidence { .. }
+            | ArtifactError::EvidenceMismatch { .. }
+            | ArtifactError::GatesFailed { .. }
+            | ArtifactError::VerdictNotReproducible { .. }),
+        ) => {
+            return Err(SharedStateError::Refused {
+                reason: format!(
+                    "the shared registry pointer names {shared}, which this node cannot make \
+                     active ({why}); nothing changed, and nothing run here moves past it until \
+                     {shared} is stored here with its evidence or another node moves the shared \
+                     pointer"
+                ),
+            }
+            .into())
+        }
+    };
+    registry.promote(&evaluated)?;
+    eprintln!(
+        "relais: the shared registry pointer names {shared} and this node's named {}; \
+         {shared} is now active here too (a promote stopped between its two halves)",
+        local.as_deref().unwrap_or("nothing")
+    );
+    Ok(())
+}
+
+/// The node's pointer lock: an flock beside the pointer files, outside
+/// `artifacts/` (which `list` reads), released by the kernel when the
+/// process dies and never deleted, so a killed writer leaves nothing
+/// stale. The wait is bounded ([`REGISTRY_LOCK_WAIT`]); a lock still held
+/// after it is [`SharedStateError::Refused`].
+fn pointer_lock(registry: &Registry, wait: Duration) -> Result<LockFile, NodeError> {
+    let artifacts = registry.artifacts_dir();
+    let path = artifacts
+        .parent()
+        .unwrap_or(artifacts)
+        .join(".pointer.lock");
+    let started = std::time::Instant::now();
+    loop {
+        match LockFile::try_acquire(&path) {
+            Ok(Some(lock)) => return Ok(lock),
+            Ok(None) if started.elapsed() < wait => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) => {
+                return Err(SharedStateError::Refused {
+                    reason: format!(
+                        "another relais process holds the registry lock {} \
+                         (waited {}s); nothing changed, run it again",
+                        path.display(),
+                        wait.as_secs()
+                    ),
+                }
+                .into())
+            }
+            Err(cause) => return Err(NodeError::Lock { path, cause }),
+        }
+    }
 }
 
 #[cfg(test)]

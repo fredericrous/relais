@@ -379,6 +379,9 @@ fn eight_threads_over_fifty_rounds_never_hand_one_ticket_to_two_sessions() {
                     let store = Store::in_state_dir(&state);
                     barrier.wait();
                     claim::next(
+                        &relais::shared_state::node::NodeReservations(
+                            &relais::shared_state::LocalState::new(),
+                        ),
                         &store,
                         Some(&programme),
                         &[],
@@ -429,6 +432,9 @@ fn two_callers_from_exhausted_programmes_reserve_at_most_one_ticket_in_one_empty
                     let exhausted = state_of(name, "done", &[]);
                     barrier.wait();
                     claim::next(
+                        &relais::shared_state::node::NodeReservations(
+                            &relais::shared_state::LocalState::new(),
+                        ),
                         &store,
                         Some(&exhausted),
                         std::slice::from_ref(&*destination),

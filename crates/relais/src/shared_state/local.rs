@@ -189,6 +189,26 @@ impl SharedState for LocalState {
         Ok(())
     }
 
+    fn reserve_handoff(&self, _request: &TicketRequest) -> Result<TicketAnswer, SharedStateError> {
+        // The claim file decides; a handoff claim is never fenced.
+        Ok(TicketAnswer::NodeDecides)
+    }
+
+    fn renew_tickets(&self, _holder: &Principal) -> Result<(), SharedStateError> {
+        // Nothing expires here: the claim files keep their own times.
+        Ok(())
+    }
+
+    fn release_tickets(&self, holder: &Principal) -> Result<(), SharedStateError> {
+        // The fences this instance handed the holder for its tickets end.
+        for (resource, entry) in self.epochs().iter_mut() {
+            if matches!(resource, ResourceId::Ticket { .. }) && entry.1.as_ref() == Some(holder) {
+                entry.1 = None;
+            }
+        }
+        Ok(())
+    }
+
     fn claim_intent(
         &self,
         _intent_id: &str,
