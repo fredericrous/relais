@@ -235,6 +235,22 @@ and `RemoteGate` with a degraded fake answers `Queued`.
   the shared primary`); Behaviour keeps the reviewed wording, which these
   supersede.
 
+- 2026-11-24 (merge of origin/main, #573 #574 #575): the branch merged main
+  (one conflict, docs/shared-state.md, kept both sides; the CHANGELOG entry
+  sits under Unreleased) and the checks reran on the merged tree 458aff5d:
+  `cargo clippy -p relais --all-targets --features conformance -- -D
+  warnings` clean (275 s) and `cargo test -q --workspace --features
+  relais/conformance` exit 0 (1114 s). The Verification rows below that say
+  "the final tree" name the pre-merge tree d9a46f0a; this line is the merged
+  tree's record.
+- 2026-11-24: under `shared_state = "external"` the daemon refuses a host with
+  no name (exit 3, `Blocked`), not the plan's `local` holder: two nodes named
+  `local` would defeat the fence. `local` still names the holder under
+  `LocalState`.
+- 2026-11-24: the daemon's own read of its limits from the settings file
+  stays direct (a non-goal here, an-t14's narrowing); it stops being right
+  once an external client serves different limits (follow-up).
+
 ## Verification
 
 | Check | Input | Expected | Actual |
