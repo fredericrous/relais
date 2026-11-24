@@ -240,8 +240,10 @@ pub(crate) fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome,
             let shared = super::ctx::shared_state()?;
             let Some(holder) = seat_holder(shared.selection(), relais::procs::host_name()) else {
                 coordinator::log_line(
-                    "shared_state = \"external\" needs this host's name to hold shared \
-                     seats, and the OS gives none; set a host name",
+                    "set this machine's host name (`scutil --set HostName <name>` on macOS, \
+                     `hostnamectl set-hostname <name>` on Linux), or set shared_state = \"local\": \
+                     shared_state = \"external\" names this node by its host name, and the OS \
+                     gives none",
                 );
                 return Ok(CliOutcome::Blocked);
             };

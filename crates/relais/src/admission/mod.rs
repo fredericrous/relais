@@ -1210,7 +1210,7 @@ pub struct AdmissionState {
 /// shared state (an-t17): a `model_work` dispatch whose lifecycle holds a
 /// seat.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SharedSeat {
+pub(crate) struct SharedSeat {
     pub dispatch_id: String,
     /// What the dispatch reserves, in micro-USD, never below zero.
     pub reserve_micros: i64,
@@ -1222,7 +1222,7 @@ pub struct SharedSeat {
 /// What a settle booked for one agent dispatch: the spend reported, or the
 /// reservation when usage was unknown.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpendBooked {
+pub(crate) struct SpendBooked {
     pub dispatch_id: String,
     pub booked_micros: i64,
 }
@@ -1281,12 +1281,12 @@ impl AdmissionState {
 
     /// Start journalling what agent dispatches settle, for the coordinator
     /// to hand to the shared state ([`Self::take_spend_journal`]).
-    pub fn track_shared_spend(&mut self) {
+    pub(crate) fn track_shared_spend(&mut self) {
         self.spend_journal.get_or_insert_with(Vec::new);
     }
 
     /// The settles journalled since the last call.
-    pub fn take_spend_journal(&mut self) -> Vec<SpendBooked> {
+    pub(crate) fn take_spend_journal(&mut self) -> Vec<SpendBooked> {
         self.spend_journal
             .as_mut()
             .map(std::mem::take)
@@ -1296,7 +1296,7 @@ impl AdmissionState {
     /// The agent dispatches that hold a seat, for the shared state to
     /// mirror. Local classes (heavy, indexing, training) bound this
     /// machine only and are not listed.
-    pub fn shared_seats(&self) -> Vec<SharedSeat> {
+    pub(crate) fn shared_seats(&self) -> Vec<SharedSeat> {
         self.dispatches
             .iter()
             .filter(|(_, d)| d.class.is_agent() && d.lifecycle.holds_seat())
@@ -1309,7 +1309,7 @@ impl AdmissionState {
     }
 
     /// Whether `dispatch_id` is still an entry (any lifecycle).
-    pub fn has_dispatch(&self, dispatch_id: &str) -> bool {
+    pub(crate) fn has_dispatch(&self, dispatch_id: &str) -> bool {
         self.dispatches.contains_key(dispatch_id)
     }
 
@@ -1318,7 +1318,7 @@ impl AdmissionState {
     /// admission, which keeps its local seat, stays withdrawable and asks
     /// again at the caller's next poll. Acts only on a claimed dispatch
     /// that nothing is bound to yet; answers whether it did.
-    pub fn unclaim(&mut self, dispatch_id: &str, now: Instant) -> bool {
+    pub(crate) fn unclaim(&mut self, dispatch_id: &str, now: Instant) -> bool {
         let Some(dispatch) = self.dispatches.get_mut(dispatch_id) else {
             return false;
         };
@@ -1338,7 +1338,7 @@ impl AdmissionState {
     /// withdrawal does, without remembering the id as finished. Acts only
     /// on a claimed dispatch nothing is bound to yet; answers whether it
     /// did.
-    pub fn revoke_grant(&mut self, dispatch_id: &str, now: Instant) -> bool {
+    pub(crate) fn revoke_grant(&mut self, dispatch_id: &str, now: Instant) -> bool {
         let unlaunched = self.dispatches.get(dispatch_id).is_some_and(|dispatch| {
             dispatch.lifecycle == Lifecycle::Claimed
                 && matches!(dispatch.binding, Binding::Unbound { .. })

@@ -2,7 +2,7 @@ use super::*;
 use crate::admission::{
     DispatchRequest, DispatchSource, ResourceClass, RunRegistration, WithdrawOutcome,
 };
-use crate::coordinator::{mirror_seats, Response};
+use crate::coordinator::{answer_after_seats, Response};
 use crate::policy::ConcurrencyLimits;
 use crate::shared_state::fake::FakeState;
 use crate::shared_state::{LocalState, Slice};
@@ -64,10 +64,10 @@ fn book(shared: Arc<dyn SharedState>) -> (SeatBook, Arc<Mutex<Vec<String>>>) {
 /// What a handler answers an admission request: `handle`, then the seats.
 fn admit(book: &SeatBook, state: &Mutex<AdmissionState>, request: &DispatchRequest) -> Decision {
     let decision = super::super::lock_state(state).request(request, Instant::now());
-    match mirror_seats(
+    book.sync_request(state, Some(&request.dispatch_id));
+    match answer_after_seats(
         book,
         state,
-        true,
         Some(&request.dispatch_id),
         Response::Decision { decision },
     ) {
@@ -136,7 +136,7 @@ fn an_unreachable_primary_turns_the_grant_into_a_wait_until_it_grants() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|line| line.contains("shared seat not granted"))
+        .filter(|line| line.contains("the shared state did not grant the seat"))
         .count();
     assert_eq!(
         downgrades, 1,
@@ -166,8 +166,10 @@ fn an_exhausted_slice_refuses_the_grant_as_a_budget_and_the_id_may_ask_again() {
             assert_eq!(
                 detail,
                 format!(
-                    "shared spend slice exhausted: reservation {} micros, slice left {slice} micros",
-                    slice + 1
+                    "this node's share of the shared budget is used up: this run needs {}, {} is \
+                     left; raise this node's share on the shared primary, or wait for the next day",
+                    crate::money::MicroUsd::from_micros(slice + 1),
+                    crate::money::MicroUsd::from_micros(slice)
                 )
             );
         }
@@ -355,16 +357,70 @@ fn the_coordinator_answers_a_refused_shared_seat_as_queued() {
         .expect("shutdown");
     server.join().expect("joined").expect("served");
     assert!(
-        fake.renew_seat(&LeaseToken {
-            resource: crate::shared_state::ResourceId::Seat {
-                node: "fake".into(),
-                dispatch: "d1".into(),
-            },
-            holder: Principal::node("node-a"),
-            epoch: 1,
-            expires_at: None,
-        })
-        .is_err(),
+        matches!(
+            fake.renew_seat(&LeaseToken {
+                resource: crate::shared_state::ResourceId::Seat {
+                    node: "fake".into(),
+                    dispatch: "d1".into(),
+                },
+                holder: Principal::node("node-a"),
+                epoch: 1,
+                expires_at: None,
+            }),
+            Err(crate::shared_state::SharedStateError::LeaseLost { .. })
+        ),
         "the seat went back when the daemon stopped"
     );
+}
+
+/// While the primary is down, one sync stops at its first unreachable
+/// answer: three waiting settles cost one shared call and one line, not
+/// three, and every one is booked once the primary is back.
+#[test]
+fn an_unreachable_primary_stops_the_sync_at_its_first_call() {
+    let fake = FakeState::new();
+    let (book, lines) = book(Arc::new(fake.clone()));
+    let state = admission(3);
+    for id in ["s1", "s2", "s3"] {
+        assert_eq!(admit(&book, &state, &agent(id, 100)), Decision::Granted);
+    }
+    fake.set_degraded(Some("network down"));
+    {
+        let mut admission = super::super::lock_state(&state);
+        for id in ["s1", "s2", "s3"] {
+            admission.settle(id, Some(10), Instant::now());
+            admission.release(id, Instant::now());
+        }
+    }
+    book.sync(&state);
+    let failed = |lines: &Arc<Mutex<Vec<String>>>| {
+        lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| {
+                line.contains("settle failed")
+                    || line.contains("giving the shared seat back failed")
+            })
+            .count()
+    };
+    assert_eq!(
+        failed(&lines),
+        1,
+        "the pass stopped at the first call: {lines:?}"
+    );
+    assert!(
+        book.lease("s3").is_some(),
+        "a freed seat keeps its token while the primary is down"
+    );
+
+    fake.set_degraded(None);
+    book.sync(&state);
+    assert_eq!(fake.spent().to_micros(), 30, "every settle is booked once");
+    for id in ["s1", "s2", "s3"] {
+        assert!(
+            book.lease(id).is_none(),
+            "{id} is released once the primary is back"
+        );
+    }
 }

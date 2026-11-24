@@ -41,7 +41,7 @@ use crate::procs::{kill, terminate, LockFile};
 use crate::shared_state::{Principal, SharedState};
 
 mod seats;
-pub use seats::{LogSink, SeatBook, SeatRefusal};
+pub use seats::{LogSink, SeatBook};
 
 /// Write one line to the daemon's stderr (the coordinator log), starting
 /// with an RFC 3339 UTC timestamp. Every line the serving daemon writes
@@ -693,7 +693,7 @@ pub struct Coordinator {
     /// reap orphaned runs; `None` when the daemon runs without one.
     ledger_path: Option<PathBuf>,
     /// The agent seats mirrored into the shared state (an-t17).
-    pub seats: Arc<SeatBook>,
+    seats: Arc<SeatBook>,
 }
 
 /// Atomic election (SPEC §23): an OS lock on `coordinator.lock`, held
@@ -1582,10 +1582,14 @@ fn handle_connection(
                 // What the shared seats need from this request: none for
                 // the read-only ones, and the dispatch an admission asks
                 // for, whose grant waits on its shared seat.
-                let mirrors = !matches!(request, Request::Ping | Request::Status);
-                let admitting = match &request {
-                    Request::RequestAdmission { request } => Some(request.dispatch_id.clone()),
-                    _ => None,
+                let mirrors =
+                    !matches!(request, Request::Ping | Request::Status | Request::Shutdown);
+                // Only an admission asks for a seat grant; every other
+                // request leaves new seats to the tick.
+                let admitting = if let Request::RequestAdmission { request } = &request {
+                    Some(request.dispatch_id.clone())
+                } else {
+                    None
                 };
                 let waiting = Instant::now();
                 // Markers are read only for the requests that can change
@@ -1609,7 +1613,10 @@ fn handle_connection(
                 journaled = (after > before).then_some(after);
                 signals = pending;
                 // The shared seats, with the admission guard gone (A6).
-                mirror_seats(seats, state, mirrors, admitting.as_deref(), response)
+                if mirrors {
+                    seats.sync_request(state, admitting.as_deref());
+                }
+                answer_after_seats(seats, state, admitting.as_deref(), response)
             }
             Err(e) => {
                 served.kind = "unparseable";
@@ -1661,20 +1668,15 @@ fn handle_connection(
     Ok(())
 }
 
-/// After a request was handled, with the admission guard gone (A6):
-/// mirror the seats into the shared state, unless the request was
-/// read-only (`mirrors` false), and let a grant to `admitting` wait on its
-/// shared seat ([`SeatBook::answer_grant`]).
-pub(crate) fn mirror_seats(
+/// After a request was handled and the seats synced, with the admission
+/// guard gone (A6): let a grant to `admitting` wait on its shared seat
+/// ([`SeatBook::answer_grant`]).
+pub(crate) fn answer_after_seats(
     seats: &SeatBook,
     state: &Mutex<AdmissionState>,
-    mirrors: bool,
     admitting: Option<&str>,
     response: Response,
 ) -> Response {
-    if mirrors {
-        seats.sync_request(state, admitting);
-    }
     match (response, admitting) {
         (
             Response::Decision {

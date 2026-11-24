@@ -186,13 +186,13 @@ and `RemoteGate` with a degraded fake answers `Queued`.
 
 ## Phases
 
-- [ ] Phase 1 — seat book, admission hooks, coordinator wiring and tests:
+- [x] Phase 1 — seat book, admission hooks, coordinator wiring and tests:
   `crates/relais/src/coordinator/seats.rs`,
   `crates/relais/src/coordinator/mod.rs`,
   `crates/relais/src/admission/mod.rs`,
   `crates/relais/src/cli/coordinator.rs`,
   `crates/relais/src/shared_state/mod.rs`
-- [ ] Phase 2 — docs: `docs/shared-state.md` (move seats from "not routed"
+- [x] Phase 2 — docs: `docs/shared-state.md` (move seats from "not routed"
   to routed, with the answers above), `CHANGELOG.md`
 - [ ] Phase 3 — homelab: the an-t17 Resolution and its Decisions-so-far
   line: `docs/programmes/agents-many-nodes/an-t17-route-seats-through-shared-state.md`,
@@ -209,17 +209,18 @@ and `RemoteGate` with a degraded fake answers `Queued`.
   Resolution leaves the global counter's writer to an-t17).
 - 2026-11-24: the fleet pack refresh did not ride this branch: its commit
   conflicted with main's newer pack in the rebase and was skipped.
-- 2026-11-24: the ticket owns the global counter's writer, so
-  `shared_state/node.rs` `daily_spent` drops its ledger floor
-  (`holds-until: an-t17`): the global counter alone is the day when the
-  implementation keeps one, else the ledger. Its test is renamed and now pins
-  that (the one existing test edited beyond the `Coordinator::start`
-  argument).
-- 2026-11-24: accepted gap. Spend that never passes through the daemon's
-  `settle_spend` (a `relais run` with no daemon, the runner's own settles)
-  is not in the global counter, and with the floor gone the cap does not see
-  it under an external primary. No external client exists yet; the follow-up
-  is to have the runner's settles feed the counter too.
+- 2026-11-24: the ticket wires the global counter's writer (`settle_spend`
+  from the seat book), but `node::daily_spent` keeps its ledger floor: the
+  architect review found spend that still reaches only the ledger (the
+  runner's own settles, a dispatch whose reserve failed after launch, settles
+  waiting at a restart), so the `holds-until` condition is not met. The
+  comment now names those three; dropping the floor is a follow-up.
+- 2026-11-24 (F4b round 1): one sync stops making shared calls at its first
+  unreachable answer, so a request served while the primary is down pays one
+  failed call (backend finding 1); `Shutdown` no longer syncs; the flag
+  argument, the `&mut Book` out-parameters, the nested `Option` and the
+  string operation keys became `Book` methods and enums; the seat book's
+  types are `pub(crate)`; the budget and wait lines say what to do.
 
 ## Verification
 
@@ -227,9 +228,9 @@ and `RemoteGate` with a degraded fake answers `Queued`.
 |---|---|---|---|
 | seat tests | `cargo test -p relais --lib coordinator::seats` | the fake tests above pass | `cargo test -p relais --lib coordinator::` passed (347 s, before a dead-constant removal); the final tree is covered by the workspace row |
 | conformance | `cargo test -p relais --lib --features conformance shared_state::` | unchanged, pass | the same workspace run with `relais/conformance` (the conformance cases run there; `node::daily_spent` is exercised by `a_fresh_state_is_online_and_empty`): passed |
-| suite | `cargo test --workspace` | passes with no existing test edited beyond the `Coordinator::start` argument | `cargo test -q --workspace --features relais/conformance`: passed (1503 s, no warnings), the final tree. One existing test edited beyond the `Coordinator::start` argument: `node::daily_spent_tests` renamed and now pinning the dropped floor |
+| suite | `cargo test --workspace` | passes with no existing test edited beyond the `Coordinator::start` argument | `cargo test -q --workspace --features relais/conformance`: passed (1503 s, no warnings) before the F4b fixes; rerun after them: passed (892 s, the final tree). No existing test edited beyond the `Coordinator::start` argument (the `daily_spent` floor and its test are as on main) |
 | piloted daemon | branch binary, scratch `RELAIS_STATE_DIR`: `relais coordinator daemon` with `shared_state` absent, then `= "external"` | absent: serves, `relais coordinator status` as on `main`; external: one stderr line, empty stdout, exit 3, no socket created (check before bind) | scratch `RELAIS_CONFIG_DIR` and `RELAIS_STATE_DIR` (binary built by the workspace run with `relais/conformance`): absent, the daemon serves (`relais coordinator status` shows the socket and limits) and `stop` ends it; external, exit 3, empty stdout, one stderr line, no socket created |
-| lint | `cargo clippy -p relais --all-targets --features conformance -- -D warnings` | clean | see the commit |
+| lint | `cargo clippy -p relais --all-targets --features conformance -- -D warnings` | clean | `cargo clippy -p relais --all-targets --features conformance -- -D warnings`: clean (328 s) before the F4b fixes; rerun after them: clean (96 s, the final tree). |
 | counter writer | `FakeState` test: one grant, then settle | shared counter shows the reservation after grant and the settled amount after settle | `a_grant_takes_a_seat_and_a_reservation_and_the_settle_books_the_spend`: pass |
 | socket downgrade | `cargo test -p relais --lib coordinator::` socket test with a degraded `FakeState` | the admission reply is `Queued { position: 1 }` with the stderr line; after recovery the next poll is `Granted` | `an_unreachable_primary_turns_the_grant_into_a_wait_until_it_grants` and `the_coordinator_answers_a_refused_shared_seat_as_queued`: pass |
 

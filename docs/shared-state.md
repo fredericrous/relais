@@ -35,9 +35,12 @@ back to an older relais.
 | the runner's widen and timed-out settles | `relais run`, `relais dataset replay` |
 | coordinator seats and their spend reservations | `relais coordinator daemon` (below) |
 
-The ceiling check reads the global counter when the implementation keeps
-one (the coordinator's settles feed it), else this node's ledger. A shared
-read that fails stops the run before dispatch.
+The ceiling check reads the larger of the global counter and this node's
+ledger. The coordinator's settles feed the counter (below), but some spend
+still reaches only the ledger (the runner's own settles, a dispatch whose
+reserve failed after launch, settles lost on a restart), so the ledger stays
+the floor until all of it reaches the counter. A shared read that fails stops
+the run before dispatch.
 
 Not routed yet, so under `external` they still read or write the node's own
 files: the daemon's read of its limits in `cli/coordinator.rs`; `relais
@@ -83,6 +86,10 @@ state:
   never claimed) settles its reservation at zero. A request takes only
   the seat it asks for; other new seats (a dispatch drained from the
   queue, an adopted one) are taken at the next tick or at their own poll.
+  Once a pass finds the primary unreachable it makes no more shared calls:
+  the waiting settles, the freed seats (which keep their tokens) and the
+  new seats are tried again at the next sync, so a request served while
+  the primary is down pays for one failed call, not one per seat.
 - Each tick renews every held seat. A seat found `lease_lost` is not taken
   again: its work in flight finishes and its reservation settles as a
   true-up.
@@ -90,15 +97,18 @@ state:
   unreachable, is answered `Queued`: the runner and the hook poll it within
   their admission wait, and each poll asks the shared state again. A
   reservation the node's slice cannot cover is answered `Refused
-  (budget_exceeded)`, `shared spend slice exhausted: reservation <n> micros,
-  slice left <m> micros`. A dispatch already running keeps its seat when its
+  (budget_exceeded)`, `this node's share of the shared budget is used up:
+  this run needs $<n>, $<m> is left; raise this node's share on the shared
+  primary, or wait for the next day`. A dispatch already running keeps its seat when its
   reservation fails; its spend is then booked on the node only.
 - The daemon's stderr carries one line per change, never the lease token:
-  `seat <dispatch>: shared seat not granted (<cause>); the dispatch waits
-  until the shared state grants it`, then `seat <dispatch>: shared seat
-  granted`; `renew`, `release`, `reserve` and `settle` failures likewise.
+  `seat <dispatch>: the shared state did not grant the seat (<cause>); this
+  run waits and asks again; if it lasts, check the shared primary`, then
+  `seat <dispatch>: shared seat granted`; `renew`, `release`, `reserve` and
+  `settle` failures likewise.
 - The holder is `Principal::node(<host name>)`, so two nodes never share
-  one; under `external` a host with no name is refused (exit 3). A restarted
+  one; under `external` a host with no name is refused (exit 3, with the
+  command that sets one). A restarted
   daemon on the same host takes its adopted seats again at a higher epoch,
   which fences the dead daemon's tokens.
 - When the daemon stops (`relais coordinator stop`, the idle exit) every

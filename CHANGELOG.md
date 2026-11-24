@@ -92,10 +92,7 @@ prints `make: 1 carried` with no timings, which are the source attempt's.
   (budget_exceeded)`. The daemon writes one stderr line per change of a
   seat's shared state. The holder is the host's name. `Coordinator::start`
   and `run_daemon` take the shared state and the holder. With `LocalState`
-  every seat is granted, so a single node answers as before. The daily spend ceiling now
-  reads the global counter alone when the implementation keeps one (it no
-  longer takes the larger of it and this node's ledger); `LocalState` keeps
-  none, so a single node still reads its ledger.
+  every seat is granted, so a single node answers as before.
 - Breaking, for a client of `relais::shared_state`: the error and grant types
   are settled before a closed client is built. `SharedStateError` no longer
   has `Lock`, `Ledger`, `Claim`, `Registry` or `Compensation`; the `node`

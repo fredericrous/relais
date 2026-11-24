@@ -37,15 +37,47 @@ pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 /// Why the shared half did not give a dispatch its seat, as the last
 /// attempt found it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SeatRefusal {
+pub(crate) enum SeatRefusal {
     /// The seat or its reservation was refused, or the primary is
     /// unreachable: the dispatch waits and asks again.
-    Wait { cause: String },
+    Wait,
     /// This node's spend slice cannot cover the reservation.
     SliceExhausted {
-        reserve_micros: i64,
-        remaining_micros: i64,
+        reserve: MicroUsd,
+        remaining: MicroUsd,
     },
+}
+
+/// The shared operation a failure line is about, so each is written once
+/// per change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SeatOp {
+    Seat,
+    Reserve,
+    Settle,
+    Renew,
+    Release,
+}
+
+/// Which new seats one sync acquires.
+#[derive(Debug, Clone, Copy)]
+enum Acquire<'a> {
+    /// Every new seat (the reconcile tick).
+    Every,
+    /// Only this dispatch's (the request that asks a seat for it).
+    Only(&'a str),
+    /// None (a request that asks no seat): new seats wait for the tick.
+    NoNew,
+}
+
+impl Acquire<'_> {
+    fn takes(self, dispatch_id: &str) -> bool {
+        match self {
+            Self::Every => true,
+            Self::Only(only) => only == dispatch_id,
+            Self::NoNew => false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -61,11 +93,100 @@ struct Book {
     /// The last acquire or reserve that failed, per dispatch; read by the
     /// handler that granted the dispatch.
     refused: BTreeMap<String, SeatRefusal>,
+    // holds-until: settles are persisted (follow-up to an-t17); until then
+    // a restart loses the ones still waiting, and the ledger floor in
+    // `node::daily_spent` keeps the cap from counting less than this node
+    // spent.
     /// Settles the primary has not taken yet, oldest first.
     settles: Vec<(String, Reservation, MicroUsd)>,
     /// The failure line last written per dispatch and operation, so each
     /// failure is written once per change, not once per sync.
-    failing: BTreeMap<(String, &'static str), String>,
+    failing: BTreeMap<(String, SeatOp), String>,
+}
+
+impl Book {
+    /// Write `line` for `(dispatch, op)` unless it is the line already
+    /// written for it.
+    fn fail(&mut self, log: &LogSink, dispatch: &str, op: SeatOp, line: String) {
+        let key = (dispatch.to_string(), op);
+        if self.failing.get(&key) != Some(&line) {
+            log(&line);
+            self.failing.insert(key, line);
+        }
+    }
+
+    /// `(dispatch, op)` works again: say so once, if it was failing.
+    fn recover(&mut self, log: &LogSink, dispatch: &str, op: SeatOp, line: &str) {
+        if self.failing.remove(&(dispatch.to_string(), op)).is_some() {
+            log(line);
+        }
+    }
+
+    /// Hand the waiting settles to the primary, oldest first; what it does
+    /// not take waits for the next sync. A settle is never refused for a
+    /// stale seat (an-t11), so only an outage keeps one waiting, and the
+    /// first unreachable answer stops the pass: the rest are not tried
+    /// until the next sync. Returns `false` when the primary was found
+    /// unreachable.
+    fn flush_settles(&mut self, shared: &dyn SharedState, log: &LogSink) -> bool {
+        let mut waiting = std::mem::take(&mut self.settles).into_iter();
+        let mut reachable = true;
+        for (id, reservation, actual) in waiting.by_ref() {
+            match shared.settle_spend(&reservation, actual) {
+                Ok(_) => self.recover(
+                    log,
+                    &id,
+                    SeatOp::Settle,
+                    &format!("seat {id}: settle recovered"),
+                ),
+                Err(settle_error) => {
+                    reachable = !matches!(settle_error, SharedStateError::Unreachable { .. });
+                    self.fail(
+                        log,
+                        &id,
+                        SeatOp::Settle,
+                        format!("seat {id}: settle failed: {settle_error}; it is retried at the next sync"),
+                    );
+                    self.settles.push((id, reservation, actual));
+                    if !reachable {
+                        break;
+                    }
+                }
+            }
+        }
+        self.settles.extend(waiting);
+        reachable
+    }
+
+    /// Give a freed seat back; a failure is one line and the token goes
+    /// either way: the primary's TTL ends the hold.
+    fn release(
+        &mut self,
+        shared: &dyn SharedState,
+        log: &LogSink,
+        id: &str,
+        token: &LeaseToken,
+    ) -> bool {
+        match shared.release_seat(token) {
+            Ok(()) => {
+                self.failing.remove(&(id.to_string(), SeatOp::Release));
+                true
+            }
+            Err(release_error) => {
+                let reachable = !matches!(release_error, SharedStateError::Unreachable { .. });
+                self.fail(
+                    log,
+                    id,
+                    SeatOp::Release,
+                    format!(
+                        "seat {id}: giving the shared seat back failed: {release_error}; it ends by \
+                         itself after its time limit"
+                    ),
+                );
+                reachable
+            }
+        }
+    }
 }
 
 /// The shared seats and reservations one coordinator holds.
@@ -74,6 +195,14 @@ pub struct SeatBook {
     holder: Principal,
     book: Mutex<Book>,
     log: LogSink,
+}
+
+/// The line for a dispatch that waits on its shared seat.
+fn wait_line(id: &str, cause: &SharedStateError) -> String {
+    format!(
+        "seat {id}: the shared state did not grant the seat ({cause}); this run waits and asks \
+         again; if it lasts, check the shared primary"
+    )
 }
 
 impl SeatBook {
@@ -94,44 +223,30 @@ impl SeatBook {
     }
 
     fn book(&self) -> MutexGuard<'_, Book> {
-        self.book.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// Write `line` for `(dispatch, op)` unless it is the line already
-    /// written for it.
-    fn fail(&self, book: &mut Book, dispatch: &str, op: &'static str, line: String) {
-        let key = (dispatch.to_string(), op);
-        if book.failing.get(&key) != Some(&line) {
-            (self.log)(&line);
-            book.failing.insert(key, line);
-        }
-    }
-
-    /// `(dispatch, op)` works again: say so once, if it was failing.
-    fn recover(&self, book: &mut Book, dispatch: &str, op: &'static str, line: &str) {
-        if book.failing.remove(&(dispatch.to_string(), op)).is_some() {
-            (self.log)(line);
-        }
+        self.book
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Mirror the admission state's seated agent dispatches into the
     /// shared state: settle what settled, release the seats that were
     /// freed, acquire and reserve the new ones. The reconcile tick's sync.
     pub fn sync(&self, state: &Mutex<AdmissionState>) {
-        self.sync_acquiring(state, None);
+        self.sync_acquiring(state, Acquire::Every);
     }
 
     /// The sync after one request: settles and releases as [`Self::sync`],
     /// but only `admitting` (the dispatch this request asks a seat for, if
-    /// any) is acquired; every other new seat waits for the tick, so one
-    /// request makes a bounded number of shared calls while the primary
-    /// fails.
+    /// any) is acquired; every other new seat waits for the tick. Once the
+    /// primary is found unreachable the pass makes no more shared calls,
+    /// so one request makes a bounded number of them while it is down.
     pub fn sync_request(&self, state: &Mutex<AdmissionState>, admitting: Option<&str>) {
-        self.sync_acquiring(state, Some(admitting));
+        self.sync_acquiring(state, admitting.map_or(Acquire::NoNew, Acquire::Only));
     }
 
-    /// `only`: `None` acquires every new seat, `Some(x)` only `x`'s.
-    fn sync_acquiring(&self, state: &Mutex<AdmissionState>, only: Option<Option<&str>>) {
+    fn sync_acquiring(&self, state: &Mutex<AdmissionState>, acquire: Acquire<'_>) {
+        let shared = self.shared.as_ref();
+        let log = &self.log;
         let mut book = self.book();
         let (seated, journal, gone) = {
             let mut admission = super::lock_state(state);
@@ -164,11 +279,14 @@ impl SeatBook {
                     .push((id, reservation, MicroUsd::from_micros(0)));
             }
         }
-        self.flush_settles(book);
+        let mut reachable = book.flush_settles(shared, log);
 
-        // Seats freed: released. A failure is one line; the token goes
-        // either way and the primary's TTL ends the hold.
-        let seated_ids: BTreeSet<&str> = seated.iter().map(|s| s.dispatch_id.as_str()).collect();
+        // Seats freed: released. While the primary is unreachable a freed
+        // seat keeps its token, and the next sync releases it.
+        let seated_ids: BTreeSet<&str> = seated
+            .iter()
+            .map(|seat| seat.dispatch_id.as_str())
+            .collect();
         let freed: Vec<String> = book
             .leases
             .keys()
@@ -176,133 +294,111 @@ impl SeatBook {
             .cloned()
             .collect();
         for id in freed {
+            if !reachable {
+                break;
+            }
             let Some(token) = book.leases.remove(&id) else {
                 continue;
             };
-            if let Err(e) = self.shared.release_seat(&token) {
-                (self.log)(&format!(
-                    "seat {id}: release failed: {e}; the shared seat ends at its TTL"
-                ));
-            }
+            reachable = book.release(shared, log, &id, &token);
         }
         book.lost.retain(|id| seated_ids.contains(id.as_str()));
         book.refused
             .retain(|id, _| seated_ids.contains(id.as_str()));
         let settling: BTreeSet<String> = book.settles.iter().map(|(id, ..)| id.clone()).collect();
-        book.failing
-            .retain(|(id, _), _| seated_ids.contains(id.as_str()) || settling.contains(id));
+        let releasing: BTreeSet<String> = book.leases.keys().cloned().collect();
+        book.failing.retain(|(id, _), _| {
+            seated_ids.contains(id.as_str()) || settling.contains(id) || releasing.contains(id)
+        });
 
         // New seats: acquired, then reserved (once per dispatch: a
         // resumed parent keeps the reservation it had).
         for seat in &seated {
             let id = seat.dispatch_id.as_str();
-            if book.leases.contains_key(id) || book.lost.contains(id) {
+            if book.leases.contains_key(id) || book.lost.contains(id) || !acquire.takes(id) {
                 continue;
             }
-            if only.is_some_and(|only| only != Some(id)) {
+            if !reachable {
+                // Not asked again in this pass: the dispatch waits, and
+                // its next poll or the tick asks the primary.
+                book.refused.insert(id.to_string(), SeatRefusal::Wait);
                 continue;
             }
-            let token = match self.shared.acquire_seat(&self.holder, id) {
+            let token = match shared.acquire_seat(&self.holder, id) {
                 Ok(token) => token,
-                Err(e) => {
-                    let cause = e.to_string();
-                    self.fail(
-                        book,
-                        id,
-                        "seat",
-                        format!(
-                            "seat {id}: shared seat not granted ({cause}); the dispatch waits \
-                             until the shared state grants it"
-                        ),
-                    );
-                    book.refused
-                        .insert(id.to_string(), SeatRefusal::Wait { cause });
+                Err(acquire_error) => {
+                    reachable = !matches!(acquire_error, SharedStateError::Unreachable { .. });
+                    book.fail(log, id, SeatOp::Seat, wait_line(id, &acquire_error));
+                    book.refused.insert(id.to_string(), SeatRefusal::Wait);
                     continue;
                 }
             };
             if book.reservations.contains_key(id) {
                 book.leases.insert(id.to_string(), token);
                 book.refused.remove(id);
-                self.recover(book, id, "seat", &format!("seat {id}: shared seat granted"));
+                book.recover(
+                    log,
+                    id,
+                    SeatOp::Seat,
+                    &format!("seat {id}: shared seat granted"),
+                );
                 continue;
             }
             let amount = MicroUsd::from_micros(seat.reserve_micros);
-            match self.shared.reserve_spend(&token, amount) {
+            match shared.reserve_spend(&token, amount) {
                 Ok(reservation) => {
                     book.reservations.insert(id.to_string(), reservation);
                     book.leases.insert(id.to_string(), token);
                     book.refused.remove(id);
-                    self.recover(book, id, "seat", &format!("seat {id}: shared seat granted"));
-                    self.recover(
-                        book,
+                    book.recover(
+                        log,
                         id,
-                        "reserve",
+                        SeatOp::Seat,
+                        &format!("seat {id}: shared seat granted"),
+                    );
+                    book.recover(
+                        log,
+                        id,
+                        SeatOp::Reserve,
                         &format!("seat {id}: reserve recovered"),
                     );
                 }
-                Err(e) if seat.launched => {
+                Err(reserve_error) if seat.launched => {
                     // Its work may be running: the seat stays, and the
-                    // node's ledger still books what it spends.
+                    // node's ledger still books what it spends (the floor
+                    // in `node::daily_spent` keeps the cap from missing it).
+                    reachable = !matches!(reserve_error, SharedStateError::Unreachable { .. });
                     book.leases.insert(id.to_string(), token);
                     book.refused.remove(id);
-                    self.fail(
-                        book,
+                    book.fail(
+                        log,
                         id,
-                        "reserve",
+                        SeatOp::Reserve,
                         format!(
-                            "seat {id}: reserve failed: {e}; the spend is booked on this node only"
+                            "seat {id}: reserve failed: {reserve_error}; the spend is booked on \
+                             this node only"
                         ),
                     );
                 }
-                Err(e) => {
-                    if let Err(release) = self.shared.release_seat(&token) {
-                        (self.log)(&format!(
-                            "seat {id}: release failed: {release}; the shared seat ends at its TTL"
-                        ));
+                Err(reserve_error) => {
+                    reachable = !matches!(reserve_error, SharedStateError::Unreachable { .. });
+                    if reachable {
+                        reachable = book.release(shared, log, id, &token);
                     }
-                    let refusal = match &e {
-                        SharedStateError::SliceExhausted {
-                            requested,
-                            remaining,
-                        } => SeatRefusal::SliceExhausted {
-                            reserve_micros: requested.to_micros(),
-                            remaining_micros: remaining.to_micros(),
-                        },
-                        other => SeatRefusal::Wait {
-                            cause: other.to_string(),
-                        },
+                    let refusal = if let SharedStateError::SliceExhausted {
+                        requested,
+                        remaining,
+                    } = &reserve_error
+                    {
+                        SeatRefusal::SliceExhausted {
+                            reserve: *requested,
+                            remaining: *remaining,
+                        }
+                    } else {
+                        SeatRefusal::Wait
                     };
-                    self.fail(
-                        book,
-                        id,
-                        "seat",
-                        format!(
-                            "seat {id}: shared seat not granted ({e}); the dispatch waits \
-                             until the shared state grants it"
-                        ),
-                    );
+                    book.fail(log, id, SeatOp::Seat, wait_line(id, &reserve_error));
                     book.refused.insert(id.to_string(), refusal);
-                }
-            }
-        }
-    }
-
-    /// Hand the waiting settles to the primary; what it does not take
-    /// waits for the next sync. A settle is never refused for a stale seat
-    /// (an-t11), so only an outage keeps one waiting.
-    fn flush_settles(&self, book: &mut Book) {
-        let waiting = std::mem::take(&mut book.settles);
-        for (id, reservation, actual) in waiting {
-            match self.shared.settle_spend(&reservation, actual) {
-                Ok(_) => self.recover(book, &id, "settle", &format!("seat {id}: settle recovered")),
-                Err(e) => {
-                    self.fail(
-                        book,
-                        &id,
-                        "settle",
-                        format!("seat {id}: settle failed: {e}; it is retried at the next sync"),
-                    );
-                    book.settles.push((id, reservation, actual));
                 }
             }
         }
@@ -328,19 +424,17 @@ impl SeatBook {
         };
         let mut admission = super::lock_state(state);
         match refusal {
-            SeatRefusal::Wait { .. } => admission
+            SeatRefusal::Wait => admission
                 .unclaim(dispatch_id, now)
                 .then_some(Decision::Queued { position: 1 }),
-            SeatRefusal::SliceExhausted {
-                reserve_micros,
-                remaining_micros,
-            } => admission
+            SeatRefusal::SliceExhausted { reserve, remaining } => admission
                 .revoke_grant(dispatch_id, now)
                 .then(|| Decision::Refused {
                     code: Refusal::BudgetExceeded,
                     detail: format!(
-                        "shared spend slice exhausted: reservation {reserve_micros} micros, \
-                         slice left {remaining_micros} micros"
+                        "this node's share of the shared budget is used up: this run needs \
+                         {reserve}, {remaining} is left; raise this node's share on the shared \
+                         primary, or wait for the next day"
                     ),
                 }),
         }
@@ -349,8 +443,10 @@ impl SeatBook {
     /// Extend every held seat (an-t11: every 15 s). The book is held only
     /// to copy the tokens and to apply each answer, so a slow primary never
     /// stalls the handlers; an answer is applied only while the book still
-    /// holds the token it renewed.
+    /// holds the token it renewed. The first unreachable answer stops the
+    /// pass; the rest are renewed at the next tick.
     pub fn renew(&self) {
+        let log = &self.log;
         let held: Vec<(String, LeaseToken)> = self
             .book()
             .leases
@@ -367,23 +463,34 @@ impl SeatBook {
             match answer {
                 Ok(renewed) => {
                     book.leases.insert(id.clone(), renewed);
-                    self.recover(book, &id, "renew", &format!("seat {id}: renew recovered"));
+                    book.recover(
+                        log,
+                        &id,
+                        SeatOp::Renew,
+                        &format!("seat {id}: renew recovered"),
+                    );
                 }
                 Err(SharedStateError::LeaseLost { .. }) => {
                     book.leases.remove(&id);
                     book.lost.insert(id.clone());
-                    book.failing.remove(&(id.clone(), "renew"));
-                    (self.log)(&format!(
-                        "seat {id}: lease_lost on renew; the work in flight finishes and the \
-                         seat is not taken again"
+                    book.failing.remove(&(id.clone(), SeatOp::Renew));
+                    log(&format!(
+                        "seat {id}: the shared seat was taken away (lease lost) on renew; the work \
+                         in flight finishes and the seat is not taken again"
                     ));
                 }
-                Err(e) => self.fail(
-                    book,
-                    &id,
-                    "renew",
-                    format!("seat {id}: renew failed: {e}; retried at the next tick"),
-                ),
+                Err(renew_error) => {
+                    let unreachable = matches!(renew_error, SharedStateError::Unreachable { .. });
+                    book.fail(
+                        log,
+                        &id,
+                        SeatOp::Renew,
+                        format!("seat {id}: renew failed: {renew_error}; retried at the next tick"),
+                    );
+                    if unreachable {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -391,14 +498,16 @@ impl SeatBook {
     /// Give back every seat still held, best effort (the daemon is going
     /// down). A killed daemon releases nothing: its seats end at their TTL.
     pub fn release_all(&self) {
+        let shared = self.shared.as_ref();
+        let log = &self.log;
         let mut book = self.book();
         let book = &mut *book;
-        self.flush_settles(book);
+        if !book.flush_settles(shared, log) {
+            return;
+        }
         for (id, token) in std::mem::take(&mut book.leases) {
-            if let Err(e) = self.shared.release_seat(&token) {
-                (self.log)(&format!(
-                    "seat {id}: release failed: {e}; the shared seat ends at its TTL"
-                ));
+            if !book.release(shared, log, &id, &token) {
+                return;
             }
         }
     }
