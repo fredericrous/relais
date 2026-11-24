@@ -274,6 +274,8 @@ Last round on tree d9a46f0a (the pushed tree), five seats, all approve; earlier 
 - lang:rust: approve (enums, `Book` methods, `pub(crate)`, an exhaustive settle match fixed); deliberate: an `is_unreachable` helper and a `Reach` enum (style only).
 - tui: approve (refusals reworded, the unbacked next-day clause and the doubled "refused" dropped); deliberate: "settle" and "reserve" stay in log lines (glossed in the docs), log line length.
 
+Merged tree 458aff5d (after main's #573 #574 #575): lang:rust and tui approve; implementation-review approve-with-changes (Verification record for the merged tree and the no-host-name refusal, both written in the Decision log); architect approve-with-changes (low; the daemon's direct settings read gets a follow-up, a deliberate non-goal); backend approve-with-changes (medium, deliberate: the seat sync's time is not a phase of the slow-request line, so a slow primary shows no `seats` phase; a follow-up adds `PhaseTimings.seats`). tui low (the no-host-name refusal puts the fix first) deliberate.
+
 ## Outcome
 
 Measure after release: shared-refusal `Queued` count against grants (any on a single node is a rollback); single-node request latency p95 (a rise above 20% is a rollback); shared counter against node ledger after settle.
