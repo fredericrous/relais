@@ -8,6 +8,11 @@ missing here.
 
 ## Unreleased
 
+A carried check reads tidier. The pane draws the passes carried from an
+earlier attempt as one row, `carried 5 from attempt1 (a, b, c +2 more)`, before
+the re-run check's output, so a short pane keeps that output. `relais report`
+prints `make: 1 carried` with no timings, which are the source attempt's.
+
 ## v0.81.0
 
 - A session started by a `/clear` relay now holds the ticket its

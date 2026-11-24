@@ -1701,7 +1701,8 @@ impl Report {
 }
 
 /// The per-check timing section: one line per label (and `cached` split),
-/// run time and admission wait at p50/p90, and the retry count.
+/// run time and admission wait at p50/p90, and the retry count. A carried
+/// label is one count line without timings: they are the source attempt's.
 fn render_check_timings(timings: &[crate::ledger::CheckTimingStats]) -> String {
     let mut out = String::from("\ncheck timings (run p50/p90 · slot wait p50/p90):\n");
     if timings.is_empty() {
