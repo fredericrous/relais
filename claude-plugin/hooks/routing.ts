@@ -106,7 +106,7 @@ async function within<T>(fx: Fx, promise: Promise<T>, ms: number): Promise<T | t
 
 // As `within`, but a promise that has already settled is taken even when no
 // time is left: the session model asked for before the spawn is often in.
-async function settledWithin<T>(fx: Fx, promise: Promise<T>, ms: number): Promise<T | typeof TIMEOUT> {
+export async function settledWithin<T>(fx: Fx, promise: Promise<T>, ms: number): Promise<T | typeof TIMEOUT> {
   if (ms > 0) return within(fx, promise, ms)
   return Promise.race([promise, Promise.resolve().then(() => TIMEOUT)])
 }

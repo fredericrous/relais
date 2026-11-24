@@ -1432,8 +1432,8 @@ export function pinRowSource(state: RouterState, type: string, callModel: string
   }
 }
 
-function assertNever(value: never): never {
-  throw new Error(`unexpected pin source ${String(value)}`)
+function assertNever(source: never): never {
+  throw new Error(`unexpected pin source ${String(source)}`)
 }
 
 // The decision a pinned spawn's row records: the model the router infers the

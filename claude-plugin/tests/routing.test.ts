@@ -4,7 +4,7 @@
 import { expect, test } from 'claude-code/testing'
 import { nativeCalls, settle, spawnLine, startQueued } from './support.ts'
 import { CLASSIFIER_SYSTEM, createRouterMemory, newTask, outcomeOf, scopedFileHash, sha256Hex, unmatchedChecksOf, withUnmatchedChecks } from '../hooks/router.ts'
-import { hashFiles, noteRelaisLaunch, resolveRoot } from '../hooks/routing.ts'
+import { hashFiles, noteRelaisLaunch, resolveRoot, settledWithin } from '../hooks/routing.ts'
 import {
   answered,
   bash,
@@ -366,6 +366,15 @@ for (const [name, script] of [['fails', { sessionModelThrows: true }], ['never a
     expect([row.reason, row.model]).toEqual(['pin', 'opus'])
   })
 }
+
+test('with no time left, a session model already in is taken and a pending one is not', async () => {
+  // The spawn may return after the hook's budget is spent: the read asked
+  // for before it still counts once settled.
+  const fx: any = {}
+  expect(await settledWithin(fx, Promise.resolve(HAIKU), 0)).toBe(HAIKU)
+  expect(await settledWithin(fx, Promise.resolve(HAIKU), -50)).toBe(HAIKU)
+  expect(typeof (await settledWithin(fx, new Promise<string>(() => {}), 0))).toBe('symbol')
+})
 
 test('a model the person names for a subagent goes to that subagent, never to the session', async ($: any, on: any) => {
   const engine = await routedSession($, on)
