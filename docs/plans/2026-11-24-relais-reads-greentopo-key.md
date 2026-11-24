@@ -74,7 +74,7 @@ ticket `topo-spotter-rename/t11-relais-aval-key`.
   pods, CI); t11 is added to t10's `blocked_by`. Rollback after the sweep reverts the sweep PRs first.
 
 ## Phases
-- [ ] Phase 1 — read the key: `crates/relais/src/policy/mod.rs` (a
+- [x] Phase 1 — read the key: `crates/relais/src/policy/mod.rs` (a
   `try_from` wire struct; serde ignores the container's
   `deny_unknown_fields`/`default` under `try_from`, so `IntegrationsWire`
   carries `#[serde(deny_unknown_fields, default)]` itself and `Integrations`

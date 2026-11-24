@@ -213,11 +213,41 @@ impl Dependency {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields, default)]
+#[serde(try_from = "IntegrationsWire")]
 pub struct Integrations {
     pub aval: Option<Dependency>,
     pub amont: Option<Dependency>,
     pub amont_agent: Option<Dependency>,
+}
+
+/// What `[integrations]` may spell on disk: the tool's new name
+/// (`greentopo`) is read into the same `aval` value, so no reader and no
+/// serialized form changes.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+struct IntegrationsWire {
+    aval: Option<Dependency>,
+    greentopo: Option<Dependency>,
+    amont: Option<Dependency>,
+    amont_agent: Option<Dependency>,
+}
+
+const BOTH_TOPO_KEYS_MESSAGE: &str =
+    "set only one of [integrations] aval and greentopo; remove the aval line";
+
+impl TryFrom<IntegrationsWire> for Integrations {
+    type Error = String;
+
+    fn try_from(wire: IntegrationsWire) -> Result<Self, Self::Error> {
+        if wire.aval.is_some() && wire.greentopo.is_some() {
+            return Err(BOTH_TOPO_KEYS_MESSAGE.to_string());
+        }
+        Ok(Integrations {
+            aval: wire.aval.or(wire.greentopo),
+            amont: wire.amont,
+            amont_agent: wire.amont_agent,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -698,6 +728,9 @@ pub struct RepoPolicy {
 
 impl RepoPolicy {
     pub fn from_toml_str(text: &str) -> Result<Self, PolicyError> {
+        if sets_both_topo_keys(text) {
+            return Err(PolicyError::BothTopoIntegrationKeys);
+        }
         let policy: RepoPolicy =
             toml::from_str(text).map_err(|e| PolicyError::MalformedToml(e.to_string()))?;
         policy.validate()?;
@@ -911,9 +944,26 @@ fn validate_reuse(reuse: &ReuseSpec) -> Result<(), PolicyError> {
         .try_for_each(|output| validate_workspace_path(output, "reuse output"))
 }
 
+/// True when the raw `[integrations]` table carries both spellings of the
+/// topo-spotter key. Checked before the typed parse, because a `try_from`
+/// error would surface as a TOML error and be reported as malformed TOML.
+fn sets_both_topo_keys(text: &str) -> bool {
+    text.parse::<toml::Table>()
+        .ok()
+        .and_then(|table| match table.get("integrations") {
+            Some(toml::Value::Table(integrations)) => {
+                Some(integrations.contains_key("aval") && integrations.contains_key("greentopo"))
+            }
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyError {
     UnsupportedSchemaVersion(u64),
+    /// `[integrations]` sets both `aval` and `greentopo`.
+    BothTopoIntegrationKeys,
     MalformedToml(String),
     EmptyRiskPaths,
     EmptyCommandArgv,
@@ -963,6 +1013,7 @@ impl std::fmt::Display for PolicyError {
                 "unsupported relais.toml schema_version {v} (this relais understands \
                  {MIN_POLICY_SCHEMA_VERSION}..={POLICY_SCHEMA_VERSION})"
             ),
+            Self::BothTopoIntegrationKeys => write!(f, "{BOTH_TOPO_KEYS_MESSAGE}"),
             Self::MalformedToml(detail) => write!(f, "policy file is not valid TOML: {detail}"),
             Self::EmptyRiskPaths => write!(f, "a [[risk]] rule needs at least one path pattern"),
             Self::EmptyCommandArgv => write!(f, "a verification command needs a non-empty argv"),
@@ -4748,5 +4799,56 @@ command = { argv = ["true"], junit = "j.xml" }
                 "limits":{"total_seconds":0}}"#,
         );
         assert!(zero.is_err(), "a zero total is not a limit");
+    }
+
+    #[test]
+    fn greentopo_key_reads_as_the_aval_dependency() {
+        let with_aval =
+            RepoPolicy::from_toml_str("schema_version = 1\n[integrations]\naval = \"required\"\n")
+                .unwrap();
+        let with_greentopo = RepoPolicy::from_toml_str(
+            "schema_version = 1\n[integrations]\ngreentopo = \"required\"\n",
+        )
+        .unwrap();
+        assert_eq!(with_aval, with_greentopo);
+        assert_eq!(with_aval.authority_hash(), with_greentopo.authority_hash());
+        let json = serde_json::to_string(&with_greentopo).unwrap();
+        assert_eq!(json, serde_json::to_string(&with_aval).unwrap());
+        assert!(!json.contains("greentopo"));
+        let back: RepoPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, with_greentopo);
+    }
+
+    #[test]
+    fn greentopo_inline_table_keeps_its_bin() {
+        let policy = RepoPolicy::from_toml_str(
+            "schema_version = 1\n[integrations]\ngreentopo = { mode = \"optional\", bin = \"x\" }\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            policy.integrations.aval,
+            Some(Dependency::Full { mode: DependencyMode::Optional, bin: Some(ref bin) }) if bin == "x"
+        ));
+    }
+
+    #[test]
+    fn both_topo_keys_are_refused_with_their_own_error() {
+        let err = RepoPolicy::from_toml_str(
+            "schema_version = 1\n[integrations]\naval = \"required\"\ngreentopo = \"required\"\n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, PolicyError::BothTopoIntegrationKeys));
+        let text = err.to_string();
+        assert!(text.contains("set only one of [integrations] aval and greentopo"));
+        assert!(!text.contains("not valid TOML"));
+    }
+
+    #[test]
+    fn a_misspelled_greentopo_key_is_an_unknown_field() {
+        let err = RepoPolicy::from_toml_str(
+            "schema_version = 1\n[integrations]\ngreentop = \"required\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 }
