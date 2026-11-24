@@ -48,10 +48,11 @@ ticket here until it is resolved or moved into a programme of its own.
   `env_missing` keeps its worker's changed tree as the blocked attempt's
   candidate, named in its message, so `verify` and `from_candidate` find it
   (it was only exported as `candidate-final.patch`).
-- [f11](f11-pricing-message-matches-toml.md) (2026-11-22, open): the
-  unpriced-model messages print `[pricing.models]` while the TOML entry is
-  `[[pricing.models]]`; one wording that a person can paste (from the
-  phase8-learner charting review).
+- [f11](f11-pricing-message-matches-toml.md) (2026-11-23): every
+  unpriced-model message prints `[[pricing.models]]`, the array-of-tables
+  header a person adds to machine.toml (runner, `native_unpriced`,
+  fast-mode rate, `relais report`, plugin fixture); prose in docs is
+  unchanged.
 - [f12](f12-claim-takeover-live-session.md) (2026-11-21, open): a work
   claim was taken over from a live session after a `/clear` relay, and two
   sessions edited one worktree (filed from the inbox, orphan of 0f2c38ac).
@@ -68,30 +69,29 @@ ticket here until it is resolved or moved into a programme of its own.
 
 ## Handoff
 
-2026-11-21, boundary 3 (f09 closed): the claims hook lock tests bound a
-busy lock at 1 s and no longer flake on a loaded disk (test-only change).
+2026-11-23, boundary 3 (f11 closed): the unpriced-model messages print
+`[[pricing.models]]`, as machine.toml writes the entry (message-only
+change, unreleased).
 
-- Done: f09; earlier today f06 and f07 (both unreleased), f05
-  (`HomeWatch` injected, no behaviour change), f04 closed as a decision,
-  and relais v0.75.0 is out.
-- Next: Measure the home fingerprint warnings (f08) is due 2026-11-27.
+- Done: f11; f10 earlier today (unreleased).
+- Next: f12 (claim takeover from a live session), f13, f14, f15 are
+  ready; Measure the home fingerprint warnings (f08) is due 2026-11-28.
 - Lessons:
-  - A timing flake that CPU burners alone do not reproduce (0/200) may be
-    the disk: 12 `/usr/bin/true` spawn loops and 4 `dd`+`sync` loops gave
-    4–7/200. Put tagged probes around each phase before choosing a fix.
-  - `hook::respond`'s `a_zero_queue_wait_refuses_at_once_with_no_wait`
-    keeps a 100 ms wall-clock bound too; it has not flaked yet.
+  - A replace of `[pricing.models]` must not touch the TOML fixtures'
+    `[[pricing.models]]`: match with lookarounds
+    (`(?<!\[)\[pricing\.models\](?!\])`), and check none read
+    `[[[`.
+  - The plugin's `unpriced_reason` fixture and comment mirror the Rust
+    message text; change them together.
   - A relais run can wait out its whole admission budget (30 min) on a
-    host at load 40+ and launch nothing; three times now. Then apply its
-    kept `candidate-1.patch` and run the checks by hand.
+    host at load 40+ and launch nothing; then apply its kept
+    `candidate-1.patch` and run the checks by hand.
   - The relais plugin refuses a Bash call whose text names its own
     install command, even inside a heredoc: edit such text with the Edit
     tool.
-  - A tmux repro of Claude Code needs `Down` then Enter on the trust dialog
-    (its default is `No, exit`); a `/clear` typed while an answer still
-    streams is queued into the prompt instead of run.
-- Your steps: `relais install --claude --write` (the plugin is at 0.72.0
-  here; it applies from the next session).
+- Your steps: reinstall the relais plugin with relais's own install
+  command for Claude (the plugin is at 0.72.0 here; it applies from the
+  next session).
 
 ## Not yet specified
 

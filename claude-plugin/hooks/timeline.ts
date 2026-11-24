@@ -571,7 +571,7 @@ const withEntry = (m: RunModel, at: number, kind: string, text: string): RunMode
 })
 
 // The model an `unpriced_reason` sentence names ("<model> has no
-// [pricing.models] entry", "<model>'s [pricing.models] entry has no …"): its
+// [[pricing.models]] entry", "<model>'s [[pricing.models]] entry has no …"): its
 // first word. Control characters are stripped and the name capped at 40.
 export function unpricedModel(reason: unknown): string | undefined {
   if (typeof reason !== 'string') return undefined

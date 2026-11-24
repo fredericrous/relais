@@ -84,7 +84,7 @@ pub fn preflight(
                  priced; the runtime check applies"
             )),
             Verdict::Unpriced { effective } => decided.refusals.push(format!(
-                "native_unpriced: {alias} runs as {effective}, which has no [pricing.models] \
+                "native_unpriced: {alias} runs as {effective}, which has no [[pricing.models]] \
                  entry in {}; add one (rates: {RATES_URL})",
                 machine_toml.display()
             )),
@@ -174,7 +174,7 @@ mod tests {
             decided.refusals,
             [
                 "native_unpriced: sonnet runs as claude-sonnet-5-5, which has no \
-                 [pricing.models] entry in /home/me/machine.toml; add one \
+                 [[pricing.models]] entry in /home/me/machine.toml; add one \
                  (rates: https://platform.claude.com/docs/en/about-claude/pricing)"
             ]
         );
@@ -240,10 +240,10 @@ mod tests {
     #[test]
     fn the_backstop_names_the_model_and_the_remedy() {
         let detail = backstop_detail(
-            &["claude-sonnet-5-5 has no [pricing.models] entry".to_string()],
+            &["claude-sonnet-5-5 has no [[pricing.models]] entry".to_string()],
             &machine(),
         );
-        assert!(detail.starts_with("native_unpriced: claude-sonnet-5-5 has no [pricing.models]"));
+        assert!(detail.starts_with("native_unpriced: claude-sonnet-5-5 has no [[pricing.models]]"));
         assert!(detail.contains("/home/me/machine.toml"));
         assert!(detail.contains("platform.claude.com/docs/en/about-claude/pricing"));
     }

@@ -1,7 +1,7 @@
 +++
 type = "task"
 mode = "afk"
-status = "open"
+status = "closed"
 blocked_by = []
 repos = ["relais"]
 +++
@@ -26,3 +26,12 @@ can paste what they read?
 
 One wording across the three sites, matching the TOML, with the tests
 updated, merged.
+
+## Resolution
+
+2026-11-23: the messages print the double-bracket form, the header a
+person pastes into machine.toml: `<model> has no [[pricing.models]] entry`,
+`<model>'s [[pricing.models]] entry has no fast-mode rate …`, the
+`native_unpriced` refusal, and `relais report`'s `no [[pricing.models]]
+entry for:` lines. The render tests and the plugin's `unpriced_reason`
+fixture follow. Prose in `docs/` that names the table is unchanged.
