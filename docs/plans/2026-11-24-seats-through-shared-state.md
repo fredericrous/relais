@@ -243,6 +243,12 @@ and `RemoteGate` with a degraded fake answers `Queued`.
   relais/conformance` exit 0 (1114 s). The Verification rows below that say
   "the final tree" name the pre-merge tree d9a46f0a; this line is the merged
   tree's record.
+- 2026-11-24 (merge of #577, tree 2d3cccb6): main moved once more (router pin
+  row; nothing under `coordinator/`, `admission/` or `shared_state/`); on the
+  merged tree `cargo clippy -p relais --all-targets --features conformance
+  -- -D warnings` is clean and the `coordinator::`, `shared_state::` and
+  `router::` lib tests pass. The full workspace run (exit 0, 1114 s) is the
+  one on 458aff5d, the tree this merge extends.
 - 2026-11-24: under `shared_state = "external"` the daemon refuses a host with
   no name (exit 3, `Blocked`), not the plan's `local` holder: two nodes named
   `local` would defeat the fence. `local` still names the holder under
