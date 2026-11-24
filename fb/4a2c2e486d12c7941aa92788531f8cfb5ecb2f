@@ -1,0 +1,13 @@
+greensummit-v2
+tree 6ff5380df1bd3c249be57daba21a22b08585091b
+gates pre-push-cargo-test
+platform x86_64-linux
+canon af12b3f763482316492ae4c6e87a8401ab5b5cf6
+greengate attest-sign-ubuntu-latest
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgwe+FHUie+0YKuEzx3YjiV6jyIC
+F0veynb1B9mEPADfwAAAALZ3JlZW5zdW1taXQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3No
+LWVkMjU1MTkAAABAO80kdwr+KrxIAxb86X+hCoFJd7Ee89rce3VpJ3lTZvc6SyVIUtQdoX
+Exj6RzIaWdYo+yAPyJ2sVGTKomP/QrDw==
+-----END SSH SIGNATURE-----
