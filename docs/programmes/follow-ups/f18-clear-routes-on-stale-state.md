@@ -11,8 +11,9 @@ repos = ["relais"]
 
 On 2026-11-24 the live check of the `preferred-model` pin (plan
 `docs/plans/2026-11-23-router-keeps-preferred-model.md`) ran in a session a
-`/clear` relay had started. Before the person typed anything, the plugin
-routed two `relais-review` spawns on a router state with no pins:
+`/clear` relay had started. Before the person typed anything, one of two
+`relais-review` spawns was table-routed, which is consistent with a router
+state that had no pins (likely the pre-clear one):
 
 - relais v0.81.0 (the pin) was installed at 10:17Z; the cleared session's
   final flush landed at 10:27:50Z; the spawns came at 10:28Z.
@@ -34,11 +35,13 @@ routed two `relais-review` spawns on a router state with no pins:
   the new one (`8bea5982…`): `r.session` survives the clear.
 
 The installed plugin (0.79.0) `routeSpawn` reads `store.router.state` and
-never checks `isStale`; the only refreshes after a clear are the
-`session.start` handler and `classifyPrompt` on a person's prompt. The
-clear-relay plugin opens every relayed session with a plugin-submitted
-prompt, which does not refresh, so this is the normal relay path. Why did
-the `session.start` refresh not give the spawn the pins, and what is the
+never checks `isStale`; the refreshes after a clear are the
+`session.start` handler, a successful non-final `router-observe` flush
+(`observe` refreshes on exit 0), `/relais-routing`, and `classifyPrompt` on
+a person's prompt. The clear-relay plugin opens every relayed session with
+a plugin-submitted prompt, which does not refresh, so this is the normal
+relay path. Why did none of those refreshes give the spawn the pins, and
+what is the
 fix: `routeSpawn` awaiting a refresh when the state is stale, a refresh
 on the plugin-submitted prompt, or resetting `r.session` at the clear?
 
@@ -46,7 +49,8 @@ on the plugin-submitted prompt, or resetting `r.session` at the clear?
 
 - `claude-plugin/hooks/routing.ts`: `routeSpawn`, `loadRouterState`
   (`r.session ?? fx.session.id()`), `refreshState`, `onSessionEnd`
-  (`isStale = true` on `clear`/`resume`), `classifyPrompt`.
+  (`isStale = true` on `clear`/`resume`), `classifyPrompt`, and `observe`
+  (the refresh after a successful non-final flush).
 - `claude-plugin/hooks/register.ts`: the `session.start` handler, and its
   order against `session.end` at a `/clear`.
 - `router_decisions` rows for session `52845f00-76e2-4902-bf83-b7baf8b08c07`

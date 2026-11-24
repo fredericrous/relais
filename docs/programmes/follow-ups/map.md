@@ -85,7 +85,9 @@ handoffs over as `work`, and the plugin runs it at the successor's first
 read (unreleased; f10 and f11 are unreleased too).
 
 - Done: f12, f13, f14.
-- Next: f15 (loop breaker fingerprint) is ready. Measure the home fingerprint
+- Next: f15 (loop breaker fingerprint) is ready; f17 (pin row records
+  the call's model) and f18 (stale state after a clear) are ready too,
+  f18 first since it skews the router pin plan's 11-30 cohort check. Measure the home fingerprint
   warnings (f08) is due 2026-11-28, and A week of relays adopts every
   handoff (f16) is due 2026-12-02, counted from the plugin reinstall.
 - Lessons:
