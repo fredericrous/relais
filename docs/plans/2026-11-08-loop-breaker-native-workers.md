@@ -123,6 +123,7 @@ Observed on branch `feat/loop-breaker` before the push, per check (input → exp
 - backend: approve after 3 rounds; fixed `stop_unacknowledged`, the guard-off line, the lookup budget in `Waits`; carried: counting piped successes, decided by shadow data. 236k tok, 134 s.
 - lang:rust: approve-with-changes after 3 rounds; fixed `StopAck`, one match on the result, the three-state guard mode, typed evidence; carried: `LoopThreshold` newtype, tagged transcript blocks, test-only fields as a sink, `Repeated` casing and imports. 219k tok, 165 s.
 - unix: approve after 2 rounds; fixed the same-output wording, unset versus off; deliberate: SPEC §9 names the last failed poll only when one failed. 136k tok, 110 s.
+- f17 (2026-11-24, piped filter counts on failure only): implementation-review, backend, unix approve after 3 rounds, lang:rust approve; fixed the holds-until ceiling, make/npm/pytest/Gradle markers, `×` at line start; deliberate: coloured vitest output, since a piped filter is not a TTY.
 - Next: the shadow measurement, the live check, then enable `loop_threshold` per the Rollout.
 
 <!-- panel: repos=relais adds=lang:rust reviewers=backend,lang:rust,unix,tui,architect,po body-sha=3051cf24ecd7 -->
