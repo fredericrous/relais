@@ -67,14 +67,23 @@ one. `failure_markers_ignore_zero_counts` pins the marker list both ways.
 `a_piped_filter_that_failed_still_counts_by_its_error_line` covers
 `pipefail`. The three earlier piped-filter tests pass unchanged.
 
-**Replay** (2026-11-24). Two subagent transcripts of the f15 replay
-session, `a6a522f6`, hold the poll shapes. One is the `s9a_run.txt` vitest
-poll. The other is a `vt-full.out` `DONE-RC` poll. They were fed through
-`LoopGuard::push_chunk` in a temporary test that was not committed:
+**Replay** (2026-11-24). Two subagent transcripts on disk under session
+`a6a522f6` hold the same poll shape as `65f3d9db` and `65ec661c`. Their call
+counts (140 and 267) do not match the f15 table, so they are not claimed to
+be those runs. One is an `s9a_run.txt` vitest poll, the other a
+`vt-full.out` `DONE-RC` poll. They were fed through `LoopGuard::push_chunk`
+in a temporary test that was not committed:
 
 | transcript | old rule fires | new rule fires |
 |---|---|---|
-| `agent-a4ecee556c8370d82` (`s9a_run.txt` poll, up to ×6) | 6 | 0 |
-| `agent-a710d4d756a995dba` (`vt-full.out` poll, ×3) | 1 | 0 |
+| `agent-a4ecee556c8370d82` (`s9a_run.txt` poll) | 6 | 0 |
+| `agent-a710d4d756a995dba` (`vt-full.out` poll) | 1 | 0 |
+
+**What is left.** A piped filter that fails under `pipefail` with no
+marker now counts by its first error line (`Exit code N`), like any failing
+Bash command. A wait poll whose filtered output shows a stable early `FAIL`
+line while the suite still runs is still counted by hash and can reach 3.
+The f15 data had no such case; the shadow measurement will show whether it
+matters.
 
 The plan's Carried line and its fingerprint rule are updated.

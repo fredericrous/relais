@@ -890,8 +890,8 @@ mod tests {
         assert_eq!(failing_run(&mut guard, "c", command, "took 3s"), None);
     }
 
-    /// The `65f3d9db` wait poll: six identical runs while a background
-    /// vitest suite ran, after which it passed.
+    /// The `65f3d9db` wait-poll shape (f15, f17): six identical runs while a
+    /// background vitest suite ran, after which it passed.
     #[test]
     fn a_wait_poll_with_no_failure_text_does_not_fire() {
         let command = r#"for i in $(seq 1 22); do grep -q "Test Files" /tmp/s9a_run.txt && break; sleep 5; done; grep -E "Tests |Test Files|×" /tmp/s9a_run.txt | head"#;
