@@ -473,7 +473,7 @@ test('a claim draws the programme under the run, and a clear draws its tail with
   expect(hidden).toContain('▶ t2 Second ◀ you')
 })
 
-test('a carried pass is drawn as carried from the attempt that ran it, after the check that ran', async ($: any, on: any) => {
+test('a carried pass is drawn as one carried row from the attempt that ran it, before the check that ran', async ($: any, on: any) => {
   const engine = await startedRun($, on)
   const { texts } = await drawn($, engine, [
     phase(0, 'prepared'),
@@ -483,7 +483,6 @@ test('a carried pass is drawn as carried from the attempt that ran it, after the
     event(RUN, 4, { kind: 'check_ended', label: 'lint', exit: 0, duration_ms: 900 }),
     event(RUN, 5, { kind: 'check_carried', label: 'make', from: 'attempt1' }),
   ])
-  const carriedAt = indexOf(texts, 'make · carried from attempt1')
-  expect(carriedAt).toBeGreaterThan(indexOf(texts, '│ lint ok'))
-  expect(texts[carriedAt]).toContain('carried from attempt1')
+  const carriedAt = indexOf(texts, 'carried 1 from attempt1 (make)')
+  expect(carriedAt).toBeLessThan(indexOf(texts, '│ lint ok'))
 })

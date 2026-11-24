@@ -65,34 +65,49 @@ ticket here until it is resolved or moved into a programme of its own.
 - [f14](f14-claim-lock-stderr-pinned.md) (2026-11-21, closed 2026-11-24):
   the claim CLI lock-timeout test asserts stderr holds `stayed held for`,
   the wording the driver's retry matches.
-- [f15](f15-loop-breaker-wider-fingerprint.md) (2026-11-23, open): replay
-  Lumina's no-progress rule (every tool, normalized results, failures
-  stale) over the wall-timeout transcripts the #418 Bash rule found no
-  loop in; widen the shadow fingerprint, add a warn rung, or no change.
-- [f17](f17-pin-row-records-call-model.md) (2026-11-24, open): a
+- [f15](f15-loop-breaker-wider-fingerprint.md) (2026-11-23, closed
+  2026-11-24): no change, and no warn rung. Over 32 wall-timeout
+  transcripts, Lumina's rule trips on 2 and the Bash rule reaches 3 on 2.
+  Every one of them is a wait on a slow test or build. 78% of the wall time
+  is inside tool calls, and no transcript has more than 140 calls.
+- [f17](f17-piped-filter-polls.md) (2026-11-24, open): the piped-filter
+  clause fires on wait polls, so it should count only on failure text
+  before `loop_threshold` is enabled.
+- [f18](f18-timeout-wall-time-waits.md) (2026-11-24, open): what a
+  timed-out worker's wall time waits on (suite, host contention, polling).
+- [f19](f19-pin-row-records-call-model.md) (2026-11-24, open): a
   `preferred-model` pin row records the preference, not the model the
   call ran; record the call's model, keep the pin source, validate the value.
-- [f18](f18-clear-routes-on-stale-state.md) (2026-11-24, open): after a
+- [f20](f20-clear-routes-on-stale-state.md) (2026-11-24, open): after a
   `/clear` relay, spawns before the first person prompt can route on a
   state with no pins (likely the pre-clear one; cause open): a pinned
   reviewer's fallback spawn was table-routed to Haiku.
 
 ## Handoff
 
-2026-11-24, boundary 4 (f14 closed): the claim lock-timeout wording the
-driver's retry matches is pinned by the claim CLI test. Boundary 3 (f12):
-`relais programme adopt --previous <old>` takes the cleared session's
-handoffs over as `work`, and the plugin runs it at the successor's first
-read (unreleased; f10 and f11 are unreleased too).
+2026-11-24, boundary 3 (f15 closed): a wider no-progress fingerprint
+catches no loop that the Bash rule misses. Both rules flag only waits on
+slow suites, so the shadow detector stays as it is and `loop_threshold`
+stays unset. The replay also showed that the shipped piped-filter clause
+fires on `… | head` wait polls, which is filed as f17. Earlier the same day,
+`relais programme adopt` (f12) and the f10 and f11 fixes merged; they are
+unreleased.
 
-- Done: f12, f13, f14.
-- Next: f15 (loop breaker fingerprint) is ready; f17 (pin row records
-  the call's model) and f18 (stale state after a clear) are ready too,
-  f18 first since it skews the router pin plan's 11-30 cohort check.
-  Measure the home fingerprint warnings (f08) is due 2026-11-28, and A
-  week of relays adopts every handoff (f16) is due 2026-12-02, counted
-  from the plugin reinstall.
+- Done: f12, f13, f14, f15.
+- Next: The loop guard counts a piped filter only on failure text (f17) and
+  What a timed-out worker's wall time waits on (f18) are ready, and so are
+  f19 (pin row records the call's model) and f20 (stale state after a
+  clear), f20 first since it skews the router pin plan's 11-30 cohort
+  check. Measure the home fingerprint warnings (f08) is due 2026-11-28. A
+  week of relays
+  adopts every handoff (f16) is due 2026-12-02, counted from the plugin
+  reinstall.
 - Lessons:
+  - A timed-out dispatch has no `agent_id` in the ledger. Find its
+    transcript by the dispatch's `session_id` and the subagent file whose
+    first line comes within 2 min of `dispatch_started`.
+  - `grep 'relais: shadow:'` also matches run prose. Count only lines whose
+    event text starts with it.
   - The 11-21 takeover was no fault of the takeover rule: the successor
     held no claim. Read `claims/log.jsonl` and the transcripts before
     blaming a rule.
