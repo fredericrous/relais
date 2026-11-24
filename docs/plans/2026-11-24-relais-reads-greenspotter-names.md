@@ -89,6 +89,13 @@ installed before t09, which removes `adr-lint` from PATH.
   with the real greenspotter 0.20.0 on PATH lists candidates and records no gap; the real 0.20.0 run in a repository with no
   decisions corpus exits 3 and the receipt says `unavailable`.
 
+## Implementation review
+- implementation-review: approve-with-changes, then approve on the Delta; real 0.20.0 capture, CHANGELOG entry and pending-wording fixed; 60k tokens.
+- backend: approve; `deliberate:` no test of the PATH default beyond the new one, covered by Phase 2's laptop check.
+- lang:rust: approve-with-changes, then approve-with-changes; fixture and stale-name assertion fixed; `deliberate: the default-program test skips its second assert when RELAIS_GREENSPOTTER is exported (a pure function would avoid it)`.
+- unix: approve-with-changes, then approve; `deliberate: no runtime notice for RELAIS_ADR_LINT (ADR-0072: no alias); the CHANGELOG names it and Phase 2 greps the fleet`.
+
 ## Outcome
+Phase 1 verified 2026-11-24: `cargo test -p relais --lib candidates` green after the real capture (89 s, new default-program test included); `cargo clippy --all-targets -D warnings` green; greenspotter 0.20.0 `candidates --json` on a scratch commit printed `greenspotter.candidates/1` with the keys relais parses. Next: Phase 2 after the PR merges and the release is cut.
 
 <!-- panel: repos=relais,decisions adds= reviewers=backend,lang:rust,platform,tui,unix body-sha=859861b13e13 -->
