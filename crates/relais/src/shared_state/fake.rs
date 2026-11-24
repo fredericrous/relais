@@ -62,7 +62,7 @@ struct Inner {
     settles_refused: Option<String>,
     /// When set, every settle fails with a compare-and-set conflict: an
     /// answered failure that is neither an outage nor a refusal (a test knob).
-    settles_conflict: bool,
+    settles_conflict: Option<String>,
     /// When set, the session-wide renew and release sleep this long first,
     /// as a primary that does not answer would (a test knob).
     slow: Option<std::time::Duration>,
@@ -129,10 +129,11 @@ impl FakeState {
         self.lock().settles_refused = reason.map(str::to_string);
     }
 
-    /// Fail (`true`) or allow (`false`) every settle with a conflict, an
-    /// answered failure that is neither an outage nor a refusal.
-    pub fn set_settles_conflict(&self, conflict: bool) {
-        self.lock().settles_conflict = conflict;
+    /// Fail every settle with a conflict on `expected` (`Some`), or allow
+    /// them again (`None`): an answered failure that is neither an outage
+    /// nor a refusal.
+    pub fn set_settles_conflict(&self, expected: Option<&str>) {
+        self.lock().settles_conflict = expected.map(str::to_string);
     }
 
     /// Make the session-wide renew and release take `delay` (`None`: answer
@@ -324,9 +325,9 @@ impl SharedState for FakeState {
         if let Some(reason) = self.lock().settles_refused.clone() {
             return Err(SharedStateError::Refused { reason });
         }
-        if self.lock().settles_conflict {
+        if let Some(expected) = self.lock().settles_conflict.clone() {
             return Err(SharedStateError::CasConflict {
-                expected: None,
+                expected: Some(expected),
                 found: None,
             });
         }

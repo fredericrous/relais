@@ -481,7 +481,7 @@ fn a_settle_with_another_failure_is_kept_and_retried_without_stopping_the_pass()
     for id in ["c1", "c2"] {
         assert_eq!(admit(&book, &state, &agent(id, 100)), Decision::Granted);
     }
-    fake.set_settles_conflict(true);
+    fake.set_settles_conflict(Some("settle-slot"));
     {
         let mut admission = super::super::lock_state(&state);
         for id in ["c1", "c2"] {
@@ -503,7 +503,7 @@ fn a_settle_with_another_failure_is_kept_and_retried_without_stopping_the_pass()
     );
     assert_eq!(fake.spent().to_micros(), 0);
 
-    fake.set_settles_conflict(false);
+    fake.set_settles_conflict(None);
     book.sync(&state);
     assert_eq!(fake.spent().to_micros(), 20, "both were kept and book now");
 }
