@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.81.0
+
 - A session started by a `/clear` relay now holds the ticket its
   predecessor handed off. The new `relais programme adopt --previous <old>`
   takes every live `handoff` claim of `<old>` over as this session's
