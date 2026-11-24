@@ -54,11 +54,7 @@ pub fn probe_integrations(repo: &RepoPolicy) -> Vec<Blocker> {
                     if !binary_available(bin) {
                         blockers.push(Blocker {
                             code: BlockCode::IntegrationMissing,
-                            detail: format!(
-                                "required integration `{name}` is not available on PATH; \
-                                 set [integrations] {name} = \"optional\" in relais.toml \
-                                 to run without it"
-                            ),
+                            detail: missing_integration_detail(name, bin),
                         });
                     }
                 }
@@ -70,6 +66,26 @@ pub fn probe_integrations(repo: &RepoPolicy) -> Vec<Blocker> {
         }
     }
     blockers
+}
+
+/// The blocker text for a required integration that is not on PATH. The
+/// aval entry names both keys it may be written under, so a repository
+/// that wrote `greentopo` is not told to add the key that both-keys
+/// refuses.
+fn missing_integration_detail(name: &str, bin: &str) -> String {
+    match name {
+        "aval" => format!(
+            "required integration `aval` (binary `{bin}`) is not available on PATH; \
+             set its [integrations] key (aval or greentopo) in relais.toml to \
+             \"optional\", or to {{ mode = \"required\", bin = \"greentopo\" }} \
+             if greentopo is installed"
+        ),
+        _ => format!(
+            "required integration `{name}` is not available on PATH; \
+             set [integrations] {name} = \"optional\" in relais.toml \
+             to run without it"
+        ),
+    }
 }
 
 /// The binary an integration's config key names when the declaration gives
@@ -345,5 +361,21 @@ mod tests {
         assert!(resolved.version.to_lowercase().contains("git"));
         assert!(resolved.path.ends_with("git") || resolved.path.contains("git"));
         assert_eq!(resolved.program, "git");
+    }
+
+    #[test]
+    fn a_missing_greentopo_integration_blocker_names_both_keys() {
+        let policy = RepoPolicy::from_toml_str(
+            "schema_version = 1\n[integrations]\ngreentopo = { mode = \"required\", bin = \"relais-test-no-such-bin\" }\n",
+        )
+        .unwrap();
+        let blockers = probe_integrations(&policy);
+        assert_eq!(blockers.len(), 1);
+        let detail = &blockers[0].detail;
+        assert!(
+            detail.contains("aval") && detail.contains("greentopo"),
+            "{detail}"
+        );
+        assert!(detail.contains("relais-test-no-such-bin"));
     }
 }

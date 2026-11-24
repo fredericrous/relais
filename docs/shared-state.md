@@ -214,6 +214,10 @@ it could not renew or give back ends by its TTL.
   must fit the 15 s tick, inside the 90 s lease). An unsettled reservation
   must end with its seat's lease on the primary (an-t11): a daemon that dies
   before settling leaves it behind, and its successor reserves again.
+- A command builds its state once and hands that instance to every step:
+  `relais run` reads the machine settings and prices, claims and releases
+  a successor intent, and runs the worker through the one it built, so a
+  client that keeps per-instance state releases what it granted.
 - The trait still speaks a few relais value types (`MachineSettings`,
   `MicroUsd`, `RunId`, `Contest`), so a client builds against one exact
   relais version, as an-t13's build plan pins it.

@@ -8,6 +8,16 @@ missing here.
 
 ## Unreleased
 
+## v0.82.0
+
+relais.toml reads `[integrations] greentopo`, the new name of aval. It declares
+the same dependency as `aval`, so the topo-spotter-rename fleet sweep can
+rename the key. Setting both keys is refused with `set only one of
+[integrations] aval and greentopo; remove the aval line`. The binary relais
+spawns is still `aval` (set `bin = "greentopo"` to use the new one), and a
+relais older than this release refuses `greentopo` as an unknown field, so
+upgrade every host before swept repositories land.
+
 A carried check reads tidier. The pane draws the passes carried from an
 earlier attempt as one row, `carried 5 from attempt1 (a, b, c +2 more)`, before
 the re-run check's output, so a short pane keeps that output. `relais report`
