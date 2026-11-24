@@ -29,12 +29,15 @@ back to an older relais.
 | successor intent claim and release | `relais run --intent` |
 | decision answer with a successor intent | `relais decide` with the revise answer |
 | registry pointer read and swap | `relais promote` |
+| daily spend ceiling check | `relais run`, `relais dataset replay` (through `RunConfig::shared_state`) |
+| the runner's widen and timed-out settles | `relais run`, `relais dataset replay` |
+
+The ceiling check reads the larger of the global counter and this node's
+ledger, since nothing feeds the global counter until seats and reservations
+are routed. A shared read that fails stops the run before dispatch.
 
 Not routed yet, so under `external` they still read or write the node's own
-files: the daily spend ceiling check and the runner's widen and timed-out
-settles (the runner would have to look the implementation up itself, since
-`RunConfig` cannot gain a field without editing the tests that build it; it
-gains one in a later change); the other direct readers of `machine.toml` (`tuning_bounds` and two
+files: the other direct readers of `machine.toml` (`tuning_bounds` and two
 more in `cli/ctx.rs`, `cli/coordinator.rs`, `doctor/mod.rs`,
 `router/mod.rs`, `holdout.rs`, `runner/attempt.rs`, `cli/learn.rs`,
 `cli/native.rs`); the coordinator's own seats (`AdmissionState` behind the

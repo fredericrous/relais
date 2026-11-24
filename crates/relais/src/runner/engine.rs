@@ -472,7 +472,9 @@ impl<'a> RunEngine<'a> {
             }
         };
         let note = rule.note();
-        let written = config.ledger.resolve_decision_with_intent(
+        let written = crate::shared_state::node::resolve_decision_with_intent(
+            config.shared_state,
+            config.ledger,
             &self.run_id,
             &crate::ledger::DecisionAnswer {
                 resolution: Reason::DecisionRevised,
@@ -924,7 +926,9 @@ impl<'a> RunEngine<'a> {
                 return None;
             }
         };
-        let written = config.ledger.resolve_decision_with_intent(
+        let written = crate::shared_state::node::resolve_decision_with_intent(
+            config.shared_state,
+            config.ledger,
             &self.run_id,
             &crate::ledger::DecisionAnswer {
                 resolution: Reason::DecisionRevised,

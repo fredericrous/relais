@@ -171,17 +171,23 @@ fn give_back<E: std::fmt::Display>(what: &str, release: Result<(), E>) {
     }
 }
 
-/// What has been spent since `day_start`: the global counter when the
-/// implementation keeps one, else this node's ledger.
+// holds-until: an-t17 wires `settle_spend`; then the global counter alone is
+// the day.
+/// What has been spent since `day_start`: the greater of the global counter
+/// (when the implementation keeps one) and this node's ledger. Nothing feeds
+/// the global counter until `settle_spend` is wired (an-t17), and local
+/// spend is a lower bound of global spend, so the cap never counts less than
+/// the ledger says.
 pub fn daily_spent(
     state: &dyn SharedState,
     ledger: &Ledger,
     day_start: &str,
 ) -> Result<MicroUsd, NodeError> {
-    match state.daily_spent(day_start)? {
-        Some(spent) => Ok(spent),
-        None => Ok(ledger.spend_since(day_start)?),
-    }
+    let local = ledger.spend_since(day_start)?;
+    Ok(match state.daily_spent(day_start)? {
+        Some(global) => global.max(local),
+        None => local,
+    })
 }
 
 /// The claim file's rules: sweep the programme's closed tickets, then
@@ -457,4 +463,68 @@ fn swap_locally(
         .into());
     }
     Ok(registry.promote(evaluated)?)
+}
+
+#[cfg(test)]
+mod daily_spent_tests {
+    use super::*;
+    use crate::shared_state::fake::FakeState;
+
+    #[test]
+    fn the_larger_of_the_global_counter_and_the_ledger_is_the_day() {
+        let dir = crate::test_support::temp_dir("daily-spent-max");
+        let ledger = Ledger::open(&dir.join("ledger.db")).expect("ledger");
+        let state = FakeState::new();
+        let day = "2026-01-01T00:00:00+00:00";
+        assert_eq!(
+            daily_spent(&state, &ledger, day).expect("read"),
+            MicroUsd::from_micros(0)
+        );
+        state.set_spent(MicroUsd::from_micros(7));
+        assert_eq!(
+            daily_spent(&state, &ledger, day).expect("read"),
+            MicroUsd::from_micros(7),
+            "global above an empty ledger"
+        );
+        // The ledger above a lower global count wins: the cap never counts
+        // less than this node's own spend.
+        ledger
+            .insert_run(
+                &RunId::from_stored("earlier-today"),
+                "/elsewhere",
+                None,
+                &crate::ids::TaskId::from_stored("task-earlier-today"),
+                "rk",
+            )
+            .expect("run");
+        ledger
+            .record_usage(&crate::ledger::UsageEvent {
+                event_id: "today".into(),
+                run_id: RunId::from_stored("earlier-today"),
+                attempt_id: None,
+                parent_event_id: None,
+                model: Some("sonnet".into()),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cost: Some(MicroUsd::from_micros(50)),
+                cost_kind: crate::money::CostKind::ApiSpend,
+                completeness: crate::money::CostCompleteness::Actual,
+                inclusive: false,
+                at: "2026-01-01T08:00:00+00:00".into(),
+                phase: None,
+                duration_ms: None,
+                requested_model: None,
+                requested_effort: None,
+                harness: None,
+            })
+            .expect("usage");
+        assert_eq!(
+            daily_spent(&state, &ledger, day).expect("read"),
+            MicroUsd::from_micros(50),
+            "the ledger above the global count"
+        );
+        std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup
+    }
 }

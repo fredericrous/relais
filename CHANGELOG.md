@@ -35,6 +35,16 @@ prints `make: 1 carried` with no timings, which are the source attempt's.
   [[pricing.models]] entry for:` (`relais report`), so the header can be
   pasted as is. A script that matched the single-bracket text must match
   the double-bracket form.
+- Breaking, for a library caller building a `RunConfig`: it carries a
+  `shared_state: &dyn SharedState`, and the runner's
+  daily spend check and its two automatic settles (scope widening and
+  timed-out verify) go through it: the ceiling reads the larger of the
+  global counter and this node's ledger, and a settle answers the decision
+  once through the shared half. A shared read that fails stops the run
+  before dispatch; a settle another node already answered leaves the
+  decision to that node, with a step line carrying the refusal. Nothing changes for a
+  single node: `LocalState` keeps no counter and grants every answer.
+  Library callers building a `RunConfig` add the field.
 - Breaking, for a client of `relais::shared_state`: the error and grant types
   are settled before a closed client is built. `SharedStateError` no longer
   has `Lock`, `Ledger`, `Claim`, `Registry` or `Compensation`; the `node`
@@ -47,6 +57,7 @@ prints `make: 1 carried` with no timings, which are the source attempt's.
   runs the new `a_decision_grant_lapses` check for an implementation with an
   injectable clock. Nothing changes for a single node: every command prints
   what it printed before.
+
 - `relais::shared_state::SharedState` takes and answers plain values only:
   no `Ledger`, claim `Store`, `Registry`, `EvaluatedArtifact`, pid-probe
   callback or borrowed request is left in its signatures, so a closed
