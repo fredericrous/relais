@@ -75,6 +75,14 @@ ticket here until it is resolved or moved into a programme of its own.
   (`shows_failure`). The real wait polls went from 7 fires to 0.
 - [f18](f18-timeout-wall-time-waits.md) (2026-11-24, open): what a
   timed-out worker's wall time waits on (suite, host contention, polling).
+- [f19](f19-pin-row-records-call-model.md) (2026-11-24, open): a
+  `preferred-model` pin row records the preference, not the model the
+  call ran; record the call's model, serve the pin source in an added
+  `pin_sources` field, validate the value.
+- [f20](f20-clear-routes-on-stale-state.md) (2026-11-24, open): after a
+  `/clear` relay, spawns before the first person prompt can route on a
+  state with no pins (likely the pre-clear one; cause open): a pinned
+  reviewer's fallback spawn was table-routed to Haiku.
 
 ## Handoff
 
@@ -88,10 +96,12 @@ went from 7 to 0. This is unreleased, like f10, f11 and f12.
 events, at most 1 in 5 passing verification.
 
 - Done: f12, f13, f14, f15, f17.
-- Next: What a timed-out worker's wall time waits on (f18) is ready.
-  Measure the home fingerprint warnings (f08) is due 2026-11-28. A week of
-  relays adopts every handoff (f16) is due 2026-12-02, counted from the
-  plugin reinstall.
+- Next: What a timed-out worker's wall time waits on (f18) is ready. So
+  are f19 (pin row records the call's model) and f20 (stale state after a
+  clear), f20 first since it skews the router pin plan's 11-30 cohort
+  check. Measure the home fingerprint warnings (f08) is due 2026-11-28. A
+  week of relays adopts every handoff (f16) is due 2026-12-02, counted
+  from the plugin reinstall.
 - Lessons:
   - A timed-out dispatch has no `agent_id` in the ledger. Find its
     transcript by the dispatch's `session_id` and the subagent file whose
