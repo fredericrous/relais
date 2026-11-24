@@ -177,22 +177,17 @@ fn give_back<E: std::fmt::Display>(what: &str, release: Result<(), E>) {
     }
 }
 
-// holds-until: an-t17 wires `settle_spend`; then the global counter alone is
-// the day.
-/// What has been spent since `day_start`: the greater of the global counter
-/// (when the implementation keeps one) and this node's ledger. Nothing feeds
-/// the global counter until `settle_spend` is wired (an-t17), and local
-/// spend is a lower bound of global spend, so the cap never counts less than
-/// the ledger says.
+/// What has been spent since `day_start`: the global counter when the
+/// implementation keeps one (the coordinator's settles feed it, an-t17),
+/// else this node's ledger.
 pub fn daily_spent(
     state: &dyn SharedState,
     ledger: &Ledger,
     day_start: &str,
 ) -> Result<MicroUsd, NodeError> {
-    let local = ledger.spend_since(day_start)?;
     Ok(match state.daily_spent(day_start)? {
-        Some(global) => global.max(local),
-        None => local,
+        Some(global) => global,
+        None => ledger.spend_since(day_start)?,
     })
 }
 

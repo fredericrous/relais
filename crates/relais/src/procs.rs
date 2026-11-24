@@ -205,6 +205,31 @@ pub fn sleep_counting_millis() -> Option<i64> {
     None
 }
 
+/// This machine's host name, for naming the node that holds shared seats
+/// (an-t17); `None` when the OS gives none or an empty one.
+#[cfg(unix)]
+pub fn host_name() -> Option<String> {
+    let mut buffer = [0u8; 256];
+    // SAFETY: the buffer is valid for its whole length, and `gethostname`
+    // writes at most that many bytes.
+    let rc = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+    let name = String::from_utf8_lossy(&buffer[..end]).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// This machine's host name: Windows states it in `COMPUTERNAME`.
+#[cfg(windows)]
+pub fn host_name() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
 /// The uid this process runs as: who the coordinator serves.
 #[cfg(unix)]
 pub fn uid() -> u32 {

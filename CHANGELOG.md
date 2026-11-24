@@ -80,6 +80,19 @@ prints `make: 1 carried` with no timings, which are the source attempt's.
   decision to that node, with a step line carrying the refusal. Nothing changes for a
   single node: `LocalState` keeps no counter and grants every answer.
   Library callers building a `RunConfig` add the field.
+- The coordinator's seats go through `relais::shared_state` (an-t17). The
+  daemon builds the implementation at start (`external` without a client
+  exits 3 before anything is bound) and mirrors every agent dispatch that
+  holds a seat into it: `acquire_seat` with a reservation of the dispatch's
+  `reserve_micros`, `renew_seat` every reconcile tick (15 s), `release_seat`
+  when the seat is freed and `settle_spend` when the dispatch settles, so a
+  shared primary's spend counter has a writer. A refused or unreachable
+  shared seat is answered `Queued` (the runner and the hook poll it within
+  their admission wait); a slice too small for the reservation is `Refused
+  (budget_exceeded)`. The daemon writes one stderr line per change of a
+  seat's shared state. The holder is the host's name. `Coordinator::start`
+  and `run_daemon` take the shared state and the holder. With `LocalState`
+  every seat is granted, so a single node answers as before.
 - Breaking, for a client of `relais::shared_state`: the error and grant types
   are settled before a closed client is built. `SharedStateError` no longer
   has `Lock`, `Ledger`, `Claim`, `Registry` or `Compensation`; the `node`
