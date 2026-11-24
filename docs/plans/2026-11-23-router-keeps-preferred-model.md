@@ -79,6 +79,14 @@ Board checked: phase8-learner's t12 runs in `relais-wt-t12-correction` (correcti
 - `cargo test -p relais --lib -- router:: install::`: 224 passed, incl. the 6 new tests (preference pins an inheriting definition, in any line order and quoted; own `model` outranks it; `inherit`/empty preference is no pin; `definition_pins` serves a preference-only file; the shipped `agent_review()` parses to `relais-review = opus`).
 - Pending after release: router-state pins and stderr, the live ledger rows, the 7-day cohort (pass needs ≥80% of the cohort matched, else inconclusive).
 
+### Observed (live, 2026-11-24, relais v0.81.0, plugin 0.79.0, routing `on`)
+- router-state: `relais native router-state --session <id>` lists all 21 reviewer agents pinned `opus`, stderr empty.
+- Round 1, in a session a `/clear` relay started, before any typed prompt: the explicit `model: "opus"` launch ran on Opus (7/7 steps `claude-opus-5-5`) but wrote no decision row; the marked fallback was table-routed: `task-1795516121648-249`, reason `table`, tier `research`, applied 1, model and steps `claude-haiku-5-5`. The binary served the pin for both session ids, so the plugin routed on its pre-clear state: filed as follow-up f18 (`docs/programmes/follow-ups/f18-clear-routes-on-stale-state.md`). Until f18 lands, the 7-day cohort counts spawns made before a session's first person prompt apart; that row is one of them.
+- Round 2, after the first typed prompt (whose flush landed round 1 at 10:35:03Z): both calls reached the tool unchanged (PostToolUse `model` none on the fallback, `opus` on the explicit launch) and every step of both ran `claude-opus-5-5`. But no record of any kind from this session reached the ledger after 10:35, over two more typed prompts: no decision rows for the two agent ids, no `router_usage`, no `continuation` rows (earlier turns of the same session wrote one each). That is indistinguishable from a plugin routing nothing (`inherit` on an Opus session gives Opus too), so round 2 is not a pass. `router-state` answers in 0.26 s (plugin timeout 10 s). Added to f18.
+- Still owed: the live ledger check, in a brand-new session (not a `/clear` relay). Type a prompt first, confirm that session's rows land (a `continuation` row), then make both launches, type one more prompt and read the rows by `agent_id`. A missing pin row in a session that is otherwise writing is a defect. The 1,123 earlier `pin` rows (`model:` pins, latest 2026-11-23T17:38Z) show the plugin writes pin rows when its state and the parent task are present.
+- The row-records-the-preference caveat is follow-up f17 (`f17-pin-row-records-call-model.md`).
+- Remaining after that: the 7-day cohort check (~2026-11-30) per Verification, with the f18 split.
+
 ## Implementation review
 - implementation-review: approve, no findings; 47k, 45 s.
 - backend: approve; 1 low to the plugin follow-up (an unchecked pin value only reaches telemetry); 66k, 78 s.

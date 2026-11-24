@@ -69,6 +69,12 @@ ticket here until it is resolved or moved into a programme of its own.
   Lumina's no-progress rule (every tool, normalized results, failures
   stale) over the wall-timeout transcripts the #418 Bash rule found no
   loop in; widen the shadow fingerprint, add a warn rung, or no change.
+- [f17](f17-pin-row-records-call-model.md) (2026-11-24, open): a
+  `preferred-model` pin row records the preference, not the model the
+  call ran; record the call's model, keep the pin source, validate the value.
+- [f18](f18-clear-routes-on-stale-state.md) (2026-11-24, open): after a
+  `/clear` relay, spawns before the first person prompt route on the
+  pre-clear state (no pins): a pinned reviewer was table-routed to Haiku.
 
 ## Handoff
 
