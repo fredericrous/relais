@@ -111,7 +111,7 @@ ticket `topo-spotter-rename/t11-relais-aval-key`.
   `authority_hash()`, equal `serde_json::to_string` with no `greentopo` key,
   and that JSON deserializes back to an equal policy;
   `greentopo = { mode = "optional", bin = "x" }` → `Dependency::Full`, bin
-  `x`; both keys → `matches!` the new `PolicyError` variant, its Display
+  `x`; both keys → `assert_eq!` to the new `PolicyError` variant, its Display
   `contains` the refusal text and not `not valid TOML`; `greentop = "required"`
   → `unknown field` error; in `tooling` tests,
   `greentopo = { mode = "required", bin = "relais-test-no-such-bin" }` → a
@@ -124,8 +124,10 @@ ticket `topo-spotter-rename/t11-relais-aval-key`.
   t10's `blocked_by` names t11.
 
 ## Implementation review
-- implementation-review: approve-with-changes; doctor-line expectation and SPEC sentence fixed; wildcard candidate dissolved by a simpler match.
-- backend: approve; backstop JSON test and doc sentence added. lang:rust: approve-with-changes; simplified, typed backstop error, assert_eq. unix: approve; SPEC fixed. tui: approve-with-changes; blocker names the paste-able fix and relais.toml.
+- implementation-review: approve-with-changes, then approve on the Delta; doctor-line and SPEC fixed, wildcard candidate dissolved.
+- backend: approve; backstop test and doc sentence added. unix: approve; SPEC fixed.
+- lang:rust: approve-with-changes, then approve; simplified, typed backstop error, assert_eq.
+- tui: approve-with-changes, then approve-with-changes; blocker fixed; `deliberate: when bin is already greentopo the paste-able hint repeats it, an edge the text still reads correctly for`.
 
 ## Outcome
 Phases 1–2 verified 2026-11-24 on the built binary. Phase 1: `cargo test -p relais --lib -- policy:: tooling::` and clippy `-D warnings` green (the relais run's verify queued 1800 s twice on a jammed host, so the kept candidate was applied by hand). Phase 2: `relais doctor` with `greentopo = "optional"` → `✓ aval optional`; with `greentopo = "required"`, no aval on PATH → `✗ aval        required by [integrations] and `aval` is not on PATH; every run is blocked on it`; both keys → `✗ relais.toml  set only one of [integrations] aval and greentopo; remove the aval line`. Phase 3 (release, hand-off) waits for the merge and the person's release call.
