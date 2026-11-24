@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.82.0
+
 relais.toml reads `[integrations] greentopo`, the new name of aval. It declares
 the same dependency as `aval`, so the topo-spotter-rename fleet sweep can
 rename the key. Setting both keys is refused with `set only one of
