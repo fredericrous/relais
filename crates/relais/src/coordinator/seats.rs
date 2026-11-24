@@ -126,7 +126,8 @@ impl Book {
     /// not take waits for the next sync. A settle is never refused for a
     /// stale seat (an-t11), so only an outage keeps one waiting, and the
     /// first unreachable answer stops the pass: the rest are not tried
-    /// until the next sync. A settle the primary refuses is dropped. Returns
+    /// until the next sync. A settle the primary refuses (`Refused`) is
+    /// dropped; any other failure is kept. Returns
     /// `false` when the primary was found unreachable (whether the settles
     /// were taken or not).
     fn flush_settles(&mut self, shared: &dyn SharedState, log: &LogSink) -> bool {
@@ -155,15 +156,30 @@ impl Book {
                     reachable = false;
                     break;
                 }
-                Err(settle_error) => {
+                Err(settle_error @ SharedStateError::Refused { .. }) => {
                     // The primary answered and refused it: retrying would
-                    // repeat the refusal forever, so it is dropped, and the
-                    // ledger floor in `node::daily_spent` still counts it.
+                    // repeat the refusal forever, so it is dropped. The
+                    // shared counter never books it; this node's ledger does,
+                    // and the floor in `node::daily_spent` counts it here.
                     self.failing.remove(&(id.clone(), SeatOp::Settle));
                     log(&format!(
-                        "seat {id}: booking the spend was refused: {settle_error}; dropped, this \
-                         node's ledger still counts it"
+                        "seat {id}: booking the spend was refused: {settle_error}; dropped, the \
+                         shared budget does not count it, this node's ledger does"
                     ));
+                }
+                Err(settle_error) => {
+                    // Any other failure (a lost answer, an error the primary
+                    // did not classify) is kept and retried at the next sync.
+                    self.fail(
+                        log,
+                        &id,
+                        SeatOp::Settle,
+                        format!(
+                            "seat {id}: booking the spend failed: {settle_error}; it is retried \
+                             at the next sync"
+                        ),
+                    );
+                    self.settles.push((id, reservation, actual));
                 }
             }
         }

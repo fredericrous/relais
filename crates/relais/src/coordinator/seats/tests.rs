@@ -424,3 +424,47 @@ fn an_unreachable_primary_stops_the_sync_at_its_first_call() {
         );
     }
 }
+
+/// A settle the primary answers and refuses is dropped once with one line,
+/// not retried at every sync; the next settle after it is still booked.
+#[test]
+fn a_settle_the_primary_refuses_is_dropped_once_and_the_next_one_books() {
+    let fake = FakeState::new();
+    let (book, lines) = book(Arc::new(fake.clone()));
+    let state = admission(2);
+    for id in ["r1", "r2"] {
+        assert_eq!(admit(&book, &state, &agent(id, 100)), Decision::Granted);
+    }
+    fake.set_settles_refused(Some("reservation unknown to the primary"));
+    {
+        let mut admission = super::super::lock_state(&state);
+        admission.settle("r1", Some(10), Instant::now());
+        admission.release("r1", Instant::now());
+    }
+    book.sync(&state);
+    book.sync(&state);
+    let refused = |lines: &Arc<Mutex<Vec<String>>>| {
+        lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains("booking the spend was refused"))
+            .count()
+    };
+    assert_eq!(refused(&lines), 1, "dropped once, not retried: {lines:?}");
+    assert_eq!(
+        fake.spent().to_micros(),
+        0,
+        "the refused settle is not booked"
+    );
+
+    fake.set_settles_refused(None);
+    {
+        let mut admission = super::super::lock_state(&state);
+        admission.settle("r2", Some(20), Instant::now());
+        admission.release("r2", Instant::now());
+    }
+    book.sync(&state);
+    assert_eq!(refused(&lines), 1, "{lines:?}");
+    assert_eq!(fake.spent().to_micros(), 20, "the next settle books");
+}

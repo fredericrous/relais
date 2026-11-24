@@ -222,9 +222,11 @@ and `RemoteGate` with a degraded fake answers `Queued`.
   string operation keys became `Book` methods and enums; the seat book's
   types are `pub(crate)`; the budget and wait lines say what to do.
 
-- 2026-11-24 (F4b delta): a settle the primary refuses (not an outage)
-  is dropped with one line instead of being retried forever; the ledger
-  floor still counts it (backend delta finding 1). The budget refusal drops
+- 2026-11-24 (F4b delta): a settle the primary answers with `Refused` is
+  dropped with one line instead of being retried forever; the shared budget
+  does not count it, the node's ledger and its floor do (backend delta
+  findings). Any other settle failure is kept and retried; `FakeState`
+  gains `set_settles_refused` so the drop is tested. The budget refusal drops
   "or wait for the next day" (no daily reset backs it). The operator lines
   now read as the code and docs/shared-state.md write them (`the shared
   state did not grant the seat (...); this run waits and asks again; if it

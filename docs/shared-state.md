@@ -88,8 +88,9 @@ state:
   queue, an adopted one) are taken at the next tick or at their own poll.
   Once a pass finds the primary unreachable it makes no more shared calls:
   the waiting settles, the freed seats not yet tried (which keep their
-  tokens) and the new seats are tried again at the next sync, so a request served while
-  the primary is down pays for one failed call, not one per seat.
+  tokens) and the new seats are tried again at the next sync, so a request
+  served while the primary is down pays for one failed call, not one per
+  seat.
 - Each tick renews every held seat. A seat found `lease_lost` is not taken
   again: its work in flight finishes and its reservation settles as a
   true-up.
@@ -105,8 +106,9 @@ state:
   `seat <dispatch>: the shared state did not grant the seat (<cause>); this
   run waits and asks again; if it lasts, check the shared primary`, then
   `seat <dispatch>: shared seat granted`; `renew`, `release`, `reserve` and
-  `settle` failures likewise. A settle the primary refuses (rather than an
-  outage) is dropped with one line; the node's ledger still counts it.
+  `settle` failures likewise. A settle the primary refuses (`Refused`) is
+  dropped with one line: the shared budget does not count it, the node's
+  ledger does. Any other settle failure is kept and retried.
 - The holder is `Principal::node(<host name>)`, so two nodes never share
   one; under `external` a host with no name is refused (exit 3, with the
   command that sets one). A restarted
