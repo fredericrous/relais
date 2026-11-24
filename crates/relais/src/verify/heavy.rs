@@ -51,7 +51,7 @@ use crate::admission::{
     ResourceClass, RunRegistration, ADMISSION_POLL,
 };
 use crate::disk::{DiskCheck, Shortfall};
-use crate::policy::{Budgets, Exhausted, WaitKind};
+use crate::policy::{Bound, Budgets, Exhausted, WaitKind};
 use crate::procs::Ended;
 use crate::protocol::{Event, Events};
 
@@ -788,7 +788,7 @@ impl<'a> HeavyAdmission<'a> {
                                 class: "heavy_local",
                                 position: *position,
                                 behind: None,
-                                moving: false,
+                                bound: Bound::Budget,
                             },
                             _ => unreachable!("granted, duplicate and refused return above"),
                         };
@@ -889,9 +889,8 @@ enum Holding<'h> {
         class: &'h str,
         position: usize,
         behind: Option<String>,
-        /// A host-slot wait, ended by a stalled line and not by the spent
-        /// admission budget (ADR-0015).
-        moving: bool,
+        /// What ends this wait: the spent budget, or a stalled line (ADR-0015).
+        bound: Bound,
     },
     Disk(Shortfall),
 }
@@ -904,8 +903,11 @@ impl Holding<'_> {
         }
     }
 
-    fn moving(&self) -> bool {
-        matches!(self, Self::Slot { moving: true, .. })
+    fn bound(&self) -> Bound {
+        match self {
+            Self::Slot { bound, .. } => *bound,
+            Self::Disk(_) => Bound::Budget,
+        }
     }
 }
 
@@ -915,7 +917,7 @@ impl Holding<'_> {
 /// both.
 struct Queue<'q> {
     admission: &'q HeavyAdmission<'q>,
-    wait: Option<(WaitKind, bool, crate::policy::Wait)>,
+    wait: Option<(WaitKind, Bound, crate::policy::Wait)>,
     started: i64,
     last_announced: i64,
 }
@@ -933,22 +935,21 @@ impl<'q> Queue<'q> {
 
     /// The wait that charges `kind`, started now if another was running
     /// (dropping that one charges it up to now).
-    fn charging(&mut self, kind: WaitKind, moving: bool) -> &mut crate::policy::Wait {
+    fn charging(&mut self, kind: WaitKind, bound: Bound) -> &mut crate::policy::Wait {
         if self
             .wait
             .as_ref()
-            .is_none_or(|(held, held_moving, _)| *held != kind || *held_moving != moving)
+            .is_none_or(|(held, held_bound, _)| *held != kind || *held_bound != bound)
         {
             self.wait = None;
             let now = self.admission.budgets.now();
             self.started = now;
             self.last_announced = now;
-            let wait = if moving {
-                self.admission.budgets.moving_wait()
-            } else {
-                self.admission.budgets.wait(kind)
+            let wait = match bound {
+                Bound::Stall => self.admission.budgets.moving_wait(),
+                Bound::Budget => self.admission.budgets.wait(kind),
             };
-            self.wait = Some((kind, moving, wait));
+            self.wait = Some((kind, bound, wait));
         }
         match &mut self.wait {
             Some((_, _, wait)) => wait,
@@ -964,7 +965,7 @@ impl<'q> Queue<'q> {
         cancel: Option<&AtomicBool>,
         sleeper: &dyn Sleeper,
     ) -> Result<(), LeaseStop> {
-        if let Some(exhausted) = self.charging(holding.kind(), holding.moving()).tick() {
+        if let Some(exhausted) = self.charging(holding.kind(), holding.bound()).tick() {
             let reason = match &holding {
                 Holding::Slot {
                     class, position, ..
@@ -1128,7 +1129,7 @@ mod slots {
 
     use std::path::{Path, PathBuf};
 
-    use super::{Ask, Event, Exhausted, Gate, HeavyAdmission, Holding, LeaseStop, Queue};
+    use super::{Ask, Bound, Event, Exhausted, Gate, HeavyAdmission, Holding, LeaseStop, Queue};
 
     /// Whether the slot directory can be used, before anything is queued
     /// for. `Ok(None)`: it cannot, which is said once and not fatal, the
@@ -1254,7 +1255,7 @@ mod slots {
                             class: "host_slot",
                             position,
                             behind: None,
-                            moving: true,
+                            bound: Bound::Stall,
                         },
                         ask.cancel,
                         admission.sleeper.as_ref(),
@@ -1290,7 +1291,7 @@ mod slots {
                     class: "host_slot",
                     position: queued.position,
                     behind: behind(&queued),
-                    moving: true,
+                    bound: Bound::Stall,
                 },
                 ask.cancel,
                 admission.sleeper.as_ref(),

@@ -67,6 +67,16 @@ pub enum WaitKind {
     Disk,
 }
 
+/// What ends a wait that charges the admission budget (ADR-0015).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound {
+    /// The spent budget: the coordinator's queue, and every wait before.
+    Budget,
+    /// A stalled line: a host-slot wait goes on past the budget while the
+    /// line moves, and the time past it is the overrun.
+    Stall,
+}
+
 /// The size of each budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetLimits {
@@ -259,12 +269,14 @@ impl Budgets {
     /// Charge `from..now` to a wait budget, and return the new mark.
     /// A wait consumes its own budget and `total` (which reads the clock
     /// and so needs no charge), and is taken out of `work`.
-    fn charge_wait(&self, kind: WaitKind, from: Mark, moving: bool) -> Mark {
+    fn charge_wait(&self, kind: WaitKind, from: Mark, bound: Bound) -> Mark {
         let now = self.mark();
         let waited = (now.at - from.at).max(0);
         let mut spent = self.lock();
         match kind {
-            WaitKind::Admission if moving && !self.limits.admission_wait.is_zero() => {
+            WaitKind::Admission
+                if bound == Bound::Stall && !self.limits.admission_wait.is_zero() =>
+            {
                 // A line that still moves keeps `admission_waited` one
                 // millisecond under its limit, so `exhausted()` never ends
                 // the run after a grant; the rest is the overrun.
@@ -292,7 +304,7 @@ impl Budgets {
             budgets: self.clone(),
             kind,
             mark: self.mark(),
-            moving: false,
+            bound: Bound::Budget,
         }
     }
 
@@ -304,7 +316,7 @@ impl Budgets {
             budgets: self.clone(),
             kind: WaitKind::Admission,
             mark: self.mark(),
-            moving: true,
+            bound: Bound::Stall,
         }
     }
 
@@ -523,21 +535,21 @@ pub struct Wait {
     budgets: Budgets,
     kind: WaitKind,
     mark: Mark,
-    moving: bool,
+    bound: Bound,
 }
 
 impl Wait {
     /// Charge the time since the last tick, and report the first budget
     /// that is spent, the wait's own included.
     pub fn tick(&mut self) -> Option<Exhausted> {
-        self.mark = self.budgets.charge_wait(self.kind, self.mark, self.moving);
+        self.mark = self.budgets.charge_wait(self.kind, self.mark, self.bound);
         self.budgets.exhausted()
     }
 }
 
 impl Drop for Wait {
     fn drop(&mut self) {
-        self.budgets.charge_wait(self.kind, self.mark, self.moving);
+        self.budgets.charge_wait(self.kind, self.mark, self.bound);
     }
 }
 

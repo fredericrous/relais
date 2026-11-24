@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 mod budgets;
 pub use budgets::{
-    BaseRun, BudgetClock, BudgetLimits, Budgets, Draws, Exhausted, Wait, WaitKind, WallClock,
-    DEFAULT_ADMISSION_WAIT_SECONDS, DEFAULT_DISK_WAIT_SECONDS,
+    BaseRun, Bound, BudgetClock, BudgetLimits, Budgets, Draws, Exhausted, Wait, WaitKind,
+    WallClock, DEFAULT_ADMISSION_WAIT_SECONDS, DEFAULT_DISK_WAIT_SECONDS,
 };
 
 use crate::contract::{Review, TaskContract};

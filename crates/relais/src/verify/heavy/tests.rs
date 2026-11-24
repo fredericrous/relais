@@ -1447,6 +1447,8 @@ mod host_slots {
         with_slots.stall_window = Duration::from_secs(1);
         with_slots.events =
             Events::for_run_on("run-st", &dir, crate::protocol::Wire::to(std::io::sink()));
+        // `deliberate`: the crate's `Stall` reads the real clock (5.0.0 has no
+        // seam for its admitted-at term), so the 1 s window passes in real time.
         with_slots.sleeper = Advancing::then(&clock, |_| {
             std::thread::sleep(Duration::from_millis(20));
         });
