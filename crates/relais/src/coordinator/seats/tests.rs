@@ -448,7 +448,9 @@ fn a_settle_the_primary_refuses_is_dropped_once_and_the_next_one_books() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|line| line.contains("booking the spend was refused"))
+            .filter(|line| {
+                line.contains("booking the spend was not accepted: refused: reservation unknown")
+            })
             .count()
     };
     assert_eq!(refused(&lines), 1, "dropped once, not retried: {lines:?}");
@@ -467,4 +469,41 @@ fn a_settle_the_primary_refuses_is_dropped_once_and_the_next_one_books() {
     book.sync(&state);
     assert_eq!(refused(&lines), 1, "{lines:?}");
     assert_eq!(fake.spent().to_micros(), 20, "the next settle books");
+}
+
+/// A settle that fails in a way that is neither an outage nor a refusal is
+/// kept, written once, and retried without stopping the pass.
+#[test]
+fn a_settle_with_another_failure_is_kept_and_retried_without_stopping_the_pass() {
+    let fake = FakeState::new();
+    let (book, lines) = book(Arc::new(fake.clone()));
+    let state = admission(2);
+    for id in ["c1", "c2"] {
+        assert_eq!(admit(&book, &state, &agent(id, 100)), Decision::Granted);
+    }
+    fake.set_settles_conflict(true);
+    {
+        let mut admission = super::super::lock_state(&state);
+        for id in ["c1", "c2"] {
+            admission.settle(id, Some(10), Instant::now());
+            admission.release(id, Instant::now());
+        }
+    }
+    book.sync(&state);
+    book.sync(&state);
+    let failed = lines
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.contains("booking the spend failed"))
+        .count();
+    assert_eq!(
+        failed, 2,
+        "both settles were tried (the pass went on), each said once: {lines:?}"
+    );
+    assert_eq!(fake.spent().to_micros(), 0);
+
+    fake.set_settles_conflict(false);
+    book.sync(&state);
+    assert_eq!(fake.spent().to_micros(), 20, "both were kept and book now");
 }

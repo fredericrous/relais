@@ -94,9 +94,9 @@ struct Book {
     /// handler that granted the dispatch.
     refused: BTreeMap<String, SeatRefusal>,
     // holds-until: settles are persisted (follow-up to an-t17); until then
-    // a restart loses the ones still waiting, and the ledger floor in
-    // `node::daily_spent` keeps the cap from counting less than this node
-    // spent.
+    // a restart loses the ones still waiting, and a settle the primary
+    // refuses is dropped; the ledger floor in `node::daily_spent` keeps the
+    // cap from counting less than this node spent.
     /// Settles the primary has not taken yet, oldest first.
     settles: Vec<(String, Reservation, MicroUsd)>,
     /// The failure line last written per dispatch and operation, so each
@@ -124,12 +124,10 @@ impl Book {
 
     /// Hand the waiting settles to the primary, oldest first; what it does
     /// not take waits for the next sync. A settle is never refused for a
-    /// stale seat (an-t11), so only an outage keeps one waiting, and the
-    /// first unreachable answer stops the pass: the rest are not tried
-    /// until the next sync. A settle the primary refuses (`Refused`) is
-    /// dropped; any other failure is kept. Returns
-    /// `false` when the primary was found unreachable (whether the settles
-    /// were taken or not).
+    /// stale seat (an-t11). An outage stops the pass: the rest are not
+    /// tried until the next sync. A settle the primary refuses (`Refused`)
+    /// is dropped; any other failure is kept and the pass goes on. Returns
+    /// `false` when the primary was found unreachable.
     fn flush_settles(&mut self, shared: &dyn SharedState, log: &LogSink) -> bool {
         let mut waiting = std::mem::take(&mut self.settles).into_iter();
         let mut reachable = true;
@@ -161,15 +159,26 @@ impl Book {
                     // repeat the refusal forever, so it is dropped. The
                     // shared counter never books it; this node's ledger does,
                     // and the floor in `node::daily_spent` counts it here.
+                    // The error already reads `refused: <reason>`.
                     self.failing.remove(&(id.clone(), SeatOp::Settle));
                     log(&format!(
-                        "seat {id}: booking the spend was refused: {settle_error}; dropped, the \
-                         shared budget does not count it, this node's ledger does"
+                        "seat {id}: booking the spend was not accepted: {settle_error}; dropped, \
+                         the shared budget does not count it, this node's ledger does; if it \
+                         repeats, check the shared primary"
                     ));
                 }
-                Err(settle_error) => {
-                    // Any other failure (a lost answer, an error the primary
-                    // did not classify) is kept and retried at the next sync.
+                Err(
+                    settle_error @ (SharedStateError::LeaseLost { .. }
+                    | SharedStateError::ClaimLost { .. }
+                    | SharedStateError::CasConflict { .. }
+                    | SharedStateError::SliceExhausted { .. }
+                    | SharedStateError::ExternalAbsent { .. }
+                    | SharedStateError::Home(_)
+                    | SharedStateError::Read { .. }
+                    | SharedStateError::Invalid { .. }),
+                ) => {
+                    // Every other failure is kept and retried at the next
+                    // sync; a new variant must be placed here or above.
                     self.fail(
                         log,
                         &id,

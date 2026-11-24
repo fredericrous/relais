@@ -60,6 +60,9 @@ struct Inner {
     releases_fail: Option<String>,
     /// When set, every settle is refused with this reason (a test knob).
     settles_refused: Option<String>,
+    /// When set, every settle fails with a compare-and-set conflict: an
+    /// answered failure that is neither an outage nor a refusal (a test knob).
+    settles_conflict: bool,
     /// When set, the session-wide renew and release sleep this long first,
     /// as a primary that does not answer would (a test knob).
     slow: Option<std::time::Duration>,
@@ -124,6 +127,12 @@ impl FakeState {
     /// with a refusal that is not an outage.
     pub fn set_settles_refused(&self, reason: Option<&str>) {
         self.lock().settles_refused = reason.map(str::to_string);
+    }
+
+    /// Fail (`true`) or allow (`false`) every settle with a conflict, an
+    /// answered failure that is neither an outage nor a refusal.
+    pub fn set_settles_conflict(&self, conflict: bool) {
+        self.lock().settles_conflict = conflict;
     }
 
     /// Make the session-wide renew and release take `delay` (`None`: answer
@@ -314,6 +323,12 @@ impl SharedState for FakeState {
     ) -> Result<Settlement, SharedStateError> {
         if let Some(reason) = self.lock().settles_refused.clone() {
             return Err(SharedStateError::Refused { reason });
+        }
+        if self.lock().settles_conflict {
+            return Err(SharedStateError::CasConflict {
+                expected: None,
+                found: None,
+            });
         }
         let current = self.fence(&reservation.seat).is_ok();
         let mut inner = self.lock();
