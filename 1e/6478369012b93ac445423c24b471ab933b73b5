@@ -1,0 +1,20 @@
+greengate-provenance-v1
+commit 1e6478369012b93ac445423c24b471ab933b73b5
+tree 798c5c35b58a1e3231ebcad198444691fdd7e79b
+canon 01dfe212e3ae35878ce115ba35fa4175ef617d22
+patch 88d7b15cc557d89b946e88dcc73489ceee245758
+plan docs/plans/2026-11-24-relais-reads-greentopo-key.md 78dfe31d20d407aade08d8a9af29e07f5e5074163ded374d545c7336ac101567
+review reviewed cdb211bab1177142e9ac8e5d849643df53c963e897e75cae7f16b52740d3ab5c
+code-review backend carried 39ab9478639b54f195dc5f32f807a9bc60576b68082adcc52de27ca7208c82ff
+code-review lang:rust reviewed cdb211bab1177142e9ac8e5d849643df53c963e897e75cae7f16b52740d3ab5c
+code-review unix carried 39ab9478639b54f195dc5f32f807a9bc60576b68082adcc52de27ca7208c82ff
+code-review tui reviewed cdb211bab1177142e9ac8e5d849643df53c963e897e75cae7f16b52740d3ab5c
+preview not-required
+producer greenbelay 6.12.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABA6Z6rUi4HE0I06FZJ3q5h1fmcySw5cHsubhqn78duNN
+sewD2x9pQGHrVnfGZkenrYrY0EWqkj1upHplW+xJ7hCw==
+-----END SSH SIGNATURE-----
