@@ -62,9 +62,9 @@ ticket here until it is resolved or moved into a programme of its own.
 - [f13](f13-lease-width-keys-shared.md) (2026-11-21, closed 2026-11-24):
   the lease env is built from `greenharness_slots::width_env`; a test pins
   its keys to `WIDTH_KEYS`. vitest/Go keys arrive with the next bump.
-- [f14](f14-claim-lock-stderr-pinned.md) (2026-11-21, open): pin the
-  `stayed held for` wording that the driver's retry matches with a claim
-  CLI test (orphan of 4bca21ec).
+- [f14](f14-claim-lock-stderr-pinned.md) (2026-11-21, closed 2026-11-24):
+  the claim CLI lock-timeout test asserts stderr holds `stayed held for`,
+  the wording the driver's retry matches.
 - [f15](f15-loop-breaker-wider-fingerprint.md) (2026-11-23, open): replay
   Lumina's no-progress rule (every tool, normalized results, failures
   stale) over the wall-timeout transcripts the #418 Bash rule found no
@@ -72,14 +72,14 @@ ticket here until it is resolved or moved into a programme of its own.
 
 ## Handoff
 
-2026-11-24, boundary 3 (f12 closed): a relayed session holds its ticket.
+2026-11-24, boundary 4 (f14 closed): the claim lock-timeout wording the
+driver's retry matches is pinned by the claim CLI test. Boundary 3 (f12):
 `relais programme adopt --previous <old>` takes the cleared session's
 handoffs over as `work`, and the plugin runs it at the successor's first
 read (unreleased; f10 and f11 are unreleased too).
 
-- Done: f12.
-- Next: f13 (lease width keys), f14 (claim lock stderr pinned), f15
-  (loop breaker fingerprint) are ready. Measure the home fingerprint
+- Done: f12, f13, f14.
+- Next: f15 (loop breaker fingerprint) is ready. Measure the home fingerprint
   warnings (f08) is due 2026-11-28, and A week of relays adopts every
   handoff (f16) is due 2026-12-02, counted from the plugin reinstall.
 - Lessons:
