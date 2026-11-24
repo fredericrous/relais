@@ -1,0 +1,7 @@
+# The router keeps a reviewer's preferred model — full reviews
+
+- backend (opus): R1 approve-with-changes, 3 (row records preference; line numbers; live check model), 33k, 44 s. R2 approve-with-changes, 2 low (applied in the delta). Delta approve-with-changes, 44k, 17 s; carried: the 7-day pass needs a matched-share floor (≥80%, else inconclusive).
+- lang:rust (opus): R1 approve-with-changes, 3 (definition_pins test required; install test pins template to parser; edge cases + both doc comments), 31k, 42 s. R2 approve, 37k, 15 s. Delta approve, 45k, 17 s; carried: `/clear` or resume also reloads pins (routing.ts:864-866).
+- tui (opus): R1 approve-with-changes, 2 (high: row records preference; report model-group split), 31k, 41 s. R2 approve; low: name the caveat in CHANGELOG; "may differ". 33k, 15 s.
+- unix (opus): R1 approve, 2 low (order/inherit cases; stderr empty), 26k, 22 s. R2 approve, 35k, 24 s.
+- codex: approve-with-changes, 3 medium, all applied in the delta at the person's request: (1) a pinned reviewer is booked to its parent task and sets `maybeWrote`, so an `answered` parent can label `unknown` (routing.ts:437, tests/routing.test.ts:827): document in the phase 8 decision and check parent attribution live; (2) the report check targets data the report does not read: inspect `router_decisions` directly, validate pricing against `router_usage`; (3) the 7-day count needs the reviewer cohort from transcripts correlated by session and agent id, missing rows reported apart.

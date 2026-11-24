@@ -3,9 +3,11 @@
 //! definitions the person maintains and serves the pins. Pure: the caller
 //! reads the files.
 
-/// The pin a definition states: its subagent type and its model. `None`
-/// when the definition names no model, or `model: inherit` (which defers
-/// to the parent, so it is no constraint).
+/// The pin a definition states: its subagent type and its model. A
+/// definition's own `model:` pins it; one with no `model:`, or
+/// `model: inherit`, is pinned by its `preferred-model:` when it declares one
+/// (the router then leaves the spawn's call as the parent made it). `None`
+/// when neither names a model.
 pub type Pin = Option<(String, String)>;
 
 /// Why a definition could not be read.
@@ -13,9 +15,9 @@ pub type Pin = Option<(String, String)>;
 pub struct PinError(pub String);
 
 /// Read the YAML front matter of one `.claude/agents/<stem>.md`: the
-/// `name:` (else the file stem) and `model:` keys. Only flat `key: value`
-/// lines are read; anything else in the front matter is ignored, since
-/// only those two keys matter here.
+/// `name:` (else the file stem), `model:` and `preferred-model:` keys. Only
+/// flat `key: value` lines are read, in any order; anything else in the front
+/// matter is ignored. `inherit` is never a pinned model.
 pub fn parse_definition(stem: &str, text: &str) -> Result<Pin, PinError> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut lines = text.lines();
@@ -26,6 +28,7 @@ pub fn parse_definition(stem: &str, text: &str) -> Result<Pin, PinError> {
     }
     let mut name = None;
     let mut model = None;
+    let mut preferred = None;
     let mut closed = false;
     for line in lines {
         if line.trim_end() == "---" {
@@ -42,18 +45,17 @@ pub fn parse_definition(stem: &str, text: &str) -> Result<Pin, PinError> {
         match key.trim() {
             "name" if !value.is_empty() => name = Some(value.to_string()),
             "model" if !value.is_empty() => model = Some(value.to_string()),
+            "preferred-model" if !value.is_empty() => preferred = Some(value.to_string()),
             _ => {}
         }
     }
     if !closed {
         return Err(PinError("the front matter is never closed with ---".into()));
     }
-    Ok(match model {
-        Some(model) if model != "inherit" => {
-            Some((name.unwrap_or_else(|| stem.to_string()), model))
-        }
-        _ => None,
-    })
+    let pinned = model
+        .filter(|model| model != "inherit")
+        .or_else(|| preferred.filter(|model| model != "inherit"));
+    Ok(pinned.map(|model| (name.unwrap_or_else(|| stem.to_string()), model)))
 }
 
 fn unquote(value: &str) -> &str {
@@ -92,6 +94,53 @@ mod tests {
             parse_definition("a", "---\nname: a\nmodel: inherit\n---\n"),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn a_preferred_model_pins_an_inheriting_definition() {
+        let pin = |text: &str| parse_definition("rev", text);
+        let opus = Ok(Some(("rev".into(), "opus".into())));
+        assert_eq!(
+            pin("---\nmodel: inherit\npreferred-model: opus\n---\n"),
+            opus
+        );
+        assert_eq!(pin("---\npreferred-model: opus\n---\n"), opus);
+        assert_eq!(
+            pin("---\npreferred-model: opus\nmodel: inherit\n---\n"),
+            opus
+        );
+        assert_eq!(
+            pin("---\nmodel: inherit\npreferred-model: \"opus\"\n---\n"),
+            opus
+        );
+        assert_eq!(
+            pin("---\nname: x\n# relais:begin abc\nmodel: inherit\npreferred-model: opus\n---\n"),
+            Ok(Some(("x".into(), "opus".into())))
+        );
+    }
+
+    #[test]
+    fn an_own_model_outranks_the_preference_in_any_order() {
+        let sonnet = Ok(Some(("rev".into(), "sonnet".into())));
+        assert_eq!(
+            parse_definition("rev", "---\nmodel: sonnet\npreferred-model: opus\n---\n"),
+            sonnet
+        );
+        assert_eq!(
+            parse_definition("rev", "---\npreferred-model: opus\nmodel: sonnet\n---\n"),
+            sonnet
+        );
+    }
+
+    #[test]
+    fn an_inherit_or_empty_preference_is_no_pin() {
+        for text in [
+            "---\nmodel: inherit\npreferred-model: inherit\n---\n",
+            "---\nmodel: inherit\npreferred-model:\n---\n",
+            "---\npreferred-model: \"\"\n---\n",
+        ] {
+            assert_eq!(parse_definition("rev", text), Ok(None), "{text:?}");
+        }
     }
 
     #[test]
