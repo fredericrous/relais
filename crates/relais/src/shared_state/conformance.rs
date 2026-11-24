@@ -6,9 +6,11 @@
 //! `make` and a fresh [`Fixture`] of node-local handles. The checks that
 //! write locally go through [`super::node`], as relais does: the trait
 //! sees plain values, the fixture's handles stay with the check. Each check is also
-//! public, so a failing one can be run alone. The properties are the ones
-//! both a single node and a primary must hold; what only a primary does
-//! (expiry, a degraded mode) is tested on the fake itself.
+//! public, so a failing one can be run alone. The properties in [`run_all`]
+//! are the ones both a single node and a primary must hold;
+//! [`run_all_with_clock`] adds what only a primary holds (a decision grant
+//! lapses, another holder's reservation is `Held`). Expiry of ticket holds
+//! and a degraded mode stay tested on the fake itself.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};

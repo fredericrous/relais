@@ -301,6 +301,12 @@ pub fn reserve_handoff(
             match lock.reserve_handoff(id, &holder.id, repo_display, now) {
                 Ok(true) => Ok(true),
                 Ok(false) => {
+                    // holds-until: every caller asks the shared half only for
+                    // tickets the claim files do not hold, under this
+                    // `SlugLock`. A primary re-grants its own holder's retry
+                    // (an-t23), so a call for a ticket whose claim file is
+                    // already written would give back a hold that file still
+                    // keeps; filed as an an-t23 follow-up.
                     give_back(&lease.resource.to_string(), state.release_ticket(&lease));
                     Ok(false)
                 }

@@ -186,8 +186,9 @@ it could not renew or give back ends by its TTL.
   per-ticket ones: `reserve_handoff` (a `handoff` hold for the next
   session, `HANDOFF_HOLD_SECS`, taken over by any session's `work` claim;
   a retry by its own holder, a `next --claim` whose claim file was never
-  written, is answered again and the hold ends `HANDOFF_HOLD_SECS` after
-  the retry; another holder is refused while it lasts, with `Held` from a
+  written, is answered again, and a primary should move the hold's end to
+  `HANDOFF_HOLD_SECS` after the retry (the fake does; the suite does not
+  check it yet); another holder is refused while it lasts, with `Held` from a
   primary or by the claim file under `LocalState`),
   `renew_tickets` and `release_tickets` (every `work` hold of one holder,
   for a resumed session and a session end). The hook calls them with no
