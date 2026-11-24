@@ -33,10 +33,10 @@ tagged commit first, which a branch rehearsal never does. Where
 `greengate.rehearseOnCommit` is on, every commit already starts that rehearsal in
 the background and `--wait` only follows it. Give these commands the
 longest timeout your tooling allows, never its default: here a check is
-killed only after 15m00s of silence or 3h00m in total
+killed only after 15m00s of silence or 1h00m in total
 (`greengate.idleTimeout` / `greengate.timeout`) — and on Linux and macOS a silent
 check whose processes are busy on CPU is not "silent": it can run to the
-3h00m ceiling. A check waiting on a cargo or uv lock answers to
+1h00m ceiling. A check waiting on a cargo or uv lock answers to
 `greengate.lockWait` instead, the silence budget stretches with the machine's
 load (`greengate.idleLoadScale`), and a heavy check (clippy, a test suite) may
 first queue for a host slot (`greengate.hostSlots`) while other worktrees run

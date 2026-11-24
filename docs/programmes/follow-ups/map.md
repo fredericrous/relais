@@ -53,9 +53,12 @@ ticket here until it is resolved or moved into a programme of its own.
   header a person adds to machine.toml (runner, `native_unpriced`,
   fast-mode rate, `relais report`, plugin fixture); prose in docs is
   unchanged.
-- [f12](f12-claim-takeover-live-session.md) (2026-11-21, open): a work
-  claim was taken over from a live session after a `/clear` relay, and two
-  sessions edited one worktree (filed from the inbox, orphan of 0f2c38ac).
+- [f12](f12-claim-takeover-live-session.md) (2026-11-24): the relayed
+  session on 11-21 never claimed, so its handoff lapsed after 2 h. Now
+  `relais programme adopt`, run by the plugin at the clear, makes it the
+  successor's `work`; the board clause is not built (accepted gap).
+- [f16](f16-adopt-week-count.md) (2026-11-24, open, due 2026-12-02): a
+  week of relays after the plugin reinstall adopts every handoff.
 - [f13](f13-lease-width-keys-shared.md) (2026-11-21, open): the lease's
   width variables are hand-listed in `verify/heavy.rs`. Build them from
   `greenharness_slots::width_env` once it ships (orphan of edf02f7e).
@@ -69,29 +72,30 @@ ticket here until it is resolved or moved into a programme of its own.
 
 ## Handoff
 
-2026-11-23, boundary 3 (f11 closed): the unpriced-model messages print
-`[[pricing.models]]`, as machine.toml writes the entry (message-only
-change, unreleased).
+2026-11-24, boundary 3 (f12 closed): a relayed session holds its ticket.
+`relais programme adopt --previous <old>` takes the cleared session's
+handoffs over as `work`, and the plugin runs it at the successor's first
+read (unreleased; f10 and f11 are unreleased too).
 
-- Done: f11; f10 earlier today (unreleased).
-- Next: f12 (claim takeover from a live session), f13, f14, f15 are
-  ready; Measure the home fingerprint warnings (f08) is due 2026-11-28.
+- Done: f12.
+- Next: f13 (lease width keys), f14 (claim lock stderr pinned), f15
+  (loop breaker fingerprint) are ready. Measure the home fingerprint
+  warnings (f08) is due 2026-11-28, and A week of relays adopts every
+  handoff (f16) is due 2026-12-02, counted from the plugin reinstall.
 - Lessons:
-  - A replace of `[pricing.models]` must not touch the TOML fixtures'
-    `[[pricing.models]]`: match with lookarounds
-    (`(?<!\[)\[pricing\.models\](?!\])`), and check none read
-    `[[[`.
-  - The plugin's `unpriced_reason` fixture and comment mirror the Rust
-    message text; change them together.
-  - A relais run can wait out its whole admission budget (30 min) on a
-    host at load 40+ and launch nothing; then apply its kept
-    `candidate-1.patch` and run the checks by hand.
-  - The relais plugin refuses a Bash call whose text names its own
-    install command, even inside a heredoc: edit such text with the Edit
-    tool.
+  - The 11-21 takeover was no fault of the takeover rule: the successor
+    held no claim. Read `claims/log.jsonl` and the transcripts before
+    blaming a rule.
+  - Mock-clock tests in the plugin cannot advance hours: every 100 ms
+    flush timer fires. Test a long wait by calling the hook function with
+    a fake `fx` whose clock is already past it.
+  - The claim CLI tests move time by backdating `claimed_at` and
+    `refreshed_at` in the claim files (`World::age_claims`).
+  - A commit here runs the whole cargo test suite (about 10 min); make no
+    tracked edit while it runs, since the gate stashes them.
 - Your steps: reinstall the relais plugin with relais's own install
-  command for Claude (the plugin is at 0.72.0 here; it applies from the
-  next session).
+  command for Claude (it is at 0.72.0 here; the adoption applies from the
+  next session after the reinstall, and f16 counts from then).
 
 ## Not yet specified
 

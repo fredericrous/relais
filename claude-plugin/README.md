@@ -95,7 +95,15 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
   `release` or `next`. Each reply is bound to the session that asked and to
   the newest read; an older one is dropped. `--previous <session>` is passed
   only for the successor of a `/clear`, so only a handoff written by
-  `relais programme next --claim` survives it. An older relais (exit 2,
+  `relais programme next --claim` survives it. Before that successor's first
+  read, the plugin runs `relais programme adopt --previous <session> --session
+  <id>`, which takes the handoff over as the successor's `work`, so the ticket
+  stays held whether or not the agent claims it. The read gets what is left
+  of the same 5 s, and at least 1 s. An adopt that times out or exits 1 is
+  retried on each later read for 2 h after the clear, with the dim note
+  `ticket not adopted · relais programme claim <slug> <ticket>`. Exit 0 or
+  exit 2 (a relais without `adopt` included) ends it. A Bash call naming
+  `relais programme adopt` reads again too. An older relais (exit 2,
   `unrecognized subcommand 'session'`) gives one dim row, `programme view needs
   a newer relais · relais install`, and is not asked again; exit 1 keeps the
   last view with one dim note. The first read of a session opens the pane
