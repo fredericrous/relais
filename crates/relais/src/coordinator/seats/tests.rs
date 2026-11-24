@@ -167,7 +167,7 @@ fn an_exhausted_slice_refuses_the_grant_as_a_budget_and_the_id_may_ask_again() {
                 detail,
                 format!(
                     "this node's share of the shared budget is used up: this run needs {}, {} is \
-                     left; raise this node's share on the shared primary, or wait for the next day",
+                     left; raise this node's share on the shared primary",
                     crate::money::MicroUsd::from_micros(slice + 1),
                     crate::money::MicroUsd::from_micros(slice)
                 )
@@ -399,7 +399,7 @@ fn an_unreachable_primary_stops_the_sync_at_its_first_call() {
             .unwrap()
             .iter()
             .filter(|line| {
-                line.contains("settle failed")
+                line.contains("booking the spend failed")
                     || line.contains("giving the shared seat back failed")
             })
             .count()

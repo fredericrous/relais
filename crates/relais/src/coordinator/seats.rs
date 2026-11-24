@@ -126,8 +126,9 @@ impl Book {
     /// not take waits for the next sync. A settle is never refused for a
     /// stale seat (an-t11), so only an outage keeps one waiting, and the
     /// first unreachable answer stops the pass: the rest are not tried
-    /// until the next sync. Returns `false` when the primary was found
-    /// unreachable.
+    /// until the next sync. A settle the primary refuses is dropped. Returns
+    /// `false` when the primary was found unreachable (whether the settles
+    /// were taken or not).
     fn flush_settles(&mut self, shared: &dyn SharedState, log: &LogSink) -> bool {
         let mut waiting = std::mem::take(&mut self.settles).into_iter();
         let mut reachable = true;
@@ -139,18 +140,30 @@ impl Book {
                     SeatOp::Settle,
                     &format!("seat {id}: settle recovered"),
                 ),
-                Err(settle_error) => {
-                    reachable = !matches!(settle_error, SharedStateError::Unreachable { .. });
+                Err(settle_error @ SharedStateError::Unreachable { .. }) => {
+                    // An outage: kept, and the pass stops here.
                     self.fail(
                         log,
                         &id,
                         SeatOp::Settle,
-                        format!("seat {id}: settle failed: {settle_error}; it is retried at the next sync"),
+                        format!(
+                            "seat {id}: booking the spend failed: {settle_error}; it is retried \
+                             at the next sync"
+                        ),
                     );
                     self.settles.push((id, reservation, actual));
-                    if !reachable {
-                        break;
-                    }
+                    reachable = false;
+                    break;
+                }
+                Err(settle_error) => {
+                    // The primary answered and refused it: retrying would
+                    // repeat the refusal forever, so it is dropped, and the
+                    // ledger floor in `node::daily_spent` still counts it.
+                    self.failing.remove(&(id.clone(), SeatOp::Settle));
+                    log(&format!(
+                        "seat {id}: booking the spend was refused: {settle_error}; dropped, this \
+                         node's ledger still counts it"
+                    ));
                 }
             }
         }
@@ -281,8 +294,9 @@ impl SeatBook {
         }
         let mut reachable = book.flush_settles(shared, log);
 
-        // Seats freed: released. While the primary is unreachable a freed
-        // seat keeps its token, and the next sync releases it.
+        // Seats freed: released. Once the primary is found unreachable the
+        // freed seats not yet tried keep their tokens, and the next sync
+        // releases them; the one whose release failed ends at its TTL.
         let seated_ids: BTreeSet<&str> = seated
             .iter()
             .map(|seat| seat.dispatch_id.as_str())
@@ -434,7 +448,7 @@ impl SeatBook {
                     detail: format!(
                         "this node's share of the shared budget is used up: this run needs \
                          {reserve}, {remaining} is left; raise this node's share on the shared \
-                         primary, or wait for the next day"
+                         primary"
                     ),
                 }),
         }

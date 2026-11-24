@@ -222,6 +222,17 @@ and `RemoteGate` with a degraded fake answers `Queued`.
   string operation keys became `Book` methods and enums; the seat book's
   types are `pub(crate)`; the budget and wait lines say what to do.
 
+- 2026-11-24 (F4b delta): a settle the primary refuses (not an outage)
+  is dropped with one line instead of being retried forever; the ledger
+  floor still counts it (backend delta finding 1). The budget refusal drops
+  "or wait for the next day" (no daily reset backs it). The operator lines
+  now read as the code and docs/shared-state.md write them (`the shared
+  state did not grant the seat (...); this run waits and asks again; if it
+  lasts, check the shared primary`; `this node's share of the shared budget
+  is used up: this run needs $<n>, $<m> is left; raise this node's share on
+  the shared primary`); Behaviour keeps the reviewed wording, which these
+  supersede.
+
 ## Verification
 
 | Check | Input | Expected | Actual |
@@ -233,6 +244,14 @@ and `RemoteGate` with a degraded fake answers `Queued`.
 | lint | `cargo clippy -p relais --all-targets --features conformance -- -D warnings` | clean | `cargo clippy -p relais --all-targets --features conformance -- -D warnings`: clean (328 s) before the F4b fixes; rerun after them: clean (96 s, the final tree). |
 | counter writer | `FakeState` test: one grant, then settle | shared counter shows the reservation after grant and the settled amount after settle | `a_grant_takes_a_seat_and_a_reservation_and_the_settle_books_the_spend`: pass |
 | socket downgrade | `cargo test -p relais --lib coordinator::` socket test with a degraded `FakeState` | the admission reply is `Queued { position: 1 }` with the stderr line; after recovery the next poll is `Granted` | `an_unreachable_primary_turns_the_grant_into_a_wait_until_it_grants` and `the_coordinator_answers_a_refused_shared_seat_as_queued`: pass |
+
+## Implementation review
+
+- implementation-review: approve-with-changes (round 1, 75k, 141 s; delta 67k, 172 s); all fixed but deliberate: `if let` over `Request` and `SharedStateError` (only an admission asks a grant; only `SliceExhausted` refuses as a budget).
+- backend: approve-with-changes (round 1 relaunched on the worktree, 73k, 174 s; delta 49k, 87 s); fixed: stop at first unreachable, Shutdown, refused settles dropped; deliberate: skipped-acquire line, degraded `release_all`/`renew` tests (follow-up).
+- architect: approve-with-changes then approve (74k, 175 s; 50k, 69 s); floor restored; deliberate: `bool` reach returns, documented on each method.
+- lang:rust: approve-with-changes twice (74k, 57 s; 39k, 23 s); enums, `Book` methods, `pub(crate)` fixed; deliberate: an `is_unreachable` helper and the `Reach` enum (style only).
+- tui: approve-with-changes twice (53k, 154 s; 40k, 15 s); refusals reworded, next-day clause dropped; deliberate: "settle"/"reserve" kept in log lines (glossed in docs), host-name line length.
 
 ## Outcome
 
