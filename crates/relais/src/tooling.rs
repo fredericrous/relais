@@ -76,8 +76,9 @@ fn missing_integration_detail(name: &str, bin: &str) -> String {
     match name {
         "aval" => format!(
             "required integration `aval` (binary `{bin}`) is not available on PATH; \
-             set its [integrations] key (aval or greentopo) to \"optional\", \
-             or point `bin` at the binary you have"
+             set its [integrations] key (aval or greentopo) in relais.toml to \
+             \"optional\", or to {{ mode = \"required\", bin = \"greentopo\" }} \
+             if greentopo is installed"
         ),
         _ => format!(
             "required integration `{name}` is not available on PATH; \

@@ -236,11 +236,11 @@ const BOTH_TOPO_KEYS_MESSAGE: &str =
     "set only one of [integrations] aval and greentopo; remove the aval line";
 
 impl TryFrom<IntegrationsWire> for Integrations {
-    type Error = String;
+    type Error = PolicyError;
 
     fn try_from(wire: IntegrationsWire) -> Result<Self, Self::Error> {
         if wire.aval.is_some() && wire.greentopo.is_some() {
-            return Err(BOTH_TOPO_KEYS_MESSAGE.to_string());
+            return Err(PolicyError::BothTopoIntegrationKeys);
         }
         Ok(Integrations {
             aval: wire.aval.or(wire.greentopo),
@@ -947,14 +947,14 @@ fn validate_reuse(reuse: &ReuseSpec) -> Result<(), PolicyError> {
 /// True when the raw `[integrations]` table carries both spellings of the
 /// topo-spotter key. Checked before the typed parse, because a `try_from`
 /// error would surface as a TOML error and be reported as malformed TOML.
+/// Unparseable text returns false, so the strict parse after it names the
+/// error.
 fn sets_both_topo_keys(text: &str) -> bool {
     text.parse::<toml::Table>()
         .ok()
-        .and_then(|table| match table.get("integrations") {
-            Some(toml::Value::Table(integrations)) => {
-                Some(integrations.contains_key("aval") && integrations.contains_key("greentopo"))
-            }
-            _ => None,
+        .and_then(|table| {
+            let integrations = table.get("integrations")?.as_table()?;
+            Some(integrations.contains_key("aval") && integrations.contains_key("greentopo"))
         })
         .unwrap_or(false)
 }
@@ -4837,10 +4837,23 @@ command = { argv = ["true"], junit = "j.xml" }
             "schema_version = 1\n[integrations]\naval = \"required\"\ngreentopo = \"required\"\n",
         )
         .unwrap_err();
-        assert!(matches!(err, PolicyError::BothTopoIntegrationKeys));
+        assert_eq!(err, PolicyError::BothTopoIntegrationKeys);
         let text = err.to_string();
         assert!(text.contains("set only one of [integrations] aval and greentopo"));
         assert!(!text.contains("not valid TOML"));
+    }
+
+    #[test]
+    fn both_topo_keys_are_refused_in_dotted_form_and_from_json() {
+        let dotted = RepoPolicy::from_toml_str(
+            "schema_version = 1\nintegrations.aval = \"required\"\nintegrations.greentopo = \"required\"\n",
+        )
+        .unwrap_err();
+        assert_eq!(dotted, PolicyError::BothTopoIntegrationKeys);
+        let json =
+            serde_json::from_str::<Integrations>(r#"{"aval":"required","greentopo":"required"}"#)
+                .unwrap_err();
+        assert!(json.to_string().contains("set only one of"), "{json}");
     }
 
     #[test]
