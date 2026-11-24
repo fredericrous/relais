@@ -192,8 +192,14 @@ impl LoopGuard {
                 output,
             } => {
                 let call = self.pending.remove(&tool_use_id)?;
-                // holds-until: the tool result carries the pipeline's exit status — the pipe hides it, so a trailing tail/head/grep is counted whatever is_error says
-                if call.ends_in_output_filter {
+                // A trailing tail/head/grep hides the pipeline's exit status, so
+                // its output stands in for it: counted by hash only when it
+                // shows a failure marker. Any other output falls through to
+                // is_error: a wait poll's empty output clears as a success, and
+                // so does a failing run without pipefail whose filtered output
+                // shows no marker.
+                // holds-until: the transcript carries the pipeline's real exit status (or every worker sets pipefail); until then the marker list stands in for it, and a stable early FAIL line in a still-running poll can reach the threshold — revisit when a shadow event shows one
+                if call.ends_in_output_filter && shows_failure(&output) {
                     let evidence = Evidence::OutputHash(hash_of(&output));
                     return self.count(call.command, evidence);
                 }
@@ -230,6 +236,54 @@ impl LoopGuard {
             count: *seen,
         })
     }
+}
+
+/// Whether a piped filter's output shows a failure. The fixed markers, case
+/// as written: `FAIL` as a word (`FAIL`, `FAILED`); `error:`, `error[`,
+/// `Error:`, `ERROR:`, `FAILURE:`, `npm ERR!`, `make: ***`; `panicked`;
+/// `fatal:`; `Traceback`; vitest's `× ` at the start of a line; and a count of at least one before
+/// `failed` or `error`/`errors` (`1 failed`, `3 errors`), so a summary's
+/// `0 failed` or `Found 0 errors.` is not one.
+fn shows_failure(output: &str) -> bool {
+    const PLAIN: [&str; 10] = [
+        "error:",
+        "error[",
+        "Error:",
+        "ERROR:",
+        "FAILURE:",
+        "npm ERR!",
+        "make: ***",
+        "panicked",
+        "fatal:",
+        "Traceback",
+    ];
+    if PLAIN.iter().any(|marker| output.contains(marker)) {
+        return true;
+    }
+    if output
+        .lines()
+        .any(|line| line.trim_start().starts_with("× "))
+    {
+        return true;
+    }
+    let mut before: Option<&str> = None;
+    for word in output
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+    {
+        let counted = || {
+            before
+                .and_then(|count| count.parse::<u64>().ok())
+                .is_some_and(|count| count > 0)
+        };
+        match word {
+            "FAIL" | "FAILED" => return true,
+            "failed" | "error" | "errors" if counted() => return true,
+            _ => {}
+        }
+        before = Some(word);
+    }
+    false
 }
 
 fn hash_of(text: &str) -> u64 {
@@ -821,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn a_piped_tail_command_is_counted_whatever_is_error_says() {
+    fn a_piped_filter_showing_failure_counts_even_when_is_error_is_false() {
         let mut guard = guard();
         let command = "cargo test | tail -5";
         for id in ["a", "b"] {
@@ -854,6 +908,73 @@ mod tests {
         failing_run(&mut guard, "a", command, "took 1s");
         failing_run(&mut guard, "b", command, "took 2s");
         assert_eq!(failing_run(&mut guard, "c", command, "took 3s"), None);
+    }
+
+    /// The `65f3d9db` wait-poll shape (f15, f17): six identical runs while a
+    /// background vitest suite ran, after which it passed.
+    #[test]
+    fn a_wait_poll_with_no_failure_text_does_not_fire() {
+        let command = r#"for i in $(seq 1 22); do grep -q "Test Files" /tmp/s9a_run.txt && break; sleep 5; done; grep -E "Tests |Test Files|×" /tmp/s9a_run.txt | head"#;
+        for output in ["(Bash completed with no output)", ""] {
+            let mut guard = guard();
+            for at in 0..6 {
+                let id = format!("p{at}");
+                assert_eq!(
+                    feed(
+                        &mut guard,
+                        &[bash_use(&id, command), result(&id, false, output)]
+                    ),
+                    None,
+                    "{output:?} poll {at}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_piped_filter_that_failed_still_counts_by_its_error_line() {
+        let mut guard = guard();
+        let command = "set -o pipefail; make | tail -3";
+        for id in ["a", "b"] {
+            assert_eq!(failing_run(&mut guard, id, command, "Exit code 2"), None);
+        }
+        let fired = failing_run(&mut guard, "c", command, "Exit code 2").expect("fires");
+        assert_eq!(fired.evidence, Evidence::ErrorLine("Exit code 2".into()));
+    }
+
+    #[test]
+    fn shows_failure_reads_markers_and_skips_zero_counts() {
+        for failing in [
+            "test result: FAILED. 1 passed; 1 failed",
+            "error[E0425]: cannot find value `x`",
+            "error: could not compile `relais`",
+            "Error: ENOENT",
+            "thread 'main' panicked at src/lib.rs:3:5",
+            "fatal: not a git repository",
+            "Traceback (most recent call last):",
+            " FAIL  src/x.test.ts > adds",
+            "      Tests  1 failed | 3 passed (4)",
+            "Found 2 errors.",
+            "make: *** [check] Error 2",
+            "npm ERR! code ELIFECYCLE",
+            "ERROR: tests/test_x.py::test_a",
+            "FAILURE: Build failed with an exception.",
+            " × adds two numbers 3ms",
+        ] {
+            assert!(shows_failure(failing), "{failing}");
+        }
+        for clean in [
+            "",
+            "(Bash completed with no output)",
+            "test result: ok. 12 passed; 0 failed; 0 ignored",
+            "Found 0 errors.",
+            " Test Files  12 passed (12)\n      Tests  817 passed (817)",
+            "no errors found",
+            "FAILURES=0 wrote failover.log",
+            "rendered 1920×1080 in 3×4 tiles",
+        ] {
+            assert!(!shows_failure(clean), "{clean}");
+        }
     }
 
     #[test]
