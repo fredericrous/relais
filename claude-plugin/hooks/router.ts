@@ -66,6 +66,9 @@ export type RouterState = {
   rates: Record<string, { input: number; output: number; cache_read: number; cache_write: number } | null>
   priors: { task_tokens_by_difficulty: number[]; task_tokens: Record<string, number> }
   pins: Record<string, string>
+  // Where each pin came from, same keys. Empty from a relais that predates
+  // it; a value this plugin does not know is dropped.
+  pin_sources: Record<string, PinSource>
   excluded_models: string[]
   checks: string[][]
   // The kind of each entry of `checks` (same order): test, lint or build.
@@ -351,10 +354,23 @@ export function parseRouterState(text: unknown): RouterState | undefined {
       task_tokens: raw.priors?.task_tokens && typeof raw.priors.task_tokens === 'object' ? raw.priors.task_tokens : {},
     },
     pins: raw.pins && typeof raw.pins === 'object' ? raw.pins : {},
+    pin_sources: parsePinSources(raw.pin_sources),
     excluded_models: Array.isArray(raw.excluded_models) ? raw.excluded_models.filter((m: unknown) => typeof m === 'string') : [],
     ...parseChecks(raw),
     accepts: Array.isArray(raw.accepts) ? raw.accepts.filter((a: unknown) => typeof a === 'string') : [],
   }
+}
+
+export type PinSource = 'own' | 'preferred' | 'machine'
+const PIN_SOURCES: readonly string[] = ['own', 'preferred', 'machine']
+
+function parsePinSources(raw: unknown): Record<string, PinSource> {
+  if (!raw || typeof raw !== 'object') return {}
+  return Object.fromEntries(
+    Object.entries(raw as Record<string, unknown>).filter(
+      (entry): entry is [string, PinSource] => typeof entry[1] === 'string' && PIN_SOURCES.includes(entry[1]),
+    ),
+  )
 }
 
 const CHECK_KINDS: readonly string[] = ['test', 'lint', 'build']
@@ -1377,6 +1393,54 @@ export type SpawnDecision = {
   // it get a task of its own and its requests are routed.
   isRouted: boolean
   class: Class | undefined
+}
+
+// A model id as a pinned call names it, for the decision row: a full
+// `claude-*` id as it is, a bare alias by the default ids. Never through the
+// tiers' configured models: a pinned call is not rewritten, so their version
+// is not the one it runs. Undefined for anything else.
+function pinnedCallModel(named: string | null | undefined): string | undefined {
+  if (!named) return undefined
+  const n = named.toLowerCase()
+  if (/^claude-[a-z0-9-]+$/.test(n)) return n
+  return Object.prototype.hasOwnProperty.call(DEFAULT_MODEL_IDS, n) ? DEFAULT_MODEL_IDS[n] : undefined
+}
+
+// Whether the row of a pinned spawn of `type` needs the session's model: no
+// call model resolves, and the pin's source runs the parent's model.
+export function pinNeedsSessionModel(state: RouterState, type: string, callModel: string | null | undefined): boolean {
+  if (pinnedCallModel(callModel)) return false
+  const source = state.pin_sources[type]
+  if (source === 'own') return false
+  return source !== undefined || state.pins[type] === 'inherit'
+}
+
+// The decision a pinned spawn's row records: the model the router infers the
+// call ran, never the pin's value. (1) The call's own `model`; (2) else an
+// own `model:` pin; (3) else, for a preference or a machine pin, the
+// session's model; (4) with no source (a relais that predates them), the
+// value recorded before: the pin, or the session's model for `inherit`.
+// When nothing resolves, the pin's string is kept. Inferred, not observed:
+// a spawn made by a subagent on another model, or after `/model`, can differ.
+export function pinRowDecision(
+  state: RouterState,
+  type: string,
+  decision: Decision,
+  callModel: string | null | undefined,
+  sessionModel: string | null | undefined,
+): Decision {
+  const pin = state.pins[type] ?? decision.model
+  const source = state.pin_sources[type]
+  const fromSession = () => pinnedCallModel(sessionModel)
+  const model =
+    pinnedCallModel(callModel) ??
+    (source === 'own'
+      ? pinnedCallModel(pin)
+      : source !== undefined || pin === 'inherit'
+        ? fromSession()
+        : undefined) ??
+    pin
+  return { ...decision, model, tier: tierOfModel(state, model) ?? 'implementation' }
 }
 
 // `personModel` is a model the PERSON named for subagents (the active main

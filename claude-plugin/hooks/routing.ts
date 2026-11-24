@@ -34,6 +34,8 @@ import {
   parseClassification,
   parseGateStamp,
   parseRouterState,
+  pinNeedsSessionModel,
+  pinRowDecision,
   reassessRecord,
   rerun,
   revertedPaths,
@@ -386,6 +388,8 @@ export async function routeSpawn(fx: Fx, store: Store, e: any, next: any, remain
   const r = store.router
   const state = r.state
   if (!state || state.mode === 'off') return next(e)
+  // The hook's budget ends here, whatever `next` takes.
+  const deadline = (await fx.clock.now()) + remainingMs
   const type = String(e.subagentType ?? e.subagent_type ?? '')
   const description = String(e.description ?? '')
   const prompt = String(e.prompt ?? '')
@@ -407,7 +411,7 @@ export async function routeSpawn(fx: Fx, store: Store, e: any, next: any, remain
   // The subagent is started: nothing below may throw, or the hook's error
   // handler would see a failure after `next` and the spawn could repeat.
   try {
-    await afterSpawn(fx, store, { state, spawn, applied, classified, description, prompt, result, taskId })
+    await afterSpawn(fx, store, { state, spawn, applied, classified, description, prompt, result, taskId, type, callModel: e.model, deadline })
   } catch (reason) {
     await note(fx, store, undefined, `relais router: the spawn's bookkeeping failed: ${String((reason as any)?.message ?? reason).slice(0, 200)}`).catch(() => {})
   }
@@ -426,11 +430,28 @@ async function afterSpawn(
     prompt: string
     result: any
     taskId: string
+    type: string
+    callModel: unknown
+    deadline: number
   },
 ) {
   const r = store.router
   const { state, spawn, applied, classified, description, prompt, result, taskId } = input
   const now = await fx.clock.now()
+  // A pin's row records the model the call ran, read after the spawn has
+  // started so the spawn never waits on it.
+  const callModel = typeof input.callModel === 'string' ? input.callModel : null
+  if (spawn.decision?.reason === 'pin') {
+    let sessionModel: string | undefined
+    if (pinNeedsSessionModel(state, input.type, callModel)) {
+      const read = Promise.resolve()
+        .then(() => fx.session.model())
+        .catch(() => undefined)
+      const got = await within(fx, read, waitFor(input.deadline - now))
+      sessionModel = got === TIMEOUT || typeof got !== 'string' ? undefined : got
+    }
+    spawn.decision = pinRowDecision(state, input.type, spawn.decision, callModel, sessionModel)
+  }
   const agentId: string | undefined = typeof result?.agentId === 'string' ? result.agentId : undefined
   let owner: TaskState | undefined = r.task
   // A subagent the router did not create edits files the hook never sees.

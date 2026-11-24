@@ -126,7 +126,7 @@ Facts checked:
   (the template-pin test expects source `preferred`). Done through relais:
   one `kind: change`, acceptance `cargo test -p relais --lib router::` and
   `cargo test -p relais --lib install::`.
-- [ ] Phase 2 — the row records the model run. `claude-plugin/hooks/router.ts`
+- [x] Phase 2 — the row records the model run. `claude-plugin/hooks/router.ts`
   (the `pin_sources` type and its parse; `decideSpawn` takes `callModel` and
   `sessionModel` and records the model run in its pin branch);
   `claude-plugin/hooks/routing.ts` (`routeSpawn` passes `e.model`, and
@@ -209,5 +209,19 @@ date.
   no `model` in a session on a non-Opus model writes a pin row whose `model`
   equals the subagent's `router_usage` step model.
 
+
+### Observed
+
+| Check | Input | Expected | Actual |
+|---|---|---|---|
+| `cargo test -p relais --lib router::`, `install::` | Phase 1 candidate | pass | pass (47.6 s, 2.2 s); clippy `-D warnings` and `cargo fmt --check` clean |
+| `make plugin` | Phase 2 | pass | 555 pass, 0 fail (the script's one rerun: an unrelated chunk-matching test timed out at 5 s under load) |
+| Red check | the row rewrite disabled | the new cases fail | 8 fail; the 4 whose expected value is today's still pass, as they should |
+| Pilot | scratch `typo.md` (`opsu`), `rev.md` (`opus`), isolated `CLAUDE_CONFIG_DIR`/`RELAIS_STATE_DIR` | exit 0, pins and sources as planned, empty stderr | exit 0; `pins` {rev: opus, typo: opsu}; `pin_sources` both `preferred`; stderr 0 lines; the scratch state directory stayed empty |
+
+## Decision log
+- 2026-11-24: Phase 1 ran through relais; both its verify runs blocked on `admission_wait_exhausted` (a jammed host, 5 waiters). The kept candidate was applied unchanged and checked in session; the run is recorded `salvaged` at `f96b007e1`.
+- 2026-11-24: Phase 2's relais run got no worker lease in 1800 s (`nothing was launched`), so Phase 2 was written by hand in session.
+- 2026-11-24: carried findings taken in Phase 2: the session model is read in `afterSpawn` after `next(e)` (backend), a `TIMEOUT` maps to undefined (typescript), aliases expand by `DEFAULT_MODEL_IDS` not the tiers (Codex 2), and the own `opsu`, preferred `opsu` and preferred-source rejecting cases (rust, typescript, backend).
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:rust,lang:typescript,tui,unix,codex body-sha=3298939a5d52 -->

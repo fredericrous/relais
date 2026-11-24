@@ -295,6 +295,77 @@ test('a model named in the prompt is honoured, and an agent definition’s pin i
   expect(engine.calls.completes.length).toBe(1)
 })
 
+// A pinned spawn of `rev` in a session whose model is `sessionModel`: the
+// row the router records, and the call the engine received.
+async function pinRow(
+  $: any,
+  on: any,
+  setup: { pins: Record<string, string>; pin_sources?: Record<string, string>; sessionModel?: string; callModel?: string; state?: Record<string, unknown>; script?: Record<string, unknown> },
+) {
+  const state: Record<string, unknown> = { ...(setup.state ?? {}), pins: setup.pins }
+  if (setup.pin_sources) state.pin_sources = setup.pin_sources
+  const engine = await routedSession($, on, { state })
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  engine.script.sessionModel = setup.sessionModel
+  Object.assign(engine.script, setup.script ?? {})
+  const spawnedBefore = engine.calls.spawned.length
+  const call = { prompt: 'review it', description: 'review', subagentType: 'rev', ...(setup.callModel ? { model: setup.callModel } : {}) }
+  const spawning = $.agent.spawn(call)
+  await engine.clock.advance(5000)
+  await spawning
+  await endSession($, engine)
+  const row = observed(engine, 'decision').find((d: any) => d.relation === 'subagent')
+  return { row, spawned: engine.calls.spawned.slice(spawnedBefore) }
+}
+
+const PREFERRED = { pins: { rev: 'opus' }, pin_sources: { rev: 'preferred' } }
+const PIN_ROW_CASES: [string, Parameters<typeof pinRow>[2], string, string][] = [
+  ['a preference with no call model records the session’s model', { ...PREFERRED, sessionModel: SONNET }, SONNET, 'implementation'],
+  ['a call model is recorded over the preference', { ...PREFERRED, sessionModel: SONNET, callModel: 'opus' }, OPUS, 'escalation'],
+  ['an own model is recorded when the call names none', { pins: { rev: 'sonnet' }, pin_sources: { rev: 'own' }, sessionModel: OPUS }, SONNET, 'implementation'],
+  ['a machine pin records the session’s model', { pins: { rev: 'inherit' }, pin_sources: { rev: 'machine' }, sessionModel: HAIKU }, HAIKU, 'research'],
+  ['a mistyped preference never reaches the row while the session’s model is known', { pins: { rev: 'opsu' }, pin_sources: { rev: 'preferred' }, sessionModel: HAIKU }, HAIKU, 'research'],
+  ['an own model that does not resolve is kept as written', { pins: { rev: 'opsu' }, pin_sources: { rev: 'own' }, sessionModel: OPUS }, 'opsu', 'implementation'],
+  ['a relais that serves no pin sources gets the value recorded before', { pins: { rev: 'opus' }, sessionModel: SONNET }, 'opus', 'escalation'],
+  ['a pin source the plugin does not know is dropped', { pins: { rev: 'opus' }, pin_sources: { rev: 'someday' }, sessionModel: SONNET }, 'opus', 'escalation'],
+  ['with no session model and no call model the pin’s string is kept', { ...PREFERRED, sessionModel: undefined }, 'opus', 'escalation'],
+  ['a call model that does not resolve falls through to the source’s rule', { ...PREFERRED, sessionModel: HAIKU, callModel: 'opsu' }, HAIKU, 'research'],
+]
+
+for (const [name, setup, model, tier] of PIN_ROW_CASES) {
+  test(`pin row: ${name}`, async ($: any, on: any) => {
+    const { row, spawned } = await pinRow($, on, setup)
+    expect([row.reason, row.applied, row.model, row.tier]).toEqual(['pin', false, model, tier])
+    expect(spawned.length).toBe(1)
+    expect(spawned[0].model).toBe(setup.callModel)
+  })
+}
+
+const SONNET_5_TIERS = {
+    research: { model: HAIKU, effort: null },
+    implementation: { model: 'claude-sonnet-5', effort: null },
+    escalation: { model: OPUS, effort: null },
+}
+
+test('a pin row resolves an alias by the default ids, not a tier’s configured model', async ($: any, on: any) => {
+  const own = await pinRow($, on, { pins: { rev: 'sonnet' }, pin_sources: { rev: 'own' }, sessionModel: OPUS, state: { tiers: SONNET_5_TIERS } })
+  expect(own.row.model).toBe(SONNET)
+})
+
+test('a pin row keeps a full id the call names', async ($: any, on: any) => {
+  const called = await pinRow($, on, { ...PREFERRED, sessionModel: OPUS, callModel: 'claude-sonnet-5', state: { tiers: SONNET_5_TIERS } })
+  expect(called.row.model).toBe('claude-sonnet-5')
+})
+
+for (const [name, script] of [['fails', { sessionModelThrows: true }], ['never answers', { sessionModelNever: true }]] as const) {
+  test(`a session model that ${name} leaves the spawn as it was and the row on the pin`, async ($: any, on: any) => {
+    const { row, spawned } = await pinRow($, on, { ...PREFERRED, sessionModel: SONNET, script })
+    expect(spawned.length).toBe(1)
+    expect(spawned[0].model).toBeUndefined()
+    expect([row.reason, row.model]).toEqual(['pin', 'opus'])
+  })
+}
+
 test('a model the person names for a subagent goes to that subagent, never to the session', async ($: any, on: any) => {
   const engine = await routedSession($, on)
   engine.labels.set('Explore agent with opus', label({ difficulty: 1, kind: 'question', user_model: 'opus', user_model_for: 'subagent' }))
