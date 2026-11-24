@@ -192,8 +192,11 @@ impl LoopGuard {
                 output,
             } => {
                 let call = self.pending.remove(&tool_use_id)?;
-                // holds-until: the tool result carries the pipeline's exit status — the pipe hides it, so a trailing tail/head/grep is counted whatever is_error says
-                if call.ends_in_output_filter {
+                // A trailing tail/head/grep hides the pipeline's exit status, so
+                // its output stands in for it: counted by hash only when it
+                // shows a failure marker. A wait poll's empty or progress
+                // output falls through and, unless is_error, clears as a success.
+                if call.ends_in_output_filter && shows_failure(&output) {
                     let evidence = Evidence::OutputHash(hash_of(&output));
                     return self.count(call.command, evidence);
                 }
@@ -230,6 +233,37 @@ impl LoopGuard {
             count: *seen,
         })
     }
+}
+
+/// Whether a piped filter's output shows a failure. The fixed markers, case
+/// as written: `FAIL` as a word (`FAIL`, `FAILED`); `error:`, `error[`,
+/// `Error:`; `panicked`; `fatal:`; `Traceback`; and a count of at least one
+/// before `failed` or `error`/`errors` (`1 failed`, `3 errors`), so a
+/// summary's `0 failed` or `Found 0 errors.` is not one.
+fn shows_failure(output: &str) -> bool {
+    const PLAIN: [&str; 6] = [
+        "error:",
+        "error[",
+        "Error:",
+        "panicked",
+        "fatal:",
+        "Traceback",
+    ];
+    if PLAIN.iter().any(|marker| output.contains(marker)) {
+        return true;
+    }
+    let words: Vec<&str> = output
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    words.iter().enumerate().any(|(at, word)| match *word {
+        "FAIL" | "FAILED" => true,
+        "failed" | "error" | "errors" => at
+            .checked_sub(1)
+            .and_then(|before| words[before].parse::<u64>().ok())
+            .is_some_and(|count| count > 0),
+        _ => false,
+    })
 }
 
 fn hash_of(text: &str) -> u64 {
@@ -854,6 +888,67 @@ mod tests {
         failing_run(&mut guard, "a", command, "took 1s");
         failing_run(&mut guard, "b", command, "took 2s");
         assert_eq!(failing_run(&mut guard, "c", command, "took 3s"), None);
+    }
+
+    /// The `65f3d9db` wait poll: six identical runs while a background
+    /// vitest suite ran, after which it passed.
+    #[test]
+    fn a_wait_poll_with_no_failure_text_does_not_fire() {
+        let command = r#"for i in $(seq 1 22); do grep -q "Test Files" /tmp/s9a_run.txt && break; sleep 5; done; grep -E "Tests |Test Files|×" /tmp/s9a_run.txt | head"#;
+        for output in ["(Bash completed with no output)", ""] {
+            let mut guard = guard();
+            for at in 0..6 {
+                let id = format!("p{at}");
+                assert_eq!(
+                    feed(
+                        &mut guard,
+                        &[bash_use(&id, command), result(&id, false, output)]
+                    ),
+                    None,
+                    "{output:?} poll {at}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_piped_filter_that_failed_still_counts_by_its_error_line() {
+        let mut guard = guard();
+        let command = "set -o pipefail; make | tail -3";
+        for id in ["a", "b"] {
+            assert_eq!(failing_run(&mut guard, id, command, "Exit code 2"), None);
+        }
+        let fired = failing_run(&mut guard, "c", command, "Exit code 2").expect("fires");
+        assert_eq!(fired.evidence, Evidence::ErrorLine("Exit code 2".into()));
+    }
+
+    #[test]
+    fn failure_markers_ignore_zero_counts() {
+        for failing in [
+            "test result: FAILED. 1 passed; 1 failed",
+            "error[E0425]: cannot find value `x`",
+            "error: could not compile `relais`",
+            "Error: ENOENT",
+            "thread 'main' panicked at src/lib.rs:3:5",
+            "fatal: not a git repository",
+            "Traceback (most recent call last):",
+            " FAIL  src/x.test.ts > adds",
+            "      Tests  1 failed | 3 passed (4)",
+            "Found 2 errors.",
+        ] {
+            assert!(shows_failure(failing), "{failing}");
+        }
+        for clean in [
+            "",
+            "(Bash completed with no output)",
+            "test result: ok. 12 passed; 0 failed; 0 ignored",
+            "Found 0 errors.",
+            " Test Files  12 passed (12)\n      Tests  817 passed (817)",
+            "no errors found",
+            "FAILURES=0 wrote failover.log",
+        ] {
+            assert!(!shows_failure(clean), "{clean}");
+        }
     }
 
     #[test]
