@@ -22,7 +22,8 @@ prints `make: 1 carried` with no timings, which are the source attempt's.
   `relais rollback` again if X should go`; the cycle notes `rollback of A
   wanted (...) but X is active now; nothing changed, the next cycle judges
   X`, or withholds its promote (`promotion of B withheld: X is active now,
-  not A; nothing changed`) and waits for `relais promote B`. A lock another
+  not A; the shared pointer was not moved`) and waits for `relais promote
+  B`. A lock another
   relais process held past 2 s is refused the same way, `relais promote`
   included (exit 3, where it used to exit 1). Under `relais rollback
   --json` a lost race or a refusal is also said on stderr beside the
@@ -34,12 +35,14 @@ prints `make: 1 carried` with no timings, which are the source attempt's.
   `relais programme next --claim` and the session hooks (a resumed
   `SessionStart`, `SessionEnd`) now go through, and `conformance::run_all`
   gains `a_rollback_compares_first` and
-  `a_session_gives_back_its_work_and_keeps_its_handoff`. The library's
-  `learn::cycle::CycleInputs` gains `shared_state`, `roll_back_active` takes
-  the state and the judged artifact, `programme::claim::next` takes the
-  state and returns `NodeError`, `hook::respond::handle` takes a
-  `SharedClaims`, and `router::router_state` and `capture_policy` take the
-  machine settings (`router::read_machine` is gone). Nothing changes for a
+  `a_session_gives_back_its_work_and_keeps_its_handoff`. In the library,
+  `learn::cycle` gains a `PointerWrites` trait (`CycleInputs.pointers`;
+  `roll_back_active` takes it and the judged artifact) and
+  `programme::claim` a `Reservations` trait (`next` takes one), both
+  implemented by `shared_state::node` (`NodePointers`, `NodeReservations`);
+  `hook::respond::handle` takes a `SharedClaims`; `router::router_state`
+  and `capture_policy` take the machine settings (`router::read_machine` is
+  gone). Nothing changes for a
   single node.
 - Under `shared_state = "external"` with no client, `relais hook` still
   answers as before and exits 0; on a resumed `SessionStart` and on
