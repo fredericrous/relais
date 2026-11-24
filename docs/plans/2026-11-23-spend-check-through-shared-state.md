@@ -115,6 +115,7 @@ Observed 2026-11-23 on the Mac (`cargo test -p relais --features conformance`).
 | `a_settle_answered_elsewhere_...` | widen settle, decision already answered | `needs_decision` stays, no intent: ok |
 | `the_same_settle_under_a_free_decision_...` | widen settle, free decision | `cancelled`, intent written, grant kept: ok |
 | existing suite under `LocalState` | the unchanged runner, CLI and conformance tests | 2640 lib + 63 + 350 of 351 integration passed; the one failure, `bounded_change_end_to_end...`, passed alone in 29 s (the host was at load 90 to 170) |
+| rebased onto an-t19 (#558), 2026-11-24, tree `3e161cfe` | `cargo test -p relais --features conformance`; `cargo clippy --all-targets -D warnings` | 2647 lib, 64, 351 integration (`bounded_change_end_to_end...` passed), 16, 16, 3, 1: all ok; `spend_read_tests`, `daily_spent_tests` and the four `tests::shared` tests among them; clippy clean |
 | timed-out settle refused by the shared half; `Granted` then local `Ok(None)` released once; step line text | not tested: the timed-out path needs the native harness; the release is the an-t15 fake test; `step` events are not captured | gap, in the ticket's fog |
 | `relais run` against the `main` binary under `LocalState` | not run: the host load made two release builds impractical; the unchanged suite is the evidence | gap |
 
@@ -139,8 +140,8 @@ Observed 2026-11-23 on the Mac (`cargo test -p relais --features conformance`).
 
 ## Implementation review
 
-- implementation-review: approve-with-changes (3 passes). Fixed: lint allow, swallowed write, missing review-check and ledger-above tests, wording. Kept as gaps: timed-out settle test, step text, `main` comparison.
-- backend: approve-with-changes. Fixed: double prefix, `max` direction test, holds-until. Kept: release-once and timed-out settle tests, named gaps.
+- implementation-review: approve-with-changes (3 passes before the rebase; after it, a round 1 and a delta: exhaustive `NodeError` match, rebased-tree row). Fixed: lint allow, swallowed write, missing review-check and ledger-above tests, wording. Kept as gaps: timed-out settle test, step text, `main` comparison.
+- backend: approve after the rebase (state built once in `run` and `replay`, Breaking CHANGELOG line). Before: approve-with-changes. Fixed: double prefix, `max` direction test, holds-until. Kept: release-once and timed-out settle tests, named gaps.
 - lang:rust: approve. Fixed: refusal wording left to an-t19's types, error arm, visibility.
 - Rebased onto an-t19 (relais #558): `node` returns `NodeError`, so the spend mapping matches `NodeError::Ledger`; the shared half answers `HeldElsewhere`, which `node::resolve_decision_with_intent` already turns into the "being answered elsewhere" refusal the settles show. Delta review on the rebased tree.
 
