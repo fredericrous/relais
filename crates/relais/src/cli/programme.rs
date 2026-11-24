@@ -1085,6 +1085,7 @@ pub(crate) fn adopt_command(previous: &str, session: Option<&str>) -> Result<Cli
     }
     let store = claim_store()?;
     let now = now_unix();
+    let shared = super::ctx::shared_state();
     let handoffs: Vec<claim::SessionClaim> = store
         .claims_of(previous, now)
         .map_err(claim_io)?
@@ -1128,17 +1129,24 @@ pub(crate) fn adopt_command(previous: &str, session: Option<&str>) -> Result<Cli
             eprintln!("relais: {} {slug} {id} {why}", state.repo);
             continue;
         }
-        let taken = super::ctx::shared_state().and_then(|shared| {
-            take_ticket(
-                &*shared,
+        // One state for the whole run; a state that could not be built is
+        // said for each ticket, which a retry may then take.
+        let taken = match &shared {
+            Ok(shared) => take_ticket(
+                &**shared,
                 &store,
                 &state,
                 id,
                 &session,
                 claim::Contest::Refuse,
                 now,
-            )
-        });
+            ),
+            Err(error) => {
+                eprintln!("relais: {} {slug} {id} not adopted: {error}", state.repo);
+                failed = true;
+                continue;
+            }
+        };
         match taken {
             Ok(Ok(claim::Taken::Claimed { how, from })) => {
                 eprintln!("relais: {}", claimed_line(&state, slug, id, how, from));
