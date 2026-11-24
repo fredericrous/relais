@@ -1,0 +1,18 @@
+greengate-provenance-v1
+commit bb6332dc6c2af091361d62f219d1037a095e4c55
+tree 1109add2581358a6593e4e4a6ae157c965f26073
+canon 8c59eb117f56487d1b2035524f038f5082e426a9
+patch e0723be581e38aa4988535a6fd89f468a5a1caf5
+plan docs/plans/2026-11-23-spend-check-through-shared-state.md 2c7ef8eed42156d45a42033b9010cac1fc7da832b8378dc98554a263e56d8524
+review reviewed 3e161cfe08edc192bc61c816ddf9c4befe7e6708eaf432f49473a894a8003f5f
+code-review backend reviewed 3e161cfe08edc192bc61c816ddf9c4befe7e6708eaf432f49473a894a8003f5f
+code-review lang:rust reviewed 3e161cfe08edc192bc61c816ddf9c4befe7e6708eaf432f49473a894a8003f5f
+preview not-required
+producer greenbelay 6.9.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABA5rtuURm62jBTARL6xHMzIT1iC9uHwQnTO8R7nR6Ll8
+i0pFDFjo39HLWxIZTJon34vKUcrOeOsQvaKFnBZpt9Cw==
+-----END SSH SIGNATURE-----
