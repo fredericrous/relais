@@ -84,7 +84,7 @@ installed before t09, which removes `adr-lint` from PATH.
 - `cargo test -p relais --lib candidates` green (484 s): format constant,
   old format `adr-lint.candidates/1` refused (new case in the bad-format test), fake `greenspotter` script spawned with the run's base and
   candidate, missing binary gap says "greenspotter could not be launched".
-- Full `amont land` gates at push; CI `sync --check` green on the 0.20.0 pin.
+- Pending, at push: the `amont land` gates, and CI `sync --check` green on the 0.20.0 pin.
 - Phase 2: `relais --version` prints the release on the laptop; a relais review
   with the real greenspotter 0.20.0 on PATH lists candidates and records no gap; the real 0.20.0 run in a repository with no
   decisions corpus exits 3 and the receipt says `unavailable`.

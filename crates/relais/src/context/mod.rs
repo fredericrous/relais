@@ -1292,6 +1292,14 @@ mod tests {
     use super::*;
     use crate::policy::ArchitectureConfig;
 
+    #[test]
+    fn the_candidates_program_defaults_to_greenspotter() {
+        assert_eq!(candidates::GREENSPOTTER_ENV, "RELAIS_GREENSPOTTER");
+        if std::env::var_os(candidates::GREENSPOTTER_ENV).is_none() {
+            assert_eq!(greenspotter_program(), "greenspotter");
+        }
+    }
+
     fn contract(architecture_keys: &[&str]) -> TaskContract {
         let mut c = TaskContract::from_json_str(
             &serde_json::json!({

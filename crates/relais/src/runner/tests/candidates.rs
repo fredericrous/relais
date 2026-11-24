@@ -261,7 +261,9 @@ fn no_candidates_adds_nothing_to_the_prompt() {
     let prompts = prompts.lock().expect("prompts");
     let prompt = prompts.first().expect("the reviewer was dispatched");
     assert!(
-        !prompt.contains("CANDIDATES") && !prompt.contains("greenspotter"),
+        !prompt.contains("CANDIDATES")
+            && !prompt.contains("greenspotter")
+            && !prompt.contains("adr-lint"),
         "{prompt}"
     );
     assert_eq!(

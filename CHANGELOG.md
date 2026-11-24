@@ -8,6 +8,13 @@ missing here.
 
 ## Unreleased
 
+relais spawns `greenspotter` (0.20.0 or later) where it spawned `adr-lint`, reads
+only `greenspotter.candidates/1`, and writes `greenspotter.ruling/1` lines to
+`rulings.jsonl`. `RELAIS_ADR_LINT` is removed with no alias: set
+`RELAIS_GREENSPOTTER` to name another program. Rulings written as
+`adr-lint.ruling/1` stay in old ledgers as history. Install greenspotter
+before upgrading; without it a review runs with a candidates gap.
+
 ## v0.82.0
 
 relais.toml reads `[integrations] greentopo`, the new name of aval. It declares

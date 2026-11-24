@@ -236,11 +236,11 @@ pub fn parse_rulings(answer: &str, listed: &[&str]) -> BTreeMap<String, Ruling> 
 mod tests {
     use super::*;
 
-    /// Captured from adr-lint 0.3.0, format id renamed; the keys (base, candidates, format, head, overflow) match greenspotter 0.20.0 output.
-    const CANDIDATES_JSON: &str = r#"{"base":"e50d22fccef1f14949c620753adf8ffe376468bd","candidates":[{"col":16,"id":"610663331e1941e0e935e32f0b2443d99e3617f07cd522178cc07ab03e5c012a","line":2,"path":"src/a.rs","pattern":"`.unwrap()`, `.expect(` or `panic!`: a failure that should be a value in the return type, unless the invariant is proven","pattern_id":"failures.expected-vs-defect/rust-panic","rule":"failures.expected-vs-defect","text":"let data = std::fs::read(\"x\").unwrap();"},{"col":9,"id":"6998f43dd19b3a4891444a2b67b42ed87028c23713230bd4c05cece9b1acf6dc","line":2,"path":"src/a.rs","pattern":"a single-letter, placeholder or abbreviated name declared here (data, result, value, item, tmp, obj, cfg, ctx, mgr, svc)","pattern_id":"names.reveal-intent/rust-weak-name","rule":"names.reveal-intent","text":"let data = std::fs::read(\"x\").unwrap();"}],"format":"greenspotter.candidates/1","head":"2d94d48229cfa25910c8bb775d8547eef8ffd2dd","overflow":{}}"#;
+    /// Captured from `greenspotter candidates --json` 0.20.0 (a commit adding an `unwrap()` and a weak name).
+    const CANDIDATES_JSON: &str = r#"{"base":"32f45c9950e4e845a1681bc2a89481235d61f927","candidates":[{"col":5,"id":"ad8e176564da84aa7f75fc6596e7362c1c71d953c721973b4c37d4494a79e657","line":3,"path":"src/a.rs","pattern":"`.unwrap()`, `.expect(` or `panic!`: a failure that should be a value in the return type, unless the invariant is proven","pattern_id":"failures.expected-vs-defect/rust-panic","rule":"failures.expected-vs-defect","text":"x.unwrap();"},{"col":9,"id":"71b3d608f891ac34d448d2077a4115c8d033b6aa8c8aaa3e73a1c1c1721cf549","line":2,"path":"src/a.rs","pattern":"a single-letter, placeholder or abbreviated name declared here (data, result, value, item, tmp, obj, cfg, ctx, mgr, svc)","pattern_id":"names.reveal-intent/rust-weak-name","rule":"names.reveal-intent","text":"let x: Option<u8> = None;"}],"format":"greenspotter.candidates/1","head":"0798a1e21b297c8c4c1564e95b046f0fdb10f00a","overflow":{}}"#;
 
-    const FIRST: &str = "610663331e1941e0e935e32f0b2443d99e3617f07cd522178cc07ab03e5c012a";
-    const SECOND: &str = "6998f43dd19b3a4891444a2b67b42ed87028c23713230bd4c05cece9b1acf6dc";
+    const FIRST: &str = "ad8e176564da84aa7f75fc6596e7362c1c71d953c721973b4c37d4494a79e657";
+    const SECOND: &str = "71b3d608f891ac34d448d2077a4115c8d033b6aa8c8aaa3e73a1c1c1721cf549";
 
     #[test]
     fn the_captured_document_parses() {
