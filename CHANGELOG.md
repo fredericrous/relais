@@ -38,7 +38,6 @@ missing here.
   decision to that node, with a step line carrying the refusal. Nothing changes for a
   single node: `LocalState` keeps no counter and grants every answer.
   Library callers building a `RunConfig` add the field.
-
 - Breaking, for a client of `relais::shared_state`: the error and grant types
   are settled before a closed client is built. `SharedStateError` no longer
   has `Lock`, `Ledger`, `Claim`, `Registry` or `Compensation`; the `node`
