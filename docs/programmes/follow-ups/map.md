@@ -70,14 +70,15 @@ ticket here until it is resolved or moved into a programme of its own.
   transcripts, Lumina's rule trips on 2 and the Bash rule reaches 3 on 2.
   Every one of them is a wait on a slow test or build. 78% of the wall time
   is inside tool calls, and no transcript has more than 140 calls.
-- [f17](f17-piped-filter-polls.md) (2026-11-24, open): the piped-filter
-  clause fires on wait polls, so it should count only on failure text
-  before `loop_threshold` is enabled.
+- [f17](f17-piped-filter-polls.md) (2026-11-24, closed 2026-11-24): a
+  piped filter counts only when its output shows a failure marker
+  (`shows_failure`). The real wait polls went from 7 fires to 0.
 - [f18](f18-timeout-wall-time-waits.md) (2026-11-24, open): what a
   timed-out worker's wall time waits on (suite, host contention, polling).
 - [f19](f19-pin-row-records-call-model.md) (2026-11-24, open): a
   `preferred-model` pin row records the preference, not the model the
-  call ran; record the call's model, keep the pin source, validate the value.
+  call ran; record the call's model, serve the pin source in an added
+  `pin_sources` field, validate the value.
 - [f20](f20-clear-routes-on-stale-state.md) (2026-11-24, open): after a
   `/clear` relay, spawns before the first person prompt can route on a
   state with no pins (likely the pre-clear one; cause open): a pinned
@@ -85,29 +86,34 @@ ticket here until it is resolved or moved into a programme of its own.
 
 ## Handoff
 
-2026-11-24, boundary 3 (f15 closed): a wider no-progress fingerprint
-catches no loop that the Bash rule misses. Both rules flag only waits on
-slow suites, so the shadow detector stays as it is and `loop_threshold`
-stays unset. The replay also showed that the shipped piped-filter clause
-fires on `… | head` wait polls, which is filed as f17. Earlier the same day,
-`relais programme adopt` (f12) and the f10 and f11 fixes merged; they are
-unreleased.
+2026-11-24, boundary 4 (f17 closed): the loop guard counts a piped
+`tail`/`head`/`grep` only when its output shows a failure marker. The
+markers are `FAIL` as a word, `error:`/`error[`/`Error:`, `panicked`,
+`fatal:`, `Traceback`, and a count of at least one before
+`failed`/`error`. Replayed over the two wait-poll transcripts, the fires
+went from 7 to 0. This is unreleased, like f10, f11 and f12.
+`loop_threshold` stays unset until the Rollout bar is met: at least 5 shadow
+events, at most 1 in 5 passing verification.
 
-- Done: f12, f13, f14, f15.
-- Next: The loop guard counts a piped filter only on failure text (f17) and
-  What a timed-out worker's wall time waits on (f18) are ready, and so are
-  f19 (pin row records the call's model) and f20 (stale state after a
+- Done: f12, f13, f14, f15, f17.
+- Next: What a timed-out worker's wall time waits on (f18) is ready. So
+  are f19 (pin row records the call's model) and f20 (stale state after a
   clear), f20 first since it skews the router pin plan's 11-30 cohort
   check. Measure the home fingerprint warnings (f08) is due 2026-11-28. A
-  week of relays
-  adopts every handoff (f16) is due 2026-12-02, counted from the plugin
-  reinstall.
+  week of relays adopts every handoff (f16) is due 2026-12-02, counted
+  from the plugin reinstall.
 - Lessons:
   - A timed-out dispatch has no `agent_id` in the ledger. Find its
     transcript by the dispatch's `session_id` and the subagent file whose
     first line comes within 2 min of `dispatch_started`.
   - `grep 'relais: shadow:'` also matches run prose. Count only lines whose
     event text starts with it.
+  - A Bash result with no output is stored as the literal text
+    `(Bash completed with no output)`, not as an empty string. Build
+    transcript tests from that text.
+  - Replay a real transcript through `LoopGuard::push_chunk` in a
+    temporary `#[ignore]` test, once with the old rule and once with the new.
+    It costs two builds and gives a before and after.
   - The 11-21 takeover was no fault of the takeover rule: the successor
     held no claim. Read `claims/log.jsonl` and the transcripts before
     blaming a rule.

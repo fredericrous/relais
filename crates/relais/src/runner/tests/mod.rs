@@ -46,6 +46,14 @@ struct Presented {
     wire: Wire,
 }
 
+/// The shared half a test runs with, the id of the run it names ahead, and
+/// where the run works.
+struct Shared<'a> {
+    state: &'a dyn crate::shared_state::SharedState,
+    run_id: Option<RunId>,
+    workspace: crate::workspace::reuse::Workspace,
+}
+
 struct Fixture {
     dir: crate::test_support::TempDir,
     repo: PathBuf,
@@ -332,6 +340,7 @@ impl Fixture {
             wire,
             design: DesignSource::Contract,
             declarations: &crate::trust::NoHistory,
+            shared_state: &crate::shared_state::LocalState::new(),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -389,6 +398,7 @@ impl Fixture {
             wire: Wire::process(),
             design: DesignSource::Contract,
             declarations: &crate::trust::NoHistory,
+            shared_state: &crate::shared_state::LocalState::new(),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -428,6 +438,7 @@ impl Fixture {
             wire: Wire::process(),
             design: DesignSource::Contract,
             declarations: &crate::trust::NoHistory,
+            shared_state: &crate::shared_state::LocalState::new(),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -466,6 +477,7 @@ impl Fixture {
             wire: Wire::process(),
             design: DesignSource::Contract,
             declarations: &crate::trust::NoHistory,
+            shared_state: &crate::shared_state::LocalState::new(),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -494,6 +506,34 @@ impl Fixture {
         machine: &MachineSettings,
         backend: &dyn Backend,
     ) -> RunOutcome {
+        self.execute_shared(
+            Shared {
+                state: &crate::shared_state::LocalState::new(),
+                run_id: None,
+                workspace,
+            },
+            contract,
+            repo,
+            machine,
+            backend,
+        )
+    }
+
+    /// `execute_in` with the shared half and the run's id chosen by the
+    /// test (a test answers the decision of a run it names ahead).
+    fn execute_shared(
+        &self,
+        shared: Shared<'_>,
+        contract: &TaskContract,
+        repo: &RepoPolicy,
+        machine: &MachineSettings,
+        backend: &dyn Backend,
+    ) -> RunOutcome {
+        let Shared {
+            state: shared_state,
+            run_id,
+            workspace,
+        } = shared;
         let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
             adr: "ADR-0001".into(),
             choice: None,
@@ -520,10 +560,11 @@ impl Fixture {
             heartbeat_every: Duration::from_millis(50),
             task_override: None,
             purpose: None,
-            run_id: None,
+            run_id,
             wire: Wire::process(),
             design: DesignSource::Contract,
             declarations: &crate::trust::NoHistory,
+            shared_state,
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -569,6 +610,7 @@ impl Fixture {
             wire: Wire::process(),
             design: DesignSource::Contract,
             declarations,
+            shared_state: &crate::shared_state::LocalState::new(),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -633,6 +675,7 @@ impl Fixture {
             wire,
             design: DesignSource::Contract,
             declarations: &crate::trust::NoHistory,
+            shared_state: &crate::shared_state::LocalState::new(),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -937,6 +980,7 @@ fn a_driver_whose_run_was_ended_elsewhere_stops_without_writing() {
         wire: Wire::process(),
         design: DesignSource::Contract,
         declarations: &crate::trust::NoHistory,
+        shared_state: &crate::shared_state::LocalState::new(),
     };
     let mut engine = RunEngine::new(&config, None).expect("engine");
     let run_id = engine.run_id.clone();
@@ -2122,6 +2166,7 @@ fn an_unreadable_working_tree_blocks_like_a_dirty_one() {
         wire: Wire::process(),
         design: DesignSource::Contract,
         declarations: &crate::trust::NoHistory,
+        shared_state: &crate::shared_state::LocalState::new(),
     })
     .expect("the fixture's id source mints identifiers");
     let RunOutcome {
@@ -8071,6 +8116,7 @@ fn guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_g
         wire: Wire::process(),
         design: DesignSource::Contract,
         declarations: &crate::trust::NoHistory,
+        shared_state: &crate::shared_state::LocalState::new(),
     };
     let mut engine = RunEngine::new(&config, None).expect("engine");
     let clean = manifest_with(Vec::new());
@@ -9821,6 +9867,7 @@ mod review_repair;
 mod review_retry;
 mod review_stop;
 mod scope_floor;
+mod shared;
 mod timeout_rerun;
 // Shells out to `sh` and a fake `claude` script made executable with
 // unix permissions: unix only, like the script it tests.

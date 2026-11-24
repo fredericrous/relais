@@ -136,7 +136,8 @@ impl<'a> RunEngine<'a> {
                  the daily spend ceiling has no day to measure"
             ))
         })?;
-        Ok(ledger.spend_since(&day_start)?)
+        crate::shared_state::node::daily_spent(self.config.shared_state, ledger, &day_start)
+            .map_err(spend_read_failure)
     }
 
     /// Where a reviewer reads the candidate from: the run's own task
@@ -986,4 +987,54 @@ fn inherited_block(request: &ReviewRequest<'_>) -> String {
         }
     });
     block
+}
+
+/// A failed read of the day's spend as the run reports it: a ledger error
+/// stays `RunError::Ledger` (its "ledger:" prefix and the storage-full
+/// check are unchanged under `LocalState`); anything else is the shared
+/// half's, said with what could not be read.
+fn spend_read_failure(e: crate::shared_state::node::NodeError) -> RunError {
+    use crate::shared_state::node::NodeError;
+    match e {
+        NodeError::Ledger(e) => RunError::Ledger(e),
+        NodeError::Shared(e) => {
+            RunError::Other(format!("the shared spend count is unavailable: {e}"))
+        }
+        // `daily_spent` touches no lock, claim file or registry; named so a
+        // new variant is a compile error here, not a "shared" sentence.
+        e @ (NodeError::Lock { .. }
+        | NodeError::Claim(_)
+        | NodeError::Registry(_)
+        | NodeError::Compensation { .. }) => RunError::Other(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod spend_read_tests {
+    use super::*;
+    use crate::shared_state::node::NodeError;
+    use crate::shared_state::SharedStateError;
+
+    #[test]
+    fn a_ledger_failure_stays_a_ledger_error() {
+        let failure = spend_read_failure(NodeError::Ledger(crate::ledger::LedgerError::Corrupt {
+            what: "usage".into(),
+            detail: "disk".into(),
+        }));
+        assert!(matches!(failure, RunError::Ledger(_)), "{failure:?}");
+        assert!(failure.to_string().starts_with("ledger: "), "{failure}");
+    }
+
+    #[test]
+    fn a_shared_failure_says_what_could_not_be_read() {
+        let failure = spend_read_failure(NodeError::Shared(SharedStateError::Refused {
+            reason: "primary unreachable".into(),
+        }));
+        let text = failure.to_string();
+        assert!(
+            text.contains("the shared spend count is unavailable") && text.contains("unreachable"),
+            "{text}"
+        );
+        assert!(!text.contains('\u{1b}'), "no escape codes: {text}");
+    }
 }

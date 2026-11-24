@@ -218,6 +218,9 @@ pub(crate) fn run_command(
     let session = relais::coordinator::resolve_session();
     let (root, repo) = load_repo_policy()?;
     let machine = load_machine()?;
+    // The shared half, built once for the whole run (an-t16): before the
+    // intent claim and the trial row, so a failure here leaves neither.
+    let shared = super::ctx::shared_state()?;
     let workspace = match run_workspace(workspace_flag, &root, &machine, &repo)? {
         Ok(workspace) => workspace,
         Err(refusal) => {
@@ -329,7 +332,7 @@ pub(crate) fn run_command(
     // making another (plan A5).
     if let RunSource::Intent(intent) = source {
         let claimed = relais::shared_state::node::claim_intent(
-            &*super::ctx::shared_state()?,
+            &*shared,
             &ledger,
             intent,
             &run_id,
@@ -540,6 +543,7 @@ pub(crate) fn run_command(
         // Only `run` consumes a pending change to the repository's
         // commands (ADR-0007).
         declarations: &relais::trust::Recorder(&ledger),
+        shared_state: &*shared,
     }) {
         Ok(outcome) => outcome,
         Err(e) => {

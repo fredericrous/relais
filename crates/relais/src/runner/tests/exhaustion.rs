@@ -399,6 +399,7 @@ fn run_to_the_end(fill: &Fill, run_id: Option<RunId>) -> Result<RunOutcome, RunE
         wire: Wire::process(),
         design: DesignSource::Contract,
         declarations: &crate::trust::NoHistory,
+        shared_state: &crate::shared_state::LocalState::new(),
     })
 }
 

@@ -816,6 +816,7 @@ fn run_package(
         wire: engine.config.wire.clone(),
         design: engine.config.design,
         declarations: engine.config.declarations,
+        shared_state: engine.config.shared_state,
     };
     engine.transition(
         State::Running,

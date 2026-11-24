@@ -70,6 +70,12 @@ pub struct RunConfig<'a> {
     /// store, so only `run` consumes a pending command change (ADR-0007).
     /// A replay never reads it: it neither says nor records a change.
     pub declarations: &'a dyn crate::trust::DeclarationStore,
+    /// The shared half of the state several nodes agree on (an-t16): the
+    /// daily spend count and the answer to a decision relais settles
+    /// itself. `LocalState` says the node decides, so one node behaves as
+    /// it always did. Built once at the CLI's composition root; a child
+    /// run uses its parent's.
+    pub shared_state: &'a dyn crate::shared_state::SharedState,
 }
 
 /// Where a run's program design comes from: the path its contract names,

@@ -300,6 +300,8 @@ pub(crate) fn replay_command(
     };
 
     let machine = load_machine()?;
+    // Built once, before any checkout or start line (an-t16).
+    let shared = super::ctx::shared_state()?;
     let artifacts_dir = paths::runs_dir().map_err(CliError::Home)?;
     let backend = match relais::adapter::claude::ClaudeBackend::discover() {
         Ok(backend) => std::sync::Arc::from(backend),
@@ -461,6 +463,7 @@ pub(crate) fn replay_command(
         // runner skips it for a replay, and `plan`, `doctor` and `trust
         // show` report it.
         declarations: &relais::trust::NoHistory,
+        shared_state: &*shared,
     });
     // Bring the replay's own refs into the live repository BEFORE the
     // checkout goes. The runner names its candidate and snapshot refs in

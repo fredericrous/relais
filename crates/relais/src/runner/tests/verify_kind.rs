@@ -1174,6 +1174,7 @@ fn execute_predicted(
         wire: Wire::process(),
         design: DesignSource::Contract,
         declarations: &crate::trust::NoHistory,
+        shared_state: &crate::shared_state::LocalState::new(),
     })
     .expect("the fixture's id source mints identifiers")
 }
