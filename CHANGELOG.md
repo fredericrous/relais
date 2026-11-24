@@ -40,6 +40,12 @@ missing here.
   `kind: verify` run (or `from_candidate`) finds it. Before, the tree was only
   exported as `candidate-final.patch`, and `verify` answered
   `candidate_missing`.
+- `Ledger::router_correction_charges` now returns `CorrectionCharges`. Its
+  `skipped_candidates` counts the candidate tasks whose end time or files do
+  not parse. `CorrectionCharge`'s `charged` and `legacy` become one `read:
+  ChargeRead` field: `Charged(tasks)`, `Legacy` (files that parse but are
+  empty), or `Unparsed` (a time or files that do not parse, which used to read
+  as legacy).
 
 ## v0.80.0
 
