@@ -1052,6 +1052,7 @@ impl<'a> RunEngine<'a> {
                 std::env::var(verify::HOST_SLOT_ENV).ok().as_deref(),
             ),
             poll: ADMISSION_POLL,
+            stall_window: self.stall_window(),
             announce_every: verify::ANNOUNCE_EVERY,
             heartbeat_every: verify::LEASE_HEARTBEAT_EVERY,
             sleeper: Arc::new(verify::ThreadSleeper),
@@ -1068,6 +1069,26 @@ impl<'a> RunEngine<'a> {
         };
         admission.note_host_sizing(&plan);
         admission
+    }
+
+    /// How long a host-slot line may make no progress before a wait ends
+    /// (ADR-0015): `GREENHARNESS_SLOT_STALL_S`, read here at relais's edge. A
+    /// bad value falls back to the crate's 300 s and is said once per process,
+    /// to the event stream of the first run that reads it (the variable is
+    /// process-wide).
+    fn stall_window(&self) -> Duration {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        let setting = std::env::var(greenharness_slots::STALL_ENV).ok();
+        let (window, complaint) = greenharness_slots::Stall::window_from(setting.as_deref());
+        if let Some(reason) = complaint {
+            SAID.call_once(|| {
+                self.events.emit(Event::Decision {
+                    what: "stall_window_ignored".into(),
+                    reason,
+                });
+            });
+        }
+        window
     }
 
     /// The places this run writes (SPEC §23): the state directory, the
@@ -1096,6 +1117,7 @@ impl<'a> RunEngine<'a> {
         let text = stop.to_string();
         match stop {
             LeaseStop::Exhausted(exhausted) => self.end_on_exhausted(exhausted, budget, candidate),
+            LeaseStop::SlotLine(end) => self.end_on_slot_line(&end, candidate),
             LeaseStop::Cancelled
             | LeaseStop::Refused {
                 code: Refusal::RunCancelled,
@@ -1148,6 +1170,46 @@ impl<'a> RunEngine<'a> {
         self.outcome_of_stop(next)
     }
 
+    /// End the run on a host-slot line that stalled or could not be read
+    /// (ADR-0015). It is blocked as a spent admission wait is, with its own
+    /// words, so a person can tell the three apart.
+    pub(crate) fn end_on_slot_line(
+        &mut self,
+        end: &verify::SlotLineEnd,
+        candidate: Option<&KeptCandidate>,
+    ) -> Result<RunOutcome, RunError> {
+        self.block_on_admission_wait(end.to_string(), candidate)
+    }
+
+    /// The run's block on the admission wait, with `detail` as its cause.
+    fn block_on_admission_wait(
+        &mut self,
+        mut detail: String,
+        candidate: Option<&KeptCandidate>,
+    ) -> Result<RunOutcome, RunError> {
+        // "Nothing was launched" holds for the lease, not the run: a
+        // worker may already have made the candidate.
+        if candidate.is_none() {
+            detail.push_str("; nothing was launched");
+        }
+        let mut detail_json = serde_json::json!({ "detail": detail });
+        if let Some(kept) = candidate {
+            detail.push_str(&format!("; {}", kept_sentence(kept)));
+            detail_json = serde_json::json!({
+                "detail": detail,
+                "candidate": { "run": kept.run, "index": kept.index, "sha": kept.sha },
+            });
+        }
+        self.finish(
+            Reason::AdmissionWaitExhausted,
+            detail_json,
+            Terminal::BlockedBy {
+                reason: Reason::AdmissionWaitExhausted,
+                detail,
+            },
+        )
+    }
+
     pub(crate) fn end_on_exhausted(
         &mut self,
         exhausted: Exhausted,
@@ -1169,34 +1231,14 @@ impl<'a> RunEngine<'a> {
                 }
             },
             Exhausted::Total => self.stop(budget, Observation::LimitReached(Limit::Total)),
-            Exhausted::AdmissionWait => {
-                let mut detail = format!(
+            Exhausted::AdmissionWait => self.block_on_admission_wait(
+                format!(
                     "queued for a lease for {}s, the whole admission wait budget \
                      (`[resources] admission_wait_seconds`)",
                     limits.admission_wait.as_secs()
-                );
-                // "Nothing was launched" holds for the lease, not the run: a
-                // worker may already have made the candidate.
-                if candidate.is_none() {
-                    detail.push_str("; nothing was launched");
-                }
-                let mut detail_json = serde_json::json!({ "detail": detail });
-                if let Some(kept) = candidate {
-                    detail.push_str(&format!("; {}", kept_sentence(kept)));
-                    detail_json = serde_json::json!({
-                        "detail": detail,
-                        "candidate": { "run": kept.run, "index": kept.index, "sha": kept.sha },
-                    });
-                }
-                self.finish(
-                    Reason::AdmissionWaitExhausted,
-                    detail_json,
-                    Terminal::BlockedBy {
-                        reason: Reason::AdmissionWaitExhausted,
-                        detail,
-                    },
-                )
-            }
+                ),
+                candidate,
+            ),
             Exhausted::DiskWait => {
                 let detail = format!(
                     "waited {}s for free disk space, the whole disk wait budget \

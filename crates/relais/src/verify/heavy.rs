@@ -51,7 +51,7 @@ use crate::admission::{
     ResourceClass, RunRegistration, ADMISSION_POLL,
 };
 use crate::disk::{DiskCheck, Shortfall};
-use crate::policy::{Budgets, Exhausted, WaitKind};
+use crate::policy::{Bound, Budgets, Exhausted, WaitKind};
 use crate::procs::Ended;
 use crate::protocol::{Event, Events};
 
@@ -399,6 +399,8 @@ pub fn dispatch_id(run: &str, phase: &str, label: &str, epoch: u32, attempt: u32
 pub enum LeaseStop {
     /// A budget ran out while the command was queued.
     Exhausted(Exhausted),
+    /// The host-slot line ended the wait without a spent budget (ADR-0015).
+    SlotLine(SlotLineEnd),
     /// The run was cancelled while the command was queued.
     Cancelled,
     /// The coordinator could not be asked, or answered with an error.
@@ -418,10 +420,35 @@ pub enum LeaseStop {
     },
 }
 
+/// Why a host-slot wait ended with no slot and no spent budget (ADR-0015).
+#[derive(Debug)]
+pub enum SlotLineEnd {
+    /// No admission and no change of place for the window.
+    Stalled { window_s: u64, position: usize },
+    /// The queue was joined, then its lock failed `failures` polls in a row.
+    Unreadable { failures: u32, cause: String },
+}
+
+impl std::fmt::Display for SlotLineEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stalled { window_s, position } => write!(
+                f,
+                "the host slot line made no progress for {window_s} s at position {position}"
+            ),
+            Self::Unreadable { failures, cause } => write!(
+                f,
+                "the host slot line could not be read {failures} times in a row: {cause}"
+            ),
+        }
+    }
+}
+
 impl std::fmt::Display for LeaseStop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Exhausted(which) => write!(f, "a budget ran out while queued ({which:?})"),
+            Self::SlotLine(end) => write!(f, "{end}"),
             Self::Cancelled => write!(f, "the run was cancelled while the command was queued"),
             Self::Gate(e) => write!(f, "{e}"),
             Self::Refused { detail, .. } => write!(f, "{detail}"),
@@ -503,6 +530,9 @@ pub struct HeavyAdmission<'a> {
     /// here, and the fact is passed on to the check.
     pub ancestor_holds_slots: bool,
     pub poll: Duration,
+    /// A host-slot line that made no progress for this long ends the wait
+    /// (ADR-0015): read from `GREENHARNESS_SLOT_STALL_S` at the edge.
+    pub stall_window: Duration,
     pub announce_every: Duration,
     /// How often a lease that is not tied to a group says it is alive.
     pub heartbeat_every: Duration,
@@ -543,6 +573,7 @@ impl<'a> HeavyAdmission<'a> {
             sizing: None,
             ancestor_holds_slots: false,
             poll: ADMISSION_POLL,
+            stall_window: greenharness_slots::STALL,
             announce_every: ANNOUNCE_EVERY,
             heartbeat_every: LEASE_HEARTBEAT_EVERY,
             sleeper: Arc::new(ThreadSleeper),
@@ -784,6 +815,7 @@ impl<'a> HeavyAdmission<'a> {
                                 class: "heavy_local",
                                 position: *position,
                                 behind: None,
+                                bound: Bound::Budget,
                             },
                             _ => unreachable!("granted, duplicate and refused return above"),
                         };
@@ -884,6 +916,8 @@ enum Holding<'h> {
         class: &'h str,
         position: usize,
         behind: Option<String>,
+        /// What ends this wait: the spent budget, or a stalled line (ADR-0015).
+        bound: Bound,
     },
     Disk(Shortfall),
 }
@@ -895,6 +929,13 @@ impl Holding<'_> {
             Self::Disk(_) => WaitKind::Disk,
         }
     }
+
+    fn bound(&self) -> Bound {
+        match self {
+            Self::Slot { bound, .. } => *bound,
+            Self::Disk(_) => Bound::Budget,
+        }
+    }
 }
 
 /// Time spent held, announced every [`HeavyAdmission::announce_every`] and
@@ -903,7 +944,7 @@ impl Holding<'_> {
 /// both.
 struct Queue<'q> {
     admission: &'q HeavyAdmission<'q>,
-    wait: Option<(WaitKind, crate::policy::Wait)>,
+    wait: Option<(WaitKind, Bound, crate::policy::Wait)>,
     started: i64,
     last_announced: i64,
 }
@@ -921,16 +962,24 @@ impl<'q> Queue<'q> {
 
     /// The wait that charges `kind`, started now if another was running
     /// (dropping that one charges it up to now).
-    fn charging(&mut self, kind: WaitKind) -> &mut crate::policy::Wait {
-        if self.wait.as_ref().is_none_or(|(held, _)| *held != kind) {
+    fn charging(&mut self, kind: WaitKind, bound: Bound) -> &mut crate::policy::Wait {
+        if self
+            .wait
+            .as_ref()
+            .is_none_or(|(held, held_bound, _)| *held != kind || *held_bound != bound)
+        {
             self.wait = None;
             let now = self.admission.budgets.now();
             self.started = now;
             self.last_announced = now;
-            self.wait = Some((kind, self.admission.budgets.wait(kind)));
+            let wait = match bound {
+                Bound::Stall => self.admission.budgets.moving_wait(),
+                Bound::Budget => self.admission.budgets.wait(kind),
+            };
+            self.wait = Some((kind, bound, wait));
         }
         match &mut self.wait {
-            Some((_, wait)) => wait,
+            Some((_, _, wait)) => wait,
             None => unreachable!("the wait was set above"),
         }
     }
@@ -943,7 +992,7 @@ impl<'q> Queue<'q> {
         cancel: Option<&AtomicBool>,
         sleeper: &dyn Sleeper,
     ) -> Result<(), LeaseStop> {
-        if let Some(exhausted) = self.charging(holding.kind()).tick() {
+        if let Some(exhausted) = self.charging(holding.kind(), holding.bound()).tick() {
             let reason = match &holding {
                 Holding::Slot {
                     class, position, ..
@@ -974,6 +1023,7 @@ impl<'q> Queue<'q> {
                     class,
                     position,
                     behind,
+                    ..
                 } => Event::WaitingForSlot {
                     class: class.to_string(),
                     position,
@@ -1106,7 +1156,7 @@ mod slots {
 
     use std::path::{Path, PathBuf};
 
-    use super::{Ask, Gate, HeavyAdmission, Holding, LeaseStop, Queue};
+    use super::{Ask, Bound, Event, Gate, HeavyAdmission, Holding, LeaseStop, Queue, SlotLineEnd};
 
     /// Whether the slot directory can be used, before anything is queued
     /// for. `Ok(None)`: it cannot, which is said once and not fatal, the
@@ -1160,13 +1210,14 @@ mod slots {
         let slot_cap = sizing.cap_for(admission.machine.cores);
         let width = admission.width(ask.weight, super::Placement::UnderHostSlot);
         // Every wait line names the sizing the command was queued under.
-        let record = |waited_ms: u128, outcome: &str| {
+        let record = |waited_ms: u128, outcome: &str, end: Option<greenharness_slots::WaitEnd>| {
             greenharness_slots::record_wait_named(
                 dir,
                 "relais",
                 greenharness_slots::WaitContext {
                     cap: Some(slot_cap),
                     cores: Some(admission.machine.cores),
+                    end,
                     ..greenharness_slots::WaitContext::default()
                 },
                 ask.weight,
@@ -1188,18 +1239,91 @@ mod slots {
                 return Ok(None);
             }
         };
+        // A line that moved inside the window keeps the wait going past
+        // `admission_wait_seconds`; one that did not ends it (ADR-0015).
+        let mut stall = greenharness_slots::Stall::new(admission.stall_window);
+        let mut joined_at: Option<usize> = None;
+        let mut failures = 0u32;
         loop {
             let queued = match waiter.poll() {
                 Ok(greenharness_slots::Poll::Granted(held)) => {
-                    record(started.elapsed().as_millis(), "admitted");
+                    record(started.elapsed().as_millis(), "admitted", None);
+                    let over = admission.budgets.overrun();
+                    if !over.is_zero() {
+                        admission.events.emit(Event::Decision {
+                            what: "admission_overrun".into(),
+                            reason: format!(
+                                "queued {} s past `admission_wait_seconds` while the host slot \
+                                 line moved; charged to the total only",
+                                over.as_secs()
+                            ),
+                        });
+                    }
                     return Ok(Some(held));
                 }
-                Ok(greenharness_slots::Poll::Waiting(queued)) => queued,
+                Ok(greenharness_slots::Poll::Waiting(queued)) => {
+                    failures = 0;
+                    joined_at = Some(queued.position);
+                    queued
+                }
                 Err(e) => {
-                    admission.host_slots_off(&format!("a host slot could not be locked: {e}"));
-                    return Ok(None);
+                    let Some(position) = joined_at else {
+                        admission.host_slots_off(&format!("a host slot could not be locked: {e}"));
+                        return Ok(None);
+                    };
+                    // The queue was joined: a failing lock ends the wait, as a
+                    // stalled line does, and never runs the command unqueued.
+                    failures += 1;
+                    if failures >= greenharness_slots::POLL_FAILURES {
+                        record(
+                            started.elapsed().as_millis(),
+                            "deferred",
+                            Some(greenharness_slots::WaitEnd::IoError),
+                        );
+                        let end = SlotLineEnd::Unreadable {
+                            failures,
+                            cause: e.to_string(),
+                        };
+                        admission.events.emit(Event::Decision {
+                            what: "admission_queue_unreadable".into(),
+                            reason: end.to_string(),
+                        });
+                        return Err(LeaseStop::SlotLine(end));
+                    }
+                    let _ = gate.heartbeat(lease); // best-effort, as in the waiting arm
+                    let waited = queue.wait(
+                        Holding::Slot {
+                            class: "host_slot",
+                            position,
+                            behind: None,
+                            bound: Bound::Stall,
+                        },
+                        ask.cancel,
+                        admission.sleeper.as_ref(),
+                    );
+                    if let Err(stop) = waited {
+                        record(started.elapsed().as_millis(), "deferred", end_of(&stop));
+                        return Err(stop);
+                    }
+                    continue;
                 }
             };
+            if stall.observe(&waiter, &queued) {
+                record(
+                    started.elapsed().as_millis(),
+                    "deferred",
+                    Some(greenharness_slots::WaitEnd::Stalled),
+                );
+                let end = SlotLineEnd::Stalled {
+                    window_s: stall.limit().as_secs(),
+                    position: queued.position,
+                };
+                admission.events.emit(Event::Decision {
+                    what: "admission_queue_ended".into(),
+                    reason: end.to_string(),
+                });
+                return Err(LeaseStop::SlotLine(end));
+            }
             // The tokens are held while the slots are awaited: say so, so
             // the coordinator does not take the lease for abandoned.
             let _ = gate.heartbeat(lease); // best-effort: the next poll beats again
@@ -1208,6 +1332,7 @@ mod slots {
                     class: "host_slot",
                     position: queued.position,
                     behind: behind(&queued),
+                    bound: Bound::Stall,
                 },
                 ask.cancel,
                 admission.sleeper.as_ref(),
@@ -1215,10 +1340,16 @@ mod slots {
             if let Err(stop) = waited {
                 // Ended by the budget or a cancel: a sample too, or the
                 // day-14 wait percentiles would see only the admissions.
-                record(started.elapsed().as_millis(), "deferred");
+                record(started.elapsed().as_millis(), "deferred", end_of(&stop));
                 return Err(stop);
             }
         }
+    }
+
+    /// The journal's `end` for a wait the queue stopped: a spent budget is a
+    /// ceiling, and a cancel ends no line.
+    fn end_of(stop: &LeaseStop) -> Option<greenharness_slots::WaitEnd> {
+        matches!(stop, LeaseStop::Exhausted(_)).then_some(greenharness_slots::WaitEnd::Ceiling)
     }
 
     /// `relais: cargo test (amont-wt-x, 4m), 1 unknown (old client)`, or
