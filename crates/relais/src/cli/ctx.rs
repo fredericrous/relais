@@ -89,8 +89,10 @@ pub(crate) fn shared_state_for_hook() -> relais::hook::respond::SharedClaims {
         },
         Err(e) => relais::hook::respond::SharedClaims {
             state: Arc::new(relais::shared_state::LocalState::new()),
+            // One line, whatever the error's own text holds.
             warning: Some(format!(
-                "relais: shared claims skipped, the local claims were updated: {e}"
+                "relais: shared claims skipped, the local claims were updated: {}",
+                e.to_string().replace('\n', " ")
             )),
         },
     }
@@ -309,23 +311,17 @@ pub(crate) fn hook_admission_settings() -> relais::policy::HookAdmissionSettings
 pub(crate) fn hook_admission_settings_from(
     state: &Arc<dyn SharedState>,
 ) -> relais::policy::HookAdmissionSettings {
-    let read = |state: &dyn SharedState| {
-        state
-            .machine_settings()
-            .map(|machine| machine.admission)
-            .unwrap_or_default()
-    };
-    if state.selection() == relais::shared_state::Selection::Local {
-        return read(&**state);
-    }
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let owned = Arc::clone(state);
-    std::thread::spawn(move || {
-        let _ = sender.send(read(&*owned));
-    });
-    receiver
-        .recv_timeout(relais::hook::respond::SHARED_CLAIM_DEADLINE)
-        .unwrap_or_default()
+    relais::shared_state::node::within(
+        state,
+        relais::hook::respond::SHARED_CLAIM_DEADLINE,
+        |state| {
+            state
+                .machine_settings()
+                .map(|machine| machine.admission)
+                .unwrap_or_default()
+        },
+    )
+    .unwrap_or_default()
 }
 
 /// `relais dataset replay` (SPEC §24): re-run a task's already-accepted

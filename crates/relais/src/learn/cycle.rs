@@ -343,6 +343,12 @@ pub enum CycleError {
     },
     /// The pointer write failed (the shared state or the node's files).
     Pointer(PointerFailure),
+    /// The node's pointer write failed after the shared swap won, and the
+    /// shared pointer could not be put back.
+    Compensated {
+        local: String,
+        release: String,
+    },
 }
 
 impl std::fmt::Display for CycleError {
@@ -353,6 +359,10 @@ impl std::fmt::Display for CycleError {
             Self::Artifact(e) => write!(f, "{e}"),
             Self::Io { what, path, cause } => write!(f, "{what} {}: {cause}", path.display()),
             Self::Pointer(e) => write!(f, "{e}"),
+            Self::Compensated { local, release } => write!(
+                f,
+                "{local} (and the shared pointer could not be put back: {release})"
+            ),
         }
     }
 }
@@ -405,8 +415,12 @@ pub enum PointerRefusal {
     /// The active pointer no longer names what the caller judged; it names
     /// `found`. Nothing changed.
     Superseded { found: Option<String> },
-    /// Another process held the pointers past the wait. Nothing changed.
-    Busy(String),
+    /// The write was refused (another process held the pointers past the
+    /// wait, or the shared half refused, with the reason). Nothing changed.
+    Refused(String),
+    /// The node's pointer write failed after the shared swap won, and
+    /// putting the shared pointer back failed too: the two disagree.
+    Compensated { local: String, release: String },
     /// The write itself failed.
     Failed(PointerFailure),
 }
@@ -684,9 +698,9 @@ pub enum NothingToRollBack {
         judged: String,
         active: Option<String>,
     },
-    /// Another relais process held the registry lock past its wait.
-    /// Nothing changed.
-    Busy {
+    /// The rollback was refused (the registry lock stayed held, or the
+    /// shared half refused, with the reason). Nothing changed.
+    Refused {
         detail: String,
     },
 }
@@ -706,7 +720,7 @@ impl std::fmt::Display for NothingToRollBack {
                 active.as_deref().unwrap_or("nothing"),
                 active.as_deref().unwrap_or("it")
             ),
-            Self::Busy { detail } => write!(f, "{detail}"),
+            Self::Refused { detail } => write!(f, "{detail}"),
         }
     }
 }
@@ -753,7 +767,12 @@ pub fn roll_back_active(
         Ok(Some(restored)) => restored,
         Ok(None) => return Ok(Err(NothingToRollBack::NoPreviousArtifact)),
         Err(PointerRefusal::Superseded { found }) => return Ok(Err(lost(found))),
-        Err(PointerRefusal::Busy(detail)) => return Ok(Err(NothingToRollBack::Busy { detail })),
+        Err(PointerRefusal::Refused(detail)) => {
+            return Ok(Err(NothingToRollBack::Refused { detail }))
+        }
+        Err(PointerRefusal::Compensated { local, release }) => {
+            return Err(CycleError::Compensated { local, release })
+        }
         Err(PointerRefusal::Failed(e)) => return Err(CycleError::Pointer(e)),
     };
     let finish = LearningCycleFinish {
@@ -1104,13 +1123,16 @@ pub fn promote_candidate(
                     ),
                 );
             }
-            Err(PointerRefusal::Busy(reason)) => {
-                report.action = LearningAction::AwaitingPromotion;
-                report.promote_hint = Some(format!("relais promote {artifact_id}"));
+            // No `relais promote` hint: the refusal (a held lock, a shared
+            // pointer this node cannot follow) would refuse it the same way.
+            Err(PointerRefusal::Refused(reason)) => {
                 add_note(
                     report,
                     format!("promotion of {artifact_id} withheld: {reason}; {note}"),
                 );
+            }
+            Err(PointerRefusal::Compensated { local, release }) => {
+                return Err(CycleError::Compensated { local, release })
             }
             Err(PointerRefusal::Failed(e)) => return Err(CycleError::Pointer(e)),
         }
@@ -2013,7 +2035,7 @@ argv = ["true"]
         world.pointers = crate::shared_state::node::NodePointers(std::sync::Arc::new(fake));
         let repo = repo_policy();
         let report = run_cycle(&world.inputs(&repo, true), &mut silent()).expect("cycle");
-        assert_ne!(report.action, LearningAction::RolledBack, "{report:?}");
+        assert_eq!(report.action, LearningAction::None, "{report:?}");
         let note = report.note.unwrap_or_default();
         assert!(
             note.contains(
@@ -2039,8 +2061,10 @@ argv = ["true"]
     fn an_automatic_promote_against_a_moved_pointer_waits_for_a_person() {
         let mut world = World::new("promote-loses");
         stored_candidate(&world, "art-new", "fp-new");
+        stored_candidate(&world, "art-other", "fp-other");
+        // Another node's promote of art-other won the shared pointer.
         let fake = crate::shared_state::fake::FakeState::new();
-        fake.swap_registry_pointer(None, Some("art-elsewhere"))
+        fake.swap_registry_pointer(None, Some("art-other"))
             .expect("moved");
         world.pointers = crate::shared_state::node::NodePointers(std::sync::Arc::new(fake));
         let report = promote_it(&world, true, "art-new");
@@ -2051,10 +2075,40 @@ argv = ["true"]
         );
         assert_eq!(
             report.note.as_deref(),
-            Some(
-                "promotion of art-new withheld: art-elsewhere is active now; \
-                 nothing changed; note"
-            )
+            Some("promotion of art-new withheld: art-other is active now; nothing changed; note")
+        );
+        assert_eq!(
+            world.registry.active_id().unwrap().as_deref(),
+            Some("art-other"),
+            "the node followed the shared pointer"
+        );
+    }
+
+    #[test]
+    fn a_promote_against_a_shared_pointer_this_node_cannot_follow_waits_with_no_hint() {
+        let mut world = World::new("promote-not-held");
+        stored_candidate(&world, "art-new", "fp-new");
+        let fake = crate::shared_state::fake::FakeState::new();
+        fake.swap_registry_pointer(None, Some("art-elsewhere"))
+            .expect("moved");
+        world.pointers = crate::shared_state::node::NodePointers(std::sync::Arc::new(fake));
+        let report = promote_it(&world, true, "art-new");
+        assert_eq!(report.action, LearningAction::None);
+        assert_eq!(report.promote_hint, None, "a promote would be refused too");
+        let note = report.note.unwrap_or_default();
+        assert!(
+            note.starts_with(
+                "promotion of art-new withheld: the shared registry pointer names art-elsewhere, \
+                 which this node cannot make active ("
+            ),
+            "{note}"
+        );
+        assert!(
+            note.contains(
+                "nothing changed, and nothing run here moves past it until art-elsewhere is \
+                 stored here with its evidence or another node moves the shared pointer"
+            ),
+            "{note}"
         );
         assert!(world.registry.active().unwrap().is_none());
     }

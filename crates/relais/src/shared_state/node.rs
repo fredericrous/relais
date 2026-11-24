@@ -27,7 +27,7 @@ use super::types::{
 use super::{SharedState, SharedStateError};
 use crate::ids::RunId;
 use crate::learn::cycle::{PointerRefusal, PointerWrites};
-use crate::learn::registry::{EvaluatedArtifact, Registry};
+use crate::learn::registry::{ArtifactError, EvaluatedArtifact, Registry};
 use crate::ledger::{
     Claim, DecisionAnswer, IntentState, Ledger, NewIntent, SuccessorIntent, SuccessorProcess,
 };
@@ -395,19 +395,60 @@ fn session_call(
     let Some(deadline) = deadline else {
         return call(&**state, holder);
     };
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let owned = Arc::clone(state);
     let holder = holder.clone();
-    std::thread::spawn(move || {
-        let _ = sender.send(call(&*owned, &holder));
-    });
-    receiver.recv_timeout(deadline).unwrap_or_else(|_| {
+    within(state, deadline, move |state| call(state, &holder)).unwrap_or_else(|unanswered| {
         Err(SharedStateError::Unreachable {
-            detail: format!(
+            detail: unanswered.to_string(),
+        })
+    })
+}
+
+/// Why [`within`] has no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unanswered {
+    /// The call was still running at the deadline; it is left behind.
+    Deadline(Duration),
+    /// The call's thread ended without an answer (it panicked).
+    Died,
+    /// No thread could be started for it.
+    NoThread,
+}
+
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unanswered::Deadline(deadline) => write!(
+                f,
                 "the shared state did not answer within {} ms",
                 deadline.as_millis()
             ),
+            Unanswered::Died => write!(f, "the call to the shared state died"),
+            Unanswered::NoThread => write!(f, "no thread could be started for the shared state"),
+        }
+    }
+}
+
+/// Run `call` on the state on a thread of its own, which owns an [`Arc`]
+/// of it and prints nothing, and wait for its answer at most `deadline`.
+/// A caller past its deadline leaves the call behind: it ends with the
+/// process, and a hold it was renewing or giving back ends by its TTL.
+pub fn within<T: Send + 'static>(
+    state: &Arc<dyn SharedState>,
+    deadline: Duration,
+    call: impl FnOnce(&dyn SharedState) -> T + Send + 'static,
+) -> Result<T, Unanswered> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let owned = Arc::clone(state);
+    std::thread::Builder::new()
+        .name("relais-shared-state".into())
+        .spawn(move || {
+            // The receiver is gone once its deadline passed; nothing waits.
+            let _ = sender.send(call(&*owned));
         })
+        .map_err(|_| Unanswered::NoThread)?;
+    receiver.recv_timeout(deadline).map_err(|e| match e {
+        std::sync::mpsc::RecvTimeoutError::Timeout => Unanswered::Deadline(deadline),
+        std::sync::mpsc::RecvTimeoutError::Disconnected => Unanswered::Died,
     })
 }
 
@@ -588,7 +629,18 @@ pub fn swap_registry_pointer(
     expected: Option<&str>,
     evaluated: &EvaluatedArtifact,
 ) -> Result<(), NodeError> {
-    let _lock = pointer_lock(registry)?;
+    swap_within(state, registry, expected, evaluated, REGISTRY_LOCK_WAIT)
+}
+
+/// [`swap_registry_pointer`] with the lock wait given.
+pub(crate) fn swap_within(
+    state: &dyn SharedState,
+    registry: &Registry,
+    expected: Option<&str>,
+    evaluated: &EvaluatedArtifact,
+    wait: Duration,
+) -> Result<(), NodeError> {
+    let _lock = pointer_lock(registry, wait)?;
     heal(state, registry)?;
     let to = evaluated.artifact_id();
     match state.swap_registry_pointer(expected, Some(to))? {
@@ -619,7 +671,17 @@ pub fn roll_back_registry(
     registry: &Registry,
     expected: &str,
 ) -> Result<Option<String>, NodeError> {
-    let _lock = pointer_lock(registry)?;
+    roll_back_within(state, registry, expected, REGISTRY_LOCK_WAIT)
+}
+
+/// [`roll_back_registry`] with the lock wait given.
+pub(crate) fn roll_back_within(
+    state: &dyn SharedState,
+    registry: &Registry,
+    expected: &str,
+    wait: Duration,
+) -> Result<Option<String>, NodeError> {
+    let _lock = pointer_lock(registry, wait)?;
     heal(state, registry)?;
     compare_locally(registry, Some(expected))?;
     let Some(previous) = registry.previous_id()?.filter(|id| id != expected) else {
@@ -650,13 +712,18 @@ impl NodePointers {
             NodeError::Shared(SharedStateError::CasConflict { found, .. }) => {
                 PointerRefusal::Superseded { found }
             }
-            NodeError::Shared(SharedStateError::Refused { reason }) => PointerRefusal::Busy(reason),
+            NodeError::Shared(SharedStateError::Refused { reason }) => {
+                PointerRefusal::Refused(reason)
+            }
+            NodeError::Compensation { local, release } => PointerRefusal::Compensated {
+                local: local.to_string(),
+                release: release.to_string(),
+            },
             e @ (NodeError::Shared(_)
             | NodeError::Lock { .. }
             | NodeError::Ledger(_)
             | NodeError::Claim(_)
-            | NodeError::Registry(_)
-            | NodeError::Compensation { .. }) => PointerRefusal::Failed(Box::new(e)),
+            | NodeError::Registry(_)) => PointerRefusal::Failed(Box::new(e)),
         }
     }
 }
@@ -709,12 +776,32 @@ fn heal(state: &dyn SharedState, registry: &Registry) -> Result<(), NodeError> {
     if local.as_deref() == Some(shared.as_str()) {
         return Ok(());
     }
-    let Ok(evaluated) = registry.evaluated(&shared) else {
-        return Err(SharedStateError::CasConflict {
-            expected: local,
-            found: Some(shared),
+    let evaluated = match registry.evaluated(&shared) {
+        Ok(evaluated) => evaluated,
+        // The node cannot read its own files: that is the error, not the
+        // shared pointer.
+        Err(e @ ArtifactError::Io(_)) => return Err(e.into()),
+        Err(
+            why @ (ArtifactError::Malformed(_)
+            | ArtifactError::IncompatibleSchema { .. }
+            | ArtifactError::DimensionMismatch { .. }
+            | ArtifactError::NonFinite
+            | ArtifactError::Unknown { .. }
+            | ArtifactError::NoEvidence { .. }
+            | ArtifactError::EvidenceMismatch { .. }
+            | ArtifactError::GatesFailed { .. }
+            | ArtifactError::VerdictNotReproducible { .. }),
+        ) => {
+            return Err(SharedStateError::Refused {
+                reason: format!(
+                    "the shared registry pointer names {shared}, which this node cannot make \
+                     active ({why}); nothing changed, and nothing run here moves past it until \
+                     {shared} is stored here with its evidence or another node moves the shared \
+                     pointer"
+                ),
+            }
+            .into())
         }
-        .into());
     };
     registry.promote(&evaluated)?;
     eprintln!(
@@ -730,7 +817,7 @@ fn heal(state: &dyn SharedState, registry: &Registry) -> Result<(), NodeError> {
 /// process dies and never deleted, so a killed writer leaves nothing
 /// stale. The wait is bounded ([`REGISTRY_LOCK_WAIT`]); a lock still held
 /// after it is [`SharedStateError::Refused`].
-fn pointer_lock(registry: &Registry) -> Result<LockFile, NodeError> {
+fn pointer_lock(registry: &Registry, wait: Duration) -> Result<LockFile, NodeError> {
     let artifacts = registry.artifacts_dir();
     let path = artifacts
         .parent()
@@ -740,7 +827,7 @@ fn pointer_lock(registry: &Registry) -> Result<LockFile, NodeError> {
     loop {
         match LockFile::try_acquire(&path) {
             Ok(Some(lock)) => return Ok(lock),
-            Ok(None) if started.elapsed() < REGISTRY_LOCK_WAIT => {
+            Ok(None) if started.elapsed() < wait => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Ok(None) => {
@@ -749,7 +836,7 @@ fn pointer_lock(registry: &Registry) -> Result<LockFile, NodeError> {
                         "another relais process holds the registry lock {} \
                          (waited {}s); nothing changed, run it again",
                         path.display(),
-                        REGISTRY_LOCK_WAIT.as_secs()
+                        wait.as_secs()
                     ),
                 }
                 .into())

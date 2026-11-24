@@ -58,8 +58,12 @@ both land. The wait is bounded (2 s); a lock still held is refused, and
 nothing changes. A shared pointer that names an artifact this node's
 pointer does not (a promote that stopped between its two halves) is made
 active here first, with one stderr note, when the node holds that artifact
-and its evidence checks; otherwise the operation is a `cas_conflict` naming
-it.
+and its evidence checks; otherwise the operation is refused with a sentence
+that names it and says why (exit 3 from `relais promote` and `relais
+rollback`, a note in the learning cycle): nothing run on this node moves
+past it until the artifact is stored here or another node moves the
+shared pointer. A failure to read the node's own artifact files is that
+error, not a refusal.
 
 ## The refusal
 

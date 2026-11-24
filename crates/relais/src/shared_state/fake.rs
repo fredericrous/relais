@@ -384,11 +384,13 @@ impl SharedState for FakeState {
         self.online()?;
         let now = self.now();
         let resource = request.resource();
-        // A held ticket is never reserved, not even by its own holder: the
-        // claim file refuses the same.
+        // A held ticket is never reserved, except again by the holder of
+        // its own reservation (a retried `next --claim` whose claim file
+        // was never written): the claim file refuses the rest the same.
         if let Some(row) = self.lock().rows.get(&resource) {
             if let Some(holder) = &row.holder {
-                if row.expires_at > now {
+                let own_reservation = row.handoff && *holder == request.holder;
+                if row.expires_at > now && !own_reservation {
                     return Ok(TicketAnswer::Held {
                         holder: holder.clone(),
                         age_secs: (now - row.claimed_at).max(0) as u64,
@@ -956,8 +958,6 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------ registry races ----
-
     use crate::learn::registry::Registry;
 
     /// A registry with `art-z` promoted then `art-a` (so `art-a` is active
@@ -1043,9 +1043,10 @@ mod tests {
             .expect("seed");
         let local = super::super::LocalState::new();
         for state in [&fake as &dyn SharedState, &local] {
+            let no_wait = std::time::Duration::ZERO;
             for result in [
-                node::swap_registry_pointer(state, &registry, Some("art-a"), &b).map(|_| None),
-                node::roll_back_registry(state, &registry, "art-a"),
+                node::swap_within(state, &registry, Some("art-a"), &b, no_wait).map(|_| None),
+                node::roll_back_within(state, &registry, "art-a", no_wait),
             ] {
                 assert!(
                     matches!(
@@ -1101,8 +1102,11 @@ mod tests {
         assert!(
             matches!(
                 &swap,
-                Err(node::NodeError::Shared(SharedStateError::CasConflict { found: Some(found), .. }))
-                    if found == "art-elsewhere"
+                Err(node::NodeError::Shared(SharedStateError::Refused { reason }))
+                    if reason.starts_with(
+                        "the shared registry pointer names art-elsewhere, which this node \
+                         cannot make active (no artifact art-elsewhere in this registry"
+                    )
             ),
             "{swap:?}"
         );
@@ -1111,8 +1115,6 @@ mod tests {
             Some("art-a")
         );
     }
-
-    // ---------------------------------------------- session holds ----
 
     fn ticket(id: &str, who: &Principal) -> TicketRequest {
         TicketRequest {
@@ -1144,6 +1146,27 @@ mod tests {
         assert!(matches!(
             state.claim_ticket(&ticket("t1", &other)).expect("answered"),
             TicketAnswer::Granted(_)
+        ));
+    }
+
+    #[test]
+    fn a_retried_reservation_by_its_own_holder_is_granted_again() {
+        let state = FakeState::new();
+        let me = Principal::operator("session-me");
+        for attempt in ["first", "retry"] {
+            assert!(
+                matches!(
+                    state.reserve_handoff(&ticket("t1", &me)).expect("answered"),
+                    TicketAnswer::Granted(_)
+                ),
+                "{attempt}"
+            );
+        }
+        assert!(matches!(
+            state
+                .reserve_handoff(&ticket("t1", &Principal::operator("session-other")))
+                .expect("answered"),
+            TicketAnswer::Held { .. }
         ));
     }
 
