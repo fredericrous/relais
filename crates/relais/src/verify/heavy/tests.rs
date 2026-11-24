@@ -168,6 +168,7 @@ fn admission<'a>(
         sizing: Some(greenharness_slots::Sizing::Fixed(4)),
         ancestor_holds_slots: false,
         poll: Duration::from_millis(10),
+        stall_window: greenharness_slots::STALL,
         announce_every: ANNOUNCE_EVERY,
         heartbeat_every: Duration::from_millis(10),
         sleeper: Arc::new(ThreadSleeper),
@@ -1381,6 +1382,91 @@ mod host_slots {
         assert!(written.contains("\"class\":\"host_slot\""), "{written}");
         assert!(
             written.contains("\"behind\":\"other: xcodebuild"),
+            "{written}"
+        );
+        std::fs::remove_dir_all(&slots_dir).ok(); // best-effort: a scratch dir
+    }
+
+    /// ADR-0015: a host-slot line that is still moving outlives
+    /// `admission_wait_seconds`; the run is granted and not blocked after.
+    #[test]
+    fn a_moving_line_outlives_the_admission_budget_and_the_grant_is_not_blocked() {
+        let slots_dir = slot_dir("moving");
+        let held = Arc::new(Mutex::new(Some(other_holder(&slots_dir, "xcodebuild"))));
+        let gate = Recording::new(gate_with(1));
+        register(&gate.inner, "run-m");
+        let clock = ManualClock::new();
+        let mut with_slots = admission(&gate, "run-m", 1, 4);
+        with_slots.slots = Some(slots_dir.clone());
+        with_slots.sizing = Some(greenharness_slots::Sizing::Fixed(1));
+        // 5 s of admission budget, a 1 s poll, and the holder lets go after
+        // 20 polls: the wait runs 4x past the budget.
+        with_slots.budgets = budgets_on(&clock, 5);
+        with_slots.poll = Duration::from_secs(1);
+        let release = Arc::clone(&held);
+        with_slots.sleeper = Advancing::then(&clock, move |number| {
+            if number >= 20 {
+                release.lock().expect("held").take();
+            }
+        });
+        let lease = with_slots
+            .admit(&ask(&BTreeMap::new(), 1))
+            .expect("a moving line is granted past the budget");
+        assert!(with_slots.budgets.overrun() >= Duration::from_secs(10));
+        assert!(
+            with_slots
+                .budgets
+                .waited(crate::policy::WaitKind::Admission)
+                < Duration::from_secs(5)
+        );
+        assert_eq!(
+            with_slots.budgets.exhausted(),
+            None,
+            "the run is not blocked after the grant"
+        );
+        drop(lease);
+        std::fs::remove_dir_all(&slots_dir).ok(); // best-effort: a scratch dir
+    }
+
+    /// ADR-0015: a line with no progress for the window ends the wait as the
+    /// spent budget did: `admission_wait_exhausted`, a `deferred` row with
+    /// `"end":"stalled"`, and the reason names the window and the place.
+    #[test]
+    fn a_stalled_line_ends_the_wait_and_the_row_says_so() {
+        let dir = temp_dir("slots-stalled");
+        let slots_dir = slot_dir("stalled");
+        let _held = other_holder(&slots_dir, "xcodebuild");
+        let gate = Recording::new(gate_with(1));
+        register(&gate.inner, "run-st");
+        let clock = ManualClock::new();
+        let mut with_slots = admission(&gate, "run-st", 1, 4);
+        with_slots.slots = Some(slots_dir.clone());
+        with_slots.sizing = Some(greenharness_slots::Sizing::Fixed(1));
+        with_slots.budgets = budgets_on(&clock, 600);
+        with_slots.poll = Duration::from_millis(5);
+        with_slots.stall_window = Duration::from_secs(1);
+        with_slots.events =
+            Events::for_run_on("run-st", &dir, crate::protocol::Wire::to(std::io::sink()));
+        with_slots.sleeper = Advancing::then(&clock, |_| {
+            std::thread::sleep(Duration::from_millis(20));
+        });
+        let stop = with_slots
+            .admit(&ask(&BTreeMap::new(), 1))
+            .err()
+            .expect("a line that does not move ends the wait");
+        assert!(
+            matches!(
+                stop,
+                LeaseStop::Exhausted(crate::policy::Exhausted::AdmissionWait)
+            ),
+            "{stop:?}"
+        );
+        let journal = std::fs::read_to_string(slots_dir.join("waits.jsonl")).expect("waits.jsonl");
+        assert!(journal.contains("\"outcome\":\"deferred\""), "{journal}");
+        assert!(journal.contains("\"end\":\"stalled\""), "{journal}");
+        let written = std::fs::read_to_string(dir.join("events.jsonl")).expect("events");
+        assert!(
+            written.contains("the host slot line made no progress for 1 s at position"),
             "{written}"
         );
         std::fs::remove_dir_all(&slots_dir).ok(); // best-effort: a scratch dir

@@ -503,6 +503,9 @@ pub struct HeavyAdmission<'a> {
     /// here, and the fact is passed on to the check.
     pub ancestor_holds_slots: bool,
     pub poll: Duration,
+    /// A host-slot line that made no progress for this long ends the wait
+    /// (ADR-0015): read from `GREENHARNESS_SLOT_STALL_S` at the edge.
+    pub stall_window: Duration,
     pub announce_every: Duration,
     /// How often a lease that is not tied to a group says it is alive.
     pub heartbeat_every: Duration,
@@ -543,6 +546,7 @@ impl<'a> HeavyAdmission<'a> {
             sizing: None,
             ancestor_holds_slots: false,
             poll: ADMISSION_POLL,
+            stall_window: greenharness_slots::STALL,
             announce_every: ANNOUNCE_EVERY,
             heartbeat_every: LEASE_HEARTBEAT_EVERY,
             sleeper: Arc::new(ThreadSleeper),
@@ -784,6 +788,7 @@ impl<'a> HeavyAdmission<'a> {
                                 class: "heavy_local",
                                 position: *position,
                                 behind: None,
+                                moving: false,
                             },
                             _ => unreachable!("granted, duplicate and refused return above"),
                         };
@@ -884,6 +889,9 @@ enum Holding<'h> {
         class: &'h str,
         position: usize,
         behind: Option<String>,
+        /// A host-slot wait, ended by a stalled line and not by the spent
+        /// admission budget (ADR-0015).
+        moving: bool,
     },
     Disk(Shortfall),
 }
@@ -895,6 +903,10 @@ impl Holding<'_> {
             Self::Disk(_) => WaitKind::Disk,
         }
     }
+
+    fn moving(&self) -> bool {
+        matches!(self, Self::Slot { moving: true, .. })
+    }
 }
 
 /// Time spent held, announced every [`HeavyAdmission::announce_every`] and
@@ -903,7 +915,7 @@ impl Holding<'_> {
 /// both.
 struct Queue<'q> {
     admission: &'q HeavyAdmission<'q>,
-    wait: Option<(WaitKind, crate::policy::Wait)>,
+    wait: Option<(WaitKind, bool, crate::policy::Wait)>,
     started: i64,
     last_announced: i64,
 }
@@ -921,16 +933,25 @@ impl<'q> Queue<'q> {
 
     /// The wait that charges `kind`, started now if another was running
     /// (dropping that one charges it up to now).
-    fn charging(&mut self, kind: WaitKind) -> &mut crate::policy::Wait {
-        if self.wait.as_ref().is_none_or(|(held, _)| *held != kind) {
+    fn charging(&mut self, kind: WaitKind, moving: bool) -> &mut crate::policy::Wait {
+        if self
+            .wait
+            .as_ref()
+            .is_none_or(|(held, held_moving, _)| *held != kind || *held_moving != moving)
+        {
             self.wait = None;
             let now = self.admission.budgets.now();
             self.started = now;
             self.last_announced = now;
-            self.wait = Some((kind, self.admission.budgets.wait(kind)));
+            let wait = if moving {
+                self.admission.budgets.moving_wait()
+            } else {
+                self.admission.budgets.wait(kind)
+            };
+            self.wait = Some((kind, moving, wait));
         }
         match &mut self.wait {
-            Some((_, wait)) => wait,
+            Some((_, _, wait)) => wait,
             None => unreachable!("the wait was set above"),
         }
     }
@@ -943,7 +964,7 @@ impl<'q> Queue<'q> {
         cancel: Option<&AtomicBool>,
         sleeper: &dyn Sleeper,
     ) -> Result<(), LeaseStop> {
-        if let Some(exhausted) = self.charging(holding.kind()).tick() {
+        if let Some(exhausted) = self.charging(holding.kind(), holding.moving()).tick() {
             let reason = match &holding {
                 Holding::Slot {
                     class, position, ..
@@ -974,6 +995,7 @@ impl<'q> Queue<'q> {
                     class,
                     position,
                     behind,
+                    ..
                 } => Event::WaitingForSlot {
                     class: class.to_string(),
                     position,
@@ -1106,7 +1128,7 @@ mod slots {
 
     use std::path::{Path, PathBuf};
 
-    use super::{Ask, Gate, HeavyAdmission, Holding, LeaseStop, Queue};
+    use super::{Ask, Event, Exhausted, Gate, HeavyAdmission, Holding, LeaseStop, Queue};
 
     /// Whether the slot directory can be used, before anything is queued
     /// for. `Ok(None)`: it cannot, which is said once and not fatal, the
@@ -1160,13 +1182,14 @@ mod slots {
         let slot_cap = sizing.cap_for(admission.machine.cores);
         let width = admission.width(ask.weight, super::Placement::UnderHostSlot);
         // Every wait line names the sizing the command was queued under.
-        let record = |waited_ms: u128, outcome: &str| {
+        let record = |waited_ms: u128, outcome: &str, end: Option<greenharness_slots::WaitEnd>| {
             greenharness_slots::record_wait_named(
                 dir,
                 "relais",
                 greenharness_slots::WaitContext {
                     cap: Some(slot_cap),
                     cores: Some(admission.machine.cores),
+                    end,
                     ..greenharness_slots::WaitContext::default()
                 },
                 ask.weight,
@@ -1188,18 +1211,77 @@ mod slots {
                 return Ok(None);
             }
         };
+        // A line that moved inside the window keeps the wait going past
+        // `admission_wait_seconds`; one that did not ends it (ADR-0015).
+        let mut stall = greenharness_slots::Stall::new(admission.stall_window);
+        let mut joined_at: Option<usize> = None;
+        let mut failures = 0u32;
         loop {
             let queued = match waiter.poll() {
                 Ok(greenharness_slots::Poll::Granted(held)) => {
-                    record(started.elapsed().as_millis(), "admitted");
+                    record(started.elapsed().as_millis(), "admitted", None);
                     return Ok(Some(held));
                 }
-                Ok(greenharness_slots::Poll::Waiting(queued)) => queued,
+                Ok(greenharness_slots::Poll::Waiting(queued)) => {
+                    failures = 0;
+                    joined_at = Some(queued.position);
+                    queued
+                }
                 Err(e) => {
-                    admission.host_slots_off(&format!("a host slot could not be locked: {e}"));
-                    return Ok(None);
+                    let Some(position) = joined_at else {
+                        admission.host_slots_off(&format!("a host slot could not be locked: {e}"));
+                        return Ok(None);
+                    };
+                    // The queue was joined: a failing lock ends the wait, as a
+                    // stalled line does, and never runs the command unqueued.
+                    failures += 1;
+                    if failures >= greenharness_slots::POLL_FAILURES {
+                        record(
+                            started.elapsed().as_millis(),
+                            "deferred",
+                            Some(greenharness_slots::WaitEnd::IoError),
+                        );
+                        admission.events.emit(Event::Decision {
+                            what: "admission_queue_ended".into(),
+                            reason: format!(
+                                "the host slot line could not be read {failures} times in a row: {e}"
+                            ),
+                        });
+                        return Err(LeaseStop::Exhausted(Exhausted::AdmissionWait));
+                    }
+                    let waited = queue.wait(
+                        Holding::Slot {
+                            class: "host_slot",
+                            position,
+                            behind: None,
+                            moving: true,
+                        },
+                        ask.cancel,
+                        admission.sleeper.as_ref(),
+                    );
+                    if let Err(stop) = waited {
+                        record(started.elapsed().as_millis(), "deferred", end_of(&stop));
+                        return Err(stop);
+                    }
+                    continue;
                 }
             };
+            if stall.observe(&waiter, &queued) {
+                record(
+                    started.elapsed().as_millis(),
+                    "deferred",
+                    Some(greenharness_slots::WaitEnd::Stalled),
+                );
+                admission.events.emit(Event::Decision {
+                    what: "admission_queue_ended".into(),
+                    reason: format!(
+                        "the host slot line made no progress for {} s at position {}",
+                        stall.limit().as_secs(),
+                        queued.position
+                    ),
+                });
+                return Err(LeaseStop::Exhausted(Exhausted::AdmissionWait));
+            }
             // The tokens are held while the slots are awaited: say so, so
             // the coordinator does not take the lease for abandoned.
             let _ = gate.heartbeat(lease); // best-effort: the next poll beats again
@@ -1208,6 +1290,7 @@ mod slots {
                     class: "host_slot",
                     position: queued.position,
                     behind: behind(&queued),
+                    moving: true,
                 },
                 ask.cancel,
                 admission.sleeper.as_ref(),
@@ -1215,10 +1298,16 @@ mod slots {
             if let Err(stop) = waited {
                 // Ended by the budget or a cancel: a sample too, or the
                 // day-14 wait percentiles would see only the admissions.
-                record(started.elapsed().as_millis(), "deferred");
+                record(started.elapsed().as_millis(), "deferred", end_of(&stop));
                 return Err(stop);
             }
         }
+    }
+
+    /// The journal's `end` for a wait the queue stopped: a spent budget is a
+    /// ceiling, and a cancel ends no line.
+    fn end_of(stop: &LeaseStop) -> Option<greenharness_slots::WaitEnd> {
+        matches!(stop, LeaseStop::Exhausted(_)).then_some(greenharness_slots::WaitEnd::Ceiling)
     }
 
     /// `relais: cargo test (amont-wt-x, 4m), 1 unknown (old client)`, or

@@ -16,6 +16,16 @@ spawns is still `aval` (set `bin = "greentopo"` to use the new one), and a
 relais older than this release refuses `greentopo` as an unknown field, so
 upgrade every host before swept repositories land.
 
+A queue that still moves no longer blocks a run. A heavy command waiting for
+a host slot keeps waiting past `admission_wait_seconds` while the line moves
+(an admission or a change of place within 300 s, `GREENHARNESS_SLOT_STALL_S`
+to change it); the time past the budget counts toward the total only, so the
+run is not blocked `admission_wait_exhausted` right after a grant. A line
+that makes no progress for the window still ends the run that way, and its
+`waits.jsonl` row carries `"end":"stalled"`. The coordinator's own queue keeps
+the old budget. It builds on `greenharness-slots` 5 (greengate 5.0.0); the
+decision is ADR-0015.
+
 A carried check reads tidier. The pane draws the passes carried from an
 earlier attempt as one row, `carried 5 from attempt1 (a, b, c +2 more)`, before
 the re-run check's output, so a short pane keeps that output. `relais report`

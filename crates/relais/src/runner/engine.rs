@@ -1052,6 +1052,7 @@ impl<'a> RunEngine<'a> {
                 std::env::var(verify::HOST_SLOT_ENV).ok().as_deref(),
             ),
             poll: ADMISSION_POLL,
+            stall_window: self.stall_window(),
             announce_every: verify::ANNOUNCE_EVERY,
             heartbeat_every: verify::LEASE_HEARTBEAT_EVERY,
             sleeper: Arc::new(verify::ThreadSleeper),
@@ -1068,6 +1069,24 @@ impl<'a> RunEngine<'a> {
         };
         admission.note_host_sizing(&plan);
         admission
+    }
+
+    /// How long a host-slot line may make no progress before a wait ends
+    /// (ADR-0015): `GREENHARNESS_SLOT_STALL_S`, read here at relais's edge. A
+    /// bad value falls back to the crate's 300 s and is said once per process.
+    fn stall_window(&self) -> Duration {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        let setting = std::env::var(greenharness_slots::STALL_ENV).ok();
+        let (window, complaint) = greenharness_slots::Stall::window_from(setting.as_deref());
+        if let Some(reason) = complaint {
+            SAID.call_once(|| {
+                self.events.emit(Event::Decision {
+                    what: "stall_window_ignored".into(),
+                    reason,
+                });
+            });
+        }
+        window
     }
 
     /// The places this run writes (SPEC §23): the state directory, the
