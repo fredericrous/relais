@@ -81,7 +81,7 @@ ticket `topo-spotter-rename/t11-relais-aval-key`.
   keeps `Default` and its derived `Serialize`), `crates/relais/src/tooling.rs`
   (blocker text, `aval` entry only), with unit tests beside the existing
   ones; becomes one commit
-- [ ] Phase 2 — document and release note: `docs/SPEC.md`, `CHANGELOG.md`;
+- [x] Phase 2 — document and release note: `docs/SPEC.md`, `CHANGELOG.md`;
   becomes one commit
 - [ ] Phase 3 — release and hand off: tag the release, install it on the
   laptop, a homelab agent pod and CI; in the decisions programme
@@ -124,6 +124,7 @@ ticket `topo-spotter-rename/t11-relais-aval-key`.
   t10's `blocked_by` names t11.
 
 ## Outcome
+Phases 1–2 verified 2026-11-24 on the built binary. Phase 1: `cargo test -p relais --lib -- policy:: tooling::` and clippy `-D warnings` green (the relais run's verify queued 1800 s twice on a jammed host, so the kept candidate was applied by hand). Phase 2: `relais doctor` with `greentopo = "optional"` → `✓ aval optional`; with `greentopo = "required"`, no aval on PATH → `✗ aval … not on PATH`; both keys → `✗ relais.toml  set only one of [integrations] aval and greentopo; remove the aval line`. Phase 3 (release, hand-off) waits for the merge and the person's release call.
 
 ## Full reviews (reference)
 See the sidecar file.
