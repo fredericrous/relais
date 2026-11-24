@@ -1709,14 +1709,16 @@ fn render_check_timings(timings: &[crate::ledger::CheckTimingStats]) -> String {
         return out;
     }
     for t in timings {
+        if t.carried {
+            // It ran nothing in that attempt, and its times are the source
+            // attempt's: count it, print no timings.
+            out.push_str(&format!("  {}: {} carried\n", t.label, t.runs));
+            continue;
+        }
         out.push_str(&format!(
             "  {}{}: {} run(s), {} retr{} · run {}/{} · wait {}/{}\n",
             t.label,
-            match (t.carried, t.cached) {
-                (true, _) => " (carried)",
-                (false, true) => " (reused)",
-                (false, false) => "",
-            },
+            if t.cached { " (reused)" } else { "" },
             t.runs,
             t.retries,
             if t.retries == 1 { "y" } else { "ies" },
@@ -1802,11 +1804,9 @@ mod tests {
             ..stats.clone()
         };
         let text = super::render_check_timings(&[stats, carried]);
-        assert!(
-            text.contains("make build (carried): 1 run(s), 0 retries"),
-            "{text}"
-        );
-        assert_eq!(text.matches("(carried)").count(), 1, "{text}");
+        assert!(text.contains("  make build: 1 carried\n"), "{text}");
+        assert_eq!(text.matches("carried").count(), 1, "{text}");
+        assert!(!text.contains("make build: 1 run"), "{text}");
         assert_eq!(text.matches("(reused)").count(), 1, "{text}");
         assert!(
             text.contains(

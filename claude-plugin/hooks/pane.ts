@@ -215,15 +215,23 @@ function agentRows(m: RunModel): AgentLine[] {
   return rows
 }
 
-// A step's own lines as the pane draws them: the last check that ran, then a
-// row for each pass carried over from an earlier attempt, which ran nothing
-// here and wrote no output.
+// A step's own lines as the pane draws them: one row per source attempt for
+// the passes carried over from it (they ran nothing here and wrote no output),
+// FIRST so the `cap` cut drops it before the re-run check's last lines, then
+// the last check that ran. Labels are cut to three, as `checks_carried` is.
 function paneStepLines(step: Step): string[] {
   const carried = step.checks.filter(c => c.carried !== undefined)
   if (carried.length === 0) return stepOutput(step)
   const ran = step.checks.filter(c => c.carried === undefined)
   const own = ran.length > 0 ? ran[ran.length - 1].output : []
-  return [...own, ...carried.map(c => `${c.label} · carried from ${c.carried}`)]
+  const bySource = new Map<string, string[]>()
+  for (const c of carried) bySource.set(c.carried!, [...(bySource.get(c.carried!) ?? []), c.label])
+  const rows = [...bySource].map(([from, labels]) => {
+    const shown = labels.slice(0, 3).join(', ')
+    const more = labels.length > 3 ? ` +${labels.length - 3} more` : ''
+    return `carried ${labels.length} from ${from} (${shown}${more})`
+  })
+  return [...rows, ...own]
 }
 
 // The output a run shows, `cap` lines at most: the last ones, so the
@@ -231,7 +239,7 @@ function paneStepLines(step: Step): string[] {
 // shows what its agent does instead. A live run's active step always shows
 // one row: its latest line, the activity row while its check runs, or a
 // waiting row when it is silent and no check runs.
-function outputRows(m: RunModel, cap: number): Row[] {
+export function outputRows(m: RunModel, cap: number): Row[] {
   if (cap < 0) return []
   const live = isLive(m)
   const n = live ? Math.max(cap, 1) : cap

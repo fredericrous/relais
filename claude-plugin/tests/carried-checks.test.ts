@@ -1,5 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import { applyEvent, emptyRun, latestOutput, stepOutput, type RunModel } from '../hooks/timeline.ts'
+import { outputRows } from '../hooks/pane.ts'
 
 const T0 = Date.parse('2026-11-23T11:00:00Z')
 
@@ -82,4 +83,19 @@ test('a step whose every check was carried shows its agent activity, not an empt
   const m = fold([verifying, carried('make@2'), carried('test@3')])
   const step = m.steps[m.steps.length - 1]
   expect(stepOutput(step)).toBe(step.activity)
+})
+
+test('five carried passes draw as one capped row first, so a short cap keeps the re-run check', () => {
+  const labels = ['a@1', 'b@2', 'c@3', 'd@4', 'e@5']
+  const m = fold([
+    verifying,
+    started('lint@0'),
+    { kind: 'output', label: 'lint@0', text: 'one\ntwo\nthree\n', elided_bytes: 0 },
+    ended('lint@0', 1),
+    ...labels.map(l => carried(l)),
+  ])
+  const rows = outputRows(m, 3).map(r => r.text)
+  expect(rows.join('\n')).toContain('three')
+  expect(rows.join('\n')).not.toContain('carried')
+  expect(outputRows(m, 4).map(r => r.text)[0]).toContain('carried 5 from attempt1 (a@1, b@2, c@3 +2 more)')
 })
