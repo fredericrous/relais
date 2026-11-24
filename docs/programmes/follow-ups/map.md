@@ -78,56 +78,56 @@ ticket here until it is resolved or moved into a programme of its own.
   background shell keeps the agent listed `running`, so the dispatch never
   settles. Suites take 24%, polls 16% (at most 9% wasted), model turns 14%;
   contention could not be shown to dominate. Act in stop detection (f21).
-- [f19](f19-pin-row-records-call-model.md) (2026-11-24, open): a
-  `preferred-model` pin row records the preference, not the model the
-  call ran; record the call's model, serve the pin source in an added
-  `pin_sources` field, validate the value.
+- [f19](f19-pin-row-records-call-model.md) (2026-11-24, closed 2026-11-24):
+  a pin row now records the model the router infers the call ran (call
+  model, else own `model:`, else the session's), and router-state serves
+  `pin_sources` beside `pins`. An unknown preference is not validated: it
+  cannot reach the row while the session model is known. Live check: f22.
 - [f20](f20-clear-routes-on-stale-state.md) (2026-11-24, open): after a
   `/clear` relay, spawns before the first person prompt can route on a
   state with no pins (likely the pre-clear one; cause open): a pinned
   reviewer's fallback spawn was table-routed to Haiku.
 - [f21](f21-settle-at-final-turn-with-shells.md) (2026-11-24, open):
   settle a worker whose final turn leaves a background shell running.
+- [f22](f22-pin-row-live-check.md) (2026-11-24, open, due 2026-12-01):
+  check live that a pin row's `model` matches its subagent's step model,
+  after the plugin reinstall and a relais that serves `pin_sources`.
 
 ## Handoff
 
-2026-11-24, boundary 3 (f18 closed): a timed-out worker's wall time goes
-mostly to waiting after it has finished. In 12 of 31 runs the worker had
-answered (often "DONE") with a background shell still running.
-`$.agent.list()` kept it `running`, and the dispatch waited out its wall
-time: 33,220 of 81,284 s. The scripts are in
-`docs/programmes/follow-ups/f18-assets/`.
+2026-11-24, boundary 3 (f19 closed): a pinned subagent's decision row now
+records the model the router infers the call ran, and router-state serves
+`pin_sources` (`own`, `preferred`, `machine`) beside `pins`. Plan
+`docs/plans/2026-11-24-pin-row-records-call-model.md`. The row is inferred,
+not observed; f22 checks it live.
 
-- Done: f12, f13, f14, f15, f17, f18.
-- Next: f20 (stale state after a clear) first, since it skews the router
-  pin plan's 11-30 cohort check; then f19 (pin row records the call's
-  model) and Settle a worker whose final turn leaves a background shell
-  running (f21). Measure the home fingerprint warnings (f08) is due
-  2026-11-28. A week of relays adopts every handoff (f16) is due
+- Done: f12, f13, f14, f15, f17, f18, f19.
+- Next: f20 (stale state after a clear; its plan is in `relais-wt-f20`,
+  it rebases on f19's `routeSpawn` and `afterSpawn` changes), then Settle a
+  worker whose final turn leaves a background shell running (f21). Measure
+  the home fingerprint warnings (f08) is due 2026-11-28. A pin row's model
+  matches the model its subagent ran (f22) is due 2026-12-01, after the
+  plugin reinstall. A week of relays adopts every handoff (f16) is due
   2026-12-02, counted from the plugin reinstall.
 - Lessons:
-  - Split a timed-out dispatch at the transcript's last line. A tail after
-    `end_turn` is time the worker had already finished. Without the tail,
-    the 31 transcripts sum to 48,064 s, which matches f15's in-transcript
-    total.
-  - `hook_journal` `SubagentStop` payloads carry `background_tasks`. A
-    `type: "shell"` entry still `running` is what predicts a late settle.
-  - Join a stop to the ledger by the nearest dispatch of that agent after
-    the stop. A repair continues the same agent under a new dispatch, so
-    one agent has several rows.
-  - `\bwait\b` matches `--max-wait`. Anchor a poll pattern on a command
-    boundary.
-  - A Bash call that runs past 120 s is moved to the background
-    (`backgroundTaskId` in its `toolUseResult`). A worker can have a
-    background task it never asked for.
-  - A timed-out dispatch has no `agent_id` in the ledger. Find its
-    transcript by the dispatch's `session_id` and the subagent file whose
-    first line comes within 2 min of `dispatch_started`.
+  - On a jammed host (load average near 90 on 6 cores), relais runs block on
+    `admission_wait_exhausted` twice in a row, and a change run can get no
+    worker lease at all. Apply the kept `candidate-1.patch`, check it in
+    session, and record the run `salvaged` at the commit.
+  - Under that load the full plugin suite fails on the 5 s per-test limit
+    in tests the change does not touch. Copy `claude-plugin/` with only the
+    test files that matter and run `claude plugin test` there.
+  - The scripted clock hangs a test that advances it by minutes: periodic
+    timers fire for every step. Test a time bound as a unit, with a fake
+    `fx`, and red-check it.
+  - `greenbelay plan-review record` refuses a disposition other than
+    `accepted`, `rejected` or `decision`. Put the reason in the review
+    file, not the disposition.
   - A commit here runs the whole cargo test suite (about 10 min); make no
     tracked edit while it runs, since the gate stashes them.
 - Your steps: reinstall the relais plugin with relais's own install
-  command for Claude (it is at 0.72.0 here; f16 counts from the session
-  after the reinstall).
+  command for Claude (it is at 0.72.0 here). f16 and f22 count from the
+  session after the reinstall.
 
 ## Not yet specified
 
