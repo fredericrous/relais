@@ -10,6 +10,7 @@ use serde::Serialize;
 use super::holdout;
 use super::mode::{resolve_mode, Mode};
 use super::outcome::TaskOutcome;
+use super::pins::{DefinitionPin, PinSource};
 use super::stats::median;
 use super::table::{default_table, CapabilityTable};
 use crate::orchestration::PriceTable;
@@ -117,6 +118,8 @@ pub struct RouterState {
     pub rates: BTreeMap<String, Option<Rates>>,
     pub priors: Priors,
     pub pins: BTreeMap<String, String>,
+    /// Where each entry of `pins` came from, same keys.
+    pub pin_sources: BTreeMap<String, PinSource>,
     pub excluded_models: Vec<String>,
     pub checks: Vec<Vec<String>>,
     /// The kind (`test`, `lint`, `build`) of each entry of `checks`, same
@@ -142,7 +145,7 @@ pub struct Inputs<'a> {
     pub completed_task_tokens: Vec<(String, u8, u64)>,
     /// Pins from the agent definitions, user scope first so the project's
     /// win on a shared name.
-    pub definition_pins: Vec<(String, String)>,
+    pub definition_pins: Vec<DefinitionPin>,
     /// The exploration stop rule fired (`explore::stop_check`): epsilon is
     /// served as 0.
     pub exploration_stopped: bool,
@@ -273,11 +276,14 @@ pub fn build(inputs: Inputs<'_>) -> RouterState {
     let mut models: Vec<String> = tiers.values().map(|tier| tier.model.clone()).collect();
     models.extend(routing.resolved_model_ids().into_values());
     let mut pins: BTreeMap<String, String> = BTreeMap::new();
+    let mut pin_sources: BTreeMap<String, PinSource> = BTreeMap::new();
     for agent in &routing.pinned_agents {
         pins.insert(agent.clone(), MACHINE_PIN.to_string());
+        pin_sources.insert(agent.clone(), PinSource::Machine);
     }
-    for (agent, model) in &inputs.definition_pins {
-        pins.insert(agent.clone(), model.clone());
+    for pin in &inputs.definition_pins {
+        pins.insert(pin.agent.clone(), pin.model.clone());
+        pin_sources.insert(pin.agent.clone(), pin.source);
     }
     let (checks, check_kinds): (Vec<Vec<String>>, Vec<&'static str>) = checks(inputs.repo)
         .into_iter()
@@ -303,6 +309,7 @@ pub fn build(inputs: Inputs<'_>) -> RouterState {
             task_tokens: task_token_priors(&inputs.completed_task_tokens),
         },
         pins,
+        pin_sources,
         excluded_models: routing.excluded_models.clone(),
         checks,
         check_kinds,
@@ -469,10 +476,19 @@ mod tests {
     fn pins_join_definitions_and_machine_pins() {
         let machine = machine("[session_routing]\npinned_agents = [\"keep-me\", \"both\"]\n");
         let mut inputs = inputs(&machine, None);
-        inputs.definition_pins = vec![("both".into(), "opus".into())];
+        inputs.definition_pins = vec![DefinitionPin {
+            agent: "both".into(),
+            model: "opus".into(),
+            source: PinSource::Preferred,
+        }];
         let state = build(inputs);
         assert_eq!(state.pins["keep-me"], "inherit");
         assert_eq!(state.pins["both"], "opus");
+        assert_eq!(state.pin_sources["keep-me"], PinSource::Machine);
+        assert_eq!(state.pin_sources["both"], PinSource::Preferred);
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["pin_sources"]["both"], "preferred");
+        assert_eq!(json["pin_sources"]["keep-me"], "machine");
     }
 
     #[test]
@@ -514,6 +530,7 @@ mod tests {
                 "holdout",
                 "mode",
                 "mode_reason",
+                "pin_sources",
                 "pins",
                 "priors",
                 "rates",

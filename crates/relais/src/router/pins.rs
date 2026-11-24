@@ -8,7 +8,28 @@
 /// `model: inherit`, is pinned by its `preferred-model:` when it declares one
 /// (the router then leaves the spawn's call as the parent made it). `None`
 /// when neither names a model.
-pub type Pin = Option<(String, String)>;
+pub type Pin = Option<DefinitionPin>;
+
+/// Where a served pin came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PinSource {
+    /// The definition's own `model:`.
+    Own,
+    /// The definition's `preferred-model:`.
+    Preferred,
+    /// `[session_routing] pinned_agents` in machine.toml.
+    Machine,
+}
+
+/// One pinned agent: its subagent type, the model string served for it
+/// (not validated) and where the pin came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionPin {
+    pub agent: String,
+    pub model: String,
+    pub source: PinSource,
+}
 
 /// Why a definition could not be read.
 #[derive(Debug, Clone, PartialEq)]
@@ -52,10 +73,19 @@ pub fn parse_definition(stem: &str, text: &str) -> Result<Pin, PinError> {
     if !closed {
         return Err(PinError("the front matter is never closed with ---".into()));
     }
-    let pinned = model
+    let own = model
         .filter(|model| model != "inherit")
-        .or_else(|| preferred.filter(|model| model != "inherit"));
-    Ok(pinned.map(|model| (name.unwrap_or_else(|| stem.to_string()), model)))
+        .map(|model| (model, PinSource::Own));
+    let pinned = own.or_else(|| {
+        preferred
+            .filter(|model| model != "inherit")
+            .map(|model| (model, PinSource::Preferred))
+    });
+    Ok(pinned.map(|(model, source)| DefinitionPin {
+        agent: name.unwrap_or_else(|| stem.to_string()),
+        model,
+        source,
+    }))
 }
 
 fn unquote(value: &str) -> &str {
@@ -74,16 +104,24 @@ fn unquote(value: &str) -> &str {
 mod tests {
     use super::*;
 
+    fn pin(agent: &str, model: &str, source: PinSource) -> Pin {
+        Some(DefinitionPin {
+            agent: agent.into(),
+            model: model.into(),
+            source,
+        })
+    }
+
     #[test]
     fn a_definition_with_a_model_is_a_pin_named_by_its_name() {
         let text = "---\nname: my-reviewer\ndescription: x: y\nmodel: \"opus\"\ntools:\n  - Read\n---\nbody\n";
         assert_eq!(
             parse_definition("file", text),
-            Ok(Some(("my-reviewer".into(), "opus".into())))
+            Ok(pin("my-reviewer", "opus", PinSource::Own))
         );
         assert_eq!(
             parse_definition("file", "---\nmodel: haiku\n---\n"),
-            Ok(Some(("file".into(), "haiku".into())))
+            Ok(pin("file", "haiku", PinSource::Own))
         );
     }
 
@@ -98,30 +136,30 @@ mod tests {
 
     #[test]
     fn a_preferred_model_pins_an_inheriting_definition() {
-        let pin = |text: &str| parse_definition("rev", text);
-        let opus = Ok(Some(("rev".into(), "opus".into())));
+        let parse = |text: &str| parse_definition("rev", text);
+        let opus = Ok(pin("rev", "opus", PinSource::Preferred));
         assert_eq!(
-            pin("---\nmodel: inherit\npreferred-model: opus\n---\n"),
+            parse("---\nmodel: inherit\npreferred-model: opus\n---\n"),
             opus
         );
-        assert_eq!(pin("---\npreferred-model: opus\n---\n"), opus);
+        assert_eq!(parse("---\npreferred-model: opus\n---\n"), opus);
         assert_eq!(
-            pin("---\npreferred-model: opus\nmodel: inherit\n---\n"),
-            opus
-        );
-        assert_eq!(
-            pin("---\nmodel: inherit\npreferred-model: \"opus\"\n---\n"),
+            parse("---\npreferred-model: opus\nmodel: inherit\n---\n"),
             opus
         );
         assert_eq!(
-            pin("---\nname: x\n# relais:begin abc\nmodel: inherit\npreferred-model: opus\n---\n"),
-            Ok(Some(("x".into(), "opus".into())))
+            parse("---\nmodel: inherit\npreferred-model: \"opus\"\n---\n"),
+            opus
+        );
+        assert_eq!(
+            parse("---\nname: x\n# relais:begin abc\nmodel: inherit\npreferred-model: opus\n---\n"),
+            Ok(pin("x", "opus", PinSource::Preferred))
         );
     }
 
     #[test]
     fn an_own_model_outranks_the_preference_in_any_order() {
-        let sonnet = Ok(Some(("rev".into(), "sonnet".into())));
+        let sonnet = Ok(pin("rev", "sonnet", PinSource::Own));
         assert_eq!(
             parse_definition("rev", "---\nmodel: sonnet\npreferred-model: opus\n---\n"),
             sonnet
@@ -129,6 +167,14 @@ mod tests {
         assert_eq!(
             parse_definition("rev", "---\npreferred-model: opus\nmodel: sonnet\n---\n"),
             sonnet
+        );
+    }
+
+    #[test]
+    fn a_mistyped_preference_is_served_as_a_preferred_pin() {
+        assert_eq!(
+            parse_definition("rev", "---\nmodel: inherit\npreferred-model: opsu\n---\n"),
+            Ok(pin("rev", "opsu", PinSource::Preferred))
         );
     }
 

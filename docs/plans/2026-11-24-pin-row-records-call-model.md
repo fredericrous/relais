@@ -115,7 +115,7 @@ Facts checked:
   whichever branch lands second rebases on the other.
 
 ## Phases
-- [ ] Phase 1 — the pin carries its source. `crates/relais/src/router/pins.rs`
+- [x] Phase 1 — the pin carries its source. `crates/relais/src/router/pins.rs`
   (`PinSource`, `DefinitionPin`, the doc
   comments, the tests under Verification); `crates/relais/src/router/mod.rs`
   (`definition_pins` returns `Vec<DefinitionPin>`);

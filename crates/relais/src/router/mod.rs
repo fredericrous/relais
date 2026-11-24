@@ -112,7 +112,7 @@ fn user_agents_dir() -> Option<PathBuf> {
 /// Every pin the `*.md` definitions in `dirs` state, in directory order
 /// (a later directory's pin for the same type wins). A file that cannot
 /// be read or has no well-formed front matter is skipped with a warning.
-pub fn definition_pins(dirs: &[PathBuf]) -> Vec<(String, String)> {
+pub fn definition_pins(dirs: &[PathBuf]) -> Vec<pins::DefinitionPin> {
     let mut pins = Vec::new();
     for dir in dirs {
         let entries = match std::fs::read_dir(dir) {
@@ -536,7 +536,11 @@ mod tests {
         std::fs::write(agents.join("notes.txt"), "---\nmodel: opus\n---\n").unwrap();
         assert_eq!(
             definition_pins(&[agents, dir.join("absent")]),
-            vec![("good".to_string(), "opus".to_string())]
+            vec![pins::DefinitionPin {
+                agent: "good".into(),
+                model: "opus".into(),
+                source: pins::PinSource::Own,
+            }]
         );
     }
 
@@ -557,7 +561,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             definition_pins(&[agents]),
-            vec![("implementation-review".to_string(), "opus".to_string())]
+            vec![pins::DefinitionPin {
+                agent: "implementation-review".into(),
+                model: "opus".into(),
+                source: pins::PinSource::Preferred,
+            }]
         );
     }
 }
