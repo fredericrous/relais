@@ -141,38 +141,42 @@ which check and step failed.
   holder never relayed to. Only a `work` claim takes a reservation over,
   as an-t18 decided.
 - 2026-11-24 — A holder's own retry is granted again at a higher epoch
-  and moves the hold's end to `HANDOFF_HOLD_SECS` after the retry (the
-  shared hold's age still counts from the first grant), because the retry writes the missing claim file with a
-  fresh `claimed_at`; the shared hold then ends with it.
+  and moves the hold's end to `HANDOFF_HOLD_SECS` after the retry (the age a
+  `Held` answer reports still counts from the first grant), because the
+  retry writes the missing claim file with a fresh `claimed_at`; the shared
+  hold then ends with it.
 
 ## Verification
 
-- Phase 1: `cargo test -p relais --lib shared_state::conformance` → the
-  three conformance tests pass with the new case on `LocalState`, the
-  fake and the fake with its clock.
-- Phase 1, the case can fail: remove the fake's own-reservation exemption
-  in `FakeState::reserve_handoff` (no commit) → `the_fake_conforms`
-  fails on the new case at step 2; revert → passes.
+- Phase 1: `cargo test -p relais --lib shared_state::conformance` → all
+  conformance tests pass (`local_state_conforms`, `the_fake_conforms`,
+  `the_fake_conforms_with_its_clock`) with the new cases on `LocalState`,
+  the fake and the fake with its clock: 29 passed in the run of 2026-11-24,
+  before the mutation runs below.
+- Phase 1, the case can fail (observed 2026-11-24): with the fake's
+  own-reservation exemption removed, `the_fake_conforms` and
+  `the_fake_conforms_with_its_clock` panic with `a_handoff_retried_by_its_holder_is_reserved_again step 2: a holder's own retry is never Held, got Held {...}`; reverted → passes.
 - Phase 1, the case bites on `LocalState` too: `LocalState` refuses
   another holder only through the claim file step 3 writes. Mutation:
-  skip step 3 (no commit) → `local_state_conforms` fails at
-  step 4 (the node reserves for `other`); restore → passes.
-- Phase 1, step 5 bites: in `FakeState::reserve_handoff`, clear
-  `row.holder` when `row.handoff` is set, before `try_acquire` (no commit;
-  dropping only the early `Held` return is not enough, since `try_acquire`
-  still refuses `other`, fake.rs:213-215) → `the_fake_conforms` panics with
-  a message starting `step 5:` (`other` is granted); revert → passes.
-- Phase 1: `cargo clippy -p relais --features conformance --all-targets`
-  and `cargo build -p relais --features conformance` → clean, so the
-  case compiles outside `cfg(test)`, as relais-fabric builds it.
+  skip step 3 (no commit) → `local_state_conforms` fails with `... step 4: another holder's reservation is refused`; restore → passes (observed 2026-11-24 on the same case, run from a test binary).
+- Phase 1, step 5 bites (observed 2026-11-24): in `FakeState::reserve_handoff`,
+  clear `row.holder` when `row.handoff` is set, before `try_acquire` (no
+  commit; dropping only the early `Held` return is not enough, since
+  `try_acquire` still refuses `other`, fake.rs:213-215) → the primary case
+  panics with `a_primary_refuses_another_holders_reservation step 5: ... got Granted(...)`,
+  and the new `run_all` case fails with `step 5: another holder is never granted`; revert → passes.
+- Phase 1: `cargo clippy -p relais --all-targets -- -D warnings`, the same
+  with `--features conformance`, and `cargo build -p relais --features
+  conformance` → all clean (observed 2026-11-24), so the cases compile
+  outside `cfg(test)`, as relais-fabric builds them.
 - Phase 1: relais-fabric (an-t13) is not on this machine, so its run of the
   case is owed at its next relais pin bump (see Outcome).
 - Phase 1, primaries: `run_all_with_clock` also runs
   `a_primary_refuses_another_holders_reservation` (step 1 `Granted`, step 5
-  `Held { holder: me }`); the `LocalState` answer `NodeDecides` is outside it
-  → passes on the fake with its clock; with the step-5 mutation above
-  (holder cleared on a handoff row) it fails with a `step 5:` message.
-- Phase 2: in the homelab task worktree, `relais programme check docs/programmes/agents-many-nodes`, run on its own and not piped → exit 0.
+  `Held { holder, .. }` with `holder == me`); `LocalState` is not run through
+  it → passes on the fake with its clock; with the step-5 mutation above it
+  fails with a `step 5:` message.
+- Phase 2: in the homelab task worktree, `relais programme check docs/programmes/agents-many-nodes`, run on its own and not piped → exit 0. A failing check exits with the non-zero code `crates/relais/src/cli/outcome.rs` assigns it, with its diagnostics on stderr.
 
 ## Outcome
 

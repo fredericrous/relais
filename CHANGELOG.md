@@ -29,6 +29,16 @@ before upgrading; without it a review runs with a candidates gap.
   and `run_daemon` take the shared state and the holder. With `LocalState`
   every seat is granted, so a single node answers as before.
 
+The `SharedState` conformance suite holds a client to the retry rule of a
+handoff reservation. `run_all` gains
+`a_handoff_retried_by_its_holder_is_reserved_again`: a reservation retried
+by its own holder is reserved again, and another holder's is refused while
+it lasts. `run_all_with_clock`, which every primary must run, gains
+`a_primary_refuses_another_holders_reservation`: the refusal is `Held`,
+naming the reserver. relais-fabric runs both at its next relais pin bump;
+a client that answers `Held` to its own holder's retry, or grants another
+holder, now fails the suite.
+
 ## v0.82.0
 
 relais.toml reads `[integrations] greentopo`, the new name of aval. It declares

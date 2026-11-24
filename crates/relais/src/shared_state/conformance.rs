@@ -65,7 +65,7 @@ pub type Check = fn(&dyn SharedState, &Fixture);
 
 /// Every check, each on a fresh implementation and fixture.
 pub fn run_all<S: SharedState>(make: impl Fn() -> S) {
-    let checks: [(&str, Check); 11] = [
+    let checks: [(&str, Check); 12] = [
         ("epoch_rises_on_every_acquire", epoch_rises_on_every_acquire),
         ("a_stale_epoch_is_lease_lost", a_stale_epoch_is_lease_lost),
         (
@@ -87,6 +87,10 @@ pub fn run_all<S: SharedState>(make: impl Fn() -> S) {
             "a_session_gives_back_its_work_and_keeps_its_handoff",
             a_session_gives_back_its_work_and_keeps_its_handoff,
         ),
+        (
+            "a_handoff_retried_by_its_holder_is_reserved_again",
+            a_handoff_retried_by_its_holder_is_reserved_again,
+        ),
         ("publish_replays_idempotently", publish_replays_idempotently),
         (
             "a_fresh_state_is_online_and_empty",
@@ -103,12 +107,17 @@ pub fn run_all<S: SharedState>(make: impl Fn() -> S) {
 /// [`run_all`] and the checks that need the implementation's clock. A
 /// client whose test primary has an injectable clock passes `advance`,
 /// which moves the clock of the state it is given forward by that many
-/// seconds; an implementation that holds decision grants must pass it.
+/// seconds. Every primary (an implementation that holds decision grants
+/// and ticket holds) must pass it: it adds the checks [`super::LocalState`]
+/// does not hold to.
 pub fn run_all_with_clock<S: SharedState>(make: impl Fn() -> S, advance: impl Fn(&S, i64)) {
     run_all(&make);
     let state = make();
     let fixture = Fixture::new("a_decision_grant_lapses");
     a_decision_grant_lapses(&state, &fixture, &|secs| advance(&state, secs));
+    let state = make();
+    let fixture = Fixture::new("a_primary_refuses_another_holders_reservation");
+    a_primary_refuses_another_holders_reservation(&state, &fixture);
 }
 
 fn holder(fixture: &Fixture, who: &str) -> Principal {
@@ -461,6 +470,118 @@ pub fn a_session_gives_back_its_work_and_keeps_its_handoff(
     state
         .release_tickets(&holder(fixture, "nobody"))
         .expect("nothing to give back");
+}
+
+/// A `handoff` reservation retried by its own holder is answered again,
+/// and the node completes it; another holder's reservation of it is
+/// refused while it lasts. The retry modelled is `next --claim` after a
+/// crash between the shared grant and the claim file: the shared half
+/// granted, no claim file was written. The case never retries the holder
+/// at the node once the file exists (the ticket is held then, and
+/// `next --claim` skips it).
+pub fn a_handoff_retried_by_its_holder_is_reserved_again(
+    state: &dyn SharedState,
+    fixture: &Fixture,
+) {
+    use super::TicketAnswer;
+    use crate::programme::claim::{now_unix, Holder, Kind, LOCK_WAIT};
+    const CHECK: &str = "a_handoff_retried_by_its_holder_is_reserved_again";
+    let me = holder(fixture, "a");
+    let other = holder(fixture, "b");
+    let first = state
+        .reserve_handoff(&ticket(fixture, "t1", &me))
+        .expect("reserve");
+    assert!(
+        !matches!(first, TicketAnswer::Held { .. }),
+        "{CHECK} step 1: a free ticket is reserved, got {first:?}"
+    );
+    let retry = state
+        .reserve_handoff(&ticket(fixture, "t1", &me))
+        .expect("retry");
+    assert!(
+        !matches!(retry, TicketAnswer::Held { .. }),
+        "{CHECK} step 2: a holder's own retry is never Held, got {retry:?}"
+    );
+    if let (TicketAnswer::Granted(first), TicketAnswer::Granted(retry)) = (&first, &retry) {
+        assert!(
+            retry.epoch > first.epoch,
+            "{CHECK} step 2: a retry is an acquire and bumps the epoch, got {} after {}",
+            retry.epoch,
+            first.epoch
+        );
+    }
+    let key = ClaimKey {
+        repo_key: fixture.name.clone(),
+        slug: "programme".into(),
+    };
+    let now = now_unix();
+    {
+        let lock = fixture.store.lock(&key, LOCK_WAIT, now).expect("lock");
+        assert!(
+            node::reserve_handoff(state, &lock, &key, "t1", &me, "/r", now).expect("answered"),
+            "{CHECK} step 3: the node completes its holder's retry"
+        );
+        let holds = fixture.store.holds(&key, now).expect("holds");
+        assert_eq!(
+            holds.get("t1").map(|hold| &hold.holder),
+            Some(&Holder::Session {
+                id: me.id.clone(),
+                kind: Kind::Handoff
+            }),
+            "{CHECK} step 3: the claim file names the holder's handoff"
+        );
+        assert!(
+            !node::reserve_handoff(state, &lock, &key, "t1", &other, "/r", now).expect("answered"),
+            "{CHECK} step 4: another holder's reservation is refused"
+        );
+    }
+    let over = state
+        .reserve_handoff(&ticket(fixture, "t1", &other))
+        .expect("answered");
+    match &over {
+        TicketAnswer::Granted(_) => {
+            panic!("{CHECK} step 5: another holder is never granted, got {over:?}")
+        }
+        TicketAnswer::Held { holder, .. } => {
+            assert_eq!(holder, &me, "{CHECK} step 5: a refusal names the reserver")
+        }
+        TicketAnswer::NodeDecides => {}
+    }
+}
+
+/// A primary's half of [`a_handoff_retried_by_its_holder_is_reserved_again`]:
+/// the shared half grants the reservation and refuses another holder with
+/// `Held`, naming the reserver, since the claim file of one node is not
+/// seen by another. [`super::LocalState`] answers `NodeDecides` and is not
+/// run through it.
+pub fn a_primary_refuses_another_holders_reservation(state: &dyn SharedState, fixture: &Fixture) {
+    use super::TicketAnswer;
+    const CHECK: &str = "a_primary_refuses_another_holders_reservation";
+    let me = holder(fixture, "a");
+    let other = holder(fixture, "b");
+    let first = state
+        .reserve_handoff(&ticket(fixture, "t1", &me))
+        .expect("reserve");
+    assert!(
+        matches!(first, TicketAnswer::Granted(_)),
+        "{CHECK} step 1: a primary grants a free ticket, got {first:?}"
+    );
+    let retry = state
+        .reserve_handoff(&ticket(fixture, "t1", &me))
+        .expect("retry");
+    assert!(
+        matches!(retry, TicketAnswer::Granted(_)),
+        "{CHECK} step 2: a primary grants its holder's retry, got {retry:?}"
+    );
+    let over = state
+        .reserve_handoff(&ticket(fixture, "t1", &other))
+        .expect("answered");
+    match &over {
+        TicketAnswer::Held { holder, .. } => {
+            assert_eq!(holder, &me, "{CHECK} step 5: a refusal names the reserver")
+        }
+        _ => panic!("{CHECK} step 5: a primary refuses another holder with Held, got {over:?}"),
+    }
 }
 
 /// Publishing the same rows twice names the same high-water mark, and
