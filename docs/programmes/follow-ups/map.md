@@ -73,8 +73,11 @@ ticket here until it is resolved or moved into a programme of its own.
 - [f17](f17-piped-filter-polls.md) (2026-11-24, closed 2026-11-24): a
   piped filter counts only when its output shows a failure marker
   (`shows_failure`). The real wait polls went from 7 fires to 0.
-- [f18](f18-timeout-wall-time-waits.md) (2026-11-24, open): what a
-  timed-out worker's wall time waits on (suite, host contention, polling).
+- [f18](f18-timeout-wall-time-waits.md) (2026-11-24, closed 2026-11-24):
+  41% of timed-out wall time passes after the worker's final answer. A
+  background shell keeps the agent listed `running`, so the dispatch never
+  settles. Suites take 24%, polls 16% (at most 9% wasted), model turns 14%;
+  contention could not be shown to dominate. Act in stop detection (f21).
 - [f19](f19-pin-row-records-call-model.md) (2026-11-24, open): a
   `preferred-model` pin row records the preference, not the model the
   call ran; record the call's model, serve the pin source in an added
@@ -83,50 +86,48 @@ ticket here until it is resolved or moved into a programme of its own.
   `/clear` relay, spawns before the first person prompt can route on a
   state with no pins (likely the pre-clear one; cause open): a pinned
   reviewer's fallback spawn was table-routed to Haiku.
+- [f21](f21-settle-at-final-turn-with-shells.md) (2026-11-24, open):
+  settle a worker whose final turn leaves a background shell running.
 
 ## Handoff
 
-2026-11-24, boundary 4 (f17 closed): the loop guard counts a piped
-`tail`/`head`/`grep` only when its output shows a failure marker. The
-markers are `FAIL` as a word, `error:`/`error[`/`Error:`, `panicked`,
-`fatal:`, `Traceback`, and a count of at least one before
-`failed`/`error`. Replayed over the two wait-poll transcripts, the fires
-went from 7 to 0. This is unreleased, like f10, f11 and f12.
-`loop_threshold` stays unset until the Rollout bar is met: at least 5 shadow
-events, at most 1 in 5 passing verification.
+2026-11-24, boundary 3 (f18 closed): a timed-out worker's wall time goes
+mostly to waiting after it has finished. In 12 of 31 runs the worker had
+answered (often "DONE") with a background shell still running.
+`$.agent.list()` kept it `running`, and the dispatch waited out its wall
+time: 33,220 of 81,284 s. The scripts are in
+`docs/programmes/follow-ups/f18-assets/`.
 
-- Done: f12, f13, f14, f15, f17.
-- Next: What a timed-out worker's wall time waits on (f18) is ready. So
-  are f19 (pin row records the call's model) and f20 (stale state after a
-  clear), f20 first since it skews the router pin plan's 11-30 cohort
-  check. Measure the home fingerprint warnings (f08) is due 2026-11-28. A
-  week of relays adopts every handoff (f16) is due 2026-12-02, counted
-  from the plugin reinstall.
+- Done: f12, f13, f14, f15, f17, f18.
+- Next: f20 (stale state after a clear) first, since it skews the router
+  pin plan's 11-30 cohort check; then f19 (pin row records the call's
+  model) and Settle a worker whose final turn leaves a background shell
+  running (f21). Measure the home fingerprint warnings (f08) is due
+  2026-11-28. A week of relays adopts every handoff (f16) is due
+  2026-12-02, counted from the plugin reinstall.
 - Lessons:
+  - Split a timed-out dispatch at the transcript's last line. A tail after
+    `end_turn` is time the worker had already finished. Without the tail,
+    the 31 transcripts sum to 48,064 s, which matches f15's in-transcript
+    total.
+  - `hook_journal` `SubagentStop` payloads carry `background_tasks`. A
+    `type: "shell"` entry still `running` is what predicts a late settle.
+  - Join a stop to the ledger by the nearest dispatch of that agent after
+    the stop. A repair continues the same agent under a new dispatch, so
+    one agent has several rows.
+  - `\bwait\b` matches `--max-wait`. Anchor a poll pattern on a command
+    boundary.
+  - A Bash call that runs past 120 s is moved to the background
+    (`backgroundTaskId` in its `toolUseResult`). A worker can have a
+    background task it never asked for.
   - A timed-out dispatch has no `agent_id` in the ledger. Find its
     transcript by the dispatch's `session_id` and the subagent file whose
     first line comes within 2 min of `dispatch_started`.
-  - `grep 'relais: shadow:'` also matches run prose. Count only lines whose
-    event text starts with it.
-  - A Bash result with no output is stored as the literal text
-    `(Bash completed with no output)`, not as an empty string. Build
-    transcript tests from that text.
-  - Replay a real transcript through `LoopGuard::push_chunk` in a
-    temporary `#[ignore]` test, once with the old rule and once with the new.
-    It costs two builds and gives a before and after.
-  - The 11-21 takeover was no fault of the takeover rule: the successor
-    held no claim. Read `claims/log.jsonl` and the transcripts before
-    blaming a rule.
-  - Mock-clock tests in the plugin cannot advance hours: every 100 ms
-    flush timer fires. Test a long wait by calling the hook function with
-    a fake `fx` whose clock is already past it.
-  - The claim CLI tests move time by backdating `claimed_at` and
-    `refreshed_at` in the claim files (`World::age_claims`).
   - A commit here runs the whole cargo test suite (about 10 min); make no
     tracked edit while it runs, since the gate stashes them.
 - Your steps: reinstall the relais plugin with relais's own install
-  command for Claude (it is at 0.72.0 here; the adoption applies from the
-  next session after the reinstall, and f16 counts from then).
+  command for Claude (it is at 0.72.0 here; f16 counts from the session
+  after the reinstall).
 
 ## Not yet specified
 
