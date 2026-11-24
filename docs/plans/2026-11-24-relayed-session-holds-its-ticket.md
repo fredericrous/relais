@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: prog/follow-ups/f12-claim-takeover-live-session
 repos: [relais]
 adrs: [ADR-0083]
@@ -117,7 +117,7 @@ no claim at all. The rule "a session starting a ticket claims it first"
 
 ## Phases
 
-- [ ] Phase 1 — the regression test, red on main:
+- [x] Phase 1 — the regression test, red on main:
   `crates/relais/tests/programme_claims.rs`. The 11-21 sequence: A reserves
   t19 as handoff and ends; B is A's relayed successor and runs only
   `adopt`; the clock moves 3 h (a `World::age_claims` helper backdates `claimed_at`/`refreshed_at` in every claim file under the state dir, and any shared-state lease with them); C's `next --claim` does not choose t19;
@@ -128,7 +128,7 @@ no claim at all. The rule "a session starting a ticket claims it first"
   closed ticket: the open one is adopted, the closed one skipped, exit 0.
   Fifth: a handoff whose recorded `repo` is a removed `-wt-` worktree is
   adopted through the primary checkout.
-- [ ] Phase 2 — `adopt` in relais: `crates/relais/src/cli/mod.rs` (the
+- [x] Phase 2 — `adopt` in relais: `crates/relais/src/cli/mod.rs` (the
   subcommand), `crates/relais/src/cli/programme.rs` (`adopt_command`, which
   lists `<old>`'s live handoffs with `Store::claims_of` and calls the claim
   path per ticket; that path, from `forget_ended` through `claim_ticket`
@@ -138,7 +138,7 @@ no claim at all. The rule "a session starting a ticket claims it first"
   primary checkout beside a `-wt-` path, else a `skipped` line),
   `crates/relais/src/programme/claim/store.rs` only if a helper is missing.
   `CHANGELOG.md` entry.
-- [ ] Phase 3 — the plugin: `claude-plugin/hooks/programme.ts`
+- [x] Phase 3 — the plugin: `claude-plugin/hooks/programme.ts`
   (`adoptPrevious`; `adopt` added to `PROGRAMME_COMMAND`), `claude-plugin/hooks/register.ts` (call it before the
   read on a clear), `claude-plugin/tests/programme.test.ts` (argv, order
   adopt → read, an older relais's exit 2 ignored, no adopt without a
@@ -146,7 +146,7 @@ no claim at all. The rule "a session starting a ticket claims it first"
   `argv[2] === 'session'`, a separate `adopts()` helper, and fakes that answer
   `adopt` and `session` separately; a second clear during a pending adopt);
   `claude-plugin/hooks/events.ts` (an `adopt` event variant).
-- [ ] Phase 4 — close f12: `docs/programmes/follow-ups/f12-claim-takeover-live-session.md`
+- [x] Phase 4 — close f12: `docs/programmes/follow-ups/f12-claim-takeover-live-session.md`
   (Resolution, `status = "closed"`), `docs/programmes/follow-ups/map.md`
   (Decisions so far, Handoff), and a dated follow-up ticket: over 7 days of
   `claims/log.jsonl` after the reinstall, every relayed handoff logs a
@@ -154,7 +154,7 @@ no claim at all. The rule "a session starting a ticket claims it first"
   while its successor is alive.
 
 ### 🧑 Your steps
-- `relais install --claude` — the plugin change applies only once the relais plugin is reinstalled (it is at 0.72.0 here), from the next session
+- `relais install --claude --write` — the plugin change applies only once the relais plugin is reinstalled (it is at 0.72.0 here), from the next session
 
 ## Decision log
 
@@ -173,14 +173,48 @@ no claim at all. The rule "a session starting a ticket claims it first"
   caught 11-21 (another repository, a branch naming no ticket), and relais
   reading greenbelay crosses a tool boundary (`harness.cross-tool-reads`).
   Accepted gap: a live session that never claims and was not relayed.
+- 2026-11-24 — Implementation: the adoption runs inside `readProgramme`,
+  not from `register.ts`, because both start paths (`session.start` and
+  `classic.SessionStart` clear) already call it. `register.ts` is unchanged.
+  The adoption binds to the successor at its first read, and the 2 h
+  give-up counts from that bind, seconds after the clear.
+- 2026-11-24 — Implementation review changed the exits. A ticket `adopt`
+  can never take (closed, missing, its repository gone or another
+  repository's) is a stderr line and exit 0, because a retry cannot change
+  it. Exit 1 is kept for what a retry may fix (a lock, an unreadable
+  programme or store). Behaviour 1 said a missing repository was a skip
+  with exit 0 and the first code exited 1; the review settled on exit 0
+  with a `not adopted:` line, and the plugin records it as a `not-adopted`
+  event.
+- 2026-11-24 — The pane note names the command a person can run: `relais
+  programme claim <slug> <ticket>` when the view names the ticket, else
+  `relais programme adopt --previous <id>`; after 2 h, the claim command or
+  `its handoff lapsed`. Behaviour 2's text was a placeholder.
+- 2026-11-24 — A clear that must adopt waits at most 6 s for its view
+  (PROGRAMME_BOUND_MS + READ_FLOOR_MS), all of it detached from the hook.
+- 2026-11-24 — The CLI tests move time by backdating the claim files only.
+  The local shared state holds no lease with a time limit: its
+  `claim_ticket` answers `NodeDecides`, and its grant is an in-process
+  fencing epoch.
+- 2026-11-24 — deliberate: the `threw` event is stamped with `Date.now()`,
+  not `fx.clock`, because the clock may be what threw (implementation
+  review, low). deliberate: `take_ticket` returns a nested `Result`,
+  documented on the function (rust, low).
 
 ## Verification
 
-| Check | Input | Expected |
-|---|---|---|
-| regression test | `cargo test -p relais --test programme_claims` | the five cases pass; case 1 fails on main (no `adopt`) |
-| piloted run | a scratch `RELAIS_STATE_DIR`: `next --claim` as A, `adopt --previous A --session B`, `claim` as D | B holds `work` from A; D exits 3 with `is held by B…` |
-| plugin tests | `make plugin` (`claude plugin validate` + `scripts/plugin-test.sh`) | the adopt-then-read order, older-relais exit 2 ignored, no adopt on resume/fork, and retry-after-failure cases pass |
-| full gate | the commit gate | green |
+| Check | Input | Expected | Actual |
+|---|---|---|---|
+| regression test | `cargo test -p relais --test programme_claims` | the cases pass; case 1 fails on main (no `adopt`) | 23/23 pass (7 new). On main, all 7 new failed with `unrecognized subcommand 'adopt'`. Covers the 11-21 replay, `claim`-then-adopt, taken by a third session, closed vs `no such ticket`, a removed `-wt-` repository, a gone repository (exit 0, `not adopted`), and empty or self `--previous` (exit 2) |
+| piloted run | a scratch `RELAIS_STATE_DIR` and repo, the built binary: `next --claim` as A, `adopt --previous A --session B`, `claim` as D | B holds `work` from A; D exits 3 with `is held by B…` | `took over alpha p t19 from aaaaaaaa` (exit 0), a `takeover` event by B in `log.jsonl`; D: `alpha p t19 is held by bbbbbbbb (0m old)`, exit 3; a second adopt prints nothing and exits 0; `--previous` equal to the session exits 2 naming the flag |
+| plugin tests | `make plugin` (`claude plugin validate` + `scripts/plugin-test.sh`) | exit 0, no `SKIPPED` line; the adopt-then-read order, older-relais exit 2, no adopt on resume/fork, retry after failure | `claude plugin test`: 540 pass, 0 fail (12 new). The race test and the throw test were each checked by mutation (setting `running` after the first await; restoring `since ?? 0`): both went red. `make plugin` exit 0 at the Phase 3 commit, no `SKIPPED` line |
+| full gate | `make check` | exit 0; the `plugin:` line says it was checked | exit 0 on the final tree (`0ad011cd`): `msrv: building with 1.89` (installed for this run), `plugin: claude 2.1.331 …` checked, 540 pass, 0 failed test results |
+
+## Implementation review
+
+- implementation-review (opus): approve-with-changes, 4 rounds. Fixed: `value` renamed, the catch path (unbound `since`, logged `threw`), the compensation line. The plan-record items land in this commit. About 205k tokens, 160 s.
+- backend (opus): approve after 3 rounds. Fixed: no futile retries on a permanent skip, the race test, a throwing effect is retried and logged. About 184k tokens, 123 s.
+- lang:typescript (opus): approve after 3 rounds. Fixed: the `Adoption` tagged union, the running state taken before the first await, `cause`/`detail`, the `not-adopted` variant. About 168k tokens, 109 s.
+- lang:rust, unix, tui (opus): approve after 2 rounds. Fixed: `not adopted:` versus `skipped`, `no such ticket`, the empty-`--previous` test, exit 0 for permanent cases. deliberate: the nested `Result` and the `Date.now()` stamp (Decision log). About 220k tokens, 177 s.
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,lang:typescript,tui,unix body-sha=0f4eb3921e8b -->
