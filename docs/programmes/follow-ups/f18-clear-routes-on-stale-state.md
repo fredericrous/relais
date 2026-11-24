@@ -42,12 +42,17 @@ state that had no pins (likely the pre-clear one):
   may have gone dark, not routed correctly. `router-state` answered in
   0.26 s, under the plugin's 10 s `STATE_TIMEOUT_MS`.
 
-Two paths fit a dark session. `loadRouterState` sets `r.state` to
+The likeliest path to a dark session: `loadRouterState` sets `r.state` to
 undefined on any failure without a note; `queue()` then drops every
-record, and `onPrompt` returns before `classifyPrompt` when there is no
-state and no stale mark, so nothing refreshes again. Or a `router-observe`
-batch exited 2 (refused: the binary writes each batch in one transaction,
-all or none) or 1, and every record in it was lost.
+record, `routeSpawn` passes every call through (which also fits round 2's
+unchanged calls), and `onPrompt` returns before `classifyPrompt` when
+there is no state and no stale mark, so nothing refreshes again until
+`/relais-routing` or the next `session.start`. A failed `router-observe`
+is less likely: exit 2 (refused, all or none, nothing written) is
+dropped with a note, and exit 1 (ledger failure) is retried up to
+`OBSERVE_RETRIES` times, then dropped with a note; no such note appeared
+in this session. Only a failed final flush (`isFinal`, at session end) is
+dropped with no retry and no note.
 
 The installed plugin (0.79.0) `routeSpawn` reads `store.router.state` and
 never checks `isStale`; the refreshes after a clear are the
@@ -59,7 +64,8 @@ relay path. Why did none of those refreshes give the spawns the pins, why
 did the session go dark after round 1's flush, and what is the fix:
 `routeSpawn` awaiting a refresh when the state is stale, a refresh on the
 plugin-submitted prompt, resetting `r.session` at the clear, or a note
-when router-state or router-observe fails?
+when router-state fails? And should a failed final flush be noted or
+kept for the next session instead of dropped silently?
 
 ## Look at
 
@@ -69,8 +75,9 @@ when router-state or router-observe fails?
   its end clears a stale mark set after it started), `onSessionEnd`
   (`isStale = true` on `clear`/`resume`), `onPrompt` (the early return),
   `classifyPrompt`, `queue`, and `observe` (the refresh after a successful
-  non-final flush; what happens to a batch on exit 2 or 1, and where its
-  stderr goes).
+  non-final flush; the notes on exit 2 and after the retries; the silent
+  drop of a failed final flush), and where `note(fx, store, undefined, …)`
+  lands, to tell whether a note could have been missed.
 - `claude-plugin/hooks/register.ts`: the `session.start` handler, its order
   against `session.end` at a `/clear`, and whether the module reloads then.
 - `crates/relais/src/cli/native.rs` `router-observe` and
@@ -84,7 +91,8 @@ when router-state or router-observe fails?
 
 The cause, shown by a test that goes red on it (a spawn right after a
 clear, before any person prompt, sees the new state's pins; a failed
-router-state or router-observe leaves a note), and the fix. Until it
+router-state load and a failed final flush each leave a note), and the
+fix. Until it
 lands, every relayed session can add matched `table` rows for pinned
 reviewers, and a dark session adds unmatched ones: the plan's 7-day cohort
 check (~2026-11-30) must count spawns made before a session's first

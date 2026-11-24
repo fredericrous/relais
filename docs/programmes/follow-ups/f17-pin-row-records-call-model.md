@@ -21,9 +21,13 @@ pin carry its source: today `Pin` (`pins.rs`) is only `(agent, model)`,
 `RouterState.pins` serves a bare string map, so neither side can tell an
 agent's own `model:`, its `preferred-model` and a machine pin
 (`MACHINE_PIN = "inherit"`, which definition pins overwrite) apart. A
-struct with a source enum (`Own | Preferred | Machine`) changes the
-`router-state` wire, so a plugin that reads a string must be gated
-through `accepts`. And should an unknown `preferred-model` value be
+source enum (`Own | Preferred | Machine`) cannot replace the string
+values: `accepts` lists what `router-observe` takes from the plugin, so
+it cannot protect an older plugin reading `router-state`. Keep `pins` as
+the string map and add a field beside it (say `pin_sources`, the enum in
+lowercase) that old plugins ignore, then retire `pins` once the plugin
+floor reads the new field; `accepts` is only for the row's new `model`
+field, which goes through `router-observe`. And should an unknown `preferred-model` value be
 refused, as `model:` pins never were?
 
 ## Look at
@@ -42,5 +46,6 @@ refused, as `model:` pins never were?
 
 A plugin change where a pin row records the model the call ran (the call's
 `model`, else the session model, resolved), with the pin source served
-end to end behind an `accepts` entry, or a reasoned no-change; and whether
+as an added `router-state` field (the string map kept), or a reasoned
+no-change; and whether
 an unknown preference value is validated, with the test that pins it.
