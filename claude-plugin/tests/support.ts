@@ -89,7 +89,10 @@ export function scriptedEngine(
     submitHold: null as Promise<void> | null,
     // `$.model.complete`'s answer (the classifier): unanswered by default.
     complete: (_e: any): any => ({ isAnswered: false, reason: 'empty-reply', usage: zeroUsage }),
-    sessionModel: 'claude-sonnet-5-5',
+    sessionModel: 'claude-sonnet-5-5' as string | undefined,
+    // `$.session.model()` rejects, or never settles.
+    sessionModelThrows: false,
+    sessionModelNever: false,
     // A response's usage; the model that answered is the request's.
     stepUsage: (e: any): any => ({ ...zeroUsage, input_tokens: 10, output_tokens: 5, model: e.model }),
     // Whether `agent.spawn` names the started agent (a workflow's remote one does not).
@@ -218,7 +221,11 @@ export function scriptedEngine(
     calls.completes.push(e)
     return { value: await script.complete(e) }
   })
-  on('session.model', () => ({ value: script.sessionModel }))
+  on('session.model', async () => {
+    if (script.sessionModelNever) await new Promise<void>(() => {})
+    if (script.sessionModelThrows) throw new Error('session.model failed')
+    return { value: script.sessionModel }
+  })
   on('session.messages', async (_$: any, e: any) => {
     calls.messages.push(e)
     if (script.messagesNever) await new Promise<void>(() => {})

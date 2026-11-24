@@ -71,6 +71,14 @@ prints `make: 1 carried` with no timings, which are the source attempt's.
   answers as before and exits 0; on a resumed `SessionStart` and on
   `SessionEnd` it updates the claim files and says so in one stderr line.
 
+A pinned subagent's decision row now records the model the call ran, not
+the pin. `router-state` serves `pin_sources` (`own`, `preferred`, `machine`)
+beside `pins`, and the plugin records the call's `model`, else the agent's own
+`model:`, else the session's model, which it reads after the spawn has
+started. Rows written before, and rows from a plugin older than this one,
+keep the pin's value (`opus`, or `inherit` for a machine pin). The plugin
+half needs the relais plugin reinstalled.
+
 ## v0.81.0
 
 - A session started by a `/clear` relay now holds the ticket its

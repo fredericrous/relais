@@ -1051,7 +1051,11 @@ mod tests {
     fn the_router_reads_the_review_agent_as_pinned_to_opus() {
         assert_eq!(
             crate::router::pins::parse_definition("relais-review", &agent_review()),
-            Ok(Some(("relais-review".to_string(), "opus".to_string())))
+            Ok(Some(crate::router::pins::DefinitionPin {
+                agent: "relais-review".to_string(),
+                model: "opus".to_string(),
+                source: crate::router::pins::PinSource::Preferred,
+            }))
         );
     }
 
