@@ -442,8 +442,7 @@ pub fn within<T: Send + 'static>(
     std::thread::Builder::new()
         .name("relais-shared-state".into())
         .spawn(move || {
-            // The receiver is gone once its deadline passed; nothing waits.
-            let _ = sender.send(call(&*owned));
+            let _ = sender.send(call(&*owned)); // after its deadline nobody waits for it
         })
         .map_err(|_| Unanswered::NoThread)?;
     receiver.recv_timeout(deadline).map_err(|e| match e {
