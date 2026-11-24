@@ -2,10 +2,10 @@
 
 use super::ctx::id_source;
 use super::ctx::load_contract;
-use super::ctx::load_machine;
-use super::ctx::load_price_table;
 use super::ctx::load_repo_policy;
+use super::ctx::machine_of;
 use super::ctx::open_ledger;
+use super::ctx::price_table_of;
 use super::ctx::pricing_refusals;
 use super::ctx::resolve_task_override;
 use super::learn::learned_registry;
@@ -31,6 +31,7 @@ use relais::runner::execute;
 use relais::runner::live_trial;
 use relais::runner::RunConfig;
 use relais::runner::Terminal;
+use relais::shared_state::SharedState;
 use relais::workspace;
 use std::path::Path;
 
@@ -170,22 +171,20 @@ pub(crate) fn successor_process(pid: u32) -> relais::ledger::SuccessorProcess {
 
 /// A launch of a successor intent was refused before its run existed: hand
 /// the claim back to pending with the refusal on the intent, so a later
-/// launch can take it instead of finding a claim with no run row.
+/// launch can take it instead of finding a claim with no run row. The
+/// release goes through `shared`, the state the claim was taken through: a
+/// client that keeps per-instance state releases what it granted (an-t22).
 pub(crate) fn release_intent(
+    shared: &dyn SharedState,
     ledger: &Ledger,
     source: RunSource<'_>,
     run_id: &RunId,
     refusal: &str,
 ) {
     if let RunSource::Intent(intent) = source {
-        let released = match super::ctx::shared_state() {
-            Ok(state) => {
-                relais::shared_state::node::release_claim(&*state, ledger, intent, run_id, refusal)
-                    .map_err(|e| e.to_string())
-            }
-            Err(e) => Err(e.to_string()),
-        };
-        if let Err(e) = released {
+        if let Err(e) =
+            relais::shared_state::node::release_claim(shared, ledger, intent, run_id, refusal)
+        {
             eprintln!("relais run: intent {intent} could not be released: {e}");
         }
     }
@@ -194,13 +193,14 @@ pub(crate) fn release_intent(
 /// A run that failed operationally hands its claim back only when it left
 /// no row: a run that exists holds the claim, and recovery reads its state.
 pub(crate) fn release_intent_without_run(
+    shared: &dyn SharedState,
     ledger: &Ledger,
     source: RunSource<'_>,
     run_id: &RunId,
     refusal: &str,
 ) {
     match ledger.run_exists(run_id) {
-        Ok(false) => release_intent(ledger, source, run_id, refusal),
+        Ok(false) => release_intent(shared, ledger, source, run_id, refusal),
         Ok(true) => {}
         Err(e) => eprintln!("relais run: could not tell whether run {run_id} exists: {e}"),
     }
@@ -217,10 +217,12 @@ pub(crate) fn run_command(
     }
     let session = relais::coordinator::resolve_session();
     let (root, repo) = load_repo_policy()?;
-    let machine = load_machine()?;
     // The shared half, built once for the whole run (an-t16): before the
     // intent claim and the trial row, so a failure here leaves neither.
+    // Every step below reads and writes through this one instance, the
+    // machine settings and prices included (an-t22).
     let shared = super::ctx::shared_state()?;
+    let machine = machine_of(&*shared)?;
     let workspace = match run_workspace(workspace_flag, &root, &machine, &repo)? {
         Ok(workspace) => workspace,
         Err(refusal) => {
@@ -362,10 +364,11 @@ pub(crate) fn run_command(
     }
     // The worker attempts go to the relais plugin of the parent session;
     // everything else stays on the Claude backend.
-    let prices = match load_price_table() {
+    let prices = match price_table_of(&*shared) {
         Ok(prices) => prices,
         Err(e) => {
             release_intent(
+                &*shared,
                 &ledger,
                 source,
                 &run_id,
@@ -378,6 +381,7 @@ pub(crate) fn run_command(
         Ok(refusals) => refusals,
         Err(e) => {
             release_intent(
+                &*shared,
                 &ledger,
                 source,
                 &run_id,
@@ -390,7 +394,7 @@ pub(crate) fn run_command(
         for refusal in &refusals {
             eprintln!("relais run: {refusal}");
         }
-        release_intent(&ledger, source, &run_id, &refusals.join("; "));
+        release_intent(&*shared, &ledger, source, &run_id, &refusals.join("; "));
         return Ok(CliOutcome::Blocked);
     }
     let native_backend = relais::adapter::native::NativeBackend::new(
@@ -450,6 +454,7 @@ pub(crate) fn run_command(
         Ok(trial) => trial,
         Err(e) => {
             release_intent(
+                &*shared,
                 &ledger,
                 source,
                 &run_id,
@@ -493,6 +498,7 @@ pub(crate) fn run_command(
                 Err(e) => {
                     eprintln!("relais run: {e}");
                     release_intent(
+                        &*shared,
                         &ledger,
                         source,
                         &run_id,
@@ -558,11 +564,23 @@ pub(crate) fn run_command(
                 eprintln!(
                     "relais run: storage full on {volume}; `relais resume {run_id}` reconciles the run"
                 );
-                release_intent_without_run(&ledger, source, &run_id, &format!("run failed: {e}"));
+                release_intent_without_run(
+                    &*shared,
+                    &ledger,
+                    source,
+                    &run_id,
+                    &format!("run failed: {e}"),
+                );
                 return Ok(CliOutcome::StorageFull);
             }
             eprintln!("relais run: {e}");
-            release_intent_without_run(&ledger, source, &run_id, &format!("run failed: {e}"));
+            release_intent_without_run(
+                &*shared,
+                &ledger,
+                source,
+                &run_id,
+                &format!("run failed: {e}"),
+            );
             return Ok(CliOutcome::OperationalFailure);
         }
     };
@@ -874,7 +892,13 @@ mod tests {
                 .expect("claim"),
             Claim::Claimed(_)
         ));
-        release_intent_without_run(&ledger, RunSource::Intent(&id), &run_id, "run failed");
+        release_intent_without_run(
+            &relais::shared_state::LocalState::new(),
+            &ledger,
+            RunSource::Intent(&id),
+            &run_id,
+            "run failed",
+        );
         let after = ledger.successor_intent(&id).expect("read").expect("row");
         assert_eq!(after.state, IntentState::Pending);
         assert_eq!(after.run_id, None);
@@ -892,7 +916,13 @@ mod tests {
         ledger
             .insert_run(&run_id, "/r", None, &TaskId::from_stored("task-a"), "rk")
             .expect("the run row");
-        release_intent_without_run(&ledger, RunSource::Intent(&id), &run_id, "run failed");
+        release_intent_without_run(
+            &relais::shared_state::LocalState::new(),
+            &ledger,
+            RunSource::Intent(&id),
+            &run_id,
+            "run failed",
+        );
         let after = ledger.successor_intent(&id).expect("read").expect("row");
         assert_eq!(after.state, IntentState::Claimed);
         assert_eq!(after.run_id, Some(run_id));
