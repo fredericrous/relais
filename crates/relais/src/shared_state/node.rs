@@ -846,7 +846,7 @@ mod daily_spent_tests {
     use crate::shared_state::fake::FakeState;
 
     #[test]
-    fn the_larger_of_the_global_counter_and_the_ledger_is_the_day() {
+    fn the_global_counter_is_the_day_when_there_is_one_else_the_ledger() {
         let dir = crate::test_support::temp_dir("daily-spent-max");
         let ledger = Ledger::open(&dir.join("ledger.db")).expect("ledger");
         let state = FakeState::new();
@@ -861,8 +861,8 @@ mod daily_spent_tests {
             MicroUsd::from_micros(7),
             "global above an empty ledger"
         );
-        // The ledger above a lower global count wins: the cap never counts
-        // less than this node's own spend.
+        // The global counter is the day: the ledger is no floor under it
+        // (the coordinator's settles feed the counter).
         ledger
             .insert_run(
                 &RunId::from_stored("earlier-today"),
@@ -897,8 +897,13 @@ mod daily_spent_tests {
             .expect("usage");
         assert_eq!(
             daily_spent(&state, &ledger, day).expect("read"),
+            MicroUsd::from_micros(7),
+            "the global counter alone, the ledger is no floor"
+        );
+        assert_eq!(
+            daily_spent(&crate::shared_state::LocalState::new(), &ledger, day).expect("read"),
             MicroUsd::from_micros(50),
-            "the ledger above the global count"
+            "no counter: the node's ledger"
         );
         std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup
     }

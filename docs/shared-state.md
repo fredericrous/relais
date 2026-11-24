@@ -35,15 +35,14 @@ back to an older relais.
 | the runner's widen and timed-out settles | `relais run`, `relais dataset replay` |
 | coordinator seats and their spend reservations | `relais coordinator daemon` (below) |
 
-The ceiling check reads the larger of the global counter and this node's
-ledger until the floor is dropped (`holds-until: an-t17`); the coordinator's
-settles now feed the global counter. A shared read that fails stops the run
-before dispatch.
+The ceiling check reads the global counter when the implementation keeps
+one (the coordinator's settles feed it), else this node's ledger. A shared
+read that fails stops the run before dispatch.
 
 Not routed yet, so under `external` they still read or write the node's own
 files: the daemon's read of its limits in `cli/coordinator.rs`; `relais
-doctor`, which checks the file itself; and every write of the machine
-settings file (`relais trust grant`, the learning envelope, the routing
+doctor`, which checks the file itself; and every write
+of `machine.toml` (`relais trust grant`, the learning envelope, the routing
 envelope and its off switch), since the trait has no settings write yet.
 `runner/attempt.rs`, `holdout.rs`, `cli/recipe.rs` and the pricing
 preflight only name the file in a message. `announce_schema`, `publish`,

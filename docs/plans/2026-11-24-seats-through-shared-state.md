@@ -207,19 +207,31 @@ and `RemoteGate` with a degraded fake answers `Queued`.
   an exhausted slice is a budget refusal; no new wire variant.
 - 2026-11-24: the reservation rides with the seat in this ticket (an-t16's
   Resolution leaves the global counter's writer to an-t17).
-- 2026-11-24: the fleet pack refresh rides this branch.
+- 2026-11-24: the fleet pack refresh did not ride this branch: its commit
+  conflicted with main's newer pack in the rebase and was skipped.
+- 2026-11-24: the ticket owns the global counter's writer, so
+  `shared_state/node.rs` `daily_spent` drops its ledger floor
+  (`holds-until: an-t17`): the global counter alone is the day when the
+  implementation keeps one, else the ledger. Its test is renamed and now pins
+  that (the one existing test edited beyond the `Coordinator::start`
+  argument).
+- 2026-11-24: accepted gap. Spend that never passes through the daemon's
+  `settle_spend` (a `relais run` with no daemon, the runner's own settles)
+  is not in the global counter, and with the floor gone the cap does not see
+  it under an external primary. No external client exists yet; the follow-up
+  is to have the runner's settles feed the counter too.
 
 ## Verification
 
 | Check | Input | Expected | Actual |
 |---|---|---|---|
-| seat tests | `cargo test -p relais --lib coordinator::seats` | the fake tests above pass | |
-| conformance | `cargo test -p relais --lib --features conformance shared_state::` | unchanged, pass | |
-| suite | `cargo test --workspace` | passes with no existing test edited beyond the `Coordinator::start` argument | |
-| piloted daemon | branch binary, scratch `RELAIS_STATE_DIR`: `relais coordinator daemon` with `shared_state` absent, then `= "external"` | absent: serves, `relais coordinator status` as on `main`; external: one stderr line, empty stdout, exit 3, no socket created (check before bind) | |
-| lint | `cargo clippy -p relais --all-targets --features conformance -- -D warnings` | clean | |
-| counter writer | `FakeState` test: one grant, then settle | shared counter shows the reservation after grant and the settled amount after settle | |
-| socket downgrade | `cargo test -p relais --lib coordinator::` socket test with a degraded `FakeState` | the admission reply is `Queued { position: 1 }` with the stderr line; after recovery the next poll is `Granted` | |
+| seat tests | `cargo test -p relais --lib coordinator::seats` | the fake tests above pass | `cargo test -p relais --lib coordinator::` passed (347 s, before a dead-constant removal); the final tree is covered by the workspace row |
+| conformance | `cargo test -p relais --lib --features conformance shared_state::` | unchanged, pass | the same workspace run with `relais/conformance` (the conformance cases run there; `node::daily_spent` is exercised by `a_fresh_state_is_online_and_empty`): passed |
+| suite | `cargo test --workspace` | passes with no existing test edited beyond the `Coordinator::start` argument | `cargo test -q --workspace --features relais/conformance`: passed (1503 s, no warnings), the final tree. One existing test edited beyond the `Coordinator::start` argument: `node::daily_spent_tests` renamed and now pinning the dropped floor |
+| piloted daemon | branch binary, scratch `RELAIS_STATE_DIR`: `relais coordinator daemon` with `shared_state` absent, then `= "external"` | absent: serves, `relais coordinator status` as on `main`; external: one stderr line, empty stdout, exit 3, no socket created (check before bind) | scratch `RELAIS_CONFIG_DIR` and `RELAIS_STATE_DIR` (binary built by the workspace run with `relais/conformance`): absent, the daemon serves (`relais coordinator status` shows the socket and limits) and `stop` ends it; external, exit 3, empty stdout, one stderr line, no socket created |
+| lint | `cargo clippy -p relais --all-targets --features conformance -- -D warnings` | clean | see the commit |
+| counter writer | `FakeState` test: one grant, then settle | shared counter shows the reservation after grant and the settled amount after settle | `a_grant_takes_a_seat_and_a_reservation_and_the_settle_books_the_spend`: pass |
+| socket downgrade | `cargo test -p relais --lib coordinator::` socket test with a degraded `FakeState` | the admission reply is `Queued { position: 1 }` with the stderr line; after recovery the next poll is `Granted` | `an_unreachable_primary_turns_the_grant_into_a_wait_until_it_grants` and `the_coordinator_answers_a_refused_shared_seat_as_queued`: pass |
 
 ## Outcome
 

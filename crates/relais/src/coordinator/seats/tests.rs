@@ -7,8 +7,6 @@ use crate::policy::ConcurrencyLimits;
 use crate::shared_state::fake::FakeState;
 use crate::shared_state::{LocalState, Slice};
 
-const START: i64 = 1_800_000_000;
-
 fn limits(agents: u32) -> ConcurrencyLimits {
     ConcurrencyLimits {
         max_active_agents: Some(agents),
