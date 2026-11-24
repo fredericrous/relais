@@ -296,6 +296,10 @@ fn a_lock_that_stays_held_exits_1_naming_the_lock_and_the_retry() {
         stderr.contains(lock_path.to_str().expect("utf8")),
         "{stderr}"
     );
+    // The programme driver retries a claim's exit 1 only on this wording
+    // (the programme skill's Drive section); a rewording turns every lock
+    // wait into a stop.
+    assert!(stderr.contains("stayed held for"), "{stderr}");
     assert!(
         stderr.contains("next: relais programme claim p t1"),
         "{stderr}"

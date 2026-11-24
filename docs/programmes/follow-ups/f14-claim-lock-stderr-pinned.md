@@ -1,7 +1,7 @@
 +++
 type = "task"
 mode = "afk"
-status = "open"
+status = "closed"
 blocked_by = []
 repos = ["relais"]
 +++
