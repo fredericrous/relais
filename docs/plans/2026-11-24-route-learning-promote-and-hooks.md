@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: prog/agents-many-nodes/an-t18-route-learning-promote-and-hooks
 repos: [relais, homelab]
 adrs: []
@@ -171,11 +171,11 @@ treats an absent file as defaults, as `router::read_machine` does.
 
 ## Phases
 
-- [ ] Phase 1 (the headline race fix; independently mergeable, and Phases 2-3 may split to a follow-up PR if review stalls) — registry: `crates/relais/src/shared_state/node.rs`,
+- [x] Phase 1 (the headline race fix; independently mergeable, and Phases 2-3 may split to a follow-up PR if review stalls) — registry: `crates/relais/src/shared_state/node.rs`,
   `crates/relais/src/learn/cycle.rs`, `crates/relais/src/cli/learn.rs`,
   `crates/relais/src/shared_state/fake.rs`,
   `crates/relais/src/shared_state/conformance.rs`; one commit
-- [ ] Phase 2 — programme claims and hooks:
+- [x] Phase 2 — programme claims and hooks:
   `crates/relais/src/shared_state/mod.rs`,
   `crates/relais/src/shared_state/types.rs`,
   `crates/relais/src/shared_state/local.rs`,
@@ -186,13 +186,13 @@ treats an absent file as defaults, as `router::read_machine` does.
   `crates/relais/src/hook/respond.rs`, `crates/relais/src/cli/doctor.rs`,
   `crates/relais/src/cli/programme.rs`,
   `crates/relais/tests/shared_state_cli.rs`; one commit
-- [ ] Phase 3 — readers and docs: `crates/relais/src/cli/ctx.rs`,
+- [x] Phase 3 — readers and docs: `crates/relais/src/cli/ctx.rs`,
   `crates/relais/src/router/mod.rs`, `crates/relais/src/cli/native.rs`,
   `docs/shared-state.md`, `CHANGELOG.md` (the trait gains three methods: a
   breaking change for a client, minor bump); one commit. Before the PR,
   the branch rebases on whichever of an-t16 and an-t17 merged (both edit
   `node.rs`, `fake.rs`, `docs/shared-state.md`)
-- [ ] Phase 4 — homelab ticket closure:
+- [x] Phase 4 — homelab ticket closure:
   `docs/programmes/agents-many-nodes/an-t18-route-learning-promote-and-hooks.md`,
   its line in `docs/programmes/agents-many-nodes/map.md` (Decisions so
   far only), and the follow-up ticket for settings writes, whose id the
@@ -211,22 +211,92 @@ treats an absent file as defaults, as `router::read_machine` does.
   external client (with one stderr line), because a hook may never fail a
   session on bookkeeping and the local pass is what ran before.
 
+## Decision log (implementation)
+
+- 2026-11-24 — The module-cycle gate refused `learn -> shared_state` (the
+  node half already imports `learn::registry`) and would refuse
+  `programme -> shared_state` the same way. Inverted: `learn::cycle` owns a
+  `PointerWrites` trait (`PointerRefusal`, finally `Superseded`, `Refused`, `Compensated`, `Failed` (below)), and
+  `programme::claim` owns `Reservations` (with `EmptyProgramme`);
+  `shared_state::node` implements them as `NodePointers(Arc<dyn
+  SharedState>)` and `NodeReservations(&dyn SharedState)`, and the CLI
+  builds both. So `CycleInputs` gains `pointers`, not `shared_state`, and
+  `roll_back_active` takes `&dyn PointerWrites`.
+- 2026-11-24 — The cycle's lost promote is `AwaitingPromotion` with the
+  `relais promote <id>` hint (one of the two actions the plan allowed): the
+  person decides whether the new artifact should replace the one that won.
+  A refused one (a held lock, or a shared pointer this node cannot follow)
+  is action `None` with no hint, since the hinted command would be refused
+  the same way (implementation review).
+- 2026-11-24 — A heal that cannot complete is a `Refused` naming the
+  artifact and why, not the `CasConflict` the Behaviour section says: a
+  conflict read as a race a retry wins, and the cycle and `relais promote`
+  printed "run it again". A failure to read the node's own artifact files
+  (`ArtifactError::Io`) is that error. `PointerRefusal` is `Superseded`,
+  `Refused`, `Compensated` and `Failed`, so the CLI matches variants and
+  never downcasts (lang:rust, architect, backend).
+- 2026-11-24 — One bounded-call helper, `shared_state::node::within`
+  (a named `std::thread::Builder` thread, `recv_timeout`, `Unanswered` says
+  deadline, died or no thread), serves the hook's claim passes and its
+  admission settings; the settings read runs on it for every
+  implementation, `LocalState` included (architect, lang:rust).
+- 2026-11-24 — The "Cycle loses" row runs with the fake's pointer moved
+  before the cycle (another node's promote that won), not the first-swap
+  wrapper the row names, and only on the fake: under `LocalState` the
+  person's promote between check and swap is the `roll_back_active` test
+  with a judged artifact no longer active. The cycle then goes on to train
+  (action `None`, no rows for lack of data).
+- 2026-11-24 — The hook's shared deadline is `SHARED_CLAIM_DEADLINE`, 1 s,
+  inside `GATHER_DEADLINE`; the shared call runs first and the local pass
+  after it (the architect's carried note: the local pass keeps its budget,
+  since `ONCE_GRACE` bounds it separately).
+- 2026-11-24 — The work-hold lapse is checked on the fake
+  (`a_work_hold_renewed_stays_and_one_left_alone_lapses`), not in
+  `conformance`: the trait exposes no TTL, so a generic check cannot know
+  when a client's hold lapses.
+- 2026-11-24 — The hook's absent-client line ends with the existing
+  `ExternalAbsent` sentence (it names the machine.toml path), so the plan's
+  wording is its prefix; the integration test pins the prefix and the fix.
+- 2026-11-24 — The follow-up for settings writes went to the homelab inbox
+  for the driver to file: a ticket agent writes only its own ticket file
+  and its Decisions line.
+
 ## Verification
 
-| Check | Input | Expected |
-|---|---|---|
-| Race (both orders) | `LocalState` and `FakeState`; two registries over one dir; promote B judged against A and rollback judged against A, run promote-first then rollback-first | exactly one returns `Ok`, the other `CasConflict`; the pointer files name the winner |
-| Cycle loses | cycle with an artifact due for rollback; a person's promote lands between the check and the swap (test seam: a wrapper `SharedState` that, on its first `swap_registry_pointer`, moves the fake's pointer or promotes C locally under `LocalState`, then delegates) | action `None`, the note names the other artifact, no rollback row |
-| Heal | fake's shared pointer moved to an evaluated B via a direct trait call; then `node::roll_back_registry` / `swap_registry_pointer` | local active becomes B first, then the operation runs; with B missing locally: `CasConflict` naming B |
-| Flock on both paths | `.pointer.lock` held through `LockFile::try_acquire`; `swap_registry_pointer` and `roll_back_registry` on `FakeState` (`Swapped`) and `LocalState` | `Refused` after `REGISTRY_LOCK_WAIT`; the shared pointer unmoved |
-| No heal locally | `LocalState`; `relais promote B` while no shared pointer exists | only the requested pointer files change; no `Registry::evaluated` heal call, no heal note |
-| Grep | `Registry::promote` / `.rollback(` call sites outside `shared_state/node.rs` and the named in-file test modules (`learn/cycle.rs` tests, `learn/registry.rs` tests); `reserve_handoff`, `refresh_session_once`, `end_session_once` outside `programme/claim/` and `shared_state/node.rs` | none |
-| Hooks | conformance cases for the three new methods on both impls; fake: handoff held, session end gives back work holds and keeps handoff | pass |
-| Hook under absent external | `tests/shared_state_cli.rs`: `shared_state = "external"`, a SessionEnd payload with a claim on disk | exit 0, one stderr line, stdout still a valid hook answer, the work claim file removed |
-| Piloted | built binary in a scratch HOME: `relais promote`, `relais rollback`, `relais programme next --claim` on a scratch programme | same stdout, stderr, exit code and files as `origin/main`'s binary, run non-TTY with `NO_COLOR=1` |
-| Suite | `cargo test -p relais --features conformance` | passes |
-| Lint | the pre-commit gates | clean |
+| Check | Input | Expected | Observed |
+|---|---|---|---|
+| Race (both orders) | `LocalState` and `FakeState`; two registries over one dir; promote B judged against A and rollback judged against A, run promote-first then rollback-first | exactly one returns `Ok`, the other `CasConflict`; the pointer files name the winner | promote-first: art-b active, rollback `CasConflict`; rollback-first: art-z active, promote `CasConflict`; on `LocalState` and the fake (`a_promote_and_a_rollback_judged_against_one_artifact_cannot_both_win`) |
+| Cycle loses | cycle with an artifact due for rollback; a person's promote lands between the check and the swap (test seam: a wrapper `SharedState` that, on its first `swap_registry_pointer`, moves the fake's pointer or promotes C locally under `LocalState`, then delegates) | action `None`, the note names the other artifact, no rollback row | action `None`; note `rollback of art-b wanted (1 run(s) it routed were reverted or had a regression confirmed) but art-c is active now; nothing changed, the next cycle judges art-c`; no rollback row (fake seam, see the Decision log) |
+| Heal | fake's shared pointer moved to an evaluated B via a direct trait call; then `node::roll_back_registry` / `swap_registry_pointer` | local active becomes B first, then the operation runs; with B missing locally: `CasConflict` naming B | shared art-b ahead: art-b made active, then rolled back to art-a on both pointers; art-elsewhere not held: `Refused` naming it with `no artifact art-elsewhere in this registry` (Decision log) |
+| Flock on both paths | `.pointer.lock` held through `LockFile::try_acquire`; `swap_registry_pointer` and `roll_back_registry` on `FakeState` (`Swapped`) and `LocalState` | `Refused` after `REGISTRY_LOCK_WAIT`; the shared pointer unmoved | `Refused` on both paths and both implementations with a zero wait; shared pointer and local active still art-a |
+| No heal locally | `LocalState`; `relais promote B` while no shared pointer exists | only the requested pointer files change; no `Registry::evaluated` heal call, no heal note | `LocalState` answers `NodeDecides`, `heal` returns at once; existing promote tests and the pilot unchanged |
+| Grep | `Registry::promote` / `.rollback(` call sites outside `shared_state/node.rs` and the named in-file test modules (`learn/cycle.rs` tests, `learn/registry.rs` tests); `reserve_handoff`, `refresh_session_once`, `end_session_once` outside `programme/claim/` and `shared_state/node.rs` | none | only `shared_state/node.rs`, `programme/claim/store.rs` and test modules |
+| Hooks | conformance cases for the three new methods on both impls; fake: handoff held, session end gives back work holds and keeps handoff | pass | `a_session_gives_back_its_work_and_keeps_its_handoff` passes on both; fake: work given back, handoff held, retry by its own holder granted |
+| Hook under absent external | `tests/shared_state_cli.rs`: `shared_state = "external"`, a SessionEnd payload with a claim on disk | exit 0, one stderr line, stdout still a valid hook answer, the work claim file removed | exit 0, one line starting `relais: shared claims skipped, the local claims were updated: machine.toml `, stdout identical to the local run, claim removed; a 10 s slow fake: SessionEnd answers inside 2 s, local pass ran |
+| Piloted | built binary in a scratch HOME: `relais promote`, `relais rollback`, `relais programme next --claim` on a scratch programme | same stdout, stderr, exit code and files as `origin/main`'s binary, run non-TTY with `NO_COLOR=1` | branch binary vs installed 0.80.0 (no origin/main binary built on a jammed host): rollback, rollback --json, promote of a missing artifact, programme next, programme next --claim on a scratch programme, a SessionEnd hook: identical on all four streams |
+| Suite | `cargo test -p relais --features conformance` | passes | full `cargo test` on Phase 3: lib 2651, bin 64, it 351, programme_claims 16, programme_session 16, shared_state_cli 4, all pass; after the review fixes: lib subset (shared_state, hook, programme, learn, router, cli) 588, `it` (learning, rollback, promote, hook) 45, shared_state_cli 4, all pass |
+| Lint | the pre-commit gates | clean | fmt, clippy with and without `conformance` (`-D warnings`), module and child cycle checks: clean, before and after the review fixes |
+
+## Implementation review
+
+- implementation-review: round 1 approve-with-changes (banners, discards, real waits, names, heal note) fixed; delta approve-with-changes (test names, lost-promote note) fixed; final tree approve; 127k + 74k + 79k tokens.
+- architect: round 1 two lows fixed (`Refused`, one `within` helper); delta approve; `deliberate: within stays in node and PointerRefusal keeps its name (optional moves)`.
+- backend: round 1 one medium and three lows fixed (heal note, `Io` kept, `Died`, retried reservation); delta approve; `deliberate: the admission read falls back silently, as an unreadable file always has`.
+- lang:rust: round 1 two mediums, four lows fixed, fake's `handoff: bool` `deliberate: a test fake's row`; final tree approve; `deliberate: no Compensated test (needs a primary failing between two calls; node-level test covers compensated())`, rollback's shared errors stay operational, as before.
+- unix: round 1 three lows fixed (stderr under --json, one-line warning); deltas approve-with-changes: whitespace collapsed, --json stderr in the CHANGELOG; `deliberate: the withheld-note wording is new on this unreleased branch`.
 
 ## Outcome
+
+Built as planned, in one relais PR of five commits after the plan: every
+registry pointer write and every programme-claim write goes through the
+node half of `SharedState`, and the settings readers go through
+`machine_settings()`. A promote and a rollback judged against the same
+artifact cannot both land (tested in both orders on both implementations);
+the `holds-until: an-t18` marker is resolved by the heal. Not done here, by
+decision: settings writes (the trait has none; follow-up in the homelab
+inbox), the spend check and settles (an-t16), the coordinator's seats
+(an-t17). Surprises: the module-cycle gate forced two small traits owned by
+`learn` and `programme`; the host's load reached 300, so the commit gates
+deferred clippy and the suite, which were run by hand on every tree.
 
 <!-- panel: repos=relais,homelab adds=contract reviewers=architect,backend,lang:rust,po,tui,unix body-sha=aa0703c7c3ee -->
