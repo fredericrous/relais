@@ -45,11 +45,12 @@ use self::native::native_command;
 use self::outcome::{exit_code, CliError, CliOutcome};
 use self::plan::{plan_command, PlanFormat};
 use self::programme::{
-    check_command as programme_check_command, claim_command as programme_claim_command,
-    frontier_command as programme_frontier_command, list_command as programme_list_command,
-    next_command as programme_next_command, release_command as programme_release_command,
-    session_command as programme_session_command, show_command as programme_show_command, Fetch,
-    Format, Listing, Reservation as ProgrammeReservation,
+    adopt_command as programme_adopt_command, check_command as programme_check_command,
+    claim_command as programme_claim_command, frontier_command as programme_frontier_command,
+    list_command as programme_list_command, next_command as programme_next_command,
+    release_command as programme_release_command, session_command as programme_session_command,
+    show_command as programme_show_command, Fetch, Format, Listing,
+    Reservation as ProgrammeReservation,
 };
 use self::protocol::{announce_unstarted, open_protocol};
 use self::recipe::{
@@ -573,6 +574,25 @@ pub(crate) enum ProgrammeCommand {
         /// A directory inside the map's repository (default: the current one)
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// The session id (default: from the environment)
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Take over, as this session's `work`, every ticket the session a
+    /// `/clear` ended handed off to it
+    ///
+    /// Each live `handoff` claim of `--previous` is claimed for the session
+    /// as `relais programme claim` would. A ticket another session already
+    /// holds stays with it. One line per ticket on stderr, for people;
+    /// stdout stays empty. Exit 0 when every ticket was taken, is held by
+    /// another session or is closed; exit 1 when a lock stayed held, a
+    /// ticket's repository is not found or the store fails, after trying
+    /// every ticket; exit 2 on a usage error. A second run finds nothing
+    /// and exits 0.
+    Adopt {
+        /// The session the `/clear` ended
+        #[arg(long)]
+        previous: String,
         /// The session id (default: from the environment)
         #[arg(long)]
         session: Option<String>,
@@ -1706,6 +1726,9 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 dir,
                 session,
             } => programme_release_command(&slug, &id, dir.as_deref(), session.as_deref()),
+            ProgrammeCommand::Adopt { previous, session } => {
+                programme_adopt_command(&previous, session.as_deref())
+            }
             ProgrammeCommand::Session {
                 session,
                 previous,

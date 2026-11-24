@@ -930,7 +930,6 @@ pub(crate) fn claim_command(
             ),
         });
     }
-    store.forget_ended(&session).map_err(claim_io)?;
     let steal_flag = match contest {
         claim::Contest::Refuse => "",
         claim::Contest::Steal => " --steal",
@@ -939,10 +938,44 @@ pub(crate) fn claim_command(
         "relais programme claim {slug} {id}{}{steal_flag}",
         dir_argument(dir)
     );
-    let holder = relais::shared_state::Principal::operator(session.clone());
+    match take_ticket(&store, &state, id, &session, contest, now)? {
+        Err(error) => claim_outcome(error, &retry),
+        Ok(claim::Taken::Claimed { how, from }) => {
+            eprintln!("relais: {}", claimed_line(&state, slug, id, how, from));
+            refresh_session_best_effort(&store, &session, now);
+            Ok(CliOutcome::Accepted)
+        }
+        Ok(claim::Taken::Refused { holder, age_secs }) => {
+            eprintln!("relais: {}", held_line(&state, slug, id, &holder, age_secs));
+            eprintln!("next: relais programme next --from {repo}:{slug} --claim");
+            eprintln!("to take it over (only when the person says so):");
+            eprintln!(
+                "relais programme claim {slug} {id}{} --steal",
+                dir_argument(dir)
+            );
+            Ok(CliOutcome::Blocked)
+        }
+    }
+}
+
+/// Claims `id` of `state` for `session` as `work`, through the shared state
+/// and then the claim file: the core `claim` and `adopt` share. It prints
+/// nothing but the one line a shared hold that could not be given back
+/// earns. The inner error is a claim-store failure (a lock that stayed
+/// held, or I/O), which each caller reports its own way.
+fn take_ticket(
+    store: &claim::Store,
+    state: &claim::ProgrammeState,
+    id: &str,
+    session: &str,
+    contest: claim::Contest,
+    now: i64,
+) -> Result<Result<claim::Taken, claim::ClaimError>, CliError> {
+    store.forget_ended(session).map_err(claim_io)?;
+    let holder = relais::shared_state::Principal::operator(session.to_string());
     let taken = relais::shared_state::node::claim_ticket(
         &*super::ctx::shared_state()?,
-        &store,
+        store,
         &relais::shared_state::TicketClaim {
             key: &state.key,
             closed: &state.closed,
@@ -954,9 +987,9 @@ pub(crate) fn claim_command(
         },
     )
     .map(|grant| grant.taken);
-    let taken = match taken {
-        Ok(taken) => Ok(taken),
-        Err(NodeError::Claim(error)) => Err(error),
+    match taken {
+        Ok(taken) => Ok(Ok(taken)),
+        Err(NodeError::Claim(error)) => Ok(Err(error)),
         // The claim file failed after a shared grant and the grant could
         // not be given back: the claim's own outcome still prints, with its
         // retry command, and the release failure is one more line.
@@ -965,54 +998,144 @@ pub(crate) fn claim_command(
                 eprintln!(
                     "relais programme claim: the shared hold could not be given back: {release}"
                 );
-                Err(error)
+                Ok(Err(error))
             }
             local => {
                 let joined = NodeError::Compensation {
                     local: Box::new(local),
                     release,
                 };
-                return Err(super::ctx::node_error("claiming the ticket", joined));
+                Err(super::ctx::node_error("claiming the ticket", joined))
             }
         },
-        Err(other) => return Err(super::ctx::node_error("claiming the ticket", other)),
-    };
-    match taken {
-        Err(error) => claim_outcome(error, &retry),
-        Ok(claim::Taken::Claimed { how, from }) => {
-            let line = match (how, from) {
-                (claim::Acquired::Created, _) => format!("claimed {repo} {slug} {id}"),
-                (claim::Acquired::TookOver, Some(from)) => {
-                    format!("took over {repo} {slug} {id} from {}", from.short())
-                }
-                (claim::Acquired::TookOver, None) => format!("took over {repo} {slug} {id}"),
-                (claim::Acquired::Refreshed, _) => {
-                    format!("refreshed your claim on {repo} {slug} {id}")
-                }
-                (claim::Acquired::Stole, Some(from)) => {
-                    format!("took {repo} {slug} {id} from {} (--steal)", from.short())
-                }
-                (claim::Acquired::Stole, None) => format!("took {repo} {slug} {id} (--steal)"),
-            };
-            eprintln!("relais: {line}");
-            refresh_session_best_effort(&store, &session, now);
-            Ok(CliOutcome::Accepted)
+        Err(other) => Err(super::ctx::node_error("claiming the ticket", other)),
+    }
+}
+
+/// The line a claim that was written prints, after `relais: `.
+fn claimed_line(
+    state: &claim::ProgrammeState,
+    slug: &str,
+    id: &str,
+    how: claim::Acquired,
+    from: Option<claim::Holder>,
+) -> String {
+    let repo = &state.repo;
+    match (how, from) {
+        (claim::Acquired::Created, _) => format!("claimed {repo} {slug} {id}"),
+        (claim::Acquired::TookOver, Some(from)) => {
+            format!("took over {repo} {slug} {id} from {}", from.short())
         }
-        Ok(claim::Taken::Refused { holder, age_secs }) => {
+        (claim::Acquired::TookOver, None) => format!("took over {repo} {slug} {id}"),
+        (claim::Acquired::Refreshed, _) => format!("refreshed your claim on {repo} {slug} {id}"),
+        (claim::Acquired::Stole, Some(from)) => {
+            format!("took {repo} {slug} {id} from {} (--steal)", from.short())
+        }
+        (claim::Acquired::Stole, None) => format!("took {repo} {slug} {id} (--steal)"),
+    }
+}
+
+/// The line a refused claim prints first, after `relais: `.
+fn held_line(
+    state: &claim::ProgrammeState,
+    slug: &str,
+    id: &str,
+    holder: &claim::Holder,
+    age_secs: u64,
+) -> String {
+    format!(
+        "{} {slug} {id} is held by {} ({} old)",
+        state.repo,
+        holder.short(),
+        format_age(age_secs)
+    )
+}
+
+/// `relais programme adopt`: every live `handoff` claim of `previous` (the
+/// session a `/clear` ended) becomes this session's `work`, through the same
+/// path as `relais programme claim`, so the relayed session holds its ticket
+/// whether or not its agent claims it (follow-ups f12). Each ticket is tried
+/// on its own; one line per ticket on stderr, nothing on stdout.
+pub(crate) fn adopt_command(previous: &str, session: Option<&str>) -> Result<CliOutcome, CliError> {
+    let session = writing_session(session)?;
+    let previous = previous.trim();
+    if previous.is_empty() {
+        return Err(CliError::Usage {
+            detail: "--previous is empty; pass the session the /clear ended".to_string(),
+        });
+    }
+    if previous == session {
+        return Err(CliError::Usage {
+            detail: "--previous is this session; pass the session the /clear ended".to_string(),
+        });
+    }
+    let store = claim_store()?;
+    let now = now_unix();
+    let handoffs: Vec<claim::SessionClaim> = store
+        .claims_of(previous, now)
+        .map_err(claim_io)?
+        .live
+        .into_iter()
+        .filter(|found| found.claim.kind == claim::Kind::Handoff)
+        .collect();
+    let mut failed = false;
+    for found in &handoffs {
+        let (slug, id) = (found.key.slug.as_str(), found.id.as_str());
+        let recorded = Path::new(&found.claim.repo);
+        let named = format!("{} {slug} {id}", dir_name(recorded));
+        let Some(dir) = relais::learn::salvage::reachable_repo(recorded) else {
             eprintln!(
-                "relais: {repo} {slug} {id} is held by {} ({} old)",
-                holder.short(),
-                format_age(age_secs)
+                "relais: {named} skipped: its repository is not found ({})",
+                found.claim.repo
             );
-            eprintln!("next: relais programme next --from {repo}:{slug} --claim");
-            eprintln!("to take it over (only when the person says so):");
+            failed = true;
+            continue;
+        };
+        let state = match claim_target(slug, Some(&dir), &store, now) {
+            Ok(loaded) if loaded.state.key == found.key => loaded.state,
+            Ok(_) => {
+                eprintln!(
+                    "relais: {named} skipped: {} is not the repository that holds the claim",
+                    dir.display()
+                );
+                failed = true;
+                continue;
+            }
+            Err(error) => {
+                eprintln!("relais: {named} skipped: its programme cannot be read: {error}");
+                failed = true;
+                continue;
+            }
+        };
+        if !state.open.contains_key(id) {
             eprintln!(
-                "relais programme claim {slug} {id}{} --steal",
-                dir_argument(dir)
+                "relais: {} {slug} {id} skipped: the ticket is closed",
+                state.repo
             );
-            Ok(CliOutcome::Blocked)
+            continue;
+        }
+        match take_ticket(&store, &state, id, &session, claim::Contest::Refuse, now) {
+            Ok(Ok(claim::Taken::Claimed { how, from })) => {
+                eprintln!("relais: {}", claimed_line(&state, slug, id, how, from));
+            }
+            Ok(Ok(claim::Taken::Refused { holder, age_secs })) => {
+                eprintln!("relais: {}", held_line(&state, slug, id, &holder, age_secs));
+            }
+            Ok(Err(error)) => {
+                eprintln!("relais: {} {slug} {id}: {error}", state.repo);
+                failed = true;
+            }
+            Err(error) => {
+                eprintln!("relais: {} {slug} {id}: {error}", state.repo);
+                failed = true;
+            }
         }
     }
+    Ok(if failed {
+        CliOutcome::OperationalFailure
+    } else {
+        CliOutcome::Accepted
+    })
 }
 
 /// Why the null answer of `programme session` has no programme.
