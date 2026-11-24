@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: prog/agents-many-nodes/an-t22-one-shared-state-in-run
 repos: [relais, homelab]
 adrs: []
@@ -91,7 +91,7 @@ for one node: `LocalState` holds no state.
 
 ## Phases
 
-- [ ] Phase 1 — one state per run: `crates/relais/src/cli/run.rs`,
+- [x] Phase 1 — one state per run: `crates/relais/src/cli/run.rs`,
   `crates/relais/src/cli/ctx.rs`, `docs/shared-state.md` (one bullet beside
   "fences within one instance only": a command builds one state and hands
   it to every step).
@@ -106,11 +106,11 @@ for one node: `LocalState` holds no state.
 
 | Check | Input | Expected | Actual |
 | --- | --- | --- | --- |
-| one construction | `grep -cF 'shared_state()' crates/relais/src/cli/run.rs` (whole file: the tests build `LocalState::new()`), on main and on the branch | main: `2` (lines 181, 223); branch: `1`, in `run_command` | |
-| no hidden construction | `grep -nF -e 'load_machine(' -e 'load_price_table(' -e 'load_machine_pricing(' -e 'tuning_bounds(' -e 'machine_for_router(' -e 'shared_state_for_hook(' crates/relais/src/cli/run.rs`, on main and on the branch | main: lines 220 and 365 (the pattern bites); branch: no match | |
-| release tests | `cargo test -p relais --bin relais cli::run` | the two release tests pass, now handed `&LocalState::new()`: they no longer read the developer's own `machine.toml` through `ctx::shared_state()` | |
-| suite | `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings` | green | |
-| pilot | `relais run` from the main and the branch binaries with `shared_state = "external"` in a sandboxed `machine.toml` (`HOME` in a temp dir), once in a repository with a `relais.toml` and once in a directory with none; stdout, stderr and exit code captured | each pair: the same exit code (3 with a policy), `diff` of stdout and of stderr empty | |
+| one construction | `grep -cF 'shared_state()' crates/relais/src/cli/run.rs` (whole file: the tests build `LocalState::new()`), on main and on the branch | main: `2` (lines 181, 223); branch: `1`, in `run_command` || main `2`, branch `1` (run.rs:224, in `run_command`) |
+| no hidden construction | `grep -nF -e 'load_machine(' -e 'load_price_table(' -e 'load_machine_pricing(' -e 'tuning_bounds(' -e 'machine_for_router(' -e 'shared_state_for_hook(' crates/relais/src/cli/run.rs`, on main and on the branch | main: lines 220 and 365 (the pattern bites); branch: no match || main: 220, 365; branch: no match |
+| release tests | `cargo test -p relais --bin relais cli::run` | the two release tests pass, now handed `&LocalState::new()`: they no longer read the developer's own `machine.toml` through `ctx::shared_state()` || 7 passed, both release tests among them |
+| suite | `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings` | green || `cargo test --workspace` 0 failed (lib 2671 passed, bin 351, ...); clippy clean, also with `--features conformance` |
+| pilot | `relais run` from the main and the branch binaries with `shared_state = "external"` in a sandboxed `machine.toml` (`HOME` in a temp dir), once in a repository with a `relais.toml` and once in a directory with none; stdout, stderr and exit code captured | each pair: the same exit code (3 with a policy), `diff` of stdout and of stderr empty || with a policy: both exit 3, `shared_state_absent`, stdout and stderr `diff` empty; no policy: both exit 2, `not_in_repository`, both diffs empty |
 
 A behaviour test that a passed-in state receives the release needs
 `shared_state::fake::FakeState`, which the binary's tests cannot see
@@ -120,8 +120,25 @@ the one released" a type fact; the grep proves nothing else is built.
 
 ## Decision log
 
+- No fallback construction in `release_intent`: every call sits after the
+  intent claim, which used the run's state; the ticket's "caller that runs
+  before the state exists" has none.
+- No `FakeState` test: the binary's tests cannot see it without the
+  `conformance` feature; the signature and the one-construction grep carry
+  the guarantee (accepted by every reviewer).
+- Phase 2 is the homelab PR on the same branch name, opened after this land.
+
 ## Implementation review
 
+- implementation-review: approve-with-changes; empty Actual cells and the unticked Phase 1 fixed in this commit; the release tests' limit kept as stated; candidate `e` binding ruled fine (44k, 17 s).
+- backend: approve; the `relais replay` follow-up: deliberate: filed in the relais inbox and reported to the driver, since this ticket writes only its own homelab files (54k, 43 s).
+- lang:rust: approve, no findings (48k, 35 s).
+
 ## Outcome
+
+`relais run` builds one `SharedState` (run.rs:224) and every step reads and
+writes through it: machine settings, prices, the intent claim and release,
+the runner. Nothing changes for one node; main and branch print the same
+bytes on the refusal paths piloted.
 
 <!-- panel: repos=relais,homelab reviewers=backend,lang:rust,tui,unix body-sha=aadeefd778d6 -->
