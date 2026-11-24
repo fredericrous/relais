@@ -111,13 +111,26 @@ async function adoptPrevious(fx: Fx, store: Store, session: string, ms: number) 
     memory.adopt = undefined // Another session: the successor is gone
     return
   }
-  const running: Adoption & { state: 'running' } = {
+  const running: Extract<Adoption, { state: 'running' }> = {
     state: 'running',
     previous: adoption.previous,
     session,
     since: adoption.state === 'failed' ? adoption.since : undefined,
   }
   memory.adopt = running
+  try {
+    await adoptOnce(fx, store, running, ms)
+  } catch {
+    // An effect that throws must not leave the adoption running forever:
+    // it is retried at the next read, like any other failure.
+    if (memory.adopt === running) memory.adopt = { state: 'failed', previous: running.previous, session, since: running.since ?? 0 }
+  }
+}
+
+// One `relais programme adopt` for an adoption already marked running.
+async function adoptOnce(fx: Fx, store: Store, running: Extract<Adoption, { state: 'running' }>, ms: number) {
+  const memory = store.programme
+  const { previous, session } = running
   const now = await fx.clock.now()
   if (store.closed || memory.adopt !== running) return
   // Bound at the successor's first read, seconds after the clear.
@@ -125,35 +138,37 @@ async function adoptPrevious(fx: Fx, store: Store, session: string, ms: number) 
   running.since = since
   if (now - since > ADOPT_GIVE_UP_MS) {
     // No more retries; the note stays for this session.
-    memory.adopt = { state: 'gaveUp', previous: running.previous, session }
+    memory.adopt = { state: 'gaveUp', previous, session }
     await recordEvent(fx, store, { at: now, kind: 'adopt', result: 'error', cause: 'gave-up' })
     return
   }
   const reply = await withinBound(fx, ms, () =>
-    fx.process.run(['relais', 'programme', 'adopt', '--previous', running.previous, '--session', session], {
+    fx.process.run(['relais', 'programme', 'adopt', '--previous', previous, '--session', session], {
       ...(store.router.cwd ? { cwd: store.router.cwd } : {}),
       timeoutMs: ms,
     }),
   )
   if (store.closed || memory.adopt !== running) return // A clear came meanwhile
   const at = await fx.clock.now()
-  const value = reply.kind === 'ok' ? reply.value : undefined
-  const exitCode = value?.exitCode
+  const exited = reply.kind === 'ok' ? reply.value : undefined
+  const exitCode = exited?.exitCode
+  const stderr = String(exited?.stderr ?? '')
   if (exitCode === 0) {
     memory.adopt = undefined
-    await recordEvent(fx, store, { at, kind: 'adopt', result: 'ok' })
+    // A ticket adopt can never take (closed, gone) is a stderr line and exit 0.
+    const notAdopted = stderr.split('\n').find(line => line.includes(' not adopted: '))
+    await recordEvent(fx, store, { at, kind: 'adopt', result: 'ok', ...(notAdopted ? { detail: notAdopted.trim() } : {}) })
     return
   }
   if (exitCode === 2) {
     memory.adopt = undefined
-    const stderr = String(value?.stderr ?? '')
     const older = OLDER_ADOPT.test(stderr)
     await recordEvent(fx, store, older ? { at, kind: 'adopt', result: 'older' } : { at, kind: 'adopt', result: 'error', cause: 'usage', detail: oneLine(stderr) })
     return
   }
-  memory.adopt = { state: 'failed', previous: running.previous, session, since }
+  memory.adopt = { state: 'failed', previous, session, since }
   const cause = reply.kind === 'late' ? 'late' : reply.kind === 'failed' ? 'spawn' : 'exit'
-  await recordEvent(fx, store, { at, kind: 'adopt', result: 'error', cause, detail: oneLine(value?.stderr) })
+  await recordEvent(fx, store, { at, kind: 'adopt', result: 'error', cause, detail: oneLine(stderr) })
 }
 
 // The dim note of an adoption that failed for this session: the command

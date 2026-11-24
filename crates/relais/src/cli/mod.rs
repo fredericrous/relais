@@ -585,8 +585,8 @@ pub(crate) enum ProgrammeCommand {
     /// as `relais programme claim` would. A ticket another session already
     /// holds stays with it. One line per ticket on stderr, for people;
     /// stdout stays empty. Exit 0 when every ticket was taken, is held by
-    /// another session, or can never be (closed, gone, or its repository
-    /// gone); exit 1 when a lock stayed held or a programme or the store
+    /// another session, or can never be (closed, gone, its repository gone
+    /// or another repository's); exit 1 when a lock stayed held or a programme or the store
     /// could not be read, after trying every ticket; exit 2 on a usage
     /// error. A second run finds nothing and exits 0.
     Adopt {

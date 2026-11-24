@@ -1054,7 +1054,8 @@ fn held_line(
 /// path as `relais programme claim`, so the relayed session holds its ticket
 /// whether or not its agent claims it (follow-ups f12). Each ticket is tried
 /// on its own; one line per ticket on stderr, nothing on stdout. A ticket
-/// that can never be adopted (closed, gone, or its repository gone) is a line
+/// that can never be adopted (closed, gone, its repository gone or another
+/// repository's) is a line
 /// and exit 0, since a retry cannot change it; exit 1 is kept for what a
 /// retry may fix (a lock that stayed held, a programme or store that could
 /// not be read).

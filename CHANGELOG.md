@@ -17,7 +17,8 @@ missing here.
   `next --claim` handed it out while the first still worked it (follow-ups
   f12). `adopt` writes one line per ticket on stderr and nothing on stdout,
   and exits 0 when every ticket was taken, is held by another session or
-  can never be (closed, gone, or its repository gone), 1 when a lock stayed
+  can never be (closed, gone, its repository gone or another
+  repository's), 1 when a lock stayed
   held or a programme or the store could not be read, and 2 on a usage
   error. `relais programme claim` prints what it printed
   before.

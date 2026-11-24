@@ -385,7 +385,7 @@ test('a second clear while an adoption runs drops it; the new successor adopts i
   expect(own[0].argv).toEqual(['relais', 'programme', 'adopt', '--previous', 'session-2', '--session', 'session-3'])
 })
 
-test('an adoption still pending 2 h after the clear stops and keeps its note', async () => {
+test('an adoption still pending 2 h after its first read stops and keeps its note', async () => {
   const store = createStore()
   store.programme.session = 'session-2'
   store.programme.adopt = { state: 'failed', previous: 'session-1', session: 'session-2', since: 0 }
@@ -407,4 +407,56 @@ test('an adoption still pending 2 h after the clear stops and keeps its note', a
   expect(runs.filter(argv => argv[2] === 'adopt').length).toBe(0)
   expect(runs.filter(argv => argv[2] === 'session').length).toBe(2)
   expect(store.programme.note).toBe('ticket not adopted in 2 h · its handoff lapsed')
+})
+
+test('two reads started together after a clear spawn one adopt', async () => {
+  const store = createStore()
+  store.programme.adopt = { state: 'unbound', previous: 'session-1', session: undefined }
+  let release: () => void = () => {}
+  const clockHeld = new Promise<void>(resolve => (release = resolve))
+  const runs: string[][] = []
+  const fx: any = {
+    kv: { get: async () => [], set: async () => undefined },
+    clock: { now: async () => (await clockHeld, 1000), after: () => ({ cancel: () => undefined }) },
+    session: { id: async () => 'session-2' },
+    process: {
+      run: async (argv: string[]) => {
+        runs.push(argv)
+        return { exitCode: 0, stdout: JSON.stringify({ programme: null }), stderr: '' }
+      },
+    },
+    ui: { open: async () => undefined },
+  }
+  const both = Promise.all([readProgramme(fx, store, 'start'), readProgramme(fx, store, 'clear')])
+  await new Promise(resolve => setTimeout(resolve, 0))
+  release()
+  await both
+  expect(runs.filter(argv => argv[2] === 'adopt').length).toBe(1)
+})
+
+test('a failed adopt records its cause and first stderr line', async () => {
+  const store = createStore()
+  store.programme.adopt = { state: 'unbound', previous: 'session-1', session: undefined }
+  const kv = new Map<string, unknown>()
+  const fx: any = {
+    kv: { get: async (key: string) => kv.get(key), set: async (key: string, value: unknown) => void kv.set(key, value) },
+    clock: { now: async () => 1000, after: () => ({ cancel: () => undefined }) },
+    session: { id: async () => 'session-2' },
+    process: {
+      run: async (argv: string[]) =>
+        argv[2] === 'adopt'
+          ? { exitCode: 1, stdout: '', stderr: 'relais: alpha p t19 not adopted: lock stayed held\n' }
+          : { exitCode: 0, stdout: JSON.stringify({ programme: null }), stderr: '' },
+    },
+    ui: { open: async () => undefined },
+  }
+  await readProgramme(fx, store, 'clear')
+  expect(kv.get('relais.programmeEvents')).toContainEqual({
+    at: 1000,
+    kind: 'adopt',
+    result: 'error',
+    cause: 'exit',
+    detail: 'relais: alpha p t19 not adopted: lock stayed held',
+  })
+  expect(store.programme.adopt?.state).toBe('failed')
 })
