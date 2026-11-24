@@ -846,6 +846,11 @@ mod tests {
             std::fs::set_permissions(&registry_dir, std::fs::Permissions::from_mode(mode))
                 .expect("chmod");
         };
+        // The lock file exists before the directory turns read-only: only
+        // the pointer writes fail, after the shared swap.
+        drop(
+            crate::procs::LockFile::try_acquire(&registry_dir.join(".pointer.lock")).expect("lock"),
+        );
         read_only(0o555);
         let swap = node::swap_registry_pointer(&state, &registry, None, &evaluated);
         read_only(0o755);
@@ -854,6 +859,162 @@ mod tests {
             state.registry_pointer().expect("read"),
             Pointer::Shared(None),
             "the shared pointer is back where it was"
+        );
+    }
+
+    // ------------------------------------------------ registry races ----
+
+    use crate::learn::registry::Registry;
+
+    /// A registry with `art-z` promoted then `art-a` (so `art-a` is active
+    /// and `art-z` previous) and `art-b` stored, all with passing evidence.
+    fn three_artifacts(label: &str) -> (Registry, crate::test_support::TempDir) {
+        use crate::learn::fixtures::{artifact, evaluation};
+        let dir = crate::test_support::temp_dir(label);
+        let registry = Registry::open(&dir.join("registry")).expect("registry");
+        for id in ["art-z", "art-a", "art-b"] {
+            registry
+                .store(&artifact(id, Some(evaluation(id, true))))
+                .expect("store");
+        }
+        for id in ["art-z", "art-a"] {
+            registry
+                .promote(&registry.evaluated(id).expect("evidence"))
+                .expect("promote");
+        }
+        (registry, dir)
+    }
+
+    fn is_conflict(result: &Result<impl std::fmt::Debug, node::NodeError>) -> bool {
+        matches!(
+            result,
+            Err(node::NodeError::Shared(
+                SharedStateError::CasConflict { .. }
+            ))
+        )
+    }
+
+    /// A promote of `art-b` and a rollback, both judged against `art-a`:
+    /// whichever lands first, the other is a compare-and-set conflict.
+    fn race(state: &dyn SharedState, label: &str) {
+        for promote_first in [true, false] {
+            let (registry, _dir) = three_artifacts(&format!("{label}-{promote_first}"));
+            let b = registry.evaluated("art-b").expect("evidence");
+            let promote = || node::swap_registry_pointer(state, &registry, Some("art-a"), &b);
+            let rollback = || node::roll_back_registry(state, &registry, "art-a");
+            let (promoted, rolled) = if promote_first {
+                let p = promote();
+                (p, rollback())
+            } else {
+                let r = rollback();
+                (promote(), r)
+            };
+            let wins = [promoted.is_ok(), rolled.is_ok()];
+            assert_eq!(
+                wins.iter().filter(|w| **w).count(),
+                1,
+                "exactly one wins: {promoted:?} {rolled:?}"
+            );
+            assert!(is_conflict(&promoted) || is_conflict(&rolled));
+            let winner = if promote_first { "art-b" } else { "art-z" };
+            assert_eq!(registry.active_id().expect("read").as_deref(), Some(winner));
+            // Put the shared pointer back for the next order.
+            if let Pointer::Shared(current) = state.registry_pointer().expect("read") {
+                state
+                    .swap_registry_pointer(current.as_deref(), Some("art-a"))
+                    .expect("reset");
+            }
+        }
+    }
+
+    #[test]
+    fn a_promote_and_a_rollback_judged_against_one_artifact_cannot_both_win() {
+        race(&super::super::LocalState::new(), "race-local");
+        let fake = FakeState::new();
+        fake.swap_registry_pointer(None, Some("art-a"))
+            .expect("seed");
+        race(&fake, "race-fake");
+    }
+
+    #[test]
+    fn a_held_pointer_lock_refuses_both_paths_and_moves_nothing() {
+        let (registry, dir) = three_artifacts("pointer-lock");
+        let _held =
+            crate::procs::LockFile::try_acquire(&dir.join("registry").join(".pointer.lock"))
+                .expect("lock")
+                .expect("free");
+        let b = registry.evaluated("art-b").expect("evidence");
+        let fake = FakeState::new();
+        fake.swap_registry_pointer(None, Some("art-a"))
+            .expect("seed");
+        let local = super::super::LocalState::new();
+        for state in [&fake as &dyn SharedState, &local] {
+            for result in [
+                node::swap_registry_pointer(state, &registry, Some("art-a"), &b).map(|_| None),
+                node::roll_back_registry(state, &registry, "art-a"),
+            ] {
+                assert!(
+                    matches!(
+                        result,
+                        Err(node::NodeError::Shared(SharedStateError::Refused { .. }))
+                    ),
+                    "{result:?}"
+                );
+            }
+        }
+        assert_eq!(
+            fake.registry_pointer().expect("read"),
+            Pointer::Shared(Some("art-a".into()))
+        );
+        assert_eq!(
+            registry.active_id().expect("read").as_deref(),
+            Some("art-a")
+        );
+    }
+
+    #[test]
+    fn a_shared_pointer_ahead_is_healed_before_the_next_swap() {
+        let (registry, _dir) = three_artifacts("heal");
+        let fake = FakeState::new();
+        // A promote of art-b won the shared swap and died before its local
+        // half: the shared pointer is ahead of this node's.
+        fake.swap_registry_pointer(None, Some("art-b"))
+            .expect("ahead");
+        let restored = node::roll_back_registry(&fake, &registry, "art-b").expect("rolled back");
+        assert_eq!(
+            restored.as_deref(),
+            Some("art-a"),
+            "healed to art-b, then back"
+        );
+        assert_eq!(
+            registry.active_id().expect("read").as_deref(),
+            Some("art-a")
+        );
+        assert_eq!(
+            fake.registry_pointer().expect("read"),
+            Pointer::Shared(Some("art-a".into()))
+        );
+    }
+
+    #[test]
+    fn a_shared_pointer_naming_an_artifact_this_node_lacks_fails_closed() {
+        let (registry, _dir) = three_artifacts("heal-missing");
+        let fake = FakeState::new();
+        fake.swap_registry_pointer(None, Some("art-elsewhere"))
+            .expect("ahead");
+        let b = registry.evaluated("art-b").expect("evidence");
+        let swap = node::swap_registry_pointer(&fake, &registry, Some("art-elsewhere"), &b);
+        assert!(
+            matches!(
+                &swap,
+                Err(node::NodeError::Shared(SharedStateError::CasConflict { found: Some(found), .. }))
+                    if found == "art-elsewhere"
+            ),
+            "{swap:?}"
+        );
+        assert_eq!(
+            registry.active_id().expect("read").as_deref(),
+            Some("art-a")
         );
     }
 }

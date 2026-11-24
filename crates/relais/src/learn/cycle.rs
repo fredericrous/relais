@@ -25,7 +25,7 @@ use crate::router::stats::clopper_pearson_upper;
 
 use super::dataset::{self, Dataset, DatasetError, Labelling};
 use super::evaluate::{self, EvalReport, EvalSettings, TrainError};
-use super::registry::{Artifact, ArtifactError, Registry};
+use super::registry::{Artifact, ArtifactError, EvaluatedArtifact, Registry};
 use super::revert;
 use super::salvage::{self, BackfillReport};
 
@@ -341,6 +341,8 @@ pub enum CycleError {
         path: PathBuf,
         cause: std::io::Error,
     },
+    /// The pointer write failed (the shared state or the node's files).
+    Pointer(PointerFailure),
 }
 
 impl std::fmt::Display for CycleError {
@@ -350,6 +352,7 @@ impl std::fmt::Display for CycleError {
             Self::Dataset(e) => write!(f, "{e}"),
             Self::Artifact(e) => write!(f, "{e}"),
             Self::Io { what, path, cause } => write!(f, "{what} {}: {cause}", path.display()),
+            Self::Pointer(e) => write!(f, "{e}"),
         }
     }
 }
@@ -372,6 +375,45 @@ impl From<ArtifactError> for CycleError {
     }
 }
 
+/// How the cycle and `relais rollback` write the registry's active
+/// pointer: compare and swap against the artifact the caller judged. The
+/// CLI hands in the shared state's node half
+/// (`shared_state::node::NodePointers`); this module never builds one.
+pub trait PointerWrites {
+    /// Make `evaluated` active while the active pointer still names
+    /// `expected`.
+    fn promote(
+        &self,
+        registry: &Registry,
+        expected: Option<&str>,
+        evaluated: &EvaluatedArtifact,
+    ) -> Result<(), PointerRefusal>;
+
+    /// Make the previous artifact active again while the active pointer
+    /// still names `expected`: the id restored, `None` when there is no
+    /// previous artifact to return to.
+    fn roll_back(
+        &self,
+        registry: &Registry,
+        expected: &str,
+    ) -> Result<Option<String>, PointerRefusal>;
+}
+
+/// Why a pointer write did not land.
+#[derive(Debug)]
+pub enum PointerRefusal {
+    /// The active pointer no longer names what the caller judged; it names
+    /// `found`. Nothing changed.
+    Superseded { found: Option<String> },
+    /// Another process held the pointers past the wait. Nothing changed.
+    Busy(String),
+    /// The write itself failed.
+    Failed(PointerFailure),
+}
+
+/// A failed pointer write, as its implementation reports it.
+pub type PointerFailure = Box<dyn std::error::Error + Send + Sync>;
+
 /// The promotion gates' thresholds, machine settings.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GateSettings {
@@ -384,6 +426,8 @@ pub struct GateSettings {
 pub struct CycleInputs<'a> {
     pub ledger: &'a Ledger,
     pub registry: &'a Registry,
+    /// Every pointer write (promote, rollback) goes through it.
+    pub pointers: &'a dyn PointerWrites,
     pub repo: &'a RepoPolicy,
     pub datasets_dir: &'a Path,
     pub gates: GateSettings,
@@ -633,6 +677,18 @@ pub enum NothingToRollBack {
     /// Nothing was promoted over a predecessor, or the predecessor is
     /// already what is active.
     NoPreviousArtifact,
+    /// The artifact judged is no longer the active one: another promotion
+    /// or rollback landed first (or the shared pointer names an artifact
+    /// this node cannot make active). Nothing changed.
+    Superseded {
+        judged: String,
+        active: Option<String>,
+    },
+    /// Another relais process held the registry lock past its wait.
+    /// Nothing changed.
+    Busy {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for NothingToRollBack {
@@ -643,35 +699,62 @@ impl std::fmt::Display for NothingToRollBack {
                 f,
                 "the active artifact has no previous artifact to return to"
             ),
+            Self::Superseded { active, .. } => write!(
+                f,
+                "another promotion made {} active while this ran; nothing changed — \
+                 run `relais rollback` again if {} should go",
+                active.as_deref().unwrap_or("nothing"),
+                active.as_deref().unwrap_or("it")
+            ),
+            Self::Busy { detail } => write!(f, "{detail}"),
         }
     }
 }
 
-/// Roll the active task artifact back through `Registry::rollback` and
-/// record it as a `learning_cycles` row. `open_cycle` is the row a running
+/// Roll the active task artifact back through
+/// [`PointerWrites::roll_back`] and record it as a `learning_cycles` row.
+/// `judged` is the artifact the caller judged (the cycle's check); `None`
+/// judges the one active now (a person's `relais rollback`). The rollback
+/// lands only while that artifact is still active: another promotion in
+/// between makes it [`NothingToRollBack::Superseded`], with no row.
+/// `open_cycle` is the row a running
 /// cycle holds: that cycle writes the row once, when it finishes, so its
 /// other notes (the floor, retention) land in it too; `None` inserts a row
 /// here. The row names the artifact rolled
 /// back FROM and the data it was trained on, which is what the anti-flap
 /// rule later compares against.
 pub fn roll_back_active(
+    pointers: &dyn PointerWrites,
     ledger: &Ledger,
     registry: &Registry,
     source: LearningSource,
     reason: &str,
     open_cycle: Option<i64>,
+    judged: Option<&str>,
 ) -> Result<Result<RolledBack, NothingToRollBack>, CycleError> {
     let Some(active) = registry.active()? else {
-        return Ok(Err(NothingToRollBack::NoActiveArtifact));
+        return Ok(Err(match judged {
+            Some(judged) => NothingToRollBack::Superseded {
+                judged: judged.to_string(),
+                active: None,
+            },
+            None => NothingToRollBack::NoActiveArtifact,
+        }));
     };
-    let Some(previous) = registry.previous_id()? else {
-        return Ok(Err(NothingToRollBack::NoPreviousArtifact));
+    let judged = judged.unwrap_or(&active.artifact_id).to_string();
+    let lost = |active: Option<String>| NothingToRollBack::Superseded {
+        judged: judged.clone(),
+        active,
     };
-    if previous == active.artifact_id {
-        return Ok(Err(NothingToRollBack::NoPreviousArtifact));
+    if judged != active.artifact_id {
+        return Ok(Err(lost(Some(active.artifact_id))));
     }
-    let Some(restored) = registry.rollback()? else {
-        return Ok(Err(NothingToRollBack::NoPreviousArtifact));
+    let restored = match pointers.roll_back(registry, &judged) {
+        Ok(Some(restored)) => restored,
+        Ok(None) => return Ok(Err(NothingToRollBack::NoPreviousArtifact)),
+        Err(PointerRefusal::Superseded { found }) => return Ok(Err(lost(found))),
+        Err(PointerRefusal::Busy(detail)) => return Ok(Err(NothingToRollBack::Busy { detail })),
+        Err(PointerRefusal::Failed(e)) => return Err(CycleError::Pointer(e)),
     };
     let finish = LearningCycleFinish {
         label_policy_version: Some(active.label_policy_version),
@@ -696,6 +779,8 @@ pub fn roll_back_active(
 /// What checking the active artifact found.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActiveCheck {
+    /// The artifact judged: the one active when the check ran.
+    pub judged: Option<String>,
     /// The reason to roll it back, if there is one.
     pub reason: Option<RollbackReason>,
     /// Said when the check fell back to the default quality floor.
@@ -708,6 +793,7 @@ pub fn active_artifact_check(
     registry: &Registry,
 ) -> Result<ActiveCheck, CycleError> {
     let nothing = ActiveCheck {
+        judged: None,
         reason: None,
         floor_note: None,
     };
@@ -733,6 +819,7 @@ pub fn active_artifact_check(
     }
     Ok(ActiveCheck {
         reason: rollback_reason(&outcomes, floor),
+        judged: Some(active.artifact_id),
         floor_note,
     })
 }
@@ -846,11 +933,13 @@ fn cycle_body(
     }
     if let Some(reason) = check.reason {
         match roll_back_active(
+            inputs.pointers,
             ledger,
             registry,
             LearningSource::Cycle,
             &reason.to_string(),
             Some(report.cycle_id),
+            check.judged.as_deref(),
         )? {
             Ok(rolled) => {
                 report.action = LearningAction::RolledBack;
@@ -866,6 +955,16 @@ fn cycle_body(
                 );
                 // `run_cycle` writes the row once, with every note.
                 return Ok(());
+            }
+            Err(NothingToRollBack::Superseded { judged, active }) => {
+                let active = active.as_deref().unwrap_or("nothing");
+                add_note(
+                    report,
+                    format!(
+                        "rollback of {judged} wanted ({reason}) but {active} is active now; \
+                         nothing changed, the next cycle judges {active}"
+                    ),
+                );
             }
             Err(nothing) => {
                 add_note(report, format!("rollback wanted ({reason}) but {nothing}"));
@@ -984,9 +1083,37 @@ pub fn promote_candidate(
         return Ok(());
     }
     if inputs.auto_promote {
-        registry.promote(&evaluated)?;
-        report.action = LearningAction::Promoted;
-        add_note(report, format!("promoted {artifact_id}; {note}"));
+        // Compared against the active artifact the anti-flap rule read: a
+        // person's promote or rollback since then wins, and this waits.
+        let judged = active.as_ref().map(|a| a.artifact_id.as_str());
+        match inputs.pointers.promote(registry, judged, &evaluated) {
+            Ok(()) => {
+                report.action = LearningAction::Promoted;
+                add_note(report, format!("promoted {artifact_id}; {note}"));
+            }
+            Err(PointerRefusal::Superseded { found }) => {
+                report.action = LearningAction::AwaitingPromotion;
+                report.promote_hint = Some(format!("relais promote {artifact_id}"));
+                add_note(
+                    report,
+                    format!(
+                        "promotion of {artifact_id} withheld: {} is active now{}; \
+                         nothing changed; {note}",
+                        found.as_deref().unwrap_or("nothing"),
+                        judged.map(|a| format!(", not {a}")).unwrap_or_default()
+                    ),
+                );
+            }
+            Err(PointerRefusal::Busy(reason)) => {
+                report.action = LearningAction::AwaitingPromotion;
+                report.promote_hint = Some(format!("relais promote {artifact_id}"));
+                add_note(
+                    report,
+                    format!("promotion of {artifact_id} withheld: {reason}; {note}"),
+                );
+            }
+            Err(PointerRefusal::Failed(e)) => return Err(CycleError::Pointer(e)),
+        }
     } else {
         report.action = LearningAction::AwaitingPromotion;
         report.promote_hint = Some(format!("relais promote {artifact_id}"));
@@ -1050,6 +1177,7 @@ mod tests {
     use crate::outcome::{Outcome, OutcomeDetail, Strategy};
     use crate::policy::Tier;
     use crate::route::RoutedBy;
+    use crate::shared_state::SharedState;
 
     fn at(text: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(text)
@@ -1260,6 +1388,7 @@ argv = ["true"]
         datasets: PathBuf,
         ledger: Ledger,
         registry: Registry,
+        pointers: crate::shared_state::node::NodePointers,
     }
 
     impl World {
@@ -1272,6 +1401,9 @@ argv = ["true"]
                 _dir: dir,
                 ledger,
                 registry,
+                pointers: crate::shared_state::node::NodePointers(std::sync::Arc::new(
+                    crate::shared_state::LocalState::new(),
+                )),
             }
         }
 
@@ -1279,6 +1411,7 @@ argv = ["true"]
             CycleInputs {
                 ledger: &self.ledger,
                 registry: &self.registry,
+                pointers: &self.pointers,
                 repo,
                 datasets_dir: &self.datasets,
                 gates: GateSettings {
@@ -1580,10 +1713,12 @@ argv = ["true"]
         );
         assert_eq!(
             roll_back_active(
+                &world.pointers,
                 &world.ledger,
                 &world.registry,
                 LearningSource::Person,
                 "x",
+                None,
                 None
             )
             .unwrap(),
@@ -1733,10 +1868,12 @@ argv = ["true"]
         let world = World::new("person");
         two_artifacts(&world);
         let rolled = roll_back_active(
+            &world.pointers,
             &world.ledger,
             &world.registry,
             LearningSource::Person,
             "rolled back by a person",
+            None,
             None,
         )
         .unwrap()
@@ -1759,10 +1896,12 @@ argv = ["true"]
         // A second rollback has nowhere to go.
         assert_eq!(
             roll_back_active(
+                &world.pointers,
                 &world.ledger,
                 &world.registry,
                 LearningSource::Person,
                 "x",
+                None,
                 None
             )
             .unwrap(),
@@ -1814,6 +1953,108 @@ argv = ["true"]
         assert_eq!(
             report.promote_hint.as_deref(),
             Some("relais promote art-new")
+        );
+        assert!(world.registry.active().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_rollback_judged_against_an_artifact_no_longer_active_changes_nothing() {
+        let world = World::new("superseded");
+        two_artifacts(&world);
+        // A person's promote made art-b active after art-a was judged.
+        let result = roll_back_active(
+            &world.pointers,
+            &world.ledger,
+            &world.registry,
+            LearningSource::Cycle,
+            "x",
+            None,
+            Some("art-a"),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            Err(NothingToRollBack::Superseded {
+                judged: "art-a".into(),
+                active: Some("art-b".into()),
+            })
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "another promotion made art-b active while this ran; nothing changed — \
+             run `relais rollback` again if art-b should go"
+        );
+        assert_eq!(
+            world.registry.active_id().unwrap().as_deref(),
+            Some("art-b")
+        );
+        assert!(
+            world.rows().is_empty(),
+            "nothing rolled back, nothing recorded"
+        );
+    }
+
+    #[test]
+    fn a_cycle_rollback_that_another_promotion_beat_is_a_note_and_no_row() {
+        let mut world = World::new("cycle-loses");
+        two_artifacts(&world);
+        stored_candidate(&world, "art-c", "fp-c");
+        world.routed_run(
+            "art-b",
+            "regressed",
+            State::Accepted,
+            Some(OutcomeKind::ConfirmedRegression),
+        );
+        // Another promotion of art-c won the shared pointer after the
+        // cycle judged art-b; this node completes it before comparing.
+        let fake = crate::shared_state::fake::FakeState::new();
+        fake.swap_registry_pointer(None, Some("art-c"))
+            .expect("ahead");
+        world.pointers = crate::shared_state::node::NodePointers(std::sync::Arc::new(fake));
+        let repo = repo_policy();
+        let report = run_cycle(&world.inputs(&repo, true), &mut silent()).expect("cycle");
+        assert_ne!(report.action, LearningAction::RolledBack, "{report:?}");
+        let note = report.note.unwrap_or_default();
+        assert!(
+            note.contains(
+                "rollback of art-b wanted (1 run(s) it routed were reverted or had a regression confirmed) but art-c is active now; \
+                 nothing changed, the next cycle judges art-c"
+            ),
+            "{note}"
+        );
+        assert_eq!(
+            world.registry.active_id().unwrap().as_deref(),
+            Some("art-c")
+        );
+        assert!(
+            world
+                .rows()
+                .iter()
+                .all(|row| row.action != LearningAction::RolledBack),
+            "no rollback row"
+        );
+    }
+
+    #[test]
+    fn an_automatic_promote_against_a_moved_pointer_waits_for_a_person() {
+        let mut world = World::new("promote-loses");
+        stored_candidate(&world, "art-new", "fp-new");
+        let fake = crate::shared_state::fake::FakeState::new();
+        fake.swap_registry_pointer(None, Some("art-elsewhere"))
+            .expect("moved");
+        world.pointers = crate::shared_state::node::NodePointers(std::sync::Arc::new(fake));
+        let report = promote_it(&world, true, "art-new");
+        assert_eq!(report.action, LearningAction::AwaitingPromotion);
+        assert_eq!(
+            report.promote_hint.as_deref(),
+            Some("relais promote art-new")
+        );
+        assert_eq!(
+            report.note.as_deref(),
+            Some(
+                "promotion of art-new withheld: art-elsewhere is active now; \
+                 nothing changed; note"
+            )
         );
         assert!(world.registry.active().unwrap().is_none());
     }

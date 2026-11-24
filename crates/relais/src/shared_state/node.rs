@@ -26,6 +26,7 @@ use super::types::{
 };
 use super::{SharedState, SharedStateError};
 use crate::ids::RunId;
+use crate::learn::cycle::{PointerRefusal, PointerWrites};
 use crate::learn::registry::{EvaluatedArtifact, Registry};
 use crate::ledger::{
     Claim, DecisionAnswer, IntentState, Ledger, NewIntent, SuccessorIntent, SuccessorProcess,
@@ -34,6 +35,7 @@ use crate::money::MicroUsd;
 use crate::procs::LockFile;
 use crate::programme::claim::{ClaimKey, Contest, Holder, Kind, Store, Taken, LOCK_WAIT};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 /// Why a node function did not do what it was asked: the shared
 /// half's own refusal, or a failure of the node's own files and ledger.
@@ -391,20 +393,26 @@ pub fn registry_pointer(
 
 /// Point the registry at `evaluated` when the active pointer still names
 /// `expected`; else [`SharedStateError::CasConflict`].
+///
+/// Under the node's pointer lock, taken before any pointer is read and
+/// held across the shared compare-and-set and the local write: two
+/// writers on one node never interleave, and a shared swap's local half
+/// always lands on the pointers it was judged against.
 pub fn swap_registry_pointer(
     state: &dyn SharedState,
     registry: &Registry,
     expected: Option<&str>,
     evaluated: &EvaluatedArtifact,
 ) -> Result<(), NodeError> {
+    let _lock = pointer_lock(registry)?;
+    heal(state, registry)?;
     let to = evaluated.artifact_id();
     match state.swap_registry_pointer(expected, Some(to))? {
-        Swap::NodeDecides => swap_locally(registry, expected, evaluated),
+        Swap::NodeDecides => {
+            compare_locally(registry, expected)?;
+            Ok(registry.promote(evaluated)?)
+        }
         // The shared compare-and-set decided; the local promote follows.
-        // holds-until: an-t18 routes the learning cycle's promote and
-        // rollback through `SharedState`; until then a promote killed
-        // between the two halves leaves the shared pointer ahead, and only
-        // the next `relais promote` brings the two back together.
         Swap::Swapped => match registry.promote(evaluated) {
             Ok(()) => Ok(()),
             Err(local) => {
@@ -415,45 +423,76 @@ pub fn swap_registry_pointer(
     }
 }
 
-/// Compare and promote the node's own pointer files, under an flock.
-fn swap_locally(
+/// Make the registry's previous artifact active again when the active
+/// pointer still names `expected` (the artifact the caller judged): the
+/// id restored, `None` when there is no previous artifact to return to
+/// (none, or it is `expected` itself), else
+/// [`SharedStateError::CasConflict`]. Under the same lock as
+/// [`swap_registry_pointer`], so a rollback and a promote judged against
+/// the same artifact cannot both land.
+pub fn roll_back_registry(
+    state: &dyn SharedState,
     registry: &Registry,
-    expected: Option<&str>,
-    evaluated: &EvaluatedArtifact,
-) -> Result<(), NodeError> {
-    // `Registry::promote` takes no lock; this one makes compare and
-    // swap one step against every other swap through the trait.
-    // holds-until: the learning cycle's automatic promote and rollback
-    // (`learn/cycle.rs`) go through `SharedState`; until then they
-    // write the pointer without this lock and can race a swap. It is
-    // an flock, released by the kernel when the process dies, and the
-    // file is never deleted, so a killed promote leaves nothing stale.
-    // Beside the pointer files, outside `artifacts/`, which `list` reads.
-    let artifacts = registry.artifacts_dir();
-    let path = artifacts
-        .parent()
-        .unwrap_or(artifacts)
-        .join(".pointer.lock");
-    let started = std::time::Instant::now();
-    let _lock = loop {
-        match LockFile::try_acquire(&path) {
-            Ok(Some(lock)) => break lock,
-            Ok(None) if started.elapsed() < REGISTRY_LOCK_WAIT => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Ok(None) => {
-                return Err(SharedStateError::Refused {
-                    reason: format!(
-                        "another promotion held {} for {}s",
-                        path.display(),
-                        REGISTRY_LOCK_WAIT.as_secs()
-                    ),
-                }
-                .into())
-            }
-            Err(cause) => return Err(NodeError::Lock { path, cause }),
-        }
+    expected: &str,
+) -> Result<Option<String>, NodeError> {
+    let _lock = pointer_lock(registry)?;
+    heal(state, registry)?;
+    compare_locally(registry, Some(expected))?;
+    let Some(previous) = registry.previous_id()?.filter(|id| id != expected) else {
+        return Ok(None);
     };
+    match state.swap_registry_pointer(Some(expected), Some(&previous))? {
+        Swap::NodeDecides => Ok(registry.rollback()?),
+        Swap::Swapped => match registry.rollback() {
+            Ok(restored) => Ok(restored),
+            Err(local) => {
+                let back = state
+                    .swap_registry_pointer(Some(&previous), Some(expected))
+                    .map(|_| ());
+                Err(compensated(local.into(), back))
+            }
+        },
+    }
+}
+
+/// The learning cycle's and `relais rollback`'s pointer writes, through
+/// [`swap_registry_pointer`] and [`roll_back_registry`]: the CLI builds one
+/// around the state it selected and hands it to `learn::cycle`.
+pub struct NodePointers(pub Arc<dyn SharedState>);
+
+impl NodePointers {
+    fn refusal(e: NodeError) -> PointerRefusal {
+        match e {
+            NodeError::Shared(SharedStateError::CasConflict { found, .. }) => {
+                PointerRefusal::Superseded { found }
+            }
+            NodeError::Shared(SharedStateError::Refused { reason }) => PointerRefusal::Busy(reason),
+            other => PointerRefusal::Failed(Box::new(other)),
+        }
+    }
+}
+
+impl PointerWrites for NodePointers {
+    fn promote(
+        &self,
+        registry: &Registry,
+        expected: Option<&str>,
+        evaluated: &EvaluatedArtifact,
+    ) -> Result<(), PointerRefusal> {
+        swap_registry_pointer(&*self.0, registry, expected, evaluated).map_err(Self::refusal)
+    }
+
+    fn roll_back(
+        &self,
+        registry: &Registry,
+        expected: &str,
+    ) -> Result<Option<String>, PointerRefusal> {
+        roll_back_registry(&*self.0, registry, expected).map_err(Self::refusal)
+    }
+}
+
+/// The node's own active pointer must name `expected`.
+fn compare_locally(registry: &Registry, expected: Option<&str>) -> Result<(), NodeError> {
     let found = registry.active_id()?;
     if found.as_deref() != expected {
         return Err(SharedStateError::CasConflict {
@@ -462,7 +501,73 @@ fn swap_locally(
         }
         .into());
     }
-    Ok(registry.promote(evaluated)?)
+    Ok(())
+}
+
+/// Complete a promote that died between its shared swap and its local
+/// one: when the shared pointer names an artifact the node's own active
+/// pointer does not, and this node holds that artifact with its evidence,
+/// it becomes active here too (one stderr note says so). An artifact this
+/// node does not hold, or whose evidence does not check, is a
+/// [`SharedStateError::CasConflict`] naming it: the node never guesses.
+/// "The node decides" never heals, so one node behaves as it always did.
+/// The caller holds the pointer lock.
+fn heal(state: &dyn SharedState, registry: &Registry) -> Result<(), NodeError> {
+    let Pointer::Shared(Some(shared)) = state.registry_pointer()? else {
+        return Ok(());
+    };
+    let local = registry.active_id()?;
+    if local.as_deref() == Some(shared.as_str()) {
+        return Ok(());
+    }
+    let Ok(evaluated) = registry.evaluated(&shared) else {
+        return Err(SharedStateError::CasConflict {
+            expected: local,
+            found: Some(shared),
+        }
+        .into());
+    };
+    registry.promote(&evaluated)?;
+    eprintln!(
+        "relais: the shared registry pointer names {shared} and this node's named {}; \
+         {shared} is now active here too (a promote stopped between its two halves)",
+        local.as_deref().unwrap_or("nothing")
+    );
+    Ok(())
+}
+
+/// The node's pointer lock: an flock beside the pointer files, outside
+/// `artifacts/` (which `list` reads), released by the kernel when the
+/// process dies and never deleted, so a killed writer leaves nothing
+/// stale. The wait is bounded ([`REGISTRY_LOCK_WAIT`]); a lock still held
+/// after it is [`SharedStateError::Refused`].
+fn pointer_lock(registry: &Registry) -> Result<LockFile, NodeError> {
+    let artifacts = registry.artifacts_dir();
+    let path = artifacts
+        .parent()
+        .unwrap_or(artifacts)
+        .join(".pointer.lock");
+    let started = std::time::Instant::now();
+    loop {
+        match LockFile::try_acquire(&path) {
+            Ok(Some(lock)) => return Ok(lock),
+            Ok(None) if started.elapsed() < REGISTRY_LOCK_WAIT => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) => {
+                return Err(SharedStateError::Refused {
+                    reason: format!(
+                        "another relais process holds the registry lock {} \
+                         (waited {}s); nothing changed, run it again",
+                        path.display(),
+                        REGISTRY_LOCK_WAIT.as_secs()
+                    ),
+                }
+                .into())
+            }
+            Err(cause) => return Err(NodeError::Lock { path, cause }),
+        }
+    }
 }
 
 #[cfg(test)]

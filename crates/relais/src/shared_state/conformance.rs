@@ -65,7 +65,7 @@ pub type Check = fn(&dyn SharedState, &Fixture);
 
 /// Every check, each on a fresh implementation and fixture.
 pub fn run_all<S: SharedState>(make: impl Fn() -> S) {
-    let checks: [(&str, Check); 9] = [
+    let checks: [(&str, Check); 10] = [
         ("epoch_rises_on_every_acquire", epoch_rises_on_every_acquire),
         ("a_stale_epoch_is_lease_lost", a_stale_epoch_is_lease_lost),
         (
@@ -82,6 +82,7 @@ pub fn run_all<S: SharedState>(make: impl Fn() -> S) {
             "a_registry_swap_compares_first",
             a_registry_swap_compares_first,
         ),
+        ("a_rollback_compares_first", a_rollback_compares_first),
         ("publish_replays_idempotently", publish_replays_idempotently),
         (
             "a_fresh_state_is_online_and_empty",
@@ -341,6 +342,49 @@ pub fn a_registry_swap_compares_first(state: &dyn SharedState, fixture: &Fixture
     }
     node::swap_registry_pointer(state, registry, Some("art-a"), &b)
         .expect("swap from the current value");
+}
+
+/// A rollback lands only from the artifact the caller judged, and then
+/// the shared and the node's pointers both name the previous artifact.
+pub fn a_rollback_compares_first(state: &dyn SharedState, fixture: &Fixture) {
+    let registry = &fixture.registry;
+    for id in ["art-a", "art-b"] {
+        registry
+            .store(&artifact(id, Some(evaluation(id, true))))
+            .expect("store");
+    }
+    let start = node::registry_pointer(state, registry).expect("read");
+    for (expected, id) in [(start.as_deref(), "art-a"), (Some("art-a"), "art-b")] {
+        let evaluated = registry.evaluated(id).expect("evidence holds");
+        node::swap_registry_pointer(state, registry, expected, &evaluated).expect("promote");
+    }
+    match node::roll_back_registry(state, registry, "art-a") {
+        Err(NodeError::Shared(SharedStateError::CasConflict { found, .. })) => {
+            assert_eq!(found.as_deref(), Some("art-b"))
+        }
+        other => panic!("a rollback judged against art-a must be cas_conflict, got {other:?}"),
+    }
+    assert_eq!(
+        node::roll_back_registry(state, registry, "art-b")
+            .expect("rollback from the current value")
+            .as_deref(),
+        Some("art-a")
+    );
+    assert_eq!(
+        node::registry_pointer(state, registry)
+            .expect("read")
+            .as_deref(),
+        Some("art-a")
+    );
+    assert_eq!(
+        registry.active_id().expect("read").as_deref(),
+        Some("art-a")
+    );
+    assert_eq!(
+        node::roll_back_registry(state, registry, "art-a").expect("nothing to return to"),
+        None,
+        "the previous artifact is the active one now"
+    );
 }
 
 /// Publishing the same rows twice names the same high-water mark, and

@@ -409,11 +409,31 @@ pub(crate) fn promote_command(artifact_id: &str) -> Result<CliOutcome, CliError>
             );
             Ok(CliOutcome::Blocked)
         }
+        Err(NodeError::Shared(relais::shared_state::SharedStateError::Refused { reason })) => {
+            eprintln!("relais promote: {reason}");
+            Ok(CliOutcome::Blocked)
+        }
+        Err(NodeError::Compensation { local, release }) => {
+            compensation_lines("promote", &local, &release);
+            Ok(CliOutcome::OperationalFailure)
+        }
         Err(e) => {
             eprintln!("relais promote: {e}");
             Ok(CliOutcome::OperationalFailure)
         }
     }
+}
+
+/// The local pointer write failed after the shared swap won, and putting
+/// the shared pointer back failed too: the two pointers disagree until the
+/// next promote or rollback on this node heals the local one.
+fn compensation_lines(command: &str, local: &NodeError, release: &NodeError) {
+    eprintln!("relais {command}: the registry's pointer files could not be written: {local}");
+    eprintln!(
+        "relais {command}: the shared pointer moved and could not be put back ({release}); \
+         run `relais {command}` again once the registry is writable, and this node takes \
+         the shared pointer's artifact"
+    );
 }
 
 /// Where a learning cycle's lines go: stdout and stderr, or, with `--log`,
@@ -614,9 +634,11 @@ pub(crate) fn learn_cycle_command(
     };
     let registry = registry()?;
     let datasets = datasets_dir()?;
+    let pointers = relais::shared_state::node::NodePointers(super::ctx::shared_state()?);
     let inputs = relais::learn::cycle::CycleInputs {
         ledger: &ledger,
         registry: &registry,
+        pointers: &pointers,
         repo: &repo,
         datasets_dir: &datasets,
         gates: relais::learn::cycle::GateSettings {
@@ -1107,16 +1129,37 @@ pub(crate) fn judge_trial_command(
 pub(crate) fn rollback_command(json: bool) -> Result<CliOutcome, CliError> {
     let reg = registry()?;
     let ledger = open_ledger()?;
-    let result = operational(
-        relais::learn::cycle::roll_back_active(
-            &ledger,
-            &reg,
-            relais::ledger::LearningSource::Person,
-            "rolled back by a person",
-            None,
-        ),
-        "rollback",
-    )?;
+    let pointers = relais::shared_state::node::NodePointers(super::ctx::shared_state()?);
+    let result = relais::learn::cycle::roll_back_active(
+        &pointers,
+        &ledger,
+        &reg,
+        relais::ledger::LearningSource::Person,
+        "rolled back by a person",
+        None,
+        None,
+    );
+    let result = match result {
+        Err(relais::learn::cycle::CycleError::Pointer(failure)) => {
+            match failure.downcast::<NodeError>().map(|e| *e) {
+                Ok(NodeError::Compensation { local, release }) => {
+                    compensation_lines("rollback", &local, &release);
+                    return Ok(CliOutcome::OperationalFailure);
+                }
+                Ok(NodeError::Shared(e)) => {
+                    return Err(super::ctx::shared_state_error("rollback", e));
+                }
+                Ok(other) => return Err(super::ctx::node_error("rollback", other)),
+                Err(other) => {
+                    return Err(CliError::Operational {
+                        operation: "rollback",
+                        cause: other,
+                    })
+                }
+            }
+        }
+        other => operational(other, "rollback")?,
+    };
     match result {
         Ok(rolled) => {
             if json {
