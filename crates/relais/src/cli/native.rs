@@ -403,7 +403,10 @@ pub(crate) fn router_state_command(session: &str) -> CliOutcome {
     }
     let answered = cwd()
         .map_err(|e| e.to_string())
-        .and_then(|cwd| relais::router::router_state(session, &cwd).map_err(|e| e.to_string()))
+        .and_then(|cwd| {
+            relais::router::router_state(session, &cwd, super::ctx::machine_for_router())
+                .map_err(|e| e.to_string())
+        })
         .and_then(|state| serde_json::to_string(&state).map_err(|e| e.to_string()));
     match answered {
         Ok(text) => {
@@ -532,9 +535,9 @@ pub(crate) fn router_observe_command() -> CliOutcome {
             return CliOutcome::OperationalFailure;
         }
     };
-    let policy = match (paths::machine_settings_path(), paths::state_dir()) {
-        (Ok(machine_path), Ok(state_dir)) => relais::router::capture_policy(
-            &machine_path,
+    let policy = match paths::state_dir() {
+        Ok(state_dir) => relais::router::capture_policy(
+            super::ctx::machine_for_router(),
             &state_dir,
             std::env::var(relais::router::mode::MODE_ENV)
                 .ok()
@@ -543,7 +546,7 @@ pub(crate) fn router_observe_command() -> CliOutcome {
         ),
         // The ledger path resolved from the same home, so this does not
         // happen; were it to, nothing is kept.
-        _ => relais::router::capture::CapturePolicy::Off,
+        Err(_) => relais::router::capture::CapturePolicy::Off,
     };
     match relais::router::observe(&ledger_path, &payload, &policy) {
         Ok(_) => CliOutcome::Accepted,

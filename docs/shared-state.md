@@ -24,11 +24,13 @@ back to an older relais.
 
 | Operation | Where |
 |---|---|
-| machine settings | every command that reads them through the CLI's `load_machine` (`relais run`, `trust`, `plan`, `replay`, `learn`, ...) |
+| machine settings | every command that reads them through the CLI's `load_machine` (`relais run`, `trust`, `plan`, `replay`, `learn`, ...), the recipe tuning bounds, the `[pricing]` table, the hook's admission settings, `relais native router-state` and `router-observe` |
 | programme ticket claim | `relais programme claim` |
+| handoff reservation | `relais programme next --claim` |
+| a session's work holds renewed or given back | `relais programme claim` (renew), the hook on a resumed `SessionStart` (renew) and on `SessionEnd` (give back) |
 | successor intent claim and release | `relais run --intent` |
 | decision answer with a successor intent | `relais decide` with the revise answer |
-| registry pointer read and swap | `relais promote` |
+| registry pointer read, swap and rollback | `relais promote`, `relais rollback`, and `relais learn cycle`'s automatic promote and rollback |
 | daily spend ceiling check | `relais run`, `relais dataset replay` (through `RunConfig::shared_state`) |
 | the runner's widen and timed-out settles | `relais run`, `relais dataset replay` |
 
@@ -37,14 +39,27 @@ ledger, since nothing feeds the global counter until seats and reservations
 are routed. A shared read that fails stops the run before dispatch.
 
 Not routed yet, so under `external` they still read or write the node's own
-files: the other direct readers of `machine.toml` (`tuning_bounds` and two
-more in `cli/ctx.rs`, `cli/coordinator.rs`, `doctor/mod.rs`,
-`router/mod.rs`, `holdout.rs`, `runner/attempt.rs`, `cli/learn.rs`,
-`cli/native.rs`); the coordinator's own seats (`AdmissionState` behind the
-`Gate` trait); the learning cycle's automatic promote and rollback
-(`learn/cycle.rs`); handoff reservations and the session hooks' claim
-refresh and end. `announce_schema`, `publish`, `queued`, `slice`, the seat
-operations and `mode` have no caller yet: nothing publishes today.
+files: the coordinator's own seats (`AdmissionState` behind the
+`Gate` trait) and the daemon's read of its limits in `cli/coordinator.rs`
+(an-t17); `relais doctor`, which checks the file itself; and every write
+of `machine.toml` (`relais trust grant`, the learning envelope, the routing
+envelope and its off switch), since the trait has no settings write yet.
+`runner/attempt.rs`, `holdout.rs`, `cli/recipe.rs` and the pricing
+preflight only name the file in a message. `announce_schema`, `publish`,
+`queued`, `slice`, the seat operations and `mode` have no caller yet:
+nothing publishes today.
+
+Every write of the registry's pointer files goes through
+`node::swap_registry_pointer` or `node::roll_back_registry`, under one
+flock beside the pointers (`.pointer.lock`): it is taken before the
+pointers are read and held across the shared compare-and-set and the local
+write, so a promote and a rollback judged against the same artifact cannot
+both land. The wait is bounded (2 s); a lock still held is refused, and
+nothing changes. A shared pointer that names an artifact this node's
+pointer does not (a promote that stopped between its two halves) is made
+active here first, with one stderr note, when the node holds that artifact
+and its evidence checks; otherwise the operation is a `cas_conflict` naming
+it.
 
 ## The refusal
 
@@ -57,7 +72,13 @@ relais: machine.toml <path> sets shared_state = "external", but this relais buil
 ```
 
 Under `relais run --protocol`, the `done` line names it `shared_state_absent`.
-`relais hook` never reads a routed path, so it keeps exiting 0.
+`relais hook` keeps exiting 0 with the same answer: its claim passes run
+on the claim files alone, and a resumed `SessionStart` or a `SessionEnd`
+adds one stderr line, `relais: shared claims skipped, the local claims were
+updated: ` followed by the line above. Its admission settings are read from
+`machine.toml` as before. With a client, the hook waits at most 1 s for
+the shared half of a claim pass, then goes on with the claim files; a hold
+it could not renew or give back ends by its TTL.
 `relais doctor` adds a failing `shared_state` finding with the same text.
 
 ## For a closed client
@@ -80,9 +101,9 @@ Under `relais run --protocol`, the `done` line names it `shared_state_absent`.
   A hold left behind ends by its TTL (tickets) or when a later claim
   replaces it (intents: `claim_intent(.., replacing)`, asked only when this
   node's own ledger saw the old run's claim and judged it abandoned). A
-  `relais promote` killed between the shared swap and the local one leaves
-  the shared pointer ahead of the node's; the next `relais promote` or
-  rollback brings them back together.
+  promote killed between the shared swap and the local one leaves the
+  shared pointer ahead of the node's; the next promote or rollback on that
+  node completes it (above).
 - Implement `SharedState` and give its factory to the CLI: public relais
   builds the implementation in one place, `cli/ctx.rs`, from
   `EXTERNAL_CLIENT` (`None` here), and a private build replaces that one
@@ -92,8 +113,22 @@ Under `relais run --protocol`, the `done` line names it `shared_state_absent`.
   single node and a primary must hold: the epoch rises on every acquire, a
   stale epoch is `lease_lost`, a late settle is never refused, a reserve
   beyond a granted slice is refused, a ticket has one holder, an intent is
-  claimed once, a registry swap compares first, publish replays
+  claimed once, a registry swap and a rollback compare first, a session's
+  end gives back its work holds and keeps its handoff reservations (and a
+  reservation is never made over a held ticket), publish replays
   idempotently by node and sequence, and a fresh state is online and empty.
+- The programme claims have three session-wide operations beside the
+  per-ticket ones: `reserve_handoff` (a `handoff` hold for the next
+  session, `HANDOFF_HOLD_SECS`, taken over by any session's `work` claim),
+  `renew_tickets` and `release_tickets` (every `work` hold of one holder,
+  for a resumed session and a session end). The hook calls them with no
+  lease in hand, so they are keyed by the holder, never fenced, and never
+  refused for a hold already gone.
+- The hook reads the admission settings and runs its claim passes through
+  the client on every event it handles; each call it makes waits at most
+  1 s (`SHARED_CLAIM_DEADLINE`), then goes on with the defaults or the
+  claim files. A client that answers slowly costs every tool call that
+  long, so it answers `machine_settings` from its cache (an-t10).
   `relais::shared_state::fake::FakeState` is the in-memory reference with a
   primary's semantics (expiry, degraded mode, a queue).
 - A failure of the node's own files comes back as `node::NodeError`

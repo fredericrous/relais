@@ -651,7 +651,12 @@ impl NodePointers {
                 PointerRefusal::Superseded { found }
             }
             NodeError::Shared(SharedStateError::Refused { reason }) => PointerRefusal::Busy(reason),
-            other => PointerRefusal::Failed(Box::new(other)),
+            e @ (NodeError::Shared(_)
+            | NodeError::Lock { .. }
+            | NodeError::Ledger(_)
+            | NodeError::Claim(_)
+            | NodeError::Registry(_)
+            | NodeError::Compensation { .. }) => PointerRefusal::Failed(Box::new(e)),
         }
     }
 }

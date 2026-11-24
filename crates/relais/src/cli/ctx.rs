@@ -138,10 +138,9 @@ pub(crate) fn node_error(what: &'static str, e: NodeError) -> CliError {
 /// both leave the catalogs unknown, which admits only the incumbent's
 /// configured efforts, never more.
 pub(crate) fn tuning_bounds(incumbent: &RepoPolicy) -> route::TuningBounds {
-    let settings = paths::machine_settings_path()
+    let settings = shared_state()
         .ok()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| MachineSettings::from_toml_str(&text).ok())
+        .and_then(|state| state.machine_settings().ok())
         .map(|machine| {
             (
                 machine.efforts,
@@ -249,23 +248,20 @@ pub(crate) fn load_price_table() -> Result<PriceTable, CliError> {
 /// The machine's `[pricing]` table; `None` when it has none, so a cost can
 /// say that no table is the reason it is unknown.
 pub(crate) fn load_machine_pricing() -> Result<Option<PriceTable>, CliError> {
-    let path = paths::machine_settings_path().map_err(CliError::Home)?;
-    match std::fs::read_to_string(&path) {
-        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(cause) => Err(CliError::Read {
-            what: "the machine settings",
-            path,
-            cause,
-        }),
-        Ok(text) => match MachineSettings::from_toml_str(&text) {
-            Ok(machine) => Ok(machine.pricing),
-            Err(e) => Err(CliError::Invalid {
-                what: "the machine settings",
-                path,
-                cause: Box::new(e),
-            }),
-        },
-    }
+    // Absent is the defaults, which carry no `[pricing]` table.
+    shared_state()?
+        .machine_settings()
+        .map(|machine| machine.pricing)
+        .map_err(|e| shared_state_error("the machine settings", e))
+}
+
+/// The machine's settings for the session router's native commands: a
+/// failure is a sentence, which each command says in its own way.
+pub(crate) fn machine_for_router() -> Result<MachineSettings, String> {
+    shared_state()
+        .map_err(|e| e.to_string())?
+        .machine_settings()
+        .map_err(|e| e.to_string())
 }
 
 pub(crate) fn read_stdin() -> Result<String, CliError> {
@@ -302,11 +298,33 @@ pub(crate) fn default_repo_policy() -> Result<RepoPolicy, CliError> {
 /// might hit — that failure belongs to `relais doctor`, not to a hook
 /// answer holding a tool call open.
 pub(crate) fn hook_admission_settings() -> relais::policy::HookAdmissionSettings {
-    paths::machine_settings_path()
-        .ok()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| MachineSettings::from_toml_str(&text).ok())
-        .map(|machine| machine.admission)
+    hook_admission_settings_from(&shared_state_for_hook().state)
+}
+
+/// [`hook_admission_settings`] read through `state`: the hook reads them
+/// through the state it already built for its claim passes. A client's
+/// answer is waited for at most `SHARED_CLAIM_DEADLINE`, on a thread of
+/// its own, then the defaults apply: a hook holds no tool call open on a
+/// primary that does not answer.
+pub(crate) fn hook_admission_settings_from(
+    state: &Arc<dyn SharedState>,
+) -> relais::policy::HookAdmissionSettings {
+    let read = |state: &dyn SharedState| {
+        state
+            .machine_settings()
+            .map(|machine| machine.admission)
+            .unwrap_or_default()
+    };
+    if state.selection() == relais::shared_state::Selection::Local {
+        return read(&**state);
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let owned = Arc::clone(state);
+    std::thread::spawn(move || {
+        let _ = sender.send(read(&*owned));
+    });
+    receiver
+        .recv_timeout(relais::hook::respond::SHARED_CLAIM_DEADLINE)
         .unwrap_or_default()
 }
 

@@ -1733,7 +1733,13 @@ pub(crate) fn next_command(
     let chosen = match chosen {
         Ok(chosen) => chosen,
         Err(NodeError::Claim(error)) => return claim_outcome(error, &retry),
-        Err(other) => return Err(super::ctx::node_error("choosing the next ticket", other)),
+        Err(
+            e @ (NodeError::Shared(_)
+            | NodeError::Lock { .. }
+            | NodeError::Ledger(_)
+            | NodeError::Registry(_)
+            | NodeError::Compensation { .. }),
+        ) => return Err(super::ctx::node_error("choosing the next ticket", e)),
     };
     if let Some(session) = &reserving {
         refresh_session_best_effort(&shared, &store, session, now);

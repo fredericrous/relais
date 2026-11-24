@@ -401,6 +401,14 @@ pub(crate) fn promote_command(artifact_id: &str) -> Result<CliOutcome, CliError>
         Err(NodeError::Shared(relais::shared_state::SharedStateError::CasConflict {
             found,
             ..
+        })) if not_held_here(&reg, found.as_deref()).is_some() => {
+            let line = not_held_here(&reg, found.as_deref()).unwrap_or_default();
+            eprintln!("relais promote: {line}");
+            Ok(CliOutcome::Blocked)
+        }
+        Err(NodeError::Shared(relais::shared_state::SharedStateError::CasConflict {
+            found,
+            ..
         })) => {
             eprintln!(
                 "relais promote: another promotion made {} active while this one ran; \
@@ -414,7 +422,7 @@ pub(crate) fn promote_command(artifact_id: &str) -> Result<CliOutcome, CliError>
             Ok(CliOutcome::Blocked)
         }
         Err(NodeError::Compensation { local, release }) => {
-            compensation_lines("promote", &local, &release);
+            compensation_lines("promote", &local, &release, &reg, &*state);
             Ok(CliOutcome::OperationalFailure)
         }
         Err(e) => {
@@ -427,13 +435,45 @@ pub(crate) fn promote_command(artifact_id: &str) -> Result<CliOutcome, CliError>
 /// The local pointer write failed after the shared swap won, and putting
 /// the shared pointer back failed too: the two pointers disagree until the
 /// next promote or rollback on this node heals the local one.
-fn compensation_lines(command: &str, local: &NodeError, release: &NodeError) {
+fn compensation_lines(
+    command: &str,
+    local: &NodeError,
+    release: &NodeError,
+    registry: &relais::learn::registry::Registry,
+    state: &dyn relais::shared_state::SharedState,
+) {
+    let here = registry.active_id().ok().flatten();
+    let shared = match state.registry_pointer() {
+        Ok(relais::shared_state::Pointer::Shared(pointer)) => pointer,
+        Ok(relais::shared_state::Pointer::NodeDecides) | Err(_) => here.clone(),
+    };
+    let name = |id: &Option<String>| id.clone().unwrap_or_else(|| "nothing".to_string());
     eprintln!("relais {command}: the registry's pointer files could not be written: {local}");
     eprintln!(
-        "relais {command}: the shared pointer moved and could not be put back ({release}); \
-         run `relais {command}` again once the registry is writable, and this node takes \
-         the shared pointer's artifact"
+        "relais {command}: the shared pointer names {} and this node's names {}, and the \
+         shared one could not be put back ({release}); run `relais {command}` again once the \
+         registry is writable, and this node takes {}",
+        name(&shared),
+        name(&here),
+        name(&shared)
     );
+}
+
+/// The shared pointer names an artifact this node does not hold, so no
+/// command run here can make it active: said as such, rather than as a
+/// race a retry would win.
+fn not_held_here(
+    registry: &relais::learn::registry::Registry,
+    found: Option<&str>,
+) -> Option<String> {
+    let found = found?;
+    registry.evaluated(found).is_err().then(|| {
+        format!(
+            "the shared pointer names {found}, which this node does not hold with its \
+             evidence; nothing changed, and nothing run here can move past it until {found} \
+             is stored here or another node moves the shared pointer"
+        )
+    })
 }
 
 /// Where a learning cycle's lines go: stdout and stderr, or, with `--log`,
@@ -1143,13 +1183,18 @@ pub(crate) fn rollback_command(json: bool) -> Result<CliOutcome, CliError> {
         Err(relais::learn::cycle::CycleError::Pointer(failure)) => {
             match failure.downcast::<NodeError>().map(|e| *e) {
                 Ok(NodeError::Compensation { local, release }) => {
-                    compensation_lines("rollback", &local, &release);
+                    compensation_lines("rollback", &local, &release, &reg, &*pointers.0);
                     return Ok(CliOutcome::OperationalFailure);
                 }
                 Ok(NodeError::Shared(e)) => {
                     return Err(super::ctx::shared_state_error("rollback", e));
                 }
-                Ok(other) => return Err(super::ctx::node_error("rollback", other)),
+                Ok(
+                    e @ (NodeError::Lock { .. }
+                    | NodeError::Ledger(_)
+                    | NodeError::Claim(_)
+                    | NodeError::Registry(_)),
+                ) => return Err(super::ctx::node_error("rollback", e)),
                 Err(other) => {
                     return Err(CliError::Operational {
                         operation: "rollback",
@@ -1175,7 +1220,16 @@ pub(crate) fn rollback_command(json: bool) -> Result<CliOutcome, CliError> {
                     &serde_json::json!({ "schema": 1, "rolled_back": null, "reason": nothing.to_string() }),
                 )?;
             } else {
-                eprintln!("relais rollback: {nothing}");
+                let line = match &nothing {
+                    relais::learn::cycle::NothingToRollBack::Superseded { active, .. } => {
+                        not_held_here(&reg, active.as_deref())
+                    }
+                    _ => None,
+                };
+                eprintln!(
+                    "relais rollback: {}",
+                    line.unwrap_or_else(|| nothing.to_string())
+                );
             }
             Ok(CliOutcome::Blocked)
         }

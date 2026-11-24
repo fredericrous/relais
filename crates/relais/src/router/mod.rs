@@ -71,19 +71,6 @@ impl std::fmt::Display for StateError {
 
 impl std::error::Error for StateError {}
 
-/// machine.toml as settings; absent is the defaults.
-pub fn read_machine(path: &Path) -> Result<MachineSettings, String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => format!(
-            "schema_version = {}\n",
-            crate::policy::MACHINE_SCHEMA_VERSION
-        ),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
-    MachineSettings::from_toml_str(&text).map_err(|e| format!("{}: {e}", path.display()))
-}
-
 /// The repository root (for project agent definitions) and its policy,
 /// when there is a valid one. An invalid `relais.toml` is said on stderr
 /// and served as absent: the router falls back to the default tiers.
@@ -225,10 +212,15 @@ fn exploration_stopped(path: &Path, epsilon_in_force: bool) -> bool {
     }
 }
 
-/// `relais native router-state --session <id>`, run in `cwd`.
-pub fn router_state(session: &str, cwd: &Path) -> Result<state::RouterState, StateError> {
-    let machine_path = crate::paths::machine_settings_path().map_err(StateError::Home)?;
-    let machine = read_machine(&machine_path).map_err(StateError::Machine)?;
+/// `relais native router-state --session <id>`, run in `cwd`, on the
+/// machine's settings as the CLI read them through the shared state
+/// (absent is the defaults; an error is said as `machine.toml: …`).
+pub fn router_state(
+    session: &str,
+    cwd: &Path,
+    machine: Result<MachineSettings, String>,
+) -> Result<state::RouterState, StateError> {
+    let machine = machine.map_err(StateError::Machine)?;
     let (root, repo) = repo_context(cwd);
     let ledger_path = crate::paths::ledger_path().map_err(StateError::Home)?;
     let completed_task_tokens = completed_task_tokens(&ledger_path);
@@ -284,12 +276,12 @@ impl std::error::Error for ObserveError {}
 /// cannot be read, which is said: a person who may have turned capture off
 /// is not guessed at.
 pub fn capture_policy(
-    machine_path: &Path,
+    machine: Result<MachineSettings, String>,
     state_dir: &Path,
     env_mode: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> capture::CapturePolicy {
-    let machine = match read_machine(machine_path) {
+    let machine = match machine {
         Ok(machine) => machine,
         Err(e) => {
             eprintln!("relais native router-observe: warning: {e}; classifier inputs are not kept");

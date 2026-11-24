@@ -13,6 +13,34 @@ earlier attempt as one row, `carried 5 from attempt1 (a, b, c +2 more)`, before
 the re-run check's output, so a short pane keeps that output. `relais report`
 prints `make: 1 carried` with no timings, which are the source attempt's.
 
+- `relais rollback` and the learning cycle's automatic promote and rollback
+  now go through the same compare-and-set as `relais promote`, under one
+  lock beside the registry's pointers. A promote and a rollback judged
+  against the same artifact can no longer both land: the one that loses
+  changes nothing. `relais rollback` then exits 3 with `relais rollback:
+  another promotion made X active while this ran; nothing changed — run
+  `relais rollback` again if X should go`; the cycle notes `rollback of A
+  wanted (...) but X is active now; nothing changed, the next cycle judges
+  X`, or withholds its promote (`promotion of B withheld: X is active now,
+  not A; nothing changed`) and waits for `relais promote B`. A lock another
+  relais process held past 2 s is refused the same way, `relais promote`
+  included (exit 3, where it used to exit 1).
+- Breaking, for a client of `relais::shared_state`: the trait gains
+  `reserve_handoff`, `renew_tickets` and `release_tickets`, which
+  `relais programme next --claim` and the session hooks (a resumed
+  `SessionStart`, `SessionEnd`) now go through, and `conformance::run_all`
+  gains `a_rollback_compares_first` and
+  `a_session_gives_back_its_work_and_keeps_its_handoff`. The library's
+  `learn::cycle::CycleInputs` gains `shared_state`, `roll_back_active` takes
+  the state and the judged artifact, `programme::claim::next` takes the
+  state and returns `NodeError`, `hook::respond::handle` takes a
+  `SharedClaims`, and `router::router_state` and `capture_policy` take the
+  machine settings (`router::read_machine` is gone). Nothing changes for a
+  single node.
+- Under `shared_state = "external"` with no client, `relais hook` still
+  answers as before and exits 0; on a resumed `SessionStart` and on
+  `SessionEnd` it updates the claim files and says so in one stderr line.
+
 ## v0.81.0
 
 - A session started by a `/clear` relay now holds the ticket its
