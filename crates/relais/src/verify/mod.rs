@@ -3257,7 +3257,7 @@ pub struct Receipt {
     /// record.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub efforts_used: Vec<String>,
-    /// What became of adr-lint's candidate lines at the review (SPEC §7).
+    /// What became of greenspotter's candidate lines at the review (SPEC §7).
     /// `NotRecorded` on a receipt written before this existed, which still
     /// parses, and on a run whose candidates were never asked for.
     #[serde(default, skip_serializing_if = "CandidatesRecord::is_not_recorded")]
@@ -3276,11 +3276,11 @@ pub struct Receipt {
 pub enum CandidatesRecord {
     #[default]
     NotRecorded,
-    /// adr-lint's candidates could not be had; the review ran without them.
+    /// greenspotter's candidates could not be had; the review ran without them.
     Unavailable { detail: String },
     /// `listed` were put to the reviewer; it ruled `violation` on some and
     /// `fine` on others, and `undisposed` got no ruling. `overflow` is what
-    /// adr-lint left out beyond its cap, across rules.
+    /// greenspotter left out beyond its cap, across rules.
     Counted {
         listed: u64,
         violation: u64,

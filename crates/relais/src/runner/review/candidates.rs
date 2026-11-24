@@ -14,7 +14,7 @@ use crate::runner::{data_list_block, RunEngine};
 use crate::verify::CandidatesRecord;
 
 /// The format token of a line of `rulings.jsonl`.
-const RULING_FORMAT: &str = "adr-lint.ruling/1";
+const RULING_FORMAT: &str = "greenspotter.ruling/1";
 
 /// The file in the run's artifact directory the rulings are appended to.
 const RULINGS_FILE: &str = "rulings.jsonl";
@@ -43,7 +43,7 @@ impl PartCandidates {
 }
 
 /// What the run knows of the candidates of one candidate commit: what
-/// adr-lint said, which candidates were put to a reviewer, and the rulings.
+/// greenspotter said, which candidates were put to a reviewer, and the rulings.
 pub(in crate::runner) struct CandidatesRun {
     sha: String,
     fetched: Result<CandidateList, GuidanceGap>,
@@ -130,7 +130,7 @@ pub(in crate::runner) fn candidates_block(part: &PartCandidates) -> String {
         .collect();
     let digest = sha256_hex(entries.join("\n").as_bytes());
     let mut block = String::from(
-        "adr-lint lists the candidates below: a candidate is a line to look at, not a finding. \
+        "greenspotter lists the candidates below: a candidate is a line to look at, not a finding. \
          Your answer must contain, BEFORE the final FINDINGS line, a `Candidates:` block with \
          one line per listed id: `<id> violation: <finding>` or `<id> fine: <one clause quoted \
          from the rule body>`. A violation is also listed under FINDINGS.\n",
@@ -164,7 +164,7 @@ fn one_line(text: &str) -> String {
 /// The prompt line for candidates that could not be had.
 pub(in crate::runner) fn candidates_unavailable_line(gap: &GuidanceGap) -> String {
     format!(
-        "adr-lint's candidates are unavailable ({}): no ruling is needed\n",
+        "greenspotter's candidates are unavailable ({}): no ruling is needed\n",
         gap.detail
     )
 }
@@ -193,7 +193,7 @@ pub(in crate::runner) struct RulingContext<'a> {
     pub(in crate::runner) at: &'a str,
 }
 
-/// Append one `adr-lint.ruling/1` line to `rulings.jsonl` in `artifacts` for
+/// Append one `greenspotter.ruling/1` line to `rulings.jsonl` in `artifacts` for
 /// each listed candidate the reviewer ruled on.
 pub(in crate::runner) fn append_rulings(
     artifacts: &Path,
@@ -344,18 +344,18 @@ mod tests {
         let gap = GuidanceGap::new(
             crate::context::GuidanceSource::Candidates,
             crate::context::guidance::GapCause::Exited(3),
-            "adr-lint exit 3",
+            "greenspotter exit 3",
         );
         let run = CandidatesRun::new("sha", Err(gap.clone()));
         assert_eq!(
             run.record(),
             CandidatesRecord::Unavailable {
-                detail: "adr-lint exit 3".into()
+                detail: "greenspotter exit 3".into()
             }
         );
         assert_eq!(
             candidates_unavailable_line(&gap),
-            "adr-lint's candidates are unavailable (adr-lint exit 3): no ruling is needed\n"
+            "greenspotter's candidates are unavailable (greenspotter exit 3): no ruling is needed\n"
         );
     }
 
