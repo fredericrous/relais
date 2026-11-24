@@ -776,8 +776,17 @@ fn claim_outcome(error: claim::ClaimError, retry: &str) -> Result<CliOutcome, Cl
 /// up to `ONCE_GRACE` in total, and a failure or a lock still busy is a warning on
 /// stderr, never the command's exit status, because the claim the person
 /// asked for is already written.
-fn refresh_session_best_effort(store: &claim::Store, session: &str, now: i64) {
-    match store.refresh_session_once(session, now) {
+fn refresh_session_best_effort(
+    state: &std::sync::Arc<dyn relais::shared_state::SharedState>,
+    store: &claim::Store,
+    session: &str,
+    now: i64,
+) {
+    let pass = relais::shared_state::node::refresh_session(state, store, session, now, None);
+    if let Err(error) = pass.shared {
+        eprintln!("relais: warning: shared claims: {error}");
+    }
+    match pass.local {
         Ok(pass) => {
             for line in pass.failure_lines() {
                 eprintln!("relais: warning: {line}");
@@ -938,11 +947,12 @@ pub(crate) fn claim_command(
         "relais programme claim {slug} {id}{}{steal_flag}",
         dir_argument(dir)
     );
-    match take_ticket(&store, &state, id, &session, contest, now)? {
+    let shared = super::ctx::shared_state()?;
+    match take_ticket(&*shared, &store, &state, id, &session, contest, now)? {
         Err(error) => claim_outcome(error, &retry),
         Ok(claim::Taken::Claimed { how, from }) => {
             eprintln!("relais: {}", claimed_line(&state, slug, id, how, from));
-            refresh_session_best_effort(&store, &session, now);
+            refresh_session_best_effort(&shared, &store, &session, now);
             Ok(CliOutcome::Accepted)
         }
         Ok(claim::Taken::Refused { holder, age_secs }) => {
@@ -964,6 +974,7 @@ pub(crate) fn claim_command(
 /// earns. The inner error is a claim-store failure (a lock that stayed
 /// held, or I/O), which each caller reports its own way.
 fn take_ticket(
+    shared: &dyn relais::shared_state::SharedState,
     store: &claim::Store,
     state: &claim::ProgrammeState,
     id: &str,
@@ -974,7 +985,7 @@ fn take_ticket(
     store.forget_ended(session).map_err(claim_io)?;
     let holder = relais::shared_state::Principal::operator(session.to_string());
     let taken = relais::shared_state::node::claim_ticket(
-        &*super::ctx::shared_state()?,
+        shared,
         store,
         &relais::shared_state::TicketClaim {
             key: &state.key,
@@ -1117,7 +1128,18 @@ pub(crate) fn adopt_command(previous: &str, session: Option<&str>) -> Result<Cli
             eprintln!("relais: {} {slug} {id} {why}", state.repo);
             continue;
         }
-        match take_ticket(&store, &state, id, &session, claim::Contest::Refuse, now) {
+        let taken = super::ctx::shared_state().and_then(|shared| {
+            take_ticket(
+                &*shared,
+                &store,
+                &state,
+                id,
+                &session,
+                claim::Contest::Refuse,
+                now,
+            )
+        });
+        match taken {
             Ok(Ok(claim::Taken::Claimed { how, from })) => {
                 eprintln!("relais: {}", claimed_line(&state, slug, id, how, from));
             }
@@ -1697,13 +1719,24 @@ pub(crate) fn next_command(
         },
         shell_quote(&root.to_string_lossy())
     );
-    let chosen = claim::next(&store, from_state.as_ref(), &states, today, now, intent);
+    let shared = super::ctx::shared_state()?;
+    let reservations = relais::shared_state::node::NodeReservations(&*shared);
+    let chosen = claim::next(
+        &reservations,
+        &store,
+        from_state.as_ref(),
+        &states,
+        today,
+        now,
+        intent,
+    );
     let chosen = match chosen {
         Ok(chosen) => chosen,
-        Err(error) => return claim_outcome(error, &retry),
+        Err(NodeError::Claim(error)) => return claim_outcome(error, &retry),
+        Err(other) => return Err(super::ctx::node_error("choosing the next ticket", other)),
     };
     if let Some(session) = &reserving {
-        refresh_session_best_effort(&store, session, now);
+        refresh_session_best_effort(&shared, &store, session, now);
     }
     match chosen {
         claim::Next::Pick(pick) => {

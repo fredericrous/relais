@@ -65,7 +65,7 @@ pub type Check = fn(&dyn SharedState, &Fixture);
 
 /// Every check, each on a fresh implementation and fixture.
 pub fn run_all<S: SharedState>(make: impl Fn() -> S) {
-    let checks: [(&str, Check); 10] = [
+    let checks: [(&str, Check); 11] = [
         ("epoch_rises_on_every_acquire", epoch_rises_on_every_acquire),
         ("a_stale_epoch_is_lease_lost", a_stale_epoch_is_lease_lost),
         (
@@ -83,6 +83,10 @@ pub fn run_all<S: SharedState>(make: impl Fn() -> S) {
             a_registry_swap_compares_first,
         ),
         ("a_rollback_compares_first", a_rollback_compares_first),
+        (
+            "a_session_gives_back_its_work_and_keeps_its_handoff",
+            a_session_gives_back_its_work_and_keeps_its_handoff,
+        ),
         ("publish_replays_idempotently", publish_replays_idempotently),
         (
             "a_fresh_state_is_online_and_empty",
@@ -385,6 +389,78 @@ pub fn a_rollback_compares_first(state: &dyn SharedState, fixture: &Fixture) {
         None,
         "the previous artifact is the active one now"
     );
+}
+
+fn ticket(fixture: &Fixture, id: &str, who: &Principal) -> super::TicketRequest {
+    super::TicketRequest {
+        repo_key: fixture.name.clone(),
+        slug: "programme".into(),
+        id: id.into(),
+        holder: who.clone(),
+        contest: Contest::Refuse,
+    }
+}
+
+/// A session's end gives back its `work` holds and keeps its `handoff`
+/// reservations; a reservation is not made over a held ticket, and the
+/// next session's `work` claim takes a reservation over.
+pub fn a_session_gives_back_its_work_and_keeps_its_handoff(
+    state: &dyn SharedState,
+    fixture: &Fixture,
+) {
+    use super::TicketAnswer;
+    let me = holder(fixture, "a");
+    let other = holder(fixture, "b");
+    let held = |answer: &TicketAnswer| matches!(answer, TicketAnswer::Held { .. });
+    // `work` on t1, a reservation on t2.
+    let work = state
+        .claim_ticket(&ticket(fixture, "t1", &me))
+        .expect("claim");
+    if let TicketAnswer::NodeDecides = work {
+        state
+            .grant_ticket(&ticket(fixture, "t1", &me))
+            .expect("fence");
+    }
+    let reserved = state
+        .reserve_handoff(&ticket(fixture, "t2", &me))
+        .expect("reserve");
+    assert!(
+        !held(&reserved),
+        "a free ticket is reserved, got {reserved:?}"
+    );
+    let over_work = state
+        .reserve_handoff(&ticket(fixture, "t1", &other))
+        .expect("answered");
+    assert!(
+        !matches!(over_work, TicketAnswer::Granted(_)),
+        "a held ticket is never reserved, got {over_work:?}"
+    );
+    state.renew_tickets(&me).expect("renew");
+    state.release_tickets(&me).expect("release");
+    let after = state
+        .claim_ticket(&ticket(fixture, "t1", &other))
+        .expect("answered");
+    assert!(
+        !held(&after),
+        "an ended session's work is free, got {after:?}"
+    );
+    let again = state
+        .reserve_handoff(&ticket(fixture, "t2", &other))
+        .expect("answered");
+    assert!(
+        !matches!(again, TicketAnswer::Granted(_)),
+        "an ended session's reservation stays, got {again:?}"
+    );
+    let taken = state
+        .claim_ticket(&ticket(fixture, "t2", &other))
+        .expect("answered");
+    assert!(
+        !held(&taken),
+        "the next session's work claim takes a reservation over, got {taken:?}"
+    );
+    state
+        .release_tickets(&holder(fixture, "nobody"))
+        .expect("nothing to give back");
 }
 
 /// Publishing the same rows twice names the same high-water mark, and

@@ -34,6 +34,8 @@ struct Row {
     epoch: u64,
     expires_at: i64,
     claimed_at: i64,
+    /// A `handoff` reservation, not a `work` hold.
+    handoff: bool,
 }
 
 #[derive(Debug, Default)]
@@ -56,6 +58,9 @@ struct Inner {
     answered: HashMap<String, i64>,
     /// When set, every release is refused with this reason (a test knob).
     releases_fail: Option<String>,
+    /// When set, the session-wide renew and release sleep this long first,
+    /// as a primary that does not answer would (a test knob).
+    slow: Option<std::time::Duration>,
 }
 
 /// The in-memory primary and its client in one.
@@ -109,6 +114,19 @@ impl FakeState {
     /// so a test sees what a release that fails after a local refusal does.
     pub fn set_releases_fail(&self, reason: Option<&str>) {
         self.lock().releases_fail = reason.map(str::to_string);
+    }
+
+    /// Make the session-wide renew and release take `delay` (`None`: answer
+    /// at once), so a test sees what a caller with a deadline does.
+    pub fn set_slow(&self, delay: Option<std::time::Duration>) {
+        self.lock().slow = delay;
+    }
+
+    fn wait_if_slow(&self) {
+        let delay = self.lock().slow;
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
+        }
     }
 
     /// The run holding `intent_id`, if any.
@@ -190,6 +208,7 @@ impl FakeState {
             epoch: 0,
             expires_at: 0,
             claimed_at: now,
+            handoff: false,
         });
         if let Some(current) = &row.holder {
             if current != holder && row.expires_at > now {
@@ -339,12 +358,87 @@ impl SharedState for FakeState {
     }
 
     fn claim_ticket(&self, request: &TicketRequest) -> Result<TicketAnswer, SharedStateError> {
+        let resource = request.resource();
+        // A handoff reservation is taken over by the next session's work
+        // claim, whoever reserved it.
+        if let Some(row) = self.lock().rows.get_mut(&resource) {
+            if row.handoff {
+                row.holder = None;
+                row.expires_at = 0;
+            }
+        }
         Ok(
-            match self.try_acquire(request.resource(), &request.holder, TICKET_TTL_SECS)? {
-                Ok(lease) => TicketAnswer::Granted(lease),
+            match self.try_acquire(resource.clone(), &request.holder, TICKET_TTL_SECS)? {
+                Ok(lease) => {
+                    if let Some(row) = self.lock().rows.get_mut(&resource) {
+                        row.handoff = false;
+                    }
+                    TicketAnswer::Granted(lease)
+                }
                 Err((holder, age_secs)) => TicketAnswer::Held { holder, age_secs },
             },
         )
+    }
+
+    fn reserve_handoff(&self, request: &TicketRequest) -> Result<TicketAnswer, SharedStateError> {
+        self.online()?;
+        let now = self.now();
+        let resource = request.resource();
+        // A held ticket is never reserved, not even by its own holder: the
+        // claim file refuses the same.
+        if let Some(row) = self.lock().rows.get(&resource) {
+            if let Some(holder) = &row.holder {
+                if row.expires_at > now {
+                    return Ok(TicketAnswer::Held {
+                        holder: holder.clone(),
+                        age_secs: (now - row.claimed_at).max(0) as u64,
+                    });
+                }
+            }
+        }
+        let ttl = crate::programme::claim::HANDOFF_HOLD_SECS;
+        Ok(
+            match self.try_acquire(resource.clone(), &request.holder, ttl)? {
+                Ok(lease) => {
+                    if let Some(row) = self.lock().rows.get_mut(&resource) {
+                        row.handoff = true;
+                    }
+                    TicketAnswer::Granted(lease)
+                }
+                Err((holder, age_secs)) => TicketAnswer::Held { holder, age_secs },
+            },
+        )
+    }
+
+    fn renew_tickets(&self, holder: &Principal) -> Result<(), SharedStateError> {
+        self.wait_if_slow();
+        self.online()?;
+        let now = self.now();
+        for (resource, row) in self.lock().rows.iter_mut() {
+            if matches!(resource, ResourceId::Ticket { .. })
+                && !row.handoff
+                && row.holder.as_ref() == Some(holder)
+                && row.expires_at > now
+            {
+                row.expires_at = now + TICKET_TTL_SECS;
+            }
+        }
+        Ok(())
+    }
+
+    fn release_tickets(&self, holder: &Principal) -> Result<(), SharedStateError> {
+        self.wait_if_slow();
+        self.may_release()?;
+        for (resource, row) in self.lock().rows.iter_mut() {
+            if matches!(resource, ResourceId::Ticket { .. })
+                && !row.handoff
+                && row.holder.as_ref() == Some(holder)
+            {
+                row.holder = None;
+                row.expires_at = 0;
+            }
+        }
+        Ok(())
     }
 
     fn grant_ticket(&self, request: &TicketRequest) -> Result<LeaseToken, SharedStateError> {
@@ -1016,5 +1110,120 @@ mod tests {
             registry.active_id().expect("read").as_deref(),
             Some("art-a")
         );
+    }
+
+    // ---------------------------------------------- session holds ----
+
+    fn ticket(id: &str, who: &Principal) -> TicketRequest {
+        TicketRequest {
+            repo_key: "rk".into(),
+            slug: "programme".into(),
+            id: id.into(),
+            holder: who.clone(),
+            contest: crate::programme::claim::Contest::Refuse,
+        }
+    }
+
+    #[test]
+    fn a_work_hold_renewed_stays_and_one_left_alone_lapses() {
+        let state = FakeState::new();
+        let me = Principal::operator("session-me");
+        let other = Principal::operator("session-other");
+        assert!(matches!(
+            state.claim_ticket(&ticket("t1", &me)).expect("claim"),
+            TicketAnswer::Granted(_)
+        ));
+        state.advance(TICKET_TTL_SECS - 10);
+        state.renew_tickets(&me).expect("renew");
+        state.advance(20);
+        assert!(matches!(
+            state.claim_ticket(&ticket("t1", &other)).expect("answered"),
+            TicketAnswer::Held { .. }
+        ));
+        state.advance(TICKET_TTL_SECS + 1);
+        assert!(matches!(
+            state.claim_ticket(&ticket("t1", &other)).expect("answered"),
+            TicketAnswer::Granted(_)
+        ));
+    }
+
+    #[test]
+    fn a_session_end_gives_back_the_shared_work_and_keeps_the_handoff() {
+        use crate::programme::claim::{ClaimKey, Contest, Store, LOCK_WAIT};
+        let dir = crate::test_support::temp_dir("fake-node-session");
+        let store = Store::in_state_dir(&dir);
+        let key = ClaimKey {
+            repo_key: "rk".into(),
+            slug: "programme".into(),
+        };
+        let now = crate::programme::claim::now_unix();
+        let me = Principal::operator("session-me");
+        let state: Arc<dyn SharedState> = Arc::new(FakeState::new());
+        let closed = BTreeSet::new();
+        node::claim_ticket(
+            &*state,
+            &store,
+            &super::super::TicketClaim {
+                key: &key,
+                closed: &closed,
+                id: "t1",
+                holder: &me,
+                repo_display: "/r",
+                contest: Contest::Refuse,
+                now,
+            },
+        )
+        .expect("claimed");
+        let lock = store.lock(&key, LOCK_WAIT, now).expect("lock");
+        assert!(
+            node::reserve_handoff(&*state, &lock, &key, "t2", &me, "/r", now).expect("reserve")
+        );
+        drop(lock);
+        let pass = node::end_session(&state, &store, "session-me", now + 1, None);
+        pass.shared.expect("given back");
+        pass.local.expect("claim files");
+        let other = Principal::operator("session-other");
+        assert!(matches!(
+            state.claim_ticket(&ticket("t1", &other)).expect("answered"),
+            TicketAnswer::Granted(_)
+        ));
+        assert!(
+            matches!(
+                state
+                    .reserve_handoff(&ticket("t2", &other))
+                    .expect("answered"),
+                TicketAnswer::Held { .. }
+            ),
+            "the reservation stays"
+        );
+        let records = store.records(&key).expect("records");
+        assert!(
+            !records.contains_key("t1") && records.contains_key("t2"),
+            "{records:?}"
+        );
+    }
+
+    #[test]
+    fn a_shared_handoff_hold_skips_the_ticket_and_the_claim_file_is_untouched() {
+        use crate::programme::claim::{ClaimKey, Store, LOCK_WAIT};
+        let dir = crate::test_support::temp_dir("fake-node-handoff");
+        let store = Store::in_state_dir(&dir);
+        let key = ClaimKey {
+            repo_key: "rk".into(),
+            slug: "programme".into(),
+        };
+        let state = FakeState::new();
+        // Another node holds t1.
+        state
+            .claim_ticket(&ticket("t1", &Principal::operator("elsewhere")))
+            .expect("held");
+        let now = crate::programme::claim::now_unix();
+        let lock = store.lock(&key, LOCK_WAIT, now).expect("lock");
+        let me = Principal::operator("session-me");
+        assert!(
+            !node::reserve_handoff(&state, &lock, &key, "t1", &me, "/r", now).expect("answered")
+        );
+        drop(lock);
+        assert!(store.records(&key).expect("records").is_empty());
     }
 }

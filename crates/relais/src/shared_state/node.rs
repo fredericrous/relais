@@ -33,9 +33,13 @@ use crate::ledger::{
 };
 use crate::money::MicroUsd;
 use crate::procs::LockFile;
-use crate::programme::claim::{ClaimKey, Contest, Holder, Kind, Store, Taken, LOCK_WAIT};
+use crate::programme::claim::{
+    ClaimError, ClaimKey, Contest, EmptyProgramme, Holder, Kind, Pass, Reservations, SlugLock,
+    Store, Taken, LOCK_WAIT,
+};
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Why a node function did not do what it was asked: the shared
 /// half's own refusal, or a failure of the node's own files and ledger.
@@ -257,6 +261,186 @@ pub fn claim_ticket(
             }
             Err(local) => Err(compensated(local, state.release_ticket(&lease))),
         },
+    }
+}
+
+/// The request the shared half sees for `id` in `key`'s programme.
+fn ticket_request(key: &ClaimKey, id: &str, holder: &Principal) -> TicketRequest {
+    TicketRequest {
+        repo_key: key.repo_key.clone(),
+        slug: key.slug.clone(),
+        id: id.to_string(),
+        holder: holder.clone(),
+        contest: Contest::Refuse,
+    }
+}
+
+/// Reserve `id` as a `handoff` claim for `holder`'s next session (the
+/// rules of [`SlugLock::reserve_handoff`]), the shared half first; whether
+/// it was reserved. A ticket the shared half says is held is not reserved,
+/// as a ticket the claim file holds is not. A crash between the shared
+/// grant and the claim file leaves a shared hold that ends at
+/// [`crate::programme::claim::HANDOFF_HOLD_SECS`].
+pub fn reserve_handoff(
+    state: &dyn SharedState,
+    lock: &SlugLock<'_>,
+    key: &ClaimKey,
+    id: &str,
+    holder: &Principal,
+    repo_display: &str,
+    now: i64,
+) -> Result<bool, NodeError> {
+    let request = ticket_request(key, id, holder);
+    match state.reserve_handoff(&request)? {
+        TicketAnswer::NodeDecides => Ok(lock.reserve_handoff(id, &holder.id, repo_display, now)?),
+        TicketAnswer::Held { .. } => Ok(false),
+        TicketAnswer::Granted(lease) => {
+            match lock.reserve_handoff(id, &holder.id, repo_display, now) {
+                Ok(true) => Ok(true),
+                Ok(false) => {
+                    give_back(&lease.resource.to_string(), state.release_ticket(&lease));
+                    Ok(false)
+                }
+                Err(local) => Err(compensated(local.into(), state.release_ticket(&lease))),
+            }
+        }
+    }
+}
+
+/// Reserve the first of the candidates as a `handoff` claim, only when the
+/// programme is empty (the rules of [`SlugLock::reserve_in_empty_programme`]),
+/// the shared half first for that ticket.
+pub fn reserve_in_empty_programme(
+    state: &dyn SharedState,
+    lock: &SlugLock<'_>,
+    programme: &EmptyProgramme<'_>,
+    holder: &Principal,
+) -> Result<Option<String>, NodeError> {
+    let Some(first) = programme.candidates.first() else {
+        return Ok(None);
+    };
+    let local = |lock: &SlugLock<'_>| {
+        lock.reserve_in_empty_programme(
+            programme.candidates,
+            programme.open,
+            programme.branch_held,
+            &holder.id,
+            programme.repo_display,
+            programme.now,
+        )
+    };
+    match state.reserve_handoff(&ticket_request(programme.key, first, holder))? {
+        TicketAnswer::NodeDecides => Ok(local(lock)?),
+        TicketAnswer::Held { .. } => Ok(None),
+        TicketAnswer::Granted(lease) => match local(lock) {
+            Ok(Some(reserved)) => Ok(Some(reserved)),
+            Ok(None) => {
+                give_back(&lease.resource.to_string(), state.release_ticket(&lease));
+                Ok(None)
+            }
+            Err(local) => Err(compensated(local.into(), state.release_ticket(&lease))),
+        },
+    }
+}
+
+/// `relais programme next --claim`'s reservations through the shared
+/// state: the CLI hands one to [`crate::programme::claim::next`]. The
+/// session reserving is the holder, as `relais programme claim` names it.
+pub struct NodeReservations<'a>(pub &'a dyn SharedState);
+
+impl Reservations for NodeReservations<'_> {
+    type Error = NodeError;
+
+    fn handoff(
+        &self,
+        lock: &SlugLock<'_>,
+        key: &ClaimKey,
+        id: &str,
+        session: &str,
+        repo_display: &str,
+        now: i64,
+    ) -> Result<bool, NodeError> {
+        let holder = Principal::operator(session);
+        reserve_handoff(self.0, lock, key, id, &holder, repo_display, now)
+    }
+
+    fn in_empty_programme(
+        &self,
+        lock: &SlugLock<'_>,
+        programme: &EmptyProgramme<'_>,
+    ) -> Result<Option<String>, NodeError> {
+        let holder = Principal::operator(programme.session);
+        reserve_in_empty_programme(self.0, lock, programme, &holder)
+    }
+}
+
+/// What a pass over a session's claims did: the shared half's answer and
+/// the claim files' pass. Both always run, so neither hides the other.
+#[derive(Debug)]
+pub struct SessionPass {
+    pub shared: Result<(), SharedStateError>,
+    pub local: Result<Pass, ClaimError>,
+}
+
+/// A session-wide shared call, bounded by `deadline` when one is given:
+/// the call runs on a thread of its own that owns an [`Arc`] of the state
+/// and prints nothing, and a caller past its deadline leaves it behind
+/// (the hold it was renewing or giving back ends by its TTL).
+fn session_call(
+    state: &Arc<dyn SharedState>,
+    holder: &Principal,
+    deadline: Option<Duration>,
+    call: fn(&dyn SharedState, &Principal) -> Result<(), SharedStateError>,
+) -> Result<(), SharedStateError> {
+    let Some(deadline) = deadline else {
+        return call(&**state, holder);
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let owned = Arc::clone(state);
+    let holder = holder.clone();
+    std::thread::spawn(move || {
+        let _ = sender.send(call(&*owned, &holder));
+    });
+    receiver.recv_timeout(deadline).unwrap_or_else(|_| {
+        Err(SharedStateError::Unreachable {
+            detail: format!(
+                "the shared state did not answer within {} ms",
+                deadline.as_millis()
+            ),
+        })
+    })
+}
+
+/// A session is still working: renew its shared `work` holds, then move
+/// its claim files' refresh time to `now` ([`Store::refresh_session_once`]).
+pub fn refresh_session(
+    state: &Arc<dyn SharedState>,
+    store: &Store,
+    session: &str,
+    now: i64,
+    deadline: Option<Duration>,
+) -> SessionPass {
+    let holder = Principal::operator(session);
+    SessionPass {
+        shared: session_call(state, &holder, deadline, |s, h| s.renew_tickets(h)),
+        local: store.refresh_session_once(session, now),
+    }
+}
+
+/// A session ended: give back its shared `work` holds, then delete its
+/// `work` claim files and keep its `handoff` ones
+/// ([`Store::end_session_once`]).
+pub fn end_session(
+    state: &Arc<dyn SharedState>,
+    store: &Store,
+    session: &str,
+    now: i64,
+    deadline: Option<Duration>,
+) -> SessionPass {
+    let holder = Principal::operator(session);
+    SessionPass {
+        shared: session_call(state, &holder, deadline, |s, h| s.release_tickets(h)),
+        local: store.end_session_once(session, now),
     }
 }
 

@@ -127,6 +127,22 @@ pub trait SharedState: Send + Sync {
     /// Give a ticket hold back. Fenced.
     fn release_ticket(&self, lease: &LeaseToken) -> Result<(), SharedStateError>;
 
+    /// The shared half of a `handoff` reservation (`relais programme next
+    /// --claim`): the ticket is held for the next session until
+    /// [`crate::programme::claim::HANDOFF_HOLD_SECS`] after it was made,
+    /// and a later `work` claim of any session takes it over. The claim
+    /// file's rules run on the node in [`node::reserve_handoff`].
+    fn reserve_handoff(&self, request: &TicketRequest) -> Result<TicketAnswer, SharedStateError>;
+
+    /// Extend every live `work` hold `holder` has: the session is still
+    /// working (a resumed session, a claim command). A hold already lapsed
+    /// stays lapsed; nothing is refused.
+    fn renew_tickets(&self, holder: &Principal) -> Result<(), SharedStateError>;
+
+    /// Give back every `work` hold `holder` has (its session ended); its
+    /// `handoff` holds stay, as the claim files keep them.
+    fn release_tickets(&self, holder: &Principal) -> Result<(), SharedStateError>;
+
     /// The shared half of claiming a successor intent for `run`.
     /// `replacing` names the run this claim takes over, as a compare-and-set:
     /// granted only when that run is still the holder.

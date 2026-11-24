@@ -25,6 +25,46 @@ pub use store::{
 
 use rules::{eligible, order_destinations, own_handoff, unheld_afk, Destination};
 
+/// How [`next`] writes a `handoff` reservation. The CLI hands in the
+/// shared state's node half (`shared_state::node::NodeReservations`),
+/// which asks the shared half first and then writes the claim file.
+pub trait Reservations {
+    type Error: From<ClaimError>;
+
+    /// Reserve `id` for `session`'s next session (the rules of
+    /// [`SlugLock::reserve_handoff`]); whether it was reserved.
+    fn handoff(
+        &self,
+        lock: &SlugLock<'_>,
+        key: &ClaimKey,
+        id: &str,
+        session: &str,
+        repo_display: &str,
+        now: i64,
+    ) -> Result<bool, Self::Error>;
+
+    /// Reserve the first candidate of an empty programme (the rules of
+    /// [`SlugLock::reserve_in_empty_programme`]).
+    fn in_empty_programme(
+        &self,
+        lock: &SlugLock<'_>,
+        programme: &EmptyProgramme<'_>,
+    ) -> Result<Option<String>, Self::Error>;
+}
+
+/// A handoff reservation in a programme no ticket of which is held.
+#[derive(Debug, Clone, Copy)]
+pub struct EmptyProgramme<'a> {
+    pub key: &'a ClaimKey,
+    /// The eligible tickets, in order; the first is reserved.
+    pub candidates: &'a [&'a str],
+    pub open: &'a BTreeSet<String>,
+    pub branch_held: &'a BTreeSet<String>,
+    pub session: &'a str,
+    pub repo_display: &'a str,
+    pub now: i64,
+}
+
 /// Picks the next ticket for a session at a boundary.
 ///
 /// 0. With [`Intent::Reserve`], the ticket a live `handoff` claim of the
@@ -39,15 +79,18 @@ use rules::{eligible, order_destinations, own_handoff, unheld_afk, Destination};
 /// moves on to the following candidate. Step 1 takes `from`'s lock once,
 /// sweeps once and releases it before step 2 takes a destination's; a lock
 /// not acquired within [`LOCK_WAIT`] counts as occupied (`from` falls through
-/// to step 2).
-pub fn next(
+/// to step 2). Each reservation goes through `reservations` (the CLI's
+/// asks the shared state first): a ticket it refuses is passed over like
+/// one the claim file holds.
+pub fn next<R: Reservations + ?Sized>(
+    reservations: &R,
     store: &Store,
     from: Option<&ProgrammeState>,
     others: &[ProgrammeState],
     today: NaiveDate,
     now: i64,
     intent: Intent<'_>,
-) -> Result<Next, ClaimError> {
+) -> Result<Next, R::Error> {
     let mut wake: Option<NaiveDate> = None;
     let mut note_wake = |tickets: &[&ReadyTicket]| {
         for ticket in tickets {
@@ -96,13 +139,20 @@ pub fn next(
                     let unheld = unheld_afk(state, &held_ids);
                     note_wake(&unheld);
                     for ticket in unheld.iter().filter(|t| eligible(t, today)) {
-                        if lock.reserve_handoff(&ticket.id, session, &state.repo_path, now)? {
+                        if reservations.handoff(
+                            &lock,
+                            &state.key,
+                            &ticket.id,
+                            session,
+                            &state.repo_path,
+                            now,
+                        )? {
                             return Ok(pick_of(ticket));
                         }
                     }
                 }
                 Err(ClaimError::LockTimeout { .. }) => {}
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             },
         }
     }
@@ -145,18 +195,22 @@ pub fn next(
         let lock = match store.lock(&state.key, LOCK_WAIT, now) {
             Ok(lock) => lock,
             Err(ClaimError::LockTimeout { .. }) => continue,
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         };
         lock.sweep(&state.closed, now)?;
         let ids: Vec<&str> = eligible.iter().map(|t| t.id.as_str()).collect();
         let open_ids: BTreeSet<String> = state.open.keys().cloned().collect();
-        if let Some(id) = lock.reserve_in_empty_programme(
-            &ids,
-            &open_ids,
-            &state.branch_held,
-            session,
-            &state.repo_path,
-            now,
+        if let Some(id) = reservations.in_empty_programme(
+            &lock,
+            &EmptyProgramme {
+                key: &state.key,
+                candidates: &ids,
+                open: &open_ids,
+                branch_held: &state.branch_held,
+                session,
+                repo_display: &state.repo_path,
+                now,
+            },
         )? {
             let name = eligible
                 .iter()
@@ -283,6 +337,9 @@ mod tests {
         let chosen = |from: Option<&ProgrammeState>| {
             picked(
                 &next(
+                    &crate::shared_state::node::NodeReservations(
+                        &crate::shared_state::LocalState::new(),
+                    ),
                     &fixture.store,
                     from,
                     std::slice::from_ref(&other),
@@ -320,7 +377,20 @@ mod tests {
         let dated = programme("e", "dated", vec![ready("t1", Some(day(10)), Mode::Afk)]);
         let others = [busy, branch, few, many, dated];
         let chosen = |others: &[ProgrammeState]| {
-            picked(&next(&fixture.store, None, others, day(19), NOW, Intent::Look).unwrap())
+            picked(
+                &next(
+                    &crate::shared_state::node::NodeReservations(
+                        &crate::shared_state::LocalState::new(),
+                    ),
+                    &fixture.store,
+                    None,
+                    others,
+                    day(19),
+                    NOW,
+                    Intent::Look,
+                )
+                .unwrap(),
+            )
         };
         assert_eq!(chosen(&others), "e:dated:t1", "soonest due first");
         assert_eq!(chosen(&others[..4]), "d:many:t1", "then most ready");
@@ -339,7 +409,20 @@ mod tests {
                 ready("person", None, Mode::Hitl),
             ],
         );
-        let run = |today| next(&fixture.store, Some(&from), &[], today, NOW, Intent::Look).unwrap();
+        let run = |today| {
+            next(
+                &crate::shared_state::node::NodeReservations(
+                    &crate::shared_state::LocalState::new(),
+                ),
+                &fixture.store,
+                Some(&from),
+                &[],
+                today,
+                NOW,
+                Intent::Look,
+            )
+            .unwrap()
+        };
         assert_eq!(
             run(day(19)),
             Next::Parked {
@@ -350,6 +433,9 @@ mod tests {
         let only_person = programme("b", "p", vec![ready("p", None, Mode::Hitl)]);
         assert_eq!(
             next(
+                &crate::shared_state::node::NodeReservations(
+                    &crate::shared_state::LocalState::new()
+                ),
                 &fixture.store,
                 None,
                 &[only_person],
@@ -374,6 +460,9 @@ mod tests {
         let take = |session: &str| {
             picked(
                 &next(
+                    &crate::shared_state::node::NodeReservations(
+                        &crate::shared_state::LocalState::new(),
+                    ),
                     &fixture.store,
                     Some(&from),
                     &[],
@@ -402,6 +491,7 @@ mod tests {
         let fixture = fixture("empty");
         let destination = programme("z", "empty", vec![afk("t1"), afk("t2")]);
         let one = next(
+            &crate::shared_state::node::NodeReservations(&crate::shared_state::LocalState::new()),
             &fixture.store,
             None,
             std::slice::from_ref(&destination),
@@ -411,6 +501,7 @@ mod tests {
         )
         .unwrap();
         let two = next(
+            &crate::shared_state::node::NodeReservations(&crate::shared_state::LocalState::new()),
             &fixture.store,
             None,
             std::slice::from_ref(&destination),

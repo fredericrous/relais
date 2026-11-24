@@ -96,6 +96,62 @@ fn the_hook_still_answers_under_an_absent_external_layer() {
 }
 
 #[test]
+fn a_session_end_under_an_absent_external_layer_updates_the_local_claims_and_says_so() {
+    use relais::programme::claim::{ClaimKey, Contest, Store, LOCK_WAIT};
+    let payload = r#"{"hook_event_name":"SessionEnd","session_id":"session-end-1"}"#;
+    let mut stdouts = Vec::new();
+    for (tag, text) in [
+        ("shared-state-end-local", "schema_version = 1\n"),
+        (
+            "shared-state-end-external",
+            "schema_version = 1\nshared_state = \"external\"\n",
+        ),
+    ] {
+        let scratch = Scratch::with_machine_toml(tag, text);
+        let store = Store::in_state_dir(&scratch.dir.join("state"));
+        let key = ClaimKey {
+            repo_key: "rk".into(),
+            slug: "programme".into(),
+        };
+        let now = relais::programme::claim::now_unix();
+        store
+            .lock(&key, LOCK_WAIT, now)
+            .expect("lock")
+            .claim_work("t1", "session-end-1", "/r", Contest::Refuse, now)
+            .expect("claimed");
+        let out = scratch.relais(&["hook"], payload);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let warnings: Vec<&str> = stderr
+            .lines()
+            .filter(|line| line.contains("shared claims skipped"))
+            .collect();
+        if text.contains("external") {
+            assert_eq!(warnings.len(), 1, "{stderr}");
+            assert!(
+                warnings[0].starts_with(
+                    "relais: shared claims skipped, the local claims were updated: machine.toml "
+                ),
+                "{stderr}"
+            );
+            assert!(
+                warnings[0]
+                    .ends_with("set shared_state = \"local\" or install the build that has one"),
+                "{stderr}"
+            );
+        } else {
+            assert!(warnings.is_empty(), "{stderr}");
+        }
+        assert!(
+            store.records(&key).expect("records").is_empty(),
+            "{tag}: the work claim is gone"
+        );
+        stdouts.push(out.stdout);
+    }
+    assert_eq!(stdouts[0], stdouts[1], "the hook's answer is the same");
+}
+
+#[test]
 fn a_trust_grant_keeps_the_key_and_adds_none() {
     let with_key = Scratch::with_machine_toml(
         "shared-state-grant-key",

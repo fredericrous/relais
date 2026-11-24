@@ -373,7 +373,8 @@ pub(crate) fn hook_respond() {
         return;
     };
     let gate = relais::coordinator::RemoteGate::new(socket);
-    let handled = relais::hook::respond::handle(&payload, &settings, &gate);
+    let shared = super::ctx::shared_state_for_hook();
+    let handled = relais::hook::respond::handle(&payload, &settings, &gate, &shared);
     if let Some(text) = handled.answer.stdout_payload() {
         print_hook_answer(&text);
     }

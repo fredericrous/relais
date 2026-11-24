@@ -77,6 +77,25 @@ pub(crate) fn shared_state() -> Result<Arc<dyn SharedState>, CliError> {
         .map_err(|e| shared_state_error("shared state", e))
 }
 
+/// The shared state the hook's claim passes go through. A hook never fails
+/// a session on bookkeeping: when the machine names an external layer this
+/// build does not have, the passes run on the claim files alone
+/// (`LocalState`) and each claim event says so in one stderr line.
+pub(crate) fn shared_state_for_hook() -> relais::hook::respond::SharedClaims {
+    match relais::shared_state::current_with(EXTERNAL_CLIENT) {
+        Ok(state) => relais::hook::respond::SharedClaims {
+            state,
+            warning: None,
+        },
+        Err(e) => relais::hook::respond::SharedClaims {
+            state: Arc::new(relais::shared_state::LocalState::new()),
+            warning: Some(format!(
+                "relais: shared claims skipped, the local claims were updated: {e}"
+            )),
+        },
+    }
+}
+
 /// A shared-state failure as the CLI reports it. The local errors keep the
 /// variants they had before the trait existed, so the lines and exit codes
 /// a single node prints do not change.
