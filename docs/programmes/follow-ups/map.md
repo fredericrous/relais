@@ -73,8 +73,9 @@ ticket here until it is resolved or moved into a programme of its own.
   `preferred-model` pin row records the preference, not the model the
   call ran; record the call's model, keep the pin source, validate the value.
 - [f18](f18-clear-routes-on-stale-state.md) (2026-11-24, open): after a
-  `/clear` relay, spawns before the first person prompt route on the
-  pre-clear state (no pins): a pinned reviewer was table-routed to Haiku.
+  `/clear` relay, spawns before the first person prompt can route on a
+  state with no pins (likely the pre-clear one; cause open): a pinned
+  reviewer's fallback spawn was table-routed to Haiku.
 
 ## Handoff
 
@@ -87,9 +88,10 @@ read (unreleased; f10 and f11 are unreleased too).
 - Done: f12, f13, f14.
 - Next: f15 (loop breaker fingerprint) is ready; f17 (pin row records
   the call's model) and f18 (stale state after a clear) are ready too,
-  f18 first since it skews the router pin plan's 11-30 cohort check. Measure the home fingerprint
-  warnings (f08) is due 2026-11-28, and A week of relays adopts every
-  handoff (f16) is due 2026-12-02, counted from the plugin reinstall.
+  f18 first since it skews the router pin plan's 11-30 cohort check.
+  Measure the home fingerprint warnings (f08) is due 2026-11-28, and A
+  week of relays adopts every handoff (f16) is due 2026-12-02, counted
+  from the plugin reinstall.
 - Lessons:
   - The 11-21 takeover was no fault of the takeover rule: the successor
     held no claim. Read `claims/log.jsonl` and the transcripts before
