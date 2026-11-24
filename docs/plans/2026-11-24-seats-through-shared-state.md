@@ -250,11 +250,13 @@ and `RemoteGate` with a degraded fake answers `Queued`.
 
 ## Implementation review
 
-- implementation-review: approve-with-changes (round 1, 75k, 141 s; delta 67k, 172 s; two more deltas), final approve on tree d9a46f0a (last delta); deliberate: `if let` over `Request` and over `SharedStateError::SliceExhausted` (only an admission asks a grant; only that variant refuses as a budget).
-- backend: approve-with-changes (round 1 relaunched on the worktree, 73k, 174 s; delta 49k, 87 s; second delta approve on the settle-drop fix, 866c2edd era and final approve on tree 8001d0dc); fixed: stop at first unreachable, Shutdown, refused settles dropped; deliberate: skipped-acquire line, degraded `release_all`/`renew` tests (follow-up).
-- architect: approve-with-changes then approve (74k, 175 s; 50k, 69 s; final delta approve-with-changes on two comment nits, then fixed in `820d3415`); floor restored; deliberate: `bool` reach returns, documented on each method.
-- lang:rust: approve-with-changes twice (74k, 57 s; 39k, 23 s; final delta approve-with-changes on the catch-all arm, fixed by listing every variant); enums, `Book` methods, `pub(crate)` fixed; deliberate: an `is_unreachable` helper and the `Reach` enum (style only).
-- tui: approve-with-changes twice (53k, 154 s; 40k, 15 s; final delta: the doubled "refused" wording, fixed in `820d3415`); refusals reworded, next-day clause dropped; deliberate: "settle"/"reserve" kept in log lines (glossed in docs), host-name line length.
+Last round on tree d9a46f0a (the pushed tree), five seats, all approve; earlier rounds' findings fixed or deliberate below.
+
+- implementation-review: approve (rounds: approve-with-changes x4, then approve; ~75k and ~140 s for round 1); deliberate: `if let` over `Request` and over `SharedStateError::SliceExhausted` (only an admission asks a grant; only that variant refuses as a budget).
+- backend: approve (round 1 relaunched on the worktree after a launch failure; fixed: stop at the first unreachable answer, `Shutdown` no sync, refused settles dropped and tested); deliberate: no attempt cap on a kept settle (follow-up).
+- architect: approve (round 1 flagged the dropped floor; restored with a `holds-until` naming the gaps); deliberate: a `retry_class` on the error type (optional, a later change).
+- lang:rust: approve (enums, `Book` methods, `pub(crate)`, an exhaustive settle match fixed); deliberate: an `is_unreachable` helper and a `Reach` enum (style only).
+- tui: approve (refusals reworded, the unbacked next-day clause and the doubled "refused" dropped); deliberate: "settle" and "reserve" stay in log lines (glossed in the docs), log line length.
 
 ## Outcome
 
