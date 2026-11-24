@@ -241,11 +241,11 @@ impl LoopGuard {
 /// Whether a piped filter's output shows a failure. The fixed markers, case
 /// as written: `FAIL` as a word (`FAIL`, `FAILED`); `error:`, `error[`,
 /// `Error:`, `ERROR:`, `FAILURE:`, `npm ERR!`, `make: ***`; `panicked`;
-/// `fatal:`; `Traceback`; vitest's `×`; and a count of at least one before
+/// `fatal:`; `Traceback`; vitest's `× ` at the start of a line; and a count of at least one before
 /// `failed` or `error`/`errors` (`1 failed`, `3 errors`), so a summary's
 /// `0 failed` or `Found 0 errors.` is not one.
 fn shows_failure(output: &str) -> bool {
-    const PLAIN: [&str; 11] = [
+    const PLAIN: [&str; 10] = [
         "error:",
         "error[",
         "Error:",
@@ -256,9 +256,14 @@ fn shows_failure(output: &str) -> bool {
         "panicked",
         "fatal:",
         "Traceback",
-        "×",
     ];
     if PLAIN.iter().any(|marker| output.contains(marker)) {
+        return true;
+    }
+    if output
+        .lines()
+        .any(|line| line.trim_start().starts_with("× "))
+    {
         return true;
     }
     let mut before: Option<&str> = None;
@@ -966,6 +971,7 @@ mod tests {
             " Test Files  12 passed (12)\n      Tests  817 passed (817)",
             "no errors found",
             "FAILURES=0 wrote failover.log",
+            "rendered 1920×1080 in 3×4 tiles",
         ] {
             assert!(!shows_failure(clean), "{clean}");
         }

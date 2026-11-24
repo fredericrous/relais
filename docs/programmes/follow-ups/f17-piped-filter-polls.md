@@ -54,7 +54,8 @@ succeeding one clears that command's counts.
 
 - `FAIL` or `FAILED` as a word;
 - `error:`, `error[`, `Error:`, `ERROR:`, `FAILURE:`, `npm ERR!`,
-  `make: ***`, `panicked`, `fatal:`, `Traceback`, and vitest's `×`;
+  `make: ***`, `panicked`, `fatal:`, `Traceback`, and vitest's `× ` at
+  the start of a line;
 - a count of at least one before `failed`, `error` or `errors`
   (`1 failed`, `Found 2 errors.`).
 
@@ -101,3 +102,7 @@ The plan's Carried line and its fingerprint rule are updated.
 - unix: approve-with-changes; added `make: ***`, `npm ERR!`, `ERROR:`, `FAILURE:`; SIGPIPE 141 recorded above. 45k tok, 32 s.
 - lang:rust: approve; the word scan no longer allocates; two test names fixed; vitest `×` added. 46k tok, 42 s.
 - backend: approve-with-changes; the early-`FAIL` limit now sits beside the gate in the `holds-until:` marker. 53k tok, 46 s.
+
+Delta (round 2): implementation-review approve; backend approve and unix
+approve-with-changes, both on the bare `×` matching `1920×1080`. It is now
+matched only at the start of a line, with that negative case pinned.
