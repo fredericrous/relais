@@ -71,13 +71,19 @@ export type ProgrammeMemory = {
   // The session a /clear just ended: `--previous` for its successor.
   previous: string | undefined
   // The handoff of the session a /clear ended, still to be adopted by its
-  // successor: bound to that successor by its first read (`session`), retried
-  // on each later read of it until `relais programme adopt` exits 0, an exit 2,
-  // a change of session, or ADOPT_GIVE_UP_MS after the clear.
-  adopt:
-    | { previous: string; session: string | undefined; since: number; running: boolean; failed: boolean; gaveUp: boolean }
-    | undefined
+  // successor (programme.ts, adoptPrevious).
+  adopt: Adoption | undefined
 }
+
+// An adoption: `unbound` until the successor's first read binds its session,
+// `running` while `relais programme adopt` runs, `failed` to run again at the
+// next read of that session, `gaveUp` ADOPT_GIVE_UP_MS after the bind. Exit 0,
+// any exit 2 or a change of session drops it.
+export type Adoption =
+  | { state: 'unbound'; previous: string; session: undefined }
+  | { state: 'running'; previous: string; session: string; since: number | undefined }
+  | { state: 'failed'; previous: string; session: string; since: number }
+  | { state: 'gaveUp'; previous: string; session: string }
 
 export type TailMessage = { role: 'user' | 'assistant'; text: string }
 

@@ -995,9 +995,7 @@ fn take_ticket(
         // retry command, and the release failure is one more line.
         Err(NodeError::Compensation { local, release }) => match *local {
             NodeError::Claim(error) => {
-                eprintln!(
-                    "relais programme claim: the shared hold could not be given back: {release}"
-                );
+                eprintln!("relais: the shared hold could not be given back: {release}");
                 Ok(Err(error))
             }
             local => {
@@ -1055,7 +1053,11 @@ fn held_line(
 /// session a `/clear` ended) becomes this session's `work`, through the same
 /// path as `relais programme claim`, so the relayed session holds its ticket
 /// whether or not its agent claims it (follow-ups f12). Each ticket is tried
-/// on its own; one line per ticket on stderr, nothing on stdout.
+/// on its own; one line per ticket on stderr, nothing on stdout. A ticket
+/// that can never be adopted (closed, gone, or its repository gone) is a line
+/// and exit 0, since a retry cannot change it; exit 1 is kept for what a
+/// retry may fix (a lock that stayed held, a programme or store that could
+/// not be read).
 pub(crate) fn adopt_command(previous: &str, session: Option<&str>) -> Result<CliOutcome, CliError> {
     let session = writing_session(session)?;
     let previous = previous.trim();
@@ -1085,33 +1087,33 @@ pub(crate) fn adopt_command(previous: &str, session: Option<&str>) -> Result<Cli
         let named = format!("{} {slug} {id}", dir_name(recorded));
         let Some(dir) = relais::learn::salvage::reachable_repo(recorded) else {
             eprintln!(
-                "relais: {named} skipped: its repository is not found ({})",
+                "relais: {named} not adopted: its repository is not found ({})",
                 found.claim.repo
             );
-            failed = true;
             continue;
         };
         let state = match claim_target(slug, Some(&dir), &store, now) {
             Ok(loaded) if loaded.state.key == found.key => loaded.state,
             Ok(_) => {
                 eprintln!(
-                    "relais: {named} skipped: {} is not the repository that holds the claim",
+                    "relais: {named} not adopted: {} is not the repository that holds the claim",
                     dir.display()
                 );
-                failed = true;
                 continue;
             }
             Err(error) => {
-                eprintln!("relais: {named} skipped: its programme cannot be read: {error}");
+                eprintln!("relais: {named} not adopted: its programme cannot be read: {error}");
                 failed = true;
                 continue;
             }
         };
         if !state.open.contains_key(id) {
-            eprintln!(
-                "relais: {} {slug} {id} skipped: the ticket is closed",
-                state.repo
-            );
+            let why = if state.closed.contains(id) {
+                "skipped: the ticket is closed"
+            } else {
+                "not adopted: no such ticket"
+            };
+            eprintln!("relais: {} {slug} {id} {why}", state.repo);
             continue;
         }
         match take_ticket(&store, &state, id, &session, claim::Contest::Refuse, now) {
@@ -1121,12 +1123,14 @@ pub(crate) fn adopt_command(previous: &str, session: Option<&str>) -> Result<Cli
             Ok(Ok(claim::Taken::Refused { holder, age_secs })) => {
                 eprintln!("relais: {}", held_line(&state, slug, id, &holder, age_secs));
             }
+            // A store failure and an operational one read alike to a person:
+            // the ticket was not adopted, and a retry may take it.
             Ok(Err(error)) => {
-                eprintln!("relais: {} {slug} {id}: {error}", state.repo);
+                eprintln!("relais: {} {slug} {id} not adopted: {error}", state.repo);
                 failed = true;
             }
             Err(error) => {
-                eprintln!("relais: {} {slug} {id}: {error}", state.repo);
+                eprintln!("relais: {} {slug} {id} not adopted: {error}", state.repo);
                 failed = true;
             }
         }

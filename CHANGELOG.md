@@ -16,9 +16,10 @@ missing here.
   ticket unheld once the 2 h handoff hold ran out, and another session's
   `next --claim` handed it out while the first still worked it (follow-ups
   f12). `adopt` writes one line per ticket on stderr and nothing on stdout,
-  and exits 0 when every ticket was taken, is held by another session or is
-  closed, 1 when a lock stayed held or a ticket's repository is not found,
-  and 2 on a usage error. `relais programme claim` prints what it printed
+  and exits 0 when every ticket was taken, is held by another session or
+  can never be (closed, gone, or its repository gone), 1 when a lock stayed
+  held or a programme or the store could not be read, and 2 on a usage
+  error. `relais programme claim` prints what it printed
   before.
 - The unpriced-model messages name the price table the way machine.toml
   writes it: `<model> has no [[pricing.models]] entry` (the runner, the

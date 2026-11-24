@@ -848,6 +848,7 @@ fn adopt_takes_the_open_handoff_and_skips_the_one_on_a_closed_ticket() {
     world.programme("alpha", "p", &[("t1", "afk", None), ("t2", "afk", None)]);
     world.next(OLD, &["--from", "alpha:p", "--claim"]);
     copy_handoff(&world, "t2", None);
+    copy_handoff(&world, "t3", None);
     let t1 = world.root.join("alpha/docs/programmes/p/t1.md");
     let closed = std::fs::read_to_string(&t1)
         .expect("ticket")
@@ -858,6 +859,10 @@ fn adopt_takes_the_open_handoff_and_skips_the_one_on_a_closed_ticket() {
     let stderr = text(&adopted.stderr);
     assert!(
         stderr.contains("relais: alpha p t1 skipped: the ticket is closed\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("relais: alpha p t3 not adopted: no such ticket\n"),
         "{stderr}"
     );
     assert!(
@@ -886,27 +891,34 @@ fn a_handoff_recorded_in_a_removed_worktree_is_adopted_through_the_primary_check
 }
 
 #[test]
-fn a_handoff_whose_repository_is_gone_is_skipped_and_adopt_exits_1() {
+fn a_handoff_whose_repository_is_gone_is_not_adopted_and_adopt_exits_0() {
     let world = World::new("adopt-gone");
     world.programme("alpha", "p", &[("t1", "afk", None), ("t2", "afk", None)]);
     world.next(OLD, &["--from", "alpha:p", "--claim"]);
     copy_handoff(&world, "t2", Some(&world.root.join("nowhere")));
     let adopted = world.adopt(OLD, NEW);
-    assert_eq!(adopted.status.code(), Some(1), "{}", text(&adopted.stderr));
+    assert_eq!(adopted.status.code(), Some(0), "{}", text(&adopted.stderr));
     let stderr = text(&adopted.stderr);
     assert!(
         stderr.contains("relais: took over alpha p t1 from aaaaaaaa\n"),
         "{stderr}"
     );
     assert!(
-        stderr.contains("p t2 skipped: its repository is not found"),
+        stderr.contains("p t2 not adopted: its repository is not found"),
         "{stderr}"
     );
 }
 
 #[test]
-fn adopt_refuses_a_previous_session_equal_to_its_own() {
+fn adopt_refuses_an_empty_previous_session_or_one_equal_to_its_own() {
     let world = World::new("adopt-usage");
+    let empty = world.adopt("  ", NEW);
+    assert_eq!(empty.status.code(), Some(2));
+    assert!(
+        text(&empty.stderr).contains("--previous is empty"),
+        "{}",
+        text(&empty.stderr)
+    );
     let out = world.adopt(NEW, NEW);
     assert_eq!(out.status.code(), Some(2));
     assert!(

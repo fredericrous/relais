@@ -388,7 +388,7 @@ test('a second clear while an adoption runs drops it; the new successor adopts i
 test('an adoption still pending 2 h after the clear stops and keeps its note', async () => {
   const store = createStore()
   store.programme.session = 'session-2'
-  store.programme.adopt = { previous: 'session-1', session: 'session-2', since: 0, running: false, failed: true, gaveUp: false }
+  store.programme.adopt = { state: 'failed', previous: 'session-1', session: 'session-2', since: 0 }
   const runs: string[][] = []
   const fx: any = {
     kv: { get: async () => [], set: async () => undefined },
@@ -406,5 +406,5 @@ test('an adoption still pending 2 h after the clear stops and keeps its note', a
   await readProgramme(fx, store, 'command')
   expect(runs.filter(argv => argv[2] === 'adopt').length).toBe(0)
   expect(runs.filter(argv => argv[2] === 'session').length).toBe(2)
-  expect(store.programme.note).toBe('ticket not adopted after 2 h · relais programme adopt --previous session-1')
+  expect(store.programme.note).toBe('ticket not adopted in 2 h · its handoff lapsed')
 })
