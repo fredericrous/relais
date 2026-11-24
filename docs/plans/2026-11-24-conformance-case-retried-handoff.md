@@ -122,7 +122,7 @@ which check and step failed.
 
 ## Phases
 
-- [ ] Phase 1 — the case and the rule:
+- [x] Phase 1 — the case and the rule:
   `crates/relais/src/shared_state/conformance.rs` (the case, `run_all` and its `[(&str, Check); 11]` array length, now 12),
   `crates/relais/src/shared_state/mod.rs` (the `reserve_handoff` doc),
   `docs/shared-state.md` (the suite list and the programme-claims bullet),
@@ -145,6 +145,18 @@ which check and step failed.
   `Held` answer reports still counts from the first grant), because the
   retry writes the missing claim file with a fresh `claimed_at`; the shared
   hold then ends with it.
+
+## Decision log (implementation)
+
+- 2026-11-24 — The trait doc and `docs/shared-state.md` say a primary
+  *should* move the hold's end to `HANDOFF_HOLD_SECS` after a retry, not
+  that it does: no conformance check holds a client to it yet (code-review
+  backend). An expiry case would belong in `run_all_with_clock`.
+- 2026-11-24 — The give-back path in `node::reserve_handoff` carries a
+  `holds-until:` marker naming the condition that ends it (a caller asking
+  the shared half for a ticket whose claim file is written); the follow-up
+  is in the relais inbox.
+- 2026-11-24 — Next: Phase 2, the homelab Resolution and map line.
 
 ## Verification
 
@@ -177,6 +189,12 @@ which check and step failed.
   it → passes on the fake with its clock; with the step-5 mutation above it
   fails with a `step 5:` message.
 - Phase 2: in the homelab task worktree, `relais programme check docs/programmes/agents-many-nodes`, run on its own and not piped → exit 0. A failing check exits with the non-zero code `crates/relais/src/cli/outcome.rs` assigns it, with its diagnostics on stderr.
+
+## Implementation review
+
+- implementation-review: approve on tree 5eb3ca45 after two deltas; fixed the `_` arm on `TicketAnswer`, the marker's end condition, one wrap (opus; 41k+64k+29k, 38+74+24 s).
+- backend profile: approve on delta; fixed: `holds-until:` marker, hold-end promise softened; carried: naming the expiry follow-up in the doc (opus; 57k+51k, 77+26 s).
+- lang:rust profile: approve on delta; fixed: the `_` arm, the module doc naming `run_all_with_clock`, a long doc line (opus; 55k+44k, 85+14 s).
 
 ## Outcome
 
