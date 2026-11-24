@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: prog/follow-ups/f19-pin-row-records-call-model
 repos: [relais]
 adrs: []
@@ -211,10 +211,18 @@ date.
 | `make plugin` | Phase 2 | pass | 555 pass, 0 fail (the script's one rerun: an unrelated chunk-matching test timed out at 5 s under load) |
 | Red check | the row rewrite disabled | the new cases fail | 8 of the 14 new tests fail; the 6 whose expected value is today's still pass, as they should |
 | Pilot | scratch `typo.md` (`opsu`), `rev.md` (`opus`), isolated `CLAUDE_CONFIG_DIR`/`RELAIS_STATE_DIR` | exit 0, pins and sources as planned, empty stderr | exit 0; `pins` {rev: opus, typo: opsu}; `pin_sources` both `preferred`; stderr 0 lines; the scratch state directory stayed empty |
+| `settledWithin` (review delta) | ms 0 and -50 with a settled read; ms 0 with a pending one | the settled model; a timeout | as expected; `routing.test.ts` 108 pass, 0 fail. Red check (the no-time branch returns the timeout): the test fails by assertion |
+| `make plugin` after review | the review fixes | pass | the 15 pin tests pass in both runs; 21 unrelated tests hit the 5 s runner limit at load average 93 on 6 cores. The router files alone (`routing`, `router`, `spawn` tests): 168 pass, 0 fail |
 
 ## Decision log
 - 2026-11-24: Phase 1 ran through relais; both its verify runs blocked on `admission_wait_exhausted` (a jammed host, 5 waiters). The kept candidate was applied unchanged and checked in session; the run is recorded `salvaged` at `f96b007e1`.
 - 2026-11-24: Phase 2's relais run got no worker lease in 1800 s (`nothing was launched`), so Phase 2 was written by hand in session.
 - 2026-11-24: carried findings taken in Phase 2: the session model is read in `afterSpawn` after `next(e)` (backend), a `TIMEOUT` maps to undefined (typescript), aliases expand by `DEFAULT_MODEL_IDS` not the tiers (Codex 2), and the own `opsu`, preferred `opsu` and preferred-source rejecting cases (rust, typescript, backend).
+
+## Implementation review
+- implementation-review: approve after 2 deltas; fixed: the `n` name (blocking), the red-check count, the Phase 2 text, a `settledWithin` test, `assertNever(source)`. 55k+50k+30k, 48+63+14 s.
+- backend: approve on the delta; fixed: one source rule, `own` serialized, the `[1m]` suffix, reading before `next`. deliberate: no note on a failed read (`note()` reaches only a live pane). 59k+28k, 61+13 s.
+- lang:rust: approve on the delta; fixed: the `Pin` doc, equal key sets. deliberate: no second source enum (one builder only). 46k+22k, 27+8 s.
+- lang:typescript: approve on the delta; fixed: exhaustive `switch`, `as const`, narrowing at entry, `string | undefined`, indentation. 55k+27k, 39+14 s.
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:rust,lang:typescript,tui,unix,codex body-sha=3298939a5d52 -->
