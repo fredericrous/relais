@@ -194,8 +194,11 @@ impl LoopGuard {
                 let call = self.pending.remove(&tool_use_id)?;
                 // A trailing tail/head/grep hides the pipeline's exit status, so
                 // its output stands in for it: counted by hash only when it
-                // shows a failure marker. A wait poll's empty or progress
-                // output falls through and, unless is_error, clears as a success.
+                // shows a failure marker. Any other output falls through to
+                // is_error: a wait poll's empty output clears as a success, and
+                // so does a failing run without pipefail whose filtered output
+                // shows no marker.
+                // holds-until: the transcript carries the pipeline's real exit status (or every worker sets pipefail); until then the marker list stands in for it, and a stable early FAIL line in a still-running poll can reach the threshold — revisit when a shadow event shows one
                 if call.ends_in_output_filter && shows_failure(&output) {
                     let evidence = Evidence::OutputHash(hash_of(&output));
                     return self.count(call.command, evidence);
@@ -237,33 +240,45 @@ impl LoopGuard {
 
 /// Whether a piped filter's output shows a failure. The fixed markers, case
 /// as written: `FAIL` as a word (`FAIL`, `FAILED`); `error:`, `error[`,
-/// `Error:`; `panicked`; `fatal:`; `Traceback`; and a count of at least one
-/// before `failed` or `error`/`errors` (`1 failed`, `3 errors`), so a
-/// summary's `0 failed` or `Found 0 errors.` is not one.
+/// `Error:`, `ERROR:`, `FAILURE:`, `npm ERR!`, `make: ***`; `panicked`;
+/// `fatal:`; `Traceback`; vitest's `×`; and a count of at least one before
+/// `failed` or `error`/`errors` (`1 failed`, `3 errors`), so a summary's
+/// `0 failed` or `Found 0 errors.` is not one.
 fn shows_failure(output: &str) -> bool {
-    const PLAIN: [&str; 6] = [
+    const PLAIN: [&str; 11] = [
         "error:",
         "error[",
         "Error:",
+        "ERROR:",
+        "FAILURE:",
+        "npm ERR!",
+        "make: ***",
         "panicked",
         "fatal:",
         "Traceback",
+        "×",
     ];
     if PLAIN.iter().any(|marker| output.contains(marker)) {
         return true;
     }
-    let words: Vec<&str> = output
+    let mut before: Option<&str> = None;
+    for word in output
         .split(|ch: char| !ch.is_ascii_alphanumeric())
         .filter(|word| !word.is_empty())
-        .collect();
-    words.iter().enumerate().any(|(at, word)| match *word {
-        "FAIL" | "FAILED" => true,
-        "failed" | "error" | "errors" => at
-            .checked_sub(1)
-            .and_then(|before| words[before].parse::<u64>().ok())
-            .is_some_and(|count| count > 0),
-        _ => false,
-    })
+    {
+        let counted = || {
+            before
+                .and_then(|count| count.parse::<u64>().ok())
+                .is_some_and(|count| count > 0)
+        };
+        match word {
+            "FAIL" | "FAILED" => return true,
+            "failed" | "error" | "errors" if counted() => return true,
+            _ => {}
+        }
+        before = Some(word);
+    }
+    false
 }
 
 fn hash_of(text: &str) -> u64 {
@@ -855,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn a_piped_tail_command_is_counted_whatever_is_error_says() {
+    fn a_piped_filter_showing_failure_counts_even_when_is_error_is_false() {
         let mut guard = guard();
         let command = "cargo test | tail -5";
         for id in ["a", "b"] {
@@ -923,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_markers_ignore_zero_counts() {
+    fn shows_failure_reads_markers_and_skips_zero_counts() {
         for failing in [
             "test result: FAILED. 1 passed; 1 failed",
             "error[E0425]: cannot find value `x`",
@@ -935,6 +950,11 @@ mod tests {
             " FAIL  src/x.test.ts > adds",
             "      Tests  1 failed | 3 passed (4)",
             "Found 2 errors.",
+            "make: *** [check] Error 2",
+            "npm ERR! code ELIFECYCLE",
+            "ERROR: tests/test_x.py::test_a",
+            "FAILURE: Build failed with an exception.",
+            " × adds two numbers 3ms",
         ] {
             assert!(shows_failure(failing), "{failing}");
         }
