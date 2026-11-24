@@ -462,9 +462,9 @@ impl<'a> RunEngine<'a> {
         }
     }
 
-    /// The candidates this dispatch lists: adr-lint is asked once per
+    /// The candidates this dispatch lists: greenspotter is asked once per
     /// candidate commit, and each dispatch gets those on the files of the
-    /// patch it reads. A gap is the answer when adr-lint gave none.
+    /// patch it reads. A gap is the answer when greenspotter gave none.
     fn part_candidates(
         &mut self,
         request: &ReviewRequest<'_>,
@@ -493,7 +493,7 @@ impl<'a> RunEngine<'a> {
     }
 
     /// Read the reviewer's rulings out of its answer, count them, and append
-    /// one `adr-lint.ruling/1` line for each. A file that cannot be written
+    /// one `greenspotter.ruling/1` line for each. A file that cannot be written
     /// is an environment warning, never a failed run.
     fn record_rulings(
         &mut self,

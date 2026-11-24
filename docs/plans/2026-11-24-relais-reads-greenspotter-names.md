@@ -63,7 +63,7 @@ installed before t09, which removes `adr-lint` from PATH.
   until t09. `greenspotter.ruling/1` rows written meanwhile stay in the ledger.
 
 ## Phases
-- [ ] Phase 1 — add `adr-lint.candidates/1` to the bad-format test, re-capture
+- [x] Phase 1 — add `adr-lint.candidates/1` to the bad-format test, re-capture
   `CANDIDATES_JSON` from real 0.20.0 output, run `cargo fmt`, clippy and fix
   "an greenspotter" wording from the sed; rename in `crates/relais/src/context/candidates.rs`,
   `crates/relais/src/context/mod.rs`, `crates/relais/src/runner/review/candidates.rs`,

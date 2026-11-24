@@ -78,7 +78,7 @@ pub(crate) struct ReviewRequest<'r> {
     /// The recipe that covered the candidate's own dispatch, if any —
     /// carried the same way as `routed_by`, for the same reason.
     pub(crate) covering: Option<Recipe>,
-    /// The run's base: adr-lint's candidates are the lines between it and
+    /// The run's base: greenspotter's candidates are the lines between it and
     /// `candidate_sha`.
     pub(crate) base_sha: &'r str,
     /// How each holdout ended on this candidate: the reviewer is given

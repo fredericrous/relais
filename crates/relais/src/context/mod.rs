@@ -205,7 +205,7 @@ pub trait DecisionResolver {
         Ok(Vec::new())
     }
 
-    /// adr-lint's candidate lines between a run's base and a candidate
+    /// greenspotter's candidate lines between a run's base and a candidate
     /// commit, for the reviewer. Same failure policy; the default knows none.
     fn candidates_for(
         &self,
@@ -235,8 +235,8 @@ pub struct AvalCli {
     /// The constraint index is the same for every package of a run, so it
     /// is fetched once per `AvalCli` (one per run) and shared.
     rules: OnceLock<Result<Rules, GuidanceGap>>,
-    /// The adr-lint program: `RELAIS_ADR_LINT`, else `adr-lint` from PATH.
-    adr_lint: String,
+    /// The greenspotter program: `RELAIS_GREENSPOTTER`, else `greenspotter` from PATH.
+    greenspotter: String,
     /// The fleet decisions directory a repository without a corpus of its
     /// own takes its code rules from: `RELAIS_FLEET_DECISIONS`, if set.
     /// Unset, the decisions pack embedded in this binary is the source.
@@ -253,7 +253,7 @@ impl AvalCli {
             bin: None,
             cancel: None,
             rules: OnceLock::new(),
-            adr_lint: adr_lint_program(),
+            greenspotter: greenspotter_program(),
             fleet_decisions: fleet_decisions_dir(),
             fleet_cache: default_fleet_cache(),
         }
@@ -267,7 +267,7 @@ impl AvalCli {
             bin: None,
             cancel: Some(cancel),
             rules: OnceLock::new(),
-            adr_lint: adr_lint_program(),
+            greenspotter: greenspotter_program(),
             fleet_decisions: fleet_decisions_dir(),
             fleet_cache: default_fleet_cache(),
         }
@@ -286,9 +286,9 @@ impl AvalCli {
         self
     }
 
-    /// The same, spawning `program` for adr-lint.
-    pub fn with_adr_lint(mut self, program: impl Into<String>) -> Self {
-        self.adr_lint = program.into();
+    /// The same, spawning `program` for greenspotter.
+    pub fn with_greenspotter(mut self, program: impl Into<String>) -> Self {
+        self.greenspotter = program.into();
         self
     }
 }
@@ -355,13 +355,13 @@ fn materialise_fleet_pack(cache: &Path, pack: &[u8]) -> std::io::Result<PathBuf>
     }
 }
 
-/// The program that answers `adr-lint candidates`: the one place the
+/// The program that answers `greenspotter candidates`: the one place the
 /// environment is read for it.
-fn adr_lint_program() -> String {
-    std::env::var(candidates::ADR_LINT_ENV)
+fn greenspotter_program() -> String {
+    std::env::var(candidates::GREENSPOTTER_ENV)
         .ok()
         .filter(|program| !program.is_empty())
-        .unwrap_or_else(|| "adr-lint".to_string())
+        .unwrap_or_else(|| "greenspotter".to_string())
 }
 
 impl DecisionResolver for AvalCli {
@@ -461,7 +461,7 @@ impl DecisionResolver for AvalCli {
         head: &str,
     ) -> Result<candidates::CandidateList, GuidanceGap> {
         candidates::fetch_candidates(
-            &self.adr_lint,
+            &self.greenspotter,
             &self.root,
             base,
             head,

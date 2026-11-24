@@ -1,4 +1,4 @@
-//! adr-lint's candidate lines for a candidate commit, and the rulings the
+//! greenspotter's candidate lines for a candidate commit, and the rulings the
 //! reviewer writes about them (SPEC §7).
 //!
 //! A candidate is a line to look at, never a finding. The pure parts live
@@ -14,18 +14,18 @@ use std::sync::atomic::AtomicBool;
 use super::guidance::{self, GapCause, GuidanceGap, GuidanceSource};
 
 /// The `format` token of the document this module reads.
-pub const CANDIDATES_FORMAT: &str = "adr-lint.candidates/1";
+pub const CANDIDATES_FORMAT: &str = "greenspotter.candidates/1";
 
-/// The environment variable naming the adr-lint program to spawn.
-pub const ADR_LINT_ENV: &str = "RELAIS_ADR_LINT";
+/// The environment variable naming the greenspotter program to spawn.
+pub const GREENSPOTTER_ENV: &str = "RELAIS_GREENSPOTTER";
 
-/// How many candidates adr-lint is asked for.
+/// How many candidates greenspotter is asked for.
 pub const CANDIDATES_MAX: usize = 40;
 
 /// The shortest id prefix a ruling may use.
 pub const MIN_ID_PREFIX: usize = 12;
 
-/// One line adr-lint asks the reviewer to look at.
+/// One line greenspotter asks the reviewer to look at.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Candidate {
     pub id: String,
@@ -38,7 +38,7 @@ pub struct Candidate {
     pub text: String,
 }
 
-/// What adr-lint listed: the candidates, and how many more each rule had
+/// What greenspotter listed: the candidates, and how many more each rule had
 /// beyond the cap.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CandidateList {
@@ -60,20 +60,20 @@ fn gap(cause: GapCause, detail: impl Into<String>) -> GuidanceGap {
     GuidanceGap::new(GuidanceSource::Candidates, cause, detail)
 }
 
-/// Parse `adr-lint candidates --json` (format `adr-lint.candidates/1`). A
+/// Parse `greenspotter candidates --json` (format `greenspotter.candidates/1`). A
 /// missing or different `format` token is a gap; unknown fields are ignored.
 pub fn parse_candidates_output(stdout: &str) -> Result<CandidateList, GuidanceGap> {
     let raw: RawCandidates = serde_json::from_str(stdout.trim()).map_err(|e| {
         gap(
             GapCause::Unparseable,
-            format!("unparseable adr-lint output: {e}"),
+            format!("unparseable greenspotter output: {e}"),
         )
     })?;
     if raw.format != CANDIDATES_FORMAT {
         return Err(gap(
             GapCause::Unparseable,
             format!(
-                "adr-lint output has format {:?}, expected {CANDIDATES_FORMAT:?}",
+                "greenspotter output has format {:?}, expected {CANDIDATES_FORMAT:?}",
                 raw.format
             ),
         ));
@@ -82,7 +82,7 @@ pub fn parse_candidates_output(stdout: &str) -> Result<CandidateList, GuidanceGa
         return Err(gap(
             GapCause::Unparseable,
             format!(
-                "adr-lint candidate id {:?} is not 64 lowercase hex characters",
+                "greenspotter candidate id {:?} is not 64 lowercase hex characters",
                 bad.id
             ),
         ));
@@ -97,7 +97,7 @@ fn is_candidate_id(id: &str) -> bool {
     id.len() == 64 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// The argv of `adr-lint candidates` between the run's base and a candidate.
+/// The argv of `greenspotter candidates` between the run's base and a candidate.
 pub fn candidates_args(base: &str, head: &str) -> Vec<String> {
     [
         "candidates",
@@ -114,8 +114,8 @@ pub fn candidates_args(base: &str, head: &str) -> Vec<String> {
     .collect()
 }
 
-/// Spawn `program` (adr-lint) in `dir`, bounded and cancellable, and parse
-/// its document. Every failure is a gap of `Candidates` naming adr-lint.
+/// Spawn `program` (greenspotter) in `dir`, bounded and cancellable, and parse
+/// its document. Every failure is a gap of `Candidates` naming greenspotter.
 pub fn fetch_candidates(
     program: &str,
     dir: &Path,
@@ -124,7 +124,7 @@ pub fn fetch_candidates(
     cancel: Option<&AtomicBool>,
 ) -> Result<CandidateList, GuidanceGap> {
     let stdout = guidance::run_tool(
-        "adr-lint",
+        "greenspotter",
         program,
         &candidates_args(base, head),
         dir,
@@ -236,8 +236,8 @@ pub fn parse_rulings(answer: &str, listed: &[&str]) -> BTreeMap<String, Ruling> 
 mod tests {
     use super::*;
 
-    /// Captured from adr-lint 0.3.0 (`adr-lint candidates --json`).
-    const CANDIDATES_JSON: &str = r#"{"base":"e50d22fccef1f14949c620753adf8ffe376468bd","candidates":[{"col":16,"id":"610663331e1941e0e935e32f0b2443d99e3617f07cd522178cc07ab03e5c012a","line":2,"path":"src/a.rs","pattern":"`.unwrap()`, `.expect(` or `panic!`: a failure that should be a value in the return type, unless the invariant is proven","pattern_id":"failures.expected-vs-defect/rust-panic","rule":"failures.expected-vs-defect","text":"let data = std::fs::read(\"x\").unwrap();"},{"col":9,"id":"6998f43dd19b3a4891444a2b67b42ed87028c23713230bd4c05cece9b1acf6dc","line":2,"path":"src/a.rs","pattern":"a single-letter, placeholder or abbreviated name declared here (data, result, value, item, tmp, obj, cfg, ctx, mgr, svc)","pattern_id":"names.reveal-intent/rust-weak-name","rule":"names.reveal-intent","text":"let data = std::fs::read(\"x\").unwrap();"}],"format":"adr-lint.candidates/1","head":"2d94d48229cfa25910c8bb775d8547eef8ffd2dd","overflow":{}}"#;
+    /// Captured from adr-lint 0.3.0, format id renamed; the keys (base, candidates, format, head, overflow) match greenspotter 0.20.0 output.
+    const CANDIDATES_JSON: &str = r#"{"base":"e50d22fccef1f14949c620753adf8ffe376468bd","candidates":[{"col":16,"id":"610663331e1941e0e935e32f0b2443d99e3617f07cd522178cc07ab03e5c012a","line":2,"path":"src/a.rs","pattern":"`.unwrap()`, `.expect(` or `panic!`: a failure that should be a value in the return type, unless the invariant is proven","pattern_id":"failures.expected-vs-defect/rust-panic","rule":"failures.expected-vs-defect","text":"let data = std::fs::read(\"x\").unwrap();"},{"col":9,"id":"6998f43dd19b3a4891444a2b67b42ed87028c23713230bd4c05cece9b1acf6dc","line":2,"path":"src/a.rs","pattern":"a single-letter, placeholder or abbreviated name declared here (data, result, value, item, tmp, obj, cfg, ctx, mgr, svc)","pattern_id":"names.reveal-intent/rust-weak-name","rule":"names.reveal-intent","text":"let data = std::fs::read(\"x\").unwrap();"}],"format":"greenspotter.candidates/1","head":"2d94d48229cfa25910c8bb775d8547eef8ffd2dd","overflow":{}}"#;
 
     const FIRST: &str = "610663331e1941e0e935e32f0b2443d99e3617f07cd522178cc07ab03e5c012a";
     const SECOND: &str = "6998f43dd19b3a4891444a2b67b42ed87028c23713230bd4c05cece9b1acf6dc";
@@ -261,14 +261,15 @@ mod tests {
     fn a_missing_or_other_format_token_is_an_unparseable_gap() {
         for bad in [
             r#"{"candidates":[],"overflow":{}}"#,
-            r#"{"format":"adr-lint.candidates/2","candidates":[]}"#,
+            r#"{"format":"greenspotter.candidates/2","candidates":[]}"#,
+            r#"{"format":"adr-lint.candidates/1","candidates":[]}"#,
             "not json",
             "[]",
         ] {
             let gap = parse_candidates_output(bad).expect_err(bad);
             assert_eq!(gap.source, GuidanceSource::Candidates, "{bad}");
             assert_eq!(gap.cause, GapCause::Unparseable, "{bad}");
-            assert!(gap.detail.contains("adr-lint"), "{}", gap.detail);
+            assert!(gap.detail.contains("greenspotter"), "{}", gap.detail);
         }
     }
 
@@ -277,7 +278,7 @@ mod tests {
         let upper = FIRST.to_uppercase();
         for id in [upper.as_str(), &FIRST[..63]] {
             let doc = format!(
-                r#"{{"format":"adr-lint.candidates/1","candidates":[{{"id":"{id}","rule":"r","pattern_id":"p","pattern":"x","path":"a.rs","line":1,"col":1,"text":"t"}}]}}"#
+                r#"{{"format":"greenspotter.candidates/1","candidates":[{{"id":"{id}","rule":"r","pattern_id":"p","pattern":"x","path":"a.rs","line":1,"col":1,"text":"t"}}]}}"#
             );
             let gap = parse_candidates_output(&doc).expect_err(id);
             assert_eq!(gap.source, GuidanceSource::Candidates, "{id}");
@@ -288,7 +289,7 @@ mod tests {
     #[test]
     fn unknown_fields_are_ignored_and_overflow_is_read() {
         let list = parse_candidates_output(
-            r#"{"format":"adr-lint.candidates/1","extra":1,"candidates":[],"overflow":{"names.reveal-intent":7}}"#,
+            r#"{"format":"greenspotter.candidates/1","extra":1,"candidates":[],"overflow":{"names.reveal-intent":7}}"#,
         )
         .expect("parses");
         assert_eq!(list.overflow["names.reveal-intent"], 7);
