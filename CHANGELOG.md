@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.83.0
+
 relais spawns `greenspotter` (0.20.0 or later) where it spawned `adr-lint`, reads
 only `greenspotter.candidates/1`, and writes `greenspotter.ruling/1` lines to
 `rulings.jsonl`. `RELAIS_ADR_LINT` is removed with no alias: set
@@ -28,6 +30,14 @@ before upgrading; without it a review runs with a candidates gap.
   seat's shared state. The holder is the host's name. `Coordinator::start`
   and `run_daemon` take the shared state and the holder. With `LocalState`
   every seat is granted, so a single node answers as before.
+
+A pinned subagent's decision row now records the model the call ran, not
+the pin. `router-state` serves `pin_sources` (`own`, `preferred`, `machine`)
+beside `pins`, and the plugin records the call's `model`, else the agent's own
+`model:`, else the session's model, which it reads after the spawn has
+started. Rows written before, and rows from a plugin older than this one,
+keep the pin's value (`opus`, or `inherit` for a machine pin). The plugin
+half needs the relais plugin reinstalled.
 
 ## v0.82.0
 
