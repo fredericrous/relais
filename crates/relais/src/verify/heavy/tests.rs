@@ -585,6 +585,17 @@ fn with_one_heavy_slot_two_runs_checks_never_overlap() {
 }
 
 #[test]
+fn the_lease_bounds_exactly_greengates_width_keys() {
+    let environment = child_environment(3, &BTreeMap::new());
+    let keys: Vec<&str> = environment.keys().map(String::as_str).collect();
+    let mut shared = greenharness_slots::WIDTH_KEYS.to_vec();
+    shared.sort_unstable();
+    assert_eq!(keys, shared);
+    assert_eq!(environment["MAKEFLAGS"], "-j3");
+    assert_eq!(environment["CARGO_BUILD_JOBS"], "3");
+}
+
+#[test]
 fn an_admitted_check_carries_parallelism_bounds_and_its_own_env_wins() {
     let dir = temp_dir("env");
     let gate = gate_with(2);

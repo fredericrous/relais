@@ -355,13 +355,16 @@ pub fn host_share(
 /// The environment of a command admitted with `jobs` jobs: the bounds
 /// relais sets, with any key the check names itself replaced by the
 /// check's value.
+///
+/// The keys are greengate's own list ([`greenharness_slots::WIDTH_KEYS`]),
+/// so a key greengate learns to bound is bounded here on the next bump.
+/// Every key is set whatever relais's own environment holds: the check's
+/// own `env` is the only override.
 pub fn child_environment(jobs: u32, own: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    let mut environment = BTreeMap::from([
-        ("MAKEFLAGS".to_string(), format!("-j{jobs}")),
-        ("CARGO_BUILD_JOBS".to_string(), jobs.to_string()),
-        ("RUST_TEST_THREADS".to_string(), jobs.to_string()),
-        ("NEXTEST_TEST_THREADS".to_string(), jobs.to_string()),
-    ]);
+    let mut environment: BTreeMap<String, String> = greenharness_slots::width_env(jobs, |_| None)
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect();
     environment.extend(own.iter().map(|(k, v)| (k.clone(), v.clone())));
     environment
 }

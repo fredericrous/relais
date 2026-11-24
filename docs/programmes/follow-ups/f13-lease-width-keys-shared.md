@@ -1,7 +1,7 @@
 +++
 type = "task"
 mode = "afk"
-status = "open"
+status = "closed"
 blocked_by = []
 repos = ["relais"]
 +++
@@ -25,3 +25,17 @@ drift.
 Once greenharness-slots ships `width_env`, relais builds the lease env
 from `greenharness_slots::width_env`, and a test pins that the two key
 sets match. Until then the ticket waits.
+
+## Resolution
+
+2026-11-24. `width_env` shipped in greenharness-slots 4.13.0, which relais
+already locks. `child_environment` now builds the lease env from
+`greenharness_slots::width_env(jobs, |_| None)`: every key in
+`WIDTH_KEYS`, whatever relais's own environment holds, with the check's
+own `env` the only override (as before). The test
+`the_lease_bounds_exactly_greengates_width_keys` pins that the lease's
+keys are exactly `WIDTH_KEYS`.
+
+The published 4.13.0 still lists the four keys; `VITEST_MAX_WORKERS` and
+`GOMAXPROCS` (amont #514) are on amont main, unreleased. They reach relais
+with the next greenharness-slots bump and no relais change.
