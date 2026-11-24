@@ -60,7 +60,13 @@ pub(crate) fn load_repo_policy() -> Result<(PathBuf, RepoPolicy), CliError> {
 /// The machine's settings, through the shared-state implementation
 /// `machine.toml` selects (`LocalState`: the file, read as it always was).
 pub(crate) fn load_machine() -> Result<MachineSettings, CliError> {
-    shared_state()?
+    machine_of(&*shared_state()?)
+}
+
+/// The machine's settings through a state the caller already built: a
+/// command that builds one (`relais run`) reads through it, never a second.
+pub(crate) fn machine_of(state: &dyn SharedState) -> Result<MachineSettings, CliError> {
+    state
         .machine_settings()
         .map_err(|e| shared_state_error("the machine settings", e))
 }
@@ -247,17 +253,24 @@ pub(crate) fn datasets_dir() -> Result<PathBuf, CliError> {
 /// defaults" posture `coordinator daemon` already takes reading this
 /// file, not an error just because nobody has priced anything yet.
 pub(crate) fn load_price_table() -> Result<PriceTable, CliError> {
-    Ok(load_machine_pricing()?.unwrap_or_else(PriceTable::empty))
+    price_table_of(&*shared_state()?)
+}
+
+/// [`load_price_table`] through a state the caller already built.
+pub(crate) fn price_table_of(state: &dyn SharedState) -> Result<PriceTable, CliError> {
+    Ok(machine_pricing_of(state)?.unwrap_or_else(PriceTable::empty))
 }
 
 /// The machine's `[pricing]` table; `None` when it has none, so a cost can
 /// say that no table is the reason it is unknown.
 pub(crate) fn load_machine_pricing() -> Result<Option<PriceTable>, CliError> {
+    machine_pricing_of(&*shared_state()?)
+}
+
+/// [`load_machine_pricing`] through a state the caller already built.
+fn machine_pricing_of(state: &dyn SharedState) -> Result<Option<PriceTable>, CliError> {
     // Absent is the defaults, which carry no `[pricing]` table.
-    shared_state()?
-        .machine_settings()
-        .map(|machine| machine.pricing)
-        .map_err(|e| shared_state_error("the machine settings", e))
+    Ok(machine_of(state)?.pricing)
 }
 
 /// The machine's settings for the session router's native commands: a
