@@ -1447,8 +1447,10 @@ mod host_slots {
         with_slots.stall_window = Duration::from_secs(1);
         with_slots.events =
             Events::for_run_on("run-st", &dir, crate::protocol::Wire::to(std::io::sink()));
-        // `deliberate`: the crate's `Stall` reads the real clock (5.0.0 has no
+        // deliberate: the crate's `Stall` reads the real clock (5.0.0 has no
         // seam for its admitted-at term), so the 1 s window passes in real time.
+        // holds-until: greenharness-slots exposes admitted_at; then drive
+        // Stall::observe_at from the ManualClock and drop this sleep.
         with_slots.sleeper = Advancing::then(&clock, |_| {
             std::thread::sleep(Duration::from_millis(20));
         });
@@ -1459,7 +1461,7 @@ mod host_slots {
         assert!(
             matches!(
                 stop,
-                LeaseStop::Exhausted(crate::policy::Exhausted::AdmissionWait)
+                LeaseStop::SlotLine(super::super::SlotLineEnd::Stalled { window_s: 1, .. })
             ),
             "{stop:?}"
         );
@@ -1472,6 +1474,92 @@ mod host_slots {
             "{written}"
         );
         std::fs::remove_dir_all(&slots_dir).ok(); // best-effort: a scratch dir
+    }
+
+    /// ADR-0015: once the line is joined, a lock that fails three polls in a
+    /// row ends the wait with its own cause. It is never a spent budget, and
+    /// never runs the command unqueued.
+    #[test]
+    fn an_unreadable_line_after_joining_ends_the_wait_with_its_own_cause() {
+        let dir = temp_dir("slots-unreadable");
+        let slots_dir = slot_dir("unreadable");
+        let _held = other_holder(&slots_dir, "xcodebuild");
+        let gate = Recording::new(gate_with(1));
+        register(&gate.inner, "run-u");
+        let clock = ManualClock::new();
+        let mut with_slots = admission(&gate, "run-u", 1, 4);
+        with_slots.slots = Some(slots_dir.clone());
+        with_slots.sizing = Some(greenharness_slots::Sizing::Fixed(1));
+        with_slots.budgets = budgets_on(&clock, 600);
+        with_slots.poll = Duration::from_millis(5);
+        with_slots.events =
+            Events::for_run_on("run-u", &dir, crate::protocol::Wire::to(std::io::sink()));
+        let gone = slots_dir.clone();
+        with_slots.sleeper = Advancing::then(&clock, move |number| {
+            if number == 1 {
+                std::fs::remove_dir_all(&gone).ok(); // best-effort: breaks the queue
+            }
+        });
+        let stop = with_slots
+            .admit(&ask(&BTreeMap::new(), 1))
+            .err()
+            .expect("an unreadable line ends the wait");
+        assert!(
+            matches!(
+                stop,
+                LeaseStop::SlotLine(super::super::SlotLineEnd::Unreadable { failures: 3, .. })
+            ),
+            "{stop:?}"
+        );
+        let written = std::fs::read_to_string(dir.join("events.jsonl")).expect("events");
+        assert!(written.contains("admission_queue_unreadable"), "{written}");
+    }
+
+    /// ADR-0015: the coordinator's queue and the host-slot queue charge the
+    /// same budget, and the overrun of one never lets the other off: a
+    /// coordinator wait, a host-slot wait past the budget, then a coordinator
+    /// wait that exhausts it, all through `Queue::charging`.
+    #[test]
+    fn the_coordinator_still_exhausts_after_a_host_slot_overrun() {
+        let clock = ManualClock::new();
+        let gate = Recording::new(gate_with(1));
+        let mut shared = admission(&gate, "run-q", 1, 4);
+        shared.budgets = budgets_on(&clock, 50);
+        shared.poll = Duration::from_secs(1);
+        let sleeper = Advancing::new(&clock);
+        let slot = |bound| Holding::Slot {
+            class: "x",
+            position: 1,
+            behind: None,
+            bound,
+        };
+        let mut queue = Queue::new(&shared);
+        for _ in 0..10 {
+            queue
+                .wait(slot(Bound::Budget), None, sleeper.as_ref())
+                .expect("10 s of coordinator queue is inside the budget");
+        }
+        for _ in 0..60 {
+            queue
+                .wait(slot(Bound::Stall), None, sleeper.as_ref())
+                .expect("a host-slot line that moves is not ended by the budget");
+        }
+        assert!(shared.budgets.overrun() >= Duration::from_secs(15));
+        // The first coordinator tick charges nothing yet; the next one finds
+        // the millisecond the host-slot wait left unspent gone.
+        queue
+            .wait(slot(Bound::Budget), None, sleeper.as_ref())
+            .expect("a wait is charged from its second poll");
+        let ended = queue.wait(slot(Bound::Budget), None, sleeper.as_ref());
+        assert!(
+            matches!(
+                ended,
+                Err(LeaseStop::Exhausted(
+                    crate::policy::Exhausted::AdmissionWait
+                ))
+            ),
+            "{ended:?}"
+        );
     }
 }
 

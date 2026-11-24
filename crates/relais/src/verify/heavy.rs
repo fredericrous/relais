@@ -399,6 +399,8 @@ pub fn dispatch_id(run: &str, phase: &str, label: &str, epoch: u32, attempt: u32
 pub enum LeaseStop {
     /// A budget ran out while the command was queued.
     Exhausted(Exhausted),
+    /// The host-slot line ended the wait without a spent budget (ADR-0015).
+    SlotLine(SlotLineEnd),
     /// The run was cancelled while the command was queued.
     Cancelled,
     /// The coordinator could not be asked, or answered with an error.
@@ -418,10 +420,35 @@ pub enum LeaseStop {
     },
 }
 
+/// Why a host-slot wait ended with no slot and no spent budget (ADR-0015).
+#[derive(Debug)]
+pub enum SlotLineEnd {
+    /// No admission and no change of place for the window.
+    Stalled { window_s: u64, position: usize },
+    /// The queue was joined, then its lock failed `failures` polls in a row.
+    Unreadable { failures: u32, cause: String },
+}
+
+impl std::fmt::Display for SlotLineEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stalled { window_s, position } => write!(
+                f,
+                "the host slot line made no progress for {window_s} s at position {position}"
+            ),
+            Self::Unreadable { failures, cause } => write!(
+                f,
+                "the host slot line could not be read {failures} times in a row: {cause}"
+            ),
+        }
+    }
+}
+
 impl std::fmt::Display for LeaseStop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Exhausted(which) => write!(f, "a budget ran out while queued ({which:?})"),
+            Self::SlotLine(end) => write!(f, "{end}"),
             Self::Cancelled => write!(f, "the run was cancelled while the command was queued"),
             Self::Gate(e) => write!(f, "{e}"),
             Self::Refused { detail, .. } => write!(f, "{detail}"),
@@ -1129,7 +1156,7 @@ mod slots {
 
     use std::path::{Path, PathBuf};
 
-    use super::{Ask, Bound, Event, Exhausted, Gate, HeavyAdmission, Holding, LeaseStop, Queue};
+    use super::{Ask, Bound, Event, Gate, HeavyAdmission, Holding, LeaseStop, Queue, SlotLineEnd};
 
     /// Whether the slot directory can be used, before anything is queued
     /// for. `Ok(None)`: it cannot, which is said once and not fatal, the
@@ -1221,6 +1248,17 @@ mod slots {
             let queued = match waiter.poll() {
                 Ok(greenharness_slots::Poll::Granted(held)) => {
                     record(started.elapsed().as_millis(), "admitted", None);
+                    let over = admission.budgets.overrun();
+                    if !over.is_zero() {
+                        admission.events.emit(Event::Decision {
+                            what: "admission_overrun".into(),
+                            reason: format!(
+                                "queued {} s past `admission_wait_seconds` while the host slot \
+                                 line moved; charged to the total only",
+                                over.as_secs()
+                            ),
+                        });
+                    }
                     return Ok(Some(held));
                 }
                 Ok(greenharness_slots::Poll::Waiting(queued)) => {
@@ -1242,14 +1280,17 @@ mod slots {
                             "deferred",
                             Some(greenharness_slots::WaitEnd::IoError),
                         );
+                        let end = SlotLineEnd::Unreadable {
+                            failures,
+                            cause: e.to_string(),
+                        };
                         admission.events.emit(Event::Decision {
-                            what: "admission_queue_ended".into(),
-                            reason: format!(
-                                "the host slot line could not be read {failures} times in a row: {e}"
-                            ),
+                            what: "admission_queue_unreadable".into(),
+                            reason: end.to_string(),
                         });
-                        return Err(LeaseStop::Exhausted(Exhausted::AdmissionWait));
+                        return Err(LeaseStop::SlotLine(end));
                     }
+                    let _ = gate.heartbeat(lease); // best-effort, as in the waiting arm
                     let waited = queue.wait(
                         Holding::Slot {
                             class: "host_slot",
@@ -1273,15 +1314,15 @@ mod slots {
                     "deferred",
                     Some(greenharness_slots::WaitEnd::Stalled),
                 );
+                let end = SlotLineEnd::Stalled {
+                    window_s: stall.limit().as_secs(),
+                    position: queued.position,
+                };
                 admission.events.emit(Event::Decision {
                     what: "admission_queue_ended".into(),
-                    reason: format!(
-                        "the host slot line made no progress for {} s at position {}",
-                        stall.limit().as_secs(),
-                        queued.position
-                    ),
+                    reason: end.to_string(),
                 });
-                return Err(LeaseStop::Exhausted(Exhausted::AdmissionWait));
+                return Err(LeaseStop::SlotLine(end));
             }
             // The tokens are held while the slots are awaited: say so, so
             // the coordinator does not take the lease for abandoned.

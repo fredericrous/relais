@@ -16,9 +16,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 mod budgets;
+pub(crate) use budgets::Bound;
 pub use budgets::{
-    BaseRun, Bound, BudgetClock, BudgetLimits, Budgets, Draws, Exhausted, Wait, WaitKind,
-    WallClock, DEFAULT_ADMISSION_WAIT_SECONDS, DEFAULT_DISK_WAIT_SECONDS,
+    BaseRun, BudgetClock, BudgetLimits, Budgets, Draws, Exhausted, Wait, WaitKind, WallClock,
+    DEFAULT_ADMISSION_WAIT_SECONDS, DEFAULT_DISK_WAIT_SECONDS,
 };
 
 use crate::contract::{Review, TaskContract};

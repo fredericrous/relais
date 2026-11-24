@@ -21,8 +21,11 @@ a host slot keeps waiting past `admission_wait_seconds` while the line moves
 (an admission or a change of place within 300 s, `GREENHARNESS_SLOT_STALL_S`
 to change it); the time past the budget counts toward the total only, so the
 run is not blocked `admission_wait_exhausted` right after a grant. A line
-that makes no progress for the window still ends the run that way, and its
-`waits.jsonl` row carries `"end":"stalled"`. The coordinator's own queue keeps
+that makes no progress for the window still ends the run that way, at any
+point of the budget, and its `waits.jsonl` row carries `"end":"stalled"`; a
+line that cannot be read three polls in a row ends it too (`"end":"io_error"`)
+instead of running the command unqueued. A grant after an overrun says how long
+it was (`admission_overrun`). The coordinator's own queue keeps
 the old budget. It builds on `greenharness-slots` 5 (greengate 5.0.0); the
 decision is ADR-0015.
 

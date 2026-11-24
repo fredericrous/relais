@@ -15,14 +15,16 @@ ADR-0014 gave `admission_wait_seconds` as the cumulative time a command is queue
 
 ## Decision
 
-1. **The host-slot wait is bounded by stall.** `take()` keeps the crate's `Stall` (300 s, `GREENHARNESS_SLOT_STALL_S`). While the line moved inside that window the wait goes on after `admission_wait_seconds` is spent.
+1. **The host-slot wait is bounded by stall.** `take()` keeps the crate's `Stall` (300 s, `GREENHARNESS_SLOT_STALL_S`). A wait ends after 300 s with no admission and no change of place, at any point of the budget, as ADR-0022 decides for every caller of the crate; and while the line moves the wait goes on after `admission_wait_seconds` is spent. A single long holder with no admission for 300 s therefore blocks a run sooner than the 1800 s budget did.
 2. **The overrun is the total's.** Time past the budget is charged to `admission_overrun`, never to `admission_waited`, so `exhausted()` does not end the run after the grant. The total still bounds it.
 3. **A stall ends the wait as the spent budget did.** A `deferred` row, then `blocked (admission_wait_exhausted)`, with the reason `the host slot line made no progress for 300 s at position N`; the journal row carries `"end":"stalled"`.
 4. **The coordinator's model-work queue keeps its exhaustion.** It charges the same budget and does not take the rule; whether it should is amont's t16.
 5. **The disk wait is unchanged.**
+6. **A line that cannot be read ends the wait too.** Once the queue is joined, three lock failures in a row end the wait: a `deferred` row with `"end":"io_error"`, a run blocked `admission_wait_exhausted` whose detail and `admission_queue_unreadable` event say the line could not be read. Before the queue is joined a lock error still turns the host slots off, as before.
+7. **The overrun is said.** A grant after an overrun emits an `admission_overrun` decision with the seconds.
 
 ## Consequences
 
 - A run can now spend more than `admission_wait_seconds` queued, up to the total.
 - `admission_overrun` is in memory only: no ledger migration, and an older binary reads the same rows.
-- Roll back by pinning `greenharness-slots = "4.13"` and removing the overrun, in one patch.
+- Roll back by pinning `greenharness-slots = "4.13"` and removing, in one patch, the overrun, the stall check and the unreadable-line end (they use `Stall`, `WaitEnd` and `POLL_FAILURES` from 5.x).

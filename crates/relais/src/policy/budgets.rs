@@ -69,7 +69,7 @@ pub enum WaitKind {
 
 /// What ends a wait that charges the admission budget (ADR-0015).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Bound {
+pub(crate) enum Bound {
     /// The spent budget: the coordinator's queue, and every wait before.
     Budget,
     /// A stalled line: a host-slot wait goes on past the budget while the
