@@ -23,3 +23,10 @@ ADR-0080).
 
 A claim CLI test that triggers a lock timeout and asserts that stderr
 contains `stayed held for`.
+
+## Resolution
+
+Closed on 2026-11-24 by #566. The claim CLI lock-timeout test now asserts
+that stderr holds `stayed held for`, the wording the driver's retry
+matches. (This Resolution was added with f15. #566 closed the ticket
+without one, and `relais programme check` refused it.)
