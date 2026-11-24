@@ -580,7 +580,9 @@ pub fn a_primary_refuses_another_holders_reservation(state: &dyn SharedState, fi
         TicketAnswer::Held { holder, .. } => {
             assert_eq!(holder, &me, "{CHECK} step 5: a refusal names the reserver")
         }
-        _ => panic!("{CHECK} step 5: a primary refuses another holder with Held, got {over:?}"),
+        TicketAnswer::Granted(_) | TicketAnswer::NodeDecides => {
+            panic!("{CHECK} step 5: a primary refuses another holder with Held, got {over:?}")
+        }
     }
 }
 
