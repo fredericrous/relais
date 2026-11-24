@@ -120,12 +120,18 @@ async function adoptPrevious(fx: Fx, store: Store, session: string, ms: number) 
   memory.adopt = running
   try {
     await adoptOnce(fx, store, running, ms)
-  } catch {
+  } catch (error) {
     // An effect that throws must not leave the adoption running forever:
-    // it is retried at the next read, like any other failure.
+    // it is retried at the next read, like any other failure, and an
+    // adoption that threw before its bind still binds at that read.
     const current = memory.adopt
     if (current?.state === 'running' && current.session === session) {
-      memory.adopt = { state: 'failed', previous: current.previous, session, since: current.since ?? 0 }
+      memory.adopt = { state: 'failed', previous: current.previous, session, since: current.since }
+    }
+    try {
+      await recordEvent(fx, store, { at: Date.now(), kind: 'adopt', result: 'error', cause: 'threw', detail: oneLine(String(error)) })
+    } catch {
+      // Fail open: the event list is bookkeeping, the retry above is not.
     }
   }
 }
@@ -161,7 +167,7 @@ async function adoptOnce(fx: Fx, store: Store, running: Extract<Adoption, { stat
     memory.adopt = undefined
     // A ticket adopt can never take (closed, gone) is a stderr line and exit 0.
     const notAdopted = stderr.split('\n').find(line => line.includes(' not adopted: '))
-    await recordEvent(fx, store, { at, kind: 'adopt', result: 'ok', ...(notAdopted ? { detail: notAdopted.trim() } : {}) })
+    await recordEvent(fx, store, notAdopted ? { at, kind: 'adopt', result: 'not-adopted', detail: notAdopted.trim() } : { at, kind: 'adopt', result: 'ok' })
     return
   }
   if (exitCode === 2) {

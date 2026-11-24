@@ -77,12 +77,12 @@ export type ProgrammeMemory = {
 
 // An adoption: `unbound` until the successor's first read binds its session,
 // `running` while `relais programme adopt` runs, `failed` to run again at the
-// next read of that session, `gaveUp` ADOPT_GIVE_UP_MS after the bind. Exit 0,
+// next read of that session (`since` unset when it failed before its bind), `gaveUp` ADOPT_GIVE_UP_MS after the bind. Exit 0,
 // any exit 2 or a change of session drops it.
 export type Adoption =
   | { state: 'unbound'; previous: string; session: undefined }
   | { state: 'running'; previous: string; session: string; since: number | undefined }
-  | { state: 'failed'; previous: string; session: string; since: number }
+  | { state: 'failed'; previous: string; session: string; since: number | undefined }
   | { state: 'gaveUp'; previous: string; session: string }
 
 export type TailMessage = { role: 'user' | 'assistant'; text: string }

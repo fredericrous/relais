@@ -461,3 +461,37 @@ test('a failed adopt records its cause and first stderr line', async () => {
   })
   expect(store.programme.adopt?.state).toBe('failed')
 })
+
+test('an adoption whose effect throws before its bind is retried, not given up', async () => {
+  const store = createStore()
+  store.programme.adopt = { state: 'unbound', previous: 'session-1', session: undefined }
+  // The second clock read is the adoption's own: the first is the read's bound.
+  let clockReads = 0
+  const kv = new Map<string, unknown>()
+  const runs: string[][] = []
+  const fx: any = {
+    kv: { get: async (key: string) => kv.get(key), set: async (key: string, value: unknown) => void kv.set(key, value) },
+    clock: {
+      now: async () => {
+        clockReads += 1
+        if (clockReads === 2) throw new Error('clock unavailable')
+        return 1000
+      },
+      after: () => ({ cancel: () => undefined }),
+    },
+    session: { id: async () => 'session-2' },
+    process: {
+      run: async (argv: string[]) => {
+        runs.push(argv)
+        return { exitCode: 0, stdout: JSON.stringify({ programme: null }), stderr: '' }
+      },
+    },
+    ui: { open: async () => undefined },
+  }
+  await readProgramme(fx, store, 'clear')
+  expect(store.programme.adopt).toEqual({ state: 'failed', previous: 'session-1', session: 'session-2', since: undefined })
+  expect(JSON.stringify(kv.get('relais.programmeEvents'))).toContain('"cause":"threw"')
+  await readProgramme(fx, store, 'command')
+  expect(runs.filter(argv => argv[2] === 'adopt').length).toBe(1)
+  expect(store.programme.adopt).toBeUndefined()
+})

@@ -10,9 +10,11 @@ export const MAX_EVENTS = 200
 
 export type ProgrammeEvent =
   | { at: number; kind: 'read'; result: 'shown' | 'null' | 'error' }
-  | { at: number; kind: 'adopt'; result: 'ok'; detail?: string }
+  | { at: number; kind: 'adopt'; result: 'ok' }
+  // A ticket adopt can never take (closed, gone): exit 0 with a `not adopted` line.
+  | { at: number; kind: 'adopt'; result: 'not-adopted'; detail: string }
   | { at: number; kind: 'adopt'; result: 'older' }
-  | { at: number; kind: 'adopt'; result: 'error'; cause: 'late' | 'spawn' | 'exit' | 'usage' | 'gave-up'; detail?: string }
+  | { at: number; kind: 'adopt'; result: 'error'; cause: 'late' | 'spawn' | 'exit' | 'usage' | 'gave-up' | 'threw'; detail?: string }
   | { at: number; kind: 'freeze'; chars: number }
   | { at: number; kind: 'hide'; seconds: number }
   | { at: number; kind: 'open'; rows: number; bodyRows: number }
