@@ -67,6 +67,16 @@ pub enum WaitKind {
     Disk,
 }
 
+/// What ends a wait that charges the admission budget (ADR-0015).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bound {
+    /// The spent budget: the coordinator's queue, and every wait before.
+    Budget,
+    /// A stalled line: a host-slot wait goes on past the budget while the
+    /// line moves, and the time past it is the overrun.
+    Stall,
+}
+
 /// The size of each budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetLimits {
@@ -126,6 +136,9 @@ struct Spent {
     /// When work began, on both scales: `None` until the baseline ends.
     work_started: Option<Mark>,
     admission_waited: i64,
+    /// Host-slot wait past `admission_wait`, while the line moved (ADR-0015):
+    /// inside the total, outside `admission_waited`, so it never exhausts.
+    admission_overrun: i64,
     disk_waited: i64,
     /// Waits charged since `work_started`: excluded from the work budget.
     waited_in_work: i64,
@@ -191,6 +204,7 @@ impl Budgets {
                 run_started,
                 work_started: None,
                 admission_waited: 0,
+                admission_overrun: 0,
                 disk_waited: 0,
                 waited_in_work: 0,
                 base_in_work: 0,
@@ -255,11 +269,24 @@ impl Budgets {
     /// Charge `from..now` to a wait budget, and return the new mark.
     /// A wait consumes its own budget and `total` (which reads the clock
     /// and so needs no charge), and is taken out of `work`.
-    fn charge_wait(&self, kind: WaitKind, from: Mark) -> Mark {
+    fn charge_wait(&self, kind: WaitKind, from: Mark, bound: Bound) -> Mark {
         let now = self.mark();
         let waited = (now.at - from.at).max(0);
         let mut spent = self.lock();
         match kind {
+            WaitKind::Admission
+                if bound == Bound::Stall && !self.limits.admission_wait.is_zero() =>
+            {
+                // A line that still moves keeps `admission_waited` one
+                // millisecond under its limit, so `exhausted()` never ends
+                // the run after a grant; the rest is the overrun.
+                let limit =
+                    i64::try_from(self.limits.admission_wait.as_millis()).unwrap_or(i64::MAX);
+                let room = (limit - 1 - spent.admission_waited).max(0);
+                let within = waited.min(room);
+                spent.admission_waited += within;
+                spent.admission_overrun += waited - within;
+            }
             WaitKind::Admission => spent.admission_waited += waited,
             WaitKind::Disk => spent.disk_waited += waited,
         }
@@ -277,7 +304,25 @@ impl Budgets {
             budgets: self.clone(),
             kind,
             mark: self.mark(),
+            bound: Bound::Budget,
         }
+    }
+
+    /// Start timing a host-slot wait whose end is a stalled line, not the
+    /// spent admission budget (ADR-0015): time past `admission_wait` is the
+    /// overrun, charged to the total only.
+    pub fn moving_wait(&self) -> Wait {
+        Wait {
+            budgets: self.clone(),
+            kind: WaitKind::Admission,
+            mark: self.mark(),
+            bound: Bound::Stall,
+        }
+    }
+
+    /// Host-slot wait past `admission_wait`, charged to the total only.
+    pub fn overrun(&self) -> Duration {
+        from_millis(self.lock().admission_overrun)
     }
 
     /// What remains of the total.
@@ -490,20 +535,21 @@ pub struct Wait {
     budgets: Budgets,
     kind: WaitKind,
     mark: Mark,
+    bound: Bound,
 }
 
 impl Wait {
     /// Charge the time since the last tick, and report the first budget
     /// that is spent, the wait's own included.
     pub fn tick(&mut self) -> Option<Exhausted> {
-        self.mark = self.budgets.charge_wait(self.kind, self.mark);
+        self.mark = self.budgets.charge_wait(self.kind, self.mark, self.bound);
         self.budgets.exhausted()
     }
 }
 
 impl Drop for Wait {
     fn drop(&mut self) {
-        self.budgets.charge_wait(self.kind, self.mark);
+        self.budgets.charge_wait(self.kind, self.mark, self.bound);
     }
 }
 
@@ -860,5 +906,78 @@ mod tests {
         let roomy = Budgets::start(clock, limits(100, 50, 50, 300));
         roomy.begin_work();
         assert_eq!(roomy.binding(), Exhausted::Work);
+    }
+
+    #[test]
+    fn a_moving_host_slot_wait_outlives_the_admission_budget_without_exhausting_it() {
+        let clock = ManualClock::new();
+        let budgets = Budgets::start(clock.clone(), limits(100, 50, 50, 300));
+        budgets.begin_work();
+        {
+            let mut wait = budgets.moving_wait();
+            clock.advance(80);
+            assert_eq!(
+                wait.tick(),
+                None,
+                "a moving line is not ended by the budget"
+            );
+            assert_eq!(
+                budgets.exhausted(),
+                None,
+                "and a grant is not followed by a block"
+            );
+        }
+        assert!(budgets.waited(WaitKind::Admission) < Duration::from_secs(50));
+        assert_eq!(
+            budgets.waited(WaitKind::Admission) + budgets.overrun(),
+            Duration::from_secs(80),
+            "every second is charged once"
+        );
+        assert!(budgets.overrun() >= Duration::from_secs(30));
+        assert_eq!(
+            budgets.total_remaining(),
+            Duration::from_secs(220),
+            "the overrun is inside the total"
+        );
+        assert_eq!(budgets.work_remaining(), Duration::from_secs(100));
+    }
+
+    #[test]
+    fn the_total_still_ends_a_moving_host_slot_wait() {
+        let clock = ManualClock::new();
+        let budgets = Budgets::start(clock.clone(), limits(100, 50, 50, 120));
+        let mut wait = budgets.moving_wait();
+        clock.advance(121);
+        assert_eq!(wait.tick(), Some(Exhausted::Total));
+    }
+
+    #[test]
+    fn the_coordinator_queue_keeps_its_exhaustion_after_an_overrun() {
+        let clock = ManualClock::new();
+        let budgets = Budgets::start(clock.clone(), limits(100, 50, 50, 1000));
+        {
+            let mut wait = budgets.moving_wait();
+            clock.advance(80);
+            assert_eq!(wait.tick(), None);
+        }
+        let mut coordinator = budgets.wait(WaitKind::Admission);
+        clock.advance(1);
+        assert_eq!(
+            coordinator.tick(),
+            Some(Exhausted::AdmissionWait),
+            "the host-slot overrun left the budget one millisecond short, and the coordinator spends it"
+        );
+    }
+
+    #[test]
+    fn a_moving_wait_with_no_admission_limit_is_charged_as_before() {
+        let clock = ManualClock::new();
+        let budgets = Budgets::start(clock.clone(), limits(100, 0, 50, 1000));
+        let mut wait = budgets.moving_wait();
+        clock.advance(40);
+        assert_eq!(wait.tick(), None);
+        drop(wait);
+        assert_eq!(budgets.waited(WaitKind::Admission), Duration::from_secs(40));
+        assert_eq!(budgets.overrun(), Duration::ZERO);
     }
 }
