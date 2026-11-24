@@ -695,3 +695,235 @@ fn two_next_claim_processes_started_together_print_different_tickets() {
         );
     }
 }
+
+// --- f12: a relayed session holds its ticket (`relais programme adopt`) ---
+
+/// Every claim file under the state directory.
+fn claim_files(world: &World) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for repo in std::fs::read_dir(world.state.join("claims")).expect("claims dir") {
+        let repo = repo.expect("entry").path();
+        if !repo.is_dir() || repo.file_name().is_some_and(|name| name == "ended") {
+            continue;
+        }
+        for slug in std::fs::read_dir(&repo).expect("repo dir") {
+            let slug = slug.expect("entry").path();
+            if !slug.is_dir() {
+                continue;
+            }
+            for file in std::fs::read_dir(&slug).expect("slug dir") {
+                let file = file.expect("entry").path();
+                if file.extension().is_some_and(|ext| ext == "toml") {
+                    files.push(file);
+                }
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+impl World {
+    /// Moves every claim `secs` into the past, as a clock moving forward
+    /// would: the CLI reads the wall clock, so the claims move instead.
+    fn age_claims(&self, secs: i64) {
+        for file in claim_files(self) {
+            let text = std::fs::read_to_string(&file).expect("claim");
+            let mut claim: toml::Table = toml::from_str(&text).expect("claim parses");
+            for field in ["claimed_at", "refreshed_at"] {
+                let at = claim[field].as_integer().expect("a timestamp");
+                claim.insert(field.to_string(), toml::Value::Integer(at - secs));
+            }
+            std::fs::write(&file, toml::to_string(&claim).expect("encodes")).expect("write");
+        }
+    }
+
+    fn adopt(&self, previous: &str, session: &str) -> Output {
+        self.run(&["adopt", "--previous", previous, "--session", session])
+    }
+}
+
+const OLD: &str = "aaaaaaaa-old-session";
+const NEW: &str = "bbbbbbbb-new-session";
+
+#[test]
+fn a_relayed_session_that_adopts_its_handoff_keeps_the_ticket_past_the_handoff_hold() {
+    let world = World::new("adopt-1121");
+    world.programme("alpha", "p", &[("t19", "afk", None), ("t20", "afk", None)]);
+    // 05:21: A reserves t19 for its successor and clears.
+    let reserved = world.next(OLD, &["--from", "alpha:p", "--claim"]);
+    assert_eq!(
+        text(&reserved.stdout),
+        "alpha p t19\tt19\n",
+        "{}",
+        text(&reserved.stderr)
+    );
+    // 05:22: B starts on the relayed prompt; the plugin adopts, B's agent claims nothing.
+    let adopted = world.adopt(OLD, NEW);
+    assert_eq!(adopted.status.code(), Some(0), "{}", text(&adopted.stderr));
+    assert_eq!(text(&adopted.stdout), "");
+    assert_eq!(
+        text(&adopted.stderr),
+        "relais: took over alpha p t19 from aaaaaaaa\n"
+    );
+    // Three hours on, past the 2 h handoff hold.
+    world.age_claims(3 * 3600);
+    // 08:36: another session's boundary does not reserve t19.
+    let other = world.next("cccccccc-other", &["--from", "alpha:p", "--claim"]);
+    assert_eq!(
+        text(&other.stdout),
+        "alpha p t20\tt20\n",
+        "{}",
+        text(&other.stderr)
+    );
+    // And a direct claim on t19 is refused: B holds it.
+    let refused = world.claim("alpha", "p", "t19", "dddddddd-relay");
+    assert_eq!(refused.status.code(), Some(3), "{}", text(&refused.stderr));
+    assert!(
+        text(&refused.stderr).contains("alpha p t19 is held by bbbbbbbb ("),
+        "{}",
+        text(&refused.stderr)
+    );
+}
+
+#[test]
+fn a_successor_that_claims_itself_still_takes_the_handoff_over_and_adopt_then_finds_nothing() {
+    let world = World::new("adopt-claim");
+    world.programme("alpha", "p", &[("t1", "afk", None)]);
+    world.next(OLD, &["--from", "alpha:p", "--claim"]);
+    let claimed = world.claim("alpha", "p", "t1", NEW);
+    assert_eq!(claimed.status.code(), Some(0), "{}", text(&claimed.stderr));
+    assert!(
+        text(&claimed.stderr).contains("relais: took over alpha p t1 from aaaaaaaa\n"),
+        "{}",
+        text(&claimed.stderr)
+    );
+    let adopted = world.adopt(OLD, NEW);
+    assert_eq!(adopted.status.code(), Some(0), "{}", text(&adopted.stderr));
+    assert_eq!(text(&adopted.stderr), "");
+    let again = world.claim("alpha", "p", "t1", NEW);
+    assert!(
+        text(&again.stderr).contains("refreshed your claim on alpha p t1"),
+        "{}",
+        text(&again.stderr)
+    );
+}
+
+#[test]
+fn a_handoff_another_session_took_over_stays_with_it_and_adopt_is_silent_twice() {
+    let world = World::new("adopt-taken");
+    world.programme("alpha", "p", &[("t1", "afk", None)]);
+    world.next(OLD, &["--from", "alpha:p", "--claim"]);
+    let taken = world.claim("alpha", "p", "t1", "eeeeeeee-first");
+    assert_eq!(taken.status.code(), Some(0), "{}", text(&taken.stderr));
+    for _ in 0..2 {
+        let adopted = world.adopt(OLD, NEW);
+        assert_eq!(adopted.status.code(), Some(0), "{}", text(&adopted.stderr));
+        assert_eq!(text(&adopted.stdout), "");
+        assert_eq!(text(&adopted.stderr), "");
+    }
+    let refused = world.claim("alpha", "p", "t1", NEW);
+    assert_eq!(refused.status.code(), Some(3), "{}", text(&refused.stderr));
+}
+
+/// A second handoff of `OLD` beside the first, as a copy of its claim file
+/// under `id`, with `repo` changed when one is given.
+fn copy_handoff(world: &World, id: &str, repo: Option<&Path>) {
+    let first = claim_files(world).pop().expect("one claim file");
+    let mut claim: toml::Table =
+        toml::from_str(&std::fs::read_to_string(&first).expect("claim")).expect("parses");
+    if let Some(repo) = repo {
+        claim.insert(
+            "repo".to_string(),
+            toml::Value::String(repo.to_str().expect("utf8").to_string()),
+        );
+    }
+    let path = first.with_file_name(format!("{id}.toml"));
+    std::fs::write(path, toml::to_string(&claim).expect("encodes")).expect("write");
+}
+
+#[test]
+fn adopt_takes_the_open_handoff_and_skips_the_one_on_a_closed_ticket() {
+    let world = World::new("adopt-closed");
+    world.programme("alpha", "p", &[("t1", "afk", None), ("t2", "afk", None)]);
+    world.next(OLD, &["--from", "alpha:p", "--claim"]);
+    copy_handoff(&world, "t2", None);
+    copy_handoff(&world, "t3", None);
+    let t1 = world.root.join("alpha/docs/programmes/p/t1.md");
+    let closed = std::fs::read_to_string(&t1)
+        .expect("ticket")
+        .replace("status = \"open\"", "status = \"closed\"");
+    std::fs::write(&t1, closed).expect("close t1");
+    let adopted = world.adopt(OLD, NEW);
+    assert_eq!(adopted.status.code(), Some(0), "{}", text(&adopted.stderr));
+    let stderr = text(&adopted.stderr);
+    assert!(
+        stderr.contains("relais: alpha p t1 skipped: the ticket is closed\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("relais: alpha p t3 not adopted: no such ticket\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("relais: took over alpha p t2 from aaaaaaaa\n"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_handoff_recorded_in_a_removed_worktree_is_adopted_through_the_primary_checkout() {
+    let world = World::new("adopt-wt");
+    world.programme("alpha", "p", &[("t1", "afk", None), ("t2", "afk", None)]);
+    world.next(OLD, &["--from", "alpha:p", "--claim"]);
+    copy_handoff(&world, "t2", Some(&world.root.join("alpha-wt-gone")));
+    let adopted = world.adopt(OLD, NEW);
+    assert_eq!(adopted.status.code(), Some(0), "{}", text(&adopted.stderr));
+    let stderr = text(&adopted.stderr);
+    assert!(
+        stderr.contains("relais: took over alpha p t1 from aaaaaaaa\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("relais: took over alpha p t2 from aaaaaaaa\n"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_handoff_whose_repository_is_gone_is_not_adopted_and_adopt_exits_0() {
+    let world = World::new("adopt-gone");
+    world.programme("alpha", "p", &[("t1", "afk", None), ("t2", "afk", None)]);
+    world.next(OLD, &["--from", "alpha:p", "--claim"]);
+    copy_handoff(&world, "t2", Some(&world.root.join("nowhere")));
+    let adopted = world.adopt(OLD, NEW);
+    assert_eq!(adopted.status.code(), Some(0), "{}", text(&adopted.stderr));
+    let stderr = text(&adopted.stderr);
+    assert!(
+        stderr.contains("relais: took over alpha p t1 from aaaaaaaa\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("p t2 not adopted: its repository is not found"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn adopt_refuses_an_empty_previous_session_or_one_equal_to_its_own() {
+    let world = World::new("adopt-usage");
+    let empty = world.adopt("  ", NEW);
+    assert_eq!(empty.status.code(), Some(2));
+    assert!(
+        text(&empty.stderr).contains("--previous is empty"),
+        "{}",
+        text(&empty.stderr)
+    );
+    let out = world.adopt(NEW, NEW);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        text(&out.stderr).contains("--previous is this session"),
+        "{}",
+        text(&out.stderr)
+    );
+}

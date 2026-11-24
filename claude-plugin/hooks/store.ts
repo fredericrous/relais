@@ -70,7 +70,20 @@ export type ProgrammeMemory = {
   opened: Set<string>
   // The session a /clear just ended: `--previous` for its successor.
   previous: string | undefined
+  // The handoff of the session a /clear ended, still to be adopted by its
+  // successor (programme.ts, adoptPrevious).
+  adopt: Adoption | undefined
 }
+
+// An adoption: `unbound` until the successor's first read binds its session,
+// `running` while `relais programme adopt` runs, `failed` to run again at the
+// next read of that session (`since` unset when it failed before its bind), `gaveUp` ADOPT_GIVE_UP_MS after the bind. Exit 0,
+// any exit 2 or a change of session drops it.
+export type Adoption =
+  | { state: 'unbound'; previous: string; session: undefined }
+  | { state: 'running'; previous: string; session: string; since: number | undefined }
+  | { state: 'failed'; previous: string; session: string; since: number | undefined }
+  | { state: 'gaveUp'; previous: string; session: string }
 
 export type TailMessage = { role: 'user' | 'assistant'; text: string }
 
@@ -254,6 +267,7 @@ export const createStore = (): Store => ({
     isOlder: false,
     opened: new Set(),
     previous: undefined,
+    adopt: undefined,
   },
   liveTail: undefined,
   clearTail: undefined,

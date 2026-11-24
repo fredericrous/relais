@@ -3,6 +3,8 @@
 
 import { expect, test } from 'claude-code/testing'
 import { scriptedEngine, settle, type Engine } from './support.ts'
+import { ADOPT_GIVE_UP_MS, readProgramme } from '../hooks/programme.ts'
+import { createStore } from '../hooks/store.ts'
 
 const view = (ticket: string, extra: Record<string, unknown> = {}) => ({
   repo: 'alpha',
@@ -30,7 +32,9 @@ const failure = (exitCode: number, stderr: string) => ({ exitCode, stdout: '', s
 
 const ok = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 
-const reads = (engine: Engine) => engine.calls.run.filter(c => c.argv[1] === 'programme')
+const reads = (engine: Engine) => engine.calls.run.filter(c => c.argv[1] === 'programme' && c.argv[2] === 'session')
+
+const adopts = (engine: Engine) => engine.calls.run.filter(c => c.argv[1] === 'programme' && c.argv[2] === 'adopt')
 
 const START = { cwd: '/repo', surface: 'terminal', isInteractive: true }
 
@@ -271,4 +275,223 @@ test('an exit code other than 0, 1 or 2 sets the stale note', async ($: any, on:
   const { texts } = await paneTexts($, engine)
   expect(texts).toContain('▶ t1 Ticket t1 ◀ you')
   expect(texts.filter(t => t.startsWith('programme view may be stale')).length).toBe(1)
+})
+
+// f12: the session a /clear starts takes its predecessor's handoff over.
+
+async function cleared($: any, on: any, adoptAnswer: (argv: string[]) => any) {
+  const engine = await started($, on)
+  engine.script.runResult = (argv: string[]) =>
+    argv[1] !== 'programme' ? ok : argv[2] === 'adopt' ? adoptAnswer(argv) : answer(view('t19'))
+  await $.session.end({ reason: 'clear', sessionId: 'session-1' })
+  engine.script.sessionId = 'session-2'
+  await $.session.start(START)
+  await settle(engine)
+  return engine
+}
+
+test('a clear adopts the handoff of the ended session for its successor, then reads', async ($: any, on: any) => {
+  const engine = await cleared($, on, () => ok)
+  expect(adopts(engine).length).toBe(1)
+  expect(adopts(engine)[0].argv).toEqual(['relais', 'programme', 'adopt', '--previous', 'session-1', '--session', 'session-2'])
+  expect(adopts(engine)[0].init.timeoutMs).toBe(5000)
+  const runs = engine.calls.run.filter(c => c.argv[1] === 'programme')
+  const adoptAt = runs.indexOf(adopts(engine)[0])
+  expect(runs[adoptAt + 1].argv[2]).toBe('session')
+  const { texts } = await paneTexts($, engine)
+  expect(texts.some(t => t.startsWith('ticket not adopted'))).toBe(false)
+  await $.tool.call({ tool: 'Bash', command: 'relais programme claim p t19' })
+  await settle(engine)
+  expect(adopts(engine).length).toBe(1)
+})
+
+test('no adoption on a first start, a resume or a fork', async ($: any, on: any) => {
+  const engine = await started($, on)
+  for (const source of ['resume', 'fork']) {
+    await $.classic.SessionStart({ source })
+    await settle(engine)
+  }
+  expect(adopts(engine).length).toBe(0)
+  await $.session.end({ reason: 'resume', sessionId: 'session-1' })
+  engine.script.sessionId = 'session-2'
+  await $.session.start(START)
+  await settle(engine)
+  expect(adopts(engine).length).toBe(0)
+})
+
+test('a failed adoption notes the claim command and is retried on the next read', async ($: any, on: any) => {
+  let answers = 0
+  const engine = await cleared($, on, () => (answers++ === 0 ? failure(1, 'relais: a lock stayed held') : ok))
+  expect(adopts(engine).length).toBe(1)
+  let { texts } = await paneTexts($, engine)
+  expect(texts).toContain('ticket not adopted · relais programme claim p t19')
+  await $.tool.call({ tool: 'Bash', command: 'relais programme next --claim' })
+  await settle(engine)
+  expect(adopts(engine).length).toBe(2)
+  expect(adopts(engine)[1].argv).toEqual(['relais', 'programme', 'adopt', '--previous', 'session-1', '--session', 'session-2'])
+  ;({ texts } = await paneTexts($, engine))
+  expect(texts.some(t => t.startsWith('ticket not adopted'))).toBe(false)
+  await $.tool.call({ tool: 'Bash', command: 'relais programme next --claim' })
+  await settle(engine)
+  expect(adopts(engine).length).toBe(2)
+})
+
+test('a pending adoption is retried with its ids after a resume of the same session', async ($: any, on: any) => {
+  let answers = 0
+  const engine = await cleared($, on, () => (answers++ === 0 ? failure(1, 'relais: a lock stayed held') : ok))
+  await $.classic.SessionStart({ source: 'resume' })
+  await settle(engine)
+  expect(adopts(engine).length).toBe(2)
+  expect(adopts(engine)[1].argv).toContain('session-1')
+})
+
+test('an older relais without adopt is noted as older and never retried; the read goes on', async ($: any, on: any) => {
+  const engine = await cleared($, on, () => failure(2, "error: unrecognized subcommand 'adopt'\n\nUsage: relais programme <COMMAND>"))
+  await $.tool.call({ tool: 'Bash', command: 'relais programme claim p t19' })
+  await settle(engine)
+  expect(adopts(engine).length).toBe(1)
+  const { texts } = await paneTexts($, engine)
+  expect(texts).toContain('▶ t19 Ticket t19 ◀ you')
+  expect(texts.some(t => t.startsWith('ticket not adopted') || t.includes('needs a newer relais'))).toBe(false)
+})
+
+test('any other exit 2 from adopt ends the adoption without a note', async ($: any, on: any) => {
+  const engine = await cleared($, on, () => failure(2, 'relais: --previous is this session'))
+  await $.tool.call({ tool: 'Bash', command: 'relais programme claim p t19' })
+  await settle(engine)
+  expect(adopts(engine).length).toBe(1)
+  const { texts } = await paneTexts($, engine)
+  expect(texts.some(t => t.startsWith('ticket not adopted'))).toBe(false)
+})
+
+test('a second clear while an adoption runs drops it; the new successor adopts its own', async ($: any, on: any) => {
+  const engine = await started($, on)
+  let release: () => void = () => {}
+  const held = new Promise<void>(resolve => (release = resolve))
+  engine.script.runResult = (argv: string[]) => (argv[1] !== 'programme' ? ok : argv[2] === 'adopt' ? ok : answer(view('t19')))
+  engine.script.runGate = (argv: string[]) => (argv[2] === 'adopt' && argv.includes('session-2') ? held : undefined)
+  await $.session.end({ reason: 'clear', sessionId: 'session-1' })
+  engine.script.sessionId = 'session-2'
+  await $.session.start(START)
+  await settle(engine)
+  await $.session.end({ reason: 'clear', sessionId: 'session-2' })
+  engine.script.sessionId = 'session-3'
+  await $.session.start(START)
+  await settle(engine)
+  release()
+  await settle(engine)
+  const own = adopts(engine).filter(c => c.argv.includes('session-3'))
+  expect(own.length).toBe(1)
+  expect(own[0].argv).toEqual(['relais', 'programme', 'adopt', '--previous', 'session-2', '--session', 'session-3'])
+})
+
+test('an adoption still pending 2 h after its first read stops and keeps its note', async () => {
+  const store = createStore()
+  store.programme.session = 'session-2'
+  store.programme.adopt = { state: 'failed', previous: 'session-1', session: 'session-2', since: 0 }
+  const runs: string[][] = []
+  const fx: any = {
+    kv: { get: async () => [], set: async () => undefined },
+    clock: { now: async () => ADOPT_GIVE_UP_MS + 1000, after: () => ({ cancel: () => undefined }) },
+    session: { id: async () => 'session-2' },
+    process: {
+      run: async (argv: string[]) => {
+        runs.push(argv)
+        return { exitCode: 0, stdout: JSON.stringify({ programme: null }), stderr: '' }
+      },
+    },
+    ui: { open: async () => undefined },
+  }
+  await readProgramme(fx, store, 'command')
+  await readProgramme(fx, store, 'command')
+  expect(runs.filter(argv => argv[2] === 'adopt').length).toBe(0)
+  expect(runs.filter(argv => argv[2] === 'session').length).toBe(2)
+  expect(store.programme.note).toBe('ticket not adopted in 2 h · its handoff lapsed')
+})
+
+test('two reads started together after a clear spawn one adopt', async () => {
+  const store = createStore()
+  store.programme.adopt = { state: 'unbound', previous: 'session-1', session: undefined }
+  let release: () => void = () => {}
+  const clockHeld = new Promise<void>(resolve => (release = resolve))
+  const runs: string[][] = []
+  const fx: any = {
+    kv: { get: async () => [], set: async () => undefined },
+    clock: { now: async () => (await clockHeld, 1000), after: () => ({ cancel: () => undefined }) },
+    session: { id: async () => 'session-2' },
+    process: {
+      run: async (argv: string[]) => {
+        runs.push(argv)
+        return { exitCode: 0, stdout: JSON.stringify({ programme: null }), stderr: '' }
+      },
+    },
+    ui: { open: async () => undefined },
+  }
+  const both = Promise.all([readProgramme(fx, store, 'start'), readProgramme(fx, store, 'clear')])
+  // Microtask turns only: both reads reach the held clock before it answers.
+  for (let turn = 0; turn < 10; turn++) await Promise.resolve()
+  release()
+  await both
+  expect(runs.filter(argv => argv[2] === 'adopt').length).toBe(1)
+})
+
+test('a failed adopt records its cause and first stderr line', async () => {
+  const store = createStore()
+  store.programme.adopt = { state: 'unbound', previous: 'session-1', session: undefined }
+  const kv = new Map<string, unknown>()
+  const fx: any = {
+    kv: { get: async (key: string) => kv.get(key), set: async (key: string, value: unknown) => void kv.set(key, value) },
+    clock: { now: async () => 1000, after: () => ({ cancel: () => undefined }) },
+    session: { id: async () => 'session-2' },
+    process: {
+      run: async (argv: string[]) =>
+        argv[2] === 'adopt'
+          ? { exitCode: 1, stdout: '', stderr: 'relais: alpha p t19 not adopted: lock stayed held\n' }
+          : { exitCode: 0, stdout: JSON.stringify({ programme: null }), stderr: '' },
+    },
+    ui: { open: async () => undefined },
+  }
+  await readProgramme(fx, store, 'clear')
+  expect(kv.get('relais.programmeEvents')).toContainEqual({
+    at: 1000,
+    kind: 'adopt',
+    result: 'error',
+    cause: 'exit',
+    detail: 'relais: alpha p t19 not adopted: lock stayed held',
+  })
+  expect(store.programme.adopt?.state).toBe('failed')
+})
+
+test('an adoption whose effect throws before its bind is retried, not given up', async () => {
+  const store = createStore()
+  store.programme.adopt = { state: 'unbound', previous: 'session-1', session: undefined }
+  // The second clock read is the adoption's own: the first is the read's bound.
+  let clockReads = 0
+  const kv = new Map<string, unknown>()
+  const runs: string[][] = []
+  const fx: any = {
+    kv: { get: async (key: string) => kv.get(key), set: async (key: string, value: unknown) => void kv.set(key, value) },
+    clock: {
+      now: async () => {
+        clockReads += 1
+        if (clockReads === 2) throw new Error('clock unavailable')
+        return 1000
+      },
+      after: () => ({ cancel: () => undefined }),
+    },
+    session: { id: async () => 'session-2' },
+    process: {
+      run: async (argv: string[]) => {
+        runs.push(argv)
+        return { exitCode: 0, stdout: JSON.stringify({ programme: null }), stderr: '' }
+      },
+    },
+    ui: { open: async () => undefined },
+  }
+  await readProgramme(fx, store, 'clear')
+  expect(store.programme.adopt).toEqual({ state: 'failed', previous: 'session-1', session: 'session-2', since: undefined })
+  expect(JSON.stringify(kv.get('relais.programmeEvents'))).toContain('"cause":"threw"')
+  await readProgramme(fx, store, 'command')
+  expect(runs.filter(argv => argv[2] === 'adopt').length).toBe(1)
+  expect(store.programme.adopt).toBeUndefined()
 })

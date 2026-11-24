@@ -6,15 +6,23 @@
 import type { Fx } from './fx.ts'
 import { recordEvent, withinBound } from './events.ts'
 import type { ProgrammeView } from './map.ts'
-import type { Store } from './store.ts'
+import type { Adoption, Store } from './store.ts'
 import { markDirty, openPane } from './ui.ts'
 
 export const PROGRAMME_BOUND_MS = 5000
+// The least a read keeps after an adoption spent the shared bound: a clear
+// that must adopt waits at most PROGRAMME_BOUND_MS + READ_FLOOR_MS (6 s), all
+// of it detached from the hook.
+const READ_FLOOR_MS = 1000
+// R, the handoff hold: past it the predecessor's handoff has lapsed, so a
+// retry finds nothing to adopt and would only hide the failure.
+export const ADOPT_GIVE_UP_MS = 2 * 60 * 60 * 1000
 export const OLDER_RELAIS_ROW = 'programme view needs a newer relais · relais install'
 const STALE_NOTE = 'programme view may be stale · relais programme session --session <id>'
+const OLDER_ADOPT = /unrecognized subcommand\s+'?adopt'?/i
 
 // A main-chain Bash command that changes which ticket the session holds.
-const PROGRAMME_COMMAND = /\brelais\s+programme\s+(claim|release|next)\b/
+const PROGRAMME_COMMAND = /\brelais\s+programme\s+(claim|release|next|adopt)\b/
 
 export const isProgrammeCommand = (e: any): boolean =>
   String(e?.tool) === 'Bash' && e?.agentId === undefined && typeof e?.command === 'string' && PROGRAMME_COMMAND.test(e.command)
@@ -88,12 +96,119 @@ function viewOf(stdout: string): { kind: 'none' } | { kind: 'view'; view: Progra
   return view ? { kind: 'view', view } : { kind: 'unreadable' }
 }
 
+// Takes the handoff of the session a /clear ended over as this session's
+// `work` (`relais programme adopt`), within `ms`, so a relayed session holds
+// its ticket whether or not its agent claims it. Exit 0 or any exit 2 ends
+// the adoption; a timeout, exit 1 or a failed spawn leaves it `failed`, to
+// run again at the next read, with the note `adoptNote` draws. The running
+// state is taken before the first await, so two overlapping reads spawn one
+// adopt.
+async function adoptPrevious(fx: Fx, store: Store, session: string, ms: number) {
+  const memory = store.programme
+  const adoption = memory.adopt
+  if (adoption === undefined || adoption.state === 'running' || adoption.state === 'gaveUp') return
+  if (adoption.state === 'failed' && adoption.session !== session) {
+    memory.adopt = undefined // Another session: the successor is gone
+    return
+  }
+  const running: Extract<Adoption, { state: 'running' }> = {
+    state: 'running',
+    previous: adoption.previous,
+    session,
+    since: adoption.state === 'failed' ? adoption.since : undefined,
+  }
+  memory.adopt = running
+  try {
+    await adoptOnce(fx, store, running, ms)
+  } catch (error) {
+    // An effect that throws must not leave the adoption running forever:
+    // it is retried at the next read, like any other failure, and an
+    // adoption that threw before its bind still binds at that read.
+    const current = memory.adopt
+    if (current?.state === 'running' && current.session === session) {
+      memory.adopt = { state: 'failed', previous: current.previous, session, since: current.since }
+    }
+    try {
+      await recordEvent(fx, store, { at: Date.now(), kind: 'adopt', result: 'error', cause: 'threw', detail: oneLine(String(error)) })
+    } catch {
+      // Fail open: the event list is bookkeeping, the retry above is not.
+    }
+  }
+}
+
+// One `relais programme adopt` for an adoption already marked running.
+async function adoptOnce(fx: Fx, store: Store, running: Extract<Adoption, { state: 'running' }>, ms: number) {
+  const memory = store.programme
+  const { previous, session } = running
+  const now = await fx.clock.now()
+  if (store.closed || memory.adopt !== running) return
+  // Bound at the successor's first read, seconds after the clear.
+  const since = running.since ?? now
+  const bound: Extract<Adoption, { state: 'running' }> = { ...running, since }
+  memory.adopt = bound
+  if (now - since > ADOPT_GIVE_UP_MS) {
+    // No more retries; the note stays for this session.
+    memory.adopt = { state: 'gaveUp', previous, session }
+    await recordEvent(fx, store, { at: now, kind: 'adopt', result: 'error', cause: 'gave-up' })
+    return
+  }
+  const reply = await withinBound(fx, ms, () =>
+    fx.process.run(['relais', 'programme', 'adopt', '--previous', previous, '--session', session], {
+      ...(store.router.cwd ? { cwd: store.router.cwd } : {}),
+      timeoutMs: ms,
+    }),
+  )
+  if (store.closed || memory.adopt !== bound) return // A clear came meanwhile
+  const at = await fx.clock.now()
+  const exited = reply.kind === 'ok' ? reply.value : undefined
+  const exitCode = exited?.exitCode
+  const stderr = String(exited?.stderr ?? '')
+  if (exitCode === 0) {
+    memory.adopt = undefined
+    // A ticket adopt can never take (closed, gone) is a stderr line and exit 0.
+    const notAdopted = stderr.split('\n').find(line => line.includes(' not adopted: '))
+    await recordEvent(fx, store, notAdopted ? { at, kind: 'adopt', result: 'not-adopted', detail: notAdopted.trim() } : { at, kind: 'adopt', result: 'ok' })
+    return
+  }
+  if (exitCode === 2) {
+    memory.adopt = undefined
+    const older = OLDER_ADOPT.test(stderr)
+    await recordEvent(fx, store, older ? { at, kind: 'adopt', result: 'older' } : { at, kind: 'adopt', result: 'error', cause: 'usage', detail: oneLine(stderr) })
+    return
+  }
+  memory.adopt = { state: 'failed', previous, session, since }
+  const cause = reply.kind === 'late' ? 'late' : reply.kind === 'failed' ? 'spawn' : 'exit'
+  await recordEvent(fx, store, { at, kind: 'adopt', result: 'error', cause, detail: oneLine(stderr) })
+}
+
+// The dim note of an adoption that failed for this session: the command
+// that takes the ticket by hand, when the view names the ticket.
+function adoptNote(store: Store, view: ProgrammeView | undefined): string | undefined {
+  const memory = store.programme
+  const adoption = memory.adopt
+  if (adoption === undefined || adoption.session !== memory.session) return undefined
+  const claim = view === undefined ? undefined : `relais programme claim ${view.slug} ${view.ticket}`
+  switch (adoption.state) {
+    case 'unbound':
+    case 'running':
+      return undefined
+    case 'failed':
+      return `ticket not adopted · ${claim ?? `relais programme adopt --previous ${adoption.previous}`}`
+    case 'gaveUp':
+      // The handoff has lapsed by now: adopt would find nothing.
+      return claim === undefined ? 'ticket not adopted in 2 h · its handoff lapsed' : `ticket not adopted in 2 h · ${claim}`
+  }
+}
+
 // Reads the programme the session holds. Detached by every caller: it never
 // delays a hook, and a reply that is older than the newest read, or belongs
-// to another session, is dropped.
+// to another session, is dropped. A pending adoption runs first, and the
+// read gets what is left of the same bound (at least READ_FLOOR_MS).
 export async function readProgramme(fx: Fx, store: Store, source: ReadSource = 'start') {
   const memory = store.programme
   if (store.closed || memory.isOlder) return
+  // A resume or fork passes no --previous. A pending adoption stays: it is
+  // bound to its session, and is dropped at the first read of another one.
   if (source === 'resume' || source === 'fork') memory.previous = undefined
   let session: unknown
   try {
@@ -108,13 +223,17 @@ export async function readProgramme(fx: Fx, store: Store, source: ReadSource = '
     memory.note = undefined
     markDirty(store)
   }
+  const started = await fx.clock.now()
+  await adoptPrevious(fx, store, session, PROGRAMME_BOUND_MS)
+  if (store.closed || memory.session !== session) return
+  const bound = Math.max(READ_FLOOR_MS, PROGRAMME_BOUND_MS - ((await fx.clock.now()) - started))
   memory.seq += 1
   const seq = memory.seq
   memory.newest = seq
-  const reply = await withinBound(fx, PROGRAMME_BOUND_MS, () =>
+  const reply = await withinBound(fx, bound, () =>
     fx.process.run(argvOf(session as string, store.router.cwd, memory.previous), {
       ...(store.router.cwd ? { cwd: store.router.cwd } : {}),
-      timeoutMs: PROGRAMME_BOUND_MS,
+      timeoutMs: bound,
     }),
   )
   if (store.closed || memory.session !== session || memory.newest !== seq) return
@@ -148,7 +267,7 @@ export async function readProgramme(fx: Fx, store: Store, source: ReadSource = '
     await recordEvent(fx, store, { at: now, kind: 'read', result: 'error' })
     return
   }
-  memory.note = undefined
+  memory.note = adoptNote(store, read.kind === 'view' ? read.view : undefined)
   if (read.kind === 'none') {
     memory.shown = undefined
     markDirty(store)
@@ -175,5 +294,8 @@ export function onProgrammeSessionEnd(store: Store, reason: string, ended: strin
   memory.newest = memory.seq + 1
   memory.seq = memory.newest
   memory.previous = reason === 'clear' ? ended : undefined
+  // The successor binds the adoption at its first read; any other end drops it.
+  memory.adopt =
+    reason === 'clear' && ended !== undefined ? { state: 'unbound', previous: ended, session: undefined } : undefined
   markDirty(store)
 }
