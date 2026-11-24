@@ -10,11 +10,17 @@ import type { Store } from './store.ts'
 import { markDirty, openPane } from './ui.ts'
 
 export const PROGRAMME_BOUND_MS = 5000
+// The least a read keeps after an adoption spent the shared bound.
+const READ_FLOOR_MS = 1000
+// R, the handoff hold: past it the predecessor's handoff has lapsed, so a
+// retry finds nothing to adopt and would only hide the failure.
+export const ADOPT_GIVE_UP_MS = 2 * 60 * 60 * 1000
 export const OLDER_RELAIS_ROW = 'programme view needs a newer relais · relais install'
 const STALE_NOTE = 'programme view may be stale · relais programme session --session <id>'
+const OLDER_ADOPT = /unrecognized subcommand\s+'?adopt'?/i
 
 // A main-chain Bash command that changes which ticket the session holds.
-const PROGRAMME_COMMAND = /\brelais\s+programme\s+(claim|release|next)\b/
+const PROGRAMME_COMMAND = /\brelais\s+programme\s+(claim|release|next|adopt)\b/
 
 export const isProgrammeCommand = (e: any): boolean =>
   String(e?.tool) === 'Bash' && e?.agentId === undefined && typeof e?.command === 'string' && PROGRAMME_COMMAND.test(e.command)
@@ -88,9 +94,68 @@ function viewOf(stdout: string): { kind: 'none' } | { kind: 'view'; view: Progra
   return view ? { kind: 'view', view } : { kind: 'unreadable' }
 }
 
+// Takes the handoff of the session a /clear ended over as this session's
+// `work` (`relais programme adopt`), within `ms`, so a relayed session holds
+// its ticket whether or not its agent claims it. Exit 0 or any exit 2 ends
+// the adoption; a timeout, exit 1 or a failed spawn keeps it for the next
+// read, with the note `adoptNote` draws.
+async function adoptPrevious(fx: Fx, store: Store, session: string, ms: number) {
+  const memory = store.programme
+  const pending = memory.adopt
+  if (pending === undefined || pending.running || pending.gaveUp) return
+  const now = await fx.clock.now()
+  if (pending.session === undefined) {
+    pending.session = session
+    pending.since = now
+  }
+  if (pending.session !== session) {
+    memory.adopt = undefined // Another session: the successor is gone
+    return
+  }
+  if (now - pending.since > ADOPT_GIVE_UP_MS) {
+    // No more retries; the note stays for this session.
+    pending.gaveUp = true
+    pending.failed = true
+    await recordEvent(fx, store, { at: now, kind: 'adopt', result: 'error' })
+    return
+  }
+  pending.running = true
+  const reply = await withinBound(fx, ms, () =>
+    fx.process.run(['relais', 'programme', 'adopt', '--previous', pending.previous, '--session', session], {
+      ...(store.router.cwd ? { cwd: store.router.cwd } : {}),
+      timeoutMs: ms,
+    }),
+  )
+  pending.running = false
+  if (store.closed || memory.adopt !== pending) return // A clear came meanwhile
+  const at = await fx.clock.now()
+  const exitCode = reply.kind === 'ok' ? reply.value?.exitCode : undefined
+  if (exitCode === 0 || exitCode === 2) {
+    memory.adopt = undefined
+    const older = exitCode === 2 && OLDER_ADOPT.test(String(reply.kind === 'ok' ? reply.value?.stderr ?? '' : ''))
+    await recordEvent(fx, store, { at, kind: 'adopt', result: exitCode === 0 ? 'ok' : older ? 'older' : 'error' })
+    return
+  }
+  pending.failed = true
+  await recordEvent(fx, store, { at, kind: 'adopt', result: 'error' })
+}
+
+// The dim note of an adoption that failed and is still pending for the
+// session: the command that takes the ticket by hand.
+function adoptNote(store: Store, view: ProgrammeView | undefined): string | undefined {
+  const memory = store.programme
+  const pending = memory.adopt
+  if (pending === undefined || !pending.failed || pending.session !== memory.session) return undefined
+  if (pending.gaveUp) return `ticket not adopted after 2 h · relais programme adopt --previous ${pending.previous}`
+  return view === undefined
+    ? `ticket not adopted · relais programme adopt --previous ${pending.previous}`
+    : `ticket not adopted · relais programme claim ${view.slug} ${view.ticket}`
+}
+
 // Reads the programme the session holds. Detached by every caller: it never
 // delays a hook, and a reply that is older than the newest read, or belongs
-// to another session, is dropped.
+// to another session, is dropped. A pending adoption runs first, and the
+// read gets what is left of the same bound (at least READ_FLOOR_MS).
 export async function readProgramme(fx: Fx, store: Store, source: ReadSource = 'start') {
   const memory = store.programme
   if (store.closed || memory.isOlder) return
@@ -108,13 +173,17 @@ export async function readProgramme(fx: Fx, store: Store, source: ReadSource = '
     memory.note = undefined
     markDirty(store)
   }
+  const started = await fx.clock.now()
+  await adoptPrevious(fx, store, session, PROGRAMME_BOUND_MS)
+  if (store.closed || memory.session !== session) return
+  const bound = Math.max(READ_FLOOR_MS, PROGRAMME_BOUND_MS - ((await fx.clock.now()) - started))
   memory.seq += 1
   const seq = memory.seq
   memory.newest = seq
-  const reply = await withinBound(fx, PROGRAMME_BOUND_MS, () =>
+  const reply = await withinBound(fx, bound, () =>
     fx.process.run(argvOf(session as string, store.router.cwd, memory.previous), {
       ...(store.router.cwd ? { cwd: store.router.cwd } : {}),
-      timeoutMs: PROGRAMME_BOUND_MS,
+      timeoutMs: bound,
     }),
   )
   if (store.closed || memory.session !== session || memory.newest !== seq) return
@@ -148,7 +217,7 @@ export async function readProgramme(fx: Fx, store: Store, source: ReadSource = '
     await recordEvent(fx, store, { at: now, kind: 'read', result: 'error' })
     return
   }
-  memory.note = undefined
+  memory.note = adoptNote(store, read.kind === 'view' ? read.view : undefined)
   if (read.kind === 'none') {
     memory.shown = undefined
     markDirty(store)
@@ -175,5 +244,8 @@ export function onProgrammeSessionEnd(store: Store, reason: string, ended: strin
   memory.newest = memory.seq + 1
   memory.seq = memory.newest
   memory.previous = reason === 'clear' ? ended : undefined
+  // The successor binds the adoption at its first read; any other end drops it.
+  memory.adopt =
+    reason === 'clear' && ended !== undefined ? { previous: ended, session: undefined, since: 0, running: false, failed: false, gaveUp: false } : undefined
   markDirty(store)
 }

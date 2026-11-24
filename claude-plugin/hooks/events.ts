@@ -10,6 +10,7 @@ export const MAX_EVENTS = 200
 
 export type ProgrammeEvent =
   | { at: number; kind: 'read'; result: 'shown' | 'null' | 'error' }
+  | { at: number; kind: 'adopt'; result: 'ok' | 'older' | 'error' }
   | { at: number; kind: 'freeze'; chars: number }
   | { at: number; kind: 'hide'; seconds: number }
   | { at: number; kind: 'open'; rows: number; bodyRows: number }
