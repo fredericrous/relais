@@ -8,6 +8,16 @@ missing here.
 
 ## Unreleased
 
+The `SharedState` conformance suite holds a client to the retry rule of a
+handoff reservation. `run_all` gains
+`a_handoff_retried_by_its_holder_is_reserved_again`: a reservation retried
+by its own holder is reserved again, and another holder's is refused while
+it lasts. `run_all_with_clock`, which every primary must run, gains
+`a_primary_refuses_another_holders_reservation`: the refusal is `Held`,
+naming the reserver. relais-fabric runs both at its next relais pin bump;
+a client that answers `Held` to its own holder's retry, or grants another
+holder, now fails the suite.
+
 The Claude Code plugin settles a native worker that answered but is still
 listed running 5 s later, held open by its own background shell: it stops the
 agent, confirms the stop with a listing taken after the stop's answer, and

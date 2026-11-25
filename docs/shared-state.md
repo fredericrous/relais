@@ -175,11 +175,21 @@ it could not renew or give back ends by its TTL.
   beyond a granted slice is refused, a ticket has one holder, an intent is
   claimed once, a registry swap and a rollback compare first, a session's
   end gives back its work holds and keeps its handoff reservations (and a
-  reservation is never made over a held ticket), publish replays
-  idempotently by node and sequence, and a fresh state is online and empty.
+  reservation is never made over a held ticket), a handoff reservation
+  retried by its own holder is reserved again while another holder's is
+  refused, publish replays idempotently by node and sequence, and a fresh
+  state is online and empty. A primary runs
+  `run_all_with_clock(make, advance)` instead: it adds the checks only a
+  primary holds to (a decision grant lapses; a primary refuses another
+  holder's reservation with `Held`, naming the reserver).
 - The programme claims have three session-wide operations beside the
   per-ticket ones: `reserve_handoff` (a `handoff` hold for the next
-  session, `HANDOFF_HOLD_SECS`, taken over by any session's `work` claim),
+  session, `HANDOFF_HOLD_SECS`, taken over by any session's `work` claim;
+  a retry by its own holder, a `next --claim` whose claim file was never
+  written, is answered again, and a primary should move the hold's end to
+  `HANDOFF_HOLD_SECS` after the retry (the fake does; the suite does not
+  check it yet); another holder is refused while it lasts, with `Held` from a
+  primary or by the claim file under `LocalState`),
   `renew_tickets` and `release_tickets` (every `work` hold of one holder,
   for a resumed session and a session end). The hook calls them with no
   lease in hand, so they are keyed by the holder, never fenced, and never

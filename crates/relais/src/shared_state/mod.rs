@@ -132,6 +132,17 @@ pub trait SharedState: Send + Sync {
     /// [`crate::programme::claim::HANDOFF_HOLD_SECS`] after it was made,
     /// and a later `work` claim of any session takes it over. The claim
     /// file's rules run on the node in [`node::reserve_handoff`].
+    ///
+    /// A retry by the reservation's own holder (a `next --claim` whose
+    /// claim file was never written) is never `Held`: a primary grants it
+    /// at a higher epoch. A primary should also move the hold's end to
+    /// `HANDOFF_HOLD_SECS` after the retry, as `fake::FakeState` does; no
+    /// conformance check holds a client to that yet. Another holder is
+    /// refused while the reservation lasts: a primary answers `Held`,
+    /// naming the reserver; a client with no shared half answers
+    /// `NodeDecides` and the claim file refuses.
+    /// Checked by `conformance::a_handoff_retried_by_its_holder_is_reserved_again`
+    /// and, for a primary, `conformance::a_primary_refuses_another_holders_reservation`.
     fn reserve_handoff(&self, request: &TicketRequest) -> Result<TicketAnswer, SharedStateError>;
 
     /// Extend every live `work` hold `holder` has: the session is still
