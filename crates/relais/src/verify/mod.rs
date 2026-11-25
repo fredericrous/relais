@@ -3552,14 +3552,11 @@ impl Drop for VerificationWorktree<'_> {
 pub fn integration_gaps(
     integrations: &Integrations,
     available: &dyn Fn(&str) -> bool,
+    aval_default: &str,
 ) -> Vec<String> {
     let mut gaps = Vec::new();
     for (name, default_bin, dependency) in [
-        (
-            "aval",
-            crate::tooling::default_bin("aval"),
-            integrations.aval.as_ref(),
-        ),
+        ("aval", aval_default, integrations.aval.as_ref()),
         ("amont", "amont", integrations.amont.as_ref()),
         (
             "amont_agent",
@@ -7088,16 +7085,18 @@ mod tests {
             amont: Some(crate::policy::Dependency::Mode(DependencyMode::Optional)),
             amont_agent: None,
         };
-        let gaps = integration_gaps(&integrations, &|name| name == "aval");
+        let gaps = integration_gaps(&integrations, &|name| name == "aval", "aval");
         assert_eq!(
             gaps,
             vec!["amont: optional integration not installed (reported, not passed)"],
             "required-but-missing is NOT a gap here because aval is available"
         );
-        let none = integration_gaps(&integrations, &|_| false);
+        let none = integration_gaps(&integrations, &|_| false, "aval");
         assert_eq!(none.len(), 2, "required missing + optional missing");
         assert!(none[0].starts_with("aval: required"));
         assert!(none[0].contains("binary `aval`"), "{}", none[0]);
+        let topo = integration_gaps(&integrations, &|_| false, "greentopo");
+        assert!(topo[0].contains("binary `greentopo`"), "{}", topo[0]);
     }
 
     /// The `amont_agent` key (its name until the census) is satisfied by the
@@ -7109,8 +7108,8 @@ mod tests {
             amont: None,
             amont_agent: Some(crate::policy::Dependency::Mode(DependencyMode::Required)),
         };
-        assert!(integration_gaps(&integrations, &|bin| bin == "greenbelay").is_empty());
-        let missing = integration_gaps(&integrations, &|bin| bin == "amont-agent");
+        assert!(integration_gaps(&integrations, &|bin| bin == "greenbelay", "aval").is_empty());
+        let missing = integration_gaps(&integrations, &|bin| bin == "amont-agent", "aval");
         assert_eq!(
             missing,
             vec!["amont_agent: required integration unavailable (binary `greenbelay` not on PATH)"]

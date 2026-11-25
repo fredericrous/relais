@@ -76,9 +76,8 @@ fn missing_integration_detail(name: &str, bin: &str) -> String {
     match name {
         "aval" => format!(
             "required integration `aval` (binary `{bin}`) is not available on PATH; \
-             set its [integrations] key (aval or greentopo) in relais.toml to \
-             \"optional\", or to {{ mode = \"required\", bin = \"greentopo\" }} \
-             if greentopo is installed"
+             install greentopo (`aval` is read until the machine switch), or set its \
+             [integrations] key (aval or greentopo) in relais.toml to \"optional\""
         ),
         _ => format!(
             "required integration `{name}` is not available on PATH; \
@@ -98,29 +97,40 @@ fn missing_integration_detail(name: &str, bin: &str) -> String {
 /// PATH, else `aval` (the rename keeps the old binary working until the
 /// machine switch). Callers that spawn it resolve once per run.
 pub(crate) fn default_bin(name: &str) -> &str {
+    if name != "aval" {
+        return default_bin_in(name, &[], &[], &exists_in_any_form);
+    }
     let path = std::env::var_os("PATH").unwrap_or_default();
     let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
     let extensions = path_extensions(std::env::var_os("PATHEXT").as_ref());
-    default_bin_in(name, &dirs, &extensions)
+    default_bin_in(name, &dirs, &extensions, &exists_in_any_form)
 }
 
-/// [`default_bin`] over the given directories and suffixes: pure apart from
-/// the existence test, so it is tested without touching the environment.
-/// An installed `greentopo` that fails is never replaced by `aval`: only its
-/// absence from the directories selects `aval`.
+/// Does anything of this name exist, in any form: a file, a directory, a
+/// dangling link, a file that is not executable? A broken install is
+/// present, so it is chosen and fails loudly instead of being skipped.
+pub(crate) fn exists_in_any_form(candidate: &Path) -> bool {
+    match std::fs::symlink_metadata(candidate) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// [`default_bin`] over the given directories, suffixes and existence
+/// test, so it is tested without touching the environment. An installed
+/// `greentopo` that fails is never replaced by `aval`: only its absence
+/// from the directories selects `aval`.
+// holds-until: decisions topo-spotter-rename t10 closes; the `aval` fallback is removed then
 pub(crate) fn default_bin_in<'a>(
     name: &'a str,
     dirs: &[PathBuf],
     extensions: &[String],
+    exists: &dyn Fn(&Path) -> bool,
 ) -> &'a str {
     match name {
         "amont_agent" => "greenbelay",
         "aval" => {
-            if resolve_in("greentopo", dirs, extensions, &|candidate| {
-                candidate.is_file()
-            })
-            .is_some()
-            {
+            if resolve_in("greentopo", dirs, extensions, exists).is_some() {
                 "greentopo"
             } else {
                 "aval"
@@ -297,7 +307,13 @@ fn first_line(text: &str) -> Option<String> {
 /// will not answer — recorded in the context manifest, which is where a
 /// run names the toolchain it was verified with.
 pub fn integration_version(name: &str) -> Option<String> {
-    program_version(default_bin(name), None)
+    program_version_text(default_bin(name))
+}
+
+/// [`integration_version`] for a program the caller already chose, so the
+/// version recorded is that of the binary the run spawns.
+pub fn program_version_text(program: &str) -> Option<String> {
+    program_version(program, None)
         .ok()
         .map(|resolved| resolved.version)
 }
@@ -321,7 +337,7 @@ mod tests {
         for name in listing {
             std::fs::write(dirs[0].join(name), "").unwrap();
         }
-        default_bin_in("aval", &dirs, &[String::new()]).to_string()
+        default_bin_in("aval", &dirs, &[String::new()], &exists_in_any_form).to_string()
     }
 
     #[test]
@@ -344,6 +360,20 @@ mod tests {
         assert_eq!(bin_for_listing(&[]), "aval");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_greentopo_is_chosen_not_skipped() {
+        let root = crate::test_support::temp_dir("default-bin-dangling");
+        let dir = root.join("bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aval"), "").unwrap();
+        std::os::unix::fs::symlink(root.join("gone"), dir.join("greentopo")).unwrap();
+        assert_eq!(
+            default_bin_in("aval", &[dir], &[String::new()], &exists_in_any_form),
+            "greentopo"
+        );
+    }
+
     #[test]
     fn a_declared_bin_wins_over_the_default() {
         let policy = RepoPolicy::from_toml_str(
@@ -351,7 +381,10 @@ mod tests {
         )
         .unwrap();
         let blockers = probe_integrations(&policy);
-        assert!(blockers[0].detail.contains("relais-test-no-such-bin"));
+        let [blocker] = blockers.as_slice() else {
+            panic!("{blockers:?}")
+        };
+        assert!(blocker.detail.contains("relais-test-no-such-bin"));
     }
 
     /// A name no machine has on PATH is missing; the interpreter running

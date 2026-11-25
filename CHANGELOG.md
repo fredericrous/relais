@@ -11,8 +11,10 @@ missing here.
 relais spawns `greentopo` wherever it spawned `aval`: the binary is
 `greentopo` when it is on `PATH`, else `aval`, resolved once per run; a
 declared `bin` still wins, and an installed `greentopo` that fails never
-falls back to `aval`. `relais init --detect` now writes `greentopo =` in
-`[integrations]`. v0.82.0 is the reader floor for that key: an older relais
+falls back to `aval` (a dangling `greentopo` link is chosen, and fails). The
+context pack records the version of the binary the run spawns, and `relais
+doctor` names it. `relais init`, with or without `--detect`, now writes
+`greentopo =` in `[integrations]`. v0.82.0 is the reader floor for that key: an older relais
 refuses it as an unknown field.
 
 ## v0.84.0

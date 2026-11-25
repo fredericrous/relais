@@ -533,15 +533,24 @@ pub fn aval_resolve_in(
     let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
     let extensions = crate::tooling::path_extensions(std::env::var_os("PATHEXT").as_ref());
     let confirmed_absent = bin.is_none() && repo_dir.is_dir() && {
-        let exists_in_any_form = |candidate: &Path| match std::fs::symlink_metadata(candidate) {
-            Ok(_) => true,
-            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-        };
         ["greentopo", "aval"].iter().all(|name| {
-            crate::tooling::resolve_in(name, &dirs, &extensions, &exists_in_any_form).is_none()
+            crate::tooling::resolve_in(
+                name,
+                &dirs,
+                &extensions,
+                &crate::tooling::exists_in_any_form,
+            )
+            .is_none()
         })
     };
-    let program = bin.unwrap_or_else(|| crate::tooling::default_bin_in("aval", &dirs, &extensions));
+    let program = bin.unwrap_or_else(|| {
+        crate::tooling::default_bin_in(
+            "aval",
+            &dirs,
+            &extensions,
+            &crate::tooling::exists_in_any_form,
+        )
+    });
     let mut command = std::process::Command::new(program);
     command
         .arg("resolve")
@@ -557,7 +566,7 @@ pub fn aval_resolve_in(
             crate::procs::Ended::Exited(code) => parse_aval_output(code, &end.stdout),
             other => AvalVerdict::ToolFailure {
                 exit: -1,
-                detail: format!("aval did not answer: {}", other.describe()),
+                detail: format!("aval (`{program}`) did not answer: {}", other.describe()),
             },
         },
         Err(crate::procs::RunError::Spawn(e))
@@ -1715,6 +1724,23 @@ mod tests {
         assert!(
             matches!(verdict, AvalVerdict::ToolFailure { .. }),
             "{verdict:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_greentopo_only_path_is_not_confirmed_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::temp_dir("aval-greentopo-only");
+        let greentopo = dir.join("greentopo");
+        std::fs::write(&greentopo, "#!/bin/sh\nexit 3\n").expect("write");
+        std::fs::set_permissions(&greentopo, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        crate::test_support::prime_script(&greentopo);
+        let verdict = resolve_with_path(&dir, None, &dir);
+        assert!(
+            !matches!(verdict, AvalVerdict::NotInstalled),
+            "greentopo is installed, so aval's absence is not confirmed: {verdict:?}"
         );
     }
 

@@ -698,6 +698,9 @@ mod tests {
         assert_eq!(proposal.integrations.amont, "optional");
         assert_eq!(proposal.integrations.aval, "optional");
         parses(&proposal);
+        let text = render_toml(&proposal.setup, &proposal.commands, &proposal.integrations);
+        assert!(text.contains("greentopo = \"optional\""), "{text}");
+        assert!(!text.contains("\naval ="), "{text}");
     }
 
     #[test]

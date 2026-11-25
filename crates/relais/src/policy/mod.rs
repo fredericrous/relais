@@ -2911,7 +2911,7 @@ max_agents_total = 24
 # never counted as passed checks. `off` is not checked at all, and
 # `relais doctor` says which of the three each one is.
 [integrations]
-aval = "required"
+greentopo = "required"
 amont = "required"
 amont_agent = "required"
 

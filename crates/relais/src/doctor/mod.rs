@@ -177,6 +177,13 @@ pub(crate) fn integration_finding(
         .map(str::to_string)
         .unwrap_or_else(|| crate::tooling::default_bin(name).to_string());
     let mode = dependency.mode();
+    // What a missing binary is called: with no `bin` declared, the `aval`
+    // key looked for `greentopo` first, so the line names both.
+    let missing_name = if name == "aval" && dependency.bin().is_none() {
+        "`greentopo` (or `aval`)".to_string()
+    } else {
+        format!("`{bin}`")
+    };
     // Installed, at whichever mode asked for it.
     let present = |mode: DependencyMode| Finding {
         component,
@@ -202,7 +209,7 @@ pub(crate) fn integration_finding(
             component,
             level: Level::Fail,
             detail: format!(
-                "required by [integrations] and `{bin}` is not on PATH; every run is blocked on it"
+                "required by [integrations] and {missing_name} is not on PATH; every run is blocked on it"
             ),
         },
         DependencyMode::Optional if available(&bin) => present(mode),
@@ -211,7 +218,7 @@ pub(crate) fn integration_finding(
             component,
             level: Level::Warn,
             detail: format!(
-                "optional and `{bin}` is not on PATH; its checks are a reported gap, not a pass"
+                "optional and {missing_name} is not on PATH; its checks are a reported gap, not a pass"
             ),
         },
     }
@@ -2745,6 +2752,11 @@ mod tests {
             &no_version,
         );
         assert_eq!(required_missing.level, Level::Fail);
+        assert!(
+            required_missing.detail.contains("`greentopo` (or `aval`)"),
+            "{}",
+            required_missing.detail
+        );
 
         let optional_missing = integration_finding(
             "amont",
