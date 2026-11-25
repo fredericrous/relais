@@ -160,13 +160,34 @@ Under `LocalState` (which always grants) nothing changes.
 | --- | --- | --- | --- |
 | no unfenced resolve | `grep -rnF -e 'resolve_decision(' -e 'resolve_decision_with_receipt(' -e 'approve_from_snapshot(' crates/relais/src --include='*.rs'`, read per hit | every non-test `resolve_decision(` hit is in `shared_state/node.rs` or `ledger/`, or is a `node::resolve_decision(` call in `cli/decide.rs` (the routed answers), and no `ledger.resolve_decision(` call remains in `cli/decide.rs`; `resolve_decision_with_receipt(` is called only from `runner/approval.rs`; the one non-test `approve_from_snapshot(` call is inside the `answer_under_grant` closure in `cli/decide.rs` |run on the branch: every non-test `resolve_decision(` hit is in `ledger/` or `shared_state/node.rs`, or is the `node::resolve_decision(` call in `cli/decide.rs`; the others (`learn/dataset.rs`, `report/mod.rs`, `cli/feedback.rs`) sit in test modules; `resolve_decision_with_receipt(` only in `runner/approval.rs`; the one `approve_from_snapshot(` call is the closure `answer_under_grant` runs |
 | node fence (lib) | `cargo test -p relais --lib shared_state::` with new `FakeState` tests: a held grant refuses `node::resolve_decision` and leaves the decision open; a closed-already decision (`Ok(false)`) releases the grant; a written answer keeps it; `answer_under_grant` releases on `closed == false` and on an `Err` that left the decision open, and keeps the grant on an `Err` after the decision closed | pass |pass, 4 `FakeState` tests (held plain answer refused and open, `Ok(false)` releases, written answer keeps the grant, `answer_under_grant` kept or released on `Ok` and `Err`, a refusal runs no write) |
-| decide refusal (bin) | `cargo test -p relais --bin relais cli::decide` with new tests: under the held-elsewhere state, `--answer approve` and `--answer reject` on a waiting run, and approve on an open stopped review, each give `Blocked` (exit 3) with the stated line on stderr and an empty stdout (with `--json`: exactly one stdout object `{"error", "exit": 3}`), and the ledger still shows the decision open (for the stopped review, `<run>/receipts/` holds no artifact); the revise answer gives the same; an approve with `--criterion` adds the sign-off note | pass |pass: approve and reject held give exit 3, the decision open, the advice naming `relais status <run>`; stopped review held writes no `receipts/`; a repeat asks no grant; a `receipt.json` failure after the commit keeps the grant (0 releases); `refusal_lines` gives one stdout object under `--json` and one stderr line without; the sign-off note through `answer_error`. Gap: no held revise test and no `--criterion` test through `decide_in` |
+| decide refusal (bin) | `cargo test -p relais --bin relais cli::decide` with new tests: under the held-elsewhere state, `--answer approve` and `--answer reject` on a waiting run, and approve on an open stopped review, each give `Blocked` (exit 3) with the stated line on stderr and an empty stdout (with `--json`: exactly one stdout object `{"error", "exit": 3}`), and the ledger still shows the decision open (for the stopped review, `<run>/receipts/` holds no artifact); the revise answer gives the same; an approve with `--criterion` adds the sign-off note | pass |pass: approve and reject held give exit 3, the decision open, the advice naming `relais status <run>`; a held `--successor-contract` revise gives exit 3 and writes no intent; stopped review held writes no `receipts/`; a repeat asks no grant; a `receipt.json` failure after the commit keeps the grant (0 releases); `refusal_lines` gives one stdout object under `--json` and one stderr line without; the sign-off note through `answer_error`. Gap: no `--criterion` test through `decide_in` (deliberate, Decision log) |
 | LocalState unchanged | the existing `cli::decide` tests, now handed `LocalState::new()`; `runner::tests::review_stop` untouched (`approve_from_snapshot` keeps its signature) | pass unchanged |pass: every earlier `cli::decide` test, now handed `LocalState`; `runner::tests::review_stop` untouched |
 | suite | `cargo test --workspace`; `cargo clippy --workspace --all-targets -- -D warnings`, also with `--features conformance` | green |after the rebase onto main (an-t17, v0.83.0): `cargo test --workspace` 0 failed (lib 2703, bin 351); clippy clean, also with `conformance` |
 | pilot | the branch binary, `HOME` in a temp dir: a run left waiting on a decision (seeded ledger), `relais decide <run> --answer reject --actor orchestrator` | exit 0, `recorded ...`, as main |gap in form: the main and branch binaries in a sandboxed `HOME`, `shared_state` local and external, plain and `--json`, on an unknown run: both exit 10, one stderr line or one stdout object, byte-identical. A seeded waiting run was not piloted; its exit 0 is the granting bin test |
 
 ## Decision log
 
+- 2026-11-25 (implementation review, Delta) — the refusal reads "(the
+  other answer holds it for up to N minutes)", not "claim" (tui: "claim" is
+  the word for ticket and intent claims), and a recorded sign-off follows as
+  "; the sign-off of criterion C is recorded". The Behaviour and Picture
+  quotes above are the reviewed wording; this line supersedes them. A held
+  `--successor-contract` revise is now tested through `decide_in`.
+- 2026-11-25 — deliberate, unix Delta #3 (high, exit 1→3 and 0→3 with no
+  prior warning in the output): neither is observable by a caller today.
+  A held grant needs an external client, and no build has one
+  (`ExternalAbsent`); the 0→3 under `external` with no client is the an-t06
+  rule (refuse rather than split), as `relais run` already does. an-t18
+  changed `relais promote` 1→3 the same way. The `Breaking` CHANGELOG line
+  states both.
+- 2026-11-25 — deliberate, unix Delta #4 (medium, `--json` errors on stdout
+  only): `refusal_lines` extracts the existing code unchanged; the
+  `{"error","exit"}` stdout object is the plugin's contract (unix round 1
+  said it predates this diff).
+- 2026-11-25 — deliberate: no `--criterion` approve through `decide_in` in
+  a test. A criterion is accepted only from a TTY `person` or a
+  plugin-proved `person-via-orchestrator` (ADR-0004), neither of which a
+  unit test has; `answer_error` pins the note.
 - 2026-11-25 (review) — the held-elsewhere refusal is recognised in
   `node::is_decision_held_elsewhere`, which builds and compares the text in
   one place (lang:rust); the line names `relais status <run>` and takes the

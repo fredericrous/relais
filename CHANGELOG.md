@@ -57,7 +57,7 @@ skill changes take effect after the plugin is reinstalled.
   grant before they write, as the revise answer already did. When another
   answerer holds it, the answer is refused with `relais decide: the decision
   of run R is being answered elsewhere: check `relais status R`, then answer
-  again if it is still open (the other answer's claim lapses in 10 minutes)`
+  again if it is still open (the other answer holds it for up to 10 minutes)`
   and exit 3 (under `--json`, `{"error": ..., "exit": 3}` on stdout and
   nothing on stderr). A repeat on an answered stopped review asks no grant and
   stays exit 0. `relais feedback` answers no decision and takes no grant.

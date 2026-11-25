@@ -222,13 +222,13 @@ fn answer_error(e: NodeError, run: &RunId, signed_off: Option<&str>) -> Result<D
     let minutes = relais::shared_state::DECISION_GRANT_TTL_SECS / 60;
     let mut message = format!(
         "the decision of run {run} is being answered elsewhere: check `relais status {run}`, \
-         then answer again if it is still open (the other answer's claim lapses in {minutes} \
+         then answer again if it is still open (the other answer holds it for up to {minutes} \
          minutes)"
     );
     if let Some(criterion) = signed_off {
         let _ = write!(
             message,
-            " (the sign-off of criterion {criterion} is recorded)"
+            "; the sign-off of criterion {criterion} is recorded"
         );
     }
     Ok(refusal(CliOutcome::Blocked, message))
@@ -1399,6 +1399,85 @@ mod tests {
     }
 
     #[test]
+    fn a_successor_revise_held_elsewhere_is_refused_with_exit_3_and_writes_no_intent() {
+        let dir = relais::test_support::short_temp_dir("decide-held-revise");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        waiting_run(
+            &ledger,
+            "run-revise",
+            "/repo",
+            State::NeedsDecision,
+            Reason::ScopeExceeded,
+            None,
+            None,
+        );
+        let contract = dir.join("successor.json");
+        std::fs::write(
+            &contract,
+            serde_json::json!({
+                "schema_version": 1,
+                "kind": "change",
+                "objective": "o",
+                "base_ref": "HEAD",
+                "acceptance": ["bare"],
+                "verification_profile": "profile",
+                "write_scope": ["src/**"],
+            })
+            .to_string(),
+        )
+        .expect("contract");
+        let revise = |shared: &Arc<Elsewhere>| {
+            let shared: Arc<dyn SharedState> = shared.clone();
+            decide_in(
+                &DecideRequest {
+                    run_id: "run-revise",
+                    answer: DecideAnswer::Revise,
+                    actor: "orchestrator",
+                    person_quote: None,
+                    note: None,
+                    successor: None,
+                    criterion: None,
+                    candidate: None,
+                    widen_scope: false,
+                    rerun_verify: false,
+                    successor_contract: Some(&contract),
+                    json: false,
+                    proof_stdin: false,
+                },
+                &|| {
+                    Ok(StateLocations {
+                        ledger: dir.join("ledger.sqlite"),
+                        runs: dir.join("runs"),
+                    })
+                },
+                &|| Ok(shared.clone()),
+            )
+            .expect("decide runs")
+        };
+        let held = Arc::new(Elsewhere::holding());
+        let refused = revise(&held).err().expect("held elsewhere");
+        assert_eq!(exit_code(&refused.outcome), 3);
+        assert!(
+            refused
+                .message
+                .starts_with("the decision of run run-revise is being answered elsewhere:"),
+            "{}",
+            refused.message
+        );
+        assert!(still_open(&ledger, "run-revise"));
+        let run = RunId::from_stored("run-revise");
+        assert!(
+            ledger.intent_of_decision(&run).expect("read").is_none(),
+            "no successor intent is written"
+        );
+        assert_eq!(held.asks(), 1);
+        // Granted, the same answer writes its intent.
+        let granting = Arc::new(Elsewhere::granting());
+        assert_eq!(exit_of(&revise(&granting)), 0);
+        assert!(ledger.intent_of_decision(&run).expect("read").is_some());
+    }
+
+    #[test]
     fn a_failure_after_the_ledger_commit_keeps_the_grant() {
         let dir = relais::test_support::short_temp_dir("decide-held-after-commit");
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
@@ -1448,6 +1527,8 @@ mod tests {
     #[test]
     fn only_the_held_elsewhere_refusal_is_exit_3_and_names_a_recorded_sign_off() {
         let run = RunId::from_stored("run-x");
+        // The wire text, written out on purpose: a change to it is a change
+        // to what the person reads, and should fail here.
         let held = || {
             NodeError::Shared(SharedStateError::Refused {
                 reason: format!("the decision of run {run} is being answered elsewhere"),
@@ -1466,7 +1547,7 @@ mod tests {
         assert!(
             signed
                 .message
-                .ends_with("(the sign-off of criterion c1 is recorded)"),
+                .ends_with("minutes); the sign-off of criterion c1 is recorded"),
             "{}",
             signed.message
         );
