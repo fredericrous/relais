@@ -128,9 +128,10 @@ ticket here until it is resolved or moved into a programme of its own.
   is named as the declaration to check, with no PATH; `greentopo` from PATH
   keeps "on PATH runs, or set `bin`"; the `aval` fallback also says to
   install greentopo. One test pins each wording.
-- [f30](f30-relative-fallback-shown.md) (2026-11-25, open): the run tool
-  shows when `--relative` falls back to the absolute path, or a count shows
-  that it never does.
+- [f30](f30-relative-fallback-shown.md) (2026-11-25, closed 2026-11-25):
+  closed as not needed. The `--relative` fallback cannot fire on a live
+  cwd: the root is an ancestor of the same cwd, and nothing in between
+  changes it. Four probes printed the path relative.
 - [f31](f31-release-commit-ci-cancelled.md) (2026-11-25, open): a push to
   main cancels the CI of the commit before it, so a release tagged there
   fails "every platform passed on main" (v0.86.0; its CI was cancelled twice).
@@ -144,23 +145,23 @@ ticket here until it is resolved or moved into a programme of its own.
 branches on where the program came from (f29, #596). v0.87.0 also carries
 #594 (an-t21, `decide` answers fenced through the grant) and #597 (an-t20,
 settings writes through `SharedState`). It is installed here through brew.
-f24 and f25 shipped in v0.84.0, f27 in v0.85.0, f26 in v0.86.0; f24 to f27
-take effect after the plugin reinstall.
+f24 and f25 shipped in v0.84.0, f27 in v0.85.0, f26 in v0.86.0. The plugin
+was reinstalled at 0.86.0 on 2026-11-25 at 22:19, so f24 to f27 are live.
+f30 closed as not needed (the fallback is unreachable).
 
-- Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f26, f27, f29.
+- Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f26, f27, f29, f30.
 - Next:
   - Check the plugin's other `tool.call` `.catch` answers (f28), ready.
   - Measure the home fingerprint warnings (f08), due 2026-11-28.
   - A pin row's model matches the model its subagent ran (f22), due
-    2026-12-01, after the plugin reinstall.
+    2026-12-01.
   - A week of relays adopts every handoff (f16), due 2026-12-02.
   - A week of worker stops settles within 60 s (f23), due 2026-12-03.
-  - f16, f22 and f23 are counted from the reinstall.
-  - Show the `--relative` fallback, or count that it never fires (f30),
-    ready.
+  - f16, f22 and f23 are counted from the first session after
+    2026-11-25 22:19 (the reinstall).
   - Name the missing directory when aval cannot start (f32), ready.
   - A push to main never cancels the release commit's CI (f31), ready.
-  - After the reinstall: `pgrep -fl <worktree>` during a live run lists no
+  - Now that the plugin is reinstalled: `pgrep -fl <worktree>` during a live run lists no
     driver pid, and `pgrep -fl 'relais run'` still lists it (f26 pilot).
 - Lessons:
   - A release branch whose CI passed can still conflict at merge when a PR
@@ -207,10 +208,8 @@ take effect after the plugin reinstall.
   - To check that new tests fail on origin/main, use a detached worktree
     (`git worktree add --detach`) with the test files copied in. Restore it
     and remove it without `--force`.
-- Your steps: v0.86.0 is out and installed; reinstall the relais plugin
-  with relais's own install command for Claude (it is at 0.72.0 here).
-  f27's skill text, f24's cancel, f25's guard and f26's relative `--task`
-  take effect from then; f16, f22 and f23 count from the session after it.
+- Your steps: none. The plugin reinstall (0.86.0, 2026-11-25 22:19) is
+  done.
 
 ## Not yet specified
 
