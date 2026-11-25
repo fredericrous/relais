@@ -10,12 +10,12 @@ missing here.
 
 - `relais decide --answer salvaged` now asks the shared half for the decision
   grant before it records the salvage, as every other answer does. A grant held
-  elsewhere is exit 3 with one line (`...then run the same `--answer salvaged`
-  again unless status shows it already salvaged`), and a salvage so refused
-  records nothing and no longer says "recording it as unknown" first: that
-  line now follows a recorded salvage and reads "recorded it as unknown".
-  Under `shared_state = "external"` with no client a salvage exits 3 like the
-  other answers (it recorded the salvage before). Nothing changes for one node.
+  elsewhere is exit 3 with one line whose next step says to run the same
+  salvage again unless `relais status` shows the salvage already recorded. A
+  salvage so refused records nothing. The line about an unknown containment
+  now follows a recorded salvage and reads "recorded it as unknown". Under
+  `shared_state = "external"` with no client a salvage exits 3 like the other
+  answers (it recorded the salvage before). Nothing changes for one node.
 
 ## v0.87.0
 

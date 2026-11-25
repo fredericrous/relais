@@ -89,7 +89,6 @@ pub(crate) fn answer_error(
     signed_off: Option<&str>,
     next: NextStep,
 ) -> Result<Decision, CliError> {
-    use std::fmt::Write;
     if !node::is_decision_held_elsewhere(&e, run) {
         return Err(node_error("decide", e));
     }
@@ -105,11 +104,9 @@ pub(crate) fn answer_error(
          then {again} (the other answer holds it for up to {minutes} minutes)"
     );
     if let Some(criterion) = signed_off {
-        // fmt::Write into a String cannot fail.
-        let _ = write!(
-            message,
+        message.push_str(&format!(
             "; the sign-off of criterion {criterion} is recorded"
-        );
+        ));
     }
     Ok(refusal(CliOutcome::Blocked, message))
 }
