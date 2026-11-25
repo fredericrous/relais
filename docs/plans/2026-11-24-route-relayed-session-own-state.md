@@ -135,8 +135,8 @@ budget. A router-state read or final flush that fails leaves a note.
 - [x] Phase 1 — red tests, then the fix: `claude-plugin/hooks/routing.ts`,
   `claude-plugin/hooks/register.ts`, `claude-plugin/hooks/router.ts` (new
   `RouterMemory` fields), `claude-plugin/tests/routing.test.ts`,
-  `claude-plugin/tests/routing-support.ts`. Done through relais
-  (`kind: change`, task type `review-fix`). The tests are red before the fix:
+  `claude-plugin/tests/routing-support.ts`, `claude-plugin/tests/support.ts`. Done through relais
+  (`kind: change`, task type `review-fix`). (a)-(d) are red before the fix; (e) is a guard, green on both:
   (a) clear, then `script.sessionId = 'session-2'` and `session.start` /
   `classic.SessionStart(clear)` fired, then a plugin-origin prompt, then a pinned `relais-review`
   launch: the launch row has the new session id, `reason: pin`,
@@ -173,11 +173,37 @@ budget. A router-state read or final flush that fails leaves a note.
   from another programme; with none ready, the handoff parks. Out of this
   plan's scope (ticket choice is `relais programme next`, not the router),
   so it is filed as a follow-up in Phase 2.
+- 2026-11-25 — Phase 1's candidate came from relais run
+  `run-661092cc52dc4-67f8`; its two verify runs were refused a slot
+  (`admission_wait_exhausted`, the host at load 60-90), so the candidate was
+  applied by hand and checked with `scripts/plugin-test.sh` in the worktree.
+- 2026-11-25 — From the implementation review: a launch whose wait ends with
+  the state still stale goes on unrouted (it would route on the state from
+  before the clear); a router-state read begun before a clear or resume
+  writes nothing (a generation count on `RouterMemory`); the failure streak
+  resets at a clear; a failure is a typed value (`exit`, `unparseable`,
+  `timeout`, `error`). Test (d) does not build a fresh store: the marker is
+  read back from the plugin's store by the next start, which is the path a
+  module reload takes, so the title no longer claims it.
+
+## Outcome
+
+| check | input | expected | actual |
+|---|---|---|---|
+| red on base | new tests, `origin/main` hooks | (a)-(d) fail | 7 fail: (a), (b), (b2), (c) ×3, (d); (e) passes (guard) |
+| suite after the fix | `scripts/plugin-test.sh`, rebased tree | green | 565 pass, 0 fail (one rerun of a 5 s timeout at load 60+) |
+| slow test is load, not the change | `routing.test.ts` alone | same time on base | retry test 1.15 s with the fix, 1.65 s on base |
+| pilot | `/clear` relay, then a pinned launch | new session id, `reason pin` | after release and reinstall (Phase 3) |
+
+## Implementation review
+- implementation-review: approve-with-changes; fixed: empty catch reason, banner, `value` → `marker`, counts, test (d) title, import cycle, `timeout` label, `support.ts` in Phase 1 (57k, 60 s).
+- backend: approve-with-changes; fixed: unrouted launch when still stale, wait taken off the deadline, generation guard, streak reset at clear, lost-flush order commented (72k, 51 s).
+- lang:typescript: approve-with-changes; fixed: `StateFailure` union, `readLostFlush(unknown)`, cycle, (d) title, label (63k, 45 s).
 
 ## Verification
 
-- `scripts/plugin-test.sh` (the `plugin-test` check): the five new tests
-  red on `origin/main`, green after the fix, whole suite green.
+- `scripts/plugin-test.sh` (the `plugin-test` check): the seven new tests of
+  (a)-(d) red on `origin/main`, (e) green on both, green after the fix, whole suite green.
 - Each test (a)-(e), (b2) by name: red on `origin/main` with the assertion
   that fails, green after the fix.
 - Piloted after release and reinstall: `/clear` with a relay armed, then

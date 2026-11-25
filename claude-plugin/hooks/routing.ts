@@ -129,30 +129,61 @@ function setStatus(store: Store, decision: Decision | undefined) {
 
 // --- router-state -----------------------------------------------------------
 
+// Why a router-state read gave no state.
+type StateFailure =
+  | { kind: 'exit'; code: number; stderr: string }
+  | { kind: 'unparseable'; stdout: string }
+  | { kind: 'timeout'; message: string }
+  | { kind: 'error'; message: string }
+
+function describeFailure(failure: StateFailure): string {
+  switch (failure.kind) {
+    case 'exit':
+      return `exit ${failure.code}): ${clip(failure.stderr.trim(), 400)}`
+    case 'unparseable':
+      return `unparseable): ${clip(failure.stdout.trim(), 400)}`
+    case 'timeout':
+      return `timeout): ${clip(failure.message, 400)}`
+    case 'error':
+      return `error): ${clip(failure.message, 400)}`
+  }
+}
+
+function thrownFailure(reason: unknown): StateFailure {
+  const message = reason instanceof Error ? reason.message : String(reason)
+  return /timed? ?out/i.test(message) ? { kind: 'timeout', message } : { kind: 'error', message }
+}
+
 export async function loadRouterState(fx: Fx, store: Store) {
   const r = store.router
+  // A clear or resume while this read runs makes it the old session's: it
+  // then writes nothing.
+  const generation = r.generation
   let session = r.session ?? 'unknown'
-  let failure: string | undefined
+  let state: RouterState | undefined
+  let failure: StateFailure | undefined
   try {
     session = r.session ?? (await fx.session.id())
-    r.session = session
+    if (r.generation === generation) r.session = session
     const result = await runFallingBackHome(fx, ['relais', 'native', 'router-state', '--session', session], {
       ...(r.cwd ? { cwd: r.cwd } : {}),
       timeoutMs: STATE_TIMEOUT_MS,
     })
-    const parsed = result?.exitCode === 0 ? parseRouterState(result.stdout) : undefined
-    r.state = parsed
-    if (!parsed) {
-      const code = result?.exitCode
+    const code = result?.exitCode
+    state = code === 0 ? parseRouterState(result.stdout) : undefined
+    if (!state) {
       failure =
         code === 0
-          ? `unparseable): ${clip(String(result?.stdout ?? '').trim(), 400)}`
-          : `${typeof code === 'number' ? `exit ${code}` : 'timeout'}): ${clip(String(result?.stderr ?? '').trim(), 400)}`
+          ? { kind: 'unparseable', stdout: String(result?.stdout ?? '') }
+          : typeof code === 'number'
+            ? { kind: 'exit', code, stderr: String(result?.stderr ?? '') }
+            : { kind: 'timeout', message: String(result?.stderr ?? '') }
     }
   } catch (reason) {
-    r.state = undefined
-    failure = `timeout): ${clip(String((reason as any)?.message ?? reason), 400)}`
+    failure = thrownFailure(reason)
   }
+  if (r.generation !== generation) return
+  r.state = state
   r.isStale = false
   if (!failure) {
     r.isStateFailureReported = false
@@ -160,7 +191,11 @@ export async function loadRouterState(fx: Fx, store: Store) {
   }
   if (r.isStateFailureReported) return
   r.isStateFailureReported = true
-  await report(fx, store, `session routing is off for this session: router-state failed (${failure}; to reproduce: relais native router-state --session ${session}`)
+  await report(
+    fx,
+    store,
+    `session routing is off for this session: router-state failed (${describeFailure(failure)}; to reproduce: relais native router-state --session ${session}`,
+  )
 }
 
 // A line for the person: a note on the runs when there are any, else a toast
@@ -181,12 +216,16 @@ export function refreshState(fx: Fx, store: Store): Promise<void> {
   return refresh(fx, store)
 }
 
+// A read already running for this session is reused; one begun before a
+// clear or resume is not, since it writes nothing.
 function refresh(fx: Fx, store: Store): Promise<void> {
   const r = store.router
-  if (!r.refreshing) {
-    r.refreshing = loadRouterState(fx, store).finally(() => {
-      r.refreshing = undefined
+  if (!r.refreshing || r.refreshingGeneration !== r.generation) {
+    const load: Promise<void> = loadRouterState(fx, store).finally(() => {
+      if (r.refreshing === load) r.refreshing = undefined
     })
+    r.refreshing = load
+    r.refreshingGeneration = r.generation
   }
   return r.refreshing
 }
@@ -427,14 +466,17 @@ export async function routeSpawn(fx: Fx, store: Store, e: any, next: any, remain
   let waitedMs = 0
   if (r.isStale || r.refreshing) {
     const started = await fx.clock.now()
-    await within(fx, refresh(fx, store).catch(() => {}), waitFor(remainingMs))
+    await within(fx, refresh(fx, store).catch(() => {}), waitFor(remainingMs)) // loadRouterState reports its own failures
     waitedMs = (await fx.clock.now()) - started
+    // Still stale after the wait: the state held is the session's before a
+    // clear or resume, so the launch goes on unrouted rather than on it.
+    if (r.isStale) return next(e)
   }
   if (!r.session) r.session = await fx.session.id()
   const state = r.state
   if (!state || state.mode === 'off') return next(e)
-  // The hook's budget ends here, whatever `next` takes.
-  const deadline = (await fx.clock.now()) + remainingMs
+  // The hook's budget ends here, whatever `next` takes; the wait above spent part of it.
+  const deadline = (await fx.clock.now()) + remainingMs - waitedMs
   const type = String(e.subagentType ?? e.subagent_type ?? '')
   const description = String(e.description ?? '')
   const prompt = String(e.prompt ?? '')
@@ -934,6 +976,9 @@ export async function onSessionEnd(fx: Fx, store: Store, reason: string, now: nu
   await flushObservations(fx, store, { isFinal: true })
   if (reason === 'clear' || reason === 'resume') {
     r.session = undefined
+    r.generation += 1
+    // A failure streak of the session before is not this one's: its first failure is reported.
+    r.isStateFailureReported = false
     r.isOpeningWindow = true
     r.forceNew = true
     r.isStale = true
@@ -949,7 +994,9 @@ export async function onSessionEnd(fx: Fx, store: Store, reason: string, now: nu
 // done, 2 is a bad payload (dropped, noted), anything else is retried at
 // most five times, then dropped and noted.
 // A final flush that failed is kept, since a note at the session's end may
-// never be seen; the next session start reports it (`noteLostFlush`).
+// never be seen; the next session start reports it (`noteLostFlush`). At a
+// clear, that start may read the store before this write lands: the loss is
+// then reported one session later.
 async function keepLostFlush(fx: Fx, lastStderr: string) {
   try {
     const before = readLostFlush(await fx.kv.get(LOST_FLUSH_KEY))
@@ -959,10 +1006,14 @@ async function keepLostFlush(fx: Fx, lastStderr: string) {
   }
 }
 
-function readLostFlush(raw: any): { count: number; stderr: string } | undefined {
-  const value = raw && typeof raw === 'object' && !('count' in raw) && 'value' in raw ? raw.value : raw
-  if (!value || typeof value.count !== 'number') return undefined
-  return { count: value.count, stderr: String(value.stderr ?? '') }
+// The store gives the value back bare or wrapped as `{ value }`; a cleared
+// key reads as null.
+function readLostFlush(raw: unknown): { count: number; stderr: string } | undefined {
+  if (raw === null || typeof raw !== 'object') return undefined
+  const marker: unknown = !('count' in raw) && 'value' in raw ? (raw as { value: unknown }).value : raw
+  if (marker === null || typeof marker !== 'object' || !('count' in marker)) return undefined
+  const { count, stderr } = marker as { count: unknown; stderr?: unknown }
+  return typeof count === 'number' ? { count, stderr: String(stderr ?? '') } : undefined
 }
 
 // At session start: a lost final flush of an earlier session is reported

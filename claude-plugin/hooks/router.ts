@@ -1784,6 +1784,11 @@ export type RouterMemory = {
   isOpeningWindow: boolean
   // A router-state failure streak has been reported; the next read that parses ends it.
   isStateFailureReported: boolean
+  // Counts clears and resumes: a router-state read begun under an older
+  // count belongs to the session before and writes nothing.
+  generation: number
+  // The count `refreshing` was begun under.
+  refreshingGeneration: number
 }
 
 export const createRouterMemory = (): RouterMemory => ({
@@ -1809,6 +1814,8 @@ export const createRouterMemory = (): RouterMemory => ({
   rootsCwd: undefined,
   isOpeningWindow: false,
   isStateFailureReported: false,
+  generation: 0,
+  refreshingGeneration: 0,
   reverts: new Set(),
 })
 

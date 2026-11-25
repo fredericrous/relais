@@ -119,8 +119,15 @@ person prompt apart, rather than read them as a pin regression.
   failed final flush is kept in the plugin's store and reported at the
   next session start.
 
+A launch whose wait ends with the state still stale goes on unrouted, and
+a router-state read begun before the clear writes nothing.
+
 Round 2's dark session is not explained: it is made visible, so the next
-occurrence says why. Seven tests went red on the base and are green after
-the fix. A pinned launch with no open parent task still writes no row
+occurrence says why. Seven tests in `claude-plugin/tests/routing.test.ts`
+went red on the base and are green after the fix: the relayed opening
+prompt (row under `session-2`, `reason pin`), the launch with no prompt
+waiting for router-state, the launch that waits only up to its budget, the
+two failure kinds and the failure streak, and the lost final flush. An
+eighth, a later plugin prompt is not classified, guards the window. A pinned launch with no open parent task still writes no row
 (out of scope). Until the release is installed, the 11-30 cohort check
 counts spawns made before a session's first typed prompt apart.

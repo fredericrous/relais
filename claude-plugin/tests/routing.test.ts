@@ -1448,7 +1448,7 @@ test('a subagent edit during a correction window is not in the main task’s cor
   expect(correctionRows(engine).filter((r: any) => r.files)).toEqual([])
 })
 
-// --- a session a relay opens after /clear ---------------------------------------
+// A session a relay opens after /clear.
 
 async function clearInto($: any, engine: any, pins: Record<string, string> = {}) {
   await $.session.end({ reason: 'clear', sessionId: 'session-1' })
@@ -1504,14 +1504,16 @@ test('after a clear, a launch with no prompt waits for the pending router-state 
   expect(engine.calls.completes.length).toBe(completes)
 })
 
-test('a launch waits for a slow router-state only up to the budget, then keeps its model with no row', async ($: any, on: any) => {
+test('a launch waits for a slow router-state only up to the budget, then goes on unrouted with its model and no row', async ($: any, on: any) => {
   on('classic.SessionStart', () => ({}))
   const engine = await routedSession($, on)
   await clearInto($, engine)
   const release = stateGate(engine)
   await startAfterClear($, engine)
+  const completes = engine.calls.completes.length
   let isDone = false
-  const launched = $.agent.spawn({ prompt: 'review it', description: 'review', subagentType: 'pinned-agent', model: 'sonnet' }).then(() => {
+  // Not pinned: routed on the state from before the clear, it would be classified.
+  const launched = $.agent.spawn({ prompt: 'review it', description: 'review', subagentType: 'general-purpose', model: 'sonnet' }).then(() => {
     isDone = true
   })
   await engine.clock.advance(1900)
@@ -1523,6 +1525,7 @@ test('a launch waits for a slow router-state only up to the budget, then keeps i
   release()
   await launched
   expect(engine.calls.spawned[0].model).toBe('sonnet')
+  expect(engine.calls.completes.length).toBe(completes)
   await endSession($, engine)
   expect(decisionSessions(engine)).toEqual([])
 })
@@ -1568,7 +1571,7 @@ test('failure, failure, success, failure gives two toasts', async ($: any, on: a
   expect(engine.calls.toasts.slice(before).length).toBe(2)
 })
 
-test('a failing final flush is noted once at the next session start, after a clear and from a fresh store', async ($: any, on: any) => {
+test('a failing final flush is noted once at the next session start after a clear, and its marker cleared', async ($: any, on: any) => {
   const engine = await routedSession($, on)
   await personTurn($, engine, 'rename foo to bar, tests exist')
   engine.observeExits.push(1)
