@@ -79,6 +79,7 @@ enum Pass {
 /// Why a `seat-settles.json` is not a settle list.
 #[derive(Debug)]
 enum SettleFileError {
+    Io(std::io::Error),
     Json(serde_json::Error),
     HolderKind(String),
 }
@@ -86,6 +87,7 @@ enum SettleFileError {
 impl std::fmt::Display for SettleFileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Io(e) => write!(f, "{e}"),
             Self::Json(e) => write!(f, "{e}"),
             Self::HolderKind(kind) => write!(f, "a settle names the unknown holder kind {kind:?}"),
         }
@@ -323,8 +325,8 @@ impl Book {
             let rows: Vec<SettleRow> = self.settles.iter().filter_map(SettleRow::of).collect();
             if rows.len() < self.settles.len() {
                 log(&format!(
-                    "seat settles: {} waiting settle(s) have a reservation that is not under a \
-                     seat and are not written to {}",
+                    "seat settles: {} waiting settle(s) cannot be saved to {} and are lost if the \
+                     coordinator restarts",
                     self.settles.len() - rows.len(),
                     path.display()
                 ));
@@ -409,6 +411,7 @@ impl Book {
             // unreachable; the rest end at their time limit.
             if reachable {
                 reachable = self.release_settle_seat(shared, log, pending.reservation.as_ref());
+                self.forget_release_failure(pending.reservation.as_ref());
             }
         }
         log(&format!(
@@ -422,6 +425,7 @@ impl Book {
     /// when its reservation is under one; never the dispatch's own seat. A
     /// failure is the book's one line per change, and the seat ends at its
     /// time limit. Answers `false` when the primary was unreachable.
+    #[must_use]
     fn release_settle_seat(
         &mut self,
         shared: &dyn SharedState,
@@ -435,7 +439,23 @@ impl Book {
             ResourceId::Seat { dispatch, .. } if dispatch.starts_with("settle:") => {
                 self.release(shared, log, dispatch, &reservation.seat)
             }
-            _ => true,
+            ResourceId::Seat { .. } | ResourceId::Ticket { .. } | ResourceId::Intent(_) => true,
+        }
+    }
+
+    /// A settle that is over keeps no release-failure entry (its line was
+    /// written once already).
+    fn forget_release_failure(&mut self, reservation: Option<&Reservation>) {
+        if let Some(Reservation {
+            seat:
+                LeaseToken {
+                    resource: ResourceId::Seat { dispatch, .. },
+                    ..
+                },
+            ..
+        }) = reservation
+        {
+            self.failing.remove(&(dispatch.clone(), SeatOp::Release));
         }
     }
 
@@ -515,7 +535,10 @@ impl Book {
                             // reservation was never sent, so it is dropped
                             // and the next pass makes and writes a new one.
                             self.settles[at].reservation = None;
-                            self.release_settle_seat(shared, log, Some(&reservation));
+                            if !self.release_settle_seat(shared, log, Some(&reservation)) {
+                                reachable = false;
+                                break;
+                            }
                             at += 1;
                             continue;
                         }
@@ -554,7 +577,8 @@ impl Book {
                     self.settles.remove(at);
                     self.dirty = true;
                     // A seat made for this settle alone goes back at once.
-                    self.release_settle_seat(shared, log, Some(&reservation));
+                    let _ = self.release_settle_seat(shared, log, Some(&reservation));
+                    self.forget_release_failure(Some(&reservation));
                 }
                 Err(settle_error @ SharedStateError::Unreachable { .. }) => {
                     // An outage: kept, and the pass stops here.
@@ -579,7 +603,8 @@ impl Book {
                     // `refused: <reason>`.
                     self.failing.remove(&(id.clone(), SeatOp::Settle));
                     let dropped = self.settles.remove(at);
-                    self.release_settle_seat(shared, log, dropped.reservation.as_ref());
+                    let _ = self.release_settle_seat(shared, log, dropped.reservation.as_ref());
+                    self.forget_release_failure(dropped.reservation.as_ref());
                     self.dirty = true;
                     log(&format!(
                         "seat {id}: booking the spend was not accepted: {settle_error}; dropped, \
@@ -703,20 +728,20 @@ impl SeatBook {
         let now = (self.clock)();
         let mut book = self.book();
         book.store = Some(path.clone());
-        let read: Result<Option<Vec<PendingSettle>>, String> = match std::fs::read_to_string(&path)
-        {
-            Ok(text) => serde_json::from_str::<SettleFile>(&text)
-                .map_err(|e| SettleFileError::Json(e).to_string())
-                .and_then(|file| {
-                    file.settles
-                        .into_iter()
-                        .map(|row| row.into_pending().map_err(|e| e.to_string()))
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .map(Some),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.to_string()),
-        };
+        let read: Result<Option<Vec<PendingSettle>>, SettleFileError> =
+            match std::fs::read_to_string(&path) {
+                Ok(text) => serde_json::from_str::<SettleFile>(&text)
+                    .map_err(SettleFileError::Json)
+                    .and_then(|file| {
+                        file.settles
+                            .into_iter()
+                            .map(SettleRow::into_pending)
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .map(Some),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(SettleFileError::Io(e)),
+            };
         match read {
             Ok(Some(rows)) => book.settles = rows,
             Ok(None) => {}
@@ -737,7 +762,8 @@ impl SeatBook {
                         log(&format!(
                             "seat settles: {} could not be read ({cause}) and could not be moved \
                              aside ({e}); the book starts empty and keeps nothing on disk until \
-                             the file is fixed and the coordinator restarted",
+                             the file is fixed and the coordinator restarted (`relais coordinator \
+                             stop`)",
                             path.display()
                         ));
                     }

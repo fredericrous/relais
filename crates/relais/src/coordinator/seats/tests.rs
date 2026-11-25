@@ -958,3 +958,55 @@ fn a_settle_is_not_sent_while_its_reservation_cannot_be_written() {
         "booked once the file can be written"
     );
 }
+
+/// The drop of an unsent reservation: the first write works (the settle is
+/// stored with no reservation), then the directory goes, and the pass that
+/// would reserve finds the write failing.
+#[test]
+fn a_reservation_made_just_before_the_file_fails_is_dropped_unsent() {
+    let dir = crate::test_support::temp_dir("seat-settles-vanish");
+    let parent = dir.join("state");
+    std::fs::create_dir(&parent).expect("dir");
+    let path = parent.join(SETTLES_FILE);
+    let fake = FakeState::new();
+    let (clock, _) = scripted_clock(1_000);
+    let state = admission(2);
+    let (book, _) = file_book(Arc::new(fake.clone()), &path, clock);
+    launched_without_reservation(&state, "d1");
+    book.sync(&state);
+    settle_and_free(&state, "d1", 400);
+    book.sync_request(&state, None);
+    assert!(path.exists(), "stored with no reservation");
+    assert!(book.book().settles[0].reservation.is_none());
+
+    std::fs::remove_dir_all(&parent).expect("the directory goes");
+    book.sync(&state);
+    assert_eq!(fake.spent().to_micros(), 0, "nothing sent");
+    assert!(book.book().settles[0].reservation.is_none());
+    let probe = fake
+        .acquire_seat(&Principal::node("node-b"), "settle:d1")
+        .expect("the dropped reservation's seat is free");
+    assert_eq!(probe.epoch, 2, "it was acquired and given back once");
+}
+
+/// A file that cannot be read and cannot be moved aside is left alone and
+/// the book keeps nothing on disk.
+#[test]
+fn a_settle_file_that_cannot_be_moved_aside_is_never_overwritten() {
+    let dir = crate::test_support::temp_dir("seat-settles-stuck");
+    let path = dir.join(SETTLES_FILE);
+    std::fs::create_dir(&path).expect("unreadable as a file");
+    let aside = dir.join(format!("{SETTLES_FILE}.unreadable-9"));
+    std::fs::create_dir(&aside).expect("the aside name is taken");
+    std::fs::write(aside.join("keep"), "x").expect("make it non-empty");
+    let (clock, _) = scripted_clock(9);
+    let state = admission(2);
+    let fake = FakeState::new();
+    let (book, lines) = file_book(Arc::new(fake.clone()), &path, clock);
+    assert_eq!(count_lines(&lines, "keeps nothing on disk"), 1, "{lines:?}");
+    assert_eq!(admit(&book, &state, &agent("d1", 100)), Decision::Granted);
+    fake.set_settles_conflict(Some("slot"));
+    settle_and_free(&state, "d1", 10);
+    book.sync(&state);
+    assert!(path.is_dir(), "the unreadable file was not replaced");
+}
