@@ -125,10 +125,8 @@ it, f24 (`mcp__relais__cancel` of an ended run stops its workers, plan
 `docs/plans/2026-11-25-cancel-stops-orphaned-workers.md`). Both plugin
 changes ship with the next relais release and run after the plugin reinstall.
 
-- Done: f12, f13, f14, f15, f17, f18, f19, f21, f24, f25.
+- Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25.
 - Next:
-  - f20 (stale state after a clear) is held by session
-    `route-relayed-session-state` in `relais-wt-f20`.
   - Keep a worker's kills off its own driver (f26), ready.
   - Measure the home fingerprint warnings (f08), due 2026-11-28.
   - A pin row's model matches the model its subagent ran (f22), due
