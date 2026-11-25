@@ -49,7 +49,7 @@ state, so nothing changes for one node.
 - `grep -nF -e 'load_machine(' -e 'load_price_table(' -e 'tuning_bounds(' crates/relais/src/cli/replay.rs`: main matches lines 93, 302 and 385; the branch matches nothing.
 - `grep -cF 'shared_state()' crates/relais/src/cli/replay.rs`: the branch prints 1 (observed on `80cc613c7`); the call is at replay.rs:94, before `tuning_bounds_of` at :95.
 - Integration test `a_replay_under_an_absent_external_layer_is_refused_at_its_one_state` (`crates/relais/tests/it/release_scenarios.rs`): under `shared_state = "external"` with no client, `dataset replay --dry-run` still exits 0, and a spending replay exits 3 with the one sentence, no spawn and no worker launch.
-- Observed (commit `80cc613c7`): `cargo test -p relais` passed before the test was added (all targets: 2720, 72, 353, 26, 16, 6, 1 passed, 0 failed); `cargo clippy -p relais --all-targets -- -D warnings` exit 0; the new test `a_replay_under_an_absent_external_layer_is_refused_at_its_one_state` passes. No test tells one build from three (`LocalState` holds no state): the greps are the proof.
+- Observed on the rebased tree `6c14bda59` (on v0.87.0): `cargo clippy -p relais --all-targets -- -D warnings` exit 0; `cargo test -p relais` exit 0 (2720, 72, 354, 26, 16, 6, 1 passed, 0 failed); the new test passes. No test tells one build from three (`LocalState` holds no state): the greps are the proof, observed on the same tree.
 
 ## Implementation review
 
