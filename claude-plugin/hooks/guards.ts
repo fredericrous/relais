@@ -29,6 +29,20 @@ export function isRelaisNotification(text: string, agentIds: ReadonlySet<string>
 export const DENY_MESSAGE =
   'This agent belongs to a relais run; relais drives it. Ask relais (the relais tool), not the agent.'
 
+// The model's `TaskStop` of a relais agent stays denied, and the deny names
+// the way out (f24): cancel of the agent's run, which stops an ended run's
+// agents still running; else the person. `run` is the store's key for the
+// agent's run: `starting-…` until the run's first event names it.
+export function taskStopDenyMessage(run: string | undefined): string {
+  if (run === undefined) {
+    return 'This agent belongs to a relais run this plugin no longer knows. Ask the person to stop it in Claude Code.'
+  }
+  if (run.startsWith('starting-')) {
+    return 'This agent belongs to a relais run that is still starting; relais drives it. Check it with mcp__relais__status.'
+  }
+  return `This agent belongs to relais run ${run}; relais drives it. To stop it, call mcp__relais__cancel with run ${run}: cancelling a run that has already ended also stops its agents still running.`
+}
+
 export const MACHINE_SETTINGS_MESSAGE =
   "machine.toml holds relais's trust grants, and only the person grants them. Call mcp__relais__trust with the repository's cwd: it shows them the exact commands and asks."
 

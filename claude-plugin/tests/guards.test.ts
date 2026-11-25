@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
-import { continueLine, RELAIS_AGENT_TYPE, settle, spawnLine, startedRun } from './support.ts'
+import { continueLine, event, RELAIS_AGENT_TYPE, settle, spawnLine, startedRun } from './support.ts'
 import { containsWords, decideTool, feedbackTool, mintNonce, RUN_CONTRACT_DESCRIPTION, TASK_TYPES } from '../hooks/decide.ts'
-import { DECIDE_MESSAGE, decideGuard } from '../hooks/guards.ts'
+import { DECIDE_MESSAGE, DENY_MESSAGE, decideGuard } from '../hooks/guards.ts'
 import { createStore } from '../hooks/store.ts'
 
 const offer = (agent: string) => ({
@@ -58,6 +58,34 @@ test('a model SendMessage or TaskStop aimed at a relais agent is denied; the plu
   await settle(engine)
   const sent = engine.calls.tool.filter((t: any) => t.tool === 'SendMessage')
   expect(sent.map((t: any) => t.to)).toEqual(['someone-else', 'agent-1'])
+})
+
+// f24: the deny names the way out, the run to cancel, else the person.
+test('a model TaskStop of a relais agent is told which run to cancel', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stdout', event('run-c', 0, { kind: 'phase', state: 'running', reason: 'x', detail: {} }))
+  engine.stream.push('stdout', spawnLine('d1'))
+  await settle(engine)
+  const stop = await $.tool.call({ tool: 'TaskStop', task_id: 'agent-1' })
+  expect(stop.deny).toContain('relais run run-c')
+  expect(stop.deny).toContain('mcp__relais__cancel with run run-c')
+  const message = await $.tool.call({ tool: 'SendMessage', to: 'agent-1', message: 'hello' })
+  expect(message.deny).toBe(DENY_MESSAGE)
+})
+
+test('a model TaskStop of a relais agent the store does not hold is sent to the person', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.agents.push({ id: 'agent-9', status: 'running', type: RELAIS_AGENT_TYPE, description: '' })
+  const stop = await $.tool.call({ tool: 'TaskStop', task_id: 'agent-9' })
+  expect(stop.deny).toContain('stop it in Claude Code')
+})
+
+test('a model TaskStop of an agent whose run is still starting is sent to status', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stdout', spawnLine('d1'))
+  await settle(engine)
+  const stop = await $.tool.call({ tool: 'TaskStop', task_id: 'agent-1' })
+  expect(stop.deny).toContain('mcp__relais__status')
 })
 
 test('a relais agent’s task-notification is dropped; an unrelated one that mentions its id is kept', async ($: any, on: any) => {

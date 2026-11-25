@@ -53,7 +53,7 @@ export const PLUGIN_STOP_NOTE =
 
 export type Listed = { id: string; status: string }
 
-const ENDED = ['completed', 'failed', 'killed']
+export const ENDED = ['completed', 'failed', 'killed']
 // Statuses a dispatch may end on with no turn, once the status has moved.
 const ENDED_WITHOUT_TURN = ['failed', 'killed']
 

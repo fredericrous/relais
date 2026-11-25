@@ -15,6 +15,14 @@ reports `stopped` `completed` with the kept answer and a `relais plugin: …`
 note, so the attempt is snapshotted and verified instead of ending `killed` at
 the wall time. Takes effect after the plugin is reinstalled.
 
+`mcp__relais__cancel` of a run that has already ended (or whose driver is gone)
+now also stops the agents that run's dispatches bound and that still run, with
+one reply line each after relais's own line (`stop sent to agent …`, `could not
+stop agent …`, or a late or unknown case). A worker that outlives its driver can
+be stopped from the session. The model's `TaskStop` of a relais agent stays
+denied, and the deny names the run to cancel. Takes effect after the plugin is
+reinstalled.
+
 ## v0.83.0
 
 relais spawns `greenspotter` (0.20.0 or later) where it spawned `adr-lint`, reads

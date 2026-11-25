@@ -2,7 +2,7 @@
 // each turn's usage, and the one `stopped` a dispatch ends with.
 
 import type { Fx } from './fx.ts'
-import { type Dispatch, observe, openDispatch, STOP_CONFIRM_MS, stoppedPayload, usagePayload, withTurn } from './dispatches.ts'
+import { type Dispatch, ENDED, observe, openDispatch, STOP_CONFIRM_MS, stoppedPayload, usagePayload, withTurn } from './dispatches.ts'
 import { sendBound, sendStopped, sendUsage } from './callbacks.ts'
 import { withinBound } from './events.ts'
 import { detach, every, type Child, type Store } from './store.ts'
@@ -142,19 +142,70 @@ export async function handleStop(fx: Fx, store: Store, line: any) {
 // may still take.
 type StopAnswer = { kind: 'done' } | { kind: 'late'; why: string } | { kind: 'refused'; why: string }
 
-async function taskStop(fx: Fx, agent: string): Promise<StopAnswer> {
-  const settled = await withinBound(fx, STOP_CONFIRM_MS, () => fx.tool.call({ tool: 'TaskStop', task_id: agent }))
-  if (settled.kind === 'late') return { kind: 'late', why: `no answer in ${STOP_CONFIRM_MS / 1000} s` }
+async function taskStop(fx: Fx, agent: string, ms = STOP_CONFIRM_MS): Promise<StopAnswer> {
+  const settled = await withinBound(fx, ms, () => fx.tool.call({ tool: 'TaskStop', task_id: agent }))
+  if (settled.kind === 'late') return { kind: 'late', why: `no answer in ${Math.round(ms / 1000)} s` }
   const why = settled.kind === 'ok' ? refusal(settled.value) : failureText(settled.reason)
   return why === undefined ? { kind: 'done' } : { kind: 'refused', why }
 }
 
-async function stopAgent(fx: Fx, store: Store, run: string | undefined, agent: string) {
-  const answer = await taskStop(fx, agent)
+async function stopAgent(fx: Fx, store: Store, run: string | undefined, agent: string, ms = STOP_CONFIRM_MS): Promise<StopAnswer> {
+  const answer = await taskStop(fx, agent, ms)
   // Said in the run's timeline: an agent relais asked to stop may still be
   // running, and the person is the one who can stop it.
   if (answer.kind === 'late') await note(fx, store, run, `TaskStop of agent ${agent} had ${answer.why}; it may still take.`)
   if (answer.kind === 'refused') await note(fx, store, run, `TaskStop of agent ${agent} failed: ${answer.why}`)
+  return answer
+}
+
+// The run whose dispatch the agent is bound to now, if this plugin knows it.
+export function runOfAgent(store: Store, agent: string): string | undefined {
+  const dispatch = store.agentDispatch.get(agent)
+  return dispatch === undefined ? undefined : store.dispatchChild.get(dispatch)?.key
+}
+
+// A cancel of a run that has ended stops the agents its dispatches bound
+// that still run (f24): a worker can outlive its driver, and the session
+// has no other way to stop it. An agent rebound to another run's dispatch
+// is that run's, and kept. One line per agent, for the cancel's reply.
+// The list read and the stops share one STOP_CONFIRM_MS window.
+export async function stopAgentsOf(fx: Fx, store: Store, run: string): Promise<string[]> {
+  const agents = new Set<string>()
+  for (const [id, child] of store.dispatchChild) {
+    const agent = child.key === run ? store.dispatches.get(id)?.agent : undefined
+    if (agent && runOfAgent(store, agent) === run) agents.add(agent)
+  }
+  if (agents.size === 0) {
+    return [`no agent of run ${run} is known to this plugin; if one still runs, ask the person to stop it in Claude Code`]
+  }
+  // Bounded too: a list that never answers must not hold the cancel.
+  const started = await fx.clock.now()
+  const read = await withinBound(fx, STOP_CONFIRM_MS, () => fx.agent.list())
+  if (read.kind !== 'ok') {
+    const why = read.kind === 'late' ? `no answer in ${STOP_CONFIRM_MS / 1000} s` : failureText(read.reason)
+    return [`the agent list could not be read (${why}); no agent of run ${run} was stopped`]
+  }
+  const listed: any[] = read.value
+  // What is left of the window, read before the ownership check below.
+  const left = Math.max(0, STOP_CONFIRM_MS - ((await fx.clock.now()) - started))
+  // Ownership is checked again: a `continue` may have rebound the agent to
+  // another run while the list was awaited. No await from here to the calls.
+  const live = [...agents].filter(agent => {
+    const seen = listed.find((a: any) => a.id === agent)
+    return seen !== undefined && !ENDED.includes(seen.status)
+  })
+  const running = live.filter(agent => runOfAgent(store, agent) === run)
+  const moved = live.filter(agent => !running.includes(agent)).map(agent => `agent ${agent} now belongs to another run; not stopped`)
+  if (live.length === 0) return [`no agent of run ${run} is still running`]
+  // In parallel, with what is left of the window: one bound in all.
+  const answers = await Promise.all(running.map(agent => stopAgent(fx, store, run, agent, left)))
+  return [...moved, ...answers.map((answer, i) => {
+    const agent = running[i]
+    // The call went through; the agent's end is not listed again here.
+    if (answer.kind === 'done') return `stop sent to agent ${agent}`
+    if (answer.kind === 'refused') return `could not stop agent ${agent}: ${answer.why}`
+    return `agent ${agent}: TaskStop had ${answer.why}; it may still take`
+  })]
 }
 
 // A failure the plugin met, as a `stderr` entry of the run it names, else
