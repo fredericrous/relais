@@ -173,11 +173,11 @@ and the counter rises by its reservation exactly once.
 
 ## Phases
 
-- [ ] Phase 1 — pending settles, persistence, caps, unreserved booking:
+- [x] Phase 1 — pending settles, persistence, caps, unreserved booking:
   `crates/relais/src/coordinator/seats.rs`,
   `crates/relais/src/coordinator/seats/tests.rs`,
   `crates/relais/src/coordinator/mod.rs`
-- [ ] Phase 2 — runner settle, the floor, conformance, docs and changelog:
+- [x] Phase 2 — runner settle, the floor, conformance, docs and changelog:
   `crates/relais/src/shared_state/node.rs`,
   `crates/relais/src/shared_state/conformance.rs`,
   `crates/relais/src/runner/launch.rs`,
@@ -189,13 +189,29 @@ and the counter rises by its reservation exactly once.
 
 ## Verification
 
-- `cargo test -p relais --lib`, then the full `cargo test -p relais`, green.
 - Input: a fake state with a counter, a daemon-less run booking 120 micros
-  → expected: counter 120, slice down 120, no ledger floor involved.
-- Input: an unreserved settle whose first settle times out after the
-  primary applied it → expected: counter rises by `actual` once.
+  → expected: counter 120, slice down 120, no ledger floor involved →
+  observed: counter 120 and slice down 120
+  (`a_run_with_no_daemon_books_its_cost_to_the_counter_and_the_slice`), and a
+  mock-backend run leaves counter = ledger
+  (`a_run_with_no_gate_books_its_cost_to_the_shared_counter`).
+- Input: an unreserved settle whose first settle failed, the primary then
+  applying it → expected: the counter rises by `actual` once → observed: 400,
+  not 800
+  (`an_unreserved_settle_whose_first_settle_failed_books_once_on_the_same_reservation`).
 - Input: book A leaves 3 settles waiting, book B opens the same file →
-  expected: counter rises by their sum, file empty.
+  expected: counter rises by their sum, file empty → observed: 60, no file,
+  mode 0600 (`a_restarted_book_settles_what_the_last_one_left_waiting`).
+- Input: a dispatch released and never settled → expected: the reconcile
+  pass settles it and the counter holds its reservation once → observed: 1000
+  once (`a_dispatch_released_but_never_settled_books_its_reservation_once`).
+- Input: a run under a gate → expected: the runner books nothing → observed:
+  counter 0 (`a_run_under_a_gate_leaves_the_counter_to_the_coordinator`).
+
+- Input: the whole crate's tests and CI's clippy on the pushed tree →
+  expected: green → observed: the commit gate's `cargo test -p relais`
+  (lib 2732, bin 352, integration targets) passes; `cargo clippy
+  --all-targets -- -D warnings` clean, also with `--features conformance`.
 
 ## Decision log
 
@@ -209,5 +225,28 @@ and the counter rises by its reservation exactly once.
 - 2026-11-25: refused settle, the runner's unreachable primary or refused
   seat, and a failed gate settle are deliberate (above), decided-by: agent
   (ADR-0080).
+- 2026-11-25 (implementation, departures from the body, all carried in the
+  reviews sidecar): unreserved settles are booked only on the reconcile
+  tick; the runner's holder comes in as `RunConfig.node_host` (read once in
+  `cli/run.rs` and `cli/replay.rs`, `effects.no-ambient-access`), and
+  `seat_holder` moved from `cli/coordinator.rs` into `shared_state::node`;
+  `Selection::Local` writes no file and books nothing; a failed `gate.settle`
+  writes a `gate_settle_failed` decision and line; the test fixtures gained
+  `execute_presented_with` for the gated test.
+- `system_clock` in `seats.rs` is the production default of the injected
+  `Clock` (`with_clock`) and the only ambient read in the book.
+- The lost-answer test is a conflict plus a direct `settle_spend`, because
+  `FakeState::settle_spend` ignores degraded mode.
+- The carry_on hook gap in the body is wrong: such an agent has no dispatch
+  on the ledger (`book_turn_usage` answers `NoSuchDispatch`), so it is not
+  metered at all; `docs/shared-state.md` says so.
+- One `book_usage` call per dispatch was checked at its three call sites
+  (`attempt.rs`, `review/engine.rs`, `scheduler.rs`: `event_id` is the
+  dispatch id). A cross-process resume of a dispatch was not read: unverified
+  residual, in the relais inbox. The ledger sum for the 5% rollback check
+  is owed by the external-client ticket.
+- A `settle:<dispatch>` seat is released on the `Ok`, `Refused` and cap-drop
+  branches; a kept failure holds its seat until its TTL, and the retry is a
+  true-up on the same reservation.
 
 <!-- panel: repos=relais,homelab adds=contract reviewers=architect,backend,lang:rust,po,tui,unix body-sha=89ad2bb99d96 -->
