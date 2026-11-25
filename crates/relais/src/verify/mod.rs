@@ -3555,7 +3555,11 @@ pub fn integration_gaps(
 ) -> Vec<String> {
     let mut gaps = Vec::new();
     for (name, default_bin, dependency) in [
-        ("aval", "aval", integrations.aval.as_ref()),
+        (
+            "aval",
+            crate::tooling::default_bin("aval"),
+            integrations.aval.as_ref(),
+        ),
         ("amont", "amont", integrations.amont.as_ref()),
         (
             "amont_agent",

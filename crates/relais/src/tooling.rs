@@ -93,9 +93,39 @@ fn missing_integration_detail(name: &str, bin: &str) -> String {
 /// verification ask it too). The key `amont_agent` keeps its name until the
 /// census; its binary is `greenbelay` (ADR-0071: no `amont-agent` copy is
 /// installed).
+///
+/// The `aval` key's binary is `greentopo` when that is on this machine's
+/// PATH, else `aval` (the rename keeps the old binary working until the
+/// machine switch). Callers that spawn it resolve once per run.
 pub(crate) fn default_bin(name: &str) -> &str {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    let extensions = path_extensions(std::env::var_os("PATHEXT").as_ref());
+    default_bin_in(name, &dirs, &extensions)
+}
+
+/// [`default_bin`] over the given directories and suffixes: pure apart from
+/// the existence test, so it is tested without touching the environment.
+/// An installed `greentopo` that fails is never replaced by `aval`: only its
+/// absence from the directories selects `aval`.
+pub(crate) fn default_bin_in<'a>(
+    name: &'a str,
+    dirs: &[PathBuf],
+    extensions: &[String],
+) -> &'a str {
     match name {
         "amont_agent" => "greenbelay",
+        "aval" => {
+            if resolve_in("greentopo", dirs, extensions, &|candidate| {
+                candidate.is_file()
+            })
+            .is_some()
+            {
+                "greentopo"
+            } else {
+                "aval"
+            }
+        }
         other => other,
     }
 }
@@ -282,7 +312,46 @@ mod tests {
     #[test]
     fn the_agent_integration_key_names_the_greenbelay_binary() {
         assert_eq!(default_bin("amont_agent"), "greenbelay");
-        assert_eq!(default_bin("aval"), "aval");
+    }
+
+    fn bin_for_listing(listing: &[&str]) -> String {
+        let root = crate::test_support::temp_dir("default-bin");
+        let dirs = vec![root.join("bin")];
+        std::fs::create_dir_all(&dirs[0]).unwrap();
+        for name in listing {
+            std::fs::write(dirs[0].join(name), "").unwrap();
+        }
+        default_bin_in("aval", &dirs, &[String::new()]).to_string()
+    }
+
+    #[test]
+    fn only_greentopo_on_path_selects_greentopo() {
+        assert_eq!(bin_for_listing(&["greentopo"]), "greentopo");
+    }
+
+    #[test]
+    fn only_aval_on_path_selects_aval() {
+        assert_eq!(bin_for_listing(&["aval"]), "aval");
+    }
+
+    #[test]
+    fn both_on_path_select_greentopo() {
+        assert_eq!(bin_for_listing(&["aval", "greentopo"]), "greentopo");
+    }
+
+    #[test]
+    fn neither_on_path_selects_aval() {
+        assert_eq!(bin_for_listing(&[]), "aval");
+    }
+
+    #[test]
+    fn a_declared_bin_wins_over_the_default() {
+        let policy = RepoPolicy::from_toml_str(
+            "schema_version = 1\n[integrations]\naval = { mode = \"required\", bin = \"relais-test-no-such-bin\" }\n",
+        )
+        .unwrap();
+        let blockers = probe_integrations(&policy);
+        assert!(blockers[0].detail.contains("relais-test-no-such-bin"));
     }
 
     /// A name no machine has on PATH is missing; the interpreter running

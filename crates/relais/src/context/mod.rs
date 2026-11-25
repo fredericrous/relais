@@ -243,9 +243,20 @@ pub struct AvalCli {
     fleet_decisions: Option<PathBuf>,
     /// Where the embedded pack is materialised, keyed by its content hash.
     fleet_cache: Option<PathBuf>,
+    /// The program an undeclared `bin` resolves to, decided once per run.
+    default_program: OnceLock<String>,
 }
 
 impl AvalCli {
+    /// The declared `bin`, else the machine's default for the `aval` key,
+    /// resolved on first use and kept for the run.
+    fn program(&self) -> &str {
+        self.bin.as_deref().unwrap_or_else(|| {
+            self.default_program
+                .get_or_init(|| crate::tooling::default_bin("aval").to_string())
+        })
+    }
+
     /// Resolve decisions for the corpus rooted at `root`.
     pub fn new(root: PathBuf) -> Self {
         Self {
@@ -256,6 +267,7 @@ impl AvalCli {
             greenspotter: greenspotter_program(),
             fleet_decisions: fleet_decisions_dir(),
             fleet_cache: default_fleet_cache(),
+            default_program: OnceLock::new(),
         }
     }
 
@@ -270,6 +282,7 @@ impl AvalCli {
             greenspotter: greenspotter_program(),
             fleet_decisions: fleet_decisions_dir(),
             fleet_cache: default_fleet_cache(),
+            default_program: OnceLock::new(),
         }
     }
 
@@ -378,7 +391,7 @@ impl DecisionResolver for AvalCli {
     fn constraint_rules(&self) -> Result<Rules, GuidanceGap> {
         self.rules
             .get_or_init(|| {
-                let program = self.bin.clone().unwrap_or_else(|| "aval".to_string());
+                let program = self.program().to_string();
                 let ask_in = |dir: &Path| {
                     let dir = dir.to_path_buf();
                     let program = program.clone();
@@ -429,7 +442,7 @@ impl DecisionResolver for AvalCli {
 
     fn relevant(&self, query: &RelevantQuery) -> Result<Relevant, GuidanceGap> {
         guidance::run_aval(
-            self.bin.as_deref().unwrap_or("aval"),
+            self.program(),
             &guidance::relevant_args(query),
             &self.root,
             GuidanceSource::Relevant,
@@ -443,7 +456,7 @@ impl DecisionResolver for AvalCli {
         guidance::fetch_decisions(
             &|args| {
                 guidance::run_aval(
-                    self.bin.as_deref().unwrap_or("aval"),
+                    self.program(),
                     args,
                     &self.root,
                     GuidanceSource::Decisions,
@@ -514,21 +527,21 @@ pub fn aval_resolve_in(
         };
     }
     // Absence is confirmed only when nothing was declared, the directory
-    // to run in exists, and no PATH entry named `aval` exists in any form:
-    // a non-executable file or a dangling link is a broken install, which
-    // keeps blocking.
+    // to run in exists, and no PATH entry named `greentopo` or `aval` exists
+    // in any form: a non-executable file or a dangling link is a broken
+    // install, which keeps blocking.
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    let extensions = crate::tooling::path_extensions(std::env::var_os("PATHEXT").as_ref());
     let confirmed_absent = bin.is_none() && repo_dir.is_dir() && {
-        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
-        let extensions = crate::tooling::path_extensions(std::env::var_os("PATHEXT").as_ref());
-        crate::tooling::resolve_in("aval", &dirs, &extensions, &|candidate| {
-            match std::fs::symlink_metadata(candidate) {
-                Ok(_) => true,
-                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-            }
+        let exists_in_any_form = |candidate: &Path| match std::fs::symlink_metadata(candidate) {
+            Ok(_) => true,
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        };
+        ["greentopo", "aval"].iter().all(|name| {
+            crate::tooling::resolve_in(name, &dirs, &extensions, &exists_in_any_form).is_none()
         })
-        .is_none()
     };
-    let program = bin.unwrap_or("aval");
+    let program = bin.unwrap_or_else(|| crate::tooling::default_bin_in("aval", &dirs, &extensions));
     let mut command = std::process::Command::new(program);
     command
         .arg("resolve")

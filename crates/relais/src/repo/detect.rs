@@ -449,7 +449,7 @@ fn render_toml(
          # \"optional\" reports it missing; \"off\" skips it.\n",
     );
     out.push_str("[integrations]\n");
-    out.push_str(&format!("aval = {}\n", quoted(integrations.aval)));
+    out.push_str(&format!("greentopo = {}\n", quoted(integrations.aval)));
     out.push_str(&format!("amont = {}\n", quoted(integrations.amont)));
     out.push_str(&format!(
         "amont_agent = {}\n",
