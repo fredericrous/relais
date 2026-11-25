@@ -210,8 +210,16 @@ and the counter rises by its reservation exactly once.
 
 - Input: the whole crate's tests and CI's clippy on the pushed tree →
   expected: green → observed: the commit gate's `cargo test -p relais`
-  (lib 2735, bin 352, integration targets; on 59729aa64) passes; `cargo clippy
+  (lib 2739, bin 352, integration targets; the commit gate of f1ceaa9f8, the merge with main) passes; `cargo clippy
   --all-targets -- -D warnings` clean, also with `--features conformance`.
+
+## Implementation review
+
+- Round 1 (tree 634a2558): implementation-review and the four profiles returned approve-with-changes; five blockers and the medium findings fixed (Pass enum, release through `Book::release`, test discards, no real wait, names, typed file errors, set-aside of unreadable files).
+- Delta 1 (tree 5e439311): rust and unix approve; implementation-review blocking on a `ResourceId` wildcard, fixed; backend and tui lows fixed.
+- Delta 2 (tree c2a2567c, after the merge with main): tui and backend approve; implementation-review approve-with-changes: the rename-fails test is weak, `deliberate:` its line count and the unmoved directory pin the branch, and the plan's suite row now names the pushed head's gate.
+- `deliberate:` backend 1 (the in-process `fed_counter` guard: three call sites mint a fresh id per launch, no production counter until the external client ships); tui 4 (no primary-status command yet) and tui's low on the persist line repeating during a write failure; lang:rust 6 (`with_settle_file` call order, documented).
+- Tokens and seconds are in the transcript; each reviewer ran on opus.
 
 ## Decision log
 
