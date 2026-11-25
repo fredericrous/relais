@@ -25,7 +25,10 @@ use relais::runner::approval;
 use relais::runner::approval::seals_on_approve;
 use relais::runner::Reason;
 use relais::runner::State;
+use relais::shared_state::node::{self, NodeError};
+use relais::shared_state::SharedState;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 /// One `relais decide` invocation's arguments, bundled because they
 /// answer one decision together.
 pub(crate) struct DecideRequest<'a> {
@@ -59,16 +62,12 @@ pub(crate) fn decide_command(request: DecideRequest<'_>) -> Result<CliOutcome, C
             Ok(CliOutcome::Accepted)
         }
         Ok(Err(refused)) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "error": refused.message,
-                        "exit": exit_code(&refused.outcome),
-                    })
-                );
-            } else {
-                eprintln!("relais decide: {}", refused.message);
+            let (stdout, stderr) = refusal_lines(json, &refused);
+            if let Some(line) = stdout {
+                println!("{line}");
+            }
+            if let Some(line) = stderr {
+                eprintln!("{line}");
             }
             Ok(refused.outcome)
         }
@@ -84,6 +83,21 @@ pub(crate) fn decide_command(request: DecideRequest<'_>) -> Result<CliOutcome, C
             }
             Err(e)
         }
+    }
+}
+
+/// What a refused answer prints: under `--json` one stdout object
+/// `{"error", "exit"}` and nothing on stderr, else one stderr line and an
+/// empty stdout.
+fn refusal_lines(json: bool, refused: &Refusal) -> (Option<String>, Option<String>) {
+    if json {
+        let object = serde_json::json!({
+            "error": refused.message,
+            "exit": exit_code(&refused.outcome),
+        });
+        (Some(object.to_string()), None)
+    } else {
+        (None, Some(format!("relais decide: {}", refused.message)))
     }
 }
 
@@ -188,7 +202,36 @@ fn locations_from_environment() -> Result<StateLocations, CliError> {
 }
 
 pub(crate) fn decide_inner(request: &DecideRequest<'_>) -> Result<Decision, CliError> {
-    decide_in(request, &locations_from_environment)
+    decide_in(
+        request,
+        &locations_from_environment,
+        &super::ctx::shared_state,
+    )
+}
+
+/// A failure of an answer, as the person sees it. Another answerer holding
+/// the decision is a refusal, exit 3, that says what to do next; the line
+/// claims nothing about the decision's state, which was not read.
+/// `signed_off` is the criterion an approve recorded before the grant was
+/// asked. Everything else is [`super::ctx::node_error`].
+fn answer_error(e: NodeError, run: &RunId, signed_off: Option<&str>) -> Result<Decision, CliError> {
+    use std::fmt::Write;
+    if !node::is_decision_held_elsewhere(&e, run) {
+        return Err(super::ctx::node_error("decide", e));
+    }
+    let minutes = relais::shared_state::DECISION_GRANT_TTL_SECS / 60;
+    let mut message = format!(
+        "the decision of run {run} is being answered elsewhere: check `relais status {run}`, \
+         then answer again if it is still open (the other answer holds it for up to {minutes} \
+         minutes)"
+    );
+    if let Some(criterion) = signed_off {
+        let _ = write!(
+            message,
+            "; the sign-off of criterion {criterion} is recorded"
+        );
+    }
+    Ok(refusal(CliOutcome::Blocked, message))
 }
 
 /// [`decide_inner`] with the state locations passed in, so a test names its
@@ -196,13 +239,14 @@ pub(crate) fn decide_inner(request: &DecideRequest<'_>) -> Result<Decision, CliE
 pub(crate) fn decide_in(
     request: &DecideRequest<'_>,
     locate: &dyn Fn() -> Result<StateLocations, CliError>,
+    shared: &dyn Fn() -> Result<Arc<dyn SharedState>, CliError>,
 ) -> Result<Decision, CliError> {
     if request.answer == DecideAnswer::Abandon {
         if let Some(fence) = standing_worker_fence(locate, request.run_id)? {
             return Ok(refusal(CliOutcome::ResumeRefusedLive, fence));
         }
     }
-    let mut decision = record_answer(request, locate)?;
+    let mut decision = record_answer(request, locate, shared)?;
     if let Ok(done) = &mut decision {
         let frees_in_place = matches!(
             request.answer,
@@ -364,6 +408,7 @@ fn tree_equals_start(root: &Path, git_dir: &Path, run: &RunId, start: &str) -> b
 fn record_answer(
     request: &DecideRequest<'_>,
     locate: &dyn Fn() -> Result<StateLocations, CliError>,
+    shared: &dyn Fn() -> Result<Arc<dyn SharedState>, CliError>,
 ) -> Result<Decision, CliError> {
     use std::io::IsTerminal;
     let actor = match check_decide_arguments(request, std::io::stdin().is_terminal()) {
@@ -448,6 +493,7 @@ fn record_answer(
             ));
         }
         return successor_decide(
+            shared,
             &ledger,
             &run,
             state,
@@ -486,6 +532,7 @@ fn record_answer(
         };
         if open_review_stop {
             return approve_stopped_review(
+                &*shared()?,
                 &ledger,
                 &locations.runs,
                 &run,
@@ -589,22 +636,24 @@ fn record_answer(
     } else {
         None
     };
-    let resolved = operational(
-        ledger.resolve_decision(
-            &run,
-            &relais::ledger::DecisionAnswer {
-                resolution,
-                actor,
-                person_quote,
-                recorded_via,
-                note,
-                successor_run: successor_run.as_ref(),
-                from_state: state,
-                to_state,
-            },
-        ),
-        "decide",
-    )?;
+    let resolved = match node::resolve_decision(
+        &*shared()?,
+        &ledger,
+        &run,
+        &relais::ledger::DecisionAnswer {
+            resolution,
+            actor,
+            person_quote,
+            recorded_via,
+            note,
+            successor_run: successor_run.as_ref(),
+            from_state: state,
+            to_state,
+        },
+    ) {
+        Ok(resolved) => resolved,
+        Err(e) => return answer_error(e, &run, criterion),
+    };
     if !resolved {
         return Ok(refusal(
             CliOutcome::InvalidInput,
@@ -634,6 +683,7 @@ fn record_answer(
 /// snapshot, published with the resolution (see [`approval`]). Repeated on
 /// the answered run it finds the same receipt and writes nothing.
 fn approve_stopped_review(
+    shared: &dyn SharedState,
     ledger: &Ledger,
     runs_dir: &Path,
     run: &RunId,
@@ -664,7 +714,39 @@ fn approve_stopped_review(
         from_state: state,
         to_state: DecideAnswer::Approve.terminal_state(),
     };
-    let sealed = match approval::approve_from_snapshot(ledger, runs_dir, run, &answer, &|| Ok(())) {
+    let approve = || approval::approve_from_snapshot(ledger, runs_dir, run, &answer, &|| Ok(()));
+    // A repeat on an answered decision writes nothing and asks no grant: it
+    // is the idempotent exit 0 that heals `receipt.json`.
+    let answered = operational(ledger.decision_of_run(run), "decide")?
+        .is_some_and(|decision| decision.resolved_at.is_some());
+    let sealed = if answered {
+        approve()
+    } else {
+        let closed = |sealed: &Result<approval::Sealed, approval::ApprovalError>| match sealed {
+            // `Ok` is a sealed receipt, or the same one already sealed by a
+            // racing answer: the decision is closed either way.
+            Ok(_) => true,
+            // A failure after the ledger commit (the `receipt.json` write)
+            // left the decision closed: its grant stays. A read that fails
+            // keeps it too; it lapses within its TTL.
+            Err(_) => match ledger.decision_of_run(run) {
+                Ok(decision) => decision.is_some_and(|d| d.resolved_at.is_some()),
+                Err(e) => {
+                    eprintln!(
+                        "relais decide: the decision of run {run} could not be re-read ({e}); \
+                         the approval may be recorded: check `relais status {run}` before \
+                         answering again"
+                    );
+                    true
+                }
+            },
+        };
+        match node::answer_under_grant(shared, run, approve, closed) {
+            Ok(sealed) => sealed,
+            Err(e) => return answer_error(e, run, None),
+        }
+    };
+    let sealed = match sealed {
         Ok(sealed) => sealed,
         Err(e @ (approval::ApprovalError::Io(_) | approval::ApprovalError::Ledger(_))) => {
             return Err(CliError::Operational {
@@ -706,6 +788,7 @@ fn approve_stopped_review(
 /// ledger transaction (plan A5). Repeated on an answered decision it returns
 /// the intent the first answer wrote.
 pub(crate) fn successor_decide(
+    shared: &dyn Fn() -> Result<Arc<dyn SharedState>, CliError>,
     ledger: &Ledger,
     run: &RunId,
     state: State,
@@ -804,25 +887,25 @@ pub(crate) fn successor_decide(
         Ok(intent) => intent,
         Err(e) => return Ok(refusal(CliOutcome::InvalidInput, e.to_string())),
     };
-    let written = operational(
-        relais::shared_state::node::resolve_decision_with_intent(
-            &*super::ctx::shared_state()?,
-            ledger,
-            run,
-            &relais::ledger::DecisionAnswer {
-                resolution: Reason::DecisionRevised,
-                actor: answerer.actor,
-                person_quote: answerer.person_quote,
-                recorded_via: answerer.recorded_via,
-                note: request.note,
-                successor_run: None,
-                from_state: state,
-                to_state: DecideAnswer::Revise.terminal_state(),
-            },
-            &intent,
-        ),
-        "decide",
-    )?;
+    let written = match node::resolve_decision_with_intent(
+        &*shared()?,
+        ledger,
+        run,
+        &relais::ledger::DecisionAnswer {
+            resolution: Reason::DecisionRevised,
+            actor: answerer.actor,
+            person_quote: answerer.person_quote,
+            recorded_via: answerer.recorded_via,
+            note: request.note,
+            successor_run: None,
+            from_state: state,
+            to_state: DecideAnswer::Revise.terminal_state(),
+        },
+        &intent,
+    ) {
+        Ok(written) => written,
+        Err(e) => return answer_error(e, run, None),
+    };
     let Some(stored) = written else {
         return Ok(refusal(
             CliOutcome::InvalidInput,
@@ -844,6 +927,7 @@ mod tests {
     use relais::ids::TaskId;
     use relais::ledger::{Transition, VerificationSnapshot};
     use relais::money::{CostCompleteness, MicroUsd};
+    use relais::shared_state::SharedStateError;
     use relais::verify::{LadderRecord, Receipt, ReviewNotRun, ReviewRecord, VerificationReport};
 
     fn receipt(run: &str) -> Receipt {
@@ -967,6 +1051,12 @@ mod tests {
         }
     }
 
+    /// The state every pre-existing test runs under: `LocalState`, which
+    /// always grants.
+    fn local_shared() -> Result<Arc<dyn SharedState>, CliError> {
+        Ok(Arc::new(relais::shared_state::LocalState::new()))
+    }
+
     fn approve(dir: &Path, run_id: &str) -> Decision {
         let locations = || {
             Ok(StateLocations {
@@ -991,8 +1081,481 @@ mod tests {
                 proof_stdin: false,
             },
             &locations,
+            &local_shared,
         )
         .expect("decide runs")
+    }
+
+    /// `LocalState` in every answer but one: the decision grant is held by
+    /// another answerer (`held`), and each ask is counted. The binary's
+    /// tests cannot see `FakeState` (it is behind the `conformance`
+    /// feature), so this stands in for a shared half that refuses.
+    struct Elsewhere {
+        local: relais::shared_state::LocalState,
+        held: bool,
+        asks: std::sync::atomic::AtomicUsize,
+        releases: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Elsewhere {
+        fn holding() -> Self {
+            Self::with(true)
+        }
+
+        fn granting() -> Self {
+            Self::with(false)
+        }
+
+        fn with(held: bool) -> Self {
+            Self {
+                local: relais::shared_state::LocalState::new(),
+                held,
+                asks: std::sync::atomic::AtomicUsize::new(0),
+                releases: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn asks(&self) -> usize {
+            self.asks.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn releases(&self) -> usize {
+            self.releases.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SharedState for Elsewhere {
+        fn selection(&self) -> relais::shared_state::Selection {
+            self.local.selection()
+        }
+        fn machine_settings(&self) -> Result<relais::policy::MachineSettings, SharedStateError> {
+            self.local.machine_settings()
+        }
+        fn daily_spent(
+            &self,
+            day_start: &str,
+        ) -> Result<Option<relais::money::MicroUsd>, SharedStateError> {
+            self.local.daily_spent(day_start)
+        }
+        fn slice(&self) -> Result<relais::shared_state::Slice, SharedStateError> {
+            self.local.slice()
+        }
+        fn reserve_spend(
+            &self,
+            seat: &relais::shared_state::LeaseToken,
+            amount: relais::money::MicroUsd,
+        ) -> Result<relais::shared_state::Reservation, SharedStateError> {
+            self.local.reserve_spend(seat, amount)
+        }
+        fn settle_spend(
+            &self,
+            reservation: &relais::shared_state::Reservation,
+            actual: relais::money::MicroUsd,
+        ) -> Result<relais::shared_state::Settlement, SharedStateError> {
+            self.local.settle_spend(reservation, actual)
+        }
+        fn acquire_seat(
+            &self,
+            holder: &relais::shared_state::Principal,
+            dispatch: &str,
+        ) -> Result<relais::shared_state::LeaseToken, SharedStateError> {
+            self.local.acquire_seat(holder, dispatch)
+        }
+        fn renew_seat(
+            &self,
+            lease: &relais::shared_state::LeaseToken,
+        ) -> Result<relais::shared_state::LeaseToken, SharedStateError> {
+            self.local.renew_seat(lease)
+        }
+        fn release_seat(
+            &self,
+            lease: &relais::shared_state::LeaseToken,
+        ) -> Result<(), SharedStateError> {
+            self.local.release_seat(lease)
+        }
+        fn claim_ticket(
+            &self,
+            request: &relais::shared_state::TicketRequest,
+        ) -> Result<relais::shared_state::TicketAnswer, SharedStateError> {
+            self.local.claim_ticket(request)
+        }
+        fn grant_ticket(
+            &self,
+            request: &relais::shared_state::TicketRequest,
+        ) -> Result<relais::shared_state::LeaseToken, SharedStateError> {
+            self.local.grant_ticket(request)
+        }
+        fn release_ticket(
+            &self,
+            lease: &relais::shared_state::LeaseToken,
+        ) -> Result<(), SharedStateError> {
+            self.local.release_ticket(lease)
+        }
+        fn reserve_handoff(
+            &self,
+            request: &relais::shared_state::TicketRequest,
+        ) -> Result<relais::shared_state::TicketAnswer, SharedStateError> {
+            self.local.reserve_handoff(request)
+        }
+        fn renew_tickets(
+            &self,
+            holder: &relais::shared_state::Principal,
+        ) -> Result<(), SharedStateError> {
+            self.local.renew_tickets(holder)
+        }
+        fn release_tickets(
+            &self,
+            holder: &relais::shared_state::Principal,
+        ) -> Result<(), SharedStateError> {
+            self.local.release_tickets(holder)
+        }
+        fn claim_intent(
+            &self,
+            intent_id: &str,
+            run: &RunId,
+            replacing: Option<&RunId>,
+        ) -> Result<relais::shared_state::IntentAnswer, SharedStateError> {
+            self.local.claim_intent(intent_id, run, replacing)
+        }
+        fn release_intent(&self, intent_id: &str, run: &RunId) -> Result<(), SharedStateError> {
+            self.local.release_intent(intent_id, run)
+        }
+        fn answer_decision(
+            &self,
+            run: &RunId,
+        ) -> Result<relais::shared_state::DecisionGrant, SharedStateError> {
+            self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.held {
+                Ok(relais::shared_state::DecisionGrant::HeldElsewhere)
+            } else {
+                self.local.answer_decision(run)
+            }
+        }
+        fn release_decision(&self, run: &RunId) -> Result<(), SharedStateError> {
+            self.releases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.local.release_decision(run)
+        }
+        fn registry_pointer(&self) -> Result<relais::shared_state::Pointer, SharedStateError> {
+            self.local.registry_pointer()
+        }
+        fn swap_registry_pointer(
+            &self,
+            expected: Option<&str>,
+            to: Option<&str>,
+        ) -> Result<relais::shared_state::Swap, SharedStateError> {
+            self.local.swap_registry_pointer(expected, to)
+        }
+        fn announce_schema(&self, node: &str, version: u64) -> Result<(), SharedStateError> {
+            self.local.announce_schema(node, version)
+        }
+        fn publish(
+            &self,
+            rows: &[relais::shared_state::PublishRow],
+        ) -> Result<relais::shared_state::PublishReceipt, SharedStateError> {
+            self.local.publish(rows)
+        }
+        fn queued(&self) -> Result<u64, SharedStateError> {
+            self.local.queued()
+        }
+        fn mode(&self) -> relais::shared_state::Mode {
+            self.local.mode()
+        }
+    }
+
+    /// `answer` for `run_id` through `shared`.
+    fn answer_through(
+        dir: &Path,
+        run_id: &str,
+        answer: DecideAnswer,
+        shared: &Arc<Elsewhere>,
+    ) -> Decision {
+        try_answer_through(dir, run_id, answer, shared).expect("decide runs")
+    }
+
+    /// [`answer_through`] without unwrapping an operational failure.
+    fn try_answer_through(
+        dir: &Path,
+        run_id: &str,
+        answer: DecideAnswer,
+        shared: &Arc<Elsewhere>,
+    ) -> Result<Decision, CliError> {
+        let shared: Arc<dyn SharedState> = shared.clone();
+        let locations = || {
+            Ok(StateLocations {
+                ledger: dir.join("ledger.sqlite"),
+                runs: dir.join("runs"),
+            })
+        };
+        decide_in(
+            &DecideRequest {
+                run_id,
+                answer,
+                actor: "orchestrator",
+                person_quote: None,
+                note: None,
+                successor: None,
+                criterion: None,
+                candidate: None,
+                widen_scope: false,
+                rerun_verify: false,
+                successor_contract: None,
+                json: false,
+                proof_stdin: false,
+            },
+            &locations,
+            &|| Ok(shared.clone()),
+        )
+    }
+
+    fn still_open(ledger: &Ledger, run: &str) -> bool {
+        ledger
+            .decision_of_run(&RunId::from_stored(run))
+            .expect("read")
+            .is_some_and(|decision| decision.resolved_at.is_none())
+    }
+
+    #[test]
+    fn an_answer_held_elsewhere_is_refused_with_exit_3_and_leaves_the_decision_open() {
+        let dir = relais::test_support::short_temp_dir("decide-held");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        for name in ["run-approve", "run-reject"] {
+            waiting_run(
+                &ledger,
+                name,
+                "/repo",
+                State::NeedsDecision,
+                Reason::ScopeExceeded,
+                None,
+                None,
+            );
+        }
+        let held = Arc::new(Elsewhere::holding());
+        for (name, answer) in [
+            ("run-approve", DecideAnswer::Approve),
+            ("run-reject", DecideAnswer::Reject),
+        ] {
+            let refused = answer_through(&dir, name, answer, &held)
+                .err()
+                .expect("held elsewhere");
+            assert_eq!(exit_code(&refused.outcome), 3, "{name}");
+            assert!(
+                refused.message.starts_with(&format!(
+                    "the decision of run {name} is being answered elsewhere:"
+                )),
+                "{}",
+                refused.message
+            );
+            assert!(
+                refused
+                    .message
+                    .contains(&format!("check `relais status {name}`")),
+                "{}",
+                refused.message
+            );
+            assert!(!refused.message.contains("node"), "{}", refused.message);
+            assert!(still_open(&ledger, name), "{name} stays open");
+        }
+        assert_eq!(held.asks(), 2);
+        // The same answers through a state that grants are written.
+        let granting = Arc::new(Elsewhere::granting());
+        let approved = answer_through(&dir, "run-approve", DecideAnswer::Approve, &granting);
+        assert_eq!(exit_of(&approved), 0);
+        assert!(!still_open(&ledger, "run-approve"));
+    }
+
+    #[test]
+    fn a_stopped_review_approval_held_elsewhere_writes_no_artifact_and_a_repeat_asks_nothing() {
+        let dir = relais::test_support::short_temp_dir("decide-held-review");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        waiting_run(
+            &ledger,
+            "run-ok",
+            "/repo",
+            State::NeedsDecision,
+            Reason::ReviewOverBudget,
+            None,
+            Some("cand"),
+        );
+        let held = Arc::new(Elsewhere::holding());
+        let refused = answer_through(&dir, "run-ok", DecideAnswer::Approve, &held)
+            .err()
+            .expect("held elsewhere");
+        assert_eq!(exit_code(&refused.outcome), 3);
+        assert!(still_open(&ledger, "run-ok"));
+        assert!(
+            !dir.join("runs").join("run-ok").join("receipts").exists(),
+            "the grant is asked before any artifact is written"
+        );
+        // Granted: sealed. A repeat on the answered decision is the local
+        // idempotent exit 0 and asks no grant, even where one is held.
+        let granting = Arc::new(Elsewhere::granting());
+        let sealed = answer_through(&dir, "run-ok", DecideAnswer::Approve, &granting);
+        assert_eq!(exit_of(&sealed), 0);
+        let repeat = Arc::new(Elsewhere::holding());
+        let again = answer_through(&dir, "run-ok", DecideAnswer::Approve, &repeat);
+        assert_eq!(exit_of(&again), 0);
+        assert_eq!(repeat.asks(), 0, "a repeat asks no grant");
+    }
+
+    #[test]
+    fn a_successor_revise_held_elsewhere_is_refused_with_exit_3_and_writes_no_intent() {
+        let dir = relais::test_support::short_temp_dir("decide-held-revise");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        waiting_run(
+            &ledger,
+            "run-revise",
+            "/repo",
+            State::NeedsDecision,
+            Reason::ScopeExceeded,
+            None,
+            None,
+        );
+        let contract = dir.join("successor.json");
+        std::fs::write(
+            &contract,
+            serde_json::json!({
+                "schema_version": 1,
+                "kind": "change",
+                "objective": "o",
+                "base_ref": "HEAD",
+                "acceptance": ["bare"],
+                "verification_profile": "profile",
+                "write_scope": ["src/**"],
+            })
+            .to_string(),
+        )
+        .expect("contract");
+        let revise = |shared: &Arc<Elsewhere>| {
+            let shared: Arc<dyn SharedState> = shared.clone();
+            decide_in(
+                &DecideRequest {
+                    run_id: "run-revise",
+                    answer: DecideAnswer::Revise,
+                    actor: "orchestrator",
+                    person_quote: None,
+                    note: None,
+                    successor: None,
+                    criterion: None,
+                    candidate: None,
+                    widen_scope: false,
+                    rerun_verify: false,
+                    successor_contract: Some(&contract),
+                    json: false,
+                    proof_stdin: false,
+                },
+                &|| {
+                    Ok(StateLocations {
+                        ledger: dir.join("ledger.sqlite"),
+                        runs: dir.join("runs"),
+                    })
+                },
+                &|| Ok(shared.clone()),
+            )
+            .expect("decide runs")
+        };
+        let held = Arc::new(Elsewhere::holding());
+        let refused = revise(&held).err().expect("held elsewhere");
+        assert_eq!(exit_code(&refused.outcome), 3);
+        assert!(
+            refused
+                .message
+                .starts_with("the decision of run run-revise is being answered elsewhere:"),
+            "{}",
+            refused.message
+        );
+        assert!(still_open(&ledger, "run-revise"));
+        let run = RunId::from_stored("run-revise");
+        assert!(
+            ledger.intent_of_decision(&run).expect("read").is_none(),
+            "no successor intent is written"
+        );
+        assert_eq!(held.asks(), 1);
+        // Granted, the same answer writes its intent.
+        let granting = Arc::new(Elsewhere::granting());
+        assert_eq!(exit_of(&revise(&granting)), 0);
+        assert!(ledger.intent_of_decision(&run).expect("read").is_some());
+    }
+
+    #[test]
+    fn a_failure_after_the_ledger_commit_keeps_the_grant() {
+        let dir = relais::test_support::short_temp_dir("decide-held-after-commit");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        waiting_run(
+            &ledger,
+            "run-ok",
+            "/repo",
+            State::NeedsDecision,
+            Reason::ReviewOverBudget,
+            None,
+            Some("cand"),
+        );
+        // A directory where `receipt.json` goes: the write after the commit fails.
+        std::fs::create_dir_all(dir.join("runs").join("run-ok").join("receipt.json"))
+            .expect("blocker");
+        let granting = Arc::new(Elsewhere::granting());
+        let failed = try_answer_through(&dir, "run-ok", DecideAnswer::Approve, &granting);
+        assert!(failed.is_err(), "the receipt.json write fails");
+        assert!(!still_open(&ledger, "run-ok"), "the ledger committed");
+        assert_eq!(granting.asks(), 1);
+        assert_eq!(granting.releases(), 0, "a closed decision keeps its grant");
+    }
+
+    #[test]
+    fn a_refusal_prints_one_line_on_one_stream() {
+        let held = Refusal {
+            outcome: CliOutcome::Blocked,
+            message: "the decision of run r is being answered elsewhere".into(),
+        };
+        let (stdout, stderr) = refusal_lines(false, &held);
+        assert_eq!(stdout, None, "plain: nothing on stdout");
+        assert_eq!(
+            stderr.as_deref(),
+            Some("relais decide: the decision of run r is being answered elsewhere")
+        );
+        let (stdout, stderr) = refusal_lines(true, &held);
+        assert_eq!(stderr, None, "--json: nothing on stderr");
+        let object: serde_json::Value =
+            serde_json::from_str(&stdout.expect("one object")).expect("json");
+        assert_eq!(object["exit"], 3);
+        assert_eq!(
+            object["error"],
+            "the decision of run r is being answered elsewhere"
+        );
+    }
+
+    #[test]
+    fn only_the_held_elsewhere_refusal_is_exit_3_and_names_a_recorded_sign_off() {
+        let run = RunId::from_stored("run-x");
+        // The wire text, written out on purpose: a change to it is a change
+        // to what the person reads, and should fail here.
+        let held = || {
+            NodeError::Shared(SharedStateError::Refused {
+                reason: format!("the decision of run {run} is being answered elsewhere"),
+            })
+        };
+        let plain = answer_error(held(), &run, None)
+            .expect("a refusal, not an error")
+            .err()
+            .expect("refused");
+        assert_eq!(exit_code(&plain.outcome), 3);
+        assert!(!plain.message.contains("sign-off"));
+        let signed = answer_error(held(), &run, Some("c1"))
+            .expect("a refusal, not an error")
+            .err()
+            .expect("refused");
+        assert!(
+            signed
+                .message
+                .ends_with("minutes); the sign-off of criterion c1 is recorded"),
+            "{}",
+            signed.message
+        );
+        // Any other shared refusal stays an operational failure.
+        let other = NodeError::Shared(SharedStateError::Refused {
+            reason: "not authorised".into(),
+        });
+        assert!(answer_error(other, &run, None).is_err());
     }
 
     fn exit_of(decision: &Decision) -> i32 {
@@ -1360,6 +1923,7 @@ mod tests {
                 proof_stdin: false,
             },
             &locations,
+            &local_shared,
         )
         .expect("decide runs")
         .expect("answered")
@@ -1421,6 +1985,7 @@ mod tests {
                 proof_stdin: false,
             },
             &locations,
+            &local_shared,
         )
         .expect("decide runs")
     }

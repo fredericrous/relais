@@ -888,6 +888,110 @@ mod tests {
         );
     }
 
+    fn plain_answer() -> DecisionAnswer<'static> {
+        DecisionAnswer {
+            resolution: Reason::DecisionApproved,
+            actor: Actor::Orchestrator,
+            person_quote: None,
+            recorded_via: RecordedVia::Cli,
+            note: None,
+            successor_run: None,
+            from_state: State::NeedsDecision,
+            to_state: State::Accepted,
+        }
+    }
+
+    #[test]
+    fn a_plain_answer_held_elsewhere_is_refused_and_leaves_the_decision_open() {
+        let (ledger, _seconds, _dir) = waiting("plain-held");
+        let state = FakeState::new();
+        state
+            .answer_decision(&run("run-a"))
+            .expect("another answerer took it");
+        let refused = node::resolve_decision(&state, &ledger, &run("run-a"), &plain_answer())
+            .expect_err("held elsewhere");
+        assert!(
+            node::is_decision_held_elsewhere(&refused, &run("run-a")),
+            "{refused}"
+        );
+        assert!(!node::is_decision_held_elsewhere(&refused, &run("run-b")));
+        let decision = ledger
+            .decision_of_run(&run("run-a"))
+            .expect("read")
+            .expect("row");
+        assert!(decision.resolved_at.is_none(), "still open");
+        // The grant lapses; the answer is then written and keeps the grant.
+        state.advance(DECISION_GRANT_TTL_SECS + 1);
+        assert!(
+            node::resolve_decision(&state, &ledger, &run("run-a"), &plain_answer())
+                .expect("written")
+        );
+        assert_eq!(
+            state.answer_decision(&run("run-a")).expect("ask"),
+            DecisionGrant::HeldElsewhere,
+            "a written answer keeps its grant"
+        );
+    }
+
+    #[test]
+    fn a_plain_answer_with_no_open_decision_gives_the_grant_back() {
+        let (ledger, _seconds, _dir) = waiting("plain-none");
+        let state = FakeState::new();
+        assert!(
+            !node::resolve_decision(&state, &ledger, &run("run-z"), &plain_answer())
+                .expect("answered")
+        );
+        assert_eq!(
+            state.answer_decision(&run("run-z")).expect("free again"),
+            DecisionGrant::Granted
+        );
+    }
+
+    #[test]
+    fn an_answer_under_grant_keeps_the_grant_only_for_a_closed_decision() {
+        let state = FakeState::new();
+        // Closed: kept, on `Ok` and on `Err` alike.
+        for (name, outcome) in [("kept-ok", Ok(1)), ("kept-err", Err("receipt.json"))] {
+            let id = run(name);
+            let got = node::answer_under_grant(&state, &id, || outcome, |_| true).expect("grant");
+            assert_eq!(got, outcome);
+            assert_eq!(
+                state.answer_decision(&id).expect("ask"),
+                DecisionGrant::HeldElsewhere,
+                "{name}: the grant is kept"
+            );
+        }
+        // Not closed: given back, on `Ok` and on `Err` alike.
+        for (name, outcome) in [("freed-ok", Ok(1)), ("freed-err", Err("refused"))] {
+            let id = run(name);
+            let got = node::answer_under_grant(&state, &id, || outcome, |_| false).expect("grant");
+            assert_eq!(got, outcome);
+            assert_eq!(
+                state.answer_decision(&id).expect("ask"),
+                DecisionGrant::Granted,
+                "{name}: the grant is given back"
+            );
+        }
+        // Held elsewhere: refused, and `write` never runs.
+        let id = run("held");
+        state.answer_decision(&id).expect("taken");
+        let mut ran = false;
+        let refused = node::answer_under_grant(
+            &state,
+            &id,
+            || {
+                ran = true;
+                Ok::<_, ()>(())
+            },
+            |_| true,
+        );
+        assert!(matches!(
+            refused,
+            Err(NodeError::Shared(SharedStateError::Refused { .. }))
+        ));
+        assert!(!ran, "a refusal writes nothing");
+    }
+
     #[test]
     fn a_failed_release_after_a_local_refusal_returns_the_refusal() {
         let (ledger, _seconds, _dir) = waiting("release-fails");

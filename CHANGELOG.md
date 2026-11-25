@@ -21,6 +21,25 @@ by the pid it recorded (`$!`), and never by a pattern (`pkill`, `killall`,
 `pgrep -f`, `ps | grep`) or with `kill 0` or `kill -1`. A successor
 contract that `decide` saves keeps its absolute path.
 
+- `relais decide` approve, reject and the other plain answers, and the
+  approval of a stopped review, now ask the shared half for the decision
+  grant before they write, as the revise answer already did. When another
+  answerer holds it, the answer is refused with `relais decide: the decision
+  of run R is being answered elsewhere: check `relais status R`, then answer
+  again if it is still open (the other answer holds it for up to 10 minutes)`
+  and exit 3 (under `--json`, `{"error": ..., "exit": 3}` on stdout and
+  nothing on stderr). A repeat on an answered stopped review asks no grant and
+  stays exit 0. `relais feedback` answers no decision and takes no grant.
+  `salvaged` still closes a decision without it. Nothing else changes for a
+  single node.
+- Breaking, for a caller of `relais decide`'s exit status: a revise refused
+  because another answerer holds the decision now exits 3 (it exited 1), and
+  under `shared_state = "external"` with no client the approve, reject and
+  other plain answers (`abandon` and `decided` included), the revise answer
+  and the stopped-review approve exit 3 (they exited 0), as `relais run`
+  refuses there. `salvaged`, a refused argument, an unknown run and a run not
+  waiting on a person are unchanged.
+
 ## v0.85.0
 
 relais spawns `greentopo` wherever it spawned `aval`: the binary is
@@ -719,7 +738,6 @@ correction files and `outcome_uncorrected`.
 
 - **Escalation and review default to Opus, not Fable.** `relais init` writes `[models.escalation] id = "opus"`, and the `relais-review` advisory agent that `relais install` writes runs on `opus`. Fable cost too much for the escalation rung, which also reviews every Sonnet-written candidate. An existing `relais.toml` keeps its own model; edit its `[models.escalation]` to switch.
 - Also in this release: the session routing rule applies only to Claude sessions (#390), and a cancelled run reports its artifacts accurately (#391).
-
 
 ## v0.48.0
 
@@ -2009,7 +2027,6 @@ effort an attempt requested.
 - No authority hash moves (new policy keys are skipped when unset), no
   trust grant needs re-issuing, and there is no ledger migration (still
   v17). New keys, once set, are not understood by an older binary.
-
 
 ### Added
 
