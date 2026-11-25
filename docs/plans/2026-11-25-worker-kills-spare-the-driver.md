@@ -139,7 +139,7 @@ Carried from review, done: symlink case, `/` joins, the pilot passes `--relative
 ## Implementation review
 
 - implementation-review: approve after round 1 (1 blocking, flag argument → `ContractPathForm` in the plugin (`runs.ts`), `ContractPath` in relais; 2 fixed), Delta, and rounds on the `pgrep -P` change; 49k+36k+37k+35k tokens.
-- backend, lang:rust, lang:typescript, unix: all approve at the end. Fixed: the doc block placement, the silent fallback (now on stderr), exhaustive matches, the `None` tests, and children-first kills.
+- backend, lang:rust, lang:typescript, unix: all approve at the end. Fixed: the doc block placement, the silent fallback (now on stderr), exhaustive matches, the `None` tests, and children-first kills. All five re-approved after the rebase onto v0.85.0 (tree 9ed048bbb10b).
 - deliberate: the plugin drops the fallback's stderr note → f30 (the fallback should not fire, since the root is found by walking up from the same cwd; not measured, f30).
 - deliberate: a child forked after `pgrep -P` runs can be missed (unix low, accepted).
 - `set -m` / `kill -- -<pid>` (unix round 1) replaced after this session measured `zsh -c` refusing it.
