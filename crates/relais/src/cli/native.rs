@@ -279,7 +279,12 @@ pub(crate) fn native_contract_command(shape: ContractPath) -> Result<CliOutcome,
                 ContractPath::Relative => {
                     let relative = match cwd() {
                         Ok(here) => relative_task_path(&here, &root, &path).ok_or_else(|| {
-                            format!("{} is not under {}", here.display(), root.display())
+                            format!(
+                                "{} could not be made relative from {} (root {})",
+                                path.display(),
+                                here.display(),
+                                root.display()
+                            )
                         }),
                         Err(e) => Err(format!("the cwd could not be read: {e}")),
                     };
@@ -1089,7 +1094,7 @@ pub(crate) fn reap_for_status(
 
 #[cfg(test)]
 mod tests {
-    use super::relative_task_path;
+    use super::*;
 
     #[test]
     fn a_relative_task_path_climbs_to_the_root_and_names_no_directory_above_it() {
@@ -1116,8 +1121,6 @@ mod tests {
         );
         assert_eq!(relative_task_path(root, root, root), None);
     }
-
-    use super::*;
 
     #[test]
     fn a_stopped_report_is_read_from_the_plugins_payload() {
