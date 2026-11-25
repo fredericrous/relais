@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: prog/follow-ups/f27-next-claim-stays-in-programme
 repos: [relais, decisions, greenharness-skills]
 adrs: [ADR-0084]
@@ -111,12 +111,12 @@ Skill text:
 
 ## Phases
 
-- [ ] Phase 1 — ADR-0084 replaces ADR-0083's `work.programme-map`
+- [x] Phase 1 — ADR-0084 replaces ADR-0083's `work.programme-map`
   (restated whole, the `next --claim` sentence changed), in decisions:
   `docs/adr/0084-the-next-ticket-stays-in-its-programme.md`,
   `docs/adr/HEADS.md`, pointer `docs/plans/2026-11-25-next-claim-stays-in-programme.md`.
   Merged before Phase 2 so relais's vendored pack resolves it.
-- [ ] Phase 2 — relais: refresh the pack (`.adr/packs/decisions.pack`,
+- [x] Phase 2 — relais: refresh the pack (`.adr/packs/decisions.pack`,
   `.adr/records/HEADS.md`) as its own commit; then
   `crates/relais/src/programme/claim.rs`, `crates/relais/src/programme/claim/rules.rs`,
   `crates/relais/src/cli/programme.rs`, `crates/relais/src/cli/mod.rs`,
@@ -125,7 +125,7 @@ Skill text:
   (skill pin), `docs/SPEC.md`, `CHANGELOG.md`, and the ticket
   `docs/programmes/follow-ups/f27-next-claim-stays-in-programme.md` and
   `docs/programmes/follow-ups/map.md` (Resolution, Decisions, Handoff).
-- [ ] Phase 3 — greenharness-skills: `parts/workflow/skills/worktree-task/SKILL.md`
+- [x] Phase 3 — greenharness-skills: `parts/workflow/skills/worktree-task/SKILL.md`
   Handoff step 4 text, pointer `docs/plans/2026-11-25-next-claim-stays-in-programme.md`.
 
 ## Decision log
@@ -145,7 +145,7 @@ Skill text:
 ## Verification
 
 - Phase 1: `aval resolve work.programme-map` in decisions → ADR-0084 active,
-  choice says the next ticket comes only from the session's own programme → <result>
+  choice says the next ticket comes only from the session's own programme → `active ADR-0084` in decisions after decisions#370 merged, and `active decisions:ADR-0084` from relais's refreshed pack; `aval check` 84 records, no findings.
 - Phase 2: unit tests in `claim.rs`: from with nothing eligible parks and
   writes no claim in another programme; `next_due` ignores another
   programme's sooner date; `elsewhere` lists it; an own handoff in another
@@ -165,18 +165,63 @@ Skill text:
   (now exit 22 plus the partial-list stderr line; without `--from` still
   exit 1), and
   `two_callers_from_exhausted_programmes_reserve_at_most_one_ticket_in_one_empty_one`
-  (no claim outside `--from`). Checked to fail on origin/main → <result>
+  (no claim outside `--from`). Checked to fail on origin/main → the
+  tests now named
+  `two_next_claim_processes_started_together_never_share_a_ticket_and_the_second_parks`,
+  `a_from_programme_that_fails_to_load_exits_1_and_only_a_failed_load_without_from_refuses_to_park`,
+  `two_callers_without_from_reserve_at_most_one_ticket_in_one_empty_one`
+  and the new `a_caller_from_an_exhausted_programme_reserves_nothing_in_an_empty_one`,
+  `an_exhausted_from_programme_parks_and_lists_the_others_in_order_without_claiming_there`,
+  `a_busy_from_lock_exits_1_with_the_retry_and_claims_nothing_elsewhere`
+  (which also asserts `stayed held for` and a retry that keeps
+  `--session` and `--json`). On the branch: lib tests (`programme::claim`,
+  `install::`, `cli::programme`) 113 passed, `programme_claims` 25 passed.
+  With the new test files on origin/main's code, 6 of the 25 integration
+  tests and both skill pin tests fail. The full suite (2704 lib tests and
+  every integration binary) and clippy pass and are stamped on the pushed
+  tree (39c4a78319ab).
 - Phase 2: piloted, the real CLI on this machine:
   `relais programme next --from relais:follow-ups` (look) → a follow-ups
   ticket or a park with ready-elsewhere lines, never another programme's
   ticket; then the same with `--claim` (released after): claim files under
-  other programmes' keys unchanged, before against after → <result>
+  other programmes' keys unchanged, before against after → the branch
+  binary, with `RELAIS_STATE_DIR` set to a copy of the real claims: look
+  exit 22, `parked: next due 2026-11-28` (follow-ups' own f08; f26 and
+  f28 are in flight on their branches), then 11
+  `ready elsewhere: <repo>:<slug> (<n> ready)` lines; `--claim` exit 22,
+  the same 12 lines, stderr empty. The claim files under the other
+  programmes' keys were unchanged. The only change was the sweep of the
+  f27 claim inside `--from`, because the map read from this worktree
+  already shows f27 closed. `--json` carries `elsewhere`.
 - Phase 2: `cargo test -p relais --lib install::` → the skill pin passes,
   its phrase list extended with `ready elsewhere:`, `start none of them`
   and `parked: lock busy` (and the Drive test with the Stop sentence),
-  checked to fail on the old SKILL.md → <result>
-- Phase 3: `grep -n "else one of a" parts/workflow/skills/worktree-task/SKILL.md` → no match → <result>
+  checked to fail on the old SKILL.md → both pin tests pass on the
+  branch. On origin/main's SKILL.md they fail
+  (`the skill lost \`never of another, for a handoff\``, and in the Drive
+  test `which the driver does not start: …`). The pin also carries Work
+  step 6's `Print a \`next:\` prompt only on exit 0` and
+  `also when the \`worktree-task\` skill is absent`.
+- Phase 3: `grep -n "else one of a" parts/workflow/skills/worktree-task/SKILL.md` → no match;
+  `ready elsewhere:` at 743, `start none of them` at 744-745,
+  `parked: lock busy` at 749 (greenharness-skills branch
+  `docs/next-claim-stays-in-programme`).
 
 ## Outcome
+
+Shipped: ADR-0084 (decisions#370), `programme next --from` staying in its
+programme with the ready-elsewhere park, and the matching programme skill
+and worktree-task text. Not shipped: a relais release. Until a release,
+the installed 0.84.0 still crosses, and the skill text reaches sessions
+only after the plugin reinstall. A surprise: the decisions pre-commit gate
+checks the whole tree, so the plan pointer could not land before the ADR.
+
+## Implementation review
+
+- relais implementation-review: r1 approve-with-changes, delta approve-with-changes (one `let _` blocker fixed with `.expect`), round 1 on that fix approve (6b356e02), delta on a one-line clippy fix approve (ddebfe5c).
+- backend: approve; own handoff elsewhere hiding a programme for at most 2 h kept deliberate: only the old crossing binary writes one there.
+- lang:rust: r1 approve-with-changes (typed `Unreadable`, `writeln!`, store test helper, test split), delta approve.
+- unix: r1 approve-with-changes (changelog Breaking note, retry keeps `--session`/`--json`), delta approve.
+- decisions and greenharness-skills: approve-with-changes, each finding the plan record above.
 
 <!-- panel: repos=relais,decisions,greenharness-skills adds=cli reviewers=backend,lang:rust,tui,unix,codex body-sha=009568a3d007 -->
