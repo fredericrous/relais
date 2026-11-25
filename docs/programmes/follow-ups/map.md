@@ -116,6 +116,9 @@ ticket here until it is resolved or moved into a programme of its own.
 - [f27](f27-next-claim-stays-in-programme.md) (2026-11-25, open):
   `programme next --claim` never crosses programmes; with no ready ticket
   in `--from` it parks (ADR-0083 amended first).
+- [f28](f28-tool-call-catch-answers.md) (2026-11-25, open): check that the
+  plugin's other `tool.call` `.catch` answers reach the caller; f25 saw the
+  guard's ignored when its hook threw.
 
 ## Handoff
 
@@ -128,6 +131,7 @@ changes ship with the next relais release and run after the plugin reinstall.
 - Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25.
 - Next:
   - Keep a worker's kills off its own driver (f26), ready.
+  - Check the plugin's other `tool.call` `.catch` answers (f28), ready.
   - Measure the home fingerprint warnings (f08), due 2026-11-28.
   - A pin row's model matches the model its subagent ran (f22), due
     2026-12-01, after the plugin reinstall.
