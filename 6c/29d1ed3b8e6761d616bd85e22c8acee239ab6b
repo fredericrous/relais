@@ -11,3 +11,17 @@ RFQerK+MWJ4bjChwcAAAALZ3JlZW5zdW1taXQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3No
 LWVkMjU1MTkAAABAszLmMNJSMfuvaKdslhIo8YLs3Yr7khA5visjPoUMXm/sLtc8iN5EsT
 6edmgdqEUYzyLYHXe6bDzzkUvlVTHaDg==
 -----END SSH SIGNATURE-----
+
+greensummit-v2
+tree 6c29d1ed3b8e6761d616bd85e22c8acee239ab6b
+gates pre-push-cargo-test
+platform aarch64-macos
+canon e442737db2c6b807ea7ef4a252c2bcdde6aea9de
+greengate attest-sign-macos-latest
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgwe+FHUie+0YKuEzx3YjiV6jyIC
+F0veynb1B9mEPADfwAAAALZ3JlZW5zdW1taXQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3No
+LWVkMjU1MTkAAABAJkkZx30XbcuBZObk5kNYrK7kfaxMR6v44mFrZMcOLPY5K6rzBHVLy+
+DwOVAvuulY/cGtn31db+I40ImZD1EMCA==
+-----END SSH SIGNATURE-----
