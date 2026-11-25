@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: prog/follow-ups/f26-worker-kills-spare-the-driver
 repos: [relais]
 adrs: []
@@ -103,7 +103,7 @@ No guard parses a `pkill` command: f24 already settled that.
   `the_prompt_carries_the_native_rules_and_no_headless_wording`
   (`runner/tests/mod.rs:7715`) and to
   `every_attempt_kind_carries_the_native_rules` (`:8191`).
-- [ ] Phase 2. Release relais (the `tag-release` skill) and install the
+- [x] Phase 2. Release relais (the `tag-release` skill) and install the
   released binary: the plugin is embedded by `build.rs` and cached by its
   version, which is relais's (`crates/relais/src/install/plugin.rs:8-11`).
 
@@ -133,6 +133,14 @@ No guard parses a `pkill` command: f24 already settled that.
 | lint | `make lint` | rc 0 |
 | child processes | under `zsh -c` and `bash -c`: `sh -c "sleep 30 & sleep 30" &`, then `kill $(pgrep -P <pid>) <pid>`; and a grandchild tree `sh -c "sh -c \"sleep 31; true\" & wait" &`, killed deepest first | no child left in either shell; the grandchild tree: parent, child and grandchild gone, checked by pid |
 | `set -m` | `zsh -c 'set -m'`, `zsh -c 'setopt monitor'` | both refused: `can't change option`; macOS has no `setsid` |
+
+### Observed (Phase 2)
+
+| Check | Input | Actual |
+| --- | --- | --- |
+| merged | #590 (`full-ci`: macOS, Ubuntu, Windows) | every check green; squash 99df07e |
+| released | #593, tag `v0.86.0` on 098fa32 | Release run green on attempt 2: six archives plus `SHA256SUMS`, Homebrew tap published, `brew can install` green |
+| installed | `brew upgrade relais`; `relais --version`; `relais native contract --help` | `relais 0.86.0`; `--relative` listed |
 
 Carried from review, done: symlink case, `/` joins, the pilot passes `--relative`, and `decide` keeps the absolute path, with a test. Kept deliberate: the reply already reads `… for: <path> (in <cwd>)`, so it names the cwd the path is relative to.
 
@@ -166,5 +174,9 @@ Carried from review, done: symlink case, `/` joins, the pilot passes `--relative
   back to the absolute path. Filed as f30, not fixed here: the root is
   found by walking up from the same cwd, so the fallback should not fire
   (not measured).
+- The first v0.86.0 Release run failed its "every platform passed on main"
+  check: main's CI group cancels in progress, so each push to main (#594)
+  cancelled the macOS test on 098fa32. Rerun once main was quiet, then the
+  release passed. Filed as f31.
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:rust,lang:typescript,tui,unix,codex body-sha=7735ec441a8d -->

@@ -584,9 +584,28 @@ pub fn aval_resolve_in(
         Err(e) => AvalVerdict::ToolFailure {
             exit: -1,
             detail: format!(
-                "aval (`{program}`) could not be launched: {e}; check that `{program}` on PATH runs, or set `bin` under [integrations] in relais.toml"
+                "aval (`{program}`) could not be launched: {e}; {}",
+                aval_launch_hint(program, bin.is_some())
             ),
         },
+    }
+}
+
+/// What to check when aval's program could not be launched, by where the
+/// program came from: a declared `bin` plays PATH no part, `greentopo` was
+/// found on PATH, and `aval` is the fallback when `greentopo` was not.
+fn aval_launch_hint(program: &str, declared: bool) -> String {
+    if declared {
+        format!(
+            "check that `{program}`, the `bin` declared under [integrations] in relais.toml, exists and runs"
+        )
+    } else if program == "greentopo" {
+        "check that `greentopo` on PATH runs, or set `bin` under [integrations] in relais.toml"
+            .to_string()
+    } else {
+        format!(
+            "install greentopo (`aval` still works for now), check that `{program}` on PATH runs, or set `bin` under [integrations] in relais.toml"
+        )
     }
 }
 
@@ -1734,6 +1753,41 @@ mod tests {
         assert!(
             matches!(verdict, AvalVerdict::ToolFailure { .. }),
             "{verdict:?}"
+        );
+    }
+
+    /// A declared `bin` that fails to launch points at the declaration,
+    /// never at PATH, which plays no part in it.
+    #[test]
+    fn a_declared_bin_launch_failure_names_the_declaration_not_path() {
+        let dir = crate::test_support::temp_dir("aval-bin-hint");
+        let AvalVerdict::ToolFailure { detail, .. } =
+            resolve_with_path(&dir, Some("/nonexistent/aval"), &dir)
+        else {
+            panic!("a declared bin that does not exist is a tool failure");
+        };
+        assert!(
+            detail.ends_with(
+                "check that `/nonexistent/aval`, the `bin` declared under [integrations] in relais.toml, exists and runs"
+            ),
+            "{detail}"
+        );
+        assert!(!detail.contains("PATH"), "{detail}");
+    }
+
+    #[test]
+    fn the_launch_hint_follows_where_the_program_came_from() {
+        assert_eq!(
+            aval_launch_hint("/opt/bin/greentopo", true),
+            "check that `/opt/bin/greentopo`, the `bin` declared under [integrations] in relais.toml, exists and runs"
+        );
+        assert_eq!(
+            aval_launch_hint("greentopo", false),
+            "check that `greentopo` on PATH runs, or set `bin` under [integrations] in relais.toml"
+        );
+        assert_eq!(
+            aval_launch_hint("aval", false),
+            "install greentopo (`aval` still works for now), check that `aval` on PATH runs, or set `bin` under [integrations] in relais.toml"
         );
     }
 

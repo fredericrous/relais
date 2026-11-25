@@ -1,7 +1,7 @@
 +++
 type = "task"
 mode = "afk"
-status = "open"
+status = "closed"
 blocked_by = []
 repos = ["relais"]
 +++
@@ -29,3 +29,20 @@ operator the wrong way. Which wording does each source of the program get
 
 The hint branches on where the program came from, with a test pinning each
 wording, in one relais release.
+
+## Resolution
+
+2026-11-25. `aval_launch_hint` in `crates/relais/src/context/mod.rs` picks
+the wording after "could not be launched: {e};" by the program's source:
+
+- declared `bin`: "check that `{program}`, the `bin` declared under
+  [integrations] in relais.toml, exists and runs" (no PATH);
+- `greentopo` found on PATH: "check that `greentopo` on PATH runs, or set
+  `bin` under [integrations] in relais.toml";
+- the `aval` fallback (no `greentopo` on PATH): "install greentopo (`aval`
+  still works for now), check that `aval` on PATH runs, or set `bin` under
+  [integrations] in relais.toml".
+
+`the_launch_hint_follows_where_the_program_came_from` pins all three;
+`a_declared_bin_launch_failure_names_the_declaration_not_path` checks the
+declared case end to end through `aval_resolve_in`.

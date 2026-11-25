@@ -577,7 +577,7 @@ impl Book {
                     self.settles.remove(at);
                     self.dirty = true;
                     // A seat made for this settle alone goes back at once.
-                    let _ = self.release_settle_seat(shared, log, Some(&reservation));
+                    let _ = self.release_settle_seat(shared, log, Some(&reservation)); // a failure is logged inside; an outage shows at the next call
                     self.forget_release_failure(Some(&reservation));
                 }
                 Err(settle_error @ SharedStateError::Unreachable { .. }) => {
@@ -603,7 +603,7 @@ impl Book {
                     // `refused: <reason>`.
                     self.failing.remove(&(id.clone(), SeatOp::Settle));
                     let dropped = self.settles.remove(at);
-                    let _ = self.release_settle_seat(shared, log, dropped.reservation.as_ref());
+                    let _ = self.release_settle_seat(shared, log, dropped.reservation.as_ref()); // logged inside; the refusal line follows
                     self.forget_release_failure(dropped.reservation.as_ref());
                     self.dirty = true;
                     log(&format!(
