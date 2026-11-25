@@ -7,7 +7,7 @@ use super::decision_record::answer_error;
 use super::decision_record::read_decide_proof;
 use super::decision_record::Decided;
 use super::decision_record::Decision;
-use super::decision_record::ANSWER_AGAIN;
+use super::decision_record::NextStep;
 use super::evidence::authorship_label;
 use super::evidence::reseal_receipt_with_signoff;
 use super::feedback::open_verification_gaps;
@@ -630,7 +630,7 @@ fn record_answer(
         },
     ) {
         Ok(resolved) => resolved,
-        Err(e) => return answer_error(e, &run, criterion, ANSWER_AGAIN),
+        Err(e) => return answer_error(e, &run, criterion, NextStep::AnswerAgain),
     };
     if !resolved {
         return Ok(refusal(
@@ -721,7 +721,7 @@ fn approve_stopped_review(
         };
         match node::answer_under_grant(shared, run, approve, closed) {
             Ok(sealed) => sealed,
-            Err(e) => return answer_error(e, run, None, ANSWER_AGAIN),
+            Err(e) => return answer_error(e, run, None, NextStep::AnswerAgain),
         }
     };
     let sealed = match sealed {
@@ -882,7 +882,7 @@ pub(crate) fn successor_decide(
         &intent,
     ) {
         Ok(written) => written,
-        Err(e) => return answer_error(e, run, None, ANSWER_AGAIN),
+        Err(e) => return answer_error(e, run, None, NextStep::AnswerAgain),
     };
     let Some(stored) = written else {
         return Ok(refusal(
@@ -1431,6 +1431,74 @@ mod tests {
     }
 
     #[test]
+    fn a_salvage_of_an_already_answered_decision_gives_its_grant_back() {
+        let dir = relais::test_support::short_temp_dir("decide-salvage-answered");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        waiting_run(
+            &ledger,
+            "run-wait",
+            "/repo",
+            State::NeedsDecision,
+            Reason::ScopeExceeded,
+            None,
+            None,
+        );
+        let granting = Arc::new(Elsewhere::granting());
+        let rejected = answer_through(&dir, "run-wait", DecideAnswer::Reject, &granting);
+        assert_eq!(exit_of(&rejected), 0);
+        // The rejected run is terminal and not accepted, so a salvage reaches
+        // the grant; the ledger finds the decision already on record.
+        let salvage = Arc::new(Elsewhere::granting());
+        let refused = try_answer_through(
+            &dir,
+            "run-wait",
+            DecideAnswer::Salvaged,
+            Some("cand"),
+            &salvage,
+        )
+        .expect("decide runs")
+        .err()
+        .expect("refused");
+        assert!(matches!(refused.outcome, CliOutcome::InvalidInput));
+        assert_eq!((salvage.asks(), salvage.releases()), (1, 1));
+    }
+
+    #[test]
+    fn a_salvage_of_an_ended_run_held_elsewhere_is_refused_and_writes_nothing() {
+        let dir = relais::test_support::short_temp_dir("decide-salvage-ended-held");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        waiting_run(
+            &ledger,
+            "run-ended",
+            "/repo",
+            State::Failed,
+            Reason::WorkerLooped,
+            None,
+            None,
+        );
+        let held = Arc::new(Elsewhere::holding());
+        let refused = try_answer_through(
+            &dir,
+            "run-ended",
+            DecideAnswer::Salvaged,
+            Some("cand"),
+            &held,
+        )
+        .expect("decide runs")
+        .err()
+        .expect("held elsewhere");
+        assert_eq!(exit_code(&refused.outcome), 3);
+        assert!(
+            ledger
+                .decision_of_run(&RunId::from_stored("run-ended"))
+                .expect("read")
+                .is_none_or(|decision| decision.resolved_at.is_none()),
+            "no decision was resolved"
+        );
+        assert_eq!((held.asks(), held.releases()), (1, 0));
+    }
+
+    #[test]
     fn a_salvage_refused_for_its_arguments_asks_no_grant_and_builds_no_state() {
         let dir = relais::test_support::short_temp_dir("decide-salvage-args");
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
@@ -1699,13 +1767,13 @@ mod tests {
                 reason: format!("the decision of run {run} is being answered elsewhere"),
             })
         };
-        let plain = answer_error(held(), &run, None, ANSWER_AGAIN)
+        let plain = answer_error(held(), &run, None, NextStep::AnswerAgain)
             .expect("a refusal, not an error")
             .err()
             .expect("refused");
         assert_eq!(exit_code(&plain.outcome), 3);
         assert!(!plain.message.contains("sign-off"));
-        let signed = answer_error(held(), &run, Some("c1"), ANSWER_AGAIN)
+        let signed = answer_error(held(), &run, Some("c1"), NextStep::AnswerAgain)
             .expect("a refusal, not an error")
             .err()
             .expect("refused");
@@ -1720,7 +1788,7 @@ mod tests {
         let other = NodeError::Shared(SharedStateError::Refused {
             reason: "not authorised".into(),
         });
-        assert!(answer_error(other, &run, None, ANSWER_AGAIN).is_err());
+        assert!(answer_error(other, &run, None, NextStep::AnswerAgain).is_err());
     }
 
     fn exit_of(decision: &Decision) -> i32 {

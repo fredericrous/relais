@@ -70,11 +70,13 @@ pub(crate) fn read_decide_proof() -> Result<DecideProof, Refusal> {
     })
 }
 
-/// What a person does next after a held answer, for the answers that close
-/// an open decision, and for `salvaged`, which may answer a run with none.
-pub(crate) const ANSWER_AGAIN: &str = "answer again if it is still open";
-pub(crate) const SALVAGE_AGAIN: &str =
-    "run the same `--answer salvaged` again unless status shows it already salvaged";
+/// What a person does next after a held answer: the answers that close an
+/// open decision, and `salvaged`, which may answer a run with none.
+#[derive(Clone, Copy)]
+pub(crate) enum NextStep {
+    AnswerAgain,
+    SalvageAgain,
+}
 
 /// A failure of an answer, as the person sees it. Another answerer holding
 /// the decision is a refusal, exit 3, that says what to do next; the line
@@ -85,18 +87,25 @@ pub(crate) fn answer_error(
     e: NodeError,
     run: &RunId,
     signed_off: Option<&str>,
-    again: &str,
+    next: NextStep,
 ) -> Result<Decision, CliError> {
     use std::fmt::Write;
     if !node::is_decision_held_elsewhere(&e, run) {
         return Err(node_error("decide", e));
     }
     let minutes = relais::shared_state::DECISION_GRANT_TTL_SECS / 60;
+    let again = match next {
+        NextStep::AnswerAgain => "answer again if it is still open",
+        NextStep::SalvageAgain => {
+            "run the same `--answer salvaged` again unless status shows it already salvaged"
+        }
+    };
     let mut message = format!(
         "the decision of run {run} is being answered elsewhere: check `relais status {run}`, \
          then {again} (the other answer holds it for up to {minutes} minutes)"
     );
     if let Some(criterion) = signed_off {
+        // fmt::Write into a String cannot fail.
         let _ = write!(
             message,
             "; the sign-off of criterion {criterion} is recorded"
