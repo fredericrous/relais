@@ -182,7 +182,11 @@ fn a_run_with_no_gate_books_its_cost_to_the_shared_counter() {
                 ..Default::default()
             };
         }
-        std::fs::write(spec.work_dir.join("src/main.rs"), "fn main() {}\n").ok();
+        std::fs::write(
+            spec.work_dir.join("src/main.rs"),
+            "fn main() { let _changed = 1; }\n",
+        )
+        .expect("write main.rs");
         MockOutcome {
             result_text: Some("DONE".into()),
             exit_code: Some(0),
@@ -190,7 +194,7 @@ fn a_run_with_no_gate_books_its_cost_to_the_shared_counter() {
             ..Default::default()
         }
     });
-    let _ = fixture.execute_shared(
+    let outcome = fixture.execute_shared(
         Shared {
             state: &state,
             run_id: None,
@@ -200,6 +204,10 @@ fn a_run_with_no_gate_books_its_cost_to_the_shared_counter() {
         &repo,
         &machine,
         &backend,
+    );
+    assert!(
+        matches!(outcome.terminal, Terminal::Accepted(_)),
+        "the run is accepted, so its spend is a finished run's: {outcome:?}"
     );
     let ledger_spend = fixture
         .ledger
@@ -234,7 +242,11 @@ fn a_run_under_a_gate_leaves_the_counter_to_the_coordinator() {
                 ..Default::default()
             };
         }
-        std::fs::write(spec.work_dir.join("src/main.rs"), "fn main() {}\n").ok();
+        std::fs::write(
+            spec.work_dir.join("src/main.rs"),
+            "fn main() { let _changed = 1; }\n",
+        )
+        .expect("write main.rs");
         MockOutcome {
             result_text: Some("DONE".into()),
             exit_code: Some(0),
@@ -242,7 +254,7 @@ fn a_run_under_a_gate_leaves_the_counter_to_the_coordinator() {
             ..Default::default()
         }
     });
-    let _ = fixture.execute_presented_with(
+    let outcome = fixture.execute_presented_with(
         &state,
         &fixture.contract(Review::Off),
         &repo,
@@ -252,6 +264,10 @@ fn a_run_under_a_gate_leaves_the_counter_to_the_coordinator() {
         Presented {
             wire: Wire::process(),
         },
+    );
+    assert!(
+        matches!(outcome.terminal, Terminal::Accepted(_)),
+        "the run is accepted, so its spend is a finished run's: {outcome:?}"
     );
     let ledger_spend = fixture
         .ledger

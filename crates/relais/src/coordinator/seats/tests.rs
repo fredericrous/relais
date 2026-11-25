@@ -519,7 +519,7 @@ fn a_settle_with_another_failure_is_kept_and_retried_without_stopping_the_pass()
 // ---- an-t24: every settle reaches the counter ----
 
 /// A scripted wall clock the test moves.
-fn scripted_clock(start: i64) -> (Clock, Arc<std::sync::atomic::AtomicI64>) {
+fn scripted_clock(start: i64) -> (UnixClock, Arc<std::sync::atomic::AtomicI64>) {
     let now = Arc::new(std::sync::atomic::AtomicI64::new(start));
     let seen = Arc::clone(&now);
     (
@@ -642,7 +642,7 @@ fn a_settle_with_no_reservation_while_its_seat_is_held_elsewhere_is_kept() {
 fn file_book(
     shared: Arc<dyn SharedState>,
     path: &std::path::Path,
-    clock: Clock,
+    clock: UnixClock,
 ) -> (SeatBook, Arc<Mutex<Vec<String>>>) {
     let lines = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&lines);
@@ -703,18 +703,14 @@ fn a_sync_that_changes_nothing_writes_nothing() {
     fake.set_settles_conflict(Some("slot"));
     settle_and_free(&state, "d1", 10);
     book.sync(&state);
-    let first = std::fs::metadata(&path)
-        .expect("written")
-        .modified()
-        .expect("mtime");
-    std::thread::sleep(std::time::Duration::from_millis(30));
+    assert!(path.exists(), "the change was written");
+    std::fs::remove_file(&path).expect("remove");
     book.sync(&state);
     book.sync_request(&state, None);
-    let second = std::fs::metadata(&path)
-        .expect("kept")
-        .modified()
-        .expect("mtime");
-    assert_eq!(first, second, "a failing retry is not a change");
+    assert!(
+        !path.exists(),
+        "a failing retry is not a change: nothing is written"
+    );
 }
 
 #[test]
@@ -747,7 +743,7 @@ fn a_settle_past_the_age_cap_is_dropped_with_one_line() {
         "{lines:?}"
     );
     assert_eq!(count_lines(&lines, "$1.5"), 1, "{lines:?}");
-    assert_eq!(count_lines(&lines, "oldest: d1"), 1, "{lines:?}");
+    assert_eq!(count_lines(&lines, "oldest dispatch: d1"), 1, "{lines:?}");
 }
 
 #[test]
@@ -796,6 +792,11 @@ fn an_unreadable_settle_file_is_kept_aside_and_the_book_starts_empty() {
     let aside = dir.join(format!("{SETTLES_FILE}.unreadable-777"));
     assert_eq!(std::fs::read_to_string(&aside).expect("kept"), "not json");
     assert_eq!(count_lines(&lines, "unreadable-777"), 1, "{lines:?}");
+    assert_eq!(
+        count_lines(&lines, "not booked to the shared counter"),
+        1,
+        "{lines:?}"
+    );
 }
 
 #[test]
@@ -863,4 +864,93 @@ fn a_refused_unreserved_settle_frees_its_own_seat() {
     assert!(book.book().settles.is_empty(), "dropped");
     fake.acquire_seat(&Principal::node("node-b"), "settle:d1")
         .expect("the settle's seat is free again");
+}
+
+/// The lost answer across a restart: the reservation was written before the
+/// settle was sent, so a second book on the same file retries it on the same
+/// reservation, and the counter holds the spend once.
+#[test]
+fn a_lost_settle_answer_is_retried_on_the_stored_reservation_after_a_restart() {
+    let dir = crate::test_support::temp_dir("seat-settles-lost");
+    let path = dir.join(SETTLES_FILE);
+    let fake = FakeState::new();
+    let (clock, _) = scripted_clock(1_000);
+    let state = admission(2);
+    let (first, _) = file_book(Arc::new(fake.clone()), &path, Arc::clone(&clock));
+    launched_without_reservation(&state, "d1");
+    first.sync(&state);
+    settle_and_free(&state, "d1", 400);
+    fake.set_settles_conflict(Some("slot"));
+    first.sync(&state);
+    let stored = first.book().settles[0]
+        .reservation
+        .clone()
+        .expect("stored before the settle was sent");
+    drop(first);
+
+    // The primary applied the settle; its answer never reached the book.
+    fake.set_settles_conflict(None);
+    fake.settle_spend(&stored, MicroUsd::from_micros(400))
+        .expect("applied");
+    let (second, _) = file_book(Arc::new(fake.clone()), &path, clock);
+    assert_eq!(
+        second.book().settles[0]
+            .reservation
+            .as_ref()
+            .map(|r| r.id.clone()),
+        Some(stored.id.clone()),
+        "the file carries the reservation"
+    );
+    second.sync(&admission(1));
+    assert_eq!(fake.spent().to_micros(), 400, "once, not twice");
+}
+
+/// A file that cannot be read for a reason other than being absent is set
+/// aside too, and never overwritten.
+#[test]
+fn a_settle_file_that_is_a_directory_is_set_aside_and_not_overwritten() {
+    let dir = crate::test_support::temp_dir("seat-settles-dir");
+    let path = dir.join(SETTLES_FILE);
+    std::fs::create_dir(&path).expect("dir");
+    let (clock, _) = scripted_clock(5);
+    let (book, lines) = file_book(Arc::new(FakeState::new()), &path, clock);
+    assert!(book.book().settles.is_empty());
+    assert!(dir.join(format!("{SETTLES_FILE}.unreadable-5")).exists());
+    assert_eq!(count_lines(&lines, "kept aside"), 1, "{lines:?}");
+}
+
+/// A reservation made for a settle is dropped when the file cannot be
+/// written: the settle is not sent, and the next pass makes a new one.
+#[test]
+fn a_settle_is_not_sent_while_its_reservation_cannot_be_written() {
+    let dir = crate::test_support::temp_dir("seat-settles-nowrite");
+    let parent = dir.join("missing");
+    let path = parent.join(SETTLES_FILE);
+    let fake = FakeState::new();
+    let (clock, _) = scripted_clock(1_000);
+    let state = admission(2);
+    let (book, _) = file_book(Arc::new(fake.clone()), &path, clock);
+    launched_without_reservation(&state, "d1");
+    book.sync(&state);
+    settle_and_free(&state, "d1", 400);
+    book.sync(&state);
+    book.sync(&state);
+    assert_eq!(
+        fake.spent().to_micros(),
+        0,
+        "nothing sent without a written reservation"
+    );
+    assert!(book.book().settles[0].reservation.is_none());
+    let probe = fake
+        .acquire_seat(&Principal::node("node-b"), "settle:d1")
+        .expect("the dropped reservation's seat went back");
+    fake.release_seat(&probe).expect("probe released");
+
+    std::fs::create_dir(&parent).expect("dir");
+    book.sync(&state);
+    assert_eq!(
+        fake.spent().to_micros(),
+        400,
+        "booked once the file can be written"
+    );
 }

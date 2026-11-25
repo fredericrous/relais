@@ -68,17 +68,19 @@ impl<'a> RunEngine<'a> {
             return;
         }
         let dispatch = &event.event_id;
-        let outcome = match crate::shared_state::node::seat_holder(
-            state.selection(),
-            self.config.node_host.clone(),
-        ) {
-            Some(holder) => {
-                crate::shared_state::node::book_unmanaged_spend(state, &holder, dispatch, cost)
-                    .map_err(|e| e.to_string())
-            }
-            None => Err("this machine has no host name to hold a shared seat under".to_string()),
-        };
-        if let Err(error) = outcome {
+        // One call per dispatch id, and an id is minted per launch in this
+        // process (`ids.dispatch_id()`), so a repeat can only be this run
+        // calling twice: the in-process guard the idempotence rule allows
+        // for deliveries that do not outlive the process.
+        let first_time = self
+            .fed_counter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(dispatch.clone());
+        if !first_time {
+            return;
+        }
+        let report = |error: &dyn std::fmt::Display| {
             eprintln!(
                 "relais: dispatch {dispatch}: {cost} was not booked to the shared counter: \
                  {error}; this node's ledger has it; check the shared primary"
@@ -87,6 +89,18 @@ impl<'a> RunEngine<'a> {
                 what: "shared_spend_not_booked".into(),
                 reason: format!("{dispatch}: {error}"),
             });
+        };
+        let Some(holder) = crate::shared_state::node::seat_holder(
+            state.selection(),
+            self.config.node_host.clone(),
+        ) else {
+            report(&"this machine has no host name to hold a shared seat under");
+            return;
+        };
+        if let Err(error) =
+            crate::shared_state::node::book_unmanaged_spend(state, &holder, dispatch, cost)
+        {
+            report(&error);
         }
     }
 
@@ -405,8 +419,8 @@ impl<'a> RunEngine<'a> {
                 .micros()
                 .map_or_else(|| "an unknown cost".to_string(), |cost| cost.to_string());
             eprintln!(
-                "relais: dispatch {}: the daemon did not take the settle of {cost}: {error}; the \
-                 shared counter books the reservation instead; check the coordinator",
+                "relais: dispatch {}: the coordinator did not take the settle of {cost}: {error}; \
+                 the shared counter books the reservation instead; run `relais coordinator status`",
                 spec.dispatch_id,
             );
             self.events.emit(Event::Decision {

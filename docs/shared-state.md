@@ -153,7 +153,9 @@ state:
   made for a settle is stored before the settle is sent, so a retry or a
   restart never books it twice. A file that cannot be read is renamed to
   `seat-settles.json.unreadable-<unix-secs>`, named in one line, and the
-  daemon starts with an empty list. A single node (`LocalState`) keeps no
+  daemon starts with an empty list; when the file cannot be moved aside
+  either, nothing is kept on disk until it is fixed and the coordinator
+  restarted. A single node (`LocalState`) keeps no
   counter, so it writes no file.
 - `LocalState` grants every seat and reservation and books every settle, so
   a single node answers what it answered before; with no counter it queues

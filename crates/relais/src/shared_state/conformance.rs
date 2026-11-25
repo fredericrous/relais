@@ -202,6 +202,20 @@ pub fn a_settle_may_exceed_its_reservation(state: &dyn SharedState, fixture: &Fi
         .settle_spend(&reservation, MicroUsd::from_micros(500))
         .expect("a settle above its reservation records spent money");
     state.release_seat(&seat).expect("release");
+
+    // A seat that lapsed or was given back before the settle (a kept settle
+    // retried later, or a stored reservation after a restart) is the same
+    // true-up.
+    let seat = state
+        .acquire_seat(&me, &format!("{}-over-late", fixture.name))
+        .expect("acquire again");
+    let reservation = state
+        .reserve_spend(&seat, MicroUsd::from_micros(0))
+        .expect("a reservation for zero fits any slice");
+    state.release_seat(&seat).expect("release first");
+    state
+        .settle_spend(&reservation, MicroUsd::from_micros(500))
+        .expect("a settle above its reservation, after its seat went back, is still booked");
 }
 
 /// A bounded slice refuses what it cannot cover; an unbounded one does not
