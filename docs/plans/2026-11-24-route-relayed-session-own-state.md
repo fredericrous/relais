@@ -201,6 +201,7 @@ budget. A router-state read or final flush that fails leaves a note.
 - backend: approve-with-changes; fixed: unrouted launch when still stale, wait taken off the deadline, generation guard, streak reset at clear, lost-flush order commented (72k, 51 s).
 - lang:typescript: approve-with-changes; fixed: `StateFailure` union, `readLostFlush(unknown)`, cycle, (d) title, label (63k, 45 s).
 - Round 2: all three approve-with-changes, every round-1 finding resolved; fixed: tests for the generation guard and the streak reset, `refreshing` one field, paren in the caller, `no result` label, lost-flush clear re-reads first, f20 window wording (61k, 49k, 55k).
+- Delta on the final tree: implementation-review approve (46k, 34 s), backend approve (44k, 24 s), lang:typescript approve-with-changes (29k, 19 s); deliberate: the lost-flush second read stays (it narrows the window, backend round 2), carried: f20 Resolution test count and "other than relais's own" wording, fixed in the release commit.
 
 ## Verification
 
