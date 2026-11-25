@@ -1833,12 +1833,12 @@ fn parked_output(
             use std::fmt::Write as _;
             let mut out = format!("{}\n", claim::Next::parked_line(next_due));
             for programme in elsewhere {
-                // Writing to a String cannot fail.
-                let _ = writeln!(
+                writeln!(
                     out,
                     "ready elsewhere: {}:{} ({} ready)",
                     programme.repo, programme.slug, programme.ready
-                );
+                )
+                .expect("writing to a String cannot fail");
             }
             out
         }

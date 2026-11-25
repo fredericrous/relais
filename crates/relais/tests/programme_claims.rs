@@ -254,7 +254,17 @@ fn a_busy_from_lock_exits_1_with_the_retry_and_claims_nothing_elsewhere() {
         "{stderr}"
     );
     // The retry is the same command: it claims for the same session.
-    assert!(stderr.contains(" --session me"), "{stderr}");
+    assert!(
+        stderr.contains("--claim --root") && stderr.contains(" --session me"),
+        "{stderr}"
+    );
+    let json = world.next("me", &["--from", "alpha:p", "--claim", "--json"]);
+    assert_eq!(json.status.code(), Some(1), "{}", text(&json.stderr));
+    assert!(
+        text(&json.stderr).contains(" --session me --json"),
+        "{}",
+        text(&json.stderr)
+    );
     assert_eq!(claim_files(&world), before);
 }
 
