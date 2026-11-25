@@ -123,9 +123,11 @@ ticket here until it is resolved or moved into a programme of its own.
 - [f28](f28-tool-call-catch-answers.md) (2026-11-25, open): check that the
   plugin's other `tool.call` `.catch` answers reach the caller; f25 saw the
   guard's ignored when its hook threw.
-- [f29](f29-aval-launch-hint-declared-bin.md) (2026-11-25, open): the aval
-  launch-failure hint says "on PATH" and "set `bin`" even when `bin` is
-  declared; branch on the program's source (t14 review, low).
+- [f29](f29-aval-launch-hint-declared-bin.md) (2026-11-25, closed): the aval
+  launch-failure hint branches on the program's source. A declared `bin`
+  is named as the declaration to check, with no PATH; `greentopo` from PATH
+  keeps "on PATH runs, or set `bin`"; the `aval` fallback also says to
+  install greentopo. One test pins each wording.
 - [f30](f30-relative-fallback-shown.md) (2026-11-25, open): the run tool
   shows when `--relative` falls back to the absolute path, or a count shows
   that it never does.
@@ -135,14 +137,14 @@ ticket here until it is resolved or moved into a programme of its own.
 
 ## Handoff
 
-2026-11-25, boundary 4 (f26 closed): a worker's process kills stay off its
-own driver. The run tool passes a relative `--task`
-(`native contract --relative`), and the worker rules forbid kills by
-pattern (plan `docs/plans/2026-11-25-worker-kills-spare-the-driver.md`,
-done). f24 and f25 shipped in v0.84.0, f27 in v0.85.0, f26 in v0.86.0
-(installed here). All of them take effect after the plugin reinstall.
+2026-11-25, boundary 3 (f29 closed): the aval launch-failure hint
+branches on where the program came from (declared `bin`, `greentopo` on
+PATH, the `aval` fallback), one test per wording; it ships in the next
+relais release. f24 and f25 shipped in v0.84.0, f27 in v0.85.0, f26 in
+v0.86.0 (installed here). f24 to f27 take effect after the plugin
+reinstall.
 
-- Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f26, f27.
+- Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f26, f27, f29.
 - Next:
   - Check the plugin's other `tool.call` `.catch` answers (f28), ready.
   - Measure the home fingerprint warnings (f08), due 2026-11-28.
@@ -153,7 +155,6 @@ done). f24 and f25 shipped in v0.84.0, f27 in v0.85.0, f26 in v0.86.0
   - f16, f22 and f23 are counted from the reinstall.
   - Show the `--relative` fallback, or count that it never fires (f30),
     ready.
-  - The aval launch hint branches on a declared `bin` (f29), ready.
   - A push to main never cancels the release commit's CI (f31), ready.
   - After the reinstall: `pgrep -fl <worktree>` during a live run lists no
     driver pid, and `pgrep -fl 'relais run'` still lists it (f26 pilot).
