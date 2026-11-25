@@ -131,7 +131,7 @@ ticket here until it is resolved or moved into a programme of its own.
   that it never does.
 - [f31](f31-release-commit-ci-cancelled.md) (2026-11-25, open): a push to
   main cancels the CI of the commit before it, so a release tagged there
-  fails "every platform passed on main" (v0.86.0, twice).
+  fails "every platform passed on main" (v0.86.0; its CI was cancelled twice).
 
 ## Handoff
 
