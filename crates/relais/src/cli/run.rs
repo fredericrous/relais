@@ -550,6 +550,7 @@ pub(crate) fn run_command(
         // commands (ADR-0007).
         declarations: &relais::trust::Recorder(&ledger),
         shared_state: &*shared,
+        node_host: relais::procs::host_name(),
     }) {
         Ok(outcome) => outcome,
         Err(e) => {

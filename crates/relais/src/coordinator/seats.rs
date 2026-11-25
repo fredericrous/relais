@@ -24,15 +24,194 @@
 //! closed client bounds each call.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::admission::{AdmissionState, Decision, Refusal};
 use crate::money::MicroUsd;
-use crate::shared_state::{LeaseToken, Principal, Reservation, SharedState, SharedStateError};
+use crate::shared_state::{
+    LeaseToken, Principal, PrincipalKind, Reservation, ResourceId, Selection, SharedState,
+    SharedStateError,
+};
 
 /// Where the book's lines go: the coordinator's stderr, or a test's buffer.
 pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// The wall clock the book stamps waiting settles with, in unix seconds
+/// (injected: `effects.no-ambient-access`).
+pub type UnixClock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+/// How long a settle may wait for the primary. The counter is a UTC day, so
+/// spend older than this belongs to another day.
+pub const SETTLE_KEEP_SECS: i64 = 24 * 60 * 60;
+
+/// How many waiting settles the book keeps (the newest); older ones are
+/// dropped with a line.
+pub const MAX_WAITING_SETTLES: usize = 500;
+
+/// The file the waiting settles survive a restart in, beside the ledger.
+pub const SETTLES_FILE: &str = "seat-settles.json";
+
+fn system_clock() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+/// Where a coordinator keeps its waiting settles: beside the ledger it serves.
+pub fn settles_path(ledger: &Path) -> PathBuf {
+    ledger.with_file_name(SETTLES_FILE)
+}
+
+/// Which sync is flushing the waiting settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// After a request: only settles that already have a reservation, so
+    /// one request makes a bounded number of shared calls.
+    Request,
+    /// The reconcile tick (and shutdown): also settles with no reservation.
+    Reconcile,
+}
+
+/// Why a `seat-settles.json` is not a settle list.
+#[derive(Debug)]
+enum SettleFileError {
+    Io(std::io::Error),
+    Json(serde_json::Error),
+    HolderKind(String),
+}
+
+impl std::fmt::Display for SettleFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "{e}"),
+            Self::Json(e) => write!(f, "{e}"),
+            Self::HolderKind(kind) => write!(f, "a settle names the unknown holder kind {kind:?}"),
+        }
+    }
+}
+
+/// What one dispatch spent that the primary has not booked yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingSettle {
+    dispatch: String,
+    /// `None`: the dispatch never got a reservation (its reserve failed
+    /// after launch); one for zero is made when it is booked.
+    reservation: Option<Reservation>,
+    actual: MicroUsd,
+    /// Unix seconds when it began to wait.
+    since: i64,
+    tries: u32,
+}
+
+/// The plain fields of a [`PendingSettle`] in `seat-settles.json`, so no
+/// public type gains a derive.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SettleRow {
+    dispatch: String,
+    actual: i64,
+    since: i64,
+    tries: u32,
+    reservation: Option<ReservationRow>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReservationRow {
+    id: String,
+    amount: i64,
+    node: String,
+    seat_dispatch: String,
+    holder_kind: String,
+    holder_id: String,
+    epoch: u64,
+    expires_at: Option<i64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SettleFile {
+    settles: Vec<SettleRow>,
+}
+
+fn kind_name(kind: PrincipalKind) -> &'static str {
+    match kind {
+        PrincipalKind::Operator => "operator",
+        PrincipalKind::Node => "node",
+        PrincipalKind::Task => "task",
+    }
+}
+
+fn kind_from(name: &str) -> Option<PrincipalKind> {
+    match name {
+        "operator" => Some(PrincipalKind::Operator),
+        "node" => Some(PrincipalKind::Node),
+        "task" => Some(PrincipalKind::Task),
+        _ => None,
+    }
+}
+
+impl SettleRow {
+    /// `None` for a settle whose reservation is not under a seat (none is).
+    fn of(pending: &PendingSettle) -> Option<Self> {
+        let reservation = match &pending.reservation {
+            None => None,
+            Some(reservation) => {
+                let ResourceId::Seat { node, dispatch } = &reservation.seat.resource else {
+                    return None;
+                };
+                Some(ReservationRow {
+                    id: reservation.id.clone(),
+                    amount: reservation.amount.to_micros(),
+                    node: node.clone(),
+                    seat_dispatch: dispatch.clone(),
+                    holder_kind: kind_name(reservation.seat.holder.kind).into(),
+                    holder_id: reservation.seat.holder.id.clone(),
+                    epoch: reservation.seat.epoch,
+                    expires_at: reservation.seat.expires_at,
+                })
+            }
+        };
+        Some(Self {
+            dispatch: pending.dispatch.clone(),
+            actual: pending.actual.to_micros(),
+            since: pending.since,
+            tries: pending.tries,
+            reservation,
+        })
+    }
+
+    fn into_pending(self) -> Result<PendingSettle, SettleFileError> {
+        let reservation = match self.reservation {
+            None => None,
+            Some(row) => Some(Reservation {
+                id: row.id,
+                amount: MicroUsd::from_micros(row.amount),
+                seat: LeaseToken {
+                    resource: ResourceId::Seat {
+                        node: row.node,
+                        dispatch: row.seat_dispatch,
+                    },
+                    holder: Principal {
+                        kind: kind_from(&row.holder_kind)
+                            .ok_or_else(|| SettleFileError::HolderKind(row.holder_kind.clone()))?,
+                        id: row.holder_id,
+                    },
+                    epoch: row.epoch,
+                    expires_at: row.expires_at,
+                },
+            }),
+        };
+        Ok(PendingSettle {
+            dispatch: self.dispatch,
+            reservation,
+            actual: MicroUsd::from_micros(self.actual),
+            since: self.since,
+            tries: self.tries,
+        })
+    }
+}
 
 /// Why the shared half did not give a dispatch its seat, as the last
 /// attempt found it.
@@ -93,12 +272,16 @@ struct Book {
     /// The last acquire or reserve that failed, per dispatch; read by the
     /// handler that granted the dispatch.
     refused: BTreeMap<String, SeatRefusal>,
-    // holds-until: settles are persisted (follow-up to an-t17); until then
-    // a restart loses the ones still waiting, and a settle the primary
-    // refuses is dropped; the ledger floor in `node::daily_spent` keeps the
-    // cap from counting less than this node spent.
-    /// Settles the primary has not taken yet, oldest first.
-    settles: Vec<(String, Reservation, MicroUsd)>,
+    /// Settles the primary has not taken yet, oldest first. They survive a
+    /// restart in [`SETTLES_FILE`] when the book has one.
+    settles: Vec<PendingSettle>,
+    /// Where the waiting settles are kept, when they are (an external
+    /// layer and a ledger); `None` writes nothing.
+    store: Option<PathBuf>,
+    /// The waiting settles changed since the file was last written.
+    dirty: bool,
+    /// The last write of the file failed (said once per change).
+    store_failing: bool,
     /// The failure line last written per dispatch and operation, so each
     /// failure is written once per change, not once per sync.
     failing: BTreeMap<(String, SeatOp), String>,
@@ -122,25 +305,284 @@ impl Book {
         }
     }
 
+    /// Write the waiting settles when they changed: owner-only (the rows
+    /// carry seat tokens), directory fsynced. An empty list removes the
+    /// file. A failure is one line per change of state.
+    fn persist(&mut self, log: &LogSink) {
+        let Some(path) = self.store.clone() else {
+            self.dirty = false;
+            return;
+        };
+        if !self.dirty {
+            return;
+        }
+        let written = if self.settles.is_empty() {
+            match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        } else {
+            let rows: Vec<SettleRow> = self.settles.iter().filter_map(SettleRow::of).collect();
+            if rows.len() < self.settles.len() {
+                log(&format!(
+                    "seat settles: {} waiting settle(s) cannot be saved to {} and are lost if the \
+                     coordinator restarts",
+                    self.settles.len() - rows.len(),
+                    path.display()
+                ));
+            }
+            let file = SettleFile { settles: rows };
+            serde_json::to_string(&file)
+                .map_err(std::io::Error::other)
+                .and_then(|json| crate::fsutil::write_atomic_with_mode(&path, &json, Some(0o600)))
+        };
+        match written {
+            Ok(()) => {
+                self.dirty = false;
+                if std::mem::take(&mut self.store_failing) {
+                    log(&format!(
+                        "seat settles: {} is written again",
+                        path.display()
+                    ));
+                }
+            }
+            Err(e) => {
+                if !self.store_failing {
+                    log(&format!(
+                        "seat settles: could not write {}: {e}; waiting settles are lost if the \
+                         coordinator restarts before the primary takes them",
+                        path.display()
+                    ));
+                }
+                self.store_failing = true;
+            }
+        }
+    }
+
+    /// Queue a settle, newest last.
+    fn push_settle(
+        &mut self,
+        dispatch: String,
+        reservation: Option<Reservation>,
+        actual: MicroUsd,
+        now: i64,
+    ) {
+        self.settles.push(PendingSettle {
+            dispatch,
+            reservation,
+            actual,
+            since: now,
+            tries: 0,
+        });
+        self.dirty = true;
+    }
+
+    /// Drop the settles that waited past [`SETTLE_KEEP_SECS`] and all but
+    /// the newest [`MAX_WAITING_SETTLES`]: one line for everything dropped.
+    fn cap_settles(&mut self, shared: &dyn SharedState, log: &LogSink, now: i64) {
+        let mut reachable = true;
+        let mut dropped: Vec<PendingSettle> = Vec::new();
+        let (keep, old): (Vec<_>, Vec<_>) = std::mem::take(&mut self.settles)
+            .into_iter()
+            .partition(|pending| now.saturating_sub(pending.since) <= SETTLE_KEEP_SECS);
+        dropped.extend(old);
+        self.settles = keep;
+        if self.settles.len() > MAX_WAITING_SETTLES {
+            let excess = self.settles.len() - MAX_WAITING_SETTLES;
+            dropped.extend(self.settles.drain(..excess));
+        }
+        if dropped.is_empty() {
+            return;
+        }
+        self.dirty = true;
+        let total = dropped
+            .iter()
+            .fold(MicroUsd::from_micros(0), |sum, pending| {
+                sum.saturating_add(pending.actual)
+            });
+        let oldest = dropped
+            .iter()
+            .min_by_key(|pending| pending.since)
+            .map_or("", |pending| pending.dispatch.as_str());
+        for pending in &dropped {
+            self.failing
+                .remove(&(pending.dispatch.clone(), SeatOp::Settle));
+            // Seats of their own go back until the primary is found
+            // unreachable; the rest end at their time limit.
+            if reachable {
+                reachable = self.release_settle_seat(shared, log, pending.reservation.as_ref());
+                self.forget_release_failure(pending.reservation.as_ref());
+            }
+        }
+        log(&format!(
+            "seat settles: dropped {} waiting settle(s) totalling {total} (oldest dispatch: \
+             {oldest}); not booked to the shared counter; check the shared primary",
+            dropped.len()
+        ));
+    }
+
+    /// Give back the seat a settle made for itself (`settle:<dispatch>`),
+    /// when its reservation is under one; never the dispatch's own seat. A
+    /// failure is the book's one line per change, and the seat ends at its
+    /// time limit. Answers `false` when the primary was unreachable.
+    #[must_use]
+    fn release_settle_seat(
+        &mut self,
+        shared: &dyn SharedState,
+        log: &LogSink,
+        reservation: Option<&Reservation>,
+    ) -> bool {
+        let Some(reservation) = reservation else {
+            return true;
+        };
+        match &reservation.seat.resource {
+            ResourceId::Seat { dispatch, .. } if dispatch.starts_with("settle:") => {
+                self.release(shared, log, dispatch, &reservation.seat)
+            }
+            ResourceId::Seat { .. } | ResourceId::Ticket { .. } | ResourceId::Intent(_) => true,
+        }
+    }
+
+    /// A settle that is over keeps no release-failure entry (its line was
+    /// written once already).
+    fn forget_release_failure(&mut self, reservation: Option<&Reservation>) {
+        if let Some(Reservation {
+            seat:
+                LeaseToken {
+                    resource: ResourceId::Seat { dispatch, .. },
+                    ..
+                },
+            ..
+        }) = reservation
+        {
+            self.failing.remove(&(dispatch.clone(), SeatOp::Release));
+        }
+    }
+
+    /// The reservation a settle with none is booked under: for zero, on the
+    /// dispatch's own lease when the book holds one (never re-acquiring that
+    /// seat, which would bump its epoch), else on a seat of its own,
+    /// `settle:<dispatch>`. A reservation for zero cannot exhaust the slice,
+    /// and the settle that follows is a true-up.
+    fn reserve_for_settle(
+        &mut self,
+        shared: &dyn SharedState,
+        log: &LogSink,
+        holder: &Principal,
+        dispatch: &str,
+    ) -> Result<Reservation, SharedStateError> {
+        let zero = MicroUsd::from_micros(0);
+        if let Some(lease) = self.leases.get(dispatch).cloned() {
+            match shared.reserve_spend(&lease, zero) {
+                Err(SharedStateError::LeaseLost { .. }) => {
+                    // The work is over: the fence protects nothing now.
+                    self.leases.remove(dispatch);
+                }
+                other => return other,
+            }
+        }
+        let seat = shared.acquire_seat(holder, &format!("settle:{dispatch}"))?;
+        match shared.reserve_spend(&seat, zero) {
+            Ok(reservation) => Ok(reservation),
+            Err(e) => {
+                self.release(shared, log, &format!("settle:{dispatch}"), &seat);
+                Err(e)
+            }
+        }
+    }
+
     /// Hand the waiting settles to the primary, oldest first; what it does
     /// not take waits for the next sync. A settle is never refused for a
     /// stale seat (an-t11). An outage stops the pass: the rest are not
     /// tried until the next sync. A settle the primary refuses (`Refused`)
-    /// is dropped; any other failure is kept and the pass goes on. Returns
-    /// `false` when the primary was found unreachable.
-    fn flush_settles(&mut self, shared: &dyn SharedState, log: &LogSink) -> bool {
-        let mut waiting = std::mem::take(&mut self.settles).into_iter();
+    /// is dropped, deliberately: a retry repeats the refusal. Any other
+    /// failure is kept and the pass goes on. A settle with no reservation is
+    /// booked only on a [`Pass::Reconcile`], so one request keeps a bounded
+    /// number of shared calls; its new reservation is stored, and the file
+    /// written, before the settle is sent (and not sent when the write
+    /// failed), so a settle whose answer was lost retries on the same
+    /// reservation and is never booked twice. Returns `false` when the
+    /// primary was found unreachable.
+    fn flush_settles(
+        &mut self,
+        shared: &dyn SharedState,
+        holder: &Principal,
+        log: &LogSink,
+        now: i64,
+        pass: Pass,
+    ) -> bool {
+        self.cap_settles(shared, log, now);
         let mut reachable = true;
-        for (id, reservation, actual) in waiting.by_ref() {
+        let mut at = 0;
+        while at < self.settles.len() {
+            let id = self.settles[at].dispatch.clone();
+            let reservation = match self.settles[at].reservation.clone() {
+                Some(reservation) => reservation,
+                // While the file cannot be written no reservation is made: each
+                // pass would only acquire and give a seat back for nothing.
+                None if pass == Pass::Request || self.store_failing => {
+                    at += 1;
+                    continue;
+                }
+                None => match self.reserve_for_settle(shared, log, holder, &id) {
+                    Ok(reservation) => {
+                        self.settles[at].reservation = Some(reservation.clone());
+                        self.dirty = true;
+                        self.persist(log);
+                        if self.dirty {
+                            // The file could not be written: a settle sent
+                            // now could book twice after a restart. The
+                            // reservation was never sent, so it is dropped
+                            // and the next pass makes and writes a new one.
+                            self.settles[at].reservation = None;
+                            if !self.release_settle_seat(shared, log, Some(&reservation)) {
+                                reachable = false;
+                                break;
+                            }
+                            at += 1;
+                            continue;
+                        }
+                        reservation
+                    }
+                    Err(reserve_error) => {
+                        let outage = matches!(reserve_error, SharedStateError::Unreachable { .. });
+                        self.settles[at].tries += 1;
+                        self.fail(
+                            log,
+                            &id,
+                            SeatOp::Settle,
+                            format!(
+                                "seat {id}: booking the spend failed: {reserve_error}; it is \
+                                 retried at the next sync"
+                            ),
+                        );
+                        if outage {
+                            reachable = false;
+                            break;
+                        }
+                        at += 1;
+                        continue;
+                    }
+                },
+            };
+            let actual = self.settles[at].actual;
             match shared.settle_spend(&reservation, actual) {
-                Ok(_) => self.recover(
-                    log,
-                    &id,
-                    SeatOp::Settle,
-                    &format!("seat {id}: settle recovered"),
-                ),
+                Ok(_) => {
+                    self.recover(
+                        log,
+                        &id,
+                        SeatOp::Settle,
+                        &format!("seat {id}: settle recovered"),
+                    );
+                    self.settles.remove(at);
+                    self.dirty = true;
+                    // A seat made for this settle alone goes back at once.
+                    let _ = self.release_settle_seat(shared, log, Some(&reservation)); // a failure is logged inside; an outage shows at the next call
+                    self.forget_release_failure(Some(&reservation));
+                }
                 Err(settle_error @ SharedStateError::Unreachable { .. }) => {
                     // An outage: kept, and the pass stops here.
+                    self.settles[at].tries += 1;
                     self.fail(
                         log,
                         &id,
@@ -150,21 +592,24 @@ impl Book {
                              at the next sync"
                         ),
                     );
-                    self.settles.push((id, reservation, actual));
                     reachable = false;
                     break;
                 }
                 Err(settle_error @ SharedStateError::Refused { .. }) => {
                     // The primary answered and refused it: retrying would
-                    // repeat the refusal forever, so it is dropped. The
-                    // shared counter never books it; this node's ledger does,
-                    // and the floor in `node::daily_spent` counts it here.
-                    // The error already reads `refused: <reason>`.
+                    // repeat the refusal forever, so it is dropped
+                    // (deliberate, decided-by: agent, ADR-0080). The shared
+                    // counter never books it. The error already reads
+                    // `refused: <reason>`.
                     self.failing.remove(&(id.clone(), SeatOp::Settle));
+                    let dropped = self.settles.remove(at);
+                    let _ = self.release_settle_seat(shared, log, dropped.reservation.as_ref()); // logged inside; the refusal line follows
+                    self.forget_release_failure(dropped.reservation.as_ref());
+                    self.dirty = true;
                     log(&format!(
                         "seat {id}: booking the spend was not accepted: {settle_error}; dropped, \
-                         the shared budget does not count it, this node's ledger does; if it \
-                         repeats, check the shared primary"
+                         the shared counter does not count it; if it repeats, check the shared \
+                         primary"
                     ));
                 }
                 Err(
@@ -180,6 +625,7 @@ impl Book {
                 ) => {
                     // Every other failure is kept and retried at the next
                     // sync; a new variant must be placed here or above.
+                    self.settles[at].tries += 1;
                     self.fail(
                         log,
                         &id,
@@ -189,11 +635,11 @@ impl Book {
                              at the next sync"
                         ),
                     );
-                    self.settles.push((id, reservation, actual));
+                    at += 1;
                 }
             }
         }
-        self.settles.extend(waiting);
+        self.persist(log);
         reachable
     }
 
@@ -234,6 +680,11 @@ pub struct SeatBook {
     holder: Principal,
     book: Mutex<Book>,
     log: LogSink,
+    clock: UnixClock,
+    /// Whether the shared state keeps a counter these settles feed: a
+    /// single node (`LocalState`) has none, so a settle with no
+    /// reservation is not queued and no file is written.
+    feeds_counter: bool,
 }
 
 /// The line for a dispatch that waits on its shared seat.
@@ -247,12 +698,81 @@ fn wait_line(id: &str, cause: &SharedStateError) -> String {
 impl SeatBook {
     /// A book holding nothing yet, writing to the coordinator's stderr.
     pub fn new(shared: Arc<dyn SharedState>, holder: Principal) -> Self {
+        let feeds_counter = shared.selection() == Selection::External;
         Self {
             shared,
             holder,
             book: Mutex::new(Book::default()),
             log: Arc::new(|line: &str| super::log_line(line)),
+            clock: Arc::new(system_clock),
+            feeds_counter,
         }
+    }
+
+    /// Stamp waiting settles with another clock (a test's scripted one).
+    pub fn with_clock(mut self, clock: UnixClock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Keep the waiting settles in `path` (see [`settles_path`]) and take
+    /// back those a coordinator that ended left there. Nothing is kept when
+    /// the shared state has no counter. A file that cannot be read is
+    /// renamed aside (`<name>.unreadable-<unix-secs>`) and named in one
+    /// line; the book starts empty and the coordinator still starts. Call
+    /// it after [`Self::with_log`] and [`Self::with_clock`].
+    pub fn with_settle_file(self, path: PathBuf) -> Self {
+        if !self.feeds_counter {
+            return self;
+        }
+        let log = Arc::clone(&self.log);
+        let now = (self.clock)();
+        let mut book = self.book();
+        book.store = Some(path.clone());
+        let read: Result<Option<Vec<PendingSettle>>, SettleFileError> =
+            match std::fs::read_to_string(&path) {
+                Ok(text) => serde_json::from_str::<SettleFile>(&text)
+                    .map_err(SettleFileError::Json)
+                    .and_then(|file| {
+                        file.settles
+                            .into_iter()
+                            .map(SettleRow::into_pending)
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .map(Some),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(SettleFileError::Io(e)),
+            };
+        match read {
+            Ok(Some(rows)) => book.settles = rows,
+            Ok(None) => {}
+            Err(cause) => {
+                let mut name = path.clone().into_os_string();
+                name.push(format!(".unreadable-{now}"));
+                let aside = PathBuf::from(name);
+                match std::fs::rename(&path, &aside) {
+                    Ok(()) => log(&format!(
+                        "seat settles: {} could not be read ({cause}); kept aside as {}; its \
+                         settles are not booked to the shared counter; the book starts empty",
+                        path.display(),
+                        aside.display()
+                    )),
+                    Err(e) => {
+                        // Nothing may overwrite a file the daemon could not read.
+                        book.store = None;
+                        log(&format!(
+                            "seat settles: {} could not be read ({cause}) and could not be moved \
+                             aside ({e}); the book starts empty and keeps nothing on disk until \
+                             the file is fixed and the coordinator restarted (`relais coordinator \
+                             stop`)",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+        }
+        drop(book);
+        self
     }
 
     /// Send the book's lines somewhere else (a test's buffer).
@@ -286,6 +806,7 @@ impl SeatBook {
     fn sync_acquiring(&self, state: &Mutex<AdmissionState>, acquire: Acquire<'_>) {
         let shared = self.shared.as_ref();
         let log = &self.log;
+        let now = (self.clock)();
         let mut book = self.book();
         let (seated, journal, gone) = {
             let mut admission = super::lock_state(state);
@@ -304,21 +825,32 @@ impl SeatBook {
         // What settled, at what it booked; then what left without a
         // settle (withdrawn, discarded unclaimed), at zero.
         for booked in journal {
-            if let Some(reservation) = book.reservations.remove(&booked.dispatch_id) {
-                book.settles.push((
-                    booked.dispatch_id,
-                    reservation,
-                    MicroUsd::from_micros(booked.booked_micros),
-                ));
+            let actual = MicroUsd::from_micros(booked.booked_micros);
+            match book.reservations.remove(&booked.dispatch_id) {
+                Some(reservation) => {
+                    book.push_settle(booked.dispatch_id, Some(reservation), actual, now);
+                }
+                // No reservation: its reserve failed after launch. The
+                // spend is queued all the same (booked at the next tick),
+                // unless it was nothing or there is no counter to feed.
+                None if self.feeds_counter && booked.booked_micros > 0 => {
+                    book.push_settle(booked.dispatch_id, None, actual, now);
+                }
+                None => {}
             }
         }
         for id in gone {
             if let Some(reservation) = book.reservations.remove(&id) {
-                book.settles
-                    .push((id, reservation, MicroUsd::from_micros(0)));
+                book.push_settle(id, Some(reservation), MicroUsd::from_micros(0), now);
             }
         }
-        let mut reachable = book.flush_settles(shared, log);
+        book.persist(log);
+        let pass = if matches!(acquire, Acquire::Every) {
+            Pass::Reconcile
+        } else {
+            Pass::Request
+        };
+        let mut reachable = book.flush_settles(shared, &self.holder, log, now, pass);
 
         // Seats freed: released. Once the primary is found unreachable the
         // freed seats not yet tried keep their tokens, and the next sync
@@ -345,7 +877,11 @@ impl SeatBook {
         book.lost.retain(|id| seated_ids.contains(id.as_str()));
         book.refused
             .retain(|id, _| seated_ids.contains(id.as_str()));
-        let settling: BTreeSet<String> = book.settles.iter().map(|(id, ..)| id.clone()).collect();
+        let settling: BTreeSet<String> = book
+            .settles
+            .iter()
+            .map(|pending| pending.dispatch.clone())
+            .collect();
         let releasing: BTreeSet<String> = book.leases.keys().cloned().collect();
         book.failing.retain(|(id, _), _| {
             seated_ids.contains(id.as_str()) || settling.contains(id) || releasing.contains(id)
@@ -404,9 +940,9 @@ impl SeatBook {
                     );
                 }
                 Err(reserve_error) if seat.launched => {
-                    // Its work may be running: the seat stays, and the
-                    // node's ledger still books what it spends (the floor
-                    // in `node::daily_spent` keeps the cap from missing it).
+                    // Its work may be running: the seat stays, and its
+                    // spend is booked to the counter when it settles
+                    // (queued without a reservation, see `flush_settles`).
                     reachable = !matches!(reserve_error, SharedStateError::Unreachable { .. });
                     book.leases.insert(id.to_string(), token);
                     book.refused.remove(id);
@@ -415,8 +951,8 @@ impl SeatBook {
                         id,
                         SeatOp::Reserve,
                         format!(
-                            "seat {id}: reserve failed: {reserve_error}; the spend is booked on \
-                             this node only"
+                            "seat {id}: reserve failed: {reserve_error}; the spend is booked to \
+                             the shared counter when it settles"
                         ),
                     );
                 }
@@ -540,9 +1076,10 @@ impl SeatBook {
     pub fn release_all(&self) {
         let shared = self.shared.as_ref();
         let log = &self.log;
+        let now = (self.clock)();
         let mut book = self.book();
         let book = &mut *book;
-        if !book.flush_settles(shared, log) {
+        if !book.flush_settles(shared, &self.holder, log, now, Pass::Reconcile) {
             return;
         }
         for (id, token) in std::mem::take(&mut book.leases) {

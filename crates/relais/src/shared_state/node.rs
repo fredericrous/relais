@@ -177,26 +177,56 @@ fn give_back<E: std::fmt::Display>(what: &str, release: Result<(), E>) {
     }
 }
 
-// holds-until: every spend reaches the global counter: the runner's own
-// settles, a dispatch whose reserve failed after launch, the settles a
-// restarted coordinator lost and the settles the primary refused (dropped by
-// the seat book; follow-ups to an-t17). Then the global counter alone is the
-// day.
-/// What has been spent since `day_start`: the greater of the global counter
-/// (when the implementation keeps one) and this node's ledger. The
-/// coordinator's settles feed the counter (an-t17), but some spend still
-/// reaches only the ledger, and local spend is a lower bound of global
-/// spend, so the cap never counts less than the ledger says.
+/// What has been spent since `day_start`: the global counter when the
+/// implementation keeps one, this node's ledger when it does not. Every
+/// settle feeds the counter (an-t17, an-t24): the coordinator's, the
+/// runner's own with no daemon, and the ones that waited for the primary.
+/// What still misses it is named in `docs/shared-state.md` (a settle the
+/// primary refused or that waited past a day, a hook that carried on with no
+/// daemon). The ledger floor this function used to keep (`max(global,
+/// local)`) is one line to restore if a UTC day's counter falls more than 5%
+/// below the ledger sum.
 pub fn daily_spent(
     state: &dyn SharedState,
     ledger: &Ledger,
     day_start: &str,
 ) -> Result<MicroUsd, NodeError> {
-    let local = ledger.spend_since(day_start)?;
     Ok(match state.daily_spent(day_start)? {
-        Some(global) => global.max(local),
-        None => local,
+        Some(global) => global,
+        None => ledger.spend_since(day_start)?,
     })
+}
+
+/// Who holds this node's shared seats: the host's name, so two nodes never
+/// share a holder. A single node shares its seats with nobody, so `local`
+/// stands in when the OS gives no usable name; an external layer without
+/// one is refused (`None`).
+pub fn seat_holder(selection: super::Selection, host: Option<String>) -> Option<Principal> {
+    match host.filter(|name| name != "localhost") {
+        Some(name) => Some(Principal::node(name)),
+        None => match selection {
+            super::Selection::Local => Some(Principal::node("local")),
+            super::Selection::External => None,
+        },
+    }
+}
+
+/// Book what a run spent with no coordinator to settle it: a seat of its
+/// own (`settle:<dispatch>`), a reservation for zero and a settle at `cost`
+/// (a true-up, never refused for the seat), then the seat goes back. The
+/// seat is released even when the settle fails; its error is the answer.
+pub fn book_unmanaged_spend(
+    state: &dyn SharedState,
+    holder: &Principal,
+    dispatch: &str,
+    cost: MicroUsd,
+) -> Result<(), SharedStateError> {
+    let seat = state.acquire_seat(holder, &format!("settle:{dispatch}"))?;
+    let booked = state
+        .reserve_spend(&seat, MicroUsd::from_micros(0))
+        .and_then(|reservation| state.settle_spend(&reservation, cost));
+    give_back(&seat.resource.to_string(), state.release_seat(&seat));
+    booked.map(|_| ())
 }
 
 /// The claim file's rules: sweep the programme's closed tickets, then
@@ -930,7 +960,7 @@ mod daily_spent_tests {
     use crate::shared_state::fake::FakeState;
 
     #[test]
-    fn the_larger_of_the_global_counter_and_the_ledger_is_the_day() {
+    fn the_global_counter_alone_is_the_day_when_there_is_one() {
         let dir = crate::test_support::temp_dir("daily-spent-max");
         let ledger = Ledger::open(&dir.join("ledger.db")).expect("ledger");
         let state = FakeState::new();
@@ -945,8 +975,7 @@ mod daily_spent_tests {
             MicroUsd::from_micros(7),
             "global above an empty ledger"
         );
-        // The ledger above a lower global count wins: the cap never counts
-        // less than this node's own spend.
+        // The ledger above the counter does not count: no floor.
         ledger
             .insert_run(
                 &RunId::from_stored("earlier-today"),
@@ -981,9 +1010,81 @@ mod daily_spent_tests {
             .expect("usage");
         assert_eq!(
             daily_spent(&state, &ledger, day).expect("read"),
+            MicroUsd::from_micros(7),
+            "the counter alone, the ledger's 50 is not a floor"
+        );
+        assert_eq!(
+            daily_spent(&crate::shared_state::LocalState::new(), &ledger, day).expect("read"),
             MicroUsd::from_micros(50),
-            "the ledger above the global count"
+            "with no counter the ledger is the day"
         );
         std::fs::remove_dir_all(&dir).ok(); // best-effort temp cleanup
+    }
+
+    use crate::shared_state::Slice;
+
+    fn remaining(state: &FakeState) -> i64 {
+        match state.slice().expect("slice") {
+            Slice::Granted { remaining, .. } => remaining.to_micros(),
+            Slice::Unbounded => panic!("the fake bounds its slice"),
+        }
+    }
+
+    #[test]
+    fn a_run_with_no_daemon_books_its_cost_to_the_counter_and_the_slice() {
+        let state = FakeState::new();
+        let before = remaining(&state);
+        book_unmanaged_spend(
+            &state,
+            &Principal::node("node-a"),
+            "d1",
+            MicroUsd::from_micros(120),
+        )
+        .expect("booked");
+        assert_eq!(state.spent(), MicroUsd::from_micros(120));
+        assert_eq!(remaining(&state), before - 120);
+        // The seat went back: another holder takes the same resource.
+        state
+            .acquire_seat(&Principal::node("node-b"), "settle:d1")
+            .expect("released");
+    }
+
+    #[test]
+    fn a_failing_primary_and_a_held_seat_are_errors_the_caller_reports() {
+        let state = FakeState::new();
+        state.set_degraded(Some("network down"));
+        assert!(book_unmanaged_spend(
+            &state,
+            &Principal::node("node-a"),
+            "d1",
+            MicroUsd::from_micros(5)
+        )
+        .is_err());
+        state.set_degraded(None);
+        state
+            .acquire_seat(&Principal::node("node-b"), "settle:d2")
+            .expect("another holder");
+        assert!(book_unmanaged_spend(
+            &state,
+            &Principal::node("node-a"),
+            "d2",
+            MicroUsd::from_micros(5)
+        )
+        .is_err());
+        assert_eq!(state.spent(), MicroUsd::from_micros(0));
+    }
+
+    #[test]
+    fn the_holder_is_the_host_and_an_external_layer_has_no_constant() {
+        use crate::shared_state::Selection;
+        assert_eq!(
+            seat_holder(Selection::External, Some("mac-1".into())),
+            Some(Principal::node("mac-1"))
+        );
+        assert_eq!(seat_holder(Selection::External, None), None);
+        assert_eq!(
+            seat_holder(Selection::Local, Some("localhost".into())),
+            Some(Principal::node("local"))
+        );
     }
 }

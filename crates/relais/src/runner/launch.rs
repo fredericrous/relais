@@ -40,6 +40,9 @@ impl<'a> RunEngine<'a> {
         if let Some(booked) = booked {
             self.events.emit(cost_booked(&booked, &result.unpriced));
         }
+        if self.config.gate.is_none() {
+            self.book_unmanaged_counter(event);
+        }
         if result.session_id.is_some() && result.booked_message_ids.is_empty() {
             self.events.emit(Event::Decision {
                 what: "rollback_ids_missing".into(),
@@ -47,6 +50,58 @@ impl<'a> RunEngine<'a> {
             });
         }
         Ok(())
+    }
+
+    /// Feed the shared counter with a dispatch's whole cost when no
+    /// coordinator settles it (with a gate, the coordinator's settle does).
+    /// A single node keeps no counter, and an unknown cost books nothing.
+    /// Never fails the run: the money is spent, so a failure is reported as
+    /// a `shared_spend_not_booked` decision and one stderr line (deliberate,
+    /// not queued: an-t24).
+    fn book_unmanaged_counter(&self, event: &UsageEvent) {
+        use crate::shared_state::Selection;
+        let state = self.config.shared_state;
+        let Some(cost) = event.cost.filter(|cost| cost.to_micros() > 0) else {
+            return;
+        };
+        if state.selection() != Selection::External {
+            return;
+        }
+        let dispatch = &event.event_id;
+        // One call per dispatch id, and an id is minted per launch in this
+        // process (`ids.dispatch_id()`), so a repeat can only be this run
+        // calling twice: the in-process guard the idempotence rule allows
+        // for deliveries that do not outlive the process.
+        let first_time = self
+            .fed_counter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(dispatch.clone());
+        if !first_time {
+            return;
+        }
+        let report = |error: &dyn std::fmt::Display| {
+            eprintln!(
+                "relais: dispatch {dispatch}: {cost} was not booked to the shared counter: \
+                 {error}; this node's ledger has it; check the shared primary"
+            );
+            self.events.emit(Event::Decision {
+                what: "shared_spend_not_booked".into(),
+                reason: format!("{dispatch}: {error}"),
+            });
+        };
+        let Some(holder) = crate::shared_state::node::seat_holder(
+            state.selection(),
+            self.config.node_host.clone(),
+        ) else {
+            report(&"this machine has no host name to hold a shared seat under");
+            return;
+        };
+        if let Err(error) =
+            crate::shared_state::node::book_unmanaged_spend(state, &holder, dispatch, cost)
+        {
+            report(&error);
+        }
     }
 
     /// Managed dispatch (SPEC §23): admission before launch, heartbeats
@@ -354,7 +409,25 @@ impl<'a> RunEngine<'a> {
         let _ = gate.bind(&spec.dispatch_id, result.session_id.as_deref(), None);
         let _ = gate.release(&spec.dispatch_id);
         let spent = result.usage.cost.micros().map(MicroUsd::to_micros);
-        let _ = gate.settle(&spec.dispatch_id, spent);
+        if let Err(error) = gate.settle(&spec.dispatch_id, spent) {
+            // The dispatch stays on the coordinator and settles unknown when
+            // its lease lapses, which books its reservation (deliberate:
+            // booking the cost again here would count it twice, an-t24).
+            let cost = result
+                .usage
+                .cost
+                .micros()
+                .map_or_else(|| "an unknown cost".to_string(), |cost| cost.to_string());
+            eprintln!(
+                "relais: dispatch {}: the coordinator did not take the settle of {cost}: {error}; \
+                 the shared counter books the reservation instead; run `relais coordinator status`",
+                spec.dispatch_id,
+            );
+            self.events.emit(Event::Decision {
+                what: "gate_settle_failed".into(),
+                reason: format!("{}: {error}", spec.dispatch_id),
+            });
+        }
         // The worker ran unheard: whatever it produced is on disk and in
         // the ledger, but nothing could have stopped it, so the run ends
         // interrupted rather than judging a candidate it could not

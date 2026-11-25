@@ -70,12 +70,16 @@ pub type Check = fn(&dyn SharedState, &Fixture);
 
 /// Every check, each on a fresh implementation and fixture.
 pub fn run_all<S: SharedState>(make: impl Fn() -> S) {
-    let checks: [(&str, Check); 12] = [
+    let checks: [(&str, Check); 13] = [
         ("epoch_rises_on_every_acquire", epoch_rises_on_every_acquire),
         ("a_stale_epoch_is_lease_lost", a_stale_epoch_is_lease_lost),
         (
             "a_late_settle_is_never_refused",
             a_late_settle_is_never_refused,
+        ),
+        (
+            "a_settle_may_exceed_its_reservation",
+            a_settle_may_exceed_its_reservation,
         ),
         (
             "a_reserve_beyond_the_slice_is_refused",
@@ -185,6 +189,36 @@ pub fn a_late_settle_is_never_refused(state: &dyn SharedState, fixture: &Fixture
     state
         .settle_spend(&reservation, MicroUsd::from_micros(900))
         .expect("a settle records spent money; it is never refused");
+}
+
+/// A settle above its reservation is a true-up, never refused: a run with
+/// no coordinator reserves zero and settles what it spent (an-t24).
+pub fn a_settle_may_exceed_its_reservation(state: &dyn SharedState, fixture: &Fixture) {
+    let me = holder(fixture, "a");
+    let seat = state
+        .acquire_seat(&me, &format!("{}-over", fixture.name))
+        .expect("acquire");
+    let reservation = state
+        .reserve_spend(&seat, MicroUsd::from_micros(0))
+        .expect("a reservation for zero fits any slice");
+    state
+        .settle_spend(&reservation, MicroUsd::from_micros(500))
+        .expect("a settle above its reservation records spent money");
+    state.release_seat(&seat).expect("release");
+
+    // A seat that lapsed or was given back before the settle (a kept settle
+    // retried later, or a stored reservation after a restart) is the same
+    // true-up.
+    let seat = state
+        .acquire_seat(&me, &format!("{}-over-late", fixture.name))
+        .expect("acquire again");
+    let reservation = state
+        .reserve_spend(&seat, MicroUsd::from_micros(0))
+        .expect("a reservation for zero fits any slice");
+    state.release_seat(&seat).expect("release first");
+    state
+        .settle_spend(&reservation, MicroUsd::from_micros(500))
+        .expect("a settle above its reservation, after its seat went back, is still booked");
 }
 
 /// A bounded slice refuses what it cannot cover; an unbounded one does not
