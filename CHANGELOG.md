@@ -15,6 +15,20 @@ only `greenspotter.candidates/1`, and writes `greenspotter.ruling/1` lines to
 `adr-lint.ruling/1` stay in old ledgers as history. Install greenspotter
 before upgrading; without it a review runs with a candidates gap.
 
+- The coordinator's seats go through `relais::shared_state` (an-t17). The
+  daemon builds the implementation at start (`external` without a client
+  exits 3 before anything is bound) and mirrors every agent dispatch that
+  holds a seat into it: `acquire_seat` with a reservation of the dispatch's
+  `reserve_micros`, `renew_seat` every reconcile tick (15 s), `release_seat`
+  when the seat is freed and `settle_spend` when the dispatch settles, so a
+  shared primary's spend counter has a writer. A refused or unreachable
+  shared seat is answered `Queued` (the runner and the hook poll it within
+  their admission wait); a slice too small for the reservation is `Refused
+  (budget_exceeded)`. The daemon writes one stderr line per change of a
+  seat's shared state. The holder is the host's name. `Coordinator::start`
+  and `run_daemon` take the shared state and the holder. With `LocalState`
+  every seat is granted, so a single node answers as before.
+
 ## v0.82.0
 
 relais.toml reads `[integrations] greentopo`, the new name of aval. It declares

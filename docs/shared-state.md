@@ -33,21 +33,23 @@ back to an older relais.
 | registry pointer read, swap and rollback | `relais promote`, `relais rollback`, and `relais learn cycle`'s automatic promote and rollback |
 | daily spend ceiling check | `relais run`, `relais dataset replay` (through `RunConfig::shared_state`) |
 | the runner's widen and timed-out settles | `relais run`, `relais dataset replay` |
+| coordinator seats and their spend reservations | `relais coordinator daemon` (below) |
 
 The ceiling check reads the larger of the global counter and this node's
-ledger, since nothing feeds the global counter until seats and reservations
-are routed. A shared read that fails stops the run before dispatch.
+ledger. The coordinator's settles feed the counter (below), but some spend
+still reaches only the ledger (the runner's own settles, a dispatch whose
+reserve failed after launch, settles lost on a restart), so the ledger stays
+the floor until all of it reaches the counter. A shared read that fails stops
+the run before dispatch.
 
 Not routed yet, so under `external` they still read or write the node's own
-files: the coordinator's own seats (`AdmissionState` behind the
-`Gate` trait) and the daemon's read of its limits in `cli/coordinator.rs`
-(an-t17); `relais doctor`, which checks the file itself; and every write
+files: the daemon's read of its limits in `cli/coordinator.rs`; `relais
+doctor`, which checks the file itself; and every write
 of `machine.toml` (`relais trust grant`, the learning envelope, the routing
 envelope and its off switch), since the trait has no settings write yet.
 `runner/attempt.rs`, `holdout.rs`, `cli/recipe.rs` and the pricing
 preflight only name the file in a message. `announce_schema`, `publish`,
-`queued`, `slice`, the seat operations and `mode` have no caller yet:
-nothing publishes today.
+`queued` and `mode` have no caller yet: nothing publishes today.
 
 Every write of the registry's pointer files goes through
 `node::swap_registry_pointer` or `node::roll_back_registry`, under one
@@ -64,6 +66,60 @@ rollback`, a note in the learning cycle): nothing run on this node moves
 past it until the artifact is stored here or another node moves the
 shared pointer. A failure to read the node's own artifact files is that
 error, not a refusal.
+
+## Coordinator seats
+
+The coordinator daemon builds the implementation once at start (an
+`external` without a client refuses it with exit 3 before anything is
+bound) and holds it in a seat book. The admission queue still decides who
+gets a seat on this node; the book mirrors that decision into the shared
+state:
+
+- An agent dispatch (`model_work`) that holds a seat holds a shared seat
+  (`acquire_seat`, every acquire bumps the epoch) and a reservation of its
+  `reserve_micros` under it (`reserve_spend`). Local classes (heavy checks,
+  indexing, training) bound this machine only and take no shared seat.
+- The book follows the admission state after every request that can change
+  it and on every reconcile tick (15 s): a freed seat is released, a settle
+  is booked (`settle_spend`, at the spend reported, or at the reservation
+  when usage is unknown), a dispatch that leaves without a settle (withdrawn,
+  never claimed) settles its reservation at zero. A request takes only
+  the seat it asks for; other new seats (a dispatch drained from the
+  queue, an adopted one) are taken at the next tick or at their own poll.
+  Once a pass finds the primary unreachable it makes no more shared calls:
+  the waiting settles, the freed seats not yet tried (which keep their
+  tokens) and the new seats are tried again at the next sync, so a request
+  served while the primary is down pays for one failed call, not one per
+  seat.
+- Each tick renews every held seat. A seat found `lease_lost` is not taken
+  again: its work in flight finishes and its reservation settles as a
+  true-up.
+- A grant whose shared seat or reservation is refused, or whose primary is
+  unreachable, is answered `Queued`: the runner and the hook poll it within
+  their admission wait, and each poll asks the shared state again. A
+  reservation the node's slice cannot cover is answered `Refused
+  (budget_exceeded)`, `this node's share of the shared budget is used up:
+  this run needs $<n>, $<m> is left; raise this node's share on the shared
+  primary`. A dispatch already running keeps its seat when its
+  reservation fails; its spend is then booked on the node only.
+- The daemon's stderr carries one line per change, never the lease token:
+  `seat <dispatch>: the shared state did not grant the seat (<cause>); this
+  run waits and asks again; if it lasts, check the shared primary`, then
+  `seat <dispatch>: shared seat granted`; `renew`, `release`, `reserve` and
+  `settle` failures likewise. A settle the primary refuses (`Refused`) is
+  dropped with one line: the shared budget does not count it, the node's
+  ledger does. Any other settle failure is kept and retried.
+- The holder is `Principal::node(<host name>)`, so two nodes never share
+  one; under `external` a host with no name is refused (exit 3, with the
+  command that sets one). A restarted
+  daemon on the same host takes its adopted seats again at a higher epoch,
+  which fences the dead daemon's tokens.
+- When the daemon stops (`relais coordinator stop`, the idle exit) every
+  seat goes back; a killed daemon's seats end at their TTL. Settles that
+  were waiting for an unreachable primary are in memory and are lost on a
+  restart; the node's ledger still has the spend.
+- `LocalState` grants every seat and reservation and books every settle, so
+  a single node answers what it answered before.
 
 ## The refusal
 
@@ -152,6 +208,12 @@ it could not renew or give back ends by its TTL.
   ships in a minor release, and the client pins the exact public version.
 - `LocalState` fences seats and tickets within one instance only; fencing
   across processes and nodes is the external client's job.
+- Seats: the coordinator calls each seat method from one thread at a time,
+  except `renew_seat`, which runs without the book's lock; the trait has no
+  timeout, so the client bounds each call (a renew pass over every held seat
+  must fit the 15 s tick, inside the 90 s lease). An unsettled reservation
+  must end with its seat's lease on the primary (an-t11): a daemon that dies
+  before settling leaves it behind, and its successor reserves again.
 - A command builds its state once and hands that instance to every step:
   `relais run` reads the machine settings and prices, claims and releases
   a successor intent, and runs the worker through the one it built, so a

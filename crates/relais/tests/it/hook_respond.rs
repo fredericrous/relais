@@ -131,6 +131,8 @@ impl RunningCoordinator {
             limits,
             None,
             relais::admission::DEFAULT_AGENT_LEASE_TTL,
+            std::sync::Arc::new(relais::shared_state::LocalState::new()),
+            relais::shared_state::Principal::node("test"),
         )
         .expect("coordinator starts");
         let server = std::thread::spawn(move || {

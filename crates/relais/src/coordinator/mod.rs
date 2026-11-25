@@ -38,6 +38,10 @@ use crate::policy::ConcurrencyLimits;
 /// lease expiry never proves a worker died). Re-exported for `resume`.
 pub use crate::procs::alive as process_alive;
 use crate::procs::{kill, terminate, LockFile};
+use crate::shared_state::{Principal, SharedState};
+
+mod seats;
+pub use seats::{LogSink, SeatBook};
 
 /// Write one line to the daemon's stderr (the coordinator log), starting
 /// with an RFC 3339 UTC timestamp. Every line the serving daemon writes
@@ -688,6 +692,8 @@ pub struct Coordinator {
     /// The ledger the reconcile thread opens its own connection to, to
     /// reap orphaned runs; `None` when the daemon runs without one.
     ledger_path: Option<PathBuf>,
+    /// The agent seats mirrored into the shared state (an-t17).
+    seats: Arc<SeatBook>,
 }
 
 /// Atomic election (SPEC §23): an OS lock on `coordinator.lock`, held
@@ -785,6 +791,8 @@ impl Coordinator {
         limits: ConcurrencyLimits,
         ledger: Option<&Ledger>,
         agent_lease_ttl: Duration,
+        shared: Arc<dyn SharedState>,
+        holder: Principal,
     ) -> Result<(Self, Listener), CoordinatorError> {
         // Read the live set BEFORE electing: not `unwrap_or_default()`,
         // because an empty live set and an unreadable one look identical
@@ -822,6 +830,8 @@ impl Coordinator {
         // than left at `DEFAULT_AGENT_LEASE_TTL` for every coordinator
         // regardless of what machine.toml states.
         state.set_agent_lease_ttl(agent_lease_ttl);
+        // What agent dispatches settle is handed to the shared state.
+        state.track_shared_spend();
         {
             let now = Instant::now();
             for live in live {
@@ -927,6 +937,7 @@ impl Coordinator {
                 lock,
                 shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 ledger_path: ledger.map(|ledger| ledger.path().to_path_buf()),
+                seats: Arc::new(SeatBook::new(shared, holder)),
             },
             listener,
         ))
@@ -949,6 +960,7 @@ impl Coordinator {
         let reconcile_state = Arc::clone(&self.state);
         let reconcile_shutdown = Arc::clone(&self.shutdown);
         let reconcile_ledger = self.ledger_path.clone();
+        let reconcile_seats = Arc::clone(&self.seats);
         let group_state = Arc::clone(&self.state);
         let group_shutdown = Arc::clone(&self.shutdown);
         let store = Arc::new(GroupStore::new(self.ledger_path.clone()));
@@ -961,6 +973,7 @@ impl Coordinator {
                 &reconcile_state,
                 &reconcile_shutdown,
                 reconcile_ledger.as_deref(),
+                &reconcile_seats,
             );
         });
 
@@ -972,8 +985,9 @@ impl Coordinator {
             let state = Arc::clone(&self.state);
             let shutdown = Arc::clone(&self.shutdown);
             let store = Arc::clone(&store);
+            let seats = Arc::clone(&self.seats);
             handlers.push(std::thread::spawn(move || {
-                handler_loop(&queue, &state, &store, &shutdown);
+                handler_loop(&queue, &state, &store, &seats, &shutdown);
             }));
         }
 
@@ -995,6 +1009,9 @@ impl Coordinator {
         // to return, and the daemon is going down either way.
         let _ = reconciler.join();
         let _ = group_sweeper.join();
+        // Nothing is served any more: the shared seats go back now rather
+        // than at their TTL.
+        self.seats.release_all();
 
         // Only now that nothing is being served does the endpoint go.
         // Unlinking it while a connection was still in flight was the C1
@@ -1079,6 +1096,7 @@ fn reconcile_loop(
     state: &Mutex<AdmissionState>,
     shutdown: &std::sync::atomic::AtomicBool,
     ledger_path: Option<&Path>,
+    seats: &SeatBook,
 ) {
     let mut idle_since: Option<Instant> = None;
     // Opened on this thread, on first need, and again after a failure.
@@ -1087,6 +1105,8 @@ fn reconcile_loop(
     // runs here, once `serve` is accepting, never in `start`: a busy
     // ledger would otherwise outlast `ensure_running`'s START_TIMEOUT.
     sweep_tick(ledger_path, &mut ledger);
+    // The seats adopted at election are taken in the shared state.
+    seats.sync(state);
     while wait_for_tick(shutdown) {
         // Ledger and file I/O happen here, before the admission lock.
         sweep_tick(ledger_path, &mut ledger);
@@ -1123,6 +1143,10 @@ fn reconcile_loop(
         // signalled at most twice in its life: once politely, once not
         // (C5).
         deliver_signals(state, report.to_signal);
+        // Every tick (`RECONCILE_EVERY`, an-t11's renew interval): extend
+        // the shared seats, then mirror what the reconcile changed.
+        seats.renew();
+        seats.sync(state);
     }
 }
 
@@ -1445,6 +1469,7 @@ fn handler_loop(
     queue: &Mutex<std::sync::mpsc::Receiver<Queued>>,
     state: &Mutex<AdmissionState>,
     store: &GroupStore,
+    seats: &SeatBook,
     shutdown: &std::sync::atomic::AtomicBool,
 ) {
     loop {
@@ -1458,7 +1483,7 @@ fn handler_loop(
         };
         let Ok((stream, accepted)) = next else { return };
         let mut served = Served::new(accepted.elapsed());
-        let outcome = handle_connection(stream, state, store, shutdown, &mut served);
+        let outcome = handle_connection(stream, state, store, seats, shutdown, &mut served);
         // The slow line is written whether or not serving succeeded: a
         // reply that fails because the client gave up is the slow one.
         if let Some(slow) = slow_request_line(served.kind, &served.timings) {
@@ -1487,6 +1512,7 @@ fn handle_connection(
     stream: Stream,
     state: &Mutex<AdmissionState>,
     store: &GroupStore,
+    seats: &SeatBook,
     shutdown: &std::sync::atomic::AtomicBool,
     served: &mut Served,
 ) -> Result<(), CoordinatorError> {
@@ -1553,6 +1579,18 @@ fn handle_connection(
             }
             Ok(request) => {
                 served.kind = request.method();
+                // What the shared seats need from this request: none for
+                // the read-only ones, and the dispatch an admission asks
+                // for, whose grant waits on its shared seat.
+                let mirrors =
+                    !matches!(request, Request::Ping | Request::Status | Request::Shutdown);
+                // Only an admission asks for a seat grant; every other
+                // request leaves new seats to the tick.
+                let admitting = if let Request::RequestAdmission { request } = &request {
+                    Some(request.dispatch_id.clone())
+                } else {
+                    None
+                };
                 let waiting = Instant::now();
                 // Markers are read only for the requests that can change
                 // what is held, and on the reconcile tick.
@@ -1574,7 +1612,11 @@ fn handle_connection(
                 served.timings.handling = handling.elapsed();
                 journaled = (after > before).then_some(after);
                 signals = pending;
-                response
+                // The shared seats, with the admission guard gone (A6).
+                if mirrors {
+                    seats.sync_request(state, admitting.as_deref());
+                }
+                answer_after_seats(seats, state, admitting.as_deref(), response)
             }
             Err(e) => {
                 served.kind = "unparseable";
@@ -1624,6 +1666,30 @@ fn handle_connection(
         drain_and_discard(&writer);
     }
     Ok(())
+}
+
+/// After a request was handled and the seats synced, with the admission
+/// guard gone (A6): let a grant to `admitting` wait on its shared seat
+/// ([`SeatBook::answer_grant`]).
+pub(crate) fn answer_after_seats(
+    seats: &SeatBook,
+    state: &Mutex<AdmissionState>,
+    admitting: Option<&str>,
+    response: Response,
+) -> Response {
+    match (response, admitting) {
+        (
+            Response::Decision {
+                decision: Decision::Granted,
+            },
+            Some(dispatch_id),
+        ) => Response::Decision {
+            decision: seats
+                .answer_grant(state, dispatch_id, Instant::now())
+                .unwrap_or(Decision::Granted),
+        },
+        (response, _) => response,
+    }
 }
 
 /// Briefly read and throw away whatever the peer is still sending, so
@@ -3044,8 +3110,11 @@ pub fn run_daemon(
     ledger: Option<&Ledger>,
     agent_lease_ttl: Duration,
     disk_floor: u64,
+    shared: Arc<dyn SharedState>,
+    holder: Principal,
 ) -> Result<(), CoordinatorError> {
-    let (coordinator, listener) = Coordinator::start(socket_path, limits, ledger, agent_lease_ttl)?;
+    let (coordinator, listener) =
+        Coordinator::start(socket_path, limits, ledger, agent_lease_ttl, shared, holder)?;
     // The machine's `min_free_bytes` (SPEC §23): a heavy lease that asks
     // about the disk is held until its volumes stay above it.
     coordinator
@@ -3089,6 +3158,15 @@ mod tests {
 
     fn temp_dir(tag: &str) -> crate::test_support::TempDir {
         crate::test_support::short_temp_dir(tag)
+    }
+
+    /// A single node's shared state: every seat granted, as before an-t17.
+    fn local_state() -> Arc<dyn SharedState> {
+        Arc::new(crate::shared_state::LocalState::new())
+    }
+
+    fn test_holder() -> Principal {
+        Principal::node("test")
     }
 
     fn limits() -> ConcurrencyLimits {
@@ -3388,6 +3466,8 @@ mod tests {
             },
             Some(&ledger),
             Duration::from_secs(120),
+            local_state(),
+            test_holder(),
         )
         .expect("start");
         let server = std::thread::spawn(move || coordinator.serve(listener));
@@ -3515,6 +3595,8 @@ mod tests {
             },
             Some(&ledger),
             Duration::from_secs(120),
+            local_state(),
+            test_holder(),
         )
         .expect("a coordinator that adopts the holds");
         drop(listener);
@@ -3693,6 +3775,8 @@ mod tests {
             limits(),
             None,
             crate::admission::DEFAULT_AGENT_LEASE_TTL,
+            local_state(),
+            test_holder(),
         )
         .expect("start");
         let state = Arc::clone(&coordinator.state);
@@ -3824,6 +3908,8 @@ mod tests {
             limits(),
             None,
             crate::admission::DEFAULT_AGENT_LEASE_TTL,
+            local_state(),
+            test_holder(),
         )
         .expect("start");
         let server = std::thread::spawn(move || coordinator.serve(listener));
@@ -3934,6 +4020,8 @@ mod tests {
             limits(),
             Some(&ledger),
             crate::admission::DEFAULT_AGENT_LEASE_TTL,
+            local_state(),
+            test_holder(),
         )
         .expect("start");
         let server = std::thread::spawn(move || coordinator.serve(listener));
@@ -3969,6 +4057,8 @@ mod tests {
             limits(),
             Some(&ledger),
             crate::admission::DEFAULT_AGENT_LEASE_TTL,
+            local_state(),
+            test_holder(),
         )
         .expect("restart");
         let server = std::thread::spawn(move || coordinator.serve(listener));
@@ -3994,6 +4084,8 @@ mod tests {
             limits(),
             None,
             crate::admission::DEFAULT_AGENT_LEASE_TTL,
+            local_state(),
+            test_holder(),
         )
         .expect("start");
         let server = std::thread::spawn(move || coordinator.serve(listener));
@@ -4095,6 +4187,8 @@ mod tests {
             limits,
             None,
             crate::admission::DEFAULT_AGENT_LEASE_TTL,
+            local_state(),
+            test_holder(),
         )
         .expect("start");
         let server = std::thread::spawn(move || coordinator.serve(listener));
@@ -4261,6 +4355,8 @@ mod tests {
             limits(),
             Some(&ledger),
             crate::admission::DEFAULT_AGENT_LEASE_TTL,
+            local_state(),
+            test_holder(),
         )
         .expect("start");
         drop(listener);
@@ -4328,6 +4424,8 @@ mod tests {
             limits(),
             Some(&ledger),
             crate::admission::DEFAULT_AGENT_LEASE_TTL,
+            local_state(),
+            test_holder(),
         )
         .expect("start");
         drop(listener);
@@ -4552,6 +4650,7 @@ mod tests {
                     stream,
                     &state,
                     &GroupStore::new(None),
+                    &SeatBook::new(local_state(), test_holder()),
                     &shutdown,
                     &mut Served::new(Duration::ZERO),
                 )
@@ -4799,10 +4898,11 @@ mod tests {
         })
         .expect("request");
         let mut served = Served::new(Duration::from_millis(7));
+        let seats = SeatBook::new(local_state(), test_holder());
         std::thread::scope(|scope| {
             let server = scope.spawn(|| {
                 let stream = listener.accept().expect("accept").expect("a connection");
-                handle_connection(stream, &state, &store, &shutdown, &mut served)
+                handle_connection(stream, &state, &store, &seats, &shutdown, &mut served)
             });
             let mut client = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
             writeln!(client, "{request}").expect("send");
@@ -4919,6 +5019,8 @@ mod tests {
             limits(),
             Some(&ledger),
             crate::admission::DEFAULT_AGENT_LEASE_TTL,
+            local_state(),
+            test_holder(),
         )
         .err()
         .expect("start refuses");
@@ -4987,6 +5089,8 @@ mod tests {
             limits(),
             Some(&ledger),
             crate::admission::DEFAULT_AGENT_LEASE_TTL,
+            local_state(),
+            test_holder(),
         )
         .expect("start");
         // `start` reaps nothing: the first sweep is the reconcile
@@ -5049,6 +5153,8 @@ mod tests {
             limits(),
             Some(&ledger),
             crate::admission::DEFAULT_AGENT_LEASE_TTL,
+            local_state(),
+            test_holder(),
         );
         assert!(started.is_ok(), "{:?}", started.err());
     }

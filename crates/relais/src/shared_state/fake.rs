@@ -58,6 +58,11 @@ struct Inner {
     answered: HashMap<String, i64>,
     /// When set, every release is refused with this reason (a test knob).
     releases_fail: Option<String>,
+    /// When set, every settle is refused with this reason (a test knob).
+    settles_refused: Option<String>,
+    /// When set, every settle fails with a compare-and-set conflict: an
+    /// answered failure that is neither an outage nor a refusal (a test knob).
+    settles_conflict: Option<String>,
     /// When set, the session-wide renew and release sleep this long first,
     /// as a primary that does not answer would (a test knob).
     slow: Option<std::time::Duration>,
@@ -114,6 +119,21 @@ impl FakeState {
     /// so a test sees what a release that fails after a local refusal does.
     pub fn set_releases_fail(&self, reason: Option<&str>) {
         self.lock().releases_fail = reason.map(str::to_string);
+    }
+
+    /// Refuse (`Some(reason)`) or allow (`None`) every settle from now on,
+    /// as a primary that answers and refuses it would (the trait never
+    /// refuses one for a stale seat), so a test sees what the caller does
+    /// with a refusal that is not an outage.
+    pub fn set_settles_refused(&self, reason: Option<&str>) {
+        self.lock().settles_refused = reason.map(str::to_string);
+    }
+
+    /// Fail every settle with a conflict on `expected` (`Some`), or allow
+    /// them again (`None`): an answered failure that is neither an outage
+    /// nor a refusal.
+    pub fn set_settles_conflict(&self, expected: Option<&str>) {
+        self.lock().settles_conflict = expected.map(str::to_string);
     }
 
     /// Make the session-wide renew and release take `delay` (`None`: answer
@@ -302,6 +322,15 @@ impl SharedState for FakeState {
         reservation: &Reservation,
         actual: MicroUsd,
     ) -> Result<Settlement, SharedStateError> {
+        if let Some(reason) = self.lock().settles_refused.clone() {
+            return Err(SharedStateError::Refused { reason });
+        }
+        if let Some(expected) = self.lock().settles_conflict.clone() {
+            return Err(SharedStateError::CasConflict {
+                expected: Some(expected),
+                found: None,
+            });
+        }
         let current = self.fence(&reservation.seat).is_ok();
         let mut inner = self.lock();
         // Idempotent by reservation: a replayed settle books nothing twice.

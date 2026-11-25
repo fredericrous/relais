@@ -1200,6 +1200,31 @@ pub struct AdmissionState {
     /// Where held orphans are journalled so a restart keeps them; `None`
     /// keeps them in memory only.
     orphan_journal: Option<std::path::PathBuf>,
+    /// What each settled agent dispatch booked, not yet handed to the
+    /// shared state; `None` (the default) journals nothing, so a state no
+    /// coordinator mirrors never grows it.
+    spend_journal: Option<Vec<SpendBooked>>,
+}
+
+/// One agent dispatch that holds a seat the coordinator mirrors into the
+/// shared state (an-t17): a `model_work` dispatch whose lifecycle holds a
+/// seat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SharedSeat {
+    pub dispatch_id: String,
+    /// What the dispatch reserves, in micro-USD, never below zero.
+    pub reserve_micros: i64,
+    /// A process or an agent lease is bound to it: its work may be running,
+    /// so a refused shared seat cannot be taken back from it.
+    pub launched: bool,
+}
+
+/// What a settle booked for one agent dispatch: the spend reported, or the
+/// reservation when usage was unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpendBooked {
+    pub dispatch_id: String,
+    pub booked_micros: i64,
 }
 
 /// How long a measurement of a path's volume is reused before the disk is
@@ -1250,7 +1275,78 @@ impl AdmissionState {
             orphans: orphan::OrphanTable::default(),
             orphan_fence: std::sync::Arc::new(NoFence),
             orphan_journal: None,
+            spend_journal: None,
         }
+    }
+
+    /// Start journalling what agent dispatches settle, for the coordinator
+    /// to hand to the shared state ([`Self::take_spend_journal`]).
+    pub(crate) fn track_shared_spend(&mut self) {
+        self.spend_journal.get_or_insert_with(Vec::new);
+    }
+
+    /// The settles journalled since the last call.
+    pub(crate) fn take_spend_journal(&mut self) -> Vec<SpendBooked> {
+        self.spend_journal
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// The agent dispatches that hold a seat, for the shared state to
+    /// mirror. Local classes (heavy, indexing, training) bound this
+    /// machine only and are not listed.
+    pub(crate) fn shared_seats(&self) -> Vec<SharedSeat> {
+        self.dispatches
+            .iter()
+            .filter(|(_, d)| d.class.is_agent() && d.lifecycle.holds_seat())
+            .map(|(id, d)| SharedSeat {
+                dispatch_id: id.clone(),
+                reserve_micros: d.reserved.max(0),
+                launched: !matches!(d.binding, Binding::Unbound { .. }),
+            })
+            .collect()
+    }
+
+    /// Whether `dispatch_id` is still an entry (any lifecycle).
+    pub(crate) fn has_dispatch(&self, dispatch_id: &str) -> bool {
+        self.dispatches.contains_key(dispatch_id)
+    }
+
+    /// The caller was told `Granted` for `dispatch_id`, and the shared
+    /// state then refused its seat: turn it back into an unclaimed
+    /// admission, which keeps its local seat, stays withdrawable and asks
+    /// again at the caller's next poll. Acts only on a claimed dispatch
+    /// that nothing is bound to yet; answers whether it did.
+    pub(crate) fn unclaim(&mut self, dispatch_id: &str, now: Instant) -> bool {
+        let Some(dispatch) = self.dispatches.get_mut(dispatch_id) else {
+            return false;
+        };
+        if dispatch.lifecycle != Lifecycle::Claimed
+            || !matches!(dispatch.binding, Binding::Unbound { .. })
+        {
+            return false;
+        }
+        dispatch.lifecycle = Lifecycle::Unclaimed;
+        // The grace an unclaimed seat is reaped on runs from now.
+        dispatch.last_heartbeat = now;
+        true
+    }
+
+    /// The caller was told `Granted` for `dispatch_id`, and the shared
+    /// spend slice cannot cover it: give back everything it took, as a
+    /// withdrawal does, without remembering the id as finished. Acts only
+    /// on a claimed dispatch nothing is bound to yet; answers whether it
+    /// did.
+    pub(crate) fn revoke_grant(&mut self, dispatch_id: &str, now: Instant) -> bool {
+        let unlaunched = self.dispatches.get(dispatch_id).is_some_and(|dispatch| {
+            dispatch.lifecycle == Lifecycle::Claimed
+                && matches!(dispatch.binding, Binding::Unbound { .. })
+        });
+        if unlaunched {
+            self.discard_unclaimed(dispatch_id, now);
+        }
+        unlaunched
     }
 
     /// Journal held orphans to `path`, and take back those a previous
@@ -2465,6 +2561,14 @@ impl AdmissionState {
         dispatch.lifecycle = Lifecycle::UsageSettled;
         let reserved = std::mem::take(&mut dispatch.reserved);
         let run_id = dispatch.run_id.clone();
+        if dispatch.class.is_agent() {
+            if let Some(journal) = self.spend_journal.as_mut() {
+                journal.push(SpendBooked {
+                    dispatch_id: dispatch_id.to_string(),
+                    booked_micros: spent_micros.unwrap_or(reserved).max(0),
+                });
+            }
+        }
         if let Some(run) = self.runs.get_mut(&run_id) {
             // Saturating: `spent_micros` is reported by the caller and
             // `reserved` came off the wire; a total that wraps would read

@@ -211,11 +211,42 @@ pub(crate) fn quiet_command(cmd: QuietCommand) -> Result<CliOutcome, CliError> {
     Ok(CliOutcome::Accepted)
 }
 
+/// Who holds this node's shared seats: the host's name, so two nodes never
+/// share a holder. A single node shares its seats with nobody, so `local`
+/// stands in when the OS gives no usable name; an external layer without
+/// one is refused (`None`).
+fn seat_holder(
+    selection: relais::shared_state::Selection,
+    host: Option<String>,
+) -> Option<relais::shared_state::Principal> {
+    use relais::shared_state::{Principal, Selection};
+    match host.filter(|name| name != "localhost") {
+        Some(name) => Some(Principal::node(name)),
+        None => match selection {
+            Selection::Local => Some(Principal::node("local")),
+            Selection::External => None,
+        },
+    }
+}
+
 pub(crate) fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> {
     use relais::coordinator::{self, Request, Response};
     let socket = coordinator::socket_path().map_err(CliError::Home)?;
     match cmd {
         CoordinatorCommand::Daemon => {
+            // The shared state the seats go through (an-t17), refused
+            // before anything is read or bound when it names an external
+            // layer this build does not have.
+            let shared = super::ctx::shared_state()?;
+            let Some(holder) = seat_holder(shared.selection(), relais::procs::host_name()) else {
+                coordinator::log_line(
+                    "set this machine's host name (`scutil --set HostName <name>` on macOS, \
+                     `hostnamectl set-hostname <name>` on Linux), or set shared_state = \"local\": \
+                     shared_state = \"external\" names this node by its host name, and the OS \
+                     gives none",
+                );
+                return Ok(CliOutcome::Blocked);
+            };
             // ABSENT machine settings are not an error for the daemon:
             // the defaults apply and the grant check stays with `run`.
             // A machine.toml that exists and does not parse is a
@@ -284,6 +315,8 @@ pub(crate) fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome,
                 ledger.as_ref(),
                 agent_lease_ttl,
                 disk_floor,
+                shared,
+                holder,
             ) {
                 Ok(()) => Ok(CliOutcome::Accepted),
                 Err(e) => {
