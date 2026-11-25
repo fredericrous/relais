@@ -24,9 +24,14 @@ on:
   schedule:
     - cron: "23 6 * * 1"
 
+# A pull request's new push cancels its older run. A push to main never
+# cancels another main run: its group is the sha, so each commit's run
+# finishes. The release (release.yaml) needs main's CI to pass on the exact
+# tagged commit, and a shared group cancelled it whenever another PR landed
+# first (v0.86.0, f31).
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # GitHub's DEFAULT shell is `bash -e {0}` — no pipefail. Only naming bash
 # explicitly gets `bash -eo pipefail {0}`; without it a `make test | tee`
