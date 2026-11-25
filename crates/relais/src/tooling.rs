@@ -54,11 +54,7 @@ pub fn probe_integrations(repo: &RepoPolicy) -> Vec<Blocker> {
                     if !binary_available(bin) {
                         blockers.push(Blocker {
                             code: BlockCode::IntegrationMissing,
-                            detail: missing_integration_detail(
-                                name,
-                                bin,
-                                dependency.bin().is_some(),
-                            ),
+                            detail: missing_integration_detail(name, bin, dependency.bin()),
                         });
                     }
                 }
@@ -76,11 +72,10 @@ pub fn probe_integrations(repo: &RepoPolicy) -> Vec<Blocker> {
 /// aval entry names both keys it may be written under, so a repository
 /// that wrote `greentopo` is not told to add the key that both-keys
 /// refuses.
-fn missing_integration_detail(name: &str, bin: &str, declared: bool) -> String {
-    let install = if declared {
-        format!("`{bin}`")
-    } else {
-        "greentopo (`aval` still works for now)".to_string()
+fn missing_integration_detail(name: &str, bin: &str, declared_bin: Option<&str>) -> String {
+    let install = match declared_bin {
+        Some(declared) => format!("`{declared}`"),
+        None => "greentopo (`aval` still works for now)".to_string(),
     };
     match name {
         "aval" => format!(
