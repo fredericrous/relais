@@ -652,7 +652,7 @@ pub(crate) fn router_envelope_command(
     };
     let edit = relais::shared_state::SettingsEdit::SetRoutingEnvelope {
         envelope: envelope.clone(),
-        if_absent: false,
+        when: relais::shared_state::SettingsWhen::Always,
     };
     if let Err(e) = super::ctx::write_settings(&edit)? {
         eprintln!("relais native router-envelope: {e}");

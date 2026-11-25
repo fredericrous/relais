@@ -43,8 +43,8 @@ pub use local::LocalState;
 pub use node::{TicketClaim, TicketGrant};
 pub use types::{
     DecisionGrant, IntentAnswer, LeaseToken, Mode, Pointer, Principal, PrincipalKind,
-    PublishReceipt, PublishRow, Reservation, ResourceId, SettingsEdit, SettingsWrite, Settlement,
-    Slice, Swap, TicketAnswer, TicketRequest, DECISION_GRANT_TTL_SECS,
+    PublishReceipt, PublishRow, Reservation, ResourceId, SettingsEdit, SettingsWhen, SettingsWrite,
+    Settlement, Slice, Swap, TicketAnswer, TicketRequest, DECISION_GRANT_TTL_SECS,
 };
 
 use crate::ids::RunId;

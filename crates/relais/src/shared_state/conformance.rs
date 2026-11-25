@@ -17,7 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::node::{self, NodeError};
 use super::types::{
-    DecisionGrant, Principal, PublishRow, SettingsEdit, Slice, DECISION_GRANT_TTL_SECS,
+    DecisionGrant, Principal, PublishRow, SettingsEdit, SettingsWhen, Slice,
+    DECISION_GRANT_TTL_SECS,
 };
 use super::{SharedState, SharedStateError, TicketClaim};
 use crate::ids::{RunId, TaskId};
@@ -728,7 +729,7 @@ pub fn only_an_operator_writes_settings(state: &dyn SharedState) {
 }
 
 /// Each edit reads back through `machine_settings`; a repeated grant is
-/// `written: false`; an `if_absent` write leaves a grant or a tombstone
+/// `written: false`; an `IfAbsent` write leaves a grant or a tombstone
 /// alone; an `off` edit says whether it removed one.
 pub fn a_settings_write_reads_back(state: &dyn SharedState) {
     let operator = Principal::operator("person");
@@ -760,18 +761,21 @@ pub fn a_settings_write_reads_back(state: &dyn SharedState) {
         by: "conformance".into(),
         source: "plugin-ask".into(),
     };
-    let if_absent = SettingsEdit::SetAutoPromote {
+    let when_absent = SettingsEdit::SetAutoPromote {
         grant: grant.clone(),
-        if_absent: true,
+        when: SettingsWhen::IfAbsent,
     };
-    assert!(write(if_absent.clone()).written);
+    assert!(write(when_absent.clone()).written);
     assert_eq!(read().learning.auto_promote, Some(grant));
-    assert!(!write(if_absent.clone()).written, "a grant is left alone");
+    assert!(!write(when_absent.clone()).written, "a grant is left alone");
     let turned_off = write(SettingsEdit::AutoPromoteOff(off.clone()));
     assert!(turned_off.removed, "{turned_off:?}");
     assert_eq!(read().learning.auto_promote, None);
     assert_eq!(read().learning.off, Some(off.clone()));
-    assert!(!write(if_absent).written, "promotion turned off stays off");
+    assert!(
+        !write(when_absent).written,
+        "promotion turned off stays off"
+    );
     assert!(!write(SettingsEdit::AutoPromoteOff(off)).removed);
 
     let envelope = routing_envelope();
@@ -780,24 +784,24 @@ pub fn a_settings_write_reads_back(state: &dyn SharedState) {
         by: "conformance".into(),
         source: "plugin-ask".into(),
     };
-    let if_absent = SettingsEdit::SetRoutingEnvelope {
+    let when_absent = SettingsEdit::SetRoutingEnvelope {
         envelope: envelope.clone(),
-        if_absent: true,
+        when: SettingsWhen::IfAbsent,
     };
-    assert!(write(if_absent.clone()).written);
+    assert!(write(when_absent.clone()).written);
     assert_eq!(read().session_routing.envelope, Some(envelope.clone()));
     assert!(
-        !write(if_absent.clone()).written,
+        !write(when_absent.clone()).written,
         "an envelope is left alone"
     );
     assert!(write(SettingsEdit::RoutingOff(routing_off.clone())).removed);
     assert_eq!(read().session_routing.envelope, None);
     assert_eq!(read().session_routing.off, Some(routing_off));
-    assert!(!write(if_absent).written, "routing turned off stays off");
+    assert!(!write(when_absent).written, "routing turned off stays off");
     assert!(
         write(SettingsEdit::SetRoutingEnvelope {
             envelope: envelope.clone(),
-            if_absent: false,
+            when: SettingsWhen::Always,
         })
         .written,
         "an explicit envelope replaces the tombstone"

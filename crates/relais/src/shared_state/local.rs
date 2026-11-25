@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 
 use super::types::{
     DecisionGrant, IntentAnswer, LeaseToken, Mode, Pointer, Principal, PrincipalKind,
-    PublishReceipt, PublishRow, Reservation, ResourceId, SettingsEdit, SettingsWrite, Settlement,
-    Slice, Swap, TicketAnswer, TicketRequest,
+    PublishReceipt, PublishRow, Reservation, ResourceId, SettingsEdit, SettingsWhen, SettingsWrite,
+    Settlement, Slice, Swap, TicketAnswer, TicketRequest,
 };
 use super::{Selection, SharedState, SharedStateError};
 use crate::ids::RunId;
@@ -160,11 +160,11 @@ impl SharedState for LocalState {
             }
             SettingsEdit::SetAutoPromote {
                 grant,
-                if_absent: true,
+                when: SettingsWhen::IfAbsent,
             } => crate::learn::envelope::write_auto_promote_if_absent(&path, grant).map(written),
             SettingsEdit::SetAutoPromote {
                 grant,
-                if_absent: false,
+                when: SettingsWhen::Always,
             } => crate::learn::envelope::write_auto_promote(&path, grant).map(|()| written(true)),
             SettingsEdit::AutoPromoteOff(off) => {
                 crate::learn::envelope::write_off(&path, off).map(|removed| SettingsWrite {
@@ -174,11 +174,11 @@ impl SharedState for LocalState {
             }
             SettingsEdit::SetRoutingEnvelope {
                 envelope,
-                if_absent: true,
+                when: SettingsWhen::IfAbsent,
             } => crate::router::write_envelope_if_absent(&path, envelope).map(written),
             SettingsEdit::SetRoutingEnvelope {
                 envelope,
-                if_absent: false,
+                when: SettingsWhen::Always,
             } => crate::router::write_envelope(&path, envelope).map(|()| written(true)),
             SettingsEdit::RoutingOff(off) => {
                 crate::router::write_off(&path, off).map(|removed| SettingsWrite {

@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 
 use super::types::{
     DecisionGrant, IntentAnswer, LeaseToken, Mode, Pointer, Principal, PublishReceipt, PublishRow,
-    Reservation, ResourceId, SettingsEdit, SettingsWrite, Settlement, Slice, Swap, TicketAnswer,
-    TicketRequest, DECISION_GRANT_TTL_SECS,
+    Reservation, ResourceId, SettingsEdit, SettingsWhen, SettingsWrite, Settlement, Slice, Swap,
+    TicketAnswer, TicketRequest, DECISION_GRANT_TTL_SECS,
 };
 use super::{Selection, SharedState, SharedStateError};
 use crate::ids::RunId;
@@ -316,8 +316,8 @@ impl SharedState for FakeState {
                     .then(|| crate::trust::add_grant_to(&text, "trust_repos", repo_key, record)),
                 false,
             ),
-            SettingsEdit::SetAutoPromote { grant, if_absent } => (
-                (!*if_absent
+            SettingsEdit::SetAutoPromote { grant, when } => (
+                (*when == SettingsWhen::Always
                     || (current.learning.auto_promote.is_none() && current.learning.off.is_none()))
                 .then(|| crate::learn::envelope::set_auto_promote(&text, grant)),
                 false,
@@ -326,11 +326,8 @@ impl SharedState for FakeState {
                 Some(crate::learn::envelope::set_off(&text, off)),
                 current.learning.auto_promote.is_some(),
             ),
-            SettingsEdit::SetRoutingEnvelope {
-                envelope,
-                if_absent,
-            } => (
-                (!*if_absent
+            SettingsEdit::SetRoutingEnvelope { envelope, when } => (
+                (*when == SettingsWhen::Always
                     || (current.session_routing.envelope.is_none()
                         && current.session_routing.off.is_none()))
                 .then(|| crate::router::set_envelope(&text, envelope)),
@@ -343,8 +340,8 @@ impl SharedState for FakeState {
         };
         let written = match edited {
             None => false,
-            Some(result) => {
-                let edited = result.map_err(|e| refused(e.to_string()))?;
+            Some(edited_text) => {
+                let edited = edited_text.map_err(|e| refused(e.to_string()))?;
                 MachineSettings::from_toml_str(&edited).map_err(|e| refused(e.to_string()))?;
                 inner.settings = Some(edited);
                 true

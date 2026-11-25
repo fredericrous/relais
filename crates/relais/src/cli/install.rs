@@ -166,7 +166,7 @@ pub(crate) fn install_routing_envelope() {
     };
     let edit = relais::shared_state::SettingsEdit::SetRoutingEnvelope {
         envelope: envelope.clone(),
-        if_absent: true,
+        when: relais::shared_state::SettingsWhen::IfAbsent,
     };
     match write_settings_for_install(&edit) {
         Ok(done) if done.written => {
@@ -206,7 +206,7 @@ pub(crate) fn install_learning_envelope() {
     };
     let edit = relais::shared_state::SettingsEdit::SetAutoPromote {
         grant: grant.clone(),
-        if_absent: true,
+        when: relais::shared_state::SettingsWhen::IfAbsent,
     };
     match write_settings_for_install(&edit) {
         Ok(done) if done.written => {
