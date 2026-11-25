@@ -31,8 +31,14 @@ pub(super) fn require_operator(writer: &Principal) -> Result<(), SharedStateErro
     }
     Err(SharedStateError::Refused {
         reason: format!(
-            "only an operator writes the machine settings; {:?} {} does not",
-            writer.kind, writer.id
+            "only an operator writes the machine settings; the {} {} may not; run it as the \
+             person at a terminal",
+            match writer.kind {
+                PrincipalKind::Operator => "operator",
+                PrincipalKind::Node => "node",
+                PrincipalKind::Task => "task",
+            },
+            writer.id
         ),
     })
 }

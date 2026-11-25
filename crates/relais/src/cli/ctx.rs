@@ -83,7 +83,12 @@ pub(crate) fn write_settings(
         .ok()
         .filter(|user| !user.is_empty())
         .unwrap_or_else(|| "operator".to_string());
-    Ok(shared_state()?.write_settings(&relais::shared_state::Principal::operator(who), edit))
+    // No home directory is the "no settings path" failure every command
+    // reported as `CliError::Home` before the trait had a write.
+    match shared_state()?.write_settings(&relais::shared_state::Principal::operator(who), edit) {
+        Err(SharedStateError::Home(e)) => Err(CliError::Home(e)),
+        written => Ok(written),
+    }
 }
 
 /// The closed shared-state client this build links. Public relais links

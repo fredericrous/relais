@@ -300,7 +300,11 @@ impl SharedState for FakeState {
         edit: &SettingsEdit,
     ) -> Result<SettingsWrite, SharedStateError> {
         super::local::require_operator(writer)?;
-        let refused = |reason: String| SharedStateError::Refused { reason };
+        // A failed edit is the local writer's `SettingsWrite`, as on
+        // `LocalState`; `Refused` stays for a writer that is not an operator.
+        let refused = |reason: String| SharedStateError::SettingsWrite {
+            cause: reason.into(),
+        };
         // One lock across read, edit and store: two writers both land.
         let mut inner = self.lock();
         let text = inner.settings.clone().unwrap_or_else(bare_settings);

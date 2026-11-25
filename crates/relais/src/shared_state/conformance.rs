@@ -663,13 +663,16 @@ pub fn a_decision_grant_lapses(state: &dyn SharedState, fixture: &Fixture, advan
     state.release_decision(&run).expect("release");
 }
 
+/// One settings-write check, run on a state it is given.
+type SettingsCheck = fn(&dyn SharedState);
+
 /// The settings-write checks (an-t20). `make` is handed the path of a
 /// scratch settings file in a directory of its own; an implementation that
 /// writes a node's file (`LocalState::at`) uses it, one that writes
 /// elsewhere ignores it. They are kept out of [`run_all`], whose `make`
 /// takes no path, so that no check ever writes the real settings file.
 pub fn run_settings_writes<S: SharedState>(make: impl Fn(&std::path::Path) -> S) {
-    let checks: [(&str, fn(&dyn SharedState)); 2] = [
+    let checks: [(&str, SettingsCheck); 2] = [
         (
             "only_an_operator_writes_settings",
             only_an_operator_writes_settings,
