@@ -333,7 +333,7 @@ export function register(on: any) {
   on('tool.call', { tool: RUN_TOOL }, async ($: any, e: any) => {
     if (typeof e.cwd !== 'string') return { deny: 'relais run needs a cwd: the repository, as an absolute path.' }
     const fx = effects($)
-    const task = await contractPath(fx, e.task, e.cwd, { relative: true })
+    const task = await contractPath(fx, e.task, e.cwd, 'relative-to-cwd')
     if (task.deny) return { deny: task.deny }
     ensurePump(fx)
     const workspace = workspaceOf(e.workspace)

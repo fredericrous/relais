@@ -254,7 +254,9 @@ pub(super) fn worker_rules() -> String {
      stop a process you started only by the pid you recorded (`$!` after\n\
      `&`), with `kill <pid>`; never by a pattern (`pkill`, `killall`,\n\
      `pgrep -f`, `ps | grep`) and never `kill 0` or `kill -1`: a pattern can\n\
-     match relais's own driver, and the run then ends interrupted.\n\
+     match relais's own driver, and the run then ends interrupted. for a\n\
+     command that starts children, run `set -m` first so it leads its own\n\
+     process group, and stop that group with `kill -- -<pid>`.\n\
      do not leave scratch files in this directory: they become part of the\n\
      candidate. give findings and reports in your final message.\n\
      finish with a line starting DONE when you believe the criteria are met,\n\

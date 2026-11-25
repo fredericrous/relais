@@ -196,12 +196,6 @@ pub(crate) fn native_cancel_command(
     }
 }
 
-/// `relais native contract`: the model writes a task as JSON, the plugin
-/// pipes it here. Refused, by its schema error, unless it is a contract —
-/// so a sentence of prose never becomes a run. Saved as
-/// `<root>/.relais/tasks/<hash>.json`, under the `.relais/` the dirty-tree
-/// check already leaves alone, with a `.gitignore` that keeps it out of
-/// `git status`.
 /// How `relais native contract` prints the path it saved: absolute, or
 /// relative to the cwd (`--relative`, what the run tool asks for).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +214,12 @@ impl ContractPath {
     }
 }
 
+/// `relais native contract`: the model writes a task as JSON, the plugin
+/// pipes it here. Refused, by its schema error, unless it is a contract —
+/// so a sentence of prose never becomes a run. Saved as
+/// `<root>/.relais/tasks/<hash>.json`, under the `.relais/` the dirty-tree
+/// check already leaves alone, with a `.gitignore` that keeps it out of
+/// `git status`.
 pub(crate) fn native_contract_command(shape: ContractPath) -> Result<CliOutcome, CliError> {
     use std::io::Read;
     let mut text = String::new();
@@ -274,16 +274,28 @@ pub(crate) fn native_contract_command(shape: ContractPath) -> Result<CliOutcome,
     })();
     match written {
         Ok(path) => {
-            let shown = if shape == ContractPath::Relative {
-                cwd()
-                    .ok()
-                    .and_then(|here| relative_task_path(&here, &root, &path))
-            } else {
-                None
-            };
-            match shown {
-                Some(shown) => println!("{shown}"),
-                None => println!("{}", path.display()),
+            match shape {
+                ContractPath::Absolute => println!("{}", path.display()),
+                ContractPath::Relative => {
+                    let relative = match cwd() {
+                        Ok(here) => relative_task_path(&here, &root, &path).ok_or_else(|| {
+                            format!("{} is not under {}", here.display(), root.display())
+                        }),
+                        Err(e) => Err(format!("the cwd could not be read: {e}")),
+                    };
+                    match relative {
+                        Ok(shown) => println!("{shown}"),
+                        // Fails open (the absolute path still runs), and
+                        // says so: that path names the worktree in the
+                        // driver's argv (f26).
+                        Err(why) => {
+                            eprintln!(
+                                "relais native contract: --relative: {why}; printed the path absolute"
+                            );
+                            println!("{}", path.display());
+                        }
+                    }
+                }
             }
             Ok(CliOutcome::Accepted)
         }
@@ -1077,6 +1089,34 @@ pub(crate) fn reap_for_status(
 
 #[cfg(test)]
 mod tests {
+    use super::relative_task_path;
+
+    #[test]
+    fn a_relative_task_path_climbs_to_the_root_and_names_no_directory_above_it() {
+        let root = Path::new("/wt/relais-wt-x");
+        let saved = root.join(".relais").join("tasks").join("a.json");
+        assert_eq!(
+            relative_task_path(root, root, &saved).as_deref(),
+            Some(".relais/tasks/a.json")
+        );
+        assert_eq!(
+            relative_task_path(&root.join("deep").join("er"), root, &saved).as_deref(),
+            Some("../../.relais/tasks/a.json")
+        );
+    }
+
+    #[test]
+    fn a_relative_task_path_is_none_outside_the_root() {
+        let root = Path::new("/b");
+        let saved = root.join(".relais").join("tasks").join("x.json");
+        assert_eq!(relative_task_path(Path::new("/a"), root, &saved), None);
+        assert_eq!(
+            relative_task_path(root, root, Path::new("/c/.relais/tasks/x.json")),
+            None
+        );
+        assert_eq!(relative_task_path(root, root, root), None);
+    }
+
     use super::*;
 
     #[test]
