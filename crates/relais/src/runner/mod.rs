@@ -270,6 +270,10 @@ pub(crate) struct RunEngine<'a> {
     /// that held it has ended, so the tree is still, and waiting would
     /// be the run waiting on itself until its own deadline.
     pub(in crate::runner) own_write_leases: std::collections::BTreeSet<String>,
+    /// Dispatches whose cost this run already fed to the shared counter
+    /// with no coordinator to settle them: a second booking of the same
+    /// dispatch is skipped, since the primary cannot tell it from a new one.
+    pub(in crate::runner) fed_counter: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// The reviewer's constraint statements that did not fit its prompt:
     /// known only once the review prompt is built, shown in the receipt.
     pub(in crate::runner) reviewer_gap: Option<GuidanceGap>,

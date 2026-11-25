@@ -8,6 +8,18 @@ missing here.
 
 ## Unreleased
 
+Every settle now feeds the shared spend counter, and the ledger floor in the
+daily spend check is gone: with an external shared state the day is the
+counter alone. A run with no coordinator books its cost through a seat of
+its own, a dispatch whose reserve failed after launch is booked when it
+settles, and the settles that waited for the primary are kept in
+`seat-settles.json` beside the ledger across a coordinator restart (owner
+only; a settle waiting more than 24 h or beyond the newest 500 is dropped
+with one line). The shared-state conformance suite gains
+`a_settle_may_exceed_its_reservation`: a client must book a settle above its
+reservation. A single node (`LocalState`) is unchanged. What still misses the
+counter, and the rollback if it matters, is in `docs/shared-state.md`.
+
 ## v0.87.0
 
 The machine settings are written through `SharedState` as they are read.
