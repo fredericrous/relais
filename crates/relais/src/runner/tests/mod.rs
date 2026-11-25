@@ -341,6 +341,7 @@ impl Fixture {
             design: DesignSource::Contract,
             declarations: &crate::trust::NoHistory,
             shared_state: &crate::shared_state::LocalState::new(),
+            node_host: Some("test-node".into()),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -399,6 +400,7 @@ impl Fixture {
             design: DesignSource::Contract,
             declarations: &crate::trust::NoHistory,
             shared_state: &crate::shared_state::LocalState::new(),
+            node_host: Some("test-node".into()),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -439,6 +441,7 @@ impl Fixture {
             design: DesignSource::Contract,
             declarations: &crate::trust::NoHistory,
             shared_state: &crate::shared_state::LocalState::new(),
+            node_host: Some("test-node".into()),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -478,6 +481,7 @@ impl Fixture {
             design: DesignSource::Contract,
             declarations: &crate::trust::NoHistory,
             shared_state: &crate::shared_state::LocalState::new(),
+            node_host: Some("test-node".into()),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -565,6 +569,7 @@ impl Fixture {
             design: DesignSource::Contract,
             declarations: &crate::trust::NoHistory,
             shared_state,
+            node_host: Some("test-node".into()),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -611,6 +616,7 @@ impl Fixture {
             design: DesignSource::Contract,
             declarations,
             shared_state: &crate::shared_state::LocalState::new(),
+            node_host: Some("test-node".into()),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -637,6 +643,31 @@ impl Fixture {
 
     fn execute_presented(
         &self,
+        contract: &TaskContract,
+        repo: &RepoPolicy,
+        machine: &MachineSettings,
+        backend: &dyn Backend,
+        gate: &(dyn Gate + Sync),
+        presented: Presented,
+    ) -> RunOutcome {
+        self.execute_presented_with(
+            &crate::shared_state::LocalState::new(),
+            contract,
+            repo,
+            machine,
+            backend,
+            gate,
+            presented,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a fixture helper: the shared state is the one new input"
+    )]
+    fn execute_presented_with(
+        &self,
+        state: &dyn crate::shared_state::SharedState,
         contract: &TaskContract,
         repo: &RepoPolicy,
         machine: &MachineSettings,
@@ -675,7 +706,8 @@ impl Fixture {
             wire,
             design: DesignSource::Contract,
             declarations: &crate::trust::NoHistory,
-            shared_state: &crate::shared_state::LocalState::new(),
+            shared_state: state,
+            node_host: Some("test-node".into()),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -981,6 +1013,7 @@ fn a_driver_whose_run_was_ended_elsewhere_stops_without_writing() {
         design: DesignSource::Contract,
         declarations: &crate::trust::NoHistory,
         shared_state: &crate::shared_state::LocalState::new(),
+        node_host: Some("test-node".into()),
     };
     let mut engine = RunEngine::new(&config, None).expect("engine");
     let run_id = engine.run_id.clone();
@@ -2167,6 +2200,7 @@ fn an_unreadable_working_tree_blocks_like_a_dirty_one() {
         design: DesignSource::Contract,
         declarations: &crate::trust::NoHistory,
         shared_state: &crate::shared_state::LocalState::new(),
+        node_host: Some("test-node".into()),
     })
     .expect("the fixture's id source mints identifiers");
     let RunOutcome {
@@ -8125,6 +8159,7 @@ fn guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_g
         design: DesignSource::Contract,
         declarations: &crate::trust::NoHistory,
         shared_state: &crate::shared_state::LocalState::new(),
+        node_host: Some("test-node".into()),
     };
     let mut engine = RunEngine::new(&config, None).expect("engine");
     let clean = manifest_with(Vec::new());

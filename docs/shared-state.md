@@ -33,14 +33,37 @@ back to an older relais.
 | registry pointer read, swap and rollback | `relais promote`, `relais rollback`, and `relais learn cycle`'s automatic promote and rollback |
 | daily spend ceiling check | `relais run`, `relais dataset replay` (through `RunConfig::shared_state`) |
 | the runner's widen and timed-out settles | `relais run`, `relais dataset replay` |
+| a run's own spend when no coordinator settles it | `relais run`, `relais dataset replay` (through `node::book_unmanaged_spend`) |
 | coordinator seats and their spend reservations | `relais coordinator daemon` (below) |
 
-The ceiling check reads the larger of the global counter and this node's
-ledger. The coordinator's settles feed the counter (below), but some spend
-still reaches only the ledger (the runner's own settles, a dispatch whose
-reserve failed after launch, settles lost on a restart), so the ledger stays
-the floor until all of it reaches the counter. A shared read that fails stops
-the run before dispatch.
+The ceiling check reads the global counter when the implementation keeps
+one, and this node's ledger when it does not (`LocalState`). Every settle
+feeds the counter: the coordinator's (below), a run's own when no
+coordinator settles it (a seat of its own, `settle:<dispatch>`, a
+reservation for zero and a settle at the cost; a failure is a
+`shared_spend_not_booked` decision and one line, not queued), a dispatch
+whose reserve failed after launch (booked on the next reconcile tick) and
+the settles that waited for the primary (kept in `seat-settles.json` beside
+the ledger, below). The ledger is no longer a floor: if a UTC day's counter
+falls more than 5% below the ledger sum over dispatches with a known cost
+(cutover day excluded; the ledger sum comes from the external-client
+work, nothing here aggregates the nodes' ledgers), put `max(global, local)`
+back in `node::daily_spent`. What still misses the counter, named on purpose:
+
+- a settle the primary refuses (dropped with a line: a retry repeats the
+  refusal) and one that waited more than 24 h or beyond the newest 500
+  (dropped with one line for the pass, the count and the dollars);
+- a run whose `gate.settle` failed: the coordinator settles it unknown when
+  its lease lapses, so the counter holds its reservation, not its cost, and
+  the run writes a `gate_settle_failed` decision and one line;
+- a run's own settle when the primary is unreachable or refuses its seat;
+- a crash between taking the journal and the first write of the file;
+- an agent a hook admitted under `on_coordinator_unreachable = carry_on` with
+  no daemon: it has no dispatch, so relais meters it nowhere (neither ledger
+  nor counter);
+- the cutover day: the counter starts when it is first fed.
+
+A shared read that fails stops the run before dispatch.
 
 Not routed yet, so under `external` they still read or write the node's own
 files: the daemon's read of its limits in `cli/coordinator.rs`; `relais
@@ -101,25 +124,40 @@ state:
   (budget_exceeded)`, `this node's share of the shared budget is used up:
   this run needs $<n>, $<m> is left; raise this node's share on the shared
   primary`. A dispatch already running keeps its seat when its
-  reservation fails; its spend is then booked on the node only.
+  reservation fails; its spend is booked to the counter when it settles
+  (no reservation: a reservation for zero is made under its seat, or under
+  a seat `settle:<dispatch>` when it has lost its own, then the settle
+  books the full amount; only on the reconcile tick, so one request makes a
+  bounded number of shared calls).
 - The daemon's stderr carries one line per change, never the lease token:
   `seat <dispatch>: the shared state did not grant the seat (<cause>); this
   run waits and asks again; if it lasts, check the shared primary`, then
   `seat <dispatch>: shared seat granted`; `renew`, `release`, `reserve` and
   `settle` failures likewise. A settle the primary refuses (`Refused`) is
-  dropped with one line: the shared budget does not count it, the node's
-  ledger does. Any other settle failure is kept and retried.
+  dropped with one line: the shared counter does not count it. Any other
+  settle failure is kept and retried. A settle waiting more than 24 h, or
+  beyond the newest 500, is dropped with one line for the whole pass
+  (`seat settles: dropped <n> waiting settle(s) totalling $<x> (oldest:
+  <dispatch>); not booked to the shared counter; check the shared
+  primary`).
 - The holder is `Principal::node(<host name>)`, so two nodes never share
   one; under `external` a host with no name is refused (exit 3, with the
   command that sets one). A restarted
   daemon on the same host takes its adopted seats again at a higher epoch,
   which fences the dead daemon's tokens.
 - When the daemon stops (`relais coordinator stop`, the idle exit) every
-  seat goes back; a killed daemon's seats end at their TTL. Settles that
-  were waiting for an unreachable primary are in memory and are lost on a
-  restart; the node's ledger still has the spend.
+  seat goes back; a killed daemon's seats end at their TTL. Settles waiting
+  for the primary are kept in `seat-settles.json` beside the ledger (owner
+  only, since the rows carry seat tokens; written when the list changes,
+  never on an idle sync) and taken back at the next start. A reservation
+  made for a settle is stored before the settle is sent, so a retry or a
+  restart never books it twice. A file that cannot be read is renamed to
+  `seat-settles.json.unreadable-<unix-secs>`, named in one line, and the
+  daemon starts with an empty list. A single node (`LocalState`) keeps no
+  counter, so it writes no file.
 - `LocalState` grants every seat and reservation and books every settle, so
-  a single node answers what it answered before.
+  a single node answers what it answered before; with no counter it queues
+  nothing and writes no file.
 
 ## The refusal
 

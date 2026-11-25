@@ -1175,6 +1175,7 @@ fn execute_predicted(
         design: DesignSource::Contract,
         declarations: &crate::trust::NoHistory,
         shared_state: &crate::shared_state::LocalState::new(),
+        node_host: Some("test-node".into()),
     })
     .expect("the fixture's id source mints identifiers")
 }
