@@ -1,7 +1,7 @@
 +++
 type = "task"
 mode = "afk"
-status = "open"
+status = "closed"
 blocked_by = []
 repos = ["relais"]
 +++
@@ -97,3 +97,41 @@ lands, every relayed session can add matched `table` rows for pinned
 reviewers, and a dark session adds unmatched ones: the plan's 7-day cohort
 check (~2026-11-30) must count spawns made before a session's first
 person prompt apart, rather than read them as a pin regression.
+
+## Resolution
+
+**Four gaps in the plugin, all fixed (plan
+`docs/plans/2026-11-24-route-relayed-session-own-state.md`).**
+
+- `onSessionEnd` at `clear`/`resume` kept `r.session`, so every row after
+  the clear was filed under the old id. It now resets it after the final
+  flush; `routeSpawn` reads the id when it is unset.
+- The relayed opening prompt comes with `origin.kind = 'plugin'` and was
+  never classified: no routing task, no refresh. The first prompt after a
+  clear or resume from any plugin other than relais itself now goes
+  through `onPrompt`; the window closes at the first prompt that is not a task notification and
+  not relais's own.
+- `routeSpawn` read whatever state was there. It now waits for a stale or
+  pending refresh, within the classifier's bound (2 s, the hook budget less
+  its margin), before it reads the state.
+- A failed router-state read (exit, timeout, unparseable stdout) left the
+  session dark with no word. It now leaves one note per failure streak,
+  as a toast when no run exists, with the command to reproduce it. A
+  failed final flush is kept in the plugin's store and reported at the
+  next session start.
+
+A launch whose wait ends with the state still stale goes on unrouted, and
+a router-state read begun before the clear writes nothing.
+
+Round 2's dark session is not explained: it is made visible, so the next
+occurrence says why. Seven tests in `claude-plugin/tests/routing.test.ts`
+went red on the base and are green after the fix: the relayed opening
+prompt (row under `session-2`, `reason pin`), the launch with no prompt
+waiting for router-state, the launch that waits only up to its budget, the
+two failure kinds and the failure streak, and the lost final flush. An
+eighth, a later plugin prompt is not classified, guards the window. Two
+more came from the implementation review, each red with its fix removed:
+a router-state read begun before the clear writes nothing, and a failing
+router-state gives a toast in each session across a clear. A pinned launch with no open parent task still writes no row
+(out of scope). Until the release is installed, the 11-30 cohort check
+counts spawns made before a session's first typed prompt apart.

@@ -33,6 +33,18 @@ be stopped from the session. The model's `TaskStop` of a relais agent stays
 denied, and the deny names the run to cancel. Takes effect after the plugin is
 reinstalled.
 
+A session a `/clear` or `/resume` starts routes on its own state. The plugin
+files its router rows under the new session id, not the cleared one's;
+the first prompt after the clear, which a relay plugin submits, is
+classified like a typed one, so it opens the routing task; and a launch
+made while the router-state is still loading waits for it, at most the
+classifier's 2 s within the hook budget. Before, a pinned reviewer launched
+right after a relay could be table-routed (follow-up f20). A router-state
+read that fails now leaves one line per failure streak (a toast when no run
+exists yet) with the command to reproduce it, and a final observation
+flush that fails at the session's end is reported at the next start,
+instead of routing going dark with no word.
+
 ## v0.83.0
 
 relais spawns `greenspotter` (0.20.0 or later) where it spawned `adr-lint`, reads

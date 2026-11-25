@@ -1755,7 +1755,8 @@ export type RouterMemory = {
   session: string | undefined
   cwd: string | undefined
   isStale: boolean
-  refreshing: Promise<void> | undefined
+  // The router-state read under way, with the clear/resume count it began under.
+  refreshing: { load: Promise<void>; generation: number } | undefined
   task: TaskState | undefined
   // Router-created subagents' tasks, by agentId.
   subtasks: Record<string, TaskState>
@@ -1779,6 +1780,14 @@ export type RouterMemory = {
   rootsCwd: string | undefined
   // Revert lookups (`git show`) not yet queued; each ends within the gate timeout.
   reverts: Set<Promise<void>>
+  // After a clear or resume, until the first prompt that is not a task
+  // notification: the session's opening request may arrive from a plugin.
+  isOpeningWindow: boolean
+  // A router-state failure streak has been reported; the next read that parses ends it.
+  isStateFailureReported: boolean
+  // Counts clears and resumes: a router-state read begun under an older
+  // count belongs to the session before and writes nothing.
+  generation: number
 }
 
 export const createRouterMemory = (): RouterMemory => ({
@@ -1802,6 +1811,9 @@ export const createRouterMemory = (): RouterMemory => ({
   repository: undefined,
   roots: new Map(),
   rootsCwd: undefined,
+  isOpeningWindow: false,
+  isStateFailureReported: false,
+  generation: 0,
   reverts: new Set(),
 })
 

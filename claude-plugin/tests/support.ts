@@ -4,6 +4,43 @@
 
 import { mock } from 'claude-code/testing'
 
+// The router-state the routing tests serve. Micro-USD per million tokens; `cache_write` is the 1-hour rate.
+export const ROUTER_STATE = {
+  schema: 1,
+  mode: 'on',
+  mode_reason: 'envelope recorded',
+  envelope: { granted_at: '2026-10-06T10:00:00Z', by: 'the person', epsilon_max: 0.1, source: 'plugin-ask' },
+  holdout: false,
+  seed: '0123456789abcdef',
+  epsilon: 0.1,
+  tiers: {
+    research: { model: 'claude-haiku-5-5', effort: null },
+    implementation: { model: 'claude-sonnet-5-5', effort: null },
+    escalation: { model: 'claude-opus-5-5', effort: null },
+  },
+  capability_table: {
+    version: 1,
+    rules: [
+      { when: { difficulty_min: 4 }, tier: 'escalation' },
+      { when: { uncertainty: ['high'], scope: ['module', 'cross-cutting', 'unknown'] }, tier: 'escalation' },
+      { when: { difficulty_max: 2, uncertainty: ['low'], verifiable_or_question: true }, tier: 'research' },
+      { when: {}, tier: 'implementation' },
+    ],
+  },
+  rates: {
+    'claude-haiku-5-5': { input: 1_000_000, output: 5_000_000, cache_read: 100_000, cache_write: 2_000_000 },
+    'claude-sonnet-5-5': { input: 3_000_000, output: 15_000_000, cache_read: 300_000, cache_write: 6_000_000 },
+    'claude-opus-5-5': { input: 5_000_000, output: 25_000_000, cache_read: 500_000, cache_write: 10_000_000 },
+  },
+  priors: { task_tokens_by_difficulty: [20000, 60000, 150000, 400000, 800000], task_tokens: {} },
+  pins: { 'pinned-agent': 'opus' },
+  excluded_models: [],
+  checks: [['cargo', 'test'], ['npm', 'test'], ['go', 'test'], ['go', 'vet'], ['golangci-lint', 'run']],
+  check_kinds: ['test', 'test', 'test', 'lint', 'lint'],
+  adjustments: [],
+  accepts: ['answered', 'parent_task_id', 'unmatched_checks', 'outcome_uncorrected'],
+}
+
 export type Calls = {
   run: { argv: string[]; init: any }[]
   spawn: any[]
@@ -115,6 +152,8 @@ export function scriptedEngine(
     sessionId: undefined as string | undefined,
     // Holds each `agent.list` call until it settles. Null answers at once.
     listHold: null as Promise<void> | null,
+    // Set by a test that answers `relais native router-state` itself.
+    isRouterStateScripted: false,
     // Holds each `process.run` until it settles: a test delays one reply. Null answers at once.
     runGate: null as ((argv: string[]) => Promise<void> | undefined) | null,
   }
@@ -158,7 +197,12 @@ export function scriptedEngine(
   on('command.register', (_$: any, e: any) => ({ value: { command: e.name } }))
   on('process.run', async (_$: any, e: any) => {
     calls.run.push({ argv: [...e.argv], init: e.init })
-    const answer = script.runResult(e.argv, e.init)
+    // A test that does not script router-state gets a state with routing
+    // off, not a failure (which the plugin reports).
+    const answer =
+      e.argv[2] === 'router-state' && !script.isRouterStateScripted
+        ? { exitCode: 0, stdout: JSON.stringify({ ...ROUTER_STATE, mode: 'off' }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+        : script.runResult(e.argv, e.init)
     if (script.runGate) await script.runGate(e.argv)
     return { value: answer }
   })

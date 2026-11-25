@@ -83,10 +83,10 @@ ticket here until it is resolved or moved into a programme of its own.
   model, else own `model:`, else the session's), and router-state serves
   `pin_sources` beside `pins`. An unknown preference is not validated: it
   cannot reach the row while the session model is known. Live check: f22.
-- [f20](f20-clear-routes-on-stale-state.md) (2026-11-24, open): after a
-  `/clear` relay, spawns before the first person prompt can route on a
-  state with no pins (likely the pre-clear one; cause open): a pinned
-  reviewer's fallback spawn was table-routed to Haiku.
+- [f20](f20-clear-routes-on-stale-state.md) (2026-11-24, closed 2026-11-25): a
+  relayed session now resets the session id at the clear, classifies its
+  opening plugin prompt, waits for a pending router-state before a launch,
+  and notes a failed router-state read or lost final flush.
 - [f21](f21-settle-at-final-turn-with-shells.md) (2026-11-24, closed 2026-11-25):
   the plugin `TaskStop`s a worker that answered but is still listed
   `running` 5 s later, and ends the dispatch `completed` once a listing taken
@@ -112,6 +112,9 @@ ticket here until it is resolved or moved into a programme of its own.
 - [f26](f26-worker-kills-spare-the-driver.md) (2026-11-25, open): keep a
   worker's `pkill -f <path>` off its own driver, through worker guidance
   or a runner change.
+- [f27](f27-next-claim-stays-in-programme.md) (2026-11-25, open):
+  `programme next --claim` never crosses programmes; with no ready ticket
+  in `--from` it parks (ADR-0083 amended first).
 
 ## Handoff
 
