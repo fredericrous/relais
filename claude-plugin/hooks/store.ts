@@ -132,6 +132,8 @@ export type Store = {
   statusFailure: string | undefined
   // Whether the last look at `$.agent.list()` failed (said once a streak).
   isListFailing: boolean
+  // Counts the looks at `$.agent.list()`, taken before each call: a stop is confirmed only by a look numbered after its answer.
+  listSeq: number
   // Whether the last verdict submission failed (said once a streak).
   isSubmitFailing: boolean
   // A verdict's `prompt.submit` is in flight: the pump holds until it
@@ -235,6 +237,7 @@ export const createStore = (): Store => ({
   isDirty: false,
   statusFailure: undefined,
   isListFailing: false,
+  listSeq: 0,
   isSubmitFailing: false,
   isSubmitting: false,
   flushedAt: 0,
