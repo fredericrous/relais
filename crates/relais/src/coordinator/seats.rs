@@ -498,7 +498,9 @@ impl Book {
             let id = self.settles[at].dispatch.clone();
             let reservation = match self.settles[at].reservation.clone() {
                 Some(reservation) => reservation,
-                None if pass == Pass::Request => {
+                // While the file cannot be written no reservation is made: each
+                // pass would only acquire and give a seat back for nothing.
+                None if pass == Pass::Request || self.store_failing => {
                     at += 1;
                     continue;
                 }

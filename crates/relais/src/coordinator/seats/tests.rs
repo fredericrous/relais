@@ -944,6 +944,10 @@ fn a_settle_is_not_sent_while_its_reservation_cannot_be_written() {
     let probe = fake
         .acquire_seat(&Principal::node("node-b"), "settle:d1")
         .expect("the dropped reservation's seat went back");
+    assert_eq!(
+        probe.epoch, 1,
+        "the book acquired no settle seat while it could not write"
+    );
     fake.release_seat(&probe).expect("probe released");
 
     std::fs::create_dir(&parent).expect("dir");
