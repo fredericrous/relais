@@ -25,6 +25,11 @@ calls them and no external client is linked yet. A
 client adds `write_settings` (and `SharedStateError::SettingsWrite` is the
 local writer's error) and runs `conformance::run_settings_writes`.
 
+When aval cannot be launched, the hint now follows where its program came
+from. A `bin` declared under `[integrations]` is named as the thing to
+check, with no mention of PATH; `greentopo` found on PATH keeps "check that
+it runs, or set `bin`"; the `aval` fallback also says to install greentopo.
+
 ## v0.86.0
 
 A worker's `pkill -f <worktree path>` no longer reaches its own relais
