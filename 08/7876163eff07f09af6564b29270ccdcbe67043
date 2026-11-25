@@ -1,0 +1,20 @@
+greengate-provenance-v1
+commit 087876163eff07f09af6564b29270ccdcbe67043
+tree 70ff427b719da9e474cae33e83fe2c648680e11f
+canon 1298a92a3a786a346d00306976a2e2c2887e9120
+patch b65872413f0e5a7eebc82c4a06850880f28d89c0
+plan docs/plans/2026-11-24-fence-decide-answers-through-grant.md 6ede5802496edfaebf14728ac1148199484574b1f1c84d99355238943e56e9d6
+review by-patch 45f89e058c9faaddd61898a67aebe81bd9ed7fc7de566e088b21e42d1c20d4da
+code-review backend by-patch 45f89e058c9faaddd61898a67aebe81bd9ed7fc7de566e088b21e42d1c20d4da
+code-review lang:rust by-patch 45f89e058c9faaddd61898a67aebe81bd9ed7fc7de566e088b21e42d1c20d4da
+code-review unix by-patch 45f89e058c9faaddd61898a67aebe81bd9ed7fc7de566e088b21e42d1c20d4da
+code-review tui by-patch 45f89e058c9faaddd61898a67aebe81bd9ed7fc7de566e088b21e42d1c20d4da
+preview not-required
+producer greenbelay 6.16.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABAFbSbZFmbCuV9fRhGSceAg+DIqukm28K/k8vWDAm2b3
+whI2DDgktqehIG1zpUsK+7QJG31BYWt7UG4ShB/M/bBA==
+-----END SSH SIGNATURE-----
