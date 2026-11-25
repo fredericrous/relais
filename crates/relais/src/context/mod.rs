@@ -243,7 +243,7 @@ pub struct AvalCli {
     fleet_decisions: Option<PathBuf>,
     /// Where the embedded pack is materialised, keyed by its content hash.
     fleet_cache: Option<PathBuf>,
-    /// The program an undeclared `bin` resolves to, decided once per run.
+    /// The program an undeclared `bin` resolves to, decided once per resolver.
     default_program: OnceLock<String>,
 }
 
@@ -379,11 +379,16 @@ fn greenspotter_program() -> String {
 
 impl DecisionResolver for AvalCli {
     fn resolve(&self, key: &str, scope: Option<&str>) -> AvalVerdict {
-        aval_resolve(
+        // The default program is this resolver's one choice, so every key
+        // of the run is asked of the same binary.
+        let default_program = self.bin.is_none().then(|| self.program());
+        aval_resolve_in(
             &self.root,
             key,
             scope,
             self.bin.as_deref(),
+            default_program,
+            std::env::var_os("PATH").unwrap_or_default(),
             self.cancel.as_deref(),
         )
     }
@@ -501,6 +506,7 @@ pub fn aval_resolve(
         key,
         scope,
         bin,
+        None,
         std::env::var_os("PATH").unwrap_or_default(),
         cancel,
     )
@@ -508,12 +514,14 @@ pub fn aval_resolve(
 
 /// [`aval_resolve`] with the search path given, so a test controls it
 /// without touching the process environment. The spawned command sees the
-/// same path the lookup used.
+/// same path the lookup used. `default_program` is the caller's choice for
+/// an undeclared `bin`; with none, it is chosen from `path`.
 pub fn aval_resolve_in(
     repo_dir: &Path,
     key: &str,
     scope: Option<&str>,
     bin: Option<&str>,
+    default_program: Option<&str>,
     path: std::ffi::OsString,
     cancel: Option<&AtomicBool>,
 ) -> AvalVerdict {
@@ -543,7 +551,7 @@ pub fn aval_resolve_in(
             .is_none()
         })
     };
-    let program = bin.unwrap_or_else(|| {
+    let program = bin.or(default_program).unwrap_or_else(|| {
         crate::tooling::default_bin_in(
             "aval",
             &dirs,
@@ -576,7 +584,7 @@ pub fn aval_resolve_in(
         }
         Err(e) => AvalVerdict::ToolFailure {
             exit: -1,
-            detail: format!("aval could not be launched: {e}"),
+            detail: format!("aval (`{program}`) could not be launched: {e}"),
         },
     }
 }
@@ -1636,6 +1644,7 @@ mod tests {
             "k",
             None,
             bin,
+            None,
             path_dir.as_os_str().to_owned(),
             None,
         )
@@ -1738,10 +1747,13 @@ mod tests {
             .expect("chmod");
         crate::test_support::prime_script(&greentopo);
         let verdict = resolve_with_path(&dir, None, &dir);
+        // exit 3 from the fake greentopo: it was the program spawned, and
+        // aval's absence was not confirmed.
         assert!(
             !matches!(verdict, AvalVerdict::NotInstalled),
             "greentopo is installed, so aval's absence is not confirmed: {verdict:?}"
         );
+        assert_eq!(verdict, parse_aval_output(3, ""), "{verdict:?}");
     }
 
     #[test]

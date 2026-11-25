@@ -54,7 +54,11 @@ pub fn probe_integrations(repo: &RepoPolicy) -> Vec<Blocker> {
                     if !binary_available(bin) {
                         blockers.push(Blocker {
                             code: BlockCode::IntegrationMissing,
-                            detail: missing_integration_detail(name, bin),
+                            detail: missing_integration_detail(
+                                name,
+                                bin,
+                                dependency.bin().is_some(),
+                            ),
                         });
                     }
                 }
@@ -72,12 +76,17 @@ pub fn probe_integrations(repo: &RepoPolicy) -> Vec<Blocker> {
 /// aval entry names both keys it may be written under, so a repository
 /// that wrote `greentopo` is not told to add the key that both-keys
 /// refuses.
-fn missing_integration_detail(name: &str, bin: &str) -> String {
+fn missing_integration_detail(name: &str, bin: &str, declared: bool) -> String {
+    let install = if declared {
+        format!("`{bin}`")
+    } else {
+        "greentopo (`aval` still works for now)".to_string()
+    };
     match name {
         "aval" => format!(
             "required integration `aval` (binary `{bin}`) is not available on PATH; \
-             install greentopo (`aval` is read until the machine switch), or set its \
-             [integrations] key (aval or greentopo) in relais.toml to \"optional\""
+             install {install}, or set its [integrations] key (aval or greentopo) in \
+             relais.toml to \"optional\""
         ),
         _ => format!(
             "required integration `{name}` is not available on PATH; \
@@ -95,7 +104,7 @@ fn missing_integration_detail(name: &str, bin: &str) -> String {
 ///
 /// The `aval` key's binary is `greentopo` when that is on this machine's
 /// PATH, else `aval` (the rename keeps the old binary working until the
-/// machine switch). Callers that spawn it resolve once per run.
+/// machine switch). Each reader of a run resolves it once.
 pub(crate) fn default_bin(name: &str) -> &str {
     if name != "aval" {
         return default_bin_in(name, &[], &[], &exists_in_any_form);
