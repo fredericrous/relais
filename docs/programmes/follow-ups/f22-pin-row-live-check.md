@@ -12,7 +12,7 @@ due = "2026-12-01"
 
 Since f19, a pinned spawn's `router_decisions` row records the model the
 router infers the call ran, not the pin. Does that hold in live sessions,
-once the relais plugin is reinstalled and relais v0.82.0 or later serves
+once the relais plugin is reinstalled and relais v0.83.0 or later serves
 `pin_sources`?
 
 ## Look at

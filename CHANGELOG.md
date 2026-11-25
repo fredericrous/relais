@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.83.0
+
 relais spawns `greenspotter` (0.20.0 or later) where it spawned `adr-lint`, reads
 only `greenspotter.candidates/1`, and writes `greenspotter.ruling/1` lines to
 `rulings.jsonl`. `RELAIS_ADR_LINT` is removed with no alias: set
@@ -29,16 +31,6 @@ before upgrading; without it a review runs with a candidates gap.
   and `run_daemon` take the shared state and the holder. With `LocalState`
   every seat is granted, so a single node answers as before.
 
-## v0.82.0
-
-relais.toml reads `[integrations] greentopo`, the new name of aval. It declares
-the same dependency as `aval`, so the topo-spotter-rename fleet sweep can
-rename the key. Setting both keys is refused with `set only one of
-[integrations] aval and greentopo; remove the aval line`. The binary relais
-spawns is still `aval` (set `bin = "greentopo"` to use the new one), and a
-relais older than this release refuses `greentopo` as an unknown field, so
-upgrade every host before swept repositories land.
-
 A queue that still moves no longer blocks a run. A heavy command waiting for
 a host slot keeps waiting past `admission_wait_seconds` while the line moves
 (an admission or a change of place within 300 s, `GREENHARNESS_SLOT_STALL_S`
@@ -51,6 +43,24 @@ instead of running the command unqueued. A grant after an overrun says how long
 it was (`admission_overrun`). The coordinator's own queue keeps
 the old budget. It builds on `greenharness-slots` 5 (greengate 5.0.0); the
 decision is ADR-0015.
+
+A pinned subagent's decision row now records the model the call ran, not
+the pin. `router-state` serves `pin_sources` (`own`, `preferred`, `machine`)
+beside `pins`, and the plugin records the call's `model`, else the agent's own
+`model:`, else the session's model, which it reads after the spawn has
+started. Rows written before, and rows from a plugin older than this one,
+keep the pin's value (`opus`, or `inherit` for a machine pin). The plugin
+half needs the relais plugin reinstalled.
+
+## v0.82.0
+
+relais.toml reads `[integrations] greentopo`, the new name of aval. It declares
+the same dependency as `aval`, so the topo-spotter-rename fleet sweep can
+rename the key. Setting both keys is refused with `set only one of
+[integrations] aval and greentopo; remove the aval line`. The binary relais
+spawns is still `aval` (set `bin = "greentopo"` to use the new one), and a
+relais older than this release refuses `greentopo` as an unknown field, so
+upgrade every host before swept repositories land.
 
 A carried check reads tidier. The pane draws the passes carried from an
 earlier attempt as one row, `carried 5 from attempt1 (a, b, c +2 more)`, before
@@ -91,14 +101,6 @@ prints `make: 1 carried` with no timings, which are the source attempt's.
 - Under `shared_state = "external"` with no client, `relais hook` still
   answers as before and exits 0; on a resumed `SessionStart` and on
   `SessionEnd` it updates the claim files and says so in one stderr line.
-
-A pinned subagent's decision row now records the model the call ran, not
-the pin. `router-state` serves `pin_sources` (`own`, `preferred`, `machine`)
-beside `pins`, and the plugin records the call's `model`, else the agent's own
-`model:`, else the session's model, which it reads after the spawn has
-started. Rows written before, and rows from a plugin older than this one,
-keep the pin's value (`opus`, or `inherit` for a machine pin). The plugin
-half needs the relais plugin reinstalled.
 
 ## v0.81.0
 
