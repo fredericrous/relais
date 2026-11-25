@@ -132,9 +132,10 @@ ticket here until it is resolved or moved into a programme of its own.
   closed as not needed. The `--relative` fallback cannot fire on a live
   cwd: the root is an ancestor of the same cwd, and nothing in between
   changes it. Four probes printed the path relative.
-- [f31](f31-release-commit-ci-cancelled.md) (2026-11-25, open): a push to
-  main cancels the CI of the commit before it, so a release tagged there
-  fails "every platform passed on main" (v0.86.0; its CI was cancelled twice).
+- [f31](f31-release-commit-ci-cancelled.md) (2026-11-25, closed 2026-11-25):
+  a push to main cancelled the CI of the commit before it, so a release
+  tagged there failed (v0.86.0). `ci.yaml` now groups a push by its sha and
+  cancels only a pull request's older run (#602).
 - [f32](f32-aval-missing-repo-dir-hint.md) (2026-11-25, open): a missing
   `repo_dir` also fails at aval's spawn and gets the f29 launch hint, which
   points at PATH; name the directory instead.
@@ -149,7 +150,7 @@ f24 and f25 shipped in v0.84.0, f27 in v0.85.0, f26 in v0.86.0. The plugin
 was reinstalled at 0.86.0 on 2026-11-25 at 22:19, so f24 to f27 are live.
 f30 closed as not needed (the fallback is unreachable).
 
-- Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f26, f27, f29, f30.
+- Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f26, f27, f29, f30, f31.
 - Next:
   - Check the plugin's other `tool.call` `.catch` answers (f28), ready.
   - Measure the home fingerprint warnings (f08), due 2026-11-28.
@@ -160,7 +161,6 @@ f30 closed as not needed (the fallback is unreachable).
   - f16, f22 and f23 are counted from the first session after
     2026-11-25 22:19 (the reinstall).
   - Name the missing directory when aval cannot start (f32), ready.
-  - A push to main never cancels the release commit's CI (f31), ready.
   - Now that the plugin is reinstalled: `pgrep -fl <worktree>` during a live run lists no
     driver pid, and `pgrep -fl 'relais run'` still lists it (f26 pilot).
 - Lessons:
@@ -175,7 +175,8 @@ f30 closed as not needed (the fallback is unreachable).
     main's CI passes on that commit, and each push to main cancels it. The
     release waits up to 40 min for it (release.yaml `--wait 2400`). Let the
     newer run finish, rerun the tagged commit's run, then rerun the release
-    (v0.86.0; f31).
+    (v0.86.0; f31); f31 fixed in #602: a push to main no
+    longer cancels a main run).
   - A branch `relais` piloted against a copy of the claims
     (`RELAIS_STATE_DIR` set to a scratch dir seeded with
     `~/.local/state/relais/claims`) leaves the real ledger and claims
