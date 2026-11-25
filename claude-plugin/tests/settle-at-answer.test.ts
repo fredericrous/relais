@@ -105,7 +105,8 @@ test('a TaskStop with no answer in 30 s is noted once, and when it takes late th
   await poll(engine, 19)
   expect(taskStops(engine).length).toBe(1)
   expect(stoppedOf(engine).length).toBe(0)
-  const late = 'could not stop agent agent-1 after its answer (no answer in 30 s); the run ends when its background work ends or at the wall time.'
+  const late =
+    'the stop of agent agent-1 after its answer had no answer in 30 s; it may still take, else the run ends when its background work ends or at the wall time.'
   expect(await timelineOf($)).toContain(late)
   // The call was not cancelled: the engine carries the stop out late.
   held.release()

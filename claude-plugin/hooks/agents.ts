@@ -153,7 +153,8 @@ async function stopAgent(fx: Fx, store: Store, run: string | undefined, agent: s
   const answer = await taskStop(fx, agent)
   // Said in the run's timeline: an agent relais asked to stop may still be
   // running, and the person is the one who can stop it.
-  if (answer.kind !== 'done') await note(fx, store, run, `TaskStop of agent ${agent} failed: ${answer.why}`)
+  if (answer.kind === 'late') await note(fx, store, run, `TaskStop of agent ${agent} had ${answer.why}; it may still take.`)
+  if (answer.kind === 'refused') await note(fx, store, run, `TaskStop of agent ${agent} failed: ${answer.why}`)
 }
 
 // A failure the plugin met, as a `stderr` entry of the run it names, else
@@ -319,7 +320,10 @@ async function stopAnswered(fx: Fx, store: Store, dispatch: Dispatch) {
           : { ...current, isEnding: false, stopFailed: true },
     )
   }
-  if (answer.kind !== 'done') {
+  if (answer.kind === 'late') {
+    await note(fx, store, undefined, `the stop of agent ${dispatch.agent} after its answer had ${answer.why}; it may still take, else the run ends when its background work ends or at the wall time.`)
+  }
+  if (answer.kind === 'refused') {
     await note(fx, store, undefined, `could not stop agent ${dispatch.agent} after its answer (${answer.why}); the run ends when its background work ends or at the wall time.`)
   }
 }
