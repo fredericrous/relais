@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.85.0
+
 relais spawns `greentopo` wherever it spawned `aval`: the binary is
 `greentopo` when it is on `PATH`, else `aval`, chosen once by each reader
 of a run (the decision resolver, preflight's gaps and version); a
