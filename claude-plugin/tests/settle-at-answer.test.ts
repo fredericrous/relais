@@ -95,7 +95,7 @@ test('a refused TaskStop is noted, not retried, and the run then ends completed 
   expect(await timelineOf($)).not.toContain('still runs 30 s')
 })
 
-test('a TaskStop with no answer in 30 s counts as refused, and the run then ends completed without the note', async ($: any, on: any) => {
+test('a TaskStop with no answer in 30 s is noted once, and when it takes late the run still ends completed with the answer', async ($: any, on: any) => {
   const engine = await spawned($, on)
   const held = gate()
   engine.script.duringTool = async (_$: any, e: any) => {
@@ -105,16 +105,20 @@ test('a TaskStop with no answer in 30 s counts as refused, and the run then ends
   await poll(engine, 19)
   expect(taskStops(engine).length).toBe(1)
   expect(stoppedOf(engine).length).toBe(0)
-  expect(await timelineOf($)).toContain(
-    'could not stop agent agent-1 after its answer (no answer in 30 s); the run ends when its background work ends or at the wall time.',
-  )
-  engine.agents[0].status = 'completed'
+  const late = 'could not stop agent agent-1 after its answer (no answer in 30 s); the run ends when its background work ends or at the wall time.'
+  expect(await timelineOf($)).toContain(late)
+  // The call was not cancelled: the engine carries the stop out late.
+  held.release()
+  engine.agents[0].status = 'killed'
   await poll(engine)
   const stopped = stoppedOf(engine)
   expect(stopped.length).toBe(1)
   expect(stopped[0].payload.status).toBe('completed')
-  expect(stopped[0].payload.answer).toBe(F12_ANSWER)
+  expect(stopped[0].payload.answer).toBe(`${F12_ANSWER}\n\n${PLUGIN_NOTE}`)
   expect(taskStops(engine).length).toBe(1)
+  const timeline = await timelineOf($)
+  expect(timeline.split(late).length - 1).toBe(1)
+  expect(timeline).not.toContain('still runs 30 s')
 })
 
 test('a worker still running across 16 polls after its stop is noted once and not stopped', async ($: any, on: any) => {
