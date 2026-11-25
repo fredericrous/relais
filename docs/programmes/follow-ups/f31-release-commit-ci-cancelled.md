@@ -1,7 +1,7 @@
 +++
 type = "task"
 mode = "afk"
-status = "open"
+status = "closed"
 blocked_by = []
 repos = ["relais"]
 +++
@@ -37,3 +37,13 @@ example a group keyed by the sha on push
 (`group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}`),
 checked by three quick pushes to main whose runs all complete; or a reason
 why releases must tolerate it.
+
+## Outcome
+
+2026-11-25, #602: `ci.yaml` groups a pull request's run by its ref and every
+other run (push, schedule) by its sha, and `cancel-in-progress` is on only for
+a pull request. A push to main no longer shares a group with the push before
+it. #602's own merge started main's run 45715376530 on dc80200. Pushes to main
+go through pull requests here, so the three quick pushes were not made: the
+check is that the next merge to main while that run is still going leaves it
+running to its end.
