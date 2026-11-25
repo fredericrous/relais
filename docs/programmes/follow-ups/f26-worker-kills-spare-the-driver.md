@@ -1,7 +1,7 @@
 +++
 type = "task"
 mode = "afk"
-status = "open"
+status = "closed"
 blocked_by = []
 repos = ["relais"]
 +++
@@ -34,3 +34,28 @@ Which one prevents it?
 A decision with its reason, and the change: guidance text (with its pinned
 test, `cargo test -p relais --lib install::`) or a runner change, with a
 test.
+
+## Resolution
+
+2026-11-25. Both changes were made, in
+`docs/plans/2026-11-25-worker-kills-spare-the-driver.md`.
+
+- **Runner.** `relais native contract --relative` prints the saved path
+  relative to its physical cwd (`.relais/tasks/<hash>.json`, or `../` steps
+  up to it). The run tool asks for that form, so `relais run --task` names
+  no worktree directory, and a worker's `pkill -f <worktree>` misses the
+  driver. Piloted with the built binary: without the flag the path is
+  `/private/tmp/…/relais-wt-pilot/.relais/tasks/…`, the shape that matched
+  on 2026-11-25; with it, `.relais/tasks/…`.
+  `decide` keeps the absolute path for a successor contract.
+- **Guidance.** The worker rules say: stop a process only by the pid you
+  recorded (`$!`); never by a pattern (`pkill`, `killall`, `pgrep -f`,
+  `ps | grep`), and never `kill 0` or `kill -1`. For a command that starts
+  children, use `kill $(pgrep -P <pid>) <pid>`, run again on each child,
+  killing the deepest first. `set -m` was dropped because `zsh -c` refuses
+  it. Both prompt pins assert the rule.
+- Argv alone misses `pkill relais`, and guidance alone depends on the
+  worker obeying, so it is both.
+- Open: the live `pgrep -fl <worktree>` check on a real driver waits for
+  the release and the plugin reinstall. That the plugin drops the stderr
+  note when `--relative` falls back is f30.

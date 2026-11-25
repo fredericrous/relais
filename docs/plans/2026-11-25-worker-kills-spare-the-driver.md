@@ -136,6 +136,14 @@ No guard parses a `pkill` command: f24 already settled that.
 
 Carried from review, done: symlink case, `/` joins, the pilot passes `--relative`, and `decide` keeps the absolute path, with a test. Kept deliberate: the reply already reads `… for: <path> (in <cwd>)`, so it names the cwd the path is relative to.
 
+## Implementation review
+
+- implementation-review: approve after round 1 (1 blocking, flag argument → `ContractPathForm` in the plugin (`runs.ts`), `ContractPath` in relais; 2 fixed), Delta, and rounds on the `pgrep -P` change; 49k+36k+37k+35k tokens.
+- backend, lang:rust, lang:typescript, unix: all approve at the end. Fixed: the doc block placement, the silent fallback (now on stderr), exhaustive matches, the `None` tests, and children-first kills.
+- deliberate: the plugin drops the fallback's stderr note → f30 (the fallback should not fire, since the root is found by walking up from the same cwd; not measured, f30).
+- deliberate: a child forked after `pgrep -P` runs can be missed (unix low, accepted).
+- `set -m` / `kill -- -<pid>` (unix round 1) replaced after this session measured `zsh -c` refusing it.
+
 ## Non-goals
 
 - Guarding `pkill` commands in a hook.
@@ -155,7 +163,8 @@ Carried from review, done: symlink case, `/` joins, the pilot passes `--relative
   then `kill -- -<pid>`, was dropped: `zsh -c`, the shell workers get on
   this machine, refuses `set -m`, and macOS has no `setsid`.
 - The plugin drops the stderr note that `--relative` prints when it falls
-  back to the absolute path. Filed in the inbox, not fixed here: the root
-  is found by walking up from the same cwd, so the fallback cannot fire.
+  back to the absolute path. Filed as f30, not fixed here: the root is
+  found by walking up from the same cwd, so the fallback should not fire
+  (not measured).
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:rust,lang:typescript,tui,unix,codex body-sha=7735ec441a8d -->
