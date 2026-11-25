@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: prog/follow-ups/f21-settle-at-final-turn-with-shells
 repos: [relais]
 adrs: []
@@ -130,7 +130,7 @@ is the one in flight.
 
 ## Phases
 
-- [ ] Phase 1 — settle at the answer. `claude-plugin/hooks/dispatches.ts`
+- [x] Phase 1 — settle at the answer. `claude-plugin/hooks/dispatches.ts`
   (`answeredAt`, `isEnding`, `stopFailed`, `isAnswerTurn`, `observe`'s
   `stop` outcome and the `isEnding` → `completed` mapping, the note in
   `stoppedPayload`); `claude-plugin/hooks/agents.ts` (`onTurn` stays synchronous and marks the answer turn; `check` reads `fx.clock.now()` once per look and passes it to `observe(d, listed, now)`, which stamps `answeredAt` on the first look after the answer; `check` acts on `stop`: `TaskStop`, confirm, note on
@@ -201,8 +201,46 @@ dated follow-up ticket when this one closes, counted from the reinstall.
   prove the job died. These belong to the dated follow-up, not to
   this PR's record.
 
+### Observed
+- Go/no-go probe (before any code): a subagent started `probe.sh` in the
+  background. It traps TERM/HUP/INT/QUIT and starts `sleep 991` plus a
+  `setpgrp` child (`sleep 992`, in its own group). Then the subagent ended
+  its turn and was `TaskStop`ped. Expected: the signal recorded, and no
+  survivor. Actual: `TERM` recorded; `pgrep` found neither sleep 3 s later.
+  **Go.**
+- Red check: the new `end-signal` and `settle-at-answer` tests against
+  `origin/main`'s `dispatches.ts`/`agents.ts`/`store.ts`. Expected: the
+  new-behaviour tests fail. Actual: 14 fail; the 5 that pass are the 3
+  older cases, "a later look no longer lists it" and "settles within the
+  grace" (both hold today).
+- Bounded `TaskStop` (added in review): with the call held,
+  `stop-bounds.test.ts` expects the "no answer in 30 s; it may still take"
+  note once and no `stopped`. When the held stop then takes late (`killed`),
+  one `stopped{completed}` follows with the answer and the plugin note, one
+  `TaskStop` in all, and no 30 s note. Red: it fails on `6a6656df0`'s
+  `agents.ts` (unbounded, then `killed`). An unbounded call fails the
+  earlier hung-stop replay as well.
+- Scratch copy (`end-signal`, `settle-at-answer`, `stop-bounds`, `usage`,
+  `spawn`) on the final tree: 43 of 43 pass. The replays take 1.5–1.9 s and
+  the units 2–13 ms (load 34).
+- `make plugin` (full suite): 573/0 at load 11 on the first commit, and
+  574/0 at load 17 after the review fixes. Runs at load 60–150 failed only
+  on the runner's fixed 5 s per-test limit, in old and new files alike.
+  That is what moved the 30 s bounds to units. The final tree
+  (`33de5a899`) got no quiet window: its run went from load 22 to 108, and
+  every one of its failures was `timed out after 5000 ms` (37 lines, no
+  assertion failed). CI's `plugin-test` on the pull request judges it.
+
 ## Decision log
 - 2026-11-25: `turn.complete` over `SubagentStop` as the signal (session-wide `background_tasks`, already wired, no Rust change).
 - 2026-11-25: report `completed` after the plugin's own stop (`killed` would drop the answer).
+- 2026-11-25: Phase 1 was salvaged from relais run `run-6610ef826b9a0-5ea8`. Its worker ran `pkill -f relais-wt-f21`, which killed its own driver (follow-up f24). The tree was reviewed, checked and committed in session.
+- 2026-11-25: every `TaskStop` is bounded by `STOP_CONFIRM_MS` through one `taskStop` helper (review). A late call is not cancelled and may still take, so the dispatch stays ending, and a later `killed` ends it `completed`. A refusal keeps today's path.
+- 2026-11-25: kept flat, deliberate: the seven `Dispatch` end-rule fields (a union type was proposed); the plan names them, and `observe` is the one place that combines them.
+
+## Implementation review
+- implementation-review (opus): approve on `11f6ad708aaf`, after 4 rounds. Fixed: `d` names, a misplaced comment, a required `look`, `observeEnd`'s flag arguments, and the record. 65k+50k+40k+31k+27k tokens.
+- code-review backend (opus): approve on `c05d83de7c44`. Fixed: an unbounded `TaskStop` (now `taskStop`, bounded), a late stop that ended `killed`, the late-note wording, and the duplicated stop code. Deliberate: `detach` swallows a `note` throw (it predates this change). 70k+34k+31k+28k.
+- code-review lang:typescript (opus): approve on `91524c558c8c`, carried by ancestry. Fixed: a detached stop, a constant in the note, a narrowed `reason`/`isAborted`, a comment's place. Deliberate: the union type for the end-rule fields. 44k+29k.
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:typescript,tui,unix,codex body-sha=91beb136793d -->
