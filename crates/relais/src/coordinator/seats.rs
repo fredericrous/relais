@@ -620,7 +620,8 @@ impl Book {
                     | SharedStateError::ExternalAbsent { .. }
                     | SharedStateError::Home(_)
                     | SharedStateError::Read { .. }
-                    | SharedStateError::Invalid { .. }),
+                    | SharedStateError::Invalid { .. }
+                    | SharedStateError::SettingsWrite { .. }),
                 ) => {
                     // Every other failure is kept and retried at the next
                     // sync; a new variant must be placed here or above.

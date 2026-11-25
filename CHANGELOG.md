@@ -20,6 +20,23 @@ with one line). The shared-state conformance suite gains
 reservation. A single node (`LocalState`) is unchanged. What still misses the
 counter, and the rollback if it matters, is in `docs/shared-state.md`.
 
+The machine settings are written through `SharedState` as they are read.
+`relais trust grant`, the learning envelope and its off switch, the routing
+envelope and its off switch, and the two "record when absent" writes of
+`relais install` call the new `write_settings(writer, edit)`, which takes
+plain values (`SettingsEdit`) and answers what changed (`SettingsWrite`).
+Only an operator principal may write settings: a node or a task is refused
+(`SharedStateError::Refused`) with nothing changed, on every
+implementation. Nothing changes for one node: `LocalState` makes the same
+locked, atomic edit of `machine.toml` as before, with the same messages. With
+`shared_state = "external"` and no client linked, these commands now exit 3
+instead of writing a file nobody reads. The path-based writers in
+`trust.rs`, `learn/envelope.rs` and `router/mod.rs` are crate-private in
+this one release, with no deprecated step: nothing outside this repository
+calls them and no external client is linked yet. A
+client adds `write_settings` (and `SharedStateError::SettingsWrite` is the
+local writer's error) and runs `conformance::run_settings_writes`.
+
 When aval cannot be launched, the hint now follows where its program came
 from. A `bin` declared under `[integrations]` is named as the thing to
 check, with no mention of PATH; `greentopo` found on PATH keeps "check that

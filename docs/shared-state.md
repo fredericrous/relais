@@ -65,11 +65,9 @@ back in `node::daily_spent`. What still misses the counter, named on purpose:
 
 A shared read that fails stops the run before dispatch.
 
-Not routed yet, so under `external` they still read or write the node's own
-files: the daemon's read of its limits in `cli/coordinator.rs`; `relais
-doctor`, which checks the file itself; and every write
-of `machine.toml` (`relais trust grant`, the learning envelope, the routing
-envelope and its off switch), since the trait has no settings write yet.
+Not routed yet, so under `external` they still read the node's own files:
+the daemon's read of its limits in `cli/coordinator.rs`; and `relais
+doctor`, which checks the file itself.
 `runner/attempt.rs`, `holdout.rs`, `cli/recipe.rs` and the pricing
 preflight only name the file in a message. `announce_schema`, `publish`,
 `queued` and `mode` have no caller yet: nothing publishes today.
@@ -89,6 +87,29 @@ rollback`, a note in the learning cycle): nothing run on this node moves
 past it until the artifact is stored here or another node moves the
 shared pointer. A failure to read the node's own artifact files is that
 error, not a refusal.
+
+## Settings writes
+
+Every write of the machine settings goes through
+`SharedState::write_settings(writer, edit)` (an-t20): `relais trust grant`
+(both scopes), the learning envelope and its off switch, the routing
+envelope and its off switch, and the installer's two "record when absent"
+writes. `SettingsEdit` names the write in plain values and `SettingsWrite`
+says whether the settings changed and whether an off edit removed a grant.
+The trait owns the whole write, not a shared half before a local one: the
+readers read the shared settings through `machine_settings`, so a node
+that wrote its own file would write one nobody reads.
+
+Only an operator principal may write (an-t12: a pod never changes trust or
+the settings' authority, and a node's certificate does not make it the
+person). A `Node` or `Task` writer is `SharedStateError::Refused` with
+nothing changed, on `LocalState` too; `conformance::run_settings_writes`
+holds a client to it. The CLI writes as `Principal::operator($USER)`.
+`LocalState` makes the same locked, atomic edit as before (comments and
+mode kept, a 10 s lock wait). Under `external` with no client linked these
+commands exit 3 instead of writing the file. The path-based writers in
+`trust.rs`, `learn/envelope.rs` and `router/mod.rs` are crate-private, so a
+caller outside `LocalState` cannot reach the file.
 
 ## Coordinator seats
 
