@@ -10,6 +10,9 @@ use relais::ids::RunId;
 use relais::ledger::Ledger;
 use relais::runner::Reason;
 use relais::runner::State;
+use relais::shared_state::node;
+use relais::shared_state::SharedState;
+use std::sync::Arc;
 /// The CLI flags `--answer salvaged` reads, grouped because they answer
 /// one decision together (mirrors [`relais::ledger::DecisionAnswer`]).
 pub(crate) struct SalvageAnswer<'a> {
@@ -33,6 +36,7 @@ pub(crate) struct SalvageAnswer<'a> {
 /// Either way the run's own reason for stopping is kept, not overwritten,
 /// by [`Ledger::record_salvage`].
 pub(crate) fn salvage_command(
+    shared: &dyn Fn() -> Result<Arc<dyn SharedState>, CliError>,
     ledger: &Ledger,
     run: &RunId,
     state: State,
@@ -73,27 +77,50 @@ pub(crate) fn salvage_command(
     // person landed is computed here, once, from the run's own evidence;
     // when the repository or the patch is gone it is recorded as unknown
     // (NULL) and said so, never guessed.
-    let contained = salvage_containment(ledger, run, candidate_sha)?;
-    let Some(original_reason) = operational(
-        ledger.record_salvage_contained(
-            run,
-            candidate_sha,
-            relais::ledger::Answerer {
-                actor: answer.actor,
-                person_quote: answer.person_quote,
-                recorded_via: answer.recorded_via,
-            },
-            answer.note,
-            contained,
-        ),
-        "decide",
-    )?
-    else {
+    let (contained, unknown) = salvage_containment(ledger, run, candidate_sha)?;
+    // The decision grant comes after the read-only containment check (which
+    // can be slow) and before the write, so a salvage held elsewhere writes
+    // nothing and says nothing about recording.
+    let recorded = match node::answer_under_grant(
+        &*shared()?,
+        run,
+        || {
+            ledger.record_salvage_contained(
+                run,
+                candidate_sha,
+                relais::ledger::Answerer {
+                    actor: answer.actor,
+                    person_quote: answer.person_quote,
+                    recorded_via: answer.recorded_via,
+                },
+                answer.note,
+                contained,
+            )
+        },
+        salvage_closed,
+    ) {
+        Ok(recorded) => recorded,
+        Err(e) => {
+            return super::decision_record::answer_error(
+                e,
+                run,
+                None,
+                super::decision_record::SALVAGE_AGAIN,
+            )
+        }
+    };
+    let Some(original_reason) = operational(recorded, "decide")? else {
         return Ok(refusal(
             CliOutcome::InvalidInput,
             format!("run {run} already carries a decision on record"),
         ));
     };
+    if let Some(reason) = unknown {
+        eprintln!(
+            "relais decide: could not tell whether run {run}'s verified candidate landed intact \
+             in {candidate_sha} ({reason}); recorded it as unknown"
+        );
+    }
     // The decision is saved: a landing that cannot be recorded is logged and
     // never fails the command; detection finds the landing itself later.
     if contained == Some(true) {
@@ -136,14 +163,22 @@ pub(crate) fn salvage_command(
     }))
 }
 
+/// Whether the write of a salvage closed the run's decision: the grant stays
+/// only then. `Ok(None)` is a decision already on record and `Err` a failed
+/// write, so the grant goes back in both.
+fn salvage_closed<E>(written: &Result<Option<Reason>, E>) -> bool {
+    matches!(written, Ok(Some(_)))
+}
+
 /// Whether `run`'s latest verified candidate patch reverse-applies on
-/// `candidate_sha`'s tree. `None`, said on stderr, when the repository or
-/// the patch is unavailable.
+/// `candidate_sha`'s tree, and, when the repository or the patch is
+/// unavailable, the reason: the caller says it on stderr once the answer is
+/// recorded, never before (a salvage refused by the grant records nothing).
 pub(crate) fn salvage_containment(
     ledger: &Ledger,
     run: &RunId,
     candidate_sha: &str,
-) -> Result<Option<bool>, CliError> {
+) -> Result<(Option<bool>, Option<String>), CliError> {
     let workspace = operational(ledger.run_workspace(run), "decide")?;
     use relais::learn::salvage::Containment;
     let containment = match workspace {
@@ -158,11 +193,21 @@ pub(crate) fn salvage_containment(
         )?,
         None => Containment::Unreachable("the run has no recorded workspace".to_string()),
     };
-    if let Containment::Unreachable(reason) = &containment {
-        eprintln!(
-            "relais decide: could not tell whether run {run}'s verified candidate landed intact \
-             in {candidate_sha} ({reason}); recording it as unknown"
-        );
+    let unknown = match &containment {
+        Containment::Unreachable(reason) => Some(reason.clone()),
+        _ => None,
+    };
+    Ok((containment.answer(), unknown))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_recorded_salvage_keeps_the_grant() {
+        assert!(salvage_closed::<()>(&Ok(Some(Reason::ScopeExceeded))));
+        assert!(!salvage_closed::<()>(&Ok(None)));
+        assert!(!salvage_closed(&Err("write failed")));
     }
-    Ok(containment.answer())
 }

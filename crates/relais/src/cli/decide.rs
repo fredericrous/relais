@@ -3,9 +3,11 @@
 use super::ctx::load_contract;
 use super::ctx::refusal;
 use super::ctx::Refusal;
+use super::decision_record::answer_error;
 use super::decision_record::read_decide_proof;
 use super::decision_record::Decided;
 use super::decision_record::Decision;
+use super::decision_record::ANSWER_AGAIN;
 use super::evidence::authorship_label;
 use super::evidence::reseal_receipt_with_signoff;
 use super::feedback::open_verification_gaps;
@@ -25,7 +27,7 @@ use relais::runner::approval;
 use relais::runner::approval::seals_on_approve;
 use relais::runner::Reason;
 use relais::runner::State;
-use relais::shared_state::node::{self, NodeError};
+use relais::shared_state::node;
 use relais::shared_state::SharedState;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -207,31 +209,6 @@ pub(crate) fn decide_inner(request: &DecideRequest<'_>) -> Result<Decision, CliE
         &locations_from_environment,
         &super::ctx::shared_state,
     )
-}
-
-/// A failure of an answer, as the person sees it. Another answerer holding
-/// the decision is a refusal, exit 3, that says what to do next; the line
-/// claims nothing about the decision's state, which was not read.
-/// `signed_off` is the criterion an approve recorded before the grant was
-/// asked. Everything else is [`super::ctx::node_error`].
-fn answer_error(e: NodeError, run: &RunId, signed_off: Option<&str>) -> Result<Decision, CliError> {
-    use std::fmt::Write;
-    if !node::is_decision_held_elsewhere(&e, run) {
-        return Err(super::ctx::node_error("decide", e));
-    }
-    let minutes = relais::shared_state::DECISION_GRANT_TTL_SECS / 60;
-    let mut message = format!(
-        "the decision of run {run} is being answered elsewhere: check `relais status {run}`, \
-         then answer again if it is still open (the other answer holds it for up to {minutes} \
-         minutes)"
-    );
-    if let Some(criterion) = signed_off {
-        let _ = write!(
-            message,
-            "; the sign-off of criterion {criterion} is recorded"
-        );
-    }
-    Ok(refusal(CliOutcome::Blocked, message))
 }
 
 /// [`decide_inner`] with the state locations passed in, so a test names its
@@ -462,6 +439,7 @@ fn record_answer(
     // falling into the `awaits_a_person` gate every other answer shares.
     if answer == DecideAnswer::Salvaged {
         return salvage_command(
+            shared,
             &ledger,
             &run,
             state,
@@ -652,7 +630,7 @@ fn record_answer(
         },
     ) {
         Ok(resolved) => resolved,
-        Err(e) => return answer_error(e, &run, criterion),
+        Err(e) => return answer_error(e, &run, criterion, ANSWER_AGAIN),
     };
     if !resolved {
         return Ok(refusal(
@@ -743,7 +721,7 @@ fn approve_stopped_review(
         };
         match node::answer_under_grant(shared, run, approve, closed) {
             Ok(sealed) => sealed,
-            Err(e) => return answer_error(e, run, None),
+            Err(e) => return answer_error(e, run, None, ANSWER_AGAIN),
         }
     };
     let sealed = match sealed {
@@ -904,7 +882,7 @@ pub(crate) fn successor_decide(
         &intent,
     ) {
         Ok(written) => written,
-        Err(e) => return answer_error(e, run, None),
+        Err(e) => return answer_error(e, run, None, ANSWER_AGAIN),
     };
     let Some(stored) = written else {
         return Ok(refusal(
@@ -927,6 +905,7 @@ mod tests {
     use relais::ids::TaskId;
     use relais::ledger::{Transition, VerificationSnapshot};
     use relais::money::{CostCompleteness, MicroUsd};
+    use relais::shared_state::node::NodeError;
     use relais::shared_state::SharedStateError;
     use relais::verify::{LadderRecord, Receipt, ReviewNotRun, ReviewRecord, VerificationReport};
 
@@ -1277,7 +1256,7 @@ mod tests {
         answer: DecideAnswer,
         shared: &Arc<Elsewhere>,
     ) -> Decision {
-        try_answer_through(dir, run_id, answer, shared).expect("decide runs")
+        try_answer_through(dir, run_id, answer, None, shared).expect("decide runs")
     }
 
     /// [`answer_through`] without unwrapping an operational failure.
@@ -1285,6 +1264,7 @@ mod tests {
         dir: &Path,
         run_id: &str,
         answer: DecideAnswer,
+        candidate: Option<&str>,
         shared: &Arc<Elsewhere>,
     ) -> Result<Decision, CliError> {
         let shared: Arc<dyn SharedState> = shared.clone();
@@ -1303,7 +1283,7 @@ mod tests {
                 note: None,
                 successor: None,
                 criterion: None,
-                candidate: None,
+                candidate,
                 widen_scope: false,
                 rerun_verify: false,
                 successor_contract: None,
@@ -1369,6 +1349,184 @@ mod tests {
         let approved = answer_through(&dir, "run-approve", DecideAnswer::Approve, &granting);
         assert_eq!(exit_of(&approved), 0);
         assert!(!still_open(&ledger, "run-approve"));
+    }
+
+    #[test]
+    fn a_salvage_held_elsewhere_is_refused_with_exit_3_and_writes_nothing() {
+        let dir = relais::test_support::short_temp_dir("decide-salvage-held");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        waiting_run(
+            &ledger,
+            "run-wait",
+            "/repo",
+            State::NeedsDecision,
+            Reason::ScopeExceeded,
+            None,
+            None,
+        );
+        let held = Arc::new(Elsewhere::holding());
+        let refused = try_answer_through(
+            &dir,
+            "run-wait",
+            DecideAnswer::Salvaged,
+            Some("cand"),
+            &held,
+        )
+        .expect("decide runs")
+        .err()
+        .expect("held elsewhere");
+        assert_eq!(exit_code(&refused.outcome), 3);
+        assert!(
+            refused.message.starts_with(
+                "the decision of run run-wait is being answered elsewhere: check \
+                 `relais status run-wait`, then run the same `--answer salvaged` again unless \
+                 status shows it already salvaged ("
+            ),
+            "{}",
+            refused.message
+        );
+        assert!(still_open(&ledger, "run-wait"), "the decision stays open");
+        assert_eq!((held.asks(), held.releases()), (1, 0));
+    }
+
+    #[test]
+    fn a_granted_salvage_closes_the_open_decision_and_keeps_the_grant() {
+        let dir = relais::test_support::short_temp_dir("decide-salvage-granted");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        waiting_run(
+            &ledger,
+            "run-wait",
+            "/repo",
+            State::NeedsDecision,
+            Reason::ScopeExceeded,
+            None,
+            None,
+        );
+        let granting = Arc::new(Elsewhere::granting());
+        let salvaged = try_answer_through(
+            &dir,
+            "run-wait",
+            DecideAnswer::Salvaged,
+            Some("cand"),
+            &granting,
+        )
+        .expect("decide runs");
+        assert!(salvaged.is_ok(), "the salvage is recorded");
+        assert!(!still_open(&ledger, "run-wait"));
+        assert_eq!((granting.asks(), granting.releases()), (1, 0));
+        // A second salvage meets an already accepted run: refused before any grant.
+        let again = Arc::new(Elsewhere::granting());
+        let refused = try_answer_through(
+            &dir,
+            "run-wait",
+            DecideAnswer::Salvaged,
+            Some("cand"),
+            &again,
+        )
+        .expect("decide runs")
+        .err()
+        .expect("refused");
+        assert!(matches!(refused.outcome, CliOutcome::InvalidInput));
+        assert_eq!(again.asks(), 0);
+    }
+
+    #[test]
+    fn a_salvage_refused_for_its_arguments_asks_no_grant_and_builds_no_state() {
+        let dir = relais::test_support::short_temp_dir("decide-salvage-args");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        waiting_run(
+            &ledger,
+            "run-wait",
+            "/repo",
+            State::NeedsDecision,
+            Reason::ScopeExceeded,
+            None,
+            None,
+        );
+        let locations = || {
+            Ok(StateLocations {
+                ledger: dir.join("ledger.sqlite"),
+                runs: dir.join("runs"),
+            })
+        };
+        let built = std::cell::Cell::new(0);
+        let shared = || {
+            built.set(built.get() + 1);
+            local_shared()
+        };
+        let refused = decide_in(
+            &DecideRequest {
+                run_id: "run-wait",
+                answer: DecideAnswer::Salvaged,
+                actor: "orchestrator",
+                person_quote: None,
+                note: None,
+                successor: None,
+                criterion: None,
+                candidate: None,
+                widen_scope: false,
+                rerun_verify: false,
+                successor_contract: None,
+                json: false,
+                proof_stdin: false,
+            },
+            &locations,
+            &shared,
+        )
+        .expect("decide runs")
+        .err()
+        .expect("a missing candidate is refused");
+        assert!(matches!(refused.outcome, CliOutcome::InvalidInput));
+        assert_eq!(built.get(), 0, "no shared state was built");
+        assert!(still_open(&ledger, "run-wait"));
+    }
+
+    #[test]
+    fn a_salvage_under_a_failing_shared_state_is_refused_before_any_write() {
+        let dir = relais::test_support::short_temp_dir("decide-salvage-external");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        waiting_run(
+            &ledger,
+            "run-wait",
+            "/repo",
+            State::NeedsDecision,
+            Reason::ScopeExceeded,
+            None,
+            None,
+        );
+        let locations = || {
+            Ok(StateLocations {
+                ledger: dir.join("ledger.sqlite"),
+                runs: dir.join("runs"),
+            })
+        };
+        let failing = || -> Result<Arc<dyn SharedState>, CliError> {
+            Err(CliError::Operational {
+                operation: "shared state",
+                cause: "no shared-state client".into(),
+            })
+        };
+        let decided = decide_in(
+            &DecideRequest {
+                run_id: "run-wait",
+                answer: DecideAnswer::Salvaged,
+                actor: "orchestrator",
+                person_quote: None,
+                note: None,
+                successor: None,
+                criterion: None,
+                candidate: Some("cand"),
+                widen_scope: false,
+                rerun_verify: false,
+                successor_contract: None,
+                json: false,
+                proof_stdin: false,
+            },
+            &locations,
+            &failing,
+        );
+        assert!(decided.is_err(), "the builder's error comes through");
+        assert!(still_open(&ledger, "run-wait"));
     }
 
     #[test]
@@ -1501,7 +1659,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("runs").join("run-ok").join("receipt.json"))
             .expect("blocker");
         let granting = Arc::new(Elsewhere::granting());
-        let failed = try_answer_through(&dir, "run-ok", DecideAnswer::Approve, &granting);
+        let failed = try_answer_through(&dir, "run-ok", DecideAnswer::Approve, None, &granting);
         assert!(failed.is_err(), "the receipt.json write fails");
         assert!(!still_open(&ledger, "run-ok"), "the ledger committed");
         assert_eq!(granting.asks(), 1);
@@ -1541,13 +1699,13 @@ mod tests {
                 reason: format!("the decision of run {run} is being answered elsewhere"),
             })
         };
-        let plain = answer_error(held(), &run, None)
+        let plain = answer_error(held(), &run, None, ANSWER_AGAIN)
             .expect("a refusal, not an error")
             .err()
             .expect("refused");
         assert_eq!(exit_code(&plain.outcome), 3);
         assert!(!plain.message.contains("sign-off"));
-        let signed = answer_error(held(), &run, Some("c1"))
+        let signed = answer_error(held(), &run, Some("c1"), ANSWER_AGAIN)
             .expect("a refusal, not an error")
             .err()
             .expect("refused");
@@ -1562,7 +1720,7 @@ mod tests {
         let other = NodeError::Shared(SharedStateError::Refused {
             reason: "not authorised".into(),
         });
-        assert!(answer_error(other, &run, None).is_err());
+        assert!(answer_error(other, &run, None, ANSWER_AGAIN).is_err());
     }
 
     fn exit_of(decision: &Decision) -> i32 {

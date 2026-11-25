@@ -227,3 +227,76 @@ fn a_trust_grant_keeps_the_key_and_adds_none() {
     let text = std::fs::read_to_string(without.machine_toml()).expect("read");
     assert!(!text.contains("shared_state"), "{text}");
 }
+
+/// an-t26: a salvage of a terminal run with no recorded workspace is refused
+/// by the absent external layer before anything is written: one stderr line,
+/// no "unknown containment" claim, and the run is left as it was.
+#[test]
+fn a_salvage_under_an_absent_external_layer_is_refused_and_records_nothing() {
+    use relais::ids::{RunId, TaskId};
+    use relais::ledger::{Ledger, Transition};
+    use relais::runner::{Reason, State};
+    for json in [false, true] {
+        let scratch = Scratch::with_machine_toml(
+            "shared-state-salvage-external",
+            "schema_version = 1\nshared_state = \"external\"\n",
+        );
+        let ledger = Ledger::open(&scratch.dir.join("state/ledger.sqlite")).expect("ledger");
+        let run = RunId::from_stored("run-ended");
+        ledger
+            .insert_run(&run, "/repo", None, &TaskId::from_stored("task"), "rk")
+            .expect("run");
+        for (from, to, why) in [
+            (State::Prepared, State::Running, Reason::WorkerDispatched),
+            (State::Running, State::Failed, Reason::WorkerLooped),
+        ] {
+            ledger
+                .record_transition(&Transition {
+                    run_id: run.clone(),
+                    attempt_id: None,
+                    from_state: Some(from),
+                    to_state: to,
+                    reason: why.as_str().into(),
+                    detail: None,
+                    at: ledger.now(),
+                })
+                .expect("transition");
+        }
+        let mut args = vec![
+            "decide",
+            "run-ended",
+            "--answer",
+            "salvaged",
+            "--candidate",
+            "abc123",
+            "--actor",
+            "orchestrator",
+        ];
+        if json {
+            args.push("--json");
+        }
+        let out = scratch.relais(&args, "");
+        assert_eq!(out.status.code(), Some(3), "json={json}: {out:?}");
+        let stderr = String::from_utf8(out.stderr.clone()).expect("utf-8");
+        let stdout = String::from_utf8(out.stdout.clone()).expect("utf-8");
+        assert!(!stderr.contains("recorded it as unknown"), "{stderr}");
+        assert!(!stderr.contains("recording it as unknown"), "{stderr}");
+        // The absent layer is refused before the answer, with its own
+        // sentence: on stderr, and under `--json` also as the stdout object.
+        assert!(
+            stderr.contains("sets shared_state = \"external\""),
+            "json={json}: {stderr}"
+        );
+        if json {
+            assert_eq!(stdout.lines().count(), 1, "{stdout}");
+            assert!(stdout.contains("\"exit\":3"), "{stdout}");
+        } else {
+            assert!(stdout.is_empty(), "{stdout}");
+            assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        }
+        assert!(
+            ledger.decision_of_run(&run).expect("read").is_none(),
+            "no decision row was written"
+        );
+    }
+}
