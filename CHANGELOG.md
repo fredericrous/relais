@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.86.0
+
 A worker's `pkill -f <worktree path>` no longer reaches its own relais
 driver. The plugin's run tool now asks `relais native contract --relative`
 for the saved contract and starts `relais run --task` with
