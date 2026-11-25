@@ -1718,14 +1718,20 @@ pub(crate) fn next_command(
         }
         None => None,
     };
+    // The same command, so a pasted retry claims for the same session.
     let retry = format!(
-        "relais programme next{}{} --root {}",
+        "relais programme next{}{} --root {}{}{}",
         from.map_or_else(String::new, |(repo, slug)| format!(" --from {repo}:{slug}")),
         match reservation {
             Reservation::Claim => " --claim",
             Reservation::Look => "",
         },
-        shell_quote(&root.to_string_lossy())
+        shell_quote(&root.to_string_lossy()),
+        session.map_or_else(String::new, |id| format!(" --session {}", shell_quote(id))),
+        match format {
+            Format::Json => " --json",
+            Format::Text => "",
+        }
     );
     let shared = super::ctx::shared_state()?;
     let reservations = relais::shared_state::node::NodeReservations(&*shared);
@@ -1779,8 +1785,11 @@ pub(crate) fn next_command(
             elsewhere,
             unreadable,
         } => {
-            for note in &unreadable {
-                eprintln!("relais: {note}");
+            for programme in &unreadable {
+                eprintln!(
+                    "relais: {} {}: {}",
+                    programme.repo, programme.slug, programme.cause
+                );
             }
             let partial = load_failed || !unreadable.is_empty();
             if partial {
@@ -1821,12 +1830,15 @@ fn parked_output(
             })
         ),
         Format::Text => {
+            use std::fmt::Write as _;
             let mut out = format!("{}\n", claim::Next::parked_line(next_due));
             for programme in elsewhere {
-                out.push_str(&format!(
-                    "ready elsewhere: {}:{} ({} ready)\n",
+                // Writing to a String cannot fail.
+                let _ = writeln!(
+                    out,
+                    "ready elsewhere: {}:{} ({} ready)",
                     programme.repo, programme.slug, programme.ready
-                ));
+                );
             }
             out
         }

@@ -18,6 +18,11 @@ doctor` names it. `relais init`, with or without `--detect`, now writes
 `greentopo =` in `[integrations]`. v0.82.0 is the reader floor for that key: an older relais
 refuses it as an unknown field.
 
+Breaking: `relais programme next --from` exits 22 (park), not 0, when its
+programme has nothing ready, and exits 1 when that programme's lock stays
+busy. A caller that expected exit 0 with another programme's ticket must
+read the park.
+
 `relais programme next --from <repo>:<slug>` never picks a ticket of another
 programme (ADR-0084). Before, when the `--from` programme had nothing ready, it
 picked the first ticket of a programme with nothing held, so a `/clear` relay

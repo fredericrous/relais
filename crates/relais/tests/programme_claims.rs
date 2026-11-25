@@ -253,6 +253,8 @@ fn a_busy_from_lock_exits_1_with_the_retry_and_claims_nothing_elsewhere() {
         stderr.contains("next: relais programme next --from alpha:p --claim --root"),
         "{stderr}"
     );
+    // The retry is the same command: it claims for the same session.
+    assert!(stderr.contains(" --session me"), "{stderr}");
     assert_eq!(claim_files(&world), before);
 }
 
@@ -483,29 +485,32 @@ fn eight_threads_over_fifty_rounds_never_hand_one_ticket_to_two_sessions() {
 }
 
 #[test]
-fn two_callers_without_from_reserve_at_most_one_ticket_in_one_empty_one_and_from_reserves_none() {
+fn a_caller_from_an_exhausted_programme_reserves_nothing_in_an_empty_one() {
+    let scratch = short_temp_dir("claims-from-none");
+    let destination = state_of("z", "empty", &["t1", "t2"]);
+    let exhausted = state_of("x", "done", &[]);
+    let store = Store::in_state_dir(&scratch.to_path_buf());
+    let chosen = claim::next(
+        &relais::shared_state::node::NodeReservations(&relais::shared_state::LocalState::new()),
+        &store,
+        Some(&exhausted),
+        std::slice::from_ref(&destination),
+        today(),
+        1_800_000_000,
+        Intent::Reserve { session: "x" },
+    )
+    .expect("next");
+    assert!(matches!(chosen, Next::Parked { .. }), "{chosen:?}");
+    assert!(store
+        .held_ids(&destination.key, 1_800_000_000)
+        .expect("held")
+        .is_empty());
+}
+
+#[test]
+fn two_callers_without_from_reserve_at_most_one_ticket_in_one_empty_one() {
     let scratch = short_temp_dir("claims-dest");
     for round in 0..20 {
-        // From an exhausted programme, nothing is reserved anywhere else.
-        let from_state = scratch.to_path_buf().join(format!("from-{round}"));
-        let destination = state_of("z", "empty", &["t1", "t2"]);
-        let exhausted = state_of("x", "done", &[]);
-        let chosen = claim::next(
-            &relais::shared_state::node::NodeReservations(&relais::shared_state::LocalState::new()),
-            &Store::in_state_dir(&from_state),
-            Some(&exhausted),
-            std::slice::from_ref(&destination),
-            today(),
-            1_800_000_000,
-            Intent::Reserve { session: "x" },
-        )
-        .expect("next");
-        assert!(matches!(chosen, Next::Parked { .. }), "{chosen:?}");
-        assert!(Store::in_state_dir(&from_state)
-            .held_ids(&destination.key, 1_800_000_000)
-            .expect("held")
-            .is_empty());
-
         let state = scratch.to_path_buf().join(format!("round-{round}"));
         let destination = Arc::new(state_of("z", "empty", &["t1", "t2"]));
         let barrier = Arc::new(Barrier::new(2));

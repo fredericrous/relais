@@ -342,9 +342,19 @@ pub enum Next {
         /// from; `next` enters none of them (ADR-0084).
         elsewhere: Vec<Elsewhere>,
         /// Programmes left out of `elsewhere` because their claims could
-        /// not be read, as `<repo> <slug>: <error>`.
-        unreadable: Vec<String>,
+        /// not be read.
+        unreadable: Vec<Unreadable>,
     },
+}
+
+/// A programme a park leaves out of its ready-elsewhere list because its
+/// claims could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable {
+    pub repo: String,
+    pub slug: String,
+    /// What reading its claims failed with.
+    pub cause: String,
 }
 
 /// A programme a park lists as ready elsewhere.

@@ -17,7 +17,8 @@ use chrono::NaiveDate;
 pub use rules::{
     held, repo_key, resolve_session, Claim, ClaimKey, ClaimRecord, Claimant, Contest, Elsewhere,
     Hold, Holder, Intent, Kind, Next, Pick, ProgrammeState, ReadyTicket, Resolution, SessionClaim,
-    SessionClaims, FUTURE_SKEW_SECS, HANDOFF_HOLD_SECS, UNPARSEABLE_HOLD_SECS, WORK_HOLD_SECS,
+    SessionClaims, Unreadable, FUTURE_SKEW_SECS, HANDOFF_HOLD_SECS, UNPARSEABLE_HOLD_SECS,
+    WORK_HOLD_SECS,
 };
 pub use store::{
     now_unix, Acquired, ClaimError, Event, Pass, Released, SlugLock, Store, Taken, LOCK_WAIT,
@@ -237,13 +238,13 @@ fn survey<'a>(
 }
 
 /// The ready-elsewhere list of a park, and the programmes left out of it
-/// because their claims could not be read (`<repo> <slug>: <error>`).
+/// because their claims could not be read.
 fn ready_elsewhere(
     store: &Store,
     others: &[ProgrammeState],
     today: NaiveDate,
     now: i64,
-) -> (Vec<Elsewhere>, Vec<String>) {
+) -> (Vec<Elsewhere>, Vec<Unreadable>) {
     let survey = survey(store, others, today, now);
     let elsewhere = survey
         .destinations
@@ -257,7 +258,11 @@ fn ready_elsewhere(
     let unreadable = survey
         .unreadable
         .into_iter()
-        .map(|(state, error)| format!("{} {}: {error}", state.repo, state.slug))
+        .map(|(state, error)| Unreadable {
+            repo: state.repo.clone(),
+            slug: state.slug.clone(),
+            cause: error.to_string(),
+        })
         .collect();
     (elsewhere, unreadable)
 }
@@ -567,13 +572,9 @@ mod tests {
         let broken = programme("b", "broken", vec![afk("x1")]);
         let fine = programme("c", "fine", vec![afk("y1")]);
         // A file where the programme's claim directory belongs: listing it fails.
-        let dir = fixture
-            .scratch
-            .to_path_buf()
-            .join("claims")
-            .join(&broken.key.repo_key);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(&broken.key.slug), "not a directory").unwrap();
+        let dir = fixture.store.claims_dir_for_test(&broken.key);
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        std::fs::write(&dir, "not a directory").unwrap();
         let others = [broken, fine];
         let Next::Parked {
             elsewhere,
@@ -592,7 +593,11 @@ mod tests {
             }]
         );
         assert_eq!(unreadable.len(), 1);
-        assert!(unreadable[0].starts_with("b broken: "), "{unreadable:?}");
+        assert_eq!(
+            (unreadable[0].repo.as_str(), unreadable[0].slug.as_str()),
+            ("b", "broken"),
+            "{unreadable:?}"
+        );
         // Without a programme to leave, an unreadable programme still fails.
         assert!(reserve(&fixture, None, &others, "s1").is_err());
     }

@@ -217,6 +217,12 @@ impl Store {
         self.dir.join(&key.repo_key).join(&key.slug)
     }
 
+    /// The directory holding a programme's claims, for tests that break it.
+    #[cfg(test)]
+    pub(crate) fn claims_dir_for_test(&self, key: &ClaimKey) -> PathBuf {
+        self.slug_dir(key)
+    }
+
     /// The ids a programme's claims hold at `now`, read without the lock:
     /// every claim is written whole, so a read sees one claim or the other.
     pub fn held_ids(&self, key: &ClaimKey, now: i64) -> Result<BTreeSet<String>, ClaimError> {
