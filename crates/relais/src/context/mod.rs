@@ -243,9 +243,20 @@ pub struct AvalCli {
     fleet_decisions: Option<PathBuf>,
     /// Where the embedded pack is materialised, keyed by its content hash.
     fleet_cache: Option<PathBuf>,
+    /// The program an undeclared `bin` resolves to, decided once per resolver.
+    default_program: OnceLock<String>,
 }
 
 impl AvalCli {
+    /// The declared `bin`, else the machine's default for the `aval` key,
+    /// resolved on first use and kept for the run.
+    fn program(&self) -> &str {
+        self.bin.as_deref().unwrap_or_else(|| {
+            self.default_program
+                .get_or_init(|| crate::tooling::default_bin("aval").to_string())
+        })
+    }
+
     /// Resolve decisions for the corpus rooted at `root`.
     pub fn new(root: PathBuf) -> Self {
         Self {
@@ -256,6 +267,7 @@ impl AvalCli {
             greenspotter: greenspotter_program(),
             fleet_decisions: fleet_decisions_dir(),
             fleet_cache: default_fleet_cache(),
+            default_program: OnceLock::new(),
         }
     }
 
@@ -270,6 +282,7 @@ impl AvalCli {
             greenspotter: greenspotter_program(),
             fleet_decisions: fleet_decisions_dir(),
             fleet_cache: default_fleet_cache(),
+            default_program: OnceLock::new(),
         }
     }
 
@@ -366,11 +379,15 @@ fn greenspotter_program() -> String {
 
 impl DecisionResolver for AvalCli {
     fn resolve(&self, key: &str, scope: Option<&str>) -> AvalVerdict {
-        aval_resolve(
+        // The default program is this resolver's one choice, so every key
+        // of the run is asked of the same binary.
+        aval_resolve_in(
             &self.root,
             key,
             scope,
             self.bin.as_deref(),
+            Some(self.program()),
+            std::env::var_os("PATH").unwrap_or_default(),
             self.cancel.as_deref(),
         )
     }
@@ -378,7 +395,7 @@ impl DecisionResolver for AvalCli {
     fn constraint_rules(&self) -> Result<Rules, GuidanceGap> {
         self.rules
             .get_or_init(|| {
-                let program = self.bin.clone().unwrap_or_else(|| "aval".to_string());
+                let program = self.program().to_string();
                 let ask_in = |dir: &Path| {
                     let dir = dir.to_path_buf();
                     let program = program.clone();
@@ -429,7 +446,7 @@ impl DecisionResolver for AvalCli {
 
     fn relevant(&self, query: &RelevantQuery) -> Result<Relevant, GuidanceGap> {
         guidance::run_aval(
-            self.bin.as_deref().unwrap_or("aval"),
+            self.program(),
             &guidance::relevant_args(query),
             &self.root,
             GuidanceSource::Relevant,
@@ -443,7 +460,7 @@ impl DecisionResolver for AvalCli {
         guidance::fetch_decisions(
             &|args| {
                 guidance::run_aval(
-                    self.bin.as_deref().unwrap_or("aval"),
+                    self.program(),
                     args,
                     &self.root,
                     GuidanceSource::Decisions,
@@ -488,6 +505,7 @@ pub fn aval_resolve(
         key,
         scope,
         bin,
+        None,
         std::env::var_os("PATH").unwrap_or_default(),
         cancel,
     )
@@ -495,12 +513,14 @@ pub fn aval_resolve(
 
 /// [`aval_resolve`] with the search path given, so a test controls it
 /// without touching the process environment. The spawned command sees the
-/// same path the lookup used.
+/// same path the lookup used. `default_program` is the caller's choice for
+/// an undeclared `bin`; with none, it is chosen from `path`.
 pub fn aval_resolve_in(
     repo_dir: &Path,
     key: &str,
     scope: Option<&str>,
     bin: Option<&str>,
+    default_program: Option<&str>,
     path: std::ffi::OsString,
     cancel: Option<&AtomicBool>,
 ) -> AvalVerdict {
@@ -514,21 +534,30 @@ pub fn aval_resolve_in(
         };
     }
     // Absence is confirmed only when nothing was declared, the directory
-    // to run in exists, and no PATH entry named `aval` exists in any form:
-    // a non-executable file or a dangling link is a broken install, which
-    // keeps blocking.
+    // to run in exists, and no PATH entry named `greentopo` or `aval` exists
+    // in any form: a non-executable file or a dangling link is a broken
+    // install, which keeps blocking.
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    let extensions = crate::tooling::path_extensions(std::env::var_os("PATHEXT").as_ref());
     let confirmed_absent = bin.is_none() && repo_dir.is_dir() && {
-        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
-        let extensions = crate::tooling::path_extensions(std::env::var_os("PATHEXT").as_ref());
-        crate::tooling::resolve_in("aval", &dirs, &extensions, &|candidate| {
-            match std::fs::symlink_metadata(candidate) {
-                Ok(_) => true,
-                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-            }
+        ["greentopo", "aval"].iter().all(|name| {
+            crate::tooling::resolve_in(
+                name,
+                &dirs,
+                &extensions,
+                &crate::tooling::exists_in_any_form,
+            )
+            .is_none()
         })
-        .is_none()
     };
-    let program = bin.unwrap_or("aval");
+    let program = bin.or(default_program).unwrap_or_else(|| {
+        crate::tooling::default_bin_in(
+            "aval",
+            &dirs,
+            &extensions,
+            &crate::tooling::exists_in_any_form,
+        )
+    });
     let mut command = std::process::Command::new(program);
     command
         .arg("resolve")
@@ -544,7 +573,7 @@ pub fn aval_resolve_in(
             crate::procs::Ended::Exited(code) => parse_aval_output(code, &end.stdout),
             other => AvalVerdict::ToolFailure {
                 exit: -1,
-                detail: format!("aval did not answer: {}", other.describe()),
+                detail: format!("aval (`{program}`) did not answer: {}", other.describe()),
             },
         },
         Err(crate::procs::RunError::Spawn(e))
@@ -554,7 +583,9 @@ pub fn aval_resolve_in(
         }
         Err(e) => AvalVerdict::ToolFailure {
             exit: -1,
-            detail: format!("aval could not be launched: {e}"),
+            detail: format!(
+                "aval (`{program}`) could not be launched: {e}; check that `{program}` on PATH runs, or set `bin` under [integrations] in relais.toml"
+            ),
         },
     }
 }
@@ -1614,6 +1645,7 @@ mod tests {
             "k",
             None,
             bin,
+            None,
             path_dir.as_os_str().to_owned(),
             None,
         )
@@ -1703,6 +1735,51 @@ mod tests {
             matches!(verdict, AvalVerdict::ToolFailure { .. }),
             "{verdict:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_greentopo_only_path_is_not_confirmed_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::temp_dir("aval-greentopo-only");
+        let greentopo = dir.join("greentopo");
+        std::fs::write(&greentopo, "#!/bin/sh\nexit 3\n").expect("write");
+        std::fs::set_permissions(&greentopo, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        crate::test_support::prime_script(&greentopo);
+        let verdict = resolve_with_path(&dir, None, &dir);
+        // exit 3 from the fake greentopo: it was the program spawned, and
+        // aval's absence was not confirmed.
+        assert!(
+            !matches!(verdict, AvalVerdict::NotInstalled),
+            "greentopo is installed, so aval's absence is not confirmed: {verdict:?}"
+        );
+        assert_eq!(verdict, parse_aval_output(3, ""), "{verdict:?}");
+    }
+
+    /// The caller's chosen program beats the PATH lookup: one resolver asks
+    /// every key of the binary it chose.
+    #[cfg(unix)]
+    #[test]
+    fn the_callers_default_program_is_the_one_spawned() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::temp_dir("aval-default-program");
+        for (name, code) in [("aval", 0), ("greentopo", 3)] {
+            let fake = dir.join(name);
+            std::fs::write(&fake, format!("#!/bin/sh\nexit {code}\n")).expect("write");
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            crate::test_support::prime_script(&fake);
+        }
+        let verdict = aval_resolve_in(
+            &dir,
+            "k",
+            None,
+            None,
+            Some("aval"),
+            dir.as_os_str().to_owned(),
+            None,
+        );
+        assert_eq!(verdict, parse_aval_output(0, ""), "{verdict:?}");
     }
 
     #[test]

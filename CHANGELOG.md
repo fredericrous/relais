@@ -8,6 +8,16 @@ missing here.
 
 ## Unreleased
 
+relais spawns `greentopo` wherever it spawned `aval`: the binary is
+`greentopo` when it is on `PATH`, else `aval`, chosen once by each reader
+of a run (the decision resolver, preflight's gaps and version); a
+declared `bin` still wins, and an installed `greentopo` that fails never
+falls back to `aval` (a dangling `greentopo` link is chosen, and fails). The
+context pack records the version of the binary the run spawns, and `relais
+doctor` names it. `relais init`, with or without `--detect`, now writes
+`greentopo =` in `[integrations]`. v0.82.0 is the reader floor for that key: an older relais
+refuses it as an unknown field.
+
 ## v0.84.0
 
 The `SharedState` conformance suite holds a client to the retry rule of a
