@@ -19,9 +19,10 @@ in between. On 2026-11-25, v0.86.0's release (098fa32) failed this way:
 was cancelled again. The release passed on its second attempt, after a
 third CI attempt on a quiet main.
 
-Should main's runs never cancel (`cancel-in-progress` only for pull
-requests), or should the release check accept a newer main run that
-contains the commit?
+Should main's pushes stop sharing one concurrency group, or should the
+release check accept a newer main run that contains the commit? Turning
+`cancel-in-progress` off is not enough: a group still holds one running
+and one pending run, and a newer run cancels the pending one.
 
 ## Look at
 
@@ -31,7 +32,8 @@ contains the commit?
 
 ## Answer looks like
 
-A CI change so that a push to main never cancels another main run (for
-example `cancel-in-progress: ${{ github.event_name == 'pull_request' }}`),
-checked by two quick pushes to main whose runs both complete, or a reason
+A CI change so that a push to main never cancels another main run, for
+example a group keyed by the sha on push
+(`group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}`),
+checked by three quick pushes to main whose runs all complete; or a reason
 why releases must tolerate it.

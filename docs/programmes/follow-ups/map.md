@@ -159,9 +159,10 @@ done). f24 and f25 shipped in v0.84.0, f27 in v0.85.0, f26 in v0.86.0
     driver pid, and `pgrep -fl 'relais run'` still lists it (f26 pilot).
 - Lessons:
   - A release tagged on a commit that is no longer main's head fails until
-    main's CI passes on that commit, and each push to main cancels it. Let
-    the newer run finish, rerun the tagged commit's run, then rerun the
-    release (v0.86.0; f31).
+    main's CI passes on that commit, and each push to main cancels it. The
+    release waits up to 40 min for it (release.yaml `--wait 2400`). Let the
+    newer run finish, rerun the tagged commit's run, then rerun the release
+    (v0.86.0; f31).
   - A branch `relais` piloted against a copy of the claims
     (`RELAIS_STATE_DIR` set to a scratch dir seeded with
     `~/.local/state/relais/claims`) leaves the real ledger and claims
