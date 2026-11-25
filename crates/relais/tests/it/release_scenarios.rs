@@ -5162,7 +5162,7 @@ fn a_replay_of_a_run_with_no_receipt_is_refused_and_says_so() {
 /// plan proves the one build). Under `shared_state = "external"` with no linked client, a
 /// dry run still answers (its bounds treat an unbuildable state as unknown,
 /// and it reads nothing else through it), and a spending replay stops with
-/// exit 3 at the one state it builds, before any checkout or spawn.
+/// exit 3 at the one state it builds, before any spawn.
 #[test]
 fn a_replay_under_an_absent_external_layer_is_refused_at_its_one_state() {
     let (world, task_id, recipe) = world_with_accepted_run("replay-external");
@@ -5199,7 +5199,6 @@ fn a_replay_under_an_absent_external_layer_is_refused_at_its_one_state() {
         "{stderr}"
     );
     assert!(!stdout.contains("\"spawn\""), "{stdout}");
-    assert!(!world.state.join("worktrees").join("replay").exists());
     assert_eq!(world.worker_launches(), launches);
 }
 

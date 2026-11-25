@@ -48,15 +48,15 @@ state, so nothing changes for one node.
 
 - `grep -nF -e 'load_machine(' -e 'load_price_table(' -e 'tuning_bounds(' crates/relais/src/cli/replay.rs`: main matches lines 93, 302 and 385; the branch matches nothing.
 - `grep -cF 'shared_state()' crates/relais/src/cli/replay.rs`: the branch prints 1 (observed on `80cc613c7`); the call is at replay.rs:94, before `tuning_bounds_of` at :95.
-- Integration test `a_replay_under_an_absent_external_layer_is_refused_at_its_one_state` (`crates/relais/tests/it/release_scenarios.rs`): under `shared_state = "external"` with no client, `dataset replay --dry-run` still exits 0, and a spending replay exits 3 with the one sentence, no spawn and no worktree.
+- Integration test `a_replay_under_an_absent_external_layer_is_refused_at_its_one_state` (`crates/relais/tests/it/release_scenarios.rs`): under `shared_state = "external"` with no client, `dataset replay --dry-run` still exits 0, and a spending replay exits 3 with the one sentence, no spawn and no worker launch.
 - Observed (commit `80cc613c7`): `cargo test -p relais` passed before the test was added (all targets: 2720, 72, 353, 26, 16, 6, 1 passed, 0 failed); `cargo clippy -p relais --all-targets -- -D warnings` exit 0; the new test `a_replay_under_an_absent_external_layer_is_refused_at_its_one_state` passes. No test tells one build from three (`LocalState` holds no state): the greps are the proof.
 
 ## Implementation review
 
 - Round 1 (implementation-review, opus): approve-with-changes; low: Phase 1 box and expectation-only verification, both fixed here; the test passes on main too (it pins the failure order, not the single build), its doc comment now says so.
-- code-review-backend (opus): approve, one low: the test's `worktrees/replay` assertion may never fail if `worktree_root` resolves elsewhere; not yet checked by hand (follow-up).
-- code-review-language lang:rust (opus): approve-with-changes, two low (comment placement, `use` for `shared_state`); both fixed in `80cc613c7`.
-- Delta (implementation-review, opus, tree `a441f373`): approve-with-changes; the one finding (a line number and the grep wording) is fixed here. Round-1 findings resolved. Open by hand: whether the test's `worktrees/replay` assertion can fail (follow-up).
+- code-review-backend (opus): round 1 approve; Delta approve-with-changes, one low: the test's `worktrees/replay` assertion could never fail (replays use `worktrees/<run_id>/task`); removed, the spawn and worker-launch assertions stay.
+- code-review-language lang:rust (opus): approve-with-changes, then Delta approve; two low (comment placement, `use` for `shared_state`); both fixed in `80cc613c7`.
+- Delta (implementation-review, opus, tree `a441f373`): approve-with-changes; the one finding (a line number and the grep wording) is fixed here. Round-1 findings resolved.
 
 ## Non-goals
 
