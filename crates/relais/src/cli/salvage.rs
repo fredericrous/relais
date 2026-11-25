@@ -100,9 +100,9 @@ pub(crate) fn salvage_command(
         salvage_closed,
     ) {
         Ok(recorded) => recorded,
-        Err(e) => {
+        Err(node_failure) => {
             return super::decision_record::answer_error(
-                e,
+                node_failure,
                 run,
                 None,
                 super::decision_record::SALVAGE_AGAIN,
@@ -195,7 +195,7 @@ pub(crate) fn salvage_containment(
     };
     let unknown = match &containment {
         Containment::Unreachable(reason) => Some(reason.clone()),
-        _ => None,
+        Containment::Contained | Containment::Rewritten => None,
     };
     Ok((containment.answer(), unknown))
 }
