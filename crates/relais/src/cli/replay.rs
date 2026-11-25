@@ -6,6 +6,7 @@ use super::ctx::machine_of;
 use super::ctx::open_ledger;
 use super::ctx::price_table_of;
 use super::ctx::pricing_preflight;
+use super::ctx::shared_state;
 use super::ctx::tuning_bounds_of;
 use super::outcome::operational;
 use super::outcome::CliError;
@@ -88,12 +89,12 @@ pub(crate) fn replay_command(
             path: recipe.to_path_buf(),
             cause: Box::new(cause),
         })?;
-    // Admitted through the same door a learner's proposal is — never a
-    // second, looser one for replay.
     // Built once for the whole replay (an-t25); a failure to build it is
     // reported where the replay first needs it, after the dry-run return.
-    let shared = super::ctx::shared_state();
+    let shared = shared_state();
     let bounds = tuning_bounds_of(shared.as_deref().ok(), &incumbent);
+    // Admitted through the same door a learner's proposal is — never a
+    // second, looser one for replay.
     let candidate = match route::validate_candidate(
         &incumbent,
         &candidate_policy,

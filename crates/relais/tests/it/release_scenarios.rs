@@ -5158,7 +5158,8 @@ fn a_replay_of_a_run_with_no_receipt_is_refused_and_says_so() {
     }
 }
 
-/// an-t25: under `shared_state = "external"` with no linked client, a
+/// an-t25: pins the failure order the single build must keep (the grep in the
+/// plan proves the one build). Under `shared_state = "external"` with no linked client, a
 /// dry run still answers (its bounds treat an unbuildable state as unknown,
 /// and it reads nothing else through it), and a spending replay stops with
 /// exit 3 at the one state it builds, before any checkout or spawn.
