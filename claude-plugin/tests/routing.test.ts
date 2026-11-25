@@ -1541,8 +1541,8 @@ const FAIL_PARSE = { exitCode: 0, stdout: 'not json', stderr: '', isStdoutTrunca
 const GOOD = (engine: any) => ({ exitCode: 0, stdout: JSON.stringify(engine.state), stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
 
 for (const [name, failure, text] of [
-  ['a non-zero exit', FAIL_EXIT, '(exit 3): boom'],
-  ['unparseable stdout', FAIL_PARSE, '(unparseable): not json'],
+  ['a non-zero exit', FAIL_EXIT, '(exit 3: boom); to reproduce'],
+  ['unparseable stdout', FAIL_PARSE, '(unparseable: not json); to reproduce'],
 ] as const) {
   test(`a failing router-state (${name}) with no run gives one toast per failure streak`, async ($: any, on: any) => {
     const engine = await routedSession($, on)
@@ -1596,4 +1596,35 @@ test('a plugin-origin prompt later in the session is not classified', async ($: 
   await $.prompt.submit({ text: 'a plugin speaks', wait: false, origin: { kind: 'plugin', name: 'other' } })
   await settle(engine)
   expect(engine.calls.completes.length).toBe(completes)
+})
+
+test('a router-state read begun before a clear writes nothing, and a launch after it waits for a new read', async ($: any, on: any) => {
+  on('classic.SessionStart', () => ({}))
+  const engine = await routedSession($, on)
+  // The read in flight answers the state from before the clear: no pin for relais-review.
+  const release = stateGate(engine)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clearInto($, engine, { 'relais-review': 'opus' })
+  release()
+  await settle(engine)
+  const completes = engine.calls.completes.length
+  await $.agent.spawn({ prompt: 'review it', description: 'review', subagentType: 'relais-review', model: 'sonnet' })
+  expect(engine.calls.spawned[0].model).toBe('sonnet')
+  // Pinned on the new state, so not classified; on the old one it would have been.
+  expect(engine.calls.completes.length).toBe(completes)
+  const reads = nativeCalls(engine.calls, 'router-state')
+  expect(reads.at(-1)?.argv).toContain('session-2')
+})
+
+test('a router-state failing before and after a clear gives a toast in each session', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  const before = engine.calls.toasts.length
+  failingState(engine, [FAIL_EXIT, FAIL_EXIT])
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await settle(engine)
+  await $.session.end({ reason: 'clear', sessionId: 'session-1' })
+  await settle(engine)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await settle(engine)
+  expect(engine.calls.toasts.slice(before).filter((t: string) => t.includes('router-state failed')).length).toBe(2)
 })

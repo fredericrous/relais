@@ -139,13 +139,13 @@ type StateFailure =
 function describeFailure(failure: StateFailure): string {
   switch (failure.kind) {
     case 'exit':
-      return `exit ${failure.code}): ${clip(failure.stderr.trim(), 400)}`
+      return `exit ${failure.code}: ${clip(failure.stderr.trim(), 400)}`
     case 'unparseable':
-      return `unparseable): ${clip(failure.stdout.trim(), 400)}`
+      return `unparseable: ${clip(failure.stdout.trim(), 400)}`
     case 'timeout':
-      return `timeout): ${clip(failure.message, 400)}`
+      return `timeout: ${clip(failure.message, 400)}`
     case 'error':
-      return `error): ${clip(failure.message, 400)}`
+      return `error: ${clip(failure.message, 400)}`
   }
 }
 
@@ -177,7 +177,9 @@ export async function loadRouterState(fx: Fx, store: Store) {
           ? { kind: 'unparseable', stdout: String(result?.stdout ?? '') }
           : typeof code === 'number'
             ? { kind: 'exit', code, stderr: String(result?.stderr ?? '') }
-            : { kind: 'timeout', message: String(result?.stderr ?? '') }
+            : result
+              ? { kind: 'timeout', message: String(result.stderr ?? '').trim() || 'no exit code' }
+              : { kind: 'error', message: 'no result' }
     }
   } catch (reason) {
     failure = thrownFailure(reason)
@@ -194,7 +196,7 @@ export async function loadRouterState(fx: Fx, store: Store) {
   await report(
     fx,
     store,
-    `session routing is off for this session: router-state failed (${describeFailure(failure)}; to reproduce: relais native router-state --session ${session}`,
+    `session routing is off for this session: router-state failed (${describeFailure(failure)}); to reproduce: relais native router-state --session ${session}`,
   )
 }
 
@@ -220,14 +222,13 @@ export function refreshState(fx: Fx, store: Store): Promise<void> {
 // clear or resume is not, since it writes nothing.
 function refresh(fx: Fx, store: Store): Promise<void> {
   const r = store.router
-  if (!r.refreshing || r.refreshingGeneration !== r.generation) {
+  if (r.refreshing?.generation !== r.generation) {
     const load: Promise<void> = loadRouterState(fx, store).finally(() => {
-      if (r.refreshing === load) r.refreshing = undefined
+      if (r.refreshing?.load === load) r.refreshing = undefined
     })
-    r.refreshing = load
-    r.refreshingGeneration = r.generation
+    r.refreshing = { load, generation: r.generation }
   }
-  return r.refreshing
+  return r.refreshing.load
 }
 
 // --- prompt.submit ------------------------------------------------------------
@@ -1022,6 +1023,9 @@ export async function noteLostFlush(fx: Fx, store: Store) {
   try {
     const lost = readLostFlush(await fx.kv.get(LOST_FLUSH_KEY))
     if (!lost) return
+    // Cleared only if no loss was added since the read; one added between
+    // this second read and the clear goes unreported.
+    if (readLostFlush(await fx.kv.get(LOST_FLUSH_KEY))?.count !== lost.count) return
     await fx.kv.set(LOST_FLUSH_KEY, null)
     await report(fx, store, `session routing observations of an earlier session were lost (${lost.count} final send${lost.count === 1 ? '' : 's'} failed; last: ${lost.stderr})`)
   } catch {

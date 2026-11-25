@@ -191,7 +191,8 @@ budget. A router-state read or final flush that fails leaves a note.
 | check | input | expected | actual |
 |---|---|---|---|
 | red on base | new tests, `origin/main` hooks | (a)-(d) fail | 7 fail: (a), (b), (b2), (c) ×3, (d); (e) passes (guard) |
-| suite after the fix | `scripts/plugin-test.sh`, rebased tree | green | 565 pass, 0 fail (one rerun of a 5 s timeout at load 60+) |
+| suite after the fix | `scripts/plugin-test.sh`, rebased tree | green | 565 pass, 0 fail (one rerun of a 5 s timeout at load 60+); 567 after review round 2 |
+| review-round tests catch their fix | `routing.test.ts` alone, guard or streak reset removed | each new test fails | generation test fails without the guard; two-toasts test fails without the reset |
 | slow test is load, not the change | `routing.test.ts` alone | same time on base | retry test 1.15 s with the fix, 1.65 s on base |
 | pilot | `/clear` relay, then a pinned launch | new session id, `reason pin` | after release and reinstall (Phase 3) |
 
@@ -199,6 +200,7 @@ budget. A router-state read or final flush that fails leaves a note.
 - implementation-review: approve-with-changes; fixed: empty catch reason, banner, `value` → `marker`, counts, test (d) title, import cycle, `timeout` label, `support.ts` in Phase 1 (57k, 60 s).
 - backend: approve-with-changes; fixed: unrouted launch when still stale, wait taken off the deadline, generation guard, streak reset at clear, lost-flush order commented (72k, 51 s).
 - lang:typescript: approve-with-changes; fixed: `StateFailure` union, `readLostFlush(unknown)`, cycle, (d) title, label (63k, 45 s).
+- Round 2: all three approve-with-changes, every round-1 finding resolved; fixed: tests for the generation guard and the streak reset, `refreshing` one field, paren in the caller, `no result` label, lost-flush clear re-reads first, f20 window wording (61k, 49k, 55k).
 
 ## Verification
 

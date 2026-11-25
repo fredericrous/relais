@@ -109,7 +109,8 @@ person prompt apart, rather than read them as a pin regression.
 - The relayed opening prompt comes with `origin.kind = 'plugin'` and was
   never classified: no routing task, no refresh. The first prompt after a
   clear or resume from any plugin other than relais itself now goes
-  through `onPrompt`; the window closes at the first prompt of any origin.
+  through `onPrompt`; the window closes at the first prompt that is not a task notification, of any
+  origin.
 - `routeSpawn` read whatever state was there. It now waits for a stale or
   pending refresh, within the classifier's bound (2 s, the hook budget less
   its margin), before it reads the state.

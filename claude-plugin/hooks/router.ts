@@ -1755,7 +1755,8 @@ export type RouterMemory = {
   session: string | undefined
   cwd: string | undefined
   isStale: boolean
-  refreshing: Promise<void> | undefined
+  // The router-state read under way, with the clear/resume count it began under.
+  refreshing: { load: Promise<void>; generation: number } | undefined
   task: TaskState | undefined
   // Router-created subagents' tasks, by agentId.
   subtasks: Record<string, TaskState>
@@ -1787,8 +1788,6 @@ export type RouterMemory = {
   // Counts clears and resumes: a router-state read begun under an older
   // count belongs to the session before and writes nothing.
   generation: number
-  // The count `refreshing` was begun under.
-  refreshingGeneration: number
 }
 
 export const createRouterMemory = (): RouterMemory => ({
@@ -1815,7 +1814,6 @@ export const createRouterMemory = (): RouterMemory => ({
   isOpeningWindow: false,
   isStateFailureReported: false,
   generation: 0,
-  refreshingGeneration: 0,
   reverts: new Set(),
 })
 
