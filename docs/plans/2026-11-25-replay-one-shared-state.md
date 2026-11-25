@@ -41,7 +41,7 @@ state, so nothing changes for one node.
 
 ## Phases
 
-- [ ] Phase 1 (relais): `crates/relais/src/cli/replay.rs`, `crates/relais/src/cli/ctx.rs`, `CHANGELOG.md`. Build the state once at replay.rs:93, before `tuning_bounds`, and keep the `Result`; add `ctx::tuning_bounds_of(Option<&dyn SharedState>, &RepoPolicy)` (the existing `tuning_bounds` stays as a wrapper for `recipe.rs`) and pass it the state when it built, so the bounds still get no error, as today; apply `?` where line 304 is now, so the failure order and the dry-run return are unchanged; replace `load_machine()` with `ctx::machine_of(&*shared)` and `load_price_table()` with `ctx::price_table_of(&*shared)` (both exist from an-t22); drop the two unused imports. Error labels are unchanged: the helpers carry them. One CHANGELOG sentence.
+- [x] Phase 1 (relais): `crates/relais/src/cli/replay.rs`, `crates/relais/src/cli/ctx.rs`, `CHANGELOG.md`. Build the state once at replay.rs:93, before `tuning_bounds`, and keep the `Result`; add `ctx::tuning_bounds_of(Option<&dyn SharedState>, &RepoPolicy)` (the existing `tuning_bounds` stays as a wrapper for `recipe.rs`) and pass it the state when it built, so the bounds still get no error, as today; apply `?` where line 304 is now, so the failure order and the dry-run return are unchanged; replace `load_machine()` with `ctx::machine_of(&*shared)` and `load_price_table()` with `ctx::price_table_of(&*shared)` (both exist from an-t22); drop the two unused imports. Error labels are unchanged: the helpers carry them. One CHANGELOG sentence.
 - [ ] Phase 2 (homelab): `docs/programmes/agents-many-nodes/an-t25-replay-one-shared-state.md`, `docs/programmes/agents-many-nodes/map.md`. Resolution, status closed, one Decisions-so-far line.
 
 ## Verification
@@ -49,7 +49,14 @@ state, so nothing changes for one node.
 - `grep -nF -e 'load_machine(' -e 'load_price_table(' -e 'tuning_bounds(' crates/relais/src/cli/replay.rs`: main matches lines 93, 302 and 385; the branch matches nothing.
 - `grep -cF 'shared_state()' crates/relais/src/cli/replay.rs`: the branch prints 1, and that one call comes before line 93.
 - Integration test `a_replay_under_an_absent_external_layer_is_refused_at_its_one_state` (`crates/relais/tests/it/release_scenarios.rs`): under `shared_state = "external"` with no client, `dataset replay --dry-run` still exits 0, and a spending replay exits 3 with the one sentence, no spawn and no worktree.
-- `cargo test -p relais` passes and `cargo clippy -p relais -- -D warnings` is clean. No test tells one build from three (`LocalState` holds no state): the greps are the proof.
+- Observed (commit `80cc613c7`): `cargo test -p relais` passed before the test was added (all targets: 2720, 72, 353, 26, 16, 6, 1 passed, 0 failed); `cargo clippy -p relais --all-targets -- -D warnings` exit 0; the new test `a_replay_under_an_absent_external_layer_is_refused_at_its_one_state` passes. No test tells one build from three (`LocalState` holds no state): the greps are the proof.
+
+## Implementation review
+
+- Round 1 (implementation-review, opus): approve-with-changes; low: Phase 1 box and expectation-only verification, both fixed here; the test passes on main too (it pins the failure order, not the single build), its doc comment now says so.
+- code-review-backend (opus): approve, one low: the test's `worktrees/replay` assertion may never fail if `worktree_root` resolves elsewhere; not yet checked by hand (follow-up).
+- code-review-language lang:rust (opus): approve-with-changes, two low (comment placement, `use` for `shared_state`); both fixed in `80cc613c7`.
+- Delta: pending on `80cc613c7`'s tree.
 
 ## Non-goals
 
