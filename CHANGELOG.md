@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+`relais dataset replay` builds its `SharedState` once and reads the effort bounds, the machine settings and the prices through it, as `relais run` does. Nothing changes for one node.
+
 ## v0.87.0
 
 The machine settings are written through `SharedState` as they are read.
