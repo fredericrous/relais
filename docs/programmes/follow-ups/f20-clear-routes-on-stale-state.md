@@ -109,8 +109,8 @@ person prompt apart, rather than read them as a pin regression.
 - The relayed opening prompt comes with `origin.kind = 'plugin'` and was
   never classified: no routing task, no refresh. The first prompt after a
   clear or resume from any plugin other than relais itself now goes
-  through `onPrompt`; the window closes at the first prompt that is not a task notification, of any
-  origin.
+  through `onPrompt`; the window closes at the first prompt that is not a task notification and
+  not relais's own.
 - `routeSpawn` read whatever state was there. It now waits for a stale or
   pending refresh, within the classifier's bound (2 s, the hook budget less
   its margin), before it reads the state.
@@ -129,6 +129,9 @@ went red on the base and are green after the fix: the relayed opening
 prompt (row under `session-2`, `reason pin`), the launch with no prompt
 waiting for router-state, the launch that waits only up to its budget, the
 two failure kinds and the failure streak, and the lost final flush. An
-eighth, a later plugin prompt is not classified, guards the window. A pinned launch with no open parent task still writes no row
+eighth, a later plugin prompt is not classified, guards the window. Two
+more came from the implementation review, each red with its fix removed:
+a router-state read begun before the clear writes nothing, and a failing
+router-state gives a toast in each session across a clear. A pinned launch with no open parent task still writes no row
 (out of scope). Until the release is installed, the 11-30 cohort check
 counts spawns made before a session's first typed prompt apart.
