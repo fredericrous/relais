@@ -101,49 +101,56 @@ ticket here until it is resolved or moved into a programme of its own.
   a week of worker stops settles within 60 s after the plugin reinstall,
   and no plugin-stopped attempt ends `TerminalResultMissing`. Also the
   live shell, process-group and slot checks.
-- [f24](f24-stop-an-orphaned-worker.md) (2026-11-25, open): a session cannot
-  stop a relais worker whose run has ended. `cancel` says "already ended",
-  and the guard refuses `TaskStop`. Seen when a worker's
-  `pkill -f <worktree>` killed its own driver.
+- [f24](f24-stop-an-orphaned-worker.md) (2026-11-25, closed): `cancel` of
+  a run that has ended now stops the agents its dispatches bound that still
+  run, with one reply line each. The model's `TaskStop` stays denied, and
+  the deny names the run to cancel, or sends the model to the person when
+  the plugin no longer knows the run.
+- [f25](f25-guard-fails-open-on-list-error.md) (2026-11-25, open): the
+  `SendMessage`/`TaskStop` guard lets a call through when `agent.list()`
+  throws, on origin/main too. Seen in an f24 test.
+- [f26](f26-worker-kills-spare-the-driver.md) (2026-11-25, open): keep a
+  worker's `pkill -f <path>` off its own driver, through worker guidance
+  or a runner change.
 
 ## Handoff
 
-2026-11-25, boundary 3 (f21 closed): the relais plugin now settles a worker
-that answered but is held open by its own background shell. It stops the
-agent, which kills the shell's whole tree with SIGTERM, and reports
-`completed` with the answer kept and a note. Plan
-`docs/plans/2026-11-25-settle-worker-at-final-answer.md`. The plugin half
+2026-11-25, boundary 3 (f24 closed): `mcp__relais__cancel` of a run that has
+ended now stops the run's workers that still run, so a worker that outlives
+its driver can be stopped from the session. Plan
+`docs/plans/2026-11-25-cancel-stops-orphaned-workers.md`. The plugin change
 ships with the next relais release and runs after the plugin reinstall.
 
-- Done: f12, f13, f14, f15, f17, f18, f19, f21.
+- Done: f12, f13, f14, f15, f17, f18, f19, f21, f24.
 - Next:
   - f20 (stale state after a clear) is held by session
     `route-relayed-session-state` in `relais-wt-f20`.
+  - The guard may fail open when the agent list throws (f25), ready.
+  - Keep a worker's kills off its own driver (f26), ready.
   - Measure the home fingerprint warnings (f08), due 2026-11-28.
   - A pin row's model matches the model its subagent ran (f22), due
     2026-12-01, after the plugin reinstall.
   - A week of relays adopts every handoff (f16), due 2026-12-02.
   - A week of worker stops settles within 60 s (f23), due 2026-12-03.
   - f16, f22 and f23 are counted from the reinstall.
-  - Let a session stop a relais worker whose run has ended (f24), ready.
 - Lessons:
-  - A relais worker's `pkill -f <worktree path>` matches its own driver's
-    argv, which kills the run (f24). The native worker then keeps writing in
-    place, and neither `cancel` nor `TaskStop` can stop it. Wait for its turn
-    to end (watch its transcript for `end_turn`), then salvage the tree.
-  - The plugin runner's 5 s limit per test is fixed. A replay that waits out
-    a 30 s bound in 2 s scripted polls takes 3.6–4.8 s even at load 11 to 17,
-    because the full suite runs files in parallel. Test such bounds as units
-    of `check` with a fake `fx` and a hand-moved clock
-    (`tests/stop-bounds.test.ts`).
-  - `withinBound` ends the wait, but it never cancels the call: a late
-    `TaskStop` may still take. Design for both outcomes.
-  - On a jammed host, a commit's gate defers `cargo-test` and `plugin-test`
-    to CI. Run `make plugin` yourself once the load drops, and read the
-    counts, not the exit code alone.
+  - Until the reinstall, a worker that outlives its driver still cannot be
+    stopped from the session: wait for its turn to end (watch its
+    transcript for `end_turn`), then salvage the tree.
+  - The plugin test runner has no per-file filter, and its 5 s limit per
+    test is fixed. Drive any bound with the scripted clock
+    (`engine.clock.advance`) and keep the call pending, as
+    `cancel-orphans.test.ts` does. At load 90 to 100, unrelated tests time
+    out; rerun once the load drops and read the counts.
+  - A hooks module refuses `arguments` at load. A `console.log` in a hook
+    did not show in the test output once (unverified whether it ever
+    does). Debug through a test's own assertions.
+  - To check that new tests fail on origin/main, use a detached worktree
+    (`git worktree add --detach`) with the test files copied in. Restore it
+    and remove it without `--force`.
 - Your steps: reinstall the relais plugin with relais's own install
   command for Claude (it is at 0.72.0 here). f16, f22 and f23 count from the
-  session after the reinstall.
+  session after the reinstall; f24's cancel works from then on.
 
 ## Not yet specified
 

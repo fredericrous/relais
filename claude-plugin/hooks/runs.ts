@@ -4,7 +4,7 @@
 // (register.ts), which calls `onChunk`.
 
 import type { Fx } from './fx.ts'
-import { handleContinue, handleSpawn, handleStop, note } from './agents.ts'
+import { handleContinue, handleSpawn, handleStop, note, stopAgentsOf } from './agents.ts'
 import { parseProtocolLine, splitLines } from './lines.ts'
 import {
   applyEvent,
@@ -783,7 +783,13 @@ export async function cancelRun(fx: Fx, store: Store, run: string): Promise<stri
   const line = String(result.stdout ?? '').trim() || String(result.stderr ?? '').trim().slice(0, 400)
   // Only a run that has ended: one whose driver was told to stop but has
   // not yet ended still waits for its dispatches' `stopped`.
-  if (result.exitCode === 0 && !line.startsWith('cancel requested')) stopDispatchesOf(store, run)
+  if (result.exitCode === 0 && !line.startsWith('cancel requested')) {
+    stopDispatchesOf(store, run)
+    // The run has ended, but its workers may not have (f24). The CLI's line
+    // stays first; a failed stop leaves the cancel a result, not an error.
+    const stops = await stopAgentsOf(fx, store, run)
+    return [line, ...stops, `exit status: ${result.exitCode}`].join('\n')
+  }
   return `${line}\nexit status: ${result.exitCode}`
 }
 

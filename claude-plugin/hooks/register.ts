@@ -3,7 +3,7 @@
 // pane. relais keeps the run, verification and the decisions; this module
 // spawns, continues, stops and shows. See ../README.md.
 
-import { dispatchOfDescription, onAgentTool, onTurn } from './agents.ts'
+import { dispatchOfDescription, onAgentTool, onTurn, runOfAgent } from './agents.ts'
 import { HELLO_EVERY_MS, sendHello } from './callbacks.ts'
 import type { Fx } from './fx.ts'
 import {
@@ -17,7 +17,7 @@ import {
   feedbackTool,
   mintNonce,
 } from './decide.ts'
-import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses } from './guards.ts'
+import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses, taskStopDenyMessage } from './guards.ts'
 import { cancelRun, childOf, contractPath, onChunk, pump, reconcileIntents, reloadTimeline, startReplay, startRun, statusOf, workspaceOf } from './runs.ts'
 import { onboardTool, onPersonPrompt, trustHoldoutsTool, trustTool, withRoutingSection } from './consent.ts'
 import { decideGuard, learningEnvelopeGuard, machineSettingsGuard, routerEnvelopeGuard } from './guards.ts'
@@ -237,7 +237,7 @@ export function register(on: any) {
     await $.tool.register({
       name: 'cancel',
       description:
-        "Cancel a relais run started from this Claude Code session: a live one is told to stop, one whose driver is gone is marked cancelled. Returns relais's one-line answer and its exit status (11: the run belongs to another live session).",
+        "Cancel a relais run started from this Claude Code session: a live one is told to stop, one whose driver is gone is marked cancelled. A run that has ended also has its agents still running stopped, where this plugin still knows them, one line each. Returns relais's one-line answer and its exit status (11: the run belongs to another live session).",
       inputSchema: {
         type: 'object',
         properties: {
@@ -540,15 +540,18 @@ export function register(on: any) {
     isRelaisType(e.agent) && store.resuming === 0 ? { isOffered: false } : next(e),
   ).catch((_$: any, e: any, next: any) => (isRelaisType(e.agent) ? { isOffered: false } : next(e)))
 
+  // A stop is told which run to cancel; a message keeps the general text.
+  const denyOf = (tool: string, target: string): string =>
+    tool === 'TaskStop' ? taskStopDenyMessage(runOfAgent(store, target)) : DENY_MESSAGE
   // The model may not message or stop a relais agent; this module may.
   on('tool.call', { tool: ['SendMessage', 'TaskStop'] }, async ($: any, e: any, next: any) => {
     if (next.origin.plugin === $.plugin.name) return next(e)
     const target = String(e.tool === 'SendMessage' ? e.to : e.task_id)
     const addresses = relaisAddresses(await $.agent.list(), $.plugin.name)
-    return addresses.has(target) || store.agentDispatch.has(target) ? { deny: DENY_MESSAGE } : next(e)
+    return addresses.has(target) || store.agentDispatch.has(target) ? { deny: denyOf(e.tool, target) } : next(e)
   }).catch(($: any, e: any, next: any) => {
     const target = String(e.tool === 'SendMessage' ? e.to : e.task_id)
-    return store.agentDispatch.has(target) ? { deny: DENY_MESSAGE } : next(e)
+    return store.agentDispatch.has(target) ? { deny: denyOf(e.tool, target) } : next(e)
   })
 
   // relais's agents' completion notices are for relais; any other prompt,
