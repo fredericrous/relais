@@ -255,9 +255,10 @@ pub(super) fn worker_rules() -> String {
      `&`), with `kill <pid>`; never by a pattern (`pkill`, `killall`,\n\
      `pgrep -f`, `ps | grep`) and never `kill 0` or `kill -1`: a pattern can\n\
      match relais's own driver, and the run then ends interrupted. for a\n\
-     command that starts children, stop them by their parent too:\n\
-     `kill $(pgrep -P <pid>) <pid>` (`pgrep -P` matches a parent pid,\n\
-     not a pattern).\n\
+     command that starts children, kill them first:\n\
+     `kill $(pgrep -P <pid>) <pid>`. `pgrep -P` matches a parent pid, not a\n\
+     pattern, and lists direct children only: run it again on each child,\n\
+     and kill the deepest first.\n\
      do not leave scratch files in this directory: they become part of the\n\
      candidate. give findings and reports in your final message.\n\
      finish with a line starting DONE when you believe the criteria are met,\n\

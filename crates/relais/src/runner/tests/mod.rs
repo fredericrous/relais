@@ -7737,6 +7737,7 @@ fn the_prompt_carries_the_native_rules_and_no_headless_wording() {
     );
     assert!(rules.contains("`pgrep -f`, `ps | grep`"), "{rules}");
     assert!(rules.contains("`kill $(pgrep -P <pid>) <pid>`"), "{rules}");
+    assert!(rules.contains("lists direct children only"), "{rules}");
     for headless_only in [
         "sandbox",
         "TMPDIR",
