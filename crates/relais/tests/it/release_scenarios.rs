@@ -5158,6 +5158,50 @@ fn a_replay_of_a_run_with_no_receipt_is_refused_and_says_so() {
     }
 }
 
+/// an-t25: under `shared_state = "external"` with no linked client, a
+/// dry run still answers (its bounds treat an unbuildable state as unknown,
+/// and it reads nothing else through it), and a spending replay stops with
+/// exit 3 at the one state it builds, before any checkout or spawn.
+#[test]
+fn a_replay_under_an_absent_external_layer_is_refused_at_its_one_state() {
+    let (world, task_id, recipe) = world_with_accepted_run("replay-external");
+    let machine = world.config.join("machine.toml");
+    let text_of = std::fs::read_to_string(&machine).expect("machine.toml");
+    std::fs::write(&machine, format!("shared_state = \"external\"\n{text_of}"))
+        .expect("machine.toml");
+    let launches = world.worker_launches();
+    let dry = world
+        .command(&[])
+        .args(["dataset", "replay", "--task", &task_id, "--recipe"])
+        .arg(&recipe)
+        .arg("--dry-run")
+        .output()
+        .expect("relais runs");
+    assert_eq!(dry.status.code(), Some(0), "{}", text(&dry.stderr));
+    assert!(text(&dry.stdout).contains("dry run: nothing was dispatched"));
+    let out = world.plugin().run(
+        &[
+            "dataset",
+            "replay",
+            "--task",
+            &task_id,
+            "--recipe",
+            recipe.to_str().unwrap(),
+            "--protocol",
+        ],
+        &[],
+    );
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(3), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("sets shared_state = \"external\""),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("\"spawn\""), "{stdout}");
+    assert!(!world.state.join("worktrees").join("replay").exists());
+    assert_eq!(world.worker_launches(), launches);
+}
+
 #[test]
 fn a_replay_naming_an_unpriced_model_is_refused_before_any_spawn() {
     let (world, task_id, recipe) = world_with_accepted_run("replay-unpriced");

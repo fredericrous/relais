@@ -21,8 +21,10 @@ plan-id: p-01M8A6003RG3Z5K7NXKB6K2P4B
  dataset_replay_command
    shared = ctx::shared_state()      <- the one construction, first
      |
+     +--> ctx::tuning_bounds_of(shared.ok())  (was tuning_bounds: 1st build)
      +--> ctx::machine_of(&*shared)       (was load_machine: 2nd build)
-     +--> ctx::price_table_of(&*shared)   (was load_price_table: 3rd build)
+     +--> (the old shared_state() here, 3rd build: now the one above)
+     +--> ctx::price_table_of(&*shared)   (was load_price_table: 4th build)
      +--> RunConfig { shared_state: &*shared, .. }
 ```
 
@@ -46,7 +48,7 @@ state, so nothing changes for one node.
 
 - `grep -nF -e 'load_machine(' -e 'load_price_table(' -e 'tuning_bounds(' crates/relais/src/cli/replay.rs`: main matches lines 93, 302 and 385; the branch matches nothing.
 - `grep -cF 'shared_state()' crates/relais/src/cli/replay.rs`: the branch prints 1, and that one call comes before line 93.
-- Pilot: run `relais dataset replay` from the main and the branch binaries with `shared_state = "external"` in a sandboxed `machine.toml` (`HOME` in a temp dir): same exit code, empty `diff` of stdout and of stderr.
+- Integration test `a_replay_under_an_absent_external_layer_is_refused_at_its_one_state` (`crates/relais/tests/it/release_scenarios.rs`): under `shared_state = "external"` with no client, `dataset replay --dry-run` still exits 0, and a spending replay exits 3 with the one sentence, no spawn and no worktree.
 - `cargo test -p relais` passes and `cargo clippy -p relais -- -D warnings` is clean. No test tells one build from three (`LocalState` holds no state): the greps are the proof.
 
 ## Non-goals
@@ -60,5 +62,10 @@ state, so nothing changes for one node.
 
 - relais: backend, lang:rust (tui: no pane or terminal output changes; unix: no process, signal or file-mode change)
 - homelab: none — markdown only
+
+## Decision log
+
+- 2026-11-25 — the manual pilot (main vs branch binary, sandboxed `machine.toml`) is replaced by integration test `a_replay_under_an_absent_external_layer_is_refused_at_its_one_state`; reason: the trust-grant guard refuses agent writes to `machine.toml`. decided-by: agent (ADR-0080), on the driver's instruction. The dry run exits 0 (it never reaches the build the plan moved), so only the spending replay is pinned at exit 3. The Picture now lists all four builds.
+- 2026-11-25 — `docs/shared-state.md` gets one sentence for replay, beside run's.
 
 <!-- panel: repos=relais,homelab reviewers=backend,lang:rust,tui,unix body-sha=32a28ca1a797 -->
