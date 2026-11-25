@@ -82,6 +82,8 @@ export const OBSERVE_RETRIES = 5
 const ENVELOPE_EPSILON = '0.1'
 export const ENVELOPE_YES = 'Allow session routing'
 
+const LOST_FLUSH_KEY = 'router.lostFlush'
+
 const TIMEOUT = Symbol('timeout')
 
 // What the prompt's classifier call resolves to.
@@ -129,18 +131,47 @@ function setStatus(store: Store, decision: Decision | undefined) {
 
 export async function loadRouterState(fx: Fx, store: Store) {
   const r = store.router
+  let session = r.session ?? 'unknown'
+  let failure: string | undefined
   try {
-    const session = r.session ?? (await fx.session.id())
+    session = r.session ?? (await fx.session.id())
     r.session = session
     const result = await runFallingBackHome(fx, ['relais', 'native', 'router-state', '--session', session], {
       ...(r.cwd ? { cwd: r.cwd } : {}),
       timeoutMs: STATE_TIMEOUT_MS,
     })
-    r.state = result?.exitCode === 0 ? parseRouterState(result.stdout) : undefined
-  } catch {
+    const parsed = result?.exitCode === 0 ? parseRouterState(result.stdout) : undefined
+    r.state = parsed
+    if (!parsed) {
+      const code = result?.exitCode
+      failure =
+        code === 0
+          ? `unparseable): ${clip(String(result?.stdout ?? '').trim(), 400)}`
+          : `${typeof code === 'number' ? `exit ${code}` : 'timeout'}): ${clip(String(result?.stderr ?? '').trim(), 400)}`
+    }
+  } catch (reason) {
     r.state = undefined
+    failure = `timeout): ${clip(String((reason as any)?.message ?? reason), 400)}`
   }
   r.isStale = false
+  if (!failure) {
+    r.isStateFailureReported = false
+    return
+  }
+  if (r.isStateFailureReported) return
+  r.isStateFailureReported = true
+  await report(fx, store, `session routing is off for this session: router-state failed (${failure}; to reproduce: relais native router-state --session ${session}`)
+}
+
+// A line for the person: a note on the runs when there are any, else a toast
+// (a relayed session has no run before its first launch).
+async function report(fx: Fx, store: Store, text: string) {
+  try {
+    if (Object.keys(store.models).length > 0) await note(fx, store, undefined, text)
+    else await fx.ui.toast(text)
+  } catch {
+    // Fail open: a line not shown is never a reason to fail routing.
+  }
 }
 
 // At session.start: the state is read in the background, and the first
@@ -393,6 +424,13 @@ export function afterStep(store: Store, e: any, result: any, now: number) {
 // parent's `model` is a preference; a pin or the person's model is kept.
 export async function routeSpawn(fx: Fx, store: Store, e: any, next: any, remainingMs: number) {
   const r = store.router
+  let waitedMs = 0
+  if (r.isStale || r.refreshing) {
+    const started = await fx.clock.now()
+    await within(fx, refresh(fx, store).catch(() => {}), waitFor(remainingMs))
+    waitedMs = (await fx.clock.now()) - started
+  }
+  if (!r.session) r.session = await fx.session.id()
   const state = r.state
   if (!state || state.mode === 'off') return next(e)
   // The hook's budget ends here, whatever `next` takes.
@@ -404,7 +442,7 @@ export async function routeSpawn(fx: Fx, store: Store, e: any, next: any, remain
   let classified: Awaited<ReturnType<typeof classify>> | undefined
   let cls: Classification | undefined
   if (!state.pins[type]) {
-    const got = await within(fx, classify(fx, store, spawnPrompt(type, description, prompt), 'spawn', ++r.seq).catch(() => undefined), waitFor(remainingMs))
+    const got = await within(fx, classify(fx, store, spawnPrompt(type, description, prompt), 'spawn', ++r.seq).catch(() => undefined), waitFor(remainingMs - waitedMs))
     if (got !== TIMEOUT && got) {
       classified = got
       cls = got.cls
@@ -895,6 +933,8 @@ export async function onSessionEnd(fx: Fx, store: Store, reason: string, now: nu
   r.isTaskEndRequested = false
   await flushObservations(fx, store, { isFinal: true })
   if (reason === 'clear' || reason === 'resume') {
+    r.session = undefined
+    r.isOpeningWindow = true
     r.forceNew = true
     r.isStale = true
     r.lastModel = undefined
@@ -908,6 +948,36 @@ export async function onSessionEnd(fx: Fx, store: Store, reason: string, now: nu
 // The queue sent as one `relais native router-observe` per session: 0 is
 // done, 2 is a bad payload (dropped, noted), anything else is retried at
 // most five times, then dropped and noted.
+// A final flush that failed is kept, since a note at the session's end may
+// never be seen; the next session start reports it (`noteLostFlush`).
+async function keepLostFlush(fx: Fx, lastStderr: string) {
+  try {
+    const before = readLostFlush(await fx.kv.get(LOST_FLUSH_KEY))
+    await fx.kv.set(LOST_FLUSH_KEY, { count: (before?.count ?? 0) + 1, stderr: lastStderr })
+  } catch {
+    // Fail open: the marker is lost with the session it described.
+  }
+}
+
+function readLostFlush(raw: any): { count: number; stderr: string } | undefined {
+  const value = raw && typeof raw === 'object' && !('count' in raw) && 'value' in raw ? raw.value : raw
+  if (!value || typeof value.count !== 'number') return undefined
+  return { count: value.count, stderr: String(value.stderr ?? '') }
+}
+
+// At session start: a lost final flush of an earlier session is reported
+// once and the marker cleared.
+export async function noteLostFlush(fx: Fx, store: Store) {
+  try {
+    const lost = readLostFlush(await fx.kv.get(LOST_FLUSH_KEY))
+    if (!lost) return
+    await fx.kv.set(LOST_FLUSH_KEY, null)
+    await report(fx, store, `session routing observations of an earlier session were lost (${lost.count} final send${lost.count === 1 ? '' : 's'} failed; last: ${lost.stderr})`)
+  } catch {
+    // Fail open: a line not shown is never a reason to fail the session.
+  }
+}
+
 export async function flushObservations(fx: Fx, store: Store, options: { isFinal?: boolean } = {}) {
   const r = store.router
   if (r.queue.length === 0) return
@@ -983,7 +1053,8 @@ async function observe(fx: Fx, store: Store, payload: unknown, attempt: number, 
     return
   }
   if (attempt >= OBSERVE_RETRIES || isFinal || store.closed) {
-    if (!isFinal) await note(fx, store, undefined, `session routing observations dropped after ${attempt + 1} tries: ${clip(stderr, 400)}`)
+    if (isFinal) await keepLostFlush(fx, clip(stderr, 400))
+    else await note(fx, store, undefined, `session routing observations dropped after ${attempt + 1} tries: ${clip(stderr, 400)}`)
     return
   }
   const wait = OBSERVE_BACKOFF_MS[Math.min(attempt, OBSERVE_BACKOFF_MS.length - 1)]

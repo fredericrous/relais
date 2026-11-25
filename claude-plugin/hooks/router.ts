@@ -1779,6 +1779,11 @@ export type RouterMemory = {
   rootsCwd: string | undefined
   // Revert lookups (`git show`) not yet queued; each ends within the gate timeout.
   reverts: Set<Promise<void>>
+  // After a clear or resume, until the first prompt that is not a task
+  // notification: the session's opening request may arrive from a plugin.
+  isOpeningWindow: boolean
+  // A router-state failure streak has been reported; the next read that parses ends it.
+  isStateFailureReported: boolean
 }
 
 export const createRouterMemory = (): RouterMemory => ({
@@ -1802,6 +1807,8 @@ export const createRouterMemory = (): RouterMemory => ({
   repository: undefined,
   roots: new Map(),
   rootsCwd: undefined,
+  isOpeningWindow: false,
+  isStateFailureReported: false,
   reverts: new Set(),
 })
 

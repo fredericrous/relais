@@ -32,6 +32,7 @@ import {
   flag,
   noteRelaisLaunch,
   onPrompt,
+  noteLostFlush,
   onSessionEnd,
   onToolResult,
   onTurnComplete,
@@ -128,6 +129,7 @@ export function register(on: any) {
     // for it (routing.ts). Until then, and on any failure, nothing is routed.
     if (typeof e.cwd === 'string') store.router.cwd = e.cwd
     detach(refreshState(fx, store))
+    detach(noteLostFlush(fx, store))
     // The programme the session holds, and the tail a module reload kept.
     detach(readProgramme(fx, store, 'start'))
     detach(restoreTail(fx, store))
@@ -570,7 +572,11 @@ export function register(on: any) {
         }
       }
       onPersonPrompt(store, e.text)
-      if (!isOwn && PERSON_ORIGINS.has(e.origin?.kind) && typeof e.text === 'string') {
+      // The first prompt after a clear or resume may come from a plugin that
+      // relays the session's opening request; it is classified like a typed one.
+      const isRelayedOpening = store.router.isOpeningWindow && e.origin?.kind === 'plugin' && !isOwn
+      if (!isOwn) store.router.isOpeningWindow = false
+      if ((isRelayedOpening || (!isOwn && PERSON_ORIGINS.has(e.origin?.kind))) && typeof e.text === 'string') {
         try {
           await onPrompt(effects($), store, e.text)
         } catch {

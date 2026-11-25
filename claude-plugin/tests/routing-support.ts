@@ -96,6 +96,7 @@ export async function routedSession(
   engine.observeExits = []
   const state: Record<string, unknown> = { ...ROUTER_STATE, ...(options.state ?? {}) }
   engine.state = state
+  engine.script.isRouterStateScripted = true
   engine.script.runResult = (argv: string[], init: any) => {
     if (argv[1] === 'native' && argv[2] === 'router-state') return { ...ok, stdout: JSON.stringify(state) }
     if (argv[1] === 'native' && argv[2] === 'router-observe') {

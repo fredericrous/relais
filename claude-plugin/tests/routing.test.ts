@@ -1447,3 +1447,150 @@ test('a subagent edit during a correction window is not in the main task’s cor
   await endSession($, engine)
   expect(correctionRows(engine).filter((r: any) => r.files)).toEqual([])
 })
+
+// --- a session a relay opens after /clear ---------------------------------------
+
+async function clearInto($: any, engine: any, pins: Record<string, string> = {}) {
+  await $.session.end({ reason: 'clear', sessionId: 'session-1' })
+  await settle(engine)
+  engine.script.sessionId = 'session-2'
+  engine.state.pins = { ...(engine.state.pins as object), ...pins }
+}
+
+async function startAfterClear($: any, engine: any) {
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await $.classic.SessionStart({ source: 'clear' })
+  await settle(engine)
+}
+
+const decisionSessions = (engine: any) =>
+  nativeCalls(engine.calls, 'router-observe').flatMap((c: any) =>
+    (c.payload.records as any[]).filter(r => r.kind === 'decision').map(r => ({ session: c.payload.session, reason: r.reason, applied: r.applied })),
+  )
+
+const stateGate = (engine: any) => {
+  let release!: () => void
+  const gate = new Promise<void>(resolve => (release = resolve))
+  engine.script.runGate = (argv: string[]) => (argv[2] === 'router-state' ? gate : undefined)
+  return release
+}
+
+test('after a clear, a relayed opening prompt opens the task and a pinned launch is recorded under the new session', async ($: any, on: any) => {
+  on('classic.SessionStart', () => ({}))
+  const engine = await routedSession($, on)
+  await clearInto($, engine, { 'relais-review': 'opus' })
+  await startAfterClear($, engine)
+  await $.prompt.submit({ text: 'resume the plan', wait: false, origin: { kind: 'plugin', name: 'relay' } })
+  await step($, { turnId: 'turn-relayed', index: 0 })
+  await $.agent.spawn({ prompt: 'review it', description: 'review', subagentType: 'relais-review', model: 'sonnet' })
+  expect(engine.calls.spawned[0].model).toBe('sonnet')
+  await endSession($, engine)
+  expect(decisionSessions(engine).filter(d => d.reason === 'pin')).toEqual([{ session: 'session-2', reason: 'pin', applied: false }])
+})
+
+test('after a clear, a launch with no prompt waits for the pending router-state and sees its pins', async ($: any, on: any) => {
+  on('classic.SessionStart', () => ({}))
+  const engine = await routedSession($, on)
+  await clearInto($, engine, { 'relais-review': 'opus' })
+  const release = stateGate(engine)
+  await startAfterClear($, engine)
+  const completes = engine.calls.completes.length
+  const launched = $.agent.spawn({ prompt: 'review it', description: 'review', subagentType: 'relais-review', model: 'sonnet' })
+  await settle(engine)
+  expect(engine.calls.spawned.length).toBe(0)
+  release()
+  await launched
+  expect(engine.calls.spawned[0].model).toBe('sonnet')
+  expect(engine.calls.completes.length).toBe(completes)
+})
+
+test('a launch waits for a slow router-state only up to the budget, then keeps its model with no row', async ($: any, on: any) => {
+  on('classic.SessionStart', () => ({}))
+  const engine = await routedSession($, on)
+  await clearInto($, engine)
+  const release = stateGate(engine)
+  await startAfterClear($, engine)
+  let isDone = false
+  const launched = $.agent.spawn({ prompt: 'review it', description: 'review', subagentType: 'pinned-agent', model: 'sonnet' }).then(() => {
+    isDone = true
+  })
+  await engine.clock.advance(1900)
+  await settle(engine)
+  expect(isDone).toBe(false)
+  await engine.clock.advance(200)
+  await settle(engine)
+  expect(isDone).toBe(true)
+  release()
+  await launched
+  expect(engine.calls.spawned[0].model).toBe('sonnet')
+  await endSession($, engine)
+  expect(decisionSessions(engine)).toEqual([])
+})
+
+const failingState = (engine: any, results: any[]) => {
+  engine.script.runResult = ((base: any) => (argv: string[], init: any) => {
+    if (argv[2] === 'router-state' && results.length > 0) return results.shift()
+    return base(argv, init)
+  })(engine.script.runResult)
+}
+const FAIL_EXIT = { exitCode: 3, stdout: '', stderr: 'boom', isStdoutTruncated: false, isStderrTruncated: false }
+const FAIL_PARSE = { exitCode: 0, stdout: 'not json', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+const GOOD = (engine: any) => ({ exitCode: 0, stdout: JSON.stringify(engine.state), stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
+
+for (const [name, failure, text] of [
+  ['a non-zero exit', FAIL_EXIT, '(exit 3): boom'],
+  ['unparseable stdout', FAIL_PARSE, '(unparseable): not json'],
+] as const) {
+  test(`a failing router-state (${name}) with no run gives one toast per failure streak`, async ($: any, on: any) => {
+    const engine = await routedSession($, on)
+    const before = engine.calls.toasts.length
+    failingState(engine, [failure, failure])
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    await settle(engine)
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    await settle(engine)
+    const toasts = engine.calls.toasts.slice(before)
+    expect(toasts.length).toBe(1)
+    expect(toasts[0]).toContain('session routing is off for this session: router-state failed (')
+    expect(toasts[0]).toContain('to reproduce: relais native router-state --session session-1')
+    expect(toasts[0]).toContain(text)
+  })
+}
+
+test('failure, failure, success, failure gives two toasts', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  const before = engine.calls.toasts.length
+  failingState(engine, [FAIL_EXIT, FAIL_EXIT, GOOD(engine), FAIL_EXIT])
+  for (let i = 0; i < 4; i++) {
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    await settle(engine)
+  }
+  expect(engine.calls.toasts.slice(before).length).toBe(2)
+})
+
+test('a failing final flush is noted once at the next session start, after a clear and from a fresh store', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  engine.observeExits.push(1)
+  const before = engine.calls.toasts.length
+  await $.session.end({ reason: 'clear', sessionId: 'session-1' })
+  await settle(engine)
+  expect(engine.calls.toasts.length).toBe(before)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await settle(engine)
+  const lost = engine.calls.toasts.slice(before).filter((t: string) => t.includes('lost'))
+  expect(lost.length).toBe(1)
+  expect(lost[0]).toContain('exit 1')
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await settle(engine)
+  expect(engine.calls.toasts.slice(before).filter((t: string) => t.includes('lost')).length).toBe(1)
+})
+
+test('a plugin-origin prompt later in the session is not classified', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  const completes = engine.calls.completes.length
+  await $.prompt.submit({ text: 'a plugin speaks', wait: false, origin: { kind: 'plugin', name: 'other' } })
+  await settle(engine)
+  expect(engine.calls.completes.length).toBe(completes)
+})

@@ -132,7 +132,7 @@ budget. A router-state read or final flush that fails leaves a note.
 
 ## Phases
 
-- [ ] Phase 1 — red tests, then the fix: `claude-plugin/hooks/routing.ts`,
+- [x] Phase 1 — red tests, then the fix: `claude-plugin/hooks/routing.ts`,
   `claude-plugin/hooks/register.ts`, `claude-plugin/hooks/router.ts` (new
   `RouterMemory` fields), `claude-plugin/tests/routing.test.ts`,
   `claude-plugin/tests/routing-support.ts`. Done through relais

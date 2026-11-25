@@ -3,6 +3,7 @@
 // with relais's request lines and reads what the plugin did.
 
 import { mock } from 'claude-code/testing'
+import { ROUTER_STATE } from './routing-support.ts'
 
 export type Calls = {
   run: { argv: string[]; init: any }[]
@@ -116,6 +117,8 @@ export function scriptedEngine(
     // Holds each `agent.list` call until it settles. Null answers at once.
     listHold: null as Promise<void> | null,
     // Holds each `process.run` until it settles: a test delays one reply. Null answers at once.
+    // Set by a test that answers `relais native router-state` itself.
+    isRouterStateScripted: false,
     runGate: null as ((argv: string[]) => Promise<void> | undefined) | null,
   }
   const store: Record<string, { value: unknown; version: number }> = {}
@@ -158,7 +161,12 @@ export function scriptedEngine(
   on('command.register', (_$: any, e: any) => ({ value: { command: e.name } }))
   on('process.run', async (_$: any, e: any) => {
     calls.run.push({ argv: [...e.argv], init: e.init })
-    const answer = script.runResult(e.argv, e.init)
+    // A test that does not script router-state gets a state with routing
+    // off, not a failure (which the plugin reports).
+    const answer =
+      e.argv[2] === 'router-state' && !script.isRouterStateScripted
+        ? { exitCode: 0, stdout: JSON.stringify({ ...ROUTER_STATE, mode: 'off' }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+        : script.runResult(e.argv, e.init)
     if (script.runGate) await script.runGate(e.argv)
     return { value: answer }
   })
