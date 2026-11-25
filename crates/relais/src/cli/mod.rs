@@ -1024,7 +1024,14 @@ pub(crate) enum NativeCommand {
     /// A task contract on stdin, validated and saved under the
     /// repository's `.relais/tasks/`; prints the path `relais run --task`
     /// takes. What the plugin's run tool calls with the model's contract.
-    Contract,
+    Contract {
+        /// Print the path relative to the current directory (`../` steps
+        /// up to the repository root, then `.relais/tasks/<hash>.json`),
+        /// so the driver's argv names no directory a worker's
+        /// `pkill -f <path>` could match
+        #[arg(long)]
+        relative: bool,
+    },
     /// What the session router needs to decide (SPEC §30): mode, tiers,
     /// capability table, rates, priors, pins, checks, hold-out and seed,
     /// as one JSON object. Reads only; never creates the ledger

@@ -9,6 +9,31 @@ test('the run tool starts relais with the protocol flag, the host and the sessio
   expect(child.env).toEqual({ RELAIS_HOST: 'claude-code-mod', RELAIS_SESSION_ID: 'session-1' })
 })
 
+// f26: a worker's `pkill -f relais-wt-f21` matched its own driver, whose
+// argv held the contract's absolute path inside the worktree. The run tool
+// asks relais for the path relative to the cwd and starts the driver with it.
+test('the run tool asks relais for a relative contract path and starts the driver with it', async ($: any, on: any) => {
+  const engine = scriptedEngine(on)
+  await $.session.start({ cwd: '/wt/relais-wt-x', surface: 'terminal', isInteractive: true })
+  await settle(engine)
+  const previous = engine.script.runResult
+  engine.script.runResult = (argv: string[], init: any) =>
+    argv[2] === 'contract'
+      ? { exitCode: 0, stdout: '.relais/tasks/a.json\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+      : previous(argv, init)
+  const contract = { schema_version: 1, kind: 'change', objective: 'x' }
+  const reply = await $.tool.call({ tool: 'mcp__relais__run', task: contract, cwd: '/wt/relais-wt-x' })
+  expect(reply.result).toContain('Started relais run for: .relais/tasks/a.json (in /wt/relais-wt-x)')
+  await startQueued(engine)
+  const saved = nativeCalls(engine.calls, 'contract')
+  expect(saved.map(call => call.argv)).toEqual([['relais', 'native', 'contract', '--relative']])
+  expect(saved[0].init.cwd).toBe('/wt/relais-wt-x')
+  const [child] = engine.calls.spawn
+  expect(child.argv).toEqual(['relais', 'run', '--task', '.relais/tasks/a.json', '--protocol'])
+  expect(child.cwd).toBe('/wt/relais-wt-x')
+  expect(child.argv.some((arg: string) => arg.includes('relais-wt-x'))).toBe(false)
+})
+
 test('the run tool returns at once with what it started', async ($: any, on: any) => {
   const engine = await startedRun($, on)
   const reply = await $.tool.call({ tool: 'mcp__relais__run', task: 'other.json', cwd: '/repo' })

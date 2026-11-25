@@ -7730,6 +7730,12 @@ fn the_prompt_carries_the_native_rules_and_no_headless_wording() {
     assert!(rules.contains("do not leave scratch files"), "{rules}");
     assert!(rules.contains("DONE"), "{rules}");
     assert!(rules.contains("relais-blocked: <reason>"), "{rules}");
+    // f26: a worker's `pkill -f <worktree>` once matched its own driver.
+    assert!(
+        rules.contains("only by the pid you recorded (`$!`"),
+        "{rules}"
+    );
+    assert!(rules.contains("`pgrep -f`, `ps | grep`"), "{rules}");
     for headless_only in [
         "sandbox",
         "TMPDIR",
@@ -8203,6 +8209,10 @@ fn every_attempt_kind_carries_the_native_rules() {
             "{kind:?}: {prompt}"
         );
         assert!(prompt.contains("you cannot spawn agents"), "{kind:?}");
+        assert!(
+            prompt.contains("with `kill <pid>`; never by a pattern"),
+            "{kind:?}"
+        );
     }
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }

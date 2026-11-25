@@ -90,7 +90,7 @@ No guard parses a `pkill` command: f24 already settled that.
 
 ## Phases
 
-- [ ] Phase 1. Add `--relative` to `relais native contract`
+- [x] Phase 1. Add `--relative` to `relais native contract`
   (`crates/relais/src/cli/native.rs`, `crates/relais/src/cli/mod.rs`), with
   an integration test in `crates/relais/tests/it/portable_scenarios.rs` run from the root and from a subdirectory.
   Change `claude-plugin/hooks/runs.ts` (`contractPath` takes an option the
@@ -120,6 +120,19 @@ No guard parses a `pkill` command: f24 already settled that.
 | new tests fail on main | the new test copied into a detached worktree of origin/main | the relative-path tests fail |
 | prompt pins | `cargo test -p relais --lib runner::` | pass; the two new assertions fail with the rule line removed |
 | piloted | in a scratch repo: `relais native contract` < a contract, then `relais plan --task .relais/tasks/<x>.json` (the same `load_contract`) | the relative path loads; after the reinstall, `pgrep -fl <worktree-name>` (the matcher `pkill -f` uses) lists no driver pid, while `pgrep -fl relais` still does |
+
+### Observed (Phase 1)
+
+| Check | Input | Actual |
+| --- | --- | --- |
+| plugin tests | `sh scripts/plugin-test.sh` | 602 pass, 0 fail; the new run-tool test and the `decide` no-flag assertion ran |
+| new tests fail on main | spawn/successor tests and `runner/tests/mod.rs` copied onto a detached origin/main | the run-tool test fails (601 pass, 1 fail); both prompt pins fail (2 failed) |
+| prompt pins | `cargo test -p relais --lib runner::` | ok (417.9 s) |
+| relative flag | `cargo test -p relais --test it native_contract` | 3 passed, including root, `deep/er`, and a symlink to it; `plan --task` gets past the contract load from each |
+| piloted | built binary in a scratch repo with linked worktree `/tmp/…/relais-wt-pilot` | `--relative`: `.relais/tasks/60b983a40d7802da.json` from the root, `../.relais/tasks/…` from `sub`, both load; without it: `/private/tmp/…/relais-wt-pilot/.relais/tasks/…` (the shape that matched). The live-driver `pgrep -fl` check waits for the release and reinstall. |
+| lint | `make lint` | rc 0 |
+
+Carried from review, done: symlink case, `/` joins, the pilot passes `--relative`, and `decide` keeps the absolute path, with a test. Kept deliberate: the reply already reads `… for: <path> (in <cwd>)`, so it names the cwd the path is relative to.
 
 ## Non-goals
 

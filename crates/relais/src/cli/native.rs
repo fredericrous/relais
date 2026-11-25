@@ -202,7 +202,7 @@ pub(crate) fn native_cancel_command(
 /// `<root>/.relais/tasks/<hash>.json`, under the `.relais/` the dirty-tree
 /// check already leaves alone, with a `.gitignore` that keeps it out of
 /// `git status`.
-pub(crate) fn native_contract_command() -> Result<CliOutcome, CliError> {
+pub(crate) fn native_contract_command(relative: bool) -> Result<CliOutcome, CliError> {
     use std::io::Read;
     let mut text = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut text) {
@@ -256,7 +256,17 @@ pub(crate) fn native_contract_command() -> Result<CliOutcome, CliError> {
     })();
     match written {
         Ok(path) => {
-            println!("{}", path.display());
+            let shown = if relative {
+                cwd()
+                    .ok()
+                    .and_then(|here| relative_task_path(&here, &root, &path))
+            } else {
+                None
+            };
+            match shown {
+                Some(shown) => println!("{shown}"),
+                None => println!("{}", path.display()),
+            }
             Ok(CliOutcome::Accepted)
         }
         Err(e) => {
@@ -269,6 +279,24 @@ pub(crate) fn native_contract_command() -> Result<CliOutcome, CliError> {
     }
 }
 
+/// `saved` (under `root`) as a path relative to `here`, a directory at or
+/// below `root`: one `../` per component of `here` below `root`, then the
+/// rest of `saved`, joined with `/` on every platform. The kernel resolves
+/// `..` against the physical directory, and `here` is the physical cwd the
+/// root was located from, so the driver started in `here` reads the same
+/// file. Holds no directory name above `root`, so a worker's
+/// `pkill -f <worktree path>` cannot match the driver's argv (f26). `None`
+/// when `here` is not under `root` or `saved` is not under it.
+pub(crate) fn relative_task_path(here: &Path, root: &Path, saved: &Path) -> Option<String> {
+    let below = here.strip_prefix(root).ok()?;
+    let inside = saved.strip_prefix(root).ok()?;
+    let mut parts: Vec<String> = below.components().map(|_| "..".to_string()).collect();
+    for part in inside.components() {
+        parts.push(part.as_os_str().to_str()?.to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 /// `relais native …`: what the relais plugin tells the coordinator, and
 /// the run timeline it reads back (SPEC §23, §29). Exit 0 acknowledges.
 pub(crate) fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError> {
@@ -278,7 +306,7 @@ pub(crate) fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError>
         }
         NativeCommand::Cancel { run, session } => native_cancel_command(&run, session.as_deref()),
         NativeCommand::Usage { dispatch } => native_usage_command(&dispatch),
-        NativeCommand::Contract => native_contract_command(),
+        NativeCommand::Contract { relative } => native_contract_command(relative),
         NativeCommand::RouterState { session } => Ok(router_state_command(&session)),
         NativeCommand::RouterObserve => Ok(router_observe_command()),
         NativeCommand::ReviewOutcome {

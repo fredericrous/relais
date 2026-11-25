@@ -197,8 +197,16 @@ function answeredText(pending: PendingOutcome, decision: any, state: string): st
 
 // The run tool's `task`: a contract object, which relais validates and saves
 // under the repository's `.relais/tasks/`, or the path of a contract file.
-// Prose is refused with what a contract needs.
-export async function contractPath(fx: Fx, task: unknown, cwd: string): Promise<{ path: string; deny?: undefined } | { deny: string }> {
+// Prose is refused with what a contract needs. With `relative`, relais
+// prints the saved path relative to `cwd` (`../` steps, then
+// `.relais/tasks/…`): the driver started there then carries no worktree
+// name in its argv for a worker's `pkill -f <path>` to match (f26).
+export async function contractPath(
+  fx: Fx,
+  task: unknown,
+  cwd: string,
+  options: { relative?: boolean } = {},
+): Promise<{ path: string; deny?: undefined } | { deny: string }> {
   if (typeof task === 'string') {
     if (task.endsWith('.json')) return { path: task }
     return {
@@ -206,7 +214,7 @@ export async function contractPath(fx: Fx, task: unknown, cwd: string): Promise<
     }
   }
   if (!task || typeof task !== 'object') return { deny: 'relais run needs a task contract object.' }
-  const saved = await fx.process.run(['relais', 'native', 'contract'], {
+  const saved = await fx.process.run(['relais', 'native', 'contract', ...(options.relative ? ['--relative'] : [])], {
     cwd,
     stdin: JSON.stringify(task),
     timeoutMs: STATUS_TIMEOUT_MS,

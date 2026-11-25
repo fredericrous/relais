@@ -2021,6 +2021,76 @@ fn native_contract_saves_a_contract_and_refuses_prose() {
     );
 }
 
+/// `--relative` prints the saved path relative to the cwd, so the driver
+/// the plugin starts there names no worktree directory a worker's
+/// `pkill -f <path>` could match (f26). From the root it is
+/// `.relais/tasks/<hash>.json`; from a subdirectory, and from a symlink to
+/// it, one `../` per level; `relais plan --task`, run in the same cwd,
+/// loads each.
+#[test]
+fn native_contract_relative_prints_a_path_with_no_directory_name() {
+    use std::io::Write;
+    let world = World::new("native-contract-relative");
+    world.write_policy();
+    let contract = std::fs::read_to_string(world.write_task("task.json")).expect("task");
+    let pipe = |cwd: &Path| {
+        let mut child = common::relais(BIN)
+            .args(["native", "contract", "--relative"])
+            .current_dir(cwd)
+            .env("RELAIS_STATE_DIR", &world.state)
+            .env("RELAIS_CONFIG_DIR", &world.config)
+            .env("HOME", &world.root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("relais runs");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(contract.as_bytes())
+            .expect("written");
+        let out = child.wait_with_output().expect("relais ends");
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        text(&out.stdout).trim().to_string()
+    };
+    // `plan` loads the contract before it looks for the harness, which
+    // this world leaves missing: reaching that refusal proves the load.
+    let loads = |cwd: &Path, printed: &str| {
+        let plan = world.relais_in(cwd, &["plan", "--task", printed]);
+        let stderr = text(&plan.stderr);
+        let at = cwd.display();
+        assert!(
+            !stderr.contains("the task contract"),
+            "{printed} from {at}: {stderr}"
+        );
+        assert!(
+            stderr.contains("the harness is unknown"),
+            "{printed} from {at}: {stderr}"
+        );
+    };
+    let from_root = pipe(&world.repo);
+    assert!(from_root.starts_with(".relais/tasks/"), "{from_root}");
+    assert!(from_root.ends_with(".json"), "{from_root}");
+    loads(&world.repo, &from_root);
+
+    let sub = world.repo.join("deep").join("er");
+    std::fs::create_dir_all(&sub).expect("subdirectory");
+    let from_sub = pipe(&sub);
+    assert_eq!(from_sub, format!("../../{from_root}"));
+    loads(&sub, &from_sub);
+
+    #[cfg(unix)]
+    {
+        let link = world.root.join("linked-sub");
+        std::os::unix::fs::symlink(&sub, &link).expect("symlink");
+        let from_link = pipe(&link);
+        assert_eq!(from_link, from_sub, "the physical cwd decides the steps");
+        loads(&link, &from_link);
+    }
+}
+
 /// A read hint that does not resolve at the contract's base is refused at
 /// submit, with nothing written, and the hint named on stderr (t08).
 #[test]
