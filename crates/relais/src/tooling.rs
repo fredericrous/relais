@@ -364,6 +364,22 @@ mod tests {
         assert_eq!(bin_for_listing(&[]), "aval");
     }
 
+    #[test]
+    fn the_aval_blocker_names_what_to_install() {
+        assert_eq!(
+            missing_integration_detail("aval", "greentopo", None),
+            "required integration `aval` (binary `greentopo`) is not available on PATH; \
+             install greentopo (`aval` still works for now), or set its [integrations] \
+             key (aval or greentopo) in relais.toml to \"optional\""
+        );
+        assert_eq!(
+            missing_integration_detail("aval", "/opt/x/topo", Some("/opt/x/topo")),
+            "required integration `aval` (binary `/opt/x/topo`) is not available on PATH; \
+             install `/opt/x/topo`, or set its [integrations] key (aval or greentopo) in \
+             relais.toml to \"optional\""
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_dangling_greentopo_is_chosen_not_skipped() {

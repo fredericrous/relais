@@ -381,13 +381,12 @@ impl DecisionResolver for AvalCli {
     fn resolve(&self, key: &str, scope: Option<&str>) -> AvalVerdict {
         // The default program is this resolver's one choice, so every key
         // of the run is asked of the same binary.
-        let default_program = self.bin.is_none().then(|| self.program());
         aval_resolve_in(
             &self.root,
             key,
             scope,
             self.bin.as_deref(),
-            default_program,
+            Some(self.program()),
             std::env::var_os("PATH").unwrap_or_default(),
             self.cancel.as_deref(),
         )
@@ -584,7 +583,9 @@ pub fn aval_resolve_in(
         }
         Err(e) => AvalVerdict::ToolFailure {
             exit: -1,
-            detail: format!("aval (`{program}`) could not be launched: {e}"),
+            detail: format!(
+                "aval (`{program}`) could not be launched: {e}; check that `{program}` on PATH runs, or set `bin` under [integrations] in relais.toml"
+            ),
         },
     }
 }
@@ -1754,6 +1755,31 @@ mod tests {
             "greentopo is installed, so aval's absence is not confirmed: {verdict:?}"
         );
         assert_eq!(verdict, parse_aval_output(3, ""), "{verdict:?}");
+    }
+
+    /// The caller's chosen program beats the PATH lookup: one resolver asks
+    /// every key of the binary it chose.
+    #[cfg(unix)]
+    #[test]
+    fn the_callers_default_program_is_the_one_spawned() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::temp_dir("aval-default-program");
+        for (name, code) in [("aval", 0), ("greentopo", 3)] {
+            let fake = dir.join(name);
+            std::fs::write(&fake, format!("#!/bin/sh\nexit {code}\n")).expect("write");
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            crate::test_support::prime_script(&fake);
+        }
+        let verdict = aval_resolve_in(
+            &dir,
+            "k",
+            None,
+            None,
+            Some("aval"),
+            dir.as_os_str().to_owned(),
+            None,
+        );
+        assert_eq!(verdict, parse_aval_output(0, ""), "{verdict:?}");
     }
 
     #[test]
