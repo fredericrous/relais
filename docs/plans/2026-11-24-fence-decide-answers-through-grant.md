@@ -173,10 +173,10 @@ Under `LocalState` (which always grants) nothing changes.
   implementation; the reviewed text said `sealed.written`.
 - 2026-11-24 (implementation) — the shared state is built lazily, at the
   three points that ask for a grant (not in `decide_inner`): an answer that
-  reaches none of them (`salvaged`, `abandon`, argument refusals) is unchanged
-  under `shared_state = "external"` with no client. The answers that do ask
-  (approve, reject, the other plain answers, revise, the stopped-review
-  approve) refuse there with exit 3 through `shared_state_error`, as
+  reaches none of them (`salvaged`, an argument refusal, an unknown run, a run
+  not waiting on a person) is unchanged under `shared_state = "external"` with
+  no client. The answers that do ask (approve, reject, `abandon`, `decided`,
+  revise, the stopped-review approve) refuse there with exit 3 through `shared_state_error`, as
   `relais run` does (an-t06, refuse rather than split). `salvaged` stays
   unfenced.
 

@@ -619,10 +619,20 @@ fn decision_held_elsewhere(run: &RunId) -> NodeError {
     .into()
 }
 
-/// The reason text of [`decision_held_elsewhere`], so a caller can tell this
-/// refusal from any other the shared half gives.
-pub fn held_elsewhere_reason(run: &RunId) -> String {
+fn held_elsewhere_reason(run: &RunId) -> String {
     format!("the decision of run {run} is being answered elsewhere")
+}
+
+/// Whether `e` is the refusal an answer to `run`'s decision gets when
+/// another answerer holds its grant, as against any other refusal the
+/// shared half gives. The text is built and compared here, so the two
+/// cannot drift apart.
+pub fn is_decision_held_elsewhere(e: &NodeError, run: &RunId) -> bool {
+    matches!(
+        e,
+        NodeError::Shared(SharedStateError::Refused { reason })
+            if *reason == held_elsewhere_reason(run)
+    )
 }
 
 /// Answer a decision with no successor (approve, reject and the other plain
@@ -664,11 +674,11 @@ pub fn answer_under_grant<T, E>(
     match state.answer_decision(run)? {
         DecisionGrant::HeldElsewhere => Err(decision_held_elsewhere(run)),
         DecisionGrant::Granted => {
-            let result = write();
-            if !closed(&result) {
+            let written = write();
+            if !closed(&written) {
                 give_back(&format!("decision:{run}"), state.release_decision(run));
             }
-            Ok(result)
+            Ok(written)
         }
     }
 }

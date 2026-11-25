@@ -190,16 +190,20 @@ prints `make: 1 carried` with no timings, which are the source attempt's.
   approval of a stopped review, now ask the shared half for the decision
   grant before they write, as the revise answer already did. When another
   answerer holds it, the answer is refused with `relais decide: the decision
-  of run R is being answered elsewhere; this node has not read its state: see
-  relais status, or answer again once that answer is in or its claim lapses
-  (10 minutes)` and exit 3 (under `--json`, `{"error": ..., "exit": 3}` on
-  stdout). The revise answer's refusal used to exit 1 and now exits 3 too. A
-  repeat on an answered stopped review asks no grant and stays exit 0.
-  Under `shared_state = "external"` with no client these answers now exit 3
-  where they used to exit 0 (the shared state cannot be built, as `relais
-  run` refuses). `relais feedback` answers no decision and takes no grant.
-  `salvaged` still closes a decision without it. Nothing changes for a single
-  node.
+  of run R is being answered elsewhere: check `relais status R`, then answer
+  again if it is still open (the other answer's claim lapses in 10 minutes)`
+  and exit 3 (under `--json`, `{"error": ..., "exit": 3}` on stdout and
+  nothing on stderr). A repeat on an answered stopped review asks no grant and
+  stays exit 0. `relais feedback` answers no decision and takes no grant.
+  `salvaged` still closes a decision without it. Nothing else changes for a
+  single node.
+- Breaking, for a caller of `relais decide`'s exit status: a revise refused
+  because another answerer holds the decision now exits 3 (it exited 1), and
+  under `shared_state = "external"` with no client the approve, reject and
+  other plain answers (`abandon` and `decided` included), the revise answer
+  and the stopped-review approve exit 3 (they exited 0), as `relais run`
+  refuses there. `salvaged`, a refused argument, an unknown run and a run not
+  waiting on a person are unchanged.
 - Under `shared_state = "external"` with no client, `relais hook` still
   answers as before and exits 0; on a resumed `SessionStart` and on
   `SessionEnd` it updates the claim files and says so in one stderr line.

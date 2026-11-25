@@ -908,10 +908,13 @@ mod tests {
         state
             .answer_decision(&run("run-a"))
             .expect("another answerer took it");
-        assert!(matches!(
-            node::resolve_decision(&state, &ledger, &run("run-a"), &plain_answer()),
-            Err(NodeError::Shared(SharedStateError::Refused { .. }))
-        ));
+        let refused = node::resolve_decision(&state, &ledger, &run("run-a"), &plain_answer())
+            .expect_err("held elsewhere");
+        assert!(
+            node::is_decision_held_elsewhere(&refused, &run("run-a")),
+            "{refused}"
+        );
+        assert!(!node::is_decision_held_elsewhere(&refused, &run("run-b")));
         let decision = ledger
             .decision_of_run(&run("run-a"))
             .expect("read")
@@ -948,10 +951,10 @@ mod tests {
     fn an_answer_under_grant_keeps_the_grant_only_for_a_closed_decision() {
         let state = FakeState::new();
         // Closed: kept, on `Ok` and on `Err` alike.
-        for (name, result) in [("kept-ok", Ok(1)), ("kept-err", Err("receipt.json"))] {
+        for (name, outcome) in [("kept-ok", Ok(1)), ("kept-err", Err("receipt.json"))] {
             let id = run(name);
-            let got = node::answer_under_grant(&state, &id, || result, |_| true).expect("grant");
-            assert_eq!(got, result);
+            let got = node::answer_under_grant(&state, &id, || outcome, |_| true).expect("grant");
+            assert_eq!(got, outcome);
             assert_eq!(
                 state.answer_decision(&id).expect("ask"),
                 DecisionGrant::HeldElsewhere,
@@ -959,10 +962,10 @@ mod tests {
             );
         }
         // Not closed: given back, on `Ok` and on `Err` alike.
-        for (name, result) in [("freed-ok", Ok(1)), ("freed-err", Err("refused"))] {
+        for (name, outcome) in [("freed-ok", Ok(1)), ("freed-err", Err("refused"))] {
             let id = run(name);
-            let got = node::answer_under_grant(&state, &id, || result, |_| false).expect("grant");
-            assert_eq!(got, result);
+            let got = node::answer_under_grant(&state, &id, || outcome, |_| false).expect("grant");
+            assert_eq!(got, outcome);
             assert_eq!(
                 state.answer_decision(&id).expect("ask"),
                 DecisionGrant::Granted,
