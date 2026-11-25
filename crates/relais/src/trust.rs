@@ -557,7 +557,7 @@ const MACHINE_FILE_MODE: u32 = 0o600;
 
 /// Add `[trust."<key>"]` to the machine settings at `path`, creating the
 /// file (and its directory) when there is none, through [`edit_machine`].
-pub fn grant(path: &Path, key: &str, record: &TrustGrant) -> Result<Granted, GrantError> {
+pub(crate) fn grant(path: &Path, key: &str, record: &TrustGrant) -> Result<Granted, GrantError> {
     let written = edit_machine(path, |text, current| {
         if current.trust.contains_key(key) {
             return Ok(None);
@@ -574,7 +574,7 @@ pub fn grant(path: &Path, key: &str, record: &TrustGrant) -> Result<Granted, Gra
 /// Add `[trust_repos."<repo_key>"]` to the machine settings at `path`: the
 /// repository is trusted once (ADR-0007). Through [`edit_machine`], so
 /// under the lock, atomic, and 0600 for a new file.
-pub fn grant_repository(
+pub(crate) fn grant_repository(
     path: &Path,
     repo_key: &str,
     record: &TrustGrant,
@@ -604,7 +604,7 @@ pub fn grant_repository(
 /// [`MachineSettings`] before it replaces the old one, written
 /// atomically, and keeps the old file's mode (0600 for a new one).
 /// `true` when the file was written.
-pub fn edit_machine(
+pub(crate) fn edit_machine(
     path: &Path,
     edit: impl FnOnce(&str, &MachineSettings) -> Result<Option<String>, GrantError>,
 ) -> Result<bool, GrantError> {
@@ -668,7 +668,7 @@ fn existing_mode(path: &Path) -> u32 {
 
 /// `text` with one more `[<section>."<key>"]` table, everything else as it
 /// was.
-fn add_grant_to(
+pub(crate) fn add_grant_to(
     text: &str,
     section: &str,
     key: &str,

@@ -390,7 +390,10 @@ pub fn set_off(text: &str, off: &RoutingOff) -> Result<String, GrantError> {
 
 /// Write the envelope to machine.toml (locked, atomic, comments and mode
 /// kept: the same writer as `trust grant`).
-pub fn write_envelope(machine_path: &Path, envelope: &RoutingEnvelope) -> Result<(), GrantError> {
+pub(crate) fn write_envelope(
+    machine_path: &Path,
+    envelope: &RoutingEnvelope,
+) -> Result<(), GrantError> {
     crate::trust::edit_machine(machine_path, |text, _| {
         set_envelope(text, envelope).map(Some)
     })?;
@@ -401,7 +404,7 @@ pub fn write_envelope(machine_path: &Path, envelope: &RoutingEnvelope) -> Result
 /// `off` tombstone, under the same lock as the check: an envelope the
 /// person recorded is never replaced, and routing they turned off stays
 /// off. Whether it was written.
-pub fn write_envelope_if_absent(
+pub(crate) fn write_envelope_if_absent(
     machine_path: &Path,
     envelope: &RoutingEnvelope,
 ) -> Result<bool, GrantError> {
@@ -417,7 +420,7 @@ pub fn write_envelope_if_absent(
 /// Turn routing off in machine.toml (the same locked writer): the
 /// envelope removed, the tombstone recorded. Whether an envelope was
 /// removed.
-pub fn write_off(machine_path: &Path, off: &RoutingOff) -> Result<bool, GrantError> {
+pub(crate) fn write_off(machine_path: &Path, off: &RoutingOff) -> Result<bool, GrantError> {
     let mut had_envelope = false;
     crate::trust::edit_machine(machine_path, |text, current| {
         had_envelope = current.session_routing.envelope.is_some();

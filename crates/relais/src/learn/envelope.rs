@@ -72,7 +72,10 @@ pub fn set_off(text: &str, off: &AutoPromoteOff) -> Result<String, GrantError> {
 }
 
 /// Write the grant to machine.toml (locked, atomic, comments and mode kept).
-pub fn write_auto_promote(machine_path: &Path, grant: &AutoPromote) -> Result<(), GrantError> {
+pub(crate) fn write_auto_promote(
+    machine_path: &Path,
+    grant: &AutoPromote,
+) -> Result<(), GrantError> {
     crate::trust::edit_machine(machine_path, |text, _| {
         set_auto_promote(text, grant).map(Some)
     })?;
@@ -83,7 +86,7 @@ pub fn write_auto_promote(machine_path: &Path, grant: &AutoPromote) -> Result<()
 /// tombstone, under the same lock as the check: a grant the person
 /// recorded is never replaced, and promotion they turned off stays off.
 /// Whether it was written.
-pub fn write_auto_promote_if_absent(
+pub(crate) fn write_auto_promote_if_absent(
     machine_path: &Path,
     grant: &AutoPromote,
 ) -> Result<bool, GrantError> {
@@ -97,7 +100,7 @@ pub fn write_auto_promote_if_absent(
 
 /// Turn automatic promotion off (the same locked writer): the grant
 /// removed, the tombstone recorded. Whether a grant was removed.
-pub fn write_off(machine_path: &Path, off: &AutoPromoteOff) -> Result<bool, GrantError> {
+pub(crate) fn write_off(machine_path: &Path, off: &AutoPromoteOff) -> Result<bool, GrantError> {
     let mut had_grant = false;
     crate::trust::edit_machine(machine_path, |text, current| {
         had_grant = current.learning.auto_promote.is_some();

@@ -71,6 +71,21 @@ pub(crate) fn machine_of(state: &dyn SharedState) -> Result<MachineSettings, Cli
         .map_err(|e| shared_state_error("the machine settings", e))
 }
 
+/// Write the machine's settings through the shared-state implementation the
+/// machine selects (an-t20), as the person at this terminal: the CLI is the
+/// operator principal's own hand (an-t12). The outer error is the state
+/// that could not be built (`external` with no client, exit 3); the inner
+/// is the write's own, which each caller reports as it always did.
+pub(crate) fn write_settings(
+    edit: &relais::shared_state::SettingsEdit,
+) -> Result<Result<relais::shared_state::SettingsWrite, SharedStateError>, CliError> {
+    let who = std::env::var("USER")
+        .ok()
+        .filter(|user| !user.is_empty())
+        .unwrap_or_else(|| "operator".to_string());
+    Ok(shared_state()?.write_settings(&relais::shared_state::Principal::operator(who), edit))
+}
+
 /// The closed shared-state client this build links. Public relais links
 /// none; a private build (an-t13) replaces this one line with its factory.
 pub(crate) const EXTERNAL_CLIENT: Option<relais::shared_state::ExternalFactory> = None;

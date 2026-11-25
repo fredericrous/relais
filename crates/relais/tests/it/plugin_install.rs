@@ -503,3 +503,28 @@ fn an_install_after_routing_was_turned_off_leaves_it_off() {
     // Off means off: no classifier call, not shadow.
     assert_eq!(state["mode"], "off");
 }
+
+/// an-t20: under `external` with no client the installer's two settings
+/// writes go through the shared state, so they record nothing, say so once
+/// each, and the install itself still succeeds.
+#[test]
+fn an_install_under_an_absent_external_layer_says_not_recorded_and_writes_nothing() {
+    let world = World::new("envelope-external");
+    let machine = world.root.join("cfg").join("machine.toml");
+    let mine = "schema_version = 1\nshared_state = \"external\"\n";
+    std::fs::write(&machine, mine).unwrap();
+    let out = world.relais(&["install", "--claude", "--write"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stderr = text(&out.stderr);
+    for what in [
+        "session routing not recorded",
+        "automatic promotion not recorded",
+    ] {
+        assert_eq!(
+            stderr.lines().filter(|line| line.contains(what)).count(),
+            1,
+            "{stderr}"
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&machine).unwrap(), mine);
+}

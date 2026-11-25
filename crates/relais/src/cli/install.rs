@@ -142,24 +142,34 @@ pub(crate) fn install_command(
     }
 }
 
+/// One of the installer's settings writes, its failures as one sentence
+/// (the callers say what was not recorded and carry on).
+fn write_settings_for_install(
+    edit: &relais::shared_state::SettingsEdit,
+) -> Result<relais::shared_state::SettingsWrite, String> {
+    super::ctx::write_settings(edit)
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
 /// Installing the plugin is the person's authorization to route the
 /// session (plan, decision 1, R1b): record the envelope when machine.toml
 /// has neither one nor an `off` tombstone, and say how to turn it off. A
 /// failure here is said and does not fail the install: routing then stays
 /// in shadow.
 pub(crate) fn install_routing_envelope() {
-    let Ok(machine_path) = paths::machine_settings_path() else {
-        eprintln!("relais install: session routing not recorded: no config directory");
-        return;
-    };
     let envelope = relais::policy::RoutingEnvelope {
         granted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         by: "relais install".to_string(),
         epsilon_max: 0.1,
         source: relais::router::Source::Install.as_str().to_string(),
     };
-    match relais::router::write_envelope_if_absent(&machine_path, &envelope) {
-        Ok(true) => {
+    let edit = relais::shared_state::SettingsEdit::SetRoutingEnvelope {
+        envelope: envelope.clone(),
+        if_absent: true,
+    };
+    match write_settings_for_install(&edit) {
+        Ok(done) if done.written => {
             let recorded = open_ledger().and_then(|ledger| {
                 operational(
                     ledger.record_router_provenance(&relais::ledger::RouterProvenance::Envelope {
@@ -178,7 +188,7 @@ pub(crate) fn install_routing_envelope() {
                 "session routing is on; turn it off with /relais-routing off or RELAIS_SESSION_ROUTING=off"
             );
         }
-        Ok(false) => {}
+        Ok(_) => {}
         Err(e) => eprintln!("relais install: session routing not recorded: {e}"),
     }
 }
@@ -189,18 +199,20 @@ pub(crate) fn install_routing_envelope() {
 /// tombstone, and say how to turn it off. A failure is said and does not
 /// fail the install: the cycle then stops at `awaiting_promotion`.
 pub(crate) fn install_learning_envelope() {
-    let Ok(machine_path) = paths::machine_settings_path() else {
-        eprintln!("relais install: automatic promotion not recorded: no config directory");
-        return;
-    };
     let grant = relais::policy::AutoPromote {
         granted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         by: "relais install".to_string(),
         source: relais::router::Source::Install.as_str().to_string(),
     };
-    match relais::learn::envelope::write_auto_promote_if_absent(&machine_path, &grant) {
-        Ok(true) => println!("automatic promotion is on; turn it off with /relais-learning off"),
-        Ok(false) => {}
+    let edit = relais::shared_state::SettingsEdit::SetAutoPromote {
+        grant: grant.clone(),
+        if_absent: true,
+    };
+    match write_settings_for_install(&edit) {
+        Ok(done) if done.written => {
+            println!("automatic promotion is on; turn it off with /relais-learning off")
+        }
+        Ok(_) => {}
         Err(e) => eprintln!("relais install: automatic promotion not recorded: {e}"),
     }
 }

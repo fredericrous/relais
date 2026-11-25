@@ -9,16 +9,33 @@
 //! single-node user did before is refused now.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use super::types::{
-    DecisionGrant, IntentAnswer, LeaseToken, Mode, Pointer, Principal, PublishReceipt, PublishRow,
-    Reservation, ResourceId, Settlement, Slice, Swap, TicketAnswer, TicketRequest,
+    DecisionGrant, IntentAnswer, LeaseToken, Mode, Pointer, Principal, PrincipalKind,
+    PublishReceipt, PublishRow, Reservation, ResourceId, SettingsEdit, SettingsWrite, Settlement,
+    Slice, Swap, TicketAnswer, TicketRequest,
 };
 use super::{Selection, SharedState, SharedStateError};
 use crate::ids::RunId;
 use crate::money::MicroUsd;
 use crate::policy::MachineSettings;
+use crate::trust::Granted;
+
+/// The settings write's principal check, one sentence for every
+/// implementation (an-t20; an-t12: operators only).
+pub(super) fn require_operator(writer: &Principal) -> Result<(), SharedStateError> {
+    if writer.kind == PrincipalKind::Operator {
+        return Ok(());
+    }
+    Err(SharedStateError::Refused {
+        reason: format!(
+            "only an operator writes the machine settings; {:?} {} does not",
+            writer.kind, writer.id
+        ),
+    })
+}
 
 /// Each resource's current epoch and holder (`None` once released).
 type EpochTable = HashMap<ResourceId, (u64, Option<Principal>)>;
@@ -33,11 +50,29 @@ const THIS_NODE: &str = "local";
 #[derive(Debug, Clone, Default)]
 pub struct LocalState {
     epochs: Arc<Mutex<EpochTable>>,
+    /// A settings file other than the config directory's (conformance runs
+    /// and tests); `None` resolves the path at each call.
+    settings_path: Option<PathBuf>,
 }
 
 impl LocalState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A node whose settings file is `path`, not the config directory's.
+    pub fn at(path: PathBuf) -> Self {
+        Self {
+            settings_path: Some(path),
+            ..Self::default()
+        }
+    }
+
+    fn settings_path(&self) -> Result<PathBuf, SharedStateError> {
+        match &self.settings_path {
+            Some(path) => Ok(path.clone()),
+            None => crate::paths::machine_settings_path().map_err(SharedStateError::Home),
+        }
     }
 
     fn epochs(&self) -> std::sync::MutexGuard<'_, EpochTable> {
@@ -79,7 +114,7 @@ impl SharedState for LocalState {
     }
 
     fn machine_settings(&self) -> Result<MachineSettings, SharedStateError> {
-        let path = crate::paths::machine_settings_path().map_err(SharedStateError::Home)?;
+        let path = self.settings_path()?;
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             // Absent is empty: no ceilings, no grants. A fresh machine then
@@ -100,6 +135,59 @@ impl SharedState for LocalState {
             path,
             cause: Box::new(cause),
         })
+    }
+
+    fn write_settings(
+        &self,
+        writer: &Principal,
+        edit: &SettingsEdit,
+    ) -> Result<SettingsWrite, SharedStateError> {
+        require_operator(writer)?;
+        let path = self.settings_path()?;
+        let failed =
+            |e: crate::trust::GrantError| SharedStateError::SettingsWrite { cause: Box::new(e) };
+        let written = |written: bool| SettingsWrite {
+            written,
+            removed: false,
+        };
+        match edit {
+            SettingsEdit::GrantTrust { key, record } => {
+                crate::trust::grant(&path, key, record).map(|g| written(g == Granted::Written))
+            }
+            SettingsEdit::GrantRepository { repo_key, record } => {
+                crate::trust::grant_repository(&path, repo_key, record)
+                    .map(|g| written(g == Granted::Written))
+            }
+            SettingsEdit::SetAutoPromote {
+                grant,
+                if_absent: true,
+            } => crate::learn::envelope::write_auto_promote_if_absent(&path, grant).map(written),
+            SettingsEdit::SetAutoPromote {
+                grant,
+                if_absent: false,
+            } => crate::learn::envelope::write_auto_promote(&path, grant).map(|()| written(true)),
+            SettingsEdit::AutoPromoteOff(off) => {
+                crate::learn::envelope::write_off(&path, off).map(|removed| SettingsWrite {
+                    written: true,
+                    removed,
+                })
+            }
+            SettingsEdit::SetRoutingEnvelope {
+                envelope,
+                if_absent: true,
+            } => crate::router::write_envelope_if_absent(&path, envelope).map(written),
+            SettingsEdit::SetRoutingEnvelope {
+                envelope,
+                if_absent: false,
+            } => crate::router::write_envelope(&path, envelope).map(|()| written(true)),
+            SettingsEdit::RoutingOff(off) => {
+                crate::router::write_off(&path, off).map(|removed| SettingsWrite {
+                    written: true,
+                    removed,
+                })
+            }
+        }
+        .map_err(failed)
     }
 
     fn daily_spent(&self, _day_start: &str) -> Result<Option<MicroUsd>, SharedStateError> {

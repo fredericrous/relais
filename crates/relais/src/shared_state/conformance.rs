@@ -16,7 +16,9 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::node::{self, NodeError};
-use super::types::{DecisionGrant, Principal, PublishRow, Slice, DECISION_GRANT_TTL_SECS};
+use super::types::{
+    DecisionGrant, Principal, PublishRow, SettingsEdit, Slice, DECISION_GRANT_TTL_SECS,
+};
 use super::{SharedState, SharedStateError, TicketClaim};
 use crate::ids::{RunId, TaskId};
 use crate::learn::fixtures::{artifact, evaluation};
@@ -660,9 +662,163 @@ pub fn a_decision_grant_lapses(state: &dyn SharedState, fixture: &Fixture, advan
     state.release_decision(&run).expect("release");
 }
 
+/// The settings-write checks (an-t20). `make` is handed the path of a
+/// scratch settings file in a directory of its own; an implementation that
+/// writes a node's file (`LocalState::at`) uses it, one that writes
+/// elsewhere ignores it. They are kept out of [`run_all`], whose `make`
+/// takes no path, so that no check ever writes the real settings file.
+pub fn run_settings_writes<S: SharedState>(make: impl Fn(&std::path::Path) -> S) {
+    let checks: [(&str, fn(&dyn SharedState)); 2] = [
+        (
+            "only_an_operator_writes_settings",
+            only_an_operator_writes_settings,
+        ),
+        ("a_settings_write_reads_back", a_settings_write_reads_back),
+    ];
+    for (name, check) in checks {
+        let dir = crate::test_support::temp_dir(&format!("conf-settings-{name}"));
+        let state = make(&dir.join("machine.toml"));
+        check(&state);
+    }
+}
+
+fn trust_record() -> crate::policy::TrustGrant {
+    crate::policy::TrustGrant {
+        granted_at: "2026-11-25T00:00:00Z".into(),
+        reviewed_by: "conformance".into(),
+        note: None,
+        repo: None,
+    }
+}
+
+fn routing_envelope() -> crate::policy::RoutingEnvelope {
+    crate::policy::RoutingEnvelope {
+        granted_at: "2026-11-25T00:00:00Z".into(),
+        by: "conformance".into(),
+        epsilon_max: 0.1,
+        source: "install".into(),
+    }
+}
+
+/// A node and a task are refused, with nothing changed; an operator is
+/// not (an-t12: pods never change trust, a node is not the person).
+pub fn only_an_operator_writes_settings(state: &dyn SharedState) {
+    let edit = SettingsEdit::GrantRepository {
+        repo_key: "repo-a".into(),
+        record: trust_record(),
+    };
+    for refused in [Principal::node("n1"), Principal::task("t1")] {
+        match state.write_settings(&refused, &edit) {
+            Err(SharedStateError::Refused { .. }) => {}
+            other => panic!("{refused:?} may not write settings: {other:?}"),
+        }
+    }
+    assert!(
+        state
+            .machine_settings()
+            .expect("settings")
+            .trust_repos
+            .is_empty(),
+        "a refused write changes nothing"
+    );
+    let done = state
+        .write_settings(&Principal::operator("person"), &edit)
+        .expect("an operator writes");
+    assert!(done.written, "{done:?}");
+}
+
+/// Each edit reads back through `machine_settings`; a repeated grant is
+/// `written: false`; an `if_absent` write leaves a grant or a tombstone
+/// alone; an `off` edit says whether it removed one.
+pub fn a_settings_write_reads_back(state: &dyn SharedState) {
+    let operator = Principal::operator("person");
+    let write = |edit: SettingsEdit| state.write_settings(&operator, &edit).expect("write");
+    let read = || state.machine_settings().expect("settings");
+
+    let repo = SettingsEdit::GrantRepository {
+        repo_key: "repo-a".into(),
+        record: trust_record(),
+    };
+    assert!(write(repo.clone()).written);
+    assert!(read().trust_repos.contains_key("repo-a"));
+    assert!(!write(repo).written, "a repository trusted once stays once");
+    let exact = SettingsEdit::GrantTrust {
+        key: "key-a".into(),
+        record: trust_record(),
+    };
+    assert!(write(exact.clone()).written);
+    assert!(read().trust.contains_key("key-a"));
+    assert!(!write(exact).written);
+
+    let grant = crate::policy::AutoPromote {
+        granted_at: "2026-11-25T00:00:00Z".into(),
+        by: "conformance".into(),
+        source: "install".into(),
+    };
+    let off = crate::policy::AutoPromoteOff {
+        at: "2026-11-25T01:00:00Z".into(),
+        by: "conformance".into(),
+        source: "plugin-ask".into(),
+    };
+    let if_absent = SettingsEdit::SetAutoPromote {
+        grant: grant.clone(),
+        if_absent: true,
+    };
+    assert!(write(if_absent.clone()).written);
+    assert_eq!(read().learning.auto_promote, Some(grant));
+    assert!(!write(if_absent.clone()).written, "a grant is left alone");
+    let turned_off = write(SettingsEdit::AutoPromoteOff(off.clone()));
+    assert!(turned_off.removed, "{turned_off:?}");
+    assert_eq!(read().learning.auto_promote, None);
+    assert_eq!(read().learning.off, Some(off.clone()));
+    assert!(!write(if_absent).written, "promotion turned off stays off");
+    assert!(!write(SettingsEdit::AutoPromoteOff(off)).removed);
+
+    let envelope = routing_envelope();
+    let routing_off = crate::policy::RoutingOff {
+        at: "2026-11-25T01:00:00Z".into(),
+        by: "conformance".into(),
+        source: "plugin-ask".into(),
+    };
+    let if_absent = SettingsEdit::SetRoutingEnvelope {
+        envelope: envelope.clone(),
+        if_absent: true,
+    };
+    assert!(write(if_absent.clone()).written);
+    assert_eq!(read().session_routing.envelope, Some(envelope.clone()));
+    assert!(
+        !write(if_absent.clone()).written,
+        "an envelope is left alone"
+    );
+    assert!(write(SettingsEdit::RoutingOff(routing_off.clone())).removed);
+    assert_eq!(read().session_routing.envelope, None);
+    assert_eq!(read().session_routing.off, Some(routing_off));
+    assert!(!write(if_absent).written, "routing turned off stays off");
+    assert!(
+        write(SettingsEdit::SetRoutingEnvelope {
+            envelope: envelope.clone(),
+            if_absent: false,
+        })
+        .written,
+        "an explicit envelope replaces the tombstone"
+    );
+    assert_eq!(read().session_routing.off, None);
+    assert_eq!(read().session_routing.envelope, Some(envelope));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_state_conforms_on_settings_writes() {
+        run_settings_writes(|path| super::super::LocalState::at(path.to_path_buf()));
+    }
+
+    #[test]
+    fn the_fake_conforms_on_settings_writes() {
+        run_settings_writes(|_| super::super::fake::FakeState::new());
+    }
 
     #[test]
     fn local_state_conforms() {

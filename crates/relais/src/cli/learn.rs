@@ -1204,13 +1204,16 @@ pub(crate) fn learning_envelope_command(
         eprintln!("relais native learning-envelope: --by is empty; name who granted it");
         return Ok(CliOutcome::InvalidInput);
     }
-    let machine_path = paths::machine_settings_path().map_err(CliError::Home)?;
     let grant = relais::policy::AutoPromote {
         granted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         by: by.to_string(),
         source: source.as_str().to_string(),
     };
-    if let Err(e) = relais::learn::envelope::write_auto_promote(&machine_path, &grant) {
+    let edit = relais::shared_state::SettingsEdit::SetAutoPromote {
+        grant: grant.clone(),
+        if_absent: false,
+    };
+    if let Err(e) = super::ctx::write_settings(&edit)? {
         eprintln!("relais native learning-envelope: {e}");
         return Ok(CliOutcome::OperationalFailure);
     }
@@ -1228,14 +1231,14 @@ pub(crate) fn learning_off_command(
         eprintln!("relais native learning-envelope: --by is empty; name who turned it off");
         return Ok(CliOutcome::InvalidInput);
     }
-    let machine_path = paths::machine_settings_path().map_err(CliError::Home)?;
     let off = relais::policy::AutoPromoteOff {
         at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         by: by.to_string(),
         source: source.as_str().to_string(),
     };
-    let had_grant = match relais::learn::envelope::write_off(&machine_path, &off) {
-        Ok(had) => had,
+    let edit = relais::shared_state::SettingsEdit::AutoPromoteOff(off.clone());
+    let had_grant = match super::ctx::write_settings(&edit)? {
+        Ok(done) => done.removed,
         Err(e) => {
             eprintln!("relais native learning-envelope: {e}");
             return Ok(CliOutcome::OperationalFailure);

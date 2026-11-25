@@ -15,13 +15,21 @@ use std::sync::{Arc, Mutex};
 
 use super::types::{
     DecisionGrant, IntentAnswer, LeaseToken, Mode, Pointer, Principal, PublishReceipt, PublishRow,
-    Reservation, ResourceId, Settlement, Slice, Swap, TicketAnswer, TicketRequest,
-    DECISION_GRANT_TTL_SECS,
+    Reservation, ResourceId, SettingsEdit, SettingsWrite, Settlement, Slice, Swap, TicketAnswer,
+    TicketRequest, DECISION_GRANT_TTL_SECS,
 };
 use super::{Selection, SharedState, SharedStateError};
 use crate::ids::RunId;
 use crate::money::MicroUsd;
 use crate::policy::MachineSettings;
+
+/// A fresh machine's settings: the schema line and nothing else.
+fn bare_settings() -> String {
+    format!(
+        "schema_version = {}\n",
+        crate::policy::MACHINE_SCHEMA_VERSION
+    )
+}
 
 /// A seat lease's time to live (an-t11's first value).
 pub const SEAT_TTL_SECS: i64 = 90;
@@ -50,6 +58,8 @@ struct Inner {
     published: BTreeMap<(String, u64), PublishRow>,
     queue: Vec<PublishRow>,
     pointer: Option<String>,
+    /// The shared settings as text; `None` is a fresh machine's bare file.
+    settings: Option<String>,
     schema: BTreeMap<String, u64>,
     /// Successor intents: which run holds each.
     intents: HashMap<String, RunId>,
@@ -174,6 +184,10 @@ impl FakeState {
         self.clock.load(Ordering::SeqCst)
     }
 
+    fn settings_text(&self) -> String {
+        self.lock().settings.clone().unwrap_or_else(bare_settings)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -274,13 +288,69 @@ impl SharedState for FakeState {
     }
 
     fn machine_settings(&self) -> Result<MachineSettings, SharedStateError> {
-        MachineSettings::from_toml_str(&format!(
-            "schema_version = {}\n",
-            crate::policy::MACHINE_SCHEMA_VERSION
-        ))
-        .map_err(|cause| SharedStateError::Refused {
+        let text = self.settings_text();
+        MachineSettings::from_toml_str(&text).map_err(|cause| SharedStateError::Refused {
             reason: cause.to_string(),
         })
+    }
+
+    fn write_settings(
+        &self,
+        writer: &Principal,
+        edit: &SettingsEdit,
+    ) -> Result<SettingsWrite, SharedStateError> {
+        super::local::require_operator(writer)?;
+        let refused = |reason: String| SharedStateError::Refused { reason };
+        // One lock across read, edit and store: two writers both land.
+        let mut inner = self.lock();
+        let text = inner.settings.clone().unwrap_or_else(bare_settings);
+        let current = MachineSettings::from_toml_str(&text).map_err(|e| refused(e.to_string()))?;
+        let (edited, removed) = match edit {
+            SettingsEdit::GrantTrust { key, record } => (
+                (!current.trust.contains_key(key))
+                    .then(|| crate::trust::add_grant_to(&text, "trust", key, record)),
+                false,
+            ),
+            SettingsEdit::GrantRepository { repo_key, record } => (
+                (!current.trust_repos.contains_key(repo_key))
+                    .then(|| crate::trust::add_grant_to(&text, "trust_repos", repo_key, record)),
+                false,
+            ),
+            SettingsEdit::SetAutoPromote { grant, if_absent } => (
+                (!*if_absent
+                    || (current.learning.auto_promote.is_none() && current.learning.off.is_none()))
+                .then(|| crate::learn::envelope::set_auto_promote(&text, grant)),
+                false,
+            ),
+            SettingsEdit::AutoPromoteOff(off) => (
+                Some(crate::learn::envelope::set_off(&text, off)),
+                current.learning.auto_promote.is_some(),
+            ),
+            SettingsEdit::SetRoutingEnvelope {
+                envelope,
+                if_absent,
+            } => (
+                (!*if_absent
+                    || (current.session_routing.envelope.is_none()
+                        && current.session_routing.off.is_none()))
+                .then(|| crate::router::set_envelope(&text, envelope)),
+                false,
+            ),
+            SettingsEdit::RoutingOff(off) => (
+                Some(crate::router::set_off(&text, off)),
+                current.session_routing.envelope.is_some(),
+            ),
+        };
+        let written = match edited {
+            None => false,
+            Some(result) => {
+                let edited = result.map_err(|e| refused(e.to_string()))?;
+                MachineSettings::from_toml_str(&edited).map_err(|e| refused(e.to_string()))?;
+                inner.settings = Some(edited);
+                true
+            }
+        };
+        Ok(SettingsWrite { written, removed })
     }
 
     fn daily_spent(&self, _day_start: &str) -> Result<Option<MicroUsd>, SharedStateError> {

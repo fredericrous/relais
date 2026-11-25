@@ -21,7 +21,8 @@
 //! The trait is public and unstable: it changes with a minor release until
 //! the closed build (an-t13) consumes it. The conformance suite
 //! (`conformance`, behind the `conformance` feature) is the contract both
-//! sides run.
+//! sides run: `run_all`, and `run_settings_writes`, which is handed a
+//! scratch settings path so a check never writes the real one.
 
 mod error;
 mod local;
@@ -42,8 +43,8 @@ pub use local::LocalState;
 pub use node::{TicketClaim, TicketGrant};
 pub use types::{
     DecisionGrant, IntentAnswer, LeaseToken, Mode, Pointer, Principal, PrincipalKind,
-    PublishReceipt, PublishRow, Reservation, ResourceId, Settlement, Slice, Swap, TicketAnswer,
-    TicketRequest, DECISION_GRANT_TTL_SECS,
+    PublishReceipt, PublishRow, Reservation, ResourceId, SettingsEdit, SettingsWrite, Settlement,
+    Slice, Swap, TicketAnswer, TicketRequest, DECISION_GRANT_TTL_SECS,
 };
 
 use crate::ids::RunId;
@@ -76,6 +77,26 @@ pub trait SharedState: Send + Sync {
     /// The machine's settings: trust grants, `[spending]` ceilings and the
     /// rest of `machine.toml`.
     fn machine_settings(&self) -> Result<MachineSettings, SharedStateError>;
+
+    /// Write the machine settings (an-t20), the counterpart of
+    /// [`SharedState::machine_settings`]: every reader goes through the
+    /// trait, so every writer must, or a node would write a file nobody
+    /// reads.
+    ///
+    /// Only an operator principal (`PrincipalKind::Operator`) may write them (an-t12: a pod
+    /// never changes trust or the settings' authority, and a node's
+    /// certificate does not make it the person). Any other kind is
+    /// [`SharedStateError::Refused`] with nothing changed, on every
+    /// implementation: the check is part of the contract
+    /// (`conformance::only_an_operator_writes_settings`). The write is one
+    /// atomic edit that keeps what it does not name; a write read back
+    /// through `machine_settings` shows it
+    /// (`conformance::a_settings_write_reads_back`).
+    fn write_settings(
+        &self,
+        writer: &Principal,
+        edit: &SettingsEdit,
+    ) -> Result<SettingsWrite, SharedStateError>;
 
     /// What has been spent since `day_start` (RFC 3339, the start of the
     /// UTC day) by the global counter; `None` when there is none, and the

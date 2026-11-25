@@ -644,14 +644,17 @@ pub(crate) fn router_envelope_command(
         );
         return Ok(CliOutcome::InvalidInput);
     }
-    let machine_path = paths::machine_settings_path().map_err(CliError::Home)?;
     let envelope = relais::policy::RoutingEnvelope {
         granted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         by: by.to_string(),
         epsilon_max,
         source: source.as_str().to_string(),
     };
-    if let Err(e) = relais::router::write_envelope(&machine_path, &envelope) {
+    let edit = relais::shared_state::SettingsEdit::SetRoutingEnvelope {
+        envelope: envelope.clone(),
+        if_absent: false,
+    };
+    if let Err(e) = super::ctx::write_settings(&edit)? {
         eprintln!("relais native router-envelope: {e}");
         return Ok(CliOutcome::OperationalFailure);
     }
@@ -686,14 +689,14 @@ pub(crate) fn router_off_command(
         eprintln!("relais native router-envelope: --by is empty; name who turned routing off");
         return Ok(CliOutcome::InvalidInput);
     }
-    let machine_path = paths::machine_settings_path().map_err(CliError::Home)?;
     let off = relais::policy::RoutingOff {
         at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         by: by.to_string(),
         source: source.as_str().to_string(),
     };
-    let had_envelope = match relais::router::write_off(&machine_path, &off) {
-        Ok(had) => had,
+    let edit = relais::shared_state::SettingsEdit::RoutingOff(off.clone());
+    let had_envelope = match super::ctx::write_settings(&edit)? {
+        Ok(done) => done.removed,
         Err(e) => {
             eprintln!("relais native router-envelope: {e}");
             return Ok(CliOutcome::OperationalFailure);
