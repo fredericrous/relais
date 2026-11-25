@@ -210,7 +210,7 @@ and the counter rises by its reservation exactly once.
 
 - Input: the whole crate's tests and CI's clippy on the pushed tree →
   expected: green → observed: the commit gate's `cargo test -p relais`
-  (lib 2732, bin 352, integration targets) passes; `cargo clippy
+  (lib 2735, bin 352, integration targets; on 59729aa64) passes; `cargo clippy
   --all-targets -- -D warnings` clean, also with `--features conformance`.
 
 ## Decision log
@@ -240,13 +240,21 @@ and the counter rises by its reservation exactly once.
 - The carry_on hook gap in the body is wrong: such an agent has no dispatch
   on the ledger (`book_turn_usage` answers `NoSuchDispatch`), so it is not
   metered at all; `docs/shared-state.md` says so.
-- One `book_usage` call per dispatch was checked at its three call sites
-  (`attempt.rs`, `review/engine.rs`, `scheduler.rs`: `event_id` is the
-  dispatch id). A cross-process resume of a dispatch was not read: unverified
-  residual, in the relais inbox. The ledger sum for the 5% rollback check
-  is owed by the external-client ticket.
-- A `settle:<dispatch>` seat is released on the `Ok`, `Refused` and cap-drop
-  branches; a kept failure holds its seat until its TTL, and the retry is a
-  true-up on the same reservation.
+- One `book_usage` call per dispatch id at its three call sites, and each
+  site mints a fresh id per launch (`ids.dispatch_id()` in `attempt.rs`,
+  `review/engine.rs`, `scheduler.rs`), so a resume or successor never reuses
+  one: the per-run `fed_counter` guard is the in-process guard the
+  idempotence rule allows for deliveries that do not outlive the process.
+  The ledger sum for the 5% rollback check is owed by the external-client
+  ticket.
+- After implementation review: a `settle:<dispatch>` seat is released through
+  `Book::release` (one line per change) and `cap_settles` stops at the first
+  unreachable answer; a reservation minted while the file cannot be written
+  is dropped unsent, and no reservation is made while the last write failed
+  (`store_failing`); a non-NotFound read error is set aside like a parse
+  failure, and when the rename fails nothing is kept on disk; the file error
+  names its cause (`SettleFileError`); `flush_settles` takes a two-variant
+  `Pass`, not a bool; the conformance case has a second half (a settle above
+  a zero reservation after its seat went back).
 
 <!-- panel: repos=relais,homelab adds=contract reviewers=architect,backend,lang:rust,po,tui,unix body-sha=89ad2bb99d96 -->
