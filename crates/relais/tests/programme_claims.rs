@@ -499,7 +499,7 @@ fn a_caller_from_an_exhausted_programme_reserves_nothing_in_an_empty_one() {
     let scratch = short_temp_dir("claims-from-none");
     let destination = state_of("z", "empty", &["t1", "t2"]);
     let exhausted = state_of("x", "done", &[]);
-    let store = Store::in_state_dir(&scratch.to_path_buf());
+    let store = Store::in_state_dir(&scratch);
     let chosen = claim::next(
         &relais::shared_state::node::NodeReservations(&relais::shared_state::LocalState::new()),
         &store,
