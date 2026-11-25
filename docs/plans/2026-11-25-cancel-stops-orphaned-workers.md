@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: prog/follow-ups/f24-stop-an-orphaned-worker
 repos: [relais]
 adrs: []
@@ -116,10 +116,10 @@ still running are stopped, where this plugin still knows them.
 
 ## Phases
 
-- [ ] Phase 1 — cancel stops orphaned agents. `claude-plugin/hooks/runs.ts`
+- [x] Phase 1 — cancel stops orphaned agents. `claude-plugin/hooks/runs.ts`
   (`cancelRun`, `stopDispatchesOf` unchanged), `claude-plugin/hooks/agents.ts`
   (`stopAgent` returns its answer; a `stopAgentsOf(fx, store, run)` helper),
-  `claude-plugin/hooks/guards.ts` (`TASK_STOP_DENY_MESSAGE`),
+  `claude-plugin/hooks/guards.ts` (`taskStopDenyMessage(run)`: the run to cancel, a `starting-…` run sent to `mcp__relais__status`, an unknown one to the person),
   `claude-plugin/hooks/register.ts` (guard picks the message by tool, `.catch` branch included; cancel
   description), tests below, `CHANGELOG.md` (Unreleased).
   Done by hand in this session: the change is one helper and its tests.
@@ -171,5 +171,32 @@ partial writes in its tree.
   the run id and `mcp__relais__cancel` when the store binds it, with `stop
   it in Claude Code` when only the agent list names it, and with the new
   text on the `.catch` path; `SendMessage` keeps its text.
+
+### Results
+
+| Check | Expected | Actual |
+|---|---|---|
+| `sh scripts/plugin-test.sh` (`make plugin`'s test step), at load 24 | all pass | 589 pass, 0 fail |
+| `claude plugin validate claude-plugin` | passes | passed (with warnings) |
+| the 13 new behaviour tests, copied onto an `origin/main` worktree | each fails | all 13 failed; `cancel requested` (unchanged behaviour) passed |
+| ended run, agent `running` | one `TaskStop`; lines CLI, `stop sent to agent agent-1`, `exit status: 0` | as expected |
+| agent `completed` / never dispatched / list throws / list never answers | no `TaskStop`; one line each | as expected |
+| second cancel after a refused stop | stopped the second time | 2 `TaskStop`s, second `stop sent` |
+| rebound before the cancel / while the list is awaited | no `TaskStop` | none; `known to this plugin` / `now belongs to another run` |
+| reaped driverless run (`run run-c had no live driver; marked cancelled`) | agent stopped | as expected |
+| two agents, one stop unanswered; a slow list then a late stop | one bound in all; late line names the 30 s window | as expected |
+| guard: store-bound / unknown / `starting-` agent | deny names `run-c` / the person / `mcp__relais__status` | as expected; `SendMessage` keeps its text |
+
+- deliberate: the `.catch`-path deny has no test. With `agent.list`
+  rejecting, the model's `TaskStop` of a store-bound agent reaches the tool
+  (`{result:'ok'}`), even though the engine reports "its .catch answered".
+  The same probe on origin/main gives the same result, so the fail-open
+  predates this change. This diff only swaps the message on that path.
+  Follow-up f25.
+- The `pkill -f` follow-up is f26.
+
+## Implementation review
+- implementation-review: approve-with-changes → Delta approve. Fixed: `result` renamed `fakeCancelOutput`, phase ticked, Phases line updated. deliberate: no `.catch` test (f25). 46k+26k, 17+10 s.
+- lang:typescript: approve-with-changes → Delta approve. Fixed: the late text names the window, with a new test; `Listed` typing, read-only `ENDED`, `denyOf` order. deliberate: `starting-` prefix (existing convention), no pure split. 49k+25k, 38+8 s.
 
 <!-- panel: repos=relais reviewers=backend,lang:typescript,tui,unix,codex body-sha=d1c9bfbea897 -->
