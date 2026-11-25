@@ -150,7 +150,7 @@ budget. A router-state read or final flush that fails leaves a note.
   failure gives two; (d) a failing final flush is noted at the next
   session start; (e) a plugin-origin prompt later in the session is still not
   classified.
-- [ ] Phase 2 — close f20: `docs/programmes/follow-ups/f20-clear-routes-on-stale-state.md`
+- [x] Phase 2 — close f20: `docs/programmes/follow-ups/f20-clear-routes-on-stale-state.md`
   (status closed, answer), `docs/plans/2026-11-23-router-keeps-preferred-model.md`
   (Observed: the typed-prompt precondition is lifted once the release is
   installed), `CHANGELOG.md`; and file a follow-up ticket (the next free
