@@ -209,17 +209,18 @@ and the counter rises by its reservation exactly once.
   counter 0 (`a_run_under_a_gate_leaves_the_counter_to_the_coordinator`).
 
 - Input: the whole crate's tests and CI's clippy on the pushed tree →
-  expected: green → observed: the commit gate's `cargo test -p relais`
-  (lib 2739, bin 352, integration targets; the commit gate of f1ceaa9f8, the merge with main) passes; `cargo clippy
-  --all-targets -- -D warnings` clean, also with `--features conformance`.
-
+  expected: green → observed: `cargo test -p relais` on c2529b23f (the merge
+  with main; lib 2741, bin 352, integration targets, the full run after the
+  merge), CI's `cargo clippy --all-targets -- -D warnings` and the
+  `--features conformance` run clean; `coordinator::seats` (29) and
+  `shared_state` (38) pass on the merged tree.
 ## Implementation review
 
-- Round 1 (tree 634a2558): implementation-review and the four profiles returned approve-with-changes; five blockers and the medium findings fixed (Pass enum, release through `Book::release`, test discards, no real wait, names, typed file errors, set-aside of unreadable files).
+- Round 1 (tree 634a2558): five seats approve-with-changes; blockers and mediums fixed (Pass enum, release through `Book::release`, test discards, no real wait, names, typed file errors, set-aside of unreadable files).
 - Delta 1 (tree 5e439311): rust and unix approve; implementation-review blocking on a `ResourceId` wildcard, fixed; backend and tui lows fixed.
-- Delta 2 (tree c2a2567c, after the merge with main): tui and backend approve; implementation-review approve-with-changes: the rename-fails test is weak, `deliberate:` its line count and the unmoved directory pin the branch, and the plan's suite row now names the pushed head's gate.
-- `deliberate:` backend 1 (the in-process `fed_counter` guard: three call sites mint a fresh id per launch, no production counter until the external client ships); tui 4 (no primary-status command yet) and tui's low on the persist line repeating during a write failure; lang:rust 6 (`with_settle_file` call order, documented).
-- Tokens and seconds are in the transcript; each reviewer ran on opus.
+- Delta 2 (tree c2a2567c): tui and backend approve; rust and unix approve after the merge with main; implementation-review approve-with-changes on the rename-fails test and the suite row, both fixed.
+- Delta 3 (tree 649c187c, merge with an-t20 f63f9124b and the `SettingsWrite` arm): implementation-review, backend, rust and unix approve; tui approve-with-changes. Its low on the installer's repeated line (an-t20's `install.rs`, main's code) is out of this branch and filed for the driver.
+- `deliberate:` backend 1 (the in-process `fed_counter` guard: three call sites mint a fresh id per launch, no production counter until the external client ships); tui 4 (no primary-status command yet); tui's low on the persist line repeating during a write failure; lang:rust 6 (`with_settle_file` call order, documented); the `SettingsWrite` arm is unreachable from `settle_spend`, kept in the retry arm for exhaustiveness.
 
 ## Decision log
 
