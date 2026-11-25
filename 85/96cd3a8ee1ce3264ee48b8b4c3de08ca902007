@@ -1,0 +1,19 @@
+greengate-provenance-v1
+commit 66278fc4f6a950e8d6cefc251e043794524f3d57
+tree 8596cd3a8ee1ce3264ee48b8b4c3de08ca902007
+canon 7adb9006e295152a2903f82d15b1750a27503c5c
+patch 7a481ae5a8ee173fa02e28cb414b7ebd53b95bbd
+plan docs/plans/2026-11-25-next-claim-stays-in-programme.md 439d6be0aaaa41d05bed2164d69609e4ca7b92e043a526ecee7d6c4fc720837b
+review reviewed ddebfe5c01836ab50004e8157d8c02d83f5ad68cab622b99db4102e28e131aca
+code-review backend carried 5ba0328681d9e2d6758a840f7c6db517d0c0decb52cf3a42bd476b946d6f121c
+code-review lang:rust carried 81fbe8e741818a1dbcdacb78e138a6d6352ba89d34ed5c238816fa0379125dea
+code-review unix carried 81fbe8e741818a1dbcdacb78e138a6d6352ba89d34ed5c238816fa0379125dea
+preview not-required
+producer greenbelay 6.15.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABAlHhDcTtwVip5+6WA3AWiYwrzSSfzT9dPqk3lGUnYpS
+26JqlLD2AmN354lmfKyrNqXXOc9xcCR6fYYy8qItAwAA==
+-----END SSH SIGNATURE-----
