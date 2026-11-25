@@ -1770,23 +1770,65 @@ pub(crate) fn next_command(
             print_stdout(&out)?;
             Ok(CliOutcome::Accepted)
         }
-        claim::Next::Parked { .. } if load_failed => {
+        claim::Next::Parked { .. } if load_failed && from.is_none() => {
             eprintln!("relais: not parking: a programme failed to load (see above)");
             Ok(CliOutcome::OperationalFailure)
         }
-        claim::Next::Parked { next_due } => {
-            let out = match format {
-                Format::Json => format!(
-                    "{}\n",
-                    json!({
-                        "parked": true,
-                        "next_due": next_due.map(|date| date.to_string()),
-                    })
-                ),
-                Format::Text => format!("{}\n", claim::Next::parked_line(next_due)),
-            };
-            print_stdout(&out)?;
+        claim::Next::Parked {
+            next_due,
+            elsewhere,
+            unreadable,
+        } => {
+            for note in &unreadable {
+                eprintln!("relais: {note}");
+            }
+            let partial = load_failed || !unreadable.is_empty();
+            if partial {
+                eprintln!(
+                    "relais: the ready-elsewhere list may be partial: a programme failed to load (see above)"
+                );
+            }
+            print_stdout(&parked_output(next_due, &elsewhere, partial, format))?;
             Ok(CliOutcome::Parked)
+        }
+    }
+}
+
+/// What `next` prints when it parks: the `parked: …` line, then one
+/// `ready elsewhere: <repo>:<slug> (<n> ready)` line per programme the
+/// person may start (ADR-0084); with `--json`, one object.
+fn parked_output(
+    next_due: Option<chrono::NaiveDate>,
+    elsewhere: &[claim::Elsewhere],
+    partial: bool,
+    format: Format,
+) -> String {
+    match format {
+        Format::Json => format!(
+            "{}\n",
+            json!({
+                "parked": true,
+                "next_due": next_due.map(|date| date.to_string()),
+                "elsewhere": elsewhere
+                    .iter()
+                    .map(|programme| json!({
+                        "repo": programme.repo,
+                        "slug": programme.slug,
+                        "ready": programme.ready,
+                    }))
+                    .collect::<Vec<_>>(),
+                "elsewhere_partial": partial,
+            })
+        ),
+        Format::Text => {
+            let mut out = format!("{}\n", claim::Next::parked_line(next_due));
+            for programme in elsewhere {
+                out.push_str(&format!(
+                    "ready elsewhere: {}:{} ({} ready)\n",
+                    programme.repo, programme.slug, programme.ready
+                ));
+            }
+            out
         }
     }
 }

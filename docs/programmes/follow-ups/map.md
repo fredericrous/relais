@@ -113,25 +113,32 @@ ticket here until it is resolved or moved into a programme of its own.
 - [f26](f26-worker-kills-spare-the-driver.md) (2026-11-25, open): keep a
   worker's `pkill -f <path>` off its own driver, through worker guidance
   or a runner change.
-- [f27](f27-next-claim-stays-in-programme.md) (2026-11-25, open):
-  `programme next --claim` never crosses programmes; with no ready ticket
-  in `--from` it parks (ADR-0083 amended first).
+- [f27](f27-next-claim-stays-in-programme.md) (2026-11-25, closed):
+  `programme next --from` never picks another programme's ticket
+  (ADR-0084). An exhausted `--from` parks (exit 22) and lists
+  `ready elsewhere: <repo>:<slug> (<n> ready)` for the person. A busy
+  `--from` lock exits 1 with the retry. The skills park and name those
+  programmes.
 - [f28](f28-tool-call-catch-answers.md) (2026-11-25, open): check that the
   plugin's other `tool.call` `.catch` answers reach the caller; f25 saw the
   guard's ignored when its hook threw.
 
 ## Handoff
 
-2026-11-25, boundary 3 (f25 closed): the model's `TaskStop`/`SendMessage`
-of a store-bound relais worker stays denied when the agent list throws. Before
-it, f24 (`mcp__relais__cancel` of an ended run stops its workers, plan
-`docs/plans/2026-11-25-cancel-stops-orphaned-workers.md`). Both plugin
-changes ship with the next relais release and run after the plugin reinstall.
+2026-11-25, boundary 3 (f27 closed): `relais programme next --from` never
+picks another programme's ticket (ADR-0084, decisions#370 merged). An
+exhausted `--from` parks and lists `ready elsewhere: <repo>:<slug> (<n> ready)`
+for the person. The programme skill and worktree-task's Handoff
+(greenharness-skills, merged after this PR) park on it and name those
+programmes. The relais change ships with the next release. Before that,
+the installed `next` (0.84.0) still crosses programmes: a session at a
+boundary runs it without `--claim` first, and parks when it names another
+programme. f24 and f25 also wait on the release and the plugin reinstall.
 
-- Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25.
+- Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f27.
+- In flight elsewhere: f26 (driver-safe worker kills) and f28 (plugin
+  `tool.call` `.catch` answers), each on its `prog/` branch.
 - Next:
-  - Keep a worker's kills off its own driver (f26), ready.
-  - Check the plugin's other `tool.call` `.catch` answers (f28), ready.
   - Measure the home fingerprint warnings (f08), due 2026-11-28.
   - A pin row's model matches the model its subagent ran (f22), due
     2026-12-01, after the plugin reinstall.
@@ -139,27 +146,22 @@ changes ship with the next relais release and run after the plugin reinstall.
   - A week of worker stops settles within 60 s (f23), due 2026-12-03.
   - f16, f22 and f23 are counted from the reinstall.
 - Lessons:
-  - In `claude plugin test` on 2.1.331, the guard's `tool.call` `.catch`
-    did not decide the call: the hook threw and the tool ran whatever
-    `.catch` returned. Unverified live or for other hooks; a guard catches
-    its own `$` failures inside the hook body (f25).
-  - Until the reinstall, a worker that outlives its driver still cannot be
-    stopped from the session: wait for its turn to end (watch its
-    transcript for `end_turn`), then salvage the tree.
-  - The plugin test runner has no per-file filter, and its 5 s limit per
-    test is fixed. Drive any bound with the scripted clock
-    (`engine.clock.advance`) and keep the call pending, as
-    `cancel-orphans.test.ts` does. At load 90 to 100, unrelated tests time
-    out; rerun once the load drops and read the counts.
-  - A hooks module refuses `arguments` at load. A `console.log` in a hook
-    did not show in the test output once (unverified whether it ever
-    does). Debug through a test's own assertions.
-  - To check that new tests fail on origin/main, use a detached worktree
-    (`git worktree add --detach`) with the test files copied in. Restore it
-    and remove it without `--force`.
-- Your steps: reinstall the relais plugin with relais's own install
-  command for Claude (it is at 0.72.0 here). f16, f22 and f23 count from the
-  session after the reinstall; f24's cancel works from then on.
+  - A branch `relais` piloted against a copy of the claims
+    (`RELAIS_STATE_DIR` set to a scratch dir seeded with
+    `~/.local/state/relais/claims`) leaves the real ledger and claims
+    alone. Its `--from` sweep reads the map from the ticket's worktree, so
+    it drops a claim on a ticket closed there but not yet merged.
+  - In decisions, the pre-commit gate checks the whole working tree: a new
+    ADR, its HEADS row, `aval.pack` and the plan pointer land in one
+    commit.
+  - Earlier lessons (f24, f25): a guard catches its own `$` failures
+    inside the hook body. The plugin test runner's 5 s per-test limit is
+    fixed. Check a new test fails on origin/main in a detached worktree.
+- Your steps: after the next relais release (not part of f27's plan),
+  reinstall the relais plugin with relais's own install command for Claude
+  (it is at 0.72.0 here). f27's skill text, f24's cancel and f25's guard
+  take effect from then. f16, f22 and f23
+  count from the session after the reinstall.
 
 ## Not yet specified
 

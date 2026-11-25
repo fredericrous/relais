@@ -627,9 +627,11 @@ pub(crate) enum ProgrammeCommand {
         no_fetch: bool,
     },
     /// The next ticket to hand off to: the first unheld ready ticket of the
-    /// `--from` programme, else of a programme with no ticket held; exit 22
-    /// and `parked: …` when there is none
+    /// `--from` programme, never of another; exit 22 and `parked: …` when
+    /// there is none, then `ready elsewhere: <repo>:<slug> (<n> ready)` for
+    /// each programme the person may start instead
     ///
+    /// Without `--from`, the first ticket of a programme with no ticket held.
     /// Tickets for the person (`hitl`) and tickets due later are never
     /// chosen. With `--claim` the choice is reserved as a `handoff` claim.
     Next {

@@ -18,6 +18,22 @@ doctor` names it. `relais init`, with or without `--detect`, now writes
 `greentopo =` in `[integrations]`. v0.82.0 is the reader floor for that key: an older relais
 refuses it as an unknown field.
 
+`relais programme next --from <repo>:<slug>` never picks a ticket of another
+programme (ADR-0084). Before, when the `--from` programme had nothing ready, it
+picked the first ticket of a programme with nothing held, so a `/clear` relay
+could resume a session on work nobody chose. Now it parks (exit 22). The first
+line stays `parked: next due <date>` or `parked: nothing due`, and that date
+comes from the `--from` programme only. Then come
+`ready elsewhere: <repo>:<slug> (<n> ready)` lines naming the programmes the
+person may start. With `--json`, the park also carries `elsewhere` and
+`elsewhere_partial`. A `--from` lock that stays busy exits 1 with the `next:`
+retry, as `claim` does, instead of falling through to another programme. With
+`--from`, another programme that fails to load no longer blocks the park: it is
+left out of the list, and the park says so on stderr. Without `--from`, `next`
+chooses as before. The programme skill parks on an exhausted programme, names
+those programmes for the person, and closes its ticket through `next`. These
+skill changes take effect after the plugin is reinstalled.
+
 ## v0.84.0
 
 The `SharedState` conformance suite holds a client to the retry rule of a

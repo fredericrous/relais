@@ -183,7 +183,77 @@ fn a_claim_on_the_first_candidate_makes_next_take_the_second() {
     let parked_json = world.next("me3", &["--from", "alpha:p", "--json"]);
     assert_eq!(parked_json.status.code(), Some(22));
     let shape: serde_json::Value = serde_json::from_slice(&parked_json.stdout).expect("json");
-    assert_eq!(shape, serde_json::json!({"parked": true, "next_due": null}));
+    assert_eq!(
+        shape,
+        serde_json::json!({"parked": true, "next_due": null, "elsewhere": [], "elsewhere_partial": false})
+    );
+}
+
+#[test]
+fn an_exhausted_from_programme_parks_and_lists_the_others_in_order_without_claiming_there() {
+    let world = World::new("elsewhere");
+    world.programme("alpha", "p", &[("t1", "afk", None)]);
+    world.programme("beta", "q", &[("q1", "afk", None)]);
+    world.programme("beta", "r", &[("r1", "afk", None), ("r2", "afk", None)]);
+    world.programme("alpha", "s", &[("s1", "afk", Some("2000-01-01"))]);
+    let held = world.claim("alpha", "p", "t1", "someone-else");
+    assert_eq!(held.status.code(), Some(0), "{}", text(&held.stderr));
+    let before = claim_files(&world);
+
+    let out = world.next("me", &["--from", "alpha:p", "--claim"]);
+    assert_eq!(out.status.code(), Some(22), "{}", text(&out.stderr));
+    // Soonest due first, then most ready, then name; pasteable into --from.
+    assert_eq!(
+        text(&out.stdout),
+        "parked: nothing due\n\
+         ready elsewhere: alpha:s (1 ready)\n\
+         ready elsewhere: beta:r (2 ready)\n\
+         ready elsewhere: beta:q (1 ready)\n"
+    );
+    assert_eq!(text(&out.stderr), "");
+    assert_eq!(claim_files(&world), before, "nothing is reserved elsewhere");
+
+    let json = world.next("me", &["--from", "alpha:p", "--claim", "--json"]);
+    assert_eq!(json.status.code(), Some(22));
+    let shape: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+    assert_eq!(
+        shape,
+        serde_json::json!({
+            "parked": true,
+            "next_due": null,
+            "elsewhere": [
+                {"repo": "alpha", "slug": "s", "ready": 1},
+                {"repo": "beta", "slug": "r", "ready": 2},
+                {"repo": "beta", "slug": "q", "ready": 1},
+            ],
+            "elsewhere_partial": false,
+        })
+    );
+    assert_eq!(claim_files(&world), before);
+}
+
+#[test]
+fn a_busy_from_lock_exits_1_with_the_retry_and_claims_nothing_elsewhere() {
+    let world = World::new("busy-from");
+    world.programme("alpha", "p", &[("t1", "afk", None)]);
+    world.programme("beta", "q", &[("q1", "afk", None)]);
+    let first = world.claim("alpha", "p", "t1", "someone-else");
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first.stderr));
+    let before = claim_files(&world);
+    let _held = relais::procs::LockFile::try_acquire(&slug_lock_path(&world, "p"))
+        .expect("opens")
+        .expect("free");
+    let out = world.next("me", &["--from", "alpha:p", "--claim"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "");
+    let stderr = text(&out.stderr);
+    // The programme skill retries `next`'s exit 1 only on this wording.
+    assert!(stderr.contains("stayed held for"), "{stderr}");
+    assert!(
+        stderr.contains("next: relais programme next --from alpha:p --claim --root"),
+        "{stderr}"
+    );
+    assert_eq!(claim_files(&world), before);
 }
 
 #[test]
@@ -413,9 +483,29 @@ fn eight_threads_over_fifty_rounds_never_hand_one_ticket_to_two_sessions() {
 }
 
 #[test]
-fn two_callers_from_exhausted_programmes_reserve_at_most_one_ticket_in_one_empty_one() {
+fn two_callers_without_from_reserve_at_most_one_ticket_in_one_empty_one_and_from_reserves_none() {
     let scratch = short_temp_dir("claims-dest");
     for round in 0..20 {
+        // From an exhausted programme, nothing is reserved anywhere else.
+        let from_state = scratch.to_path_buf().join(format!("from-{round}"));
+        let destination = state_of("z", "empty", &["t1", "t2"]);
+        let exhausted = state_of("x", "done", &[]);
+        let chosen = claim::next(
+            &relais::shared_state::node::NodeReservations(&relais::shared_state::LocalState::new()),
+            &Store::in_state_dir(&from_state),
+            Some(&exhausted),
+            std::slice::from_ref(&destination),
+            today(),
+            1_800_000_000,
+            Intent::Reserve { session: "x" },
+        )
+        .expect("next");
+        assert!(matches!(chosen, Next::Parked { .. }), "{chosen:?}");
+        assert!(Store::in_state_dir(&from_state)
+            .held_ids(&destination.key, 1_800_000_000)
+            .expect("held")
+            .is_empty());
+
         let state = scratch.to_path_buf().join(format!("round-{round}"));
         let destination = Arc::new(state_of("z", "empty", &["t1", "t2"]));
         let barrier = Arc::new(Barrier::new(2));
@@ -429,14 +519,13 @@ fn two_callers_from_exhausted_programmes_reserve_at_most_one_ticket_in_one_empty
                 );
                 std::thread::spawn(move || {
                     let store = Store::in_state_dir(&state);
-                    let exhausted = state_of(name, "done", &[]);
                     barrier.wait();
                     claim::next(
                         &relais::shared_state::node::NodeReservations(
                             &relais::shared_state::LocalState::new(),
                         ),
                         &store,
-                        Some(&exhausted),
+                        None,
                         std::slice::from_ref(&*destination),
                         today(),
                         1_800_000_000,
@@ -646,7 +735,8 @@ fn a_busy_lock_in_another_programme_leaves_next_claim_at_exit_0_with_its_pick() 
 }
 
 #[test]
-fn a_from_programme_that_fails_to_load_exits_1_and_a_failed_load_never_parks() {
+fn a_from_programme_that_fails_to_load_exits_1_and_only_a_failed_load_without_from_refuses_to_park()
+{
     let world = World::new("broken");
     world.programme("alpha", "p", &[("t1", "afk", None)]);
     std::fs::write(
@@ -663,8 +753,25 @@ fn a_from_programme_that_fails_to_load_exits_1_and_a_failed_load_never_parks() {
     );
     assert_eq!(text(&from_broken.stdout), "");
 
+    // Another programme failing to load cannot hide a ticket of beta:q, so
+    // the park stands, flagged partial.
     world.programme("beta", "q", &[("person", "hitl", None)]);
-    let would_park = world.next("me", &["--from", "beta:q"]);
+    let parks = world.next("me", &["--from", "beta:q"]);
+    assert_eq!(parks.status.code(), Some(22), "{}", text(&parks.stderr));
+    assert_eq!(text(&parks.stdout), "parked: nothing due\n");
+    assert!(
+        text(&parks.stderr).contains(
+            "relais: the ready-elsewhere list may be partial: a programme failed to load (see above)"
+        ),
+        "{}",
+        text(&parks.stderr)
+    );
+    let json = world.next("me", &["--from", "beta:q", "--json"]);
+    assert_eq!(json.status.code(), Some(22));
+    let shape: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+    assert_eq!(shape["elsewhere_partial"], serde_json::json!(true));
+
+    let would_park = world.next("me", &[]);
     assert_eq!(
         would_park.status.code(),
         Some(1),
@@ -675,7 +782,7 @@ fn a_from_programme_that_fails_to_load_exits_1_and_a_failed_load_never_parks() {
 }
 
 #[test]
-fn two_next_claim_processes_started_together_print_different_tickets() {
+fn two_next_claim_processes_started_together_never_share_a_ticket_and_the_second_parks() {
     for round in 0..5 {
         let world = Arc::new(World::new(&format!("procs-{round}")));
         world.programme("alpha", "alpha", &[("a1", "afk", None)]);
@@ -695,13 +802,22 @@ fn two_next_claim_processes_started_together_print_different_tickets() {
             .into_iter()
             .map(|handle| handle.join().expect("thread"))
             .collect();
-        for out in &outputs {
-            assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
-        }
-        assert_ne!(
-            text(&outputs[0].stdout),
-            text(&outputs[1].stdout),
-            "round {round}"
+        let mut results: Vec<(Option<i32>, String)> = outputs
+            .iter()
+            .map(|out| (out.status.code(), text(&out.stdout)))
+            .collect();
+        results.sort();
+        assert_eq!(
+            results,
+            [
+                (Some(0), "alpha alpha a1\ta1\n".to_string()),
+                (
+                    Some(22),
+                    "parked: nothing due\nready elsewhere: beta:beta (1 ready)\n".to_string()
+                ),
+            ],
+            "round {round}: {}",
+            outputs.iter().map(|o| text(&o.stderr)).collect::<String>()
         );
     }
 }

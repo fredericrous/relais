@@ -33,7 +33,7 @@
 //! | 19 | `NothingDetected` | `init --detect` found no verification command and none was typed; nothing was written |
 //! | 20 | `TrainingLeaseHeld` | `learn cycle`: another cycle holds the Training lease; the message names its pid and start time |
 //! | 21 | `StorageFull` | relais's own storage is full and the run could not be recorded; `relais resume <run>` reconciles |
-//! | 22 | `Parked` | `programme next`: no ticket is eligible; stdout says `parked: next due <date>` or `parked: nothing due` |
+//! | 22 | `Parked` | `programme next`: no ticket is eligible (in the `--from` programme, when given); stdout says `parked: next due <date>` or `parked: nothing due`, then any `ready elsewhere: <repo>:<slug> (<n> ready)` lines |
 //!
 //! `learn cycle` also ends 0 where it did nothing wrong and nothing was
 //! asked of the person: `deferred` (agents of other sessions are active and
