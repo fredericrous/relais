@@ -598,10 +598,7 @@ pub fn resolve_decision_with_intent(
     match state.answer_decision(run)? {
         // Another answerer holds the decision: said as such, never as "no
         // open decision", which this node's ledger may contradict.
-        DecisionGrant::HeldElsewhere => Err(SharedStateError::Refused {
-            reason: format!("the decision of run {run} is being answered elsewhere"),
-        }
-        .into()),
+        DecisionGrant::HeldElsewhere => Err(decision_held_elsewhere(run)),
         DecisionGrant::Granted => match ledger.resolve_decision_with_intent(run, answer, intent) {
             Ok(Some(written)) => Ok(Some(written)),
             Ok(None) => {
@@ -610,6 +607,69 @@ pub fn resolve_decision_with_intent(
             }
             Err(local) => Err(compensated(local.into(), state.release_decision(run))),
         },
+    }
+}
+
+/// The refusal every answer to a decision gets when another answerer holds
+/// its grant.
+fn decision_held_elsewhere(run: &RunId) -> NodeError {
+    SharedStateError::Refused {
+        reason: held_elsewhere_reason(run),
+    }
+    .into()
+}
+
+/// The reason text of [`decision_held_elsewhere`], so a caller can tell this
+/// refusal from any other the shared half gives.
+pub fn held_elsewhere_reason(run: &RunId) -> String {
+    format!("the decision of run {run} is being answered elsewhere")
+}
+
+/// Answer a decision with no successor (approve, reject and the other plain
+/// answers): the grant first, then the ledger's write. `Ok(false)` is a
+/// decision this node's ledger has no open row for; the grant is then given
+/// back, as [`resolve_decision_with_intent`] does.
+pub fn resolve_decision(
+    state: &dyn SharedState,
+    ledger: &Ledger,
+    run: &RunId,
+    answer: &DecisionAnswer<'_>,
+) -> Result<bool, NodeError> {
+    match state.answer_decision(run)? {
+        DecisionGrant::HeldElsewhere => Err(decision_held_elsewhere(run)),
+        DecisionGrant::Granted => match ledger.resolve_decision(run, answer) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                give_back(&format!("decision:{run}"), state.release_decision(run));
+                Ok(false)
+            }
+            Err(local) => Err(compensated(local.into(), state.release_decision(run))),
+        },
+    }
+}
+
+/// Run `write`, a decision's answer whose error is not a [`NodeError`] (the
+/// stopped review's approval), under the decision grant. `closed` judges the
+/// result: when it says the decision is closed the grant is kept, as for
+/// any written answer; else it is given back, a failed release said on
+/// stderr since the caller's error type has no `Compensation` arm.
+///
+/// The grant is asked before `write` runs, so a refusal writes nothing.
+pub fn answer_under_grant<T, E>(
+    state: &dyn SharedState,
+    run: &RunId,
+    write: impl FnOnce() -> Result<T, E>,
+    closed: impl FnOnce(&Result<T, E>) -> bool,
+) -> Result<Result<T, E>, NodeError> {
+    match state.answer_decision(run)? {
+        DecisionGrant::HeldElsewhere => Err(decision_held_elsewhere(run)),
+        DecisionGrant::Granted => {
+            let result = write();
+            if !closed(&result) {
+                give_back(&format!("decision:{run}"), state.release_decision(run));
+            }
+            Ok(result)
+        }
     }
 }
 

@@ -29,7 +29,7 @@ back to an older relais.
 | handoff reservation | `relais programme next --claim` |
 | a session's work holds renewed or given back | `relais programme claim` (renew), the hook on a resumed `SessionStart` (renew) and on `SessionEnd` (give back) |
 | successor intent claim and release | `relais run --intent` |
-| decision answer with a successor intent | `relais decide` with the revise answer |
+| decision answer, with or without a successor intent | `relais decide` (approve, reject, revise and the other answers but `salvaged`, which closes its decision unfenced) |
 | registry pointer read, swap and rollback | `relais promote`, `relais rollback`, and `relais learn cycle`'s automatic promote and rollback |
 | daily spend ceiling check | `relais run`, `relais dataset replay` (through `RunConfig::shared_state`) |
 | the runner's widen and timed-out settles | `relais run`, `relais dataset replay` |
@@ -210,7 +210,9 @@ it could not renew or give back ends by its TTL.
   was given, so an answerer that died before its ledger write does not hold
   the decision for good. `LocalState` holds none: the node's ledger decides.
   The ledger fences a late answer only within one ledger, so a client with
-  several answerers adds its own fence (an-t13 owns it).
+  several answerers adds its own fence (an-t13 owns it). A grant held
+  elsewhere refuses `relais decide` with exit 3; `relais feedback` answers no
+  decision and takes none.
   `conformance::run_all_with_clock(make, advance)` runs the lapse check; a
   client whose test primary has an injectable clock must pass it, and
   `run_all` alone does not cover the lapse.

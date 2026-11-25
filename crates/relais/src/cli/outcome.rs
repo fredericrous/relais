@@ -14,7 +14,7 @@
 //! | 0 | `Accepted` | the command did what was asked |
 //! | 1 | `OperationalFailure` | relais's own machinery failed: the ledger, the registry, a file it owns. Nothing is implied about the task |
 //! | 2 | `InvalidInput` | the invocation or a file it names is wrong: a malformed contract, a missing policy, conflicting flags |
-//! | 3 | `Blocked` | policy, trust, admission or the environment refuses; no model ran |
+//! | 3 | `Blocked` | policy, trust, admission or the environment refuses; no model ran. Also `relais decide`: another answerer holds the shared decision grant (retry once it lapses) |
 //! | 4 | `Failed` | the task executed and produced no acceptable candidate |
 //! | 5 | `BudgetExhausted` | the spending ceiling was reached; the patch and evidence are preserved |
 //! | 6 | `Interrupted` | the run stopped mid-flight; `relais resume` reconciles it |

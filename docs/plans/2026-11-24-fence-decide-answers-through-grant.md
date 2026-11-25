@@ -111,7 +111,7 @@ Under `LocalState` (which always grants) nothing changes.
 - `relais decide --answer approve|reject|...` (every answer that reached
   `ledger.resolve_decision`) calls `node::resolve_decision`.
 - `relais decide --answer approve` on a stopped review: an OPEN decision is
-  approved through `answer_under_grant` (closed = `sealed.written` on `Ok`;
+  approved through `answer_under_grant` (closed = any `Ok`, a sealed receipt or the same one from a racing answer;
   on `Err`, a re-read `decision_of_run` showing it resolved; if that re-read
   fails, the grant is kept, the read error is said on stderr, and it lapses
   within the TTL); the
@@ -131,9 +131,9 @@ Under `LocalState` (which always grants) nothing changes.
   it itself. Today the revise path prints it as an operational failure,
   exit 1; that changes (a CHANGELOG line says so). Every other shared or node
   error goes through `ctx::node_error("decide", e)`.
-- `decide_in` takes the state beside `locate`; `decide_inner` builds it once
-  with `ctx::shared_state()` and hands it to all three paths, so a decide
-  builds one state, as `relais run` does since an-t22.
+- `decide_in` takes a state builder beside `locate`, `ctx::shared_state`;
+  `record_answer` calls it at each grant point, so a decide that asks no
+  grant builds none.
 - No `Ledger::resolve_decision` call is left outside `shared_state/node.rs`
   and test modules (`ledger/` itself defines it).
 
@@ -166,6 +166,19 @@ Under `LocalState` (which always grants) nothing changes.
 | pilot | the branch binary, `HOME` in a temp dir: a run left waiting on a decision (seeded ledger), `relais decide <run> --answer reject --actor orchestrator` | exit 0, `recorded ...`, as main | |
 
 ## Decision log
+
+- 2026-11-24 (implementation) — `closed` on `Ok` is every `Ok`, not
+  `sealed.written`: an `Ok` with no write is the same receipt a racing
+  answer sealed, so the decision is closed and the grant stays. Found in
+  implementation; the reviewed text said `sealed.written`.
+- 2026-11-24 (implementation) — the shared state is built lazily, at the
+  three points that ask for a grant (not in `decide_inner`): an answer that
+  reaches none of them (`salvaged`, `abandon`, argument refusals) is unchanged
+  under `shared_state = "external"` with no client. The answers that do ask
+  (approve, reject, the other plain answers, revise, the stopped-review
+  approve) refuse there with exit 3 through `shared_state_error`, as
+  `relais run` does (an-t06, refuse rather than split). `salvaged` stays
+  unfenced.
 
 - 2026-11-24 — feedback is not fenced (see Non-goals), because it answers no
   decision and a fence would refuse a person's feedback for 10 minutes after
