@@ -87,46 +87,62 @@ ticket here until it is resolved or moved into a programme of its own.
   `/clear` relay, spawns before the first person prompt can route on a
   state with no pins (likely the pre-clear one; cause open): a pinned
   reviewer's fallback spawn was table-routed to Haiku.
-- [f21](f21-settle-at-final-turn-with-shells.md) (2026-11-24, open):
-  settle a worker whose final turn leaves a background shell running.
+- [f21](f21-settle-at-final-turn-with-shells.md) (2026-11-24, closed 2026-11-25):
+  the plugin `TaskStop`s a worker that answered but is still listed
+  `running` 5 s later, and ends the dispatch `completed` once a listing taken
+  after the stop's answer shows it gone. `killed` would drop the answer.
+  `TaskStop` sends SIGTERM to the whole tree, own-group children included.
+  Every `TaskStop` is bounded at 30 s, and a late one may still take.
+  Measure: f23.
 - [f22](f22-pin-row-live-check.md) (2026-11-24, open, due 2026-12-01):
   check live that a pin row's `model` matches its subagent's step model,
   after the plugin reinstall and a relais that serves `pin_sources`.
+- [f23](f23-settle-at-answer-week.md) (2026-11-25, open, due 2026-12-03):
+  a week of worker stops settles within 60 s after the plugin reinstall,
+  and no plugin-stopped attempt ends `TerminalResultMissing`. Also the
+  live shell, process-group and slot checks.
+- [f24](f24-stop-an-orphaned-worker.md) (2026-11-25, open): a session cannot
+  stop a relais worker whose run has ended. `cancel` says "already ended",
+  and the guard refuses `TaskStop`. Seen when a worker's
+  `pkill -f <worktree>` killed its own driver.
 
 ## Handoff
 
-2026-11-24, boundary 3 (f19 closed): a pinned subagent's decision row now
-records the model the router infers the call ran, and router-state serves
-`pin_sources` (`own`, `preferred`, `machine`) beside `pins`. Plan
-`docs/plans/2026-11-24-pin-row-records-call-model.md`. The row is inferred,
-not observed; f22 checks it live.
+2026-11-25, boundary 3 (f21 closed): the relais plugin now settles a worker
+that answered but is held open by its own background shell. It stops the
+agent, which kills the shell's whole tree with SIGTERM, and reports
+`completed` with the answer kept and a note. Plan
+`docs/plans/2026-11-25-settle-worker-at-final-answer.md`. The plugin half
+ships with the next relais release and runs after the plugin reinstall.
 
-- Done: f12, f13, f14, f15, f17, f18, f19.
-- Next: f20 (stale state after a clear; its plan is in `relais-wt-f20`,
-  it rebases on f19's `routeSpawn` and `afterSpawn` changes), then Settle a
-  worker whose final turn leaves a background shell running (f21). Measure
-  the home fingerprint warnings (f08) is due 2026-11-28. A pin row's model
-  matches the model its subagent ran (f22) is due 2026-12-01, after the
-  plugin reinstall. A week of relays adopts every handoff (f16) is due
-  2026-12-02, counted from the plugin reinstall.
+- Done: f12, f13, f14, f15, f17, f18, f19, f21.
+- Next:
+  - f20 (stale state after a clear) is held by session
+    `route-relayed-session-state` in `relais-wt-f20`.
+  - Measure the home fingerprint warnings (f08), due 2026-11-28.
+  - A pin row's model matches the model its subagent ran (f22), due
+    2026-12-01, after the plugin reinstall.
+  - A week of relays adopts every handoff (f16), due 2026-12-02.
+  - A week of worker stops settles within 60 s (f23), due 2026-12-03.
+  - f16, f22 and f23 are counted from the reinstall.
+  - Let a session stop a relais worker whose run has ended (f24), ready.
 - Lessons:
-  - On a jammed host (load average near 90 on 6 cores), relais runs block on
-    `admission_wait_exhausted` twice in a row, and a change run can get no
-    worker lease at all. Apply the kept `candidate-1.patch`, check it in
-    session, and record the run `salvaged` at the commit.
-  - Under that load the full plugin suite fails on the 5 s per-test limit
-    in tests the change does not touch. Copy `claude-plugin/` with only the
-    test files that matter and run `claude plugin test` there.
-  - The scripted clock hangs a test that advances it by minutes: periodic
-    timers fire for every step. Test a time bound as a unit, with a fake
-    `fx`, and red-check it.
-  - `greenbelay plan-review record` refuses a disposition other than
-    `accepted`, `rejected` or `decision`. Put the reason in the review
-    file, not the disposition.
-  - A commit here runs the whole cargo test suite (about 10 min); make no
-    tracked edit while it runs, since the gate stashes them.
+  - A relais worker's `pkill -f <worktree path>` matches its own driver's
+    argv, which kills the run (f24). The native worker then keeps writing in
+    place, and neither `cancel` nor `TaskStop` can stop it. Wait for its turn
+    to end (watch its transcript for `end_turn`), then salvage the tree.
+  - The plugin runner's 5 s limit per test is fixed. A replay that waits out
+    a 30 s bound in 2 s scripted polls takes 3.6–4.8 s even at load 11 to 17,
+    because the full suite runs files in parallel. Test such bounds as units
+    of `check` with a fake `fx` and a hand-moved clock
+    (`tests/stop-bounds.test.ts`).
+  - `withinBound` ends the wait, but it never cancels the call: a late
+    `TaskStop` may still take. Design for both outcomes.
+  - On a jammed host, a commit's gate defers `cargo-test` and `plugin-test`
+    to CI. Run `make plugin` yourself once the load drops, and read the
+    counts, not the exit code alone.
 - Your steps: reinstall the relais plugin with relais's own install
-  command for Claude (it is at 0.72.0 here). f16 and f22 count from the
+  command for Claude (it is at 0.72.0 here). f16, f22 and f23 count from the
   session after the reinstall.
 
 ## Not yet specified
