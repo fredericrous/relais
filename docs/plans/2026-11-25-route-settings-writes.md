@@ -168,7 +168,10 @@ Observed on the tree before the review fixes, then again after them.
 
 ## Implementation review
 
-- implementation-review, round 1: approve-with-changes (3 blocking: results not recorded, impossible byte comparison, `if_absent` flag, placeholder name); all fixed; 90 s.
-- Delta: approve. Two low findings: `SettingsWhen` compared by equality in the fake (`deliberate: two variants, a third would be reviewed with its writer`); results wording corrected. Stdout progress line in install is pre-existing (follow-up).
+- implementation-review: round 1 approve-with-changes (3 blocking, all fixed); delta approve-with-changes, one low (install progress line on stdout, pre-existing, a follow-up); 17 candidates ruled fine but that one.
+- backend: round 1 approve-with-changes (three low; comment, CHANGELOG sentence fixed, message wording deferred as `deliberate: an-t13`); delta approve.
+- lang:rust: round 1 approve-with-changes (fake errors fixed; `deliberate:` the fake keeps its own edit logic, both run the conformance checks; `SettingsWrite` stays two booleans as the plan names it); delta approve-with-changes, low only (a `PrincipalKind` label helper, a stderr assertion in the no-home test: carried).
+- unix: round 1 approve-with-changes (no-home exit code fixed with a test); delta approve.
+- tui: round 1 approve-with-changes (`deliberate:` the installer prints one line per write; refusal wording fixed); delta approve.
 
 <!-- panel: repos=relais,homelab reviewers=backend,lang:rust,tui,unix body-sha=f6c833d71392 -->
