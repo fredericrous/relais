@@ -113,9 +113,9 @@ export function scriptedEngine(
     messagesNever: false,
     // The session id `$.session.id()` answers instead of `options.session`; a test changes it as /clear does.
     sessionId: undefined as string | undefined,
-    // Holds each `process.run` until it settles: a test delays one reply. Null answers at once.
     // Holds each `agent.list` call until it settles. Null answers at once.
     listHold: null as Promise<void> | null,
+    // Holds each `process.run` until it settles: a test delays one reply. Null answers at once.
     runGate: null as ((argv: string[]) => Promise<void> | undefined) | null,
   }
   const store: Record<string, { value: unknown; version: number }> = {}

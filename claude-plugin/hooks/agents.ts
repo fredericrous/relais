@@ -2,8 +2,9 @@
 // each turn's usage, and the one `stopped` a dispatch ends with.
 
 import type { Fx } from './fx.ts'
-import { type Dispatch, observe, openDispatch, stoppedPayload, usagePayload, withTurn } from './dispatches.ts'
+import { type Dispatch, observe, openDispatch, STOP_CONFIRM_MS, stoppedPayload, usagePayload, withTurn } from './dispatches.ts'
 import { sendBound, sendStopped, sendUsage } from './callbacks.ts'
+import { withinBound } from './events.ts'
 import { detach, every, type Child, type Store } from './store.ts'
 import { applyEvent, isLive } from './timeline.ts'
 
@@ -136,13 +137,18 @@ export async function handleStop(fx: Fx, store: Store, line: any) {
   await stopAgent(fx, store, text(line.run), agent)
 }
 
+// `TaskStop` of an agent, bounded: why it did not go through, or undefined
+// when it did. A call with no answer within STOP_CONFIRM_MS counts as
+// refused, so a hung call never holds a dispatch open.
+async function taskStop(fx: Fx, agent: string): Promise<string | undefined> {
+  const settled = await withinBound(fx, STOP_CONFIRM_MS, () => fx.tool.call({ tool: 'TaskStop', task_id: agent }))
+  if (settled.kind === 'ok') return refusal(settled.value)
+  if (settled.kind === 'late') return `no answer in ${STOP_CONFIRM_MS / 1000} s`
+  return failureText(settled.reason)
+}
+
 async function stopAgent(fx: Fx, store: Store, run: string | undefined, agent: string) {
-  let why: string | undefined
-  try {
-    why = refusal(await fx.tool.call({ tool: 'TaskStop', task_id: agent }))
-  } catch (reason) {
-    why = failureText(reason)
-  }
+  const why = await taskStop(fx, agent)
   // Said in the run's timeline: an agent relais asked to stop may still be
   // running, and the person is the one who can stop it.
   if (why !== undefined) await note(fx, store, run, `TaskStop of agent ${agent} failed: ${why}`)
@@ -232,7 +238,12 @@ export function onTurn(fx: Fx, store: Store, e: any) {
   const dispatch = store.agentDispatch.get(e.agentId)
   const d = dispatch ? store.dispatches.get(dispatch) : undefined
   if (!d || d.isStopped) return
-  const turned = withTurn(d, { usage: e.usage, answer: e.answer, reason: e.reason, isAborted: e.isAborted })
+  const turned = withTurn(d, {
+    usage: e.usage,
+    answer: e.answer,
+    reason: typeof e.reason === 'string' ? e.reason : undefined,
+    isAborted: e.isAborted === true,
+  })
   store.dispatches.set(d.id, turned)
   // The cost is booked every turn, not only at the agent's end: an agent
   // that never stops would otherwise book nothing.
@@ -268,9 +279,10 @@ export async function check(fx: Fx, store: Store) {
     if (ended === undefined) {
       // `isEnding` is written before any await: a poll and a turn's check overlap.
       store.dispatches.set(d.id, dispatch)
-      if (stop) await stopAnswered(fx, store, dispatch)
+      // Detached: a stop held by the engine must not hold the other dispatches' ends.
+      if (stop) detach(stopAnswered(fx, store, dispatch))
       if (isUnconfirmed) {
-        await note(fx, store, undefined, `agent ${dispatch.agent} still runs 30 s after its stop; it ends with its shell or at the wall time. To end it now, stop it in Claude Code.`)
+        await note(fx, store, undefined, `agent ${dispatch.agent} still runs ${STOP_CONFIRM_MS / 1000} s after its stop; it ends with its shell or at the wall time. To end it now, stop it in Claude Code.`)
       }
       continue
     }
@@ -284,25 +296,23 @@ export async function check(fx: Fx, store: Store) {
 // `TaskStop` of an agent that answered but is held open by its background work.
 // A refusal is said in the timeline and the agent is not stopped again; an
 // answer starts the wait for a look, ordered after it, that shows it gone.
-async function stopAnswered(fx: Fx, store: Store, d: Dispatch) {
-  let why: string | undefined
-  try {
-    why = refusal(await fx.tool.call({ tool: 'TaskStop', task_id: d.agent }))
-  } catch (reason) {
-    why = failureText(reason)
-  }
+// A new answer turn that lands while the call is out clears `isEnding`, and
+// the stop is then not recorded: that agent ends as today. Accepted: a
+// stopped agent's last turn is aborted, not an answer.
+async function stopAnswered(fx: Fx, store: Store, dispatch: Dispatch) {
+  const why = await taskStop(fx, dispatch.agent)
   const sentAt = await fx.clock.now()
-  const current = store.dispatches.get(d.id)
+  const current = store.dispatches.get(dispatch.id)
   if (current && !current.isStopped && current.isEnding) {
     store.dispatches.set(
-      d.id,
+      dispatch.id,
       why === undefined
         ? { ...current, stopSeq: store.listSeq, stopSentAt: sentAt }
         : { ...current, isEnding: false, stopFailed: true },
     )
   }
   if (why !== undefined) {
-    await note(fx, store, undefined, `could not stop agent ${d.agent} after its answer (${why}); the run ends when its background work ends or at the wall time.`)
+    await note(fx, store, undefined, `could not stop agent ${dispatch.agent} after its answer (${why}); the run ends when its background work ends or at the wall time.`)
   }
 }
 

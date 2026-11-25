@@ -4,25 +4,28 @@
 import { expect, test } from 'claude-code/testing'
 import { observe, openDispatch, withTurn } from '../hooks/dispatches.ts'
 
+// A look for the cases that do not depend on time.
+const look = { now: 0, seq: 0 }
+
 test('a repair whose stale listing is evicted before the resumed one shows is not ended', () => {
   // Continued while the list still showed the previous run's `completed`.
   let d = openDispatch('d2', 'agent-1', 'completed')
-  d = observe(d, { id: 'agent-1', status: 'completed' }).dispatch
+  d = observe(d, { id: 'agent-1', status: 'completed' }, look).dispatch
   // Evicted before the resumed run is listed: no turn, status never moved.
-  const { ended } = observe(d, undefined)
+  const { ended } = observe(d, undefined, look)
   expect(ended).toBe(undefined)
 })
 
 test('a repair that ran and then vanished with no turn ends failed', () => {
   let d = openDispatch('d2', 'agent-1', 'completed')
-  d = observe(d, { id: 'agent-1', status: 'running' }).dispatch
-  expect(observe(d, undefined).ended).toBe('failed')
+  d = observe(d, { id: 'agent-1', status: 'running' }, look).dispatch
+  expect(observe(d, undefined, look).ended).toBe('failed')
 })
 
 test('a first spawn seen and then gone with no turn ends failed', () => {
   let d = openDispatch('d1', 'agent-1')
-  d = observe(d, { id: 'agent-1', status: 'running' }).dispatch
-  expect(observe(d, undefined).ended).toBe('failed')
+  d = observe(d, { id: 'agent-1', status: 'running' }, look).dispatch
+  expect(observe(d, undefined, look).ended).toBe('failed')
 })
 
 const answered = (answer = 'done', extra: Record<string, unknown> = {}) =>

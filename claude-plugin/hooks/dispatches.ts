@@ -149,7 +149,7 @@ export function withTurn(
 export function observe(
   d: Dispatch,
   listed: Listed | undefined,
-  look: Look = { now: 0, seq: 0 },
+  look: Look,
 ): { dispatch: Dispatch; ended: string | undefined; stop: boolean; isUnconfirmed: boolean } {
   const moved = d.moved || (listed !== undefined && listed.status !== d.startStatus)
   const seen = d.seen || listed !== undefined
@@ -181,7 +181,7 @@ export function observe(
 }
 
 function observeEnd(
-  d: Dispatch,
+  dispatch: Dispatch,
   listed: Listed | undefined,
   moved: boolean,
   seen: boolean,
@@ -191,12 +191,12 @@ function observeEnd(
     // A repair's agent was listed (stale) at the continue already, so its
     // vanishing counts only once its status has moved since: before that,
     // the stale listing may simply have been evicted ahead of the resumed one.
-    if (d.turns > 0) return d.last && ENDED.includes(d.last) ? d.last : 'completed'
-    const vanished = seen && (d.startStatus === undefined || moved)
+    if (dispatch.turns > 0) return dispatch.last && ENDED.includes(dispatch.last) ? dispatch.last : 'completed'
+    const vanished = seen && (dispatch.startStatus === undefined || moved)
     return vanished ? 'failed' : undefined
   }
   if (!ENDED.includes(listed.status)) return undefined
-  if (d.turns > 0) return listed.status
+  if (dispatch.turns > 0) return listed.status
   const isEndedWithoutTurn = moved && ENDED_WITHOUT_TURN.includes(listed.status)
   return isEndedWithoutTurn ? listed.status : undefined
 }
