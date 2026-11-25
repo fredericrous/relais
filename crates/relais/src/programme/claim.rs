@@ -15,9 +15,10 @@ use std::collections::BTreeSet;
 use chrono::NaiveDate;
 
 pub use rules::{
-    held, repo_key, resolve_session, Claim, ClaimKey, ClaimRecord, Claimant, Contest, Hold, Holder,
-    Intent, Kind, Next, Pick, ProgrammeState, ReadyTicket, Resolution, SessionClaim, SessionClaims,
-    FUTURE_SKEW_SECS, HANDOFF_HOLD_SECS, UNPARSEABLE_HOLD_SECS, WORK_HOLD_SECS,
+    held, repo_key, resolve_session, Claim, ClaimKey, ClaimRecord, Claimant, Contest, Elsewhere,
+    Hold, Holder, Intent, Kind, Next, Pick, ProgrammeState, ReadyTicket, Resolution, SessionClaim,
+    SessionClaims, Unreadable, FUTURE_SKEW_SECS, HANDOFF_HOLD_SECS, UNPARSEABLE_HOLD_SECS,
+    WORK_HOLD_SECS,
 };
 pub use store::{
     now_unix, Acquired, ClaimError, Event, Pass, Released, SlugLock, Store, Taken, LOCK_WAIT,
@@ -67,21 +68,29 @@ pub struct EmptyProgramme<'a> {
 
 /// Picks the next ticket for a session at a boundary.
 ///
+/// With a `from` programme (a session handing off from it), the choice never
+/// leaves it (ADR-0084):
+///
 /// 0. With [`Intent::Reserve`], the ticket a live `handoff` claim of the
-///    session already holds, so a re-run names the same ticket.
+///    session already holds in `from`, so a re-run names the same ticket.
+///    One it holds in another programme is left to expire.
 /// 1. The first unheld, eligible ready ticket of `from`.
-/// 2. Otherwise the first eligible ready ticket of a programme in which no
-///    ticket is held, programmes ordered like the root summary (soonest
-///    due, then most ready, then name).
-/// 3. Otherwise [`Next::Parked`].
+/// 2. Otherwise [`Next::Parked`], with the date of `from`'s soonest future
+///    ticket and, read without a lock, the other programmes in which nothing
+///    is held and some ticket is eligible ([`Next::Parked::elsewhere`]).
+///
+/// Without `from`, no programme is being left: step 0 looks in every
+/// programme, then the first eligible ready ticket of a programme in which no
+/// ticket is held is chosen, programmes ordered like the root summary
+/// (soonest due, then most ready, then name), else [`Next::Parked`].
 ///
 /// When reserving, the choice is written as a `handoff` claim; a lost race
-/// moves on to the following candidate. Step 1 takes `from`'s lock once,
-/// sweeps once and releases it before step 2 takes a destination's; a lock
-/// not acquired within [`LOCK_WAIT`] counts as occupied (`from` falls through
-/// to step 2). Each reservation goes through `reservations` (the CLI's
-/// asks the shared state first): a ticket it refuses is passed over like
-/// one the claim file holds.
+/// moves on to the following candidate. `from`'s lock is taken once and its
+/// claims swept once; a `from` lock not acquired within [`LOCK_WAIT`] is
+/// [`ClaimError::LockTimeout`]. A destination's lock not acquired in time
+/// counts as occupied. Each reservation goes through `reservations` (the
+/// CLI's asks the shared state first): a ticket it refuses is passed over
+/// like one the claim file holds.
 pub fn next<R: Reservations + ?Sized>(
     reservations: &R,
     store: &Store,
@@ -91,81 +100,124 @@ pub fn next<R: Reservations + ?Sized>(
     now: i64,
     intent: Intent<'_>,
 ) -> Result<Next, R::Error> {
-    let mut wake: Option<NaiveDate> = None;
-    let mut note_wake = |tickets: &[&ReadyTicket]| {
-        for ticket in tickets {
-            if let Some(due) = ticket.due.filter(|due| *due > today) {
-                wake = Some(wake.map_or(due, |soonest| soonest.min(due)));
-            }
-        }
-    };
-
     if let Intent::Reserve { session } = intent {
-        for state in from.into_iter().chain(others) {
+        let scope: Vec<&ProgrammeState> = match from {
+            Some(state) => vec![state],
+            None => others.iter().collect(),
+        };
+        for state in scope {
             let records = store.records(&state.key)?;
             if let Some((id, name)) = own_handoff(state, &records, session, now) {
-                return Ok(Next::Pick(Pick {
-                    repo: state.repo.clone(),
-                    slug: state.slug.clone(),
-                    id: id.to_string(),
-                    name: name.to_string(),
-                }));
+                return Ok(Next::Pick(pick_of(state, id, name)));
             }
         }
     }
+    match from {
+        Some(state) => next_in(reservations, store, state, others, today, now, intent),
+        None => next_anywhere(reservations, store, others, today, now, intent),
+    }
+}
 
-    if let Some(state) = from {
-        let pick_of = |ticket: &ReadyTicket| {
-            Next::Pick(Pick {
-                repo: state.repo.clone(),
-                slug: state.slug.clone(),
-                id: ticket.id.clone(),
-                name: ticket.name.clone(),
-            })
-        };
-        match intent {
-            Intent::Look => {
-                let held_ids = store.held_ids(&state.key, now)?;
-                let unheld = unheld_afk(state, &held_ids);
-                note_wake(&unheld);
-                if let Some(ticket) = unheld.iter().find(|t| eligible(t, today)) {
-                    return Ok(pick_of(ticket));
+fn pick_of(state: &ProgrammeState, id: &str, name: &str) -> Pick {
+    Pick {
+        repo: state.repo.clone(),
+        slug: state.slug.clone(),
+        id: id.to_string(),
+        name: name.to_string(),
+    }
+}
+
+/// The soonest due date after `today` among `tickets`.
+fn soonest_future_due(tickets: &[&ReadyTicket], today: NaiveDate) -> Option<NaiveDate> {
+    tickets
+        .iter()
+        .filter_map(|ticket| ticket.due.filter(|due| *due > today))
+        .min()
+}
+
+/// Steps 1 and 2 with a `from` programme: its tickets only, else the park.
+fn next_in<R: Reservations + ?Sized>(
+    reservations: &R,
+    store: &Store,
+    state: &ProgrammeState,
+    others: &[ProgrammeState],
+    today: NaiveDate,
+    now: i64,
+    intent: Intent<'_>,
+) -> Result<Next, R::Error> {
+    let wake = match intent {
+        Intent::Look => {
+            let held_ids = store.held_ids(&state.key, now)?;
+            let unheld = unheld_afk(state, &held_ids);
+            if let Some(ticket) = unheld.iter().find(|t| eligible(t, today)) {
+                return Ok(Next::Pick(pick_of(state, &ticket.id, &ticket.name)));
+            }
+            soonest_future_due(&unheld, today)
+        }
+        Intent::Reserve { session } => {
+            let lock = store.lock(&state.key, LOCK_WAIT, now)?;
+            lock.sweep(&state.closed, now)?;
+            let held_ids = lock.held_ids(now)?;
+            let unheld = unheld_afk(state, &held_ids);
+            for ticket in unheld.iter().filter(|t| eligible(t, today)) {
+                if reservations.handoff(
+                    &lock,
+                    &state.key,
+                    &ticket.id,
+                    session,
+                    &state.repo_path,
+                    now,
+                )? {
+                    return Ok(Next::Pick(pick_of(state, &ticket.id, &ticket.name)));
                 }
             }
-            Intent::Reserve { session } => match store.lock(&state.key, LOCK_WAIT, now) {
-                Ok(lock) => {
-                    lock.sweep(&state.closed, now)?;
-                    let held_ids = lock.held_ids(now)?;
-                    let unheld = unheld_afk(state, &held_ids);
-                    note_wake(&unheld);
-                    for ticket in unheld.iter().filter(|t| eligible(t, today)) {
-                        if reservations.handoff(
-                            &lock,
-                            &state.key,
-                            &ticket.id,
-                            session,
-                            &state.repo_path,
-                            now,
-                        )? {
-                            return Ok(pick_of(ticket));
-                        }
-                    }
-                }
-                Err(ClaimError::LockTimeout { .. }) => {}
-                Err(error) => return Err(error.into()),
-            },
+            soonest_future_due(&unheld, today)
         }
-    }
+    };
+    let (elsewhere, unreadable) = ready_elsewhere(store, others, today, now);
+    Ok(Next::Parked {
+        next_due: wake,
+        elsewhere,
+        unreadable,
+    })
+}
 
+/// The other programmes as `next` sees them without a lock.
+struct Survey<'a> {
+    /// Programmes in which nothing is held and some ticket is eligible, in
+    /// the root summary's order.
+    destinations: Vec<Destination<'a>>,
+    /// The soonest future due among their unheld `afk` tickets, held
+    /// programmes included.
+    wake: Option<NaiveDate>,
+    /// Programmes whose claims could not be read.
+    unreadable: Vec<(&'a ProgrammeState, ClaimError)>,
+}
+
+fn survey<'a>(
+    store: &Store,
+    others: &'a [ProgrammeState],
+    today: NaiveDate,
+    now: i64,
+) -> Survey<'a> {
     let mut destinations = Vec::new();
+    let mut wake: Option<NaiveDate> = None;
+    let mut unreadable = Vec::new();
     for state in others {
-        let held_ids: BTreeSet<String> = store
-            .held_ids(&state.key, now)?
-            .into_iter()
-            .filter(|id| state.open.contains_key(id))
-            .collect();
+        let held_ids: BTreeSet<String> = match store.held_ids(&state.key, now) {
+            Ok(ids) => ids
+                .into_iter()
+                .filter(|id| state.open.contains_key(id))
+                .collect(),
+            Err(error) => {
+                unreadable.push((state, error));
+                continue;
+            }
+        };
         let unheld = unheld_afk(state, &held_ids);
-        note_wake(&unheld);
+        if let Some(due) = soonest_future_due(&unheld, today) {
+            wake = Some(wake.map_or(due, |soonest| soonest.min(due)));
+        }
         let is_empty = held_ids.is_empty() && state.branch_held.is_empty();
         let eligible_tickets: Vec<&ReadyTicket> = unheld
             .into_iter()
@@ -178,19 +230,61 @@ pub fn next<R: Reservations + ?Sized>(
             });
         }
     }
-    let destinations = order_destinations(destinations);
-    for Destination { state, eligible } in &destinations {
+    Survey {
+        destinations: order_destinations(destinations),
+        wake,
+        unreadable,
+    }
+}
+
+/// The ready-elsewhere list of a park, and the programmes left out of it
+/// because their claims could not be read.
+fn ready_elsewhere(
+    store: &Store,
+    others: &[ProgrammeState],
+    today: NaiveDate,
+    now: i64,
+) -> (Vec<Elsewhere>, Vec<Unreadable>) {
+    let survey = survey(store, others, today, now);
+    let elsewhere = survey
+        .destinations
+        .iter()
+        .map(|destination| Elsewhere {
+            repo: destination.state.repo.clone(),
+            slug: destination.state.slug.clone(),
+            ready: destination.eligible.len(),
+        })
+        .collect();
+    let unreadable = survey
+        .unreadable
+        .into_iter()
+        .map(|(state, error)| Unreadable {
+            repo: state.repo.clone(),
+            slug: state.slug.clone(),
+            cause: error.to_string(),
+        })
+        .collect();
+    (elsewhere, unreadable)
+}
+
+/// Without a `from` programme: the first programme in which nothing is
+/// held, else the park.
+fn next_anywhere<R: Reservations + ?Sized>(
+    reservations: &R,
+    store: &Store,
+    others: &[ProgrammeState],
+    today: NaiveDate,
+    now: i64,
+    intent: Intent<'_>,
+) -> Result<Next, R::Error> {
+    let survey = survey(store, others, today, now);
+    if let Some((_, error)) = survey.unreadable.into_iter().next() {
+        return Err(error.into());
+    }
+    for Destination { state, eligible } in &survey.destinations {
         let first = eligible[0];
-        let pick = |id: &str, name: &str| {
-            Next::Pick(Pick {
-                repo: state.repo.clone(),
-                slug: state.slug.clone(),
-                id: id.to_string(),
-                name: name.to_string(),
-            })
-        };
         let Intent::Reserve { session } = intent else {
-            return Ok(pick(&first.id, &first.name));
+            return Ok(Next::Pick(pick_of(state, &first.id, &first.name)));
         };
         let lock = match store.lock(&state.key, LOCK_WAIT, now) {
             Ok(lock) => lock,
@@ -216,10 +310,14 @@ pub fn next<R: Reservations + ?Sized>(
                 .iter()
                 .find(|t| t.id == id)
                 .map_or(first.name.as_str(), |t| t.name.as_str());
-            return Ok(pick(&id, name));
+            return Ok(Next::Pick(pick_of(state, &id, name)));
         }
     }
-    Ok(Next::Parked { next_due: wake })
+    Ok(Next::Parked {
+        next_due: survey.wake,
+        elsewhere: Vec::new(),
+        unreadable: Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -360,6 +458,150 @@ mod tests {
         assert_eq!(chosen(Some(&from)), "a:own:t2");
     }
 
+    fn reserve(
+        fixture: &Fixture,
+        from: Option<&ProgrammeState>,
+        others: &[ProgrammeState],
+        session: &str,
+    ) -> Result<Next, crate::shared_state::node::NodeError> {
+        next(
+            &crate::shared_state::node::NodeReservations(&crate::shared_state::LocalState::new()),
+            &fixture.store,
+            from,
+            others,
+            day(19),
+            NOW,
+            Intent::Reserve { session },
+        )
+    }
+
+    #[test]
+    fn an_exhausted_from_programme_parks_and_lists_the_empty_ones_without_reserving_there() {
+        let fixture = fixture("stay");
+        let from = programme("a", "own", vec![ready("later", Some(day(24)), Mode::Afk)]);
+        // A sooner date elsewhere is not the park's date: it is not this programme's.
+        let far = programme(
+            "b",
+            "far",
+            vec![afk("x1"), ready("x2", Some(day(20)), Mode::Afk)],
+        );
+        let busy = programme("c", "busy", vec![afk("y1"), afk("y2")]);
+        fixture
+            .store
+            .lock(&busy.key, LOCK_WAIT, NOW)
+            .unwrap()
+            .reserve_handoff("y1", "s9", "/r/c", NOW)
+            .unwrap();
+        let many = programme("d", "many", vec![afk("z1"), afk("z2")]);
+        let others = [far.clone(), busy, many.clone()];
+        let parked = reserve(&fixture, Some(&from), &others, "s1").unwrap();
+        let elsewhere = |repo: &str, slug: &str, ready: usize| Elsewhere {
+            repo: repo.into(),
+            slug: slug.into(),
+            ready,
+        };
+        assert_eq!(
+            parked,
+            Next::Parked {
+                next_due: Some(day(24)),
+                // Most ready first; the programme with a held ticket is left out.
+                elsewhere: vec![elsewhere("d", "many", 2), elsewhere("b", "far", 1)],
+                unreadable: Vec::new(),
+            }
+        );
+        assert!(fixture.store.records(&far.key).unwrap().is_empty());
+        assert!(fixture.store.records(&many.key).unwrap().is_empty());
+        assert!(fixture.store.records(&from.key).unwrap().is_empty());
+        // Without a programme to leave, the same call still enters one.
+        assert_eq!(
+            picked(&reserve(&fixture, None, &others, "s1").unwrap()),
+            "d:many:z1"
+        );
+    }
+
+    #[test]
+    fn an_own_handoff_in_another_programme_is_not_returned_from_a_from_programme() {
+        let fixture = fixture("ownelse");
+        let from = programme("a", "own", Vec::new());
+        let far = programme("b", "far", vec![afk("x1")]);
+        fixture
+            .store
+            .lock(&far.key, LOCK_WAIT, NOW)
+            .unwrap()
+            .reserve_handoff("x1", "s1", "/r/b", NOW)
+            .unwrap();
+        let others = [far];
+        assert_eq!(
+            reserve(&fixture, Some(&from), &others, "s1").unwrap(),
+            Next::Parked {
+                next_due: None,
+                elsewhere: Vec::new(),
+                unreadable: Vec::new(),
+            }
+        );
+        assert_eq!(
+            picked(&reserve(&fixture, None, &others, "s1").unwrap()),
+            "b:far:x1"
+        );
+    }
+
+    #[test]
+    fn a_busy_from_lock_is_a_lock_timeout_not_a_way_into_another_programme() {
+        let fixture = fixture("busyfrom");
+        let from = programme("a", "own", vec![afk("t1")]);
+        let far = programme("b", "far", vec![afk("x1")]);
+        let held = fixture.store.lock(&from.key, LOCK_WAIT, NOW).unwrap();
+        let outcome = reserve(&fixture, Some(&from), std::slice::from_ref(&far), "s1");
+        drop(held);
+        assert!(
+            matches!(
+                outcome,
+                Err(crate::shared_state::node::NodeError::Claim(
+                    ClaimError::LockTimeout { .. }
+                ))
+            ),
+            "{outcome:?}"
+        );
+        assert!(fixture.store.records(&far.key).unwrap().is_empty());
+    }
+
+    #[test]
+    fn claims_that_cannot_be_read_elsewhere_leave_that_programme_out_of_the_park() {
+        let fixture = fixture("unread");
+        let from = programme("a", "own", Vec::new());
+        let broken = programme("b", "broken", vec![afk("x1")]);
+        let fine = programme("c", "fine", vec![afk("y1")]);
+        // A file where the programme's claim directory belongs: listing it fails.
+        let dir = fixture.store.claims_dir_for_test(&broken.key);
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        std::fs::write(&dir, "not a directory").unwrap();
+        let others = [broken, fine];
+        let Next::Parked {
+            elsewhere,
+            unreadable,
+            ..
+        } = reserve(&fixture, Some(&from), &others, "s1").unwrap()
+        else {
+            panic!("expected a park");
+        };
+        assert_eq!(
+            elsewhere,
+            vec![Elsewhere {
+                repo: "c".into(),
+                slug: "fine".into(),
+                ready: 1
+            }]
+        );
+        assert_eq!(unreadable.len(), 1);
+        assert_eq!(
+            (unreadable[0].repo.as_str(), unreadable[0].slug.as_str()),
+            ("b", "broken"),
+            "{unreadable:?}"
+        );
+        // Without a programme to leave, an unreadable programme still fails.
+        assert!(reserve(&fixture, None, &others, "s1").is_err());
+    }
+
     #[test]
     fn a_programme_with_a_held_ticket_is_not_entered_and_the_rest_are_ordered_like_the_summary() {
         let fixture = fixture("dest");
@@ -426,7 +668,9 @@ mod tests {
         assert_eq!(
             run(day(19)),
             Next::Parked {
-                next_due: Some(day(21))
+                next_due: Some(day(21)),
+                elsewhere: Vec::new(),
+                unreadable: Vec::new(),
             }
         );
         assert_eq!(picked(&run(day(21))), "a:own:soon");
@@ -444,7 +688,11 @@ mod tests {
                 Intent::Look
             )
             .unwrap(),
-            Next::Parked { next_due: None }
+            Next::Parked {
+                next_due: None,
+                elsewhere: Vec::new(),
+                unreadable: Vec::new(),
+            }
         );
         assert_eq!(Next::parked_line(None), "parked: nothing due");
         assert_eq!(

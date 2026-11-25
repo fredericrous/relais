@@ -1513,6 +1513,13 @@ mod tests {
             "safe to /clear; parked: next due <date>",
             "any other non-zero exit: report the stderr line and stop",
             "Print no clear line",
+            // ADR-0084: the next ticket never comes from another programme.
+            "never of another, for a handoff",
+            "ready elsewhere: <repo>:<slug> (<n> ready)",
+            "start none of them: starting another programme is the person's call",
+            "safe to /clear; parked: lock busy",
+            "Print a `next:` prompt only on exit 0",
+            "also when the `worktree-task` skill is absent",
         ] {
             assert!(flat.contains(phrase), "the skill lost `{phrase}`:\n{body}");
         }
@@ -1544,6 +1551,7 @@ mod tests {
             "1 with `stayed held for` on stderr",
             "a 1 or 3 without those words: report the stderr line and stop",
             "Never hand off with an agent of the driver still running.",
+            "which the driver does not start: starting one is the person's call",
             "no capacity is not the end of the programme",
             "never a fork",
             "Never enter plan mode while a drive runs",

@@ -139,15 +139,24 @@ Resolution.
    - 0: the ticket is yours; go on.
    - 3: another live session holds it. Run
      `relais programme next --from <repo>:<slug> --claim`, which reserves one
-     unheld ready ticket for a handoff and prints `<repo> <slug> <id>`. Then
+     unheld ready ticket of this programme, never of another, for a handoff
+     and prints `<repo> <slug> <id>`. Then
      run `relais programme claim <slug> <id> --dir <map dir>` on what it
      names, and only after it exits 0 start any work: the reservation is a
      handoff, not active work. If that claim exits 3 too, another session
      took the reservation over and it is theirs: do not release it. Select
      again, at most 3 selections in all, then park.
-   - 22 (from `next`): nothing is unheld and due. Park: end the answer with
-     `safe to /clear; parked: next due <date>`, with the date `next` printed,
-     and no `next:` prompt.
+   - 22 (from `next`): nothing in this programme is unheld and due. Park:
+     end the answer with `safe to /clear; parked: next due <date>`, with
+     the first line `next` printed (`parked: …`), and no `next:` prompt.
+     When `next` also printed `ready elsewhere: <repo>:<slug> (<n> ready)`
+     lines, name those programmes for the person just above the parked
+     line, and start none of them: starting another programme is the
+     person's call.
+   - 1 from `next` with `stayed held for` on stderr: the programme's lock
+     was busy. Run the `next:` command it printed once more; if it is still
+     busy, write that command for the person and park with
+     `safe to /clear; parked: lock busy`.
    - any other non-zero exit: report the stderr line and stop. Print no
      clear line, and do not switch ticket or programme on a configuration or
      I/O failure.
@@ -189,13 +198,18 @@ Resolution.
 6. **Done** when `relais programme check <dir>` exits 0 and the pull
    request has merged. Then, once nothing of this session is in flight (no
    uncommitted or unpushed work, no run or background task still going, no
-   question unanswered, no worktree left to remove), end the answer with
-   this line, last, with nothing after it; the prompt is one line of at
-   most 2,000 characters with no backtick:
+   question unanswered, no worktree left to remove), run
+   `relais programme next --from <repo>:<slug> --claim` and read its exit as
+   step 2 does, also when the `worktree-task` skill is absent. Print a
+   `next:` prompt only on exit 0, naming the ticket it reserved, as this
+   line, last, with nothing after it; the prompt is one line of at most
+   2,000 characters with no backtick:
 
    ```
-   safe to /clear; next: `<the next session's first prompt>`
+   safe to /clear; next: `resume <repo> <slug> <id>: <gist>`
    ```
+
+   On exit 22 or a busy lock, end with the parked line of step 2 instead.
 
 A single-ticket session works one ticket, except research, which may be
 fanned out. Steps 4–6 are its close; a driver closes its tickets as the
@@ -284,7 +298,10 @@ recorded verdicts are the audit record.
 7. **Stop** when nothing is running and nothing ready is left, after the
    reconcile. Write the Handoff in one PR, then send **one** summary: the
    decisions agents took, the held tickets and why, the steps only the
-   person can run, the tickets waiting on a due date. Each line names the
+   person can run, the tickets waiting on a due date, and the programmes
+   `relais programme next --from <repo>:<slug>` lists under
+   `ready elsewhere:`, which the driver does not start: starting one is the
+   person's call. Each line names the
    ticket by its `# ` name, its file (`docs/programmes/<slug>/<id>.md`),
    and the exact command or edit the person runs. End with exactly one
    closing line: work left for the person → `safe to /clear; next:`; only

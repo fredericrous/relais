@@ -333,10 +333,37 @@ pub struct Pick {
 pub enum Next {
     Pick(Pick),
     /// Nothing is eligible; the soonest day an otherwise-ready, unheld,
-    /// `afk` ticket falls due, if there is one.
+    /// `afk` ticket falls due, if there is one (with a `from` programme,
+    /// of that programme only).
     Parked {
         next_due: Option<NaiveDate>,
+        /// With a `from` programme: the other programmes in which nothing
+        /// is held and some ticket is eligible, for the person to choose
+        /// from; `next` enters none of them (ADR-0084).
+        elsewhere: Vec<Elsewhere>,
+        /// Programmes left out of `elsewhere` because their claims could
+        /// not be read.
+        unreadable: Vec<Unreadable>,
     },
+}
+
+/// A programme a park leaves out of its ready-elsewhere list because its
+/// claims could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable {
+    pub repo: String,
+    pub slug: String,
+    /// What reading its claims failed with.
+    pub cause: String,
+}
+
+/// A programme a park lists as ready elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Elsewhere {
+    pub repo: String,
+    pub slug: String,
+    /// Its eligible tickets.
+    pub ready: usize,
 }
 
 impl Next {

@@ -1718,14 +1718,20 @@ pub(crate) fn next_command(
         }
         None => None,
     };
+    // The same command, so a pasted retry claims for the same session.
     let retry = format!(
-        "relais programme next{}{} --root {}",
+        "relais programme next{}{} --root {}{}{}",
         from.map_or_else(String::new, |(repo, slug)| format!(" --from {repo}:{slug}")),
         match reservation {
             Reservation::Claim => " --claim",
             Reservation::Look => "",
         },
-        shell_quote(&root.to_string_lossy())
+        shell_quote(&root.to_string_lossy()),
+        session.map_or_else(String::new, |id| format!(" --session {}", shell_quote(id))),
+        match format {
+            Format::Json => " --json",
+            Format::Text => "",
+        }
     );
     let shared = super::ctx::shared_state()?;
     let reservations = relais::shared_state::node::NodeReservations(&*shared);
@@ -1770,23 +1776,71 @@ pub(crate) fn next_command(
             print_stdout(&out)?;
             Ok(CliOutcome::Accepted)
         }
-        claim::Next::Parked { .. } if load_failed => {
+        claim::Next::Parked { .. } if load_failed && from.is_none() => {
             eprintln!("relais: not parking: a programme failed to load (see above)");
             Ok(CliOutcome::OperationalFailure)
         }
-        claim::Next::Parked { next_due } => {
-            let out = match format {
-                Format::Json => format!(
-                    "{}\n",
-                    json!({
-                        "parked": true,
-                        "next_due": next_due.map(|date| date.to_string()),
-                    })
-                ),
-                Format::Text => format!("{}\n", claim::Next::parked_line(next_due)),
-            };
-            print_stdout(&out)?;
+        claim::Next::Parked {
+            next_due,
+            elsewhere,
+            unreadable,
+        } => {
+            for programme in &unreadable {
+                eprintln!(
+                    "relais: {} {}: {}",
+                    programme.repo, programme.slug, programme.cause
+                );
+            }
+            let partial = load_failed || !unreadable.is_empty();
+            if partial {
+                eprintln!(
+                    "relais: the ready-elsewhere list may be partial: a programme failed to load (see above)"
+                );
+            }
+            print_stdout(&parked_output(next_due, &elsewhere, partial, format))?;
             Ok(CliOutcome::Parked)
+        }
+    }
+}
+
+/// What `next` prints when it parks: the `parked: …` line, then one
+/// `ready elsewhere: <repo>:<slug> (<n> ready)` line per programme the
+/// person may start (ADR-0084); with `--json`, one object.
+fn parked_output(
+    next_due: Option<chrono::NaiveDate>,
+    elsewhere: &[claim::Elsewhere],
+    partial: bool,
+    format: Format,
+) -> String {
+    match format {
+        Format::Json => format!(
+            "{}\n",
+            json!({
+                "parked": true,
+                "next_due": next_due.map(|date| date.to_string()),
+                "elsewhere": elsewhere
+                    .iter()
+                    .map(|programme| json!({
+                        "repo": programme.repo,
+                        "slug": programme.slug,
+                        "ready": programme.ready,
+                    }))
+                    .collect::<Vec<_>>(),
+                "elsewhere_partial": partial,
+            })
+        ),
+        Format::Text => {
+            use std::fmt::Write as _;
+            let mut out = format!("{}\n", claim::Next::parked_line(next_due));
+            for programme in elsewhere {
+                writeln!(
+                    out,
+                    "ready elsewhere: {}:{} ({} ready)",
+                    programme.repo, programme.slug, programme.ready
+                )
+                .expect("writing to a String cannot fail");
+            }
+            out
         }
     }
 }
