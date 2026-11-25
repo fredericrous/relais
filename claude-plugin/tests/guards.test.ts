@@ -86,6 +86,17 @@ test('a model TaskStop or SendMessage of a store-bound relais agent is denied wh
   expect(engine.calls.tool.filter((t: any) => t.tool === 'SendMessage' || t.tool === 'TaskStop').length).toBe(0)
 })
 
+test('a model TaskStop of an agent the store does not hold goes through when the agent list throws', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.agents.push({ id: 'agent-9', status: 'running', type: RELAIS_AGENT_TYPE, description: '' })
+  const down = Promise.reject(new Error('list down'))
+  down.catch(() => {})
+  engine.script.listHold = down
+  const stop = await $.tool.call({ tool: 'TaskStop', task_id: 'agent-9' })
+  expect(stop.deny).toBe(undefined)
+  expect(engine.calls.tool.filter((t: any) => t.tool === 'TaskStop').map((t: any) => t.task_id)).toEqual(['agent-9'])
+})
+
 test('a model TaskStop of a relais agent the store does not hold is sent to the person', async ($: any, on: any) => {
   const engine = await startedRun($, on)
   engine.agents.push({ id: 'agent-9', status: 'running', type: RELAIS_AGENT_TYPE, description: '' })

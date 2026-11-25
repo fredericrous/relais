@@ -45,16 +45,18 @@ the test green.
 
 ## Resolution
 
-Measured 2026-11-25 on Claude Code 2.1.331: when a `tool.call` hook throws,
-the engine runs its `.catch` ("its .catch answered") but the call still
-reaches the tool. A `.catch` answer of `{ deny }` and one of `{ result }` both
-came back as `{ result: 'ok' }`, for the engine's `HooksError` from
-`$.agent.list()` and for a plain `throw` alike. The guard's `.catch` was
-never what decided.
+Measured 2026-11-25 in `claude plugin test` on Claude Code 2.1.331 (CI pins
+2.1.291; not checked live), on this guard only: when the hook threw, the
+engine ran its `.catch` ("its .catch answered") but the call still reached
+the tool. With the `HooksError` from `$.agent.list()`, a `.catch` answer of
+`{ deny }` and one of `{ result }` both came back as `{ result: 'ok' }`; with a
+plain `throw`, a `{ result }` answer did too (a `{ deny }` one was not tried).
+The guard's `.catch` was not what decided.
 
 Fix: the guard reads the store first (a store-bound agent is denied without
 the list) and catches a failed `$.agent.list()` inside the hook, failing open
 only for an agent the store does not hold, as before. The test
 `a model TaskStop or SendMessage of a store-bound relais agent is denied when
 the agent list throws` (tests/guards.test.ts) went red before the fix
-(`stop.deny` undefined) and is green after it, 590 of 590.
+(`stop.deny` undefined) and is green after it. A second test covers the caught
+list: an agent the store does not hold still goes through. 591 of 591.

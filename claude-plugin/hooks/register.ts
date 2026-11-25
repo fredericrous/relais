@@ -549,9 +549,9 @@ export function register(on: any) {
   on('tool.call', { tool: ['SendMessage', 'TaskStop'] }, async ($: any, e: any, next: any) => {
     if (next.origin.plugin === $.plugin.name) return next(e)
     const target = String(e.tool === 'SendMessage' ? e.to : e.task_id)
-    // The store is read first, and a list that throws is caught here: the
-    // engine lets a tool.call through when its hook throws, whatever the
-    // .catch below answers (f25, measured on 2.1.331).
+    // The store is read first, and a list that throws is caught here: when
+    // this hook threw, the call reached the tool whatever the .catch below
+    // answered (f25, measured in `claude plugin test` on 2.1.331).
     if (store.agentDispatch.has(target)) return { deny: denyOf(e.tool, target) }
     let addresses: Set<string>
     try {

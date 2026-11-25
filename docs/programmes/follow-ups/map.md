@@ -108,8 +108,8 @@ ticket here until it is resolved or moved into a programme of its own.
   the plugin no longer knows the run.
 - [f25](f25-guard-fails-open-on-list-error.md) (2026-11-25, closed): the
   `SendMessage`/`TaskStop` guard reads the store before the agent list and
-  catches a failed list itself: Claude Code lets a `tool.call` through when
-  its hook throws, whatever the hook's `.catch` answers.
+  catches a failed list itself: when the hook threw, the call reached the
+  tool whatever its `.catch` answered (`claude plugin test`, 2.1.331).
 - [f26](f26-worker-kills-spare-the-driver.md) (2026-11-25, open): keep a
   worker's `pkill -f <path>` off its own driver, through worker guidance
   or a runner change.
@@ -137,9 +137,10 @@ changes ship with the next relais release and run after the plugin reinstall.
   - A week of worker stops settles within 60 s (f23), due 2026-12-03.
   - f16, f22 and f23 are counted from the reinstall.
 - Lessons:
-  - A `tool.call` hook's `.catch` does not decide the call: when the hook
-    throws, Claude Code (2.1.331) runs the tool whatever `.catch` returns.
-    A guard catches its own `$` failures inside the hook body (f25).
+  - In `claude plugin test` on 2.1.331, the guard's `tool.call` `.catch`
+    did not decide the call: the hook threw and the tool ran whatever
+    `.catch` returned. Unverified live or for other hooks; a guard catches
+    its own `$` failures inside the hook body (f25).
   - Until the reinstall, a worker that outlives its driver still cannot be
     stopped from the session: wait for its turn to end (watch its
     transcript for `end_turn`), then salvage the tree.
