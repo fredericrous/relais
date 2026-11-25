@@ -549,8 +549,17 @@ export function register(on: any) {
   on('tool.call', { tool: ['SendMessage', 'TaskStop'] }, async ($: any, e: any, next: any) => {
     if (next.origin.plugin === $.plugin.name) return next(e)
     const target = String(e.tool === 'SendMessage' ? e.to : e.task_id)
-    const addresses = relaisAddresses(await $.agent.list(), $.plugin.name)
-    return addresses.has(target) || store.agentDispatch.has(target) ? { deny: denyOf(e.tool, target) } : next(e)
+    // The store is read first, and a list that throws is caught here: when
+    // this hook threw, the call reached the tool whatever the .catch below
+    // answered (f25, measured in `claude plugin test` on 2.1.331).
+    if (store.agentDispatch.has(target)) return { deny: denyOf(e.tool, target) }
+    let addresses: Set<string>
+    try {
+      addresses = relaisAddresses(await $.agent.list(), $.plugin.name)
+    } catch {
+      return next(e)
+    }
+    return addresses.has(target) ? { deny: denyOf(e.tool, target) } : next(e)
   }).catch(($: any, e: any, next: any) => {
     const target = String(e.tool === 'SendMessage' ? e.to : e.task_id)
     return store.agentDispatch.has(target) ? { deny: denyOf(e.tool, target) } : next(e)

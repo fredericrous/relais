@@ -73,6 +73,30 @@ test('a model TaskStop of a relais agent is told which run to cancel', async ($:
   expect(message.deny).toBe(DENY_MESSAGE)
 })
 
+// f25: an agent list that cannot be read must not let a stop through.
+test('a model TaskStop or SendMessage of a store-bound relais agent is denied when the agent list throws', async ($: any, on: any) => {
+  const engine = await spawned($, on)
+  const down = Promise.reject(new Error('list down'))
+  down.catch(() => {})
+  engine.script.listHold = down
+  const stop = await $.tool.call({ tool: 'TaskStop', task_id: 'agent-1' })
+  expect(typeof stop.deny).toBe('string')
+  const message = await $.tool.call({ tool: 'SendMessage', to: 'agent-1', message: 'hello' })
+  expect(typeof message.deny).toBe('string')
+  expect(engine.calls.tool.filter((t: any) => t.tool === 'SendMessage' || t.tool === 'TaskStop').length).toBe(0)
+})
+
+test('a model TaskStop of an agent the store does not hold goes through when the agent list throws', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.agents.push({ id: 'agent-9', status: 'running', type: RELAIS_AGENT_TYPE, description: '' })
+  const down = Promise.reject(new Error('list down'))
+  down.catch(() => {})
+  engine.script.listHold = down
+  const stop = await $.tool.call({ tool: 'TaskStop', task_id: 'agent-9' })
+  expect(stop.deny).toBe(undefined)
+  expect(engine.calls.tool.filter((t: any) => t.tool === 'TaskStop').map((t: any) => t.task_id)).toEqual(['agent-9'])
+})
+
 test('a model TaskStop of a relais agent the store does not hold is sent to the person', async ($: any, on: any) => {
   const engine = await startedRun($, on)
   engine.agents.push({ id: 'agent-9', status: 'running', type: RELAIS_AGENT_TYPE, description: '' })
