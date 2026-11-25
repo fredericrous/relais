@@ -106,9 +106,10 @@ ticket here until it is resolved or moved into a programme of its own.
   run, with one reply line each. The model's `TaskStop` stays denied, and
   the deny names the run to cancel, or sends the model to the person when
   the plugin no longer knows the run.
-- [f25](f25-guard-fails-open-on-list-error.md) (2026-11-25, open): the
-  `SendMessage`/`TaskStop` guard lets a call through when `agent.list()`
-  throws, on origin/main too. Seen in an f24 test.
+- [f25](f25-guard-fails-open-on-list-error.md) (2026-11-25, closed): the
+  `SendMessage`/`TaskStop` guard reads the store before the agent list and
+  catches a failed list itself: Claude Code lets a `tool.call` through when
+  its hook throws, whatever the hook's `.catch` answers.
 - [f26](f26-worker-kills-spare-the-driver.md) (2026-11-25, open): keep a
   worker's `pkill -f <path>` off its own driver, through worker guidance
   or a runner change.
@@ -118,17 +119,16 @@ ticket here until it is resolved or moved into a programme of its own.
 
 ## Handoff
 
-2026-11-25, boundary 3 (f24 closed): `mcp__relais__cancel` of a run that has
-ended now stops the run's workers that still run, so a worker that outlives
-its driver can be stopped from the session. Plan
-`docs/plans/2026-11-25-cancel-stops-orphaned-workers.md`. The plugin change
-ships with the next relais release and runs after the plugin reinstall.
+2026-11-25, boundary 3 (f25 closed): the model's `TaskStop`/`SendMessage`
+of a store-bound relais worker stays denied when the agent list throws. Before
+it, f24 (`mcp__relais__cancel` of an ended run stops its workers, plan
+`docs/plans/2026-11-25-cancel-stops-orphaned-workers.md`). Both plugin
+changes ship with the next relais release and run after the plugin reinstall.
 
-- Done: f12, f13, f14, f15, f17, f18, f19, f21, f24.
+- Done: f12, f13, f14, f15, f17, f18, f19, f21, f24, f25.
 - Next:
   - f20 (stale state after a clear) is held by session
     `route-relayed-session-state` in `relais-wt-f20`.
-  - The guard may fail open when the agent list throws (f25), ready.
   - Keep a worker's kills off its own driver (f26), ready.
   - Measure the home fingerprint warnings (f08), due 2026-11-28.
   - A pin row's model matches the model its subagent ran (f22), due
@@ -137,6 +137,9 @@ ships with the next relais release and runs after the plugin reinstall.
   - A week of worker stops settles within 60 s (f23), due 2026-12-03.
   - f16, f22 and f23 are counted from the reinstall.
 - Lessons:
+  - A `tool.call` hook's `.catch` does not decide the call: when the hook
+    throws, Claude Code (2.1.331) runs the tool whatever `.catch` returns.
+    A guard catches its own `$` failures inside the hook body (f25).
   - Until the reinstall, a worker that outlives its driver still cannot be
     stopped from the session: wait for its turn to end (watch its
     transcript for `end_turn`), then salvage the tree.

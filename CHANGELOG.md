@@ -18,6 +18,11 @@ naming the reserver. relais-fabric runs both at its next relais pin bump;
 a client that answers `Held` to its own holder's retry, or grants another
 holder, now fails the suite.
 
+The Claude Code plugin keeps denying the model's `TaskStop` or `SendMessage` of
+a relais worker when Claude Code's agent list cannot be read: before, a list
+that failed let the call through to the worker. Takes effect after the plugin
+is reinstalled.
+
 The Claude Code plugin settles a native worker that answered but is still
 listed running 5 s later, held open by its own background shell: it stops the
 agent, confirms the stop with a listing taken after the stop's answer, and
