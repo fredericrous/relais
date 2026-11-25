@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/spawn-greentopo
 repos: [relais]
 adrs: [ADR-0072]
@@ -57,7 +57,7 @@ can remove `aval`. Programme ticket `topo-spotter-rename/t14-relais-spawns-green
 
 ## Phases
 - [x] Phase 1 — code and tests in `crates/relais/src/{tooling,context/mod,context/guidance,verify/mod,doctor/mod,runner/preflight,repo/detect}.rs`, `docs/SPEC.md`, `CHANGELOG.md`; one commit
-- [ ] Phase 2 — release and hand-off: tag via `tag-release`, then in the decisions repo write t14's Resolution in `docs/programmes/topo-spotter-rename/t14-relais-spawns-greentopo.md` and file the fallback removal in `docs/programmes/topo-spotter-rename/t10-fleet-sweep.md`
+- [x] Phase 2 — release and hand-off: tag via `tag-release`, then in the decisions repo write t14's Resolution in `docs/programmes/topo-spotter-rename/t14-relais-spawns-greentopo.md` and file the fallback removal in `docs/programmes/topo-spotter-rename/t10-fleet-sweep.md`
 
 ## Decision log
 - 2026-11-25 — fallback to `aval` by PATH probe rather than a flag: hosts
@@ -98,6 +98,27 @@ Observed before the push (2026-11-25, tree `9c0adf4e0`):
 | `cargo clippy -p relais --all-targets -D warnings`; `cargo test -p relais --lib` | green | green (full lib run 523 s on `8d81a0010`, focused modules 461 s on `be17b615c`, tooling + context on `9c0adf4e0`) |
 
 The after-release row (doctor and one run with `aval` off PATH on this host) is Phase 2's.
+
+After the release (2026-11-25, relais v0.85.0 installed by brew; greentopo
+2.0.0's released x86_64-apple-darwin binary on a scratch PATH, `aval` removed
+from it):
+
+| input | expected | actual |
+|---|---|---|
+| `relais doctor` in the relais checkout | aval row names greentopo | `✓ aval  required — greentopo greentopo 2.0.0` |
+| `greentopo resolve execution.settle-before-asking --json` | answers like aval | `{"adr":"ADR-0012",…}` |
+| one live run with `aval` off PATH | context pack version is greentopo's, no gap | not observable here: a live run inherits the plugin's PATH, where `aval` is installed. Unit tests cover it; decisions t09 checks it live after the machine switch |
+
+## Outcome
+Done 2026-11-25. relais#588 (spawn) and relais#591 (release) merged;
+**v0.85.0** tagged on `d7b6044be`, Release run 45597824722 `success` on every
+job, six platform assets plus `SHA256SUMS`, tap published. Installed on the
+laptop. Decisions t14 closed with its Resolution; the `aval` fallback's removal
+is in t10, the live context-pack check in t09. The declared-bin launch hint
+(review low) is follow-up f29.
+
+### 🧑 Your steps
+- `relais install --claude --write` — because the relais Claude Code plugin is still at 0.84.0, and reinstalling it is the person's step.
 
 ## Implementation review
 - implementation-review: approve-with-changes ×3 rounds; doctor row kept (label is `aval`), pack version and per-resolver choice fixed, tests added; plan edits here.

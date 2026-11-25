@@ -122,6 +122,9 @@ ticket here until it is resolved or moved into a programme of its own.
 - [f28](f28-tool-call-catch-answers.md) (2026-11-25, open): check that the
   plugin's other `tool.call` `.catch` answers reach the caller; f25 saw the
   guard's ignored when its hook threw.
+- [f29](f29-aval-launch-hint-declared-bin.md) (2026-11-25, open): the aval
+  launch-failure hint says "on PATH" and "set `bin`" even when `bin` is
+  declared; branch on the program's source (t14 review, low).
 
 ## Handoff
 
