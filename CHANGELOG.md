@@ -42,18 +42,30 @@ from. A `bin` declared under `[integrations]` is named as the thing to
 check, with no mention of PATH; `greentopo` found on PATH keeps "check that
 it runs, or set `bin`"; the `aval` fallback also says to install greentopo.
 
-## v0.86.0
 
-A worker's `pkill -f <worktree path>` no longer reaches its own relais
-driver. The plugin's run tool now asks `relais native contract --relative`
-for the saved contract and starts `relais run --task` with
-`.relais/tasks/<hash>.json`, or `../` steps up to it from a subdirectory.
-The driver's command line therefore names no worktree directory. On
-2026-11-25 such a pattern ended a run `interrupted` while its worker kept
-editing. The worker's rules now also say to stop only a process it started,
-by the pid it recorded (`$!`), and never by a pattern (`pkill`, `killall`,
-`pgrep -f`, `ps | grep`) or with `kill 0` or `kill -1`. A successor
-contract that `decide` saves keeps its absolute path.
+## v0.87.0
+
+The machine settings are written through `SharedState` as they are read.
+`relais trust grant`, the learning envelope and its off switch, the routing
+envelope and its off switch, and the two "record when absent" writes of
+`relais install` call the new `write_settings(writer, edit)`, which takes
+plain values (`SettingsEdit`) and answers what changed (`SettingsWrite`).
+Only an operator principal may write settings: a node or a task is refused
+(`SharedStateError::Refused`) with nothing changed, on every
+implementation. Nothing changes for one node: `LocalState` makes the same
+locked, atomic edit of `machine.toml` as before, with the same messages. With
+`shared_state = "external"` and no client linked, these commands now exit 3
+instead of writing a file nobody reads. The path-based writers in
+`trust.rs`, `learn/envelope.rs` and `router/mod.rs` are crate-private in
+this one release, with no deprecated step: nothing outside this repository
+calls them and no external client is linked yet. A
+client adds `write_settings` (and `SharedStateError::SettingsWrite` is the
+local writer's error) and runs `conformance::run_settings_writes`.
+
+When aval cannot be launched, the hint now follows where its program came
+from. A `bin` declared under `[integrations]` is named as the thing to
+check, with no mention of PATH; `greentopo` found on PATH keeps "check that
+it runs, or set `bin`"; the `aval` fallback also says to install greentopo.
 
 - `relais decide` approve, reject and the other plain answers, and the
   approval of a stopped review, now ask the shared half for the decision
@@ -73,6 +85,19 @@ contract that `decide` saves keeps its absolute path.
   and the stopped-review approve exit 3 (they exited 0), as `relais run`
   refuses there. `salvaged`, a refused argument, an unknown run and a run not
   waiting on a person are unchanged.
+
+## v0.86.0
+
+A worker's `pkill -f <worktree path>` no longer reaches its own relais
+driver. The plugin's run tool now asks `relais native contract --relative`
+for the saved contract and starts `relais run --task` with
+`.relais/tasks/<hash>.json`, or `../` steps up to it from a subdirectory.
+The driver's command line therefore names no worktree directory. On
+2026-11-25 such a pattern ended a run `interrupted` while its worker kept
+editing. The worker's rules now also say to stop only a process it started,
+by the pid it recorded (`$!`), and never by a pattern (`pkill`, `killall`,
+`pgrep -f`, `ps | grep`) or with `kill 0` or `kill -1`. A successor
+contract that `decide` saves keeps its absolute path.
 
 ## v0.85.0
 
