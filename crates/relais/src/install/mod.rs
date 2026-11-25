@@ -253,7 +253,7 @@ fn agent_implementation() -> String {
     let body = r#"---
 name: relais-implementation
 description: Implementation worker (relais advisory default) for bounded changes under a task contract.
-tools: Read, Grep, Glob, LSP, Edit, Write, Bash, mcp__aval__aval_rule, mcp__aval__aval_resolve, mcp__aval__aval_relevant
+tools: Read, Grep, Glob, LSP, Edit, Write, Bash, mcp__greentopo__greentopo_rule, mcp__greentopo__greentopo_resolve, mcp__greentopo__greentopo_relevant
 model: sonnet
 ---
 
@@ -284,7 +284,7 @@ fn agent_review() -> String {
     let body = r#"---
 name: relais-review
 description: Semantic reviewer (relais advisory default). Reports findings; cannot edit or waive anything.
-tools: Read, Grep, Glob, LSP, mcp__aval__aval_rule
+tools: Read, Grep, Glob, LSP, mcp__greentopo__greentopo_rule
 model: inherit
 preferred-model: opus
 ---

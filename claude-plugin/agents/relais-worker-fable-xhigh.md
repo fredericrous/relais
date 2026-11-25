@@ -1,7 +1,7 @@
 ---
 name: relais-worker-fable-xhigh
 description: relais worker. Started only by the relais plugin for a run's dispatch; never pick it yourself.
-tools: Read, Grep, Glob, LSP, Edit, Write, Bash, mcp__aval__aval_rule, mcp__aval__aval_resolve, mcp__aval__aval_relevant
+tools: Read, Grep, Glob, LSP, Edit, Write, Bash, mcp__greentopo__greentopo_rule, mcp__greentopo__greentopo_resolve, mcp__greentopo__greentopo_relevant
 model: fable
 effort: xhigh
 ---
