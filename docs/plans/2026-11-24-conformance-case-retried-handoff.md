@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: prog/agents-many-nodes/an-t23-conformance-retried-handoff
 repos: [relais, homelab]
 adrs: []
@@ -127,7 +127,7 @@ which check and step failed.
   `crates/relais/src/shared_state/mod.rs` (the `reserve_handoff` doc),
   `docs/shared-state.md` (the suite list and the programme-claims bullet),
   `CHANGELOG.md` (Unreleased: a client must now pass this case; name relais-fabric as the consumer to re-run at its next relais pin bump; no release is cut here).
-- [ ] Phase 2 — the ticket closure in homelab:
+- [x] Phase 2 — the ticket closure in homelab (homelab PR 1298):
   `docs/programmes/agents-many-nodes/an-t23-conformance-retried-handoff.md`
   (Resolution, status closed, the give-back path filed to the inbox) and this ticket's line in
   `docs/programmes/agents-many-nodes/map.md` (Decisions so far).
@@ -156,7 +156,7 @@ which check and step failed.
   `holds-until:` marker naming the condition that ends it (a caller asking
   the shared half for a ticket whose claim file is written); the follow-up
   is in the relais inbox.
-- 2026-11-24 — Next: Phase 2, the homelab Resolution and map line.
+- 2026-11-24 — Phase 2: the homelab Resolution and map line are homelab PR 1298 (`relais programme check docs/programmes/agents-many-nodes` exit 0). Rebased onto an-t17 (relais 576): only CHANGELOG.md conflicted, both entries kept.
 
 ## Verification
 
