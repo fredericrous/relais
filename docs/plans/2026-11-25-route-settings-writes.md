@@ -137,9 +137,8 @@ Your steps: none.
   "external"`, `trust grant`, the learning envelope and its `--off`, and the
   routing envelope and its `--off` each exit 3 with the one-line sentence on
   stderr and the file byte-identical; `relais install` exits 0, says "not
-  recorded", and leaves the file byte-identical. Switching one CLI call back
-  to a direct writer must fail them (the `pub(crate)` change cannot stop a
-  writer inside the library).
+  recorded", and leaves the file byte-identical. The `pub(crate)` change cannot stop a writer inside the library; the
+  switch-back run was not made.
 - Same file as before: the envelope commands write timestamps from
   `Utc::now()`, so a byte comparison of two runs cannot pass; the existing
   tests that read the written file back (`an_install_records_the_routing_envelope_once_and_a_preview_does_not`,
@@ -159,12 +158,17 @@ Observed on the tree before the review fixes, then again after them.
   off, routing envelope and off, `IfAbsent` leaving a grant or tombstone):
   pass on `LocalState::at(scratch)` and on the fake (35 `shared_state`
   tests).
-- `shared_state_cli`: five commands under `external`, expected exit 3, one
-  stderr line, empty stdout, file bytes unchanged, actual the same (5 tests
-  pass); `relais install` under `external`, expected exit 0 with one
+- `shared_state_cli` (one test, five commands) under `external`, expected exit 3, one
+  stderr line, empty stdout, file bytes unchanged, actual the same (the
+  file's 5 tests pass); `relais install` under `external`, expected exit 0 with one
   "not recorded" line per write and the file unchanged, actual the same.
 - `cargo test -p relais --features conformance`: lib 2718, bin 72, `it`
   353, 26, 16, 5 and the doc test pass; `cargo fmt --check` and `cargo
   clippy --all-targets --features conformance -D warnings` clean.
+
+## Implementation review
+
+- implementation-review, round 1: approve-with-changes (3 blocking: results not recorded, impossible byte comparison, `if_absent` flag, placeholder name); all fixed; 90 s.
+- Delta: approve. Two low findings: `SettingsWhen` compared by equality in the fake (`deliberate: two variants, a third would be reviewed with its writer`); results wording corrected. Stdout progress line in install is pre-existing (follow-up).
 
 <!-- panel: repos=relais,homelab reviewers=backend,lang:rust,tui,unix body-sha=f6c833d71392 -->
