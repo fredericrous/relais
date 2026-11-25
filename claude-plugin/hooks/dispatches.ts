@@ -176,16 +176,14 @@ export function observe(
   ) {
     return { dispatch: { ...next, isEnding: true }, ended: undefined, stop: true, isUnconfirmed: false }
   }
-  const settled = observeEnd(d, listed, moved, seen)
+  const settled = observeEnd(next, listed)
   return { dispatch: next, ended: settled, ...quiet }
 }
 
-function observeEnd(
-  dispatch: Dispatch,
-  listed: Listed | undefined,
-  moved: boolean,
-  seen: boolean,
-): string | undefined {
+// The end today's rule reads from one look, given the dispatch with this
+// look's `moved` and `seen` already latched.
+function observeEnd(dispatch: Dispatch, listed: Listed | undefined): string | undefined {
+  const { moved, seen } = dispatch
   if (!listed) {
     // Evicted after it ended: a turn was its answer; with none, it vanished.
     // A repair's agent was listed (stale) at the continue already, so its
