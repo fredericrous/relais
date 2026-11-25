@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: prog/agents-many-nodes/an-t20-route-settings-writes
 repos: [relais, homelab]
 adrs: []
@@ -117,9 +117,9 @@ fake keeps settings text in memory and applies the same edits.
 
 ## Phases
 
-- [ ] Phase 1 — trait, `LocalState`, fake, conformance: `crates/relais/src/shared_state/mod.rs`, `crates/relais/src/shared_state/types.rs`, `crates/relais/src/shared_state/error.rs`, `crates/relais/src/shared_state/local.rs`, `crates/relais/src/shared_state/fake.rs`, `crates/relais/src/shared_state/conformance.rs`, `crates/relais/src/coordinator/seats.rs`
-- [ ] Phase 2 — route the writers: `crates/relais/src/cli/ctx.rs`, `crates/relais/src/cli/trust.rs`, `crates/relais/src/cli/learn.rs`, `crates/relais/src/cli/native.rs`, `crates/relais/src/cli/install.rs`, `crates/relais/src/cli/decide.rs`, `crates/relais/src/trust.rs`, `crates/relais/src/learn/envelope.rs`, `crates/relais/src/router/mod.rs`, `crates/relais/tests/shared_state_cli.rs`
-- [ ] Phase 3 — docs and changelog: `docs/shared-state.md`, `CHANGELOG.md`
+- [x] Phase 1 — trait, `LocalState`, fake, conformance: `crates/relais/src/shared_state/mod.rs`, `crates/relais/src/shared_state/types.rs`, `crates/relais/src/shared_state/error.rs`, `crates/relais/src/shared_state/local.rs`, `crates/relais/src/shared_state/fake.rs`, `crates/relais/src/shared_state/conformance.rs`, `crates/relais/src/coordinator/seats.rs`
+- [x] Phase 2 — route the writers: `crates/relais/src/cli/ctx.rs`, `crates/relais/src/cli/trust.rs`, `crates/relais/src/cli/learn.rs`, `crates/relais/src/cli/native.rs`, `crates/relais/src/cli/install.rs`, `crates/relais/src/cli/decide.rs`, `crates/relais/src/trust.rs`, `crates/relais/src/learn/envelope.rs`, `crates/relais/src/router/mod.rs`, `crates/relais/tests/shared_state_cli.rs`, `crates/relais/tests/it/plugin_install.rs`
+- [x] Phase 3 — docs and changelog: `docs/shared-state.md`, `CHANGELOG.md`
 
 ### 🧑 Your steps
 
@@ -140,9 +140,31 @@ Your steps: none.
   recorded", and leaves the file byte-identical. Switching one CLI call back
   to a direct writer must fail them (the `pub(crate)` change cannot stop a
   writer inside the library).
-- Same input, same file: `trust grant`, the learning envelope on and off and
-  the routing envelope on and off, on a scratch `RELAIS_CONFIG_DIR`, with the
-  `main` binary and with this branch give a byte-identical file (diff empty).
-- `cargo test -p relais` and clippy clean.
+- Same file as before: the envelope commands write timestamps from
+  `Utc::now()`, so a byte comparison of two runs cannot pass; the existing
+  tests that read the written file back (`an_install_records_the_routing_envelope_once_and_a_preview_does_not`,
+  `an_install_never_replaces_an_envelope_the_person_recorded`,
+  `an_install_after_routing_was_turned_off_leaves_it_off`, the `trust grant`
+  tests, and the writers' own comment-and-mode tests) run unchanged on this
+  tree and pass. A by-hand run of the envelope commands against a scratch
+  config was not made: a hook reserves those commands for the person.
+
+## Results
+
+Observed on the tree before the review fixes, then again after them.
+- Conformance, input a Node then a Task writer of `GrantRepository`,
+  expected `Refused` and no repository, actual `Refused` twice and
+  `trust_repos` empty; an operator write, expected `written`, actual
+  `written`; every edit read back (trust, repository, learning grant and
+  off, routing envelope and off, `IfAbsent` leaving a grant or tombstone):
+  pass on `LocalState::at(scratch)` and on the fake (35 `shared_state`
+  tests).
+- `shared_state_cli`: five commands under `external`, expected exit 3, one
+  stderr line, empty stdout, file bytes unchanged, actual the same (5 tests
+  pass); `relais install` under `external`, expected exit 0 with one
+  "not recorded" line per write and the file unchanged, actual the same.
+- `cargo test -p relais --features conformance`: lib 2718, bin 72, `it`
+  353, 26, 16, 5 and the doc test pass; `cargo fmt --check` and `cargo
+  clippy --all-targets --features conformance -D warnings` clean.
 
 <!-- panel: repos=relais,homelab reviewers=backend,lang:rust,tui,unix body-sha=f6c833d71392 -->
