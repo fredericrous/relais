@@ -1131,6 +1131,13 @@ mod tests {
         fn machine_settings(&self) -> Result<relais::policy::MachineSettings, SharedStateError> {
             self.local.machine_settings()
         }
+        fn write_settings(
+            &self,
+            writer: &relais::shared_state::Principal,
+            edit: &relais::shared_state::SettingsEdit,
+        ) -> Result<relais::shared_state::SettingsWrite, SharedStateError> {
+            self.local.write_settings(writer, edit)
+        }
         fn daily_spent(
             &self,
             day_start: &str,

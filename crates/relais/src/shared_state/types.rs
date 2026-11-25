@@ -5,6 +5,7 @@
 
 use crate::ids::RunId;
 use crate::money::MicroUsd;
+use crate::policy::{AutoPromote, AutoPromoteOff, RoutingEnvelope, RoutingOff, TrustGrant};
 use crate::programme::claim::Contest;
 
 /// What kind of caller a [`Principal`] is (an-t12): the person's own
@@ -222,4 +223,55 @@ pub struct PublishReceipt {
     pub duplicates: u64,
     pub queued: u64,
     pub through_seq: Option<u64>,
+}
+
+/// One write of the machine settings, as plain values (an-t20). Each is one
+/// of the writes the settings file took before the trait had a settings
+/// write; a client applies it to the shared settings, `LocalState` to the
+/// node's file under the lock `relais trust grant` always took.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingsEdit {
+    /// `[trust."<key>"]`: one exact policy (`relais trust grant --key`).
+    GrantTrust { key: String, record: TrustGrant },
+    /// `[trust_repos."<repo_key>"]`: the repository, once (`relais trust
+    /// grant`).
+    GrantRepository {
+        repo_key: String,
+        record: TrustGrant,
+    },
+    /// `[learning] auto_promote`; `when: IfAbsent` leaves a grant or an `off`
+    /// tombstone already there alone (the installer).
+    SetAutoPromote {
+        grant: AutoPromote,
+        when: SettingsWhen,
+    },
+    /// `[learning]`: the grant removed, the `off` tombstone recorded.
+    AutoPromoteOff(AutoPromoteOff),
+    /// `[session_routing] envelope`; `when` as above.
+    SetRoutingEnvelope {
+        envelope: RoutingEnvelope,
+        when: SettingsWhen,
+    },
+    /// `[session_routing]`: the envelope removed, the `off` tombstone
+    /// recorded.
+    RoutingOff(RoutingOff),
+}
+
+/// Whether a [`SettingsEdit`] that records a grant replaces what is there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsWhen {
+    /// Record it, replacing a grant or an `off` tombstone (the person's own command).
+    Always,
+    /// Record it only when there is neither (the installer).
+    IfAbsent,
+}
+
+/// What a [`SettingsEdit`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SettingsWrite {
+    /// The settings changed. `false` when the key was already granted, or
+    /// an `IfAbsent` write found a grant or a tombstone.
+    pub written: bool,
+    /// An `off` edit removed a grant or an envelope that was there.
+    pub removed: bool,
 }

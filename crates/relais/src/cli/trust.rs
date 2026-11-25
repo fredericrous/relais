@@ -85,7 +85,12 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
             };
             let (granted, recorded_key, scope) = match key {
                 None => (
-                    relais::trust::grant_repository(&machine_path, &repo_key, &record),
+                    super::ctx::write_settings(
+                        &relais::shared_state::SettingsEdit::GrantRepository {
+                            repo_key: repo_key.clone(),
+                            record: record.clone(),
+                        },
+                    )?,
                     repo_key.clone(),
                     GrantScope::Repository,
                 ),
@@ -111,7 +116,12 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                          once"
                     );
                     (
-                        relais::trust::grant(&machine_path, &key, &record),
+                        super::ctx::write_settings(
+                            &relais::shared_state::SettingsEdit::GrantTrust {
+                                key: key.clone(),
+                                record: record.clone(),
+                            },
+                        )?,
                         key,
                         GrantScope::Legacy,
                     )
@@ -130,7 +140,7 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
             // warning compares against. A ledger that cannot take it is
             // said, not turned into a failed grant: the grant stands
             // either way.
-            if granted == relais::trust::Granted::Written {
+            if granted.written {
                 if let Err(e) = record_grant(&GrantRecord {
                     shown: &shown,
                     key: &recorded_key,
@@ -147,7 +157,7 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                     );
                 }
             }
-            let written = granted == relais::trust::Granted::Written;
+            let written = granted.written;
             if json {
                 print_document(&serde_json::json!({
                     "code": if written { "granted" } else { "already_granted" },

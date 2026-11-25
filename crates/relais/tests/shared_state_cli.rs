@@ -151,6 +151,65 @@ fn a_session_end_under_an_absent_external_layer_updates_the_local_claims_and_say
     assert_eq!(stdouts[0], stdouts[1], "the hook's answer is the same");
 }
 
+/// an-t20: every settings writer asks the shared state, so under an absent
+/// external layer each exits 3 with the one sentence and the file is the
+/// bytes it was.
+#[test]
+fn every_settings_writer_is_refused_under_an_absent_external_layer() {
+    let before = "# mine\nschema_version = 1\nshared_state = \"external\"\n";
+    let commands: [&[&str]; 5] = [
+        // Pins exit 3, not the write path: `trust grant` already stops at
+        // its read of the settings. The rows below reach the write.
+        &["trust", "grant", "--reviewed-by", "test"],
+        &["native", "learning-envelope", "--by", "me"],
+        &["native", "learning-envelope", "--off", "--by", "me"],
+        &[
+            "native",
+            "router-envelope",
+            "--by",
+            "me",
+            "--epsilon-max",
+            "0.1",
+        ],
+        &["native", "router-envelope", "--off", "--by", "me"],
+    ];
+    for args in commands {
+        let scratch = Scratch::with_machine_toml("shared-state-writers-external", before);
+        let out = scratch.relais(args, "");
+        assert_eq!(out.status.code(), Some(3), "{args:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "{args:?}: {out:?}");
+        let stderr = String::from_utf8(out.stderr).expect("utf-8");
+        assert_eq!(stderr.lines().count(), 1, "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("sets shared_state = \"external\""),
+            "{args:?}: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.machine_toml()).expect("read"),
+            before,
+            "{args:?}: the file is untouched"
+        );
+    }
+}
+
+/// With no home directory there is no settings path: the envelope commands
+/// stay exit 3 (`CliError::Home`), as before the write went through the trait.
+#[test]
+fn a_settings_writer_with_no_home_directory_is_exit_3() {
+    let scratch = Scratch::with_machine_toml("shared-state-no-home", "schema_version = 1\n");
+    let out = Command::new(BIN)
+        .args(["native", "router-envelope", "--off", "--by", "me"])
+        .current_dir(repo_root())
+        .env_remove("HOME")
+        .env_remove("USERPROFILE")
+        .env_remove("RELAIS_CONFIG_DIR")
+        .env("RELAIS_STATE_DIR", scratch.dir.join("state"))
+        .output()
+        .expect("relais runs");
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+}
+
 #[test]
 fn a_trust_grant_keeps_the_key_and_adds_none() {
     let with_key = Scratch::with_machine_toml(

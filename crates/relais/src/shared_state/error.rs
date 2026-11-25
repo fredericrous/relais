@@ -42,6 +42,11 @@ pub enum SharedStateError {
         path: PathBuf,
         cause: std::io::Error,
     },
+    /// The node's settings file could not be edited (locked, unreadable,
+    /// unwritable, or not valid): the message is the local writer's own.
+    SettingsWrite {
+        cause: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// A local file was read and is not valid.
     Invalid {
         path: PathBuf,
@@ -94,6 +99,7 @@ impl std::fmt::Display for SharedStateError {
             SharedStateError::Invalid { path, cause } => {
                 write!(f, "{} is invalid: {cause}", path.display())
             }
+            SharedStateError::SettingsWrite { cause } => write!(f, "{cause}"),
         }
     }
 }
@@ -103,7 +109,9 @@ impl std::error::Error for SharedStateError {
         match self {
             SharedStateError::Home(e) => Some(e),
             SharedStateError::Read { cause, .. } => Some(cause),
-            SharedStateError::Invalid { cause, .. } => Some(cause.as_ref()),
+            SharedStateError::Invalid { cause, .. } | SharedStateError::SettingsWrite { cause } => {
+                Some(cause.as_ref())
+            }
             SharedStateError::LeaseLost { .. }
             | SharedStateError::ClaimLost { .. }
             | SharedStateError::CasConflict { .. }
