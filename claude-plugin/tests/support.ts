@@ -114,6 +114,8 @@ export function scriptedEngine(
     // The session id `$.session.id()` answers instead of `options.session`; a test changes it as /clear does.
     sessionId: undefined as string | undefined,
     // Holds each `process.run` until it settles: a test delays one reply. Null answers at once.
+    // Holds each `agent.list` call until it settles. Null answers at once.
+    listHold: null as Promise<void> | null,
     runGate: null as ((argv: string[]) => Promise<void> | undefined) | null,
   }
   const store: Record<string, { value: unknown; version: number }> = {}
@@ -196,7 +198,11 @@ export function scriptedEngine(
       yield next
     }
   })
-  on('agent.list', () => ({ value: agents.map(a => ({ type: RELAIS_AGENT_TYPE, description: '', ...a })) }))
+  on('agent.list', async () => {
+    // The snapshot is taken after the hold: a list begun earlier answers with what is true later.
+    if (script.listHold) await script.listHold
+    return { value: agents.map(a => ({ type: RELAIS_AGENT_TYPE, description: '', ...a })) }
+  })
   // `agent.spawn` hooks decide the model and the directory; the agent then
   // shows in `$.agent.list()` as running.
   on('agent.spawn', async (_$: any, e: any) => {

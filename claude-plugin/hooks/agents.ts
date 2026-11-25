@@ -232,7 +232,7 @@ export function onTurn(fx: Fx, store: Store, e: any) {
   const dispatch = store.agentDispatch.get(e.agentId)
   const d = dispatch ? store.dispatches.get(dispatch) : undefined
   if (!d || d.isStopped) return
-  const turned = withTurn(d, { usage: e.usage, answer: e.answer })
+  const turned = withTurn(d, { usage: e.usage, answer: e.answer, reason: e.reason, isAborted: e.isAborted })
   store.dispatches.set(d.id, turned)
   // The cost is booked every turn, not only at the agent's end: an agent
   // that never stops would otherwise book nothing.
@@ -245,6 +245,9 @@ export function onTurn(fx: Fx, store: Store, e: any) {
 export async function check(fx: Fx, store: Store) {
   const open = [...store.dispatches.values()].filter(d => !d.isStopped)
   if (open.length === 0) return
+  // Taken before the call: a look is ordered by when it was asked for, not by the clock.
+  store.listSeq += 1
+  const look = { now: await fx.clock.now(), seq: store.listSeq }
   let listed: any[]
   try {
     listed = await fx.agent.list()
@@ -261,15 +264,45 @@ export async function check(fx: Fx, store: Store) {
     const current = store.dispatches.get(d.id)
     if (!current || current.isStopped) continue
     const seen = listed.find((a: any) => a.id === current.agent)
-    const { dispatch, ended } = observe(current, seen && { id: seen.id, status: seen.status })
+    const { dispatch, ended, stop, isUnconfirmed } = observe(current, seen && { id: seen.id, status: seen.status }, look)
     if (ended === undefined) {
+      // `isEnding` is written before any await: a poll and a turn's check overlap.
       store.dispatches.set(d.id, dispatch)
+      if (stop) await stopAnswered(fx, store, dispatch)
+      if (isUnconfirmed) {
+        await note(fx, store, undefined, `agent ${dispatch.agent} still runs 30 s after its stop; it ends with its shell or at the wall time. To end it now, stop it in Claude Code.`)
+      }
       continue
     }
     const stopped = { ...dispatch, isStopped: true }
     store.dispatches.set(d.id, stopped)
     const child = store.dispatchChild.get(d.id)
     if (child) sendStopped(fx, store, child, d.id, stoppedPayload(stopped, ended))
+  }
+}
+
+// `TaskStop` of an agent that answered but is held open by its background work.
+// A refusal is said in the timeline and the agent is not stopped again; an
+// answer starts the wait for a look, ordered after it, that shows it gone.
+async function stopAnswered(fx: Fx, store: Store, d: Dispatch) {
+  let why: string | undefined
+  try {
+    why = refusal(await fx.tool.call({ tool: 'TaskStop', task_id: d.agent }))
+  } catch (reason) {
+    why = failureText(reason)
+  }
+  const sentAt = await fx.clock.now()
+  const current = store.dispatches.get(d.id)
+  if (current && !current.isStopped && current.isEnding) {
+    store.dispatches.set(
+      d.id,
+      why === undefined
+        ? { ...current, stopSeq: store.listSeq, stopSentAt: sentAt }
+        : { ...current, isEnding: false, stopFailed: true },
+    )
+  }
+  if (why !== undefined) {
+    await note(fx, store, undefined, `could not stop agent ${d.agent} after its answer (${why}); the run ends when its background work ends or at the wall time.`)
   }
 }
 

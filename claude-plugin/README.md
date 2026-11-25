@@ -50,6 +50,13 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
   with `{agent, status, usage, answer}` on stdin. `bound` and `stopped` carry an
   explicit timeout and are retried (1, 2, 4, 8 s, then every 15 s) until
   acknowledged or the run's child exits.
+  A worker that answered (`turn.complete` with reason `answer`) but is still
+  listed `running` 5 s later is held open by its own background work: the
+  plugin `TaskStop`s it, and the first listing after the stop's answer that
+  shows it `killed`, `completed` or gone ends the dispatch `completed`, with the
+  kept answer and a `relais plugin: …` note after a blank line. A refused stop
+  is said in the timeline and not retried; a stop still unconfirmed 30 s later
+  is said once.
 - **Guards.** `agent.offer` hides `relais:*` agent types from the model (fail
   closed), except while the plugin resumes its own agent; `SendMessage` and
   `TaskStop` aimed at a relais agent are denied unless the plugin sent them; a
