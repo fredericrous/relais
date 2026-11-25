@@ -134,15 +134,18 @@ ticket here until it is resolved or moved into a programme of its own.
 - [f31](f31-release-commit-ci-cancelled.md) (2026-11-25, open): a push to
   main cancels the CI of the commit before it, so a release tagged there
   fails "every platform passed on main" (v0.86.0; its CI was cancelled twice).
+- [f32](f32-aval-missing-repo-dir-hint.md) (2026-11-25, open): a missing
+  `repo_dir` also fails at aval's spawn and gets the f29 launch hint, which
+  points at PATH; name the directory instead.
 
 ## Handoff
 
-2026-11-25, boundary 3 (f29 closed): the aval launch-failure hint
-branches on where the program came from (declared `bin`, `greentopo` on
-PATH, the `aval` fallback), one test per wording; it ships in the next
-relais release. f24 and f25 shipped in v0.84.0, f27 in v0.85.0, f26 in
-v0.86.0 (installed here). f24 to f27 take effect after the plugin
-reinstall.
+2026-11-25, boundary 4 (v0.87.0 released): the aval launch-failure hint
+branches on where the program came from (f29, #596). v0.87.0 also carries
+#594 (an-t21, `decide` answers fenced through the grant) and #597 (an-t20,
+settings writes through `SharedState`). It is installed here through brew.
+f24 and f25 shipped in v0.84.0, f27 in v0.85.0, f26 in v0.86.0; f24 to f27
+take effect after the plugin reinstall.
 
 - Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f26, f27, f29.
 - Next:
@@ -155,10 +158,18 @@ reinstall.
   - f16, f22 and f23 are counted from the reinstall.
   - Show the `--relative` fallback, or count that it never fires (f30),
     ready.
+  - Name the missing directory when aval cannot start (f32), ready.
   - A push to main never cancels the release commit's CI (f31), ready.
   - After the reinstall: `pgrep -fl <worktree>` during a live run lists no
     driver pid, and `pgrep -fl 'relais run'` still lists it (f26 pilot).
 - Lessons:
+  - A release branch whose CI passed can still conflict at merge when a PR
+    lands on main meanwhile (#597 during v0.87.0): rebase, put the new
+    Unreleased notes under the version heading, and land with
+    `amont land --json --force`. The gate's cargo-test runs again.
+  - A PR's changelog bullets can land under the last released heading
+    (#594 sat under v0.86.0). Before a release, check each section's PRs
+    with `git tag --contains <sha>`.
   - A release tagged on a commit that is no longer main's head fails until
     main's CI passes on that commit, and each push to main cancels it. The
     release waits up to 40 min for it (release.yaml `--wait 2400`). Let the
