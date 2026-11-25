@@ -540,6 +540,9 @@ export function register(on: any) {
     isRelaisType(e.agent) && store.resuming === 0 ? { isOffered: false } : next(e),
   ).catch((_$: any, e: any, next: any) => (isRelaisType(e.agent) ? { isOffered: false } : next(e)))
 
+  // A stop is told which run to cancel; a message keeps the general text.
+  const denyOf = (tool: string, target: string): string =>
+    tool === 'TaskStop' ? taskStopDenyMessage(runOfAgent(store, target)) : DENY_MESSAGE
   // The model may not message or stop a relais agent; this module may.
   on('tool.call', { tool: ['SendMessage', 'TaskStop'] }, async ($: any, e: any, next: any) => {
     if (next.origin.plugin === $.plugin.name) return next(e)
@@ -550,9 +553,6 @@ export function register(on: any) {
     const target = String(e.tool === 'SendMessage' ? e.to : e.task_id)
     return store.agentDispatch.has(target) ? { deny: denyOf(e.tool, target) } : next(e)
   })
-  // A stop is told which run to cancel; a message keeps the general text.
-  const denyOf = (tool: string, target: string): string =>
-    tool === 'TaskStop' ? taskStopDenyMessage(runOfAgent(store, target)) : DENY_MESSAGE
 
   // relais's agents' completion notices are for relais; any other prompt,
   // one that only mentions an id included, is kept.

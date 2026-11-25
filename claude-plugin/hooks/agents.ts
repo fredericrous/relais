@@ -2,7 +2,7 @@
 // each turn's usage, and the one `stopped` a dispatch ends with.
 
 import type { Fx } from './fx.ts'
-import { type Dispatch, ENDED, observe, openDispatch, STOP_CONFIRM_MS, stoppedPayload, usagePayload, withTurn } from './dispatches.ts'
+import { type Dispatch, ENDED, type Listed, observe, openDispatch, STOP_CONFIRM_MS, stoppedPayload, usagePayload, withTurn } from './dispatches.ts'
 import { sendBound, sendStopped, sendUsage } from './callbacks.ts'
 import { withinBound } from './events.ts'
 import { detach, every, type Child, type Store } from './store.ts'
@@ -142,9 +142,14 @@ export async function handleStop(fx: Fx, store: Store, line: any) {
 // may still take.
 type StopAnswer = { kind: 'done' } | { kind: 'late'; why: string } | { kind: 'refused'; why: string }
 
+// `ms` is what is left of the STOP_CONFIRM_MS window; the text names the
+// window, not the remainder, which can be near 0 after a slow list.
 async function taskStop(fx: Fx, agent: string, ms = STOP_CONFIRM_MS): Promise<StopAnswer> {
   const settled = await withinBound(fx, ms, () => fx.tool.call({ tool: 'TaskStop', task_id: agent }))
-  if (settled.kind === 'late') return { kind: 'late', why: `no answer in ${Math.round(ms / 1000)} s` }
+  if (settled.kind === 'late') {
+    const why = ms === STOP_CONFIRM_MS ? `no answer in ${STOP_CONFIRM_MS / 1000} s` : `no answer within the ${STOP_CONFIRM_MS / 1000} s window`
+    return { kind: 'late', why }
+  }
   const why = settled.kind === 'ok' ? refusal(settled.value) : failureText(settled.reason)
   return why === undefined ? { kind: 'done' } : { kind: 'refused', why }
 }
@@ -185,13 +190,13 @@ export async function stopAgentsOf(fx: Fx, store: Store, run: string): Promise<s
     const why = read.kind === 'late' ? `no answer in ${STOP_CONFIRM_MS / 1000} s` : failureText(read.reason)
     return [`the agent list could not be read (${why}); no agent of run ${run} was stopped`]
   }
-  const listed: any[] = read.value
+  const listed: readonly Listed[] = read.value
   // What is left of the window, read before the ownership check below.
   const left = Math.max(0, STOP_CONFIRM_MS - ((await fx.clock.now()) - started))
   // Ownership is checked again: a `continue` may have rebound the agent to
   // another run while the list was awaited. No await from here to the calls.
   const live = [...agents].filter(agent => {
-    const seen = listed.find((a: any) => a.id === agent)
+    const seen = listed.find(a => a.id === agent)
     return seen !== undefined && !ENDED.includes(seen.status)
   })
   const running = live.filter(agent => runOfAgent(store, agent) === run)

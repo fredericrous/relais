@@ -9,7 +9,7 @@ import { STOP_CONFIRM_MS } from '../hooks/dispatches.ts'
 // The late case moves the scripted clock by STOP_CONFIRM_MS: not a 5 s test.
 const SLOW = { timeoutMs: 60000 }
 
-const result = (stdout: string, exitCode = 0) => ({ exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
+const fakeCancelOutput = (stdout: string, exitCode = 0) => ({ exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
 const ENDED_LINE = 'run run-c already ended: interrupted'
 const named = (run: string) => event(run, 0, { kind: 'phase', state: 'running', reason: 'x', detail: {} })
 
@@ -23,7 +23,7 @@ async function runWith($: any, on: any, dispatches: string[]) {
 }
 
 const answering = (engine: any, line: string, exitCode = 0) => {
-  engine.script.runResult = (argv: string[]) => (argv[2] === 'cancel' ? result(line + '\n', exitCode) : result(''))
+  engine.script.runResult = (argv: string[]) => (argv[2] === 'cancel' ? fakeCancelOutput(line + '\n', exitCode) : fakeCancelOutput(''))
 }
 const stops = (engine: any) => engine.calls.tool.filter((t: any) => t.tool === 'TaskStop').map((t: any) => t.task_id)
 const cancel = async ($: any) => (await $.tool.call({ tool: 'mcp__relais__cancel', run: 'run-c' })).result as string
@@ -147,6 +147,26 @@ test('an agent list that cannot be read is said, and nothing is stopped', async 
   expect(stops(engine)).toEqual([])
   expect(reply).toContain('the agent list could not be read (')
   expect(reply).toContain('); no agent of run run-c was stopped')
+})
+
+test('a slow list leaves the stop the rest of the window, and the late line names the window', SLOW, async ($: any, on: any) => {
+  const engine = await runWith($, on, ['d1'])
+  answering(engine, ENDED_LINE)
+  engine.script.toolResult = (e: any) => (e.tool === 'TaskStop' ? new Promise(() => undefined) : { result: 'ok', text: 'ok' })
+  let release = () => undefined as void
+  engine.script.listHold = new Promise<void>(resolve => (release = resolve))
+  let reply: string | undefined
+  const pending = cancel($).then(text => (reply = text))
+  await settle(engine)
+  await engine.clock.advance(STOP_CONFIRM_MS - 10000)
+  engine.script.listHold = null
+  release()
+  await settle(engine)
+  await engine.clock.advance(10000)
+  await settle(engine)
+  await pending
+  expect(stops(engine)).toEqual(['agent-1'])
+  expect(reply).toContain(`agent agent-1: TaskStop had no answer within the ${STOP_CONFIRM_MS / 1000} s window; it may still take`)
 })
 
 test('two agents, one stop unanswered: one bound in all, both lines said', SLOW, async ($: any, on: any) => {
