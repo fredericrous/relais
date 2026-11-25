@@ -126,11 +126,13 @@ No guard parses a `pkill` command: f24 already settled that.
 | Check | Input | Actual |
 | --- | --- | --- |
 | plugin tests | `sh scripts/plugin-test.sh` | 602 pass, 0 fail; the new run-tool test and the `decide` no-flag assertion ran |
-| new tests fail on main | spawn/successor tests and `runner/tests/mod.rs` copied onto a detached origin/main | the run-tool test fails (601 pass, 1 fail); both prompt pins fail (2 failed) |
-| prompt pins | `cargo test -p relais --lib runner::` | ok (417.9 s) |
+| new tests fail on main | spawn/successor tests and `runner/tests/mod.rs` copied onto a detached origin/main | the run-tool test fails (601 pass, 1 fail); both prompt pins fail (2 failed) Run before the child-process clause, whose two new assertions name text origin/main does not have. |
+| prompt pins | `cargo test -p relais --lib runner::`, on the tree with the child-process clause | ok, 555 passed, including both pins with the `pgrep -P` and "direct children only" assertions |
 | relative flag | `cargo test -p relais --test it native_contract` | 3 passed, including root, `deep/er`, and a symlink to it; `plan --task` gets past the contract load from each |
 | piloted | built binary in a scratch repo with linked worktree `/tmp/…/relais-wt-pilot` | `--relative`: `.relais/tasks/60b983a40d7802da.json` from the root, `../.relais/tasks/…` from `sub`, both load; without it: `/private/tmp/…/relais-wt-pilot/.relais/tasks/…` (the shape that matched). The live-driver `pgrep -fl` check waits for the release and reinstall. |
 | lint | `make lint` | rc 0 |
+| child processes | under `zsh -c` and `bash -c`: `sh -c "sleep 30 & sleep 30" &`, then `kill $(pgrep -P <pid>) <pid>`; and a grandchild tree `sh -c "sh -c \"sleep 31; true\" & wait" &`, killed deepest first | no child left in either shell; the grandchild tree: parent, child and grandchild gone, checked by pid |
+| `set -m` | `zsh -c 'set -m'`, `zsh -c 'setopt monitor'` | both refused: `can't change option`; macOS has no `setsid` |
 
 Carried from review, done: symlink case, `/` joins, the pilot passes `--relative`, and `decide` keeps the absolute path, with a test. Kept deliberate: the reply already reads `… for: <path> (in <cwd>)`, so it names the cwd the path is relative to.
 
@@ -147,5 +149,13 @@ Carried from review, done: symlink case, `/` joins, the pilot passes `--relative
 
 - Both changes, not one: argv alone misses `pkill relais`; guidance alone
   depends on the worker obeying.
+- The worker rule gained a clause for commands that start children:
+  `kill $(pgrep -P <pid>) <pid>`, run again on each child, deepest first.
+  `pgrep -P` matches a parent pid, not a pattern. The first wording, `set -m`
+  then `kill -- -<pid>`, was dropped: `zsh -c`, the shell workers get on
+  this machine, refuses `set -m`, and macOS has no `setsid`.
+- The plugin drops the stderr note that `--relative` prints when it falls
+  back to the absolute path. Filed in the inbox, not fixed here: the root
+  is found by walking up from the same cwd, so the fallback cannot fire.
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:rust,lang:typescript,tui,unix,codex body-sha=7735ec441a8d -->
