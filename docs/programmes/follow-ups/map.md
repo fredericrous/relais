@@ -129,6 +129,9 @@ ticket here until it is resolved or moved into a programme of its own.
 - [f30](f30-relative-fallback-shown.md) (2026-11-25, open): the run tool
   shows when `--relative` falls back to the absolute path, or a count shows
   that it never does.
+- [f31](f31-release-commit-ci-cancelled.md) (2026-11-25, open): a push to
+  main cancels the CI of the commit before it, so a release tagged there
+  fails "every platform passed on main" (v0.86.0, twice).
 
 ## Handoff
 
@@ -136,9 +139,8 @@ ticket here until it is resolved or moved into a programme of its own.
 own driver. The run tool passes a relative `--task`
 (`native contract --relative`), and the worker rules forbid kills by
 pattern (plan `docs/plans/2026-11-25-worker-kills-spare-the-driver.md`,
-Phase 2 = the release). f24 and f25 shipped in v0.84.0, f27 in v0.85.0;
-f26 ships with the next relais release. All of them run after the plugin
-reinstall.
+done). f24 and f25 shipped in v0.84.0, f27 in v0.85.0, f26 in v0.86.0
+(installed here). All of them take effect after the plugin reinstall.
 
 - Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f26, f27.
 - Next:
@@ -152,9 +154,14 @@ reinstall.
   - Show the `--relative` fallback, or count that it never fires (f30),
     ready.
   - The aval launch hint branches on a declared `bin` (f29), ready.
+  - A push to main never cancels the release commit's CI (f31), ready.
   - After the reinstall: `pgrep -fl <worktree>` during a live run lists no
     driver pid, and `pgrep -fl 'relais run'` still lists it (f26 pilot).
 - Lessons:
+  - A release tagged on a commit that is no longer main's head fails until
+    main's CI passes on that commit, and each push to main cancels it. Let
+    the newer run finish, rerun the tagged commit's run, then rerun the
+    release (v0.86.0; f31).
   - A branch `relais` piloted against a copy of the claims
     (`RELAIS_STATE_DIR` set to a scratch dir seeded with
     `~/.local/state/relais/claims`) leaves the real ledger and claims
@@ -187,7 +194,7 @@ reinstall.
   - To check that new tests fail on origin/main, use a detached worktree
     (`git worktree add --detach`) with the test files copied in. Restore it
     and remove it without `--force`.
-- Your steps: once the release with f26 is out, reinstall the relais plugin
+- Your steps: v0.86.0 is out and installed; reinstall the relais plugin
   with relais's own install command for Claude (it is at 0.72.0 here).
   f27's skill text, f24's cancel, f25's guard and f26's relative `--task`
   take effect from then; f16, f22 and f23 count from the session after it.
