@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.84.0
+
 The `SharedState` conformance suite holds a client to the retry rule of a
 handoff reservation. `run_all` gains
 `a_handoff_retried_by_its_holder_is_reserved_again`: a reservation retried
