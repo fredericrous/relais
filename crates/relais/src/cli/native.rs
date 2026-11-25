@@ -202,7 +202,25 @@ pub(crate) fn native_cancel_command(
 /// `<root>/.relais/tasks/<hash>.json`, under the `.relais/` the dirty-tree
 /// check already leaves alone, with a `.gitignore` that keeps it out of
 /// `git status`.
-pub(crate) fn native_contract_command(relative: bool) -> Result<CliOutcome, CliError> {
+/// How `relais native contract` prints the path it saved: absolute, or
+/// relative to the cwd (`--relative`, what the run tool asks for).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContractPath {
+    Absolute,
+    Relative,
+}
+
+impl ContractPath {
+    pub(crate) fn from_flag(relative: bool) -> Self {
+        if relative {
+            Self::Relative
+        } else {
+            Self::Absolute
+        }
+    }
+}
+
+pub(crate) fn native_contract_command(shape: ContractPath) -> Result<CliOutcome, CliError> {
     use std::io::Read;
     let mut text = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut text) {
@@ -256,7 +274,7 @@ pub(crate) fn native_contract_command(relative: bool) -> Result<CliOutcome, CliE
     })();
     match written {
         Ok(path) => {
-            let shown = if relative {
+            let shown = if shape == ContractPath::Relative {
                 cwd()
                     .ok()
                     .and_then(|here| relative_task_path(&here, &root, &path))
@@ -306,7 +324,9 @@ pub(crate) fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError>
         }
         NativeCommand::Cancel { run, session } => native_cancel_command(&run, session.as_deref()),
         NativeCommand::Usage { dispatch } => native_usage_command(&dispatch),
-        NativeCommand::Contract { relative } => native_contract_command(relative),
+        NativeCommand::Contract { relative } => {
+            native_contract_command(ContractPath::from_flag(relative))
+        }
         NativeCommand::RouterState { session } => Ok(router_state_command(&session)),
         NativeCommand::RouterObserve => Ok(router_observe_command()),
         NativeCommand::ReviewOutcome {
