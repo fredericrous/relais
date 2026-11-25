@@ -81,7 +81,7 @@ Under `LocalState` (which always grants) nothing changes.
   as they stay before the gaps refusal today: a sign-off is the person's
   statement about one criterion and stands whoever answers the decision. A
   refused approve leaves it recorded, as a gaps refusal already does, and
-  the refusal line then adds `(the sign-off of criterion <id> is recorded)`.
+  the refusal line then adds `; the sign-off of criterion <id> is recorded`.
 
 ## Code review
 
@@ -179,7 +179,8 @@ Under `LocalState` (which always grants) nothing changes.
   (`ExternalAbsent`); the 0→3 under `external` with no client is the an-t06
   rule (refuse rather than split), as `relais run` already does. an-t18
   changed `relais promote` 1→3 the same way. The `Breaking` CHANGELOG line
-  states both.
+  states both. Verified in code: `cli/ctx.rs:76` sets `EXTERNAL_CLIENT` to
+  `None`, so `shared_state = "external"` always ends in `ExternalAbsent`.
 - 2026-11-25 — deliberate, unix Delta #4 (medium, `--json` errors on stdout
   only): `refusal_lines` extracts the existing code unchanged; the
   `{"error","exit"}` stdout object is the plugin's contract (unix round 1
@@ -221,5 +222,22 @@ Under `LocalState` (which always grants) nothing changes.
 - 2026-11-24 — a delegating test state in the binary rather than a
   `conformance` dev-dependency on itself: plain `cargo test` must run the
   refusal tests.
+
+
+## Implementation review
+
+- implementation-review: approve-with-changes, then Delta twice; fixed: held revise test, lazy state in `successor_decide`, names, Phase 1 record, plan wording; deliberate: `--criterion` through `decide_in`, test-only `with(held)` (52k+50k+64k).
+- backend: approve after Delta; fixed: revise and Err-after-commit tests, `refusal_lines` test; deliberate: `--criterion` test (53k+34k+47k).
+- lang:rust: approve after Delta; fixed: `is_decision_held_elsewhere` replaces the public reason string, `write!`, a pinned-literal comment (63k+30k+43k).
+- unix: approve-with-changes; fixed: Breaking line, TTL from the constant; deliberate: exit 1→3 and 0→3 unobservable (`EXTERNAL_CLIENT = None`), `--json` stdout-only contract kept (67k+80k+85k).
+- tui: approve after Delta; fixed: run-scoped `relais status` advice, "holds it for up to N minutes", sign-off joined with ";", re-read warning next step (62k+60k+73k).
+
+## Outcome
+
+Every `relais decide` answer that closes a decision, except `salvaged`, asks
+the shared half for the decision grant before it writes; a grant held
+elsewhere is exit 3 with a run-scoped next step. `relais feedback` answers no
+decision and takes no grant (the ticket's premise, corrected). Under
+`LocalState` nothing changes. Phase 2, the homelab Resolution, is next.
 
 <!-- panel: repos=relais,homelab reviewers=backend,lang:rust,tui,unix body-sha=671f658ee3ae -->
