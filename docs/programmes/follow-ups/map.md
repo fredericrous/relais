@@ -110,9 +110,10 @@ ticket here until it is resolved or moved into a programme of its own.
   `SendMessage`/`TaskStop` guard reads the store before the agent list and
   catches a failed list itself: when the hook threw, the call reached the
   tool whatever its `.catch` answered (`claude plugin test`, 2.1.331).
-- [f26](f26-worker-kills-spare-the-driver.md) (2026-11-25, open): keep a
-  worker's `pkill -f <path>` off its own driver, through worker guidance
-  or a runner change.
+- [f26](f26-worker-kills-spare-the-driver.md) (2026-11-25, closed): both
+  changes. The run tool asks `native contract --relative`, so the driver's
+  argv names no worktree. The worker rules say to kill by the recorded pid,
+  never by a pattern, and to kill children by `pgrep -P`, deepest first.
 - [f27](f27-next-claim-stays-in-programme.md) (2026-11-25, closed):
   `programme next --from` never picks another programme's ticket
   (ADR-0084). An exhausted `--from` parks (exit 22) and lists
@@ -125,29 +126,34 @@ ticket here until it is resolved or moved into a programme of its own.
 - [f29](f29-aval-launch-hint-declared-bin.md) (2026-11-25, open): the aval
   launch-failure hint says "on PATH" and "set `bin`" even when `bin` is
   declared; branch on the program's source (t14 review, low).
+- [f30](f30-relative-fallback-shown.md) (2026-11-25, open): the run tool
+  shows when `--relative` falls back to the absolute path, or a count shows
+  that it never does.
 
 ## Handoff
 
-2026-11-25, boundary 3 (f27 closed): `relais programme next --from` never
-picks another programme's ticket (ADR-0084, decisions#370 merged). An
-exhausted `--from` parks and lists `ready elsewhere: <repo>:<slug> (<n> ready)`
-for the person. The programme skill and worktree-task's Handoff
-(greenharness-skills, merged after this PR) park on it and name those
-programmes. The relais change ships with the next release. Before that,
-the installed `next` (0.84.0) still crosses programmes: a session at a
-boundary runs it without `--claim` first, and parks when it names another
-programme. f24 and f25 also wait on the release and the plugin reinstall.
+2026-11-25, boundary 4 (f26 closed): a worker's process kills stay off its
+own driver. The run tool passes a relative `--task`
+(`native contract --relative`), and the worker rules forbid kills by
+pattern (plan `docs/plans/2026-11-25-worker-kills-spare-the-driver.md`,
+Phase 2 = the release). f24 and f25 shipped in v0.84.0, f27 in v0.85.0;
+f26 ships with the next relais release. All of them run after the plugin
+reinstall.
 
-- Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f27.
-- In flight elsewhere: f26 (driver-safe worker kills) and f28 (plugin
-  `tool.call` `.catch` answers), each on its `prog/` branch.
+- Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f26, f27.
 - Next:
+  - Check the plugin's other `tool.call` `.catch` answers (f28), ready.
   - Measure the home fingerprint warnings (f08), due 2026-11-28.
   - A pin row's model matches the model its subagent ran (f22), due
     2026-12-01, after the plugin reinstall.
   - A week of relays adopts every handoff (f16), due 2026-12-02.
   - A week of worker stops settles within 60 s (f23), due 2026-12-03.
   - f16, f22 and f23 are counted from the reinstall.
+  - Show the `--relative` fallback, or count that it never fires (f30),
+    ready.
+  - The aval launch hint branches on a declared `bin` (f29), ready.
+  - After the reinstall: `pgrep -fl <worktree>` during a live run lists no
+    driver pid, and `pgrep -fl 'relais run'` still lists it (f26 pilot).
 - Lessons:
   - A branch `relais` piloted against a copy of the claims
     (`RELAIS_STATE_DIR` set to a scratch dir seeded with
@@ -157,14 +163,34 @@ programme. f24 and f25 also wait on the release and the plugin reinstall.
   - In decisions, the pre-commit gate checks the whole working tree: a new
     ADR, its HEADS row, `aval.pack` and the plan pointer land in one
     commit.
-  - Earlier lessons (f24, f25): a guard catches its own `$` failures
-    inside the hook body. The plugin test runner's 5 s per-test limit is
-    fixed. Check a new test fails on origin/main in a detached worktree.
-- Your steps: after the next relais release (not part of f27's plan),
-  reinstall the relais plugin with relais's own install command for Claude
-  (it is at 0.72.0 here). f27's skill text, f24's cancel and f25's guard
-  take effect from then. f16, f22 and f23
-  count from the session after the reinstall.
+  - `zsh -c` (the worker's Bash on this machine) refuses `set -m` and
+    `setopt monitor`, and macOS has no `setsid`. To stop a process tree,
+    find its children with `pgrep -P <pid>` (f26).
+  - A `pgrep -f "<text>"` check run inside `zsh -c '…<text>…'` matches its
+    own shell: verify a kill by pid, not by pattern (seen once in f26: a
+    `sleep 31` tree read as 1 left after it was gone by pid).
+  - `relais::cli` lives in the binary crate (`main.rs: mod cli`): its unit
+    tests run under `cargo test -p relais --bin relais`, not `--lib`
+    (f26: `--lib relative_task_path` ran 0 of them, `--bin` ran 2).
+  - In `claude plugin test` on 2.1.331, the guard's `tool.call` `.catch`
+    did not decide the call: the hook threw and the tool ran whatever
+    `.catch` returned. Unverified live or for other hooks; a guard catches
+    its own `$` failures inside the hook body (f25).
+  - Until the reinstall, a worker that outlives its driver still cannot be
+    stopped from the session: wait for its turn to end (watch its
+    transcript for `end_turn`), then salvage the tree.
+  - The plugin test runner has no per-file filter, and its 5 s limit per
+    test is fixed. Drive any bound with the scripted clock
+    (`engine.clock.advance`) and keep the call pending, as
+    `cancel-orphans.test.ts` does. At load 70 to 100 (13 timeouts at load
+    70 in f26), unrelated tests time out; rerun once the load drops and read the counts.
+  - To check that new tests fail on origin/main, use a detached worktree
+    (`git worktree add --detach`) with the test files copied in. Restore it
+    and remove it without `--force`.
+- Your steps: once the release with f26 is out, reinstall the relais plugin
+  with relais's own install command for Claude (it is at 0.72.0 here).
+  f27's skill text, f24's cancel, f25's guard and f26's relative `--task`
+  take effect from then; f16, f22 and f23 count from the session after it.
 
 ## Not yet specified
 

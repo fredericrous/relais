@@ -206,7 +206,7 @@ async function successorFlags(fx: Fx, input: DecideInput, answer: string): Promi
   if (typeof contract === 'string' && contract !== '') return { argv: ['--successor-contract', contract] }
   if (contract && typeof contract === 'object') {
     if (typeof input.cwd !== 'string') return { deny: 'a successor_contract object is saved in the repository: pass cwd (absolute path), or pass the path of a .json file.' }
-    const saved = await contractPath(fx, contract, input.cwd)
+    const saved = await contractPath(fx, contract, input.cwd, 'absolute')
     if (saved.deny) return { deny: saved.deny }
     return { argv: ['--successor-contract', saved.path] }
   }

@@ -8,6 +8,17 @@ missing here.
 
 ## Unreleased
 
+A worker's `pkill -f <worktree path>` no longer reaches its own relais
+driver. The plugin's run tool now asks `relais native contract --relative`
+for the saved contract and starts `relais run --task` with
+`.relais/tasks/<hash>.json`, or `../` steps up to it from a subdirectory.
+The driver's command line therefore names no worktree directory. On
+2026-11-25 such a pattern ended a run `interrupted` while its worker kept
+editing. The worker's rules now also say to stop only a process it started,
+by the pid it recorded (`$!`), and never by a pattern (`pkill`, `killall`,
+`pgrep -f`, `ps | grep`) or with `kill 0` or `kill -1`. A successor
+contract that `decide` saves keeps its absolute path.
+
 ## v0.85.0
 
 relais spawns `greentopo` wherever it spawned `aval`: the binary is

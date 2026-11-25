@@ -196,13 +196,31 @@ pub(crate) fn native_cancel_command(
     }
 }
 
+/// How `relais native contract` prints the path it saved: absolute, or
+/// relative to the cwd (`--relative`, what the run tool asks for).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContractPath {
+    Absolute,
+    Relative,
+}
+
+impl ContractPath {
+    pub(crate) fn from_flag(relative: bool) -> Self {
+        if relative {
+            Self::Relative
+        } else {
+            Self::Absolute
+        }
+    }
+}
+
 /// `relais native contract`: the model writes a task as JSON, the plugin
 /// pipes it here. Refused, by its schema error, unless it is a contract —
 /// so a sentence of prose never becomes a run. Saved as
 /// `<root>/.relais/tasks/<hash>.json`, under the `.relais/` the dirty-tree
 /// check already leaves alone, with a `.gitignore` that keeps it out of
 /// `git status`.
-pub(crate) fn native_contract_command() -> Result<CliOutcome, CliError> {
+pub(crate) fn native_contract_command(shape: ContractPath) -> Result<CliOutcome, CliError> {
     use std::io::Read;
     let mut text = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut text) {
@@ -256,7 +274,34 @@ pub(crate) fn native_contract_command() -> Result<CliOutcome, CliError> {
     })();
     match written {
         Ok(path) => {
-            println!("{}", path.display());
+            match shape {
+                ContractPath::Absolute => println!("{}", path.display()),
+                ContractPath::Relative => {
+                    let relative = match cwd() {
+                        Ok(here) => relative_task_path(&here, &root, &path).ok_or_else(|| {
+                            format!(
+                                "{} could not be made relative from {} (root {})",
+                                path.display(),
+                                here.display(),
+                                root.display()
+                            )
+                        }),
+                        Err(e) => Err(format!("the cwd could not be read: {e}")),
+                    };
+                    match relative {
+                        Ok(shown) => println!("{shown}"),
+                        // Fails open (the absolute path still runs), and
+                        // says so: that path names the worktree in the
+                        // driver's argv (f26).
+                        Err(why) => {
+                            eprintln!(
+                                "relais native contract: --relative: {why}; printed the path absolute"
+                            );
+                            println!("{}", path.display());
+                        }
+                    }
+                }
+            }
             Ok(CliOutcome::Accepted)
         }
         Err(e) => {
@@ -269,6 +314,24 @@ pub(crate) fn native_contract_command() -> Result<CliOutcome, CliError> {
     }
 }
 
+/// `saved` (under `root`) as a path relative to `here`, a directory at or
+/// below `root`: one `../` per component of `here` below `root`, then the
+/// rest of `saved`, joined with `/` on every platform. The kernel resolves
+/// `..` against the physical directory, and `here` is the physical cwd the
+/// root was located from, so the driver started in `here` reads the same
+/// file. Holds no directory name above `root`, so a worker's
+/// `pkill -f <worktree path>` cannot match the driver's argv (f26). `None`
+/// when `here` is not under `root` or `saved` is not under it.
+pub(crate) fn relative_task_path(here: &Path, root: &Path, saved: &Path) -> Option<String> {
+    let below = here.strip_prefix(root).ok()?;
+    let inside = saved.strip_prefix(root).ok()?;
+    let mut parts: Vec<String> = below.components().map(|_| "..".to_string()).collect();
+    for part in inside.components() {
+        parts.push(part.as_os_str().to_str()?.to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 /// `relais native …`: what the relais plugin tells the coordinator, and
 /// the run timeline it reads back (SPEC §23, §29). Exit 0 acknowledges.
 pub(crate) fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError> {
@@ -278,7 +341,9 @@ pub(crate) fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError>
         }
         NativeCommand::Cancel { run, session } => native_cancel_command(&run, session.as_deref()),
         NativeCommand::Usage { dispatch } => native_usage_command(&dispatch),
-        NativeCommand::Contract => native_contract_command(),
+        NativeCommand::Contract { relative } => {
+            native_contract_command(ContractPath::from_flag(relative))
+        }
         NativeCommand::RouterState { session } => Ok(router_state_command(&session)),
         NativeCommand::RouterObserve => Ok(router_observe_command()),
         NativeCommand::ReviewOutcome {
@@ -1030,6 +1095,32 @@ pub(crate) fn reap_for_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relative_task_path_climbs_to_the_root_and_names_no_directory_above_it() {
+        let root = Path::new("/wt/relais-wt-x");
+        let saved = root.join(".relais").join("tasks").join("a.json");
+        assert_eq!(
+            relative_task_path(root, root, &saved).as_deref(),
+            Some(".relais/tasks/a.json")
+        );
+        assert_eq!(
+            relative_task_path(&root.join("deep").join("er"), root, &saved).as_deref(),
+            Some("../../.relais/tasks/a.json")
+        );
+    }
+
+    #[test]
+    fn a_relative_task_path_is_none_outside_the_root() {
+        let root = Path::new("/b");
+        let saved = root.join(".relais").join("tasks").join("x.json");
+        assert_eq!(relative_task_path(Path::new("/a"), root, &saved), None);
+        assert_eq!(
+            relative_task_path(root, root, Path::new("/c/.relais/tasks/x.json")),
+            None
+        );
+        assert_eq!(relative_task_path(root, root, root), None);
+    }
 
     #[test]
     fn a_stopped_report_is_read_from_the_plugins_payload() {

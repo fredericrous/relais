@@ -201,6 +201,8 @@ test('a successor_contract object is saved first and its path passed to decide',
   const saved = nativeCalls(engine.calls, 'contract')
   expect(saved.length).toBe(1)
   expect(saved[0].payload).toEqual(contract)
+  // A successor contract stays absolute: it outlives this cwd (f26).
+  expect(saved[0].argv).toEqual(['relais', 'native', 'contract'])
   const call = engine.calls.run.find(c => c.argv[1] === 'decide')!
   expect(call.argv.slice(call.argv.indexOf('--successor-contract'))[1]).toBe('/repo/.relais/tasks/next.json')
   expect(launches(engine).length).toBe(1)
