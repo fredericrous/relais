@@ -312,7 +312,10 @@ fn ticket_request(key: &ClaimKey, id: &str, holder: &Principal) -> TicketRequest
 /// that holds the holder's own live `handoff` keeps the shared hold (a
 /// primary re-grants a holder's retry, an-t23), and its end moves to match
 /// the lease's; any other refusal gives the grant back. A failed renewal
-/// gives the lease back and is the answer.
+/// gives the lease back and is the answer. A renewal that fails before its
+/// claim is written (the log line, then the write) leaves the file as it
+/// was; a failure after the write is not reachable from here, so the file
+/// and the lease never disagree by more than the clock skew.
 fn keep_or_give_back(
     state: &dyn SharedState,
     lock: &SlugLock<'_>,
@@ -353,7 +356,9 @@ pub fn reserve_handoff(
         TicketAnswer::Granted(lease) => {
             match lock.reserve_handoff(id, &holder.id, repo_display, now) {
                 Ok(true) => Ok(true),
-                Ok(false) => keep_or_give_back(state, lock, id, holder, now, &lease).map(|_| false),
+                Ok(false) => {
+                    keep_or_give_back(state, lock, id, holder, now, &lease).map(|()| false)
+                }
                 Err(local) => Err(compensated(local.into(), state.release_ticket(&lease))),
             }
         }
@@ -388,7 +393,7 @@ pub fn reserve_in_empty_programme(
         TicketAnswer::Granted(lease) => match local(lock) {
             Ok(Some(reserved)) => Ok(Some(reserved)),
             Ok(None) => {
-                keep_or_give_back(state, lock, first, holder, programme.now, &lease).map(|_| None)
+                keep_or_give_back(state, lock, first, holder, programme.now, &lease).map(|()| None)
             }
             Err(local) => Err(compensated(local.into(), state.release_ticket(&lease))),
         },

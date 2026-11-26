@@ -850,21 +850,23 @@ impl SlugLock<'_> {
         let Some(record) = read_all(&self.dir)?.remove(id) else {
             return Ok(false);
         };
-        let ClaimRecord::Parsed(claim) = &record else {
-            return Ok(false);
-        };
-        if claim.session != session || claim.kind != Kind::Handoff || !held(&record, now) {
+        if !held(&record, now) {
             return Ok(false);
         }
-        self.write(
-            id,
-            &Claim {
-                claimed_at: now,
-                refreshed_at: now,
-                ..claim.clone()
-            },
-        )?;
+        let ClaimRecord::Parsed(mut claim) = record else {
+            return Ok(false);
+        };
+        if claim.session != session || claim.kind != Kind::Handoff {
+            return Ok(false);
+        }
+        // The log line comes first: if it fails, nothing was written and the
+        // caller gives the shared lease back, so the two halves still agree.
+        // If the write fails after the line, the file keeps its old end and
+        // the lease is given back the same way.
         self.log(Event::Refresh, id, Some((session, Kind::Handoff)), now)?;
+        claim.claimed_at = now;
+        claim.refreshed_at = now;
+        self.write(id, &claim)?;
         Ok(true)
     }
 

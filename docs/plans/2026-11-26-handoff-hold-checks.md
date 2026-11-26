@@ -83,7 +83,7 @@ hold the file keeps. Close both: the expiry case on the fake with its clock
   Before the fix the second call released the lease and other was granted.
   The file's hold end moving to that `now` plus the hold is a primary-only
   effect (`LocalState` answers `NodeDecides` and never renews), so a
-  `node.rs` unit test on the fake asserts it, with another for
+  `fake.rs` unit test asserts it, with another for
   `reserve_in_empty_programme` (me reserves, asks again: `None`, other `Held`).
 - Trait doc and `docs/shared-state.md` now say a primary moves the hold's
   end `HANDOFF_HOLD_SECS` after the retry, checked by the new case;
@@ -119,10 +119,16 @@ hold the file keeps. Close both: the expiry case on the fake with its clock
   lease `reserve_in_empty_programme` answers `None`, as `reserve_handoff`
   answers `false` (round 2, lang:rust and tui, carried).
 - 2026-11-26 — `renew_own_handoff` logs `Event::Refresh` with
-  `Kind::Handoff`; a log failure after the write gives the lease back, as
-  every claim write already logs after it writes (round 2, unix, carried).
+  `Kind::Handoff` before it writes, so a failed log leaves the file as it
+  was and the lease is given back (F4b backend, medium: a log failure after
+  the write had released the lease while the file kept the later end).
+  A failed write after the log is given back the same way.
 - 2026-11-26 — The file's end matches the lease's to within the clock skew
   between the node and the primary (round 2, architect, carried).
+- 2026-11-26 — A file that holds another session's `handoff` or `work` claim
+  gives the shared grant back; `fake.rs`
+  `a_file_that_is_not_my_handoff_gives_the_shared_grant_back` holds that
+  (F4b implementation review, medium).
 - 2026-11-26 — LocalState answers `NodeDecides` and holds no shared ticket
   hold, so the expiry case does not apply to it; it meets the ticket by
   passing `run_all`, the new give-back case included (round 2, po, carried).

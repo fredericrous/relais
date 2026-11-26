@@ -721,7 +721,9 @@ pub fn a_primary_ends_a_reservation_hold_from_its_last_grant(
             TicketAnswer::Held { holder, .. } => {
                 assert_eq!(holder, &me, "{CHECK} {step}: a refusal names the reserver")
             }
-            _ => panic!("{CHECK} {step}: another holder is Held, got {answer:?}"),
+            TicketAnswer::Granted(_) | TicketAnswer::NodeDecides => {
+                panic!("{CHECK} {step}: another holder is Held, got {answer:?}")
+            }
         }
     };
     granted(&me, "step 1 (first grant)");

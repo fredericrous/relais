@@ -1537,4 +1537,58 @@ mod tests {
             "the shared hold stays"
         );
     }
+
+    #[test]
+    fn a_file_that_is_not_my_handoff_gives_the_shared_grant_back() {
+        use crate::programme::claim::{ClaimKey, Contest, Store, LOCK_WAIT};
+        let dir = crate::test_support::temp_dir("fake-node-not-mine");
+        let store = Store::in_state_dir(&dir);
+        let key = ClaimKey {
+            repo_key: "rk".into(),
+            slug: "programme".into(),
+        };
+        let state = FakeState::new();
+        let me = Principal::operator("session-me");
+        let other = Principal::operator("session-other");
+        let now = 1_000;
+        let lock = store.lock(&key, LOCK_WAIT, now).expect("lock");
+        // The file holds another session's handoff; the shared half is free.
+        assert!(lock
+            .reserve_handoff("t1", "session-other", "/r", now)
+            .expect("file"));
+        assert!(
+            !node::reserve_handoff(&state, &lock, &key, "t1", &me, "/r", now).expect("answered"),
+            "the file refuses me"
+        );
+        assert!(
+            matches!(
+                state
+                    .reserve_handoff(&ticket("t1", &other))
+                    .expect("answered"),
+                TicketAnswer::Granted(_)
+            ),
+            "my shared grant was given back"
+        );
+        drop(lock);
+        // The file holds a `work` claim of another session: same rule.
+        let lock = store.lock(&key, LOCK_WAIT, now).expect("lock");
+        assert!(matches!(
+            lock.claim_work("t2", "session-other", "/r", Contest::Refuse, now)
+                .expect("work"),
+            crate::programme::claim::Taken::Claimed { .. }
+        ));
+        assert!(
+            !node::reserve_handoff(&state, &lock, &key, "t2", &me, "/r", now).expect("answered"),
+            "the file refuses me over a work claim"
+        );
+        assert!(
+            matches!(
+                state
+                    .reserve_handoff(&ticket("t2", &other))
+                    .expect("answered"),
+                TicketAnswer::Granted(_)
+            ),
+            "no shared hold is kept over another session's work"
+        );
+    }
 }

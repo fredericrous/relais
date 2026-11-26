@@ -250,7 +250,8 @@ it could not renew or give back ends by its TTL.
   session, `HANDOFF_HOLD_SECS`, taken over by any session's `work` claim;
   a retry by its own holder, a `next --claim` whose claim file was never
   written, is answered again, and a primary moves the hold's end to
-  `HANDOFF_HOLD_SECS` after the retry (`run_all_with_clock` checks it); a node
+  `HANDOFF_HOLD_SECS` after the retry (`run_all_with_clock` checks it; `run_all`
+  alone does not tie a primary to that, so a primary passes both); a node
   whose claim file already holds the holder's `handoff` keeps that shared hold
   when asked again, and moves the file's hold end with it; another holder is refused while it lasts, with `Held` from a
   primary or by the claim file under `LocalState`),
