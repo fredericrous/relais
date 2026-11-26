@@ -444,8 +444,6 @@ pub enum RecordedOn {
     SharedPrimary,
 }
 
-impl RecordedOn {}
-
 /// What `relais trust show` reports.
 #[derive(Debug, Clone, Serialize)]
 pub struct Shown {

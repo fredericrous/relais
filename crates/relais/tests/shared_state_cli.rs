@@ -324,6 +324,11 @@ fn a_json_trust_show_says_where_settings_live() {
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     let object: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
     assert_eq!(object["recorded_on"], "machine_settings", "{object}");
+    let text = scratch.relais(&["trust", "show"], "");
+    assert_eq!(text.status.code(), Some(0), "{text:?}");
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(stdout.contains("machine.toml: "), "{stdout}");
+    assert!(!stdout.contains("the shared primary"), "{stdout}");
 }
 
 /// an-t26: a salvage of a terminal run with no recorded workspace is refused
