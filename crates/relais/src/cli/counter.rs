@@ -9,6 +9,7 @@ use super::ctx::shared_state_error;
 use super::outcome::operational;
 use super::outcome::CliError;
 use super::outcome::CliOutcome;
+use super::programme::Format;
 use chrono::NaiveDate;
 use relais::ledger::Ledger;
 use relais::money::MicroUsd;
@@ -395,7 +396,7 @@ fn measure(
     Ok(figures)
 }
 
-pub(crate) fn counter_command(days: u32, json: bool) -> Result<CliOutcome, CliError> {
+pub(crate) fn counter_command(days: u32, format: Format) -> Result<CliOutcome, CliError> {
     if days == 0 || days > MAX_DAYS {
         return Err(CliError::Usage {
             detail: format!("--days takes 1 to {MAX_DAYS}, not {days}"),
@@ -477,7 +478,7 @@ pub(crate) fn counter_command(days: u32, json: bool) -> Result<CliOutcome, CliEr
             covers_from: log.covers_from.map(|at| at.to_rfc3339()),
         },
     };
-    if json {
+    if format == Format::Json {
         let text = operational(serde_json::to_string_pretty(&document), "rendering JSON")?;
         emit(&format!("{text}\n"))?;
     } else {

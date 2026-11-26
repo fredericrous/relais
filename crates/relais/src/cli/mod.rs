@@ -1562,10 +1562,10 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             Format::from_json_flag(json),
             report_command(since.as_deref(), json, by, no_import),
         ),
-        Command::Counter { days, json } => error_object_under_json(
-            Format::from_json_flag(json),
-            counter::counter_command(days, json),
-        ),
+        Command::Counter { days, json } => {
+            let format = Format::from_json_flag(json);
+            error_object_under_json(format, counter::counter_command(days, format))
+        }
         Command::Usage { cmd } => match cmd {
             UsageCommand::Import {
                 session,
