@@ -1453,4 +1453,142 @@ mod tests {
         drop(lock);
         assert!(store.records(&key).expect("records").is_empty());
     }
+
+    #[test]
+    fn a_kept_handoff_moves_the_claim_files_end_to_the_retrys_lease() {
+        use crate::programme::claim::{ClaimKey, Store, HANDOFF_HOLD_SECS as HOLD, LOCK_WAIT};
+        let dir = crate::test_support::temp_dir("fake-node-kept-handoff");
+        let store = Store::in_state_dir(&dir);
+        let key = ClaimKey {
+            repo_key: "rk".into(),
+            slug: "programme".into(),
+        };
+        let state = FakeState::new();
+        let me = Principal::operator("session-me");
+        let other = Principal::operator("session-other");
+        let now = 1_000;
+        let lock = store.lock(&key, LOCK_WAIT, now).expect("lock");
+        assert!(node::reserve_handoff(&state, &lock, &key, "t1", &me, "/r", now).expect("first"));
+        state.advance(HOLD / 2);
+        let later = now + HOLD / 2;
+        assert!(
+            !node::reserve_handoff(&state, &lock, &key, "t1", &me, "/r", later).expect("again"),
+            "asking again is not a new reservation"
+        );
+        drop(lock);
+        // The file's hold now ends HOLD after the retry, as the lease does.
+        let held_at = |t: i64| store.holds(&key, t).expect("holds").contains_key("t1");
+        assert!(held_at(later + HOLD), "held up to the retry's end");
+        assert!(!held_at(later + HOLD + 1), "free after it");
+        let ask = |who: &Principal| state.reserve_handoff(&ticket("t1", who)).expect("answered");
+        state.advance(HOLD / 2 + 1);
+        assert!(
+            matches!(ask(&other), TicketAnswer::Held { .. }),
+            "the shared hold is kept past the first grant's end"
+        );
+        state.advance(HOLD / 2);
+        assert!(matches!(ask(&other), TicketAnswer::Granted(_)));
+    }
+
+    #[test]
+    fn an_empty_programmes_kept_handoff_keeps_its_shared_hold() {
+        use crate::programme::claim::{ClaimKey, EmptyProgramme, Store};
+        let dir = crate::test_support::temp_dir("fake-node-empty-kept");
+        let store = Store::in_state_dir(&dir);
+        let key = ClaimKey {
+            repo_key: "rk".into(),
+            slug: "programme".into(),
+        };
+        let state = FakeState::new();
+        let me = Principal::operator("session-me");
+        let other = Principal::operator("session-other");
+        let open: BTreeSet<String> = ["t1".to_string()].into();
+        let branch_held = BTreeSet::new();
+        let lock = store
+            .lock(&key, crate::programme::claim::LOCK_WAIT, 1_000)
+            .expect("lock");
+        let ask = |now: i64| {
+            node::reserve_in_empty_programme(
+                &state,
+                &lock,
+                &EmptyProgramme {
+                    key: &key,
+                    candidates: &["t1"],
+                    open: &open,
+                    branch_held: &branch_held,
+                    session: &me.id,
+                    repo_display: "/r",
+                    now,
+                },
+                &me,
+            )
+            .expect("answered")
+        };
+        assert_eq!(ask(1_000).as_deref(), Some("t1"));
+        assert_eq!(ask(1_060), None, "its own handoff holds the programme");
+        drop(lock);
+        assert!(
+            matches!(
+                state
+                    .reserve_handoff(&ticket("t1", &other))
+                    .expect("answered"),
+                TicketAnswer::Held { .. }
+            ),
+            "the shared hold stays"
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_my_handoff_gives_the_shared_grant_back() {
+        use crate::programme::claim::{ClaimKey, Contest, Store, LOCK_WAIT};
+        let dir = crate::test_support::temp_dir("fake-node-not-mine");
+        let store = Store::in_state_dir(&dir);
+        let key = ClaimKey {
+            repo_key: "rk".into(),
+            slug: "programme".into(),
+        };
+        let state = FakeState::new();
+        let me = Principal::operator("session-me");
+        let other = Principal::operator("session-other");
+        let now = 1_000;
+        let lock = store.lock(&key, LOCK_WAIT, now).expect("lock");
+        // The file holds another session's handoff; the shared half is free.
+        assert!(lock
+            .reserve_handoff("t1", "session-other", "/r", now)
+            .expect("file"));
+        assert!(
+            !node::reserve_handoff(&state, &lock, &key, "t1", &me, "/r", now).expect("answered"),
+            "the file refuses me"
+        );
+        assert!(
+            matches!(
+                state
+                    .reserve_handoff(&ticket("t1", &other))
+                    .expect("answered"),
+                TicketAnswer::Granted(_)
+            ),
+            "my shared grant was given back"
+        );
+        drop(lock);
+        // The file holds a `work` claim of another session: same rule.
+        let lock = store.lock(&key, LOCK_WAIT, now).expect("lock");
+        assert!(matches!(
+            lock.claim_work("t2", "session-other", "/r", Contest::Refuse, now)
+                .expect("work"),
+            crate::programme::claim::Taken::Claimed { .. }
+        ));
+        assert!(
+            !node::reserve_handoff(&state, &lock, &key, "t2", &me, "/r", now).expect("answered"),
+            "the file refuses me over a work claim"
+        );
+        assert!(
+            matches!(
+                state
+                    .reserve_handoff(&ticket("t2", &other))
+                    .expect("answered"),
+                TicketAnswer::Granted(_)
+            ),
+            "no shared hold is kept over another session's work"
+        );
+    }
 }

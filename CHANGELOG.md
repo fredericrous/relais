@@ -8,6 +8,16 @@ missing here.
 
 ## Unreleased
 
+A retried handoff reservation keeps its shared hold when the claim file
+already holds it: `node::reserve_handoff` and `reserve_in_empty_programme` no
+longer give the shared lease back then, and the claim file's hold end moves
+with the re-granted lease. The shared-state conformance suite gains
+`a_handoff_whose_claim_file_exists_keeps_its_shared_hold` (in `run_all`) and
+`a_primary_ends_a_reservation_hold_from_its_last_grant` (in
+`run_all_with_clock`: a primary's hold ends `HANDOFF_HOLD_SECS` after the
+holder's last grant, not the first). relais-fabric runs both at its next
+relais pin bump.
+
 Every settle now feeds the shared spend counter, and the ledger floor in the
 daily spend check is gone: with an external shared state the day is the
 counter alone. A run with no coordinator books its cost through a seat of

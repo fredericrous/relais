@@ -308,6 +308,32 @@ fn ticket_request(key: &ClaimKey, id: &str, holder: &Principal) -> TicketRequest
     }
 }
 
+/// After the shared half granted `id` and the claim file refused: a file
+/// that holds the holder's own live `handoff` keeps the shared hold (a
+/// primary re-grants a holder's retry, an-t23), and its end moves to match
+/// the lease's; any other refusal gives the grant back. A failed renewal
+/// gives the lease back and is the answer. A renewal that fails before its
+/// claim is written (the log line, then the write) leaves the file as it
+/// was; a failure after the write is not reachable from here, so the file
+/// and the lease never disagree by more than the clock skew.
+fn keep_or_give_back(
+    state: &dyn SharedState,
+    lock: &SlugLock<'_>,
+    id: &str,
+    holder: &Principal,
+    now: i64,
+    lease: &LeaseToken,
+) -> Result<(), NodeError> {
+    match lock.renew_own_handoff(id, &holder.id, now) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            give_back(&lease.resource.to_string(), state.release_ticket(lease));
+            Ok(())
+        }
+        Err(local) => Err(compensated(local.into(), state.release_ticket(lease))),
+    }
+}
+
 /// Reserve `id` as a `handoff` claim for `holder`'s next session (the
 /// rules of [`SlugLock::reserve_handoff`]), the shared half first; whether
 /// it was reserved. A ticket the shared half says is held is not reserved,
@@ -331,14 +357,7 @@ pub fn reserve_handoff(
             match lock.reserve_handoff(id, &holder.id, repo_display, now) {
                 Ok(true) => Ok(true),
                 Ok(false) => {
-                    // holds-until: a caller asks the shared half for a ticket
-                    // whose claim file is already written. Today every caller
-                    // asks only for tickets the claim files do not hold, under
-                    // this `SlugLock`; since a primary re-grants its own
-                    // holder's retry (an-t23), such a call would give back a
-                    // shared hold the claim file still keeps.
-                    give_back(&lease.resource.to_string(), state.release_ticket(&lease));
-                    Ok(false)
+                    keep_or_give_back(state, lock, id, holder, now, &lease).map(|()| false)
                 }
                 Err(local) => Err(compensated(local.into(), state.release_ticket(&lease))),
             }
@@ -374,8 +393,7 @@ pub fn reserve_in_empty_programme(
         TicketAnswer::Granted(lease) => match local(lock) {
             Ok(Some(reserved)) => Ok(Some(reserved)),
             Ok(None) => {
-                give_back(&lease.resource.to_string(), state.release_ticket(&lease));
-                Ok(None)
+                keep_or_give_back(state, lock, first, holder, programme.now, &lease).map(|()| None)
             }
             Err(local) => Err(compensated(local.into(), state.release_ticket(&lease))),
         },
