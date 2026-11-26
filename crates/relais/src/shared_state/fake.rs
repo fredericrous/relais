@@ -1578,6 +1578,13 @@ mod tests {
         );
     }
 
+    /// The store-wide claims log becomes a directory, so its append fails.
+    fn break_the_claims_log(dir: &crate::test_support::TempDir) {
+        let log = dir.join("claims").join("log.jsonl");
+        std::fs::remove_file(&log).expect("log exists");
+        std::fs::create_dir(&log).expect("directory in its place");
+    }
+
     /// `t1` reserved by `session-me` at 1_000, the fake's clock moved half
     /// a hold on: the state a retry finds.
     fn a_reserved_handoff_to_retry(
@@ -1610,9 +1617,7 @@ mod tests {
         let (dir, store, key, state) = a_reserved_handoff_to_retry("fake-node-renew-log");
         let me = Principal::operator("session-me");
         // The store-wide claims log becomes a directory: the append fails.
-        let log = dir.join("claims").join("log.jsonl");
-        std::fs::remove_file(&log).expect("log exists");
-        std::fs::create_dir(&log).expect("directory in its place");
+        break_the_claims_log(&dir);
         let lock = store.lock(&key, LOCK_WAIT, 1_000 + HOLD / 2).expect("lock");
         let err = node::reserve_handoff(&state, &lock, &key, "t1", &me, "/r", 1_000 + HOLD / 2)
             .expect_err("the renewal failed");
@@ -1628,6 +1633,7 @@ mod tests {
         struct Restore(std::path::PathBuf);
         impl Drop for Restore {
             fn drop(&mut self) {
+                // Drop cannot return an error; a failed restore leaves only a test temp dir.
                 let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
             }
         }
@@ -1645,6 +1651,8 @@ mod tests {
         }
         let err = node::reserve_handoff(&state, &lock, &key, "t1", &me, "/r", 1_000 + HOLD / 2)
             .expect_err("the renewal failed");
+        // The mode is restored before the lock drops: the lock's release
+        // touches the slug directory.
         std::fs::set_permissions(&slug_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         drop(lock);
         assert_a_failed_renewal_gave_the_grant_back(&state, &store, &key, err, "t1.toml");
@@ -1662,9 +1670,7 @@ mod tests {
         use crate::programme::claim::{EmptyProgramme, HANDOFF_HOLD_SECS as HOLD, LOCK_WAIT};
         let (dir, store, key, state) = a_reserved_handoff_to_retry("fake-node-renew-empty");
         let me = Principal::operator("session-me");
-        let log = dir.join("claims").join("log.jsonl");
-        std::fs::remove_file(&log).expect("log exists");
-        std::fs::create_dir(&log).expect("directory in its place");
+        break_the_claims_log(&dir);
         let open: BTreeSet<String> = ["t1".to_string()].into();
         let branch_held = BTreeSet::new();
         let now = 1_000 + HOLD / 2;

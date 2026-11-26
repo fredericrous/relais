@@ -859,10 +859,10 @@ impl SlugLock<'_> {
         if claim.session != session || claim.kind != Kind::Handoff {
             return Ok(false);
         }
-        // The log line comes first: if it fails, nothing was written and the
-        // caller gives the shared lease back, so the two halves still agree.
-        // If the write fails after the line, the file keeps its old end and
-        // the lease is given back the same way.
+        // The log line comes first: if it fails, nothing was written. If the
+        // write fails after the line, the file keeps its old end and the
+        // caller gives the shared lease back; the two halves then disagree
+        // until that old end (an-t30), as `node::keep_or_give_back` documents.
         self.log(Event::Refresh, id, Some((session, Kind::Handoff)), now)?;
         claim.claimed_at = now;
         claim.refreshed_at = now;
