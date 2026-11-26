@@ -334,6 +334,7 @@ impl Fixture {
             gate: None,
             session_id: "test-session".into(),
             heartbeat_every: Duration::from_millis(50),
+            settle_retry_pause: Duration::ZERO,
             task_override: None,
             purpose: None,
             run_id,
@@ -393,6 +394,7 @@ impl Fixture {
             gate: None,
             session_id: "test-session".into(),
             heartbeat_every: Duration::from_millis(50),
+            settle_retry_pause: Duration::ZERO,
             task_override: None,
             purpose: None,
             run_id,
@@ -434,6 +436,7 @@ impl Fixture {
             gate: None,
             session_id: "test-session".into(),
             heartbeat_every: Duration::from_millis(50),
+            settle_retry_pause: Duration::ZERO,
             task_override: None,
             purpose: None,
             run_id,
@@ -474,6 +477,7 @@ impl Fixture {
             gate: None,
             session_id: "test-session".into(),
             heartbeat_every: Duration::from_millis(50),
+            settle_retry_pause: Duration::ZERO,
             task_override: None,
             purpose: None,
             run_id: None,
@@ -562,6 +566,7 @@ impl Fixture {
             gate: None,
             session_id: "test-session".into(),
             heartbeat_every: Duration::from_millis(50),
+            settle_retry_pause: Duration::ZERO,
             task_override: None,
             purpose: None,
             run_id,
@@ -609,6 +614,7 @@ impl Fixture {
             gate: None,
             session_id: "test-session".into(),
             heartbeat_every: Duration::from_millis(50),
+            settle_retry_pause: Duration::ZERO,
             task_override: None,
             purpose,
             run_id: None,
@@ -700,6 +706,7 @@ impl Fixture {
             gate: Some(gate),
             session_id: "test-session".into(),
             heartbeat_every: Duration::from_millis(50),
+            settle_retry_pause: Duration::ZERO,
             task_override: None,
             purpose: None,
             run_id: None,
@@ -1006,6 +1013,7 @@ fn a_driver_whose_run_was_ended_elsewhere_stops_without_writing() {
         gate: None,
         session_id: "test-session".into(),
         heartbeat_every: Duration::from_millis(50),
+        settle_retry_pause: Duration::ZERO,
         task_override: None,
         purpose: None,
         run_id: None,
@@ -2193,6 +2201,7 @@ fn an_unreadable_working_tree_blocks_like_a_dirty_one() {
         gate: None,
         session_id: "test-session".into(),
         heartbeat_every: Duration::from_millis(50),
+        settle_retry_pause: Duration::ZERO,
         task_override: None,
         purpose: None,
         run_id: None,
@@ -8152,6 +8161,7 @@ fn guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_g
         gate: None,
         session_id: "test-session".into(),
         heartbeat_every: Duration::from_millis(50),
+        settle_retry_pause: Duration::ZERO,
         task_override: None,
         purpose: None,
         run_id: None,
@@ -8607,6 +8617,13 @@ enum Fault {
     ReleaseWrite,
     /// Every heartbeat is refused, so cancellation cannot arrive.
     Heartbeat,
+    /// The first settle is applied, then its answer is lost in transit
+    /// (`Unavailable`); later settles answer as usual (an-t28).
+    SettleAnswerLost,
+    /// Every settle finds no coordinator answering.
+    SettleUnavailable,
+    /// Every settle is refused by a coordinator that answered.
+    SettleRefused,
 }
 
 /// A gate that answers like a `LocalGate` on every call but one.
@@ -8614,6 +8631,8 @@ struct FaultyGate {
     inner: crate::admission::LocalGate,
     fault: Fault,
     calls: std::sync::atomic::AtomicUsize,
+    /// Every settle offered with a cost, in order.
+    settles: std::sync::Mutex<Vec<Option<i64>>>,
 }
 
 impl FaultyGate {
@@ -8625,6 +8644,19 @@ impl FaultyGate {
             ),
             fault,
             calls: std::sync::atomic::AtomicUsize::new(0),
+            settles: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn settles(&self) -> Vec<Option<i64>> {
+        self.settles.lock().expect("settles").clone()
+    }
+
+    fn lost(operation: &'static str) -> GateError {
+        GateError::Unavailable {
+            operation,
+            socket: "test".into(),
+            cause: Box::new(std::io::Error::other("the answer was lost in transit")),
         }
     }
 
@@ -8668,7 +8700,10 @@ impl Gate for FaultyGate {
     fn heartbeat(&self, dispatch_id: &str) -> Result<crate::admission::HeartbeatStatus, GateError> {
         match self.fault {
             Fault::Heartbeat => Err(self.refuse("heartbeat", dispatch_id)),
-            Fault::ReleaseWrite => self.inner.heartbeat(dispatch_id),
+            Fault::ReleaseWrite
+            | Fault::SettleAnswerLost
+            | Fault::SettleUnavailable
+            | Fault::SettleRefused => self.inner.heartbeat(dispatch_id),
         }
     }
     fn mark_waiting(&self, dispatch_id: &str) -> Result<crate::admission::WaitOutcome, GateError> {
@@ -8685,7 +8720,28 @@ impl Gate for FaultyGate {
         dispatch_id: &str,
         spent_micros: Option<i64>,
     ) -> Result<crate::admission::LifecycleOutcome, GateError> {
-        self.inner.settle(dispatch_id, spent_micros)
+        // A heavy check settles at zero through the same gate; only the
+        // worker's settle, which carries a cost, meets the fault.
+        if spent_micros == Some(0) {
+            return self.inner.settle(dispatch_id, spent_micros);
+        }
+        let first = {
+            let mut settles = self.settles.lock().expect("settles");
+            settles.push(spent_micros);
+            settles.len() == 1
+        };
+        match self.fault {
+            Fault::ReleaseWrite | Fault::Heartbeat => self.inner.settle(dispatch_id, spent_micros),
+            Fault::SettleAnswerLost => {
+                let answer = self.inner.settle(dispatch_id, spent_micros);
+                if first {
+                    return Err(Self::lost("settle"));
+                }
+                answer
+            }
+            Fault::SettleUnavailable => Err(Self::lost("settle")),
+            Fault::SettleRefused => Err(self.refuse("settle", dispatch_id)),
+        }
     }
     fn withdraw(&self, dispatch_id: &str) -> Result<crate::admission::WithdrawOutcome, GateError> {
         self.inner.withdraw(dispatch_id)
@@ -8704,7 +8760,10 @@ impl Gate for FaultyGate {
     ) -> Result<ReleaseWriteOutcome, GateError> {
         match self.fault {
             Fault::ReleaseWrite => Err(self.refuse("release_write", worktree)),
-            Fault::Heartbeat => self.inner.release_write(dispatch_id, worktree),
+            Fault::Heartbeat
+            | Fault::SettleAnswerLost
+            | Fault::SettleUnavailable
+            | Fault::SettleRefused => self.inner.release_write(dispatch_id, worktree),
         }
     }
     fn write_lease_holder(&self, worktree: &str) -> Result<Option<String>, GateError> {
@@ -8814,6 +8873,123 @@ fn a_coordinator_that_stops_answering_heartbeats_ends_the_run() {
     let (state, _) = retirement(&transitions);
     assert_eq!(state, State::Interrupted);
     assert!(!fixture.worktree(&run_id).exists());
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+/// The settle retry's pause is spread over [0.5, 1.5) of its base by the
+/// dispatch id, the same for the same id.
+#[test]
+fn a_settle_retry_pause_is_jittered_within_half_its_base() {
+    let base = Duration::from_millis(1_000);
+    let pauses: Vec<Duration> = (0..50)
+        .map(|n| super::launch::jittered(base, &format!("disp-{n}")))
+        .collect();
+    assert!(pauses
+        .iter()
+        .all(|pause| *pause >= base / 2 && *pause < base * 3 / 2));
+    assert!(pauses.iter().any(|pause| *pause != pauses[0]), "it varies");
+    assert_eq!(
+        super::launch::jittered(base, "disp-7"),
+        super::launch::jittered(base, "disp-7")
+    );
+    assert_eq!(
+        super::launch::jittered(Duration::ZERO, "disp-7"),
+        Duration::ZERO
+    );
+}
+
+/// Run one passing managed dispatch through a `FaultyGate` with `fault`.
+fn run_through_settle_fault(fault: Fault) -> (Fixture, FaultyGate, RunId) {
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let machine = fixture.machine_for(&repo);
+    let gate = FaultyGate::new(fault);
+    let backend = conditional_worker("relais task");
+    let outcome = fixture.execute_managed(
+        &fixture.contract(Review::Off),
+        &repo,
+        &machine,
+        &backend,
+        &gate,
+    );
+    let run_id = outcome.run_id.clone();
+    assert!(
+        matches!(outcome.terminal, Terminal::Accepted(_)),
+        "a settle the coordinator did not take never fails the run: {outcome:?}"
+    );
+    // A zero settle passes the fault by, so the worker's must cost something.
+    assert!(
+        gate.settles()
+            .first()
+            .copied()
+            .flatten()
+            .is_some_and(|cost| cost > 0),
+        "the worker's settle met the fault: {:?}",
+        gate.settles()
+    );
+    (fixture, gate, run_id)
+}
+
+/// an-t28: a settle the coordinator applied but whose answer was lost is
+/// tried again; the retry is answered `Unknown` (the entry is already
+/// forgotten), so the coordinator holds the cost once, nothing reports a
+/// failed settle, and the run says the retry could not confirm it.
+#[test]
+fn a_settle_whose_answer_was_lost_is_retried_and_booked_once() {
+    let (fixture, gate, run_id) = run_through_settle_fault(Fault::SettleAnswerLost);
+    let settles = gate.settles();
+    assert_eq!(settles.len(), 2, "tried once more: {settles:?}");
+    assert_eq!(settles[0], settles[1], "the same amount both times");
+    let cost = settles[0].expect("the mock worker reports its cost");
+    assert!(cost > 0, "{settles:?}");
+    let booked: i64 = gate
+        .inner
+        .status()
+        .runs
+        .values()
+        .map(|run| run.settled_micros)
+        .sum();
+    assert_eq!(booked, cost, "the coordinator holds the cost once");
+    let decisions = decisions_of(&fixture, &run_id);
+    assert!(
+        !decisions.contains(&"gate_settle_failed".to_string()),
+        "the retry was taken: {decisions:?}"
+    );
+    assert_eq!(
+        decisions
+            .iter()
+            .filter(|what| *what == "gate_settle_unconfirmed")
+            .count(),
+        1,
+        "{decisions:?}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+/// an-t28: a coordinator that never answers the settle is tried twice, then
+/// the run records `gate_settle_failed` once (its reservation stands in).
+#[test]
+fn a_settle_no_coordinator_answers_is_tried_twice_then_reported_once() {
+    let (fixture, gate, run_id) = run_through_settle_fault(Fault::SettleUnavailable);
+    assert_eq!(gate.settles().len(), 2, "SETTLE_TRIES");
+    let failed = decisions_of(&fixture, &run_id)
+        .into_iter()
+        .filter(|what| what == "gate_settle_failed")
+        .count();
+    assert_eq!(failed, 1);
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+/// an-t28: a refusal is an answer and would repeat, so it is not retried.
+#[test]
+fn a_refused_settle_is_not_retried_and_is_reported_once() {
+    let (fixture, gate, run_id) = run_through_settle_fault(Fault::SettleRefused);
+    assert_eq!(gate.settles().len(), 1, "an answer is not asked again");
+    let failed = decisions_of(&fixture, &run_id)
+        .into_iter()
+        .filter(|what| what == "gate_settle_failed")
+        .count();
+    assert_eq!(failed, 1);
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 

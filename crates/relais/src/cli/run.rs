@@ -538,6 +538,7 @@ pub(crate) fn run_command(
         gate: Some(&gate),
         session_id: session.id.clone(),
         heartbeat_every: std::time::Duration::from_secs(30),
+        settle_retry_pause: relais::runner::SETTLE_RETRY_PAUSE,
         task_override: task_override.as_ref(),
         // A run a live trial row names is a trial arm on the run's own
         // record too — Control included — so `runs.purpose` and

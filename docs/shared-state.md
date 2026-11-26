@@ -48,19 +48,39 @@ the ledger, below). The ledger is no longer a floor: if a UTC day's counter
 falls more than 5% below the ledger sum over dispatches with a known cost
 (cutover day excluded; the ledger sum comes from the external-client
 work, nothing here aggregates the nodes' ledgers), put `max(global, local)`
-back in `node::daily_spent`. What still misses the counter, named on purpose:
+back in `node::daily_spent`. What still misses the counter, named on purpose
+(an-t28), each with its ceiling:
 
 - a settle the primary refuses (dropped with a line: a retry repeats the
   refusal) and one that waited more than 24 h or beyond the newest 500
-  (dropped with one line for the pass, the count and the dollars);
-- a run whose `gate.settle` failed: the coordinator settles it unknown when
-  its lease lapses, so the counter holds its reservation, not its cost, and
-  the run writes a `gate_settle_failed` decision and one line;
+  (dropped with one line for the pass, the count and the dollars). Both
+  lines end `(dropped_micros=<n>)`, a fixed token the 5% check sums per UTC
+  day to add the dropped spend back. Ceiling: a conforming primary never
+  refuses a settle (conformance `a_late_settle_is_never_refused`), so a
+  refusal is 0; the caps drop only what waited a day or overflowed 500;
+- a run whose `gate.settle` failed: the runner tries once more, after a
+  pause of about 1 s (jittered by the dispatch id), when the coordinator
+  did not answer (`Unavailable`; a refusal is an answer and is not
+  retried), which a settle applied but whose answer was lost answers
+  without booking twice. A retry answered `Unknown` cannot tell that case
+  from a coordinator that forgot the dispatch, so the run writes a
+  `gate_settle_unconfirmed` decision and one line. A settle not taken leaves the coordinator to
+  settle it unknown when its lease lapses, so the counter holds its
+  reservation, not its cost, and the run writes a `gate_settle_failed`
+  decision and one line. Ceiling: cost minus reservation, per such run;
 - a run's own settle when the primary is unreachable or refuses its seat;
 - a crash between taking the journal and the first write of the file;
 - an agent a hook admitted under `on_coordinator_unreachable = carry_on` with
   no daemon: it has no dispatch, so relais meters it nowhere (neither ledger
-  nor counter);
+  nor counter), which leaves the counter-versus-ledger check unskewed;
+  booking it to the counter alone would lift the counter and hide an
+  undercount elsewhere. A hook-admitted agent books its reservation even
+  with a daemon (a hook payload carries no usage), and
+  `dispatch_reserve_micros` defaults to 0, so there is no figure to book.
+  Ceiling: $0 on the counter, unbounded in real cost, and the daily
+  ceiling misses it. The hook journal marks each one: a `PreToolUse` on the
+  Agent tool with `decision: silent` and `coordinator_debug: null`. Pinned
+  by `a_carry_on_spawn_with_no_coordinator_is_metered_nowhere`;
 - the cutover day: the counter starts when it is first fed.
 
 A shared read that fails stops the run before dispatch.
@@ -155,12 +175,14 @@ state:
   run waits and asks again; if it lasts, check the shared primary`, then
   `seat <dispatch>: shared seat granted`; `renew`, `release`, `reserve` and
   `settle` failures likewise. A settle the primary refuses (`Refused`) is
-  dropped with one line: the shared counter does not count it. Any other
+  dropped with one line: `seat <dispatch>: booking the spend of $<x> was
+  not accepted: <error>; dropped, the shared counter does not count it; if
+  it repeats, check the shared primary (dropped_micros=<n>)`. Any other
   settle failure is kept and retried. A settle waiting more than 24 h, or
   beyond the newest 500, is dropped with one line for the whole pass
-  (`seat settles: dropped <n> waiting settle(s) totalling $<x> (oldest:
-  <dispatch>); not booked to the shared counter; check the shared
-  primary`).
+  (`seat settles: dropped <n> waiting settle(s) totalling $<x> (oldest
+  dispatch: <dispatch>); not booked to the shared counter; check the shared
+  primary (dropped_micros=<n>)`).
 - The holder is `Principal::node(<host name>)`, so two nodes never share
   one; under `external` a host with no name is refused (exit 3, with the
   command that sets one). A restarted

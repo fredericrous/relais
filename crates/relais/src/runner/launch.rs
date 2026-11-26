@@ -7,6 +7,7 @@ use super::{
     Refusal, ReleaseWriteOutcome, ResourceClass, RunEngine, RunError, Terminal, UsageEvent,
     WaitKind, WriteLeaseOutcome, ADMISSION_POLL, HEARTBEAT_FAILURES_ALLOWED,
 };
+use crate::admission::LifecycleOutcome;
 
 impl<'a> RunEngine<'a> {
     /// Marks a dispatch row `native_run`, with the agent once one is bound:
@@ -409,24 +410,55 @@ impl<'a> RunEngine<'a> {
         let _ = gate.bind(&spec.dispatch_id, result.session_id.as_deref(), None);
         let _ = gate.release(&spec.dispatch_id);
         let spent = result.usage.cost.micros().map(MicroUsd::to_micros);
-        if let Err(error) = gate.settle(&spec.dispatch_id, spent) {
-            // The dispatch stays on the coordinator and settles unknown when
-            // its lease lapses, which books its reservation (deliberate:
-            // booking the cost again here would count it twice, an-t24).
-            let cost = result
+        let cost = || {
+            result
                 .usage
                 .cost
                 .micros()
-                .map_or_else(|| "an unknown cost".to_string(), |cost| cost.to_string());
-            eprintln!(
-                "relais: dispatch {}: the coordinator did not take the settle of {cost}: {error}; \
-                 the shared counter books the reservation instead; run `relais coordinator status`",
-                spec.dispatch_id,
-            );
-            self.events.emit(Event::Decision {
-                what: "gate_settle_failed".into(),
-                reason: format!("{}: {error}", spec.dispatch_id),
-            });
+                .map_or_else(|| "an unknown cost".to_string(), |cost| cost.to_string())
+        };
+        match settle_with_retry(
+            gate,
+            &spec.dispatch_id,
+            spent,
+            self.config.settle_retry_pause,
+        ) {
+            Ok(SettleTaken::Confirmed) => {}
+            Ok(SettleTaken::Unconfirmed) => {
+                // The retry found no dispatch: the first try landed and its
+                // answer was lost (booked once), or the coordinator forgot
+                // the dispatch (restarted, or its lease lapsed). Which one
+                // is not knowable here, so it is said.
+                eprintln!(
+                    "relais: dispatch {}: the retried settle of {} found no dispatch on the \
+                     coordinator: booked once if the first try landed, else at the reservation \
+                     or not at all; run `relais coordinator status`",
+                    spec.dispatch_id,
+                    cost(),
+                );
+                self.events.emit(Event::Decision {
+                    what: "gate_settle_unconfirmed".into(),
+                    reason: spec.dispatch_id.clone(),
+                });
+            }
+            Err(SettleNotTaken { tries, last }) => {
+                // The dispatch stays on the coordinator and settles unknown
+                // when its lease lapses, which books its reservation
+                // (deliberate: booking the cost again here would count it
+                // twice, an-t24).
+                eprintln!(
+                    "relais: dispatch {}: the coordinator did not take the settle of {} after \
+                     {tries} {}: {last}; the shared counter books the reservation instead; run \
+                     `relais coordinator status`",
+                    spec.dispatch_id,
+                    cost(),
+                    if tries == 1 { "try" } else { "tries" },
+                );
+                self.events.emit(Event::Decision {
+                    what: "gate_settle_failed".into(),
+                    reason: format!("{}: {last}", spec.dispatch_id),
+                });
+            }
         }
         // The worker ran unheard: whatever it produced is on disk and in
         // the ledger, but nothing could have stopped it, so the run ends
@@ -515,6 +547,80 @@ pub(super) fn admission_block(error: &GateError) -> (Reason, BlockCode) {
     } else {
         (Reason::AdmissionRefused, BlockCode::AdmissionRefused)
     }
+}
+
+/// How many times a finished dispatch offers its settle to the coordinator
+/// before the reservation stands in for its cost (an-t28).
+const SETTLE_TRIES: u32 = 2;
+
+/// The base pause before a settle is tried again: long enough for a
+/// coordinator between an exit and the next election to come back, short
+/// beside the 30 s a timed-out try has already waited.
+pub const SETTLE_RETRY_PAUSE: Duration = Duration::from_secs(1);
+
+/// What a settle the coordinator took came to.
+#[derive(Debug, PartialEq, Eq)]
+enum SettleTaken {
+    /// The first try was answered, or a retry was applied.
+    Confirmed,
+    /// A retry was answered `Unknown`: the first try may have landed (its
+    /// answer lost, the entry then forgotten) or the coordinator forgot the
+    /// dispatch. A first try answered `Unknown` stays `Confirmed`, as
+    /// before this retry existed.
+    Unconfirmed,
+}
+
+/// A settle the coordinator did not take: how many tries, and the last
+/// error.
+#[derive(Debug)]
+struct SettleNotTaken {
+    tries: u32,
+    last: GateError,
+}
+
+/// Settle a finished dispatch, trying again after a jittered `pause` when
+/// the coordinator did not answer (`Unavailable`: no daemon, a timeout); a
+/// refusal or a protocol error is an answer and would repeat. The
+/// coordinator's settle is idempotent: a settle it applied whose answer was
+/// lost answers the retry `Applied` (a duplicate) or `Unknown` (both ends
+/// in, the entry forgotten), so a retry never books twice. A try waits up
+/// to the coordinator's write timeout (30 s), so the line before the
+/// second says why the run's end is slow.
+fn settle_with_retry(
+    gate: &(dyn Gate + Sync),
+    dispatch_id: &str,
+    spent: Option<i64>,
+    pause: Duration,
+) -> Result<SettleTaken, SettleNotTaken> {
+    for tries in 1..=SETTLE_TRIES {
+        match gate.settle(dispatch_id, spent) {
+            Ok(LifecycleOutcome::Unknown) if tries > 1 => return Ok(SettleTaken::Unconfirmed),
+            Ok(LifecycleOutcome::Applied | LifecycleOutcome::Unknown) => {
+                return Ok(SettleTaken::Confirmed)
+            }
+            Err(error) if error.unavailable() && tries < SETTLE_TRIES => {
+                let wait = jittered(pause, dispatch_id);
+                eprintln!(
+                    "relais: dispatch {dispatch_id}: the coordinator did not answer the settle \
+                     ({error}); trying once more in {} ms",
+                    wait.as_millis()
+                );
+                std::thread::sleep(wait);
+            }
+            Err(last) => return Err(SettleNotTaken { tries, last }),
+        }
+    }
+    unreachable!("the last try returns from the loop")
+}
+
+/// `base` spread over [0.5, 1.5) of itself by the dispatch id, so runners
+/// that lost the same coordinator do not all retry in the same instant.
+pub(super) fn jittered(base: Duration, dispatch_id: &str) -> Duration {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    dispatch_id.hash(&mut hasher);
+    let permille = 500 + hasher.finish() % 1000;
+    base.mul_f64(permille as f64 / 1000.0)
 }
 
 /// Record the first reason this dispatch lost its seat. The first is the

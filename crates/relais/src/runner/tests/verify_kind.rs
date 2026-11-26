@@ -1168,6 +1168,7 @@ fn execute_predicted(
         gate: None,
         session_id: "test-session".into(),
         heartbeat_every: Duration::from_millis(50),
+        settle_retry_pause: Duration::ZERO,
         task_override: None,
         purpose: None,
         run_id: None,

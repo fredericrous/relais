@@ -83,6 +83,7 @@ use error::Finish;
 pub use error::RunError;
 pub use holdouts::sweep_ended_holdouts;
 use launch::admission_block;
+pub use launch::SETTLE_RETRY_PAUSE;
 use machine::kept_sentence;
 pub use machine::{
     decide, AttemptKind, Budget, BudgetCause, FloorKind, HoldoutStop, KeptCandidate, Limit, Next,

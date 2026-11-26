@@ -449,11 +449,21 @@ fn a_settle_the_primary_refuses_is_dropped_once_and_the_next_one_books() {
             .unwrap()
             .iter()
             .filter(|line| {
-                line.contains("booking the spend was not accepted: refused: reservation unknown")
+                line.contains(
+                    "booking the spend of $0.00001 was not accepted: refused: reservation unknown",
+                )
             })
             .count()
     };
     assert_eq!(refused(&lines), 1, "dropped once, not retried: {lines:?}");
+    assert!(
+        lines
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.ends_with("(dropped_micros=10)")),
+        "{lines:?}"
+    );
     assert!(
         lines
             .lock()
@@ -743,6 +753,11 @@ fn a_settle_past_the_age_cap_is_dropped_with_one_line() {
         "{lines:?}"
     );
     assert_eq!(count_lines(&lines, "$1.5"), 1, "{lines:?}");
+    assert_eq!(
+        count_lines(&lines, "(dropped_micros=1500000)"),
+        1,
+        "{lines:?}"
+    );
     assert_eq!(count_lines(&lines, "oldest dispatch: d1"), 1, "{lines:?}");
 }
 
@@ -779,6 +794,11 @@ fn more_than_the_count_cap_drops_the_oldest_in_one_line() {
         "{lines:?}"
     );
     assert_eq!(count_lines(&lines, "$3"), 1, "{lines:?}");
+    assert_eq!(
+        count_lines(&lines, "(dropped_micros=3000000)"),
+        1,
+        "{lines:?}"
+    );
 }
 
 #[test]
@@ -848,7 +868,7 @@ fn a_dispatch_released_but_never_settled_books_its_reservation_once() {
 #[test]
 fn a_refused_unreserved_settle_frees_its_own_seat() {
     let fake = FakeState::new();
-    let (book, _) = book(Arc::new(fake.clone()));
+    let (book, lines) = book(Arc::new(fake.clone()));
     let state = admission(2);
     launched_without_reservation(&state, "d1");
     book.sync(&state);
@@ -862,6 +882,18 @@ fn a_refused_unreserved_settle_frees_its_own_seat() {
     fake.set_settles_refused(Some("unknown reservation"));
     book.sync(&state);
     assert!(book.book().settles.is_empty(), "dropped");
+    // The gap is named with its amount, so the 5% check can add it back.
+    assert!(
+        lines.lock().unwrap().iter().any(|line| line
+            .contains("seat d1: booking the spend of $0.0004 was not accepted")
+            && line.ends_with("(dropped_micros=400)")),
+        "{lines:?}"
+    );
+    assert_eq!(
+        fake.spent().to_micros(),
+        0,
+        "the refused settle is not booked"
+    );
     fake.acquire_seat(&Principal::node("node-b"), "settle:d1")
         .expect("the settle's seat is free again");
 }

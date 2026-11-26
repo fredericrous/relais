@@ -43,6 +43,10 @@ pub struct RunConfig<'a> {
     pub session_id: String,
     /// Lease heartbeat period while a worker runs.
     pub heartbeat_every: Duration,
+    /// The base pause before a finished dispatch's settle is tried again
+    /// (jittered by half either way; zero tries again at once). The CLI
+    /// sets [`crate::runner::SETTLE_RETRY_PAUSE`]; tests set zero.
+    pub settle_retry_pause: Duration,
     /// This run's task identity, already resolved and confirmed on
     /// record by the caller (the CLI's `--revise`, or the contract's own
     /// declared task): `None` derives a fresh one at preflight, as

@@ -1283,6 +1283,43 @@ mod tests {
         );
     }
 
+    /// an-t28, a named gap: a spawn admitted under `carry_on` with no
+    /// coordinator books nothing to the shared counter, from its spawn to its
+    /// end, even with a reservation set. It misses the ledger too, so the
+    /// counter-versus-ledger check is not skewed; the journal marks it
+    /// (`silent` with no coordinator answer). FALSIFY: book the reservation
+    /// to the counter on this path and `spent` is no longer zero.
+    #[test]
+    fn a_carry_on_spawn_with_no_coordinator_is_metered_nowhere() {
+        let fake = crate::shared_state::fake::FakeState::new();
+        let claims = SharedClaims {
+            state: std::sync::Arc::new(fake.clone()),
+            warning: None,
+        };
+        let gate = Unreachable {
+            at: OutageAt::FirstAdmit,
+            registrations: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let settings = HookAdmissionSettings {
+            dispatch_reserve_micros: crate::money::MicroUsd::from_micros(500),
+            ..settings()
+        };
+        let payload = spawn_payload("session-unmetered", "tool-1");
+        let spawned = super::handle(&payload, &settings, &gate, &claims);
+        assert_eq!(spawned.answer, HookAnswer::Silent);
+        let entry = journal_entry(&payload, &spawned);
+        assert_eq!(entry["decision"], "silent");
+        assert_eq!(entry["coordinator_debug"], serde_json::Value::Null);
+        let stopped = super::handle(
+            &stop_payload("session-unmetered", "agent-1"),
+            &settings,
+            &gate,
+            &claims,
+        );
+        assert_eq!(stopped.answer, HookAnswer::Silent);
+        assert_eq!(fake.spent().to_micros(), 0, "the counter books nothing");
+    }
+
     /// An outage that arrives BETWEEN the first answer and the
     /// registration it prompts is still an outage, and is answered like
     /// one: silent under `carry_on`. Folding it into the stored
