@@ -103,7 +103,7 @@ exports the held marker, so no step after the first queues again.
 
 ## Phases
 
-- [ ] Phase 1 — the kept slot in the admission and its use in setup, with the
+- [x] Phase 1 — the kept slot in the admission and its use in setup, with the
   tests: `crates/relais/src/verify/heavy.rs`, `crates/relais/src/verify/mod.rs`,
   `crates/relais/src/verify/heavy/tests.rs`,
   `crates/relais/src/runner/engine.rs`, `CHANGELOG.md`
@@ -123,6 +123,9 @@ exports the held marker, so no step after the first queues again.
   a whole setup holds p50 0.8 s, p95 419 s, max 425 s; 2 of 24 pass 300 s.
   Accepted: such a setup is one long holder, like a 7-minute gate, and the
   stall window is ADR-0015's, not this plan's.
+- 2026-11-26 — The real-run and `kill -TERM` pilots run on the installed
+  release, not on a branch build: a branch build is another hour in the
+  jammed host-slot line. Their result goes in the t12 ticket's Resolution.
 - 2026-11-26 — Reuse needs an equal weight. A heavier step cannot widen a
   lease, and a lighter one would hold slots it does not use.
 
@@ -140,5 +143,17 @@ exports the held marker, so no step after the first queues again.
 | `cargo test -p relais --lib verify::heavy::tests::host_slots` | the new kept-slot tests listed and passing |
 | `kill -TERM` the runner during step 2 of a 2-step setup | another waiter takes the slot within one poll; the journal shows `admitted` with no `released`, as Behaviour states |
 | a real run with a 2-step setup against the live slot dir | one relais `admitted` row and one `released` row with `held_ms` spanning both steps |
+
+### Verification record (2026-11-26, before the push)
+
+| Check | Actual |
+|---|---|
+| `a_setup_takes_one_host_slot_for_all_its_steps` | passes: 3 sleeps (step 1 only), admission wait 3 s, `exhausted()` None, joined waiter `[true, true, true]` then granted, 1 relais `waited_ms` row, 1 `released`, markers `held`, each holder record names its step, 2 `host_slot_kept`, no `waiting_for_slot` after the first |
+| the same with `let _kept = admission.keep_slot();` removed | fails at the waiter assertion: `[false, false, false]`, the joined waiter was granted between steps |
+| coordinator queued, unreachable, weight change, disk short, failed and cancelled setup | each passes (`setup_keeps_one_slot::*`): the give-back reason is emitted, 2 `admitted` and 2 `released` rows; a failed or cancelled setup releases once |
+| `admit` twice under an open kept slot | passes: `host_slots()` 1, marker `held`, `holders/slot-0.who` names `step-2`, no release until the guard drops |
+| `cargo test -p relais --lib verify::` (via `greengate slot run`) | 178 passed, 0 failed, 2 ignored |
+| `cargo clippy -p relais --all-targets -- -D warnings`, `cargo fmt --check` | clean (fmt applied once) |
+| a real 2-step run, and `kill -TERM` mid-setup | moved after the install: the installed release is piloted, and its result goes in the t12 ticket's Resolution (Decision log) |
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix body-sha=84280d3ae89b -->

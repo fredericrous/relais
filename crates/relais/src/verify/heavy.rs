@@ -62,6 +62,12 @@ pub const ANNOUNCE_EVERY: Duration = Duration::from_secs(30);
 /// inside the check does not queue again (amont ADR-0009).
 pub const HOST_SLOT_ENV: &str = greenharness_slots::HELD_ENV;
 
+/// The value [`HOST_SLOT_ENV`] carries when this tree holds host slots: the
+/// bare `held` that `greenharness-slots` 5 and greengate read. Written here
+/// only, so the per-lease form (`held:<lease>`, amont host-slot-admission
+/// t15) replaces one place.
+const HELD_MARKER: &str = "held";
+
 /// How often a lease the coordinator could not tie to a process group says
 /// it is alive while its check runs (the coordinator frees a lease it has
 /// not heard from for `LEASE_GRACE`, 300 s).
@@ -551,6 +557,45 @@ pub struct HeavyAdmission<'a> {
     /// a failure is evidence for a decision and is never retried. Passed in
     /// because the classifier reads `verify`'s outcomes.
     pub exhausted: fn(Ended, &str) -> bool,
+    /// The host slot a setup keeps across its steps; closed outside one.
+    pub setup_slot: SetupSlot,
+}
+
+/// The host slot a setup keeps across its steps (amont host-slot-admission
+/// t07): the first step that queues for host slots takes them, each later
+/// step relabels the same lease, and the setup's end gives it back. Without
+/// it each step joined the tail of the line again and starved under load.
+/// For the sequential steps of one setup: the admission that opens it is
+/// not shared with commands running beside them.
+#[derive(Debug, Default)]
+pub struct SetupSlot {
+    open: AtomicBool,
+    lease: Mutex<Option<greenharness_slots::Lease>>,
+    rename_said: AtomicBool,
+}
+
+impl SetupSlot {
+    fn lease(&self) -> std::sync::MutexGuard<'_, Option<greenharness_slots::Lease>> {
+        self.lease.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn is_open(&self) -> bool {
+        self.open.load(Ordering::SeqCst)
+    }
+}
+
+/// An open [`SetupSlot`]; dropping it, on every way out of the setup,
+/// gives the kept slot back, which writes its one `released` row.
+pub struct KeptSlot<'k> {
+    slot: &'k SetupSlot,
+}
+
+impl Drop for KeptSlot<'_> {
+    fn drop(&mut self) {
+        self.slot.open.store(false, Ordering::SeqCst);
+        let kept = self.slot.lease().take();
+        drop(kept);
+    }
 }
 
 /// The default `exhausted`: nothing shows exhaustion.
@@ -584,7 +629,82 @@ impl<'a> HeavyAdmission<'a> {
             tries: Tries::default(),
             disk: DiskCheck::off(),
             exhausted: never_exhausted,
+            setup_slot: SetupSlot::default(),
         }
+    }
+
+    /// Keep the host slot the next command takes until the guard drops:
+    /// the commands admitted meanwhile are one setup's steps, run one after
+    /// another (amont host-slot-admission t07).
+    pub fn keep_slot(&self) -> KeptSlot<'_> {
+        self.setup_slot.open.store(true, Ordering::SeqCst);
+        KeptSlot {
+            slot: &self.setup_slot,
+        }
+    }
+
+    /// Give the kept slot back before the setup ends, and say why. Nothing
+    /// happens when none is kept.
+    fn give_back_kept(&self, why: &str) {
+        let Some(kept) = self.setup_slot.lease().take() else {
+            return;
+        };
+        drop(kept);
+        self.events.emit(Event::Decision {
+            what: "kept_slot_given_back".into(),
+            reason: format!("the host slot kept for this setup was given back: {why}"),
+        });
+    }
+
+    /// The kept slot, relabelled for `ask`, when one is kept and fits its
+    /// weight: the weight it holds. A slot of another weight is given back,
+    /// and the step takes its own.
+    fn reuse_kept(&self, ask: &Ask<'_>) -> Option<usize> {
+        if !self.setup_slot.is_open() {
+            return None;
+        }
+        let kept = self.setup_slot.lease();
+        let lease = kept.as_ref()?;
+        let weight = lease.weight();
+        if weight != ask.weight as usize {
+            drop(kept);
+            self.give_back_kept(&format!(
+                "the next step asks a weight of {}, not {weight}",
+                ask.weight
+            ));
+            return None;
+        }
+        if let Err(e) = lease.rename(&slots::holder(self, ask.label)) {
+            // The record keeps the previous step's name; said once a setup.
+            if !self.setup_slot.rename_said.swap(true, Ordering::SeqCst) {
+                let detail = format!("the kept host slot still names the previous step: {e}");
+                eprintln!("relais: host slot rename: {detail}");
+                self.events.emit(Event::EnvironmentWarning {
+                    what: "host_slot_rename_failed".into(),
+                    detail,
+                });
+            }
+        }
+        drop(kept);
+        self.events.emit(Event::Decision {
+            what: "host_slot_kept".into(),
+            reason: format!(
+                "`{}` runs under the host slot this setup already holds",
+                ask.label
+            ),
+        });
+        Some(weight)
+    }
+
+    /// Keep `held` for the setup when one is open: the weight it holds.
+    /// Otherwise it is handed back, for the command's own lease.
+    fn keep(&self, held: greenharness_slots::Lease) -> Result<usize, greenharness_slots::Lease> {
+        if !self.setup_slot.is_open() {
+            return Err(held);
+        }
+        let weight = held.weight();
+        *self.setup_slot.lease() = Some(held);
+        Ok(weight)
     }
 
     /// Whether this admission belongs to a run. A command outside any run
@@ -621,7 +741,7 @@ impl<'a> HeavyAdmission<'a> {
         }
         let mut environment = child_environment(self.width(weight, placement), &BTreeMap::new());
         if self.ancestor_holds_slots {
-            environment.insert(HOST_SLOT_ENV.to_string(), "held".to_string());
+            environment.insert(HOST_SLOT_ENV.to_string(), HELD_MARKER.to_string());
         }
         environment.extend(own.iter().map(|(k, v)| (k.clone(), v.clone())));
         environment
@@ -650,6 +770,9 @@ impl<'a> HeavyAdmission<'a> {
                     code: Refusal::UnknownRun,
                     ..
                 }) if !*registered_again && self.registration.is_some() => {
+                    // Never wait on the coordinator while holding a slot:
+                    // its holders wait for slots while holding its tokens.
+                    self.give_back_kept("the coordinator had forgotten the run");
                     if let Some(registration) = &self.registration {
                         match gate.register_run(registration) {
                             Ok(()) => *registered_again = true,
@@ -667,7 +790,10 @@ impl<'a> HeavyAdmission<'a> {
                     return Ok(Decision::Granted)
                 }
                 Ok(decision) => return Ok(decision),
-                Err(e) if e.unavailable() => self.retry_unreachable(e, &mut retrying, cancel)?,
+                Err(e) if e.unavailable() => {
+                    self.give_back_kept("the coordinator could not be reached");
+                    self.retry_unreachable(e, &mut retrying, cancel)?
+                }
                 Err(e) => return Err(LeaseStop::Gate(e)),
             }
         }
@@ -759,6 +885,9 @@ impl<'a> HeavyAdmission<'a> {
             (Some(dir), false) => slots::usable(dir, ask.weight, self)?,
             _ => None,
         };
+        if shared.is_none() {
+            self.give_back_kept("the host slots are no longer usable");
+        }
         let estimate = self.disk.estimate(ask.label);
         let mut queue = Queue::new(self);
         let mut registered_again = false;
@@ -819,6 +948,13 @@ impl<'a> HeavyAdmission<'a> {
                             },
                             _ => unreachable!("granted, duplicate and refused return above"),
                         };
+                        // Never wait on the coordinator while holding a
+                        // slot: its holders wait for slots while holding
+                        // its tokens. The step takes a slot afresh.
+                        self.give_back_kept(match &holding {
+                            Holding::Disk(_) => "the coordinator held this step for the disk",
+                            Holding::Slot { .. } => "the coordinator queued this step",
+                        });
                         if let Err(stop) = queue.wait(holding, ask.cancel, self.sleeper.as_ref()) {
                             // Best effort: nothing started, and a request the
                             // coordinator still holds expires unclaimed.
@@ -830,14 +966,31 @@ impl<'a> HeavyAdmission<'a> {
             }
             let mut lease = Admitted::leased(gate, id, environment.clone());
             if let Some(dir) = &shared {
+                // A setup's later step runs under the slot its first step
+                // took; any other command (or a first step) queues for one.
                 // `lease` drops on an error and gives its tokens back.
-                if let Some(held) = slots::take(dir, ask, self, &mut queue, gate, &lease.id)? {
-                    lease.slots = Some(held);
+                let held = match self.reuse_kept(ask) {
+                    Some(weight) => {
+                        lease.kept_weight = weight;
+                        true
+                    }
+                    None => match slots::take(dir, ask, self, &mut queue, gate, &lease.id)? {
+                        Some(held) => {
+                            match self.keep(held) {
+                                Ok(weight) => lease.kept_weight = weight,
+                                Err(held) => lease.slots = Some(held),
+                            }
+                            true
+                        }
+                        None => false,
+                    },
+                };
+                if held {
                     // Under its own host slot: the slots' share, as greengate gives.
                     lease.env = self.environment(ask.weight, ask.env, Placement::UnderHostSlot);
                     lease
                         .env
-                        .insert(HOST_SLOT_ENV.to_string(), "held".to_string());
+                        .insert(HOST_SLOT_ENV.to_string(), HELD_MARKER.to_string());
                 }
             }
             // The window between the grant and the use: space may have gone
@@ -847,6 +1000,7 @@ impl<'a> HeavyAdmission<'a> {
                 None => return Ok(lease),
                 Some(short) => {
                     drop(lease);
+                    self.give_back_kept("the disk fell short after the grant");
                     queue.wait(Holding::Disk(short), ask.cancel, self.sleeper.as_ref())?;
                 }
             }
@@ -1053,6 +1207,9 @@ pub struct Admitted<'a> {
     /// The host slots held, by this runner and never by the check: released
     /// when the lease drops, after the check ended.
     slots: Option<greenharness_slots::Lease>,
+    /// The weight of the slot a setup keeps for this command: held by the
+    /// admission's [`SetupSlot`], not released when this lease drops.
+    kept_weight: usize,
 }
 
 impl<'a> Admitted<'a> {
@@ -1062,6 +1219,7 @@ impl<'a> Admitted<'a> {
             id: String::new(),
             env,
             slots: None,
+            kept_weight: 0,
         }
     }
 
@@ -1071,6 +1229,7 @@ impl<'a> Admitted<'a> {
             id,
             env,
             slots: None,
+            kept_weight: 0,
         }
     }
 
@@ -1084,11 +1243,12 @@ impl<'a> Admitted<'a> {
         &self.env
     }
 
-    /// How many host slots this lease holds.
+    /// How many host slots this command runs under: its own, or those its
+    /// setup keeps.
     pub fn host_slots(&self) -> usize {
         self.slots
             .as_ref()
-            .map_or(0, greenharness_slots::Lease::weight)
+            .map_or(self.kept_weight, greenharness_slots::Lease::weight)
     }
 
     /// Tell the coordinator which process group runs the command, so the
@@ -1191,6 +1351,16 @@ mod slots {
         Ok(Some(dir.to_path_buf()))
     }
 
+    /// The holder record of a relais command: its label, under the run.
+    pub(super) fn holder(
+        admission: &HeavyAdmission<'_>,
+        label: &str,
+    ) -> greenharness_slots::Holder {
+        let mut holder = greenharness_slots::Holder::here("relais", label);
+        holder.session = admission.run_id.clone();
+        holder
+    }
+
     /// Wait for `ask.weight` host slots. `Ok(None)`: the slots became
     /// unusable, which is said once and not fatal.
     pub(super) fn take(
@@ -1204,8 +1374,7 @@ mod slots {
         let Some(sizing) = admission.sizing else {
             return Ok(None);
         };
-        let mut holder = greenharness_slots::Holder::here("relais", ask.label);
-        holder.session = admission.run_id.clone();
+        let holder = holder(admission, ask.label);
         let started = std::time::Instant::now();
         let slot_cap = sizing.cap_for(admission.machine.cores);
         let width = admission.width(ask.weight, super::Placement::UnderHostSlot);
