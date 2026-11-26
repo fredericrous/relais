@@ -4,6 +4,7 @@ use super::ctx::load_contract;
 use super::ctx::refusal;
 use super::ctx::Refusal;
 use super::decision_record::answer_error;
+use super::decision_record::print_refusal;
 use super::decision_record::read_decide_proof;
 use super::decision_record::Decided;
 use super::decision_record::Decision;
@@ -15,6 +16,7 @@ use super::outcome::exit_code;
 use super::outcome::operational;
 use super::outcome::CliError;
 use super::outcome::CliOutcome;
+use super::programme::Format;
 use super::salvage::salvage_command;
 use super::salvage::SalvageAnswer;
 use super::status::intent_json;
@@ -57,20 +59,21 @@ pub(crate) fn decide_command(request: DecideRequest<'_>) -> Result<CliOutcome, C
                 println!("{}", decided_json(&done));
             } else {
                 println!("{}", done.sentence);
-                if let Some(line) = done.receipt_skipped_line() {
-                    eprintln!("{line}");
-                }
+            }
+            // A warning reaches stderr under `--json` too (`print_refusal`'s
+            // rule); the object carries it as `receipt_skipped` as well.
+            if let Some(line) = done.receipt_skipped_line() {
+                eprintln!("{line}");
             }
             Ok(CliOutcome::Accepted)
         }
         Ok(Err(refused)) => {
-            let (stdout, stderr) = refusal_lines(json, &refused);
-            if let Some(line) = stdout {
-                println!("{line}");
-            }
-            if let Some(line) = stderr {
-                eprintln!("{line}");
-            }
+            print_refusal(
+                "relais decide",
+                Format::from_json_flag(json),
+                &refused.outcome,
+                &refused.message,
+            );
             Ok(refused.outcome)
         }
         Err(e) => {
@@ -85,21 +88,6 @@ pub(crate) fn decide_command(request: DecideRequest<'_>) -> Result<CliOutcome, C
             }
             Err(e)
         }
-    }
-}
-
-/// What a refused answer prints: under `--json` one stdout object
-/// `{"error", "exit"}` and nothing on stderr, else one stderr line and an
-/// empty stdout.
-fn refusal_lines(json: bool, refused: &Refusal) -> (Option<String>, Option<String>) {
-    if json {
-        let object = serde_json::json!({
-            "error": refused.message,
-            "exit": exit_code(&refused.outcome),
-        });
-        (Some(object.to_string()), None)
-    } else {
-        (None, Some(format!("relais decide: {}", refused.message)))
     }
 }
 
@@ -1328,7 +1316,8 @@ mod tests {
             assert_eq!(exit_code(&refused.outcome), 3, "{name}");
             assert!(
                 refused.message.starts_with(&format!(
-                    "the decision of run {name} is being answered elsewhere:"
+                    "another answer holds run {name}'s decision (it may already be recorded): \
+                     check"
                 )),
                 "{}",
                 refused.message
@@ -1340,7 +1329,13 @@ mod tests {
                 "{}",
                 refused.message
             );
-            assert!(!refused.message.contains("node"), "{}", refused.message);
+            assert!(
+                refused
+                    .message
+                    .contains("after the hold (up to 10 min), answer again if it is still open"),
+                "the wait comes before the next step: {}",
+                refused.message
+            );
             assert!(still_open(&ledger, name), "{name} stays open");
         }
         assert_eq!(held.asks(), 2);
@@ -1376,14 +1371,11 @@ mod tests {
         .err()
         .expect("held elsewhere");
         assert_eq!(exit_code(&refused.outcome), 3);
-        assert!(
-            refused.message.starts_with(
-                "the decision of run run-wait is being answered elsewhere: check \
-                 `relais status run-wait`, then run the same `--answer salvaged` again unless \
-                 status shows it already salvaged ("
-            ),
-            "{}",
-            refused.message
+        assert_eq!(
+            refused.message,
+            "another answer holds run run-wait's decision (it may already be recorded): check \
+             `relais status run-wait`; after the hold (up to 10 min), run `relais decide \
+             run-wait --answer salvaged` again (status cannot show another node's salvage)"
         );
         assert!(still_open(&ledger, "run-wait"), "the decision stays open");
         assert_eq!((held.asks(), held.releases()), (1, 0));
@@ -1693,7 +1685,7 @@ mod tests {
         assert!(
             refused
                 .message
-                .starts_with("the decision of run run-revise is being answered elsewhere:"),
+                .starts_with("another answer holds run run-revise's decision ("),
             "{}",
             refused.message
         );
@@ -1735,29 +1727,6 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_prints_one_line_on_one_stream() {
-        let held = Refusal {
-            outcome: CliOutcome::Blocked,
-            message: "the decision of run r is being answered elsewhere".into(),
-        };
-        let (stdout, stderr) = refusal_lines(false, &held);
-        assert_eq!(stdout, None, "plain: nothing on stdout");
-        assert_eq!(
-            stderr.as_deref(),
-            Some("relais decide: the decision of run r is being answered elsewhere")
-        );
-        let (stdout, stderr) = refusal_lines(true, &held);
-        assert_eq!(stderr, None, "--json: nothing on stderr");
-        let object: serde_json::Value =
-            serde_json::from_str(&stdout.expect("one object")).expect("json");
-        assert_eq!(object["exit"], 3);
-        assert_eq!(
-            object["error"],
-            "the decision of run r is being answered elsewhere"
-        );
-    }
-
-    #[test]
     fn only_the_held_elsewhere_refusal_is_exit_3_and_names_a_recorded_sign_off() {
         let run = RunId::from_stored("run-x");
         // The wire text, written out on purpose: a change to it is a change
@@ -1778,9 +1747,9 @@ mod tests {
             .err()
             .expect("refused");
         assert!(
-            signed
-                .message
-                .ends_with("minutes); the sign-off of criterion c1 is recorded"),
+            signed.message.ends_with(
+                "answer again if it is still open; the sign-off of criterion c1 is recorded"
+            ),
             "{}",
             signed.message
         );
@@ -2005,7 +1974,7 @@ mod tests {
         );
         assert_eq!(
             bare.receipt_skipped_line().as_deref(),
-            Some("no receipt written: no verification snapshot for this review_findings stop")
+            Some("relais decide: no receipt written: no verification snapshot for this review_findings stop")
         );
         let printed = decided_json(&bare);
         assert_eq!(printed["receipt"], serde_json::Value::Null);

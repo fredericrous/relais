@@ -196,7 +196,9 @@ pub(crate) fn install_routing_envelope(shared: &InstallState) {
             if let Err(e) = recorded {
                 eprintln!("relais install: warning: the ledger did not record the envelope ({e})");
             }
-            println!(
+            // A notice of a side effect, not the install's report: stderr
+            // (`cli::decision_record::refusal_streams` states the rule).
+            eprintln!(
                 "session routing is on; turn it off with /relais-routing off or RELAIS_SESSION_ROUTING=off"
             );
         }
@@ -222,7 +224,7 @@ pub(crate) fn install_learning_envelope(shared: &InstallState) {
     };
     match write_settings_for_install(shared, &edit) {
         Ok(done) if done.written => {
-            println!("automatic promotion is on; turn it off with /relais-learning off")
+            eprintln!("automatic promotion is on; turn it off with /relais-learning off")
         }
         Ok(_) => {}
         Err(e) => eprintln!("relais install: automatic promotion not recorded: {e}"),

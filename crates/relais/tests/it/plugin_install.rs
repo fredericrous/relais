@@ -449,9 +449,13 @@ fn an_install_records_the_routing_envelope_once_and_a_preview_does_not() {
     let out = world.relais(&["install", "--claude", "--write"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert!(
-        text(&out.stdout).contains("session routing is on; turn it off with /relais-routing off"),
+        text(&out.stderr).contains("session routing is on; turn it off with /relais-routing off"),
         "{}",
-        text(&out.stdout)
+        text(&out.stderr)
+    );
+    assert!(
+        !text(&out.stdout).contains("session routing is on"),
+        "a notice, not the report: stderr only"
     );
     let recorded = std::fs::read_to_string(&machine).expect("machine.toml");
     assert!(recorded.contains("[session_routing]"), "{recorded}");
@@ -465,7 +469,7 @@ fn an_install_records_the_routing_envelope_once_and_a_preview_does_not() {
     // A second install leaves the envelope as it is, and says nothing.
     let again = world.relais(&["install", "--claude", "--write"]);
     assert_eq!(again.status.code(), Some(0), "{}", text(&again.stderr));
-    assert!(!text(&again.stdout).contains("session routing is on"));
+    assert!(!text(&again.stderr).contains("session routing is on"));
     assert_eq!(std::fs::read_to_string(&machine).unwrap(), recorded);
 }
 

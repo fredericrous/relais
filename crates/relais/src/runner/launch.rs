@@ -82,10 +82,7 @@ impl<'a> RunEngine<'a> {
             return;
         }
         let report = |error: &dyn std::fmt::Display| {
-            eprintln!(
-                "relais: dispatch {dispatch}: {cost} was not booked to the shared counter: \
-                 {error}; this node's ledger has it; check the shared primary"
-            );
+            eprintln!("{}", unbooked_line(dispatch, &cost, error));
             self.events.emit(Event::Decision {
                 what: "shared_spend_not_booked".into(),
                 reason: format!("{dispatch}: {error}"),
@@ -531,6 +528,20 @@ impl<'a> RunEngine<'a> {
             }),
         )
     }
+}
+
+/// The stderr line for a dispatch cost the shared counter did not book: the
+/// node's ledger keeps it, and no command reads the primary yet (an-t31).
+pub(super) fn unbooked_line(
+    dispatch: &str,
+    cost: &dyn std::fmt::Display,
+    error: &dyn std::fmt::Display,
+) -> String {
+    format!(
+        "relais: dispatch {dispatch}: {cost} was not booked to the shared counter: {error}; this \
+         node's ledger has it, the shared counter does not ({})",
+        crate::shared_state::PRIMARY_UNREAD
+    )
 }
 
 /// How a failed admission call is reported. An unreachable coordinator
