@@ -21,6 +21,8 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
+/// The log's one rotated copy, beside `coordinator.log`.
+const ROTATED_LOG: &str = "coordinator.log.1";
 /// How far back `--days` may reach.
 const MAX_DAYS: u32 = 31;
 /// The shortfall, in percent of the ledger, past which the floor is due.
@@ -124,19 +126,20 @@ fn assess(days: &[Figures], today: NaiveDate) -> Vec<(Option<f64>, Check)> {
                 Check::Partial
             } else if first_fed.is_some_and(|fed| at <= fed) {
                 Check::Cutover
-            } else if percents[at].is_none() {
+            } else if day.waiting.is_none() {
                 Check::WaitingUnknown
             } else {
-                match percents[at] {
-                    Some(percent) if percent > FLOOR_PERCENT => {
-                        if is_day_edge(days, &percents, at) {
-                            Check::Edge
-                        } else {
-                            Check::Short
-                        }
+                let percent = percents[at].unwrap_or(0.0); // every term is known here
+                if percent > FLOOR_PERCENT {
+                    if is_day_edge(days, &percents, at) {
+                        Check::Edge
+                    } else {
+                        Check::Short
                     }
-                    Some(percent) if percent < -FLOOR_PERCENT => Check::CounterAboveLedger,
-                    _ => Check::Ok,
+                } else if percent < -FLOOR_PERCENT {
+                    Check::CounterAboveLedger
+                } else {
+                    Check::Ok
                 }
             };
             (percents[at], check)
@@ -218,22 +221,23 @@ impl DropLog {
 
     /// Read both files of the rotation. Both are opened before either is
     /// read, and a file seen twice (the same inode, a rotation between the
-    /// two opens) is read once.
-    fn read(dir: &Path) -> Result<Self, CliError> {
+    /// two opens) is read once. A rotated copy that opened means the log was
+    /// rotated, whether or not it is read. An error names its file.
+    fn read(dir: &Path) -> Result<Self, std::io::Error> {
+        let named = |path: &Path, cause: std::io::Error| {
+            std::io::Error::new(cause.kind(), format!("{}: {cause}", path.display()))
+        };
         let mut log = Self::default();
         let mut open = Vec::new();
-        for name in [relais::coordinator::DAEMON_LOG, "coordinator.log.1"] {
+        for name in [relais::coordinator::DAEMON_LOG, ROTATED_LOG] {
             let path = dir.join(name);
             match std::fs::File::open(&path) {
-                Ok(file) => open.push((path, file)),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(cause) => {
-                    return Err(CliError::Read {
-                        what: "the coordinator log",
-                        path,
-                        cause,
-                    })
+                Ok(file) => {
+                    log.rotated |= name == ROTATED_LOG;
+                    open.push((path, file));
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(cause) => return Err(named(&path, cause)),
             }
         }
         let mut seen = Vec::new();
@@ -245,14 +249,8 @@ impl DropLog {
                 seen.push(id);
             }
             let mut bytes = Vec::new();
-            if let Err(cause) = file.read_to_end(&mut bytes) {
-                return Err(CliError::Read {
-                    what: "the coordinator log",
-                    path,
-                    cause,
-                });
-            }
-            log.rotated |= path.ends_with("coordinator.log.1");
+            file.read_to_end(&mut bytes)
+                .map_err(|cause| named(&path, cause))?;
             log.add_text(&String::from_utf8_lossy(&bytes));
             log.files.push(path);
         }
@@ -348,14 +346,16 @@ fn warn(line: &str) {
 /// keeps the micro-dollars.
 fn money(micros: Option<i64>) -> String {
     micros.map_or("-".to_string(), |micros| {
-        format!("${:.4}", micros as f64 / 1_000_000.0)
+        let sign = if micros < 0 { "-" } else { "" };
+        let abs = micros.unsigned_abs();
+        format!("{sign}${}.{:04}", abs / 1_000_000, (abs % 1_000_000) / 100)
     })
 }
 
 /// One text row, at most 80 columns for the usual figures.
 fn text_row(row: &DayRow) -> String {
     format!(
-        "{:<10} {:>9} {:>9} {:>9} {:>8} {:>6} {}\n",
+        "{:<10} {:>9} {:>9} {:>9} {:>9} {:>6} {}\n",
         row.day,
         money(row.counter_micros),
         money(Some(row.ledger_micros)),
@@ -374,25 +374,44 @@ fn render_text(document: &CounterDocument) -> String {
     } else {
         out.push_str("the shared counter beside this node's ledger (shared_state = external)\n");
     }
-    out.push_str(&format!(
-        "{:<10} {:>9} {:>9} {:>9} {:>8} {:>6} check\n",
-        "day", "counter", "ledger", "dropped", "waiting", "short%"
-    ));
+    // The rows are newest first, so the first short row is the newest.
     let short: Vec<&DayRow> = document
         .days
         .iter()
         .filter(|row| row.check == Check::Short.name())
         .collect();
+    let judged = document
+        .days
+        .iter()
+        .filter(|row| {
+            [
+                Check::Ok,
+                Check::Short,
+                Check::Edge,
+                Check::CounterAboveLedger,
+            ]
+            .iter()
+            .any(|check| row.check == check.name())
+        })
+        .count();
     if document.selection != "local" {
-        out.push_str(&match short.first() {
-            None => "no day is short\n".to_string(),
-            Some(newest) => format!(
+        out.push_str(&match (short.first(), judged) {
+            (Some(newest), _) => format!(
                 "{} day(s) short, newest {}: the floor is due (docs/shared-state.md)\n",
                 short.len(),
                 newest.day
             ),
+            (None, 0) => "no day could be judged (see the check column)\n".to_string(),
+            (None, _) => format!(
+                "no day is short ({judged} of {} judged)\n",
+                document.days.len()
+            ),
         });
     }
+    out.push_str(&format!(
+        "{:<10} {:>9} {:>9} {:>9} {:>9} {:>6} check\n",
+        "day", "counter", "ledger", "dropped", "waiting", "short%"
+    ));
     for row in &document.days {
         out.push_str(&text_row(row));
     }
@@ -478,7 +497,7 @@ pub(crate) fn counter_command(days: u32, format: Format) -> Result<CliOutcome, C
         None
     };
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
-    let log = DropLog::read(&state_dir)?;
+    let log = operational(DropLog::read(&state_dir), "reading the coordinator log")?;
     let settles_file = relais::coordinator::settles_path(&ledger_path);
     let waiting = relais::coordinator::waiting_settles(&settles_file);
     let today = chrono::Utc::now().date_naive();
@@ -735,6 +754,10 @@ mod tests {
         let log = DropLog::read(&dir).expect("read");
         assert_eq!(log.by_day.get(&day(26)), Some(&7));
         assert_eq!(log.files.len(), 1);
+        assert!(
+            log.rotated,
+            "a rotated copy that opened says the log rotated"
+        );
     }
 
     #[test]
@@ -786,6 +809,75 @@ mod tests {
         assert_eq!(unread[0].waiting, None);
     }
 
+    fn row(day: &str, check: &'static str) -> DayRow {
+        DayRow {
+            day: day.into(),
+            counter_micros: Some(1),
+            ledger_micros: 1,
+            dropped_micros: Some(0),
+            waiting_micros: Some(0),
+            short_percent: None,
+            check,
+        }
+    }
+
+    fn document(selection: &'static str, days: Vec<DayRow>) -> CounterDocument {
+        CounterDocument {
+            selection,
+            days,
+            waiting: WaitingInfo {
+                count: 0,
+                micros: 0,
+                oldest_since: None,
+                error: None,
+            },
+            log: LogInfo {
+                path: String::new(),
+                files: Vec::new(),
+                unparsed: 0,
+                covers_from: None,
+            },
+        }
+    }
+
+    #[test]
+    fn the_summary_comes_first_and_names_the_newest_short_day() {
+        // Rows are newest first.
+        let text = render_text(&document(
+            "external",
+            vec![
+                row("2026-11-26", "short"),
+                row("2026-11-25", "short"),
+                row("2026-11-24", "ok"),
+            ],
+        ));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[1],
+            "2 day(s) short, newest 2026-11-26: the floor is due (docs/shared-state.md)"
+        );
+        assert!(lines[2].starts_with("day "), "{text}");
+        let none = render_text(&document(
+            "external",
+            vec![row("2026-11-26", "waiting_unknown")],
+        ));
+        assert!(none.contains("no day could be judged"), "{none}");
+        let clean = render_text(&document(
+            "external",
+            vec![row("2026-11-26", "ok"), row("2026-11-25", "cutover")],
+        ));
+        assert!(clean.contains("no day is short (1 of 2 judged)"), "{clean}");
+    }
+
+    #[test]
+    fn an_unreadable_log_is_an_operational_failure_naming_its_file() {
+        let dir = relais::test_support::short_temp_dir("counter-bad-log");
+        // A directory where the log should be: it opens, and cannot be read.
+        std::fs::create_dir(dir.join(relais::coordinator::DAEMON_LOG)).expect("dir");
+        let error = DropLog::read(&dir).expect_err("a directory is not a log");
+        assert!(error.to_string().contains("coordinator.log"), "{error}");
+    }
+
     #[test]
     fn the_text_row_fits_eighty_columns_for_a_big_day_with_the_longest_word() {
         let row = DayRow {
@@ -801,7 +893,7 @@ mod tests {
         assert!(text.trim_end().chars().count() <= 80, "{text}");
         assert!(!text.contains('\u{1b}'));
         let header = format!(
-            "{:<10} {:>9} {:>9} {:>9} {:>8} {:>6} check",
+            "{:<10} {:>9} {:>9} {:>9} {:>9} {:>6} check",
             "day", "counter", "ledger", "dropped", "waiting", "short%"
         );
         assert!(header.chars().count() <= 80);

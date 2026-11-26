@@ -94,7 +94,14 @@ impl std::fmt::Display for WaitingSettlesError {
     }
 }
 
-impl std::error::Error for WaitingSettlesError {}
+impl std::error::Error for WaitingSettlesError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read(e) => Some(e),
+            Self::Parse(e) => Some(e),
+        }
+    }
+}
 
 /// The settles waiting in `path` (see [`settles_path`]), read without
 /// taking them: an absent file is an empty list. Reads the file the coordinator writes, so a settle taken
