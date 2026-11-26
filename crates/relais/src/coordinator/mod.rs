@@ -937,7 +937,13 @@ impl Coordinator {
                 lock,
                 shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 ledger_path: ledger.map(|ledger| ledger.path().to_path_buf()),
-                seats: Arc::new(SeatBook::new(shared, holder)),
+                seats: Arc::new(match ledger {
+                    // Settles the primary has not taken survive a restart
+                    // beside the ledger (an external layer only).
+                    Some(ledger) => SeatBook::new(shared, holder)
+                        .with_settle_file(seats::settles_path(ledger.path())),
+                    None => SeatBook::new(shared, holder),
+                }),
             },
             listener,
         ))

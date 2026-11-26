@@ -76,6 +76,11 @@ pub struct RunConfig<'a> {
     /// it always did. Built once at the CLI's composition root; a child
     /// run uses its parent's.
     pub shared_state: &'a dyn crate::shared_state::SharedState,
+    /// This machine's host name, which names the node holding the seat a
+    /// run's own spend is booked under when no coordinator settles it
+    /// (an-t24). Read once at the CLI's composition root; `None` when the OS
+    /// gives none.
+    pub node_host: Option<String>,
 }
 
 /// Where a run's program design comes from: the path its contract names,

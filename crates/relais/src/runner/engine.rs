@@ -84,6 +84,7 @@ impl<'a> RunEngine<'a> {
             parent,
             harness: None,
             own_write_leases: std::collections::BTreeSet::new(),
+            fed_counter: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             inplace: None,
             last_snapshot: None,
             timed_out_settled: None,

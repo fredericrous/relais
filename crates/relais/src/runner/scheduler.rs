@@ -817,6 +817,7 @@ fn run_package(
         design: engine.config.design,
         declarations: engine.config.declarations,
         shared_state: engine.config.shared_state,
+        node_host: engine.config.node_host.clone(),
     };
     engine.transition(
         State::Running,

@@ -464,6 +464,7 @@ pub(crate) fn replay_command(
         // show` report it.
         declarations: &relais::trust::NoHistory,
         shared_state: &*shared,
+        node_host: relais::procs::host_name(),
     });
     // Bring the replay's own refs into the live repository BEFORE the
     // checkout goes. The runner names its candidate and snapshot refs in
