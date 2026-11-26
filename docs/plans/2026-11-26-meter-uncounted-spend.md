@@ -10,7 +10,7 @@ plan-id: p-01M8AV8C8687YVY1G3RE96STS7
 ## Review panel
 
 👉 **Decide:** none — approve if a retried settle plus three named, ceilinged gaps beats new hook metering.
-📍 relais, homelab · 2 phases · next: Phase 1. Panel: backend, lang:rust, tui, unix (opus); codex: not run (programme ticket agent).
+📍 relais, homelab · Phase 1 built · next: Phase 2 (the homelab Resolution). Panel: backend, lang:rust, tui, unix (opus); codex: not run (programme ticket agent).
 **Changed by review:** only `Unavailable` is retried, with a line before the second try; `dropped_micros=<n>` token; each gap names its ceiling.
 **Verdicts:** round 2: 2 approve, 2 approve-with-changes; 4 carried (implemented); words 872 → 1070 (×1.23); remove 0, merge 0.
 📄 Full reviews: [2026-11-26-meter-uncounted-spend.reviews.md](2026-11-26-meter-uncounted-spend.reviews.md)
@@ -115,7 +115,7 @@ puts the ledger floor back) can be trusted:
 
 ## Phases
 
-- [ ] Phase 1 — relais: the amount in the refused-settle line, the settle
+- [x] Phase 1 — relais: the amount in the refused-settle line, the settle
   retry, the tests, docs and changelog:
   `crates/relais/src/coordinator/seats.rs`,
   `crates/relais/src/coordinator/seats/tests.rs`,
@@ -146,12 +146,52 @@ puts the ledger floor back) can be trusted:
   shared claims, `dispatch_reserve_micros` 500, a spawn then its
   `SubagentStop` → expected: `Silent`, `fake.spent()` 0, the journal entry
   `decision: silent`, `coordinator_debug: null` → new hook test.
-- Input: the whole crate → `cargo test -p relais`, `cargo clippy
-  --all-targets -- -D warnings` (also `--features conformance`) green.
+
+Observed on f3910c69a (rebased on main 1bebd973b):
+
+- Refused settles: one drop line each, `$0.00001 … (dropped_micros=10)`
+  and `$0.0004 … (dropped_micros=400)`, counter 0; the cap lines carry
+  `(dropped_micros=1500000)` and `(dropped_micros=3000000)`
+  (`coordinator::seats`, all pass).
+- `a_settle_whose_answer_was_lost_is_retried_and_booked_once`: settles
+  `[Some(100), Some(100)]`, the `LocalGate` run settled at 100 once, no
+  `gate_settle_failed`, one `gate_settle_unconfirmed` (the retry is answered
+  `Unknown`, the entry forgotten after release).
+- `a_settle_no_coordinator_answers_is_tried_twice_then_reported_once`: 2
+  settles, 1 `gate_settle_failed`; `a_refused_settle_is_not_retried_and_is_reported_once`:
+  1 settle, 1 `gate_settle_failed`. The stderr lines were seen in the first
+  red run (`trying once more`, `after 2 tries`, `after 1 try`); a passing
+  test's stderr is captured, so the final `in <n> ms` wording is unobserved.
+- `a_settle_retry_pause_is_jittered_within_half_its_base`: 50 ids all in
+  [500, 1500) ms, varying, the same id the same pause, zero stays zero.
+- `a_carry_on_spawn_with_no_coordinator_is_metered_nowhere`: `Silent`
+  twice, journal `silent` / `null`, `fake.spent()` 0 with a 500-micro
+  reservation set.
+- The first run of the runner tests went red twice on the fixture (an empty
+  candidate, then heavy-check settles at $0 counted as faults); both fixed
+  in the test double, not the code.
+- Pre-commit gate on f3910c69a: `cargo test` 3232 passed, 0 failed (lib
+  2749, integration 354, others), clippy `-D warnings` clean; `cargo clippy
+  --all-targets --features conformance -- -D warnings` clean.
 
 ## Decision log
 
 - 2026-11-26: the three paths decided as in the Goal, decided-by: agent
   (ADR-0080).
+- 2026-11-26: `greenbelay plan-review record` exited 1 (no transcript of the
+  panel visible to a ticket agent); the panel ran, its reviews are in the
+  sidecar.
+- 2026-11-26 (implementation, after review): the retry waits a jittered
+  pause (`RunConfig.settle_retry_pause`, 1 s from the CLI, zero in tests);
+  a retry answered `Unknown` writes `gate_settle_unconfirmed`, since it
+  cannot tell a lost answer from a forgotten dispatch; the Code review
+  reason "one stderr line gains an amount" understates it (two new runner
+  lines), the profile set is kept.
+
+## Implementation review
+
+- implementation-review: round 1 approve-with-changes; blocking (no backoff) fixed with a jittered, injected pause; plan ticks and observed rows filled; vacuous-fault guard added. Delta (tree e50743c6) approve-with-changes: its two mediums are this closing commit; candidate d04a2ba77be5 fine. Tokens 50k + 41k, 36 s + 38 s.
+- backend: round 1 approve-with-changes; unconfirmed retry now reported (`gate_settle_unconfirmed`), pause added, fault-cost guard. Delta approve; its low (no test pins a first-try `Unknown` as confirmed) kept `deliberate: the guard is two lines beside its comment; a test would reopen review for a low, filed as a follow-up`. 72k + 38k.
+- lang:rust: approve; typed `SettleTaken`/`SettleNotTaken`, bounded `for` loop, `calls` no longer bumped by Unavailable (all three lows fixed).
 
 <!-- panel: repos=relais,homelab adds= reviewers=backend,lang:rust,tui,unix body-sha=b30818e85eae -->
