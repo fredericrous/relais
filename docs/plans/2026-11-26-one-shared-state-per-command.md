@@ -118,7 +118,7 @@ Everything else builds once and is not touched:
 
 ## Implementation review
 
-- implementation-review (opus): round 1 approve-with-changes (plan ticks, report-test wording, install arm, doctor comment; fixed or `deliberate` above); Delta approve-with-changes: one low (`handed_on` needs `::`), `deliberate: no cli file imports a builder by name; the census says so in its rules`.
+- implementation-review (opus): round 1 approve-with-changes (plan ticks, report-test wording, install arm, doctor comment; fixed or `deliberate` above); Delta approve-with-changes: one low (`handed_on` needs `::`), `deliberate: no cli file passes an imported builder bare as a value (six import one by name, none hands it on); the limit carries a `holds-until:` marker above `handed_on` in ctx.rs`.
 - code-review-backend (opus): round 1 approve-with-changes (doctor error swallowed: comment now states the limit, deliberate pre-existing; `impl` blind spot fixed); Delta approve.
 - code-review-language lang:rust (opus): round 1 approve-with-changes (unreachable arm: `LazyCell`; tuple `if let`; census nested, deliberate: `module-cycles` gate; `impl` blind spot fixed); Delta approve.
 - One edit of the Delta round (`impl` reset) had not applied the first time (the Python edit raised and the chain went on); the backend reviewer caught it, it was redone with every replacement asserted, and the tree reviewed last is `8a962530`.
@@ -139,7 +139,7 @@ Everything else builds once and is not touched:
 - 2026-11-26 — install builds its state only when a step needs it, not at the top: a preview without `--hooks` built none before, and an external client's build may reach the primary. decided-by: agent (ADR-0080).
 - 2026-11-26 — round 1 (tui): moving the report's price-table load ahead of the claude-projects dir lookup means a broken home and an external layer together show the external refusal first. Rejected: both messages are actionable, exit 3 is unchanged, and it is noted for the code review.
 - 2026-11-26 — round 2 (unix, low): "the report test must fail on main" rejected: on main `load_price_table()?` (report.rs:74) already precedes `import_for_report`, so the test passes there by design; it guards the reorder, and the plan now says so.
-- 2026-11-26 — the census's `handed_on` limit (a builder imported with `use` and passed bare) stays: no cli file does it, and the doc comment names the rule. decided-by: agent (ADR-0080).
+- 2026-11-26 — the census's `handed_on` limit (a builder imported with `use` and passed bare as a value) stays: no cli file does it, and a `holds-until:` marker above `handed_on` in ctx.rs names the ceiling. decided-by: agent (ADR-0080).
 - 2026-11-26 — the round-1 ledger record (`greenbelay plan-review record`) did not bind the four reviews to this plan (no completed plan-review found in the session transcript); the review text stays in the Full reviews section, and the record is retried at the close.
 
 <!-- panel: repos=relais,homelab reviewers=backend,lang:rust,tui,unix body-sha=108aaa073d90 -->
