@@ -224,6 +224,13 @@ the shared half of a claim pass, then goes on with the claim files; a hold
 it could not renew or give back ends by its TTL.
 `relais doctor` adds a failing `shared_state` finding with the same text.
 
+Every routed command follows one stream rule (`cli::outcome::refusal_streams`,
+an-t31): stdout carries what the command did, its result sentence or, under
+`--json`, exactly one object (`{"error","exit"}` for a refusal); stderr
+carries every refusal, warning and failure as one line, under `--json` too;
+the exit code agrees with both. A refusal reads `relais <command>: …`, an
+error such as the one above `relais: …`.
+
 ## For a closed client
 
 - The trait is the shared half only, in plain values: no `Ledger`, claim
@@ -304,7 +311,11 @@ it could not renew or give back ends by its TTL.
   The ledger fences a late answer only within one ledger, so a client with
   several answerers adds its own fence (an-t13 owns it). A grant held
   elsewhere refuses `relais decide` with exit 3; `relais feedback` answers no
-  decision and takes none.
+  decision and takes none. The refusal says another answer holds the
+  decision and may already be recorded, on this node or another: the grant
+  does not say which, and `relais status` reads this node's ledger only, so
+  a salvage recorded on another node does not show there (an-t31; telling
+  "answered" from "being answered" needs a grant answer that says so).
   `conformance::run_all_with_clock(make, advance)` runs the lapse check; a
   client whose test primary has an injectable clock must pass it, and
   `run_all` alone does not cover the lapse.

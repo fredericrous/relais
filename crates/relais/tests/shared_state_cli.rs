@@ -231,6 +231,23 @@ fn a_trust_grant_keeps_the_key_and_adds_none() {
     assert!(!text.contains("shared_state"), "{text}");
 }
 
+/// an-t31: `trust grant --json` says where the grant was recorded; on a
+/// single node that is the settings file, still named in `machine_settings`.
+#[test]
+fn a_json_trust_grant_says_where_it_was_recorded() {
+    let scratch = Scratch::with_machine_toml("shared-state-grant-json", "schema_version = 1\n");
+    let out = scratch.relais(&["trust", "grant", "--reviewed-by", "test", "--json"], "");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let object: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(object["code"], "granted", "{object}");
+    assert_eq!(object["recorded_on"], "machine_settings", "{object}");
+    assert_eq!(
+        object["machine_settings"],
+        scratch.machine_toml().display().to_string(),
+        "{object}"
+    );
+}
+
 /// an-t26: a salvage of a terminal run with no recorded workspace is refused
 /// by the absent external layer before anything is written: one stderr line,
 /// no "unknown containment" claim, and the run is left as it was.
@@ -290,12 +307,15 @@ fn a_salvage_under_an_absent_external_layer_is_refused_and_records_nothing() {
             stderr.contains("sets shared_state = \"external\""),
             "json={json}: {stderr}"
         );
+        // An error, not a refusal: main's one line, `relais: <error>`, on
+        // both paths (an-t31: the prefix differs from a refusal's on purpose).
+        assert_eq!(stderr.lines().count(), 1, "json={json}: {stderr}");
+        assert!(stderr.starts_with("relais: "), "json={json}: {stderr}");
         if json {
             assert_eq!(stdout.lines().count(), 1, "{stdout}");
             assert!(stdout.contains("\"exit\":3"), "{stdout}");
         } else {
             assert!(stdout.is_empty(), "{stdout}");
-            assert_eq!(stderr.lines().count(), 1, "{stderr}");
         }
         assert!(
             ledger.decision_of_run(&run).expect("read").is_none(),
@@ -351,5 +371,136 @@ fn a_learn_cycle_under_an_absent_external_layer_is_refused_before_the_coordinato
     assert!(
         !scratch.dir.join("state/relais.sock").exists(),
         "no coordinator was started"
+    );
+}
+
+/// an-t31: a refusal under `--json` is the `{"error","exit"}` object on
+/// stdout and one `relais <command>:` line on stderr, the exit code agreeing
+/// with both (`cli::outcome::refusal_streams`); plain, it is the stderr line
+/// alone. Both commands refuse here before any shared state is built.
+#[test]
+fn a_refusal_under_json_is_one_stdout_object_and_one_stderr_line() {
+    let scratch =
+        Scratch::with_machine_toml("shared-state-refusal-streams", "schema_version = 1\n");
+    let decide = [
+        "decide",
+        "run-x",
+        "--answer",
+        "approve",
+        "--actor",
+        "person-via-orchestrator",
+    ];
+    let feedback = [
+        "feedback",
+        "run-x",
+        "--outcome",
+        "accepted",
+        "--actor",
+        "nobody",
+    ];
+    for (prefix, args) in [
+        ("relais decide: ", &decide[..]),
+        ("relais feedback: ", &feedback[..]),
+    ] {
+        for json in [false, true] {
+            let mut args = args.to_vec();
+            if json {
+                args.push("--json");
+            }
+            let out = scratch.relais(&args, "");
+            let code = out.status.code().expect("an exit code");
+            assert_ne!(code, 0, "{args:?} is refused: {out:?}");
+            let stdout = String::from_utf8(out.stdout.clone()).expect("utf-8");
+            let stderr = String::from_utf8(out.stderr.clone()).expect("utf-8");
+            assert_eq!(stderr.lines().count(), 1, "{args:?}: {stderr}");
+            assert!(stderr.starts_with(prefix), "{args:?}: {stderr}");
+            if json {
+                assert_eq!(stdout.lines().count(), 1, "{args:?}: {stdout}");
+                let object: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+                assert_eq!(object["exit"], code, "{args:?}: the exit agrees");
+                assert_eq!(
+                    format!("{prefix}{}", object["error"].as_str().expect("error")),
+                    stderr.trim_end(),
+                    "{args:?}: the same refusal on both streams"
+                );
+            } else {
+                assert!(stdout.is_empty(), "{args:?}: {stdout}");
+            }
+        }
+    }
+}
+
+/// an-t31: an approval that wrote no receipt says so on stderr under
+/// `--json` too, while stdout stays the one object carrying
+/// `receipt_skipped`.
+#[test]
+fn a_json_approval_with_no_receipt_warns_on_stderr_and_keeps_one_object() {
+    use relais::ids::{RunId, TaskId};
+    use relais::ledger::{Ledger, Transition};
+    use relais::runner::{Reason, State};
+    let scratch =
+        Scratch::with_machine_toml("shared-state-receipt-skipped", "schema_version = 1\n");
+    let ledger = Ledger::open(&scratch.dir.join("state/ledger.sqlite")).expect("ledger");
+    let run = RunId::from_stored("run-old");
+    ledger
+        .insert_run(&run, "/repo", None, &TaskId::from_stored("task"), "rk")
+        .expect("run");
+    let revision = ledger
+        .insert_contract_revision(&run, "h", "{}", "HEAD", None)
+        .expect("revision");
+    let attempt = ledger
+        .insert_attempt(
+            &run,
+            revision,
+            1,
+            "implementation",
+            relais::lifecycle::UsagePhase::Initial,
+        )
+        .expect("attempt");
+    ledger
+        .finish_attempt(attempt, State::Running, None, Some("cand"))
+        .expect("candidate");
+    for (from, to, why) in [
+        (State::Prepared, State::Running, Reason::WorkerDispatched),
+        (
+            State::Running,
+            State::NeedsReview,
+            Reason::ReviewUnavailable,
+        ),
+    ] {
+        ledger
+            .record_transition(&Transition {
+                run_id: run.clone(),
+                attempt_id: None,
+                from_state: Some(from),
+                to_state: to,
+                reason: why.as_str().into(),
+                detail: None,
+                at: ledger.now(),
+            })
+            .expect("transition");
+    }
+    let out = scratch.relais(
+        &[
+            "decide",
+            "run-old",
+            "--answer",
+            "approve",
+            "--actor",
+            "orchestrator",
+            "--json",
+        ],
+        "",
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let stdout = String::from_utf8(out.stdout.clone()).expect("utf-8");
+    let stderr = String::from_utf8(out.stderr.clone()).expect("utf-8");
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    let object: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(object["receipt_skipped"], "review_unavailable", "{object}");
+    assert_eq!(
+        stderr.trim_end(),
+        "no receipt written: no verification snapshot for this review_unavailable stop",
+        "{stderr}"
     );
 }

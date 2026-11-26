@@ -6,6 +6,7 @@ use super::ctx::Refusal;
 use super::decision_record::read_decide_proof;
 use super::outcome::exit_code;
 use super::outcome::operational;
+use super::outcome::print_refusal;
 use super::outcome::CliError;
 use super::outcome::CliOutcome;
 use super::FeedbackOutcome;
@@ -83,17 +84,7 @@ pub(crate) fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, C
             Ok(CliOutcome::Accepted)
         }
         Ok(Err(refused)) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "error": refused.message,
-                        "exit": exit_code(&refused.outcome),
-                    })
-                );
-            } else {
-                eprintln!("relais feedback: {}", refused.message);
-            }
+            print_refusal("relais feedback", json, &refused.outcome, &refused.message);
             Ok(refused.outcome)
         }
         Err(e) => {

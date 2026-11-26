@@ -296,9 +296,63 @@ where
     })
 }
 
+/// What a refused command prints, the one stream rule its callers share
+/// (decisions ADR-0021: `cli.basics.stdout-is-data-stderr-is-talk`,
+/// `cli.output.json-flag`):
+///
+/// - stdout carries what the command did: its result sentence, or under
+///   `--json` exactly one object, the result or, for a refusal,
+///   `{"error", "exit"}`;
+/// - stderr carries every refusal, warning and failure as one line for the
+///   person, `<command>: <message>`, under `--json` too;
+/// - the exit code agrees with both.
+///
+/// Returns the stdout object (under `--json` only) and the stderr line.
+pub(crate) fn refusal_streams(
+    command: &str,
+    json: bool,
+    outcome: &CliOutcome,
+    message: &str,
+) -> (Option<String>, String) {
+    let object = json.then(|| {
+        serde_json::json!({
+            "error": message,
+            "exit": exit_code(outcome),
+        })
+        .to_string()
+    });
+    (object, format!("{command}: {message}"))
+}
+
+/// Print a refusal by [`refusal_streams`]. A reader that closed either
+/// pipe is not a failure: the exit code still says what happened.
+pub(crate) fn print_refusal(command: &str, json: bool, outcome: &CliOutcome, message: &str) {
+    use std::io::Write;
+    let (stdout, stderr) = refusal_streams(command, json, outcome, message);
+    if let Some(object) = stdout {
+        let _ = writeln!(std::io::stdout().lock(), "{object}"); // a closed pipe is the reader's choice
+    }
+    let _ = writeln!(std::io::stderr().lock(), "{stderr}"); // nowhere left to say a failed write
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refusal_is_one_stderr_line_and_under_json_also_one_stdout_object() {
+        let (stdout, stderr) = refusal_streams("relais decide", true, &CliOutcome::Blocked, "held");
+        let object: serde_json::Value =
+            serde_json::from_str(&stdout.expect("an object under --json")).expect("json");
+        assert_eq!(object["error"], "held");
+        assert_eq!(object["exit"], exit_code(&CliOutcome::Blocked));
+        assert_eq!(stderr, "relais decide: held");
+
+        let (stdout, stderr) =
+            refusal_streams("relais decide", false, &CliOutcome::Blocked, "held");
+        assert_eq!(stdout, None, "nothing on stdout without --json");
+        assert_eq!(stderr, "relais decide: held");
+    }
 
     /// Every outcome the table has. Listed here rather than derived,
     /// because the point of the test below is that two of them never

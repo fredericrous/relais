@@ -602,9 +602,9 @@ fn the_learning_envelope_is_written_and_an_off_tombstone_stops_the_installer() {
         "an off tombstone keeps the installer from recording it: {machine}"
     );
     assert!(
-        !text(&install.stdout).contains("automatic promotion is on"),
+        !text(&install.stderr).contains("automatic promotion is on"),
         "{}",
-        text(&install.stdout)
+        text(&install.stderr)
     );
 }
 
@@ -614,10 +614,14 @@ fn installing_records_the_envelope_and_says_how_to_turn_it_off() {
     let install = world.relais(&["install", "--claude", "--write"]);
     assert_eq!(install.status.code(), Some(0), "{}", text(&install.stderr));
     assert!(
-        text(&install.stdout)
+        text(&install.stderr)
             .contains("automatic promotion is on; turn it off with /relais-learning off"),
         "{}",
-        text(&install.stdout)
+        text(&install.stderr)
+    );
+    assert!(
+        !text(&install.stdout).contains("automatic promotion is on"),
+        "a notice, not the report: stderr only"
     );
     let machine = world.machine_text();
     assert!(machine.contains("auto_promote"), "{machine}");

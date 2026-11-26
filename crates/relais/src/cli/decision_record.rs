@@ -79,8 +79,10 @@ pub(crate) enum NextStep {
 }
 
 /// A failure of an answer, as the person sees it. Another answerer holding
-/// the decision is a refusal, exit 3, that says what to do next; the line
-/// claims nothing about the decision's state, which was not read.
+/// the decision is a refusal, exit 3, that says what to do next. The grant
+/// says only that another answer holds the decision, not whether that
+/// answer was recorded, nor on which node; the line says so and claims
+/// nothing more (`relais status` reads this node's ledger alone).
 /// `signed_off` is the criterion an approve recorded before the grant was
 /// asked. Everything else is [`node_error`].
 pub(crate) fn answer_error(
@@ -94,14 +96,16 @@ pub(crate) fn answer_error(
     }
     let minutes = relais::shared_state::DECISION_GRANT_TTL_SECS / 60;
     let again = match next {
-        NextStep::AnswerAgain => "answer again if it is still open",
-        NextStep::SalvageAgain => {
-            "run the same `--answer salvaged` again unless status shows it already salvaged"
-        }
+        NextStep::AnswerAgain => "answer again if it is still open".to_string(),
+        NextStep::SalvageAgain => format!(
+            "run `relais decide {run} --answer salvaged` again if this node should salvage it; \
+             a salvage recorded on another node does not show here"
+        ),
     };
     let mut message = format!(
-        "the decision of run {run} is being answered elsewhere: check `relais status {run}`, \
-         then {again} (the other answer holds it for up to {minutes} minutes)"
+        "another answer holds the decision of run {run}; it may already be recorded, on this \
+         node or another, and this node cannot tell which. Check `relais status {run}`, then, \
+         once the hold ends (up to {minutes} minutes), {again}"
     );
     if let Some(criterion) = signed_off {
         message.push_str(&format!(
