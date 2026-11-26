@@ -136,9 +136,10 @@ ticket here until it is resolved or moved into a programme of its own.
   a push to main cancelled the CI of the commit before it, so a release
   tagged there failed (v0.86.0). `ci.yaml` now groups a push by its sha and
   cancels only a pull request's older run (#602).
-- [f32](f32-aval-missing-repo-dir-hint.md) (2026-11-25, open): a missing
-  `repo_dir` also fails at aval's spawn and gets the f29 launch hint, which
-  points at PATH; name the directory instead.
+- [f32](f32-aval-missing-repo-dir-hint.md) (2026-11-25, closed 2026-11-26):
+  a missing `repo_dir` also failed at aval's spawn and got the f29 launch
+  hint, which points at PATH. It is now checked before the spawn, and the
+  detail names the directory.
 
 ## Handoff
 
@@ -150,7 +151,7 @@ f24 and f25 shipped in v0.84.0, f27 in v0.85.0, f26 in v0.86.0. The plugin
 was reinstalled at 0.86.0 on 2026-11-25 at 22:19, so f24 to f27 are live.
 f30 closed as not needed (the fallback is unreachable).
 
-- Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f26, f27, f29, f30, f31.
+- Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f26, f27, f29, f30, f31, f32.
 - Next:
   - Check the plugin's other `tool.call` `.catch` answers (f28), ready.
   - Measure the home fingerprint warnings (f08), due 2026-11-28.
@@ -160,7 +161,6 @@ f30 closed as not needed (the fallback is unreachable).
   - A week of worker stops settles within 60 s (f23), due 2026-12-03.
   - f16, f22 and f23 are counted from the first session after
     2026-11-25 22:19 (the reinstall).
-  - Name the missing directory when aval cannot start (f32), ready.
   - Now that the plugin is reinstalled: `pgrep -fl <worktree>` during a live run lists no
     driver pid, and `pgrep -fl 'relais run'` still lists it (f26 pilot).
 - Lessons:

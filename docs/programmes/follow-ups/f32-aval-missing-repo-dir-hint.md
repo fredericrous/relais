@@ -1,7 +1,7 @@
 +++
 type = "task"
 mode = "afk"
-status = "open"
+status = "closed"
 blocked_by = []
 repos = ["relais"]
 +++
@@ -29,3 +29,16 @@ missing. Which detail should a missing `repo_dir` get?
 A missing `repo_dir` is a `ToolFailure` whose detail names the directory
 and gives no launch hint, checked before the spawn or by the error's
 cause. A test pins the detail, and it ships in one relais release.
+
+## Outcome
+
+2026-11-26: `aval_resolve_in` checks `repo_dir.is_dir()` before the spawn
+and returns a `ToolFailure` (exit -1) whose detail is "the directory aval
+would run in does not exist: <dir>", with no launch hint.
+`a_missing_repo_dir_is_a_tool_failure_not_absence` now pins the detail: it
+names the directory and carries none of the hint's text. The patch came
+from relais run run-66121efa5b002-10e41. Its verify (run-6612320fd2118-12599)
+stopped at a verification gap, because the named test had no JUnit report.
+The person approved it with that gap accepted and had it landed outside
+relais; the test and clippy were run by hand. It ships in the next relais
+release.

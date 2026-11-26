@@ -533,6 +533,18 @@ pub fn aval_resolve_in(
             detail: format!("decision key `{key}` is not a key aval can be asked for"),
         };
     }
+    // A directory that does not exist would fail the spawn with the same
+    // NotFound as a missing program, and the launch hint would then point
+    // at the wrong cause.
+    if !repo_dir.is_dir() {
+        return AvalVerdict::ToolFailure {
+            exit: -1,
+            detail: format!(
+                "the directory aval would run in does not exist: {}",
+                repo_dir.display()
+            ),
+        };
+    }
     // Absence is confirmed only when nothing was declared, the directory
     // to run in exists, and no PATH entry named `greentopo` or `aval` exists
     // in any form: a non-executable file or a dangling link is a broken
@@ -1839,11 +1851,15 @@ mod tests {
     #[test]
     fn a_missing_repo_dir_is_a_tool_failure_not_absence() {
         let dir = crate::test_support::temp_dir("aval-nodir");
-        let verdict = resolve_with_path(&dir.join("missing"), None, &dir);
-        assert!(
-            matches!(verdict, AvalVerdict::ToolFailure { .. }),
-            "{verdict:?}"
-        );
+        let missing = dir.join("missing");
+        let verdict = resolve_with_path(&missing, None, &dir);
+        let AvalVerdict::ToolFailure { detail, .. } = verdict else {
+            panic!("expected a tool failure, got {verdict:?}");
+        };
+        assert!(detail.contains(&missing.display().to_string()), "{detail}");
+        assert!(!detail.contains("relais.toml"), "{detail}");
+        assert!(!detail.contains("PATH"), "{detail}");
+        assert!(!detail.contains("could not be launched"), "{detail}");
     }
 
     #[cfg(unix)]
