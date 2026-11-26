@@ -451,8 +451,8 @@ pub struct Shown {
     pub authority_hash: String,
     pub repository: String,
     pub machine_settings: PathBuf,
-    /// Where a grant is recorded; `machine_settings` names this node's file
-    /// only when this says `machine_settings`.
+    /// Where a grant is recorded. `machine_settings` is always this node's
+    /// settings file; the grant is in it only when this says `machine_settings`.
     pub recorded_on: RecordedOn,
     /// Whether any grant holds: the repository's, or a legacy exact one.
     pub granted: bool,

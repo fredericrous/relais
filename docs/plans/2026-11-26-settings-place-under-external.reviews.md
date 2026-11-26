@@ -16,4 +16,13 @@ Round 2: backend approve, no findings. Codex: not run.
 - implementation-review (opus), round 1: approve-with-changes. Verification had no observed results (recorded in the homelab ticket Resolution), the binary test lacked the text check (added), an empty `impl RecordedOn {}` (removed). All applied.
 - implementation-review (opus), delta on tree 2cbb9838: approve-with-changes on the Resolution gap only, which the homelab Resolution now answers; everything else resolved, no new findings. Candidates `names.reveal-intent` on `w` and `q` in consent.test.ts ruled fine.
 - Rebase onto main 74d0b48c9: CHANGELOG.md conflict resolved under Unreleased; the code tree differs from the reviewed one only by main's v0.89.0 version bump (Cargo.toml, plugin.json), so no delta is due.
+- Final-tree review (tree 92af73fd): approve-with-changes, one low finding: Phase 1 names `RecordedOn::of(...)` but the code has the free function `recorded_on` in `cli/trust.rs` (the trust module must not import shared_state: module-cycles gate). `deliberate: the plan body is bound by its panel sha; the deviation is stated here and in the homelab Resolution`. Candidates ruled fine.
+
+## Code review profiles (tree 92af73fd, opus)
+
+- backend: approve. One low note on the unchecked `parsed<Shown>` cast; `deliberate: the cast predates this change and the ternary falls back safely`.
+- unix: approve, no findings.
+- lang:typescript: approve. Same low note on the cast; `deliberate: as above`.
+- lang:rust: approve-with-changes, one low: the `Shown::recorded_on` doc comment misdescribed `machine_settings`. Fixed.
+- tui: approve-with-changes, one low: the label `selected in:` is unclear. `deliberate: the plan's tui reviewer proposed this wording, the SPEC and the Resolution say what the path is, and a rename would reopen the panel round`.
 
