@@ -47,6 +47,14 @@ met: the build time after a one-line edit, and the size of the largest file.
   `epic-vocabulary`).
 - "Epic" and "story" are the new words for programme and ticket (decided in
   `epic-vocabulary`).
+- Baseline and coupling map: a one-line edit rebuilds in 23–29 s, the largest
+  production file is `verify/mod.rs`, and `ids`, `lifecycle`, `policy` and
+  `money` are the lowest layer ([t01](t01-coupling-map.md)).
+- Host scheduling is not a deletion: relais already uses greengate's slot
+  queue, and only about 105 lines overlap (a wait loop that needs a cancel
+  seam in `wait_in_line`, and `load_average`), so `admission`, `coordinator`
+  and `procs` stay relais's own and t02 weighs them as a crate
+  ([t03](t03-slot-overlap.md)).
 
 ## Not yet specified
 
