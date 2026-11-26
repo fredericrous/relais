@@ -1,7 +1,7 @@
 //! `relais doctor`, `relais hook` and `relais init`.
 
-use super::ctx::load_machine;
 use super::ctx::load_repo_policy;
+use super::ctx::machine_of;
 use super::ctx::print_document;
 use super::ctx::project_dir;
 use super::outcome::CliError;
@@ -10,6 +10,7 @@ use relais::backend::Harness;
 use relais::doctor;
 use relais::paths;
 use relais::route;
+use relais::shared_state::SharedState;
 use std::path::Path;
 
 /// Say on doctor's `effort` finding which models a `raise` repair WOULD hold
@@ -19,8 +20,11 @@ use std::path::Path;
 /// the effort never changes the finding's level — nothing is blocked. A
 /// repository or machine.toml that cannot be read says nothing here: doctor
 /// reports those on findings of their own.
-pub(crate) fn note_held_repair_effort(report: &mut doctor::DoctorReport) {
-    let (Ok((_, repo)), Ok(machine)) = (load_repo_policy(), load_machine()) else {
+pub(crate) fn note_held_repair_effort(
+    report: &mut doctor::DoctorReport,
+    state: Option<&dyn SharedState>,
+) {
+    let (Ok((_, repo)), Some(Ok(machine))) = (load_repo_policy(), state.map(machine_of)) else {
         return;
     };
     let cli = relais::adapter::claude::ClaudeBackend::discover()
@@ -77,8 +81,8 @@ fn loop_threshold_text(threshold: Option<u32>) -> String {
 /// configured and machine.toml declares none for this repository. A
 /// repository or machine.toml that cannot be read says nothing here: doctor
 /// reports those on findings of their own.
-pub(crate) fn holdouts_finding() -> Option<doctor::Finding> {
-    let (Ok(root), Ok(machine)) = (project_dir(), load_machine()) else {
+pub(crate) fn holdouts_finding(state: Option<&dyn SharedState>) -> Option<doctor::Finding> {
+    let (Ok(root), Some(Ok(machine))) = (project_dir(), state.map(machine_of)) else {
         return None;
     };
     let repo = relais::repo::main_checkout_name(&root).unwrap_or_default();
@@ -271,9 +275,14 @@ pub(crate) fn doctor_command(json: bool) -> Result<CliOutcome, CliError> {
         .and_then(Claude::installed);
     let integration = relais::install::plugin::integration(&claude, &listing);
     let mut report = doctor::doctor(&project_dir()?, listing);
-    note_held_repair_effort(&mut report);
+    // One state for every finding that reads the machine through it
+    // (an-t29). One that does not build says nothing on those two findings,
+    // as before; only the external-absent case is reported, by
+    // `shared_state_finding` below.
+    let shared = super::ctx::shared_state().ok();
+    note_held_repair_effort(&mut report, shared.as_deref());
     report.findings.extend(loop_threshold_finding());
-    report.findings.extend(holdouts_finding());
+    report.findings.extend(holdouts_finding(shared.as_deref()));
     report.findings.extend(purge_finding());
     report.findings.extend(backups_finding());
     if let Ok(machine_toml) = relais::paths::machine_settings_path() {

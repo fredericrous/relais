@@ -79,13 +79,22 @@ pub(crate) fn machine_of(state: &dyn SharedState) -> Result<MachineSettings, Cli
 pub(crate) fn write_settings(
     edit: &relais::shared_state::SettingsEdit,
 ) -> Result<Result<relais::shared_state::SettingsWrite, SharedStateError>, CliError> {
+    write_settings_of(&*shared_state()?, edit)
+}
+
+/// [`write_settings`] through a state the caller already built: a command
+/// that also reads through it (`relais trust grant`) builds one, never two.
+pub(crate) fn write_settings_of(
+    state: &dyn SharedState,
+    edit: &relais::shared_state::SettingsEdit,
+) -> Result<Result<relais::shared_state::SettingsWrite, SharedStateError>, CliError> {
     let who = std::env::var("USER")
         .ok()
         .filter(|user| !user.is_empty())
         .unwrap_or_else(|| "operator".to_string());
     // No home directory is the "no settings path" failure every command
     // reported as `CliError::Home` before the trait had a write.
-    match shared_state()?.write_settings(&relais::shared_state::Principal::operator(who), edit) {
+    match state.write_settings(&relais::shared_state::Principal::operator(who), edit) {
         Err(SharedStateError::Home(e)) => Err(CliError::Home(e)),
         written => Ok(written),
     }
@@ -339,16 +348,11 @@ pub(crate) fn default_repo_policy() -> Result<RepoPolicy, CliError> {
     })
 }
 
-/// The machine's hook-admission settings, or the stated defaults when
-/// machine.toml is missing or will not parse. A hook cannot refuse to
-/// answer over a settings problem any more than over anything else it
-/// might hit — that failure belongs to `relais doctor`, not to a hook
-/// answer holding a tool call open.
-pub(crate) fn hook_admission_settings() -> relais::policy::HookAdmissionSettings {
-    hook_admission_settings_from(&shared_state_for_hook().state)
-}
-
-/// [`hook_admission_settings`] read through `state`: the hook reads them
+/// The machine's hook-admission settings read through `state`, or the
+/// stated defaults when machine.toml is missing or will not parse. A hook
+/// cannot refuse to answer over a settings problem any more than over
+/// anything else it might hit — that failure belongs to `relais doctor`,
+/// not to a hook answer holding a tool call open. The hook reads them
 /// through the state it already built for its claim passes. A client's
 /// answer is waited for at most `SHARED_CLAIM_DEADLINE`, on a thread of
 /// its own, then the defaults apply: a hook holds no tool call open on a
@@ -651,5 +655,204 @@ mod home_drift_warning_tests {
             ),
             CliError::Home(_)
         ));
+    }
+
+    /// an-t29: a command builds its `SharedState` once. `LocalState` holds no
+    /// state, so no behaviour tells one build from two; the sources do. Every
+    /// call to `shared_state()` or a wrapper that builds one is counted per
+    /// function, outside this file and its tests: only a command entry may
+    /// hold one, and at most one, so a helper that builds its own (a second
+    /// state for its command) fails here.
+    mod one_state_per_command_tests {
+        /// Every file of `src/cli`, so a new one cannot escape the count.
+        const SOURCES: &[(&str, &str)] = &[
+            ("coordinator.rs", include_str!("coordinator.rs")),
+            ("decide.rs", include_str!("decide.rs")),
+            ("decision_record.rs", include_str!("decision_record.rs")),
+            ("doctor.rs", include_str!("doctor.rs")),
+            ("evidence.rs", include_str!("evidence.rs")),
+            ("feedback.rs", include_str!("feedback.rs")),
+            ("install.rs", include_str!("install.rs")),
+            ("learn.rs", include_str!("learn.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            ("native.rs", include_str!("native.rs")),
+            ("outcome.rs", include_str!("outcome.rs")),
+            ("plan.rs", include_str!("plan.rs")),
+            ("programme.rs", include_str!("programme.rs")),
+            ("protocol.rs", include_str!("protocol.rs")),
+            ("recipe.rs", include_str!("recipe.rs")),
+            ("replay.rs", include_str!("replay.rs")),
+            ("report.rs", include_str!("report.rs")),
+            ("resume.rs", include_str!("resume.rs")),
+            ("run.rs", include_str!("run.rs")),
+            ("salvage.rs", include_str!("salvage.rs")),
+            ("status.rs", include_str!("status.rs")),
+            ("trust.rs", include_str!("trust.rs")),
+        ];
+
+        /// `ctx` functions that build a state (`write_settings` only as a free
+        /// call: `.write_settings(` is the trait method on a state in hand).
+        const BUILDERS: &[&str] = &[
+            "shared_state",
+            "load_machine",
+            "load_price_table",
+            "load_machine_pricing",
+            "machine_for_router",
+            "write_settings",
+            "tuning_bounds",
+            "shared_state_for_hook",
+        ];
+
+        /// A command entry: what `cli/mod.rs` dispatches to.
+        fn is_command_entry(function: &str) -> bool {
+            function.ends_with("_command") || function == "hook_respond"
+        }
+
+        /// The name a top-level `fn` line declares.
+        fn declared(line: &str) -> Option<&str> {
+            let rest = line
+                .strip_prefix("pub(crate) fn ")
+                .or_else(|| line.strip_prefix("fn "))?;
+            let end = rest
+                .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .unwrap_or(rest.len());
+            Some(&rest[..end])
+        }
+
+        /// How many builder calls `line` makes.
+        fn builder_calls(line: &str) -> usize {
+            BUILDERS
+                .iter()
+                .map(|builder| {
+                    line.match_indices(builder)
+                        .filter(|(at, _)| {
+                            let before = line[..*at].chars().next_back();
+                            let after = line[*at + builder.len()..].chars().next();
+                            let own_word = !matches!(before, Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '.');
+                            // A call, or the path handed on as a value
+                            // (`LazyCell::new(super::ctx::shared_state)`).
+                            let called = after == Some('(');
+                            // holds-until: no cli file passes an imported builder
+                            // bare as a value (`LazyCell::new(shared_state)` after a
+                            // `use`); drop the `::` test when one does.
+                            let handed_on = line[..*at].ends_with("::") && matches!(after, Some(')' | ','));
+                            own_word && (called || handed_on)
+                        })
+                        .count()
+                })
+                .sum()
+        }
+
+        /// Functions that hand a builder on as a factory and call it once per
+        /// path (`decide_in`'s `shared`, plan Census): counted by the
+        /// bare-path rule, not builds. Named here, so a new one is a reviewed
+        /// entry, not a silent pass.
+        const FACTORY_HAND_ON: &[(&str, &str)] = &[("decide.rs", "decide_inner")];
+
+        /// Builder calls per function of one source, test modules excluded.
+        fn census(source: &str) -> Vec<(String, usize)> {
+            let mut counts: Vec<(String, usize)> = Vec::new();
+            let mut current = String::new();
+            for line in source.lines() {
+                if line.starts_with("#[cfg(test)]") {
+                    break;
+                }
+                if let Some(name) = declared(line) {
+                    current = name.to_string();
+                    continue;
+                }
+                // A method is not a command entry: a build inside an `impl`
+                // is counted under the impl's name, so it fails the guard.
+                if line.starts_with("impl") {
+                    current = line.trim_end_matches(" {").to_string();
+                    continue;
+                }
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let calls = builder_calls(line);
+                if calls == 0 {
+                    continue;
+                }
+                match counts.iter_mut().find(|(name, _)| *name == current) {
+                    Some((_, count)) => *count += calls,
+                    None => counts.push((current.clone(), calls)),
+                }
+            }
+            counts
+        }
+
+        #[test]
+        fn every_cli_file_is_counted() {
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/cli");
+            let mut on_disk: Vec<String> = std::fs::read_dir(dir)
+                .expect("src/cli")
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .into_string()
+                        .expect("utf-8")
+                })
+                .filter(|name| name.ends_with(".rs") && name != "ctx.rs")
+                .collect();
+            on_disk.sort();
+            let counted: Vec<String> = SOURCES.iter().map(|(name, _)| name.to_string()).collect();
+            assert_eq!(on_disk, counted, "add the new file to SOURCES");
+        }
+
+        #[test]
+        fn every_command_builds_its_shared_state_once() {
+            let mut wrong = Vec::new();
+            for (file, source) in SOURCES {
+                for (function, calls) in census(source) {
+                    // The one factory hand-on is not a build; any other call
+                    // beside it in the same function is.
+                    if FACTORY_HAND_ON.contains(&(*file, function.as_str())) && calls == 1 {
+                        continue;
+                    }
+                    if !is_command_entry(&function) || calls > 1 {
+                        wrong.push(format!("{file}:{function} {calls}"));
+                    }
+                }
+            }
+            assert!(
+                wrong.is_empty(),
+                "each command builds one SharedState and hands it down: {wrong:?}"
+            );
+            // An exemption whose function moved or went is stale, not a pass.
+            for (file, function) in FACTORY_HAND_ON {
+                let (_, source) = SOURCES
+                    .iter()
+                    .find(|(name, _)| name == file)
+                    .expect("an exempt file is counted");
+                assert!(
+                    census(source)
+                        .iter()
+                        .any(|(name, calls)| name == function && *calls == 1),
+                    "{file}:{function} no longer hands a builder on once; drop or fix it"
+                );
+            }
+        }
+
+        #[test]
+        fn the_census_counts_calls_not_their_lookalikes() {
+            assert_eq!(builder_calls("let s = shared_state()?;"), 1);
+            assert_eq!(builder_calls("load_machine_pricing()?"), 1);
+            assert_eq!(builder_calls("machine_of(&*shared)?"), 0);
+            assert_eq!(builder_calls("route::default_tuning_bounds(a, b)"), 0);
+            assert_eq!(builder_calls("state.write_settings(who, edit)"), 0);
+            assert_eq!(builder_calls("super::ctx::write_settings(&edit)?"), 1);
+            assert_eq!(builder_calls("LazyCell::new(super::ctx::shared_state)"), 1);
+            assert_eq!(builder_calls("fn run(shared_state: u8)"), 0);
+            assert_eq!(
+                census("fn a_command() {\n    load_machine()?;\n    // shared_state()\n    shared_state()?;\n}\n#[cfg(test)]\nfn t() { shared_state(); }\n"),
+                vec![("a_command".to_string(), 2)]
+            );
+            assert_eq!(
+                census("fn a_command() {}\nimpl Helper {\n    fn build(&self) {\n        shared_state();\n    }\n}\n"),
+                vec![("impl Helper".to_string(), 1)]
+            );
+        }
     }
 }

@@ -323,7 +323,13 @@ it could not renew or give back ends by its TTL.
   a successor intent, and runs the worker through the one it built, so a
   client that keeps per-instance state releases what it granted.
   `relais dataset replay` does the same for the effort bounds, the machine
-  settings, the prices and the run (an-t25).
+  settings, the prices and the run (an-t25). Every other command builds one
+  too (an-t29): `report` for its import and its routing section, `doctor`
+  for its findings, `trust grant` for its read and its write, `install` for
+  its two settings writes and its hooks step (only when a step needs one),
+  and `learn cycle` for its settings and the registry pointers. The test
+  `every_command_builds_its_shared_state_once` counts the builds per
+  function in `src/cli`.
 - The trait still speaks a few relais value types (`MachineSettings`,
   `MicroUsd`, `RunId`, `Contest`), so a client builds against one exact
   relais version, as an-t13's build plan pins it.

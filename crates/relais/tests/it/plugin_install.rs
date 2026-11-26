@@ -528,3 +528,56 @@ fn an_install_under_an_absent_external_layer_says_not_recorded_and_writes_nothin
     }
     assert_eq!(std::fs::read_to_string(&machine).unwrap(), mine);
 }
+
+/// an-t29: the install's one state is shared by its two settings writes and
+/// the hooks step. Under `external` with no client the writes say they were
+/// not recorded and the hooks step reads the default admission settings
+/// through `LocalState`, as the hook itself does, so the install still wires
+/// its hooks with the timeouts a local machine gets. A regression guard:
+/// main passes it too.
+#[test]
+fn an_install_with_hooks_under_an_absent_external_layer_still_succeeds() {
+    /// The timeouts of the `PreToolUse` handlers the install wrote.
+    fn pre_tool_use_timeouts(world: &World) -> Vec<serde_json::Value> {
+        let path = world.project.join(".claude").join("settings.json");
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("settings.json"))
+                .expect("json");
+        let handlers = settings["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse handlers");
+        handlers
+            .iter()
+            .flat_map(|matcher| matcher["hooks"].as_array().cloned().unwrap_or_default())
+            .map(|hook| hook["timeout"].clone())
+            .collect()
+    }
+    let args = ["install", "--claude", "--write", "--hooks"];
+    let local = World::new("hooks-local");
+    let out = local.relais(&args);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+
+    let world = World::new("hooks-external");
+    let machine = world.root.join("cfg").join("machine.toml");
+    let mine = "schema_version = 1\nshared_state = \"external\"\n";
+    std::fs::write(&machine, mine).unwrap();
+    let out = world.relais(&args);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stderr = text(&out.stderr);
+    for what in [
+        "session routing not recorded",
+        "automatic promotion not recorded",
+    ] {
+        assert_eq!(
+            stderr.lines().filter(|line| line.contains(what)).count(),
+            1,
+            "{stderr}"
+        );
+    }
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains("--hooks: wired"), "{stdout}");
+    let timeouts = pre_tool_use_timeouts(&world);
+    assert!(!timeouts.is_empty(), "a PreToolUse handler is wired");
+    assert_eq!(timeouts, pre_tool_use_timeouts(&local));
+    assert_eq!(std::fs::read_to_string(&machine).unwrap(), mine);
+}

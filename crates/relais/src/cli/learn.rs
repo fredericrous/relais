@@ -527,7 +527,11 @@ pub(crate) fn learn_cycle_command(
     use relais::admission::TrainingDecision;
     let mut out = CycleOut::open(log, quiet)?;
     let ledger = open_ledger()?;
-    let machine = load_machine()?;
+    // One state for the machine settings and the registry pointers
+    // (an-t29), built before the coordinator is started, so an absent
+    // external layer starts nothing.
+    let shared = super::ctx::shared_state()?;
+    let machine = super::ctx::machine_of(&*shared)?;
     let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
     let client = match relais::coordinator::ensure_running(&socket) {
         Ok(client) => client,
@@ -649,7 +653,7 @@ pub(crate) fn learn_cycle_command(
     };
     let registry = registry()?;
     let datasets = datasets_dir()?;
-    let pointers = relais::shared_state::node::NodePointers(super::ctx::shared_state()?);
+    let pointers = relais::shared_state::node::NodePointers(shared);
     let inputs = relais::learn::cycle::CycleInputs {
         ledger: &ledger,
         registry: &registry,
