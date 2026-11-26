@@ -478,7 +478,7 @@ pub(crate) fn check_command(
                 .map_err(programme_error)?;
             let from_ref = load::added_since_merge_base(&located.checkout, &located.slug, rev)
                 .map_err(programme_error)?;
-            analysis::duplicate_ids(&own, &from_ref, dir, Some(rev))
+            analysis::duplicate_ids(&own, Some((&from_ref, rev)), dir)
         }
         None => {
             let own: BTreeSet<String> = programme
@@ -487,11 +487,22 @@ pub(crate) fn check_command(
                 .chain(&programme.unreadable)
                 .cloned()
                 .collect();
-            analysis::duplicate_ids(&own, &BTreeSet::new(), dir, None)
+            analysis::duplicate_ids(&own, None, dir)
         }
     };
+    // Under `--with-ref` the duplicates name the checkout's files, not the
+    // ref's, so they carry no `(<ref>) ` tag.
+    let untagged_from = match with_ref {
+        Some(_) => problems.len(),
+        None => usize::MAX,
+    };
     problems.extend(duplicates);
-    for problem in &problems {
+    for (index, problem) in problems.iter().enumerate() {
+        let tag = if index < untagged_from {
+            tag.as_str()
+        } else {
+            ""
+        };
         eprintln!(
             "{}:{}: {tag}{}",
             dir.join(&problem.file).display(),

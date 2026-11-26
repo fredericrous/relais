@@ -1894,7 +1894,7 @@ fn with_ref_reads_the_branch_tickets_when_the_programme_is_read_from_origin() {
     let stderr = text(&out.stderr);
     assert!(
         stderr.contains(&format!(
-            "f71-b.md:1: ({rev}) id f71 is also used by {} on {rev}; renumber to f72\n",
+            "f71-b.md:1: id f71 is also used by {} on {rev}; renumber to f72\n",
             world.dir().join("f71-a.md").display()
         )),
         "{stderr}"
@@ -1913,4 +1913,19 @@ fn with_ref_refuses_an_empty_or_dash_ref_before_reading_anything() {
             text(&out.stderr)
         );
     }
+}
+
+#[test]
+fn with_ref_naming_no_ref_exits_one_with_one_relais_line() {
+    let world = world_with_trunk_and_feature("ref-missing", &[]);
+    let out = world.programme(&["check", "--no-fetch", "--with-ref", "no-such-ref"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "");
+    let stderr = text(&out.stderr);
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("relais:"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{stderr}");
+    assert!(lines[0].contains("no-such-ref"), "{stderr}");
 }

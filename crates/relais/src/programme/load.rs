@@ -346,16 +346,19 @@ pub fn added_since_merge_base(
     slug: &str,
     rev: &str,
 ) -> Result<BTreeSet<String>, ProgrammeError> {
-    let base = git_stdout(checkout, &["merge-base", "HEAD", rev]).map_err(|e| match e {
-        ProgrammeError::Git { repo, detail } => ProgrammeError::Git {
-            repo,
-            detail: format!(
-                "{rev} shares no history with HEAD, or is not a ref ({})",
-                detail.trim_end_matches(": ")
-            ),
+    // git's own words first (a timeout reads as one), then the likely cause.
+    let base = git_stdout(checkout, &["merge-base", "--end-of-options", "HEAD", rev]).map_err(
+        |e| match e {
+            ProgrammeError::Git { repo, detail } => ProgrammeError::Git {
+                repo,
+                detail: format!(
+                    "merge-base HEAD {rev}: {}; is {rev} a ref sharing history with HEAD?",
+                    detail.trim_end_matches(": ")
+                ),
+            },
+            other => other,
         },
-        other => other,
-    })?;
+    )?;
     let base = base.trim();
     let relative = format!("docs/programmes/{slug}/");
     let names = git_stdout(
@@ -367,6 +370,7 @@ pub fn added_since_merge_base(
             "--diff-filter=A",
             &format!("--relative={relative}"),
             "-z",
+            "--end-of-options",
             base,
             rev,
             "--",

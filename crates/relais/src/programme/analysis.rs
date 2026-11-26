@@ -275,7 +275,7 @@ fn id_prefix(id: &str) -> Option<(&str, &str)> {
 
 /// Where a ticket id checked by [`duplicate_ids`] comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Origin {
+enum Listing {
     /// A ticket file of the directory being checked.
     Branch,
     /// A ticket the ref added since the merge-base, absent from the branch.
@@ -294,20 +294,26 @@ enum Origin {
 /// are different ids.
 pub fn duplicate_ids(
     own: &BTreeSet<String>,
-    from_ref: &BTreeSet<String>,
+    from_ref: Option<(&BTreeSet<String>, &str)>,
     dir: &Path,
-    rev: Option<&str>,
 ) -> Vec<Problem> {
-    let mut tickets: Vec<(&str, Origin)> =
-        own.iter().map(|id| (id.as_str(), Origin::Branch)).collect();
+    let (ref_ids, rev) = match from_ref {
+        Some((ids, rev)) => (Some(ids), Some(rev)),
+        None => (None, None),
+    };
+    let mut tickets: Vec<(&str, Listing)> = own
+        .iter()
+        .map(|id| (id.as_str(), Listing::Branch))
+        .collect();
     tickets.extend(
-        from_ref
-            .iter()
+        ref_ids
+            .into_iter()
+            .flatten()
             .filter(|id| !own.contains(*id))
-            .map(|id| (id.as_str(), Origin::Ref)),
+            .map(|id| (id.as_str(), Listing::Ref)),
     );
     tickets.sort_unstable();
-    let mut groups: BTreeMap<(&str, &str), Vec<(&str, Origin)>> = BTreeMap::new();
+    let mut groups: BTreeMap<(&str, &str), Vec<(&str, Listing)>> = BTreeMap::new();
     let mut highest: BTreeMap<&str, Option<u64>> = BTreeMap::new();
     for &(id, origin) in &tickets {
         let Some((letters, digits)) = id_prefix(id) else {
@@ -334,10 +340,10 @@ pub fn duplicate_ids(
             .copied()
             .flatten()
             .and_then(|high| high.checked_add(1));
-        let ref_took_it = group.iter().any(|(_, origin)| *origin == Origin::Ref);
+        let ref_took_it = group.iter().any(|(_, origin)| *origin == Listing::Ref);
         let mut first_branch_seen = false;
         for &(id, origin) in group {
-            if origin == Origin::Ref {
+            if origin == Listing::Ref {
                 continue;
             }
             if !first_branch_seen && !ref_took_it {
@@ -351,15 +357,15 @@ pub fn duplicate_ids(
                     .iter()
                     .copied()
                     .find(|&(candidate, candidate_origin)| {
-                        candidate != id && (!ref_took_it || candidate_origin == Origin::Ref)
+                        candidate != id && (!ref_took_it || candidate_origin == Listing::Ref)
                     })
             else {
                 continue;
             };
             let other_path = dir.join(format!("{other}.md"));
             let other_named = match (other_origin, rev) {
-                (Origin::Ref, Some(rev)) => format!("{} on {rev}", other_path.display()),
-                _ => other_path.display().to_string(),
+                (Listing::Ref, Some(rev)) => format!("{} on {rev}", other_path.display()),
+                (Listing::Ref, None) | (Listing::Branch, _) => other_path.display().to_string(),
             };
             let renumber = match next {
                 Some(next) => format!("; renumber to {letters}{next}"),
@@ -484,9 +490,8 @@ mod tests {
     fn duplicates(own: &[&str], from_ref: &[&str]) -> Vec<(String, String)> {
         duplicate_ids(
             &ids(own),
-            &ids(from_ref),
+            Some((&ids(from_ref), "origin/main")),
             Path::new("d"),
-            Some("origin/main"),
         )
         .into_iter()
         .map(|problem| (problem.file, problem.message))
