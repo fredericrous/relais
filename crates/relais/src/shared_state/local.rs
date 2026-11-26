@@ -202,7 +202,7 @@ impl SharedState for LocalState {
     }
 
     fn spent_between(&self, from: &str, to: &str) -> Result<Option<MicroUsd>, SharedStateError> {
-        super::day_bounds(from, to)?;
+        super::range_bounds(from, to)?;
         Ok(None)
     }
 

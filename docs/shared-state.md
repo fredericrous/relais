@@ -235,8 +235,12 @@ state:
   with more than one node feeding the counter, sum each node's
   `ledger_micros`, `dropped_micros` and `waiting_micros` from its own run
   against one `counter_micros`. `log_incomplete` is a day the log was
-  rotated past (one old file is kept past 1 MiB): the drops of that day are
-  unknown, so there is no verdict. A run with no coordinator logs its drop
+  rotated past (one old file is kept past 1 MiB; the day of its oldest line
+  counts, since the rotation took that day's earlier lines): the drops of that
+  day are unknown, so there is no verdict. `waiting_unknown` is a day judged
+  while `seat-settles.json` could not be read (the command says so on stderr).
+  `cutover` is the first day the counter was fed, and the days before it that
+  spent while the counter read 0: leave them out of the check. A run with no coordinator logs its drop
   on its own stderr, which the command does not read.
 - The command does not read the primary's slice or seats. A private build's client
   (an-t13) or the primary's operator reads them; a status command is a

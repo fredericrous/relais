@@ -364,12 +364,12 @@ impl SharedState for FakeState {
     }
 
     fn spent_between(&self, from: &str, to: &str) -> Result<Option<MicroUsd>, SharedStateError> {
-        let (from, to) = super::day_bounds(from, to)?;
+        let range = super::range_bounds(from, to)?;
         let total: i64 = self
             .lock()
             .booked
             .iter()
-            .filter(|(at, _)| (from..to).contains(at))
+            .filter(|(at, _)| range.contains(at))
             .map(|(_, micros)| micros)
             .sum();
         Ok(Some(MicroUsd::from_micros(total)))

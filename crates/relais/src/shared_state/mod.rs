@@ -58,10 +58,10 @@ use crate::policy::MachineSettings;
 pub(crate) const PRIMARY_UNREAD: &str =
     "`relais counter` shows this node's side; no relais command reads the primary itself";
 
-/// The bounds of a [`SharedState::spent_between`] read as unix seconds:
+/// The bounds of a [`SharedState::spent_between`] read as a range of unix seconds:
 /// `Refused` for a malformed bound or `from > to`, so every implementation
 /// judges them alike.
-pub fn day_bounds(from: &str, to: &str) -> Result<(i64, i64), SharedStateError> {
+pub fn range_bounds(from: &str, to: &str) -> Result<std::ops::Range<i64>, SharedStateError> {
     let parse = |text: &str| {
         chrono::DateTime::parse_from_rfc3339(text)
             .map(|at| at.timestamp())
@@ -75,7 +75,7 @@ pub fn day_bounds(from: &str, to: &str) -> Result<(i64, i64), SharedStateError> 
             reason: "the range ends before it starts".into(),
         });
     }
-    Ok((from, to))
+    Ok(from..to)
 }
 
 /// The single-owner operations nodes share (an-t01's list), shaped by
@@ -133,7 +133,7 @@ pub trait SharedState: Send + Sync {
     /// What the global counter booked in `[from, to)` (RFC 3339 bounds),
     /// the read behind `relais counter` (an-t35). One rule for every
     /// implementation: the bounds are checked first (a malformed bound, or
-    /// `from > to`, is [`SharedStateError::Refused`], see [`day_bounds`]),
+    /// `from > to`, is [`SharedStateError::Refused`], see [`range_bounds`]),
     /// then the answer is `None` exactly when [`SharedState::daily_spent`]
     /// answers `None` (there is no counter), else `Some`; `from == to` is
     /// `Some(0)`. A counter answers it from the settles it booked, by the

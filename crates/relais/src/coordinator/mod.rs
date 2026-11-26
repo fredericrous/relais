@@ -41,7 +41,7 @@ use crate::procs::{kill, terminate, LockFile};
 use crate::shared_state::{Principal, SharedState};
 
 mod seats;
-pub use seats::{settles_path, waiting_settles, WaitingSettle};
+pub use seats::{settles_path, waiting_settles, WaitingSettle, WaitingSettlesError};
 pub use seats::{LogSink, SeatBook};
 
 /// Write one line to the daemon's stderr (the coordinator log), starting

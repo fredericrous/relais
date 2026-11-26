@@ -16,6 +16,7 @@ use relais::money::MicroUsd;
 use relais::paths;
 use relais::shared_state::SharedState;
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -44,6 +45,8 @@ enum Check {
     /// More than the ledger by over 5%: another node feeds the counter, or
     /// something books twice. This node's ledger cannot judge the day.
     CounterAboveLedger,
+    /// The waiting settles could not be read, so the day cannot be judged.
+    WaitingUnknown,
     /// Within 5% of the ledger.
     Ok,
     /// Over 5% below the ledger: the floor is due.
@@ -60,6 +63,7 @@ impl Check {
             Self::Cutover => "cutover",
             Self::Edge => "edge",
             Self::CounterAboveLedger => "counter_above_ledger",
+            Self::WaitingUnknown => "waiting_unknown",
             Self::Ok => "ok",
             Self::Short => "short",
         }
@@ -74,14 +78,15 @@ struct Figures {
     ledger: i64,
     /// `None` for a day the log does not cover.
     dropped: Option<i64>,
-    waiting: i64,
+    /// `None` when the settles file could not be read.
+    waiting: Option<i64>,
 }
 
 impl Figures {
     /// What the ledger holds that neither the counter, the drops nor the
     /// waiting settles account for.
     fn gap(&self) -> Option<i64> {
-        Some(self.ledger - self.counter? - self.dropped? - self.waiting)
+        Some(self.ledger - self.counter? - self.dropped? - self.waiting?)
     }
 
     fn short_percent(&self) -> Option<f64> {
@@ -96,7 +101,16 @@ impl Figures {
 /// judged on. Pure: the day edge and the cutover need the neighbours.
 fn assess(days: &[Figures], today: NaiveDate) -> Vec<(Option<f64>, Check)> {
     let percents: Vec<Option<f64>> = days.iter().map(Figures::short_percent).collect();
-    let fed_before = |at: usize| days[..at].iter().all(|day| day.counter == Some(0));
+    // The first day the counter was fed, when it was not fed from the
+    // start of the window: the days before it that spent are the cutover.
+    let first_fed = days
+        .iter()
+        .position(|day| day.counter.is_some_and(|counter| counter > 0))
+        .filter(|&at| {
+            days[..at]
+                .iter()
+                .any(|day| day.ledger > 0 && day.counter == Some(0))
+        });
     days.iter()
         .enumerate()
         .map(|(at, day)| {
@@ -108,8 +122,10 @@ fn assess(days: &[Figures], today: NaiveDate) -> Vec<(Option<f64>, Check)> {
                 Check::NoLedgerSpend
             } else if day.day == today {
                 Check::Partial
-            } else if at > 0 && day.counter > Some(0) && fed_before(at) {
+            } else if first_fed.is_some_and(|fed| at <= fed) {
                 Check::Cutover
+            } else if percents[at].is_none() {
+                Check::WaitingUnknown
             } else {
                 match percents[at] {
                     Some(percent) if percent > FLOOR_PERCENT => {
@@ -157,6 +173,9 @@ struct DropLog {
     unparsed: usize,
     /// The files that were read.
     files: Vec<PathBuf>,
+    /// `coordinator.log.1` was read: the log was rotated, so what the oldest
+    /// stamp's day logged before it is gone.
+    rotated: bool,
 }
 
 /// The line-final `(dropped_micros=<n>)` of a line: the refusal line carries
@@ -181,7 +200,7 @@ impl DropLog {
                 .and_then(|word| chrono::DateTime::parse_from_rfc3339(word).ok())
                 .map(|at| at.with_timezone(&chrono::Utc));
             if let Some(at) = stamp {
-                if self.covers_from.map_or(true, |oldest| at < oldest) {
+                if self.covers_from.is_none_or(|oldest| at < oldest) {
                     self.covers_from = Some(at);
                 }
             }
@@ -200,7 +219,7 @@ impl DropLog {
     /// Read both files of the rotation. Both are opened before either is
     /// read, and a file seen twice (the same inode, a rotation between the
     /// two opens) is read once.
-    fn read(dir: &Path) -> Result<Self, std::io::Error> {
+    fn read(dir: &Path) -> Result<Self, CliError> {
         let mut log = Self::default();
         let mut open = Vec::new();
         for name in [relais::coordinator::DAEMON_LOG, "coordinator.log.1"] {
@@ -208,7 +227,13 @@ impl DropLog {
             match std::fs::File::open(&path) {
                 Ok(file) => open.push((path, file)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
+                Err(cause) => {
+                    return Err(CliError::Read {
+                        what: "the coordinator log",
+                        path,
+                        cause,
+                    })
+                }
             }
         }
         let mut seen = Vec::new();
@@ -220,17 +245,27 @@ impl DropLog {
                 seen.push(id);
             }
             let mut bytes = Vec::new();
-            std::io::Read::read_to_end(&mut file, &mut bytes)?;
+            if let Err(cause) = file.read_to_end(&mut bytes) {
+                return Err(CliError::Read {
+                    what: "the coordinator log",
+                    path,
+                    cause,
+                });
+            }
+            log.rotated |= path.ends_with("coordinator.log.1");
             log.add_text(&String::from_utf8_lossy(&bytes));
             log.files.push(path);
         }
         Ok(log)
     }
 
-    /// Whether the log covers `day`: it has no gap before its oldest stamp.
+    /// Whether the log covers `day`: nothing it logged that day is gone. The
+    /// day of the oldest stamp is covered only while the log was never
+    /// rotated, since a rotation drops that day's earlier lines.
     fn covers(&self, day: NaiveDate) -> bool {
-        self.covers_from
-            .is_some_and(|oldest| day >= oldest.date_naive())
+        self.covers_from.is_some_and(|oldest| {
+            day > oldest.date_naive() || (day == oldest.date_naive() && !self.rotated)
+        })
     }
 }
 
@@ -252,7 +287,7 @@ struct DayRow {
     counter_micros: Option<i64>,
     ledger_micros: i64,
     dropped_micros: Option<i64>,
-    waiting_micros: i64,
+    waiting_micros: Option<i64>,
     short_percent: Option<f64>,
     check: &'static str,
 }
@@ -304,21 +339,28 @@ fn emit(text: &str) -> Result<(), CliError> {
     }
 }
 
+/// One stderr line; a closed stderr cannot make a successful read fail.
+fn warn(line: &str) {
+    let _ = writeln!(std::io::stderr().lock(), "{line}"); // nowhere left to say a failed write
+}
+
+/// A table amount in dollars to four places, so columns line up; the JSON
+/// keeps the micro-dollars.
 fn money(micros: Option<i64>) -> String {
     micros.map_or("-".to_string(), |micros| {
-        MicroUsd::from_micros(micros).to_string()
+        format!("${:.4}", micros as f64 / 1_000_000.0)
     })
 }
 
 /// One text row, at most 80 columns for the usual figures.
 fn text_row(row: &DayRow) -> String {
     format!(
-        "{:<10} {:>9} {:>9} {:>9} {:>9} {:>6} {}\n",
+        "{:<10} {:>9} {:>9} {:>9} {:>8} {:>6} {}\n",
         row.day,
         money(row.counter_micros),
         money(Some(row.ledger_micros)),
         money(row.dropped_micros),
-        money(Some(row.waiting_micros)),
+        money(row.waiting_micros),
         row.short_percent
             .map_or("-".to_string(), |percent| format!("{percent:.1}")),
         row.check,
@@ -333,25 +375,47 @@ fn render_text(document: &CounterDocument) -> String {
         out.push_str("the shared counter beside this node's ledger (shared_state = external)\n");
     }
     out.push_str(&format!(
-        "{:<10} {:>9} {:>9} {:>9} {:>9} {:>6} check\n",
+        "{:<10} {:>9} {:>9} {:>9} {:>8} {:>6} check\n",
         "day", "counter", "ledger", "dropped", "waiting", "short%"
     ));
+    let short: Vec<&DayRow> = document
+        .days
+        .iter()
+        .filter(|row| row.check == Check::Short.name())
+        .collect();
+    if document.selection != "local" {
+        out.push_str(&match short.first() {
+            None => "no day is short\n".to_string(),
+            Some(newest) => format!(
+                "{} day(s) short, newest {}: the floor is due (docs/shared-state.md)\n",
+                short.len(),
+                newest.day
+            ),
+        });
+    }
     for row in &document.days {
         out.push_str(&text_row(row));
     }
     let waiting = &document.waiting;
-    out.push_str(&format!(
-        "waiting settles on this node: {} worth {}{}\n",
-        waiting.count,
-        MicroUsd::from_micros(waiting.micros),
-        waiting
-            .oldest_since
-            .as_deref()
-            .map_or(String::new(), |since| format!(", oldest since {since}")),
-    ));
+    if waiting.error.is_some() {
+        out.push_str("waiting: unreadable (see stderr); short days may be overstated\n");
+    } else {
+        out.push_str(&format!(
+            "waiting: {} settle(s), {}{}\n",
+            waiting.count,
+            money(Some(waiting.micros)),
+            waiting
+                .oldest_since
+                .as_deref()
+                .map_or(String::new(), |since| format!(
+                    ", oldest {}",
+                    since.get(..10).unwrap_or(since)
+                )),
+        ));
+    }
     out.push_str(
-        "dropped is read from this node's coordinator.log; the first-fed (cutover) day\n\
-         is the person's to exclude.\n",
+        "dropped is read from this node's coordinator.log. A `cutover` day is the first\n\
+         the counter was fed: leave it out of the check.\n",
     );
     out
 }
@@ -361,7 +425,7 @@ fn measure(
     state: &dyn SharedState,
     ledger: Option<&Ledger>,
     log: &DropLog,
-    waiting: &[relais::coordinator::WaitingSettle],
+    waiting: Option<&[relais::coordinator::WaitingSettle]>,
     today: NaiveDate,
     days: u32,
 ) -> Result<Vec<Figures>, CliError> {
@@ -375,7 +439,7 @@ fn measure(
             .map(MicroUsd::to_micros);
         let ledger_micros = match ledger {
             Some(ledger) => {
-                operational(ledger.spend_between(&from, &to), "the ledger sum")?.to_micros()
+                operational(ledger.spend_between(&from, &to), "reading the ledger")?.to_micros()
             }
             None => 0,
         };
@@ -386,11 +450,12 @@ fn measure(
             dropped: log
                 .covers(day)
                 .then(|| log.by_day.get(&day).copied().unwrap_or(0)),
-            waiting: waiting
-                .iter()
-                .filter(|settle| unix_day(settle.since) == Some(day))
-                .map(|settle| settle.micros)
-                .sum(),
+            waiting: waiting.map(|list| {
+                list.iter()
+                    .filter(|settle| unix_day(settle.since) == Some(day))
+                    .map(|settle| settle.micros)
+                    .sum()
+            }),
         });
     }
     Ok(figures)
@@ -404,16 +469,16 @@ pub(crate) fn counter_command(days: u32, format: Format) -> Result<CliOutcome, C
     }
     let state = shared_state()?;
     let ledger_path = paths::ledger_path().map_err(CliError::Home)?;
-    let ledger = if ledger_path.exists() {
+    let ledger = if operational(ledger_path.try_exists(), "reading the ledger")? {
         Some(operational(
             Ledger::open_read_only(&ledger_path),
-            "the ledger is unavailable",
+            "reading the ledger",
         )?)
     } else {
         None
     };
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
-    let log = operational(DropLog::read(&state_dir), "reading the coordinator log")?;
+    let log = DropLog::read(&state_dir)?;
     let settles_file = relais::coordinator::settles_path(&ledger_path);
     let waiting = relais::coordinator::waiting_settles(&settles_file);
     let today = chrono::Utc::now().date_naive();
@@ -421,7 +486,7 @@ pub(crate) fn counter_command(days: u32, format: Format) -> Result<CliOutcome, C
         &*state,
         ledger.as_ref(),
         &log,
-        waiting.as_deref().unwrap_or(&[]),
+        waiting.as_deref().ok(),
         today,
         days,
     )?;
@@ -461,7 +526,7 @@ pub(crate) fn counter_command(days: u32, format: Format) -> Result<CliOutcome, C
             count: 0,
             micros: 0,
             oldest_since: None,
-            error: Some(error.clone()),
+            error: Some(error.to_string()),
         },
     };
     let document = CounterDocument {
@@ -484,16 +549,17 @@ pub(crate) fn counter_command(days: u32, format: Format) -> Result<CliOutcome, C
     } else {
         emit(&render_text(&document))?;
         if let Some(error) = &document.waiting.error {
-            eprintln!(
-                "relais counter: the waiting settles could not be read: {error} ({})",
+            warn(&format!(
+                "relais counter: the waiting settles could not be read: {error} ({}); short \
+                 days may be overstated",
                 settles_file.display()
-            );
+            ));
         }
         if document.log.unparsed > 0 {
-            eprintln!(
+            warn(&format!(
                 "relais counter: {} dropped line(s) had no readable stamp or amount ({})",
                 document.log.unparsed, document.log.path
-            );
+            ));
         }
     }
     Ok(CliOutcome::Accepted)
@@ -512,7 +578,7 @@ mod tests {
         counter: Option<i64>,
         ledger: i64,
         dropped: Option<i64>,
-        waiting: i64,
+        waiting: Option<i64>,
     ) -> Figures {
         Figures {
             day: day(n),
@@ -521,6 +587,11 @@ mod tests {
             dropped,
             waiting,
         }
+    }
+
+    /// A day with nothing dropped or waiting.
+    fn plain(n: u32, counter: i64, ledger: i64) -> Figures {
+        figures(n, Some(counter), ledger, Some(0), Some(0))
     }
 
     fn checks(days: &[Figures]) -> Vec<&'static str> {
@@ -532,43 +603,53 @@ mod tests {
 
     #[test]
     fn a_day_is_judged_against_the_five_percent_floor() {
-        let before = figures(1, Some(0), 0, Some(0), 0);
+        // The node spent before the counter was fed: the first fed day and
+        // the day before it are the cutover.
         assert_eq!(
             checks(&[
-                before.clone(),
-                figures(2, Some(960), 1000, Some(0), 0),
-                figures(3, Some(970), 1000, Some(0), 0),
-                figures(4, Some(1100), 1000, Some(0), 0),
-                figures(5, Some(920), 1000, Some(0), 0),
+                plain(1, 0, 1000),
+                plain(2, 960, 1000),
+                plain(3, 970, 1000),
+                plain(4, 1100, 1000),
+                plain(5, 920, 1000),
             ]),
-            [
-                "no_ledger_spend",
-                "cutover",
-                "ok",
-                "counter_above_ledger",
-                "short"
-            ]
-        );
-        // Dropped and waiting spend is added back before the verdict.
-        assert_eq!(
-            checks(&[
-                before,
-                figures(2, Some(700), 1000, Some(250), 50),
-                figures(3, Some(700), 1000, Some(100), 0),
-            ]),
-            ["no_ledger_spend", "cutover", "short"]
+            ["cutover", "cutover", "ok", "counter_above_ledger", "short"]
         );
     }
 
     #[test]
-    fn a_local_node_and_a_rotated_log_are_not_verdicts() {
+    fn dropped_and_waiting_spend_is_added_back_before_the_verdict() {
         assert_eq!(
-            checks(&[figures(1, None, 1000, Some(0), 0)]),
+            checks(&[
+                plain(1, 500, 520),
+                figures(2, Some(700), 1000, Some(250), Some(50)),
+                figures(3, Some(700), 1000, Some(100), Some(0)),
+            ]),
+            ["ok", "ok", "short"]
+        );
+    }
+
+    #[test]
+    fn quiet_days_before_a_short_day_are_not_a_cutover() {
+        assert_eq!(
+            checks(&[plain(1, 0, 0), plain(2, 0, 0), plain(3, 800, 1000)]),
+            ["no_ledger_spend", "no_ledger_spend", "short"]
+        );
+    }
+
+    #[test]
+    fn a_local_node_a_rotated_log_and_unread_settles_are_not_verdicts() {
+        assert_eq!(
+            checks(&[figures(1, None, 1000, Some(0), Some(0))]),
             ["no_counter"]
         );
         assert_eq!(
-            checks(&[figures(1, Some(0), 1000, None, 0)]),
+            checks(&[figures(1, Some(0), 1000, None, Some(0))]),
             ["log_incomplete"]
+        );
+        assert_eq!(
+            checks(&[figures(1, Some(980), 1000, Some(0), None)]),
+            ["waiting_unknown"]
         );
     }
 
@@ -576,10 +657,10 @@ mod tests {
     fn today_is_partial_and_a_day_edge_pair_is_not_a_floor() {
         // 6% short, then 6% over: together 0%, so the first is an edge.
         let days = [
-            figures(1, Some(500), 520, Some(0), 0),
-            figures(2, Some(940), 1000, Some(0), 0),
-            figures(3, Some(1060), 1000, Some(0), 0),
-            figures(30, Some(10), 1000, Some(0), 0),
+            plain(1, 500, 520),
+            plain(2, 940, 1000),
+            plain(3, 1060, 1000),
+            plain(30, 10, 1000),
         ];
         assert_eq!(
             checks(&days),
@@ -591,9 +672,9 @@ mod tests {
     fn a_short_day_before_a_small_overcount_stays_short() {
         // 12% short, next day 1% over: together still 5.5% short.
         let days = [
-            figures(2, Some(500), 600, Some(0), 0),
-            figures(3, Some(880), 1000, Some(0), 0),
-            figures(4, Some(1010), 1000, Some(0), 0),
+            plain(2, 500, 600),
+            plain(3, 880, 1000),
+            plain(4, 1010, 1000),
         ];
         assert_eq!(checks(&days)[1], "short");
     }
@@ -616,7 +697,14 @@ mod tests {
             "an unstamped drop line is counted, a half line is not"
         );
         assert_eq!(log.covers_from.map(|at| at.date_naive()), Some(day(25)));
-        assert!(log.covers(day(25)) && !log.covers(day(24)));
+        assert!(log.covers(day(25)), "a log never rotated has its first day");
+        assert!(!log.covers(day(24)));
+        log.rotated = true;
+        assert!(
+            !log.covers(day(25)),
+            "a rotation took the oldest day's earlier lines"
+        );
+        assert!(log.covers(day(26)));
     }
 
     #[test]
@@ -632,6 +720,7 @@ mod tests {
         assert_eq!(log.unparsed, 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_log_seen_twice_by_inode_is_read_once() {
         let dir = relais::test_support::short_temp_dir("counter-log");
@@ -649,18 +738,72 @@ mod tests {
     }
 
     #[test]
-    fn the_text_row_fits_eighty_columns_for_usual_figures() {
+    fn the_two_files_of_a_rotation_add_up() {
+        let dir = relais::test_support::short_temp_dir("counter-two-logs");
+        std::fs::write(
+            dir.join("coordinator.log.1"),
+            "2026-11-25T10:00:00.000Z relais coordinator: x (dropped_micros=3)\n\
+             2026-11-26T09:00:00.000Z relais coordinator: x (dropped_micros=4)\n",
+        )
+        .expect("old");
+        std::fs::write(
+            dir.join(relais::coordinator::DAEMON_LOG),
+            "2026-11-26T10:00:00.000Z relais coordinator: x (dropped_micros=5)\n",
+        )
+        .expect("new");
+        let log = DropLog::read(&dir).expect("read");
+        assert_eq!(log.by_day.get(&day(25)), Some(&3));
+        assert_eq!(log.by_day.get(&day(26)), Some(&9));
+        assert_eq!(log.files.len(), 2);
+        assert!(log.rotated);
+        assert!(!log.covers(day(25)) && log.covers(day(26)));
+    }
+
+    #[test]
+    fn a_waiting_settle_belongs_to_the_day_it_began_to_wait() {
+        let began = day(25)
+            .and_hms_opt(10, 0, 0)
+            .expect("time")
+            .and_utc()
+            .timestamp();
+        let waiting = [relais::coordinator::WaitingSettle {
+            micros: 5,
+            since: began,
+        }];
+        let state = relais::shared_state::LocalState::new();
+        let measured = measure(
+            &state,
+            None,
+            &DropLog::default(),
+            Some(&waiting),
+            day(26),
+            3,
+        )
+        .expect("measure");
+        let by_day: Vec<_> = measured.iter().map(|figures| figures.waiting).collect();
+        assert_eq!(by_day, [Some(0), Some(5), Some(0)]);
+        let unread = measure(&state, None, &DropLog::default(), None, day(26), 1).expect("measure");
+        assert_eq!(unread[0].waiting, None);
+    }
+
+    #[test]
+    fn the_text_row_fits_eighty_columns_for_a_big_day_with_the_longest_word() {
         let row = DayRow {
             day: "2026-11-26".into(),
-            counter_micros: Some(12_345_678),
-            ledger_micros: 12_345_678,
-            dropped_micros: Some(1_500_000),
-            waiting_micros: 0,
+            counter_micros: Some(123_456_789),
+            ledger_micros: 123_456_789,
+            dropped_micros: Some(15_000_000),
+            waiting_micros: Some(0),
             short_percent: Some(-100.0),
             check: "counter_above_ledger",
         };
         let text = text_row(&row);
         assert!(text.trim_end().chars().count() <= 80, "{text}");
         assert!(!text.contains('\u{1b}'));
+        let header = format!(
+            "{:<10} {:>9} {:>9} {:>9} {:>8} {:>6} check",
+            "day", "counter", "ledger", "dropped", "waiting", "short%"
+        );
+        assert!(header.chars().count() <= 80);
     }
 }

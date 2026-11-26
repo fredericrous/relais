@@ -1215,6 +1215,7 @@ mod tests {
             ("inside", "2026-09-20T12:00:00+00:00", 100),
             ("zulu", "2026-09-20T13:00:00.500Z", 1_000),
             ("end", "2026-09-21T00:00:00+00:00", 10_000),
+            ("endz", "2026-09-21T00:00:00.000Z", 100_000),
         ] {
             let mut usage = event(id, "run-d", micros);
             usage.at = at.into();
@@ -1224,7 +1225,7 @@ mod tests {
             .spend_between("2026-09-20T00:00:00+00:00", "2026-09-21T00:00:00+00:00")
             .expect("day");
         assert_eq!(day, MicroUsd::from_micros(1_110), "end bound is excluded");
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // a leftover scratch directory is harmless
     }
 
     #[test]
