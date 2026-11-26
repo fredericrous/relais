@@ -8,6 +8,11 @@ missing here.
 
 ## Unreleased
 
+The home fingerprint no longer warns when greengate records a trust or its
+known identity in the shared `.git/config`: the `trusted` and `knownIdentity`
+keys of its `[greengate]` section are left out of the hash. Any other change to
+that file, other `greengate.*` keys included, still warns.
+
 ## v0.88.0
 
 A run whose settle the coordinator did not answer tries it once more after
