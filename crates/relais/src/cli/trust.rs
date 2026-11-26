@@ -1,4 +1,5 @@
-//! `relais trust`: showing and recording the repository grant in machine.toml.
+//! `relais trust`: showing and recording the repository grant (in machine.toml,
+//! or on the shared primary under `shared_state = "external"`).
 
 use super::ctx::load_repo_policy;
 use super::ctx::machine_of;
@@ -20,53 +21,38 @@ use relais::paths;
 use relais::policy::RepoIdentity;
 use relais::policy::RepoPolicy;
 use relais::shared_state::Selection;
+use relais::trust::RecordedOn;
 
-/// Where `trust grant` recorded a grant: this node's settings file, or the
-/// shared primary under `shared_state = "external"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GrantPlace {
-    MachineSettings,
-    SharedPrimary,
-}
-
-impl GrantPlace {
-    fn of(selection: Selection) -> Self {
-        match selection {
-            Selection::Local => GrantPlace::MachineSettings,
-            Selection::External => GrantPlace::SharedPrimary,
-        }
-    }
-
-    /// The `recorded_on` value of `trust grant --json`.
-    fn as_str(self) -> &'static str {
-        match self {
-            GrantPlace::MachineSettings => "machine_settings",
-            GrantPlace::SharedPrimary => "shared_primary",
-        }
+/// Where a grant is recorded, from the state's selection (an-t33). Kept here,
+/// not in `relais::trust`, so the trust module does not depend on shared_state.
+fn recorded_on(selection: Selection) -> RecordedOn {
+    match selection {
+        Selection::Local => RecordedOn::MachineSettings,
+        Selection::External => RecordedOn::SharedPrimary,
     }
 }
 
 /// The result sentence of `trust grant` (stdout: it is what was asked).
 fn grant_line(
-    place: GrantPlace,
+    place: RecordedOn,
     scope: &str,
     key: &str,
     settings_path: &std::path::Path,
     granted: relais::shared_state::SettingsWrite,
 ) -> String {
     match (granted.written, place) {
-        (true, GrantPlace::MachineSettings) => format!(
+        (true, RecordedOn::MachineSettings) => format!(
             "trust grant: {scope} {key} recorded in {}",
             settings_path.display()
         ),
-        (false, GrantPlace::MachineSettings) => format!(
+        (false, RecordedOn::MachineSettings) => format!(
             "trust grant: {scope} {key} was already in {}",
             settings_path.display()
         ),
-        (true, GrantPlace::SharedPrimary) => {
+        (true, RecordedOn::SharedPrimary) => {
             format!("trust grant: {scope} {key} recorded on the shared primary")
         }
-        (false, GrantPlace::SharedPrimary) => {
+        (false, RecordedOn::SharedPrimary) => {
             format!("trust grant: {scope} {key} was already on the shared primary")
         }
     }
@@ -78,6 +64,9 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
     let shared = super::ctx::shared_state()?;
     let machine = machine_of(&*shared)?;
     let machine_path = paths::machine_settings_path().map_err(CliError::Home)?;
+    // Where grants live, from the state already built: no second read of
+    // machine.toml that an edit between the two could make disagree.
+    let place = recorded_on(shared.selection());
     let identity = relais::repo::identity(&root);
     let repo_key = relais::policy::repo_key(&identity);
     match cmd {
@@ -94,6 +83,7 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                 &identity,
                 &machine,
                 machine_path,
+                place,
                 previous.as_deref(),
             );
             // Only the caller that tells the person records the change as said.
@@ -132,8 +122,14 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
             source,
             json,
         } => {
-            let shown =
-                relais::trust::show(&policy, &identity, &machine, machine_path.clone(), None);
+            let shown = relais::trust::show(
+                &policy,
+                &identity,
+                &machine,
+                machine_path.clone(),
+                place,
+                None,
+            );
             if reviewed_by.trim().is_empty() {
                 print_refusal(
                     "relais trust grant",
@@ -149,11 +145,6 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                 note,
                 repo: Some(identity.label().to_string()),
             };
-            // Where the write goes, read once before it from the file the
-            // shared state is selected from (`current_with` reads the same):
-            // under `external` the grant is on the primary, not in this
-            // node's settings file.
-            let place = GrantPlace::of(relais::shared_state::selection_at(&machine_path));
             let (granted, recorded_key, scope) = match key {
                 None => (
                     super::ctx::write_settings_of(
@@ -246,7 +237,7 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                     "scope": scope.as_str(),
                     "grant_key": recorded_key,
                     "machine_settings": machine_path,
-                    "recorded_on": place.as_str(),
+                    "recorded_on": place,
                 }))?;
             } else {
                 println!(
@@ -539,10 +530,19 @@ pub(crate) fn trust_show_text(shown: &relais::trust::Shown) -> String {
             (None, false) => "not granted",
         }
     ));
-    out.push_str(&format!(
-        "machine.toml: {} ($RELAIS_CONFIG_DIR, else ~/.config/relais)\n",
-        shown.machine_settings.display()
-    ));
+    match shown.recorded_on {
+        RecordedOn::MachineSettings => out.push_str(&format!(
+            "machine.toml: {} ($RELAIS_CONFIG_DIR, else ~/.config/relais)\n",
+            shown.machine_settings.display()
+        )),
+        RecordedOn::SharedPrimary => {
+            out.push_str("settings: the shared primary (shared_state = \"external\")\n");
+            out.push_str(&format!(
+                "selected in: {}\n",
+                shown.machine_settings.display()
+            ));
+        }
+    }
     out.push_str("commands relais would run:\n");
     let width = shown
         .declaration
@@ -611,8 +611,8 @@ mod tests {
     #[test]
     fn a_grant_names_where_it_was_recorded() {
         let path = Path::new("/home/p/.config/relais/settings-file");
-        let local = GrantPlace::of(Selection::Local);
-        let external = GrantPlace::of(Selection::External);
+        let local = recorded_on(Selection::Local);
+        let external = recorded_on(Selection::External);
         assert_eq!(
             grant_line(local, "repository", "k1", path, WROTE),
             "trust grant: repository k1 recorded in /home/p/.config/relais/settings-file"
@@ -629,7 +629,51 @@ mod tests {
             grant_line(external, "repository", "k1", path, KEPT),
             "trust grant: repository k1 was already on the shared primary"
         );
-        assert_eq!(local.as_str(), "machine_settings");
-        assert_eq!(external.as_str(), "shared_primary");
+    }
+
+    /// an-t33: `trust show` names the shared primary under `external`, and
+    /// its `--json` carries the same `recorded_on` as `trust grant`.
+    #[test]
+    fn show_names_where_settings_live() {
+        let policy = relais::policy::RepoPolicy::from_toml_str(
+            "schema_version = 1\n[models.implementation]\nid = \"sonnet\"\n",
+        )
+        .expect("policy");
+        let identity = relais::policy::RepoIdentity::origin("git@example.invalid:me/r.git");
+        let machine = relais::policy::MachineSettings::from_toml_str("schema_version = 1\n")
+            .expect("machine");
+        let path = Path::new("/home/p/.config/relais/settings-file");
+        let shown = |selection| {
+            relais::trust::show(
+                &policy,
+                &identity,
+                &machine,
+                path.to_path_buf(),
+                recorded_on(selection),
+                None,
+            )
+        };
+        let local = shown(Selection::Local);
+        let text = trust_show_text(&local);
+        assert!(
+            text.contains("machine.toml: /home/p/.config/relais/settings-file"),
+            "{text}"
+        );
+        assert_eq!(
+            serde_json::to_value(&local).expect("json")["recorded_on"],
+            "machine_settings"
+        );
+        let external = shown(Selection::External);
+        let text = trust_show_text(&external);
+        assert!(text.contains("settings: the shared primary"), "{text}");
+        assert!(!text.contains("machine.toml"), "{text}");
+        assert!(
+            text.contains("selected in: /home/p/.config/relais/settings-file"),
+            "{text}"
+        );
+        assert_eq!(
+            serde_json::to_value(&external).expect("json")["recorded_on"],
+            "shared_primary"
+        );
     }
 }

@@ -101,6 +101,8 @@ export type Shown = {
   grant_key: string
   repository: string
   machine_settings: string
+  // Where a grant is recorded; absent from an older relais, which means its settings file.
+  recorded_on?: 'machine_settings' | 'shared_primary'
   // Any grant holds: the repository's, or a legacy exact one.
   granted: boolean
   declaration: {
@@ -171,7 +173,9 @@ export function question2(shown: Shown, repo: string): { text: string; yes: stri
       ...listed,
       ...unchanged,
       `  models ${models || 'none'}${integrations ? `     integrations ${integrations}` : ''}`,
-      `Saved once for the repository in ${escapeDisplay(shown.machine_settings)}.`,
+      shown.recorded_on === 'shared_primary'
+        ? 'Saved once for the repository on the shared primary.'
+        : `Saved once for the repository in ${escapeDisplay(shown.machine_settings)}.`,
       'A later change to these commands is reported, not asked again.',
     ].join('\n'),
     yes: allowLabel(steps.length),

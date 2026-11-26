@@ -40,6 +40,12 @@ there, or the coordinator cannot be reached, the slot is given back first, and
 a `kept_slot_given_back` decision says why. A reused slot emits
 `host_slot_kept`.
 
+`relais trust show` and the plugin's consent card now name where a grant
+lives: under `shared_state = "external"` they say the shared primary instead
+of `machine.toml`. `trust show --json` gains `recorded_on`, the same value
+`trust grant --json` has. `trust grant` takes the place from the state it
+built, not from a second read of `machine.toml`.
+
 ## v0.89.0
 
 A failed renewal of a kept handoff (the claim file cannot be rewritten) is

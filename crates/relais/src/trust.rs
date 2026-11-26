@@ -434,6 +434,18 @@ pub fn display_argv(argv: &[String]) -> String {
         .join(" ")
 }
 
+/// Where a grant lives: this node's settings file, or the shared primary
+/// under `shared_state = "external"`. Taken from the built `SharedState`,
+/// never from a second read of `machine.toml` (an-t33).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordedOn {
+    MachineSettings,
+    SharedPrimary,
+}
+
+impl RecordedOn {}
+
 /// What `relais trust show` reports.
 #[derive(Debug, Clone, Serialize)]
 pub struct Shown {
@@ -441,6 +453,9 @@ pub struct Shown {
     pub authority_hash: String,
     pub repository: String,
     pub machine_settings: PathBuf,
+    /// Where a grant is recorded; `machine_settings` names this node's file
+    /// only when this says `machine_settings`.
+    pub recorded_on: RecordedOn,
     /// Whether any grant holds: the repository's, or a legacy exact one.
     pub granted: bool,
     /// The repository grant (`[trust_repos]`), when there is one.
@@ -470,6 +485,7 @@ pub fn show(
     identity: &RepoIdentity,
     machine: &MachineSettings,
     machine_settings: PathBuf,
+    recorded_on: RecordedOn,
     previous: Option<&[Step]>,
 ) -> Shown {
     let authority_hash = policy.authority_hash();
@@ -493,6 +509,7 @@ pub fn show(
         authority_hash,
         repository: identity.to_string(),
         machine_settings,
+        recorded_on,
         declaration,
         changes,
     }
