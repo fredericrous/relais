@@ -1,0 +1,18 @@
+greengate-provenance-v1
+commit e40d77e8ace54ff1ef533156c9ed73e38489eecf
+tree afafd95936cdf58a0094426395f0f889f17ce101
+canon 589ba6411762167ad23912ffea76e42f17a84966
+patch 6449391a430b070608dc0ffe1af936ccd4231d98
+plan docs/plans/2026-11-26-pin-settle-retry-guard.md 8d1166c9f5378a9c53911b579b8e12d20caf2f4a738c4113d251db1e69798616
+review reviewed 7eb5a8ef8e81354368319f469ce0e2aeee40bfba7c580e0c31853921c8b57640
+code-review backend reviewed 7eb5a8ef8e81354368319f469ce0e2aeee40bfba7c580e0c31853921c8b57640
+code-review lang:rust reviewed 7eb5a8ef8e81354368319f469ce0e2aeee40bfba7c580e0c31853921c8b57640
+preview not-required
+producer greenbelay 6.18.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABAMiCG5oN6A99huj9hmZby+IPKVLlqYP2BE0xJmG8uqx
+JuUBWfjiucv9Ri3aGh2SZK+VKmmjZeQHf+KqOk3tgPAQ==
+-----END SSH SIGNATURE-----
