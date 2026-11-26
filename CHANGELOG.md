@@ -20,6 +20,8 @@ with one line). The shared-state conformance suite gains
 reservation. A single node (`LocalState`) is unchanged. What still misses the
 counter, and the rollback if it matters, is in `docs/shared-state.md`.
 
+`relais dataset replay` builds its `SharedState` once and reads the effort bounds, the machine settings and the prices through it, as `relais run` does. Nothing changes for one node.
+
 - `relais decide --answer salvaged` now asks the shared half for the decision
   grant before it records the salvage, as every other answer does. A grant held
   elsewhere is exit 3 with one line whose next step says to run the same

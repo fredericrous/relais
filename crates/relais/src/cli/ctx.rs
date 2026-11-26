@@ -169,8 +169,17 @@ pub(crate) fn node_error(what: &'static str, e: NodeError) -> CliError {
 /// both leave the catalogs unknown, which admits only the incumbent's
 /// configured efforts, never more.
 pub(crate) fn tuning_bounds(incumbent: &RepoPolicy) -> route::TuningBounds {
-    let settings = shared_state()
-        .ok()
+    let state = shared_state().ok();
+    tuning_bounds_of(state.as_deref(), incumbent)
+}
+
+/// [`tuning_bounds`] through a state the caller already built (`None`: the
+/// state could not be built, which leaves the machine's facts unknown).
+pub(crate) fn tuning_bounds_of(
+    state: Option<&dyn SharedState>,
+    incumbent: &RepoPolicy,
+) -> route::TuningBounds {
+    let settings = state
         .and_then(|state| state.machine_settings().ok())
         .map(|machine| {
             (
