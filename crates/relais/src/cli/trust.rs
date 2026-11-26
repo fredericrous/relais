@@ -47,9 +47,9 @@ fn grant_line(
     scope: &str,
     key: &str,
     settings_path: &std::path::Path,
-    written: bool,
+    granted: relais::shared_state::SettingsWrite,
 ) -> String {
-    match (written, place) {
+    match (granted.written, place) {
         (true, GrantPlace::MachineSettings) => format!(
             "trust grant: {scope} {key} recorded in {}",
             settings_path.display()
@@ -228,7 +228,7 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
             } else {
                 println!(
                     "{}",
-                    grant_line(place, scope.as_str(), &recorded_key, &machine_path, written)
+                    grant_line(place, scope.as_str(), &recorded_key, &machine_path, granted)
                 );
             }
             Ok(CliOutcome::Accepted)
@@ -549,7 +549,17 @@ pub(crate) fn trust_show_text(shown: &relais::trust::Shown) -> String {
 mod tests {
     use super::*;
     use relais::shared_state::Selection;
+    use relais::shared_state::SettingsWrite;
     use std::path::Path;
+
+    const WROTE: SettingsWrite = SettingsWrite {
+        written: true,
+        removed: false,
+    };
+    const KEPT: SettingsWrite = SettingsWrite {
+        written: false,
+        removed: false,
+    };
 
     /// an-t31: under `external` the grant went to the primary, and the
     /// line says so instead of naming this node's settings file.
@@ -559,19 +569,19 @@ mod tests {
         let local = GrantPlace::of(Selection::Local);
         let external = GrantPlace::of(Selection::External);
         assert_eq!(
-            grant_line(local, "repository", "k1", path, true),
+            grant_line(local, "repository", "k1", path, WROTE),
             "trust grant: repository k1 recorded in /home/p/.config/relais/settings-file"
         );
         assert_eq!(
-            grant_line(local, "repository", "k1", path, false),
+            grant_line(local, "repository", "k1", path, KEPT),
             "trust grant: repository k1 was already in /home/p/.config/relais/settings-file"
         );
         assert_eq!(
-            grant_line(external, "repository", "k1", path, true),
+            grant_line(external, "repository", "k1", path, WROTE),
             "trust grant: repository k1 recorded on the shared primary"
         );
         assert_eq!(
-            grant_line(external, "repository", "k1", path, false),
+            grant_line(external, "repository", "k1", path, KEPT),
             "trust grant: repository k1 was already on the shared primary"
         );
         assert_eq!(local.as_str(), "machine_settings");
