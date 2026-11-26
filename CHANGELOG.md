@@ -48,6 +48,11 @@ of `machine.toml`. `trust show --json` gains `recorded_on`, the same value
 `trust grant --json` has. `trust grant` takes the place from the state it
 built, not from a second read of `machine.toml`.
 
+A first settle that the coordinator answers `Unknown` is now pinned as
+confirmed: only a retry's `Unknown` records `gate_settle_unconfirmed`, so a
+later change cannot turn every first `Unknown` into an unconfirmed settle.
+Tests only, no behaviour change.
+
 ## v0.89.0
 
 A failed renewal of a kept handoff (the claim file cannot be rewritten) is

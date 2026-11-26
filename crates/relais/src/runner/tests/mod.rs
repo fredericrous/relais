@@ -8624,6 +8624,9 @@ enum Fault {
     SettleUnavailable,
     /// Every settle is refused by a coordinator that answered.
     SettleRefused,
+    /// The first settle is answered `Unknown` (the coordinator answered and
+    /// holds no such dispatch); later settles answer as usual (an-t36).
+    SettleUnknownFirst,
 }
 
 /// A gate that answers like a `LocalGate` on every call but one.
@@ -8703,7 +8706,8 @@ impl Gate for FaultyGate {
             Fault::ReleaseWrite
             | Fault::SettleAnswerLost
             | Fault::SettleUnavailable
-            | Fault::SettleRefused => self.inner.heartbeat(dispatch_id),
+            | Fault::SettleRefused
+            | Fault::SettleUnknownFirst => self.inner.heartbeat(dispatch_id),
         }
     }
     fn mark_waiting(&self, dispatch_id: &str) -> Result<crate::admission::WaitOutcome, GateError> {
@@ -8741,6 +8745,8 @@ impl Gate for FaultyGate {
             }
             Fault::SettleUnavailable => Err(Self::lost("settle")),
             Fault::SettleRefused => Err(self.refuse("settle", dispatch_id)),
+            Fault::SettleUnknownFirst if first => Ok(crate::admission::LifecycleOutcome::Unknown),
+            Fault::SettleUnknownFirst => self.inner.settle(dispatch_id, spent_micros),
         }
     }
     fn withdraw(&self, dispatch_id: &str) -> Result<crate::admission::WithdrawOutcome, GateError> {
@@ -8763,7 +8769,8 @@ impl Gate for FaultyGate {
             Fault::Heartbeat
             | Fault::SettleAnswerLost
             | Fault::SettleUnavailable
-            | Fault::SettleRefused => self.inner.release_write(dispatch_id, worktree),
+            | Fault::SettleRefused
+            | Fault::SettleUnknownFirst => self.inner.release_write(dispatch_id, worktree),
         }
     }
     fn write_lease_holder(&self, worktree: &str) -> Result<Option<String>, GateError> {
@@ -8990,6 +8997,40 @@ fn a_refused_settle_is_not_retried_and_is_reported_once() {
         .filter(|what| what == "gate_settle_failed")
         .count();
     assert_eq!(failed, 1);
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+/// an-t36: only a RETRY's `Unknown` is unconfirmed. A coordinator that
+/// answers the first settle `Unknown` has answered: the settle is confirmed,
+/// not asked again, and no `gate_settle_unconfirmed` or `gate_settle_failed`
+/// is recorded. Removing the `tries > 1` guard in `settle_with_retry` fails
+/// this test.
+#[test]
+fn a_first_settle_answered_unknown_stays_confirmed() {
+    let (fixture, gate, run_id) = run_through_settle_fault(Fault::SettleUnknownFirst);
+    assert_eq!(
+        gate.settles().len(),
+        1,
+        "an answer is not asked again: {:?}",
+        gate.settles()
+    );
+    let booked: i64 = gate
+        .inner
+        .status()
+        .runs
+        .values()
+        .map(|run| run.settled_micros)
+        .sum();
+    assert_eq!(booked, 0, "the fault answered without settling");
+    let decisions = decisions_of(&fixture, &run_id);
+    assert!(
+        !decisions.contains(&"gate_settle_unconfirmed".to_string()),
+        "a first `Unknown` is confirmed: {decisions:?}"
+    );
+    assert!(
+        !decisions.contains(&"gate_settle_failed".to_string()),
+        "{decisions:?}"
+    );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
