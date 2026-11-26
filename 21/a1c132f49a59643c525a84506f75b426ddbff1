@@ -1,0 +1,18 @@
+greengate-provenance-v1
+commit a18ee9edc23cc170fd5b11a255b12eb7252004cc
+tree 21a1c132f49a59643c525a84506f75b426ddbff1
+canon 2e485d94b47a9ddc092f30a02e3c6e20276a5dc3
+patch f60f63b0a1fca22b2a7a15a58fe07e6cba58866f
+plan docs/plans/2026-11-26-give-back-error-arm.md 09c936a343b1ddf157114060c0a49e61ae782d43a15a76a0f9cf1d1e7aa1c5b2
+review by-patch b5403fe1dfe09c29be039caed5bfb1a1a2e12201aed909b111ed7fed02d03eda
+code-review backend by-patch b5403fe1dfe09c29be039caed5bfb1a1a2e12201aed909b111ed7fed02d03eda
+code-review lang:rust by-patch b5403fe1dfe09c29be039caed5bfb1a1a2e12201aed909b111ed7fed02d03eda
+preview not-required
+producer greenbelay 6.18.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABAqqUsrYpCp3j6wrwgWFCc/Mump1kS0w5Rqe2Skucg3a
+f1NCkjPz2PfUakThI53Uu6oileZgMbc2J462ZPy3NmCg==
+-----END SSH SIGNATURE-----
