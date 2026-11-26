@@ -26,3 +26,10 @@ Round 2: backend approve, no findings. Codex: not run.
 - lang:rust: approve-with-changes, one low: the `Shown::recorded_on` doc comment misdescribed `machine_settings`. Fixed.
 - tui: approve-with-changes, one low: the label `selected in:` is unclear. `deliberate: the plan's tui reviewer proposed this wording, the SPEC and the Resolution say what the path is, and a rename would reopen the panel round`.
 
+## After the rebase onto an-t32 (tree f27fe281, opus)
+
+- implementation-review: approve-with-changes; Verification rows lacked observed results. Fixed: `Observed:` lines added under each row (docs only, the code tree is unchanged).
+- backend: approve. Low: no test reaches the `shared.selection()` line under `external`; `deliberate: carried to the first private-build run (an-t13), as the plan states; a trust_command_with(state) split is a larger refactor than this ticket`.
+- lang:rust, lang:typescript, unix: approve, no findings (typescript repeats the cast note, deliberate as before).
+- tui: approve. Low: the new `selected in:` path is printed raw like the old `machine.toml:` line; `deliberate: same behaviour as the line it sits beside, which also prints it raw; an escape pass over both is a separate change`.
+

@@ -53,9 +53,13 @@ Touches `crates/relais/src/trust.rs` (`RecordedOn` with serde `snake_case` as th
 ## Verification
 
 - Local run, `relais trust show --json | jq -r .recorded_on`: expected `machine_settings`; the text keeps the `machine.toml:` line (binary test in `shared_state_cli.rs`).
+  Observed: `a_json_trust_show_says_where_settings_live` passed (`shared_state_cli` 13 of 13 before the an-t32 rebase): `recorded_on` was `machine_settings`, the text had `machine.toml: ` and no `the shared primary`.
 - `show_names_where_settings_live`: under `Selection::External` the text has `settings: the shared primary` and `selected in: <path>`, no `machine.toml:`, and `recorded_on` is `shared_primary`; under `Local` it is `machine_settings`. A binary run under `external` exits 3 before showing and `ctx::shared_state()` has no test seam, so the `shared.selection()` wiring itself has no external test; the first real external run (private build, an-t13) is the check, carried to relais-fabric.
+  Observed: passed (`cli::trust::tests`, 2 of 2): External gave `settings: the shared primary`, `selected in: <path>` and no `machine.toml:`, `recorded_on` `shared_primary`; Local gave `machine_settings`. The external wiring itself was not observed.
 - `consent.test.ts`: the card says `Saved once for the repository on the shared primary.` for `recorded_on: 'shared_primary'`, keeps the `in <path>` line without it; every line at most 80 columns.
+  Observed: the case passed in the full `claude plugin test` run (484 pass, 121 fail; all 121 are 5-second timeouts in unrelated pane and hook tests under host load, none a consent or trust test; CI is their baseline).
 - `grep -n selection_at crates/relais/src/cli/trust.rs`: exit 1.
+  Observed: `grep -n selection_at crates/relais/src/cli/trust.rs` exit 1, no match. clippy `-D warnings --all-targets` and `cargo fmt --check` clean.
 
 Your steps: none.
 
