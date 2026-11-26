@@ -16,6 +16,59 @@ use relais::ledger::Ledger;
 use relais::paths;
 use relais::policy::RepoIdentity;
 use relais::policy::RepoPolicy;
+use relais::shared_state::Selection;
+
+/// Where `trust grant` recorded a grant: this node's settings file, or the
+/// shared primary under `shared_state = "external"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrantPlace {
+    MachineSettings,
+    SharedPrimary,
+}
+
+impl GrantPlace {
+    fn of(selection: Selection) -> Self {
+        match selection {
+            Selection::Local => GrantPlace::MachineSettings,
+            Selection::External => GrantPlace::SharedPrimary,
+        }
+    }
+
+    /// The `recorded_on` value of `trust grant --json`.
+    fn as_str(self) -> &'static str {
+        match self {
+            GrantPlace::MachineSettings => "machine_settings",
+            GrantPlace::SharedPrimary => "shared_primary",
+        }
+    }
+}
+
+/// The result sentence of `trust grant` (stdout: it is what was asked).
+fn grant_line(
+    place: GrantPlace,
+    scope: &str,
+    key: &str,
+    settings_path: &std::path::Path,
+    granted: relais::shared_state::SettingsWrite,
+) -> String {
+    match (granted.written, place) {
+        (true, GrantPlace::MachineSettings) => format!(
+            "trust grant: {scope} {key} recorded in {}",
+            settings_path.display()
+        ),
+        (false, GrantPlace::MachineSettings) => format!(
+            "trust grant: {scope} {key} was already in {}",
+            settings_path.display()
+        ),
+        (true, GrantPlace::SharedPrimary) => {
+            format!("trust grant: {scope} {key} recorded on the shared primary")
+        }
+        (false, GrantPlace::SharedPrimary) => {
+            format!("trust grant: {scope} {key} was already on the shared primary")
+        }
+    }
+}
+
 pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
     let (root, policy) = load_repo_policy()?;
     // One state for the machine read and the grant's write (an-t29).
@@ -85,6 +138,11 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                 note,
                 repo: Some(identity.label().to_string()),
             };
+            // Where the write goes, read once before it from the file the
+            // shared state is selected from (`current_with` reads the same):
+            // under `external` the grant is on the primary, not in this
+            // node's settings file.
+            let place = GrantPlace::of(relais::shared_state::selection_at(&machine_path));
             let (granted, recorded_key, scope) = match key {
                 None => (
                     super::ctx::write_settings_of(
@@ -138,7 +196,8 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                     return Ok(CliOutcome::OperationalFailure);
                 }
             };
-            // The grant is in machine.toml now; the ledger row is its audit
+            // The grant is saved now (machine.toml, or the shared primary
+            // under `external`); the ledger row is its audit
             // trail and the base of the next question's change marks, and a
             // repository grant also starts the declaration the command
             // warning compares against. A ledger that cannot take it is
@@ -156,8 +215,8 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                     policy: &policy,
                 }) {
                     eprintln!(
-                        "relais trust grant: warning: the grant is in machine.toml, but the ledger \
-                         did not record it ({e}); the next question will not mark what changed"
+                        "relais trust grant: warning: the grant is saved, but this node's ledger \
+                         did not log it ({e}); the next question will not mark what changed"
                     );
                 }
             }
@@ -168,18 +227,12 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                     "scope": scope.as_str(),
                     "grant_key": recorded_key,
                     "machine_settings": machine_path,
+                    "recorded_on": place.as_str(),
                 }))?;
-            } else if written {
-                println!(
-                    "trust grant: {} {recorded_key} recorded in {}",
-                    scope.as_str(),
-                    machine_path.display()
-                );
             } else {
                 println!(
-                    "trust grant: {} {recorded_key} was already in {}",
-                    scope.as_str(),
-                    machine_path.display()
+                    "{}",
+                    grant_line(place, scope.as_str(), &recorded_key, &machine_path, granted)
                 );
             }
             Ok(CliOutcome::Accepted)
@@ -494,4 +547,47 @@ pub(crate) fn trust_show_text(shown: &relais::trust::Shown) -> String {
         out.push_str(&format!("{}\n", change.text()));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use relais::shared_state::SettingsWrite;
+    use std::path::Path;
+
+    const WROTE: SettingsWrite = SettingsWrite {
+        written: true,
+        removed: false,
+    };
+    const KEPT: SettingsWrite = SettingsWrite {
+        written: false,
+        removed: false,
+    };
+
+    /// an-t31: under `external` the grant went to the primary, and the
+    /// line says so instead of naming this node's settings file.
+    #[test]
+    fn a_grant_names_where_it_was_recorded() {
+        let path = Path::new("/home/p/.config/relais/settings-file");
+        let local = GrantPlace::of(Selection::Local);
+        let external = GrantPlace::of(Selection::External);
+        assert_eq!(
+            grant_line(local, "repository", "k1", path, WROTE),
+            "trust grant: repository k1 recorded in /home/p/.config/relais/settings-file"
+        );
+        assert_eq!(
+            grant_line(local, "repository", "k1", path, KEPT),
+            "trust grant: repository k1 was already in /home/p/.config/relais/settings-file"
+        );
+        assert_eq!(
+            grant_line(external, "repository", "k1", path, WROTE),
+            "trust grant: repository k1 recorded on the shared primary"
+        );
+        assert_eq!(
+            grant_line(external, "repository", "k1", path, KEPT),
+            "trust grant: repository k1 was already on the shared primary"
+        );
+        assert_eq!(local.as_str(), "machine_settings");
+        assert_eq!(external.as_str(), "shared_primary");
+    }
 }

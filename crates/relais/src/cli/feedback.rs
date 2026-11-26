@@ -3,11 +3,13 @@
 use super::ctx::open_ledger;
 use super::ctx::refusal;
 use super::ctx::Refusal;
+use super::decision_record::print_refusal;
 use super::decision_record::read_decide_proof;
 use super::outcome::exit_code;
 use super::outcome::operational;
 use super::outcome::CliError;
 use super::outcome::CliOutcome;
+use super::programme::Format;
 use super::FeedbackOutcome;
 use relais::ids::RunId;
 use relais::ids::TaskId;
@@ -83,17 +85,12 @@ pub(crate) fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, C
             Ok(CliOutcome::Accepted)
         }
         Ok(Err(refused)) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "error": refused.message,
-                        "exit": exit_code(&refused.outcome),
-                    })
-                );
-            } else {
-                eprintln!("relais feedback: {}", refused.message);
-            }
+            print_refusal(
+                "relais feedback",
+                Format::from_json_flag(json),
+                &refused.outcome,
+                &refused.message,
+            );
             Ok(refused.outcome)
         }
         Err(e) => {

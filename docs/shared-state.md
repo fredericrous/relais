@@ -172,17 +172,20 @@ state:
   bounded number of shared calls).
 - The daemon's stderr carries one line per change, never the lease token:
   `seat <dispatch>: the shared state did not grant the seat (<cause>); this
-  run waits and asks again; if it lasts, check the shared primary`, then
+  run waits and asks again; if it lasts, ask the primary's operator to
+  check it (no relais command reads the shared primary yet)`, then
   `seat <dispatch>: shared seat granted`; `renew`, `release`, `reserve` and
   `settle` failures likewise. A settle the primary refuses (`Refused`) is
   dropped with one line: `seat <dispatch>: booking the spend of $<x> was
-  not accepted: <error>; dropped, the shared counter does not count it; if
-  it repeats, check the shared primary (dropped_micros=<n>)`. Any other
+  not accepted: <error>; dropped, the shared counter is short by $<x>; if
+  it repeats, ask the primary's operator to check it (no relais command
+  reads the shared primary yet) (dropped_micros=<n>)`. Any other
   settle failure is kept and retried. A settle waiting more than 24 h, or
   beyond the newest 500, is dropped with one line for the whole pass
-  (`seat settles: dropped <n> waiting settle(s) totalling $<x> (oldest
-  dispatch: <dispatch>); not booked to the shared counter; check the shared
-  primary (dropped_micros=<n>)`).
+  (`seat settles: dropped <n> waiting settle(s) (oldest dispatch:
+  <dispatch>); the shared counter is short by $<x> (no relais command reads
+  the shared primary yet) (dropped_micros=<n>)`). Where these lines are
+  written is below (an-t31).
 - The holder is `Principal::node(<host name>)`, so two nodes never share
   one; under `external` a host with no name is refused (exit 3, with the
   command that sets one). A restarted
@@ -204,6 +207,25 @@ state:
   a single node answers what it answered before; with no counter it queues
   nothing and writes no file.
 
+## Where to look
+
+- The coordinator's lines (seats, settles, drops) go to its log when it
+  was started on demand (the usual case; one started by hand writes them
+  to its own stderr), `coordinator.log` in the state directory beside the ledger
+  (`$RELAIS_STATE_DIR`, else `~/.local/state/relais`), owner only, kept once as
+  `coordinator.log.1` past 1 MiB. Search it for `seat settles: dropped`
+  (a pass that dropped waiting settles) and `was not accepted` (a settle
+  the primary refused); each ends `(dropped_micros=<n>)`.
+- A run with no coordinator prints its line on the run's own stderr:
+  `relais: dispatch <id>: $<x> was not booked to the shared counter`, and
+  records a `shared_spend_not_booked` decision on the run.
+- The dollars the counter is short by are in each line. Adding them back
+  to the day's counter is the 5% check above.
+- No public relais command reads the shared primary yet (its counter,
+  slice or seats; an-t24 kept that deliberate). A private build's client
+  (an-t13) or the primary's operator reads it; a status command is a
+  follow-up.
+
 ## The refusal
 
 With `shared_state = "external"` and no client in the build, the routed
@@ -223,6 +245,13 @@ updated: ` followed by the line above. Its admission settings are read from
 the shared half of a claim pass, then goes on with the claim files; a hold
 it could not renew or give back ends by its TTL.
 `relais doctor` adds a failing `shared_state` finding with the same text.
+
+Every routed command follows one stream rule (`cli::decision_record::refusal_streams`,
+an-t31): stdout carries what the command did, its result sentence or, under
+`--json`, exactly one object (`{"error","exit"}` for a refusal); stderr
+carries every refusal, warning and failure as one line, under `--json` too;
+the exit code agrees with both. A refusal reads `relais <command>: …`, an
+error such as the one above `relais: …`.
 
 ## For a closed client
 
@@ -304,7 +333,11 @@ it could not renew or give back ends by its TTL.
   The ledger fences a late answer only within one ledger, so a client with
   several answerers adds its own fence (an-t13 owns it). A grant held
   elsewhere refuses `relais decide` with exit 3; `relais feedback` answers no
-  decision and takes none.
+  decision and takes none. The refusal says another answer holds the
+  decision and may already be recorded, on this node or another: the grant
+  does not say which, and `relais status` reads this node's ledger only, so
+  a salvage recorded on another node does not show there (an-t31; telling
+  "answered" from "being answered" needs a grant answer that says so).
   `conformance::run_all_with_clock(make, advance)` runs the lapse check; a
   client whose test primary has an injectable clock must pass it, and
   `run_all` alone does not cover the lapse.
