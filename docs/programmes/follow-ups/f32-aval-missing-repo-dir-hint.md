@@ -41,5 +41,5 @@ from relais run run-66121efa5b002-10e41. Its verify (run-6612320fd2118-12599)
 stopped at a verification gap, because the named test had no JUnit report.
 The person approved it with that gap accepted and had it landed outside
 relais. Run by hand instead: `cargo test -p relais --lib context::`
-(97 passed, the pinned test among them) and `cargo clippy -p relais
+(98 passed, the pinned test and a regular-file case among them) and `cargo clippy -p relais
 --all-targets -- -D warnings` (clean). It ships in the next relais release.
