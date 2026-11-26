@@ -545,13 +545,13 @@ pub fn aval_resolve_in(
             ),
         };
     }
-    // Absence is confirmed only when nothing was declared, the directory
-    // to run in exists, and no PATH entry named `greentopo` or `aval` exists
-    // in any form: a non-executable file or a dangling link is a broken
-    // install, which keeps blocking.
+    // Absence is confirmed only when nothing was declared and no PATH entry
+    // named `greentopo` or `aval` exists in any form: a non-executable file
+    // or a dangling link is a broken install, which keeps blocking. The
+    // directory to run in was checked above.
     let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
     let extensions = crate::tooling::path_extensions(std::env::var_os("PATHEXT").as_ref());
-    let confirmed_absent = bin.is_none() && repo_dir.is_dir() && {
+    let confirmed_absent = bin.is_none() && {
         ["greentopo", "aval"].iter().all(|name| {
             crate::tooling::resolve_in(
                 name,
