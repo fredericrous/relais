@@ -172,18 +172,20 @@ state:
   bounded number of shared calls).
 - The daemon's stderr carries one line per change, never the lease token:
   `seat <dispatch>: the shared state did not grant the seat (<cause>); this
-  run waits and asks again; if it lasts, <where to look>`, then
+  run waits and asks again; if it lasts, the primary's operator checks it
+  (no relais command reads the shared primary yet)`, then
   `seat <dispatch>: shared seat granted`; `renew`, `release`, `reserve` and
   `settle` failures likewise. A settle the primary refuses (`Refused`) is
   dropped with one line: `seat <dispatch>: booking the spend of $<x> was
   not accepted: <error>; dropped, the shared counter is short by $<x>; if
-  it repeats, <where to look> (dropped_micros=<n>)`. Any other
+  it repeats, the primary's operator checks it (no relais command reads the
+  shared primary yet) (dropped_micros=<n>)`. Any other
   settle failure is kept and retried. A settle waiting more than 24 h, or
   beyond the newest 500, is dropped with one line for the whole pass
   (`seat settles: dropped <n> waiting settle(s) (oldest dispatch:
-  <dispatch>); the shared counter is short by $<x>; <where to look>
-  (dropped_micros=<n>)`). `<where to look>` reads `no relais command reads
-  the shared primary yet; see docs/shared-state.md, Where to look` (an-t31).
+  <dispatch>); the shared counter is short by $<x> (no relais command reads
+  the shared primary yet) (dropped_micros=<n>)`). Where these lines are
+  written is below (an-t31).
 - The holder is `Principal::node(<host name>)`, so two nodes never share
   one; under `external` a host with no name is refused (exit 3, with the
   command that sets one). A restarted
@@ -207,8 +209,9 @@ state:
 
 ## Where to look
 
-- The coordinator's lines (seats, settles, drops) go to its log,
-  `coordinator.log` in the state directory beside the ledger
+- The coordinator's lines (seats, settles, drops) go to its log when it
+  was started on demand (the usual case; one started by hand writes them
+  to its own stderr), `coordinator.log` in the state directory beside the ledger
   (`$RELAIS_STATE_DIR`, else `~/.local/state/relais`), owner only, kept once as
   `coordinator.log.1` past 1 MiB. Search it for `seat settles: dropped`
   (a pass that dropped waiting settles) and `was not accepted` (a settle

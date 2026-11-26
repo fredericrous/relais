@@ -51,12 +51,11 @@ use crate::ids::RunId;
 use crate::money::MicroUsd;
 use crate::policy::MachineSettings;
 
-/// What a line that would send the person to the shared primary ends with:
-/// no public relais command reads the primary's state yet (an-t24 kept that
-/// deliberate), so the line names where the rest is written down instead of
-/// a check the person cannot run (an-t31).
-pub(crate) const PRIMARY_UNREAD: &str =
-    "no relais command reads the shared primary yet; see docs/shared-state.md, Where to look";
+/// Said where a line would send the person to the shared primary: no public
+/// relais command reads the primary's state yet (an-t24 kept that
+/// deliberate), so the line says so instead of naming a check the person
+/// cannot run with relais (an-t31; `docs/shared-state.md`, Where to look).
+pub(crate) const PRIMARY_UNREAD: &str = "no relais command reads the shared primary yet";
 
 /// The single-owner operations nodes share (an-t01's list), shaped by
 /// an-t10 (slice, degraded mode, publish queue), an-t11 (an epoch in every

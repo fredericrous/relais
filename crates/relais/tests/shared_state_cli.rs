@@ -500,7 +500,8 @@ fn a_json_approval_with_no_receipt_warns_on_stderr_and_keeps_one_object() {
     assert_eq!(object["receipt_skipped"], "review_unavailable", "{object}");
     assert_eq!(
         stderr.trim_end(),
-        "no receipt written: no verification snapshot for this review_unavailable stop",
+        "relais decide: no receipt written: no verification snapshot for this \
+         review_unavailable stop",
         "{stderr}"
     );
 }

@@ -16,6 +16,8 @@ use relais::ledger::Ledger;
 use relais::paths;
 use relais::policy::RepoIdentity;
 use relais::policy::RepoPolicy;
+use relais::shared_state::Selection;
+
 /// Where `trust grant` recorded a grant: this node's settings file, or the
 /// shared primary under `shared_state = "external"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,10 +27,10 @@ enum GrantPlace {
 }
 
 impl GrantPlace {
-    fn of(selection: relais::shared_state::Selection) -> Self {
+    fn of(selection: Selection) -> Self {
         match selection {
-            relais::shared_state::Selection::Local => GrantPlace::MachineSettings,
-            relais::shared_state::Selection::External => GrantPlace::SharedPrimary,
+            Selection::Local => GrantPlace::MachineSettings,
+            Selection::External => GrantPlace::SharedPrimary,
         }
     }
 
@@ -136,6 +138,11 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                 note,
                 repo: Some(identity.label().to_string()),
             };
+            // Where the write goes, read once before it from the file the
+            // shared state is selected from (`current_with` reads the same):
+            // under `external` the grant is on the primary, not in this
+            // node's settings file.
+            let place = GrantPlace::of(relais::shared_state::selection_at(&machine_path));
             let (granted, recorded_key, scope) = match key {
                 None => (
                     super::ctx::write_settings_of(
@@ -189,7 +196,8 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                     return Ok(CliOutcome::OperationalFailure);
                 }
             };
-            // The grant is in machine.toml now; the ledger row is its audit
+            // The grant is saved now (machine.toml, or the shared primary
+            // under `external`); the ledger row is its audit
             // trail and the base of the next question's change marks, and a
             // repository grant also starts the declaration the command
             // warning compares against. A ledger that cannot take it is
@@ -207,16 +215,12 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                     policy: &policy,
                 }) {
                     eprintln!(
-                        "relais trust grant: warning: the grant is recorded, but the ledger did \
-                         not record it ({e}); the next question will not mark what changed"
+                        "relais trust grant: warning: the grant is saved, but this node's ledger \
+                         did not log it ({e}); the next question will not mark what changed"
                     );
                 }
             }
             let written = granted.written;
-            // The selection the write went through, read from the same file
-            // the shared state was selected from: under `external` the grant
-            // is on the primary, not in this node's settings file.
-            let place = GrantPlace::of(relais::shared_state::selection_at(&machine_path));
             if json {
                 print_document(&serde_json::json!({
                     "code": if written { "granted" } else { "already_granted" },
@@ -548,7 +552,6 @@ pub(crate) fn trust_show_text(shown: &relais::trust::Shown) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use relais::shared_state::Selection;
     use relais::shared_state::SettingsWrite;
     use std::path::Path;
 

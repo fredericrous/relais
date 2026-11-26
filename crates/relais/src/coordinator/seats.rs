@@ -416,8 +416,7 @@ impl Book {
         }
         log(&format!(
             "seat settles: dropped {} waiting settle(s) (oldest dispatch: {oldest}); the shared \
-             counter is short by {total}; {PRIMARY_UNREAD} \
-             (dropped_micros={micros})",
+             counter is short by {total} ({PRIMARY_UNREAD}) (dropped_micros={micros})",
             dropped.len(),
             micros = total.to_micros(),
         ));
@@ -614,7 +613,8 @@ impl Book {
                     log(&format!(
                         "seat {id}: booking the spend of {amount} was not accepted: \
                          {settle_error}; dropped, the shared counter is short by {amount}; if \
-                         it repeats, {PRIMARY_UNREAD} (dropped_micros={micros})",
+                         it repeats, the primary's operator checks it ({PRIMARY_UNREAD}) \
+                         (dropped_micros={micros})",
                         amount = dropped.actual,
                         micros = dropped.actual.to_micros(),
                     ));
@@ -698,9 +698,10 @@ pub struct SeatBook {
 fn wait_line(id: &str, cause: &SharedStateError) -> String {
     format!(
         "seat {id}: the shared state did not grant the seat ({cause}); this run waits and asks \
-         again; if it lasts, {PRIMARY_UNREAD}"
+         again; if it lasts, the primary's operator checks it ({PRIMARY_UNREAD})"
     )
 }
+
 impl SeatBook {
     /// A book holding nothing yet, writing to the coordinator's stderr.
     pub fn new(shared: Arc<dyn SharedState>, holder: Principal) -> Self {

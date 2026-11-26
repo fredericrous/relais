@@ -4,6 +4,7 @@ use super::ctx::load_contract;
 use super::ctx::refusal;
 use super::ctx::Refusal;
 use super::decision_record::answer_error;
+use super::decision_record::print_refusal;
 use super::decision_record::read_decide_proof;
 use super::decision_record::Decided;
 use super::decision_record::Decision;
@@ -13,9 +14,9 @@ use super::evidence::reseal_receipt_with_signoff;
 use super::feedback::open_verification_gaps;
 use super::outcome::exit_code;
 use super::outcome::operational;
-use super::outcome::print_refusal;
 use super::outcome::CliError;
 use super::outcome::CliOutcome;
+use super::programme::Format;
 use super::salvage::salvage_command;
 use super::salvage::SalvageAnswer;
 use super::status::intent_json;
@@ -67,7 +68,12 @@ pub(crate) fn decide_command(request: DecideRequest<'_>) -> Result<CliOutcome, C
             Ok(CliOutcome::Accepted)
         }
         Ok(Err(refused)) => {
-            print_refusal("relais decide", json, &refused.outcome, &refused.message);
+            print_refusal(
+                "relais decide",
+                Format::from_json_flag(json),
+                &refused.outcome,
+                &refused.message,
+            );
             Ok(refused.outcome)
         }
         Err(e) => {
@@ -1310,8 +1316,8 @@ mod tests {
             assert_eq!(exit_code(&refused.outcome), 3, "{name}");
             assert!(
                 refused.message.starts_with(&format!(
-                    "another answer holds the decision of run {name}; it may already be \
-                     recorded, on this node or another, and this node cannot tell which."
+                    "another answer holds the decision of run {name} (it may already be \
+                     recorded, here or on another node): check"
                 )),
                 "{}",
                 refused.message
@@ -1367,11 +1373,10 @@ mod tests {
         assert_eq!(exit_code(&refused.outcome), 3);
         assert_eq!(
             refused.message,
-            "another answer holds the decision of run run-wait; it may already be recorded, on \
-             this node or another, and this node cannot tell which. Check `relais status \
-             run-wait`, then, once the hold ends (up to 10 minutes), run `relais decide run-wait \
-             --answer salvaged` again if this node should salvage it; a salvage recorded on \
-             another node does not show here"
+            "another answer holds the decision of run run-wait (it may already be recorded, here \
+             or on another node): check `relais status run-wait`, then, once the hold ends (up to \
+             10 minutes), run `relais decide run-wait --answer salvaged` again if this node should \
+             salvage it; a salvage recorded on another node does not show here"
         );
         assert!(still_open(&ledger, "run-wait"), "the decision stays open");
         assert_eq!((held.asks(), held.releases()), (1, 0));
@@ -1681,7 +1686,7 @@ mod tests {
         assert!(
             refused
                 .message
-                .starts_with("another answer holds the decision of run run-revise;"),
+                .starts_with("another answer holds the decision of run run-revise ("),
             "{}",
             refused.message
         );
@@ -1970,7 +1975,7 @@ mod tests {
         );
         assert_eq!(
             bare.receipt_skipped_line().as_deref(),
-            Some("no receipt written: no verification snapshot for this review_findings stop")
+            Some("relais decide: no receipt written: no verification snapshot for this review_findings stop")
         );
         let printed = decided_json(&bare);
         assert_eq!(printed["receipt"], serde_json::Value::Null);

@@ -530,11 +530,6 @@ impl<'a> RunEngine<'a> {
     }
 }
 
-/// How a failed admission call is reported. An unreachable coordinator
-/// is an outage — the request is preserved and nothing was launched — and
-/// anything else is a decision the coordinator made and answered with.
-/// Reporting a refusal as `admission_unavailable` sent the operator
-/// looking for a dead daemon that was answering perfectly well (A12).
 /// The stderr line for a dispatch cost the shared counter did not book: the
 /// node's ledger keeps it, and no command reads the primary yet (an-t31).
 pub(super) fn unbooked_line(
@@ -544,11 +539,16 @@ pub(super) fn unbooked_line(
 ) -> String {
     format!(
         "relais: dispatch {dispatch}: {cost} was not booked to the shared counter: {error}; this \
-         node's ledger has it, the shared counter is short by {cost}; {}",
+         node's ledger has it, the shared counter does not ({})",
         crate::shared_state::PRIMARY_UNREAD
     )
 }
 
+/// How a failed admission call is reported. An unreachable coordinator
+/// is an outage — the request is preserved and nothing was launched — and
+/// anything else is a decision the coordinator made and answered with.
+/// Reporting a refusal as `admission_unavailable` sent the operator
+/// looking for a dead daemon that was answering perfectly well (A12).
 pub(super) fn admission_block(error: &GateError) -> (Reason, BlockCode) {
     if error.unavailable() {
         (

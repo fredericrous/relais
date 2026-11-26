@@ -293,10 +293,15 @@ fn an_unbooked_cost_says_how_short_the_counter_is_and_where_to_look() {
     );
     assert!(line.starts_with("relais: dispatch disp-1: "), "{line}");
     assert!(line.contains("primary unreachable"), "{line}");
-    assert!(line.contains("the shared counter is short by"), "{line}");
     assert!(
-        line.ends_with(crate::shared_state::PRIMARY_UNREAD),
+        line.contains("disp-1: $1.5 was not booked to the shared counter"),
         "{line}"
     );
+    assert!(line.contains("the shared counter does not"), "{line}");
+    assert!(
+        line.ends_with(&format!("({})", crate::shared_state::PRIMARY_UNREAD)),
+        "{line}"
+    );
+    assert_eq!(line.matches("$1.5").count(), 1, "the cost once: {line}");
     assert!(!line.contains("check the shared primary"), "{line}");
 }

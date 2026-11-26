@@ -30,18 +30,18 @@ the command did (its sentence, or under `--json` one object), stderr carries
 every refusal, warning and failure as one line, under `--json` too.
 `relais decide --json` and `relais feedback --json` now also print a refusal
 on stderr (`relais decide: …`); the object on stdout is unchanged, and a
-`--json` approval that wrote no receipt says so on stderr as well. The
-held-grant refusal now reads "another answer holds the decision of run R; it
-may already be recorded, on this node or another, and this node cannot tell
-which", and a held salvage prints the command to run again instead of
+`--json` approval that wrote no receipt says so on stderr as well, now
+prefixed `relais decide:`. The held-grant refusal now reads "another answer
+holds the decision of run R (it may already be recorded, here or on another
+node)", and a held salvage prints the command to run again instead of
 pointing at a `relais status` that cannot show another node's salvage. The
 installer's "session routing is on" and "automatic promotion is on" notices
 move to stderr. `relais trust grant` under `shared_state = "external"` says
 the grant was recorded on the shared primary, and `--json` adds
 `recorded_on` (`machine_settings` or `shared_primary`). The coordinator's
-drop lines and a run's unbooked-cost line say how short the shared counter
-is and, instead of "check the shared primary", that no relais command reads
-the primary yet; `docs/shared-state.md` gains "Where to look": the
+drop lines say how short the shared counter is, and they and a run's
+unbooked-cost line say, instead of "check the shared primary", that no relais
+command reads the primary yet; `docs/shared-state.md` gains "Where to look": the
 coordinator log is `coordinator.log` in the state directory (kept once as
 `coordinator.log.1`), and `seat settles: dropped` is the line to search for.
 

@@ -138,7 +138,9 @@ fn an_unreachable_primary_turns_the_grant_into_a_wait_until_it_grants() {
         .iter()
         .filter(|line| {
             line.contains("the shared state did not grant the seat")
-                && line.ends_with(&format!("if it lasts, {PRIMARY_UNREAD}"))
+                && line.ends_with(&format!(
+                    "if it lasts, the primary's operator checks it ({PRIMARY_UNREAD})"
+                ))
         })
         .count();
     assert_eq!(
@@ -473,7 +475,9 @@ fn a_settle_the_primary_refuses_is_dropped_once_and_the_next_one_books() {
             .unwrap()
             .iter()
             .any(|line| line.contains("the shared counter is short by")
-                && line.contains(&format!("if it repeats, {PRIMARY_UNREAD}"))
+                && line.contains(&format!(
+                    "if it repeats, the primary's operator checks it ({PRIMARY_UNREAD})"
+                ))
                 && !line.contains("check the shared primary")),
         "{lines:?}"
     );
@@ -772,7 +776,7 @@ fn a_settle_past_the_age_cap_is_dropped_with_one_line() {
         "{lines:?}"
     );
     assert_eq!(
-        count_lines(&lines, &format!("{PRIMARY_UNREAD} (dropped_micros=")),
+        count_lines(&lines, &format!("({PRIMARY_UNREAD}) (dropped_micros=")),
         1,
         "{lines:?}"
     );
