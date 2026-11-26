@@ -491,15 +491,17 @@ pub fn snapshot(watch: &Watch<'_>, read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) 
 /// setting that decides which gates run is still a drift.
 const TOOL_KEYS: [&str; 2] = ["trusted", "knownidentity"];
 
-/// The section a config line opens, lowercased, cut at its first
-/// subsection or `]`. `None` for any other line.
+/// The header a config line opens: what stands between `[` and `]`,
+/// lowercased and trimmed, subsection included (`greengate "x"`, so it is
+/// never `greengate`). `None` for any other line.
 fn section_opened(line: &[u8]) -> Option<String> {
     let rest = line.trim_ascii_start().strip_prefix(b"[")?;
     let end = rest
         .iter()
-        .position(|byte| matches!(byte, b']' | b' ' | b'\t' | b'"' | b'.'))
+        .position(|byte| *byte == b']')
         .unwrap_or(rest.len());
-    Some(String::from_utf8_lossy(&rest[..end]).to_ascii_lowercase())
+    let header = String::from_utf8_lossy(&rest[..end]);
+    Some(header.trim().to_ascii_lowercase())
 }
 
 /// Whether a line inside `[greengate]` sets one of [`TOOL_KEYS`].
@@ -706,6 +708,15 @@ mod tests {
         let before = "[greengate]\n\ttrusted = aaa\n\tattest = true\n";
         let after = "[greengate]\n\ttrusted = aaa\n\tattest = false\n";
         assert_eq!(repo_config_drift(before, after).len(), 1);
+    }
+
+    #[test]
+    fn a_trusted_key_in_a_greengate_subsection_is_still_drift() {
+        for header in ["[greengate \"x\"]", "[greengate.x]"] {
+            let before = format!("[greengate]\n\tattest = true\n{header}\n\tattest = true\n");
+            let after = format!("{before}\ttrusted = b\n\tknownIdentity = c\n");
+            assert_eq!(repo_config_drift(&before, &after).len(), 1, "{header}");
+        }
     }
 
     #[test]
