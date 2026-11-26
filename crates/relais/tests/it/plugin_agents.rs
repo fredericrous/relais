@@ -47,11 +47,17 @@ fn tools_of(kind: AgentKind) -> &'static [&'static str] {
             "Edit",
             "Write",
             "Bash",
-            "mcp__aval__aval_rule",
-            "mcp__aval__aval_resolve",
-            "mcp__aval__aval_relevant",
+            "mcp__greentopo__greentopo_rule",
+            "mcp__greentopo__greentopo_resolve",
+            "mcp__greentopo__greentopo_relevant",
         ],
-        AgentKind::Reviewer => &["Read", "Grep", "Glob", "LSP", "mcp__aval__aval_rule"],
+        AgentKind::Reviewer => &[
+            "Read",
+            "Grep",
+            "Glob",
+            "LSP",
+            "mcp__greentopo__greentopo_rule",
+        ],
         AgentKind::Planner => &["Read", "Grep", "Glob", "LSP", "Bash"],
     }
 }
