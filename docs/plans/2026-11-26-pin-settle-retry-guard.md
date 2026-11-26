@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: prog/agents-many-nodes/an-t36-pin-settle-retry-guard
 repos: [relais, homelab]
 adrs: []
@@ -66,19 +66,25 @@ under Decisions so far in the map.
 
 ## Phases
 
-- [ ] Phase 1 — the pinning test (relais): `crates/relais/src/runner/tests/mod.rs`, `CHANGELOG.md`
-- [ ] Phase 2 — the Resolution (homelab): `docs/programmes/agents-many-nodes/an-t36-pin-settle-retry-guard.md`, `docs/programmes/agents-many-nodes/map.md`
+- [x] Phase 1 — the pinning test (relais): `crates/relais/src/runner/tests/mod.rs`, `CHANGELOG.md`
+- [x] Phase 2 — the Resolution (homelab): `docs/programmes/agents-many-nodes/an-t36-pin-settle-retry-guard.md`, `docs/programmes/agents-many-nodes/map.md`
 
 ## Verification
 
 | check | input | expected | actual |
 |---|---|---|---|
-| new test | `cargo test -p relais a_first_settle_answered_unknown_stays_confirmed` | 1 settle, no `gate_settle_unconfirmed`, none booked | |
-| mutation | guard `tries > 1` removed, same command | compiles; fails on the `gate_settle_unconfirmed` assertion | |
-| suite | `cargo test -p relais runner::` | 0 failed; the new test listed ok | |
+| new test | `cargo test -p relais a_first_settle_answered_unknown_stays_confirmed` | 1 settle, no `gate_settle_unconfirmed`, none booked | ok: `--lib settle` exit 0; the test asserts 1 settle, booked 0, neither decision |
+| mutation | guard `tries > 1` removed, same command | compiles; fails on the `gate_settle_unconfirmed` assertion | ok: compiled; failed at `mod.rs:9026` "a first `Unknown` is confirmed: [baseline_deferred, gate_settle_unconfirmed, accept]"; guard restored, `launch.rs` diff empty |
+| suite | `cargo test -p relais runner::` | 0 failed; the new test listed ok | ok: `--lib runner::` 564 tests, exit 0 (the new one among them) |
 
 ## Decision log
 
 - 2026-11-26: a programme ticket agent writes and reviews this plan (ADR-0080).
+
+## Implementation review
+
+- implementation-review: approve-with-changes; tick Phase 1 and record the actual column, both fixed here; the optional positive-decision assertion is `deliberate: the mutation run is the proof it can fail`; opus.
+- code-review backend: approve, no findings; follow-up (log line on a first `Unknown`) filed to the inbox; opus.
+- code-review lang:rust: approve; one low (bind `gate.settles()` once), `deliberate: the message reads the same Vec, cost nil`; opus.
 
 <!-- panel: repos=relais,homelab adds= reviewers=backend,lang:rust,tui,unix body-sha=6e674ffe4d7a -->
