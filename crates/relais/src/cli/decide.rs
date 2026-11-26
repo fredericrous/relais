@@ -4,6 +4,7 @@ use super::ctx::load_contract;
 use super::ctx::refusal;
 use super::ctx::Refusal;
 use super::decision_record::answer_error;
+use super::decision_record::print_error_object;
 use super::decision_record::print_refusal;
 use super::decision_record::read_decide_proof;
 use super::decision_record::Decided;
@@ -77,15 +78,7 @@ pub(crate) fn decide_command(request: DecideRequest<'_>) -> Result<CliOutcome, C
             Ok(refused.outcome)
         }
         Err(e) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "error": e.to_string(),
-                        "exit": exit_code(&e.outcome()),
-                    })
-                );
-            }
+            print_error_object(Format::from_json_flag(json), &e.outcome(), &e.to_string());
             Err(e)
         }
     }

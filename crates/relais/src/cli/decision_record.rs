@@ -129,7 +129,9 @@ pub(crate) fn answer_error(
 ///
 /// An error that is not a refusal reaches stderr from `main`, as
 /// `relais: <error>`: the prefix differs by path on purpose, a refusal
-/// naming its command. Lives here, not in `outcome`, which `programme`
+/// naming its command. Under `--json` it also prints the same object on
+/// stdout ([`error_object_under_json`]), so a JSON consumer reads one
+/// object for every failure and never an empty stdout. Lives here, not in `outcome`, which `programme`
 /// (owner of [`Format`]) imports.
 ///
 /// Returns the stdout object (under `--json` only) and the stderr line.
@@ -139,14 +141,30 @@ pub(crate) fn refusal_streams(
     outcome: &CliOutcome,
     message: &str,
 ) -> (Option<String>, String) {
+    refusal_streams_with(command, format, outcome, message, &[])
+}
+
+/// [`refusal_streams`] with extra fields a consumer already reads on the
+/// object (`trust`'s `code` and `current_key`), added beside `error` and
+/// `exit`: one object, never a second document.
+pub(crate) fn refusal_streams_with(
+    command: &str,
+    format: Format,
+    outcome: &CliOutcome,
+    message: &str,
+    extra: &[(&str, serde_json::Value)],
+) -> (Option<String>, String) {
     let object = match format {
-        Format::Json => Some(
-            serde_json::json!({
+        Format::Json => {
+            let mut object = serde_json::json!({
                 "error": message,
                 "exit": exit_code(outcome),
-            })
-            .to_string(),
-        ),
+            });
+            for (key, value) in extra {
+                object[*key] = value.clone();
+            }
+            Some(object.to_string())
+        }
         Format::Text => None,
     };
     (object, format!("{command}: {message}"))
@@ -156,16 +174,60 @@ pub(crate) fn refusal_streams(
 /// not a failure (the exit code still says what happened); any other
 /// failed write of the object is said in the one stderr line.
 pub(crate) fn print_refusal(command: &str, format: Format, outcome: &CliOutcome, message: &str) {
+    print_refusal_with(command, format, outcome, message, &[]);
+}
+
+/// [`print_refusal`] with [`refusal_streams_with`]'s extra fields.
+pub(crate) fn print_refusal_with(
+    command: &str,
+    format: Format,
+    outcome: &CliOutcome,
+    message: &str,
+    extra: &[(&str, serde_json::Value)],
+) {
     use std::io::Write;
-    let (stdout, mut stderr) = refusal_streams(command, format, outcome, message);
+    let (stdout, mut stderr) = refusal_streams_with(command, format, outcome, message, extra);
     if let Some(object) = stdout {
-        match writeln!(std::io::stdout().lock(), "{object}") {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-            Err(e) => stderr.push_str(&format!(" (stdout: {e})")),
+        if let Err(e) = write_object(&object) {
+            stderr.push_str(&format!(" (stdout: {e})"));
         }
     }
     let _ = writeln!(std::io::stderr().lock(), "{stderr}"); // nowhere left to say a failed write
+}
+
+/// One stdout line; a reader that closed it is not a failure.
+fn write_object(object: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    match writeln!(std::io::stdout().lock(), "{object}") {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// The `--json` contract for an error that is not a refusal, the same on
+/// every shared-state command: under `--json` stdout carries exactly the
+/// `{"error", "exit"}` object a refusal prints, and stderr carries the one
+/// `relais: <error>` line (`main` prints it) or the command's own
+/// `relais <command>: <message>` line. Without `--json` stdout stays empty.
+/// This prints the object only; the stderr line stays with its caller.
+pub(crate) fn print_error_object(format: Format, outcome: &CliOutcome, message: &str) {
+    if let (Some(object), _) = refusal_streams("", format, outcome, message) {
+        if let Err(e) = write_object(&object) {
+            eprintln!("relais: could not write the error object to stdout: {e}");
+        }
+    }
+}
+
+/// [`print_error_object`] for a command's `Err(CliError)` return, which
+/// `main` then reports on stderr. Passes the result through.
+pub(crate) fn error_object_under_json<T>(
+    json: bool,
+    result: Result<T, CliError>,
+) -> Result<T, CliError> {
+    if let Err(e) = &result {
+        print_error_object(Format::from_json_flag(json), &e.outcome(), &e.to_string());
+    }
+    result
 }
 
 #[cfg(test)]

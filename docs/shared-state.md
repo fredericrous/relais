@@ -230,7 +230,7 @@ state:
 
 With `shared_state = "external"` and no client in the build, the routed
 commands print one line on stderr and exit 3 (`Blocked`), with nothing on
-stdout:
+stdout without `--json` (with it, the error object, below):
 
 ```
 relais: machine.toml <path> sets shared_state = "external", but this relais build has no shared-state client; set shared_state = "local" or install the build that has one
@@ -248,10 +248,22 @@ it could not renew or give back ends by its TTL.
 
 Every routed command follows one stream rule (`cli::decision_record::refusal_streams`,
 an-t31): stdout carries what the command did, its result sentence or, under
-`--json`, exactly one object (`{"error","exit"}` for a refusal); stderr
-carries every refusal, warning and failure as one line, under `--json` too;
-the exit code agrees with both. A refusal reads `relais <command>: …`, an
-error such as the one above `relais: …`.
+`--json`, exactly one object; stderr carries every refusal, warning and
+failure as one line, under `--json` too; the exit code agrees with both.
+A refusal reads `relais <command>: …`, an error such as the one above
+`relais: …`.
+
+The `--json` error contract (an-t32): a failure under `--json`, refusal or
+not, is always the one `{"error","exit"}` object on stdout, with the same
+message as the stderr line (minus its prefix), so a JSON consumer parses
+stdout and never meets an empty one. Without `--json` stdout stays empty.
+It holds for `decide`, `feedback`, `report`, `learn cycle`, `doctor` and
+`trust`; `trust`'s two stale-review refusals keep their `code`, `current_key`
+and `detail` fields on the same object. Exceptions: a command-line usage
+error (exit 2, before any command runs) prints nothing on stdout;
+`learn cycle --log` writes the stderr line to the log file, the object still
+goes to stdout; and `learn cycle --json` still prints its plain `deferred:`
+and `not due` lines on exit 0 (a follow-up).
 
 ## For a closed client
 

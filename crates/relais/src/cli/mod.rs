@@ -4,6 +4,7 @@ pub(crate) mod coordinator;
 pub(crate) mod ctx;
 pub(crate) mod decide;
 pub(crate) mod decision_record;
+use self::decision_record::error_object_under_json;
 pub(crate) mod doctor;
 pub(crate) mod evidence;
 pub(crate) mod feedback;
@@ -1442,7 +1443,7 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             if effort_template {
                 doctor_effort_template_command()
             } else {
-                doctor_command(json)
+                error_object_under_json(json, doctor_command(json))
             }
         }
         Command::Hook { probe, record } => match (probe, record) {
@@ -1500,7 +1501,14 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
         }
         Command::Native { cmd } => native_command(cmd),
         Command::Quiet { cmd } => quiet_command(cmd),
-        Command::Trust { cmd } => trust_command(cmd),
+        Command::Trust { cmd } => {
+            let json = match &cmd {
+                TrustCommand::Show { json, .. }
+                | TrustCommand::Grant { json, .. }
+                | TrustCommand::Holdouts { json, .. } => *json,
+            };
+            error_object_under_json(json, trust_command(cmd))
+        }
         Command::Status { run_id } => status_command(run_id.as_deref()),
         Command::Explain { run_id } => explain_command(&run_id),
         Command::Resume {
@@ -1532,7 +1540,7 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             by,
             no_import,
             cmd: None,
-        } => report_command(since.as_deref(), json, by, no_import),
+        } => error_object_under_json(json, report_command(since.as_deref(), json, by, no_import)),
         Command::Usage { cmd } => match cmd {
             UsageCommand::Import {
                 session,
@@ -1593,7 +1601,10 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 json,
                 log,
                 quiet,
-            } => learn_cycle_command(if_due, json, log.as_deref(), quiet),
+            } => error_object_under_json(
+                json,
+                learn_cycle_command(if_due, json, log.as_deref(), quiet),
+            ),
             LearnCommand::Last { json } => learn_last_command(json),
         },
         Command::Router { cmd } => match cmd {
