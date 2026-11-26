@@ -148,12 +148,13 @@ exports the held marker, so no step after the first queues again.
 
 | Check | Actual |
 |---|---|
-| `a_setup_takes_one_host_slot_for_all_its_steps` | passes: 3 sleeps (step 1 only), admission wait 3 s, `exhausted()` None, joined waiter `[true, true, true]` then granted, 1 relais `waited_ms` row, 1 `released`, markers `held`, each holder record names its step, 2 `host_slot_kept`, no `waiting_for_slot` after the first |
+| `a_setup_takes_one_host_slot_for_all_its_steps` | passes: at least 3 queue sleeps, all before step 0 ended (macOS 3, ubuntu CI 5: a poll can find the admission lock busy), admission wait equal to them, `exhausted()` None, joined waiter `[true, true, true]` then granted, 1 relais `waited_ms` row, 1 `released`, markers `held`, each holder record names its step, 2 `host_slot_kept`, no `waiting_for_slot` after the first |
 | the same with `let _kept = admission.keep_slot();` removed | fails at the waiter assertion: `[false, false, false]`, the joined waiter was granted between steps |
 | coordinator queued (through `run_setup_gated_within`, the token taken in `ran(0)`, given back on the injected clock), unreachable, weight change, disk short, unusable slot dir, failed and cancelled setup | each passes (`setup_keeps_one_slot::*`): the give-back reason is emitted, 2 `admitted` and 2 `released` rows (the unusable dir: 1 `released` before step 2, which runs queued nowhere); a failed or cancelled setup releases once |
 | `admit` twice under an open kept slot | passes: `host_slots()` 1, marker `held`, `holders/slot-0.who` names `step-2`, no release until the guard drops |
 | `cargo test -p relais --lib verify::` (via `greengate slot run`) | 179 passed, 0 failed, 2 ignored (after the review fixes) |
 | `cargo clippy -p relais --all-targets -- -D warnings`, `cargo fmt --check` | clean (fmt applied once) |
+| CI on PR #624, first push | macOS pass; windows failed to compile (`std::os::unix` without `#[cfg(unix)]`); ubuntu saw 5 sleeps against an exact 3. Fixed in `test(verify): kept-slot test portable to CI`; re-run locally: 179 passed, clippy and fmt clean |
 | a real 2-step run, and `kill -TERM` mid-setup | moved after the install: the installed release is piloted, and its result goes in the t12 ticket's Resolution (Decision log) |
 
 ## Implementation review
@@ -161,7 +162,8 @@ exports the held marker, so no step after the first queues again.
 - implementation-review: round 1 approve-with-changes (blocking: real 100 ms wait in the coordinator test; fixed on the injected clock, driven through the setup); Delta approve. 81k+57k tokens, 84+65 s.
 - backend: approve-with-changes (unusable-dir test added, one-state `Kept`, `keep` assert, holds-until note); Delta approve. 78k+35k, 86+32 s.
 - lang:rust: approve-with-changes (`#[must_use]`, `Mutex<Kept>`, `HostHold`, reporting after the lock); Delta approve-with-changes, 6 deliberate: the `unreachable!` re-match in `reuse_kept` is a local invariant, kept. 63k+35k, 46+34 s.
-- unix: approve, Delta approve. deliberate: the 0755 test follows `an_unsafe_directory_warns_once_and_falls_back` (root CI would not trip it; CI runs unprivileged); `setup_keeps_one_slot` lacks `#[cfg(unix)]` (no non-unix build). 59k+33k, 33+22 s.
+- unix: approve, Delta approve. deliberate: the 0755 test follows `an_unsafe_directory_warns_once_and_falls_back` (root CI would not trip it; CI runs unprivileged). The windows CI job failed on the missing `#[cfg(unix)]`; the module is now gated. 59k+33k, 33+22 s.
+- CI fix round: implementation-review approve-with-changes (plan record only, fixed here), 46k, 51 s; lang:rust approve, 29k, 34 s. deliberate: the budget equals sleeps x 1 s because every queue sleep is `kept.poll`; the re-read `journal` is a fresh read after more rows.
 - Next: Phase 2, release v0.90.0 after merge (v0.89.0 is tagged), install, then the live pilots.
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix body-sha=84280d3ae89b -->
