@@ -33,3 +33,10 @@ Round 2: backend approve, no findings. Codex: not run.
 - lang:rust, lang:typescript, unix: approve, no findings (typescript repeats the cast note, deliberate as before).
 - tui: approve. Low: the new `selected in:` path is printed raw like the old `machine.toml:` line; `deliberate: same behaviour as the line it sits beside, which also prints it raw; an escape pass over both is a separate change`.
 
+## Final tree 718cf2e7 (opus)
+
+- implementation-review: approve; low = plan names `RecordedOn::of`, code has `recorded_on` (deliberate, above).
+- backend, unix: approve. lang:typescript: approve, three optional lows (non-exhaustive ternary, unchecked cast, test path); `deliberate: the ternary falls back safely and the cast predates this change`.
+- tui: approve, low on `selected in:` (deliberate, above).
+- lang:rust: approve-with-changes, low: the comment said the free function avoids a trust -> shared_state dependency, which is false (`Selection` re-exports `policy::SharedStateSelection`, which trust.rs already imports). Fixed: the comment no longer gives that reason. `deliberate: the free function stays, a From impl is the same behaviour and only a different home`.
+

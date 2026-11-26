@@ -23,8 +23,8 @@ use relais::policy::RepoPolicy;
 use relais::shared_state::Selection;
 use relais::trust::RecordedOn;
 
-/// Where a grant is recorded, from the state's selection (an-t33). Kept here,
-/// not in `relais::trust`, so the trust module does not depend on shared_state.
+/// Where a grant is recorded, from the state's selection (an-t33): the one
+/// place the command maps the built state's `Selection` onto `RecordedOn`.
 fn recorded_on(selection: Selection) -> RecordedOn {
     match selection {
         Selection::Local => RecordedOn::MachineSettings,
