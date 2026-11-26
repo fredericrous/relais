@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.88.0
+
 A run whose settle the coordinator did not answer tries it once more after
 about a second (`relais: dispatch <id>: the coordinator did not answer the
 settle (…); trying once more in <n> ms`), so a lost answer no longer leaves
@@ -51,6 +53,8 @@ counter, and the rollback if it matters, is in `docs/shared-state.md`.
   now follows a recorded salvage and reads "recorded it as unknown". Under
   `shared_state = "external"` with no client a salvage exits 3 like the other
   answers (it recorded the salvage before). Nothing changes for one node.
+
+The shipped worker and reviewer agents list `mcp__greentopo__greentopo_*` tools instead of `mcp__aval__aval_*`, because the MCP server is registered as `greentopo` (programme topo-spotter-rename t16, #609). The plugin's agent files change, so the plugin needs a reinstall, and the agents the installer writes under `~/.claude/agents` (`relais-implementation`, `relais-review`) change the same way at the next install.
 
 ## v0.87.0
 
