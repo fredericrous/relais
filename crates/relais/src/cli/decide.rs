@@ -1748,9 +1748,9 @@ mod tests {
             .err()
             .expect("refused");
         assert!(
-            signed
-                .message
-                .ends_with("minutes); the sign-off of criterion c1 is recorded"),
+            signed.message.ends_with(
+                "answer again if it is still open; the sign-off of criterion c1 is recorded"
+            ),
             "{}",
             signed.message
         );
