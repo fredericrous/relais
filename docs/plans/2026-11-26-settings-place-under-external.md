@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: prog/agents-many-nodes/an-t33-settings-place-under-external
 repos: [relais]
 adrs: []

@@ -10,3 +10,10 @@ Panel ran from areas (the phase headings were not read as phases). Round 1 (opus
 - po: approve-with-changes. Verification names the external checks; public build non-goal; older plugin note (applied).
 
 Round 2: backend approve, no findings. Codex: not run.
+
+## Implementation review
+
+- implementation-review (opus), round 1: approve-with-changes. Verification had no observed results (recorded in the homelab ticket Resolution), the binary test lacked the text check (added), an empty `impl RecordedOn {}` (removed). All applied.
+- implementation-review (opus), delta on tree 2cbb9838: approve-with-changes on the Resolution gap only, which the homelab Resolution now answers; everything else resolved, no new findings. Candidates `names.reveal-intent` on `w` and `q` in consent.test.ts ruled fine.
+- Rebase onto main 74d0b48c9: CHANGELOG.md conflict resolved under Unreleased; the code tree differs from the reviewed one only by main's v0.89.0 version bump (Cargo.toml, plugin.json), so no delta is due.
+
