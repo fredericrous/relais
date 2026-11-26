@@ -154,7 +154,7 @@ f30 closed as not needed (the fallback is unreachable).
 - Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f26, f27, f29, f30, f31, f32.
 - Next:
   - Check the plugin's other `tool.call` `.catch` answers (f28), ready.
-  - Measure the home fingerprint warnings (f08), due 2026-11-28.
+  - Count unexplained home drifts (f08), due 2026-11-28; attribute each drift to a tool call (f33), ready.
   - A pin row's model matches the model its subagent ran (f22), due
     2026-12-01.
   - A week of relays adopts every handoff (f16), due 2026-12-02.
