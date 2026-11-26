@@ -33,8 +33,8 @@ cause. A test pins the detail, and it ships in one relais release.
 ## Outcome
 
 2026-11-26: `aval_resolve_in` checks `repo_dir.is_dir()` before the spawn
-and returns a `ToolFailure` (exit -1) whose detail is "the directory aval
-would run in does not exist: <dir>", with no launch hint.
+and returns a `ToolFailure` (exit -1) whose detail is "aval cannot run in
+<dir>: it is not a directory or does not exist", with no launch hint.
 `a_missing_repo_dir_is_a_tool_failure_not_absence` now pins the detail: it
 names the directory and carries none of the hint's text. The patch came
 from relais run run-66121efa5b002-10e41. Its verify (run-6612320fd2118-12599)

@@ -540,7 +540,7 @@ pub fn aval_resolve_in(
         return AvalVerdict::ToolFailure {
             exit: -1,
             detail: format!(
-                "the directory aval would run in does not exist: {}",
+                "aval cannot run in {}: it is not a directory or does not exist",
                 repo_dir.display()
             ),
         };
