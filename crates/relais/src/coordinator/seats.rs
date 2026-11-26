@@ -32,7 +32,7 @@ use crate::admission::{AdmissionState, Decision, Refusal};
 use crate::money::MicroUsd;
 use crate::shared_state::{
     LeaseToken, Principal, PrincipalKind, Reservation, ResourceId, Selection, SharedState,
-    SharedStateError,
+    SharedStateError, PRIMARY_UNREAD,
 };
 
 /// Where the book's lines go: the coordinator's stderr, or a test's buffer.
@@ -415,8 +415,8 @@ impl Book {
             }
         }
         log(&format!(
-            "seat settles: dropped {} waiting settle(s) totalling {total} (oldest dispatch: \
-             {oldest}); not booked to the shared counter; check the shared primary \
+            "seat settles: dropped {} waiting settle(s) (oldest dispatch: {oldest}); the shared \
+             counter is short by {total}; {PRIMARY_UNREAD} \
              (dropped_micros={micros})",
             dropped.len(),
             micros = total.to_micros(),
@@ -613,8 +613,8 @@ impl Book {
                     // back (an-t28).
                     log(&format!(
                         "seat {id}: booking the spend of {amount} was not accepted: \
-                         {settle_error}; dropped, the shared counter does not count it; if it \
-                         repeats, check the shared primary (dropped_micros={micros})",
+                         {settle_error}; dropped, the shared counter is short by {amount}; if \
+                         it repeats, {PRIMARY_UNREAD} (dropped_micros={micros})",
                         amount = dropped.actual,
                         micros = dropped.actual.to_micros(),
                     ));
@@ -698,10 +698,9 @@ pub struct SeatBook {
 fn wait_line(id: &str, cause: &SharedStateError) -> String {
     format!(
         "seat {id}: the shared state did not grant the seat ({cause}); this run waits and asks \
-         again; if it lasts, check the shared primary"
+         again; if it lasts, {PRIMARY_UNREAD}"
     )
 }
-
 impl SeatBook {
     /// A book holding nothing yet, writing to the coordinator's stderr.
     pub fn new(shared: Arc<dyn SharedState>, holder: Principal) -> Self {

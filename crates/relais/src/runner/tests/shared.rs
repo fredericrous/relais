@@ -281,3 +281,22 @@ fn a_run_under_a_gate_leaves_the_counter_to_the_coordinator() {
     );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
+
+/// an-t31: the line for a cost the counter did not book says how short the
+/// counter is and where to read on, never a check no command can make.
+#[test]
+fn an_unbooked_cost_says_how_short_the_counter_is_and_where_to_look() {
+    let line = crate::runner::launch::unbooked_line(
+        "disp-1",
+        &MicroUsd::from_micros(1_500_000),
+        &"primary unreachable",
+    );
+    assert!(line.starts_with("relais: dispatch disp-1: "), "{line}");
+    assert!(line.contains("primary unreachable"), "{line}");
+    assert!(line.contains("the shared counter is short by"), "{line}");
+    assert!(
+        line.ends_with(crate::shared_state::PRIMARY_UNREAD),
+        "{line}"
+    );
+    assert!(!line.contains("check the shared primary"), "{line}");
+}

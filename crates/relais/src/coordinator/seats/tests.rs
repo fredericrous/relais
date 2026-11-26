@@ -136,7 +136,10 @@ fn an_unreachable_primary_turns_the_grant_into_a_wait_until_it_grants() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|line| line.contains("the shared state did not grant the seat"))
+        .filter(|line| {
+            line.contains("the shared state did not grant the seat")
+                && line.ends_with(&format!("if it lasts, {PRIMARY_UNREAD}"))
+        })
         .count();
     assert_eq!(
         downgrades, 1,
@@ -469,7 +472,9 @@ fn a_settle_the_primary_refuses_is_dropped_once_and_the_next_one_books() {
             .lock()
             .unwrap()
             .iter()
-            .any(|line| line.contains("the shared counter does not count it")),
+            .any(|line| line.contains("the shared counter is short by")
+                && line.contains(&format!("if it repeats, {PRIMARY_UNREAD}"))
+                && !line.contains("check the shared primary")),
         "{lines:?}"
     );
     assert_eq!(
@@ -759,6 +764,23 @@ fn a_settle_past_the_age_cap_is_dropped_with_one_line() {
         "{lines:?}"
     );
     assert_eq!(count_lines(&lines, "oldest dispatch: d1"), 1, "{lines:?}");
+    // an-t31: the line says how short the counter is and where to read on,
+    // never a check no command can make.
+    assert_eq!(
+        count_lines(&lines, "the shared counter is short by $1.5"),
+        1,
+        "{lines:?}"
+    );
+    assert_eq!(
+        count_lines(&lines, &format!("{PRIMARY_UNREAD} (dropped_micros=")),
+        1,
+        "{lines:?}"
+    );
+    assert_eq!(
+        count_lines(&lines, "check the shared primary"),
+        0,
+        "{lines:?}"
+    );
 }
 
 #[test]
