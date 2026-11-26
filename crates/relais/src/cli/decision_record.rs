@@ -4,11 +4,16 @@
 //! would import `decide` back, an import cycle
 //! (`scripts/check-child-cycles.py crates/relais/src/cli`).
 
+use super::ctx::node_error;
 use super::ctx::refusal;
 use super::ctx::Refusal;
+use super::outcome::CliError;
 use super::outcome::CliOutcome;
+use relais::ids::RunId;
 use relais::runner::Reason;
 use relais::runner::State;
+use relais::shared_state::node;
+use relais::shared_state::node::NodeError;
 
 /// What a recorded decision reports, for both the sentence and `--json`.
 pub(crate) struct Decided {
@@ -63,4 +68,45 @@ pub(crate) fn read_decide_proof() -> Result<DecideProof, Refusal> {
             format!("`--proof-stdin` expects {{\"session\", \"nonce\"}} on stdin: {e}"),
         )
     })
+}
+
+/// What a person does next after a held answer: the answers that close an
+/// open decision, and `salvaged`, which may answer a run with none.
+#[derive(Clone, Copy)]
+pub(crate) enum NextStep {
+    AnswerAgain,
+    SalvageAgain,
+}
+
+/// A failure of an answer, as the person sees it. Another answerer holding
+/// the decision is a refusal, exit 3, that says what to do next; the line
+/// claims nothing about the decision's state, which was not read.
+/// `signed_off` is the criterion an approve recorded before the grant was
+/// asked. Everything else is [`node_error`].
+pub(crate) fn answer_error(
+    e: NodeError,
+    run: &RunId,
+    signed_off: Option<&str>,
+    next: NextStep,
+) -> Result<Decision, CliError> {
+    if !node::is_decision_held_elsewhere(&e, run) {
+        return Err(node_error("decide", e));
+    }
+    let minutes = relais::shared_state::DECISION_GRANT_TTL_SECS / 60;
+    let again = match next {
+        NextStep::AnswerAgain => "answer again if it is still open",
+        NextStep::SalvageAgain => {
+            "run the same `--answer salvaged` again unless status shows it already salvaged"
+        }
+    };
+    let mut message = format!(
+        "the decision of run {run} is being answered elsewhere: check `relais status {run}`, \
+         then {again} (the other answer holds it for up to {minutes} minutes)"
+    );
+    if let Some(criterion) = signed_off {
+        message.push_str(&format!(
+            "; the sign-off of criterion {criterion} is recorded"
+        ));
+    }
+    Ok(refusal(CliOutcome::Blocked, message))
 }

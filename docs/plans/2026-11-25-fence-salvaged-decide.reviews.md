@@ -1,0 +1,5 @@
+# Reviews: fence salvaged decide
+
+Round 1 (opus): tui approve-with-changes (containment warning printed before a refused grant; next-step tail for a run with no decision row); unix approve-with-changes (same warning; `--json` row); backend approve-with-changes (external-no-client row, write-fails row, counts); lang:rust approve-with-changes (test helper hard-codes no candidate; external row; stated line). Rejected: lang:rust#3 (equal-text assertion conflicts with the salvage tail).
+
+Round 2: tui approve (low: past-tense warning, carried). unix approve (low: name the `answer_error` tail parameter, carried). backend approve-with-changes (low: `next` argument and an approve-tail-unchanged row, carried). lang:rust approve-with-changes (medium: stderr is not capturable in `cargo test --bin` unit tests, put the stderr and `--json` checks in `tests/shared_state_cli.rs` on the external-no-client path; low: named `closed` predicate; low: quote the salvage tail in the held row; all carried into implementation).

@@ -29,7 +29,7 @@ back to an older relais.
 | handoff reservation | `relais programme next --claim` |
 | a session's work holds renewed or given back | `relais programme claim` (renew), the hook on a resumed `SessionStart` (renew) and on `SessionEnd` (give back) |
 | successor intent claim and release | `relais run --intent` |
-| decision answer, with or without a successor intent | `relais decide` (approve, reject, revise and the other answers but `salvaged`, which closes its decision unfenced) |
+| decision answer, with or without a successor intent | `relais decide` (every answer that closes a decision: approve, reject, revise, `salvaged` and the others) |
 | registry pointer read, swap and rollback | `relais promote`, `relais rollback`, and `relais learn cycle`'s automatic promote and rollback |
 | daily spend ceiling check | `relais run`, `relais dataset replay` (through `RunConfig::shared_state`) |
 | the runner's widen and timed-out settles | `relais run`, `relais dataset replay` |

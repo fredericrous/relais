@@ -22,6 +22,15 @@ counter, and the rollback if it matters, is in `docs/shared-state.md`.
 
 `relais dataset replay` builds its `SharedState` once and reads the effort bounds, the machine settings and the prices through it, as `relais run` does. Nothing changes for one node.
 
+- `relais decide --answer salvaged` now asks the shared half for the decision
+  grant before it records the salvage, as every other answer does. A grant held
+  elsewhere is exit 3 with one line whose next step says to run the same
+  salvage again unless `relais status` shows the salvage already recorded. A
+  salvage so refused records nothing. The line about an unknown containment
+  now follows a recorded salvage and reads "recorded it as unknown". Under
+  `shared_state = "external"` with no client a salvage exits 3 like the other
+  answers (it recorded the salvage before). Nothing changes for one node.
+
 ## v0.87.0
 
 The machine settings are written through `SharedState` as they are read.
