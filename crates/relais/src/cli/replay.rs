@@ -1,12 +1,13 @@
 //! `relais dataset replay`.
 
 use super::ctx::id_source;
-use super::ctx::load_machine;
-use super::ctx::load_price_table;
 use super::ctx::load_repo_policy;
+use super::ctx::machine_of;
 use super::ctx::open_ledger;
+use super::ctx::price_table_of;
 use super::ctx::pricing_preflight;
-use super::ctx::tuning_bounds;
+use super::ctx::shared_state;
+use super::ctx::tuning_bounds_of;
 use super::outcome::operational;
 use super::outcome::CliError;
 use super::outcome::CliOutcome;
@@ -88,9 +89,12 @@ pub(crate) fn replay_command(
             path: recipe.to_path_buf(),
             cause: Box::new(cause),
         })?;
+    // Built once for the whole replay (an-t25); a failure to build it is
+    // reported where the replay first needs it, after the dry-run return.
+    let shared = shared_state();
+    let bounds = tuning_bounds_of(shared.as_deref().ok(), &incumbent);
     // Admitted through the same door a learner's proposal is — never a
     // second, looser one for replay.
-    let bounds = tuning_bounds(&incumbent);
     let candidate = match route::validate_candidate(
         &incumbent,
         &candidate_policy,
@@ -299,9 +303,9 @@ pub(crate) fn replay_command(
         return Ok(CliOutcome::Blocked);
     };
 
-    let machine = load_machine()?;
-    // Built once, before any checkout or start line (an-t16).
-    let shared = super::ctx::shared_state()?;
+    // Before any checkout or start line (an-t16).
+    let shared = shared?;
+    let machine = machine_of(&*shared)?;
     let artifacts_dir = paths::runs_dir().map_err(CliError::Home)?;
     let backend = match relais::adapter::claude::ClaudeBackend::discover() {
         Ok(backend) => std::sync::Arc::from(backend),
@@ -382,7 +386,7 @@ pub(crate) fn replay_command(
     );
     let hooks = relais::verify::AmontCli::new();
     let attest = relais::verify::AmontCli::new();
-    let prices = load_price_table()?;
+    let prices = price_table_of(&*shared)?;
     if let Some(blocked) = pricing_preflight(
         "relais dataset replay",
         candidate.policy(),
