@@ -1629,13 +1629,13 @@ mod tests {
     #[test]
     fn a_failed_renewal_write_gives_the_shared_grant_back() {
         use crate::programme::claim::{HANDOFF_HOLD_SECS as HOLD, LOCK_WAIT};
+        use std::fs::Permissions;
         use std::os::unix::fs::PermissionsExt;
         struct Restore(std::path::PathBuf);
         impl Drop for Restore {
             fn drop(&mut self) {
-                // Drop cannot return an error; a failed restore leaves only a test temp dir.
-                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
-                // best effort: Drop cannot return it
+                let restored = std::fs::set_permissions(&self.0, Permissions::from_mode(0o755));
+                let _ = restored; // Drop cannot return it; a failed restore leaves a test temp dir
             }
         }
         let (dir, store, key, state) = a_reserved_handoff_to_retry("fake-node-renew-write");
@@ -1652,8 +1652,8 @@ mod tests {
         }
         let err = node::reserve_handoff(&state, &lock, &key, "t1", &me, "/r", 1_000 + HOLD / 2)
             .expect_err("the renewal failed");
-        // The mode is restored before the lock drops: the lock's release
-        // touches the slug directory.
+        // The guard restores the mode on a panic; this resets it before the
+        // asserts read the directory.
         std::fs::set_permissions(&slug_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         drop(lock);
         assert_a_failed_renewal_gave_the_grant_back(&state, &store, &key, err, "t1.toml");
