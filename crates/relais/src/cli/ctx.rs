@@ -732,6 +732,9 @@ mod home_drift_warning_tests {
                             // A call, or the path handed on as a value
                             // (`LazyCell::new(super::ctx::shared_state)`).
                             let called = after == Some('(');
+                            // holds-until: no cli file passes an imported builder
+                            // bare as a value (`LazyCell::new(shared_state)` after a
+                            // `use`); drop the `::` test when one does.
                             let handed_on = line[..*at].ends_with("::") && matches!(after, Some(')' | ','));
                             own_word && (called || handed_on)
                         })
