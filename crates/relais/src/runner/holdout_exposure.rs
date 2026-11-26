@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 
+use super::transcript_calls::tool_uses;
 use crate::holdout::ResolvedHoldout;
 
 /// A kind of location a holdout hides.
@@ -71,27 +72,9 @@ impl Markers {
 /// that is not JSON, or holds no `tool_use` block, hits nothing.
 pub(crate) fn scan_transcript(text: &str, markers: &Markers) -> BTreeSet<(String, Marker)> {
     let mut hits = BTreeSet::new();
-    for line in text.lines() {
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let content = record
-            .pointer("/message/content")
-            .or_else(|| record.get("content"))
-            .and_then(serde_json::Value::as_array);
-        for block in content.into_iter().flatten() {
-            if block.get("type").and_then(serde_json::Value::as_str) != Some("tool_use") {
-                continue;
-            }
-            let tool = block
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
-            if let Some(input) = block.get("input") {
-                for marker in markers_in(input, markers) {
-                    hits.insert((tool.to_string(), marker));
-                }
-            }
+    for call in tool_uses(text) {
+        for marker in markers_in(&call.input, markers) {
+            hits.insert((call.name.clone(), marker));
         }
     }
     hits

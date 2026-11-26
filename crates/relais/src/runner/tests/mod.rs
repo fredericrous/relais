@@ -2,6 +2,7 @@ use super::review::{report_review_prompt, review_verdict, REVIEW_MIN_WALL};
 use super::review::{CandidateNames, ReviewerGuidance, REVIEW_CONSTRAINTS_BUDGET_BYTES};
 use super::*;
 use crate::adapter::{MockBackend, MockOutcome};
+use crate::backend::{BackendError, Harness};
 use crate::context::AvalVerdict;
 use crate::contract::Review;
 use crate::ids::derive_task_id;
@@ -717,6 +718,43 @@ impl Fixture {
             node_host: Some("test-node".into()),
         })
         .expect("the fixture's id source mints identifiers")
+    }
+}
+
+/// A backend that runs as an agent with a transcript: each dispatch is
+/// recorded as a native agent in the ledger, and `transcript_of` answers
+/// with the given text.
+struct TranscriptBackend {
+    inner: MockBackend,
+    ledger_path: std::path::PathBuf,
+    transcript: Option<String>,
+}
+
+impl Harness for TranscriptBackend {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn probe(&self) -> Option<crate::backend::Capabilities> {
+        self.inner.probe()
+    }
+}
+
+impl Backend for TranscriptBackend {
+    fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
+        let launched = self.inner.launch(spec)?;
+        let ledger = crate::ledger::Ledger::open(&self.ledger_path).expect("ledger");
+        ledger
+            .record_native_dispatch(
+                &crate::ids::DispatchId::from_stored(spec.dispatch_id.clone()),
+                Some("agent-1"),
+            )
+            .expect("the dispatch is recorded as an agent");
+        Ok(launched)
+    }
+
+    fn transcript_of(&self, agent_id: &str) -> Option<String> {
+        assert_eq!(agent_id, "agent-1");
+        self.transcript.clone()
     }
 }
 

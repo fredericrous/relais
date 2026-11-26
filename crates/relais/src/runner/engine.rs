@@ -544,7 +544,7 @@ impl<'a> RunEngine<'a> {
     }
 
     fn run_to_outcome(&mut self) -> Finish {
-        let home_before = self.home_snapshot();
+        let home_before = self.home_before();
         let ended = self.run_inner();
         if !ended.as_ref().is_err_and(RunError::is_storage_full) {
             self.record_home_drift(home_before.as_ref());

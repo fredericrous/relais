@@ -194,7 +194,7 @@ suffix. `Unexplained { calls_read: false }` prints its cause line as
 
 ## Phases
 
-- [ ] Phase 1 — writer parts and `Cause` in
+- [x] Phase 1 — writer parts and `Cause` in
   `crates/relais/src/homeprint.rs`; worker-call attribution in
   `crates/relais/src/runner/home_drift.rs`, with the shared `tool_use`
   walk taken out of `runner/holdout_exposure.rs`; report order and the
@@ -254,5 +254,25 @@ None.
   watch of it, both plugin files and relais's `.git/config` saw no change,
   so no settings key is known to be Claude Code's own. Its drifts stay
   unexplained unless a worker call names it.
+- 2026-11-26 — Phase 1 written by relais (run-6613411a6a63c-17b1e,
+  candidate 1). Its two verify runs never got a host slot
+  (`admission_wait_exhausted` three times, the line held by other
+  sessions' push gates), so the candidate was applied with `git apply`
+  and checked here, and the commit gate runs the full suite.
+- 2026-11-26 — carried review findings taken in Phase 1: `$HOME/` and
+  `${HOME}/` spellings, `>|`, `&>` and `n>` redirections, git 2.46
+  `config set/unset/rename-section/remove-section`, calls dated before
+  the first snapshot ignored, the full agent ID printed, a quote-aware
+  word split with no new dependency, `calls_read` per agent. The worker
+  also recurses into `sh -c` (depth 2) and keeps a call whose record has
+  no timestamp, since it cannot be shown to be older.
+- 2026-11-26 — the follow-up's new wording ("the run, its tests or
+  another session") also prints for old rows, because it is one shared
+  constant and the old wording blamed the run for what the data shows
+  are other sessions' writes. Every other line of an old row prints
+  unchanged.
+- 2026-11-26 — the pilot runs after Phase 2's install, not before,
+  because `relais run` starts only through the plugin, which runs the
+  installed binary; a branch build cannot be piloted through it.
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:rust,tui,unix,codex body-sha=a20afd906fa8 -->

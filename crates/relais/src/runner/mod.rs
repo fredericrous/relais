@@ -70,6 +70,7 @@ pub mod scheduler;
 mod setup_gate;
 mod spend;
 pub mod successor;
+mod transcript_calls;
 mod types;
 mod verification;
 mod workspace_ops;

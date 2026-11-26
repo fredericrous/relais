@@ -37,8 +37,9 @@ const GIT_WAIT: Duration = Duration::from_secs(10);
 
 /// The last lines of a warning that lists changed files, each short enough
 /// for an 80-column terminal.
-pub const FOLLOW_UP: [&str; 2] = [
-    "check these files; if you did not change them, the run or its tests did:",
+pub const FOLLOW_UP: [&str; 3] = [
+    "check these files; if you did not change them, the run, its tests or",
+    "another session did:",
     "  rerun them with HOME set to a temporary directory",
 ];
 
@@ -95,6 +96,62 @@ pub struct Watch<'a> {
     pub extra_paths: &'a [PathBuf],
 }
 
+/// The hash of a file with one writer's own part taken out, and the
+/// writer's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReducedHash {
+    writer: &'static str,
+    sha256: String,
+}
+
+/// Which part of a watched file a known writer owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterPart {
+    /// The per-entry bookkeeping of `installed_plugins.json`.
+    InstalledPlugins,
+    /// The per-marketplace bookkeeping of `known_marketplaces.json`.
+    KnownMarketplaces,
+    /// The `[branch "…"]` sections of the repository's `.git/config`.
+    BranchSections,
+}
+
+const PLUGIN_WRITER: &str = "claude code plugin refresh";
+const BRANCH_WRITER: &str = "git branch tracking";
+
+/// The fields Claude Code rewrites on a plugin or marketplace entry when a
+/// session refreshes it. Every other field stays in the reduced hash, so a
+/// new entry or a changed `source` is never explained.
+const PLUGIN_ENTRY_KEYS: [&str; 5] = [
+    "lastUpdated",
+    "installedAt",
+    "gitCommitSha",
+    "version",
+    "installPath",
+];
+
+impl WriterPart {
+    fn writer(self) -> &'static str {
+        match self {
+            Self::InstalledPlugins | Self::KnownMarketplaces => PLUGIN_WRITER,
+            Self::BranchSections => BRANCH_WRITER,
+        }
+    }
+
+    /// The hash of `bytes` without this writer's part; `None` when the
+    /// file does not parse as the format the part is cut from.
+    fn reduced_hash(self, bytes: &[u8]) -> Option<ReducedHash> {
+        let reduced = match self {
+            Self::InstalledPlugins => without_installed_plugin_bookkeeping(bytes)?,
+            Self::KnownMarketplaces => without_marketplace_bookkeeping(bytes)?,
+            Self::BranchSections => without_branch_sections(bytes)?,
+        };
+        Some(ReducedHash {
+            writer: self.writer(),
+            sha256: sha256_hex(&reduced),
+        })
+    }
+}
+
 /// What one watched path held.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Entry {
@@ -103,6 +160,9 @@ enum Entry {
         sha256: String,
         size: u64,
         mode: Option<u32>,
+        /// The hash of the file without its known writer's part, for the
+        /// few files a tool rewrites in its normal work.
+        reduced: Option<ReducedHash>,
     },
     /// A regular file over [`HASH_LIMIT`], never read. One whose
     /// modification time cannot be read is recorded as unreadable.
@@ -169,6 +229,31 @@ impl fmt::Display for Change {
 pub struct Drift {
     pub path: String,
     pub change: Change,
+    /// Why the path changed; absent on a record an older relais wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<Cause>,
+}
+
+/// Why a watched path changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Cause {
+    /// A known tool's own upkeep: only the writer's part of the file changed.
+    Writer { name: String },
+    /// A tool call of one of the run's own workers writes the path.
+    Call { tool: String, agent: String },
+    /// Nothing known explains it. `calls_read` is false when the run had no
+    /// worker dispatch, or a worker's transcript could not be read, so the
+    /// worker's calls were not all checked.
+    Unexplained { calls_read: bool },
+}
+
+/// A tool call of a worker that writes a watched path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerCall {
+    pub tool: String,
+    /// The full agent id.
+    pub agent: String,
 }
 
 impl Drift {
@@ -190,38 +275,123 @@ impl Drift {
     }
 }
 
-/// The lines that report `drifts`: under `heading`, one indented line per
-/// changed path and the follow-up; then one line per path that was not
+/// The lines that report `drifts`: under `heading`, the paths nothing
+/// explains first (a record with no cause is among them), then the paths a
+/// worker's call wrote, each as an indented line with its cause below it,
+/// then one count line per known writer, and the follow-up when a path of
+/// the first two groups was listed; then one line per path that was not
 /// compared. Empty when there is nothing to say.
 /// A path under `home` prints as `~/…` on unix; with no `home`, every
 /// path prints as stored.
 pub fn report(drifts: &[Drift], heading: &str, home: Option<&Path>) -> Vec<String> {
-    let drifts: Vec<Drift> = drifts
-        .iter()
-        .map(|drift| Drift {
-            path: home.map_or_else(
-                || drift.path.clone(),
-                |home| shown(Path::new(&drift.path), home),
-            ),
-            change: drift.change,
-        })
-        .collect();
-    let changed: Vec<&Drift> = drifts
-        .iter()
-        .filter(|drift| drift.notice_line().is_none())
-        .collect();
-    let mut lines = Vec::new();
-    if !changed.is_empty() {
-        lines.push(heading.to_string());
-        lines.extend(
-            changed
-                .iter()
-                .map(|drift| format!("  {} ({})", drift.path, drift.change)),
-        );
-        lines.extend(FOLLOW_UP.iter().map(|line| (*line).to_string()));
+    let shown_path = |drift: &Drift| {
+        home.map_or_else(
+            || drift.path.clone(),
+            |home| shown(Path::new(&drift.path), home),
+        )
+    };
+    let mut unexplained = Vec::new();
+    let mut by_worker = Vec::new();
+    let mut by_writer: BTreeMap<&str, usize> = BTreeMap::new();
+    for drift in drifts.iter().filter(|drift| drift.notice_line().is_none()) {
+        let line = format!("  {} ({})", shown_path(drift), drift.change);
+        match &drift.cause {
+            None => unexplained.push(vec![line]),
+            Some(Cause::Unexplained { calls_read: true }) => {
+                unexplained.push(vec![line, "    unexplained".to_string()]);
+            }
+            Some(Cause::Unexplained { calls_read: false }) => unexplained.push(vec![
+                line,
+                "    unexplained (no worker transcript read)".to_string(),
+            ]),
+            Some(Cause::Call { tool, agent }) => {
+                by_worker.push(vec![line, format!("    by {tool} in agent {agent}")]);
+            }
+            Some(Cause::Writer { name }) => *by_writer.entry(name.as_str()).or_default() += 1,
+        }
     }
-    lines.extend(drifts.iter().filter_map(Drift::notice_line));
+    let mut lines = Vec::new();
+    if !(unexplained.is_empty() && by_worker.is_empty() && by_writer.is_empty()) {
+        lines.push(heading.to_string());
+        let needs_follow_up = !(unexplained.is_empty() && by_worker.is_empty());
+        lines.extend(unexplained.into_iter().chain(by_worker).flatten());
+        lines.extend(
+            by_writer
+                .iter()
+                .map(|(name, count)| format!("  {count} by known writer: {name}")),
+        );
+        if needs_follow_up {
+            lines.extend(FOLLOW_UP.iter().map(|line| (*line).to_string()));
+        }
+    }
+    lines.extend(drifts.iter().filter_map(|drift| {
+        let mut shown_drift = drift.clone();
+        shown_drift.path = shown_path(drift);
+        shown_drift.notice_line()
+    }));
     lines
+}
+
+/// Give each drift its cause. A worker's call that writes the path comes
+/// first (a worker that writes only a writer's part is still the run's own
+/// write); then a known writer, when both sides are the same regular file
+/// with the same mode, both have a reduced hash, the reduced hashes are
+/// equal and the full hash changed; else the drift is unexplained.
+/// `calls_read` says whether every worker transcript was read. A path that
+/// was not compared at all has no cause.
+pub fn attribute(
+    drifts: Vec<Drift>,
+    before: &Snapshot,
+    after: &Snapshot,
+    call_for: &dyn Fn(&Path) -> Option<WorkerCall>,
+    calls_read: bool,
+) -> Vec<Drift> {
+    drifts
+        .into_iter()
+        .map(|drift| {
+            let cause = if drift.notice_line().is_some() {
+                None
+            } else {
+                let path = PathBuf::from(&drift.path);
+                Some(if let Some(call) = call_for(&path) {
+                    Cause::Call {
+                        tool: call.tool,
+                        agent: call.agent,
+                    }
+                } else if let Some(name) = known_writer(before, after, &path) {
+                    Cause::Writer {
+                        name: name.to_string(),
+                    }
+                } else {
+                    Cause::Unexplained { calls_read }
+                })
+            };
+            Drift { cause, ..drift }
+        })
+        .collect()
+}
+
+/// The writer whose own part is all that changed at `path`.
+fn known_writer(before: &Snapshot, after: &Snapshot, path: &Path) -> Option<&'static str> {
+    match (before.entries.get(path)?, after.entries.get(path)?) {
+        (
+            Entry::File {
+                sha256: was,
+                mode: was_mode,
+                reduced: Some(was_reduced),
+                ..
+            },
+            Entry::File {
+                sha256: is,
+                mode: is_mode,
+                reduced: Some(is_reduced),
+                ..
+            },
+        ) if was != is && was_mode == is_mode && was_reduced == is_reduced => {
+            Some(was_reduced.writer)
+        }
+        _ => None,
+    }
 }
 
 /// Whether `path` may be listed in `[fingerprint] extra_paths`: absolute,
@@ -266,6 +436,8 @@ struct Target {
     path: PathBuf,
     recursive: bool,
     keep: fn(&str) -> bool,
+    /// The part of the file a known writer owns, for a single file.
+    part: Option<WriterPart>,
 }
 
 fn keep_all(_: &str) -> bool {
@@ -286,6 +458,14 @@ fn single(path: PathBuf) -> Target {
         path,
         recursive: false,
         keep: keep_all,
+        part: None,
+    }
+}
+
+fn with_part(target: Target, part: WriterPart) -> Target {
+    Target {
+        part: Some(part),
+        ..target
     }
 }
 
@@ -306,25 +486,36 @@ fn targets(watch: &Watch<'_>) -> Vec<Target> {
             path: claude.clone(),
             recursive: false,
             keep: keep_claude_settings,
+            part: None,
         },
-        single(claude.join("plugins").join("installed_plugins.json")),
-        single(claude.join("plugins").join("known_marketplaces.json")),
+        with_part(
+            single(claude.join("plugins").join("installed_plugins.json")),
+            WriterPart::InstalledPlugins,
+        ),
+        with_part(
+            single(claude.join("plugins").join("known_marketplaces.json")),
+            WriterPart::KnownMarketplaces,
+        ),
         Target {
             path: home.join(".ssh"),
             recursive: true,
             keep: keep_ssh,
+            part: None,
         },
     ];
     if cfg!(windows) {
         targets.push(single(home.join("_netrc")));
     }
     match &watch.repo_config {
-        RepoConfig::At(path) | RepoConfig::Unresolved(path) => targets.push(single(path.clone())),
+        RepoConfig::At(path) | RepoConfig::Unresolved(path) => {
+            targets.push(with_part(single(path.clone()), WriterPart::BranchSections))
+        }
     }
     targets.extend(watch.extra_paths.iter().map(|path| Target {
         path: path.clone(),
         recursive: true,
         keep: keep_all,
+        part: None,
     }));
     targets
 }
@@ -343,7 +534,11 @@ fn mode_of(_: &std::fs::Metadata) -> Option<u32> {
 /// What a path holds, or `None` for what is not watched: a directory is
 /// walked by its caller, and a FIFO, socket or device is skipped, since
 /// opening a FIFO blocks and sockets come and go.
-fn entry_of(path: &Path, read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) -> Option<Entry> {
+fn entry_of(
+    path: &Path,
+    read: &dyn Fn(&Path) -> io::Result<Vec<u8>>,
+    part: Option<WriterPart>,
+) -> Option<Entry> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(Entry::Absent),
@@ -377,6 +572,7 @@ fn entry_of(path: &Path, read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) -> Option<
             sha256: sha256_hex(&bytes),
             size: bytes.len() as u64,
             mode: mode_of(&metadata),
+            reduced: part.and_then(|part| part.reduced_hash(&bytes)),
         },
         Err(_) => Entry::Unreadable,
     })
@@ -432,7 +628,7 @@ fn walk(
             }
             continue;
         }
-        let Some(entry) = entry_of(&path, read) else {
+        let Some(entry) = entry_of(&path, read, None) else {
             continue;
         };
         if walked.files == MAX_FILES_PER_DIRECTORY {
@@ -469,11 +665,13 @@ pub fn snapshot(watch: &Watch<'_>, read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) 
             );
             let entry = if is_repo_config {
                 // The tool's own keys are left out of what is hashed.
-                entry_of(&target.path, &|path| {
-                    read(path).map(|bytes| without_tool_keys(&bytes))
-                })
+                entry_of(
+                    &target.path,
+                    &|path| read(path).map(|bytes| without_tool_keys(&bytes)),
+                    target.part,
+                )
             } else {
-                entry_of(&target.path, read)
+                entry_of(&target.path, read, target.part)
             };
             if let Some(entry) = entry {
                 taken.entries.insert(target.path, entry);
@@ -531,6 +729,66 @@ fn without_tool_keys(config: &[u8]) -> Vec<u8> {
     kept
 }
 
+/// `config` without its `[branch "…"]` sections, which git rewrites to
+/// keep track of branches; `None` when a section header is not closed.
+fn without_branch_sections(config: &[u8]) -> Option<Vec<u8>> {
+    let mut kept = Vec::with_capacity(config.len());
+    let mut in_branch = false;
+    for line in config.split_inclusive(|byte| *byte == b'\n') {
+        if let Some(name) = section_opened(line) {
+            if !line.contains(&b']') {
+                return None;
+            }
+            in_branch = name
+                .split_once(char::is_whitespace)
+                .is_some_and(|(section, rest)| {
+                    section == "branch" && rest.trim_start().starts_with('"')
+                });
+        }
+        if !in_branch {
+            kept.extend_from_slice(line);
+        }
+    }
+    Some(kept)
+}
+
+/// `value` without the fields of [`PLUGIN_ENTRY_KEYS`], when it is an object.
+fn without_plugin_entry_keys(value: &mut serde_json::Value) {
+    if let Some(entry) = value.as_object_mut() {
+        for key in PLUGIN_ENTRY_KEYS {
+            entry.remove(key);
+        }
+    }
+}
+
+/// `installed_plugins.json` without the bookkeeping of each install in
+/// `plugins.<name>[i]`; the top-level `version` stays.
+fn without_installed_plugin_bookkeeping(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut document: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let root = document.as_object_mut()?;
+    if let Some(plugins) = root
+        .get_mut("plugins")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for installs in plugins.values_mut() {
+            for install in installs.as_array_mut().into_iter().flatten() {
+                without_plugin_entry_keys(install);
+            }
+        }
+    }
+    serde_json::to_vec(&document).ok()
+}
+
+/// `known_marketplaces.json` without the bookkeeping of each top-level
+/// marketplace entry.
+fn without_marketplace_bookkeeping(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut document: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    for marketplace in document.as_object_mut()?.values_mut() {
+        without_plugin_entry_keys(marketplace);
+    }
+    serde_json::to_vec(&document).ok()
+}
+
 /// What changed between two snapshots, in path order. A path one side
 /// does not hold counts as absent there.
 pub fn diff(before: &Snapshot, after: &Snapshot) -> Vec<Drift> {
@@ -551,6 +809,7 @@ pub fn diff(before: &Snapshot, after: &Snapshot) -> Vec<Drift> {
             drifts.push(Drift {
                 path: path.display().to_string(),
                 change,
+                cause: None,
             });
         }
     }
@@ -563,6 +822,7 @@ pub fn diff(before: &Snapshot, after: &Snapshot) -> Vec<Drift> {
         drifts.push(Drift {
             path: path.display().to_string(),
             change,
+            cause: None,
         });
     }
     drifts
@@ -769,7 +1029,8 @@ mod tests {
                 "heading".to_string(),
                 format!("  {} (not checked: unreadable)", shown_gitconfig(&home)),
                 FOLLOW_UP[0].to_string(),
-                FOLLOW_UP[1].to_string()
+                FOLLOW_UP[1].to_string(),
+                FOLLOW_UP[2].to_string()
             ]
         );
     }
@@ -891,6 +1152,7 @@ mod tests {
         let drifts = [Drift {
             path: "~/.gitconfig".into(),
             change: Change::Modified,
+            cause: None,
         }];
         assert_eq!(
             report(&drifts, "home files changed:", Some(Path::new("/h"))),
@@ -898,7 +1160,8 @@ mod tests {
                 "home files changed:".to_string(),
                 "  ~/.gitconfig (modified)".to_string(),
                 FOLLOW_UP[0].to_string(),
-                FOLLOW_UP[1].to_string()
+                FOLLOW_UP[1].to_string(),
+                FOLLOW_UP[2].to_string()
             ]
         );
     }
@@ -954,6 +1217,7 @@ mod tests {
         let drifts = [Drift {
             path: stored.clone(),
             change: Change::Modified,
+            cause: None,
         }];
         assert_eq!(
             report(&drifts, "heading", None)[1],
@@ -991,6 +1255,7 @@ mod tests {
             vec![Drift {
                 path: big.display().to_string(),
                 change: Change::Modified,
+                cause: None,
             }]
         );
     }
@@ -1022,6 +1287,7 @@ mod tests {
             vec![Drift {
                 path: big.display().to_string(),
                 change: Change::Modified,
+                cause: None,
             }]
         );
     }
@@ -1039,6 +1305,280 @@ mod tests {
         assert!(is_valid_extra_path(&absolute));
         assert!(!is_valid_extra_path(Path::new("x/y")));
         assert!(!is_valid_extra_path(Path::new("~other/x")));
+    }
+
+    fn no_call(_: &Path) -> Option<WorkerCall> {
+        None
+    }
+
+    /// The causes of the drifts between a home whose plugin file held
+    /// `before` and then `after`, with no worker call.
+    fn plugin_causes(file: &str, before: &str, after: &str) -> Vec<(String, Option<Cause>)> {
+        let home = crate::test_support::temp_dir("homeprint-plugin");
+        let path = home.join(".claude").join("plugins").join(file);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, before).expect("write");
+        let first = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        std::fs::write(&path, after).expect("write");
+        let second = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        attribute(diff(&first, &second), &first, &second, &no_call, true)
+            .into_iter()
+            .map(|drift| (drift.path, drift.cause))
+            .collect()
+    }
+
+    fn writer(name: &str) -> Option<Cause> {
+        Some(Cause::Writer { name: name.into() })
+    }
+
+    const MARKETPLACES: &str = r#"{"a":{"source":{"repo":"x/a"},"lastUpdated":"1"}}"#;
+
+    #[test]
+    fn a_last_updated_only_change_is_the_plugin_writers() {
+        let after = r#"{"a":{"source":{"repo":"x/a"},"lastUpdated":"2"}}"#;
+        let causes = plugin_causes("known_marketplaces.json", MARKETPLACES, after);
+        assert_eq!(causes.len(), 1, "{causes:?}");
+        assert_eq!(causes[0].1, writer("claude code plugin refresh"));
+    }
+
+    #[test]
+    fn a_new_marketplace_entry_or_a_changed_source_is_unexplained() {
+        let added = r#"{"a":{"source":{"repo":"x/a"},"lastUpdated":"1"},"b":{"lastUpdated":"1"}}"#;
+        let moved = r#"{"a":{"source":{"repo":"x/evil"},"lastUpdated":"2"}}"#;
+        for after in [added, moved] {
+            let causes = plugin_causes("known_marketplaces.json", MARKETPLACES, after);
+            assert_eq!(
+                causes[0].1,
+                Some(Cause::Unexplained { calls_read: true }),
+                "{after}"
+            );
+        }
+    }
+
+    #[test]
+    fn installed_plugins_bookkeeping_is_the_writers_and_a_new_plugin_is_not() {
+        let before = r#"{"version":2,"plugins":{"p":[{"scope":"user","version":"1","installPath":"/a","gitCommitSha":"x","installedAt":"1","lastUpdated":"1"}]}}"#;
+        let after = r#"{"version":2,"plugins":{"p":[{"scope":"user","version":"2","installPath":"/b","gitCommitSha":"y","installedAt":"2","lastUpdated":"2"}]}}"#;
+        let causes = plugin_causes("installed_plugins.json", before, after);
+        assert_eq!(causes[0].1, writer("claude code plugin refresh"));
+        let top_level = after.replace(r#""version":2,"#, r#""version":3,"#);
+        let causes = plugin_causes("installed_plugins.json", after, &top_level);
+        assert_eq!(causes[0].1, Some(Cause::Unexplained { calls_read: true }));
+        let scoped = after.replace(r#""scope":"user""#, r#""scope":"project""#);
+        let causes = plugin_causes("installed_plugins.json", after, &scoped);
+        assert_eq!(causes[0].1, Some(Cause::Unexplained { calls_read: true }));
+    }
+
+    #[test]
+    fn unparsable_json_has_no_writer() {
+        let causes = plugin_causes("known_marketplaces.json", "{not json", "{still not");
+        assert_eq!(causes[0].1, Some(Cause::Unexplained { calls_read: true }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_last_updated_bump_with_a_chmod_is_unexplained() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = crate::test_support::temp_dir("homeprint-plugin-chmod");
+        let path = home
+            .join(".claude")
+            .join("plugins")
+            .join("known_marketplaces.json");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, MARKETPLACES).expect("write");
+        let first = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        std::fs::write(&path, MARKETPLACES.replace("\"1\"", "\"2\"")).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let second = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        let drifts = attribute(diff(&first, &second), &first, &second, &no_call, true);
+        assert_eq!(
+            drifts[0].cause,
+            Some(Cause::Unexplained { calls_read: true })
+        );
+    }
+
+    #[test]
+    fn a_branch_section_only_change_is_git_branch_tracking() {
+        let before = "[core]\n\tbare = false\n";
+        let after = "[core]\n\tbare = false\n[branch \"t\"]\n\tremote = origin\n";
+        let drifts = repo_config_drift(before, after);
+        assert_eq!(drifts.len(), 1, "{drifts:?}");
+        assert_eq!(drifts[0].cause, None, "diff alone attributes nothing");
+        let attributed = attributed_repo_config(before, after);
+        assert_eq!(attributed[0].cause, writer("git branch tracking"));
+        let other = "[core]\n\tbare = true\n[branch \"t\"]\n\tremote = origin\n";
+        let attributed = attributed_repo_config(before, other);
+        assert_eq!(
+            attributed[0].cause,
+            Some(Cause::Unexplained { calls_read: true })
+        );
+    }
+
+    fn attributed_repo_config(before: &str, after: &str) -> Vec<Drift> {
+        let home = crate::test_support::temp_dir("homeprint-repo-config-cause");
+        let config = home.join("repo").join(".git").join("config");
+        std::fs::create_dir_all(config.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&config, before).expect("write");
+        let first = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        std::fs::write(&config, after).expect("write");
+        let second = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        attribute(diff(&first, &second), &first, &second, &no_call, true)
+    }
+
+    #[test]
+    fn a_worker_call_outranks_a_writer() {
+        let before = "[core]\n\tbare = false\n";
+        let after = "[core]\n\tbare = false\n[branch \"t\"]\n\tremote = origin\n";
+        let home = crate::test_support::temp_dir("homeprint-call-first");
+        let config = home.join("repo").join(".git").join("config");
+        std::fs::create_dir_all(config.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&config, before).expect("write");
+        let first = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        std::fs::write(&config, after).expect("write");
+        let second = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        let call = |_: &Path| {
+            Some(WorkerCall {
+                tool: "Bash".into(),
+                agent: "agent-1".into(),
+            })
+        };
+        let drifts = attribute(diff(&first, &second), &first, &second, &call, true);
+        assert_eq!(
+            drifts[0].cause,
+            Some(Cause::Call {
+                tool: "Bash".into(),
+                agent: "agent-1".into()
+            })
+        );
+    }
+
+    fn drift_with(path: &str, change: Change, cause: Option<Cause>) -> Drift {
+        Drift {
+            path: path.into(),
+            change,
+            cause,
+        }
+    }
+
+    #[test]
+    fn the_report_lists_unexplained_then_worker_named_then_one_count_line_per_writer() {
+        let drifts = [
+            drift_with(
+                "/h/.claude/plugins/known_marketplaces.json",
+                Change::Modified,
+                writer("claude code plugin refresh"),
+            ),
+            drift_with(
+                "/h/repo/.git/config",
+                Change::Modified,
+                writer("git branch tracking"),
+            ),
+            drift_with(
+                "/h/.claude/plugins/installed_plugins.json",
+                Change::Modified,
+                writer("claude code plugin refresh"),
+            ),
+            drift_with(
+                "/h/.netrc",
+                Change::Added,
+                Some(Cause::Call {
+                    tool: "Write".into(),
+                    agent: "a30abb7e-1234-4abc".into(),
+                }),
+            ),
+            drift_with(
+                "/h/.zshrc",
+                Change::Modified,
+                Some(Cause::Unexplained { calls_read: false }),
+            ),
+            drift_with("/h/.gitconfig", Change::Modified, None),
+            drift_with(
+                "/h/.ssh/config",
+                Change::Modified,
+                Some(Cause::Unexplained { calls_read: true }),
+            ),
+        ];
+        assert_eq!(
+            report(&drifts, "heading", Some(Path::new("/h"))),
+            vec![
+                "heading",
+                "  ~/.zshrc (modified)",
+                "    unexplained (no worker transcript read)",
+                "  ~/.gitconfig (modified)",
+                "  ~/.ssh/config (modified)",
+                "    unexplained",
+                "  ~/.netrc (added)",
+                "    by Write in agent a30abb7e-1234-4abc",
+                "  2 by known writer: claude code plugin refresh",
+                "  1 by known writer: git branch tracking",
+                FOLLOW_UP[0],
+                FOLLOW_UP[1],
+                FOLLOW_UP[2],
+            ]
+        );
+    }
+
+    #[test]
+    fn only_known_writers_print_the_heading_and_the_count_line() {
+        let drifts = [drift_with(
+            "/h/repo/.git/config",
+            Change::Modified,
+            writer("git branch tracking"),
+        )];
+        assert_eq!(
+            report(&drifts, "heading", None),
+            vec!["heading", "  1 by known writer: git branch tracking"]
+        );
+    }
+
+    #[test]
+    fn every_report_line_fits_80_columns_with_a_17_character_agent() {
+        let drifts = [
+            drift_with(
+                "~/.netrc",
+                Change::Modified,
+                Some(Cause::Call {
+                    tool: "NotebookEdit".into(),
+                    agent: "a30abb7e12345678a".into(),
+                }),
+            ),
+            drift_with(
+                "~/.gitconfig",
+                Change::Modified,
+                Some(Cause::Unexplained { calls_read: false }),
+            ),
+            drift_with(
+                "~/.claude/plugins/known_marketplaces.json",
+                Change::Modified,
+                writer("claude code plugin refresh"),
+            ),
+        ];
+        let lines = report(&drifts, STATUS_HEADING, None);
+        assert!(
+            lines.iter().all(|line| line.chars().count() <= 80),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_old_record_still_reads_and_a_cause_round_trips() {
+        let old: Drift =
+            serde_json::from_str(r#"{"path":"~/.gitconfig","change":"modified"}"#).expect("old");
+        assert_eq!(old.cause, None);
+        assert_eq!(
+            serde_json::to_string(&old).expect("json"),
+            r#"{"path":"~/.gitconfig","change":"modified"}"#
+        );
+        let caused = Drift {
+            cause: Some(Cause::Unexplained { calls_read: true }),
+            ..old
+        };
+        let text = serde_json::to_string(&caused).expect("json");
+        assert!(
+            text.contains(r#""cause":{"kind":"unexplained","calls_read":true}"#),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<Drift>(&text).expect("back"), caused);
     }
 
     /// An absolute path on this platform: `/abs/tool` is not absolute on
