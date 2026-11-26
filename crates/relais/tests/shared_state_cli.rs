@@ -248,6 +248,74 @@ fn a_json_trust_grant_says_where_it_was_recorded() {
     );
 }
 
+/// an-t32: a grant that fails after its checks (an empty `--reviewed-by`) is
+/// one `relais trust grant: ` stderr line and, under `--json`, the
+/// `{"error","exit"}` object; plain, stdout is empty.
+#[test]
+fn a_failed_grant_follows_the_json_error_contract() {
+    for json in [false, true] {
+        let scratch =
+            Scratch::with_machine_toml("shared-state-grant-error", "schema_version = 1\n");
+        let mut args = vec!["trust", "grant", "--reviewed-by", ""];
+        if json {
+            args.push("--json");
+        }
+        let out = scratch.relais(&args, "");
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+        let stdout = String::from_utf8(out.stdout.clone()).expect("utf-8");
+        let stderr = String::from_utf8(out.stderr.clone()).expect("utf-8");
+        assert_eq!(stderr.lines().count(), 1, "{args:?}: {stderr}");
+        assert!(
+            stderr.starts_with("relais trust grant: "),
+            "{args:?}: {stderr}"
+        );
+        if json {
+            let object: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+            assert_eq!(object["exit"], 2, "{args:?}: {stdout}");
+            assert_eq!(
+                format!(
+                    "relais trust grant: {}",
+                    object["error"].as_str().expect("error")
+                ),
+                stderr.trim_end(),
+                "{args:?}"
+            );
+        } else {
+            assert!(stdout.is_empty(), "{args:?}: {stdout}");
+        }
+    }
+}
+
+/// an-t32: a stale `--key` keeps its `code` and `current_key` on the one
+/// error object (they were a second document before), exit 18.
+#[test]
+fn a_stale_grant_key_is_one_error_object_with_its_code() {
+    let scratch = Scratch::with_machine_toml("shared-state-grant-stale", "schema_version = 1\n");
+    let out = scratch.relais(
+        &[
+            "trust",
+            "grant",
+            "--key",
+            "stale",
+            "--reviewed-by",
+            "test",
+            "--json",
+        ],
+        "",
+    );
+    assert_eq!(out.status.code(), Some(18), "{out:?}");
+    let stdout = String::from_utf8(out.stdout.clone()).expect("utf-8");
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    let object: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(object["exit"], 18, "{object}");
+    assert_eq!(object["code"], "stale_grant_key", "{object}");
+    assert!(object["current_key"].is_string(), "{object}");
+    assert!(object["error"].is_string(), "{object}");
+    let stderr = String::from_utf8(out.stderr).expect("utf-8");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.starts_with("relais trust grant: "), "{stderr}");
+}
+
 /// an-t26: a salvage of a terminal run with no recorded workspace is refused
 /// by the absent external layer before anything is written: one stderr line,
 /// no "unknown containment" claim, and the run is left as it was.
@@ -309,6 +377,7 @@ fn a_salvage_under_an_absent_external_layer_is_refused_and_records_nothing() {
         );
         // An error, not a refusal: main's one line, `relais: <error>`, on
         // both paths (an-t31: the prefix differs from a refusal's on purpose).
+        // This is also an-t32's pin of `decide`'s error arm under `--json`.
         assert_eq!(stderr.lines().count(), 1, "json={json}: {stderr}");
         assert!(stderr.starts_with("relais: "), "json={json}: {stderr}");
         if json {
@@ -324,54 +393,77 @@ fn a_salvage_under_an_absent_external_layer_is_refused_and_records_nothing() {
     }
 }
 
+/// The `--json` contract for an error that is not a refusal (an-t32):
+/// stderr is the one `relais: ` line, exit 3, and stdout is empty without
+/// `--json` and exactly the `{"error","exit"}` object with it, the object
+/// naming the same error the line does.
+fn assert_error_streams(args: &[&str], out: &Output) {
+    let json = args.contains(&"--json");
+    assert_eq!(out.status.code(), Some(3), "{args:?}: {out:?}");
+    let stdout = String::from_utf8(out.stdout.clone()).expect("utf-8");
+    let stderr = String::from_utf8(out.stderr.clone()).expect("utf-8");
+    assert_eq!(stderr.lines().count(), 1, "{args:?}: {stderr}");
+    assert!(stderr.starts_with("relais: "), "{args:?}: {stderr}");
+    assert!(
+        stderr.contains("sets shared_state = \"external\""),
+        "{args:?}: {stderr}"
+    );
+    if json {
+        assert_eq!(stdout.lines().count(), 1, "{args:?}: {stdout}");
+        let object: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+        assert_eq!(object["exit"], 3, "{args:?}: {stdout}");
+        assert_eq!(
+            format!("relais: {}", object["error"].as_str().expect("error")),
+            stderr.trim_end(),
+            "{args:?}: the same error on both streams"
+        );
+    } else {
+        assert!(stdout.is_empty(), "{args:?}: {stdout}");
+    }
+}
+
 /// an-t29: `relais report` reads one price table, so builds one state, for
 /// the import and the routing section, before the import. Under an absent
 /// external layer both forms exit 3 with the one sentence, once, and print
-/// nothing. This pins the refusal and its single report, not the build count
-/// (`LocalState` holds no state; `every_command_builds_its_shared_state_once`
-/// counts the builds), and passes on main too.
+/// nothing else (`LocalState` holds no state;
+/// `every_command_builds_its_shared_state_once` counts the builds). an-t32:
+/// under `--json` stdout is the error object.
 #[test]
 fn a_report_under_an_absent_external_layer_is_refused_before_the_import() {
-    for args in [&["report"][..], &["report", "--no-import"][..]] {
+    for args in [
+        &["report"][..],
+        &["report", "--no-import"][..],
+        &["report", "--json"][..],
+        &["report", "--no-import", "--json"][..],
+    ] {
         let scratch = Scratch::with_machine_toml(
             "shared-state-report-external",
             "schema_version = 1\nshared_state = \"external\"\n",
         );
         let out = scratch.relais(args, "");
-        assert_eq!(out.status.code(), Some(3), "{args:?}: {out:?}");
-        assert!(out.stdout.is_empty(), "{args:?}: {out:?}");
-        let stderr = String::from_utf8(out.stderr).expect("utf-8");
-        assert_eq!(stderr.lines().count(), 1, "{args:?}: {stderr}");
-        assert!(
-            stderr.contains("sets shared_state = \"external\""),
-            "{args:?}: {stderr}"
-        );
+        assert_error_streams(args, &out);
     }
 }
 
 /// an-t29: `relais learn cycle` builds its one state where it reads the
 /// machine settings, before it starts a coordinator, so an absent external
 /// layer exits 3 with the one sentence and leaves no coordinator socket
-/// (`socket_path()` is `RELAIS_STATE_DIR/relais.sock`).
+/// (`socket_path()` is `RELAIS_STATE_DIR/relais.sock`). an-t32: `--json`
+/// adds the error object on stdout.
 #[test]
 fn a_learn_cycle_under_an_absent_external_layer_is_refused_before_the_coordinator() {
-    let scratch = Scratch::with_machine_toml(
-        "shared-state-cycle-external",
-        "schema_version = 1\nshared_state = \"external\"\n",
-    );
-    let out = scratch.relais(&["learn", "cycle"], "");
-    assert_eq!(out.status.code(), Some(3), "{out:?}");
-    assert!(out.stdout.is_empty(), "{out:?}");
-    let stderr = String::from_utf8(out.stderr).expect("utf-8");
-    assert_eq!(stderr.lines().count(), 1, "{stderr}");
-    assert!(
-        stderr.contains("sets shared_state = \"external\""),
-        "{stderr}"
-    );
-    assert!(
-        !scratch.dir.join("state/relais.sock").exists(),
-        "no coordinator was started"
-    );
+    for args in [&["learn", "cycle"][..], &["learn", "cycle", "--json"][..]] {
+        let scratch = Scratch::with_machine_toml(
+            "shared-state-cycle-external",
+            "schema_version = 1\nshared_state = \"external\"\n",
+        );
+        let out = scratch.relais(args, "");
+        assert_error_streams(args, &out);
+        assert!(
+            !scratch.dir.join("state/relais.sock").exists(),
+            "{args:?}: no coordinator was started"
+        );
+    }
 }
 
 /// an-t31: a refusal under `--json` is the `{"error","exit"}` object on

@@ -4,11 +4,14 @@ use super::ctx::load_repo_policy;
 use super::ctx::machine_of;
 use super::ctx::open_ledger;
 use super::ctx::print_document;
+use super::decision_record::print_refusal;
+use super::decision_record::print_refusal_with;
 use super::outcome::operational;
 use super::outcome::CliError;
 use super::outcome::CliOutcome;
 use super::plan::command_change;
 use super::plan::Seeing;
+use super::programme::Format;
 use super::GrantScope;
 use super::GrantSource;
 use super::TrustCommand;
@@ -106,7 +109,12 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                     None
                 }
                 (Err(unreported), Seeing::Reporting) => {
-                    eprintln!("relais trust show --mark-reported: {unreported}");
+                    print_refusal(
+                        "relais trust show --mark-reported",
+                        Format::from_json_flag(json),
+                        &CliOutcome::OperationalFailure,
+                        &unreported.to_string(),
+                    );
                     return Ok(CliOutcome::OperationalFailure);
                 }
             };
@@ -127,8 +135,11 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
             let shown =
                 relais::trust::show(&policy, &identity, &machine, machine_path.clone(), None);
             if reviewed_by.trim().is_empty() {
-                eprintln!(
-                    "relais trust grant: --reviewed-by is empty; name who reviewed the commands"
+                print_refusal(
+                    "relais trust grant",
+                    Format::from_json_flag(json),
+                    &CliOutcome::InvalidInput,
+                    "--reviewed-by is empty; name who reviewed the commands",
                 );
                 return Ok(CliOutcome::InvalidInput);
             }
@@ -157,17 +168,20 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                 ),
                 Some(key) => {
                     if key != shown.grant_key {
-                        if json {
-                            print_document(&serde_json::json!({
-                                "code": "stale_grant_key",
-                                "current_key": shown.grant_key,
-                            }))?;
-                        }
-                        eprintln!(
-                            "relais trust grant: refused (stale_grant_key): {key} is not this \
-                             policy's key; relais.toml changed since it was shown. The current \
-                             key is {}; review it with `relais trust show`",
-                            shown.grant_key
+                        print_refusal_with(
+                            "relais trust grant",
+                            Format::from_json_flag(json),
+                            &CliOutcome::StaleGrantKey,
+                            &format!(
+                                "refused (stale_grant_key): {key} is not this policy's key; \
+                                 relais.toml changed since it was shown. The current key is {}; \
+                                 review it with `relais trust show`",
+                                shown.grant_key
+                            ),
+                            &[
+                                ("code", serde_json::json!("stale_grant_key")),
+                                ("current_key", serde_json::json!(shown.grant_key)),
+                            ],
                         );
                         return Ok(CliOutcome::StaleGrantKey);
                     }
@@ -192,7 +206,12 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
             let granted = match granted {
                 Ok(granted) => granted,
                 Err(e) => {
-                    eprintln!("relais trust grant: {e}");
+                    print_refusal(
+                        "relais trust grant",
+                        Format::from_json_flag(json),
+                        &CliOutcome::OperationalFailure,
+                        &e.to_string(),
+                    );
                     return Ok(CliOutcome::OperationalFailure);
                 }
             };
@@ -277,12 +296,22 @@ fn trust_holdouts(
     ) {
         Ok(view) => view,
         Err(invalid) => {
-            eprintln!("relais trust holdouts: {invalid}");
+            print_refusal(
+                "relais trust holdouts",
+                format,
+                &CliOutcome::Blocked,
+                &invalid.to_string(),
+            );
             return Ok(CliOutcome::Blocked);
         }
     };
     if let Some(cause) = &view.unread {
-        eprintln!("relais trust holdouts: the holdout store could not be read: {cause}");
+        print_refusal(
+            "relais trust holdouts",
+            format,
+            &CliOutcome::OperationalFailure,
+            &format!("the holdout store could not be read: {cause}"),
+        );
         return Ok(CliOutcome::OperationalFailure);
     }
     let store = machine.holdouts.store.clone().unwrap_or_default();
@@ -298,22 +327,30 @@ fn trust_holdouts(
     }
     if let Some(((name, sha), fingerprint)) = accept {
         if shadowed.contains(name) {
-            eprintln!(
-                "relais trust holdouts: `{name}` is shadowed by a machine.toml table; the store's \
-                 declaration does not run, so there is nothing to confirm"
+            print_refusal(
+                "relais trust holdouts",
+                format,
+                &CliOutcome::Blocked,
+                &format!(
+                    "`{name}` is shadowed by a machine.toml table; the store's declaration does \
+                     not run, so there is nothing to confirm"
+                ),
             );
             return Ok(CliOutcome::Blocked);
         }
         let snapshot = match relais::holdout::accept(&view, name, sha, fingerprint) {
             Ok(snapshot) => snapshot,
             Err(refusal) => {
-                if json {
-                    print_document(&serde_json::json!({
-                        "code": "stale_holdout_review",
-                        "detail": refusal.to_string(),
-                    }))?;
-                }
-                eprintln!("relais trust holdouts: refused: {refusal}");
+                print_refusal_with(
+                    "relais trust holdouts",
+                    format,
+                    &CliOutcome::Blocked,
+                    &format!("refused: {refusal}"),
+                    &[
+                        ("code", serde_json::json!("stale_holdout_review")),
+                        ("detail", serde_json::json!(refusal.to_string())),
+                    ],
+                );
                 return Ok(CliOutcome::Blocked);
             }
         };
@@ -358,7 +395,12 @@ fn trust_holdouts(
     let reviews = match relais::holdout::review(&view, &shadowed, &confirmed) {
         Ok(reviews) => reviews,
         Err(failed) => {
-            eprintln!("relais trust holdouts: {failed}");
+            print_refusal(
+                "relais trust holdouts",
+                format,
+                &CliOutcome::Blocked,
+                &failed.to_string(),
+            );
             return Ok(CliOutcome::Blocked);
         }
     };

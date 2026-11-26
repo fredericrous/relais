@@ -4,6 +4,7 @@ use super::ctx::load_contract;
 use super::ctx::refusal;
 use super::ctx::Refusal;
 use super::decision_record::answer_error;
+use super::decision_record::print_error_object;
 use super::decision_record::print_refusal;
 use super::decision_record::read_decide_proof;
 use super::decision_record::Decided;
@@ -12,7 +13,6 @@ use super::decision_record::NextStep;
 use super::evidence::authorship_label;
 use super::evidence::reseal_receipt_with_signoff;
 use super::feedback::open_verification_gaps;
-use super::outcome::exit_code;
 use super::outcome::operational;
 use super::outcome::CliError;
 use super::outcome::CliOutcome;
@@ -77,15 +77,7 @@ pub(crate) fn decide_command(request: DecideRequest<'_>) -> Result<CliOutcome, C
             Ok(refused.outcome)
         }
         Err(e) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "error": e.to_string(),
-                        "exit": exit_code(&e.outcome()),
-                    })
-                );
-            }
+            print_error_object(Format::from_json_flag(json), &e.outcome(), &e.to_string());
             Err(e)
         }
     }
@@ -890,6 +882,7 @@ pub(crate) fn successor_decide(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::outcome::exit_code;
     use relais::ids::TaskId;
     use relais::ledger::{Transition, VerificationSnapshot};
     use relais::money::{CostCompleteness, MicroUsd};
