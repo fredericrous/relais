@@ -377,6 +377,7 @@ fn a_salvage_under_an_absent_external_layer_is_refused_and_records_nothing() {
         );
         // An error, not a refusal: main's one line, `relais: <error>`, on
         // both paths (an-t31: the prefix differs from a refusal's on purpose).
+        // This is also an-t32's pin of `decide`'s error arm under `--json`.
         assert_eq!(stderr.lines().count(), 1, "json={json}: {stderr}");
         assert!(stderr.starts_with("relais: "), "json={json}: {stderr}");
         if json {
@@ -396,7 +397,8 @@ fn a_salvage_under_an_absent_external_layer_is_refused_and_records_nothing() {
 /// stderr is the one `relais: ` line, exit 3, and stdout is empty without
 /// `--json` and exactly the `{"error","exit"}` object with it, the object
 /// naming the same error the line does.
-fn assert_error_streams(args: &[&str], out: &Output, json: bool) {
+fn assert_error_streams(args: &[&str], out: &Output) {
+    let json = args.contains(&"--json");
     assert_eq!(out.status.code(), Some(3), "{args:?}: {out:?}");
     let stdout = String::from_utf8(out.stdout.clone()).expect("utf-8");
     let stderr = String::from_utf8(out.stderr.clone()).expect("utf-8");
@@ -439,7 +441,7 @@ fn a_report_under_an_absent_external_layer_is_refused_before_the_import() {
             "schema_version = 1\nshared_state = \"external\"\n",
         );
         let out = scratch.relais(args, "");
-        assert_error_streams(args, &out, args.contains(&"--json"));
+        assert_error_streams(args, &out);
     }
 }
 
@@ -456,53 +458,11 @@ fn a_learn_cycle_under_an_absent_external_layer_is_refused_before_the_coordinato
             "schema_version = 1\nshared_state = \"external\"\n",
         );
         let out = scratch.relais(args, "");
-        assert_error_streams(args, &out, args.contains(&"--json"));
+        assert_error_streams(args, &out);
         assert!(
             !scratch.dir.join("state/relais.sock").exists(),
             "{args:?}: no coordinator was started"
         );
-    }
-}
-
-/// an-t32: the same contract on the answering commands, whose error arm
-/// printed the object before. `decide` and `feedback` read the machine
-/// settings through the state, so an absent external layer is an error here
-/// too, not a refusal.
-#[test]
-fn an_error_under_json_is_one_object_on_every_shared_state_command() {
-    let decide = ["decide", "run-x", "--answer", "reject", "--actor", "cli"];
-    let feedback = [
-        "feedback",
-        "run-x",
-        "--outcome",
-        "accepted",
-        "--actor",
-        "cli",
-    ];
-    for base in [&decide[..], &feedback[..]] {
-        for json in [false, true] {
-            let scratch = Scratch::with_machine_toml(
-                "shared-state-error-object",
-                "schema_version = 1\nshared_state = \"external\"\n",
-            );
-            let mut args = base.to_vec();
-            if json {
-                args.push("--json");
-            }
-            let out = scratch.relais(&args, "");
-            let stdout = String::from_utf8(out.stdout.clone()).expect("utf-8");
-            let stderr = String::from_utf8(out.stderr.clone()).expect("utf-8");
-            assert_eq!(stderr.lines().count(), 1, "{args:?}: {stderr}");
-            assert_eq!(
-                stdout.lines().count(),
-                usize::from(json),
-                "{args:?}: {stdout}"
-            );
-            if json {
-                let object: serde_json::Value = serde_json::from_str(&stdout).expect("json");
-                assert_eq!(object["exit"], out.status.code().expect("code"), "{args:?}");
-            }
-        }
     }
 }
 

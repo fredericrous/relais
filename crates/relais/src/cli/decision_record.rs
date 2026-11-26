@@ -140,34 +140,31 @@ pub(crate) fn refusal_streams(
     format: Format,
     outcome: &CliOutcome,
     message: &str,
-) -> (Option<String>, String) {
-    refusal_streams_with(command, format, outcome, message, &[])
-}
-
-/// [`refusal_streams`] with extra fields a consumer already reads on the
-/// object (`trust`'s `code` and `current_key`), added beside `error` and
-/// `exit`: one object, never a second document.
-pub(crate) fn refusal_streams_with(
-    command: &str,
-    format: Format,
-    outcome: &CliOutcome,
-    message: &str,
     extra: &[(&str, serde_json::Value)],
 ) -> (Option<String>, String) {
     let object = match format {
-        Format::Json => {
-            let mut object = serde_json::json!({
-                "error": message,
-                "exit": exit_code(outcome),
-            });
-            for (key, value) in extra {
-                object[*key] = value.clone();
-            }
-            Some(object.to_string())
-        }
+        Format::Json => Some(error_object(outcome, message, extra).to_string()),
         Format::Text => None,
     };
     (object, format!("{command}: {message}"))
+}
+
+/// The `{"error", "exit"}` object, with any extra fields beside them. An
+/// extra field never replaces `error` or `exit`.
+fn error_object(
+    outcome: &CliOutcome,
+    message: &str,
+    extra: &[(&str, serde_json::Value)],
+) -> serde_json::Value {
+    let mut object = serde_json::json!({
+        "error": message,
+        "exit": exit_code(outcome),
+    });
+    for (key, value) in extra {
+        debug_assert!(!matches!(*key, "error" | "exit"), "{key} is the contract's");
+        object[*key] = value.clone();
+    }
+    object
 }
 
 /// Print a refusal by [`refusal_streams`]. A reader that closed stdout is
@@ -177,7 +174,7 @@ pub(crate) fn print_refusal(command: &str, format: Format, outcome: &CliOutcome,
     print_refusal_with(command, format, outcome, message, &[]);
 }
 
-/// [`print_refusal`] with [`refusal_streams_with`]'s extra fields.
+/// [`print_refusal`] with [`refusal_streams`]'s extra fields.
 pub(crate) fn print_refusal_with(
     command: &str,
     format: Format,
@@ -186,7 +183,7 @@ pub(crate) fn print_refusal_with(
     extra: &[(&str, serde_json::Value)],
 ) {
     use std::io::Write;
-    let (stdout, mut stderr) = refusal_streams_with(command, format, outcome, message, extra);
+    let (stdout, mut stderr) = refusal_streams(command, format, outcome, message, extra);
     if let Some(object) = stdout {
         if let Err(e) = write_object(&object) {
             stderr.push_str(&format!(" (stdout: {e})"));
@@ -209,25 +206,27 @@ fn write_object(object: &str) -> std::io::Result<()> {
 /// `{"error", "exit"}` object a refusal prints, and stderr carries the one
 /// `relais: <error>` line (`main` prints it) or the command's own
 /// `relais <command>: <message>` line. Without `--json` stdout stays empty.
-/// This prints the object only; the stderr line stays with its caller.
+/// This prints the object only; the stderr line stays with its caller. A
+/// failed stdout write (not a closed pipe) adds a second stderr line before
+/// the caller's, deliberately: the object is lost and the person is told.
 pub(crate) fn print_error_object(format: Format, outcome: &CliOutcome, message: &str) {
-    if let (Some(object), _) = refusal_streams("", format, outcome, message) {
-        if let Err(e) = write_object(&object) {
+    if format == Format::Json {
+        if let Err(e) = write_object(&error_object(outcome, message, &[]).to_string()) {
             eprintln!("relais: could not write the error object to stdout: {e}");
         }
     }
 }
 
 /// [`print_error_object`] for a command's `Err(CliError)` return, which
-/// `main` then reports on stderr. Passes the result through.
+/// `main` then reports on stderr. Passes the command's result through.
 pub(crate) fn error_object_under_json<T>(
-    json: bool,
-    result: Result<T, CliError>,
+    format: Format,
+    command_result: Result<T, CliError>,
 ) -> Result<T, CliError> {
-    if let Err(e) = &result {
-        print_error_object(Format::from_json_flag(json), &e.outcome(), &e.to_string());
+    if let Err(e) = &command_result {
+        print_error_object(format, &e.outcome(), &e.to_string());
     }
-    result
+    command_result
 }
 
 #[cfg(test)]
@@ -236,16 +235,26 @@ mod tests {
 
     #[test]
     fn a_refusal_is_one_stderr_line_and_under_json_also_one_stdout_object() {
-        let (stdout, stderr) =
-            refusal_streams("relais decide", Format::Json, &CliOutcome::Blocked, "held");
+        let (stdout, stderr) = refusal_streams(
+            "relais decide",
+            Format::Json,
+            &CliOutcome::Blocked,
+            "held",
+            &[],
+        );
         let object: serde_json::Value =
             serde_json::from_str(&stdout.expect("an object under --json")).expect("json");
         assert_eq!(object["error"], "held");
         assert_eq!(object["exit"], exit_code(&CliOutcome::Blocked));
         assert_eq!(stderr, "relais decide: held");
 
-        let (stdout, stderr) =
-            refusal_streams("relais decide", Format::Text, &CliOutcome::Blocked, "held");
+        let (stdout, stderr) = refusal_streams(
+            "relais decide",
+            Format::Text,
+            &CliOutcome::Blocked,
+            "held",
+            &[],
+        );
         assert_eq!(stdout, None, "nothing on stdout without --json");
         assert_eq!(stderr, "relais decide: held");
     }

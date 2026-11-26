@@ -1443,7 +1443,7 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             if effort_template {
                 doctor_effort_template_command()
             } else {
-                error_object_under_json(json, doctor_command(json))
+                error_object_under_json(Format::from_json_flag(json), doctor_command(json))
             }
         }
         Command::Hook { probe, record } => match (probe, record) {
@@ -1507,7 +1507,7 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 | TrustCommand::Grant { json, .. }
                 | TrustCommand::Holdouts { json, .. } => *json,
             };
-            error_object_under_json(json, trust_command(cmd))
+            error_object_under_json(Format::from_json_flag(json), trust_command(cmd))
         }
         Command::Status { run_id } => status_command(run_id.as_deref()),
         Command::Explain { run_id } => explain_command(&run_id),
@@ -1540,7 +1540,10 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             by,
             no_import,
             cmd: None,
-        } => error_object_under_json(json, report_command(since.as_deref(), json, by, no_import)),
+        } => error_object_under_json(
+            Format::from_json_flag(json),
+            report_command(since.as_deref(), json, by, no_import),
+        ),
         Command::Usage { cmd } => match cmd {
             UsageCommand::Import {
                 session,
@@ -1602,7 +1605,7 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 log,
                 quiet,
             } => error_object_under_json(
-                json,
+                Format::from_json_flag(json),
                 learn_cycle_command(if_due, json, log.as_deref(), quiet),
             ),
             LearnCommand::Last { json } => learn_last_command(json),

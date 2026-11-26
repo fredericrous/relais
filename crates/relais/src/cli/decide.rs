@@ -13,7 +13,6 @@ use super::decision_record::NextStep;
 use super::evidence::authorship_label;
 use super::evidence::reseal_receipt_with_signoff;
 use super::feedback::open_verification_gaps;
-use super::outcome::exit_code;
 use super::outcome::operational;
 use super::outcome::CliError;
 use super::outcome::CliOutcome;
@@ -883,6 +882,7 @@ pub(crate) fn successor_decide(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::outcome::exit_code;
     use relais::ids::TaskId;
     use relais::ledger::{Transition, VerificationSnapshot};
     use relais::money::{CostCompleteness, MicroUsd};

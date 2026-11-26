@@ -261,8 +261,8 @@ It holds for `decide`, `feedback`, `report`, `learn cycle`, `doctor` and
 `trust`; `trust`'s two stale-review refusals keep their `code`, `current_key`
 and `detail` fields on the same object. Exceptions: a command-line usage
 error (exit 2, before any command runs) prints nothing on stdout;
-`learn cycle --log` writes the stderr line to the log file, the object still
-goes to stdout; and `learn cycle --json` still prints its plain `deferred:`
+`learn cycle --log` writes the stderr line, and a successful `--json` result,
+to the log file, while a failure's object still goes to stdout; and `learn cycle --json` still prints its plain `deferred:`
 and `not due` lines on exit 0 (a follow-up).
 
 ## For a closed client
