@@ -743,6 +743,12 @@ mod home_drift_warning_tests {
                 .sum()
         }
 
+        /// Functions that hand a builder on as a factory and call it once per
+        /// path (`decide_in`'s `shared`, plan Census): counted by the
+        /// bare-path rule, not builds. Named here, so a new one is a reviewed
+        /// entry, not a silent pass.
+        const FACTORY_HAND_ON: &[(&str, &str)] = &[("decide.rs", "decide_inner")];
+
         /// Builder calls per function of one source, test modules excluded.
         fn census(source: &str) -> Vec<(String, usize)> {
             let mut counts: Vec<(String, usize)> = Vec::new();
@@ -800,6 +806,9 @@ mod home_drift_warning_tests {
             let mut wrong = Vec::new();
             for (file, source) in SOURCES {
                 for (function, calls) in census(source) {
+                    if FACTORY_HAND_ON.contains(&(*file, function.as_str())) {
+                        continue;
+                    }
                     if !is_command_entry(&function) || calls > 1 {
                         wrong.push(format!("{file}:{function} {calls}"));
                     }
