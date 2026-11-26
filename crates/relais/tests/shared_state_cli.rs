@@ -376,7 +376,7 @@ fn a_learn_cycle_under_an_absent_external_layer_is_refused_before_the_coordinato
 
 /// an-t31: a refusal under `--json` is the `{"error","exit"}` object on
 /// stdout and one `relais <command>:` line on stderr, the exit code agreeing
-/// with both (`cli::outcome::refusal_streams`); plain, it is the stderr line
+/// with both (`cli::decision_record::refusal_streams`); plain, it is the stderr line
 /// alone. Both commands refuse here before any shared state is built.
 #[test]
 fn a_refusal_under_json_is_one_stdout_object_and_one_stderr_line() {

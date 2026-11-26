@@ -197,7 +197,7 @@ pub(crate) fn install_routing_envelope(shared: &InstallState) {
                 eprintln!("relais install: warning: the ledger did not record the envelope ({e})");
             }
             // A notice of a side effect, not the install's report: stderr
-            // (`cli::outcome::refusal_streams` states the rule).
+            // (`cli::decision_record::refusal_streams` states the rule).
             eprintln!(
                 "session routing is on; turn it off with /relais-routing off or RELAIS_SESSION_ROUTING=off"
             );

@@ -246,7 +246,7 @@ the shared half of a claim pass, then goes on with the claim files; a hold
 it could not renew or give back ends by its TTL.
 `relais doctor` adds a failing `shared_state` finding with the same text.
 
-Every routed command follows one stream rule (`cli::outcome::refusal_streams`,
+Every routed command follows one stream rule (`cli::decision_record::refusal_streams`,
 an-t31): stdout carries what the command did, its result sentence or, under
 `--json`, exactly one object (`{"error","exit"}` for a refusal); stderr
 carries every refusal, warning and failure as one line, under `--json` too;
