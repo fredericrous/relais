@@ -409,7 +409,7 @@ impl<'a> RunEngine<'a> {
         let _ = gate.bind(&spec.dispatch_id, result.session_id.as_deref(), None);
         let _ = gate.release(&spec.dispatch_id);
         let spent = result.usage.cost.micros().map(MicroUsd::to_micros);
-        if let Err(error) = gate.settle(&spec.dispatch_id, spent) {
+        if let Err((tries, error)) = settle_with_retry(gate, &spec.dispatch_id, spent) {
             // The dispatch stays on the coordinator and settles unknown when
             // its lease lapses, which books its reservation (deliberate:
             // booking the cost again here would count it twice, an-t24).
@@ -419,9 +419,11 @@ impl<'a> RunEngine<'a> {
                 .micros()
                 .map_or_else(|| "an unknown cost".to_string(), |cost| cost.to_string());
             eprintln!(
-                "relais: dispatch {}: the coordinator did not take the settle of {cost}: {error}; \
-                 the shared counter books the reservation instead; run `relais coordinator status`",
+                "relais: dispatch {}: the coordinator did not take the settle of {cost} after \
+                 {tries} {}: {error}; the shared counter books the reservation instead; run \
+                 `relais coordinator status`",
                 spec.dispatch_id,
+                if tries == 1 { "try" } else { "tries" },
             );
             self.events.emit(Event::Decision {
                 what: "gate_settle_failed".into(),
@@ -514,6 +516,41 @@ pub(super) fn admission_block(error: &GateError) -> (Reason, BlockCode) {
         )
     } else {
         (Reason::AdmissionRefused, BlockCode::AdmissionRefused)
+    }
+}
+
+/// How many times a finished dispatch offers its settle to the coordinator
+/// before the reservation stands in for its cost (an-t28).
+const SETTLE_TRIES: u32 = 2;
+
+/// Settle a finished dispatch, trying again when the coordinator did not
+/// answer (`Unavailable`: no daemon, a timeout); a refusal or a protocol
+/// error is an answer and would repeat. The coordinator's settle is
+/// idempotent: a settle it applied whose answer was lost answers the retry
+/// `Applied` (a duplicate) or `Unknown` (both ends in, the entry
+/// forgotten), so a retry never books twice. `Unknown` counts as taken, as
+/// it always has: it cannot tell a forgotten entry from a restarted
+/// coordinator. A try waits up to the coordinator's write timeout (30 s),
+/// so the line before the second says why the run's end is slow. Returns
+/// the tries made and the last error when the settle was not taken.
+fn settle_with_retry(
+    gate: &(dyn Gate + Sync),
+    dispatch_id: &str,
+    spent: Option<i64>,
+) -> Result<(), (u32, GateError)> {
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        match gate.settle(dispatch_id, spent) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.unavailable() && tries < SETTLE_TRIES => {
+                eprintln!(
+                    "relais: dispatch {dispatch_id}: the coordinator did not answer the settle \
+                     ({error}); trying once more"
+                );
+            }
+            Err(error) => return Err((tries, error)),
+        }
     }
 }
 

@@ -416,8 +416,10 @@ impl Book {
         }
         log(&format!(
             "seat settles: dropped {} waiting settle(s) totalling {total} (oldest dispatch: \
-             {oldest}); not booked to the shared counter; check the shared primary",
-            dropped.len()
+             {oldest}); not booked to the shared counter; check the shared primary \
+             (dropped_micros={micros})",
+            dropped.len(),
+            micros = total.to_micros(),
         ));
     }
 
@@ -606,10 +608,15 @@ impl Book {
                     let _ = self.release_settle_seat(shared, log, dropped.reservation.as_ref()); // logged inside; the refusal line follows
                     self.forget_release_failure(dropped.reservation.as_ref());
                     self.dirty = true;
+                    // The amount is in the line, and in a fixed token, so the
+                    // counter-versus-ledger check can add the dropped dollars
+                    // back (an-t28).
                     log(&format!(
-                        "seat {id}: booking the spend was not accepted: {settle_error}; dropped, \
-                         the shared counter does not count it; if it repeats, check the shared \
-                         primary"
+                        "seat {id}: booking the spend of {amount} was not accepted: \
+                         {settle_error}; dropped, the shared counter does not count it; if it \
+                         repeats, check the shared primary (dropped_micros={micros})",
+                        amount = dropped.actual,
+                        micros = dropped.actual.to_micros(),
                     ));
                 }
                 Err(

@@ -8,6 +8,15 @@ missing here.
 
 ## Unreleased
 
+A run whose settle the coordinator did not answer tries it once more
+(`relais: dispatch <id>: the coordinator did not answer the settle (…);
+trying once more`), so a lost answer no longer leaves the shared counter
+holding the reservation; a refusal is not retried. The end of such a run
+can now wait up to 60 s on a coordinator that hangs. The coordinator's
+lines for a refused and a capped settle end `(dropped_micros=<n>)`, and
+`docs/shared-state.md` names each spend path the counter still misses with
+its ceiling.
+
 A retried handoff reservation keeps its shared hold when the claim file
 already holds it: `node::reserve_handoff` and `reserve_in_empty_programme` no
 longer give the shared lease back then, and the claim file's hold end moves
