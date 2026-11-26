@@ -5,6 +5,7 @@
 //! programme's files, or origin's default branch through git, and the
 //! branch names git lists in the map's repository.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -453,26 +454,43 @@ pub(crate) fn check_command(
     fetch: Fetch,
     with_ref: Option<&str>,
 ) -> Result<CliOutcome, CliError> {
+    if let Some(rev) = with_ref {
+        if rev.is_empty() || rev.starts_with('-') {
+            return Err(CliError::Usage {
+                detail: format!(
+                    "--with-ref `{rev}`: a ref is not empty and does not start with `-`"
+                ),
+            });
+        }
+    }
     let found = resolve_dir(dir, fetch)?;
     let programme = found.load().map_err(programme_error)?;
     let tag = ref_tag(&found.source);
-    let from_ref = match with_ref {
-        None => std::collections::BTreeSet::new(),
-        Some(rev) if rev.starts_with('-') => {
-            return Err(CliError::Usage {
-                detail: format!("--with-ref {rev}: a ref cannot start with `-`"),
-            })
-        }
-        Some(rev) => load::added_since_merge_base(dir, rev).map_err(programme_error)?,
-    };
-    let own: std::collections::BTreeSet<String> = programme
-        .tickets
-        .keys()
-        .chain(&programme.unreadable)
-        .map(|id| format!("{id}.md"))
-        .collect();
     let mut problems = programme.problems();
-    problems.extend(analysis::duplicate_ids(&own, &from_ref, dir));
+    let duplicates = match with_ref {
+        // The programme may be read from origin (the branch's work on it
+        // being older), so the branch's own tickets come from the named
+        // checkout's files, and git runs there, never in `dir`, which may
+        // be absent on disk.
+        Some(rev) => {
+            let located = load::locate(dir).map_err(programme_error)?;
+            let own = load::branch_ticket_ids(&located.checkout, &located.slug)
+                .map_err(programme_error)?;
+            let from_ref = load::added_since_merge_base(&located.checkout, &located.slug, rev)
+                .map_err(programme_error)?;
+            analysis::duplicate_ids(&own, &from_ref, dir, Some(rev))
+        }
+        None => {
+            let own: BTreeSet<String> = programme
+                .tickets
+                .keys()
+                .chain(&programme.unreadable)
+                .cloned()
+                .collect();
+            analysis::duplicate_ids(&own, &BTreeSet::new(), dir, None)
+        }
+    };
+    problems.extend(duplicates);
     for problem in &problems {
         eprintln!(
             "{}:{}: {tag}{}",

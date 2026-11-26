@@ -1850,3 +1850,67 @@ fn with_ref_catches_a_number_the_ref_reached_by_renaming() {
     assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
     assert!(text(&out.stderr).contains("f71-y.md:1: id f71 is also used by"));
 }
+
+#[test]
+fn with_ref_reads_the_branch_tickets_when_the_programme_is_read_from_origin() {
+    let world = World::new("ref-origin-newer");
+    let branch = with_upstream(&world);
+    let alpha = world.root.join("alpha");
+    git(&alpha, &["checkout", "-q", "-b", "feature"]);
+    world.write("f71-b.md", &open_ticket("On feature"));
+    git(&alpha, &["add", "-A"]);
+    // The branch's work is older than origin's, so `check` reads origin.
+    let committed = git_command(&alpha)
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "feature adds f71-b",
+        ])
+        .env("GIT_COMMITTER_DATE", "2001-01-01T00:00:00Z")
+        .env("GIT_AUTHOR_DATE", "2001-01-01T00:00:00Z")
+        .status()
+        .expect("git runs");
+    assert!(committed.success());
+    push_upstream(&world, |demo| {
+        std::fs::write(demo.join("f71-a.md"), open_ticket("On main")).expect("ticket");
+    });
+    let rev = format!("origin/{branch}");
+    let out = world.programme(&["check", "--json", "--with-ref", &rev]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_eq!(
+        json_of(&out)["source"],
+        rev.as_str(),
+        "the programme is read from origin"
+    );
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "f71-b.md:1: ({rev}) id f71 is also used by {} on {rev}; renumber to f72\n",
+            world.dir().join("f71-a.md").display()
+        )),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn with_ref_refuses_an_empty_or_dash_ref_before_reading_anything() {
+    let world = World::new("ref-usage");
+    for rev in ["", "-x"] {
+        let out = world.programme(&["check", "--no-fetch", &format!("--with-ref={rev}")]);
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+        assert!(
+            text(&out.stderr).contains("--with-ref"),
+            "{}",
+            text(&out.stderr)
+        );
+    }
+}
