@@ -88,7 +88,7 @@ pub fn parse_aval_output(exit_code: i32, stdout: &str) -> AvalVerdict {
         Err(_) => {
             return AvalVerdict::ToolFailure {
                 exit: exit_code,
-                detail: format!("unparseable aval output: {stdout:?}"),
+                detail: format!("unparseable greentopo output: {stdout:?}"),
             }
         }
     };
@@ -96,7 +96,7 @@ pub fn parse_aval_output(exit_code: i32, stdout: &str) -> AvalVerdict {
         let detail = value
             .get("error")
             .and_then(|e| e.as_str())
-            .unwrap_or("aval reported a tool failure")
+            .unwrap_or("greentopo reported a tool failure")
             .to_string();
         let exit = value
             .get("exit")
@@ -157,7 +157,7 @@ pub fn parse_aval_output(exit_code: i32, stdout: &str) -> AvalVerdict {
         Some("unknown") => AvalVerdict::Unknown,
         other => AvalVerdict::ToolFailure {
             exit: exit_code,
-            detail: format!("aval emitted an unrecognized state: {other:?}"),
+            detail: format!("greentopo emitted an unrecognized state: {other:?}"),
         },
     }
 }
@@ -530,7 +530,7 @@ pub fn aval_resolve_in(
     if key.starts_with('-') || key.trim().is_empty() {
         return AvalVerdict::ToolFailure {
             exit: 2,
-            detail: format!("decision key `{key}` is not a key aval can be asked for"),
+            detail: format!("decision key `{key}` is not a key greentopo can be asked for"),
         };
     }
     // A `repo_dir` that is not a directory (missing, a file, or unreadable)
@@ -541,7 +541,7 @@ pub fn aval_resolve_in(
         return AvalVerdict::ToolFailure {
             exit: -1,
             detail: format!(
-                "aval cannot run in {}: it is not a directory or does not exist",
+                "greentopo cannot run in {}: it is not a directory or does not exist",
                 repo_dir.display()
             ),
         };
@@ -586,7 +586,10 @@ pub fn aval_resolve_in(
             crate::procs::Ended::Exited(code) => parse_aval_output(code, &end.stdout),
             other => AvalVerdict::ToolFailure {
                 exit: -1,
-                detail: format!("aval (`{program}`) did not answer: {}", other.describe()),
+                detail: format!(
+                    "greentopo (`{program}`) did not answer: {}",
+                    other.describe()
+                ),
             },
         },
         Err(crate::procs::RunError::Spawn(e))
@@ -597,7 +600,7 @@ pub fn aval_resolve_in(
         Err(e) => AvalVerdict::ToolFailure {
             exit: -1,
             detail: format!(
-                "aval (`{program}`) could not be launched: {e}; {}",
+                "greentopo (`{program}`) could not be launched: {e}; {}",
                 aval_launch_hint(program, bin.is_some())
             ),
         },
@@ -673,15 +676,15 @@ impl std::fmt::Display for ContextError {
                 by_scope,
             } => write!(
                 f,
-                "aval reports a contradiction on `{key}` ({}); affected work is blocked until it is resolved",
+                "greentopo reports a contradiction on `{key}` ({}); affected work is blocked until it is resolved",
                 contradiction_detail(heads, by_scope)
             ),
             Self::NeedsDecision { key, verdict } => write!(
                 f,
-                "the task depends on `{key}` but aval's answer is {verdict:?}; needs_decision"
+                "the task depends on `{key}` but greentopo's answer is {verdict:?}; needs_decision"
             ),
             Self::ToolFailure { key, detail } => {
-                write!(f, "aval tool failure while resolving `{key}`: {detail}")
+                write!(f, "greentopo tool failure while resolving `{key}`: {detail}")
             }
         }
     }
@@ -1170,7 +1173,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
             AvalVerdict::NotInstalled => {
                 return Err(ContextError::ToolFailure {
                     key: key.clone(),
-                    detail: "aval is not installed".to_string(),
+                    detail: "greentopo is not installed".to_string(),
                 })
             }
             AvalVerdict::Active { .. } => {}
@@ -1212,7 +1215,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
                 }
                 (Some(choice), None) => format!("`{key}` ({adr}): {choice}"),
                 (None, Some(_) | None) => {
-                    format!("`{key}` is decided by {adr} (run `aval show {adr}` for the text)")
+                    format!("`{key}` is decided by {adr} (run `greentopo show {adr}` for the text)")
                 }
             }),
             // Only an Active verdict carries a constraint: Undecided and
@@ -1618,7 +1621,7 @@ mod tests {
         let described = assert_unchecked(&["k"], Some(crate::policy::DependencyMode::Optional));
         assert_eq!(
             described,
-            "aval: not installed, decision keys k not checked (reported, not passed)"
+            "greentopo: not installed, decision keys k not checked (reported, not passed)"
         );
     }
 
@@ -1627,7 +1630,7 @@ mod tests {
         let described = assert_unchecked(&["k"], None);
         assert_eq!(
             described,
-            "aval: not installed, decision keys k not checked (reported, not passed)"
+            "greentopo: not installed, decision keys k not checked (reported, not passed)"
         );
     }
 
@@ -1667,7 +1670,7 @@ mod tests {
         );
         assert_eq!(
             described,
-            "aval: not installed, decision keys k1, k2, k3, k4, k5 and 2 more not checked (reported, not passed)"
+            "greentopo: not installed, decision keys k1, k2, k3, k4, k5 and 2 more not checked (reported, not passed)"
         );
     }
 
@@ -1736,26 +1739,26 @@ mod tests {
     }
 
     #[test]
-    fn a_real_aval_reads_the_materialised_fleet_pack() {
-        let dir = crate::test_support::temp_dir("fleet-real-aval");
+    fn a_real_greentopo_reads_the_materialised_fleet_pack() {
+        let dir = crate::test_support::temp_dir("fleet-real-greentopo");
         let materialised =
             materialise_fleet_pack(&dir.join("cache"), EMBEDDED_FLEET_PACK).expect("materialised");
-        let output = match std::process::Command::new("aval")
+        let output = match std::process::Command::new("greentopo")
             .args(["rules", "--level", "constraint", "--full", "--json"])
             .current_dir(&materialised)
             .output()
         {
             Ok(output) => output,
-            // no aval installed here: the fake-aval tests still cover the wiring
+            // no greentopo installed here: the fake-aval tests still cover the wiring
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!("skipped: no aval on PATH; the fake-aval tests cover the wiring");
+                eprintln!("skipped: no greentopo on PATH; the fake-aval tests cover the wiring");
                 return;
             }
-            Err(error) => panic!("aval did not run: {error}"),
+            Err(error) => panic!("greentopo did not run: {error}"),
         };
         assert!(output.status.success(), "{output:?}");
         let rules = guidance::parse_rules_output(&String::from_utf8_lossy(&output.stdout))
-            .expect("aval's rules");
+            .expect("greentopo's rules");
         assert!(!rules.code_rules.is_empty());
     }
 
@@ -2252,7 +2255,7 @@ mod tests {
         let note = GuidanceGap::new(
             GuidanceSource::CodeRules,
             cause,
-            "code rules are not carried; upgrade aval or run `aval add`",
+            "code rules are not carried; upgrade greentopo or run `greentopo add`",
         );
         let resolver = two_rules_with_note(Vec::new(), vec![note]);
         let manifest = assemble(inputs(&contract(&[]), &repo(), &resolver)).expect("assembles");
@@ -2264,7 +2267,7 @@ mod tests {
         let line = guidance::gap_line(&guidance.gaps).expect("the gap is reported");
         assert!(line.contains("code rules missing"), "{line}");
         assert!(
-            line.contains("upgrade aval") || line.contains("aval add"),
+            line.contains("upgrade greentopo") || line.contains("greentopo add"),
             "{line}"
         );
         assert!(!line.contains("index missing"), "{line}");

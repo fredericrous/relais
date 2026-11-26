@@ -580,7 +580,7 @@ impl crate::context::DecisionResolver for NoCorpus {
             Err(GuidanceGap::new(
                 crate::context::GuidanceSource::Index,
                 crate::context::guidance::GapCause::Exited(3),
-                "aval exit 3",
+                "greentopo exit 3",
             ))
         };
         let in_fleet = |_: &[String]| Ok(FLEET_RULES_JSON.to_string());

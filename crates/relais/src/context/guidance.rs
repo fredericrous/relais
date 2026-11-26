@@ -100,7 +100,7 @@ impl GuidanceGap {
         self.cause == GapCause::NotLaunched
     }
 
-    /// One phrase for the receipt: `relevant missing (aval exit 2)`.
+    /// One phrase for the receipt: `relevant missing (greentopo exit 2)`.
     pub fn describe(&self) -> String {
         let what = match self.source {
             GuidanceSource::Index => "index missing",
@@ -112,7 +112,7 @@ impl GuidanceGap {
             GuidanceSource::Candidates => "candidates missing",
             GuidanceSource::DecisionKeys => {
                 return format!(
-                    "aval: not installed, decision keys {} not checked (reported, not passed)",
+                    "greentopo: not installed, decision keys {} not checked (reported, not passed)",
                     self.detail
                 )
             }
@@ -348,7 +348,7 @@ pub struct Guidance {
     pub gaps: Vec<GuidanceGap>,
     /// The directory name of the repository root this run is for, which is
     /// the name aval's corpus knows the repository by; the worker passes it
-    /// as `repo` to the `aval_rule` tool. `None` when unknown.
+    /// as `repo` to the `greentopo_rule` tool. `None` when unknown.
     #[serde(default)]
     pub repo_name: Option<String>,
 }
@@ -581,7 +581,7 @@ pub fn parse_rules_output(stdout: &str) -> Result<Rules, GuidanceGap> {
         GuidanceGap::new(
             GuidanceSource::Index,
             GapCause::Unparseable,
-            format!("unparseable aval rules output: {e}"),
+            format!("unparseable greentopo rules output: {e}"),
         )
     })?;
     let active: Vec<RawRule> = raw.rules.into_iter().filter(|rule| rule.active).collect();
@@ -642,13 +642,13 @@ pub fn fetch_rules(
         rules.notes.push(GuidanceGap::new(
             GuidanceSource::CodeRules,
             GapCause::AvalTooOld,
-            "aval is older than 1.10.0 (no --full/governs; exit 2): code rules are not carried; upgrade it, e.g. `brew upgrade aval` or aval's install/install.sh",
+            "greentopo is older than 1.10.0 (no --full/governs; exit 2): code rules are not carried; upgrade it, e.g. `brew upgrade greentopo` or greentopo's install/install.sh",
         ));
     } else if !rules.rules.is_empty() && rules.code_rules.is_empty() {
         rules.notes.push(GuidanceGap::new(
             GuidanceSource::CodeRules,
             GapCause::StalePack,
-            "no constraint declares `governs: code`; the decisions pack is stale, so code rules are not carried; run `aval add` for the decisions pack",
+            "no constraint declares `governs: code`; the decisions pack is stale, so code rules are not carried; run `greentopo add` for the decisions pack",
         ));
     }
     Ok(rules)
@@ -680,10 +680,10 @@ pub fn parse_relevant_output(stdout: &str) -> Result<Relevant, GuidanceGap> {
     let gap =
         |detail: String| GuidanceGap::new(GuidanceSource::Relevant, GapCause::Unparseable, detail);
     let raw: RawRelevant = serde_json::from_str(stdout.trim())
-        .map_err(|e| gap(format!("unparseable aval relevant output: {e}")))?;
+        .map_err(|e| gap(format!("unparseable greentopo relevant output: {e}")))?;
     if raw.keys.is_none() && raw.rules.is_none() {
         return Err(gap(
-            "aval relevant output carries neither keys nor rules".to_string()
+            "greentopo relevant output carries neither keys nor rules".to_string(),
         ));
     }
     Ok(Relevant {
@@ -825,7 +825,7 @@ pub fn run_aval(
     timeout: Duration,
     cancel: Option<&AtomicBool>,
 ) -> Result<String, GuidanceGap> {
-    run_tool("aval", program, args, dir, source, timeout, cancel)
+    run_tool("greentopo", program, args, dir, source, timeout, cancel)
 }
 
 /// [`run_aval`] for any guidance tool: `tool` is the name its gaps carry.
@@ -1060,7 +1060,7 @@ printf '%s' '{"rules":[{"id":"errors.typed-values","level":"constraint","stateme
         assert_eq!(rules.notes.len(), 1);
         assert_eq!(rules.notes[0].cause, GapCause::StalePack);
         assert!(
-            rules.notes[0].detail.contains("aval add"),
+            rules.notes[0].detail.contains("greentopo add"),
             "{:?}",
             rules.notes
         );
@@ -1289,7 +1289,7 @@ EOF"#;
         assert_eq!(exit1.cause, GapCause::Exited(1));
         let exit2 = sh("exit 2", GuidanceSource::Relevant, five).unwrap_err();
         assert_eq!(exit2.cause, GapCause::Exited(2));
-        assert_eq!(exit2.describe(), "relevant missing (aval exit 2)");
+        assert_eq!(exit2.describe(), "relevant missing (greentopo exit 2)");
 
         let slow = sh(
             "sleep 5",
@@ -1512,10 +1512,14 @@ EOF"#;
     #[test]
     fn the_receipt_line_exists_only_for_a_gap() {
         assert_eq!(gap_line(&[]), None);
-        let gap = GuidanceGap::new(GuidanceSource::Relevant, GapCause::Exited(2), "aval exit 2");
+        let gap = GuidanceGap::new(
+            GuidanceSource::Relevant,
+            GapCause::Exited(2),
+            "greentopo exit 2",
+        );
         assert_eq!(
             gap_line(&[gap]).as_deref(),
-            Some("guidance: relevant missing (aval exit 2)")
+            Some("guidance: relevant missing (greentopo exit 2)")
         );
     }
 

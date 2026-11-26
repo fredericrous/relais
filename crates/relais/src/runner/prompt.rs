@@ -12,8 +12,8 @@ use super::{
 /// What the worker's full-text code rules may occupy, in bytes.
 pub(super) const WORKER_CODE_RULES_BUDGET_BYTES: usize = 64 * 1024;
 
-/// aval's precedence, as the worker and the reviewer are both told it.
-pub(in crate::runner) const DECISION_PRECEDENCE: &str = "aval's precedence is an applicable \
+/// greentopo's precedence, as the worker and the reviewer are both told it.
+pub(in crate::runner) const DECISION_PRECEDENCE: &str = "greentopo's precedence is an applicable \
 scoped decision, then a default-scope decision, then an adopted rule: an applicable decision \
 outranks an adopted rule, and a code-rule violation is not reported where a listed decision \
 decides otherwise; missing decision evidence is reported as uncertainty, not as permission.\n";
@@ -492,14 +492,14 @@ pub(in crate::runner) fn tool_checked_block(lines: &[String], instruction: &str)
     )
 }
 
-/// How an agent reads one rule's full text: the `aval_rule` tool with the
+/// How an agent reads one rule's full text: the `greentopo_rule` tool with the
 /// repository's corpus named, else the CLI. `purpose` ends the sentence.
 pub(in crate::runner) fn aval_rule_instruction(guidance: &Guidance, purpose: &str) -> String {
     match &guidance.repo_name {
         Some(name) => format!(
-            "read one rule with the `aval_rule` tool, passing `repo: \"{name}\"`, or run `aval rule <id>` in the working directory when that tool is not available or answers with an error, {purpose}."
+            "read one rule with the `greentopo_rule` tool, passing `repo: \"{name}\"`, or run `greentopo rule <id>` in the working directory when that tool is not available or answers with an error, {purpose}."
         ),
-        None => format!("run `aval rule <id>` in the working directory to read one rule {purpose}."),
+        None => format!("run `greentopo rule <id>` in the working directory to read one rule {purpose}."),
     }
 }
 
@@ -570,7 +570,7 @@ pub(crate) fn relevant_block(guidance: &Guidance, skip_rules: &[&str]) -> String
         return String::new();
     }
     format!(
-        "the decisions and rules below are ranked by aval as relevant to this task\n\
+        "the decisions and rules below are ranked by greentopo as relevant to this task\n\
          (advisory ranking; each decision listed is active).\n{}",
         data_list_block("relevant guidance", &entries)
     )

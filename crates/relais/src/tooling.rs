@@ -79,8 +79,8 @@ fn missing_integration_detail(name: &str, bin: &str, declared_bin: Option<&str>)
     };
     match name {
         "aval" => format!(
-            "required integration `aval` (binary `{bin}`) is not available on PATH; \
-             install {install}, or set its [integrations] key (aval or greentopo) in \
+            "required integration `greentopo` (binary `{bin}`) is not available on PATH; \
+             install {install}, or set its [integrations] key (greentopo or aval) in \
              relais.toml to \"optional\""
         ),
         _ => format!(
@@ -124,7 +124,7 @@ pub(crate) fn exists_in_any_form(candidate: &Path) -> bool {
 /// test, so it is tested without touching the environment. An installed
 /// `greentopo` that fails is never replaced by `aval`: only its absence
 /// from the directories selects `aval`.
-// holds-until: decisions topo-spotter-rename t10 closes; the `aval` fallback is removed then
+// holds-until: decisions topo-spotter-rename t22 closes; the `aval` fallback is removed then
 pub(crate) fn default_bin_in<'a>(
     name: &'a str,
     dirs: &[PathBuf],
@@ -368,14 +368,14 @@ mod tests {
     fn the_aval_blocker_names_what_to_install() {
         assert_eq!(
             missing_integration_detail("aval", "greentopo", None),
-            "required integration `aval` (binary `greentopo`) is not available on PATH; \
+            "required integration `greentopo` (binary `greentopo`) is not available on PATH; \
              install greentopo (`aval` still works for now), or set its [integrations] \
-             key (aval or greentopo) in relais.toml to \"optional\""
+             key (greentopo or aval) in relais.toml to \"optional\""
         );
         assert_eq!(
             missing_integration_detail("aval", "/opt/x/topo", Some("/opt/x/topo")),
-            "required integration `aval` (binary `/opt/x/topo`) is not available on PATH; \
-             install `/opt/x/topo`, or set its [integrations] key (aval or greentopo) in \
+            "required integration `greentopo` (binary `/opt/x/topo`) is not available on PATH; \
+             install `/opt/x/topo`, or set its [integrations] key (greentopo or aval) in \
              relais.toml to \"optional\""
         );
     }

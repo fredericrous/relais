@@ -179,7 +179,7 @@ max_repairs_before_escalation = 1
 max_wall_seconds = 120
 
 [integrations]
-aval = "off"
+greentopo = "off"
 amont = "off"
 amont_agent = "off"
 
@@ -216,7 +216,7 @@ max_repairs_before_escalation = 1
 max_wall_seconds = 120
 
 [integrations]
-aval = "off"
+greentopo = "off"
 amont = "off"
 amont_agent = "off"
 
@@ -1475,7 +1475,7 @@ max_repairs_before_escalation = 1
 max_wall_seconds = 120
 
 [integrations]
-aval = "off"
+greentopo = "off"
 amont = "off"
 amont_agent = "off"
 

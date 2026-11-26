@@ -886,12 +886,13 @@ impl<'a> RunEngine<'a> {
                 Reason::ArchitectureContradiction,
                 BlockCode::ArchitectureContradiction,
                 format!(
-                    "aval contradiction on `{key}` ({})",
+                    "greentopo contradiction on `{key}` ({})",
                     context::contradiction_detail(&heads, &by_scope)
                 ),
             )?)),
             Err(ContextError::NeedsDecision { key, verdict }) => {
-                let detail = format!("the task depends on `{key}` but aval answers {verdict:?}");
+                let detail =
+                    format!("the task depends on `{key}` but greentopo answers {verdict:?}");
                 Ok(Phase::Ended(self.finish(
                     Reason::ArchitectureUnresolved,
                     serde_json::json!({ "key": key, "verdict": format!("{verdict:?}") }),

@@ -579,7 +579,7 @@ fn reviewer_full_code_rules<'a>(
         .collect()
 }
 
-/// How the reviewer reads one rule in full: the `aval_rule` tool, with the
+/// How the reviewer reads one rule in full: the `greentopo_rule` tool, with the
 /// repository's corpus named when it is known, and what to say when that
 /// tool is missing. Unlike the worker's, it names no CLI: a reviewer has no
 /// shell.
@@ -589,7 +589,7 @@ fn reviewer_fetch_instruction(guidance: &Guidance) -> String {
         None => String::new(),
     };
     format!(
-        "read one rule in full with the `aval_rule` tool{corpus} when your review needs it; if \
+        "read one rule in full with the `greentopo_rule` tool{corpus} when your review needs it; if \
          that tool is not available or answers with an error, say so in your report, naming the \
          rule you could not read."
     )
@@ -598,7 +598,7 @@ fn reviewer_fetch_instruction(guidance: &Guidance) -> String {
 /// What the reviewer reads of aval (ADR-0066): in full, the code rules with
 /// a judge part and the tool-checked ones a candidate of this diff names;
 /// one line each for the other tool-checked code rules and for the process
-/// rules, with how to read one through `aval_rule`; then the relevant block
+/// rules, with how to read one through `greentopo_rule`; then the relevant block
 /// without the rules already given above it. `named` is
 /// [`candidate_rules`]. `budget` is the constraints budget; rules that do
 /// not fit whole are left out and named in the returned gap.
