@@ -804,6 +804,7 @@ fn run_package(
         gate: engine.config.gate,
         session_id: engine.config.session_id.clone(),
         heartbeat_every: engine.config.heartbeat_every,
+        settle_retry_pause: engine.config.settle_retry_pause,
         // Irrelevant for a child: `preflight`'s child branch inherits
         // the root's task from the ledger unconditionally, never this.
         task_override: None,

@@ -334,6 +334,7 @@ impl Fixture {
             gate: None,
             session_id: "test-session".into(),
             heartbeat_every: Duration::from_millis(50),
+            settle_retry_pause: Duration::ZERO,
             task_override: None,
             purpose: None,
             run_id,
@@ -393,6 +394,7 @@ impl Fixture {
             gate: None,
             session_id: "test-session".into(),
             heartbeat_every: Duration::from_millis(50),
+            settle_retry_pause: Duration::ZERO,
             task_override: None,
             purpose: None,
             run_id,
@@ -434,6 +436,7 @@ impl Fixture {
             gate: None,
             session_id: "test-session".into(),
             heartbeat_every: Duration::from_millis(50),
+            settle_retry_pause: Duration::ZERO,
             task_override: None,
             purpose: None,
             run_id,
@@ -474,6 +477,7 @@ impl Fixture {
             gate: None,
             session_id: "test-session".into(),
             heartbeat_every: Duration::from_millis(50),
+            settle_retry_pause: Duration::ZERO,
             task_override: None,
             purpose: None,
             run_id: None,
@@ -562,6 +566,7 @@ impl Fixture {
             gate: None,
             session_id: "test-session".into(),
             heartbeat_every: Duration::from_millis(50),
+            settle_retry_pause: Duration::ZERO,
             task_override: None,
             purpose: None,
             run_id,
@@ -609,6 +614,7 @@ impl Fixture {
             gate: None,
             session_id: "test-session".into(),
             heartbeat_every: Duration::from_millis(50),
+            settle_retry_pause: Duration::ZERO,
             task_override: None,
             purpose,
             run_id: None,
@@ -700,6 +706,7 @@ impl Fixture {
             gate: Some(gate),
             session_id: "test-session".into(),
             heartbeat_every: Duration::from_millis(50),
+            settle_retry_pause: Duration::ZERO,
             task_override: None,
             purpose: None,
             run_id: None,
@@ -1006,6 +1013,7 @@ fn a_driver_whose_run_was_ended_elsewhere_stops_without_writing() {
         gate: None,
         session_id: "test-session".into(),
         heartbeat_every: Duration::from_millis(50),
+        settle_retry_pause: Duration::ZERO,
         task_override: None,
         purpose: None,
         run_id: None,
@@ -2193,6 +2201,7 @@ fn an_unreadable_working_tree_blocks_like_a_dirty_one() {
         gate: None,
         session_id: "test-session".into(),
         heartbeat_every: Duration::from_millis(50),
+        settle_retry_pause: Duration::ZERO,
         task_override: None,
         purpose: None,
         run_id: None,
@@ -8152,6 +8161,7 @@ fn guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_g
         gate: None,
         session_id: "test-session".into(),
         heartbeat_every: Duration::from_millis(50),
+        settle_retry_pause: Duration::ZERO,
         task_override: None,
         purpose: None,
         run_id: None,
@@ -8725,15 +8735,11 @@ impl Gate for FaultyGate {
             Fault::SettleAnswerLost => {
                 let answer = self.inner.settle(dispatch_id, spent_micros);
                 if first {
-                    self.calls.fetch_add(1, Ordering::SeqCst);
                     return Err(Self::lost("settle"));
                 }
                 answer
             }
-            Fault::SettleUnavailable => {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                Err(Self::lost("settle"))
-            }
+            Fault::SettleUnavailable => Err(Self::lost("settle")),
             Fault::SettleRefused => Err(self.refuse("settle", dispatch_id)),
         }
     }
@@ -8870,6 +8876,28 @@ fn a_coordinator_that_stops_answering_heartbeats_ends_the_run() {
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
+/// The settle retry's pause is spread over [0.5, 1.5) of its base by the
+/// dispatch id, the same for the same id.
+#[test]
+fn a_settle_retry_pause_is_jittered_within_half_its_base() {
+    let base = Duration::from_millis(1_000);
+    let pauses: Vec<Duration> = (0..50)
+        .map(|n| super::launch::jittered(base, &format!("disp-{n}")))
+        .collect();
+    assert!(pauses
+        .iter()
+        .all(|pause| *pause >= base / 2 && *pause < base * 3 / 2));
+    assert!(pauses.iter().any(|pause| *pause != pauses[0]), "it varies");
+    assert_eq!(
+        super::launch::jittered(base, "disp-7"),
+        super::launch::jittered(base, "disp-7")
+    );
+    assert_eq!(
+        super::launch::jittered(Duration::ZERO, "disp-7"),
+        Duration::ZERO
+    );
+}
+
 /// Run one passing managed dispatch through a `FaultyGate` with `fault`.
 fn run_through_settle_fault(fault: Fault) -> (Fixture, FaultyGate, RunId) {
     let fixture = Fixture::new();
@@ -8889,12 +8917,23 @@ fn run_through_settle_fault(fault: Fault) -> (Fixture, FaultyGate, RunId) {
         matches!(outcome.terminal, Terminal::Accepted(_)),
         "a settle the coordinator did not take never fails the run: {outcome:?}"
     );
+    // A zero settle passes the fault by, so the worker's must cost something.
+    assert!(
+        gate.settles()
+            .first()
+            .copied()
+            .flatten()
+            .is_some_and(|cost| cost > 0),
+        "the worker's settle met the fault: {:?}",
+        gate.settles()
+    );
     (fixture, gate, run_id)
 }
 
 /// an-t28: a settle the coordinator applied but whose answer was lost is
-/// tried again; the retry is answered (the entry is already forgotten), so
-/// the coordinator holds the cost once and nothing reports a failed settle.
+/// tried again; the retry is answered `Unknown` (the entry is already
+/// forgotten), so the coordinator holds the cost once, nothing reports a
+/// failed settle, and the run says the retry could not confirm it.
 #[test]
 fn a_settle_whose_answer_was_lost_is_retried_and_booked_once() {
     let (fixture, gate, run_id) = run_through_settle_fault(Fault::SettleAnswerLost);
@@ -8911,9 +8950,18 @@ fn a_settle_whose_answer_was_lost_is_retried_and_booked_once() {
         .map(|run| run.settled_micros)
         .sum();
     assert_eq!(booked, cost, "the coordinator holds the cost once");
+    let decisions = decisions_of(&fixture, &run_id);
     assert!(
-        !decisions_of(&fixture, &run_id).contains(&"gate_settle_failed".to_string()),
-        "the retry was taken"
+        !decisions.contains(&"gate_settle_failed".to_string()),
+        "the retry was taken: {decisions:?}"
+    );
+    assert_eq!(
+        decisions
+            .iter()
+            .filter(|what| *what == "gate_settle_unconfirmed")
+            .count(),
+        1,
+        "{decisions:?}"
     );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }

@@ -454,6 +454,7 @@ pub(crate) fn replay_command(
         gate: Some(&gate),
         session_id: session.id.clone(),
         heartbeat_every: std::time::Duration::from_secs(30),
+        settle_retry_pause: relais::runner::SETTLE_RETRY_PAUSE,
         task_override: Some(&task_id),
         purpose: Some(RunPurpose::Replay),
         run_id: Some(run_id.clone()),

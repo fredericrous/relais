@@ -58,10 +58,13 @@ back in `node::daily_spent`. What still misses the counter, named on purpose
   day to add the dropped spend back. Ceiling: a conforming primary never
   refuses a settle (conformance `a_late_settle_is_never_refused`), so a
   refusal is 0; the caps drop only what waited a day or overflowed 500;
-- a run whose `gate.settle` failed: the runner tries once more when the
-  coordinator did not answer (`Unavailable`; a refusal is an answer and is
-  not retried), which a settle applied but whose answer was lost answers
-  without booking twice. A settle not taken leaves the coordinator to
+- a run whose `gate.settle` failed: the runner tries once more, after a
+  pause of about 1 s (jittered by the dispatch id), when the coordinator
+  did not answer (`Unavailable`; a refusal is an answer and is not
+  retried), which a settle applied but whose answer was lost answers
+  without booking twice. A retry answered `Unknown` cannot tell that case
+  from a coordinator that forgot the dispatch, so the run writes a
+  `gate_settle_unconfirmed` decision and one line. A settle not taken leaves the coordinator to
   settle it unknown when its lease lapses, so the counter holds its
   reservation, not its cost, and the run writes a `gate_settle_failed`
   decision and one line. Ceiling: cost minus reservation, per such run;
