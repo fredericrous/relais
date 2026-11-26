@@ -3,6 +3,7 @@
 //! tickets and the repositories that exist arrive as values.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use super::claim::rules::Hold;
 use super::model::{MapDoc, Mode, Problem, Status, Ticket, MAP_FILE};
@@ -252,6 +253,86 @@ pub fn check(
         }
     }
     problems.extend(cycles(tickets));
+    problems
+}
+
+/// A ticket id's leading `<letters><digits>` when the id is that and then
+/// ends or continues with `-`: the letters and the digits.
+fn id_prefix(id: &str) -> Option<(&str, &str)> {
+    let letters_end = id
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .filter(|end| *end > 0)?;
+    let rest = &id[letters_end..];
+    let digits_len = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if digits_len == 0 {
+        return None;
+    }
+    let after = &rest[digits_len..];
+    (after.is_empty() || after.starts_with('-')).then(|| (&id[..letters_end], &rest[..digits_len]))
+}
+
+/// One problem per ticket file whose id shares its leading
+/// `<letters><digits>` prefix with another ticket's, on line 1 of the file.
+/// `own` and `from_ref` are file names (`<id>.md`) in the directory; a file
+/// in both counts once, and only an `own` file is reported, so a ref's
+/// file is a name to avoid and never a line to fix. `dir` prefixes the
+/// other file's path in the message.
+pub fn duplicate_ids(
+    own: &BTreeSet<String>,
+    from_ref: &BTreeSet<String>,
+    dir: &Path,
+) -> Vec<Problem> {
+    let mut files: Vec<(&str, bool)> = own.iter().map(|file| (file.as_str(), true)).collect();
+    files.extend(
+        from_ref
+            .iter()
+            .filter(|file| !own.contains(*file))
+            .map(|file| (file.as_str(), false)),
+    );
+    files.sort_unstable();
+    let mut groups: BTreeMap<String, Vec<(&str, bool)>> = BTreeMap::new();
+    let mut highest: BTreeMap<&str, u64> = BTreeMap::new();
+    for &(file, is_own) in &files {
+        let Some((letters, digits)) = id_prefix(file.strip_suffix(".md").unwrap_or(file)) else {
+            continue;
+        };
+        if let Ok(number) = digits.parse::<u64>() {
+            let slot = highest.entry(letters).or_insert(0);
+            *slot = (*slot).max(number);
+        }
+        groups
+            .entry(format!("{letters}{digits}"))
+            .or_default()
+            .push((file, is_own));
+    }
+    let mut problems = Vec::new();
+    for (prefix, group) in &groups {
+        if group.len() < 2 {
+            continue;
+        }
+        let letters = prefix.trim_end_matches(|c: char| c.is_ascii_digit());
+        let next = highest.get(letters).copied().unwrap_or(0) + 1;
+        for (index, &(file, is_own)) in group.iter().enumerate() {
+            if !is_own {
+                continue;
+            }
+            let reported = index > 0 || group[1..].iter().all(|(_, other_own)| !other_own);
+            if !reported {
+                continue;
+            }
+            let other = if index == 0 { group[1].0 } else { group[0].0 };
+            problems.push(Problem {
+                file: file.to_string(),
+                line: 1,
+                message: format!(
+                    "id {prefix} is also used by {}; renumber to {letters}{next}",
+                    dir.join(other).display()
+                ),
+            });
+        }
+    }
     problems
 }
 

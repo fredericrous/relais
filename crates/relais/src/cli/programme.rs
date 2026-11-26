@@ -451,11 +451,28 @@ pub(crate) fn check_command(
     dir: &Path,
     format: Format,
     fetch: Fetch,
+    with_ref: Option<&str>,
 ) -> Result<CliOutcome, CliError> {
     let found = resolve_dir(dir, fetch)?;
     let programme = found.load().map_err(programme_error)?;
     let tag = ref_tag(&found.source);
-    let problems = programme.problems();
+    let from_ref = match with_ref {
+        None => std::collections::BTreeSet::new(),
+        Some(rev) if rev.starts_with('-') => {
+            return Err(CliError::Usage {
+                detail: format!("--with-ref {rev}: a ref cannot start with `-`"),
+            })
+        }
+        Some(rev) => load::added_since_merge_base(dir, rev).map_err(programme_error)?,
+    };
+    let own: std::collections::BTreeSet<String> = programme
+        .tickets
+        .keys()
+        .chain(&programme.unreadable)
+        .map(|id| format!("{id}.md"))
+        .collect();
+    let mut problems = programme.problems();
+    problems.extend(analysis::duplicate_ids(&own, &from_ref, dir));
     for problem in &problems {
         eprintln!(
             "{}:{}: {tag}{}",

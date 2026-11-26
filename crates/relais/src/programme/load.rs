@@ -307,6 +307,34 @@ impl Programme {
     }
 }
 
+/// The `.md` files directly in `dir` that `rev` added since the merge-base
+/// of `HEAD` and `rev`, by file name. Renames are not followed: a file
+/// renamed on `rev` is an addition under its new name.
+pub fn added_since_merge_base(dir: &Path, rev: &str) -> Result<BTreeSet<String>, ProgrammeError> {
+    let base = git_stdout(dir, &["merge-base", "HEAD", rev])?;
+    let base = base.trim();
+    let names = git_stdout(
+        dir,
+        &[
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "--diff-filter=A",
+            "--relative",
+            "-z",
+            base,
+            rev,
+            "--",
+            ".",
+        ],
+    )?;
+    Ok(names
+        .split('\0')
+        .filter(|name| name.ends_with(".md") && !name.contains('/'))
+        .map(str::to_string)
+        .collect())
+}
+
 /// What `git <args>` prints in `repo`.
 fn git_stdout(repo: &Path, args: &[&str]) -> Result<String, ProgrammeError> {
     let mut command = crate::workspace::git_command(repo);

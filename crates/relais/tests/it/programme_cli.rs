@@ -1722,3 +1722,131 @@ fn a_session_start_outside_a_repository_summarises_the_children_and_expands_the_
         "{context}"
     );
 }
+
+fn open_ticket(name: &str) -> String {
+    ticket("open", "[]", None, name, None)
+}
+
+#[test]
+fn check_refuses_two_tickets_sharing_a_number_and_names_the_next_free_one() {
+    let world = World::new("dup-ids");
+    world.write("f12-a.md", &open_ticket("First"));
+    world.write("f12-b.md", &open_ticket("Second"));
+    let out = world.programme(&["check"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "");
+    let dir = world.dir();
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "{}:1: id f12 is also used by {}; renumber to f13\n",
+            dir.join("f12-b.md").display(),
+            dir.join("f12-a.md").display()
+        )),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_bare_id_collides_but_a_longer_number_and_an_assets_directory_do_not() {
+    let world = World::new("dup-prefix");
+    world.write("f11.md", &open_ticket("Bare"));
+    world.write("f11-x.md", &open_ticket("Suffixed"));
+    let out = world.programme(&["check"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("id f11 is also used by"));
+
+    let world = World::new("dup-longer");
+    world.write("f110-a.md", &open_ticket("Long"));
+    world.write("f11-x.md", &open_ticket("Short"));
+    std::fs::create_dir(world.dir().join("f18-assets")).expect("assets dir");
+    world.write("f18-x.md", &open_ticket("Eighteen"));
+    let out = world.programme(&["check"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stderr), "");
+}
+
+fn commit_all(world: &World, message: &str) {
+    let repo = world.root.join("alpha");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", message]);
+}
+
+/// The programme committed on `trunk`, the working tree on `feature`
+/// branched from it, `HEAD` on `feature`.
+fn world_with_trunk_and_feature(tag: &str, base: &[&str]) -> World {
+    let world = World::new(tag);
+    for file in base {
+        world.write(file, &open_ticket(file));
+    }
+    let repo = world.root.join("alpha");
+    git(&repo, &["checkout", "-q", "-b", "trunk"]);
+    commit_all(&world, "base");
+    git(&repo, &["checkout", "-q", "-b", "feature"]);
+    world
+}
+
+fn check_with_trunk(world: &World) -> Output {
+    world.programme(&["check", "--no-fetch", "--with-ref", "trunk"])
+}
+
+#[test]
+fn with_ref_refuses_an_id_the_ref_took_since_the_merge_base() {
+    let world = world_with_trunk_and_feature("ref-taken", &[]);
+    let repo = world.root.join("alpha");
+    git(&repo, &["checkout", "-q", "trunk"]);
+    world.write("f71-a.md", &open_ticket("On trunk"));
+    commit_all(&world, "trunk adds f71-a");
+    git(&repo, &["checkout", "-q", "feature"]);
+    world.write("f71-b.md", &open_ticket("On feature"));
+    assert!(world.programme(&["check", "--no-fetch"]).status.success());
+    let out = check_with_trunk(&world);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "");
+    assert!(text(&out.stderr).contains("f71-b.md:1: id f71 is also used by"));
+}
+
+#[test]
+fn with_ref_lets_a_branch_rename_one_of_an_existing_pair() {
+    let world = world_with_trunk_and_feature("ref-rename", &["f71-a.md", "f71-b.md"]);
+    let repo = world.root.join("alpha");
+    git(&repo, &["checkout", "-q", "trunk"]);
+    world.write("f80-a.md", &open_ticket("Unrelated"));
+    commit_all(&world, "trunk adds f80-a");
+    git(&repo, &["checkout", "-q", "feature"]);
+    assert_eq!(
+        world.programme(&["check", "--no-fetch"]).status.code(),
+        Some(2)
+    );
+    git(
+        &repo,
+        &[
+            "mv",
+            "docs/programmes/demo/f71-a.md",
+            "docs/programmes/demo/f72-a.md",
+        ],
+    );
+    let out = check_with_trunk(&world);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+}
+
+#[test]
+fn with_ref_catches_a_number_the_ref_reached_by_renaming() {
+    let world = world_with_trunk_and_feature("ref-renamed", &["f70-x.md"]);
+    let repo = world.root.join("alpha");
+    git(&repo, &["checkout", "-q", "trunk"]);
+    git(
+        &repo,
+        &[
+            "mv",
+            "docs/programmes/demo/f70-x.md",
+            "docs/programmes/demo/f71-x.md",
+        ],
+    );
+    commit_all(&world, "trunk renames f70-x to f71-x");
+    git(&repo, &["checkout", "-q", "feature"]);
+    world.write("f71-y.md", &open_ticket("On feature"));
+    let out = check_with_trunk(&world);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("f71-y.md:1: id f71 is also used by"));
+}
