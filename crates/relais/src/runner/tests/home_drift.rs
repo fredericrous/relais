@@ -323,7 +323,8 @@ fn a_path_unreadable_before_and_after_prints_the_not_watched_line() {
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
-// -- each drift says why it happened ---------------------------------------
+// Each drift says why it happened: a worker's write, a known writer's
+// bookkeeping, or nothing found.
 
 const MARKETPLACES_BEFORE: &str = r#"{"a":{"source":{"repo":"x/a"},"lastUpdated":"1"}}"#;
 const MARKETPLACES_AFTER: &str = r#"{"a":{"source":{"repo":"x/a"},"lastUpdated":"2"}}"#;

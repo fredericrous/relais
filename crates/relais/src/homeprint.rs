@@ -752,12 +752,17 @@ fn without_branch_sections(config: &[u8]) -> Option<Vec<u8>> {
     Some(kept)
 }
 
-/// `value` without the fields of [`PLUGIN_ENTRY_KEYS`], when it is an object.
-fn without_plugin_entry_keys(value: &mut serde_json::Value) {
-    if let Some(entry) = value.as_object_mut() {
-        for key in PLUGIN_ENTRY_KEYS {
-            entry.remove(key);
-        }
+/// `entry` without the fields of [`PLUGIN_ENTRY_KEYS`], when it is an
+/// object; any other value unchanged.
+fn without_plugin_entry_keys(entry: serde_json::Value) -> serde_json::Value {
+    match entry {
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .into_iter()
+                .filter(|(key, _)| !PLUGIN_ENTRY_KEYS.contains(&key.as_str()))
+                .collect(),
+        ),
+        other => other,
     }
 }
 
@@ -772,7 +777,7 @@ fn without_installed_plugin_bookkeeping(bytes: &[u8]) -> Option<Vec<u8>> {
     {
         for installs in plugins.values_mut() {
             for install in installs.as_array_mut().into_iter().flatten() {
-                without_plugin_entry_keys(install);
+                *install = without_plugin_entry_keys(install.take());
             }
         }
     }
@@ -782,11 +787,15 @@ fn without_installed_plugin_bookkeeping(bytes: &[u8]) -> Option<Vec<u8>> {
 /// `known_marketplaces.json` without the bookkeeping of each top-level
 /// marketplace entry.
 fn without_marketplace_bookkeeping(bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut document: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    for marketplace in document.as_object_mut()?.values_mut() {
-        without_plugin_entry_keys(marketplace);
-    }
-    serde_json::to_vec(&document).ok()
+    let document: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let serde_json::Value::Object(marketplaces) = document else {
+        return None;
+    };
+    let reduced: serde_json::Map<_, _> = marketplaces
+        .into_iter()
+        .map(|(name, marketplace)| (name, without_plugin_entry_keys(marketplace)))
+        .collect();
+    serde_json::to_vec(&reduced).ok()
 }
 
 /// What changed between two snapshots, in path order. A path one side

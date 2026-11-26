@@ -68,18 +68,25 @@ pub(crate) fn tool_uses(text: &str) -> Vec<ToolUse> {
     found
 }
 
-/// The path a write test looks for.
-pub(crate) struct WriteTarget<'a> {
-    path: &'a Path,
-    /// The spellings a shell command may use for it.
-    spellings: Vec<String>,
-    /// Whether it is the run repository's `.git/config`, which a git
-    /// command can write without naming it.
-    is_repo_config: bool,
+/// What a drifted path is to a write test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetKind {
+    /// Written only by a command that names it.
+    File,
+    /// The run repository's `.git/config`, which a git command also writes
+    /// without naming it.
+    RepoConfig,
 }
 
-impl<'a> WriteTarget<'a> {
-    pub(crate) fn new(path: &'a Path, home: Option<&Path>, is_repo_config: bool) -> Self {
+/// The path a write test looks for.
+pub(crate) struct WriteTarget {
+    /// The spellings a call may use for it, the absolute path first.
+    spellings: Vec<String>,
+    kind: TargetKind,
+}
+
+impl WriteTarget {
+    pub(crate) fn new(path: &Path, home: Option<&Path>, kind: TargetKind) -> Self {
         let mut spellings = vec![path.to_string_lossy().into_owned()];
         if let Some(rest) = home.and_then(|home| path.strip_prefix(home).ok()) {
             let rest = rest.to_string_lossy();
@@ -87,11 +94,7 @@ impl<'a> WriteTarget<'a> {
             spellings.push(format!("$HOME/{rest}"));
             spellings.push(format!("${{HOME}}/{rest}"));
         }
-        Self {
-            path,
-            spellings,
-            is_repo_config,
-        }
+        Self { spellings, kind }
     }
 
     fn names(&self, word: &str) -> bool {
@@ -108,16 +111,22 @@ pub(crate) struct WriteWorld<'a> {
 
 const FILE_EDIT_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
+/// Whether a tool of this name can write a path at all: a file-edit tool
+/// or `Bash`. Every other call is a mention at most.
+pub(crate) fn is_writing_tool(name: &str) -> bool {
+    FILE_EDIT_TOOLS.contains(&name) || name == "Bash"
+}
+
 /// Whether `call` writes `target`: a file-edit tool whose path is the
 /// target, or a `Bash` command that names it as a write target. A mere
 /// mention (a read, a search, quoted text) is not a write.
-pub(crate) fn writes(call: &ToolUse, target: &WriteTarget<'_>, world: &WriteWorld<'_>) -> bool {
+pub(crate) fn writes(call: &ToolUse, target: &WriteTarget, world: &WriteWorld<'_>) -> bool {
     if FILE_EDIT_TOOLS.contains(&call.name.as_str()) {
         return ["file_path", "notebook_path"].iter().any(|key| {
             call.input
                 .get(key)
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|given| given == target.path.to_string_lossy() || target.names(given))
+                .is_some_and(|given| target.names(given))
         });
     }
     if call.name != "Bash" {
@@ -239,23 +248,53 @@ const MAX_SHELL_DEPTH: u8 = 2;
 fn command_writes(
     command: &str,
     start: Option<PathBuf>,
-    target: &WriteTarget<'_>,
+    target: &WriteTarget,
     world: &WriteWorld<'_>,
     depth: u8,
 ) -> bool {
     let mut cwd = start;
-    tokens(command)
-        .split(|token| *token == Token::Separator)
-        .any(|simple| simple_writes(simple, &mut cwd, target, world, depth))
+    for simple in tokens(command).split(|token| *token == Token::Separator) {
+        let step = simple_writes(simple, cwd.as_deref(), target, world, depth);
+        if step.writes {
+            return true;
+        }
+        if let Some(next) = step.cwd_after {
+            cwd = next;
+        }
+    }
+    false
 }
 
+/// What one simple command did: whether it wrote the target, and, for a
+/// `cd`, the directory the next command runs in (`Some(None)` when it
+/// cannot be known).
+struct Step {
+    writes: bool,
+    cwd_after: Option<Option<PathBuf>>,
+}
+
+impl Step {
+    fn writes(writes: bool) -> Self {
+        Self {
+            writes,
+            cwd_after: None,
+        }
+    }
+}
+
+// holds-until: a worker's write to `.git/config` through a form this test
+// does not read (a subshell `( … )`, `xargs`, `make`, a script) is
+// counted as the known writer's. Only direct shell words are read: `cd`,
+// redirections, the commands listed here and `sh -c` two levels deep. It
+// ends when a pilot or a recorded drift shows a worker write counted as a
+// known writer; then the subshell and `xargs` forms are read too.
 fn simple_writes(
     simple: &[Token],
-    cwd: &mut Option<PathBuf>,
-    target: &WriteTarget<'_>,
+    cwd: Option<&Path>,
+    target: &WriteTarget,
     world: &WriteWorld<'_>,
     depth: u8,
-) -> bool {
+) -> Step {
     let mut words: Vec<&str> = Vec::new();
     let mut after_redirect = false;
     for token in simple {
@@ -263,7 +302,7 @@ fn simple_writes(
             Token::Redirect => after_redirect = true,
             Token::Word(word) if after_redirect => {
                 if target.names(word) {
-                    return true;
+                    return Step::writes(true);
                 }
                 after_redirect = false;
             }
@@ -283,32 +322,36 @@ fn simple_writes(
         }
     }
     let Some((name, args)) = rest.split_first() else {
-        return false;
+        return Step::writes(false);
     };
     let name = name.rsplit('/').next().unwrap_or(name);
-    match name {
+    let writes = match name {
         "cd" => {
-            if let Some(dir) = args.first() {
-                *cwd = Some(resolve(cwd.as_deref(), dir, world.home));
-            }
-            false
+            return Step {
+                writes: false,
+                cwd_after: args.first().map(|dir| resolve(cwd, dir, world.home)),
+            };
         }
         "tee" | "rm" | "chmod" | "touch" => args.iter().any(|arg| target.names(arg)),
         "sed" => {
             args.iter().any(|arg| is_sed_in_place(arg)) && args.iter().any(|arg| target.names(arg))
         }
         "cp" | "mv" | "ln" | "install" => args.last().is_some_and(|last| target.names(last)),
-        "git" => target.is_repo_config && git_writes_config(args, cwd.as_deref(), world),
+        "git" => match target.kind {
+            TargetKind::RepoConfig => git_writes_config(args, cwd, world),
+            TargetKind::File => false,
+        },
         shell if SHELLS.contains(&shell) && depth < MAX_SHELL_DEPTH => {
             match args.iter().position(|arg| *arg == "-c") {
                 Some(at) => args.get(at + 1).is_some_and(|script| {
-                    command_writes(script, cwd.clone(), target, world, depth + 1)
+                    command_writes(script, cwd.map(Path::to_path_buf), target, world, depth + 1)
                 }),
                 None => false,
             }
         }
         _ => false,
-    }
+    };
+    Step::writes(writes)
 }
 
 fn is_name_char(ch: char) -> bool {
@@ -327,14 +370,16 @@ fn is_sed_in_place(arg: &str) -> bool {
     })
 }
 
-fn resolve(cwd: Option<&Path>, dir: &str, home: Option<&Path>) -> PathBuf {
+/// Where `dir` is, from `cwd`. `None` for a relative `dir` with no known
+/// `cwd`: resolving it against relais's own directory would guess.
+fn resolve(cwd: Option<&Path>, dir: &str, home: Option<&Path>) -> Option<PathBuf> {
     if let (Some(home), Some(rest)) = (home, dir.strip_prefix("~/")) {
-        return home.join(rest);
+        return Some(home.join(rest));
     }
-    match cwd {
-        Some(base) => base.join(dir),
-        None => PathBuf::from(dir),
+    if Path::new(dir).is_absolute() {
+        return Some(PathBuf::from(dir));
     }
+    cwd.map(|base| base.join(dir))
 }
 
 /// Whether a `git` command, run from `cwd` (after its own `-C`), writes the
@@ -348,7 +393,10 @@ fn git_writes_config(args: &[&str], cwd: Option<&Path>, world: &WriteWorld<'_>) 
                 let Some((given, after)) = tail.split_first() else {
                     return false;
                 };
-                dir = Some(resolve(dir.as_deref(), given, world.home));
+                let Some(resolved) = resolve(dir.as_deref(), given, world.home) else {
+                    return false;
+                };
+                dir = Some(resolved);
                 rest = after;
             }
             "-c" | "--git-dir" | "--work-tree" | "--namespace" => {
@@ -499,7 +547,7 @@ mod tests {
 
     fn writes_netrc(call: &ToolUse) -> bool {
         let path = PathBuf::from(HOME).join(".netrc");
-        let target = WriteTarget::new(&path, Some(Path::new(HOME)), false);
+        let target = WriteTarget::new(&path, Some(Path::new(HOME)), TargetKind::File);
         let world = WriteWorld {
             home: Some(Path::new(HOME)),
             in_run_repo: &|_| false,
@@ -509,7 +557,7 @@ mod tests {
 
     fn writes_repo_config(call: &ToolUse) -> bool {
         let path = PathBuf::from(REPO).join(".git").join("config");
-        let target = WriteTarget::new(&path, Some(Path::new(HOME)), true);
+        let target = WriteTarget::new(&path, Some(Path::new(HOME)), TargetKind::RepoConfig);
         let world = WriteWorld {
             home: Some(Path::new(HOME)),
             in_run_repo: &|dir| dir.starts_with(REPO),
@@ -629,6 +677,10 @@ mod tests {
             Some("/elsewhere"),
         );
         assert!(!writes_repo_config(&elsewhere));
+        for relative in ["git -C sub branch t", "cd sub && git branch t"] {
+            let unknown_base = call("Bash", serde_json::json!({ "command": relative }), None);
+            assert!(!writes_repo_config(&unknown_base), "{relative}");
+        }
         let no_directory = call(
             "Bash",
             serde_json::json!({ "command": "git branch t" }),

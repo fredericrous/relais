@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
-use super::transcript_calls::{tool_uses, writes, ToolUse, WriteTarget, WriteWorld};
+use super::transcript_calls::{
+    is_writing_tool, tool_uses, writes, TargetKind, ToolUse, WriteTarget, WriteWorld,
+};
 use super::RunEngine;
 use crate::homeprint::{self, Drift, RepoConfig, Snapshot, Watch, WorkerCall};
 use crate::ids::RunId;
@@ -92,10 +94,17 @@ impl<'a> RunEngine<'a> {
                     let kept = tool_uses(&text)
                         .into_iter()
                         .filter(|call| since.is_none_or(|since| call.at_or_after(since)))
+                        .filter_map(write_relevant)
                         .collect();
                     calls.by_agent.push((agent, kept));
                 }
-                None => calls.all_read = false,
+                None => {
+                    eprintln!(
+                        "relais: the transcript of agent {agent} could not be read to explain \
+                         home drift"
+                    );
+                    calls.all_read = false;
+                }
             }
         }
         calls
@@ -119,11 +128,27 @@ impl<'a> RunEngine<'a> {
             RepoConfig::At(path) => Some(path),
             RepoConfig::Unresolved(_) => None,
         };
+        let in_repo_cache: RefCell<HashMap<PathBuf, bool>> = RefCell::default();
+        let in_run_repo = |dir: &Path| {
+            *in_repo_cache
+                .borrow_mut()
+                .entry(dir.to_path_buf())
+                .or_insert_with(|| {
+                    matches!(
+                        homeprint::repo_config(dir),
+                        RepoConfig::At(found) if Some(found.as_path()) == repo_config.as_deref()
+                    )
+                })
+        };
+        let world = WriteWorld {
+            home,
+            in_run_repo: &in_run_repo,
+        };
         let drifts = homeprint::attribute(
             drifts,
             &before.snapshot,
             &after,
-            &|path| call_writing(&calls, path, home, repo_config.as_deref()),
+            &|path| call_writing(&calls, path, &world, repo_config.as_deref()),
             calls.all_read,
         );
         if let Err(error) = std::fs::create_dir_all(&self.artifacts) {
@@ -150,34 +175,43 @@ impl<'a> RunEngine<'a> {
     }
 }
 
+/// The input fields a write test reads; every other field (a `Write`'s
+/// content, an `Edit`'s strings) is dropped, so a long run's transcripts
+/// are not held twice.
+const WRITE_FIELDS: [&str; 3] = ["file_path", "notebook_path", "command"];
+
+/// `call` reduced to what a write test reads, or `None` for a tool that
+/// never writes a path.
+fn write_relevant(call: ToolUse) -> Option<ToolUse> {
+    if !is_writing_tool(&call.name) {
+        return None;
+    }
+    let input = WRITE_FIELDS
+        .iter()
+        .filter_map(|key| Some(((*key).to_string(), call.input.get(*key)?.clone())))
+        .collect::<serde_json::Map<_, _>>();
+    Some(ToolUse {
+        input: serde_json::Value::Object(input),
+        ..call
+    })
+}
+
 /// The first worker call that writes `path`.
 fn call_writing(
     calls: &WorkerCalls,
     path: &Path,
-    home: Option<&Path>,
+    world: &WriteWorld<'_>,
     repo_config: Option<&Path>,
 ) -> Option<WorkerCall> {
-    let is_repo_config = repo_config == Some(path);
-    let target = WriteTarget::new(path, home, is_repo_config);
-    let in_repo_cache: RefCell<HashMap<PathBuf, bool>> = RefCell::default();
-    let in_run_repo = |dir: &Path| {
-        *in_repo_cache
-            .borrow_mut()
-            .entry(dir.to_path_buf())
-            .or_insert_with(|| {
-                matches!(
-                    homeprint::repo_config(dir),
-                    RepoConfig::At(found) if Some(found.as_path()) == repo_config
-                )
-            })
+    let kind = if repo_config == Some(path) {
+        TargetKind::RepoConfig
+    } else {
+        TargetKind::File
     };
-    let world = WriteWorld {
-        home,
-        in_run_repo: &in_run_repo,
-    };
+    let target = WriteTarget::new(path, world.home, kind);
     calls.by_agent.iter().find_map(|(agent, uses)| {
         uses.iter()
-            .find(|call| writes(call, &target, &world))
+            .find(|call| writes(call, &target, world))
             .map(|call| WorkerCall {
                 tool: call.name.clone(),
                 agent: agent.clone(),

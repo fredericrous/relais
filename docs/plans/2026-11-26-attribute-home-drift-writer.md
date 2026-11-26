@@ -20,10 +20,10 @@ plan-id: p-01M8CD27X6X2E4CB1HWFPEG8SP
 ```
  today                          after this plan
  -----                          ---------------
- drift --> "changed" line   drift --> writer part only? --yes--> count line
+ drift --> "changed" line   drift --> worker writes it? --yes--> "by Write"
                                         | no
                                         v
-                             worker call names it? --yes--> "by Write"
+                             writer part only? --yes--> count line
                                         | no
                                         v
                              "unexplained", listed first
@@ -210,38 +210,59 @@ None.
 
 ## Verification
 
-- Replay test (`runner/tests/home_drift.rs`): a scratch home holding the
-  49 rows' path mix. Before and after the run, `known_marketplaces.json`
-  and `installed_plugins.json` differ only in `lastUpdated` and `version`,
-  `.git/config` gains a `[branch "t"]` section, and settings.json changes
-  in `enabledPlugins`. `.gitconfig` is also changed, and no call touches
-  it. Expected: the two plugin files and `.git/config` get `Writer` causes
-  with their writer names; settings.json and `.gitconfig` are
-  `Unexplained { calls_read: true }`.
-- The same test with a new marketplace entry added to
-  `known_marketplaces.json`: expected `Unexplained`, since the writer
-  never explains a new source.
-- A worker whose transcript holds `Write` with `file_path` `<home>/.netrc`:
-  expected `Call { tool: "Write", agent }`, printed on its own line and
-  not counted in the writer line.
-- A worker whose transcript holds `Bash` `git config branch.t.pushRemote x`,
-  with `.git/config` changed only in `[branch "t"]`: expected
-  `Call { tool: "Bash", agent }`, not `Writer { git branch tracking }`.
-- An old row (`{"path":…,"change":"modified"}`) still reads, and prints
-  as it does today.
-- A worker whose transcript holds only `Bash` `git branch --show-current`, with `.git/config` changed in `[branch "t"]`: expected `Writer { git branch tracking }`. Re-scoring the 24 existing transcripts with the Bash rule gives 0 `Call` causes.
-- `cargo test -p relais --lib homeprint:: runner::tests::home_drift` and the `cli::ctx` warning tests (`--bin relais`) pass, including a new bin test that `status` lists unexplained, then worker-named, then the count line.
-- Piloted: a branch build of `relais run` on a scratch task in a scratch
-  clone of this repo, with a `git worktree add -b` in that clone during the
-  run (branch and worktree removed afterwards). Expected stderr: a count
-  line naming `git branch tracking`, no unexplained or worker-named line
-  and no follow-up lines (other sessions' plugin refreshes may add to the
-  count). `jq -r .cause.kind` over its `home-drift-*.json` prints only
-  `writer`.
-- `relais status <piloted run>` and `relais explain <piloted run>`:
-  expected the same order as the warning (unexplained, worker-named, then
-  the count line); on a run recorded by 0.88.0, expected the lines
-  unchanged from today.
+Observed on 2026-11-26 (input → expected → actual):
+
+- Replay of the 49 rows' path mix,
+  `the_49_rows_path_mix_is_told_apart_by_cause`: plugin JSONs differing
+  in `lastUpdated`/`version`, `.git/config` with a new `[branch "t"]`,
+  settings.json changed in `enabledPlugins`, `.gitconfig` changed by
+  nobody → both plugin files and `.git/config` `Writer`, settings.json
+  and `.gitconfig` `Unexplained { calls_read: true }` → as expected.
+- A new marketplace entry beside a refresh,
+  `a_new_marketplace_entry_is_unexplained_even_beside_a_refresh` →
+  `Unexplained` → as expected.
+- A worker `Write` to `~/.netrc`,
+  `a_worker_write_to_a_watched_file_is_named_with_its_tool_and_agent` →
+  `Call { tool: "Write", agent }` on its own line → as expected.
+- `Bash` `git config branch.t.pushRemote x` against `git branch
+  --show-current` alone,
+  `a_worker_git_config_write_is_a_call_and_a_read_only_git_form_leaves_the_writer`
+  → `Call { tool: "Bash" }`, then `Writer { git branch tracking }` → as
+  expected.
+- `cat`, `Read` and a `Write` dated before the first snapshot,
+  `a_mention_or_an_old_write_is_not_a_worker_write` → `Unexplained` → as
+  expected. A relative `git -C sub` or `cd sub` with no record `cwd`
+  (transcript_calls tests) → no write → as expected.
+- A run with no worker agent,
+  `a_run_with_no_worker_agent_says_its_calls_were_not_read` →
+  `Unexplained { calls_read: false }` → as expected.
+- Report order, `status_lists_unexplained_then_worker_named_then_the_count_line`
+  (`--bin relais`) and width,
+  `every_report_line_fits_80_columns_with_a_17_character_agent` →
+  unexplained, worker-named, count lines; every line ≤ 80 columns → as
+  expected. Lib run: 127 passed; bin run: 7 passed; clippy `-D warnings`
+  clean.
+- Re-scoring the real transcripts: a throwaway ignored test (not
+  committed) fed `transcript_calls::writes` the 19 drift rows whose
+  worker transcripts still exist (5 of the 24 have since been removed),
+  each with its run's repository and start time → 0 `Call` causes → 0
+  (19 rows, 0 writes, the implementing run's own drift included).
+- An old row (`{"path":…,"change":"modified"}`), `relais status
+  run-660c47b928e3f-424` with the branch build against a copy of the
+  state directory, next to installed 0.88.0 → the same lines → the same
+  lines, except the follow-up's first line, which now names "another
+  session" (Decision log).
+
+Phase 2 checks (after the install; a branch build cannot run through the
+plugin):
+
+- Pilot: a scratch task in a scratch clone, with `git worktree add -b`
+  in that clone during the run → a count line naming `git branch
+  tracking`, no unexplained or worker-named line, no follow-up;
+  `jq -r .cause.kind` over its `home-drift-*.json` (settings.json left
+  out) prints only `writer`.
+- `relais status` and `relais explain` on that run → the warning's
+  order.
 
 ## Decision log
 
