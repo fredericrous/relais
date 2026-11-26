@@ -279,7 +279,7 @@ pub(crate) fn doctor_command(json: bool) -> Result<CliOutcome, CliError> {
     // (an-t29). One that does not build says nothing on those two findings,
     // as before; only the external-absent case is reported, by
     // `shared_state_finding` below.
-    let shared = super::ctx::shared_state().ok(); // the error is said there
+    let shared = super::ctx::shared_state().ok();
     note_held_repair_effort(&mut report, shared.as_deref());
     report.findings.extend(loop_threshold_finding());
     report.findings.extend(holdouts_finding(shared.as_deref()));

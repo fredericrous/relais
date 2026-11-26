@@ -724,11 +724,16 @@ mod home_drift_warning_tests {
             BUILDERS
                 .iter()
                 .map(|builder| {
-                    let call = format!("{builder}(");
-                    line.match_indices(&call)
+                    line.match_indices(builder)
                         .filter(|(at, _)| {
                             let before = line[..*at].chars().next_back();
-                            !matches!(before, Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                            let after = line[*at + builder.len()..].chars().next();
+                            let own_word = !matches!(before, Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '.');
+                            // A call, or the path handed on as a value
+                            // (`LazyCell::new(super::ctx::shared_state)`).
+                            let called = after == Some('(');
+                            let handed_on = line[..*at].ends_with("::") && matches!(after, Some(')' | ','));
+                            own_word && (called || handed_on)
                         })
                         .count()
                 })
@@ -745,6 +750,12 @@ mod home_drift_warning_tests {
                 }
                 if let Some(name) = declared(line) {
                     current = name.to_string();
+                    continue;
+                }
+                // A method is not a command entry: a build inside an `impl`
+                // is counted under the impl's name, so it fails the guard.
+                if line.starts_with("impl") {
+                    current = line.trim_end_matches(" {").to_string();
                     continue;
                 }
                 if line.trim_start().starts_with("//") {
@@ -805,9 +816,15 @@ mod home_drift_warning_tests {
             assert_eq!(builder_calls("route::default_tuning_bounds(a, b)"), 0);
             assert_eq!(builder_calls("state.write_settings(who, edit)"), 0);
             assert_eq!(builder_calls("super::ctx::write_settings(&edit)?"), 1);
+            assert_eq!(builder_calls("LazyCell::new(super::ctx::shared_state)"), 1);
+            assert_eq!(builder_calls("fn run(shared_state: u8)"), 0);
             assert_eq!(
                 census("fn a_command() {\n    load_machine()?;\n    // shared_state()\n    shared_state()?;\n}\n#[cfg(test)]\nfn t() { shared_state(); }\n"),
                 vec![("a_command".to_string(), 2)]
+            );
+            assert_eq!(
+                census("fn a_command() {}\nimpl Helper {\n    fn build(&self) {\n        shared_state();\n    }\n}\n"),
+                vec![("impl Helper".to_string(), 1)]
             );
         }
     }
