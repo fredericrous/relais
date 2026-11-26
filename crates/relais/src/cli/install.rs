@@ -136,24 +136,19 @@ pub(crate) fn install_command(
     let report = operational(relais::install::install(&request, &home), "install")?;
     let plugin = relais::install::plugin::install(request.mode, &marketplace_dir()?);
     let outcome = render_install("install", &request, &report, &plugin);
-    let envelopes = request.mode == Mode::Apply && plugin.failure.is_none();
-    let hooks = matches!(targets, Targets::OwnedFilesAndHooks);
-    // A preview without `--hooks` needs no state and builds none.
-    let shared = if envelopes || hooks {
-        Some(super::ctx::shared_state())
-    } else {
-        None
-    };
-    if let (true, Some(shared)) = (envelopes, &shared) {
-        install_routing_envelope(shared);
-        install_learning_envelope(shared);
+    // The one state of this install, built when a step first needs it: a
+    // preview without `--hooks` builds none.
+    let shared = std::cell::LazyCell::new(super::ctx::shared_state);
+    if request.mode == Mode::Apply && plugin.failure.is_none() {
+        install_routing_envelope(&shared);
+        install_learning_envelope(&shared);
     }
-    match (targets, &shared) {
-        (Targets::OwnedFilesAndHooks, Some(shared)) => Ok(worse_outcome(
+    match targets {
+        Targets::OwnedFiles => Ok(outcome),
+        Targets::OwnedFilesAndHooks => Ok(worse_outcome(
             outcome,
-            install_hooks_target(&request, &home, shared)?,
+            install_hooks_target(&request, &home, &shared)?,
         )),
-        (Targets::OwnedFiles, _) | (Targets::OwnedFilesAndHooks, None) => Ok(outcome),
     }
 }
 

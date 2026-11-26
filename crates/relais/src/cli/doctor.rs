@@ -276,9 +276,10 @@ pub(crate) fn doctor_command(json: bool) -> Result<CliOutcome, CliError> {
     let integration = relais::install::plugin::integration(&claude, &listing);
     let mut report = doctor::doctor(&project_dir()?, listing);
     // One state for every finding that reads the machine through it
-    // (an-t29). One that does not build says nothing on those findings:
-    // `shared_state_finding` below reports it.
-    let shared = super::ctx::shared_state().ok();
+    // (an-t29). One that does not build says nothing on those two findings,
+    // as before; only the external-absent case is reported, by
+    // `shared_state_finding` below.
+    let shared = super::ctx::shared_state().ok(); // the error is said there
     note_held_repair_effort(&mut report, shared.as_deref());
     report.findings.extend(loop_threshold_finding());
     report.findings.extend(holdouts_finding(shared.as_deref()));
