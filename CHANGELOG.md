@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.90.0
+
 relais now says greentopo wherever it names the decisions tool: run gaps
 and blockers (`greentopo exit 3`, `greentopo: not installed, decision keys …
 not checked`, `greentopo contradiction on …`), `relais doctor`'s integration
