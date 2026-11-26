@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.89.0
+
 A failed renewal of a kept handoff (the claim file cannot be rewritten) is
 now pinned: the node gives the shared hold back and returns the claim error,
 the file keeps its old hold end, and a failed write leaves a `refresh` line in
@@ -24,6 +26,11 @@ The home fingerprint no longer warns when greengate records a trust or its
 known identity in the shared `.git/config`: the `trusted` and `knownIdentity`
 keys of its `[greengate]` section are left out of the hash. Any other change to
 that file, other `greengate.*` keys included, still warns.
+
+When the directory aval would run in is missing, a regular file or cannot
+be inspected, the decision lookup now fails with `aval cannot run in <dir>: it
+is not a directory or does not exist`. Before, it got the launch hint that
+pointed at PATH and `bin` (follow-up f32, #616).
 
 What the shared-state commands print follows one rule: stdout carries what
 the command did (its sentence, or under `--json` one object), stderr carries
