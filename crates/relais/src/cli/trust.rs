@@ -1,7 +1,7 @@
 //! `relais trust`: showing and recording the repository grant in machine.toml.
 
-use super::ctx::load_machine;
 use super::ctx::load_repo_policy;
+use super::ctx::machine_of;
 use super::ctx::open_ledger;
 use super::ctx::print_document;
 use super::outcome::operational;
@@ -18,7 +18,9 @@ use relais::policy::RepoIdentity;
 use relais::policy::RepoPolicy;
 pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
     let (root, policy) = load_repo_policy()?;
-    let machine = load_machine()?;
+    // One state for the machine read and the grant's write (an-t29).
+    let shared = super::ctx::shared_state()?;
+    let machine = machine_of(&*shared)?;
     let machine_path = paths::machine_settings_path().map_err(CliError::Home)?;
     let identity = relais::repo::identity(&root);
     let repo_key = relais::policy::repo_key(&identity);
@@ -85,7 +87,8 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
             };
             let (granted, recorded_key, scope) = match key {
                 None => (
-                    super::ctx::write_settings(
+                    super::ctx::write_settings_of(
+                        &*shared,
                         &relais::shared_state::SettingsEdit::GrantRepository {
                             repo_key: repo_key.clone(),
                             record: record.clone(),
@@ -116,7 +119,8 @@ pub(crate) fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                          once"
                     );
                     (
-                        super::ctx::write_settings(
+                        super::ctx::write_settings_of(
+                            &*shared,
                             &relais::shared_state::SettingsEdit::GrantTrust {
                                 key: key.clone(),
                                 record: record.clone(),

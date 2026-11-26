@@ -1,6 +1,6 @@
 //! `relais install` and `relais uninstall`: what they plan, apply and print.
 
-use super::ctx::hook_admission_settings;
+use super::ctx::hook_admission_settings_from;
 use super::ctx::open_ledger;
 use super::ctx::project_dir;
 use super::outcome::operational;
@@ -13,6 +13,13 @@ use relais::install::Scope;
 use relais::paths;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+/// The shared state an install writes and reads through, built once per
+/// install (an-t29), and only when a step needs one. A state that could not
+/// be built is kept as its error: each settings write says it was not
+/// recorded, and the hooks step reads the defaults.
+type InstallState = Result<Arc<dyn relais::shared_state::SharedState>, CliError>;
 /// The request the two `--claude` commands share. `--write` is the only
 /// thing that applies anything; `--user` is the only thing that leaves
 /// the project.
@@ -129,25 +136,35 @@ pub(crate) fn install_command(
     let report = operational(relais::install::install(&request, &home), "install")?;
     let plugin = relais::install::plugin::install(request.mode, &marketplace_dir()?);
     let outcome = render_install("install", &request, &report, &plugin);
-    if request.mode == Mode::Apply && plugin.failure.is_none() {
-        install_routing_envelope();
-        install_learning_envelope();
+    let envelopes = request.mode == Mode::Apply && plugin.failure.is_none();
+    let hooks = matches!(targets, Targets::OwnedFilesAndHooks);
+    // A preview without `--hooks` needs no state and builds none.
+    let shared = if envelopes || hooks {
+        Some(super::ctx::shared_state())
+    } else {
+        None
+    };
+    if let (true, Some(shared)) = (envelopes, &shared) {
+        install_routing_envelope(shared);
+        install_learning_envelope(shared);
     }
-    match targets {
-        Targets::OwnedFiles => Ok(outcome),
-        Targets::OwnedFilesAndHooks => Ok(worse_outcome(
+    match (targets, &shared) {
+        (Targets::OwnedFilesAndHooks, Some(shared)) => Ok(worse_outcome(
             outcome,
-            install_hooks_target(&request, &home)?,
+            install_hooks_target(&request, &home, shared)?,
         )),
+        (Targets::OwnedFiles, _) | (Targets::OwnedFilesAndHooks, None) => Ok(outcome),
     }
 }
 
 /// One of the installer's settings writes, its failures as one sentence
 /// (the callers say what was not recorded and carry on).
 fn write_settings_for_install(
+    shared: &InstallState,
     edit: &relais::shared_state::SettingsEdit,
 ) -> Result<relais::shared_state::SettingsWrite, String> {
-    super::ctx::write_settings(edit)
+    let state = shared.as_ref().map_err(|e| e.to_string())?;
+    super::ctx::write_settings_of(&**state, edit)
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
 }
@@ -157,7 +174,7 @@ fn write_settings_for_install(
 /// has neither one nor an `off` tombstone, and say how to turn it off. A
 /// failure here is said and does not fail the install: routing then stays
 /// in shadow.
-pub(crate) fn install_routing_envelope() {
+pub(crate) fn install_routing_envelope(shared: &InstallState) {
     let envelope = relais::policy::RoutingEnvelope {
         granted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         by: "relais install".to_string(),
@@ -168,7 +185,7 @@ pub(crate) fn install_routing_envelope() {
         envelope: envelope.clone(),
         when: relais::shared_state::SettingsWhen::IfAbsent,
     };
-    match write_settings_for_install(&edit) {
+    match write_settings_for_install(shared, &edit) {
         Ok(done) if done.written => {
             let recorded = open_ledger().and_then(|ledger| {
                 operational(
@@ -198,7 +215,7 @@ pub(crate) fn install_routing_envelope() {
 /// record the grant when machine.toml has neither one nor an `off`
 /// tombstone, and say how to turn it off. A failure is said and does not
 /// fail the install: the cycle then stops at `awaiting_promotion`.
-pub(crate) fn install_learning_envelope() {
+pub(crate) fn install_learning_envelope(shared: &InstallState) {
     let grant = relais::policy::AutoPromote {
         granted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         by: "relais install".to_string(),
@@ -208,7 +225,7 @@ pub(crate) fn install_learning_envelope() {
         grant: grant.clone(),
         when: relais::shared_state::SettingsWhen::IfAbsent,
     };
-    match write_settings_for_install(&edit) {
+    match write_settings_for_install(shared, &edit) {
         Ok(done) if done.written => {
             println!("automatic promotion is on; turn it off with /relais-learning off")
         }
@@ -223,10 +240,11 @@ pub(crate) fn install_learning_envelope() {
 pub(crate) fn install_hooks_target(
     request: &InstallRequest,
     home: &Path,
+    shared: &InstallState,
 ) -> Result<CliOutcome, CliError> {
     let relais_binary = operational(std::env::current_exe(), "install --hooks")?;
     let root = request.root(home);
-    let queue_wait = admission_queue_wait();
+    let queue_wait = admission_queue_wait(shared);
     // Both roots the harness merges, regardless of which one this install
     // writes to: a `--user` install still has to see the project's files,
     // or it writes the second handler issue #94 is about. The project is
@@ -256,10 +274,20 @@ pub(crate) fn install_hooks_target(
 
 /// The admission wait the installer must size the `PreToolUse` handler
 /// timeout for — a missing or unreadable machine.toml is exactly the
-/// default this crate ships (`hook_admission_settings` reads the same
-/// way), never an error install itself should stop over.
-pub(crate) fn admission_queue_wait() -> std::time::Duration {
-    match hook_admission_settings().queue_behaviour() {
+/// default this crate ships (`hook_admission_settings_from` reads the same
+/// way), never an error install itself should stop over. A state that could
+/// not be built reads through `LocalState`, as the hook itself does
+/// (`shared_state_for_hook`).
+pub(crate) fn admission_queue_wait(shared: &InstallState) -> std::time::Duration {
+    let local: Arc<dyn relais::shared_state::SharedState>;
+    let state = match shared {
+        Ok(state) => state,
+        Err(_) => {
+            local = Arc::new(relais::shared_state::LocalState::new());
+            &local
+        }
+    };
+    match hook_admission_settings_from(state).queue_behaviour() {
         relais::policy::QueueBehaviour::RefuseImmediately => std::time::Duration::ZERO,
         relais::policy::QueueBehaviour::WaitUpTo(wait) => wait,
     }
