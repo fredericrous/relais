@@ -32,17 +32,18 @@ every refusal, warning and failure as one line, under `--json` too.
 on stderr (`relais decide: …`); the object on stdout is unchanged, and a
 `--json` approval that wrote no receipt says so on stderr as well, now
 prefixed `relais decide:`. The held-grant refusal now reads "another answer
-holds run R's decision (it may already be recorded)", and a held salvage prints the command to run again instead of
-pointing at a `relais status` that cannot show another node's salvage. The
-installer's "session routing is on" and "automatic promotion is on" notices
-move to stderr. `relais trust grant` under `shared_state = "external"` says
-the grant was recorded on the shared primary, and `--json` adds
-`recorded_on` (`machine_settings` or `shared_primary`). The coordinator's
-drop lines say how short the shared counter is, and they and a run's
-unbooked-cost line say, instead of "check the shared primary", that no relais
-command reads the primary yet; `docs/shared-state.md` gains "Where to look": the
-coordinator log is `coordinator.log` in the state directory (kept once as
-`coordinator.log.1`), and `seat settles: dropped` is the line to search for.
+holds run R's decision (it may already be recorded)", and a held salvage
+prints the command to run again and says that `relais status` cannot show
+another node's salvage. The installer's "session routing is on" and
+"automatic promotion is on" notices move to stderr. `relais trust grant`
+under `shared_state = "external"` says the grant was recorded on the shared
+primary, and `--json` adds `recorded_on` (`machine_settings` or
+`shared_primary`). The coordinator's drop lines say how short the shared
+counter is, and they and a run's unbooked-cost line say, instead of "check
+the shared primary", that no relais command reads the primary yet;
+`docs/shared-state.md` gains "Where to look": the coordinator log is
+`coordinator.log` in the state directory (kept once as `coordinator.log.1`),
+and `seat settles: dropped` is the line to search for.
 
 ## v0.88.0
 

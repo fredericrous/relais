@@ -172,14 +172,14 @@ state:
   bounded number of shared calls).
 - The daemon's stderr carries one line per change, never the lease token:
   `seat <dispatch>: the shared state did not grant the seat (<cause>); this
-  run waits and asks again; if it lasts, ask the primary's operator to check it
-  (no relais command reads the shared primary yet)`, then
+  run waits and asks again; if it lasts, ask the primary's operator to
+  check it (no relais command reads the shared primary yet)`, then
   `seat <dispatch>: shared seat granted`; `renew`, `release`, `reserve` and
   `settle` failures likewise. A settle the primary refuses (`Refused`) is
   dropped with one line: `seat <dispatch>: booking the spend of $<x> was
   not accepted: <error>; dropped, the shared counter is short by $<x>; if
-  it repeats, ask the primary's operator to check it (no relais command reads the
-  shared primary yet) (dropped_micros=<n>)`. Any other
+  it repeats, ask the primary's operator to check it (no relais command
+  reads the shared primary yet) (dropped_micros=<n>)`. Any other
   settle failure is kept and retried. A settle waiting more than 24 h, or
   beyond the newest 500, is dropped with one line for the whole pass
   (`seat settles: dropped <n> waiting settle(s) (oldest dispatch:
