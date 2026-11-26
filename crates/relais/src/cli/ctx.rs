@@ -806,7 +806,9 @@ mod home_drift_warning_tests {
             let mut wrong = Vec::new();
             for (file, source) in SOURCES {
                 for (function, calls) in census(source) {
-                    if FACTORY_HAND_ON.contains(&(*file, function.as_str())) {
+                    // The one factory hand-on is not a build; any other call
+                    // beside it in the same function is.
+                    if FACTORY_HAND_ON.contains(&(*file, function.as_str())) && calls == 1 {
                         continue;
                     }
                     if !is_command_entry(&function) || calls > 1 {
@@ -818,6 +820,19 @@ mod home_drift_warning_tests {
                 wrong.is_empty(),
                 "each command builds one SharedState and hands it down: {wrong:?}"
             );
+            // An exemption whose function moved or went is stale, not a pass.
+            for (file, function) in FACTORY_HAND_ON {
+                let (_, source) = SOURCES
+                    .iter()
+                    .find(|(name, _)| name == file)
+                    .expect("an exempt file is counted");
+                assert!(
+                    census(source)
+                        .iter()
+                        .any(|(name, calls)| name == function && *calls == 1),
+                    "{file}:{function} no longer hands a builder on once; drop or fix it"
+                );
+            }
         }
 
         #[test]
