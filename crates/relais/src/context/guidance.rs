@@ -642,7 +642,7 @@ pub fn fetch_rules(
         rules.notes.push(GuidanceGap::new(
             GuidanceSource::CodeRules,
             GapCause::AvalTooOld,
-            "greentopo is older than 1.10.0 (no --full/governs; exit 2): code rules are not carried; upgrade it, e.g. `brew upgrade greentopo` or greentopo's install/install.sh",
+            "the decisions tool (greentopo or aval) is older than 1.10.0 (no --full/governs; exit 2): code rules are not carried; upgrade it, e.g. `brew upgrade greentopo` or greentopo's install/install.sh",
         ));
     } else if !rules.rules.is_empty() && rules.code_rules.is_empty() {
         rules.notes.push(GuidanceGap::new(

@@ -12,7 +12,8 @@ relais now says greentopo wherever it names the decisions tool: run gaps
 and blockers (`greentopo exit 3`, `greentopo: not installed, decision keys …
 not checked`, `greentopo contradiction on …`), `relais doctor`'s integration
 line, and the worker and reviewer prompts, which point at the
-`greentopo_rule` MCP tool and `greentopo rule <id>`. `greentopo = "required"`
+`greentopo_rule` MCP tool (the worker's also at `greentopo rule <id>`).
+`greentopo = "required"`
 is the documented `[integrations]` key; `aval` is still read as the same
 key (and the old binary still spawned when greentopo is absent), so no trust
 grant moves. relais's own gates moved from adr-lint to greenspotter: nothing
