@@ -1635,6 +1635,7 @@ mod tests {
             fn drop(&mut self) {
                 // Drop cannot return an error; a failed restore leaves only a test temp dir.
                 let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+                // best effort: Drop cannot return it
             }
         }
         let (dir, store, key, state) = a_reserved_handoff_to_retry("fake-node-renew-write");
