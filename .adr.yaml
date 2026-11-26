@@ -9,13 +9,13 @@
 #
 # relais is also a CONSUMER of this corpus at runtime: `[[architecture.mapping]]`
 # in relais.toml maps paths to keys, and every run resolves them through
-# `aval` for the worker's context package (SPEC §7). Until this file existed,
-# `[integrations] aval = "required"` was satisfied by the binary being on
+# `greentopo` for the worker's context package (SPEC §7). Until this file existed,
+# `[integrations] greentopo = "required"` was satisfied by the binary being on
 # PATH and nothing more — the tool relais makes workers consult had no
 # corpus to consult in relais itself.
 #
-# `aval add github:fredericrous/decisions` refreshes the pack; nothing tells
-# this repository when a fleet decision changes, so `aval add --check` asks.
+# `greentopo add github:fredericrous/decisions` refreshes the pack; nothing tells
+# this repository when a fleet decision changes, so `greentopo add --check` asks.
 
 packs:
   - .adr/packs/decisions.pack
@@ -53,9 +53,9 @@ keys:
     description: When relais checks the base tree (never when amont proves it, else only after a red candidate), and what the base run covers
 
 # Which parts of this repository have which traits (aval 1.7, SEMANTICS
-# section 2.5), as `aval traits --detect` proposed and a reviewer accepted.
+# section 2.5), as `greentopo traits --detect` proposed and a reviewer accepted.
 # Rules about a trait not named here are left out of the session hook and
-# counted; `aval rules --all-traits` lists them. `aval traits --check`, run
+# counted; `greentopo rules --all-traits` lists them. `greentopo traits --check`, run
 # by this repository's gate, reports a package this stops describing.
 areas:
   # cli: crates/relais/Cargo.toml — `crates/relais/src/main.rs`

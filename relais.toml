@@ -44,7 +44,7 @@ max_agents_total = 24
 # required blocks execution when missing; optional gaps are reported and
 # never counted as passed checks.
 [integrations]
-aval = "required"
+greentopo = "required"
 amont = "required"
 amont_agent = "required"
 
@@ -172,7 +172,7 @@ paths = ["crates/relais/src/adapter/**", "crates/relais/src/coordinator/**", "cr
 minimum_tier = "implementation"
 review = "required"
 
-# Path-to-aval-key mappings. aval resolves exact keys; it has no
+# Path-to-greentopo-key mappings. greentopo resolves exact keys; it has no
 # source-impact analysis, so the mapping lives here (SPEC §7).
 #
 # The corpus these resolve against is vendored at `.adr/packs/decisions.pack`
