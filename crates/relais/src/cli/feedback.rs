@@ -3,9 +3,9 @@
 use super::ctx::open_ledger;
 use super::ctx::refusal;
 use super::ctx::Refusal;
+use super::decision_record::print_error_object;
 use super::decision_record::print_refusal;
 use super::decision_record::read_decide_proof;
-use super::outcome::exit_code;
 use super::outcome::operational;
 use super::outcome::CliError;
 use super::outcome::CliOutcome;
@@ -94,15 +94,7 @@ pub(crate) fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, C
             Ok(refused.outcome)
         }
         Err(e) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "error": e.to_string(),
-                        "exit": exit_code(&e.outcome()),
-                    })
-                );
-            }
+            print_error_object(Format::from_json_flag(json), &e.outcome(), &e.to_string());
             Err(e)
         }
     }

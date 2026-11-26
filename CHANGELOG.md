@@ -24,6 +24,12 @@ fallback (a repository with no corpus of its own) needs greentopo; aval
 `mcp__greentopo__greentopo_rule`, so the prompts' pointer to `aval_rule`
 named a tool they did not have: this fixes it.
 
+Under `--json`, a failure that is not a refusal now prints the same
+`{"error","exit"}` object on stdout that a refusal does, from `decide`,
+`feedback`, `report`, `learn cycle`, `doctor` and `trust` alike; `report` and
+`learn cycle` printed nothing on stdout before. The stderr line and the exit
+code are unchanged, and without `--json` stdout stays empty.
+
 ## v0.89.0
 
 A failed renewal of a kept handoff (the claim file cannot be rewritten) is

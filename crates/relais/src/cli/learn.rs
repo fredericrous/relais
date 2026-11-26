@@ -8,9 +8,11 @@ use super::ctx::load_repo_policy;
 use super::ctx::open_ledger;
 use super::ctx::print_document;
 use super::ctx::registry;
+use super::decision_record::print_error_object;
 use super::outcome::operational;
 use super::outcome::CliError;
 use super::outcome::CliOutcome;
+use super::programme::Format;
 use super::JudgeVerdict;
 use relais::backend::Harness;
 use relais::contract::TaskContract;
@@ -537,6 +539,11 @@ pub(crate) fn learn_cycle_command(
         Ok(client) => client,
         Err(e) => {
             out.complain(&format!("relais learn cycle: {e}"));
+            print_error_object(
+                Format::from_json_flag(json),
+                &CliOutcome::OperationalFailure,
+                &e.to_string(),
+            );
             return Ok(CliOutcome::OperationalFailure);
         }
     };
@@ -546,6 +553,11 @@ pub(crate) fn learn_cycle_command(
         Ok(lease) => lease,
         Err(e) => {
             out.complain(&format!("relais learn cycle: {e}"));
+            print_error_object(
+                Format::from_json_flag(json),
+                &CliOutcome::OperationalFailure,
+                &e.to_string(),
+            );
             return Ok(CliOutcome::OperationalFailure);
         }
     };
@@ -581,10 +593,14 @@ pub(crate) fn learn_cycle_command(
                 ),
                 None => "its holder is not recorded".to_string(),
             };
-            out.complain(&format!(
-                "relais learn cycle: another learning cycle holds the Training lease ({who}); \
-                 not queued"
-            ));
+            let message =
+                format!("another learning cycle holds the Training lease ({who}); not queued");
+            out.complain(&format!("relais learn cycle: {message}"));
+            print_error_object(
+                Format::from_json_flag(json),
+                &CliOutcome::TrainingLeaseHeld,
+                &message,
+            );
             return Ok(CliOutcome::TrainingLeaseHeld);
         }
         TrainingDecision::NotIdle { agents } => {
@@ -608,10 +624,16 @@ pub(crate) fn learn_cycle_command(
             return Ok(CliOutcome::Accepted);
         }
         TrainingDecision::Refused { code, detail } => {
-            out.complain(&format!(
-                "relais learn cycle: the coordinator refused the Training lease ({}): {detail}",
+            let message = format!(
+                "the coordinator refused the Training lease ({}): {detail}",
                 code.as_str()
-            ));
+            );
+            out.complain(&format!("relais learn cycle: {message}"));
+            print_error_object(
+                Format::from_json_flag(json),
+                &CliOutcome::OperationalFailure,
+                &message,
+            );
             return Ok(CliOutcome::OperationalFailure);
         }
     }
@@ -642,12 +664,19 @@ pub(crate) fn learn_cycle_command(
                     id,
                     &relais::ledger::LearningCycleFinish {
                         action: Some(relais::ledger::LearningAction::Error),
-                        error: Some(message),
+                        error: Some(message.clone()),
                         ..Default::default()
                     },
                 ),
                 "learn cycle",
             )?;
+            // After the ledger writes: their `?` errors reach the wrapper's
+            // object, so this one must not already have been printed.
+            print_error_object(
+                Format::from_json_flag(json),
+                &CliOutcome::OperationalFailure,
+                &message,
+            );
             return Ok(CliOutcome::OperationalFailure);
         }
     };
