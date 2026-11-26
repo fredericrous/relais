@@ -150,9 +150,9 @@ exports the held marker, so no step after the first queues again.
 |---|---|
 | `a_setup_takes_one_host_slot_for_all_its_steps` | passes: 3 sleeps (step 1 only), admission wait 3 s, `exhausted()` None, joined waiter `[true, true, true]` then granted, 1 relais `waited_ms` row, 1 `released`, markers `held`, each holder record names its step, 2 `host_slot_kept`, no `waiting_for_slot` after the first |
 | the same with `let _kept = admission.keep_slot();` removed | fails at the waiter assertion: `[false, false, false]`, the joined waiter was granted between steps |
-| coordinator queued, unreachable, weight change, disk short, failed and cancelled setup | each passes (`setup_keeps_one_slot::*`): the give-back reason is emitted, 2 `admitted` and 2 `released` rows; a failed or cancelled setup releases once |
+| coordinator queued (through `run_setup_gated_within`, the token taken in `ran(0)`, given back on the injected clock), unreachable, weight change, disk short, unusable slot dir, failed and cancelled setup | each passes (`setup_keeps_one_slot::*`): the give-back reason is emitted, 2 `admitted` and 2 `released` rows (the unusable dir: 1 `released` before step 2, which runs queued nowhere); a failed or cancelled setup releases once |
 | `admit` twice under an open kept slot | passes: `host_slots()` 1, marker `held`, `holders/slot-0.who` names `step-2`, no release until the guard drops |
-| `cargo test -p relais --lib verify::` (via `greengate slot run`) | 178 passed, 0 failed, 2 ignored |
+| `cargo test -p relais --lib verify::` (via `greengate slot run`) | 179 passed, 0 failed, 2 ignored (after the review fixes) |
 | `cargo clippy -p relais --all-targets -- -D warnings`, `cargo fmt --check` | clean (fmt applied once) |
 | a real 2-step run, and `kill -TERM` mid-setup | moved after the install: the installed release is piloted, and its result goes in the t12 ticket's Resolution (Decision log) |
 

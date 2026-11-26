@@ -2438,35 +2438,60 @@ mod setup_keeps_one_slot {
         std::fs::remove_dir_all(&slots).ok(); // best-effort: a scratch dir
     }
 
-    /// The coordinator queues the second command: the kept slot is given
-    /// back before that wait (never a slot held while waiting for a token),
-    /// and the command takes a slot afresh.
+    /// Takes the only coordinator token for another run after step 0.
+    struct TakesTheToken<'g>(&'g LocalGate);
+
+    impl SetupGate for TakesTheToken<'_> {
+        fn skip(&mut self, _: usize, _: &CommandSpec) -> bool {
+            false
+        }
+
+        fn ran(&mut self, index: usize, _: &CommandSpec, _: bool) {
+            if index == 0 {
+                register(self.0, "run-other");
+                assert_eq!(
+                    self.0
+                        .admit(&heavy_request("other", "run-other", 1))
+                        .expect("answered"),
+                    Decision::Granted
+                );
+            }
+        }
+    }
+
+    /// The coordinator queues step 1 of a setup: the kept slot is given back
+    /// before that wait (never a slot held while waiting for a token), and
+    /// the step takes a slot afresh.
     #[test]
     fn a_coordinator_wait_gives_the_kept_slot_back_first() {
         let work = temp_dir("kept-coord");
         let slots = slot_dir("coord");
-        let gate = Recording::new(gate_with(1));
+        let gate = Arc::new(Recording::new(gate_with(1)));
+        let clock = ManualClock::new();
         let mut kept = admission_on(&gate, "run-q", &slots, &work);
-        kept.poll = Duration::from_millis(5);
-        let none = BTreeMap::new();
-        let open = kept.keep_slot();
-        drop(kept.admit(&labelled("step-1", &none, 1)).expect("first"));
-        register(&gate.inner, "run-other");
-        assert_eq!(
-            gate.inner
-                .admit(&heavy_request("other", "run-other", 1))
-                .expect("answered"),
-            Decision::Granted
-        );
-        let second = std::thread::scope(|scope| {
-            scope.spawn(|| {
-                std::thread::sleep(Duration::from_millis(100));
-                gate.inner.release("other").expect("release");
-                gate.inner.settle("other", Some(0)).expect("settle");
-            });
-            kept.admit(&labelled("step-2", &none, 1)).expect("second")
+        kept.budgets = budgets_on(&clock, 50);
+        kept.poll = Duration::from_secs(1);
+        let other = Arc::clone(&gate);
+        kept.sleeper = Advancing::then(&clock, move |number| {
+            if number == 1 {
+                // The other run's command ends: its token comes back.
+                other.inner.release("other").expect("release");
+                other.inner.settle("other", Some(0)).expect("settle");
+            }
         });
-        assert_eq!(second.host_slots(), 1);
+        let steps = profile(vec![step(0, &slots), step(1, &slots)]);
+        let outcomes = run_setup_gated_within(SetupRun {
+            dir: &work,
+            profile: &steps,
+            logs_dir: &work.join("logs"),
+            prefix: "base",
+            events: &kept.events,
+            cancel: None,
+            gate: &mut TakesTheToken(&gate.inner),
+            admission: &kept,
+        })
+        .expect("setup");
+        assert!(outcomes.iter().all(|o| !o.failed()), "{outcomes:?}");
         let written = events(&work);
         assert!(
             written.contains("kept_slot_given_back")
@@ -2474,9 +2499,34 @@ mod setup_keeps_one_slot {
             "{written}"
         );
         assert_eq!(rows(&slots, "admitted"), 2, "taken afresh");
+        assert_eq!(rows(&slots, "released"), 2);
+        std::fs::remove_dir_all(&slots).ok(); // best-effort: a scratch dir
+    }
+
+    /// The slot directory becomes unusable between two commands: the kept
+    /// slot is given back, and the next command runs queued nowhere.
+    #[test]
+    fn an_unusable_slot_dir_gives_the_kept_slot_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = temp_dir("kept-unusable");
+        let slots = slot_dir("unusable");
+        let gate = Recording::new(gate_with(1));
+        let kept = admission_on(&gate, "run-x", &slots, &work);
+        let none = BTreeMap::new();
+        let open = kept.keep_slot();
+        drop(kept.admit(&labelled("step-1", &none, 1)).expect("first"));
+        std::fs::set_permissions(&slots, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let second = kept.admit(&labelled("step-2", &none, 1)).expect("second");
+        assert_eq!(second.host_slots(), 0, "queued nowhere");
+        assert!(
+            events(&work).contains("the host slots are no longer usable"),
+            "{}",
+            events(&work)
+        );
+        assert_eq!(rows(&slots, "released"), 1, "given back before step 2 ran");
         drop(second);
         drop(open);
-        assert_eq!(rows(&slots, "released"), 2);
+        assert_eq!(rows(&slots, "released"), 1);
         std::fs::remove_dir_all(&slots).ok(); // best-effort: a scratch dir
     }
 
