@@ -316,6 +316,21 @@ fn a_stale_grant_key_is_one_error_object_with_its_code() {
     assert!(stderr.starts_with("relais trust grant: "), "{stderr}");
 }
 
+/// an-t33: `trust show --json` carries the same `recorded_on` as the grant.
+#[test]
+fn a_json_trust_show_says_where_settings_live() {
+    let scratch = Scratch::with_machine_toml("shared-state-show-json", "schema_version = 1\n");
+    let out = scratch.relais(&["trust", "show", "--json"], "");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let object: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(object["recorded_on"], "machine_settings", "{object}");
+    let text = scratch.relais(&["trust", "show"], "");
+    assert_eq!(text.status.code(), Some(0), "{text:?}");
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(stdout.contains("machine.toml: "), "{stdout}");
+    assert!(!stdout.contains("the shared primary"), "{stdout}");
+}
+
 /// an-t26: a salvage of a terminal run with no recorded workspace is refused
 /// by the absent external layer before anything is written: one stderr line,
 /// no "unknown containment" claim, and the run is left as it was.

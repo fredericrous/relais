@@ -227,6 +227,16 @@ test('the trust question lists every command, the models and integrations, safe 
   for (const line of q.text.split('\n')) expect(line.length <= 80).toBe(true)
 })
 
+test('under an external client the card names the shared primary, not a file', async () => {
+  const w = world()
+  const q = question2({ ...w.shown(), recorded_on: 'shared_primary' }, 'repo')
+  expect(q.text).toContain('Saved once for the repository on the shared primary.')
+  expect(q.text).not.toContain('machine.toml')
+  const local = question2({ ...w.shown(), recorded_on: 'machine_settings' }, 'repo')
+  expect(local.text).toContain('machine.toml')
+  for (const line of q.text.split('\n')) expect(line.length <= 80).toBe(true)
+})
+
 test('a re-ask marks what changed since the last grant', async () => {
   const w = world({ detected: [['make', 'check'], ['cargo', 'test']], changes: ['same', 'same', 'new'] })
   const text = question2(w.shown(), 'repo').text
