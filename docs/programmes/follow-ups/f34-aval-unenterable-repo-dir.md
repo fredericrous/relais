@@ -32,10 +32,12 @@ check does not catch. Which detail should an unenterable `repo_dir` get?
 
 An unenterable `repo_dir`, on its own or through a parent, is a
 `ToolFailure` whose detail names the directory and the permission, with no
-launch hint. It is either checked before the spawn with a call that needs
-search permission (such as `metadata(repo_dir.join("."))`; `read_dir`
-passes on 0400) or told apart from a missing program by the spawn error.
-The guard's comment says only what it checks. Unix tests pin the detail for
-a mode-000 and a mode-0400 directory and for an unsearchable parent
-(skipped when run as root), after confirming the error kind macOS's
-`posix_spawn` reports, and it ships in one relais release.
+launch hint. It is checked before the spawn with a call that needs search
+permission on the directory itself (such as
+`metadata(repo_dir.join("."))`; `read_dir` passes on 0400). The spawn
+error alone cannot do it: a failed `chdir` and a declared `bin` that is
+not executable both give `PermissionDenied`. The guard's detail changes
+for the parent case, and its comment says only what it checks. Unix tests
+pin the detail for a mode-000 and a mode-0400 directory and for an
+unsearchable parent (skipped when run as root), and it ships in one relais
+release.
