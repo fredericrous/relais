@@ -68,15 +68,18 @@ pub(crate) fn report_command(
             .to_string()
     });
     let ledger = open_ledger()?;
+    // One price table, so one shared state, for the import and the routing
+    // section (an-t29); read before the import, so a refused state stops
+    // the report before anything is written.
+    let price_table = load_price_table()?;
     let mut not_imported = NotImported::default();
     if !no_import {
         let projects_dir = paths::claude_projects_dir().map_err(CliError::Home)?;
-        let price_table = load_price_table()?;
         not_imported = import_for_report(&ledger, &projects_dir, &price_table, &since)?;
     }
     let mut report = operational(report::runs_report(&ledger, &since, by), "report")?;
     report.session_routing = operational(
-        relais::router::report_section(&ledger, &since, &load_price_table()?),
+        relais::router::report_section(&ledger, &since, &price_table),
         "the session-routing section",
     )?;
     // Best-effort: a registry that will not open reads as no active artifact.

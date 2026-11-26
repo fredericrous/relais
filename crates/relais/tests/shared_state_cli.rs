@@ -30,7 +30,7 @@ struct Scratch {
 impl Scratch {
     fn with_machine_toml(tag: &str, text: &str) -> Self {
         let dir = temp_dir(tag);
-        for sub in ["home", "config", "state"] {
+        for sub in ["home", "config", "state", "claude"] {
             std::fs::create_dir_all(dir.join(sub)).expect("scratch dir");
         }
         std::fs::write(dir.join("config/machine.toml"), text).expect("machine.toml");
@@ -48,6 +48,9 @@ impl Scratch {
             .env("HOME", self.dir.join("home"))
             .env("RELAIS_CONFIG_DIR", self.dir.join("config"))
             .env("RELAIS_STATE_DIR", self.dir.join("state"))
+            // `claude_projects_dir` prefers it over HOME: a session that
+            // sets it must not lend its transcripts to a test.
+            .env("CLAUDE_CONFIG_DIR", self.dir.join("claude"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -299,4 +302,54 @@ fn a_salvage_under_an_absent_external_layer_is_refused_and_records_nothing() {
             "no decision row was written"
         );
     }
+}
+
+/// an-t29: `relais report` reads one price table, so builds one state, for
+/// the import and the routing section, before the import. Under an absent
+/// external layer both forms exit 3 with the one sentence, once, and print
+/// nothing. This pins the refusal and its single report, not the build count
+/// (`LocalState` holds no state; `every_command_builds_its_shared_state_once`
+/// counts the builds), and passes on main too.
+#[test]
+fn a_report_under_an_absent_external_layer_is_refused_before_the_import() {
+    for args in [&["report"][..], &["report", "--no-import"][..]] {
+        let scratch = Scratch::with_machine_toml(
+            "shared-state-report-external",
+            "schema_version = 1\nshared_state = \"external\"\n",
+        );
+        let out = scratch.relais(args, "");
+        assert_eq!(out.status.code(), Some(3), "{args:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "{args:?}: {out:?}");
+        let stderr = String::from_utf8(out.stderr).expect("utf-8");
+        assert_eq!(stderr.lines().count(), 1, "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("sets shared_state = \"external\""),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+/// an-t29: `relais learn cycle` builds its one state where it reads the
+/// machine settings, before it starts a coordinator, so an absent external
+/// layer exits 3 with the one sentence and leaves no coordinator socket
+/// (`socket_path()` is `RELAIS_STATE_DIR/relais.sock`).
+#[test]
+fn a_learn_cycle_under_an_absent_external_layer_is_refused_before_the_coordinator() {
+    let scratch = Scratch::with_machine_toml(
+        "shared-state-cycle-external",
+        "schema_version = 1\nshared_state = \"external\"\n",
+    );
+    let out = scratch.relais(&["learn", "cycle"], "");
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    let stderr = String::from_utf8(out.stderr).expect("utf-8");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("sets shared_state = \"external\""),
+        "{stderr}"
+    );
+    assert!(
+        !scratch.dir.join("state/relais.sock").exists(),
+        "no coordinator was started"
+    );
 }

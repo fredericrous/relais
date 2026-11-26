@@ -275,7 +275,12 @@ it could not renew or give back ends by its TTL.
   `HANDOFF_HOLD_SECS` after the retry (`run_all_with_clock` checks it; `run_all`
   alone does not tie a primary to that, so a primary passes both); a node
   whose claim file already holds the holder's `handoff` keeps that shared hold
-  when asked again, and moves the file's hold end with it; another holder is refused while it lasts, with `Held` from a
+  when asked again, and moves the file's hold end with it (when that renewal
+  fails, the node gives the shared hold back and returns the claim error: the
+  file keeps its old end, so the node's own sessions stay refused until then
+  while another node's holder can be granted, and a failed write leaves a
+  `refresh` line in the claims log for a renewal that did not happen: a line
+  records an attempt); another holder is refused while it lasts, with `Held` from a
   primary or by the claim file under `LocalState`),
   `renew_tickets` and `release_tickets` (every `work` hold of one holder,
   for a resumed session and a session end). The hook calls them with no
@@ -318,7 +323,13 @@ it could not renew or give back ends by its TTL.
   a successor intent, and runs the worker through the one it built, so a
   client that keeps per-instance state releases what it granted.
   `relais dataset replay` does the same for the effort bounds, the machine
-  settings, the prices and the run (an-t25).
+  settings, the prices and the run (an-t25). Every other command builds one
+  too (an-t29): `report` for its import and its routing section, `doctor`
+  for its findings, `trust grant` for its read and its write, `install` for
+  its two settings writes and its hooks step (only when a step needs one),
+  and `learn cycle` for its settings and the registry pointers. The test
+  `every_command_builds_its_shared_state_once` counts the builds per
+  function in `src/cli`.
 - The trait still speaks a few relais value types (`MachineSettings`,
   `MicroUsd`, `RunId`, `Contest`), so a client builds against one exact
   relais version, as an-t13's build plan pins it.

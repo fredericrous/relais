@@ -10,6 +10,18 @@ missing here.
 
 ## v0.89.0
 
+A failed renewal of a kept handoff (the claim file cannot be rewritten) is
+now pinned: the node gives the shared hold back and returns the claim error,
+the file keeps its old hold end, and a failed write leaves a `refresh` line in
+the claims log for a renewal that did not happen. Tests only, no behaviour
+change.
+
+Every relais command now builds its shared state once: `relais report`,
+`doctor`, `trust grant`, `install` and `learn cycle` each built two or three,
+and now hand one instance to every step, as `run` and `dataset replay`
+already did. A test counts the builds per command in the sources. A single
+node (`LocalState`) is unchanged.
+
 The home fingerprint no longer warns when greengate records a trust or its
 known identity in the shared `.git/config`: the `trusted` and `knownIdentity`
 keys of its `[greengate]` section are left out of the hash. Any other change to
