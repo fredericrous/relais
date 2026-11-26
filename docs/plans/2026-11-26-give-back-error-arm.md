@@ -91,8 +91,9 @@ names the path that failed.
 
 ## Phases
 
-- [ ] Phase 1: `crates/relais/src/shared_state/fake.rs` (three tests),
+- [x] Phase 1: `crates/relais/src/shared_state/fake.rs` (three tests),
   `crates/relais/src/shared_state/node.rs` (doc comment),
+  `crates/relais/src/programme/claim/store.rs` (comment only),
   `docs/shared-state.md`, `CHANGELOG.md`.
 - [ ] Phase 2: homelab: an-t30 Resolution, status closed, its line in the
   map's Decisions so far (`docs/programmes/agents-many-nodes/an-t30-give-back-error-arm.md`,
@@ -109,8 +110,20 @@ names the path that failed.
 - Phase 1: `cargo test -p relais --lib shared_state::fake` -> the three
   tests pass; with the `Err` arm of `keep_or_give_back` changed to
   `Err(local) => Err(local.into())` (no release), each fails on the "another
-  holder is Granted" assertion -> result pending.
-- Phase 2: the ticket file reads `status = "closed"` with a Resolution, and
-  the map's Decisions so far has its line -> result pending.
+  holder is Granted" assertion -> observed: the three tests pass; with the
+  mutant, `a_failed_renewal_log_`, `a_failed_renewal_write_` and
+  `an_empty_programmes_failed_renewal_` all fail at the "the lease was given
+  back" assertion (fake.rs:1570), and `node.rs` is restored after each run.
+  `cargo test -p relais --bin relais cli::ctx` is untouched (no bin change).
+- Phase 2 (homelab PR, not this one): the ticket file reads
+  `status = "closed"` with a Resolution, and the map's Decisions so far has
+  its line -> carried by the homelab PR.
+
+## Implementation review
+
+- implementation-review: approve-with-changes on the Delta (round 1 blocking `let _ =` reason fixed); low comment finding `deliberate: the guard comment is advisory and accurate enough`; 5 min.
+- backend: approve with 2 low; `deliberate: restoring the "release touches the slug directory" clause would be false (LockFile has no Drop)`; the `let _ =` stays (the rule wants a same-line reason).
+- lang:rust: approve-with-changes, 3 low; `deliberate: no third pass; `.ok()` and `Permissions` spelling are style only`.
+- `plan-review record` refused every transcript ("no completed plan-review"), so the panel's ledger rows are unwritten (a gap for the driver).
 
 <!-- panel: repos=relais adds=lang:rust reviewers=backend,lang:rust,tui,unix body-sha=10fcdba3c5f4 -->
