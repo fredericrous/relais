@@ -375,7 +375,7 @@ fn entry_of(path: &Path, read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) -> Option<
     Some(match read(path) {
         Ok(bytes) => Entry::File {
             sha256: sha256_hex(&bytes),
-            size: metadata.len(),
+            size: bytes.len() as u64,
             mode: mode_of(&metadata),
         },
         Err(_) => Entry::Unreadable,
@@ -462,11 +462,73 @@ pub fn snapshot(watch: &Watch<'_>, read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) 
             if walked.truncated {
                 taken.truncated.insert(target.path);
             }
-        } else if let Some(entry) = entry_of(&target.path, read) {
-            taken.entries.insert(target.path, entry);
+        } else {
+            let is_repo_config = matches!(
+                &watch.repo_config,
+                RepoConfig::At(path) if *path == target.path
+            );
+            let entry = if is_repo_config {
+                // The tool's own keys are left out of what is hashed.
+                entry_of(&target.path, &|path| {
+                    read(path).map(|bytes| without_tool_keys(&bytes))
+                })
+            } else {
+                entry_of(&target.path, read)
+            };
+            if let Some(entry) = entry {
+                taken.entries.insert(target.path, entry);
+            }
         }
     }
     taken
+}
+
+/// Keys of the `[greengate]` section that greengate writes to the shared
+/// `.git/config` in its normal work: a trust record when a `greengate.conf`
+/// is accepted (one per checkout, trimmed to sixteen) and the identity its
+/// commit hook learns. They are not a run reaching outside its worktree, so
+/// they stay out of the hash. Every other key stays in it: a change to a
+/// setting that decides which gates run is still a drift.
+const TOOL_KEYS: [&str; 2] = ["trusted", "knownidentity"];
+
+/// The header a config line opens: what stands between `[` and `]`,
+/// lowercased and trimmed, subsection included (`greengate "x"`, so it is
+/// never `greengate`). `None` for any other line.
+fn section_opened(line: &[u8]) -> Option<String> {
+    let rest = line.trim_ascii_start().strip_prefix(b"[")?;
+    let end = rest
+        .iter()
+        .position(|byte| *byte == b']')
+        .unwrap_or(rest.len());
+    let header = String::from_utf8_lossy(&rest[..end]);
+    Some(header.trim().to_ascii_lowercase())
+}
+
+/// Whether a line inside `[greengate]` sets one of [`TOOL_KEYS`].
+fn is_tool_key(line: &[u8]) -> bool {
+    let line = line.trim_ascii_start();
+    let end = line
+        .iter()
+        .position(|byte| matches!(byte, b'=' | b' ' | b'\t' | b'\r' | b'\n'))
+        .unwrap_or(line.len());
+    let key = String::from_utf8_lossy(&line[..end]).to_ascii_lowercase();
+    TOOL_KEYS.contains(&key.as_str())
+}
+
+/// `config` without the [`TOOL_KEYS`] lines of its `[greengate]` section;
+/// everything else, byte for byte.
+fn without_tool_keys(config: &[u8]) -> Vec<u8> {
+    let mut kept = Vec::with_capacity(config.len());
+    let mut in_greengate = false;
+    for line in config.split_inclusive(|byte| *byte == b'\n') {
+        if let Some(name) = section_opened(line) {
+            in_greengate = name == "greengate";
+        } else if in_greengate && is_tool_key(line) {
+            continue;
+        }
+        kept.extend_from_slice(line);
+    }
+    kept
 }
 
 /// What changed between two snapshots, in path order. A path one side
@@ -620,6 +682,58 @@ mod tests {
             lines.contains(&format!("  {} (modified)", shown_gitconfig(&home))),
             "{lines:?}"
         );
+    }
+
+    fn repo_config_drift(before: &str, after: &str) -> Vec<Drift> {
+        let home = crate::test_support::temp_dir("homeprint-repo-config");
+        let config = home.join("repo").join(".git").join("config");
+        std::fs::create_dir_all(config.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&config, before).expect("write");
+        let first = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        std::fs::write(&config, after).expect("write");
+        let second = snapshot(&watch(&home, &no_env, &[]), &real_read);
+        diff(&first, &second)
+    }
+
+    #[test]
+    fn greengate_trust_and_identity_writes_to_the_repo_config_are_no_drift() {
+        let before = "[core]\n\tbare = false\n[GreenGate]\n\tattest = true\n\ttrusted = aaa\n";
+        let after = "[core]\n\tbare = false\n[GreenGate]\n\tattest = true\n\ttrusted = aaa\n\
+                     \tTrusted = bbb\n\tknownIdentity = x <y@z>\n";
+        assert_eq!(repo_config_drift(before, after), Vec::new());
+    }
+
+    #[test]
+    fn another_greengate_key_changing_is_still_drift() {
+        let before = "[greengate]\n\ttrusted = aaa\n\tattest = true\n";
+        let after = "[greengate]\n\ttrusted = aaa\n\tattest = false\n";
+        assert_eq!(repo_config_drift(before, after).len(), 1);
+    }
+
+    #[test]
+    fn a_trusted_key_in_a_greengate_subsection_is_still_drift() {
+        for header in ["[greengate \"x\"]", "[greengate.x]"] {
+            let before = format!("[greengate]\n\tattest = true\n{header}\n\tattest = true\n");
+            let after = format!("{before}\ttrusted = b\n\tknownIdentity = c\n");
+            assert_eq!(repo_config_drift(&before, &after).len(), 1, "{header}");
+        }
+    }
+
+    #[test]
+    fn a_trusted_key_in_another_section_is_still_drift() {
+        let before = "[greengate]\n\tattest = true\n[core]\n\thooksPath = a\n";
+        let after = "[greengate]\n\tattest = true\n[core]\n\thooksPath = a\n\ttrusted = b\n";
+        assert_eq!(repo_config_drift(before, after).len(), 1);
+    }
+
+    #[test]
+    fn a_change_beside_greengate_keys_is_still_drift() {
+        let before = "[greengate]\n\ttrusted = aaa\n[user]\n\tname = a\n";
+        let after = "[greengate]\n\ttrusted = aaa\n[user]\n\tname = a\n\
+                     [url \"ssh://evil/\"]\n\tinsteadOf = https://x/\n";
+        let drifts = repo_config_drift(before, after);
+        assert_eq!(drifts.len(), 1, "{drifts:?}");
+        assert_eq!(drifts[0].change, Change::Modified);
     }
 
     #[test]
