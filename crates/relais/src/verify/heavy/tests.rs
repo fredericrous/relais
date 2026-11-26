@@ -2146,6 +2146,7 @@ fn a_cancel_during_a_long_backoff_is_seen_within_one_poll() {
 /// amont host-slot-admission t07/t12: a setup takes one host slot and keeps
 /// it across its steps, relabelled per step, instead of joining the tail of
 /// the line again between them.
+#[cfg(unix)]
 mod setup_keeps_one_slot {
     use super::*;
     use crate::policy::VerificationProfile;
@@ -2234,11 +2235,14 @@ mod setup_keeps_one_slot {
         std::fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default()
     }
 
-    /// Joins the host-slot line after step 0 and polls once after each step.
+    /// Joins the host-slot line after step 0 and polls once after each step,
+    /// noting how many queue sleeps there were by then.
     struct JoinsBehind {
         slots: PathBuf,
+        sleeper: Arc<Advancing>,
         other: Option<greenharness_slots::Waiter>,
         waiting: Vec<bool>,
+        slept: Vec<usize>,
     }
 
     impl SetupGate for JoinsBehind {
@@ -2247,6 +2251,8 @@ mod setup_keeps_one_slot {
         }
 
         fn ran(&mut self, index: usize, _: &CommandSpec, _: bool) {
+            self.slept
+                .push(self.sleeper.slept.lock().expect("sleeps").len());
             if index == 0 {
                 self.other = Some(other_waiter(&self.slots));
             }
@@ -2282,8 +2288,10 @@ mod setup_keeps_one_slot {
         let steps = profile((0..3).map(|n| step(n, &slots)).collect());
         let mut joins = JoinsBehind {
             slots: slots.clone(),
+            sleeper: Arc::clone(&sleeper),
             other: None,
             waiting: Vec::new(),
+            slept: Vec::new(),
         };
         let outcomes = run_setup_gated_within(SetupRun {
             dir: &work,
@@ -2298,11 +2306,21 @@ mod setup_keeps_one_slot {
         .expect("setup");
         assert_eq!(outcomes.len(), 3);
         assert!(outcomes.iter().all(|o| !o.failed()), "{outcomes:?}");
-        // One wait, in the first step, charged once.
-        assert_eq!(sleeper.slept.lock().expect("sleeps").len(), 3);
+        // One wait, in the first step, charged once: every queue sleep
+        // happened before step 0 ended (at least the 3 the holder needed;
+        // a poll can also find the admission lock busy), and the admission
+        // budget holds exactly those 1 s sleeps.
+        let journal = std::fs::read_to_string(slots.join("waits.jsonl")).unwrap_or_default();
+        let slept = sleeper.slept.lock().expect("sleeps").len();
+        assert!(slept >= 3, "{slept} sleeps: {journal}");
+        assert_eq!(
+            joins.slept,
+            vec![slept; 3],
+            "no step after the first slept: {journal}"
+        );
         assert_eq!(
             kept.budgets.waited(crate::policy::WaitKind::Admission),
-            Duration::from_secs(3)
+            Duration::from_secs(u64::try_from(slept).expect("small"))
         );
         assert_eq!(kept.budgets.exhausted(), None);
         // The waiter that joined after step 0 waited through every step.
