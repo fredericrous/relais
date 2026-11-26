@@ -156,4 +156,12 @@ exports the held marker, so no step after the first queues again.
 | `cargo clippy -p relais --all-targets -- -D warnings`, `cargo fmt --check` | clean (fmt applied once) |
 | a real 2-step run, and `kill -TERM` mid-setup | moved after the install: the installed release is piloted, and its result goes in the t12 ticket's Resolution (Decision log) |
 
+## Implementation review
+
+- implementation-review: round 1 approve-with-changes (blocking: real 100 ms wait in the coordinator test; fixed on the injected clock, driven through the setup); Delta approve. 81k+57k tokens, 84+65 s.
+- backend: approve-with-changes (unusable-dir test added, one-state `Kept`, `keep` assert, holds-until note); Delta approve. 78k+35k, 86+32 s.
+- lang:rust: approve-with-changes (`#[must_use]`, `Mutex<Kept>`, `HostHold`, reporting after the lock); Delta approve-with-changes, 6 deliberate: the `unreachable!` re-match in `reuse_kept` is a local invariant, kept. 63k+35k, 46+34 s.
+- unix: approve, Delta approve. deliberate: the 0755 test follows `an_unsafe_directory_warns_once_and_falls_back` (root CI would not trip it; CI runs unprivileged); `setup_keeps_one_slot` lacks `#[cfg(unix)]` (no non-unix build). 59k+33k, 33+22 s.
+- Next: Phase 2, release v0.90.0 after merge (v0.89.0 is tagged), install, then the live pilots.
+
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix body-sha=84280d3ae89b -->
