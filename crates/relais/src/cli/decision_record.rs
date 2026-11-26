@@ -100,14 +100,13 @@ pub(crate) fn answer_error(
     let again = match next {
         NextStep::AnswerAgain => "answer again if it is still open".to_string(),
         NextStep::SalvageAgain => format!(
-            "run `relais decide {run} --answer salvaged` again if this node should salvage it; \
-             a salvage recorded on another node does not show here"
+            "run `relais decide {run} --answer salvaged` again (status cannot show another \
+             node's salvage)"
         ),
     };
     let mut message = format!(
-        "another answer holds the decision of run {run} (it may already be recorded, here or \
-         on another node): check `relais status {run}`, then, once the hold ends (up to \
-         {minutes} minutes), {again}"
+        "another answer holds run {run}'s decision (it may already be recorded): check \
+         `relais status {run}`; after the hold (up to {minutes} min), {again}"
     );
     if let Some(criterion) = signed_off {
         message.push_str(&format!(

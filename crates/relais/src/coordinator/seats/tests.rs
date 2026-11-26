@@ -139,7 +139,7 @@ fn an_unreachable_primary_turns_the_grant_into_a_wait_until_it_grants() {
         .filter(|line| {
             line.contains("the shared state did not grant the seat")
                 && line.ends_with(&format!(
-                    "if it lasts, the primary's operator checks it ({PRIMARY_UNREAD})"
+                    "if it lasts, ask the primary's operator to check it ({PRIMARY_UNREAD})"
                 ))
         })
         .count();
@@ -476,7 +476,7 @@ fn a_settle_the_primary_refuses_is_dropped_once_and_the_next_one_books() {
             .iter()
             .any(|line| line.contains("the shared counter is short by")
                 && line.contains(&format!(
-                    "if it repeats, the primary's operator checks it ({PRIMARY_UNREAD})"
+                    "if it repeats, ask the primary's operator to check it ({PRIMARY_UNREAD})"
                 ))
                 && !line.contains("check the shared primary")),
         "{lines:?}"

@@ -32,8 +32,7 @@ every refusal, warning and failure as one line, under `--json` too.
 on stderr (`relais decide: …`); the object on stdout is unchanged, and a
 `--json` approval that wrote no receipt says so on stderr as well, now
 prefixed `relais decide:`. The held-grant refusal now reads "another answer
-holds the decision of run R (it may already be recorded, here or on another
-node)", and a held salvage prints the command to run again instead of
+holds run R's decision (it may already be recorded)", and a held salvage prints the command to run again instead of
 pointing at a `relais status` that cannot show another node's salvage. The
 installer's "session routing is on" and "automatic promotion is on" notices
 move to stderr. `relais trust grant` under `shared_state = "external"` says

@@ -1316,8 +1316,8 @@ mod tests {
             assert_eq!(exit_code(&refused.outcome), 3, "{name}");
             assert!(
                 refused.message.starts_with(&format!(
-                    "another answer holds the decision of run {name} (it may already be \
-                     recorded, here or on another node): check"
+                    "another answer holds run {name}'s decision (it may already be recorded): \
+                     check"
                 )),
                 "{}",
                 refused.message
@@ -1330,9 +1330,9 @@ mod tests {
                 refused.message
             );
             assert!(
-                refused.message.contains(
-                    "then, once the hold ends (up to 10 minutes), answer again if it is still open"
-                ),
+                refused
+                    .message
+                    .contains("after the hold (up to 10 min), answer again if it is still open"),
                 "the wait comes before the next step: {}",
                 refused.message
             );
@@ -1373,10 +1373,9 @@ mod tests {
         assert_eq!(exit_code(&refused.outcome), 3);
         assert_eq!(
             refused.message,
-            "another answer holds the decision of run run-wait (it may already be recorded, here \
-             or on another node): check `relais status run-wait`, then, once the hold ends (up to \
-             10 minutes), run `relais decide run-wait --answer salvaged` again if this node should \
-             salvage it; a salvage recorded on another node does not show here"
+            "another answer holds run run-wait's decision (it may already be recorded): check \
+             `relais status run-wait`; after the hold (up to 10 min), run `relais decide \
+             run-wait --answer salvaged` again (status cannot show another node's salvage)"
         );
         assert!(still_open(&ledger, "run-wait"), "the decision stays open");
         assert_eq!((held.asks(), held.releases()), (1, 0));
@@ -1686,7 +1685,7 @@ mod tests {
         assert!(
             refused
                 .message
-                .starts_with("another answer holds the decision of run run-revise ("),
+                .starts_with("another answer holds run run-revise's decision ("),
             "{}",
             refused.message
         );

@@ -613,7 +613,7 @@ impl Book {
                     log(&format!(
                         "seat {id}: booking the spend of {amount} was not accepted: \
                          {settle_error}; dropped, the shared counter is short by {amount}; if \
-                         it repeats, the primary's operator checks it ({PRIMARY_UNREAD}) \
+                         it repeats, ask the primary's operator to check it ({PRIMARY_UNREAD}) \
                          (dropped_micros={micros})",
                         amount = dropped.actual,
                         micros = dropped.actual.to_micros(),
@@ -698,7 +698,7 @@ pub struct SeatBook {
 fn wait_line(id: &str, cause: &SharedStateError) -> String {
     format!(
         "seat {id}: the shared state did not grant the seat ({cause}); this run waits and asks \
-         again; if it lasts, the primary's operator checks it ({PRIMARY_UNREAD})"
+         again; if it lasts, ask the primary's operator to check it ({PRIMARY_UNREAD})"
     )
 }
 
