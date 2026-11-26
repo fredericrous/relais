@@ -667,6 +667,7 @@ mod home_drift_warning_tests {
         /// Every file of `src/cli`, so a new one cannot escape the count.
         const SOURCES: &[(&str, &str)] = &[
             ("coordinator.rs", include_str!("coordinator.rs")),
+            ("counter.rs", include_str!("counter.rs")),
             ("decide.rs", include_str!("decide.rs")),
             ("decision_record.rs", include_str!("decision_record.rs")),
             ("doctor.rs", include_str!("doctor.rs")),

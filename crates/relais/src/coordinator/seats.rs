@@ -66,6 +66,37 @@ pub fn settles_path(ledger: &Path) -> PathBuf {
     ledger.with_file_name(SETTLES_FILE)
 }
 
+/// One settle waiting for the primary, as `relais counter` shows it
+/// (an-t35): what it is worth and when it began to wait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitingSettle {
+    /// The micro-dollars it will book.
+    pub micros: i64,
+    /// Unix seconds when it began to wait.
+    pub since: i64,
+}
+
+/// The settles waiting in `path` (see [`settles_path`]), read without
+/// taking them: an absent file is an empty list, an unreadable one is the
+/// error's text. Reads the file the coordinator writes, so a settle taken
+/// between the write and this read shows as still waiting.
+pub fn waiting_settles(path: &Path) -> Result<Vec<WaitingSettle>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let file: SettleFile = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    Ok(file
+        .settles
+        .into_iter()
+        .map(|row| WaitingSettle {
+            micros: row.actual,
+            since: row.since,
+        })
+        .collect())
+}
+
 /// Which sync is flushing the waiting settles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pass {

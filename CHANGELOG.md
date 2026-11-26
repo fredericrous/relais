@@ -32,6 +32,20 @@ whose ids share a leading `<letters><digits>` prefix (`f12-a.md` and
 also counts the tickets `<ref>` added since the merge-base, so a branch is
 refused an id the ref already took.
 
+A new `relais counter [--days N] [--json]` reads the shared day counter: per
+UTC day (today included, default 7, at most 31) the counter's figure, this
+node's ledger sum, the spend the coordinator dropped (summed from the
+`(dropped_micros=<n>)` token of `coordinator.log` and `coordinator.log.1` by
+each line's stamp), the settles still waiting and a `check` word, so the 5%
+check of `docs/shared-state.md` is one run instead of a log search. It reads
+only, exits 0 whenever it read, and follows the `--json` error contract.
+The counter lines now say `relais counter` shows this node's side. For the
+closed shared-state client: `SharedState` gains a required method,
+`spent_between(from, to)` (the counter's booking in `[from, to)`, `None`
+exactly when `daily_spent` is `None`, bounds checked first), and
+`conformance::run_all` runs two new cases, `a_counter_range_is_checked` and
+`a_counter_adds_up`; `coordinator::stamped` is now public.
+
 ## v0.90.0
 
 relais now says greentopo wherever it names the decisions tool: run gaps

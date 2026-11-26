@@ -173,18 +173,16 @@ state:
 - The daemon's stderr carries one line per change, never the lease token:
   `seat <dispatch>: the shared state did not grant the seat (<cause>); this
   run waits and asks again; if it lasts, ask the primary's operator to
-  check it (no relais command reads the shared primary yet)`, then
+  check it (`relais counter` shows this node's side; no relais command reads the primary itself)`, then
   `seat <dispatch>: shared seat granted`; `renew`, `release`, `reserve` and
   `settle` failures likewise. A settle the primary refuses (`Refused`) is
   dropped with one line: `seat <dispatch>: booking the spend of $<x> was
   not accepted: <error>; dropped, the shared counter is short by $<x>; if
-  it repeats, ask the primary's operator to check it (no relais command
-  reads the shared primary yet) (dropped_micros=<n>)`. Any other
+  it repeats, ask the primary's operator to check it (`relais counter` shows this node's side; no relais command reads the primary itself) (dropped_micros=<n>)`. Any other
   settle failure is kept and retried. A settle waiting more than 24 h, or
   beyond the newest 500, is dropped with one line for the whole pass
   (`seat settles: dropped <n> waiting settle(s) (oldest dispatch:
-  <dispatch>); the shared counter is short by $<x> (no relais command reads
-  the shared primary yet) (dropped_micros=<n>)`). Where these lines are
+  <dispatch>); the shared counter is short by $<x> (`relais counter` shows this node's side; no relais command reads the primary itself) (dropped_micros=<n>)`). Where these lines are
   written is below (an-t31).
 - The holder is `Principal::node(<host name>)`, so two nodes never share
   one; under `external` a host with no name is refused (exit 3, with the
@@ -219,11 +217,29 @@ state:
 - A run with no coordinator prints its line on the run's own stderr:
   `relais: dispatch <id>: $<x> was not booked to the shared counter`, and
   records a `shared_spend_not_booked` decision on the run.
-- The dollars the counter is short by are in each line. Adding them back
-  to the day's counter is the 5% check above.
-- No public relais command reads the shared primary yet (its counter,
-  slice or seats; an-t24 kept that deliberate). A private build's client
-  (an-t13) or the primary's operator reads it; a status command is a
+- `relais counter [--days N] [--json]` reads the counter (an-t35): per UTC
+  day (today included, default 7, at most 31) the counter's figure, this
+  node's ledger sum, the `dropped_micros` summed from the two log files by
+  the line's stamp, the settles still waiting (by the day they began to
+  wait) and `short_percent`, with a `check` word. It reads and writes
+  nothing; exit 0 whenever it read, a `short` day included. Under `local`
+  there is no counter (`no_counter`). Waiting settles and drops are this
+  node's: a drop is credited to the day it was logged, up to 24 h after the
+  spend, so a day that is short while the next is over by about as much is
+  `edge`, not a floor.
+- The 5% check is one run: `relais counter --days 14 --json`, read each
+  day's `check`. Restore `max(global, local)` in `node::daily_spent` when a
+  day that is not the `cutover` day says `short`. `ok` is within 5%;
+  `counter_above_ledger` (over 5% above) means another node feeds the
+  counter or something books twice, and one node's ledger cannot judge it:
+  with more than one node feeding the counter, sum each node's
+  `ledger_micros`, `dropped_micros` and `waiting_micros` from its own run
+  against one `counter_micros`. `log_incomplete` is a day the log was
+  rotated past (one old file is kept past 1 MiB): the drops of that day are
+  unknown, so there is no verdict. A run with no coordinator logs its drop
+  on its own stderr, which the command does not read.
+- The command does not read the primary's slice or seats. A private build's client
+  (an-t13) or the primary's operator reads them; a status command is a
   follow-up.
 
 ## The refusal

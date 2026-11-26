@@ -51,11 +51,32 @@ use crate::ids::RunId;
 use crate::money::MicroUsd;
 use crate::policy::MachineSettings;
 
-/// Said where a line would send the person to the shared primary: no public
-/// relais command reads the primary's state yet (an-t24 kept that
-/// deliberate), so the line says so instead of naming a check the person
-/// cannot run with relais (an-t31; `docs/shared-state.md`, Where to look).
-pub(crate) const PRIMARY_UNREAD: &str = "no relais command reads the shared primary yet";
+/// Said where a line would send the person to the shared primary: `relais
+/// counter` shows this node's side of the counter (an-t35), but no relais
+/// command reads the primary itself, so the line says both
+/// (`docs/shared-state.md`, Where to look).
+pub(crate) const PRIMARY_UNREAD: &str =
+    "`relais counter` shows this node's side; no relais command reads the primary itself";
+
+/// The bounds of a [`SharedState::spent_between`] read as unix seconds:
+/// `Refused` for a malformed bound or `from > to`, so every implementation
+/// judges them alike.
+pub fn day_bounds(from: &str, to: &str) -> Result<(i64, i64), SharedStateError> {
+    let parse = |text: &str| {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .map(|at| at.timestamp())
+            .map_err(|e| SharedStateError::Refused {
+                reason: format!("{text:?} is not an RFC 3339 time: {e}"),
+            })
+    };
+    let (from, to) = (parse(from)?, parse(to)?);
+    if from > to {
+        return Err(SharedStateError::Refused {
+            reason: "the range ends before it starts".into(),
+        });
+    }
+    Ok((from, to))
+}
 
 /// The single-owner operations nodes share (an-t01's list), shaped by
 /// an-t10 (slice, degraded mode, publish queue), an-t11 (an epoch in every
@@ -108,6 +129,16 @@ pub trait SharedState: Send + Sync {
     /// UTC day) by the global counter; `None` when there is none, and the
     /// node's own ledger is the count ([`node::daily_spent`]).
     fn daily_spent(&self, day_start: &str) -> Result<Option<MicroUsd>, SharedStateError>;
+
+    /// What the global counter booked in `[from, to)` (RFC 3339 bounds),
+    /// the read behind `relais counter` (an-t35). One rule for every
+    /// implementation: the bounds are checked first (a malformed bound, or
+    /// `from > to`, is [`SharedStateError::Refused`], see [`day_bounds`]),
+    /// then the answer is `None` exactly when [`SharedState::daily_spent`]
+    /// answers `None` (there is no counter), else `Some`; `from == to` is
+    /// `Some(0)`. A counter answers it from the settles it booked, by the
+    /// time it booked each one (`conformance::a_counter_adds_up`).
+    fn spent_between(&self, from: &str, to: &str) -> Result<Option<MicroUsd>, SharedStateError>;
 
     /// The part of the daily cap this node may spend without asking.
     fn slice(&self) -> Result<Slice, SharedStateError>;

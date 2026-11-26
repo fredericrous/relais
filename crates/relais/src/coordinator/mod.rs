@@ -41,6 +41,7 @@ use crate::procs::{kill, terminate, LockFile};
 use crate::shared_state::{Principal, SharedState};
 
 mod seats;
+pub use seats::{settles_path, waiting_settles, WaitingSettle};
 pub use seats::{LogSink, SeatBook};
 
 /// Write one line to the daemon's stderr (the coordinator log), starting
@@ -59,7 +60,7 @@ pub fn log_line(message: &str) {
 }
 
 /// A log line: the time, then the daemon's name and the message.
-fn stamped(at: chrono::DateTime<chrono::Utc>, message: &str) -> String {
+pub fn stamped(at: chrono::DateTime<chrono::Utc>, message: &str) -> String {
     format!(
         "{} relais coordinator: {message}",
         at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)

@@ -844,6 +844,23 @@ impl Ledger {
         Ok(MicroUsd::from_micros(micros))
     }
 
+    /// What was spent in `[from, to)`: [`Ledger::spend_since`] with an end
+    /// (an-t35, `relais counter`). The bounds are compared as the stored
+    /// text, as `spend_since` does.
+    pub fn spend_between(&self, from: &str, to: &str) -> Result<MicroUsd> {
+        let micros: i64 = self.conn.query_row(
+            &format!(
+                "{COVERED_BY_AN_INCLUSIVE_PARENT}
+                 SELECT COALESCE(SUM(cost_micros), 0) FROM usage_events
+                  WHERE at >= ?1 AND at < ?2
+                    AND event_id NOT IN (SELECT event_id FROM covered)"
+            ),
+            [from, to],
+            |row| row.get(0),
+        )?;
+        Ok(MicroUsd::from_micros(micros))
+    }
+
     /// A task's total cost: each of its runs' OWN usage, summed once.
     /// Unlike [`Ledger::run_cost`] this does not also walk `child_runs` —
     /// a decomposed run's packages already carry the same `task_id` as
@@ -1183,6 +1200,30 @@ mod tests {
             MicroUsd::from_micros(900),
             "the day's figure counts it once too"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spend_between_counts_the_day_in_either_stored_format() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-d"), "/repo", None, &task("run-d"), "rk")
+            .expect("run");
+        for (id, at, micros) in [
+            ("before", "2026-09-19T23:59:59+00:00", 1),
+            ("start", "2026-09-20T00:00:00.123+00:00", 10),
+            ("inside", "2026-09-20T12:00:00+00:00", 100),
+            ("zulu", "2026-09-20T13:00:00.500Z", 1_000),
+            ("end", "2026-09-21T00:00:00+00:00", 10_000),
+        ] {
+            let mut usage = event(id, "run-d", micros);
+            usage.at = at.into();
+            ledger.record_usage(&usage).expect("usage");
+        }
+        let day = ledger
+            .spend_between("2026-09-20T00:00:00+00:00", "2026-09-21T00:00:00+00:00")
+            .expect("day");
+        assert_eq!(day, MicroUsd::from_micros(1_110), "end bound is excluded");
         std::fs::remove_dir_all(&dir).ok();
     }
 
