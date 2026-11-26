@@ -85,6 +85,7 @@ under Decisions so far in the map.
 
 - implementation-review: approve-with-changes; tick Phase 1 and record the actual column, both fixed here; the optional positive-decision assertion is `deliberate: the mutation run is the proof it can fail`; opus.
 - code-review backend: approve, no findings; follow-up (log line on a first `Unknown`) filed to the inbox; opus.
+- delta after the rebase onto main (tree 63d5c4c9): implementation-review, backend and lang:rust all approve, no new findings; opus.
 - code-review lang:rust: approve; one low (bind `gate.settles()` once), `deliberate: the message reads the same Vec, cost nil`; opus.
 
 <!-- panel: repos=relais,homelab adds= reviewers=backend,lang:rust,tui,unix body-sha=6e674ffe4d7a -->
