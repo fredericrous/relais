@@ -533,9 +533,10 @@ pub fn aval_resolve_in(
             detail: format!("decision key `{key}` is not a key aval can be asked for"),
         };
     }
-    // A directory that does not exist would fail the spawn with the same
-    // NotFound as a missing program, and the launch hint would then point
-    // at the wrong cause.
+    // A `repo_dir` that is not a directory (missing, a file, or unreadable)
+    // would fail the spawn, a missing one with the same NotFound as a
+    // missing program, and the launch hint would then point at the wrong
+    // cause.
     if !repo_dir.is_dir() {
         return AvalVerdict::ToolFailure {
             exit: -1,
@@ -1859,6 +1860,19 @@ mod tests {
         assert!(detail.contains(&missing.display().to_string()), "{detail}");
         assert!(!detail.contains("relais.toml"), "{detail}");
         assert!(!detail.contains("PATH"), "{detail}");
+        assert!(!detail.contains("could not be launched"), "{detail}");
+    }
+
+    #[test]
+    fn a_file_repo_dir_is_a_tool_failure_naming_it() {
+        let dir = crate::test_support::temp_dir("aval-filedir");
+        let file = dir.join("not-a-dir");
+        std::fs::write(&file, "").expect("write");
+        let verdict = resolve_with_path(&file, None, &dir);
+        let AvalVerdict::ToolFailure { detail, .. } = verdict else {
+            panic!("expected a tool failure, got {verdict:?}");
+        };
+        assert!(detail.contains(&file.display().to_string()), "{detail}");
         assert!(!detail.contains("could not be launched"), "{detail}");
     }
 
