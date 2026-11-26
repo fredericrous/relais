@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: prog/agents-many-nodes/an-t31-shared-state-cli-messages
 repos: [relais, homelab]
 adrs: []
@@ -60,8 +60,9 @@ behind it. Settle one stream rule and fix each line against it (an-t31).
 ## Behaviour
 
 **The stream rule**, stated once as the doc comment of a new
-`cli/outcome.rs` helper, `refusal_streams(command, json, outcome, message)`,
-that `decide` and `feedback` both call; `print_refusal` writes it with
+`cli/decision_record.rs` helper, `refusal_streams(command, format, outcome,
+message)` (it takes `programme::Format`, not a bool; `outcome.rs` would cycle
+with `programme`, which owns `Format`), that `decide` and `feedback` both call; `print_refusal` writes it with
 `writeln!` and treats a closed pipe as success, as `cli/programme.rs` does:
 
 > stdout carries what the command did: its result sentence, or under
@@ -87,13 +88,12 @@ So, per line the ticket lists:
    only today); the object already carries `receipt_skipped`.
 2. **The held-grant line** (`answer_error`) stops claiming more than the
    node knows. New text:
-   `another answer holds the decision of run R; it may already be recorded,
-   on this node or another, and this node cannot tell which. Check
-   `relais status R`, then <next> once the hold ends (up to N minutes)`,
+   `another answer holds run R's decision (it may already be recorded):
+   check `relais status R`; after the hold (up to N min), <next>`,
    N computed from `DECISION_GRANT_TTL_SECS` as today,
    where `<next>` is "answer again if it is still open" or, for salvage,
-   "run `relais decide R --answer salvaged` again if this node should
-   salvage it; a salvage recorded on another node does not show here"
+   "run `relais decide R --answer salvaged` again (status cannot show
+   another node's salvage)"
    (`relais status` reads this node's ledger only, so the old tail "unless
    status shows it already salvaged" pointed at what cannot show it; a
    repeat after the hold is recorded on this node, which the line now says
@@ -107,8 +107,9 @@ So, per line the ticket lists:
 4. **`trust grant` under `shared_state = "external"`**: the text line reads
    `trust grant: repository <key> recorded on the shared primary` (or `was
    already on the shared primary`), and the ledger warning says "the grant
-   is recorded, but the ledger did not record it". Under `local` the lines
-   are unchanged. `--json` keeps `machine_settings` (the plugin reads it)
+   is saved, but this node's ledger did not log it", under `local` too (the
+   old "in machine.toml" was untrue under `external`; one text reads right
+   in both). The `local` result sentence is unchanged. `--json` keeps `machine_settings` (the plugin reads it)
    and adds `"recorded_on": "machine_settings" | "shared_primary"`. The
    selection is read with `shared_state::selection_at(&machine_path)` (no
    second `ctx::shared_state()` build, which an-t29's census counts). The
@@ -120,9 +121,13 @@ So, per line the ticket lists:
 5. **The counter's lines that say "check the shared primary"**
    (`coordinator/seats.rs`: the cap drop, the seat wait; `runner/launch.rs`:
    the unmanaged booking failure) end instead with what is true: the
-   amount the counter is short by where the line knows it, and "no relais
-   command reads the primary's counter yet; see docs/shared-state.md, Where
-   to look", the section item 6 adds. The `launch.rs` line moves into a pure
+   amount the counter is short by where the line knows it, and "ask the
+   primary's operator to check it (no relais command reads the shared
+   primary yet)". Departure from the round-2 plan, which had the line name
+   `docs/shared-state.md, Where to look`: an installed binary has no `docs/`
+   path, and the coordinator log would print it into the log the section
+   tells the person to search, so the line states the fact and the docs
+   (item 6) carry Where to look. The `launch.rs` line moves into a pure
    builder so a unit test reads its tail. The refused
    settle line keeps "if it repeats" and gets the same tail. These edits
    are written on the post-an-t28 text (relais PR 610 adds
@@ -137,23 +142,23 @@ So, per line the ticket lists:
 
 ## Phases
 
-- [ ] Phase 1 — stream rule and refusals: `crates/relais/src/cli/outcome.rs`,
+- [x] Phase 1 — stream rule and refusals: `crates/relais/src/cli/decision_record.rs`,
   `crates/relais/src/cli/decide.rs`, `crates/relais/src/cli/feedback.rs`,
   `crates/relais/tests/shared_state_cli.rs`.
-- [ ] Phase 2 — held-grant line: `crates/relais/src/cli/decision_record.rs`,
+- [x] Phase 2 — held-grant line: `crates/relais/src/cli/decision_record.rs`,
   `crates/relais/src/cli/decide.rs` (tests), `docs/shared-state.md`.
-- [ ] Phase 3 — trust grant under external, installer lines: `crates/relais/src/cli/trust.rs`,
+- [x] Phase 3 — trust grant under external, installer lines: `crates/relais/src/cli/trust.rs`,
   `crates/relais/src/cli/install.rs`, `crates/relais/tests/it/plugin_install.rs`,
   `crates/relais/tests/it/learning_cycle.rs` (its checks at 605 and 618 read
   stdout; every check, the negative ones too, moves to stderr).
-- [ ] Phase 4 — after relais PR 610 merges, rebase, then the counter lines
+- [x] Phase 4 — after relais PR 610 merges, rebase, then the counter lines
   (if 610 is still open when Phases 1–3 pass, they land with their own
   CHANGELOG lines and Phase 4 follows as its own commit after 610 merges):
   `crates/relais/src/coordinator/seats.rs`,
   `crates/relais/src/coordinator/seats/tests.rs`,
   `crates/relais/src/runner/launch.rs`, `docs/shared-state.md`,
   `CHANGELOG.md`.
-- [ ] Phase 5 — close an-t31 in homelab:
+- [x] Phase 5 — close an-t31 in homelab:
   `docs/programmes/agents-many-nodes/an-t31-shared-state-cli-messages.md`
   (Resolution, `status = "closed"`) and one Decisions line in
   `docs/programmes/agents-many-nodes/map.md`.
@@ -162,17 +167,25 @@ So, per line the ticket lists:
 
 | Check | Input | Expected | Actual |
 | --- | --- | --- | --- |
-| json refusal, both streams | `refusal_streams` (pure) unit test, `json = true` and `false` | json: object on stdout and one stderr line; plain: stderr only | |
-| refusal wiring, binary | `tests/shared_state_cli.rs`: `decide --json` and `feedback --json` invocations that return a `Refusal` | stdout one `{"error","exit"}`, stderr one `relais <cmd>:` line, exit agrees; fails on today's `refusal_lines` | |
-| absent layer, binary | `tests/shared_state_cli.rs`, `relais decide --json` and `relais feedback --json` under `external` with no client | stdout one `{"error","exit":3}`, stderr one line starting `relais: `, exit 3 | |
-| held line | `cli::decide` held tests, answer and salvage | the new text, exit 3, nothing written | |
-| trust lines | unit test of the line builder, `Local` and `External`, written and not | `recorded in <path>` vs `recorded on the shared primary`; JSON `recorded_on` | |
-| installer lines | `tests/it/plugin_install.rs` and `tests/it/learning_cycle.rs` install `--write` in a temp HOME | "session routing is on" and "automatic promotion is on" on stderr, not stdout | |
-| trust, binary | `relais trust grant --reviewed-by x --json` in a temp HOME | `recorded_on: machine_settings`, exit 0 | |
-| counter lines | `coordinator::seats` tests on the drop and refused lines | the new tail, `dropped_micros` kept | |
-| unbooked line | unit test of the `runner/launch.rs` line builder | the new tail | |
-| pilot | the branch binary: `relais decide <unknown run> --answer approve --json` | stdout object, stderr line, exit equals the object's `exit` | |
-| suite | `cargo test -p relais`, `cargo clippy -p relais --all-targets -- -D warnings` | 0 failed, clean | |
+| json refusal, both streams | `refusal_streams` (pure) unit test, `json = true` and `false` | json: object on stdout and one stderr line; plain: stderr only | pass: `cli::decision_record::a_refusal_is_one_stderr_line_and_under_json_also_one_stdout_object` (takes `Format`) |
+| refusal wiring, binary | `tests/shared_state_cli.rs`: `decide --json` and `feedback --json` invocations that return a `Refusal` | stdout one `{"error","exit"}`, stderr one `relais <cmd>:` line, exit agrees; fails on today's `refusal_lines` | pass: `a_refusal_under_json_is_one_stdout_object_and_one_stderr_line`, decide and feedback, plain and `--json` |
+| absent layer, binary | `tests/shared_state_cli.rs`, `relais decide --json` and `relais feedback --json` under `external` with no client | stdout one `{"error","exit":3}`, stderr one line starting `relais: `, exit 3 | pass: `a_salvage_under_an_absent_external_layer_is_refused_and_records_nothing` pins one `relais: ` line both ways |
+| held line | `cli::decide` held tests, answer and salvage | the new text, exit 3, nothing written | pass: the four `cli::decide` held tests and `only_the_held_elsewhere_refusal_…`; salvage line 288 chars with a 21-char run id (was ~335) |
+| trust lines | unit test of the line builder, `Local` and `External`, written and not | `recorded in <path>` vs `recorded on the shared primary`; JSON `recorded_on` | pass: `cli::trust::a_grant_names_where_it_was_recorded`, both selections, written and kept |
+| installer lines | `tests/it/plugin_install.rs` and `tests/it/learning_cycle.rs` install `--write` in a temp HOME | "session routing is on" and "automatic promotion is on" on stderr, not stdout | pass: `plugin_install::an_install_records_the_routing_envelope_once_…`, `learning_cycle::installing_records_…` and `…off_tombstone…`, stderr present, stdout absent |
+| trust, binary | `relais trust grant --reviewed-by x --json` in a temp HOME | `recorded_on: machine_settings`, exit 0 | pass: `a_json_trust_grant_says_where_it_was_recorded`: `recorded_on: machine_settings`, exit 0 |
+| counter lines | `coordinator::seats` tests on the drop and refused lines | the new tail, `dropped_micros` kept | pass: `coordinator::seats` tests (cap drop, count cap, refused settle, seat wait) on the new tail, `dropped_micros` kept, no `check the shared primary` |
+| unbooked line | unit test of the `runner/launch.rs` line builder | the new tail | pass: `runner::tests::shared::an_unbooked_cost_…`, cost once, new tail |
+| pilot | the branch binary: `relais decide <unknown run> --answer approve --json` | stdout object, stderr line, exit equals the object's `exit` | binary 06:33: `decide run-nope --answer approve --json` exit 10; stdout `{"error":"unknown run run-nope","exit":10}`; stderr `relais decide: unknown run run-nope`; with stdout closed (`head -c0`) no panic |
+| suite | `cargo test -p relais`, `cargo clippy -p relais --all-targets -- -D warnings` | 0 failed, clean | `cargo test -p relais` on `1bde131b1`: lib 2750, bin 80, it 354, shared_state_cli 10, 26, 16, 1; 0 failed. clippy `--all-targets -D warnings` clean |
+
+## Implementation review
+
+- implementation-review: round 1 approve-with-changes (blocking: `json: bool` flag args, fixed with `programme::Format`; doc split, fixed); Delta approve-with-changes (comment paths fixed; Where-to-look departure recorded in Behaviour 5; plan Actuals filled); ~79k+74k, 59+29 s.
+- backend: round 1 approve-with-changes (doc split, selection read once, amount asserted: all fixed); Delta approve; 74k+71k.
+- lang:rust: round 1 approve-with-changes (doc split, comment, layout: fixed); Delta approve; `deliberate:` take `&Refusal` and a typed scope (lows, file-local style); 65k+63k.
+- unix: round 1 approve-with-changes (only BrokenPipe dropped: fixed); Delta approve; 79k+52k.
+- tui: round 1 approve-with-changes (6 wording items fixed); Delta approve-with-changes, its two lows fixed in `1bde131b1` (held line 288 chars, "ask the primary's operator to check it"); 63k+64k.
 
 ## Follow-ups
 
