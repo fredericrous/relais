@@ -9,8 +9,9 @@
 //! public, so a failing one can be run alone. The properties in [`run_all`]
 //! are the ones both a single node and a primary must hold;
 //! [`run_all_with_clock`] adds what only a primary holds (a decision grant
-//! lapses, another holder's reservation is `Held`). Expiry of ticket holds
-//! and a degraded mode stay tested on the fake itself.
+//! lapses, another holder's reservation is `Held`, a reservation's hold ends
+//! `HANDOFF_HOLD_SECS` after its last grant). Expiry of `work` holds and a
+//! degraded mode stay tested on the fake itself.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,7 +71,7 @@ pub type Check = fn(&dyn SharedState, &Fixture);
 
 /// Every check, each on a fresh implementation and fixture.
 pub fn run_all<S: SharedState>(make: impl Fn() -> S) {
-    let checks: [(&str, Check); 13] = [
+    let checks: [(&str, Check); 14] = [
         ("epoch_rises_on_every_acquire", epoch_rises_on_every_acquire),
         ("a_stale_epoch_is_lease_lost", a_stale_epoch_is_lease_lost),
         (
@@ -100,6 +101,10 @@ pub fn run_all<S: SharedState>(make: impl Fn() -> S) {
             "a_handoff_retried_by_its_holder_is_reserved_again",
             a_handoff_retried_by_its_holder_is_reserved_again,
         ),
+        (
+            "a_handoff_whose_claim_file_exists_keeps_its_shared_hold",
+            a_handoff_whose_claim_file_exists_keeps_its_shared_hold,
+        ),
         ("publish_replays_idempotently", publish_replays_idempotently),
         (
             "a_fresh_state_is_online_and_empty",
@@ -127,6 +132,11 @@ pub fn run_all_with_clock<S: SharedState>(make: impl Fn() -> S, advance: impl Fn
     let state = make();
     let fixture = Fixture::new("a_primary_refuses_another_holders_reservation");
     a_primary_refuses_another_holders_reservation(&state, &fixture);
+    let state = make();
+    let fixture = Fixture::new("a_primary_ends_a_reservation_hold_from_its_last_grant");
+    a_primary_ends_a_reservation_hold_from_its_last_grant(&state, &fixture, &|secs| {
+        advance(&state, secs)
+    });
 }
 
 fn holder(fixture: &Fixture, who: &str) -> Principal {
@@ -623,6 +633,106 @@ pub fn a_primary_refuses_another_holders_reservation(state: &dyn SharedState, fi
             panic!("{CHECK} step 5: a primary refuses another holder with Held, got {over:?}")
         }
     }
+}
+
+/// A claim file that already holds its holder's `handoff` keeps the shared
+/// hold when the holder asks again: the shared half re-grants the holder's
+/// own reservation and the claim file answers "not reserved", and the node
+/// does not give the grant back (another holder is still refused). On a
+/// client with no shared half (`NodeDecides`) the file alone refuses.
+pub fn a_handoff_whose_claim_file_exists_keeps_its_shared_hold(
+    state: &dyn SharedState,
+    fixture: &Fixture,
+) {
+    use super::TicketAnswer;
+    use crate::programme::claim::{now_unix, Holder, Kind, LOCK_WAIT};
+    const CHECK: &str = "a_handoff_whose_claim_file_exists_keeps_its_shared_hold";
+    let me = holder(fixture, "a");
+    let other = holder(fixture, "b");
+    let key = ClaimKey {
+        repo_key: fixture.name.clone(),
+        slug: "programme".into(),
+    };
+    let now = now_unix();
+    {
+        let lock = fixture.store.lock(&key, LOCK_WAIT, now).expect("lock");
+        assert!(
+            node::reserve_handoff(state, &lock, &key, "t1", &me, "/r", now).expect("answered"),
+            "{CHECK} step 1: a free ticket is reserved"
+        );
+        assert!(
+            !node::reserve_handoff(state, &lock, &key, "t1", &me, "/r", now + 60)
+                .expect("answered"),
+            "{CHECK} step 2: asking again is not a new reservation"
+        );
+    }
+    let holds = fixture.store.holds(&key, now + 60).expect("holds");
+    assert_eq!(
+        holds.get("t1").map(|hold| &hold.holder),
+        Some(&Holder::Session {
+            id: me.id.clone(),
+            kind: Kind::Handoff
+        }),
+        "{CHECK} step 3: the claim file still names the holder's handoff"
+    );
+    let over = state
+        .reserve_handoff(&ticket(fixture, "t1", &other))
+        .expect("answered");
+    match &over {
+        TicketAnswer::Granted(_) => {
+            panic!("{CHECK} step 4: the shared hold is kept while the file holds, got {over:?}")
+        }
+        TicketAnswer::Held { holder, .. } => {
+            assert_eq!(holder, &me, "{CHECK} step 4: a refusal names the reserver")
+        }
+        TicketAnswer::NodeDecides => {}
+    }
+}
+
+/// A primary's hold on a reservation ends `HANDOFF_HOLD_SECS` after the
+/// holder's last grant, not after the first: a retry moves the end. Another
+/// holder is `Held`, naming the reserver, past the first grant's end and
+/// until the retry's. [`super::LocalState`] holds no shared ticket hold and
+/// is not run through it.
+pub fn a_primary_ends_a_reservation_hold_from_its_last_grant(
+    state: &dyn SharedState,
+    fixture: &Fixture,
+    advance: &dyn Fn(i64),
+) {
+    use super::TicketAnswer;
+    use crate::programme::claim::HANDOFF_HOLD_SECS as HOLD;
+    const CHECK: &str = "a_primary_ends_a_reservation_hold_from_its_last_grant";
+    let me = holder(fixture, "a");
+    let other = holder(fixture, "b");
+    let granted = |who: &Principal, step: &str| {
+        let answer = state
+            .reserve_handoff(&ticket(fixture, "t1", who))
+            .expect("answered");
+        assert!(
+            matches!(answer, TicketAnswer::Granted(_)),
+            "{CHECK} {step}: expected Granted, got {answer:?}"
+        );
+    };
+    let held_by_me = |step: &str| {
+        let answer = state
+            .reserve_handoff(&ticket(fixture, "t1", &other))
+            .expect("answered");
+        match &answer {
+            TicketAnswer::Held { holder, .. } => {
+                assert_eq!(holder, &me, "{CHECK} {step}: a refusal names the reserver")
+            }
+            _ => panic!("{CHECK} {step}: another holder is Held, got {answer:?}"),
+        }
+    };
+    granted(&me, "step 1 (first grant)");
+    advance(HOLD / 2);
+    granted(&me, "step 2 (the holder's retry)");
+    advance(HOLD / 2 + 1);
+    held_by_me("step 3 (past the first grant's end, inside the retry's)");
+    advance(HOLD / 2 - 2);
+    held_by_me("step 4 (just before the retry's end)");
+    advance(2);
+    granted(&other, "step 5 (past the retry's end)");
 }
 
 /// Publishing the same rows twice names the same high-water mark, and

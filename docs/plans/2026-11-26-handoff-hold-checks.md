@@ -92,7 +92,7 @@ hold the file keeps. Close both: the expiry case on the fake with its clock
 
 ## Phases
 
-- [ ] Phase 1: `crates/relais/src/programme/claim/store.rs`
+- [x] Phase 1: `crates/relais/src/programme/claim/store.rs`
   (`renew_own_handoff`), `crates/relais/src/shared_state/node.rs` (the fix),
   `crates/relais/src/shared_state/conformance.rs` (two cases, array length 13 to 14,
   `run_all_with_clock`), `crates/relais/src/shared_state/mod.rs` (doc), the `conformance.rs` module doc
@@ -110,6 +110,45 @@ hold the file keeps. Close both: the expiry case on the fake with its clock
   any other claim-file hold still gives the grant back, so a shared hold
   never outlives a refusal that is not its own holder's.
   decided-by: agent (ADR-0080).
+
+## Decision log (implementation)
+
+- 2026-11-26 — One helper, `node::keep_or_give_back`, serves both
+  `reserve_handoff` and `reserve_in_empty_programme`, error arm included
+  (a failed renewal gives the lease back through `compensated`). On a kept
+  lease `reserve_in_empty_programme` answers `None`, as `reserve_handoff`
+  answers `false` (round 2, lang:rust and tui, carried).
+- 2026-11-26 — `renew_own_handoff` logs `Event::Refresh` with
+  `Kind::Handoff`; a log failure after the write gives the lease back, as
+  every claim write already logs after it writes (round 2, unix, carried).
+- 2026-11-26 — The file's end matches the lease's to within the clock skew
+  between the node and the primary (round 2, architect, carried).
+- 2026-11-26 — LocalState answers `NodeDecides` and holds no shared ticket
+  hold, so the expiry case does not apply to it; it meets the ticket by
+  passing `run_all`, the new give-back case included (round 2, po, carried).
+
+## Verification (observed)
+
+- 2026-11-26: `cargo test -p relais --lib shared_state` 40 passed, listing
+  both conformance cases on the fake and `LocalState` and the two unit tests
+  in `fake.rs` (`a_kept_handoff_moves_the_claim_files_end_to_the_retrys_lease`,
+  `an_empty_programmes_kept_handoff_keeps_its_shared_hold`).
+- Mutations, each reverted: (M1) the fake keeps the first grant's end on a
+  retry → `a_primary_ends_a_reservation_hold_from_its_last_grant step 3`
+  fails, and the moved-end unit test; (M2) `renew_own_handoff` answers
+  `true` without writing → the moved-end unit test fails, conformance passes;
+  (M3) the old give-back restored → `a_handoff_whose_claim_file_exists_keeps_its_shared_hold
+  step 4` fails on the fake (LocalState passes either way, as expected), and
+  both unit tests.
+- Full `cargo test -p relais`: lib 2743 passed, bin 353, integration targets
+  all ok. `cargo clippy -p relais --all-targets -- -D warnings`, also with
+  `--features conformance`: clean.
+
+## Outcome
+
+- After release: relais-fabric's next pin bump runs `run_all_with_clock`
+  green. One report in the following week of a ticket granted to another
+  session while the claim file keeps the first session's handoff means revert.
 
 ## Verification
 

@@ -841,6 +841,33 @@ impl SlugLock<'_> {
         Ok(true)
     }
 
+    /// Moves a live `handoff` claim of `session` on `id` to `now` (its
+    /// `claimed_at` and `refreshed_at`), so its hold ends
+    /// [`HANDOFF_HOLD_SECS`] after `now`; whether there was one. Another
+    /// session's claim, a `work` claim, an expired or an unparsed one is
+    /// left as it is.
+    pub fn renew_own_handoff(&self, id: &str, session: &str, now: i64) -> Result<bool, ClaimError> {
+        let Some(record) = read_all(&self.dir)?.remove(id) else {
+            return Ok(false);
+        };
+        let ClaimRecord::Parsed(claim) = &record else {
+            return Ok(false);
+        };
+        if claim.session != session || claim.kind != Kind::Handoff || !held(&record, now) {
+            return Ok(false);
+        }
+        self.write(
+            id,
+            &Claim {
+                claimed_at: now,
+                refreshed_at: now,
+                ..claim.clone()
+            },
+        )?;
+        self.log(Event::Refresh, id, Some((session, Kind::Handoff)), now)?;
+        Ok(true)
+    }
+
     /// Writes a `handoff` claim on the first of `candidates`, only when the
     /// programme is empty: no open ticket held by a claim, none by a branch.
     /// The check and the write are one step under the lock, so two callers
