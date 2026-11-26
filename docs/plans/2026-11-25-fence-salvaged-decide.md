@@ -126,7 +126,7 @@ is unchanged.
 
 ## Implementation review
 
-- implementation-review: approve after two Deltas; fixed: the sign-off `write!` now `push_str(&format!)`, the held test rows, the shared-state builder called before containment (round 1 approve-with-changes, deltas approve) (opus).
+- implementation-review: approve after two Deltas; fixed: the sign-off `write!` now `push_str(&format!)`, the held test rows, the shared-state builder called before containment (round 1 and delta 1 approve-with-changes, delta 2 and the post-merge Delta approve) (opus).
 - backend: approve after the Delta; fixed: the not-recorded and ended-held tests (opus).
 - lang:rust: approve after the Delta; fixed: `Containment` returned whole, `NextStep` enum, `use` imports (opus).
 - unix: approve, no findings in round 1 (opus).
