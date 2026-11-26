@@ -27,7 +27,7 @@ person for its fields.
   Never "looks right" or a worker's own completion message.
 - **Decisions:** name `architecture.keys` in the contract when the task
   depends on a decision: that is binding. The worker also sees the
-  constraint index and aval's relevance ranking, but that is advisory
+  constraint index and greentopo's relevance ranking, but that is advisory
   and never blocks.
 - **Task type:** declare one `task_type` (report, mechanical, pattern,
   review-fix, feature, refactor, ui or infra), the one that fits the work.

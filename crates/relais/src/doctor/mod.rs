@@ -169,7 +169,7 @@ pub(crate) fn integration_finding(
         return Finding {
             component,
             level: Level::Ok,
-            detail: format!("not declared in [integrations]; `{name}` is not checked"),
+            detail: format!("not declared in [integrations]; `{component}` is not checked"),
         };
     };
     let bin = dependency
@@ -1441,7 +1441,7 @@ pub fn doctor(
     match &policy {
         Some(policy) => {
             for (name, component, dependency) in [
-                ("aval", "aval", policy.integrations.aval.as_ref()),
+                ("aval", "greentopo", policy.integrations.aval.as_ref()),
                 ("amont", "amont", policy.integrations.amont.as_ref()),
                 (
                     "amont_agent",
@@ -2746,7 +2746,7 @@ mod tests {
 
         let required_missing = integration_finding(
             "aval",
-            "aval",
+            "greentopo",
             Some(&dependency("required")),
             &missing,
             &no_version,
@@ -2776,7 +2776,7 @@ mod tests {
         // failing a repository that declared it does not use the tool.
         let off = integration_finding(
             "aval",
-            "aval",
+            "greentopo",
             Some(&dependency("off")),
             &missing,
             &no_version,

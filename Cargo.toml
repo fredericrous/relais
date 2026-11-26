@@ -16,7 +16,7 @@ authors = ["Frederic Rousseau"]
 edition = "2021"
 
 [workspace.lints.clippy]
-# adr-lint sync: general.linters-police-suppressions
+# greenspotter sync: general.linters-police-suppressions
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
 

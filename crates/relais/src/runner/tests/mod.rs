@@ -7904,9 +7904,9 @@ fn the_worker_prompt_fences_the_index_and_the_relevant_block_once_each() {
     assert_eq!(prompt.matches("--- begin relevant guidance (").count(), 1);
     assert_eq!(prompt.matches("--- end relevant guidance ---").count(), 1);
     assert!(!prompt.contains("repo: \"\""), "{prompt}");
-    assert!(!prompt.contains("`aval_rule` tool"), "{prompt}");
+    assert!(!prompt.contains("`greentopo_rule` tool"), "{prompt}");
     assert!(
-        prompt.contains("run `aval rule <id>` in the working directory"),
+        prompt.contains("run `greentopo rule <id>` in the working directory"),
         "{prompt}"
     );
     let index = fenced(&prompt, "constraint index").expect("index");
@@ -7947,7 +7947,7 @@ fn the_index_instruction_names_the_repository_root_never_the_task_worktree() {
 }
 
 #[test]
-fn without_an_index_there_is_no_aval_rule_line_and_no_empty_fence() {
+fn without_an_index_there_is_no_greentopo_rule_line_and_no_empty_fence() {
     let fixture = Fixture::new();
     let contract = fixture.contract(Review::Off);
     let prompt = build_prompt(
@@ -7958,7 +7958,7 @@ fn without_an_index_there_is_no_aval_rule_line_and_no_empty_fence() {
         AttemptKind::Initial,
     )
     .0;
-    assert!(!prompt.contains("aval rule"), "{prompt}");
+    assert!(!prompt.contains("greentopo rule"), "{prompt}");
     assert!(!prompt.contains("constraint index"), "{prompt}");
     assert!(prompt.contains("--- begin relevant guidance ("));
 
@@ -7971,7 +7971,7 @@ fn without_an_index_there_is_no_aval_rule_line_and_no_empty_fence() {
     )
     .0;
     assert!(
-        !bare.contains("relevant guidance") && !bare.contains("aval rule"),
+        !bare.contains("relevant guidance") && !bare.contains("greentopo rule"),
         "{bare}"
     );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
@@ -8008,13 +8008,13 @@ fn the_planner_gets_the_relevant_block_and_never_the_index() {
     let manifest = guided_manifest(&["a.b"], &[("k.k", "choice")]);
     let block = relevant_block(&manifest.guidance, &[]);
     assert!(block.contains("--- begin relevant guidance ("), "{block}");
-    assert!(!block.contains("constraint index") && !block.contains("aval rule"));
+    assert!(!block.contains("constraint index") && !block.contains("greentopo rule"));
 }
 
 /// ADR-0066: the reviewer reads process rules as one line each and is told
-/// to fetch one with `aval_rule`, naming the corpus.
+/// to fetch one with `greentopo_rule`, naming the corpus.
 #[test]
-fn the_reviewer_reads_process_rules_as_lines_and_fetches_with_aval_rule() {
+fn the_reviewer_reads_process_rules_as_lines_and_fetches_with_greentopo_rule() {
     let manifest = guided_manifest(
         &["errors.never-swallowed", "errors.typed-values"],
         &[("k.k", "choice")],
@@ -8032,7 +8032,7 @@ fn the_reviewer_reads_process_rules_as_lines_and_fetches_with_aval_rule() {
     let block = fenced(&text, "process rules in force").expect("process lines");
     assert!(block.contains("`errors.never-swallowed`: the statement of errors.never-swallowed"));
     assert!(block.contains("`errors.typed-values`: the statement of errors.typed-values"));
-    assert!(text.contains("the `aval_rule` tool"), "{text}");
+    assert!(text.contains("the `greentopo_rule` tool"), "{text}");
     assert!(
         text.contains(
             "if that tool is not available or answers with an error, say so in your report"
@@ -8040,7 +8040,7 @@ fn the_reviewer_reads_process_rules_as_lines_and_fetches_with_aval_rule() {
         "the reviewer says which rule it could not read: {text}"
     );
     assert!(
-        !text.contains("aval rule <id>"),
+        !text.contains("greentopo rule <id>"),
         "a reviewer has no shell: {text}"
     );
     assert!(!text.contains("constraint index"), "{text}");
@@ -8122,11 +8122,11 @@ fn the_receipt_shows_a_guidance_line_only_when_there_is_a_gap() {
     let gap = GuidanceGap::new(
         GuidanceSource::Relevant,
         context::guidance::GapCause::Exited(2),
-        "aval exit 2",
+        "greentopo exit 2",
     );
     assert_eq!(
         context::guidance::gap_line(&[gap]).as_deref(),
-        Some("guidance: relevant missing (aval exit 2)")
+        Some("guidance: relevant missing (greentopo exit 2)")
     );
 }
 
@@ -8179,7 +8179,7 @@ fn guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_g
     gapped.guidance.gaps.push(GuidanceGap::new(
         GuidanceSource::Index,
         context::guidance::GapCause::NotLaunched,
-        "aval could not be launched",
+        "greentopo could not be launched",
     ));
     let note = engine.guidance_note(&gapped).expect("a manifest gap");
     assert_eq!(note.matches("guidance:").count(), 1, "{note}");
@@ -9505,7 +9505,7 @@ fn an_aval_failure_is_a_gap_and_the_review_text_only_says_so() {
     let failure = GuidanceGap::new(
         GuidanceSource::Decisions,
         context::guidance::GapCause::Exited(3),
-        "aval exit 3",
+        "greentopo exit 3",
     );
     let resolver = DecisionsFor {
         answer: Err(failure.clone()),
@@ -9514,7 +9514,9 @@ fn an_aval_failure_is_a_gap_and_the_review_text_only_says_so() {
     let files = vec!["src/a.rs".to_string()];
     let (text, gap) = super::review::reviewer_decisions(&resolver, &files, 4096, 0);
     assert!(
-        text.contains("decisions that apply to this diff are missing or partial (aval exit 3)"),
+        text.contains(
+            "decisions that apply to this diff are missing or partial (greentopo exit 3)"
+        ),
         "{text}"
     );
     assert!(!text.contains("decisions that apply\n```"), "{text}");
@@ -9588,7 +9590,7 @@ impl crate::context::DecisionResolver for FailingDecisions {
         Err(GuidanceGap::new(
             GuidanceSource::Decisions,
             context::guidance::GapCause::Exited(3),
-            "aval exit 3",
+            "greentopo exit 3",
         ))
     }
 }
@@ -9626,8 +9628,9 @@ fn a_failing_decisions_lookup_still_reaches_the_review_verdict_and_is_a_receipt_
     assert!(!prompts.is_empty(), "the reviewer was dispatched");
     for prompt in prompts.iter() {
         assert!(
-            prompt
-                .contains("decisions that apply to this diff are missing or partial (aval exit 3)"),
+            prompt.contains(
+                "decisions that apply to this diff are missing or partial (greentopo exit 3)"
+            ),
             "{prompt}"
         );
     }
@@ -9683,7 +9686,7 @@ fn a_constraints_overflow_and_a_decisions_failure_keep_both_labels_and_causes() 
         .expect("a guidance line");
     assert!(note.contains("reviewer constraints partial"), "{note}");
     assert!(
-        note.contains("reviewer decisions missing (aval exit 3)"),
+        note.contains("reviewer decisions missing (greentopo exit 3)"),
         "{note}"
     );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
@@ -10299,7 +10302,7 @@ fn the_reviewer_reads_a_tool_checked_rule_in_full_only_when_its_candidate_fires(
         lines.contains("`b.tooled`: the statement of b.tooled"),
         "{lines}"
     );
-    assert!(text.contains("the `aval_rule` tool"), "{text}");
+    assert!(text.contains("the `greentopo_rule` tool"), "{text}");
     assert_eq!(indexed, vec!["b.tooled".to_string()]);
 
     let named = std::collections::BTreeSet::from(["b.tooled".to_string()]);

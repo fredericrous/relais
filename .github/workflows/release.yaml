@@ -1,7 +1,7 @@
 name: Release
 
 # Cutting a release means: a tag, prebuilt binaries for every platform the
-# siblings (amont, aval) ship to, and checksums. The shape is aval's release
+# siblings (amont, greentopo) ship to, and checksums. The shape is greentopo's release
 # workflow, job for job, minus the npm and crates.io channels: `relais` is a
 # working name whose package availability has not been checked (SPEC.md). Until this existed the only install path was
 # `git clone` into a specific config directory — a 2015 install story for a Rust

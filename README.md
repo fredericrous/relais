@@ -128,7 +128,7 @@ One crate, `crates/relais`, one binary. Modules follow SPEC §13:
 | `contract` | task contracts: validated, frozen, hashed; work plans (§4, §19) |
 | `policy` | `relais.toml`, machine settings, the effective authority (§5) |
 | `route` | deterministic routing, risk floors, the learned predictor hook (§6) |
-| `context` | context manifests and aval resolution (§7) |
+| `context` | context manifests and greentopo resolution (§7) |
 | `workspace` | owned worktrees, candidate snapshots, scope checks (§8) |
 | `adapter` | the `Backend` trait, the Claude Code adapter, a mock (§20) |
 | `runner` | the interpreter: observes, records, performs one effect per step (§9, §10) |
@@ -261,7 +261,7 @@ declares no setup:
 
 ### Runs alone
 
-relais runs on a machine with none of its sibling tools. Without aval, decision keys it cannot resolve are not looked up: they are listed once as "not checked (reported, not passed)" in the receipt and the run goes on, unless `[integrations] aval = "required"` makes the missing tool block. Without amont, its hook and attestation checks are skipped and the missing tool is reported as a gap, not a pass. Without amont-agent, the guard it would add is absent and that is reported too. A tool that is installed but fails still blocks. `relais init` proposes all three as `"optional"`, and `relais doctor` lists each with its mode and whether it is installed.
+relais runs on a machine with none of its sibling tools. Without greentopo, decision keys it cannot resolve are not looked up: they are listed once as "not checked (reported, not passed)" in the receipt and the run goes on, unless `[integrations] greentopo = "required"` makes the missing tool block. Without amont, its hook and attestation checks are skipped and the missing tool is reported as a gap, not a pass. Without amont-agent, the guard it would add is absent and that is reported too. A tool that is installed but fails still blocks. `relais init` proposes all three as `"optional"`, and `relais doctor` lists each with its mode and whether it is installed.
 
 ### Programme maps
 

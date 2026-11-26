@@ -8,6 +8,22 @@ missing here.
 
 ## Unreleased
 
+relais now says greentopo wherever it names the decisions tool: run gaps
+and blockers (`greentopo exit 3`, `greentopo: not installed, decision keys …
+not checked`, `greentopo contradiction on …`), `relais doctor`'s integration
+line, and the worker and reviewer prompts, which point at the
+`greentopo_rule` MCP tool (the worker's also at `greentopo rule <id>`).
+`greentopo = "required"`
+is the documented `[integrations]` key; `aval` is still read as the same
+key (and the old binary still spawned when greentopo is absent), so no trust
+grant moves. relais's own gates moved from adr-lint to greenspotter: nothing
+in this repository runs `adr-lint` any more. The fleet decisions pack
+embedded in the binary is now the `greentopo:`-keyed one, so the fleet
+fallback (a repository with no corpus of its own) needs greentopo; aval
+1.12 cannot read it. The worker and reviewer agents already held only
+`mcp__greentopo__greentopo_rule`, so the prompts' pointer to `aval_rule`
+named a tool they did not have: this fixes it.
+
 Under `--json`, a failure that is not a refusal now prints the same
 `{"error","exit"}` object on stdout that a refusal does, from `decide`,
 `feedback`, `report`, `learn cycle`, `doctor` and `trust` alike; `report` and

@@ -3561,7 +3561,7 @@ pub fn integration_gaps(
 ) -> Vec<String> {
     let mut gaps = Vec::new();
     for (name, default_bin, dependency) in [
-        ("aval", aval_default, integrations.aval.as_ref()),
+        ("greentopo", aval_default, integrations.aval.as_ref()),
         ("amont", "amont", integrations.amont.as_ref()),
         (
             "amont_agent",
@@ -7098,7 +7098,7 @@ mod tests {
         );
         let none = integration_gaps(&integrations, &|_| false, "aval");
         assert_eq!(none.len(), 2, "required missing + optional missing");
-        assert!(none[0].starts_with("aval: required"));
+        assert!(none[0].starts_with("greentopo: required"));
         assert!(none[0].contains("binary `aval`"), "{}", none[0]);
         let topo = integration_gaps(&integrations, &|_| false, "greentopo");
         assert!(topo[0].contains("binary `greentopo`"), "{}", topo[0]);
