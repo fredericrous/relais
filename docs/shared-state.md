@@ -275,7 +275,12 @@ it could not renew or give back ends by its TTL.
   `HANDOFF_HOLD_SECS` after the retry (`run_all_with_clock` checks it; `run_all`
   alone does not tie a primary to that, so a primary passes both); a node
   whose claim file already holds the holder's `handoff` keeps that shared hold
-  when asked again, and moves the file's hold end with it; another holder is refused while it lasts, with `Held` from a
+  when asked again, and moves the file's hold end with it (when that renewal
+  fails, the node gives the shared hold back and returns the claim error: the
+  file keeps its old end, so the node's own sessions stay refused until then
+  while another node's holder can be granted, and a failed write leaves a
+  `refresh` line in the claims log for a renewal that did not happen: a line
+  records an attempt); another holder is refused while it lasts, with `Held` from a
   primary or by the claim file under `LocalState`),
   `renew_tickets` and `release_tickets` (every `work` hold of one holder,
   for a resumed session and a session end). The hook calls them with no

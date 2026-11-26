@@ -1538,6 +1538,163 @@ mod tests {
         );
     }
 
+    /// What a failed renewal leaves behind (an-t30): the shared hold is
+    /// given back, so another holder is granted; the claim file keeps the
+    /// first grant's end, not the retry's; and the error names `path_part`.
+    fn assert_a_failed_renewal_gave_the_grant_back(
+        state: &FakeState,
+        store: &crate::programme::claim::Store,
+        key: &crate::programme::claim::ClaimKey,
+        err: NodeError,
+        path_part: &str,
+    ) {
+        use crate::programme::claim::HANDOFF_HOLD_SECS as HOLD;
+        assert!(
+            matches!(err, NodeError::Claim(_)),
+            "the claim error: {err:?}"
+        );
+        assert!(
+            err.to_string().contains(path_part),
+            "the error names {path_part}: {err}"
+        );
+        let held_at = |t: i64| store.holds(key, t).expect("holds").contains_key("t1");
+        assert!(
+            held_at(1_000 + HOLD),
+            "the file keeps the first grant's end"
+        );
+        assert!(
+            !held_at(1_000 + HOLD + 1),
+            "the retry's end was not written"
+        );
+        let other = Principal::operator("session-other");
+        assert!(
+            matches!(
+                state
+                    .reserve_handoff(&ticket("t1", &other))
+                    .expect("answered"),
+                TicketAnswer::Granted(_)
+            ),
+            "the lease was given back"
+        );
+    }
+
+    /// The store-wide claims log becomes a directory, so its append fails.
+    fn break_the_claims_log(dir: &crate::test_support::TempDir) {
+        let log = dir.join("claims").join("log.jsonl");
+        std::fs::remove_file(&log).expect("log exists");
+        std::fs::create_dir(&log).expect("directory in its place");
+    }
+
+    /// `t1` reserved by `session-me` at 1_000, the fake's clock moved half
+    /// a hold on: the state a retry finds.
+    fn a_reserved_handoff_to_retry(
+        name: &str,
+    ) -> (
+        crate::test_support::TempDir,
+        crate::programme::claim::Store,
+        crate::programme::claim::ClaimKey,
+        FakeState,
+    ) {
+        use crate::programme::claim::{ClaimKey, Store, HANDOFF_HOLD_SECS as HOLD, LOCK_WAIT};
+        let dir = crate::test_support::temp_dir(name);
+        let store = Store::in_state_dir(&dir);
+        let key = ClaimKey {
+            repo_key: "rk".into(),
+            slug: "programme".into(),
+        };
+        let state = FakeState::new();
+        let me = Principal::operator("session-me");
+        let lock = store.lock(&key, LOCK_WAIT, 1_000).expect("lock");
+        assert!(node::reserve_handoff(&state, &lock, &key, "t1", &me, "/r", 1_000).expect("first"));
+        drop(lock);
+        state.advance(HOLD / 2);
+        (dir, store, key, state)
+    }
+
+    #[test]
+    fn a_failed_renewal_log_gives_the_shared_grant_back() {
+        use crate::programme::claim::{HANDOFF_HOLD_SECS as HOLD, LOCK_WAIT};
+        let (dir, store, key, state) = a_reserved_handoff_to_retry("fake-node-renew-log");
+        let me = Principal::operator("session-me");
+        // The store-wide claims log becomes a directory: the append fails.
+        break_the_claims_log(&dir);
+        let lock = store.lock(&key, LOCK_WAIT, 1_000 + HOLD / 2).expect("lock");
+        let err = node::reserve_handoff(&state, &lock, &key, "t1", &me, "/r", 1_000 + HOLD / 2)
+            .expect_err("the renewal failed");
+        drop(lock);
+        assert_a_failed_renewal_gave_the_grant_back(&state, &store, &key, err, "log.jsonl");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_renewal_write_gives_the_shared_grant_back() {
+        use crate::programme::claim::{HANDOFF_HOLD_SECS as HOLD, LOCK_WAIT};
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+        struct Restore(std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let restored = std::fs::set_permissions(&self.0, Permissions::from_mode(0o755));
+                let _ = restored; // Drop cannot return it; a failed restore leaves a test temp dir
+            }
+        }
+        let (dir, store, key, state) = a_reserved_handoff_to_retry("fake-node-renew-write");
+        let me = Principal::operator("session-me");
+        let slug_dir = store.claims_dir_for_test(&key);
+        let _restore = Restore(slug_dir.clone());
+        // The lock file exists once the lock is taken; the directory then
+        // refuses a new file, so the log line lands and the write fails.
+        let lock = store.lock(&key, LOCK_WAIT, 1_000 + HOLD / 2).expect("lock");
+        std::fs::set_permissions(&slug_dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        if std::fs::write(slug_dir.join(".probe"), b"").is_ok() {
+            eprintln!("skipped: running as root, nothing is refused");
+            return;
+        }
+        let err = node::reserve_handoff(&state, &lock, &key, "t1", &me, "/r", 1_000 + HOLD / 2)
+            .expect_err("the renewal failed");
+        // The guard restores the mode on a panic; this resets it before the
+        // asserts read the directory.
+        std::fs::set_permissions(&slug_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        drop(lock);
+        assert_a_failed_renewal_gave_the_grant_back(&state, &store, &key, err, "t1.toml");
+        // The log line was written before the failed write: an attempt.
+        let log = std::fs::read_to_string(dir.join("claims").join("log.jsonl")).expect("log");
+        let last = log.lines().last().expect("a line");
+        assert!(
+            last.contains("\"event\":\"refresh\"") && last.contains("\"id\":\"t1\""),
+            "the last log line is the refresh attempt: {last}"
+        );
+    }
+
+    #[test]
+    fn an_empty_programmes_failed_renewal_gives_the_shared_grant_back() {
+        use crate::programme::claim::{EmptyProgramme, HANDOFF_HOLD_SECS as HOLD, LOCK_WAIT};
+        let (dir, store, key, state) = a_reserved_handoff_to_retry("fake-node-renew-empty");
+        let me = Principal::operator("session-me");
+        break_the_claims_log(&dir);
+        let open: BTreeSet<String> = ["t1".to_string()].into();
+        let branch_held = BTreeSet::new();
+        let now = 1_000 + HOLD / 2;
+        let lock = store.lock(&key, LOCK_WAIT, now).expect("lock");
+        let err = node::reserve_in_empty_programme(
+            &state,
+            &lock,
+            &EmptyProgramme {
+                key: &key,
+                candidates: &["t1"],
+                open: &open,
+                branch_held: &branch_held,
+                session: &me.id,
+                repo_display: "/r",
+                now,
+            },
+            &me,
+        )
+        .expect_err("the renewal failed");
+        drop(lock);
+        assert_a_failed_renewal_gave_the_grant_back(&state, &store, &key, err, "log.jsonl");
+    }
+
     #[test]
     fn a_file_that_is_not_my_handoff_gives_the_shared_grant_back() {
         use crate::programme::claim::{ClaimKey, Contest, Store, LOCK_WAIT};
