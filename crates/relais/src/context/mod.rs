@@ -533,13 +533,26 @@ pub fn aval_resolve_in(
             detail: format!("decision key `{key}` is not a key aval can be asked for"),
         };
     }
-    // Absence is confirmed only when nothing was declared, the directory
-    // to run in exists, and no PATH entry named `greentopo` or `aval` exists
-    // in any form: a non-executable file or a dangling link is a broken
-    // install, which keeps blocking.
+    // A `repo_dir` that is not a directory (missing, a file, or unreadable)
+    // would fail the spawn, a missing one with the same NotFound as a
+    // missing program, and the launch hint would then point at the wrong
+    // cause.
+    if !repo_dir.is_dir() {
+        return AvalVerdict::ToolFailure {
+            exit: -1,
+            detail: format!(
+                "aval cannot run in {}: it is not a directory or does not exist",
+                repo_dir.display()
+            ),
+        };
+    }
+    // Absence is confirmed only when nothing was declared and no PATH entry
+    // named `greentopo` or `aval` exists in any form: a non-executable file
+    // or a dangling link is a broken install, which keeps blocking. The
+    // directory to run in was checked above.
     let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
     let extensions = crate::tooling::path_extensions(std::env::var_os("PATHEXT").as_ref());
-    let confirmed_absent = bin.is_none() && repo_dir.is_dir() && {
+    let confirmed_absent = bin.is_none() && {
         ["greentopo", "aval"].iter().all(|name| {
             crate::tooling::resolve_in(
                 name,
@@ -1839,11 +1852,28 @@ mod tests {
     #[test]
     fn a_missing_repo_dir_is_a_tool_failure_not_absence() {
         let dir = crate::test_support::temp_dir("aval-nodir");
-        let verdict = resolve_with_path(&dir.join("missing"), None, &dir);
-        assert!(
-            matches!(verdict, AvalVerdict::ToolFailure { .. }),
-            "{verdict:?}"
-        );
+        let missing = dir.join("missing");
+        let verdict = resolve_with_path(&missing, None, &dir);
+        let AvalVerdict::ToolFailure { detail, .. } = verdict else {
+            panic!("expected a tool failure, got {verdict:?}");
+        };
+        assert!(detail.contains(&missing.display().to_string()), "{detail}");
+        assert!(!detail.contains("relais.toml"), "{detail}");
+        assert!(!detail.contains("PATH"), "{detail}");
+        assert!(!detail.contains("could not be launched"), "{detail}");
+    }
+
+    #[test]
+    fn a_file_repo_dir_is_a_tool_failure_naming_it() {
+        let dir = crate::test_support::temp_dir("aval-filedir");
+        let file = dir.join("not-a-dir");
+        std::fs::write(&file, "").expect("write");
+        let verdict = resolve_with_path(&file, None, &dir);
+        let AvalVerdict::ToolFailure { detail, .. } = verdict else {
+            panic!("expected a tool failure, got {verdict:?}");
+        };
+        assert!(detail.contains(&file.display().to_string()), "{detail}");
+        assert!(!detail.contains("could not be launched"), "{detail}");
     }
 
     #[cfg(unix)]
