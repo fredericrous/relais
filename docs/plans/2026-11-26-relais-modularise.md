@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: docs/relais-modularise-programmes
 repos: [relais]
 adrs: []
@@ -68,7 +68,7 @@ Locations: `relais/docs/programmes/relais-modularise/` (the split) and `relais/d
 ### `relais-modularise/map.md` (sections as `MAP_SECTIONS` requires)
 
 - **Destination.** relais (today a workspace with one member, `crates/relais`) is a workspace of several member crates with enforced boundaries. Each piece that is a separate tool has its own name, chosen once, and the rename to the family name happens once. Done when two targets, set at t01 from the baseline below, are met.
-- **Notes.** relais is 229,504 lines in one crate. Baseline to record when charting: the build time after a one-line edit, and the largest file's line count. The module groups are routing/learning, execution, verification, host scheduling (overlaps greengate's slot queue, ADR-0014), the programme module, plugin/hook/install/doctor and the ledger. The family name is greenlift (ADR-0076, `harness.bundle-names`); a stray memory note saying greenguide is wrong, since decisions#174 rejected it. The rename of the tool and the vocabulary migration of `epic-vocabulary` ship in one window, so hook text and branch prefix change once.
+- **Notes.** relais is 229,504 lines in one crate. Baseline to record when charting: the build time after a one-line edit, and the largest file's line count. The module groups are routing/learning, execution, verification, host scheduling (overlaps greengate's slot queue, ADR-0014), the programme module, plugin/hook/install/doctor and the ledger. The family name is greenlift (ADR-0076, `harness.bundle-names`); a stray memory note saying greenguide is wrong, since decisions#174 rejected it. Whether the rename of the tool and the vocabulary migration of `epic-vocabulary` ship in one window is open: t04 asks it, and reads vocabulary t01's answer by hand because `blocked_by` cannot name another programme.
 - **Decisions so far.** Git is truth and activity-vision projects it (decided in `epic-vocabulary`). Epic and story are the new words.
 - **Not yet specified.** Workspace-split implementation stories (one per crate, after t02). Their order against the rename implementation, since both rewrite `crates/relais/src/programme/` and `cli/programme.rs`: one lands before the other starts.
 - **Out of scope.** Splitting relais into separate repositories before the workspace split proves the seams. Moving any state out of git.
@@ -114,6 +114,17 @@ Frontier at the start: `relais-modularise` t01, t03; `epic-vocabulary` t01 (hitl
 2. `relais programme frontier docs/programmes/relais-modularise --no-fetch` exits 0 and lists exactly t01 and t03; the same for `epic-vocabulary` lists exactly t01. (`frontier` needs the directory argument.)
 3. `relais programme list --no-fetch --root ~/Developer/Perso` shows both programmes.
 4. The project checks run locally before the push (`greengate`), the push goes through `amont land`, and the PR merges on green with `merge-when-green`. After the merge, `relais programme frontier` on origin/main shows the same lists.
+
+### Observed (2026-11-26, before the push)
+
+1. `relais programme check docs/programmes/relais-modularise --no-fetch` and the same for `epic-vocabulary`: exit 0, empty stderr.
+2. `relais programme frontier … --no-fetch`: exit 0; `relais-modularise` lists t01-coupling-map and t03-slot-overlap, `epic-vocabulary` lists t01-vocabulary.
+3. `relais programme list --no-fetch --root ~/Developer/Perso` shows both (open 4 frontier 2; open 2 frontier 1).
+4. Local gate: the pre-commit gate passed 27 checks on each commit. The frontier on origin/main is read after the merge, in the next session's start.
+
+## Implementation review
+
+- implementation-review (opus, 62k, 45 s): approve-with-changes. One low finding, fixed: the plan stated the one-window question as settled while the map and t04 leave it open; the plan now says open.
 
 ## After this plan
 
