@@ -312,10 +312,12 @@ fn ticket_request(key: &ClaimKey, id: &str, holder: &Principal) -> TicketRequest
 /// that holds the holder's own live `handoff` keeps the shared hold (a
 /// primary re-grants a holder's retry, an-t23), and its end moves to match
 /// the lease's; any other refusal gives the grant back. A failed renewal
-/// gives the lease back and is the answer. A renewal that fails before its
-/// claim is written (the log line, then the write) leaves the file as it
-/// was; a failure after the write is not reachable from here, so the file
-/// and the lease never disagree by more than the clock skew.
+/// gives the lease back and is the answer (an-t30): the shared hold is
+/// released, the file is unchanged and keeps its old end (the log line is
+/// written before the file, the file atomically), so until that end this
+/// node's own sessions are refused while another node's holder can be
+/// granted; a failed write leaves a `refresh` log line for a renewal that
+/// did not happen. A failure after the write is not reachable from here.
 fn keep_or_give_back(
     state: &dyn SharedState,
     lock: &SlugLock<'_>,
