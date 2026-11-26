@@ -8,10 +8,17 @@ missing here.
 
 ## Unreleased
 
+## v0.89.0
+
 The home fingerprint no longer warns when greengate records a trust or its
 known identity in the shared `.git/config`: the `trusted` and `knownIdentity`
 keys of its `[greengate]` section are left out of the hash. Any other change to
 that file, other `greengate.*` keys included, still warns.
+
+When the directory aval would run in is missing, a regular file or
+unreadable, the decision lookup now fails with `aval cannot run in <dir>: it
+is not a directory or does not exist`. Before, it got the launch hint that
+pointed at PATH and `bin` (follow-up f32, #616).
 
 ## v0.88.0
 
