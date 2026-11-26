@@ -126,20 +126,20 @@ fn assess(days: &[Figures], today: NaiveDate) -> Vec<(Option<f64>, Check)> {
                 Check::Partial
             } else if first_fed.is_some_and(|fed| at <= fed) {
                 Check::Cutover
-            } else if day.waiting.is_none() {
-                Check::WaitingUnknown
             } else {
-                let percent = percents[at].unwrap_or(0.0); // every term is known here
-                if percent > FLOOR_PERCENT {
-                    if is_day_edge(days, &percents, at) {
-                        Check::Edge
-                    } else {
-                        Check::Short
+                // A missing term (the waiting settles) is the only way left
+                // for the percent to be unknown: that day is not judged.
+                match percents[at] {
+                    None => Check::WaitingUnknown,
+                    Some(percent) if percent > FLOOR_PERCENT => {
+                        if is_day_edge(days, &percents, at) {
+                            Check::Edge
+                        } else {
+                            Check::Short
+                        }
                     }
-                } else if percent < -FLOOR_PERCENT {
-                    Check::CounterAboveLedger
-                } else {
-                    Check::Ok
+                    Some(percent) if percent < -FLOOR_PERCENT => Check::CounterAboveLedger,
+                    Some(_) => Check::Ok,
                 }
             };
             (percents[at], check)
@@ -401,7 +401,10 @@ fn render_text(document: &CounterDocument) -> String {
                 short.len(),
                 newest.day
             ),
-            (None, 0) => "no day could be judged (see the check column)\n".to_string(),
+            (None, 0) => {
+                "no day could be judged (the log or the waiting settles do not cover them)\n"
+                    .to_string()
+            }
             (None, _) => format!(
                 "no day is short ({judged} of {} judged)\n",
                 document.days.len()
