@@ -10,13 +10,16 @@ repos = ["relais"]
 ## Question
 
 f32 checks `repo_dir.is_dir()` before aval's spawn, so a missing
-`repo_dir` or a regular file gets a detail naming it. A directory that
-exists but cannot be entered (mode 000, or no search permission on it or a
-parent) still passes `is_dir()`. The spawn's `current_dir` then fails with
-`PermissionDenied`, the error lands in the `RunError::Spawn` arm, and the
-detail ends with the f29 launch hint, which points at PATH and `bin`. The
-comment above the check also says "unreadable", which the check does not
-catch. Which detail should an unenterable `repo_dir` get?
+`repo_dir` or a regular file gets a detail naming it. A `repo_dir` that
+exists but cannot itself be searched (mode 000 or 0400) still passes
+`is_dir()`. The spawn's `current_dir` then fails with `PermissionDenied`,
+which is not the `NotFound` the `RunError::Spawn` arm matches, so it falls
+through to the catch-all `Err(e)` arm, and the detail ends with the f29
+launch hint, which points at PATH and `bin`. A parent that cannot be
+searched makes `stat` fail, so `is_dir()` is false and the guard catches
+it, but its detail then says "not a directory or does not exist", which is
+wrong too. The comment above the check also says "unreadable", which the
+check does not catch. Which detail should an unenterable `repo_dir` get?
 
 ## Look at
 
@@ -27,9 +30,12 @@ catch. Which detail should an unenterable `repo_dir` get?
 
 ## Answer looks like
 
-An unenterable `repo_dir` is a `ToolFailure` whose detail names the
-directory and the permission, with no launch hint: either checked before
-the spawn (for example by reading the directory) or by telling a
-`current_dir` failure from a missing program. The guard's comment says only
-what it checks. A unix test pins the detail (a mode-000 directory, skipped
-when run as root), and it ships in one relais release.
+An unenterable `repo_dir`, on its own or through a parent, is a
+`ToolFailure` whose detail names the directory and the permission, with no
+launch hint. It is either checked before the spawn with a call that needs
+search permission (such as `metadata(repo_dir.join("."))`; `read_dir`
+passes on 0400) or told apart from a missing program by the spawn error.
+The guard's comment says only what it checks. Unix tests pin the detail for
+a mode-000 and a mode-0400 directory and for an unsearchable parent
+(skipped when run as root), after confirming the error kind macOS's
+`posix_spawn` reports, and it ships in one relais release.
