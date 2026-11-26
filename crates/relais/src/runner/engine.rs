@@ -1067,6 +1067,7 @@ impl<'a> RunEngine<'a> {
                 paths: self.disk_paths(),
                 growth: &self.growth,
             },
+            setup_slot: verify::SetupSlot::default(),
         };
         admission.note_host_sizing(&plan);
         admission

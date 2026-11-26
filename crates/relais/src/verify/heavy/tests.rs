@@ -177,6 +177,7 @@ fn admission<'a>(
         tries: Tries::default(),
         exhausted: |_, _| false,
         disk: crate::disk::DiskCheck::off(),
+        setup_slot: SetupSlot::default(),
     }
 }
 
@@ -223,6 +224,8 @@ struct Recording {
     /// Answer `bind_group` with `UnknownDispatch`, as a coordinator that
     /// restarted would.
     refuse_bind: bool,
+    /// Answer this many `admit` calls as unreachable first.
+    down: std::sync::atomic::AtomicUsize,
 }
 
 impl Recording {
@@ -231,6 +234,7 @@ impl Recording {
             inner,
             events: Mutex::new(Vec::new()),
             refuse_bind: false,
+            down: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -255,6 +259,16 @@ impl Gate for Recording {
         self.inner.register_run(registration)
     }
     fn admit(&self, request: &DispatchRequest) -> Result<Decision, GateError> {
+        let down = self
+            .down
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        if down.is_ok() {
+            return Err(GateError::Unavailable {
+                operation: "admit",
+                socket: "none".into(),
+                cause: "Resource temporarily unavailable".into(),
+            });
+        }
         let decision = self.inner.admit(request)?;
         if decision == Decision::Granted {
             self.note(format!("granted {}", request.run_id));
@@ -2127,4 +2141,493 @@ fn a_cancel_during_a_long_backoff_is_seen_within_one_poll() {
     let slept = sleeper.slept.lock().expect("sleeps");
     assert_eq!(slept.len(), 320, "stopped on the slice that set the flag");
     assert!(slept.iter().all(|d| *d <= Duration::from_millis(100)));
+}
+
+/// amont host-slot-admission t07/t12: a setup takes one host slot and keeps
+/// it across its steps, relabelled per step, instead of joining the tail of
+/// the line again between them.
+#[cfg(unix)]
+mod setup_keeps_one_slot {
+    use super::*;
+    use crate::policy::VerificationProfile;
+    use crate::verify::{run_setup_gated_within, SetupGate, SetupRun};
+    use std::os::unix::fs::DirBuilderExt;
+
+    /// A private slot directory, as `greenharness-slots` requires (0700, ours).
+    fn slot_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("relais-kept-slots-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: a fresh scratch dir
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .expect("slot dir");
+        dir
+    }
+
+    /// Another holder of one slot in `dir`, through the same crate.
+    fn other_holder(dir: &Path) -> greenharness_slots::Lease {
+        let mut waiter = other_waiter(dir);
+        match waiter.poll().expect("poll") {
+            greenharness_slots::Poll::Granted(lease) => lease,
+            greenharness_slots::Poll::Waiting(q) => panic!("the slot was free: {q:?}"),
+        }
+    }
+
+    fn other_waiter(dir: &Path) -> greenharness_slots::Waiter {
+        greenharness_slots::Waiter::new_in(
+            dir,
+            greenharness_slots::Sizing::Fixed(1),
+            1,
+            greenharness_slots::Holder::here("other", "cargo test"),
+        )
+        .expect("waiter")
+    }
+
+    /// relais's rows of `outcome` in the slot journal.
+    fn rows(slots: &Path, outcome: &str) -> usize {
+        let journal = std::fs::read_to_string(slots.join("waits.jsonl")).unwrap_or_default();
+        journal
+            .lines()
+            .filter(|l| l.contains("\"tool\":\"relais\""))
+            .filter(|l| l.contains(&format!("\"outcome\":\"{outcome}\"")))
+            .count()
+    }
+
+    fn profile(setup: Vec<CommandSpec>) -> VerificationProfile {
+        VerificationProfile {
+            setup,
+            commands: Vec::new(),
+            amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
+            inputs: Vec::new(),
+            cache_baseline: false,
+        }
+    }
+
+    /// Step `n` writes the held marker it sees and the holder records.
+    fn step(n: usize, slots: &Path) -> CommandSpec {
+        let mut spec = sh(&format!(
+            "printf %s \"$GREENHARNESS_HOST_SLOT\" > marker{n}; \
+             cat \"$SLOTS\"/holders/*.who > holder{n}"
+        ));
+        spec.env.insert("SLOTS".into(), slots.display().to_string());
+        spec
+    }
+
+    fn admission_on<'a>(
+        gate: &'a Recording,
+        run: &str,
+        slots: &Path,
+        events_dir: &Path,
+    ) -> HeavyAdmission<'a> {
+        register(&gate.inner, run);
+        let mut kept = admission(gate, run, 1, 4);
+        kept.slots = Some(slots.to_path_buf());
+        kept.sizing = Some(greenharness_slots::Sizing::Fixed(1));
+        kept.events =
+            Events::for_run_on(run, events_dir, crate::protocol::Wire::to(std::io::sink()));
+        kept
+    }
+
+    fn events(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default()
+    }
+
+    /// Joins the host-slot line after step 0 and polls once after each step,
+    /// noting how many queue sleeps there were by then.
+    struct JoinsBehind {
+        slots: PathBuf,
+        sleeper: Arc<Advancing>,
+        other: Option<greenharness_slots::Waiter>,
+        waiting: Vec<bool>,
+        slept: Vec<usize>,
+    }
+
+    impl SetupGate for JoinsBehind {
+        fn skip(&mut self, _: usize, _: &CommandSpec) -> bool {
+            false
+        }
+
+        fn ran(&mut self, index: usize, _: &CommandSpec, _: bool) {
+            self.slept
+                .push(self.sleeper.slept.lock().expect("sleeps").len());
+            if index == 0 {
+                self.other = Some(other_waiter(&self.slots));
+            }
+            if let Some(other) = &mut self.other {
+                let polled = other.poll().expect("poll");
+                self.waiting
+                    .push(matches!(polled, greenharness_slots::Poll::Waiting(_)));
+            }
+        }
+    }
+
+    /// The starvation in miniature, fixed: 3 steps, 1 slot held by another
+    /// tool for the first 3 s. The first step waits once; a waiter that joins
+    /// after it never gets the slot between steps; one `slots::take` (one
+    /// `admitted` row), one `released` row, one admission-budget spend.
+    #[test]
+    fn a_setup_takes_one_host_slot_for_all_its_steps() {
+        let work = temp_dir("kept-setup");
+        let slots = slot_dir("setup");
+        let held = Arc::new(Mutex::new(Some(other_holder(&slots))));
+        let gate = Recording::new(gate_with(1));
+        let clock = ManualClock::new();
+        let mut kept = admission_on(&gate, "run-k", &slots, &work);
+        kept.budgets = budgets_on(&clock, 50);
+        kept.poll = Duration::from_secs(1);
+        let release = Arc::clone(&held);
+        let sleeper = Advancing::then(&clock, move |number| {
+            if number >= 3 {
+                release.lock().expect("held").take();
+            }
+        });
+        kept.sleeper = sleeper.clone();
+        let steps = profile((0..3).map(|n| step(n, &slots)).collect());
+        let mut joins = JoinsBehind {
+            slots: slots.clone(),
+            sleeper: Arc::clone(&sleeper),
+            other: None,
+            waiting: Vec::new(),
+            slept: Vec::new(),
+        };
+        let outcomes = run_setup_gated_within(SetupRun {
+            dir: &work,
+            profile: &steps,
+            logs_dir: &work.join("logs"),
+            prefix: "base",
+            events: &kept.events,
+            cancel: None,
+            gate: &mut joins,
+            admission: &kept,
+        })
+        .expect("setup");
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes.iter().all(|o| !o.failed()), "{outcomes:?}");
+        // One wait, in the first step, charged once: every queue sleep
+        // happened before step 0 ended (at least the 3 the holder needed;
+        // a poll can also find the admission lock busy), and the admission
+        // budget holds exactly those 1 s sleeps.
+        let journal = std::fs::read_to_string(slots.join("waits.jsonl")).unwrap_or_default();
+        let slept = sleeper.slept.lock().expect("sleeps").len();
+        assert!(slept >= 3, "{slept} sleeps: {journal}");
+        assert_eq!(
+            joins.slept,
+            vec![slept; 3],
+            "no step after the first slept: {journal}"
+        );
+        assert_eq!(
+            kept.budgets.waited(crate::policy::WaitKind::Admission),
+            Duration::from_secs(u64::try_from(slept).expect("small"))
+        );
+        assert_eq!(kept.budgets.exhausted(), None);
+        // The waiter that joined after step 0 waited through every step.
+        assert_eq!(joins.waiting, vec![true, true, true]);
+        // Every `slots::take` ends in one row with `waited_ms` (admitted or
+        // deferred): exactly one take for the 3 steps.
+        let journal = std::fs::read_to_string(slots.join("waits.jsonl")).expect("journal");
+        let takes = journal
+            .lines()
+            .filter(|l| l.contains("\"tool\":\"relais\"") && l.contains("\"waited_ms\""))
+            .count();
+        assert_eq!(takes, 1, "one slots::take for 3 steps: {journal}");
+        assert_eq!(rows(&slots, "admitted"), 1);
+        assert_eq!(rows(&slots, "released"), 1);
+        // ...and gets the slot once the setup is over.
+        let mut other = joins.other.take().expect("joined");
+        assert!(matches!(
+            other.poll().expect("poll"),
+            greenharness_slots::Poll::Granted(_)
+        ));
+        for (n, outcome) in outcomes.iter().enumerate() {
+            let marker = std::fs::read_to_string(work.join(format!("marker{n}"))).expect("marker");
+            assert_eq!(marker, HELD_MARKER, "step {n} runs under the held marker");
+            let holder = std::fs::read_to_string(work.join(format!("holder{n}"))).expect("holder");
+            assert!(
+                holder.contains(&format!("\"command\":\"{}\"", outcome.label)),
+                "step {n} is the named holder: {holder}"
+            );
+        }
+        let written = events(&work);
+        assert_eq!(written.matches("host_slot_kept").count(), 2, "{written}");
+        let first_kept = written.find("host_slot_kept").expect("kept");
+        assert!(
+            written
+                .rfind("waiting_for_slot")
+                .is_none_or(|at| at < first_kept),
+            "no step after the first waits: {written}"
+        );
+        std::fs::remove_dir_all(&slots).ok(); // best-effort: a scratch dir
+    }
+
+    /// Cancels the setup after step 0.
+    struct CancelsAfterFirst<'c>(&'c AtomicBool);
+
+    impl SetupGate for CancelsAfterFirst<'_> {
+        fn skip(&mut self, _: usize, _: &CommandSpec) -> bool {
+            false
+        }
+
+        fn ran(&mut self, _: usize, _: &CommandSpec, _: bool) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A setup that fails at its first step, and one cancelled after it,
+    /// each give the kept slot back exactly once.
+    #[test]
+    fn a_failed_or_cancelled_setup_gives_its_slot_back_once() {
+        let work = temp_dir("kept-fail");
+        let slots = slot_dir("fail");
+        let gate = Recording::new(gate_with(1));
+        let failing = admission_on(&gate, "run-f", &slots, &work);
+        let steps = profile(vec![sh("exit 1"), step(1, &slots)]);
+        let outcomes = run_setup_gated_within(SetupRun {
+            dir: &work,
+            profile: &steps,
+            logs_dir: &work.join("logs"),
+            prefix: "base",
+            events: &failing.events,
+            cancel: None,
+            gate: &mut crate::verify::RunEveryStep,
+            admission: &failing,
+        })
+        .expect("setup");
+        assert_eq!(outcomes.len(), 1, "stops at the failure");
+        assert_eq!(rows(&slots, "admitted"), 1);
+        assert_eq!(rows(&slots, "released"), 1);
+
+        let cancel = AtomicBool::new(false);
+        let cancelled = admission_on(&gate, "run-c", &slots, &work);
+        let steps = profile(vec![step(0, &slots), step(1, &slots)]);
+        run_setup_gated_within(SetupRun {
+            dir: &work,
+            profile: &steps,
+            logs_dir: &work.join("logs"),
+            prefix: "cand",
+            events: &cancelled.events,
+            cancel: Some(&cancel),
+            gate: &mut CancelsAfterFirst(&cancel),
+            admission: &cancelled,
+        })
+        .expect("a cancel ends the setup, not the call");
+        assert_eq!(rows(&slots, "admitted"), 2);
+        assert_eq!(rows(&slots, "released"), 2);
+        std::fs::remove_dir_all(&slots).ok(); // best-effort: a scratch dir
+    }
+
+    fn labelled<'a>(label: &'a str, env: &'a BTreeMap<String, String>, weight: u32) -> Ask<'a> {
+        Ask {
+            phase: "base-setup",
+            label,
+            weight,
+            env,
+            cancel: None,
+        }
+    }
+
+    /// Under an open kept slot, the second command runs under the first's
+    /// slot with the marker, and the holder record names it.
+    #[test]
+    fn a_second_command_under_a_kept_slot_is_relabelled_not_queued() {
+        let work = temp_dir("kept-reuse");
+        let slots = slot_dir("reuse");
+        let gate = Recording::new(gate_with(1));
+        let kept = admission_on(&gate, "run-r", &slots, &work);
+        let none = BTreeMap::new();
+        let open = kept.keep_slot();
+        drop(kept.admit(&labelled("step-1", &none, 1)).expect("first"));
+        let second = kept.admit(&labelled("step-2", &none, 1)).expect("second");
+        assert_eq!(second.host_slots(), 1);
+        assert_eq!(
+            second.env().get(HOST_SLOT_ENV).map(String::as_str),
+            Some(HELD_MARKER)
+        );
+        let record =
+            std::fs::read_to_string(slots.join("holders/slot-0.who")).expect("holder record");
+        assert!(record.contains("\"command\":\"step-2\""), "{record}");
+        drop(second);
+        assert_eq!(rows(&slots, "admitted"), 1);
+        assert_eq!(rows(&slots, "released"), 0, "kept past the command");
+        drop(open);
+        assert_eq!(rows(&slots, "released"), 1);
+        std::fs::remove_dir_all(&slots).ok(); // best-effort: a scratch dir
+    }
+
+    /// Takes the only coordinator token for another run after step 0.
+    struct TakesTheToken<'g>(&'g LocalGate);
+
+    impl SetupGate for TakesTheToken<'_> {
+        fn skip(&mut self, _: usize, _: &CommandSpec) -> bool {
+            false
+        }
+
+        fn ran(&mut self, index: usize, _: &CommandSpec, _: bool) {
+            if index == 0 {
+                register(self.0, "run-other");
+                assert_eq!(
+                    self.0
+                        .admit(&heavy_request("other", "run-other", 1))
+                        .expect("answered"),
+                    Decision::Granted
+                );
+            }
+        }
+    }
+
+    /// The coordinator queues step 1 of a setup: the kept slot is given back
+    /// before that wait (never a slot held while waiting for a token), and
+    /// the step takes a slot afresh.
+    #[test]
+    fn a_coordinator_wait_gives_the_kept_slot_back_first() {
+        let work = temp_dir("kept-coord");
+        let slots = slot_dir("coord");
+        let gate = Arc::new(Recording::new(gate_with(1)));
+        let clock = ManualClock::new();
+        let mut kept = admission_on(&gate, "run-q", &slots, &work);
+        kept.budgets = budgets_on(&clock, 50);
+        kept.poll = Duration::from_secs(1);
+        let other = Arc::clone(&gate);
+        kept.sleeper = Advancing::then(&clock, move |number| {
+            if number == 1 {
+                // The other run's command ends: its token comes back.
+                other.inner.release("other").expect("release");
+                other.inner.settle("other", Some(0)).expect("settle");
+            }
+        });
+        let steps = profile(vec![step(0, &slots), step(1, &slots)]);
+        let outcomes = run_setup_gated_within(SetupRun {
+            dir: &work,
+            profile: &steps,
+            logs_dir: &work.join("logs"),
+            prefix: "base",
+            events: &kept.events,
+            cancel: None,
+            gate: &mut TakesTheToken(&gate.inner),
+            admission: &kept,
+        })
+        .expect("setup");
+        assert!(outcomes.iter().all(|o| !o.failed()), "{outcomes:?}");
+        let written = events(&work);
+        assert!(
+            written.contains("kept_slot_given_back")
+                && written.contains("the coordinator queued this step"),
+            "{written}"
+        );
+        assert_eq!(rows(&slots, "admitted"), 2, "taken afresh");
+        assert_eq!(rows(&slots, "released"), 2);
+        std::fs::remove_dir_all(&slots).ok(); // best-effort: a scratch dir
+    }
+
+    /// The slot directory becomes unusable between two commands: the kept
+    /// slot is given back, and the next command runs queued nowhere.
+    #[test]
+    fn an_unusable_slot_dir_gives_the_kept_slot_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = temp_dir("kept-unusable");
+        let slots = slot_dir("unusable");
+        let gate = Recording::new(gate_with(1));
+        let kept = admission_on(&gate, "run-x", &slots, &work);
+        let none = BTreeMap::new();
+        let open = kept.keep_slot();
+        drop(kept.admit(&labelled("step-1", &none, 1)).expect("first"));
+        std::fs::set_permissions(&slots, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let second = kept.admit(&labelled("step-2", &none, 1)).expect("second");
+        assert_eq!(second.host_slots(), 0, "queued nowhere");
+        assert!(
+            events(&work).contains("the host slots are no longer usable"),
+            "{}",
+            events(&work)
+        );
+        assert_eq!(rows(&slots, "released"), 1, "given back before step 2 ran");
+        drop(second);
+        drop(open);
+        assert_eq!(rows(&slots, "released"), 1);
+        std::fs::remove_dir_all(&slots).ok(); // best-effort: a scratch dir
+    }
+
+    /// An unreachable coordinator on the second command: the kept slot is
+    /// given back before the retry sleep.
+    #[test]
+    fn an_unreachable_coordinator_gives_the_kept_slot_back_first() {
+        let work = temp_dir("kept-down");
+        let slots = slot_dir("down");
+        let gate = Recording::new(gate_with(1));
+        let mut kept = admission_on(&gate, "run-u2", &slots, &work);
+        let clock = ManualClock::new();
+        kept.budgets = budgets_on(&clock, 50);
+        kept.sleeper = Advancing::new(&clock);
+        let none = BTreeMap::new();
+        let open = kept.keep_slot();
+        drop(kept.admit(&labelled("step-1", &none, 1)).expect("first"));
+        gate.down.store(1, Ordering::SeqCst);
+        let second = kept.admit(&labelled("step-2", &none, 1)).expect("second");
+        let written = events(&work);
+        assert!(
+            written.contains("the coordinator could not be reached"),
+            "{written}"
+        );
+        assert_eq!(rows(&slots, "admitted"), 2);
+        drop(second);
+        drop(open);
+        assert_eq!(rows(&slots, "released"), 2);
+        std::fs::remove_dir_all(&slots).ok(); // best-effort: a scratch dir
+    }
+
+    /// A step of another weight gives the kept slot back and takes its own.
+    #[test]
+    fn a_step_of_another_weight_takes_its_own_slot() {
+        let work = temp_dir("kept-weight");
+        let slots = slot_dir("weight");
+        let gate = Recording::new(gate_with(2));
+        register(&gate.inner, "run-w");
+        let mut kept = admission(&gate, "run-w", 2, 4);
+        kept.slots = Some(slots.clone());
+        kept.sizing = Some(greenharness_slots::Sizing::Fixed(2));
+        kept.events =
+            Events::for_run_on("run-w", &work, crate::protocol::Wire::to(std::io::sink()));
+        let none = BTreeMap::new();
+        let open = kept.keep_slot();
+        drop(kept.admit(&labelled("step-1", &none, 1)).expect("first"));
+        let second = kept.admit(&labelled("step-2", &none, 2)).expect("second");
+        assert_eq!(second.host_slots(), 2);
+        assert!(events(&work).contains("asks a weight of 2, not 1"));
+        drop(second);
+        drop(open);
+        assert_eq!(rows(&slots, "admitted"), 2);
+        assert_eq!(rows(&slots, "released"), 2);
+        std::fs::remove_dir_all(&slots).ok(); // best-effort: a scratch dir
+    }
+
+    /// The disk falls short after the coordinator's grant: the kept slot is
+    /// given back before the disk wait, as the step's own slot was before.
+    #[test]
+    fn a_disk_short_after_the_grant_gives_the_kept_slot_back() {
+        let work = temp_dir("kept-disk");
+        let slots = slot_dir("disk");
+        let disk = StubDisk::with(10 * GIB);
+        let gate = Recording::new(gate_with(1));
+        let clock = ManualClock::new();
+        let mut kept = checking(admission_on(&gate, "run-d2", &slots, &work), 8 * GIB, &disk);
+        kept.budgets = budgets_on(&clock, 50);
+        let refill = Arc::clone(&disk);
+        kept.sleeper = Advancing::then(&clock, move |_| refill.set(10 * GIB));
+        let none = BTreeMap::new();
+        let open = kept.keep_slot();
+        drop(kept.admit(&labelled("step-1", &none, 1)).expect("first"));
+        disk.set(5 * GIB);
+        let second = kept.admit(&labelled("step-2", &none, 1)).expect("second");
+        assert!(
+            events(&work).contains("the disk fell short after the grant"),
+            "{}",
+            events(&work)
+        );
+        assert_eq!(rows(&slots, "admitted"), 2);
+        drop(second);
+        drop(open);
+        assert_eq!(rows(&slots, "released"), 2);
+        std::fs::remove_dir_all(&slots).ok(); // best-effort: a scratch dir
+    }
 }

@@ -14,6 +14,16 @@ Under `--json`, a failure that is not a refusal now prints the same
 `learn cycle` printed nothing on stdout before. The stderr line and the exit
 code are unchanged, and without `--json` stdout stays empty.
 
+A run's setup now takes one host slot and keeps it for all its steps. Before,
+each step (`make toolchain`, `yarn install`, …) went back to the tail of
+greengate's line, so under load a setup waited again at every step and could
+end `admission_wait_exhausted`. Each later step relabels the same holder record,
+and the journal shows one `admitted` and one `released` row per setup. The run
+never waits on the coordinator while it keeps the slot: when a step is queued
+there, or the coordinator cannot be reached, the slot is given back first, and
+a `kept_slot_given_back` decision says why. A reused slot emits
+`host_slot_kept`.
+
 ## v0.89.0
 
 A failed renewal of a kept handoff (the claim file cannot be rewritten) is

@@ -45,8 +45,9 @@ pub use end::CheckEnd;
 pub use heavy::{
     ancestor_holds_slots, child_environment, default_heavy_commands, dispatch_id, heavy_cap,
     host_plan, host_share, logical_cores, overweight, parallelism, Admitted, Ask, HeavyAdmission,
-    HostPlan, HostSlots, HostSlotsOff, Jitter, LeaseStop, Placement, SeededJitter, Sleeper,
-    SlotLineEnd, ThreadSleeper, Tries, ANNOUNCE_EVERY, HOST_SLOT_ENV, LEASE_HEARTBEAT_EVERY,
+    HostPlan, HostSlots, HostSlotsOff, Jitter, KeptSlot, LeaseStop, Placement, SeededJitter,
+    SetupSlot, Sleeper, SlotLineEnd, ThreadSleeper, Tries, ANNOUNCE_EVERY, HOST_SLOT_ENV,
+    LEASE_HEARTBEAT_EVERY,
 };
 pub use holdout_run::{HoldoutAttempt, HoldoutRun, HoldoutTest, HoldoutVerdict};
 pub use junit::{parse_junit, parse_report, JunitArtifact, JunitError, JunitReport, TestOutcome};
@@ -1941,6 +1942,8 @@ pub struct SetupRun<'a> {
 
 /// [`run_setup_gated`] under a run's budgets and heavy leases: each step
 /// waits for its lease, then is clipped to what is left when it starts.
+/// The host slot the first step takes is kept for the whole setup, so a
+/// later step does not join the line again (amont host-slot-admission t07).
 pub fn run_setup_gated_within(run: SetupRun<'_>) -> Result<Vec<CheckOutcome>, VerifyError> {
     let SetupRun {
         dir,
@@ -1952,6 +1955,8 @@ pub fn run_setup_gated_within(run: SetupRun<'_>) -> Result<Vec<CheckOutcome>, Ve
         gate,
         admission,
     } = run;
+    // Dropped on every way out: the kept slot goes back with it.
+    let _kept = admission.keep_slot();
     let mut outcomes = Vec::new();
     for (index, command) in profile.setup.iter().enumerate() {
         if gate.skip(index, command) {
