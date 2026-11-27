@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.91.0
+
 `relais programme check` now reports two tickets in one programme directory
 whose ids share a leading `<letters><digits>` prefix (`f12-a.md` and
 `f12-b.md`), and names the next free number. The new `--with-ref <ref>` flag
