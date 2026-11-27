@@ -1055,7 +1055,12 @@ impl<'a> RunEngine<'a> {
             &MARKER_LOG,
         );
         if let Some(line) = said {
+            // Said where `host_slots_off` is: on stderr and in the events.
             eprintln!("{line}");
+            self.events.emit(Event::EnvironmentWarning {
+                what: "host_marker_refused".into(),
+                detail: line,
+            });
         }
         let admission = verify::HeavyAdmission {
             gate: self.config.gate,

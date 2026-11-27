@@ -99,7 +99,8 @@ pub const COORDINATOR_UNREACHABLE_CLASS: &str = "coordinator_unreachable";
 /// rollout). The runner reads it at its boundary, holds the once-per-process
 /// `log`, and prints the line. `queues` is the slot directory this run would
 /// queue on, when the host queue is on there: a refused marker is then
-/// journalled there once per log, and its line returned once.
+/// journalled there once per log, and its line returned once. A held marker
+/// never returns a line: the crate has none for an accepted marker.
 // holds-until: no machine sets `shared_host_slots`. The row goes to the
 // run's queue directory while the lease is judged against the slots crate's
 // own directory; the two differ only under that setting, and the phase-3
@@ -109,9 +110,13 @@ pub fn ancestor_holds_slots(
     queues: Option<&Path>,
     log: &greenharness_slots::MarkerLog,
 ) -> (bool, Option<String>) {
-    let said = queues
-        .filter(|dir| log.record(dir, "relais", marker))
-        .and_then(|_| greenharness_slots::refused_line("relais", marker));
+    // `record` appends the journal row: an action, so a match, not a filter.
+    let said = match queues {
+        Some(dir) if log.record(dir, "relais", marker) => {
+            greenharness_slots::refused_line("relais", marker)
+        }
+        _ => None,
+    };
     (marker.is_held(), said)
 }
 
