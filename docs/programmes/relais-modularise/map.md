@@ -33,7 +33,7 @@ met: the build time after a one-line edit, and the size of the largest file.
   cannot name another programme, so t04 reads that programme's t01 answer by
   hand.
 - **Governing decisions:** resolve before deciding a ticket:
-  `harness.bundle-names` (ADR-0076), `harness.tool-boundaries` (ADR-0064),
+  `harness.bundle-names` (ADR-0076), `harness.tool-boundaries` (head: decisions ADR-0075),
   `work.programme-map` (ADR-0084).
 - **Neighbouring programmes:** relais `docs/programmes/epic-vocabulary`
   (the word programme becomes epic), `homelab-offload` and `phase8-learner`
@@ -55,13 +55,43 @@ met: the build time after a one-line edit, and the size of the largest file.
   seam in `wait_in_line`, and `load_average`), so `admission`, `coordinator`
   and `procs` stay relais's own and t02 weighs them as a crate
   ([t03](t03-slot-overlap.md)).
+- Crates and order: the production module graph has no cycle (only rustdoc
+  links close one), so eight crates are cut bottom-up (`core`, `policy`,
+  `admission`, `ledger`, `routing`, `verify`, `report`, then `programme`
+  after the epic-vocabulary rename), the rest staying in the binary. No crate
+  becomes its own tool; the stories wait for t04's names. Targets: a one-line
+  edit in `verify/` or `runner/` rebuilds in ≤ 10 s, and no production file
+  exceeds 700 non-blank lines (56 files do today)
+  ([t02](t02-seams.md)).
+
+## Handoff
+
+2026-11-27, boundary: t02 closed (grilling with the person).
+
+- Done: t01 (#619), t03 (#621), t02 (this change).
+- Live state: nothing in flight for this programme. epic-vocabulary's t01
+  (the vocabulary) is still open, and its rename implementation must land
+  before the `programme` crate is cut.
+- Next, in order: t04 (names, `hitl`: needs the person), then the split
+  stories once named. t05 (wait-loop cancel seam, `afk`) is ready now and
+  independent; t06 (what slots-off means, `hitl`) is ready.
+- Accepted gaps: the rebuild baseline is still t01's busy-host sample; the
+  first split story re-measures it on a quiet host. Line counts in t03 are
+  estimates from symbol ranges.
+- Lesson: a module graph read with comments included shows cycles that
+  are only rustdoc links; drop comment lines before judging layers.
 
 ## Not yet specified
 
-- Workspace-split implementation stories, one per crate, after t02.
-- Their order against the `epic-vocabulary` rename implementation: both
-  rewrite `crates/relais/src/programme/` and `cli/programme.rs`, so one lands
-  before the other starts. t02 owns the answer.
+- Workspace-split implementation stories, one per crate in t02's order,
+  after t04 names them. The first re-measures the rebuild baseline on a quiet
+  host; the rustdoc-link cleanup and the `workspace::git_command` move come
+  before any cut.
+- File-split stories for the 56 production files over 700 lines, each after
+  the crate it sits in is cut; t01's job sections for `verify`, `admission`,
+  `coordinator` and `report` are where the four largest start. Whether a
+  check enforces the 700-line ceiling (a ratchet over the files still above
+  it) is open.
 
 ## Out of scope
 
