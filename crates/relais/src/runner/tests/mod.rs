@@ -9008,6 +9008,10 @@ fn a_settle_whose_answer_was_lost_is_retried_and_booked_once() {
         1,
         "{decisions:?}"
     );
+    assert!(
+        !decisions.contains(&"gate_settle_unknown_first".to_string()),
+        "a retry's `Unknown` is unconfirmed, not a first: {decisions:?}"
+    );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
@@ -9022,6 +9026,7 @@ fn a_settle_no_coordinator_answers_is_tried_twice_then_reported_once() {
         .filter(|what| what == "gate_settle_failed")
         .count();
     assert_eq!(failed, 1);
+    assert!(!decisions_of(&fixture, &run_id).contains(&"gate_settle_unknown_first".to_string()));
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
@@ -9035,14 +9040,16 @@ fn a_refused_settle_is_not_retried_and_is_reported_once() {
         .filter(|what| what == "gate_settle_failed")
         .count();
     assert_eq!(failed, 1);
+    assert!(!decisions_of(&fixture, &run_id).contains(&"gate_settle_unknown_first".to_string()));
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
-/// an-t36: only a RETRY's `Unknown` is unconfirmed. A coordinator that
-/// answers the first settle `Unknown` has answered: the settle is confirmed,
-/// not asked again, and no `gate_settle_unconfirmed` or `gate_settle_failed`
-/// is recorded. Removing the `tries > 1` guard in `settle_with_retry` fails
-/// this test.
+/// an-t36, an-t38: only a RETRY's `Unknown` is unconfirmed. A coordinator
+/// that answers the first settle `Unknown` has answered: the settle is not
+/// asked again and no `gate_settle_unconfirmed` or `gate_settle_failed` is
+/// recorded, but one `gate_settle_unknown_first` says the coordinator had no
+/// such dispatch. Removing the `tries > 1` guard in `settle_with_retry` fails
+/// the unconfirmed assertion; removing the emit fails the last.
 #[test]
 fn a_first_settle_answered_unknown_stays_confirmed() {
     let (fixture, gate, run_id) = run_through_settle_fault(Fault::SettleUnknownFirst);
@@ -9069,7 +9076,28 @@ fn a_first_settle_answered_unknown_stays_confirmed() {
         !decisions.contains(&"gate_settle_failed".to_string()),
         "{decisions:?}"
     );
+    assert_eq!(
+        decisions
+            .iter()
+            .filter(|what| *what == "gate_settle_unknown_first")
+            .count(),
+        1,
+        "a first `Unknown` is said once: {decisions:?}"
+    );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+/// an-t38: the stderr line for a first `Unknown` is one line that names the
+/// dispatch and the command, and carries no `dropped_micros=`, the token
+/// `relais counter` sums from `coordinator.log`.
+#[test]
+fn the_first_unknown_line_names_the_dispatch_and_stays_off_the_counter() {
+    let line = crate::runner::launch::unknown_first_line("disp-7", &MicroUsd::from_micros(250_000));
+    assert!(!line.contains('\n'), "{line}");
+    assert!(line.starts_with("relais: dispatch disp-7: "), "{line}");
+    assert!(line.contains("settle of $0.25 found no dispatch"), "{line}");
+    assert!(line.contains("`relais coordinator status`"), "{line}");
+    assert!(!line.contains("dropped_micros="), "{line}");
 }
 
 /// R7: `verifying` is a state the ledger shows, not one the runner
