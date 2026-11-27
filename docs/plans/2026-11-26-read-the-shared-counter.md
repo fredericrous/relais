@@ -156,6 +156,7 @@ operator to check the primary.
 ## Decision log
 
 - 2026-11-26: `stamped` made `pub` (the plan said `pub(crate)`): the bin crate's test reads the daemon's stamp through it. The log parser and verdicts live in `cli/counter.rs`, not a lib module.
+- 2026-11-27: Windows CI showed the added subcommand overflowed the 1 MiB main stack at startup (140 integration failures); `crates/relais/build.rs` now links the Windows binary with an 8 MiB stack. Not in the reviewed plan; reviewed as a delta.
 - 2026-11-26: the panel could not be bound by `plan-review record` (no transcript for a ticket agent); its reviews are in the `.reviews.md` sidecar.
 
 
