@@ -489,6 +489,11 @@ mod tests {
         names.iter().map(|name| name.to_string()).collect()
     }
 
+    /// `file` under the test directory `d`, with the platform's separator.
+    fn in_d(file: &str) -> String {
+        Path::new("d").join(file).display().to_string()
+    }
+
     /// `(file, message)` of each duplicate found, in order.
     fn duplicates(own: &[&str], from_ref: &[&str]) -> Vec<(String, String)> {
         duplicate_ids(
@@ -524,11 +529,17 @@ mod tests {
             vec![
                 (
                     "f12-b.md".to_string(),
-                    "id f12 is also used by d/f12-a.md; renumber to f13".to_string()
+                    format!(
+                        "id f12 is also used by {}; renumber to f13",
+                        in_d("f12-a.md")
+                    )
                 ),
                 (
                     "f12-c.md".to_string(),
-                    "id f12 is also used by d/f12-a.md; renumber to f14".to_string()
+                    format!(
+                        "id f12 is also used by {}; renumber to f14",
+                        in_d("f12-a.md")
+                    )
                 ),
             ]
         );
@@ -540,7 +551,10 @@ mod tests {
             duplicates(&["f71-b"], &["f71-a", "f72-z"]),
             vec![(
                 "f71-b.md".to_string(),
-                "id f71 is also used by d/f71-a.md on origin/main; renumber to f73".to_string()
+                format!(
+                    "id f71 is also used by {} on origin/main; renumber to f73",
+                    in_d("f71-a.md")
+                )
             )]
         );
     }
@@ -558,7 +572,10 @@ mod tests {
             duplicates(&[&format!("{huge}-a"), &format!("{huge}-b")], &[]),
             vec![(
                 format!("{huge}-b.md"),
-                format!("id {huge} is also used by d/{huge}-a.md")
+                format!(
+                    "id {huge} is also used by {}",
+                    in_d(&format!("{huge}-a.md"))
+                )
             )]
         );
     }
