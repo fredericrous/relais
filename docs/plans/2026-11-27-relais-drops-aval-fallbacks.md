@@ -82,7 +82,7 @@ says to rename the line, never a silent read.
   granted again.
 
 ## Phases
-- [ ] Phase 1 — one key, one binary: `crates/relais/src/policy/mod.rs`,
+- [x] Phase 1 — one key, one binary: `crates/relais/src/policy/mod.rs`,
   `crates/relais/src/tooling.rs`, `crates/relais/src/context/mod.rs`,
   `crates/relais/src/runner/preflight.rs`, `crates/relais/src/verify/mod.rs`,
   `crates/relais/src/doctor/mod.rs`, `crates/relais/src/trust.rs`,
@@ -139,20 +139,42 @@ says to rename the line, never a silent read.
   cosmetic and collides with three open branches; follow-up filed.
 - 2026-11-27 — Refuse `aval =` with its own error before the typed parse
   (not as an unknown field), because the person must be told the fix.
+- 2026-11-27 — Code review changed the texts the Behaviour quotes: the
+  refusal says "rename the key aval to greentopo and keep its value" (a
+  copied `"required"` example could harden an optional key), and "… and
+  greentopo is already set: remove the aval line" when both are set; the
+  missing-greentopo blocker shows "(binary …)" only for a declared `bin`;
+  doctor's FAIL line names the fix; a dangling `greentopo` blocks the run
+  as "found at <path> but it is not a runnable file". `context/guidance.rs`
+  changed too (doc comments and the too-old gap text, which still said
+  "(greentopo or aval)").
+- 2026-11-27 — The re-grant list is empty: every granted checkout on this
+  Mac holds a repository grant (`[trust_repos]`, ADR-0007), which the hash
+  move does not touch; none is legacy-exact. This corrects the ticket's
+  "every repository grants trust again".
 
 ## Verification
-| Check | Input | Expected |
-|---|---|---|
-| hash | serialized fixture policy | `integrations` key `greentopo`, no `aval`; pins moved |
-| suite | `greengate run` gates (fmt, clippy, tests) | pass, 0 failed |
-| refusal (CLI) | `relais plan --task <valid task file>` in a scratch repo whose `relais.toml` says `aval = "required"` | exit 2, stderr contains `rename the key aval to greentopo`; with `greentopo =` it does not exit 2 |
-| refusal (doctor) | `relais doctor` in the same repo | exit 3, the rename message on the `relais.toml` FAIL line |
-| JSON | `Integrations` from `{"aval":"required"}` | Err, unknown field `aval` |
-| new key | `relais doctor` in a scratch repo with `greentopo = "required"` | `greentopo` found, version printed |
-| no fallback | `relais doctor` with only `aval` on a scratch PATH | `greentopo` not installed; no line says `aval` |
-| broken install | dangling `greentopo` on a scratch PATH | blocks, not "not installed" |
-| declared bin | `greentopo = { mode = "required", bin = "tools/greentopo" }` with that file present | no `IntegrationMissing` |
-| real repo | after install, `relais run` in one fleet repository with `[trust_repos]` | runs; commands-changed warning once, not on the second run |
-| pins | `cargo test -p relais --lib install::` and `policy::tests` | 0 failed, refusal tests in three spellings run |
+Observed 2026-11-27 on the branch build, every CLI row with a scratch
+`RELAIS_STATE_DIR` in scratch repositories (`/tmp/t22-f2/pilot.sh`).
+
+| Check | Input | Expected | Observed |
+|---|---|---|---|
+| hash | serialized fixture policy | `integrations` key `greentopo`, no `aval`; pins moved | `greentopo_is_the_serialized_integration_key` passes; five pins moved (own policy `93ca8f03…` → `bc14c309…`, v1 `62accc6a…` → `1f9f2b43…`, recipe and tiered pins) |
+| suite | `greengate run` gates (fmt, clippy, tests) | pass, 0 failed | pre-commit gate on the fix commit: 31 checks passed (whole `cargo test`); clippy `--all-targets -D warnings` clean after the rebase |
+| refusal (CLI) | `relais plan --task <valid task file>` in a scratch repo whose `relais.toml` says `aval = "required"` | exit 2, stderr contains `rename the key aval to greentopo`; with `greentopo =` it does not exit 2 | exit 2, stdout empty, stderr `relais: the repository policy …/relais.toml is invalid: [integrations] aval is no longer read: rename the key aval to greentopo and keep its value`; dotted spelling the same; both keys: `… and greentopo is already set: remove the aval line`; with `greentopo =`: exit 3 (missing trust grant), not 2 |
+| refusal (doctor) | `relais doctor` in the same repo | exit 3, the rename message on the `relais.toml` FAIL line | exit 3, `✗ relais.toml  [integrations] aval is no longer read: rename the key aval to greentopo and keep its value` |
+| JSON | `Integrations` from `{"aval":"required"}` | Err, unknown field `aval` | `an_aval_key_that_skips_the_toml_entry_point_is_an_unknown_field` passes (JSON and bare `toml::from_str`) |
+| new key | `relais doctor` in a scratch repo with `greentopo = "required"` | `greentopo` found, version printed | exit 0, `✓ greentopo    required — `greentopo` greentopo 3.0.0` |
+| no fallback | `relais doctor` with only `aval` on a scratch PATH | `greentopo` not installed; no line says `aval` | `✗ greentopo    required by [integrations] and `greentopo` is not on PATH; every run is blocked on it: install …`; the one `aval` in the output is the `aval` repository's URL in the trust line |
+| broken install | dangling `greentopo` on a scratch PATH | blocks, not "not installed" | run probe: `a_dangling_greentopo_blocks_as_a_broken_install` ("found at … but it is not a runnable file"); spawn: `a_dangling_greentopo_is_a_tool_failure_not_absence`; doctor blocks but says "not on PATH" (deliberate, see review) |
+| declared bin | `greentopo = { mode = "required", bin = "tools/greentopo" }` with that file present | no `IntegrationMissing` | doctor `✓ greentopo    required — `…/tools/greentopo` greentopo 3.0.0`; relative name: `a_relative_name_with_a_path_is_checked_as_it_is` |
+| real repo | after install, `relais run` in one fleet repository with `[trust_repos]` | runs; commands-changed warning once, not on the second run | Phase 2 row, after the release |
+| pins | `cargo test -p relais --lib install::` and `policy::tests` | 0 failed, refusal tests in three spellings run | 596 passed, 0 failed over `policy:: tooling:: context:: doctor:: verify:: trust:: install::`; `install::` needed no change (no skill or agent text named aval) |
+
+## Implementation review
+- implementation-review: approve-with-changes, then Delta approve-with-changes; guidance text and relative-bin test fixed; plan rows recorded here (81k+107k, 79+22 s).
+- backend: approve-with-changes → approve; both-keys message and broken-install text fixed; deliberate: a declared dangling `bin` keeps the missing text, the spawn hint names it (75k+100k).
+- lang:rust: approve-with-changes ×2; `default_bin`, Option hint, dead assertion fixed; deliberate: the `greentopo_also_set` field and the `then().flatten()` stay, follow-up (64k+87k).
+- unix, tui: approve-with-changes ×2; JSON rename paragraph, fix hints, keep-its-value text fixed; deliberate: doctor's dangling-link wording differs from the run's, follow-up (57k+82k, 56k+82k).
 
 <!-- panel: repos=relais adds=contract reviewers=backend,lang:rust,tui,unix,architect,po body-sha=7ac7ee9c2e09 -->
