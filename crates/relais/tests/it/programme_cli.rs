@@ -1904,15 +1904,40 @@ fn with_ref_reads_the_branch_tickets_when_the_programme_is_read_from_origin() {
 #[test]
 fn with_ref_refuses_an_empty_or_dash_ref_before_reading_anything() {
     let world = World::new("ref-usage");
+    // With no map.md, a check that read the directory first would fail
+    // with another message.
+    std::fs::remove_file(world.dir().join("map.md")).expect("remove map.md");
     for rev in ["", "-x"] {
         let out = world.programme(&["check", "--no-fetch", &format!("--with-ref={rev}")]);
         assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
         assert!(
-            text(&out.stderr).contains("--with-ref"),
+            text(&out.stderr).contains("a ref is not empty and does not start with `-`"),
             "{}",
             text(&out.stderr)
         );
     }
+}
+
+#[test]
+fn with_ref_sharing_no_history_exits_one_with_the_hint() {
+    let world = world_with_trunk_and_feature("ref-orphan", &[]);
+    let repo = world.root.join("alpha");
+    git(&repo, &["checkout", "-q", "--orphan", "lonely"]);
+    commit_all(&world, "unrelated root");
+    git(&repo, &["checkout", "-q", "feature"]);
+    let out = world.programme(&["check", "--no-fetch", "--with-ref", "lonely"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "");
+    let stderr = text(&out.stderr);
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("relais:"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{stderr}");
+    assert!(
+        lines[0].contains("is lonely a ref sharing history with HEAD?"),
+        "{stderr}"
+    );
 }
 
 #[test]

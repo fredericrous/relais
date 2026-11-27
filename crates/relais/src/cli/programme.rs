@@ -492,24 +492,23 @@ pub(crate) fn check_command(
     };
     // Under `--with-ref` the duplicates name the checkout's files, not the
     // ref's, so they carry no `(<ref>) ` tag.
-    let untagged_from = match with_ref {
-        Some(_) => problems.len(),
-        None => usize::MAX,
+    let duplicate_tag = match with_ref {
+        Some(_) => "",
+        None => tag.as_str(),
     };
+    let print = |found: &[relais::programme::model::Problem], tag: &str| {
+        for problem in found {
+            eprintln!(
+                "{}:{}: {tag}{}",
+                dir.join(&problem.file).display(),
+                problem.line,
+                problem.message
+            );
+        }
+    };
+    print(&problems, &tag);
+    print(&duplicates, duplicate_tag);
     problems.extend(duplicates);
-    for (index, problem) in problems.iter().enumerate() {
-        let tag = if index < untagged_from {
-            tag.as_str()
-        } else {
-            ""
-        };
-        eprintln!(
-            "{}:{}: {tag}{}",
-            dir.join(&problem.file).display(),
-            problem.line,
-            problem.message
-        );
-    }
     if !problems.is_empty() {
         eprintln!("{} problems", problems.len());
     }
