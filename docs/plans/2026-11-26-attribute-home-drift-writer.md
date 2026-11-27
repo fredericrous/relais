@@ -296,4 +296,11 @@ plugin):
   because `relais run` starts only through the plugin, which runs the
   installed binary; a branch build cannot be piloted through it.
 
+## Implementation review
+
+- implementation-review approve-with-changes (103k, 80 s; Delta 47k, 48 s): 4 blockers and 4 plan-record findings fixed; Delta blocker `Step::writes(bool)` deliberate: overruled by the person, the private constructor only stores the value and picks no path.
+- backend approve-with-changes (83k, 103 s; Delta approve 32k, 21 s): input trimming, unreadable-agent line, `holds-until:` fixed; `--git-dir` not followed deliberate: such writes still print as Bash calls.
+- lang:rust approve-with-changes (75k, 118 s; Delta 32k, 19 s): relative `-C`/`cd`, `TargetKind`, cache once, extra compare fixed; per-call timestamp parse, writer-name constants, nested `Option` in `Step`, one clone, tool list twice deliberate: low, no behaviour change.
+- architect approve (57k, 39 s): cache once fixed; `WorkerCall` beside `Cause::Call` deliberate: the port's return shape. unix approve (55k, 49 s): no findings.
+
 <!-- panel: repos=relais adds= reviewers=backend,lang:rust,tui,unix,codex body-sha=a20afd906fa8 -->
