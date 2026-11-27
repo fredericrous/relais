@@ -417,15 +417,19 @@ fn writer_cause(name: &str) -> Option<Cause> {
     Some(Cause::Writer { name: name.into() })
 }
 
-/// The repository's `.git/config` as git names it (a resolved path: a
-/// temporary directory may sit behind a symlink).
+/// The repository's `.git/config` as git names it, which is the path the
+/// snapshot records: macOS resolves `/var` to `/private/var`, Windows may
+/// keep an 8.3 short name, and `canonicalize` would differ from both.
 fn repo_config_path(fixture: &Fixture) -> PathBuf {
-    fixture
-        .repo
-        .canonicalize()
-        .expect("the repository exists")
-        .join(".git")
-        .join("config")
+    match crate::homeprint::repo_config(&fixture.repo) {
+        crate::homeprint::RepoConfig::At(path) => path,
+        crate::homeprint::RepoConfig::Unresolved(path) => {
+            panic!(
+                "git could not name the fixture's config: {}",
+                path.display()
+            )
+        }
+    }
 }
 
 fn with_branch_t(fixture: &Fixture) -> String {
@@ -433,9 +437,6 @@ fn with_branch_t(fixture: &Fixture) -> String {
     format!("{before}[branch \"t\"]\n\tremote = origin\n")
 }
 
-// unix: the fixture spells home paths with `/` and `~/` (Windows prints them
-// absolute and joins with `\`).
-#[cfg(unix)]
 #[test]
 fn the_49_rows_path_mix_is_told_apart_by_cause() {
     let fixture = Fixture::new();
@@ -529,33 +530,18 @@ fn netrc_call(fixture: &Fixture, line: String) -> Option<Cause> {
     causes.get(&netrc).cloned().expect("a netrc drift")
 }
 
-// unix: the fixture spells home paths with `/` and `~/` (Windows prints them
-// absolute and joins with `\`).
-#[cfg(unix)]
 #[test]
 fn a_worker_write_to_a_watched_file_is_named_with_its_tool_and_agent() {
-    let calls = [
-        (
-            "Write",
-            tool_use_line(
-                "Write",
-                serde_json::json!({"file_path": "@HOME@/.netrc"}),
-                None,
-            ),
-        ),
-        (
-            "Bash",
-            tool_use_line(
-                "Bash",
-                serde_json::json!({"command": "echo x >> \"$HOME/.netrc\""}),
-                None,
-            ),
-        ),
-    ];
-    for (tool, line) in calls {
+    for tool in ["Write", "Bash"] {
         let fixture = Fixture::new();
         let home = fixture.dir.join("home");
-        let line = line.replace("@HOME@", &home.display().to_string());
+        // Built as JSON, so a Windows home's `\` is escaped, and spelled with
+        // `/` as a tool or shell writes it.
+        let input = match tool {
+            "Write" => serde_json::json!({"file_path": format!("{}/.netrc", home.display())}),
+            _ => serde_json::json!({"command": "echo x >> \"$HOME/.netrc\""}),
+        };
+        let line = tool_use_line(tool, input, None);
         assert_eq!(
             netrc_call(&fixture, line),
             Some(Cause::Call {
@@ -600,9 +586,6 @@ fn bash_in_repo(fixture: &Fixture, command: &str) -> String {
     record.to_string()
 }
 
-// unix: the fixture spells home paths with `/` and `~/` (Windows prints them
-// absolute and joins with `\`).
-#[cfg(unix)]
 #[test]
 fn a_worker_git_config_write_is_a_call_and_a_read_only_git_form_leaves_the_writer() {
     let fixture = Fixture::new();

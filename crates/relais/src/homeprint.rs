@@ -1469,9 +1469,6 @@ mod tests {
         }
     }
 
-    // unix: the fixture spells home paths with `/` and `~/` (Windows prints them
-    // absolute and joins with `\`).
-    #[cfg(unix)]
     #[test]
     fn the_report_lists_unexplained_then_worker_named_then_one_count_line_per_writer() {
         let drifts = [
@@ -1510,16 +1507,18 @@ mod tests {
                 Some(Cause::Unexplained { calls_read: true }),
             ),
         ];
+        // No home: paths print as stored on every platform, so this pins the
+        // order alone; the `~/` form is pinned by its own unix test.
         assert_eq!(
-            report(&drifts, "heading", Some(Path::new("/h"))),
+            report(&drifts, "heading", None),
             vec![
                 "heading",
-                "  ~/.zshrc (modified)",
+                "  /h/.zshrc (modified)",
                 "    unexplained (no worker transcript read)",
-                "  ~/.gitconfig (modified)",
-                "  ~/.ssh/config (modified)",
+                "  /h/.gitconfig (modified)",
+                "  /h/.ssh/config (modified)",
                 "    unexplained",
-                "  ~/.netrc (added)",
+                "  /h/.netrc (added)",
                 "    by Write in agent a30abb7e-1234-4abc",
                 "  2 by known writer: claude code plugin refresh",
                 "  1 by known writer: git branch tracking",

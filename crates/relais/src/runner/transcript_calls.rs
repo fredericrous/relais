@@ -87,9 +87,9 @@ pub(crate) struct WriteTarget {
 
 impl WriteTarget {
     pub(crate) fn new(path: &Path, home: Option<&Path>, kind: TargetKind) -> Self {
-        let mut spellings = vec![path.to_string_lossy().into_owned()];
+        let mut spellings = vec![separators_unified(&path.to_string_lossy())];
         if let Some(rest) = home.and_then(|home| path.strip_prefix(home).ok()) {
-            let rest = rest.to_string_lossy();
+            let rest = separators_unified(&rest.to_string_lossy());
             spellings.push(format!("~/{rest}"));
             spellings.push(format!("$HOME/{rest}"));
             spellings.push(format!("${{HOME}}/{rest}"));
@@ -98,7 +98,19 @@ impl WriteTarget {
     }
 
     fn names(&self, word: &str) -> bool {
-        self.spellings.iter().any(|spelling| spelling == word)
+        let word = separators_unified(word);
+        self.spellings.contains(&word)
+    }
+}
+
+/// `text` with Windows's `\` separators as `/`, so a path joined by the OS
+/// and one a shell or tool spelled with `/` compare equal there. On unix a
+/// `\` is part of a name and is kept.
+fn separators_unified(text: &str) -> String {
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.to_string()
     }
 }
 
@@ -565,9 +577,6 @@ mod tests {
         writes(call, &target, &world)
     }
 
-    // unix: the fixture spells home paths with `/` and `~/` (Windows prints them
-    // absolute and joins with `\`).
-    #[cfg(unix)]
     #[test]
     fn a_file_edit_tool_on_the_path_writes_it() {
         for name in ["Edit", "Write", "MultiEdit"] {
@@ -582,9 +591,6 @@ mod tests {
         assert!(!writes_netrc(&call("Write", other, None)));
     }
 
-    // unix: the fixture spells home paths with `/` and `~/` (Windows prints them
-    // absolute and joins with `\`).
-    #[cfg(unix)]
     #[test]
     fn a_command_writes_a_path_by_redirect_or_a_writing_program() {
         let writing = [
