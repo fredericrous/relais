@@ -97,6 +97,8 @@ then one count line per known writer.
 - Re-attributing old rows. A row without the new field prints as it does
   today.
 - greenbelay's own fingerprint hook. f08 counts that one separately.
+- Case on Windows: a tool's `c:/users/…` against an OS-joined
+  `C:\Users\…` target does not match, so that write shows unexplained.
 - A per-machine allowlist.
 
 ## Code review
@@ -295,6 +297,15 @@ plugin):
 - 2026-11-26 — the pilot runs after Phase 2's install, not before,
   because `relais run` starts only through the plugin, which runs the
   installed binary; a branch build cannot be piloted through it.
+- 2026-11-27 — PR #637's `test (windows-latest)` failed 6 new tests on
+  path shapes. One was a real gap: a target joined with `\` never
+  matched a tool or shell spelling with `/`, so `WriteTarget` now
+  compares with `\` unified to `/` on Windows. The rest were fixtures:
+  the report-order test now passes no home, the runner fixtures take
+  git's own config spelling (`homeprint::repo_config`) instead of
+  `canonicalize` (`\\?\`, 8.3 names), and the worker-write line is built
+  with `json!`. A first try gated the 6 tests to unix; review refused it
+  (`general.no-disabled-safety`), and the gates are gone.
 
 ## Implementation review
 
@@ -302,5 +313,6 @@ plugin):
 - backend approve-with-changes (83k, 103 s; Delta approve 32k, 21 s): input trimming, unreadable-agent line, `holds-until:` fixed; `--git-dir` not followed deliberate: such writes still print as Bash calls.
 - lang:rust approve-with-changes (75k, 118 s; Delta 32k, 19 s): relative `-C`/`cd`, `TargetKind`, cache once, extra compare fixed; per-call timestamp parse, writer-name constants, nested `Option` in `Step`, one clone, tool list twice deliberate: low, no behaviour change.
 - architect approve (57k, 39 s): cache once fixed; `WorkerCall` beside `Cause::Call` deliberate: the port's return shape. unix approve (55k, 49 s): no findings.
+- Windows round (after the red CI): unix gates refused as blocking, replaced by the separator fix; all five approve on tree 52e06cd8 (rust's `Cow` instead of a `String` copy deliberate: low).
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:rust,tui,unix,codex body-sha=a20afd906fa8 -->
