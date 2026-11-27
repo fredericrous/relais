@@ -1089,12 +1089,12 @@ fn a_refused_marker_is_journalled_once_where_the_run_queues() {
     let refused = held_marker_in(&dir, Some(std::ffi::OsStr::new("1")));
     assert!(matches!(refused, Marker::Refused { .. }), "{refused:?}");
     let log = MarkerLog::new();
-    let (held, said) = holds_or_says(&refused, Some(&*dir), &log);
+    let (held, said) = ancestor_holds_slots(&refused, Some(&*dir), &log);
     assert!(!held);
     let said = said.expect("the first refusal is said");
     assert!(said.starts_with("relais: "), "{said}");
     assert_eq!(
-        holds_or_says(&refused, Some(&*dir), &log),
+        ancestor_holds_slots(&refused, Some(&*dir), &log),
         (false, None),
         "said once"
     );
@@ -1108,13 +1108,13 @@ fn a_refused_marker_is_journalled_once_where_the_run_queues() {
 
     let quiet = temp_dir("marker-quiet");
     assert_eq!(
-        holds_or_says(&refused, None, &MarkerLog::new()),
+        ancestor_holds_slots(&refused, None, &MarkerLog::new()),
         (false, None)
     );
     assert!(!quiet.join("waits.jsonl").exists());
     let bare = held_marker_in(&quiet, Some(std::ffi::OsStr::new("held")));
     assert_eq!(
-        holds_or_says(&bare, Some(&*quiet), &MarkerLog::new()),
+        ancestor_holds_slots(&bare, Some(&*quiet), &MarkerLog::new()),
         (true, None)
     );
     assert!(
@@ -1124,7 +1124,7 @@ fn a_refused_marker_is_journalled_once_where_the_run_queues() {
     for empty in [None, Some(std::ffi::OsStr::new(""))] {
         let absent = held_marker_in(&quiet, empty);
         assert_eq!(
-            holds_or_says(&absent, Some(&*quiet), &MarkerLog::new()),
+            ancestor_holds_slots(&absent, Some(&*quiet), &MarkerLog::new()),
             (false, None),
             "no marker queues, silently: {absent:?}"
         );

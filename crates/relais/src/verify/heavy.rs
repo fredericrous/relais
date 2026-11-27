@@ -15,9 +15,11 @@
 //!    alone); a directory the crate refuses is said once as
 //!    `host_slots_off`. The runner holds the slots, never the check: their
 //!    descriptors are close-on-exec, so a daemon a check leaves behind does
-//!    not keep one. Where an ancestor already holds slots
-//!    (`GREENHARNESS_HOST_SLOT=held` in relais's own environment) nothing is
-//!    queued for, and the variable is passed on;
+//!    not keep one. Where an ancestor already holds slots (relais's own
+//!    `GREENHARNESS_HOST_SLOT` is a marker the slots crate's reader accepts:
+//!    a live `held:<lease>`, or the bare `held` during the rollout) nothing
+//!    is queued for, and the checks get the bare `held` (the lease's own
+//!    marker from amont host-slot-admission t15's phase 2);
 //! 3. the child's environment: the parallelism bounds below, then the
 //!    check's own `env`;
 //! 4. once the process group exists, its id goes to the coordinator, which
@@ -90,32 +92,19 @@ pub const UNREACHABLE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// spent retrying), so the run stays visibly alive.
 pub const COORDINATOR_UNREACHABLE_CLASS: &str = "coordinator_unreachable";
 
-/// The once-per-process row of a refused marker: `heavy_with` builds an
-/// admission at several call sites per run.
-static MARKER_LOG: greenharness_slots::MarkerLog = greenharness_slots::MarkerLog::new();
-
-/// Whether an ancestor already holds host slots for this process tree:
-/// `marker` is relais's own `GREENHARNESS_HOST_SLOT` as the slots crate's one
-/// reader judged it (amont ADR-0022, amended for t15; the bare `held` is
-/// accepted during the rollout), read by the runner at its boundary and
-/// passed in. `queues` is the slot directory this run would queue on, when
-/// the host queue is on there: a refused marker is then said once on stderr
-/// and journalled there.
+/// Whether an ancestor already holds host slots for this process tree, and
+/// the line to say when it does not: `marker` is relais's own
+/// `GREENHARNESS_HOST_SLOT` as the slots crate's one reader judged it (amont
+/// ADR-0022, amended for t15; the bare `held` is accepted during the
+/// rollout). The runner reads it at its boundary, holds the once-per-process
+/// `log`, and prints the line. `queues` is the slot directory this run would
+/// queue on, when the host queue is on there: a refused marker is then
+/// journalled there once per log, and its line returned once.
 // holds-until: no machine sets `shared_host_slots`. The row goes to the
 // run's queue directory while the lease is judged against the slots crate's
 // own directory; the two differ only under that setting, and the phase-3
 // count reads the default one (amont plan, phase 3 gate).
-pub fn ancestor_holds_slots(marker: &greenharness_slots::Marker, queues: Option<&Path>) -> bool {
-    let (held, said) = holds_or_says(marker, queues, &MARKER_LOG);
-    if let Some(line) = said {
-        eprintln!("{line}");
-    }
-    held
-}
-
-/// [`ancestor_holds_slots`] for a given log, returning the line to say
-/// instead of printing it: the seam tests use.
-fn holds_or_says(
+pub fn ancestor_holds_slots(
     marker: &greenharness_slots::Marker,
     queues: Option<&Path>,
     log: &greenharness_slots::MarkerLog,

@@ -14,7 +14,8 @@ host-slot-admission t15). A run skips the host queue only when its
 `GREENHARNESS_HOST_SLOT` names a live lease (`held:<lease>`), or is the bare
 `held` that greengate and relais still write during the rollout. Any other
 value, set by hand or left by a holder that has ended, queues: relais says so
-once on stderr and journals one `marker_refused` row in `waits.jsonl`. The
+once per run on stderr (when the run first readies a check, whether or not one
+then queues) and journals one `marker_refused` row in `waits.jsonl`. The
 next release writes `held:<lease>`. The tests now run with host slots off
 (`GREENGATE_HOST_SLOTS=0`) instead of a bare marker.
 

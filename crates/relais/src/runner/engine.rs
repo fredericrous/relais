@@ -19,6 +19,10 @@ use super::{
 static ANCESTOR_MARKER: std::sync::OnceLock<greenharness_slots::Marker> =
     std::sync::OnceLock::new();
 
+/// The once-per-process row and line of a refused marker: `heavy_with`
+/// builds an admission at several call sites per run.
+static MARKER_LOG: greenharness_slots::MarkerLog = greenharness_slots::MarkerLog::new();
+
 impl<'a> RunEngine<'a> {
     /// The phase an attempt of THIS run records: a root run and an
     /// ordinary package say which attempt it is; every attempt of an
@@ -1045,10 +1049,14 @@ impl<'a> RunEngine<'a> {
         // Judged before the queue directory moves into the admission: a
         // refused marker is journalled where this run would queue.
         let queue_on_here = queue_dir.as_deref().filter(|_| queue_sizing.is_some());
-        let ancestor_holds_slots = verify::ancestor_holds_slots(
+        let (ancestor_holds_slots, said) = verify::ancestor_holds_slots(
             ANCESTOR_MARKER.get_or_init(greenharness_slots::held_marker),
             queue_on_here,
+            &MARKER_LOG,
         );
+        if let Some(line) = said {
+            eprintln!("{line}");
+        }
         let admission = verify::HeavyAdmission {
             gate: self.config.gate,
             run_id: self.run_id.as_str().to_string(),
