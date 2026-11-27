@@ -280,10 +280,24 @@ stdout and never meets an empty one. Without `--json` stdout stays empty.
 It holds for `decide`, `feedback`, `report`, `learn cycle`, `doctor` and
 `trust`; `trust`'s two stale-review refusals keep their `code`, `current_key`
 and `detail` fields on the same object. Exceptions: a command-line usage
-error (exit 2, before any command runs) prints nothing on stdout;
+error (exit 2, before any command runs) prints nothing on stdout; and
 `learn cycle --log` writes the stderr line, and a successful `--json` result,
-to the log file, while a failure's object still goes to stdout; and `learn cycle --json` still prints its plain `deferred:`
-and `not due` lines on exit 0 (a follow-up).
+to the log file, while a failure's object still goes to stdout.
+
+A `learn cycle` that did not run, and exits 0, prints one compact object under
+`--json` (an-t37), so its stdout is always JSON:
+
+```
+{"outcome":"deferred","reason":"not_idle","agents":3}
+{"outcome":"deferred","reason":"not_due","detail":"<why>","next_due":"<when, in words>"}
+```
+
+`not_due` wins over `not_idle` under `--if-due`. The report of a cycle that
+ran has no `outcome` key (it has `action`), so a consumer branches on
+`outcome`. Without `--json` the plain `deferred: not idle (<n> agents active)`
+and `not due: <why>; <when>` lines are unchanged. Under `--log` the object is
+one bare line in the file (a stamped line would not be JSON) and stdout and
+stderr stay empty: a second exception to "stdout is never empty".
 
 ## For a closed client
 

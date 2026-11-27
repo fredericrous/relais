@@ -459,10 +459,29 @@ fn compensation_lines(
 pub(crate) struct CycleOut {
     log: Option<relais::learn::cycle::CycleLog>,
     quiet: bool,
+    format: Format,
+}
+
+/// Why a cycle did not run and still exits 0; the `reason` of the `--json`
+/// object (`docs/shared-state.md`).
+#[derive(serde::Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+enum Deferred<'a> {
+    NotIdle { agents: u32 },
+    NotDue { detail: &'a str, next_due: &'a str },
+}
+
+/// The `--json` object of a cycle that did not run: `outcome` marks it, the
+/// report of a cycle that ran has `action` instead.
+#[derive(serde::Serialize)]
+struct DeferredObject<'a> {
+    outcome: &'static str,
+    #[serde(flatten)]
+    why: Deferred<'a>,
 }
 
 impl CycleOut {
-    pub(crate) fn open(log: Option<&Path>, quiet: bool) -> Result<Self, CliError> {
+    pub(crate) fn open(log: Option<&Path>, quiet: bool, format: Format) -> Result<Self, CliError> {
         let log = match log {
             Some(path) => Some(relais::learn::cycle::CycleLog::open(path).map_err(|cause| {
                 CliError::Read {
@@ -473,7 +492,7 @@ impl CycleOut {
             })?),
             None => None,
         };
-        Ok(Self { log, quiet })
+        Ok(Self { log, quiet, format })
     }
 
     /// A result line: stdout.
@@ -481,6 +500,71 @@ impl CycleOut {
         match &mut self.log {
             Some(log) => log.line(line),
             None => println!("{line}"),
+        }
+    }
+
+    /// One JSON object on the result stream: a bare line in the `--log` file
+    /// (whose own write errors are dropped, as for every log line), else one
+    /// stdout line, quiet on a closed pipe. A failed stdout write is said on
+    /// stderr and is a failure: the caller asked for that object.
+    fn object(&mut self, object: &DeferredObject) -> CliOutcome {
+        let line = match serde_json::to_string(object) {
+            Ok(line) => line,
+            Err(e) => {
+                eprintln!("relais learn cycle: could not render the result: {e}");
+                return CliOutcome::OperationalFailure;
+            }
+        };
+        match &mut self.log {
+            Some(log) => log.line(&line),
+            None => {
+                if let Err(e) = super::decision_record::write_object(&line) {
+                    eprintln!("relais learn cycle: could not write the result to stdout: {e}");
+                    return CliOutcome::OperationalFailure;
+                }
+            }
+        }
+        CliOutcome::Accepted
+    }
+
+    /// A cycle that did not run and exits 0: one `outcome` object under
+    /// `--json`, else its plain line (the `--log` file stamps the not-idle
+    /// line only, as before).
+    fn defer(&mut self, why: Deferred) -> CliOutcome {
+        match (self.format, &why) {
+            (Format::Json, _) => self.object(&DeferredObject {
+                outcome: "deferred",
+                why,
+            }),
+            (Format::Text, Deferred::NotIdle { agents }) => {
+                let line = format!("deferred: not idle ({agents} agents active)");
+                match &mut self.log {
+                    Some(log) => log.line(&format!(
+                        "{} {line}",
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                    )),
+                    None => println!("{line}"),
+                }
+                CliOutcome::Accepted
+            }
+            (Format::Text, Deferred::NotDue { detail, next_due }) => {
+                self.say(&relais::learn::cycle::not_due_line(detail, next_due));
+                CliOutcome::Accepted
+            }
+        }
+    }
+
+    /// What `--if-due` does when the cycle is not due: the outcome of
+    /// deferring it, or `None` when it is due and nothing was printed.
+    fn defer_if_not_due(&mut self, due: &relais::learn::cycle::Due) -> Option<CliOutcome> {
+        match due {
+            relais::learn::cycle::Due::Yes => None,
+            relais::learn::cycle::Due::No { reason, next_due } => {
+                Some(self.defer(Deferred::NotDue {
+                    detail: reason,
+                    next_due,
+                }))
+            }
         }
     }
 
@@ -527,7 +611,7 @@ pub(crate) fn learn_cycle_command(
     quiet: bool,
 ) -> Result<CliOutcome, CliError> {
     use relais::admission::TrainingDecision;
-    let mut out = CycleOut::open(log, quiet)?;
+    let mut out = CycleOut::open(log, quiet, Format::from_json_flag(json))?;
     let ledger = open_ledger()?;
     // One state for the machine settings and the registry pointers
     // (an-t29), built before the coordinator is started, so an absent
@@ -606,22 +690,11 @@ pub(crate) fn learn_cycle_command(
         TrainingDecision::NotIdle { agents } => {
             // A cycle that is not due has nothing to defer.
             if if_due {
-                if let Some(line) = due(&ledger)?.line() {
-                    out.say(&line);
-                    return Ok(CliOutcome::Accepted);
+                if let Some(outcome) = out.defer_if_not_due(&due(&ledger)?) {
+                    return Ok(outcome);
                 }
             }
-            let line = format!("deferred: not idle ({agents} agents active)");
-            // With `--log` the one line goes to the file, stamped (it is
-            // appended to a log read days later); otherwise to stdout.
-            match &mut out.log {
-                Some(log) => log.line(&format!(
-                    "{} {line}",
-                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-                )),
-                None => println!("{line}"),
-            }
-            return Ok(CliOutcome::Accepted);
+            return Ok(out.defer(Deferred::NotIdle { agents }));
         }
         TrainingDecision::Refused { code, detail } => {
             let message = format!(
@@ -639,9 +712,8 @@ pub(crate) fn learn_cycle_command(
     }
     let _guard = TrainingGuard { client, lease };
     if if_due {
-        if let Some(line) = due(&ledger)?.line() {
-            out.say(&line);
-            return Ok(CliOutcome::Accepted);
+        if let Some(outcome) = out.defer_if_not_due(&due(&ledger)?) {
+            return Ok(outcome);
         }
     }
     let repo = match load_repo_policy() {

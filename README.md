@@ -104,7 +104,9 @@ writes `machine.toml`.
 not idle (<n> agents active)` (another session's agents are running; the cycle
 stays due), `not due: …` under `--if-due`, and `awaiting_promotion` (an
 artifact passed every gate and `relais promote <id>` is yours to run). An
-error inside a cycle exits 1.
+error inside a cycle exits 1. With `--json`, the first two are one object,
+`{"outcome":"deferred","reason":"not_idle"|"not_due",…}`
+(`docs/shared-state.md`).
 
 `native cancel --run X --session S` exits 0 when the run is cancelled, was
 already over, or had no live driver and was marked cancelled (and also when the

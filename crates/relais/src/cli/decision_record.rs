@@ -193,7 +193,7 @@ pub(crate) fn print_refusal_with(
 }
 
 /// One stdout line; a reader that closed it is not a failure.
-fn write_object(object: &str) -> std::io::Result<()> {
+pub(crate) fn write_object(object: &str) -> std::io::Result<()> {
     use std::io::Write;
     match writeln!(std::io::stdout().lock(), "{object}") {
         Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(e),

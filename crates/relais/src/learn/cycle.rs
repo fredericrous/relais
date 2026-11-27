@@ -108,9 +108,15 @@ impl Due {
     pub fn line(&self) -> Option<String> {
         match self {
             Self::Yes => None,
-            Self::No { reason, next_due } => Some(format!("not due: {reason}; {next_due}")),
+            Self::No { reason, next_due } => Some(not_due_line(reason, next_due)),
         }
     }
+}
+
+/// The plain `--if-due` line for a cycle that is not due; the one source of
+/// its text, for [`Due::line`] and for the CLI's deferral.
+pub fn not_due_line(reason: &str, next_due: &str) -> String {
+    format!("not due: {reason}; {next_due}")
 }
 
 /// Due when no cycle ever ran, or the last one is at least

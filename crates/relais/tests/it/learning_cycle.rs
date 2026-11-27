@@ -318,6 +318,166 @@ fn an_agent_of_another_session_defers_the_cycle_without_a_row_and_logs_one_line(
     daemon.stop();
 }
 
+/// an-t37: under `--json` a cycle that did not run is one `outcome` object on
+/// exit 0, whatever the reason; the report object has no `outcome` key.
+fn one_object(out: &Output) -> serde_json::Value {
+    let stdout = text(&out.stdout);
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    serde_json::from_str(&stdout).expect("one JSON object")
+}
+
+#[test]
+fn a_deferred_cycle_under_json_is_one_object_on_stdout_or_one_bare_line_in_the_log() {
+    let world = World::new("deferred-json");
+    let daemon = Daemon::start(&world.socket(), true);
+    daemon.agent_of_another_session(std::process::id());
+
+    let out = world.relais(&["learn", "cycle", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stderr), "");
+    assert_eq!(
+        one_object(&out),
+        serde_json::json!({"outcome": "deferred", "reason": "not_idle", "agents": 1})
+    );
+    assert!(world.rows().is_empty(), "a deferral writes no row");
+
+    let log = world.root.join("learn-cycle.log");
+    let out = world.relais(&["learn", "cycle", "--json", "--log", log.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        (text(&out.stdout), text(&out.stderr)),
+        (String::new(), String::new())
+    );
+    let logged = std::fs::read_to_string(&log).expect("the log");
+    assert_eq!(logged.lines().count(), 1, "{logged}");
+    let object: serde_json::Value = serde_json::from_str(logged.trim_end()).expect("bare JSON");
+    assert_eq!(object["reason"], "not_idle", "{object}");
+    daemon.stop();
+}
+
+#[test]
+fn a_cycle_that_is_not_due_under_json_is_one_deferred_object_at_both_call_sites() {
+    let world = World::new("not-due-json");
+    let daemon = Daemon::start(&world.socket(), true);
+    let first = world.relais(&["learn", "cycle", "--if-due"]);
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first.stderr));
+
+    let out = world.relais(&["learn", "cycle", "--if-due", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let object = one_object(&out);
+    assert_eq!(object["outcome"], "deferred", "{object}");
+    assert_eq!(object["reason"], "not_due", "{object}");
+    assert!(
+        object["detail"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("the last cycle started ")),
+        "{object}"
+    );
+    assert!(
+        object["next_due"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("next due 20")),
+        "{object}"
+    );
+    assert_eq!(world.rows().len(), 1, "no second row");
+
+    // The `NotIdle` arm checks the clock first: not due wins over not idle.
+    daemon.agent_of_another_session(std::process::id());
+    let out = world.relais(&["learn", "cycle", "--if-due", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(one_object(&out)["reason"], "not_due");
+
+    let log = world.root.join("learn-cycle.log");
+    let out = world.relais(&[
+        "learn",
+        "cycle",
+        "--if-due",
+        "--json",
+        "--log",
+        log.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(text(&out.stdout), "");
+    let logged = std::fs::read_to_string(&log).expect("the log");
+    assert_eq!(logged.lines().count(), 1, "{logged}");
+    let object: serde_json::Value = serde_json::from_str(logged.trim_end()).expect("bare JSON");
+    assert_eq!(object["reason"], "not_due", "{object}");
+    daemon.stop();
+}
+
+#[test]
+fn a_held_lease_under_json_is_the_error_object_with_exit_20() {
+    let world = World::new("held-json");
+    let daemon = Daemon::start(&world.socket(), false);
+    let holder = daemon
+        .client
+        .acquire_training("tab-holder", std::process::id(), "2026-10-10T10:00:00Z")
+        .expect("lease");
+    let out = world.relais(&["learn", "cycle", "--json"]);
+    assert_eq!(out.status.code(), Some(20), "{}", text(&out.stderr));
+    let object = one_object(&out);
+    assert_eq!(object["exit"], 20, "{object}");
+    let stderr = text(&out.stderr);
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert_eq!(
+        format!(
+            "relais learn cycle: {}",
+            object["error"].as_str().expect("error")
+        ),
+        stderr.trim_end()
+    );
+    assert!(object["error"]
+        .as_str()
+        .unwrap()
+        .contains("2026-10-10T10:00:00Z"));
+    daemon.client.end_training(&holder).expect("release");
+    daemon.stop();
+}
+
+#[test]
+fn a_malformed_policy_under_json_is_the_error_object_with_exit_1() {
+    let world = World::new("bad-toml-json");
+    let git = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&world.repo)
+        .output()
+        .expect("git init");
+    assert!(git.status.success());
+    std::fs::write(world.repo.join("relais.toml"), "this is = = not toml\n").expect("write");
+    for json in [false, true] {
+        let args: &[&str] = if json {
+            &["learn", "cycle", "--json"]
+        } else {
+            &["learn", "cycle"]
+        };
+        let out = world.relais(args);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{args:?}: {}",
+            text(&out.stdout)
+        );
+        let stderr = text(&out.stderr);
+        // The parser's message spans lines; the prefix appears once.
+        assert_eq!(
+            stderr.matches("relais learn cycle: ").count(),
+            1,
+            "{stderr}"
+        );
+        if json {
+            let object = one_object(&out);
+            assert_eq!(object["exit"], 1, "{object}");
+            assert!(object["error"].as_str().unwrap().contains("relais.toml"));
+            assert_eq!(
+                format!("relais learn cycle: {}", object["error"].as_str().unwrap()).trim_end(),
+                stderr.trim_end()
+            );
+        } else {
+            assert_eq!(text(&out.stdout), "");
+        }
+    }
+}
+
 #[test]
 fn the_log_file_is_created_0600() {
     use std::os::unix::fs::PermissionsExt;

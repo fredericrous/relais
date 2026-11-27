@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use relais::test_support::{temp_dir, TempDir};
+use relais::test_support::{short_temp_dir, temp_dir, TempDir};
 
 const BIN: &str = env!("CARGO_BIN_EXE_relais");
 
@@ -35,6 +35,30 @@ impl Scratch {
         }
         std::fs::write(dir.join("config/machine.toml"), text).expect("machine.toml");
         Self { dir }
+    }
+
+    /// A scratch whose path is short enough for a Unix socket under it.
+    fn short(tag: &str) -> Self {
+        let dir = short_temp_dir(tag);
+        for sub in ["home", "config", "state", "claude"] {
+            std::fs::create_dir_all(dir.join(sub)).expect("scratch dir");
+        }
+        std::fs::write(dir.join("config/machine.toml"), "schema_version = 1\n")
+            .expect("machine.toml");
+        Self { dir }
+    }
+
+    /// `program` with this scratch's environment, run from `cwd`.
+    fn command_in(&self, program: &str, cwd: &Path) -> Command {
+        let mut command = Command::new(program);
+        command
+            .current_dir(cwd)
+            .env("HOME", self.dir.join("home"))
+            .env("RELAIS_CONFIG_DIR", self.dir.join("config"))
+            .env("RELAIS_STATE_DIR", self.dir.join("state"))
+            .env("CLAUDE_CONFIG_DIR", self.dir.join("claude"))
+            .stdin(Stdio::null());
+        command
     }
 
     fn machine_toml(&self) -> PathBuf {
@@ -713,4 +737,292 @@ fn a_counter_whose_stdout_is_closed_still_exits_0() {
         assert_eq!(out.status.code(), Some(0), "{args:?}: {out:?}");
         assert!(out.stderr.is_empty(), "{args:?}: {out:?}");
     }
+}
+
+/// A coordinator that answers `ping` (at `protocol`), `acquire_training` (with
+/// `decision`) and `end_training`, and counts the last. Its replies are
+/// encoded from the crate's own `Response`. It is bound before the binary
+/// runs: any other ping failure makes `ensure_running` start a real
+/// detached daemon.
+struct FakeCoordinator {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ended: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FakeCoordinator {
+    fn start(socket: &Path, protocol: u32, decision: relais::admission::TrainingDecision) -> Self {
+        use relais::coordinator::{Request, Response};
+        use std::io::{BufRead, BufReader};
+        use std::sync::atomic::Ordering;
+        let listener = std::os::unix::net::UnixListener::bind(socket).expect("fake socket");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (stop_in, ended_in) = (stop.clone(), ended.clone());
+        let thread = std::thread::spawn(move || {
+            while !stop_in.load(Ordering::SeqCst) {
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).expect("blocking");
+                let bound = Some(std::time::Duration::from_secs(5));
+                stream.set_read_timeout(bound).expect("read timeout");
+                stream.set_write_timeout(bound).expect("write timeout");
+                let mut line = String::new();
+                if BufReader::new(&stream).read_line(&mut line).is_err() {
+                    continue;
+                }
+                let response = match serde_json::from_str::<Request>(line.trim()) {
+                    Ok(Request::Ping) => Response::Pong {
+                        pid: std::process::id(),
+                        version: "fake".into(),
+                        protocol,
+                    },
+                    Ok(Request::AcquireTraining { .. }) => Response::Training {
+                        decision: decision.clone(),
+                    },
+                    Ok(Request::EndTraining { .. }) => {
+                        ended_in.fetch_add(1, Ordering::SeqCst);
+                        Response::Ack
+                    }
+                    _ => Response::Error {
+                        detail: "the fake serves ping and training only".into(),
+                    },
+                };
+                let mut stream = stream;
+                let payload = serde_json::to_string(&response).expect("response");
+                writeln!(stream, "{payload}").expect("the fake's reply is written");
+            }
+        });
+        Self {
+            stop,
+            ended,
+            thread: Some(thread),
+        }
+    }
+
+    fn ended(&self) -> usize {
+        self.ended.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for FakeCoordinator {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() && !std::thread::panicking() {
+                panic!("the fake coordinator panicked");
+            }
+        }
+    }
+}
+
+/// The failure contract of a command that says `relais <command>: <message>`:
+/// plain, one stderr line (or the message's own lines) and empty stdout;
+/// under `--json` the one `{"error","exit"}` object whose message is the
+/// stderr text minus its prefix.
+fn assert_failure_streams(prefix: &str, args: &[&str], out: &Output, exit: i32) -> String {
+    assert_eq!(out.status.code(), Some(exit), "{args:?}: {out:?}");
+    let stdout = String::from_utf8(out.stdout.clone()).expect("utf-8");
+    let stderr = String::from_utf8(out.stderr.clone()).expect("utf-8");
+    assert!(stderr.starts_with(prefix), "{args:?}: {stderr}");
+    let message = stderr
+        .trim_end()
+        .strip_prefix(prefix)
+        .expect("prefix")
+        .to_string();
+    if args.contains(&"--json") {
+        assert_eq!(stdout.lines().count(), 1, "{args:?}: {stdout}");
+        let object: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+        assert_eq!(object["exit"], exit, "{args:?}: {stdout}");
+        assert_eq!(
+            object["error"].as_str().expect("error").trim_end(),
+            message,
+            "{args:?}"
+        );
+    } else {
+        assert!(stdout.is_empty(), "{args:?}: {stdout}");
+    }
+    message
+}
+
+/// an-t37: the coordinator's refusal of the Training lease (a hard limit) is
+/// exit 1, one `relais learn cycle:` line naming the code and detail, and
+/// under `--json` the error object. Nothing is held, so nothing is given back.
+#[test]
+fn a_refused_training_lease_follows_the_json_error_contract() {
+    for json in [false, true] {
+        let scratch = Scratch::short("shared-state-refused");
+        let fake = FakeCoordinator::start(
+            &scratch.dir.join("state/relais.sock"),
+            relais::coordinator::PROTOCOL_VERSION,
+            relais::admission::TrainingDecision::Refused {
+                code: relais::admission::Refusal::DepthExceeded,
+                detail: "depth 9 is over 8".into(),
+            },
+        );
+        let mut args = vec!["learn", "cycle"];
+        if json {
+            args.push("--json");
+        }
+        let out = scratch.relais(&args, "");
+        let message = assert_failure_streams("relais learn cycle: ", &args, &out, 1);
+        assert!(
+            message.contains("the coordinator refused the Training lease (depth_exceeded)")
+                && message.contains("depth 9 is over 8"),
+            "{message}"
+        );
+        assert_eq!(fake.ended(), 0, "no lease, nothing to give back");
+    }
+}
+
+/// an-t37: a Training lease held by a process the coordinator did not record
+/// is exit 20 and says so, without a holder to name.
+#[test]
+fn a_busy_lease_with_no_recorded_holder_is_exit_20_and_the_error_object() {
+    let scratch = Scratch::short("shared-state-busy");
+    let _fake = FakeCoordinator::start(
+        &scratch.dir.join("state/relais.sock"),
+        relais::coordinator::PROTOCOL_VERSION,
+        relais::admission::TrainingDecision::Busy { holder: None },
+    );
+    for args in [&["learn", "cycle"][..], &["learn", "cycle", "--json"][..]] {
+        let out = scratch.relais(args, "");
+        let message = assert_failure_streams("relais learn cycle: ", args, &out, 20);
+        assert!(message.contains("its holder is not recorded"), "{message}");
+    }
+}
+
+/// an-t37: a daemon that speaks another protocol is named with both protocol
+/// numbers, exit 1; any other failure (a daemon started over it, a timeout)
+/// would read differently.
+#[test]
+fn a_coordinator_of_another_protocol_follows_the_json_error_contract() {
+    for json in [false, true] {
+        let scratch = Scratch::short("shared-state-skew");
+        let _fake = FakeCoordinator::start(
+            &scratch.dir.join("state/relais.sock"),
+            relais::coordinator::PROTOCOL_VERSION + 1,
+            relais::admission::TrainingDecision::Granted,
+        );
+        let mut args = vec!["learn", "cycle"];
+        if json {
+            args.push("--json");
+        }
+        let out = scratch.relais(&args, "");
+        let message = assert_failure_streams("relais learn cycle: ", &args, &out, 1);
+        let ours = relais::coordinator::PROTOCOL_VERSION;
+        assert!(
+            message.contains(&format!(
+                "(relais fake) speaks wire protocol {} and this relais speaks {ours}",
+                ours + 1
+            )),
+            "{message}"
+        );
+    }
+}
+
+/// an-t37: a policy that does not parse, after the lease was granted, is
+/// exit 1 and the error object, and the lease is given back exactly once.
+#[test]
+fn a_policy_failure_gives_the_training_lease_back_once() {
+    for json in [false, true] {
+        let scratch = Scratch::short("shared-state-policy");
+        let repo = scratch.dir.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let git = scratch
+            .command_in("git", &repo)
+            .args(["init", "-q"])
+            .output()
+            .expect("git init");
+        assert!(git.status.success());
+        std::fs::write(repo.join("relais.toml"), "this is = = not toml\n").expect("policy");
+        let fake = FakeCoordinator::start(
+            &scratch.dir.join("state/relais.sock"),
+            relais::coordinator::PROTOCOL_VERSION,
+            relais::admission::TrainingDecision::Granted,
+        );
+        let mut args = vec!["learn", "cycle"];
+        if json {
+            args.push("--json");
+        }
+        let out = scratch
+            .command_in(BIN, &repo)
+            .args(&args)
+            .output()
+            .expect("relais runs");
+        let message = assert_failure_streams("relais learn cycle: ", &args, &out, 1);
+        assert!(message.contains("relais.toml"), "{message}");
+        assert_eq!(fake.ended(), 1, "the lease was given back once");
+    }
+}
+
+/// an-t37: `doctor --json` whose command fails before it can report (here the
+/// working directory was removed under it) is the error object on stdout and
+/// the same message on stderr, exit 3; plain, stdout is empty.
+#[test]
+fn a_failed_doctor_follows_the_json_error_contract() {
+    for json in [false, true] {
+        let scratch = Scratch::with_machine_toml("shared-state-doctor", "schema_version = 1\n");
+        let gone = scratch.dir.join("gone");
+        std::fs::create_dir_all(&gone).expect("dir");
+        let mut args = vec!["doctor"];
+        if json {
+            args.push("--json");
+        }
+        let out = scratch
+            .command_in("sh", &scratch.dir)
+            .arg("-c")
+            .arg(r#"cd "$1" && rmdir "$1" && shift && exec "$@""#)
+            .arg("sh")
+            .arg(&gone)
+            .arg(BIN)
+            .args(&args)
+            .output()
+            .expect("sh runs");
+        let message = assert_failure_streams("relais: ", &args, &out, 3);
+        assert!(message.contains("working directory"), "{message}");
+    }
+}
+
+/// an-t37: a stale holdout review keeps its `code` and `detail` on the one
+/// error object, exit 3 (reached with no `[holdouts]` store: `accept`
+/// refuses with its own text, the same arm that prints the fields).
+#[test]
+fn a_stale_holdout_review_is_one_error_object_with_its_code_and_detail() {
+    let scratch = Scratch::with_machine_toml("shared-state-holdout", "schema_version = 1\n");
+    let args = [
+        "trust",
+        "holdouts",
+        "--accept",
+        "h",
+        "--sha",
+        "abc",
+        "--fingerprint",
+        "def",
+        "--json",
+    ];
+    let out = scratch.relais(&args, "");
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let stdout = String::from_utf8(out.stdout.clone()).expect("utf-8");
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    let object: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(object["exit"], 3, "{object}");
+    assert_eq!(object["code"], "stale_holdout_review", "{object}");
+    let detail = object["detail"].as_str().expect("detail");
+    assert_eq!(
+        object["error"].as_str().expect("error"),
+        format!("refused: {detail}")
+    );
+    let stderr = String::from_utf8(out.stderr).expect("utf-8");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert_eq!(
+        stderr.trim_end(),
+        format!(
+            "relais trust holdouts: {}",
+            object["error"].as_str().unwrap()
+        )
+    );
 }
