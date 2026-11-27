@@ -1045,10 +1045,6 @@ fn a_lease_the_coordinator_could_not_tie_to_the_group_is_kept_alive_while_the_ch
 
 #[test]
 fn an_ancestor_that_holds_host_slots_is_not_queued_behind_and_the_fact_is_passed_on() {
-    assert!(ancestor_holds_slots(Some("held")));
-    assert!(!ancestor_holds_slots(Some("other")));
-    assert!(!ancestor_holds_slots(None));
-
     let dir = temp_dir("ancestor");
     let gate = gate_with(1);
     register(&gate, "run-a");
@@ -1083,11 +1079,48 @@ fn an_ancestor_that_holds_host_slots_is_not_queued_behind_and_the_fact_is_passed
     assert_eq!(log.trim(), "slot=held", "the check sees the variable");
 }
 
+/// A held marker is read by the slots crate's one reader (amont t15): a
+/// refused one, where the run would queue, is said once and journalled once,
+/// and the run queues; with no queue, nothing is said or written.
+#[test]
+fn a_refused_marker_is_journalled_once_where_the_run_queues() {
+    use greenharness_slots::{held_marker_in, Marker, MarkerLog};
+    let dir = temp_dir("marker");
+    let refused = held_marker_in(&dir, Some(std::ffi::OsStr::new("1")));
+    assert!(matches!(refused, Marker::Refused { .. }), "{refused:?}");
+    let log = MarkerLog::new();
+    assert!(!holds_or_says(&refused, Some(&*dir), &log));
+    assert!(!holds_or_says(&refused, Some(&*dir), &log));
+    let journal = std::fs::read_to_string(dir.join("waits.jsonl")).expect("journal");
+    assert_eq!(journal.lines().count(), 1, "{journal}");
+    assert!(journal.contains("\"tool\":\"relais\""), "{journal}");
+    assert!(
+        journal.contains("\"outcome\":\"marker_refused\""),
+        "{journal}"
+    );
+
+    let quiet = temp_dir("marker-quiet");
+    assert!(!holds_or_says(&refused, None, &MarkerLog::new()));
+    assert!(!quiet.join("waits.jsonl").exists());
+    let bare = held_marker_in(&quiet, Some(std::ffi::OsStr::new("held")));
+    assert!(holds_or_says(&bare, Some(&*quiet), &MarkerLog::new()));
+    assert!(
+        !quiet.join("waits.jsonl").exists(),
+        "an accepted marker writes nothing"
+    );
+}
+
 /// `.cargo/config.toml` reaches the tests: without it, every test that
 /// builds a runner with default settings would queue on the real host slots.
+/// Slots are off, and the marker is forced empty: a bare `held` is refused
+/// once amont's held-marker rollout ends.
 #[test]
 fn cargo_pins_the_host_slot_for_tests() {
-    assert_eq!(std::env::var(HOST_SLOT_ENV).as_deref(), Ok("held"));
+    assert_eq!(std::env::var(HOST_SLOT_ENV).as_deref(), Ok(""));
+    assert_eq!(
+        std::env::var(greenharness_slots::host::SLOTS_ENV).as_deref(),
+        Ok("0")
+    );
 }
 
 #[cfg(unix)]

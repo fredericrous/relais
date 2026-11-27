@@ -1036,6 +1036,10 @@ impl<'a> RunEngine<'a> {
             &plan,
             self.config.machine.resources.shared_host_slots.as_deref(),
         );
+        // Read before the queue directory moves into the admission: a refused
+        // marker is journalled where this run would queue.
+        let ancestor_holds_slots =
+            verify::ancestor_holds_slots(queue_dir.as_deref().filter(|_| queue_sizing.is_some()));
         let admission = verify::HeavyAdmission {
             gate: self.config.gate,
             run_id: self.run_id.as_str().to_string(),
@@ -1049,9 +1053,7 @@ impl<'a> RunEngine<'a> {
             machine: plan.machine,
             slots: queue_dir,
             sizing: queue_sizing,
-            ancestor_holds_slots: verify::ancestor_holds_slots(
-                std::env::var(verify::HOST_SLOT_ENV).ok().as_deref(),
-            ),
+            ancestor_holds_slots,
             poll: ADMISSION_POLL,
             stall_window: self.stall_window(),
             announce_every: verify::ANNOUNCE_EVERY,
