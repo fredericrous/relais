@@ -307,6 +307,84 @@ impl Programme {
     }
 }
 
+/// The ticket ids (stems of the `.md` files other than `map.md`) directly
+/// in `<checkout>/docs/programmes/<slug>` on disk: the branch's own
+/// listing, whatever source the programme itself is read from. A directory
+/// absent on disk lists nothing.
+pub fn branch_ticket_ids(checkout: &Path, slug: &str) -> Result<BTreeSet<String>, ProgrammeError> {
+    let dir = programme_path(checkout, slug);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(e) => return Err(read_error(&dir)(e)),
+    };
+    let mut ids = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(read_error(&dir))?;
+        // As `Programme::load` lists tickets: a symlink to a file counts.
+        if !entry.path().is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == MAP_FILE {
+            continue;
+        }
+        if let Some(id) = name.strip_suffix(".md") {
+            ids.insert(id.to_string());
+        }
+    }
+    Ok(ids)
+}
+
+/// The ticket ids (stems of the `.md` files directly in
+/// `docs/programmes/<slug>`, `map.md` aside) that `rev` added since the
+/// merge-base of `HEAD` and `rev`, git being run in `checkout`. Renames
+/// are not followed: a file renamed on `rev` is an addition under its new
+/// name.
+pub fn added_since_merge_base(
+    checkout: &Path,
+    slug: &str,
+    rev: &str,
+) -> Result<BTreeSet<String>, ProgrammeError> {
+    // git's own words first (a timeout reads as one), then the likely cause.
+    let base = git_stdout(checkout, &["merge-base", "--end-of-options", "HEAD", rev]).map_err(
+        |e| match e {
+            ProgrammeError::Git { repo, detail } => ProgrammeError::Git {
+                repo,
+                detail: format!(
+                    "merge-base HEAD {rev}: {}; is {rev} a ref sharing history with HEAD?",
+                    detail.trim_end_matches(": ")
+                ),
+            },
+            other => other,
+        },
+    )?;
+    let base = base.trim();
+    let relative = format!("docs/programmes/{slug}/");
+    let names = git_stdout(
+        checkout,
+        &[
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "--diff-filter=A",
+            &format!("--relative={relative}"),
+            "-z",
+            "--end-of-options",
+            base,
+            rev,
+            "--",
+            &relative,
+        ],
+    )?;
+    Ok(names
+        .split('\0')
+        .filter(|name| !name.contains('/') && *name != MAP_FILE)
+        .filter_map(|name| name.strip_suffix(".md"))
+        .map(str::to_string)
+        .collect())
+}
+
 /// What `git <args>` prints in `repo`.
 fn git_stdout(repo: &Path, args: &[&str]) -> Result<String, ProgrammeError> {
     let mut command = crate::workspace::git_command(repo);

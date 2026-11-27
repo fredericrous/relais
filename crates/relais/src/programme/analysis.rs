@@ -3,6 +3,7 @@
 //! tickets and the repositories that exist arrive as values.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use super::claim::rules::Hold;
 use super::model::{MapDoc, Mode, Problem, Status, Ticket, MAP_FILE};
@@ -255,6 +256,134 @@ pub fn check(
     problems
 }
 
+/// A ticket id's leading `<letters><digits>` when the id is that and then
+/// ends or continues with `-`: the letters and the digits.
+fn id_prefix(id: &str) -> Option<(&str, &str)> {
+    let letters_end = id
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .filter(|end| *end > 0)?;
+    let rest = &id[letters_end..];
+    let digits_len = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if digits_len == 0 {
+        return None;
+    }
+    let after = &rest[digits_len..];
+    (after.is_empty() || after.starts_with('-')).then(|| (&id[..letters_end], &rest[..digits_len]))
+}
+
+/// Where a ticket id checked by [`duplicate_ids`] comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Listing<'a> {
+    /// A ticket file of the directory being checked.
+    Branch,
+    /// A ticket the named ref added since the merge-base, absent from the
+    /// branch.
+    Ref(&'a str),
+}
+
+/// One problem per ticket whose id shares its leading `<letters><digits>`
+/// prefix with another ticket's, on line 1 of its file. `own` and
+/// `from_ref` are ticket ids (file stems) in the directory; an id in both
+/// counts once. Only a branch ticket is reported: a ref's ticket is a
+/// number to avoid, never a line to fix. Of several branch tickets sharing
+/// a prefix, the first (by id) stays and each later one is reported; when
+/// the ref took the prefix, every branch ticket is. `dir` prefixes the
+/// other ticket's path in the message, and `rev` names the ref a ref-only
+/// ticket is on. The digits are compared as written, so `f011` and `f11`
+/// are different ids.
+pub fn duplicate_ids(
+    own: &BTreeSet<String>,
+    from_ref: Option<(&BTreeSet<String>, &str)>,
+    dir: &Path,
+) -> Vec<Problem> {
+    let mut tickets: Vec<(&str, Listing)> = own
+        .iter()
+        .map(|id| (id.as_str(), Listing::Branch))
+        .collect();
+    if let Some((ref_ids, rev)) = from_ref {
+        tickets.extend(
+            ref_ids
+                .iter()
+                .filter(|id| !own.contains(*id))
+                .map(|id| (id.as_str(), Listing::Ref(rev))),
+        );
+    }
+    tickets.sort_unstable();
+    let mut groups: BTreeMap<(&str, &str), Vec<(&str, Listing)>> = BTreeMap::new();
+    let mut highest: BTreeMap<&str, Option<u64>> = BTreeMap::new();
+    for &(id, origin) in &tickets {
+        let Some((letters, digits)) = id_prefix(id) else {
+            continue;
+        };
+        // A number too long for u64 leaves the next free one unknown.
+        let slot = highest.entry(letters).or_insert(Some(0));
+        *slot = match (*slot, digits.parse::<u64>()) {
+            (Some(high), Ok(number)) => Some(high.max(number)),
+            _ => None,
+        };
+        groups
+            .entry((letters, digits))
+            .or_default()
+            .push((id, origin));
+    }
+    let mut problems = Vec::new();
+    for (&(letters, digits), group) in &groups {
+        if group.len() < 2 {
+            continue;
+        }
+        let ref_took_it = group
+            .iter()
+            .any(|(_, origin)| matches!(origin, Listing::Ref(_)));
+        let mut first_branch_seen = false;
+        for &(id, origin) in group {
+            if matches!(origin, Listing::Ref(_)) {
+                continue;
+            }
+            if !first_branch_seen && !ref_took_it {
+                first_branch_seen = true;
+                continue;
+            }
+            // The ref's ticket when the ref took the number, else the
+            // branch ticket that stays.
+            let Some((other, other_origin)) =
+                group
+                    .iter()
+                    .copied()
+                    .find(|&(candidate, candidate_origin)| {
+                        candidate != id
+                            && (!ref_took_it || matches!(candidate_origin, Listing::Ref(_)))
+                    })
+            else {
+                continue;
+            };
+            let other_path = dir.join(format!("{other}.md"));
+            let other_named = match other_origin {
+                Listing::Ref(rev) => format!("{} on {rev}", other_path.display()),
+                Listing::Branch => other_path.display().to_string(),
+            };
+            // Each suggestion takes the next free number, so following
+            // every hint never makes a new duplicate.
+            let slot = highest.entry(letters).or_insert(None);
+            let next = slot.and_then(|high| high.checked_add(1));
+            if next.is_some() {
+                *slot = next;
+            }
+            let renumber = match next {
+                Some(next) => format!("; renumber to {letters}{next}"),
+                None => String::new(),
+            };
+            problems.push(Problem {
+                file: format!("{id}.md"),
+                line: 1,
+                message: format!("id {letters}{digits} is also used by {other_named}{renumber}"),
+            });
+        }
+    }
+    problems
+}
+
 /// What is worth fixing but does not fail `check`: each open afk ticket
 /// without a `## Look at` or a `## Answer looks like` section, on its
 /// heading line.
@@ -355,6 +484,84 @@ mod tests {
     use super::*;
     use crate::programme::claim::rules::{Holder as ClaimHolder, Kind};
     use crate::programme::model::{Mode, TicketType};
+
+    fn ids(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// `(file, message)` of each duplicate found, in order.
+    fn duplicates(own: &[&str], from_ref: &[&str]) -> Vec<(String, String)> {
+        duplicate_ids(
+            &ids(own),
+            Some((&ids(from_ref), "origin/main")),
+            Path::new("d"),
+        )
+        .into_iter()
+        .map(|problem| (problem.file, problem.message))
+        .collect()
+    }
+
+    #[test]
+    fn id_prefix_takes_letters_then_digits_up_to_a_dash_or_the_end() {
+        let cases: &[(&str, Option<(&str, &str)>)] = &[
+            ("f12", Some(("f", "12"))),
+            ("f12-a", Some(("f", "12"))),
+            ("t011-x", Some(("t", "011"))),
+            ("map", None),
+            ("12-a", None),
+            ("f12a", None),
+            ("f-12", None),
+        ];
+        for (id, expected) in cases {
+            assert_eq!(id_prefix(id), *expected, "{id}");
+        }
+    }
+
+    #[test]
+    fn of_three_branch_tickets_the_first_stays_and_the_later_two_name_it() {
+        assert_eq!(
+            duplicates(&["f12-a", "f12-b", "f12-c", "f3-x"], &[]),
+            vec![
+                (
+                    "f12-b.md".to_string(),
+                    "id f12 is also used by d/f12-a.md; renumber to f13".to_string()
+                ),
+                (
+                    "f12-c.md".to_string(),
+                    "id f12 is also used by d/f12-a.md; renumber to f14".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_number_the_ref_took_reports_every_branch_ticket_against_the_ref() {
+        assert_eq!(
+            duplicates(&["f71-b"], &["f71-a", "f72-z"]),
+            vec![(
+                "f71-b.md".to_string(),
+                "id f71 is also used by d/f71-a.md on origin/main; renumber to f73".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn duplicates_among_ref_tickets_alone_and_padded_numbers_are_not_reported() {
+        assert!(duplicates(&["f5-x"], &["f9-a", "f9-b"]).is_empty());
+        assert!(duplicates(&["f011-a", "f11-b"], &[]).is_empty());
+    }
+
+    #[test]
+    fn a_number_too_long_for_u64_drops_the_renumber_hint() {
+        let huge = "f99999999999999999999";
+        assert_eq!(
+            duplicates(&[&format!("{huge}-a"), &format!("{huge}-b")], &[]),
+            vec![(
+                format!("{huge}-b.md"),
+                format!("id {huge} is also used by d/{huge}-a.md")
+            )]
+        );
+    }
 
     fn ticket(id: &str, status: Status, blocked_by: &[&str]) -> Ticket {
         Ticket {

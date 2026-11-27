@@ -1722,3 +1722,235 @@ fn a_session_start_outside_a_repository_summarises_the_children_and_expands_the_
         "{context}"
     );
 }
+
+fn open_ticket(name: &str) -> String {
+    ticket("open", "[]", None, name, None)
+}
+
+#[test]
+fn check_refuses_two_tickets_sharing_a_number_and_names_the_next_free_one() {
+    let world = World::new("dup-ids");
+    world.write("f12-a.md", &open_ticket("First"));
+    world.write("f12-b.md", &open_ticket("Second"));
+    let out = world.programme(&["check"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "");
+    let dir = world.dir();
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "{}:1: id f12 is also used by {}; renumber to f13\n",
+            dir.join("f12-b.md").display(),
+            dir.join("f12-a.md").display()
+        )),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_bare_id_collides_but_a_longer_number_and_an_assets_directory_do_not() {
+    let world = World::new("dup-prefix");
+    world.write("f11.md", &open_ticket("Bare"));
+    world.write("f11-x.md", &open_ticket("Suffixed"));
+    let out = world.programme(&["check"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("id f11 is also used by"));
+
+    let world = World::new("dup-longer");
+    world.write("f110-a.md", &open_ticket("Long"));
+    world.write("f11-x.md", &open_ticket("Short"));
+    std::fs::create_dir(world.dir().join("f18-assets")).expect("assets dir");
+    world.write("f18-x.md", &open_ticket("Eighteen"));
+    let out = world.programme(&["check"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stderr), "");
+}
+
+fn commit_all(world: &World, message: &str) {
+    let repo = world.root.join("alpha");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", message]);
+}
+
+/// The programme committed on `trunk`, the working tree on `feature`
+/// branched from it, `HEAD` on `feature`.
+fn world_with_trunk_and_feature(tag: &str, base: &[&str]) -> World {
+    let world = World::new(tag);
+    for file in base {
+        world.write(file, &open_ticket(file));
+    }
+    let repo = world.root.join("alpha");
+    git(&repo, &["checkout", "-q", "-b", "trunk"]);
+    commit_all(&world, "base");
+    git(&repo, &["checkout", "-q", "-b", "feature"]);
+    world
+}
+
+fn check_with_trunk(world: &World) -> Output {
+    world.programme(&["check", "--no-fetch", "--with-ref", "trunk"])
+}
+
+#[test]
+fn with_ref_refuses_an_id_the_ref_took_since_the_merge_base() {
+    let world = world_with_trunk_and_feature("ref-taken", &[]);
+    let repo = world.root.join("alpha");
+    git(&repo, &["checkout", "-q", "trunk"]);
+    world.write("f71-a.md", &open_ticket("On trunk"));
+    commit_all(&world, "trunk adds f71-a");
+    git(&repo, &["checkout", "-q", "feature"]);
+    world.write("f71-b.md", &open_ticket("On feature"));
+    assert!(world.programme(&["check", "--no-fetch"]).status.success());
+    let out = check_with_trunk(&world);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "");
+    assert!(text(&out.stderr).contains("f71-b.md:1: id f71 is also used by"));
+}
+
+#[test]
+fn with_ref_lets_a_branch_rename_one_of_an_existing_pair() {
+    let world = world_with_trunk_and_feature("ref-rename", &["f71-a.md", "f71-b.md"]);
+    let repo = world.root.join("alpha");
+    git(&repo, &["checkout", "-q", "trunk"]);
+    world.write("f80-a.md", &open_ticket("Unrelated"));
+    commit_all(&world, "trunk adds f80-a");
+    git(&repo, &["checkout", "-q", "feature"]);
+    assert_eq!(
+        world.programme(&["check", "--no-fetch"]).status.code(),
+        Some(2)
+    );
+    git(
+        &repo,
+        &[
+            "mv",
+            "docs/programmes/demo/f71-a.md",
+            "docs/programmes/demo/f72-a.md",
+        ],
+    );
+    let out = check_with_trunk(&world);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+}
+
+#[test]
+fn with_ref_catches_a_number_the_ref_reached_by_renaming() {
+    let world = world_with_trunk_and_feature("ref-renamed", &["f70-x.md"]);
+    let repo = world.root.join("alpha");
+    git(&repo, &["checkout", "-q", "trunk"]);
+    git(
+        &repo,
+        &[
+            "mv",
+            "docs/programmes/demo/f70-x.md",
+            "docs/programmes/demo/f71-x.md",
+        ],
+    );
+    commit_all(&world, "trunk renames f70-x to f71-x");
+    git(&repo, &["checkout", "-q", "feature"]);
+    world.write("f71-y.md", &open_ticket("On feature"));
+    let out = check_with_trunk(&world);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("f71-y.md:1: id f71 is also used by"));
+}
+
+#[test]
+fn with_ref_reads_the_branch_tickets_when_the_programme_is_read_from_origin() {
+    let world = World::new("ref-origin-newer");
+    let branch = with_upstream(&world);
+    let alpha = world.root.join("alpha");
+    git(&alpha, &["checkout", "-q", "-b", "feature"]);
+    world.write("f71-b.md", &open_ticket("On feature"));
+    git(&alpha, &["add", "-A"]);
+    // The branch's work is older than origin's, so `check` reads origin.
+    let committed = git_command(&alpha)
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "feature adds f71-b",
+        ])
+        .env("GIT_COMMITTER_DATE", "2001-01-01T00:00:00Z")
+        .env("GIT_AUTHOR_DATE", "2001-01-01T00:00:00Z")
+        .status()
+        .expect("git runs");
+    assert!(committed.success());
+    push_upstream(&world, |demo| {
+        std::fs::write(demo.join("f71-a.md"), open_ticket("On main")).expect("ticket");
+    });
+    let rev = format!("origin/{branch}");
+    let out = world.programme(&["check", "--json", "--with-ref", &rev]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_eq!(
+        json_of(&out)["source"],
+        rev.as_str(),
+        "the programme is read from origin"
+    );
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "f71-b.md:1: id f71 is also used by {} on {rev}; renumber to f72\n",
+            world.dir().join("f71-a.md").display()
+        )),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn with_ref_refuses_an_empty_or_dash_ref_before_reading_anything() {
+    let world = World::new("ref-usage");
+    // With no map.md, a check that read the directory first would fail
+    // with another message.
+    std::fs::remove_file(world.dir().join("map.md")).expect("remove map.md");
+    for rev in ["", "-x"] {
+        let out = world.programme(&["check", "--no-fetch", &format!("--with-ref={rev}")]);
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+        assert!(
+            text(&out.stderr).contains("a ref is not empty and does not start with `-`"),
+            "{}",
+            text(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn with_ref_sharing_no_history_exits_one_with_the_hint() {
+    let world = world_with_trunk_and_feature("ref-orphan", &[]);
+    let repo = world.root.join("alpha");
+    git(&repo, &["checkout", "-q", "--orphan", "lonely"]);
+    commit_all(&world, "unrelated root");
+    git(&repo, &["checkout", "-q", "feature"]);
+    let out = world.programme(&["check", "--no-fetch", "--with-ref", "lonely"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "");
+    let stderr = text(&out.stderr);
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("relais:"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{stderr}");
+    assert!(
+        lines[0].contains("is lonely a ref sharing history with HEAD?"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn with_ref_naming_no_ref_exits_one_with_one_relais_line() {
+    let world = world_with_trunk_and_feature("ref-missing", &[]);
+    let out = world.programme(&["check", "--no-fetch", "--with-ref", "no-such-ref"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "");
+    let stderr = text(&out.stderr);
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("relais:"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{stderr}");
+    assert!(lines[0].contains("no-such-ref"), "{stderr}");
+}

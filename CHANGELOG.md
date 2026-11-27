@@ -8,6 +8,12 @@ missing here.
 
 ## Unreleased
 
+`relais programme check` now reports two tickets in one programme directory
+whose ids share a leading `<letters><digits>` prefix (`f12-a.md` and
+`f12-b.md`), and names the next free number. The new `--with-ref <ref>` flag
+also counts the tickets `<ref>` added since the merge-base, so a branch is
+refused an id the ref already took.
+
 ## v0.90.0
 
 relais now says greentopo wherever it names the decisions tool: run gaps

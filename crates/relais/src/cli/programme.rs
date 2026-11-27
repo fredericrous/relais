@@ -5,6 +5,7 @@
 //! programme's files, or origin's default branch through git, and the
 //! branch names git lists in the map's repository.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -451,19 +452,63 @@ pub(crate) fn check_command(
     dir: &Path,
     format: Format,
     fetch: Fetch,
+    with_ref: Option<&str>,
 ) -> Result<CliOutcome, CliError> {
+    if let Some(rev) = with_ref {
+        if rev.is_empty() || rev.starts_with('-') {
+            return Err(CliError::Usage {
+                detail: format!(
+                    "--with-ref `{rev}`: a ref is not empty and does not start with `-`"
+                ),
+            });
+        }
+    }
     let found = resolve_dir(dir, fetch)?;
     let programme = found.load().map_err(programme_error)?;
     let tag = ref_tag(&found.source);
-    let problems = programme.problems();
-    for problem in &problems {
-        eprintln!(
-            "{}:{}: {tag}{}",
-            dir.join(&problem.file).display(),
-            problem.line,
-            problem.message
-        );
-    }
+    let mut problems = programme.problems();
+    let duplicates = match with_ref {
+        // The programme may be read from origin (the branch's work on it
+        // being older), so the branch's own tickets come from the named
+        // checkout's files, and git runs there, never in `dir`, which may
+        // be absent on disk.
+        Some(rev) => {
+            let located = load::locate(dir).map_err(programme_error)?;
+            let own = load::branch_ticket_ids(&located.checkout, &located.slug)
+                .map_err(programme_error)?;
+            let from_ref = load::added_since_merge_base(&located.checkout, &located.slug, rev)
+                .map_err(programme_error)?;
+            analysis::duplicate_ids(&own, Some((&from_ref, rev)), dir)
+        }
+        None => {
+            let own: BTreeSet<String> = programme
+                .tickets
+                .keys()
+                .chain(&programme.unreadable)
+                .cloned()
+                .collect();
+            analysis::duplicate_ids(&own, None, dir)
+        }
+    };
+    // Under `--with-ref` the duplicates name the checkout's files, not the
+    // ref's, so they carry no `(<ref>) ` tag.
+    let duplicate_tag = match with_ref {
+        Some(_) => "",
+        None => tag.as_str(),
+    };
+    let print = |found: &[relais::programme::model::Problem], tag: &str| {
+        for problem in found {
+            eprintln!(
+                "{}:{}: {tag}{}",
+                dir.join(&problem.file).display(),
+                problem.line,
+                problem.message
+            );
+        }
+    };
+    print(&problems, &tag);
+    print(&duplicates, duplicate_tag);
+    problems.extend(duplicates);
     if !problems.is_empty() {
         eprintln!("{} problems", problems.len());
     }

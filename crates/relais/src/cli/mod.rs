@@ -544,6 +544,10 @@ pub(crate) enum ProgrammeCommand {
         /// Read origin as of the last fetch instead of fetching it first
         #[arg(long)]
         no_fetch: bool,
+        /// Also count the tickets this ref added since its merge-base with
+        /// HEAD, so an id the ref took is a duplicate here
+        #[arg(long, value_name = "REF")]
+        with_ref: Option<String>,
     },
     /// Take a ticket for this session as `work`, so no handoff names it to
     /// another; exit 3 when another live session holds it as `work`
@@ -1725,10 +1729,12 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 dir,
                 json,
                 no_fetch,
+                with_ref,
             } => programme_check_command(
                 &dir,
                 Format::from_json_flag(json),
                 Fetch::from_no_fetch_flag(no_fetch),
+                with_ref.as_deref(),
             ),
             ProgrammeCommand::Claim {
                 slug,
