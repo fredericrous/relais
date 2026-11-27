@@ -1367,11 +1367,16 @@ impl Drop for Admitted<'_> {
 
 mod slots {
     //! The host slots, through greengate's `greenharness-slots` crate (amont ADR-0014):
-    //! a waiter keeps its place across polls, and relais drives the polling
-    //! from its own queue, so the coordinator lease keeps its heartbeat and
-    //! the wait is charged like any other.
+    //! a waiter keeps its place across polls in the crate's one wait loop
+    //! (`wait_in_line_paced`, amont ADR-0022), and relais owns the pause
+    //! between polls through its own queue, so the coordinator lease keeps its
+    //! heartbeat and the wait is charged like any other.
 
+    use std::ops::ControlFlow;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use greenharness_slots::{Ended, LineEnd, Pause, WaitBounds, WaitEnd};
 
     use super::{Ask, Bound, Event, Gate, HeavyAdmission, Holding, LeaseStop, Queue, SlotLineEnd};
 
@@ -1452,7 +1457,7 @@ mod slots {
                 outcome,
             );
         };
-        let mut waiter = match greenharness_slots::Waiter::new_in_on(
+        let waiter = match greenharness_slots::Waiter::new_in_on(
             dir,
             sizing,
             ask.weight,
@@ -1466,110 +1471,113 @@ mod slots {
             }
         };
         // A line that moved inside the window keeps the wait going past
-        // `admission_wait_seconds`; one that did not ends it (ADR-0015).
-        let mut stall = greenharness_slots::Stall::new(admission.stall_window);
+        // `admission_wait_seconds`; one that did not ends it (ADR-0015). The
+        // crate's one loop (amont ADR-0022) owns the stall rule and the
+        // failure count, relais the pause; its budgets end a wait, not a ceiling.
+        let bounds = WaitBounds {
+            window: Some(admission.stall_window),
+            ceiling: Duration::MAX,
+        };
         let mut joined_at: Option<usize> = None;
-        let mut failures = 0u32;
-        loop {
-            let queued = match waiter.poll() {
-                Ok(greenharness_slots::Poll::Granted(held)) => {
-                    record(started.elapsed().as_millis(), "admitted", None);
-                    let over = admission.budgets.overrun();
-                    if !over.is_zero() {
-                        admission.events.emit(Event::Decision {
-                            what: "admission_overrun".into(),
-                            reason: format!(
-                                "queued {} s past `admission_wait_seconds` while the host slot \
-                                 line moved; charged to the total only",
-                                over.as_secs()
-                            ),
-                        });
+        let ended = greenharness_slots::wait_in_line_paced(
+            waiter,
+            bounds,
+            |_| {},
+            |step| {
+                let (position, behind) = match (step, joined_at) {
+                    (Pause::Waiting(queued), _) => {
+                        joined_at = Some(queued.position);
+                        (queued.position, behind(queued))
                     }
-                    return Ok(Some(held));
-                }
-                Ok(greenharness_slots::Poll::Waiting(queued)) => {
-                    failures = 0;
-                    joined_at = Some(queued.position);
-                    queued
-                }
-                Err(e) => {
-                    let Some(position) = joined_at else {
-                        admission.host_slots_off(&format!("a host slot could not be locked: {e}"));
-                        return Ok(None);
-                    };
-                    // The queue was joined: a failing lock ends the wait, as a
-                    // stalled line does, and never runs the command unqueued.
-                    failures += 1;
-                    if failures >= greenharness_slots::POLL_FAILURES {
-                        record(
-                            started.elapsed().as_millis(),
-                            "deferred",
-                            Some(greenharness_slots::WaitEnd::IoError),
-                        );
-                        let end = SlotLineEnd::Unreadable {
-                            failures,
-                            cause: e.to_string(),
-                        };
-                        admission.events.emit(Event::Decision {
-                            what: "admission_queue_unreadable".into(),
-                            reason: end.to_string(),
-                        });
-                        return Err(LeaseStop::SlotLine(end));
+                    (Pause::Retrying { .. }, Some(position)) => (position, None),
+                    // Not joined yet: the slots cannot be used, said once.
+                    (Pause::Retrying { error, .. }, None) => {
+                        admission
+                            .host_slots_off(&format!("a host slot could not be locked: {error}"));
+                        return ControlFlow::Break(Halt::Unusable);
                     }
-                    let _ = gate.heartbeat(lease); // best-effort, as in the waiting arm
-                    let waited = queue.wait(
-                        Holding::Slot {
-                            class: "host_slot",
-                            position,
-                            behind: None,
-                            bound: Bound::Stall,
-                        },
-                        ask.cancel,
-                        admission.sleeper.as_ref(),
-                    );
-                    if let Err(stop) = waited {
-                        record(started.elapsed().as_millis(), "deferred", end_of(&stop));
-                        return Err(stop);
-                    }
-                    continue;
-                }
-            };
-            if stall.observe(&waiter, &queued) {
-                record(
-                    started.elapsed().as_millis(),
-                    "deferred",
-                    Some(greenharness_slots::WaitEnd::Stalled),
-                );
-                let end = SlotLineEnd::Stalled {
-                    window_s: stall.limit().as_secs(),
-                    position: queued.position,
                 };
-                admission.events.emit(Event::Decision {
-                    what: "admission_queue_ended".into(),
-                    reason: end.to_string(),
-                });
-                return Err(LeaseStop::SlotLine(end));
-            }
-            // The tokens are held while the slots are awaited: say so, so
-            // the coordinator does not take the lease for abandoned.
-            let _ = gate.heartbeat(lease); // best-effort: the next poll beats again
-            let waited = queue.wait(
-                Holding::Slot {
+                // The tokens are held while the slots are awaited: say so, so
+                // the coordinator does not take the lease for abandoned.
+                let _ = gate.heartbeat(lease); // best-effort: the next poll beats again
+                let slot = Holding::Slot {
                     class: "host_slot",
-                    position: queued.position,
-                    behind: behind(&queued),
+                    position,
+                    behind,
                     bound: Bound::Stall,
-                },
-                ask.cancel,
-                admission.sleeper.as_ref(),
-            );
-            if let Err(stop) = waited {
-                // Ended by the budget or a cancel: a sample too, or the
-                // day-14 wait percentiles would see only the admissions.
-                record(started.elapsed().as_millis(), "deferred", end_of(&stop));
+                };
+                match queue.wait(slot, ask.cancel, admission.sleeper.as_ref()) {
+                    Ok(()) => ControlFlow::Continue(()),
+                    Err(stop) => ControlFlow::Break(Halt::Stop(stop)),
+                }
+            },
+        );
+        let waited_ms = started.elapsed().as_millis();
+        let (what, end, journal) = match ended {
+            Ok(held) => {
+                record(waited_ms, "admitted", None);
+                let over = admission.budgets.overrun();
+                if !over.is_zero() {
+                    admission.events.emit(Event::Decision {
+                        what: "admission_overrun".into(),
+                        reason: format!(
+                            "queued {} s past `admission_wait_seconds` while the host slot \
+                             line moved; charged to the total only",
+                            over.as_secs()
+                        ),
+                    });
+                }
+                return Ok(Some(held));
+            }
+            Err(Ended::Caller(Halt::Unusable)) => return Ok(None),
+            // Ended by the budget or a cancel: a sample too, or the day-14
+            // wait percentiles would see only the admissions.
+            Err(Ended::Caller(Halt::Stop(stop))) => {
+                record(waited_ms, "deferred", end_of(&stop));
                 return Err(stop);
             }
-        }
+            Err(Ended::Line(LineEnd::PollFailed { error })) => (
+                "admission_queue_unreadable",
+                SlotLineEnd::Unreadable {
+                    failures: greenharness_slots::POLL_FAILURES,
+                    cause: error.to_string(),
+                },
+                WaitEnd::IoError,
+            ),
+            Err(Ended::Line(LineEnd::Stalled { window, position })) => (
+                "admission_queue_ended",
+                SlotLineEnd::Stalled {
+                    window_s: window.as_secs(),
+                    position,
+                },
+                WaitEnd::Stalled,
+            ),
+            // Never reached under `Duration::MAX`: a line that stopped where
+            // it was, never a panic.
+            Err(Ended::Line(LineEnd::Ceiling { .. })) => (
+                "admission_queue_ended",
+                SlotLineEnd::Stalled {
+                    window_s: admission.stall_window.as_secs(),
+                    position: joined_at.unwrap_or_default(),
+                },
+                WaitEnd::Ceiling,
+            ),
+        };
+        record(waited_ms, "deferred", Some(journal));
+        admission.events.emit(Event::Decision {
+            what: what.into(),
+            reason: end.to_string(),
+        });
+        Err(LeaseStop::SlotLine(end))
+    }
+
+    /// What ends a host-slot wait from relais's side of the pause: slots that
+    /// could not be used before the line was joined (said once, the command
+    /// runs unqueued), or a stop of relais's own queue (a spent budget, a
+    /// cancel).
+    enum Halt {
+        Unusable,
+        Stop(LeaseStop),
     }
 
     /// The journal's `end` for a wait the queue stopped: a spent budget is a

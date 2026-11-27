@@ -5184,7 +5184,7 @@ mod tests {
         let mut followed = None;
         // How long the last followed run took, for the bound on its events.
         let mut last_followed_took = std::time::Duration::ZERO;
-        let load_before = crate::procs::load_average();
+        let load_before = greenharness_slots::load1();
         for round in 0..3 {
             let start = std::time::Instant::now();
             silent =
@@ -5207,7 +5207,7 @@ mod tests {
             last_followed_took = start.elapsed();
             followed_took = followed_took.min(last_followed_took);
         }
-        let load_after = crate::procs::load_average();
+        let load_after = greenharness_slots::load1();
         let silent = silent.expect("ran");
         let followed = followed.expect("ran");
 

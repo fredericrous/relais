@@ -431,7 +431,7 @@ pub(crate) fn replay_command(
         task_type,
         task: &task_id,
         arm_model: arm.model.unwrap_or("none"),
-        load: relais::procs::load_average(),
+        load: greenharness_slots::load1(),
         started: std::time::Instant::now(),
     };
     eprintln!("{}", log.start_line());
