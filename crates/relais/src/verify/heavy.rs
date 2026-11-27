@@ -92,12 +92,46 @@ pub const UNREACHABLE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// spent retrying), so the run stays visibly alive.
 pub const COORDINATOR_UNREACHABLE_CLASS: &str = "coordinator_unreachable";
 
+/// relais's own held marker, judged once at the composition root (the CLI
+/// reads it before `execute`) by the slots crate's one reader, with the log
+/// that says a refusal once: every admission of one run, and of the child
+/// runs it hosts, gets the same answer (amont host-slot-admission t15).
+pub struct HostMarker {
+    marker: greenharness_slots::Marker,
+    log: greenharness_slots::MarkerLog,
+}
+
+impl HostMarker {
+    /// This process's `GREENHARNESS_HOST_SLOT`, judged now.
+    pub fn read() -> HostMarker {
+        HostMarker::given(greenharness_slots::held_marker())
+    }
+
+    /// A marker already judged, with a fresh log: the seam tests use.
+    pub fn given(marker: greenharness_slots::Marker) -> HostMarker {
+        HostMarker {
+            marker,
+            log: greenharness_slots::MarkerLog::new(),
+        }
+    }
+
+    /// No marker: nothing held above this run.
+    pub fn absent() -> HostMarker {
+        HostMarker::given(greenharness_slots::Marker::Absent)
+    }
+
+    /// [`ancestor_holds_slots`] for this marker and its log.
+    pub fn judge(&self, queues: Option<&Path>) -> (bool, Option<String>) {
+        ancestor_holds_slots(&self.marker, queues, &self.log)
+    }
+}
+
 /// Whether an ancestor already holds host slots for this process tree, and
 /// the line to say when it does not: `marker` is relais's own
 /// `GREENHARNESS_HOST_SLOT` as the slots crate's one reader judged it (amont
 /// ADR-0022, amended for t15; the bare `held` is accepted during the
-/// rollout). The runner reads it at its boundary, holds the once-per-process
-/// `log`, and prints the line. `queues` is the slot directory this run would
+/// rollout), and `log` the run's ([`HostMarker`]); the runner prints the
+/// line. `queues` is the slot directory this run would
 /// queue on, when the host queue is on there: a refused marker is then
 /// journalled there once per log, and its line returned once. A held marker
 /// never returns a line: the crate has none for an accepted marker.

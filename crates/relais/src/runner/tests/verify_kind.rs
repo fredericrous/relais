@@ -1177,6 +1177,7 @@ fn execute_predicted(
         declarations: &crate::trust::NoHistory,
         shared_state: &crate::shared_state::LocalState::new(),
         node_host: Some("test-node".into()),
+        host_marker: &crate::verify::HostMarker::absent(),
     })
     .expect("the fixture's id source mints identifiers")
 }

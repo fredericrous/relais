@@ -402,6 +402,7 @@ fn run_to_the_end(fill: &Fill, run_id: Option<RunId>) -> Result<RunOutcome, RunE
         declarations: &crate::trust::NoHistory,
         shared_state: &crate::shared_state::LocalState::new(),
         node_host: Some("test-node".into()),
+        host_marker: &crate::verify::HostMarker::absent(),
     })
 }
 
