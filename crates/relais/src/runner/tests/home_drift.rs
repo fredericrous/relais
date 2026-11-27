@@ -433,6 +433,9 @@ fn with_branch_t(fixture: &Fixture) -> String {
     format!("{before}[branch \"t\"]\n\tremote = origin\n")
 }
 
+// unix: the fixture spells home paths with `/` and `~/` (Windows prints them
+// absolute and joins with `\`).
+#[cfg(unix)]
 #[test]
 fn the_49_rows_path_mix_is_told_apart_by_cause() {
     let fixture = Fixture::new();
@@ -526,6 +529,9 @@ fn netrc_call(fixture: &Fixture, line: String) -> Option<Cause> {
     causes.get(&netrc).cloned().expect("a netrc drift")
 }
 
+// unix: the fixture spells home paths with `/` and `~/` (Windows prints them
+// absolute and joins with `\`).
+#[cfg(unix)]
 #[test]
 fn a_worker_write_to_a_watched_file_is_named_with_its_tool_and_agent() {
     let calls = [
@@ -594,6 +600,9 @@ fn bash_in_repo(fixture: &Fixture, command: &str) -> String {
     record.to_string()
 }
 
+// unix: the fixture spells home paths with `/` and `~/` (Windows prints them
+// absolute and joins with `\`).
+#[cfg(unix)]
 #[test]
 fn a_worker_git_config_write_is_a_call_and_a_read_only_git_form_leaves_the_writer() {
     let fixture = Fixture::new();

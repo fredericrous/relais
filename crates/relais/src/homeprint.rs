@@ -1469,6 +1469,9 @@ mod tests {
         }
     }
 
+    // unix: the fixture spells home paths with `/` and `~/` (Windows prints them
+    // absolute and joins with `\`).
+    #[cfg(unix)]
     #[test]
     fn the_report_lists_unexplained_then_worker_named_then_one_count_line_per_writer() {
         let drifts = [

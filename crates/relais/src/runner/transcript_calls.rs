@@ -565,6 +565,9 @@ mod tests {
         writes(call, &target, &world)
     }
 
+    // unix: the fixture spells home paths with `/` and `~/` (Windows prints them
+    // absolute and joins with `\`).
+    #[cfg(unix)]
     #[test]
     fn a_file_edit_tool_on_the_path_writes_it() {
         for name in ["Edit", "Write", "MultiEdit"] {
@@ -579,6 +582,9 @@ mod tests {
         assert!(!writes_netrc(&call("Write", other, None)));
     }
 
+    // unix: the fixture spells home paths with `/` and `~/` (Windows prints them
+    // absolute and joins with `\`).
+    #[cfg(unix)]
     #[test]
     fn a_command_writes_a_path_by_redirect_or_a_writing_program() {
         let writing = [
