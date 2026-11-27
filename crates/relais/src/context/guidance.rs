@@ -31,17 +31,17 @@ pub const RELEVANT_TOP: usize = 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GuidanceSource {
-    /// `aval rules`: the constraint index.
+    /// `greentopo rules`: the constraint index.
     Index,
     /// The full text of the `governs: code` rules.
     CodeRules,
-    /// `aval relevant`: the relevance ranking.
+    /// `greentopo relevant`: the relevance ranking.
     Relevant,
     /// The relevance ranking, some entries dropped over the budget.
     RelevantPartial,
     /// The full statements the reviewer prompt carries.
     Reviewer,
-    /// `aval relevant` for the paths the candidate patch changes: the
+    /// `greentopo relevant` for the paths the candidate patch changes: the
     /// decisions the reviewer is given.
     Decisions,
     /// `greenspotter candidates`: the lines the reviewer is asked to rule on.
@@ -70,7 +70,7 @@ pub enum GapCause {
     /// aval timed out, was cancelled or died on a signal.
     #[default]
     NoAnswer,
-    /// The `aval` binary could not be launched at all: asking it a second
+    /// The `greentopo` binary could not be launched at all: asking it a second
     /// question would fail the same way.
     NotLaunched,
     /// The guidance was dropped to fit its byte budget.
@@ -148,7 +148,7 @@ pub struct RuleRef {
     pub statement: String,
 }
 
-/// What `aval rules` left out of the list, as aval counts it.
+/// What `greentopo rules` left out of the list, as aval counts it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Omitted {
     #[serde(default)]
@@ -305,7 +305,7 @@ pub struct RankedKey {
     pub scope: Option<String>,
 }
 
-/// What `aval relevant` ranked for a query.
+/// What `greentopo relevant` ranked for a query.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Relevant {
     pub keys: Vec<RankedKey>,
@@ -572,7 +572,7 @@ struct RawRules {
     omitted: Omitted,
 }
 
-/// Parse `aval rules --level constraint --full --json` (aval 1.10.0), or
+/// Parse `greentopo rules --level constraint --full --json` (aval 1.10.0), or
 /// the same without `--full` (1.9.0, no `governs`, no `body`): the active
 /// rules, the ones that govern code, and what aval omitted. Any other
 /// shape is a gap.
@@ -604,7 +604,7 @@ pub fn parse_rules_output(stdout: &str) -> Result<Rules, GuidanceGap> {
     })
 }
 
-/// One spawn of `aval` with the given argv.
+/// One spawn of `greentopo` with the given argv.
 pub(super) type AvalRun<'a> = &'a dyn Fn(&[String]) -> Result<String, GuidanceGap>;
 
 /// [`fetch_rules`] in the repository, and when the repository has no
@@ -642,7 +642,7 @@ pub fn fetch_rules(
         rules.notes.push(GuidanceGap::new(
             GuidanceSource::CodeRules,
             GapCause::AvalTooOld,
-            "the decisions tool (greentopo or aval) is older than 1.10.0 (no --full/governs; exit 2): code rules are not carried; upgrade it, e.g. `brew upgrade greentopo` or greentopo's install/install.sh",
+            "greentopo is older than 1.10.0 (no --full/governs; exit 2): code rules are not carried; upgrade it, e.g. `brew upgrade greentopo` or greentopo's install/install.sh",
         ));
     } else if !rules.rules.is_empty() && rules.code_rules.is_empty() {
         rules.notes.push(GuidanceGap::new(
@@ -674,7 +674,7 @@ struct RawRelevant {
     rules: Option<Vec<RawRule>>,
 }
 
-/// Parse `aval relevant … --json` (aval 1.9.0): the ranked keys with their
+/// Parse `greentopo relevant … --json` (aval 1.9.0): the ranked keys with their
 /// state and the ranked rules. An output with neither list is a gap.
 pub fn parse_relevant_output(stdout: &str) -> Result<Relevant, GuidanceGap> {
     let gap =
@@ -755,7 +755,7 @@ pub fn query_paths(scope: &[String], read_hints: &[String]) -> Vec<String> {
     paths
 }
 
-/// The argv of `aval relevant`: joined `--path=`/`--text=` forms, so a
+/// The argv of `greentopo relevant`: joined `--path=`/`--text=` forms, so a
 /// value that starts with `-` is a value and never a flag; the objective
 /// is cut to `OBJECTIVE_ARGV_BYTES` on a char boundary.
 pub fn relevant_args(query: &RelevantQuery) -> Vec<String> {
@@ -771,7 +771,7 @@ pub fn relevant_args(query: &RelevantQuery) -> Vec<String> {
     args
 }
 
-/// The argv of `aval relevant` for the paths a candidate patch changes: the
+/// The argv of `greentopo relevant` for the paths a candidate patch changes: the
 /// joined `--path=` form, one per file, and no objective text.
 pub fn decisions_args(paths: &[String]) -> Vec<String> {
     let mut args = vec![
@@ -799,7 +799,7 @@ pub fn fetch_decisions(
         })
 }
 
-/// The argv of `aval rules` for the constraints, full text included.
+/// The argv of `greentopo rules` for the constraints, full text included.
 pub fn rules_args() -> Vec<String> {
     ["rules", "--level", "constraint", "--full", "--json"]
         .into_iter()
@@ -926,7 +926,7 @@ mod tests {
         assert_eq!(rule.checker(), Checker::Tool);
     }
 
-    /// Captured from aval 1.9.0 (`aval rules --level constraint --json`),
+    /// Captured from aval 1.9.0 (`greentopo rules --level constraint --json`),
     /// shortened to three rules; one is inactive.
     const RULES_JSON: &str = r#"{"omitted":{"constraints":11,"heuristics":0,"traits":["cli"]},
       "rules":[
@@ -935,7 +935,7 @@ mod tests {
       {"active":false,"id":"functions.retired","level":"constraint","statement":"Not in force."},
       {"active":true,"id":"functions.no-flag-arguments","level":"constraint","statement":"No flag arguments."}]}"#;
 
-    /// Captured from aval 1.9.0 (`aval relevant --path=… --json`).
+    /// Captured from aval 1.9.0 (`greentopo relevant --path=… --json`).
     const RELEVANT_JSON: &str = r#"{"advisory":true,"kind":"suggestion","ranked":3,
       "keys":[
         {"adr":"ADR-0001","choice":"relais routes the model of the person's own session","key":"routing.session-model","state":"active","score":3.1},

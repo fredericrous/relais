@@ -184,7 +184,7 @@ pub enum DependencyMode {
     Off,
 }
 
-/// String (`aval = "required"`) or table form with an explicit binary
+/// String (`greentopo = "required"`) or table form with an explicit binary
 /// override for doctor/invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -213,41 +213,32 @@ impl Dependency {
     }
 }
 
+/// The `[integrations]` key of the decision corpus tool (greentopo, which
+/// was aval). Every reader names the key through this constant, so no
+/// copy of the old name can keep selecting the old binary.
+pub(crate) const TOPO_KEY: &str = "greentopo";
+
+/// The `[integrations]` key greentopo had before its rename. It is no
+/// longer read: [`RepoPolicy::from_toml_str`] refuses it by name.
+const RETIRED_TOPO_KEY: &str = "aval";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(try_from = "IntegrationsWire")]
+#[serde(deny_unknown_fields)]
 pub struct Integrations {
-    pub aval: Option<Dependency>,
+    pub greentopo: Option<Dependency>,
     pub amont: Option<Dependency>,
     pub amont_agent: Option<Dependency>,
 }
 
-/// What `[integrations]` may spell on disk: the tool's new name
-/// (`greentopo`) is read into the same `aval` value, so no reader and no
-/// serialized form changes.
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields, default)]
-struct IntegrationsWire {
-    aval: Option<Dependency>,
-    greentopo: Option<Dependency>,
-    amont: Option<Dependency>,
-    amont_agent: Option<Dependency>,
-}
-
-const BOTH_TOPO_KEYS_MESSAGE: &str =
-    "set only one of [integrations] aval and greentopo; remove the aval line";
-
-impl TryFrom<IntegrationsWire> for Integrations {
-    type Error = PolicyError;
-
-    fn try_from(wire: IntegrationsWire) -> Result<Self, Self::Error> {
-        if wire.aval.is_some() && wire.greentopo.is_some() {
-            return Err(PolicyError::BothTopoIntegrationKeys);
-        }
-        Ok(Integrations {
-            aval: wire.aval.or(wire.greentopo),
-            amont: wire.amont,
-            amont_agent: wire.amont_agent,
-        })
+impl Integrations {
+    /// Every integration with its `[integrations]` key, in one order: the
+    /// one list probing, the trust declaration and doctor iterate.
+    pub fn entries(&self) -> [(&'static str, Option<&Dependency>); 3] {
+        [
+            (TOPO_KEY, self.greentopo.as_ref()),
+            ("amont", self.amont.as_ref()),
+            ("amont_agent", self.amont_agent.as_ref()),
+        ]
     }
 }
 
@@ -729,8 +720,8 @@ pub struct RepoPolicy {
 
 impl RepoPolicy {
     pub fn from_toml_str(text: &str) -> Result<Self, PolicyError> {
-        if sets_both_topo_keys(text) {
-            return Err(PolicyError::BothTopoIntegrationKeys);
+        if let Some(greentopo_also_set) = retired_topo_key(text) {
+            return Err(PolicyError::RetiredAvalIntegrationKey { greentopo_also_set });
         }
         let policy: RepoPolicy =
             toml::from_str(text).map_err(|e| PolicyError::MalformedToml(e.to_string()))?;
@@ -945,26 +936,28 @@ fn validate_reuse(reuse: &ReuseSpec) -> Result<(), PolicyError> {
         .try_for_each(|output| validate_workspace_path(output, "reuse output"))
 }
 
-/// True when the raw `[integrations]` table carries both spellings of the
-/// topo-spotter key. Checked before the typed parse, because a `try_from`
-/// error would surface as a TOML error and be reported as malformed TOML.
-/// Unparseable text returns false, so the strict parse after it names the
-/// error.
-fn sets_both_topo_keys(text: &str) -> bool {
-    text.parse::<toml::Table>()
-        .ok()
-        .and_then(|table| {
-            let integrations = table.get("integrations")?.as_table()?;
-            Some(integrations.contains_key("aval") && integrations.contains_key("greentopo"))
-        })
-        .unwrap_or(false)
+/// Whether the raw `[integrations]` table still carries the retired `aval`
+/// key, in any TOML spelling (table, dotted or inline): `Some` when it
+/// does, holding whether `greentopo` is set beside it. Checked before the
+/// typed parse so the refusal names the fix instead of reading as a
+/// generic unknown field. Unparseable text gives `None`, so the strict
+/// parse after it names the error.
+fn retired_topo_key(text: &str) -> Option<bool> {
+    let table = text.parse::<toml::Table>().ok()?;
+    let integrations = table.get("integrations")?.as_table()?;
+    integrations
+        .contains_key(RETIRED_TOPO_KEY)
+        .then(|| integrations.contains_key(TOPO_KEY))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyError {
     UnsupportedSchemaVersion(u64),
-    /// `[integrations]` sets both `aval` and `greentopo`.
-    BothTopoIntegrationKeys,
+    /// `[integrations]` still sets the retired `aval` key, alone or beside
+    /// `greentopo`.
+    RetiredAvalIntegrationKey {
+        greentopo_also_set: bool,
+    },
     MalformedToml(String),
     EmptyRiskPaths,
     EmptyCommandArgv,
@@ -1014,7 +1007,20 @@ impl std::fmt::Display for PolicyError {
                 "unsupported relais.toml schema_version {v} (this relais understands \
                  {MIN_POLICY_SCHEMA_VERSION}..={POLICY_SCHEMA_VERSION})"
             ),
-            Self::BothTopoIntegrationKeys => write!(f, "{BOTH_TOPO_KEYS_MESSAGE}"),
+            Self::RetiredAvalIntegrationKey {
+                greentopo_also_set: false,
+            } => write!(
+                f,
+                "[integrations] {RETIRED_TOPO_KEY} is no longer read: rename the key \
+                 {RETIRED_TOPO_KEY} to {TOPO_KEY} and keep its value"
+            ),
+            Self::RetiredAvalIntegrationKey {
+                greentopo_also_set: true,
+            } => write!(
+                f,
+                "[integrations] {RETIRED_TOPO_KEY} is no longer read and {TOPO_KEY} is \
+                 already set: remove the {RETIRED_TOPO_KEY} line"
+            ),
             Self::MalformedToml(detail) => write!(f, "policy file is not valid TOML: {detail}"),
             Self::EmptyRiskPaths => write!(f, "a [[risk]] rule needs at least one path pattern"),
             Self::EmptyCommandArgv => write!(f, "a verification command needs a non-empty argv"),
@@ -3004,7 +3010,7 @@ max_repairs_before_escalation = 1
 max_wall_seconds = 1200
 
 [integrations]
-aval = "required"
+greentopo = "required"
 amont = "required"
 amont_agent = "required"
 
@@ -3074,7 +3080,7 @@ keys = ["output.contract"]
             ["make", "check"]
         );
         assert_eq!(
-            policy.integrations.aval.as_ref().unwrap().mode(),
+            policy.integrations.greentopo.as_ref().unwrap().mode(),
             DependencyMode::Required
         );
         assert_eq!(policy.architecture.mapping[0].keys, ["output.contract"]);
@@ -4054,7 +4060,7 @@ max_agent_depth = 1
 max_agents_total = 1
 
 [integrations]
-aval = "optional"
+greentopo = "optional"
 amont = "optional"
 
 [[verification.profiles.default.commands]]
@@ -4075,7 +4081,7 @@ timeout_seconds = 60
         // Pinned from the base revision, before the key existed.
         assert_eq!(
             repo.authority_hash(),
-            "62accc6aa657334e14ec991ef466b22c3db7917bb3bb8654d85d111ecf3acf33"
+            "1f9f2b4341120f6721ecd0eaac34b7d42c67771b3a214aeff3fb4102c7a88d3c"
         );
     }
 
@@ -4151,7 +4157,7 @@ timeout_seconds = 60
         let repo = RepoPolicy::from_toml_str(FROZEN_V1_POLICY).expect("the frozen fixture parses");
         assert_eq!(
             repo.authority_hash(),
-            "62accc6aa657334e14ec991ef466b22c3db7917bb3bb8654d85d111ecf3acf33",
+            "1f9f2b4341120f6721ecd0eaac34b7d42c67771b3a214aeff3fb4102c7a88d3c",
             "the authority hash of a v1-shaped policy must not move; a moved hash is a DEAD \
              TRUST GRANT on every repository whose policy has this shape"
         );
@@ -4167,7 +4173,7 @@ timeout_seconds = 60
         .expect("the frozen fixture plus one recipe parses");
         assert_eq!(
             with_recipe.authority_hash(),
-            "ae3a0efe11b4cecfcdc95e527e05bba923967d62556767a91750c17cb12e75cb",
+            "2b73d3a1b97ec2c5ca1c91930175ecc76d716aa5324cd83356225ea76ca4136e",
             "a recipe setting only name/kind/scope_within/tier must hash exactly as it did \
              before RecipeSpec grew its new fields"
         );
@@ -4181,7 +4187,7 @@ timeout_seconds = 60
             .expect("this repository's own relais.toml parses");
         assert_eq!(
             own.authority_hash(),
-            "93ca8f03b55b50e7103b38fbefdb4e47ae572c93c25a85661275ae89296077dd",
+            "bc14c309ac79541fbfe93c1bfd9e307f972fd9f493fb73f91126f3a2dfc82d36",
             "the hash of this repository's own policy must not move (it moved deliberately nine \
 times: when the per-type recipes were seeded, when `cache_baseline` was turned on, when \
 `make check` was split into one check per gate, when the `make test` and `make msrv` \
@@ -4193,7 +4199,7 @@ greengate 4.0's `GREENGATE_ON_BUSY`)"
         let tiered = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
         assert_eq!(
             tiered.authority_hash(),
-            "d909b85bb81bf97cd2a2415b758cc9cc9d5d74eac087ef3746755ac1d27c74c7",
+            "404b5eb6b25d8d92f314ff046a8951bf32c6766f6020310537e6c633632d994f",
             "a policy with per-tier efforts must hash as it did with the enum"
         );
     }
@@ -4803,21 +4809,17 @@ command = { argv = ["true"], junit = "j.xml" }
     }
 
     #[test]
-    fn greentopo_key_reads_as_the_aval_dependency() {
-        let with_aval =
-            RepoPolicy::from_toml_str("schema_version = 1\n[integrations]\naval = \"required\"\n")
-                .unwrap();
-        let with_greentopo = RepoPolicy::from_toml_str(
+    fn greentopo_is_the_serialized_integration_key() {
+        let policy = RepoPolicy::from_toml_str(
             "schema_version = 1\n[integrations]\ngreentopo = \"required\"\n",
         )
         .unwrap();
-        assert_eq!(with_aval, with_greentopo);
-        assert_eq!(with_aval.authority_hash(), with_greentopo.authority_hash());
-        let json = serde_json::to_string(&with_greentopo).unwrap();
-        assert_eq!(json, serde_json::to_string(&with_aval).unwrap());
-        assert!(!json.contains("greentopo"));
-        let back: RepoPolicy = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, with_greentopo);
+        let json = serde_json::to_value(&policy).unwrap();
+        let integrations = json["integrations"].as_object().unwrap();
+        assert!(integrations.contains_key("greentopo"), "{json}");
+        assert!(!integrations.contains_key("aval"), "{json}");
+        let back: RepoPolicy = serde_json::from_value(json).unwrap();
+        assert_eq!(back, policy);
     }
 
     #[test]
@@ -4827,34 +4829,61 @@ command = { argv = ["true"], junit = "j.xml" }
         )
         .unwrap();
         assert!(matches!(
-            policy.integrations.aval,
+            policy.integrations.greentopo,
             Some(Dependency::Full { mode: DependencyMode::Optional, bin: Some(ref bin) }) if bin == "x"
         ));
     }
 
     #[test]
-    fn both_topo_keys_are_refused_with_their_own_error() {
-        let err = RepoPolicy::from_toml_str(
+    fn the_retired_aval_key_is_refused_by_name_in_every_spelling() {
+        for text in [
+            "schema_version = 1\n[integrations]\naval = \"required\"\n",
+            "schema_version = 1\nintegrations.aval = \"required\"\n",
+            "schema_version = 1\nintegrations = { aval = { mode = \"optional\", bin = \"x\" } }\n",
+        ] {
+            let err = RepoPolicy::from_toml_str(text).unwrap_err();
+            assert_eq!(
+                err,
+                PolicyError::RetiredAvalIntegrationKey {
+                    greentopo_also_set: false
+                },
+                "{text}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "[integrations] aval is no longer read: rename the key aval to greentopo \
+                 and keep its value"
+            );
+        }
+        let both = RepoPolicy::from_toml_str(
             "schema_version = 1\n[integrations]\naval = \"required\"\ngreentopo = \"required\"\n",
         )
         .unwrap_err();
-        assert_eq!(err, PolicyError::BothTopoIntegrationKeys);
-        let text = err.to_string();
-        assert!(text.contains("set only one of [integrations] aval and greentopo"));
-        assert!(!text.contains("not valid TOML"));
+        assert_eq!(
+            both.to_string(),
+            "[integrations] aval is no longer read and greentopo is already set: \
+             remove the aval line"
+        );
     }
 
     #[test]
-    fn both_topo_keys_are_refused_in_dotted_form_and_from_json() {
-        let dotted = RepoPolicy::from_toml_str(
-            "schema_version = 1\nintegrations.aval = \"required\"\nintegrations.greentopo = \"required\"\n",
+    fn an_aval_key_that_skips_the_toml_entry_point_is_an_unknown_field() {
+        let json = serde_json::from_str::<Integrations>(r#"{"aval":"required"}"#).unwrap_err();
+        assert!(json.to_string().contains("unknown field `aval`"), "{json}");
+        let toml = toml::from_str::<RepoPolicy>(
+            "schema_version = 1\n[integrations]\naval = \"required\"\n",
         )
         .unwrap_err();
-        assert_eq!(dotted, PolicyError::BothTopoIntegrationKeys);
-        let json =
-            serde_json::from_str::<Integrations>(r#"{"aval":"required","greentopo":"required"}"#)
-                .unwrap_err();
-        assert!(json.to_string().contains("set only one of"), "{json}");
+        assert!(toml.to_string().contains("unknown field `aval`"), "{toml}");
+    }
+
+    #[test]
+    fn the_init_template_declares_greentopo() {
+        let policy = RepoPolicy::from_toml_str(INIT_TEMPLATE).unwrap();
+        assert_eq!(
+            policy.integrations.greentopo.as_ref().map(Dependency::mode),
+            Some(DependencyMode::Required)
+        );
     }
 
     #[test]

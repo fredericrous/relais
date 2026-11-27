@@ -42,7 +42,7 @@ pub struct Skipped {
 /// The `[integrations]` a proposal declares.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProposedIntegrations {
-    pub aval: &'static str,
+    pub greentopo: &'static str,
     pub amont: &'static str,
     pub amont_agent: &'static str,
 }
@@ -101,7 +101,7 @@ fn detect_policy_with(root: &Path, amont: Option<&Path>) -> Proposal {
         // Every integration is proposed optional: a missing tool is
         // reported, never a reason a run cannot start (ADR-0047).
         amont: "optional",
-        aval: "optional",
+        greentopo: "optional",
         amont_agent: "optional",
     };
     let toml = render_toml(&setup, &commands, &integrations);
@@ -449,7 +449,7 @@ fn render_toml(
          # \"optional\" reports it missing; \"off\" skips it.\n",
     );
     out.push_str("[integrations]\n");
-    out.push_str(&format!("greentopo = {}\n", quoted(integrations.aval)));
+    out.push_str(&format!("greentopo = {}\n", quoted(integrations.greentopo)));
     out.push_str(&format!("amont = {}\n", quoted(integrations.amont)));
     out.push_str(&format!(
         "amont_agent = {}\n",
@@ -696,7 +696,7 @@ mod tests {
         assert_eq!(argvs(&proposal.commands), [["cargo", "test"]]);
         assert!(proposal.setup.is_empty(), "Cargo.lock calls for no setup");
         assert_eq!(proposal.integrations.amont, "optional");
-        assert_eq!(proposal.integrations.aval, "optional");
+        assert_eq!(proposal.integrations.greentopo, "optional");
         parses(&proposal);
         let text = render_toml(&proposal.setup, &proposal.commands, &proposal.integrations);
         assert!(text.contains("greentopo = \"optional\""), "{text}");
@@ -957,7 +957,7 @@ mod tests {
         );
         assert_eq!(argvs(&proposal.commands), [["cargo", "test"]]);
         assert_eq!(proposal.integrations.amont, "optional");
-        assert_eq!(proposal.integrations.aval, "optional");
+        assert_eq!(proposal.integrations.greentopo, "optional");
         assert_eq!(proposal.integrations.amont_agent, "optional");
         assert!(
             proposal.toml.contains(

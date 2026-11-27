@@ -5168,7 +5168,7 @@ fn changing_verification_inputs_is_reviewed_only_under_required() {
 fn a_missing_required_integration_blocks_before_any_dispatch() {
     let fixture = Fixture::new();
     let mut repo = fixture.repo_policy(vec![passing_check()], 3);
-    repo.integrations.aval = Some(Dependency::Full {
+    repo.integrations.greentopo = Some(Dependency::Full {
         mode: DependencyMode::Required,
         bin: Some("relais-test-no-such-binary".into()),
     });

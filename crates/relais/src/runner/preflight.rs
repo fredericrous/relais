@@ -17,17 +17,17 @@ use super::{
 };
 
 impl<'a> RunEngine<'a> {
-    /// The program the `aval` integration means for this run: the declared
-    /// `bin`, else the machine's default for the key. The gaps and the
-    /// version recorded in the context pack both name it.
-    fn aval_program(&self) -> String {
+    /// The program the `greentopo` integration means for this run: the
+    /// declared `bin`, else `greentopo`. The gaps and the version recorded
+    /// in the context pack both name it.
+    fn greentopo_program(&self) -> String {
         self.config
             .repo_policy
             .integrations
-            .aval
+            .greentopo
             .as_ref()
             .and_then(|dependency| dependency.bin())
-            .unwrap_or_else(|| crate::tooling::default_bin("aval"))
+            .unwrap_or(crate::tooling::default_bin(crate::policy::TOPO_KEY))
             .to_string()
     }
 
@@ -188,11 +188,9 @@ impl<'a> RunEngine<'a> {
             let (code, detail) = (blocker.code, blocker.detail.clone());
             return Ok(Phase::Ended(self.fail_preflight(code, detail)?));
         }
-        let aval_program = self.aval_program();
         let integration_gaps = verify::integration_gaps(
             &self.config.repo_policy.integrations,
             &crate::tooling::binary_available,
-            &aval_program,
         );
 
         // A weight no machine setting can grant is a profile that cannot
@@ -847,7 +845,7 @@ impl<'a> RunEngine<'a> {
             fingerprints,
             tool_versions: context::ToolVersions {
                 relais: crate::version().to_string(),
-                aval: crate::tooling::program_version_text(&self.aval_program()),
+                aval: crate::tooling::program_version_text(&self.greentopo_program()),
                 amont: crate::tooling::integration_version("amont"),
                 claude_code: capabilities.and_then(|capabilities| capabilities.version.clone()),
             },

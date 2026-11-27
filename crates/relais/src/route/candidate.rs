@@ -1977,7 +1977,7 @@ mod tests {
         );
 
         let mut integrations = incumbent.clone();
-        integrations.integrations.aval = Some(Dependency::Mode(DependencyMode::Required));
+        integrations.integrations.greentopo = Some(Dependency::Mode(DependencyMode::Required));
         assert_eq!(
             validate_candidate(
                 &incumbent,
@@ -2615,7 +2615,7 @@ mod tests {
             }
             Tamper::EditIntegrations => {
                 policy.integrations = crate::policy::Integrations {
-                    aval: None,
+                    greentopo: None,
                     amont: None,
                     amont_agent: None,
                 };

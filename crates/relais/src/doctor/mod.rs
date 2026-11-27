@@ -1,7 +1,7 @@
 //! Environment diagnosis (SPEC §3: `relais doctor`).
 //!
 //! Checks the directories in effect, git, the Claude Code binary and its
-//! capability report, the aval/amont/amont-agent integrations *at the
+//! capability report, the greentopo/amont/greenbelay integrations *at the
 //! modes this repository declares*, policy files, the ledger, the
 //! artifact registry and the coordinator socket. Findings distinguish
 //! hard blockers from warnings; nothing here repairs anything by itself,
@@ -177,13 +177,7 @@ pub(crate) fn integration_finding(
         .map(str::to_string)
         .unwrap_or_else(|| crate::tooling::default_bin(name).to_string());
     let mode = dependency.mode();
-    // What a missing binary is called: with no `bin` declared, the `aval`
-    // key looked for `greentopo` first, so the line names both.
-    let missing_name = if name == "aval" && dependency.bin().is_none() {
-        "`greentopo` (or `aval`)".to_string()
-    } else {
-        format!("`{bin}`")
-    };
+    let missing_name = format!("`{bin}`");
     // Installed, at whichever mode asked for it.
     let present = |mode: DependencyMode| Finding {
         component,
@@ -209,7 +203,9 @@ pub(crate) fn integration_finding(
             component,
             level: Level::Fail,
             detail: format!(
-                "required by [integrations] and {missing_name} is not on PATH; every run is blocked on it"
+                "required by [integrations] and {missing_name} is not on PATH; every run is \
+                 blocked on it: install {missing_name}, or set [integrations] {name} = \"optional\" \
+                 in relais.toml"
             ),
         },
         DependencyMode::Optional if available(&bin) => present(mode),
@@ -1436,22 +1432,14 @@ pub fn doctor(
     };
 
     // Integrations are judged at the declared modes, not probed blindly:
-    // a repository that says `aval = "off"` is not broken for not having
-    // aval installed (SPEC §5).
+    // a repository that says `greentopo = "off"` is not broken for not
+    // having greentopo installed (SPEC §5).
     match &policy {
         Some(policy) => {
-            for (name, component, dependency) in [
-                ("aval", "greentopo", policy.integrations.aval.as_ref()),
-                ("amont", "amont", policy.integrations.amont.as_ref()),
-                (
-                    "amont_agent",
-                    crate::tooling::default_bin("amont_agent"),
-                    policy.integrations.amont_agent.as_ref(),
-                ),
-            ] {
+            for (name, dependency) in policy.integrations.entries() {
                 findings.push(integration_finding(
                     name,
-                    component,
+                    crate::tooling::default_bin(name),
                     dependency,
                     &|bin| crate::tooling::binary_available(bin),
                     &|bin| crate::tooling::integration_version(bin),
@@ -2745,17 +2733,17 @@ mod tests {
         let version = |_: &str| Some("1.2.3".to_string());
 
         let required_missing = integration_finding(
-            "aval",
+            "greentopo",
             "greentopo",
             Some(&dependency("required")),
             &missing,
             &no_version,
         );
         assert_eq!(required_missing.level, Level::Fail);
-        assert!(
-            required_missing.detail.contains("`greentopo` (or `aval`)"),
-            "{}",
-            required_missing.detail
+        assert_eq!(
+            required_missing.detail,
+            "required by [integrations] and `greentopo` is not on PATH; every run is blocked on \
+             it: install `greentopo`, or set [integrations] greentopo = \"optional\" in relais.toml"
         );
 
         let optional_missing = integration_finding(
@@ -2775,7 +2763,7 @@ mod tests {
         // `off` is not probed at all, and the line says so rather than
         // failing a repository that declared it does not use the tool.
         let off = integration_finding(
-            "aval",
+            "greentopo",
             "greentopo",
             Some(&dependency("off")),
             &missing,

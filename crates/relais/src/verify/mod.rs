@@ -3557,22 +3557,15 @@ impl Drop for VerificationWorktree<'_> {
 pub fn integration_gaps(
     integrations: &Integrations,
     available: &dyn Fn(&str) -> bool,
-    aval_default: &str,
 ) -> Vec<String> {
     let mut gaps = Vec::new();
-    for (name, default_bin, dependency) in [
-        ("greentopo", aval_default, integrations.aval.as_ref()),
-        ("amont", "amont", integrations.amont.as_ref()),
-        (
-            "amont_agent",
-            crate::tooling::default_bin("amont_agent"),
-            integrations.amont_agent.as_ref(),
-        ),
-    ] {
+    for (name, dependency) in integrations.entries() {
         let Some(dependency) = dependency else {
             continue;
         };
-        let bin = dependency.bin().unwrap_or(default_bin);
+        let bin = dependency
+            .bin()
+            .unwrap_or(crate::tooling::default_bin(name));
         let installed = available(bin);
         match dependency.mode() {
             DependencyMode::Required if !installed => gaps.push(format!(
@@ -7086,22 +7079,22 @@ mod tests {
     #[test]
     fn optional_integration_gaps_are_reported_not_passed() {
         let integrations = crate::policy::Integrations {
-            aval: Some(crate::policy::Dependency::Mode(DependencyMode::Required)),
+            greentopo: Some(crate::policy::Dependency::Mode(DependencyMode::Required)),
             amont: Some(crate::policy::Dependency::Mode(DependencyMode::Optional)),
             amont_agent: None,
         };
-        let gaps = integration_gaps(&integrations, &|name| name == "aval", "aval");
+        let gaps = integration_gaps(&integrations, &|name| name == "greentopo");
         assert_eq!(
             gaps,
             vec!["amont: optional integration not installed (reported, not passed)"],
-            "required-but-missing is NOT a gap here because aval is available"
+            "required-but-missing is NOT a gap here because greentopo is available"
         );
-        let none = integration_gaps(&integrations, &|_| false, "aval");
+        let none = integration_gaps(&integrations, &|_| false);
         assert_eq!(none.len(), 2, "required missing + optional missing");
-        assert!(none[0].starts_with("greentopo: required"));
-        assert!(none[0].contains("binary `aval`"), "{}", none[0]);
-        let topo = integration_gaps(&integrations, &|_| false, "greentopo");
-        assert!(topo[0].contains("binary `greentopo`"), "{}", topo[0]);
+        assert_eq!(
+            none[0],
+            "greentopo: required integration unavailable (binary `greentopo` not on PATH)"
+        );
     }
 
     /// The `amont_agent` key (its name until the census) is satisfied by the
@@ -7109,12 +7102,12 @@ mod tests {
     #[test]
     fn the_agent_integration_is_found_by_the_greenbelay_binary() {
         let integrations = crate::policy::Integrations {
-            aval: None,
+            greentopo: None,
             amont: None,
             amont_agent: Some(crate::policy::Dependency::Mode(DependencyMode::Required)),
         };
-        assert!(integration_gaps(&integrations, &|bin| bin == "greenbelay", "aval").is_empty());
-        let missing = integration_gaps(&integrations, &|bin| bin == "amont-agent", "aval");
+        assert!(integration_gaps(&integrations, &|bin| bin == "greenbelay").is_empty());
+        let missing = integration_gaps(&integrations, &|bin| bin == "amont-agent");
         assert_eq!(
             missing,
             vec!["amont_agent: required integration unavailable (binary `greenbelay` not on PATH)"]

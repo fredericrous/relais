@@ -53,7 +53,7 @@ pub enum AvalVerdict {
         adr: String,
     },
     Unknown,
-    /// No `aval` anywhere on PATH, confirmed before the spawn. Not a
+    /// No `greentopo` anywhere on PATH, confirmed before the spawn. Not a
     /// verdict and not a pass: the key was not checked (ADR-0047).
     NotInstalled,
     /// Exit 1/2/3 from aval: a tool or corpus failure, NOT a verdict.
@@ -79,7 +79,7 @@ fn string_field(entry: &serde_json::Value, field: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Parse `aval resolve <key> --json` output (SEMANTICS.md v1.2.0 is the
+/// Parse `greentopo resolve <key> --json` output (SEMANTICS.md v1.2.0 is the
 /// normative contract): the payload carries `state` and `exit`; an error
 /// envelope is `{"ok": false, "exit": N, "error": "..."}`.
 pub fn parse_aval_output(exit_code: i32, stdout: &str) -> AvalVerdict {
@@ -179,7 +179,7 @@ pub fn contradiction_detail(heads: &[String], by_scope: &[ScopedHead]) -> String
 }
 
 /// What the decision corpus currently says. The interface belongs to
-/// relais — the runner asks a `DecisionResolver`, never `aval` — so a
+/// relais — the runner asks a `DecisionResolver`, never `greentopo` — so a
 /// test supplies verdicts without a corpus on disk and a second corpus
 /// tool would cost nobody a change of import (boundaries.own-the-interface).
 pub trait DecisionResolver {
@@ -226,10 +226,10 @@ where
     }
 }
 
-/// The `aval` binary on this machine — the one place it is spawned.
+/// The `greentopo` binary on this machine — the one place it is spawned.
 pub struct AvalCli {
     root: PathBuf,
-    /// The `[integrations] aval` `bin` override, when one is declared.
+    /// The `[integrations] greentopo` `bin` override, when one is declared.
     bin: Option<String>,
     cancel: Option<Arc<AtomicBool>>,
     /// The constraint index is the same for every package of a run, so it
@@ -243,18 +243,14 @@ pub struct AvalCli {
     fleet_decisions: Option<PathBuf>,
     /// Where the embedded pack is materialised, keyed by its content hash.
     fleet_cache: Option<PathBuf>,
-    /// The program an undeclared `bin` resolves to, decided once per resolver.
-    default_program: OnceLock<String>,
 }
 
 impl AvalCli {
-    /// The declared `bin`, else the machine's default for the `aval` key,
-    /// resolved on first use and kept for the run.
+    /// The declared `bin`, else the key's binary, `greentopo`.
     fn program(&self) -> &str {
-        self.bin.as_deref().unwrap_or_else(|| {
-            self.default_program
-                .get_or_init(|| crate::tooling::default_bin("aval").to_string())
-        })
+        self.bin
+            .as_deref()
+            .unwrap_or(crate::tooling::default_bin(crate::policy::TOPO_KEY))
     }
 
     /// Resolve decisions for the corpus rooted at `root`.
@@ -267,7 +263,6 @@ impl AvalCli {
             greenspotter: greenspotter_program(),
             fleet_decisions: fleet_decisions_dir(),
             fleet_cache: default_fleet_cache(),
-            default_program: OnceLock::new(),
         }
     }
 
@@ -282,12 +277,11 @@ impl AvalCli {
             greenspotter: greenspotter_program(),
             fleet_decisions: fleet_decisions_dir(),
             fleet_cache: default_fleet_cache(),
-            default_program: OnceLock::new(),
         }
     }
 
-    /// The same, resolving keys with the declared `[integrations] aval`
-    /// `bin` instead of `aval` from PATH.
+    /// The same, resolving keys with the declared `[integrations] greentopo`
+    /// `bin` instead of `greentopo` from PATH.
     pub fn with_bin(mut self, bin: Option<&str>) -> Self {
         self.bin = bin.map(str::to_string);
         self
@@ -379,14 +373,11 @@ fn greenspotter_program() -> String {
 
 impl DecisionResolver for AvalCli {
     fn resolve(&self, key: &str, scope: Option<&str>) -> AvalVerdict {
-        // The default program is this resolver's one choice, so every key
-        // of the run is asked of the same binary.
         aval_resolve_in(
             &self.root,
             key,
             scope,
             self.bin.as_deref(),
-            Some(self.program()),
             std::env::var_os("PATH").unwrap_or_default(),
             self.cancel.as_deref(),
         )
@@ -487,7 +478,7 @@ impl DecisionResolver for AvalCli {
     }
 }
 
-/// Invoke `aval resolve KEY --json` in a repository. The exit-code contract
+/// Invoke `greentopo resolve KEY --json` in a repository. The exit-code contract
 /// is part of aval's stable interface: 0 active, 4 undecided,
 /// 5 contradiction, 6 retired, 7 unknown, 1/2/3 tool or corpus failure.
 ///
@@ -505,7 +496,6 @@ pub fn aval_resolve(
         key,
         scope,
         bin,
-        None,
         std::env::var_os("PATH").unwrap_or_default(),
         cancel,
     )
@@ -513,14 +503,12 @@ pub fn aval_resolve(
 
 /// [`aval_resolve`] with the search path given, so a test controls it
 /// without touching the process environment. The spawned command sees the
-/// same path the lookup used. `default_program` is the caller's choice for
-/// an undeclared `bin`; with none, it is chosen from `path`.
+/// same path the lookup used.
 pub fn aval_resolve_in(
     repo_dir: &Path,
     key: &str,
     scope: Option<&str>,
     bin: Option<&str>,
-    default_program: Option<&str>,
     path: std::ffi::OsString,
     cancel: Option<&AtomicBool>,
 ) -> AvalVerdict {
@@ -547,30 +535,22 @@ pub fn aval_resolve_in(
         };
     }
     // Absence is confirmed only when nothing was declared and no PATH entry
-    // named `greentopo` or `aval` exists in any form: a non-executable file
+    // named `greentopo` exists in any form: a non-executable file
     // or a dangling link is a broken install, which keeps blocking. The
     // directory to run in was checked above.
     let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
     let extensions = crate::tooling::path_extensions(std::env::var_os("PATHEXT").as_ref());
+    let default_program = crate::tooling::default_bin(crate::policy::TOPO_KEY);
     let confirmed_absent = bin.is_none() && {
-        ["greentopo", "aval"].iter().all(|name| {
-            crate::tooling::resolve_in(
-                name,
-                &dirs,
-                &extensions,
-                &crate::tooling::exists_in_any_form,
-            )
-            .is_none()
-        })
-    };
-    let program = bin.or(default_program).unwrap_or_else(|| {
-        crate::tooling::default_bin_in(
-            "aval",
+        crate::tooling::resolve_in(
+            default_program,
             &dirs,
             &extensions,
             &crate::tooling::exists_in_any_form,
         )
-    });
+        .is_none()
+    };
+    let program = bin.unwrap_or(default_program);
     let mut command = std::process::Command::new(program);
     command
         .arg("resolve")
@@ -601,27 +581,23 @@ pub fn aval_resolve_in(
             exit: -1,
             detail: format!(
                 "greentopo (`{program}`) could not be launched: {e}; {}",
-                aval_launch_hint(program, bin.is_some())
+                aval_launch_hint(program, bin)
             ),
         },
     }
 }
 
-/// What to check when aval's program could not be launched, by where the
-/// program came from: a declared `bin` plays PATH no part, `greentopo` was
-/// found on PATH, and `aval` is the fallback when `greentopo` was not.
-fn aval_launch_hint(program: &str, declared: bool) -> String {
-    if declared {
-        format!(
-            "check that `{program}`, the `bin` declared under [integrations] in relais.toml, exists and runs"
-        )
-    } else if program == "greentopo" {
-        "check that `greentopo` on PATH runs, or set `bin` under [integrations] in relais.toml"
-            .to_string()
-    } else {
-        format!(
-            "install greentopo (`aval` still works for now), check that `{program}` on PATH runs, or set `bin` under [integrations] in relais.toml"
-        )
+/// What to check when greentopo could not be launched, by where the
+/// program came from: a declared `bin` plays PATH no part; otherwise
+/// `greentopo` was found on PATH in some form and did not start.
+fn aval_launch_hint(program: &str, declared_bin: Option<&str>) -> String {
+    match declared_bin {
+        Some(declared) => format!(
+            "check that `{declared}`, the `bin` declared under [integrations] in relais.toml, exists and runs"
+        ),
+        None => format!(
+            "check that `{program}` on PATH runs, or set `bin` under [integrations] in relais.toml"
+        ),
     }
 }
 
@@ -1137,7 +1113,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
     keys.sort();
     keys.dedup();
 
-    let aval_mode = repo.integrations.aval.as_ref().map(|d| d.mode());
+    let aval_mode = repo.integrations.greentopo.as_ref().map(|d| d.mode());
     let mut unchecked_keys: Vec<String> = Vec::new();
     let mut resolved = Vec::new();
     for key in &keys {
@@ -1200,8 +1176,8 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
     }
 
     // The constraint is the decision in the record's own words — what
-    // `aval resolve --json` carries as `choice` and `reason`; the full
-    // body stays behind `aval show ADR` for the worker to fetch on demand.
+    // `greentopo resolve --json` carries as `choice` and `reason`; the full
+    // body stays behind `greentopo show ADR` for the worker to fetch on demand.
     let constraints: Vec<String> = resolved
         .iter()
         .filter_map(|(key, verdict)| match verdict {
@@ -1589,7 +1565,7 @@ mod tests {
 
     fn repo_with_aval(mode: Option<crate::policy::DependencyMode>) -> RepoPolicy {
         let mut r = repo();
-        r.integrations.aval = mode.map(crate::policy::Dependency::Mode);
+        r.integrations.greentopo = mode.map(crate::policy::Dependency::Mode);
         r
     }
 
@@ -1680,7 +1656,6 @@ mod tests {
             "k",
             None,
             bin,
-            None,
             path_dir.as_os_str().to_owned(),
             None,
         )
@@ -1794,16 +1769,12 @@ mod tests {
     #[test]
     fn the_launch_hint_follows_where_the_program_came_from() {
         assert_eq!(
-            aval_launch_hint("/opt/bin/greentopo", true),
+            aval_launch_hint("/opt/bin/greentopo", Some("/opt/bin/greentopo")),
             "check that `/opt/bin/greentopo`, the `bin` declared under [integrations] in relais.toml, exists and runs"
         );
         assert_eq!(
-            aval_launch_hint("greentopo", false),
+            aval_launch_hint("greentopo", None),
             "check that `greentopo` on PATH runs, or set `bin` under [integrations] in relais.toml"
-        );
-        assert_eq!(
-            aval_launch_hint("aval", false),
-            "install greentopo (`aval` still works for now), check that `aval` on PATH runs, or set `bin` under [integrations] in relais.toml"
         );
     }
 
@@ -1819,37 +1790,48 @@ mod tests {
         crate::test_support::prime_script(&greentopo);
         let verdict = resolve_with_path(&dir, None, &dir);
         // exit 3 from the fake greentopo: it was the program spawned, and
-        // aval's absence was not confirmed.
+        // its absence was not confirmed.
         assert!(
             !matches!(verdict, AvalVerdict::NotInstalled),
-            "greentopo is installed, so aval's absence is not confirmed: {verdict:?}"
+            "greentopo is installed, so its absence is not confirmed: {verdict:?}"
         );
         assert_eq!(verdict, parse_aval_output(3, ""), "{verdict:?}");
     }
 
-    /// The caller's chosen program beats the PATH lookup: one resolver asks
-    /// every key of the binary it chose.
+    /// The old `aval` binary is never spawned: with only it on PATH,
+    /// greentopo is not installed.
     #[cfg(unix)]
     #[test]
-    fn the_callers_default_program_is_the_one_spawned() {
+    fn only_aval_on_path_is_not_installed() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = crate::test_support::temp_dir("aval-default-program");
-        for (name, code) in [("aval", 0), ("greentopo", 3)] {
-            let fake = dir.join(name);
-            std::fs::write(&fake, format!("#!/bin/sh\nexit {code}\n")).expect("write");
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-            crate::test_support::prime_script(&fake);
-        }
-        let verdict = aval_resolve_in(
-            &dir,
-            "k",
-            None,
-            None,
-            Some("aval"),
-            dir.as_os_str().to_owned(),
-            None,
+        let dir = crate::test_support::temp_dir("aval-only-old-binary");
+        let fake = dir.join("aval");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::test_support::prime_script(&fake);
+        assert_eq!(
+            resolve_with_path(&dir, None, &dir),
+            AvalVerdict::NotInstalled
         );
-        assert_eq!(verdict, parse_aval_output(0, ""), "{verdict:?}");
+    }
+
+    /// A broken install keeps blocking (ADR-0073): a dangling `greentopo`
+    /// link is present, so its failure to start is a tool failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_greentopo_is_a_tool_failure_not_absence() {
+        let dir = crate::test_support::temp_dir("aval-dangling-greentopo");
+        std::os::unix::fs::symlink(dir.join("gone"), dir.join("greentopo")).expect("link");
+        let verdict = resolve_with_path(&dir, None, &dir);
+        let AvalVerdict::ToolFailure { detail, .. } = verdict else {
+            panic!("expected a tool failure, got {verdict:?}");
+        };
+        assert!(
+            detail.ends_with(
+                "check that `greentopo` on PATH runs, or set `bin` under [integrations] in relais.toml"
+            ),
+            "{detail}"
+        );
     }
 
     #[test]
@@ -1881,12 +1863,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn an_aval_with_a_missing_interpreter_is_a_tool_failure() {
+    fn a_greentopo_with_a_missing_interpreter_is_a_tool_failure() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = crate::test_support::temp_dir("aval-shebang");
-        let aval = dir.join("aval");
-        std::fs::write(&aval, "#!/nonexistent/sh\n").expect("write");
-        std::fs::set_permissions(&aval, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let dir = crate::test_support::temp_dir("greentopo-shebang");
+        let topo = dir.join("greentopo");
+        std::fs::write(&topo, "#!/nonexistent/sh\n").expect("write");
+        std::fs::set_permissions(&topo, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let verdict = resolve_with_path(&dir, None, &dir);
         assert!(
             matches!(verdict, AvalVerdict::ToolFailure { .. }),
@@ -1896,24 +1878,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_non_executable_aval_is_a_tool_failure() {
+    fn a_non_executable_greentopo_is_a_tool_failure() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = crate::test_support::temp_dir("aval-noexec");
-        let aval = dir.join("aval");
-        std::fs::write(&aval, "#!/bin/sh\n").expect("write");
-        std::fs::set_permissions(&aval, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-        let verdict = resolve_with_path(&dir, None, &dir);
-        assert!(
-            matches!(verdict, AvalVerdict::ToolFailure { .. }),
-            "{verdict:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_dangling_aval_symlink_is_a_tool_failure() {
-        let dir = crate::test_support::temp_dir("aval-dangling");
-        std::os::unix::fs::symlink(dir.join("gone"), dir.join("aval")).expect("symlink");
+        let dir = crate::test_support::temp_dir("greentopo-noexec");
+        let topo = dir.join("greentopo");
+        std::fs::write(&topo, "#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&topo, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         let verdict = resolve_with_path(&dir, None, &dir);
         assert!(
             matches!(verdict, AvalVerdict::ToolFailure { .. }),
