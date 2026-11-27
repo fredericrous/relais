@@ -1,6 +1,7 @@
 //! The binary's module tree. Not part of the library.
 
 pub(crate) mod coordinator;
+pub(crate) mod counter;
 pub(crate) mod ctx;
 pub(crate) mod decide;
 pub(crate) mod decision_record;
@@ -264,6 +265,19 @@ pub(crate) enum Command {
         no_import: bool,
         #[command(subcommand)]
         cmd: Option<ReportCommand>,
+    },
+    /// The shared day counter beside this node's ledger, the spend the
+    /// coordinator dropped and the settles still waiting, per UTC day: the
+    /// 5% check of `docs/shared-state.md` as one run. Reads only; exit 0
+    /// whenever it read, a `short` day included
+    Counter {
+        /// How many UTC days to show, today included (1 to 31)
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+        /// Machine-readable output: one object; a failure is
+        /// `{"error","exit"}`
+        #[arg(long)]
+        json: bool,
     },
     /// The orchestrating Claude Code session's own usage (SPEC §11)
     Usage {
@@ -1548,6 +1562,10 @@ pub(crate) fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             Format::from_json_flag(json),
             report_command(since.as_deref(), json, by, no_import),
         ),
+        Command::Counter { days, json } => {
+            let format = Format::from_json_flag(json);
+            error_object_under_json(format, counter::counter_command(days, format))
+        }
         Command::Usage { cmd } => match cmd {
             UsageCommand::Import {
                 session,

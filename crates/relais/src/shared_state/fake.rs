@@ -53,6 +53,8 @@ struct Inner {
     slice: i64,
     /// The global counter: what every settle booked.
     spent: i64,
+    /// What each settle booked, by the unix second it was booked.
+    booked: Vec<(i64, i64)>,
     settled: BTreeSet<String>,
     degraded: Option<String>,
     published: BTreeMap<(String, u64), PublishRow>,
@@ -172,7 +174,10 @@ impl FakeState {
     /// Set the global counter, as if other nodes had settled that much
     /// (a test knob: nothing in the runner feeds it until an-t17).
     pub fn set_spent(&self, amount: MicroUsd) {
-        self.lock().spent = amount.to_micros();
+        let at = self.now();
+        let mut inner = self.lock();
+        inner.spent = amount.to_micros();
+        inner.booked = vec![(at, amount.to_micros())];
     }
 
     /// What every settle booked against the global counter.
@@ -358,6 +363,18 @@ impl SharedState for FakeState {
         Ok(Some(self.spent()))
     }
 
+    fn spent_between(&self, from: &str, to: &str) -> Result<Option<MicroUsd>, SharedStateError> {
+        let range = super::range_bounds(from, to)?;
+        let total: i64 = self
+            .lock()
+            .booked
+            .iter()
+            .filter(|(at, _)| range.contains(at))
+            .map(|(_, micros)| micros)
+            .sum();
+        Ok(Some(MicroUsd::from_micros(total)))
+    }
+
     fn slice(&self) -> Result<Slice, SharedStateError> {
         let now = self.now();
         Ok(Slice::Granted {
@@ -403,10 +420,12 @@ impl SharedState for FakeState {
             });
         }
         let current = self.fence(&reservation.seat).is_ok();
+        let now = self.now();
         let mut inner = self.lock();
         // Idempotent by reservation: a replayed settle books nothing twice.
         if inner.settled.insert(reservation.id.clone()) {
             inner.spent += actual.to_micros();
+            inner.booked.push((now, actual.to_micros()));
             inner.slice += reservation.amount.to_micros() - actual.to_micros();
         }
         Ok(if current {
@@ -683,6 +702,38 @@ mod tests {
         state
             .acquire_seat(&Principal::task("pod-a"), dispatch)
             .expect("seat")
+    }
+
+    #[test]
+    fn a_settle_is_counted_on_the_day_it_was_booked() {
+        let state = FakeState::new();
+        let book = |dispatch: &str, micros: i64| {
+            let lease = seat(&state, dispatch);
+            let reservation = state
+                .reserve_spend(&lease, MicroUsd::from_micros(micros))
+                .expect("reserve");
+            state
+                .settle_spend(&reservation, MicroUsd::from_micros(micros))
+                .expect("settle");
+        };
+        // 1_800_000_000 is 2027-01-15T08:00:00Z.
+        book("d1", 300);
+        state.advance(86_400);
+        book("d2", 500);
+        let day = |from: &str, to: &str| state.spent_between(from, to).expect("read");
+        assert_eq!(
+            day("2027-01-15T00:00:00Z", "2027-01-16T00:00:00Z"),
+            Some(MicroUsd::from_micros(300))
+        );
+        assert_eq!(
+            day("2027-01-16T00:00:00Z", "2027-01-17T00:00:00Z"),
+            Some(MicroUsd::from_micros(500))
+        );
+        assert_eq!(
+            day("2027-01-15T00:00:00Z", "2027-01-17T00:00:00Z"),
+            Some(MicroUsd::from_micros(800)),
+            "a seat past its day books where it is booked"
+        );
     }
 
     #[test]

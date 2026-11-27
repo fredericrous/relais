@@ -39,7 +39,25 @@ fn files_under(root: &Path, dir: &Path, found: &mut Vec<String>) {
     }
 }
 
+/// The relais binary parses a command enum of some forty subcommands, and a
+/// debug build's clap parser keeps all of it on the main thread's stack. The
+/// platforms give the main thread 8 MiB (Linux, macOS) but Windows only
+/// 1 MiB, which one more subcommand (`counter`, an-t35) overflowed at
+/// startup: every `relais` run died with a stack overflow. Ask the Windows
+/// linker for the 8 MiB the other platforms have.
+fn windows_main_stack() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let arg = match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+        Ok("msvc") => "/STACK:8388608",
+        _ => "-Wl,--stack,8388608",
+    };
+    println!("cargo:rustc-link-arg-bins={arg}");
+}
+
 fn main() {
+    windows_main_stack();
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets it"));
     let root = manifest.join("../../claude-plugin");
     println!("cargo:rerun-if-changed={}", root.display());

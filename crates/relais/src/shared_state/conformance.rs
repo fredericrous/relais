@@ -71,7 +71,7 @@ pub type Check = fn(&dyn SharedState, &Fixture);
 
 /// Every check, each on a fresh implementation and fixture.
 pub fn run_all<S: SharedState>(make: impl Fn() -> S) {
-    let checks: [(&str, Check); 14] = [
+    let checks: [(&str, Check); 16] = [
         ("epoch_rises_on_every_acquire", epoch_rises_on_every_acquire),
         ("a_stale_epoch_is_lease_lost", a_stale_epoch_is_lease_lost),
         (
@@ -110,6 +110,8 @@ pub fn run_all<S: SharedState>(make: impl Fn() -> S) {
             "a_fresh_state_is_online_and_empty",
             a_fresh_state_is_online_and_empty,
         ),
+        ("a_counter_range_is_checked", a_counter_range_is_checked),
+        ("a_counter_adds_up", a_counter_adds_up),
     ];
     for (name, check) in checks {
         let state = make();
@@ -772,6 +774,75 @@ pub fn a_fresh_state_is_online_and_empty(state: &dyn SharedState, fixture: &Fixt
         node::daily_spent(state, &fixture.ledger, "2000-01-01T00:00:00+00:00").expect("spent"),
         MicroUsd::ZERO
     );
+}
+
+const EPOCH: &str = "1970-01-01T00:00:00+00:00";
+const FAR: &str = "2200-01-01T00:00:00+00:00";
+
+/// `spent_between` judges its bounds the same way everywhere (an-t35): a
+/// malformed bound or a range that ends before it starts is refused, and
+/// an empty range or one nothing was booked in reads as zero or as no
+/// counter.
+pub fn a_counter_range_is_checked(state: &dyn SharedState, _fixture: &Fixture) {
+    let refused = |from: &str, to: &str| {
+        matches!(
+            state.spent_between(from, to),
+            Err(super::SharedStateError::Refused { .. })
+        )
+    };
+    assert!(refused("yesterday", FAR), "a malformed start is refused");
+    assert!(refused(EPOCH, "2026-13-45"), "a malformed end is refused");
+    assert!(refused(FAR, EPOCH), "a reversed range is refused");
+    let zero_or_none = |from: &str, to: &str| {
+        matches!(
+            state.spent_between(from, to).expect("a valid range reads"),
+            None | Some(MicroUsd::ZERO)
+        )
+    };
+    assert!(zero_or_none(FAR, FAR), "an empty range is zero");
+    assert!(
+        zero_or_none("2000-01-01T00:00:00+00:00", "2000-01-02T00:00:00+00:00"),
+        "nothing was booked in the year 2000"
+    );
+}
+
+/// The counter's reads add up (an-t35): after a settle, the whole range
+/// equals `daily_spent` from its start, a split at any midpoint adds up to
+/// the whole, and `None` is answered exactly when `daily_spent` answers
+/// `None`. The check needs no clock: it never says which day a settle fell
+/// on, since a client's clock is its own.
+pub fn a_counter_adds_up(state: &dyn SharedState, fixture: &Fixture) {
+    let me = holder(fixture, "a");
+    let seat = state
+        .acquire_seat(&me, &format!("{}-d", fixture.name))
+        .expect("acquire");
+    let reservation = state
+        .reserve_spend(&seat, MicroUsd::from_micros(1_000))
+        .expect("reserve inside any slice");
+    state
+        .settle_spend(&reservation, MicroUsd::from_micros(700))
+        .expect("settle");
+    let whole = state.spent_between(EPOCH, FAR).expect("whole range");
+    let daily = state.daily_spent(EPOCH).expect("daily");
+    assert_eq!(
+        whole, daily,
+        "spent_between answers None exactly when daily_spent does, and the same sum"
+    );
+    let Some(whole) = whole else { return };
+    for middle in [
+        "2000-01-01T00:00:00+00:00",
+        "2026-11-26T12:00:00+00:00",
+        "2100-01-01T00:00:00+00:00",
+    ] {
+        let low = state.spent_between(EPOCH, middle).expect("low half");
+        let high = state.spent_between(middle, FAR).expect("high half");
+        assert_eq!(
+            low.expect("a counter")
+                .saturating_add(high.expect("a counter")),
+            whole,
+            "a split at {middle} adds up"
+        );
+    }
 }
 
 /// A decision grant that is held is exclusive until [`DECISION_GRANT_TTL_SECS`]

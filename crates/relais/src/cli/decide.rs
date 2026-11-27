@@ -1104,6 +1104,13 @@ mod tests {
         ) -> Result<Option<relais::money::MicroUsd>, SharedStateError> {
             self.local.daily_spent(day_start)
         }
+        fn spent_between(
+            &self,
+            from: &str,
+            to: &str,
+        ) -> Result<Option<relais::money::MicroUsd>, SharedStateError> {
+            self.local.spent_between(from, to)
+        }
         fn slice(&self) -> Result<relais::shared_state::Slice, SharedStateError> {
             self.local.slice()
         }

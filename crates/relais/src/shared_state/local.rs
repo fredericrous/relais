@@ -201,6 +201,11 @@ impl SharedState for LocalState {
         Ok(None)
     }
 
+    fn spent_between(&self, from: &str, to: &str) -> Result<Option<MicroUsd>, SharedStateError> {
+        super::range_bounds(from, to)?;
+        Ok(None)
+    }
+
     fn slice(&self) -> Result<Slice, SharedStateError> {
         Ok(Slice::Unbounded)
     }

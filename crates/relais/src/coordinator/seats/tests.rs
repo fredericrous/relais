@@ -1068,3 +1068,35 @@ fn a_settle_file_that_cannot_be_moved_aside_is_never_overwritten() {
     book.sync(&state);
     assert!(path.is_dir(), "the unreadable file was not replaced");
 }
+
+/// `relais counter` reads the waiting settles without taking them (an-t35):
+/// an absent file is none, a valid one is read, a bad one is a typed error.
+#[test]
+fn the_waiting_settles_are_read_from_their_file() {
+    let dir = crate::test_support::short_temp_dir("seat-settles-read");
+    let path = dir.join(SETTLES_FILE);
+    assert_eq!(waiting_settles(&path).expect("absent"), Vec::new());
+    std::fs::write(
+        &path,
+        r#"{"settles":[{"dispatch":"d","actual":5,"since":100,"tries":0,"reservation":null}]}"#,
+    )
+    .expect("write");
+    assert_eq!(
+        waiting_settles(&path).expect("valid"),
+        vec![WaitingSettle {
+            micros: 5,
+            since: 100
+        }]
+    );
+    std::fs::write(&path, "not json").expect("write");
+    assert!(matches!(
+        waiting_settles(&path),
+        Err(WaitingSettlesError::Parse(_))
+    ));
+    std::fs::remove_file(&path).expect("remove");
+    std::fs::create_dir(&path).expect("a directory where the file should be");
+    assert!(matches!(
+        waiting_settles(&path),
+        Err(WaitingSettlesError::Read(_))
+    ));
+}

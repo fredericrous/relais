@@ -612,3 +612,105 @@ fn a_json_approval_with_no_receipt_warns_on_stderr_and_keeps_one_object() {
         "{stderr}"
     );
 }
+
+/// an-t35: `relais counter` under an absent external layer follows the
+/// an-t32 contract: exit 3, one `relais: ` line, and with `--json` the
+/// error object on stdout.
+#[test]
+fn a_counter_under_an_absent_external_layer_is_refused_on_both_streams() {
+    for args in [&["counter"][..], &["counter", "--json"][..]] {
+        let scratch = Scratch::with_machine_toml(
+            "shared-state-counter-external",
+            "schema_version = 1\nshared_state = \"external\"\n",
+        );
+        let out = scratch.relais(args, "");
+        assert_error_streams(args, &out);
+    }
+}
+
+/// an-t35: a local node has no counter: one object, `no_counter` on every
+/// day, today included, the dropped sum read from this node's own log.
+#[test]
+fn a_local_counter_is_one_object_with_no_counter_verdicts() {
+    let scratch = Scratch::with_machine_toml("shared-state-counter-local", "schema_version = 1\n");
+    let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    std::fs::write(
+        scratch.dir.join("state/coordinator.log"),
+        format!("{stamp} relais coordinator: seat settles: dropped 1 waiting settle(s) (dropped_micros=42)\n"),
+    )
+    .expect("log");
+    let out = scratch.relais(&["counter", "--days", "3", "--json"], "");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    let object: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one object");
+    assert_eq!(object["selection"], "local");
+    let days = object["days"].as_array().expect("days");
+    assert_eq!(days.len(), 3);
+    assert!(
+        days.iter().all(|day| day["check"] == "no_counter"),
+        "{days:?}"
+    );
+    assert_eq!(days[0]["dropped_micros"], 42, "newest first, the log day");
+    assert_eq!(object["log"]["unparsed"], 0);
+    assert_eq!(object["waiting"]["count"], 0);
+}
+
+/// an-t35: the text form fits 80 columns, has no escape byte and keeps
+/// stderr empty; a bad `--days` is exit 2 with one line, and the object
+/// under `--json`.
+#[test]
+fn the_counter_text_fits_and_a_bad_day_count_is_exit_2() {
+    let scratch = Scratch::with_machine_toml("shared-state-counter-text", "schema_version = 1\n");
+    let out = scratch.relais(&["counter"], "");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    let text = String::from_utf8(out.stdout).expect("utf-8");
+    assert!(
+        text.lines().all(|line| line.chars().count() <= 80),
+        "{text}"
+    );
+    assert!(!text.contains('\u{1b}'), "{text}");
+    assert!(text.contains("no shared counter"), "{text}");
+
+    let out = scratch.relais(&["counter", "--days", "0"], "");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert_eq!(
+        String::from_utf8(out.stderr)
+            .expect("utf-8")
+            .lines()
+            .count(),
+        1
+    );
+    let out = scratch.relais(&["counter", "--days", "40", "--json"], "");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let object: serde_json::Value = serde_json::from_slice(&out.stdout).expect("object");
+    assert_eq!(object["exit"], 2);
+}
+
+/// an-t35: a reader that closes stdout before the first write is not a
+/// failure: the binary's own exit is 0 and stderr is empty. The output is
+/// under the pipe buffer, so a shell `head` could not raise EPIPE; the
+/// read end is dropped before the child writes.
+#[test]
+fn a_counter_whose_stdout_is_closed_still_exits_0() {
+    let scratch = Scratch::with_machine_toml("shared-state-counter-pipe", "schema_version = 1\n");
+    for args in [&["counter"][..], &["counter", "--json"][..]] {
+        let mut child = Command::new(BIN)
+            .args(args)
+            .current_dir(repo_root())
+            .env("HOME", scratch.dir.join("home"))
+            .env("RELAIS_CONFIG_DIR", scratch.dir.join("config"))
+            .env("RELAIS_STATE_DIR", scratch.dir.join("state"))
+            .env("CLAUDE_CONFIG_DIR", scratch.dir.join("claude"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("relais runs");
+        drop(child.stdout.take());
+        let out = child.wait_with_output().expect("exits");
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {out:?}");
+        assert!(out.stderr.is_empty(), "{args:?}: {out:?}");
+    }
+}

@@ -66,6 +66,63 @@ pub fn settles_path(ledger: &Path) -> PathBuf {
     ledger.with_file_name(SETTLES_FILE)
 }
 
+/// One settle waiting for the primary, as `relais counter` shows it
+/// (an-t35): what it is worth and when it began to wait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitingSettle {
+    /// The micro-dollars it will book.
+    pub micros: i64,
+    /// Unix seconds when it began to wait.
+    pub since: i64,
+}
+
+/// Why the settles file could not be read by [`waiting_settles`].
+#[derive(Debug)]
+pub enum WaitingSettlesError {
+    /// The file exists and cannot be read.
+    Read(std::io::Error),
+    /// The file is not a settle list.
+    Parse(serde_json::Error),
+}
+
+impl std::fmt::Display for WaitingSettlesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(e) => write!(f, "{e}"),
+            Self::Parse(e) => write!(f, "not a settle list: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for WaitingSettlesError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read(e) => Some(e),
+            Self::Parse(e) => Some(e),
+        }
+    }
+}
+
+/// The settles waiting in `path` (see [`settles_path`]), read without
+/// taking them: an absent file is an empty list. Reads the file the coordinator writes, so a settle taken
+/// between the write and this read shows as still waiting.
+pub fn waiting_settles(path: &Path) -> Result<Vec<WaitingSettle>, WaitingSettlesError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(WaitingSettlesError::Read(e)),
+    };
+    let file: SettleFile = serde_json::from_str(&text).map_err(WaitingSettlesError::Parse)?;
+    Ok(file
+        .settles
+        .into_iter()
+        .map(|row| WaitingSettle {
+            micros: row.actual,
+            since: row.since,
+        })
+        .collect())
+}
+
 /// Which sync is flushing the waiting settles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pass {
