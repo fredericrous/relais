@@ -335,11 +335,6 @@ pub fn duplicate_ids(
         if group.len() < 2 {
             continue;
         }
-        let next = highest
-            .get(letters)
-            .copied()
-            .flatten()
-            .and_then(|high| high.checked_add(1));
         let ref_took_it = group.iter().any(|(_, origin)| *origin == Listing::Ref);
         let mut first_branch_seen = false;
         for &(id, origin) in group {
@@ -367,6 +362,13 @@ pub fn duplicate_ids(
                 (Listing::Ref, Some(rev)) => format!("{} on {rev}", other_path.display()),
                 (Listing::Ref, None) | (Listing::Branch, _) => other_path.display().to_string(),
             };
+            // Each suggestion takes the next free number, so following
+            // every hint never makes a new duplicate.
+            let slot = highest.entry(letters).or_insert(None);
+            let next = slot.and_then(|high| high.checked_add(1));
+            if next.is_some() {
+                *slot = next;
+            }
             let renumber = match next {
                 Some(next) => format!("; renumber to {letters}{next}"),
                 None => String::new(),
@@ -525,7 +527,7 @@ mod tests {
                 ),
                 (
                     "f12-c.md".to_string(),
-                    "id f12 is also used by d/f12-a.md; renumber to f13".to_string()
+                    "id f12 is also used by d/f12-a.md; renumber to f14".to_string()
                 ),
             ]
         );
