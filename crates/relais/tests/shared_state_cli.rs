@@ -767,6 +767,9 @@ impl FakeCoordinator {
                     continue;
                 };
                 stream.set_nonblocking(false).expect("blocking");
+                let bound = Some(std::time::Duration::from_secs(5));
+                stream.set_read_timeout(bound).expect("read timeout");
+                stream.set_write_timeout(bound).expect("write timeout");
                 let mut line = String::new();
                 if BufReader::new(&stream).read_line(&mut line).is_err() {
                     continue;
@@ -790,7 +793,7 @@ impl FakeCoordinator {
                 };
                 let mut stream = stream;
                 let payload = serde_json::to_string(&response).expect("response");
-                let _ = writeln!(stream, "{payload}");
+                writeln!(stream, "{payload}").expect("the fake's reply is written");
             }
         });
         Self {
@@ -809,7 +812,9 @@ impl Drop for FakeCoordinator {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            if thread.join().is_err() && !std::thread::panicking() {
+                panic!("the fake coordinator panicked");
+            }
         }
     }
 }
@@ -883,14 +888,16 @@ fn a_busy_lease_with_no_recorded_holder_is_exit_20_and_the_error_object() {
         relais::coordinator::PROTOCOL_VERSION,
         relais::admission::TrainingDecision::Busy { holder: None },
     );
-    let args = ["learn", "cycle", "--json"];
-    let out = scratch.relais(&args, "");
-    let message = assert_failure_streams("relais learn cycle: ", &args, &out, 20);
-    assert!(message.contains("its holder is not recorded"), "{message}");
+    for args in [&["learn", "cycle"][..], &["learn", "cycle", "--json"][..]] {
+        let out = scratch.relais(args, "");
+        let message = assert_failure_streams("relais learn cycle: ", args, &out, 20);
+        assert!(message.contains("its holder is not recorded"), "{message}");
+    }
 }
 
-/// an-t37: a daemon that speaks another protocol is named, exit 1, and no
-/// second coordinator is started over it.
+/// an-t37: a daemon that speaks another protocol is named with both protocol
+/// numbers, exit 1; any other failure (a daemon started over it, a timeout)
+/// would read differently.
 #[test]
 fn a_coordinator_of_another_protocol_follows_the_json_error_contract() {
     for json in [false, true] {
@@ -906,7 +913,14 @@ fn a_coordinator_of_another_protocol_follows_the_json_error_contract() {
         }
         let out = scratch.relais(&args, "");
         let message = assert_failure_streams("relais learn cycle: ", &args, &out, 1);
-        assert!(!message.is_empty());
+        let ours = relais::coordinator::PROTOCOL_VERSION;
+        assert!(
+            message.contains(&format!(
+                "(relais fake) speaks wire protocol {} and this relais speaks {ours}",
+                ours + 1
+            )),
+            "{message}"
+        );
     }
 }
 
