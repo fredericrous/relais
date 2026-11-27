@@ -1,7 +1,6 @@
 //! Holdout criteria at preflight and at verification (ADR-0045 phases 2, 3a).
 
 use super::*;
-use crate::backend::{BackendError, Harness};
 use crate::ledger::{Actor, DecisionAnswer, RecordedVia};
 use crate::policy::{HoldoutDecl, HoldoutSettings};
 use crate::runner::approval::{approve_from_snapshot, ApprovalError};
@@ -1517,43 +1516,6 @@ fn a_decomposed_run_whose_assembled_candidate_wrote_the_overlay_leaves_no_attemp
         .expect("rows");
     assert!(unfinished.is_empty(), "{unfinished:?}");
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup; a leftover dir fails nothing
-}
-
-/// A backend that runs as an agent with a transcript: each dispatch is
-/// recorded as a native agent in the ledger, and `transcript_of` answers
-/// with the given text.
-struct TranscriptBackend {
-    inner: MockBackend,
-    ledger_path: std::path::PathBuf,
-    transcript: Option<String>,
-}
-
-impl Harness for TranscriptBackend {
-    fn name(&self) -> &'static str {
-        self.inner.name()
-    }
-    fn probe(&self) -> Option<crate::backend::Capabilities> {
-        self.inner.probe()
-    }
-}
-
-impl Backend for TranscriptBackend {
-    fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
-        let launched = self.inner.launch(spec)?;
-        let ledger = crate::ledger::Ledger::open(&self.ledger_path).expect("ledger");
-        ledger
-            .record_native_dispatch(
-                &crate::ids::DispatchId::from_stored(spec.dispatch_id.clone()),
-                Some("agent-1"),
-            )
-            .expect("the dispatch is recorded as an agent");
-        Ok(launched)
-    }
-
-    fn transcript_of(&self, agent_id: &str) -> Option<String> {
-        assert_eq!(agent_id, "agent-1");
-        self.transcript.clone()
-    }
 }
 
 fn holdout_counts(fixture: &Fixture) -> crate::report::HoldoutsReport {

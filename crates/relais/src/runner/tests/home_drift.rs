@@ -3,9 +3,10 @@
 // The fingerprint never changes how a run ends: it adds evidence rows.
 
 use super::*;
-use crate::homeprint::{Change, Drift};
+use crate::homeprint::{Cause, Change, Drift};
 use crate::ledger::EvidenceKind;
 use crate::policy::MachineSettings;
+use std::collections::BTreeMap;
 
 /// A machine whose home directory is a scratch one, with `.gitconfig` in it.
 fn machine_with_home(fixture: &Fixture, repo: &RepoPolicy) -> (MachineSettings, PathBuf) {
@@ -43,6 +44,7 @@ fn modified_gitconfig(home: &Path) -> Drift {
     Drift {
         path: home.join(".gitconfig").display().to_string(),
         change: Change::Modified,
+        cause: Some(Cause::Unexplained { calls_read: false }),
     }
 }
 
@@ -206,7 +208,7 @@ fn the_status_report_ends_with_the_follow_up() {
     assert_eq!(status.first().map(String::as_str), Some(heading));
     assert_eq!(
         status.last().map(String::as_str),
-        Some(crate::homeprint::FOLLOW_UP[1])
+        crate::homeprint::FOLLOW_UP.last().copied()
     );
     // The fixed lines fit 80 columns; a path line is as long as its path
     // (absolute on Windows).
@@ -216,7 +218,7 @@ fn the_status_report_ends_with_the_follow_up() {
             .all(|line| line.chars().count() <= 80),
         "{status:?}"
     );
-    assert_eq!(status.len(), 4, "{status:?}");
+    assert_eq!(status.len(), 6, "{status:?}");
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }
 
@@ -318,5 +320,302 @@ fn a_path_unreadable_before_and_after_prints_the_not_watched_line() {
         "{lines:?}"
     );
     assert!(lines[0].ends_with("locked"), "{lines:?}");
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+// Each drift says why it happened: a worker's write, a known writer's
+// bookkeeping, or nothing found.
+
+const MARKETPLACES_BEFORE: &str = r#"{"a":{"source":{"repo":"x/a"},"lastUpdated":"1"}}"#;
+const MARKETPLACES_AFTER: &str = r#"{"a":{"source":{"repo":"x/a"},"lastUpdated":"2"}}"#;
+const INSTALLED_BEFORE: &str =
+    r#"{"version":2,"plugins":{"p":[{"scope":"user","version":"1","lastUpdated":"1"}]}}"#;
+const INSTALLED_AFTER: &str =
+    r#"{"version":2,"plugins":{"p":[{"scope":"user","version":"2","lastUpdated":"2"}]}}"#;
+
+/// Where the fixture's home keeps the plugin files and `settings.json`.
+fn claude_dir(home: &Path) -> PathBuf {
+    home.join(".claude")
+}
+
+/// The scratch home of the 49 rows' path mix, before the run.
+fn seed_plugin_home(home: &Path) {
+    let plugins = claude_dir(home).join("plugins");
+    std::fs::create_dir_all(&plugins).expect("mkdir");
+    std::fs::write(plugins.join("known_marketplaces.json"), MARKETPLACES_BEFORE).expect("write");
+    std::fs::write(plugins.join("installed_plugins.json"), INSTALLED_BEFORE).expect("write");
+    std::fs::write(
+        claude_dir(home).join("settings.json"),
+        r#"{"enabledPlugins":{}}"#,
+    )
+    .expect("write");
+}
+
+/// A worker that rewrites each `(path, text)` and then completes.
+fn rewriting_worker(edits: Vec<(PathBuf, String)>) -> MockBackend {
+    MockBackend::new(move |spec| {
+        for (path, text) in &edits {
+            std::fs::write(path, text).expect("rewrite");
+        }
+        std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("worker completes");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    })
+}
+
+fn tool_use_line(name: &str, input: serde_json::Value, timestamp: Option<&str>) -> String {
+    let mut record = serde_json::json!({
+        "type": "assistant",
+        "cwd": "",
+        "message": { "content": [{ "type": "tool_use", "id": "t1", "name": name, "input": input }] },
+    });
+    if let Some(stamp) = timestamp {
+        record["timestamp"] = stamp.into();
+    }
+    record.to_string()
+}
+
+/// Run with `edits` made by the worker and `transcript` as its agent's
+/// transcript (`None`: the worker runs with no agent); the drifts, by path.
+fn caused_drifts(
+    fixture: &Fixture,
+    transcript: Option<String>,
+    edits: Vec<(PathBuf, String)>,
+) -> BTreeMap<PathBuf, Option<Cause>> {
+    let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+    let (machine, _home) = machine_with_home(fixture, &repo);
+    let inner = rewriting_worker(edits);
+    let outcome = match transcript {
+        Some(transcript) => fixture.execute_with_machine(
+            &fixture.contract(Review::Optional),
+            &repo,
+            &machine,
+            &TranscriptBackend {
+                inner,
+                ledger_path: fixture.dir.join("ledger.sqlite"),
+                transcript: Some(transcript),
+            },
+        ),
+        None => fixture.execute_with_machine(
+            &fixture.contract(Review::Optional),
+            &repo,
+            &machine,
+            &inner,
+        ),
+    };
+    drifts_of(fixture, &outcome)
+        .into_iter()
+        .map(|drift| (PathBuf::from(drift.path), drift.cause))
+        .collect()
+}
+
+fn writer_cause(name: &str) -> Option<Cause> {
+    Some(Cause::Writer { name: name.into() })
+}
+
+/// The repository's `.git/config` as git names it, which is the path the
+/// snapshot records: macOS resolves `/var` to `/private/var`, Windows may
+/// keep an 8.3 short name, and `canonicalize` would differ from both.
+fn repo_config_path(fixture: &Fixture) -> PathBuf {
+    match crate::homeprint::repo_config(&fixture.repo) {
+        crate::homeprint::RepoConfig::At(path) => path,
+        crate::homeprint::RepoConfig::Unresolved(path) => {
+            panic!(
+                "git could not name the fixture's config: {}",
+                path.display()
+            )
+        }
+    }
+}
+
+fn with_branch_t(fixture: &Fixture) -> String {
+    let before = std::fs::read_to_string(repo_config_path(fixture)).expect("read");
+    format!("{before}[branch \"t\"]\n\tremote = origin\n")
+}
+
+#[test]
+fn the_49_rows_path_mix_is_told_apart_by_cause() {
+    let fixture = Fixture::new();
+    let home = fixture.dir.join("home");
+    std::fs::create_dir_all(&home).expect("mkdir");
+    seed_plugin_home(&home);
+    let plugins = claude_dir(&home).join("plugins");
+    let edits = vec![
+        (
+            plugins.join("known_marketplaces.json"),
+            MARKETPLACES_AFTER.to_string(),
+        ),
+        (
+            plugins.join("installed_plugins.json"),
+            INSTALLED_AFTER.to_string(),
+        ),
+        (repo_config_path(&fixture), with_branch_t(&fixture)),
+        (
+            claude_dir(&home).join("settings.json"),
+            r#"{"enabledPlugins":{"x@y":true}}"#.to_string(),
+        ),
+        (home.join(".gitconfig"), "[user]\nname = after\n".into()),
+    ];
+    let causes = caused_drifts(&fixture, Some(String::new()), edits);
+    let plugin_writer = writer_cause("claude code plugin refresh");
+    let unexplained = Some(Cause::Unexplained { calls_read: true });
+    assert_eq!(
+        causes,
+        BTreeMap::from([
+            (
+                plugins.join("known_marketplaces.json"),
+                plugin_writer.clone()
+            ),
+            (plugins.join("installed_plugins.json"), plugin_writer),
+            (
+                repo_config_path(&fixture),
+                writer_cause("git branch tracking")
+            ),
+            (claude_dir(&home).join("settings.json"), unexplained.clone()),
+            (home.join(".gitconfig"), unexplained),
+        ])
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+#[test]
+fn a_new_marketplace_entry_is_unexplained_even_beside_a_refresh() {
+    let fixture = Fixture::new();
+    let home = fixture.dir.join("home");
+    std::fs::create_dir_all(&home).expect("mkdir");
+    seed_plugin_home(&home);
+    let marketplaces = claude_dir(&home)
+        .join("plugins")
+        .join("known_marketplaces.json");
+    let added = r#"{"a":{"source":{"repo":"x/a"},"lastUpdated":"2"},"b":{"lastUpdated":"2"}}"#;
+    let causes = caused_drifts(
+        &fixture,
+        Some(String::new()),
+        vec![(marketplaces.clone(), added.to_string())],
+    );
+    assert_eq!(
+        causes.get(&marketplaces),
+        Some(&Some(Cause::Unexplained { calls_read: true }))
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+#[test]
+fn a_run_with_no_worker_agent_says_its_calls_were_not_read() {
+    let fixture = Fixture::new();
+    let home = fixture.dir.join("home");
+    let causes = caused_drifts(
+        &fixture,
+        None,
+        vec![(home.join(".gitconfig"), "[user]\nname = after\n".into())],
+    );
+    assert_eq!(
+        causes.get(&home.join(".gitconfig")),
+        Some(&Some(Cause::Unexplained { calls_read: false }))
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+fn netrc_call(fixture: &Fixture, line: String) -> Option<Cause> {
+    let netrc = fixture.dir.join("home").join(".netrc");
+    let causes = caused_drifts(
+        fixture,
+        Some(line),
+        vec![(netrc.clone(), "machine x\n".into())],
+    );
+    causes.get(&netrc).cloned().expect("a netrc drift")
+}
+
+#[test]
+fn a_worker_write_to_a_watched_file_is_named_with_its_tool_and_agent() {
+    for tool in ["Write", "Bash"] {
+        let fixture = Fixture::new();
+        let home = fixture.dir.join("home");
+        // Built as JSON, so a Windows home's `\` is escaped, and spelled with
+        // `/` as a tool or shell writes it.
+        let input = match tool {
+            "Write" => serde_json::json!({"file_path": format!("{}/.netrc", home.display())}),
+            _ => serde_json::json!({"command": "echo x >> \"$HOME/.netrc\""}),
+        };
+        let line = tool_use_line(tool, input, None);
+        assert_eq!(
+            netrc_call(&fixture, line),
+            Some(Cause::Call {
+                tool: tool.into(),
+                agent: "agent-1".into()
+            })
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+    }
+}
+
+#[test]
+fn a_mention_or_an_old_write_is_not_a_worker_write() {
+    let fixture = Fixture::new();
+    let home = fixture.dir.join("home");
+    let netrc = home.join(".netrc").display().to_string();
+    let transcript = [
+        tool_use_line("Read", serde_json::json!({"file_path": netrc}), None),
+        tool_use_line("Bash", serde_json::json!({"command": "cat ~/.netrc"}), None),
+        tool_use_line(
+            "Write",
+            serde_json::json!({"file_path": netrc}),
+            Some("2000-01-01T00:00:00Z"),
+        ),
+    ]
+    .join("\n");
+    assert_eq!(
+        netrc_call(&fixture, transcript),
+        Some(Cause::Unexplained { calls_read: true })
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+}
+
+fn bash_in_repo(fixture: &Fixture, command: &str) -> String {
+    let mut record: serde_json::Value = serde_json::from_str(&tool_use_line(
+        "Bash",
+        serde_json::json!({ "command": command }),
+        None,
+    ))
+    .expect("json");
+    record["cwd"] = fixture.repo.display().to_string().into();
+    record.to_string()
+}
+
+#[test]
+fn a_worker_git_config_write_is_a_call_and_a_read_only_git_form_leaves_the_writer() {
+    let fixture = Fixture::new();
+    let config = repo_config_path(&fixture);
+    let transcript = bash_in_repo(&fixture, "git config branch.t.pushRemote x");
+    let causes = caused_drifts(
+        &fixture,
+        Some(transcript),
+        vec![(config.clone(), with_branch_t(&fixture))],
+    );
+    assert_eq!(
+        causes.get(&config),
+        Some(&Some(Cause::Call {
+            tool: "Bash".into(),
+            agent: "agent-1".into()
+        }))
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
+
+    let fixture = Fixture::new();
+    let config = repo_config_path(&fixture);
+    let transcript = bash_in_repo(&fixture, "git branch --show-current");
+    let causes = caused_drifts(
+        &fixture,
+        Some(transcript),
+        vec![(config.clone(), with_branch_t(&fixture))],
+    );
+    assert_eq!(
+        causes.get(&config),
+        Some(&writer_cause("git branch tracking"))
+    );
     std::fs::remove_dir_all(&fixture.dir).ok(); // best-effort temp cleanup
 }

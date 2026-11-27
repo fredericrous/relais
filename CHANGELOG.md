@@ -23,6 +23,15 @@ exactly when `daily_spent` is `None`, bounds checked first), and
 `a_counter_adds_up`; `coordinator::stamped` is now public.
 On Windows the `relais` binary now asks the linker for an 8 MiB main-thread stack (the other platforms' size): with one more subcommand the 1 MiB default overflowed while parsing the command line.
 
+Each new `home_drift` record now says why the file changed: by a known
+writer (Claude Code's plugin refresh of `installed_plugins.json` and
+`known_marketplaces.json`, git's branch tracking in the repository's
+`.git/config`), by a tool call of the run's own worker (the tool and the
+agent), or unexplained. The warning at the end of `relais run`, and
+`status` and `explain`, list the unexplained drifts first, then the
+worker-named ones, then one count line per known writer. An old record
+prints as it did.
+
 ## v0.92.0
 
 **Breaking: the old name `aval` is gone.** `[integrations] greentopo` is the

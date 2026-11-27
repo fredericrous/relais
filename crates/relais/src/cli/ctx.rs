@@ -473,10 +473,22 @@ fn home_drift_warning_report(
 }
 
 fn home_drift_report(ledger: &Ledger, run: &RunId, heading: &str) -> Vec<String> {
-    let (drifts, mut lines) = relais::runner::drifts_of_run(ledger, run);
+    let (drifts, problems) = relais::runner::drifts_of_run(ledger, run);
     let home = relais::homeprint::print_home();
-    lines.extend(relais::homeprint::report(&drifts, heading, home.as_deref()));
-    lines
+    home_drift_status_report(&drifts, problems, heading, home.as_deref())
+}
+
+/// What `status` and `explain` print: the unreadable records, then the
+/// report, whose order is unexplained, worker-named, then one count line
+/// per known writer.
+fn home_drift_status_report(
+    drifts: &[relais::homeprint::Drift],
+    mut problems: Vec<String>,
+    heading: &str,
+    home: Option<&std::path::Path>,
+) -> Vec<String> {
+    problems.extend(relais::homeprint::report(drifts, heading, home));
+    problems
 }
 
 #[cfg(test)]
@@ -498,6 +510,47 @@ mod home_drift_warning_tests {
         );
     }
 
+    #[test]
+    fn status_lists_unexplained_then_worker_named_then_the_count_line() {
+        use relais::homeprint::{Cause, Change, Drift};
+        let drift = |path: &str, cause: Cause| Drift {
+            path: path.to_string(),
+            change: Change::Modified,
+            cause: Some(cause),
+        };
+        let drifts = [
+            drift(
+                "~/.claude/plugins/known_marketplaces.json",
+                Cause::Writer {
+                    name: "claude code plugin refresh".into(),
+                },
+            ),
+            drift(
+                "~/.netrc",
+                Cause::Call {
+                    tool: "Write".into(),
+                    agent: "a30abb7e1234567ab".into(),
+                },
+            ),
+            drift("~/.gitconfig", Cause::Unexplained { calls_read: true }),
+        ];
+        let lines = home_drift_status_report(&drifts, Vec::new(), "heading", None);
+        assert_eq!(
+            lines,
+            vec![
+                "heading",
+                "  ~/.gitconfig (modified)",
+                "    unexplained",
+                "  ~/.netrc (modified)",
+                "    by Write in agent a30abb7e1234567ab",
+                "  1 by known writer: claude code plugin refresh",
+                relais::homeprint::FOLLOW_UP[0],
+                relais::homeprint::FOLLOW_UP[1],
+                relais::homeprint::FOLLOW_UP[2],
+            ]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_stored_absolute_path_under_home_prints_with_a_tilde_at_run_end() {
@@ -505,6 +558,7 @@ mod home_drift_warning_tests {
         let drifts = [relais::homeprint::Drift {
             path: "/home/u/.gitconfig".to_string(),
             change: relais::homeprint::Change::Modified,
+            cause: None,
         }];
         let lines = home_drift_warning_report(
             &drifts,
