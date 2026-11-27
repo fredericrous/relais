@@ -1,0 +1,18 @@
+greengate-provenance-v1
+commit 68ff86ef4cccb12cb4d4c0d8a59dad5bb2124e92
+tree 60d9143700c6eeaca614f3518e112d3078f45e39
+canon 45e67eea08d1c5d9404a61d7bf3ffe0f427aaa16
+patch 55068f04a91c5657ad56a383ae936291fc23b2bd
+plan docs/plans/2026-11-27-an-t38-log-first-unknown-settle.md b50dbfa213ee35275ad3f15777e7ffd895b84f90f989d8c3bebe04af6dc9b2c8
+review reviewed 0b31a2d3df538499f0f6d60739d44883cb048ab684677fb0a5979b80b22220b6
+code-review backend reviewed 0b31a2d3df538499f0f6d60739d44883cb048ab684677fb0a5979b80b22220b6
+code-review lang:rust reviewed 0b31a2d3df538499f0f6d60739d44883cb048ab684677fb0a5979b80b22220b6
+preview not-required
+producer greenbelay 6.18.2
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABAEY5dce30iRLLtIOHwxlLlzKmvRX7gTPO0Mc1iLKHRV
+HbOoZX52BPji6NILlsuEJJv2OaCj+sEwo9vDIgD8/BBg==
+-----END SSH SIGNATURE-----
