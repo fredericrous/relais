@@ -8,6 +8,18 @@ missing here.
 
 ## Unreleased
 
+**Breaking: the old name `aval` is gone.** `[integrations] greentopo` is the
+only key for the decisions tool. A `relais.toml` that still says `aval =`
+(in any spelling) is refused with `[integrations] aval is no longer read:
+rename the key aval to greentopo`, so rename that one line before upgrading.
+relais only spawns `greentopo` (or the `bin` you declare): with only `aval`
+installed, greentopo is reported as not installed. The policy now records
+the key as `greentopo`, so every policy's authority hash moves once: a
+repository trusted once (`[trust_repos]`) stays trusted and warns once that
+its integrations changed; a legacy exact grant (`[trust."<key>"]`) must be
+granted again. `relais init --detect --json` names the proposed key
+`greentopo` too.
+
 ## v0.91.0
 
 `relais programme check` now reports two tickets in one programme directory

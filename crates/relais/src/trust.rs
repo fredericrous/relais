@@ -107,23 +107,21 @@ pub fn declaration(policy: &RepoPolicy) -> Declaration {
                 .map(|effort| effort.as_str().to_string()),
         })
         .collect();
-    let integrations = [
-        ("aval", &policy.integrations.aval),
-        ("amont", &policy.integrations.amont),
-        ("amont_agent", &policy.integrations.amont_agent),
-    ]
-    .into_iter()
-    .filter_map(|(name, dependency)| {
-        dependency.as_ref().map(|dependency| IntegrationLine {
-            name,
-            mode: match dependency.mode() {
-                crate::policy::DependencyMode::Required => "required",
-                crate::policy::DependencyMode::Optional => "optional",
-                crate::policy::DependencyMode::Off => "off",
-            },
+    let integrations = policy
+        .integrations
+        .entries()
+        .into_iter()
+        .filter_map(|(name, dependency)| {
+            dependency.map(|dependency| IntegrationLine {
+                name,
+                mode: match dependency.mode() {
+                    crate::policy::DependencyMode::Required => "required",
+                    crate::policy::DependencyMode::Optional => "optional",
+                    crate::policy::DependencyMode::Off => "off",
+                },
+            })
         })
-    })
-    .collect();
+        .collect();
     Declaration {
         steps,
         models,

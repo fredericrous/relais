@@ -380,9 +380,9 @@ pub(crate) fn replay_command(
         candidate
             .policy()
             .integrations
-            .aval
+            .greentopo
             .as_ref()
-            .and_then(|aval| aval.bin()),
+            .and_then(|topo| topo.bin()),
     );
     let hooks = relais::verify::AmontCli::new();
     let attest = relais::verify::AmontCli::new();

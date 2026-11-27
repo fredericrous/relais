@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use crate::policy::{BlockCode, Blocker, DependencyMode, RepoPolicy};
+use crate::policy::{BlockCode, Blocker, DependencyMode, RepoPolicy, TOPO_KEY};
 use crate::procs::{run_with_timeout, Ended};
 
 /// How long a `--version`/`--help` probe may take. A probe is a question
@@ -31,27 +31,32 @@ use crate::procs::{run_with_timeout, Ended};
 /// busy laptop.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long one guidance question (`aval rules`, `aval relevant`) may
-/// take. Guidance is advisory and the run waits for it before it starts,
-/// so it gets a bound of its own, far below a probe's: a slow aval is a
-/// gap in the guidance, not a delayed run.
+/// How long one guidance question (`greentopo rules`, `greentopo relevant`)
+/// may take. Guidance is advisory and the run waits for it before it
+/// starts, so it gets a bound of its own, far below a probe's: a slow
+/// greentopo is a gap in the guidance, not a delayed run.
 pub const GUIDANCE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Availability of required integrations at run time. Kept out of
 /// `effective_authority` on purpose: the intersection stays a pure function
 /// over policy files, while PATH probing belongs to doctor, plan and run.
 pub fn probe_integrations(repo: &RepoPolicy) -> Vec<Blocker> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    probe_integrations_in(repo, &path)
+}
+
+/// [`probe_integrations`] against the given search path, so a test points
+/// it at a directory of its own without touching the process environment.
+pub(crate) fn probe_integrations_in(repo: &RepoPolicy, path: &std::ffi::OsStr) -> Vec<Blocker> {
+    let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
+    let extensions = path_extensions(std::env::var_os("PATHEXT").as_ref());
     let mut blockers = Vec::new();
-    for (name, dependency) in [
-        ("aval", repo.integrations.aval.as_ref()),
-        ("amont", repo.integrations.amont.as_ref()),
-        ("amont_agent", repo.integrations.amont_agent.as_ref()),
-    ] {
+    for (name, dependency) in repo.integrations.entries() {
         if let Some(dependency) = dependency {
             match dependency.mode() {
                 DependencyMode::Required => {
                     let bin = dependency.bin().unwrap_or(default_bin(name));
-                    if !binary_available(bin) {
+                    if which_in(bin, &dirs, &extensions).is_none() {
                         blockers.push(Blocker {
                             code: BlockCode::IntegrationMissing,
                             detail: missing_integration_detail(name, bin, dependency.bin()),
@@ -68,46 +73,35 @@ pub fn probe_integrations(repo: &RepoPolicy) -> Vec<Blocker> {
     blockers
 }
 
-/// The blocker text for a required integration that is not on PATH. The
-/// aval entry names both keys it may be written under, so a repository
-/// that wrote `greentopo` is not told to add the key that both-keys
-/// refuses.
+/// The blocker text for a required integration that is not on PATH.
 fn missing_integration_detail(name: &str, bin: &str, declared_bin: Option<&str>) -> String {
-    let install = match declared_bin {
-        Some(declared) => format!("`{declared}`"),
-        None => "greentopo (`aval` still works for now)".to_string(),
-    };
-    match name {
-        "aval" => format!(
-            "required integration `greentopo` (binary `{bin}`) is not available on PATH; \
-             install {install}, or set its [integrations] key (greentopo or aval) in \
-             relais.toml to \"optional\""
-        ),
-        _ => format!(
-            "required integration `{name}` is not available on PATH; \
-             set [integrations] {name} = \"optional\" in relais.toml \
-             to run without it"
-        ),
+    if name == TOPO_KEY {
+        let install = match declared_bin {
+            Some(declared) => format!("`{declared}`"),
+            None => TOPO_KEY.to_string(),
+        };
+        return format!(
+            "required integration `{TOPO_KEY}` (binary `{bin}`) is not available on PATH; \
+             install {install}, or set [integrations] {TOPO_KEY} = \"optional\" in relais.toml"
+        );
     }
+    format!(
+        "required integration `{name}` is not available on PATH; \
+         set [integrations] {name} = \"optional\" in relais.toml \
+         to run without it"
+    )
 }
 
 /// The binary an integration's config key names when the declaration gives
 /// no `bin`: the one place the key-to-binary mapping lives (doctor and
 /// verification ask it too). The key `amont_agent` keeps its name until the
 /// census; its binary is `greenbelay` (ADR-0071: no `amont-agent` copy is
-/// installed).
-///
-/// The `aval` key's binary is `greentopo` when that is on this machine's
-/// PATH, else `aval` (the rename keeps the old binary working until the
-/// machine switch). Each reader of a run resolves it once.
+/// installed). Every other key is its binary's name.
 pub(crate) fn default_bin(name: &str) -> &str {
-    if name != "aval" {
-        return default_bin_in(name, &[], &[], &exists_in_any_form);
+    match name {
+        "amont_agent" => "greenbelay",
+        other => other,
     }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
-    let extensions = path_extensions(std::env::var_os("PATHEXT").as_ref());
-    default_bin_in(name, &dirs, &extensions, &exists_in_any_form)
 }
 
 /// Does anything of this name exist, in any form: a file, a directory, a
@@ -117,30 +111,6 @@ pub(crate) fn exists_in_any_form(candidate: &Path) -> bool {
     match std::fs::symlink_metadata(candidate) {
         Ok(_) => true,
         Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-    }
-}
-
-/// [`default_bin`] over the given directories, suffixes and existence
-/// test, so it is tested without touching the environment. An installed
-/// `greentopo` that fails is never replaced by `aval`: only its absence
-/// from the directories selects `aval`.
-// holds-until: decisions topo-spotter-rename t22 closes; the `aval` fallback is removed then
-pub(crate) fn default_bin_in<'a>(
-    name: &'a str,
-    dirs: &[PathBuf],
-    extensions: &[String],
-    exists: &dyn Fn(&Path) -> bool,
-) -> &'a str {
-    match name {
-        "amont_agent" => "greenbelay",
-        "aval" => {
-            if resolve_in("greentopo", dirs, extensions, exists).is_some() {
-                "greentopo"
-            } else {
-                "aval"
-            }
-        }
-        other => other,
     }
 }
 
@@ -203,15 +173,21 @@ pub fn resolve_in(
 
 /// Where this machine's `PATH` resolves a program name, if anywhere.
 pub fn which(name: &str) -> Option<PathBuf> {
-    // A name that already carries a path is not a PATH lookup.
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    let extensions = path_extensions(std::env::var_os("PATHEXT").as_ref());
+    which_in(name, &dirs, &extensions)
+}
+
+/// [`which`] over the given directories and suffixes. A name that already
+/// carries a path is checked as it is, never looked up; a candidate counts
+/// only when it is a file.
+fn which_in(name: &str, dirs: &[PathBuf], extensions: &[String]) -> Option<PathBuf> {
     if Path::new(name).components().count() > 1 {
         let named = PathBuf::from(name);
         return named.is_file().then_some(named);
     }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
-    let extensions = path_extensions(std::env::var_os("PATHEXT").as_ref());
-    resolve_in(name, &dirs, &extensions, &|candidate| candidate.is_file())
+    resolve_in(name, dirs, extensions, &|candidate| candidate.is_file())
 }
 
 /// Is this binary on PATH?
@@ -334,70 +310,66 @@ mod tests {
         assert_eq!(default_bin("amont_agent"), "greenbelay");
     }
 
-    fn bin_for_listing(listing: &[&str]) -> String {
-        let root = crate::test_support::temp_dir("default-bin");
-        let dirs = vec![root.join("bin")];
-        std::fs::create_dir_all(&dirs[0]).unwrap();
-        for name in listing {
-            std::fs::write(dirs[0].join(name), "").unwrap();
-        }
-        default_bin_in("aval", &dirs, &[String::new()], &exists_in_any_form).to_string()
-    }
-
+    /// The decision corpus key names the `greentopo` binary and nothing
+    /// else: with only the old `aval` binary on PATH, a required greentopo
+    /// is missing, and the blocker never names the old binary.
     #[test]
-    fn only_greentopo_on_path_selects_greentopo() {
-        assert_eq!(bin_for_listing(&["greentopo"]), "greentopo");
-    }
-
-    #[test]
-    fn only_aval_on_path_selects_aval() {
-        assert_eq!(bin_for_listing(&["aval"]), "aval");
-    }
-
-    #[test]
-    fn both_on_path_select_greentopo() {
-        assert_eq!(bin_for_listing(&["aval", "greentopo"]), "greentopo");
-    }
-
-    #[test]
-    fn neither_on_path_selects_aval() {
-        assert_eq!(bin_for_listing(&[]), "aval");
-    }
-
-    #[test]
-    fn the_aval_blocker_names_what_to_install() {
-        assert_eq!(
-            missing_integration_detail("aval", "greentopo", None),
-            "required integration `greentopo` (binary `greentopo`) is not available on PATH; \
-             install greentopo (`aval` still works for now), or set its [integrations] \
-             key (greentopo or aval) in relais.toml to \"optional\""
-        );
-        assert_eq!(
-            missing_integration_detail("aval", "/opt/x/topo", Some("/opt/x/topo")),
-            "required integration `greentopo` (binary `/opt/x/topo`) is not available on PATH; \
-             install `/opt/x/topo`, or set its [integrations] key (greentopo or aval) in \
-             relais.toml to \"optional\""
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_dangling_greentopo_is_chosen_not_skipped() {
-        let root = crate::test_support::temp_dir("default-bin-dangling");
+    fn only_aval_on_path_leaves_a_required_greentopo_missing() {
+        let root = crate::test_support::temp_dir("probe-only-aval");
         let dir = root.join("bin");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("aval"), "").unwrap();
-        std::os::unix::fs::symlink(root.join("gone"), dir.join("greentopo")).unwrap();
+        let policy = RepoPolicy::from_toml_str(
+            "schema_version = 1\n[integrations]\ngreentopo = \"required\"\n",
+        )
+        .unwrap();
+        let blockers = probe_integrations_in(&policy, dir.as_os_str());
+        let [blocker] = blockers.as_slice() else {
+            panic!("{blockers:?}")
+        };
+        assert_eq!(blocker.code, BlockCode::IntegrationMissing);
         assert_eq!(
-            default_bin_in("aval", &[dir], &[String::new()], &exists_in_any_form),
-            "greentopo"
+            blocker.detail,
+            "required integration `greentopo` (binary `greentopo`) is not available on PATH; \
+             install greentopo, or set [integrations] greentopo = \"optional\" in relais.toml"
+        );
+        assert!(!blocker.detail.contains("aval"), "{}", blocker.detail);
+
+        std::fs::write(dir.join("greentopo"), "").unwrap();
+        assert!(probe_integrations_in(&policy, dir.as_os_str()).is_empty());
+    }
+
+    /// A declared `bin` that carries a path is checked as it is, not
+    /// joined onto each PATH directory.
+    #[test]
+    fn a_declared_bin_with_a_path_is_checked_where_it_is() {
+        let root = crate::test_support::temp_dir("probe-declared-path");
+        let tool = root.join("tools").join("greentopo");
+        std::fs::create_dir_all(tool.parent().unwrap()).unwrap();
+        std::fs::write(&tool, "").unwrap();
+        let policy = RepoPolicy::from_toml_str(&format!(
+            "schema_version = 1\n[integrations]\ngreentopo = {{ mode = \"required\", bin = {:?} }}\n",
+            tool.display().to_string()
+        ))
+        .unwrap();
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(probe_integrations_in(&policy, empty.as_os_str()).is_empty());
+    }
+
+    #[test]
+    fn the_greentopo_blocker_names_a_declared_bin() {
+        assert_eq!(
+            missing_integration_detail(TOPO_KEY, "/opt/x/topo", Some("/opt/x/topo")),
+            "required integration `greentopo` (binary `/opt/x/topo`) is not available on PATH; \
+             install `/opt/x/topo`, or set [integrations] greentopo = \"optional\" in relais.toml"
         );
     }
 
     #[test]
     fn a_declared_bin_wins_over_the_default() {
         let policy = RepoPolicy::from_toml_str(
-            "schema_version = 1\n[integrations]\naval = { mode = \"required\", bin = \"relais-test-no-such-bin\" }\n",
+            "schema_version = 1\n[integrations]\ngreentopo = { mode = \"required\", bin = \"relais-test-no-such-bin\" }\n",
         )
         .unwrap();
         let blockers = probe_integrations(&policy);
@@ -427,7 +399,11 @@ mod tests {
     #[test]
     fn a_windows_program_resolves_through_its_pathext_suffix() {
         let dirs = vec![PathBuf::from("C:/tools"), PathBuf::from("C:/npm")];
-        let listing = ["C:/tools/git.exe", "C:/npm/claude.cmd", "C:/npm/aval.ps1"];
+        let listing = [
+            "C:/tools/git.exe",
+            "C:/npm/claude.cmd",
+            "C:/npm/greentopo.ps1",
+        ];
         let exists = |candidate: &Path| listing.iter().any(|entry| Path::new(entry) == candidate);
         let extensions: Vec<String> = [".com", ".exe", ".bat", ".cmd", ".ps1"]
             .iter()
@@ -445,8 +421,8 @@ mod tests {
             "an npm-installed CLI is a .cmd shim"
         );
         assert_eq!(
-            resolve_in("aval", &dirs, &extensions, &exists),
-            Some(PathBuf::from("C:/npm/aval.ps1"))
+            resolve_in("greentopo", &dirs, &extensions, &exists),
+            Some(PathBuf::from("C:/npm/greentopo.ps1"))
         );
         assert_eq!(
             resolve_in("git", &dirs, &bare, &exists),
@@ -483,21 +459,5 @@ mod tests {
         assert!(resolved.version.to_lowercase().contains("git"));
         assert!(resolved.path.ends_with("git") || resolved.path.contains("git"));
         assert_eq!(resolved.program, "git");
-    }
-
-    #[test]
-    fn a_missing_greentopo_integration_blocker_names_both_keys() {
-        let policy = RepoPolicy::from_toml_str(
-            "schema_version = 1\n[integrations]\ngreentopo = { mode = \"required\", bin = \"relais-test-no-such-bin\" }\n",
-        )
-        .unwrap();
-        let blockers = probe_integrations(&policy);
-        assert_eq!(blockers.len(), 1);
-        let detail = &blockers[0].detail;
-        assert!(
-            detail.contains("aval") && detail.contains("greentopo"),
-            "{detail}"
-        );
-        assert!(detail.contains("relais-test-no-such-bin"));
     }
 }
