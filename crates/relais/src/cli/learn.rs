@@ -484,6 +484,42 @@ impl CycleOut {
         }
     }
 
+    /// One JSON object on the result stream: a bare line in the `--log` file,
+    /// else one stdout line (quiet on a closed pipe). Any other failed write
+    /// is said on stderr.
+    fn object(&mut self, object: &serde_json::Value) {
+        let line = object.to_string();
+        match &mut self.log {
+            Some(log) => log.line(&line),
+            None => {
+                if let Err(e) = super::decision_record::write_object(&line) {
+                    eprintln!("relais learn cycle: could not write the result to stdout: {e}");
+                }
+            }
+        }
+    }
+
+    /// What `--if-due` prints for a cycle that is not due; false when it is
+    /// due and nothing was printed. Under `--json` it is the deferred object.
+    fn say_not_due(&mut self, json: bool, due: &relais::learn::cycle::Due) -> bool {
+        match due {
+            relais::learn::cycle::Due::Yes => false,
+            relais::learn::cycle::Due::No { reason, next_due } => {
+                if json {
+                    self.object(&serde_json::json!({
+                        "outcome": "deferred",
+                        "reason": "not_due",
+                        "detail": reason,
+                        "next_due": next_due,
+                    }));
+                } else if let Some(line) = due.line() {
+                    self.say(&line);
+                }
+                true
+            }
+        }
+    }
+
     /// A diagnostic: stderr.
     pub(crate) fn complain(&mut self, line: &str) {
         match &mut self.log {
@@ -605,11 +641,16 @@ pub(crate) fn learn_cycle_command(
         }
         TrainingDecision::NotIdle { agents } => {
             // A cycle that is not due has nothing to defer.
-            if if_due {
-                if let Some(line) = due(&ledger)?.line() {
-                    out.say(&line);
-                    return Ok(CliOutcome::Accepted);
-                }
+            if if_due && out.say_not_due(json, &due(&ledger)?) {
+                return Ok(CliOutcome::Accepted);
+            }
+            if json {
+                out.object(&serde_json::json!({
+                    "outcome": "deferred",
+                    "reason": "not_idle",
+                    "agents": agents,
+                }));
+                return Ok(CliOutcome::Accepted);
             }
             let line = format!("deferred: not idle ({agents} agents active)");
             // With `--log` the one line goes to the file, stamped (it is
@@ -638,11 +679,8 @@ pub(crate) fn learn_cycle_command(
         }
     }
     let _guard = TrainingGuard { client, lease };
-    if if_due {
-        if let Some(line) = due(&ledger)?.line() {
-            out.say(&line);
-            return Ok(CliOutcome::Accepted);
-        }
+    if if_due && out.say_not_due(json, &due(&ledger)?) {
+        return Ok(CliOutcome::Accepted);
     }
     let repo = match load_repo_policy() {
         Ok((_, repo)) => repo,

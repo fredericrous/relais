@@ -39,7 +39,8 @@
 //! asked of the person: `deferred` (agents of other sessions are active and
 //! `training_when_idle` is set), `not due` (`--if-due`), and
 //! `awaiting_promotion` (an artifact passed its gates and waits for `relais
-//! promote`).
+//! promote`). Under `--json` the first two print one `{"outcome":"deferred",
+//! "reason":"not_idle"|"not_due",…}` object (`docs/shared-state.md`).
 //!
 //! The session-router commands (`native router-state`, `router-observe`,
 //! `router-envelope`) use 0, 1 and 2 only: 2 is a bad payload or

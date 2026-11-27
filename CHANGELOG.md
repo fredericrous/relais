@@ -8,6 +8,16 @@ missing here.
 
 ## Unreleased
 
+`relais learn cycle --json` now prints one JSON object for a cycle that did
+not run, on exit 0, instead of the plain `deferred: not idle` and `not due`
+lines: `{"outcome":"deferred","reason":"not_idle","agents":<n>}` or
+`{"outcome":"deferred","reason":"not_due","detail":…,"next_due":…}`. A report
+of a cycle that ran has no `outcome` key. Under `--log` the object is one bare
+line in the file. Without `--json` nothing changes. The failure arms of
+`learn cycle` (busy, refused, a coordinator of another protocol, a policy that
+does not parse), `doctor --json`'s error object and `trust`'s stale-holdout
+`code` and `detail` fields now have tests (an-t37).
+
 A new `relais counter [--days N] [--json]` reads the shared day counter: per
 UTC day (today included, default 7, at most 31) the counter's figure, this
 node's ledger sum, the spend the coordinator dropped (summed from the
