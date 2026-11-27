@@ -41,3 +41,4 @@ comes in a second PR after greensummit 2.1.0.
 - backend (opus): approve-with-changes; orphan-ref test and SPEC sentences (working-tree listing; ref-only duplicates unreported, deliberate: a branch based on the ref reports them). 60k, 72 s.
 - lang:rust (opus): approve-with-changes; two vectors replace the index sentinel, `Listing::Ref(rev)`; deliberate: no `GitRev` newtype (one boundary, tested), hint string kept, lossy names match `Programme::load`. 47k, 37 s.
 - unix (opus): approve, no findings. 61k, 49 s.
+- Round 2 (tree 8401457ff004, opus): all four approve; every round-1 finding resolved or accepted; deliberate: shadowed `found` closure parameter (low, harmless). 214k in all, 18–40 s.
