@@ -536,7 +536,7 @@ impl CycleOut {
                 outcome: "deferred",
                 why,
             }),
-            (_, Deferred::NotIdle { agents }) => {
+            (Format::Text, Deferred::NotIdle { agents }) => {
                 let line = format!("deferred: not idle ({agents} agents active)");
                 match &mut self.log {
                     Some(log) => log.line(&format!(
@@ -547,8 +547,8 @@ impl CycleOut {
                 }
                 CliOutcome::Accepted
             }
-            (_, Deferred::NotDue { detail, next_due }) => {
-                self.say(&format!("not due: {detail}; {next_due}"));
+            (Format::Text, Deferred::NotDue { detail, next_due }) => {
+                self.say(&relais::learn::cycle::not_due_line(detail, next_due));
                 CliOutcome::Accepted
             }
         }
