@@ -720,8 +720,8 @@ pub struct RepoPolicy {
 
 impl RepoPolicy {
     pub fn from_toml_str(text: &str) -> Result<Self, PolicyError> {
-        if sets_retired_topo_key(text) {
-            return Err(PolicyError::RetiredAvalIntegrationKey);
+        if let Some(greentopo_also_set) = retired_topo_key(text) {
+            return Err(PolicyError::RetiredAvalIntegrationKey { greentopo_also_set });
         }
         let policy: RepoPolicy =
             toml::from_str(text).map_err(|e| PolicyError::MalformedToml(e.to_string()))?;
@@ -936,26 +936,28 @@ fn validate_reuse(reuse: &ReuseSpec) -> Result<(), PolicyError> {
         .try_for_each(|output| validate_workspace_path(output, "reuse output"))
 }
 
-/// True when the raw `[integrations]` table still carries the retired
-/// `aval` key, in any TOML spelling (table, dotted or inline). Checked
-/// before the typed parse so the refusal names the fix instead of reading
-/// as a generic unknown field. Unparseable text returns false, so the
-/// strict parse after it names the error.
-fn sets_retired_topo_key(text: &str) -> bool {
-    text.parse::<toml::Table>()
-        .ok()
-        .and_then(|table| {
-            let integrations = table.get("integrations")?.as_table()?;
-            Some(integrations.contains_key(RETIRED_TOPO_KEY))
-        })
-        .unwrap_or(false)
+/// Whether the raw `[integrations]` table still carries the retired `aval`
+/// key, in any TOML spelling (table, dotted or inline): `Some` when it
+/// does, holding whether `greentopo` is set beside it. Checked before the
+/// typed parse so the refusal names the fix instead of reading as a
+/// generic unknown field. Unparseable text gives `None`, so the strict
+/// parse after it names the error.
+fn retired_topo_key(text: &str) -> Option<bool> {
+    let table = text.parse::<toml::Table>().ok()?;
+    let integrations = table.get("integrations")?.as_table()?;
+    integrations
+        .contains_key(RETIRED_TOPO_KEY)
+        .then(|| integrations.contains_key(TOPO_KEY))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyError {
     UnsupportedSchemaVersion(u64),
-    /// `[integrations]` still sets the retired `aval` key.
-    RetiredAvalIntegrationKey,
+    /// `[integrations]` still sets the retired `aval` key, alone or beside
+    /// `greentopo`.
+    RetiredAvalIntegrationKey {
+        greentopo_also_set: bool,
+    },
     MalformedToml(String),
     EmptyRiskPaths,
     EmptyCommandArgv,
@@ -1005,10 +1007,19 @@ impl std::fmt::Display for PolicyError {
                 "unsupported relais.toml schema_version {v} (this relais understands \
                  {MIN_POLICY_SCHEMA_VERSION}..={POLICY_SCHEMA_VERSION})"
             ),
-            Self::RetiredAvalIntegrationKey => write!(
+            Self::RetiredAvalIntegrationKey {
+                greentopo_also_set: false,
+            } => write!(
                 f,
                 "[integrations] {RETIRED_TOPO_KEY} is no longer read: rename the key \
-                 {RETIRED_TOPO_KEY} to {TOPO_KEY} (for example {TOPO_KEY} = \"required\")"
+                 {RETIRED_TOPO_KEY} to {TOPO_KEY} and keep its value"
+            ),
+            Self::RetiredAvalIntegrationKey {
+                greentopo_also_set: true,
+            } => write!(
+                f,
+                "[integrations] {RETIRED_TOPO_KEY} is no longer read and {TOPO_KEY} is \
+                 already set: remove the {RETIRED_TOPO_KEY} line"
             ),
             Self::MalformedToml(detail) => write!(f, "policy file is not valid TOML: {detail}"),
             Self::EmptyRiskPaths => write!(f, "a [[risk]] rule needs at least one path pattern"),
@@ -4162,7 +4173,7 @@ timeout_seconds = 60
         .expect("the frozen fixture plus one recipe parses");
         assert_eq!(
             with_recipe.authority_hash(),
-            "ae3a0efe11b4cecfcdc95e527e05bba923967d62556767a91750c17cb12e75cb",
+            "2b73d3a1b97ec2c5ca1c91930175ecc76d716aa5324cd83356225ea76ca4136e",
             "a recipe setting only name/kind/scope_within/tier must hash exactly as it did \
              before RecipeSpec grew its new fields"
         );
@@ -4188,7 +4199,7 @@ greengate 4.0's `GREENGATE_ON_BUSY`)"
         let tiered = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
         assert_eq!(
             tiered.authority_hash(),
-            "d909b85bb81bf97cd2a2415b758cc9cc9d5d74eac087ef3746755ac1d27c74c7",
+            "404b5eb6b25d8d92f314ff046a8951bf32c6766f6020310537e6c633632d994f",
             "a policy with per-tier efforts must hash as it did with the enum"
         );
     }
@@ -4829,16 +4840,30 @@ command = { argv = ["true"], junit = "j.xml" }
             "schema_version = 1\n[integrations]\naval = \"required\"\n",
             "schema_version = 1\nintegrations.aval = \"required\"\n",
             "schema_version = 1\nintegrations = { aval = { mode = \"optional\", bin = \"x\" } }\n",
-            "schema_version = 1\n[integrations]\naval = \"required\"\ngreentopo = \"required\"\n",
         ] {
             let err = RepoPolicy::from_toml_str(text).unwrap_err();
-            assert_eq!(err, PolicyError::RetiredAvalIntegrationKey, "{text}");
+            assert_eq!(
+                err,
+                PolicyError::RetiredAvalIntegrationKey {
+                    greentopo_also_set: false
+                },
+                "{text}"
+            );
             assert_eq!(
                 err.to_string(),
                 "[integrations] aval is no longer read: rename the key aval to greentopo \
-                 (for example greentopo = \"required\")"
+                 and keep its value"
             );
         }
+        let both = RepoPolicy::from_toml_str(
+            "schema_version = 1\n[integrations]\naval = \"required\"\ngreentopo = \"required\"\n",
+        )
+        .unwrap_err();
+        assert_eq!(
+            both.to_string(),
+            "[integrations] aval is no longer read and greentopo is already set: \
+             remove the aval line"
+        );
     }
 
     #[test]

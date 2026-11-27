@@ -246,9 +246,11 @@ pub struct AvalCli {
 }
 
 impl AvalCli {
-    /// The declared `bin`, else `greentopo`.
+    /// The declared `bin`, else the key's binary, `greentopo`.
     fn program(&self) -> &str {
-        self.bin.as_deref().unwrap_or(crate::policy::TOPO_KEY)
+        self.bin
+            .as_deref()
+            .unwrap_or(crate::tooling::default_bin(crate::policy::TOPO_KEY))
     }
 
     /// Resolve decisions for the corpus rooted at `root`.
@@ -538,16 +540,17 @@ pub fn aval_resolve_in(
     // directory to run in was checked above.
     let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
     let extensions = crate::tooling::path_extensions(std::env::var_os("PATHEXT").as_ref());
+    let default_program = crate::tooling::default_bin(crate::policy::TOPO_KEY);
     let confirmed_absent = bin.is_none() && {
         crate::tooling::resolve_in(
-            crate::policy::TOPO_KEY,
+            default_program,
             &dirs,
             &extensions,
             &crate::tooling::exists_in_any_form,
         )
         .is_none()
     };
-    let program = bin.unwrap_or(crate::policy::TOPO_KEY);
+    let program = bin.unwrap_or(default_program);
     let mut command = std::process::Command::new(program);
     command
         .arg("resolve")
@@ -578,7 +581,7 @@ pub fn aval_resolve_in(
             exit: -1,
             detail: format!(
                 "greentopo (`{program}`) could not be launched: {e}; {}",
-                aval_launch_hint(program, bin.is_some())
+                aval_launch_hint(program, bin)
             ),
         },
     }
@@ -587,15 +590,14 @@ pub fn aval_resolve_in(
 /// What to check when greentopo could not be launched, by where the
 /// program came from: a declared `bin` plays PATH no part; otherwise
 /// `greentopo` was found on PATH in some form and did not start.
-fn aval_launch_hint(program: &str, declared: bool) -> String {
-    if declared {
-        format!(
-            "check that `{program}`, the `bin` declared under [integrations] in relais.toml, exists and runs"
-        )
-    } else {
-        format!(
+fn aval_launch_hint(program: &str, declared_bin: Option<&str>) -> String {
+    match declared_bin {
+        Some(declared) => format!(
+            "check that `{declared}`, the `bin` declared under [integrations] in relais.toml, exists and runs"
+        ),
+        None => format!(
             "check that `{program}` on PATH runs, or set `bin` under [integrations] in relais.toml"
-        )
+        ),
     }
 }
 
@@ -1767,11 +1769,11 @@ mod tests {
     #[test]
     fn the_launch_hint_follows_where_the_program_came_from() {
         assert_eq!(
-            aval_launch_hint("/opt/bin/greentopo", true),
+            aval_launch_hint("/opt/bin/greentopo", Some("/opt/bin/greentopo")),
             "check that `/opt/bin/greentopo`, the `bin` declared under [integrations] in relais.toml, exists and runs"
         );
         assert_eq!(
-            aval_launch_hint("greentopo", false),
+            aval_launch_hint("greentopo", None),
             "check that `greentopo` on PATH runs, or set `bin` under [integrations] in relais.toml"
         );
     }

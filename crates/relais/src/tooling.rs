@@ -57,9 +57,26 @@ pub(crate) fn probe_integrations_in(repo: &RepoPolicy, path: &std::ffi::OsStr) -
                 DependencyMode::Required => {
                     let bin = dependency.bin().unwrap_or(default_bin(name));
                     if which_in(bin, &dirs, &extensions).is_none() {
+                        // Present in some form but not a runnable file (a
+                        // dangling link, a directory): a broken install,
+                        // named as one rather than as an absence.
+                        let broken = dependency
+                            .bin()
+                            .is_none()
+                            .then(|| resolve_in(bin, &dirs, &extensions, &exists_in_any_form))
+                            .flatten();
+                        let detail = match broken {
+                            Some(found) => format!(
+                                "required integration `{name}` is found at {} but it is not a \
+                                 runnable file; reinstall {bin}, or set [integrations] {name} = \
+                                 \"optional\" in relais.toml",
+                                found.display()
+                            ),
+                            None => missing_integration_detail(name, bin, dependency.bin()),
+                        };
                         blockers.push(Blocker {
                             code: BlockCode::IntegrationMissing,
-                            detail: missing_integration_detail(name, bin, dependency.bin()),
+                            detail,
                         });
                     }
                 }
@@ -76,14 +93,16 @@ pub(crate) fn probe_integrations_in(repo: &RepoPolicy, path: &std::ffi::OsStr) -
 /// The blocker text for a required integration that is not on PATH.
 fn missing_integration_detail(name: &str, bin: &str, declared_bin: Option<&str>) -> String {
     if name == TOPO_KEY {
-        let install = match declared_bin {
-            Some(declared) => format!("`{declared}`"),
-            None => TOPO_KEY.to_string(),
+        return match declared_bin {
+            Some(declared) => format!(
+                "required integration `{TOPO_KEY}` (binary `{bin}`) is not available on PATH; \
+                 install `{declared}`, or set [integrations] {TOPO_KEY} = \"optional\" in relais.toml"
+            ),
+            None => format!(
+                "required integration `{TOPO_KEY}` is not available on PATH; \
+                 install {bin}, or set [integrations] {TOPO_KEY} = \"optional\" in relais.toml"
+            ),
         };
-        return format!(
-            "required integration `{TOPO_KEY}` (binary `{bin}`) is not available on PATH; \
-             install {install}, or set [integrations] {TOPO_KEY} = \"optional\" in relais.toml"
-        );
     }
     format!(
         "required integration `{name}` is not available on PATH; \
@@ -330,13 +349,59 @@ mod tests {
         assert_eq!(blocker.code, BlockCode::IntegrationMissing);
         assert_eq!(
             blocker.detail,
-            "required integration `greentopo` (binary `greentopo`) is not available on PATH; \
+            "required integration `greentopo` is not available on PATH; \
              install greentopo, or set [integrations] greentopo = \"optional\" in relais.toml"
         );
         assert!(!blocker.detail.contains("aval"), "{}", blocker.detail);
 
         std::fs::write(dir.join("greentopo"), "").unwrap();
         assert!(probe_integrations_in(&policy, dir.as_os_str()).is_empty());
+    }
+
+    /// A dangling `greentopo` blocks as a broken install, not as an
+    /// absence (ADR-0073), and the text says which.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_greentopo_blocks_as_a_broken_install() {
+        let root = crate::test_support::temp_dir("probe-dangling");
+        let dir = root.join("bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(root.join("gone"), dir.join("greentopo")).unwrap();
+        let policy = RepoPolicy::from_toml_str(
+            "schema_version = 1\n[integrations]\ngreentopo = \"required\"\n",
+        )
+        .unwrap();
+        let blockers = probe_integrations_in(&policy, dir.as_os_str());
+        let [blocker] = blockers.as_slice() else {
+            panic!("{blockers:?}")
+        };
+        assert_eq!(blocker.code, BlockCode::IntegrationMissing);
+        assert!(
+            blocker.detail.contains("but it is not a runnable file"),
+            "{}",
+            blocker.detail
+        );
+    }
+
+    /// A relative name that carries a path is checked from the working
+    /// directory as it is, never joined onto a PATH directory.
+    #[test]
+    fn a_relative_name_with_a_path_is_checked_as_it_is() {
+        let empty = crate::test_support::temp_dir("which-relative");
+        let here = std::env::current_dir().unwrap();
+        let relative = "src/tooling.rs";
+        assert!(
+            here.join(relative).is_file(),
+            "cargo runs tests from the crate root"
+        );
+        assert_eq!(
+            which_in(relative, &[empty.to_path_buf()], &[String::new()]),
+            Some(PathBuf::from(relative))
+        );
+        assert_eq!(
+            which_in("src/no-such-file", &[empty.to_path_buf()], &[String::new()]),
+            None
+        );
     }
 
     /// A declared `bin` that carries a path is checked as it is, not

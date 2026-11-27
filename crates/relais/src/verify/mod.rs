@@ -7095,11 +7095,6 @@ mod tests {
             none[0],
             "greentopo: required integration unavailable (binary `greentopo` not on PATH)"
         );
-        let only_aval = integration_gaps(&integrations, &|name| name == "aval");
-        assert!(
-            only_aval[0].starts_with("greentopo: required"),
-            "{only_aval:?}"
-        );
     }
 
     /// The `amont_agent` key (its name until the census) is satisfied by the

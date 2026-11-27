@@ -27,7 +27,7 @@ impl<'a> RunEngine<'a> {
             .greentopo
             .as_ref()
             .and_then(|dependency| dependency.bin())
-            .unwrap_or(crate::policy::TOPO_KEY)
+            .unwrap_or(crate::tooling::default_bin(crate::policy::TOPO_KEY))
             .to_string()
     }
 

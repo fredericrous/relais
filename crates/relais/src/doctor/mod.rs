@@ -203,7 +203,9 @@ pub(crate) fn integration_finding(
             component,
             level: Level::Fail,
             detail: format!(
-                "required by [integrations] and {missing_name} is not on PATH; every run is blocked on it"
+                "required by [integrations] and {missing_name} is not on PATH; every run is \
+                 blocked on it: install {missing_name}, or set [integrations] {name} = \"optional\" \
+                 in relais.toml"
             ),
         },
         DependencyMode::Optional if available(&bin) => present(mode),
@@ -2740,7 +2742,8 @@ mod tests {
         assert_eq!(required_missing.level, Level::Fail);
         assert_eq!(
             required_missing.detail,
-            "required by [integrations] and `greentopo` is not on PATH; every run is blocked on it"
+            "required by [integrations] and `greentopo` is not on PATH; every run is blocked on \
+             it: install `greentopo`, or set [integrations] greentopo = \"optional\" in relais.toml"
         );
 
         let optional_missing = integration_finding(
