@@ -97,9 +97,9 @@ point at `relais coordinator status`.
 | --- | --- | --- | --- |
 | an-t36 test extended | `cargo test -p relais a_first_settle_answered_unknown_stays_confirmed` | 1 settle, 1 `gate_settle_unknown_first`, no unconfirmed/failed | ok (4.7 s): one `gate_settle_unknown_first`, no unconfirmed or failed |
 | retry test unchanged in meaning | `cargo test -p relais a_settle_whose_answer_was_lost_is_retried_and_booked_once` | zero `gate_settle_unknown_first`, one `gate_settle_unconfirmed` | ok (4.3 s) |
-| mutation | `what: "gate_settle_unknown_first"` renamed to `mutated` in `launch.rs`, run `cargo test -p relais a_first_settle_answered_unknown_stays_confirmed` | fails on the new assertion | failed at `mod.rs:9041`: "a first `Unknown` is said once: [baseline_deferred, mutated, accept]" left 0 right 1; restored |
+| mutation | `what: "gate_settle_unknown_first"` renamed to `mutated` in `launch.rs`, run `cargo test -p relais a_first_settle_answered_unknown_stays_confirmed` | fails on the new assertion | failed at `mod.rs:9079` (the count assertion, measured before the rebase; the same assertion sits there now): "a first `Unknown` is said once: [baseline_deferred, mutated, accept]" left 0 right 1; restored |
 | stderr line | `cargo test -p relais first_unknown_line` | one line, names dispatch, contains `relais coordinator status`, no `dropped_micros=` | ok (50 s): pure `unknown_first_line` test passed |
-| suite | `cargo test -p relais` | exit 0 | exit 0 on the first implementation tree; after the comment, cost-once and line-move edits the two settle tests and the line test were re-run and passed |
+| suite | `cargo test -p relais` | exit 0 | exit 0 on the first implementation tree; after the comment, cost-once and line-move edits the two settle tests and the line test were re-run and passed. Not run on the rebased tree by hand: the pre-push gate runs the full `cargo test -p relais` on the pushed tree, and its exit is the record |
 
 ## Implementation review
 

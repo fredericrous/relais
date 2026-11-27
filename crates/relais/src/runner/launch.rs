@@ -425,8 +425,7 @@ impl<'a> RunEngine<'a> {
                 use std::io::Write;
                 let cost = cost();
                 let line = unknown_first_line(&spec.dispatch_id, &cost);
-                let mut stderr = std::io::stderr().lock();
-                let _ = writeln!(stderr, "{line}"); // a closed stderr cannot fail a settle that already ran
+                let _ = writeln!(std::io::stderr().lock(), "{line}"); // a closed stderr cannot fail a settle that already ran
                 self.events.emit(Event::Decision {
                     what: "gate_settle_unknown_first".into(),
                     reason: format!("{}: {cost}", spec.dispatch_id),
