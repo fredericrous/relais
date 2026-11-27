@@ -421,6 +421,16 @@ impl<'a> RunEngine<'a> {
             self.config.settle_retry_pause,
         ) {
             Ok(SettleTaken::Confirmed) => {}
+            Ok(SettleTaken::UnknownFirst) => {
+                use std::io::Write;
+                let cost = cost();
+                let line = unknown_first_line(&spec.dispatch_id, &cost);
+                let _ = writeln!(std::io::stderr().lock(), "{line}"); // a closed stderr cannot fail a settle that already ran
+                self.events.emit(Event::Decision {
+                    what: "gate_settle_unknown_first".into(),
+                    reason: format!("{}: {cost}", spec.dispatch_id),
+                });
+            }
             Ok(SettleTaken::Unconfirmed) => {
                 // The retry found no dispatch: the first try landed and its
                 // answer was lost (booked once), or the coordinator forgot
@@ -544,6 +554,19 @@ pub(super) fn unbooked_line(
     )
 }
 
+/// The stderr line for a first settle the coordinator answered `Unknown`
+/// (an-t38): it has no such dispatch (it restarted, or its lease lapsed and
+/// its sweep forgot the entry), so nothing was booked from this try. One
+/// line, and no `dropped_micros=`: `relais counter` sums that token from
+/// `coordinator.log`, and this line is the run's, not the coordinator's.
+pub(super) fn unknown_first_line(dispatch: &str, cost: &dyn std::fmt::Display) -> String {
+    format!(
+        "relais: dispatch {dispatch}: the settle of {cost} found no dispatch on the coordinator \
+         (it restarted or its lease lapsed): booked at the reservation if the lease lapsed, not \
+         at all if it restarted; run `relais coordinator status`"
+    )
+}
+
 /// How a failed admission call is reported. An unreachable coordinator
 /// is an outage — the request is preserved and nothing was launched — and
 /// anything else is a decision the coordinator made and answered with.
@@ -572,12 +595,15 @@ pub const SETTLE_RETRY_PAUSE: Duration = Duration::from_secs(1);
 /// What a settle the coordinator took came to.
 #[derive(Debug, PartialEq, Eq)]
 enum SettleTaken {
-    /// The first try was answered, or a retry was applied.
+    /// The first try or a retry was answered `Applied`.
     Confirmed,
+    /// The first try was answered `Unknown`: the coordinator has no such
+    /// dispatch (it restarted, or its lease lapsed). An answer, so it is not
+    /// asked again and stays confirmed, but it is said (an-t38).
+    UnknownFirst,
     /// A retry was answered `Unknown`: the first try may have landed (its
     /// answer lost, the entry then forgotten) or the coordinator forgot the
-    /// dispatch. A first try answered `Unknown` stays `Confirmed`, as
-    /// before this retry existed.
+    /// dispatch.
     Unconfirmed,
 }
 
@@ -606,9 +632,8 @@ fn settle_with_retry(
     for tries in 1..=SETTLE_TRIES {
         match gate.settle(dispatch_id, spent) {
             Ok(LifecycleOutcome::Unknown) if tries > 1 => return Ok(SettleTaken::Unconfirmed),
-            Ok(LifecycleOutcome::Applied | LifecycleOutcome::Unknown) => {
-                return Ok(SettleTaken::Confirmed)
-            }
+            Ok(LifecycleOutcome::Unknown) => return Ok(SettleTaken::UnknownFirst),
+            Ok(LifecycleOutcome::Applied) => return Ok(SettleTaken::Confirmed),
             Err(error) if error.unavailable() && tries < SETTLE_TRIES => {
                 let wait = jittered(pause, dispatch_id);
                 eprintln!(

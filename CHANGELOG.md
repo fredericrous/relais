@@ -18,6 +18,14 @@ line in the file. Without `--json` nothing changes. The failure arms of
 does not parse), `doctor --json`'s error object and `trust`'s stale-holdout
 `code` and `detail` fields now have tests (an-t37).
 
+A first settle the coordinator answers `Unknown` (it restarted, or its lease
+lapsed and the entry was forgotten) now writes one `gate_settle_unknown_first`
+decision and one stderr line naming the dispatch and the cost; it stays
+confirmed, books nothing and is not asked again, and a retry's `Unknown` stays
+the only `gate_settle_unconfirmed`. `relais counter` does not read it: its
+inputs, `coordinator.log` and the ledger, hold neither a run's decisions nor
+its stderr (`docs/shared-state.md`).
+
 A new `relais counter [--days N] [--json]` reads the shared day counter: per
 UTC day (today included, default 7, at most 31) the counter's figure, this
 node's ledger sum, the spend the coordinator dropped (summed from the

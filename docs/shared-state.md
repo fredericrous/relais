@@ -64,7 +64,17 @@ back in `node::daily_spent`. What still misses the counter, named on purpose
   retried), which a settle applied but whose answer was lost answers
   without booking twice. A retry answered `Unknown` cannot tell that case
   from a coordinator that forgot the dispatch, so the run writes a
-  `gate_settle_unconfirmed` decision and one line. A settle not taken leaves the coordinator to
+  `gate_settle_unconfirmed` decision and one line. A first settle answered
+  `Unknown` is an answer: it is not asked again and books nothing, but the
+  coordinator has no such dispatch (it restarted, or its lease lapsed and its
+  sweep forgot the entry), so the run writes a `gate_settle_unknown_first`
+  decision and one line (an-t38); a retry's `Unknown` stays the only
+  `gate_settle_unconfirmed`. Neither line carries `dropped_micros=`, and
+  `relais counter` reads neither: it reads `coordinator.log` and the ledger,
+  and a run's decisions and stderr are in neither, so the check keeps saying
+  `short` by that cost. Ceiling: cost minus reservation when the lease lapsed
+  (the sweep booked the reservation), the whole cost when the coordinator
+  restarted, per such run. A settle not taken leaves the coordinator to
   settle it unknown when its lease lapses, so the counter holds its
   reservation, not its cost, and the run writes a `gate_settle_failed`
   decision and one line. Ceiling: cost minus reservation, per such run;
