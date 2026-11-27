@@ -422,16 +422,16 @@ impl<'a> RunEngine<'a> {
         ) {
             Ok(SettleTaken::Confirmed) => {}
             Ok(SettleTaken::UnknownFirst) => {
-                // A closed stderr cannot fail the settle that already ran.
                 use std::io::Write;
+                let cost = cost();
                 let _ = writeln!(
-                    std::io::stderr().lock(),
+                    std::io::stderr().lock(), // a closed stderr cannot fail a settle that already ran
                     "{}",
-                    unknown_first_line(&spec.dispatch_id, &cost())
+                    unknown_first_line(&spec.dispatch_id, &cost)
                 );
                 self.events.emit(Event::Decision {
                     what: "gate_settle_unknown_first".into(),
-                    reason: format!("{}: {}", spec.dispatch_id, cost()),
+                    reason: format!("{}: {cost}", spec.dispatch_id),
                 });
             }
             Ok(SettleTaken::Unconfirmed) => {

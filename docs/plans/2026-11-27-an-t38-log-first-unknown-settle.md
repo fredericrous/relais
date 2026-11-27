@@ -40,7 +40,7 @@ Which settle answers can be `Unknown` on a first try (read, not assumed):
 
 ## Phases
 
-- [ ] **Phase 1, the line and the event.** `crates/relais/src/runner/launch.rs`:
+- [x] **Phase 1, the line and the event.** `crates/relais/src/runner/launch.rs`:
   `settle_with_retry` returns a new `SettleTaken::UnknownFirst` for an
   `Unknown` on try 1 (the `tries > 1` guard still returns `Unconfirmed` for
   a retry). The caller emits one stderr line
@@ -54,7 +54,7 @@ Which settle answers can be `Unknown` on a first try (read, not assumed):
   contain `dropped_micros=` (the counter's filter, `counter.rs:210`, counts any
   such unparsable line as unparsed). The `SettleTaken` doc comments and the
   an-t36 test doc are rewritten to say a first `Unknown` is `UnknownFirst`.
-- [ ] **Phase 2, tests.** `crates/relais/src/runner/tests/mod.rs`: `a_first_settle_answered_unknown_stays_confirmed`
+- [x] **Phase 2, tests.** `crates/relais/src/runner/tests/mod.rs`: `a_first_settle_answered_unknown_stays_confirmed`
   asserts exactly one `gate_settle_unknown_first` and still no
   `gate_settle_unconfirmed` or `gate_settle_failed`. The retry test
   (`a_settle_whose_answer_was_lost_is_retried_and_booked_once`) asserts zero
@@ -62,12 +62,12 @@ Which settle answers can be `Unknown` on a first try (read, not assumed):
   `SettleRefused` tests. A unit test asserts `unknown_first_line` has no
   newline, names the dispatch, contains the text `relais coordinator status`,
   and does not contain `dropped_micros=`.
-- [ ] **Phase 3, docs.** `docs/shared-state.md`, the settle bullet in "What
+- [x] **Phase 3, docs.** `docs/shared-state.md`, the settle bullet in "What
   still misses the counter": name `gate_settle_unknown_first` beside the
   `gate_settle_unconfirmed` sentence, with its ceiling (the cost minus the
   reservation if the coordinator's lease lapsed, the whole cost if it
   restarted), and one sentence on why the counter does not read it.
-- [ ] **Phase 4, CHANGELOG** `CHANGELOG.md` under `## Unreleased`.
+- [x] **Phase 4, CHANGELOG** `CHANGELOG.md` under `## Unreleased`.
 
 ## Counter decision
 
@@ -98,7 +98,7 @@ point at `relais coordinator status`.
 | an-t36 test extended | `cargo test -p relais a_first_settle_answered_unknown_stays_confirmed` | 1 settle, 1 `gate_settle_unknown_first`, no unconfirmed/failed | pending |
 | retry test unchanged in meaning | `cargo test -p relais a_settle_whose_answer_was_lost_is_retried_and_booked_once` | zero `gate_settle_unknown_first`, one `gate_settle_unconfirmed` | pending |
 | mutation | remove the emit in `launch.rs`, run `cargo test -p relais a_first_settle_answered_unknown_stays_confirmed` | fails on the new assertion | pending |
-| stderr line | `cargo test -p relais unknown_first_line` | one line, names dispatch, no `dropped_micros=` | pending |
+| stderr line | `cargo test -p relais first_unknown_line` | one line, names dispatch, no `dropped_micros=` | pending |
 | suite | `cargo test -p relais` | exit 0 | pending |
 
 ## Decision log
