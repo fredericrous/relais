@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 plan-id: p-01M8DWJAT8B86CRSSZKNEJ9HFH
 branch: prog/agents-many-nodes/an-t37-json-contract-gaps
 repos: [relais, homelab]
@@ -111,12 +111,12 @@ from `short_temp_dir` for the 104-byte socket cap, every reply encoded from
 
 ## Phases
 
-- [ ] Phase 1 — the object: `crates/relais/src/cli/learn.rs`, reading
+- [x] Phase 1 — the object: `crates/relais/src/cli/learn.rs`, reading
   `Due::No`'s existing fields for both the line and the object
-- [ ] Phase 2 — tests: `crates/relais/tests/it/learning_cycle.rs`,
+- [x] Phase 2 — tests: `crates/relais/tests/it/learning_cycle.rs`,
   `crates/relais/tests/shared_state_cli.rs` (a `Scratch` on `short_temp_dir`
   and a variant taking the working directory)
-- [ ] Phase 3 — docs and changelog: `docs/shared-state.md`, `docs/SPEC.md`
+- [x] Phase 3 — docs and changelog: `docs/shared-state.md`, `docs/SPEC.md`
   §17, `README.md` where it quotes the lines,
   `crates/relais/src/cli/outcome.rs` module doc, `CHANGELOG.md`; close
   homelab `docs/programmes/agents-many-nodes/an-t37-json-contract-gaps.md`
@@ -136,12 +136,25 @@ from `short_temp_dir` for the 104-byte socket cap, every reply encoded from
 
 ## Verification
 
-| Check | Input | Expected |
-|---|---|---|
-| not idle | `learn cycle --json`, another session's agent active | stdout parses, `outcome=deferred`, `reason=not_idle`, exit 0 |
-| not due | `--if-due --json` after an error row | `reason=not_due`, `next_due` non-empty, exit 0 |
-| policy | malformed `relais.toml`, `--json` | exit 1, `exit=1`, one stderr line, one `end_training` |
-| log | not idle with `--json --log f` | `f` gains one JSON line; stdout and stderr empty |
-| suite | `cargo test -p relais` | 0 failed |
+Observed 2026-11-27 on the branch build, through the real binary with scratch
+`RELAIS_STATE_DIR`s.
+
+| Check | Input | Expected | Observed |
+|---|---|---|---|
+| not idle | `learn cycle --json`, another session's agent active (real `Daemon`) | one object, exit 0 | `{"outcome":"deferred","reason":"not_idle","agents":1}`, exit 0, stderr empty, no row |
+| not due | `--if-due --json` after a cycle ran | `reason=not_due`, `next_due` set, exit 0 | object with `detail` "the last cycle started …" and `next_due` "next due 20…"; same with an agent active (not due wins) |
+| log | `--json --log f`, not idle and not due | `f` gains one JSON line; stdout and stderr empty | one bare line each, stdout empty |
+| busy | held lease, `--json`; fake `Busy{holder:None}`, plain and `--json` | exit 20, object `exit` 20, one stderr line | pass; "its holder is not recorded" |
+| refused, skew | fake `Refused(depth_exceeded)`; fake `Pong` at `PROTOCOL_VERSION + 1` | exit 1, object equals the stderr text, no lease given back | pass; skew message names both protocol numbers |
+| policy | malformed `relais.toml`, plain and `--json` | exit 1, object `exit=1`, one `end_training` | pass on the real `Daemon` (object) and the fake (count 1) |
+| doctor, trust | `doctor --json` from a removed cwd; `trust holdouts --accept … --json` with no store | exit 3, one object; trust's has `code=stale_holdout_review` | pass |
+| suite | `cargo test -p relais`, `cargo clippy --all-targets -D warnings` | 0 failed, clean | see the PR checks |
+
+## Implementation review
+
+- implementation-review: approve-with-changes ×3, all code findings resolved; typed `Format`/`Deferred`, fake's swallowed errors, `Format::Text` arms and one `not_due_line` source fixed (81k+46k, 66 s+207 s).
+- lang:rust: approve-with-changes ×2; bool flag, untyped literals, doc comment fixed; `Format::Text` arms fixed after the Delta (63k+29k).
+- backend: approve-with-changes, then approve; skew assertion, fake timeouts fixed; deliberate: exit-1-on-write-failure has no test (needs an injectable writer) (73k+30k).
+- unix: approve-with-changes, then approve; failed stdout write now exits 1; deliberate: plain-line `println!` predates this change (64k+29k).
 
 <!-- panel: repos=relais,homelab adds=contract reviewers=backend,lang:rust,tui,unix,po,architect body-sha=fd2a042ae1ed -->
