@@ -45,6 +45,7 @@ closed shared-state client: `SharedState` gains a required method,
 exactly when `daily_spent` is `None`, bounds checked first), and
 `conformance::run_all` runs two new cases, `a_counter_range_is_checked` and
 `a_counter_adds_up`; `coordinator::stamped` is now public.
+On Windows the `relais` binary now asks the linker for an 8 MiB main-thread stack (the other platforms' size): with one more subcommand the 1 MiB default overflowed while parsing the command line.
 
 ## v0.90.0
 
