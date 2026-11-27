@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.92.0
+
 **Breaking: the old name `aval` is gone.** `[integrations] greentopo` is the
 only key for the decisions tool. A `relais.toml` that still says `aval =`
 (in any spelling) is refused with `[integrations] aval is no longer read:
