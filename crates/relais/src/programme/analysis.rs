@@ -489,6 +489,15 @@ mod tests {
         names.iter().map(|name| name.to_string()).collect()
     }
 
+    /// The other ticket's path as the message shows it: `dir` joined
+    /// with the native separator, so the tests hold on Windows too.
+    fn shown(id: &str) -> String {
+        Path::new("d")
+            .join(format!("{id}.md"))
+            .display()
+            .to_string()
+    }
+
     /// `(file, message)` of each duplicate found, in order.
     fn duplicates(own: &[&str], from_ref: &[&str]) -> Vec<(String, String)> {
         duplicate_ids(
@@ -524,11 +533,11 @@ mod tests {
             vec![
                 (
                     "f12-b.md".to_string(),
-                    "id f12 is also used by d/f12-a.md; renumber to f13".to_string()
+                    format!("id f12 is also used by {}; renumber to f13", shown("f12-a"))
                 ),
                 (
                     "f12-c.md".to_string(),
-                    "id f12 is also used by d/f12-a.md; renumber to f14".to_string()
+                    format!("id f12 is also used by {}; renumber to f14", shown("f12-a"))
                 ),
             ]
         );
@@ -540,7 +549,10 @@ mod tests {
             duplicates(&["f71-b"], &["f71-a", "f72-z"]),
             vec![(
                 "f71-b.md".to_string(),
-                "id f71 is also used by d/f71-a.md on origin/main; renumber to f73".to_string()
+                format!(
+                    "id f71 is also used by {} on origin/main; renumber to f73",
+                    shown("f71-a")
+                )
             )]
         );
     }
@@ -558,7 +570,7 @@ mod tests {
             duplicates(&[&format!("{huge}-a"), &format!("{huge}-b")], &[]),
             vec![(
                 format!("{huge}-b.md"),
-                format!("id {huge} is also used by d/{huge}-a.md")
+                format!("id {huge} is also used by {}", shown(&format!("{huge}-a")))
             )]
         );
     }
