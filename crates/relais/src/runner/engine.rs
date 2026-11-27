@@ -13,6 +13,12 @@ use super::{
     UsagePhase, WorkBound, ADMISSION_POLL,
 };
 
+/// This process's held marker, read once at the runner's boundary by the
+/// slots crate's one reader: every admission of one run, and of the child
+/// runs it hosts, gets the same answer (amont host-slot-admission t15).
+static ANCESTOR_MARKER: std::sync::OnceLock<greenharness_slots::Marker> =
+    std::sync::OnceLock::new();
+
 impl<'a> RunEngine<'a> {
     /// The phase an attempt of THIS run records: a root run and an
     /// ordinary package say which attempt it is; every attempt of an
@@ -1036,10 +1042,13 @@ impl<'a> RunEngine<'a> {
             &plan,
             self.config.machine.resources.shared_host_slots.as_deref(),
         );
-        // Read before the queue directory moves into the admission: a refused
-        // marker is journalled where this run would queue.
-        let ancestor_holds_slots =
-            verify::ancestor_holds_slots(queue_dir.as_deref().filter(|_| queue_sizing.is_some()));
+        // Judged before the queue directory moves into the admission: a
+        // refused marker is journalled where this run would queue.
+        let queue_on_here = queue_dir.as_deref().filter(|_| queue_sizing.is_some());
+        let ancestor_holds_slots = verify::ancestor_holds_slots(
+            ANCESTOR_MARKER.get_or_init(greenharness_slots::held_marker),
+            queue_on_here,
+        );
         let admission = verify::HeavyAdmission {
             gate: self.config.gate,
             run_id: self.run_id.as_str().to_string(),

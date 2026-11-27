@@ -90,41 +90,40 @@ pub const UNREACHABLE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// spent retrying), so the run stays visibly alive.
 pub const COORDINATOR_UNREACHABLE_CLASS: &str = "coordinator_unreachable";
 
-/// This process's held marker, read once: every admission of one run gets
-/// the same answer (amont host-slot-admission t15).
-static ANCESTOR_MARKER: std::sync::OnceLock<greenharness_slots::Marker> =
-    std::sync::OnceLock::new();
-
 /// The once-per-process row of a refused marker: `heavy_with` builds an
 /// admission at several call sites per run.
 static MARKER_LOG: greenharness_slots::MarkerLog = greenharness_slots::MarkerLog::new();
 
-/// Whether relais's own environment says an ancestor already holds host
-/// slots for this process tree: its `GREENHARNESS_HOST_SLOT` names a live
-/// lease, read by the slots crate's one reader (amont ADR-0022, amended for
-/// t15; the bare `held` is accepted during the rollout). Read at the
-/// boundary (the runner), passed in as a fact. `queues` is the slot
-/// directory this run would queue on, when the host queue is on there: a
-/// refused marker is then said once on stderr and journalled there.
-pub fn ancestor_holds_slots(queues: Option<&Path>) -> bool {
-    let marker = ANCESTOR_MARKER.get_or_init(greenharness_slots::held_marker);
-    holds_or_says(marker, queues, &MARKER_LOG)
+/// Whether an ancestor already holds host slots for this process tree:
+/// `marker` is relais's own `GREENHARNESS_HOST_SLOT` as the slots crate's one
+/// reader judged it (amont ADR-0022, amended for t15; the bare `held` is
+/// accepted during the rollout), read by the runner at its boundary and
+/// passed in. `queues` is the slot directory this run would queue on, when
+/// the host queue is on there: a refused marker is then said once on stderr
+/// and journalled there.
+// holds-until: no machine sets `shared_host_slots`. The row goes to the
+// run's queue directory while the lease is judged against the slots crate's
+// own directory; the two differ only under that setting, and the phase-3
+// count reads the default one (amont plan, phase 3 gate).
+pub fn ancestor_holds_slots(marker: &greenharness_slots::Marker, queues: Option<&Path>) -> bool {
+    let (held, said) = holds_or_says(marker, queues, &MARKER_LOG);
+    if let Some(line) = said {
+        eprintln!("{line}");
+    }
+    held
 }
 
-/// [`ancestor_holds_slots`] for a given marker and log: the seam tests use.
+/// [`ancestor_holds_slots`] for a given log, returning the line to say
+/// instead of printing it: the seam tests use.
 fn holds_or_says(
     marker: &greenharness_slots::Marker,
     queues: Option<&Path>,
     log: &greenharness_slots::MarkerLog,
-) -> bool {
-    if let Some(dir) = queues {
-        if log.record(dir, "relais", marker) {
-            if let Some(line) = greenharness_slots::refused_line("relais", marker) {
-                eprintln!("{line}");
-            }
-        }
-    }
-    marker.is_held()
+) -> (bool, Option<String>) {
+    let said = queues
+        .filter(|dir| log.record(dir, "relais", marker))
+        .and_then(|_| greenharness_slots::refused_line("relais", marker));
+    (marker.is_held(), said)
 }
 
 /// Waiting, made injectable: a queue sleeps through this, so a test that

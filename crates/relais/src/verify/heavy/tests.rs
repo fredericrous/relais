@@ -1089,8 +1089,15 @@ fn a_refused_marker_is_journalled_once_where_the_run_queues() {
     let refused = held_marker_in(&dir, Some(std::ffi::OsStr::new("1")));
     assert!(matches!(refused, Marker::Refused { .. }), "{refused:?}");
     let log = MarkerLog::new();
-    assert!(!holds_or_says(&refused, Some(&*dir), &log));
-    assert!(!holds_or_says(&refused, Some(&*dir), &log));
+    let (held, said) = holds_or_says(&refused, Some(&*dir), &log);
+    assert!(!held);
+    let said = said.expect("the first refusal is said");
+    assert!(said.starts_with("relais: "), "{said}");
+    assert_eq!(
+        holds_or_says(&refused, Some(&*dir), &log),
+        (false, None),
+        "said once"
+    );
     let journal = std::fs::read_to_string(dir.join("waits.jsonl")).expect("journal");
     assert_eq!(journal.lines().count(), 1, "{journal}");
     assert!(journal.contains("\"tool\":\"relais\""), "{journal}");
@@ -1100,13 +1107,31 @@ fn a_refused_marker_is_journalled_once_where_the_run_queues() {
     );
 
     let quiet = temp_dir("marker-quiet");
-    assert!(!holds_or_says(&refused, None, &MarkerLog::new()));
+    assert_eq!(
+        holds_or_says(&refused, None, &MarkerLog::new()),
+        (false, None)
+    );
     assert!(!quiet.join("waits.jsonl").exists());
     let bare = held_marker_in(&quiet, Some(std::ffi::OsStr::new("held")));
-    assert!(holds_or_says(&bare, Some(&*quiet), &MarkerLog::new()));
+    assert_eq!(
+        holds_or_says(&bare, Some(&*quiet), &MarkerLog::new()),
+        (true, None)
+    );
     assert!(
         !quiet.join("waits.jsonl").exists(),
         "an accepted marker writes nothing"
+    );
+    for empty in [None, Some(std::ffi::OsStr::new(""))] {
+        let absent = held_marker_in(&quiet, empty);
+        assert_eq!(
+            holds_or_says(&absent, Some(&*quiet), &MarkerLog::new()),
+            (false, None),
+            "no marker queues, silently: {absent:?}"
+        );
+    }
+    assert!(
+        !quiet.join("waits.jsonl").exists(),
+        "an absent marker writes nothing"
     );
 }
 

@@ -23,4 +23,10 @@ refuses the bare `held`.
   warning per scenario, and `outcome_after_session_line` skips that one
   stderr line: the suite now runs with host slots off
   (`GREENGATE_HOST_SLOTS=0`) instead of a bare `held` marker, and relais says
-  so once per run. Nothing else in the golden moved.
+  so once per run. Nothing else in the golden moved. Regenerated as the
+  test's rule says: at origin/main `6a99e144d` with only this branch's
+  `.cargo/config.toml`, `RELAIS_GOLDEN_GENERATE_AT_COMMIT=1` wrote a golden
+  byte-identical to the branch's (`cmp`).
+- 2026-11-27: the suite leaves no row in the real `waits.jsonl`: after a
+  `cargo test -p relais` run (2,776 + 364 + 98 + … passed, 0 failed), the
+  only `relais` row since its start came from another live session.
