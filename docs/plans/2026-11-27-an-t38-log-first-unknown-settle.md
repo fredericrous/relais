@@ -95,11 +95,17 @@ point at `relais coordinator status`.
 
 | Check | Command | Expected | Actual |
 | --- | --- | --- | --- |
-| an-t36 test extended | `cargo test -p relais a_first_settle_answered_unknown_stays_confirmed` | 1 settle, 1 `gate_settle_unknown_first`, no unconfirmed/failed | pending |
-| retry test unchanged in meaning | `cargo test -p relais a_settle_whose_answer_was_lost_is_retried_and_booked_once` | zero `gate_settle_unknown_first`, one `gate_settle_unconfirmed` | pending |
-| mutation | remove the emit in `launch.rs`, run `cargo test -p relais a_first_settle_answered_unknown_stays_confirmed` | fails on the new assertion | pending |
-| stderr line | `cargo test -p relais first_unknown_line` | one line, names dispatch, no `dropped_micros=` | pending |
-| suite | `cargo test -p relais` | exit 0 | pending |
+| an-t36 test extended | `cargo test -p relais a_first_settle_answered_unknown_stays_confirmed` | 1 settle, 1 `gate_settle_unknown_first`, no unconfirmed/failed | ok (4.7 s): one `gate_settle_unknown_first`, no unconfirmed or failed |
+| retry test unchanged in meaning | `cargo test -p relais a_settle_whose_answer_was_lost_is_retried_and_booked_once` | zero `gate_settle_unknown_first`, one `gate_settle_unconfirmed` | ok (4.3 s) |
+| mutation | `what: "gate_settle_unknown_first"` renamed to `mutated` in `launch.rs`, run `cargo test -p relais a_first_settle_answered_unknown_stays_confirmed` | fails on the new assertion | failed at `mod.rs:9041`: "a first `Unknown` is said once: [baseline_deferred, mutated, accept]" left 0 right 1; restored |
+| stderr line | `cargo test -p relais first_unknown_line` | one line, names dispatch, contains `relais coordinator status`, no `dropped_micros=` | ok (50 s): pure `unknown_first_line` test passed |
+| suite | `cargo test -p relais` | exit 0 | exit 0 on the first implementation tree (before the comment and cost-once edits); those edits were run through the two settle tests and the line test |
+
+## Implementation review
+
+- backend (round 1 approve-with-changes, delta approve); rust (round 1 approve, the cost-once note applied); implementation-review (round 1 approve-with-changes: discard reason, filter name, pending rows; fixed).
+- Deliberate: the run-path stderr line is not captured by a test (stderr capture needs a harness change); the pure `unknown_first_line` test and the Decision-event assertion cover it. The sibling arms `Unconfirmed` and `SettleNotTaken` keep `eprintln!`; moving them to the non-panicking form is a follow-up.
+- The coordinator keeps dispatches in memory and persists only group bindings, so "not at all if it restarted" and the "whole cost" ceiling are correct.
 
 ## Decision log
 
