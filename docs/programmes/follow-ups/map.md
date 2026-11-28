@@ -145,6 +145,11 @@ ticket here until it is resolved or moved into a programme of its own.
   path, a known writer (plugin refresh, git branch tracking), or nothing
   known. The warning lists unexplained drifts first and folds known-writer
   drifts into a count line (#637, v0.93.0).
+- [f34](f34-aval-unenterable-repo-dir.md) (2026-11-26, closed 2026-11-28):
+  a `repo_dir` that exists but cannot be searched (mode 000 or 0400, or a
+  parent that cannot be searched) is now a tool failure naming the
+  directory and the permission, with no launch hint, checked before the
+  spawn.
 - [f08](f08-home-fingerprint-measure.md) (2026-11-20, closed 2026-11-28):
   no rollback. The drift check adds about 6 ms before a command and
   9 ms p50, 29 ms p95 after it; the whole hook's p95 is already 72 ms
@@ -165,13 +170,11 @@ f29 shipped in v0.87.0, f24 and f25 in v0.84.0, f27 in v0.85.0, and f26 in
 v0.86.0. The plugin was reinstalled at 0.86.0 on 2026-11-25 at 22:19, so f24
 to f27 are live.
 
-- Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f26, f27, f29, f30, f31, f32, f33.
+- Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f26, f27, f29, f30, f31, f32, f33, f34.
 - Next:
   - Recount home drifts by cause over a week of v0.93.0 rows (f47), due
     2026-12-05. f08 closed 2026-11-28.
   - Check the plugin's other `tool.call` `.catch` answers (f28), ready.
-  - Name the directory aval cannot enter, since f32 catches only a
-    missing one or a file (f34), ready.
   - Fix or widen the Windows `timeout_rerun` work budget (f46), ready.
   - A pin row's model matches the model its subagent ran (f22), due
     2026-12-01.

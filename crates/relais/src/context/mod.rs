@@ -523,18 +523,31 @@ pub fn greentopo_resolve_in(
             detail: format!("decision key `{key}` is not a key greentopo can be asked for"),
         };
     }
-    // A `repo_dir` that is not a directory (missing, a file, or unreadable)
-    // would fail the spawn, a missing one with the same NotFound as a
-    // missing program, and the launch hint would then point at the wrong
-    // cause.
-    if !repo_dir.is_dir() {
-        return GreentopoVerdict::ToolFailure {
-            exit: -1,
-            detail: format!(
-                "greentopo cannot run in {}: it is not a directory or does not exist",
-                repo_dir.display()
-            ),
-        };
+    // `repo_dir` must be a directory that can be entered. Statting `.` inside
+    // it needs search permission on the directory itself, and on every parent.
+    // Left to the spawn, a missing one fails with the same NotFound as a
+    // missing program and a permission failure falls to the launch hint, which
+    // would point at the wrong cause.
+    match std::fs::metadata(repo_dir.join(".")) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return GreentopoVerdict::ToolFailure {
+                exit: -1,
+                detail: format!(
+                    "greentopo cannot run in {}: permission denied, the directory or one of its parents cannot be searched",
+                    repo_dir.display()
+                ),
+            };
+        }
+        _ => {
+            return GreentopoVerdict::ToolFailure {
+                exit: -1,
+                detail: format!(
+                    "greentopo cannot run in {}: it is not a directory or does not exist",
+                    repo_dir.display()
+                ),
+            };
+        }
     }
     // Absence is confirmed only when nothing was declared and no PATH entry
     // named `greentopo` exists in any form: a non-executable file
@@ -1865,6 +1878,53 @@ mod tests {
         };
         assert!(detail.contains(&file.display().to_string()), "{detail}");
         assert!(!detail.contains("could not be launched"), "{detail}");
+    }
+
+    #[cfg(unix)]
+    fn assert_permission_detail(target: &Path, path_dir: &Path) {
+        let verdict = resolve_with_path(target, None, path_dir);
+        let GreentopoVerdict::ToolFailure { detail, .. } = verdict else {
+            panic!("expected a tool failure, got {verdict:?}");
+        };
+        assert!(detail.contains(&target.display().to_string()), "{detail}");
+        assert!(detail.contains("permission denied"), "{detail}");
+        assert!(!detail.contains("could not be launched"), "{detail}");
+        assert!(!detail.contains("PATH"), "{detail}");
+        assert!(!detail.contains("relais.toml"), "{detail}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unenterable_repo_dir_is_a_permission_failure_naming_it() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o000, 0o400] {
+            let root = crate::test_support::temp_dir("greentopo-perm");
+            let locked = root.join("locked");
+            std::fs::create_dir(&locked).expect("mkdir");
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+            let can_still_enter = std::fs::metadata(locked.join(".")).is_ok();
+            if !can_still_enter {
+                assert_permission_detail(&locked, &root);
+            }
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
+                .expect("restore");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unsearchable_parent_gives_the_same_permission_detail() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_support::temp_dir("greentopo-perm-parent");
+        let parent = root.join("parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).expect("mkdir");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        if std::fs::metadata(child.join(".")).is_err() {
+            assert_permission_detail(&child, &root);
+        }
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).expect("restore");
     }
 
     #[cfg(unix)]

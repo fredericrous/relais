@@ -20,6 +20,12 @@ no host-slot row carries the run id any more, and relais's own
 Claude session keeps the run id and cannot be moved. (amont
 host-slot-admission t24)
 
+A greentopo `repo_dir` that exists but cannot be entered (mode 000 or 0400,
+or under a parent that cannot be searched) now blocks the run with "greentopo
+cannot run in <dir>: permission denied", naming the directory. It used to
+end with the launch hint about PATH and `bin`, which pointed at the wrong
+cause. (follow-ups f34)
+
 ## v0.96.0
 
 relais now exports `GREENHARNESS_HOST_SLOT=held:<lease>`, the id of the host

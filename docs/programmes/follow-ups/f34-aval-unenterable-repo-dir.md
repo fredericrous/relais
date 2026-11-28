@@ -1,7 +1,7 @@
 +++
 type = "task"
 mode = "afk"
-status = "open"
+status = "closed"
 blocked_by = []
 repos = ["relais"]
 +++
@@ -41,3 +41,30 @@ for the parent case, and its comment says only what it checks. Unix tests
 pin the detail for a mode-000 and a mode-0400 directory and for an
 unsearchable parent (skipped when run as root), and it ships in one relais
 release.
+
+## Resolution
+
+2026-11-28: `greentopo_resolve_in` (renamed from `aval_resolve_in`) checks
+`metadata(repo_dir.join("."))` before the spawn. That call needs search
+permission on the directory itself and on every parent. `PermissionDenied`
+returns a `ToolFailure` (exit -1) whose detail is "greentopo cannot run in
+<dir>: permission denied, the directory or one of its parents cannot be
+searched", with no launch hint. A missing path or a non-directory keeps
+f32's "not a directory or does not exist". The comment says only what the
+check does. `an_unenterable_repo_dir_is_a_permission_failure_naming_it`
+pins the detail for mode 000 and 0400, and
+`an_unsearchable_parent_gives_the_same_permission_detail` for a parent;
+both skip their assertion when the directory stays enterable (run as
+root).
+
+The patch came from relais run run-6615674823a3a-134c3, which hit its wall
+time. Its verify (run-661588445fccb-184ae) failed on two checks: one
+unformatted line in the new test, fixed by `cargo fmt`, and clippy's
+`fetch_update` deprecation in `verify/heavy/tests.rs`, a file the patch
+does not touch. That one came from this Mac's toolchain: Homebrew's
+`cargo-clippy` 0.1.100 comes first on PATH, so even
+`rustup run 1.94.1 cargo clippy` ran it, and CI on main (pinned 1.94.1)
+is green. Landed by hand after this run with `~/.cargo/bin` first on PATH
+(clippy 0.1.94): `cargo clippy -p relais --all-targets -- -D warnings`
+clean, `cargo test -p relais --lib -- context::` 102 passed, the two new
+tests among them. It ships in the next relais release.
