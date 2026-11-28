@@ -45,7 +45,7 @@ pub use end::CheckEnd;
 pub use heavy::{
     ancestor_holds_slots, child_environment, default_heavy_commands, dispatch_id, heavy_cap,
     host_plan, host_share, logical_cores, overweight, parallelism, Admitted, Ask, HeavyAdmission,
-    HostMarker, HostPlan, HostSlots, HostSlotsOff, Jitter, KeptSlot, LeaseStop, Placement,
+    HostMarker, HostPlan, HostSlots, HostSlotsOff, Jitter, Judged, KeptSlot, LeaseStop, Placement,
     SeededJitter, SetupSlot, Sleeper, SlotLineEnd, ThreadSleeper, Tries, ANNOUNCE_EVERY,
     HOST_SLOT_ENV, LEASE_HEARTBEAT_EVERY,
 };

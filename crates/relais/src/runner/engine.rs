@@ -1039,7 +1039,11 @@ impl<'a> RunEngine<'a> {
         // Judged before the queue directory moves into the admission: a
         // refused marker is journalled where this run would queue.
         let queue_on_here = queue_dir.as_deref().filter(|_| queue_sizing.is_some());
-        let (ancestor_holds_slots, said) = self.config.host_marker.judge(queue_on_here);
+        // An accepted marker passes on to the checks as it came (t15 phase 2).
+        let verify::Judged {
+            ancestor_marker,
+            said,
+        } = self.config.host_marker.judge(queue_on_here);
         if let Some(line) = said {
             // Said where `host_slots_off` is: on stderr and in the events.
             eprintln!("{line}");
@@ -1061,7 +1065,7 @@ impl<'a> RunEngine<'a> {
             machine: plan.machine,
             slots: queue_dir,
             sizing: queue_sizing,
-            ancestor_holds_slots,
+            ancestor_marker,
             poll: ADMISSION_POLL,
             stall_window: self.stall_window(),
             announce_every: verify::ANNOUNCE_EVERY,
