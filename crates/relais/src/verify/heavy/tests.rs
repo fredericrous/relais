@@ -166,7 +166,7 @@ fn admission<'a>(
         machine: greenharness_slots::Machine { cores },
         slots: None,
         sizing: Some(greenharness_slots::Sizing::Fixed(4)),
-        ancestor_holds_slots: false,
+        ancestor_marker: None,
         poll: Duration::from_millis(10),
         stall_window: greenharness_slots::STALL,
         announce_every: ANNOUNCE_EVERY,
@@ -494,7 +494,7 @@ fn an_ancestor_slot_with_the_host_slots_off_keeps_the_coordinators_width() {
     register(&gate, "run-a0");
     let mut nested = admission(&gate, "run-a0", 2, 8);
     nested.sizing = None;
-    nested.ancestor_holds_slots = true;
+    nested.ancestor_marker = Some("held:1-0".into());
     let lease = nested.admit(&ask(&BTreeMap::new(), 1)).expect("admitted");
     assert_eq!(
         lease.env().get("CARGO_BUILD_JOBS").map(String::as_str),
@@ -1051,11 +1051,12 @@ fn an_ancestor_that_holds_host_slots_is_not_queued_behind_and_the_fact_is_passed
     let mut inside = admission(&gate, "run-a", 1, 4);
     // Slots that could never be taken: a directory that does not exist.
     inside.slots = Some(dir.join("no-such-slots"));
-    inside.ancestor_holds_slots = true;
+    inside.ancestor_marker = Some("held:7-3".into());
     let lease = inside.admit(&ask(&BTreeMap::new(), 1)).expect("admitted");
     assert_eq!(
         lease.env().get(HOST_SLOT_ENV).map(String::as_str),
-        Some("held")
+        Some("held:7-3"),
+        "the inherited marker passes through unchanged"
     );
     assert_eq!(lease.host_slots(), 0, "no host slot was queued for");
     assert!(
@@ -1076,7 +1077,25 @@ fn an_ancestor_that_holds_host_slots_is_not_queued_behind_and_the_fact_is_passed
     })
     .expect("run");
     let log = std::fs::read_to_string(outcome.log_path).expect("log");
-    assert_eq!(log.trim(), "slot=held", "the check sees the variable");
+    assert_eq!(log.trim(), "slot=held:7-3", "the check sees the variable");
+}
+
+/// An accepted marker passes to the checks as it came; a refused one passes
+/// nothing and is said once (t15 phase 2).
+#[test]
+fn a_host_marker_passes_an_accepted_value_on_unchanged() {
+    use greenharness_slots::held_marker_in;
+    let dir = temp_dir("host-marker");
+    let bare = held_marker_in(&dir, Some(std::ffi::OsStr::new("held")));
+    let held = HostMarker::given(bare, Some("held".into()));
+    assert_eq!(held.judge(Some(&*dir)), (Some("held".to_string()), None));
+    let refused = held_marker_in(&dir, Some(std::ffi::OsStr::new("1")));
+    let refused = HostMarker::given(refused, Some("1".into()));
+    let (marker, said) = refused.judge(Some(&*dir));
+    assert_eq!(marker, None, "a refused value is not passed on");
+    assert!(said.is_some_and(|l| l.starts_with("relais: ")));
+    assert_eq!(refused.judge(Some(&*dir)), (None, None), "said once");
+    assert_eq!(HostMarker::absent().judge(Some(&*dir)), (None, None));
 }
 
 /// A held marker is read by the slots crate's one reader (amont t15): a
@@ -1194,10 +1213,8 @@ mod host_slots {
         shared.sizing = Some(greenharness_slots::Sizing::Fixed(1));
         let lease = shared.admit(&ask(&BTreeMap::new(), 1)).expect("admitted");
         assert_eq!(lease.host_slots(), 1);
-        assert_eq!(
-            lease.env().get(HOST_SLOT_ENV).map(String::as_str),
-            Some("held")
-        );
+        let marker = lease.env().get(HOST_SLOT_ENV).expect("a marker");
+        assert!(marker.starts_with("held:"), "its own lease: {marker}");
         let mode = std::fs::metadata(&missing)
             .expect("made")
             .permissions()
@@ -1435,7 +1452,7 @@ mod host_slots {
         .expect("run");
         order.lock().expect("order").push("check finished".into());
         let log = std::fs::read_to_string(outcome.log_path).expect("log");
-        assert_eq!(log.trim(), "slot=held");
+        assert!(log.trim().starts_with("slot=held:"), "{log}");
         let order = order.lock().expect("order");
         let let_go = order
             .iter()
@@ -2521,9 +2538,20 @@ mod setup_keeps_one_slot {
         // ...and gets the slot once the setup is over.
         let mut other = joins.other.take().expect("joined");
         granted_soon(&mut other, &slots);
+        // One `held:<lease>` across every step: the kept slot's own lease.
+        let first = std::fs::read_to_string(work.join("marker0")).expect("marker");
+        let lease = first.strip_prefix("held:").expect("a held:<lease> marker");
+        assert!(
+            lease.split_once('-').is_some_and(|(pid, seq)| {
+                !pid.is_empty()
+                    && !seq.is_empty()
+                    && pid.bytes().chain(seq.bytes()).all(|b| b.is_ascii_digit())
+            }),
+            "{first}"
+        );
         for (n, outcome) in outcomes.iter().enumerate() {
             let marker = std::fs::read_to_string(work.join(format!("marker{n}"))).expect("marker");
-            assert_eq!(marker, HELD_MARKER, "step {n} runs under the held marker");
+            assert_eq!(marker, first, "step {n} runs under the kept lease's marker");
             let holder = std::fs::read_to_string(work.join(format!("holder{n}"))).expect("holder");
             assert!(
                 holder.contains(&format!("\"command\":\"{}\"", outcome.label)),
@@ -2621,12 +2649,14 @@ mod setup_keeps_one_slot {
         drop(kept.admit(&labelled("step-1", &none, 1)).expect("first"));
         let second = kept.admit(&labelled("step-2", &none, 1)).expect("second");
         assert_eq!(second.host_slots(), 1);
-        assert_eq!(
-            second.env().get(HOST_SLOT_ENV).map(String::as_str),
-            Some(HELD_MARKER)
-        );
+        let marker = second.env().get(HOST_SLOT_ENV).expect("a marker").clone();
+        let lease = marker.strip_prefix("held:").expect("a held:<lease> marker");
         let record =
             std::fs::read_to_string(slots.join("holders/slot-0.who")).expect("holder record");
+        assert!(
+            record.contains(&format!("\"lease\":\"{lease}\"")),
+            "{marker} names the kept lease: {record}"
+        );
         assert!(record.contains("\"command\":\"step-2\""), "{record}");
         drop(second);
         assert_eq!(rows(&slots, "admitted"), 1);

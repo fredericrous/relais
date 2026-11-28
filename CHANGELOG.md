@@ -8,6 +8,13 @@ missing here.
 
 ## Unreleased
 
+relais now exports `GREENHARNESS_HOST_SLOT=held:<lease>`, the id of the host
+slot lease a command runs under, instead of the bare `held` (amont
+host-slot-admission t15, phase 2): a setup's later steps carry the kept
+slot's lease, and under an ancestor's slot the inherited marker passes to the
+check unchanged. A run under `[resources] shared_host_slots` holds its lease
+in that directory, so a greengate child reading the default one queues there.
+
 ## v0.95.0
 
 relais names greentopo in its own code and in the names it stores

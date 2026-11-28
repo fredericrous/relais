@@ -18,8 +18,9 @@
 //!    not keep one. Where an ancestor already holds slots (relais's own
 //!    `GREENHARNESS_HOST_SLOT` is a marker the slots crate's reader accepts:
 //!    a live `held:<lease>`, or the bare `held` during the rollout) nothing
-//!    is queued for, and the checks get the bare `held` (the lease's own
-//!    marker from amont host-slot-admission t15's phase 2);
+//!    is queued for, and the checks get that marker unchanged; under its
+//!    own slots a check gets `held:<lease>`, its lease's id (amont
+//!    host-slot-admission t15, phase 2);
 //! 3. the child's environment: the parallelism bounds below, then the
 //!    check's own `env`;
 //! 4. once the process group exists, its id goes to the coordinator, which
@@ -64,12 +65,6 @@ pub const ANNOUNCE_EVERY: Duration = Duration::from_secs(30);
 /// inside the check does not queue again (amont ADR-0009).
 pub const HOST_SLOT_ENV: &str = greenharness_slots::HELD_ENV;
 
-/// The value [`HOST_SLOT_ENV`] carries when this tree holds host slots: the
-/// bare `held` that `greenharness-slots` 5 and greengate read. Written here
-/// only, so the per-lease form (`held:<lease>`, amont host-slot-admission
-/// t15) replaces one place.
-const HELD_MARKER: &str = "held";
-
 /// How often a lease the coordinator could not tie to a process group says
 /// it is alive while its check runs (the coordinator frees a lease it has
 /// not heard from for `LEASE_GRACE`, 300 s).
@@ -98,31 +93,38 @@ pub const COORDINATOR_UNREACHABLE_CLASS: &str = "coordinator_unreachable";
 /// runs it hosts, gets the same answer (amont host-slot-admission t15).
 pub struct HostMarker {
     marker: greenharness_slots::Marker,
+    /// The `GREENHARNESS_HOST_SLOT` value the marker was judged from.
+    value: Option<String>,
     log: greenharness_slots::MarkerLog,
 }
 
 impl HostMarker {
     /// This process's `GREENHARNESS_HOST_SLOT`, judged now.
     pub fn read() -> HostMarker {
-        HostMarker::given(greenharness_slots::held_marker())
+        let value = std::env::var(HOST_SLOT_ENV).ok();
+        HostMarker::given(greenharness_slots::held_marker(), value)
     }
 
-    /// A marker already judged, with a fresh log: the seam tests use.
-    pub fn given(marker: greenharness_slots::Marker) -> HostMarker {
+    /// A marker already judged from `value`, with a fresh log.
+    pub fn given(marker: greenharness_slots::Marker, value: Option<String>) -> HostMarker {
         HostMarker {
             marker,
+            value,
             log: greenharness_slots::MarkerLog::new(),
         }
     }
 
     /// No marker: nothing held above this run.
     pub fn absent() -> HostMarker {
-        HostMarker::given(greenharness_slots::Marker::Absent)
+        HostMarker::given(greenharness_slots::Marker::Absent, None)
     }
 
-    /// [`ancestor_holds_slots`] for this marker and its log.
-    pub fn judge(&self, queues: Option<&Path>) -> (bool, Option<String>) {
-        ancestor_holds_slots(&self.marker, queues, &self.log)
+    /// [`ancestor_holds_slots`] for this marker and its log: the marker an
+    /// ancestor holds the slots under, passed to the checks unchanged (t15
+    /// phase 2), or `None`; and the line to say, once.
+    pub fn judge(&self, queues: Option<&Path>) -> (Option<String>, Option<String>) {
+        let (held, said) = ancestor_holds_slots(&self.marker, queues, &self.log);
+        (held.then(|| self.value.clone()).flatten(), said)
     }
 }
 
@@ -598,9 +600,10 @@ pub struct HeavyAdmission<'a> {
     /// How many host slots there are, from the run's plan; `None` when the
     /// host slots are off, so no width is ever read from a placeholder.
     pub sizing: Option<greenharness_slots::Sizing>,
-    /// An ancestor holds host slots for this tree: nothing is queued for
-    /// here, and the fact is passed on to the check.
-    pub ancestor_holds_slots: bool,
+    /// An ancestor holds host slots for this tree: its accepted marker, the
+    /// inherited `GREENHARNESS_HOST_SLOT`. Nothing is queued for here, and the
+    /// marker passes on to the check unchanged (amont host-slot-admission t15).
+    pub ancestor_marker: Option<String>,
     pub poll: Duration,
     /// A host-slot line that made no progress for this long ends the wait
     /// (ADR-0015): read from `GREENHARNESS_SLOT_STALL_S` at the edge.
@@ -693,7 +696,7 @@ impl<'a> HeavyAdmission<'a> {
             machine: greenharness_slots::Machine { cores: 1 },
             slots: None,
             sizing: None,
-            ancestor_holds_slots: false,
+            ancestor_marker: None,
             poll: ADMISSION_POLL,
             stall_window: greenharness_slots::STALL,
             announce_every: ANNOUNCE_EVERY,
@@ -744,13 +747,13 @@ impl<'a> HeavyAdmission<'a> {
     }
 
     /// The kept slot, relabelled for `ask`, when one is kept and fits its
-    /// weight: the weight it holds. A slot of another weight is given back,
-    /// and the step takes its own.
-    fn reuse_kept(&self, ask: &Ask<'_>) -> Option<usize> {
+    /// weight: the weight it holds and its marker. A slot of another weight is
+    /// given back, and the step takes its own.
+    fn reuse_kept(&self, ask: &Ask<'_>) -> Option<(usize, String)> {
         let asked = usize::try_from(ask.weight).unwrap_or(usize::MAX);
         // Under the lock: read, relabel, or take out the lease of another
         // weight. Everything said is said after the lock is let go.
-        let (weight, renamed, other) = {
+        let (weight, marker, renamed, other) = {
             let mut state = self.setup_slot.state();
             let Kept::Open {
                 lease: Some(lease),
@@ -768,12 +771,12 @@ impl<'a> HeavyAdmission<'a> {
                     }
                     _ => Ok(()),
                 };
-                (weight, renamed, None)
+                (weight, lease.marker(), renamed, None)
             } else {
                 let Kept::Open { lease, .. } = &mut *state else {
                     unreachable!("matched as open above");
                 };
-                (weight, Ok(()), lease.take())
+                (weight, String::new(), Ok(()), lease.take())
             }
         };
         if let Some(other) = other {
@@ -804,7 +807,7 @@ impl<'a> HeavyAdmission<'a> {
                 ask.label
             ),
         });
-        Some(weight)
+        Some((weight, marker))
     }
 
     /// Keep `held` for the setup when one is open: the weight it holds.
@@ -855,8 +858,8 @@ impl<'a> HeavyAdmission<'a> {
             return own.clone();
         }
         let mut environment = child_environment(self.width(weight, placement), &BTreeMap::new());
-        if self.ancestor_holds_slots {
-            environment.insert(HOST_SLOT_ENV.to_string(), HELD_MARKER.to_string());
+        if let Some(marker) = &self.ancestor_marker {
+            environment.insert(HOST_SLOT_ENV.to_string(), marker.clone());
         }
         environment.extend(own.iter().map(|(k, v)| (k.clone(), v.clone())));
         environment
@@ -985,7 +988,7 @@ impl<'a> HeavyAdmission<'a> {
         let environment = self.environment(
             ask.weight,
             ask.env,
-            Placement::from_held(self.ancestor_holds_slots),
+            Placement::from_held(self.ancestor_marker.is_some()),
         );
         let Some(gate) = self.gate else {
             if self.manages() {
@@ -996,7 +999,7 @@ impl<'a> HeavyAdmission<'a> {
         // The shared queue is greengate's: its files are counted before any
         // token is queued for, so a weight it can never grant is refused
         // without waiting.
-        let shared = match (&self.slots, self.ancestor_holds_slots) {
+        let shared = match (&self.slots, self.ancestor_marker.is_some()) {
             (Some(dir), false) => slots::usable(dir, ask.weight, self)?,
             _ => None,
         };
@@ -1084,28 +1087,30 @@ impl<'a> HeavyAdmission<'a> {
                 // A setup's later step runs under the slot its first step
                 // took; any other command (or a first step) queues for one.
                 // `lease` drops on an error and gives its tokens back.
-                let held = match self.reuse_kept(ask) {
-                    Some(weight) => {
+                // The marker its command gets: `held:<lease>` of the slot it
+                // runs under, the kept one's for a setup's later step.
+                let marker = match self.reuse_kept(ask) {
+                    Some((weight, marker)) => {
                         lease.slots = HostHold::Kept { weight };
-                        true
+                        Some(marker)
                     }
                     None => match slots::take(dir, ask, self, &mut queue, gate, &lease.id)? {
                         Some(held) => {
+                            // Read before `keep` moves the lease.
+                            let marker = held.marker();
                             match self.keep(held) {
                                 Ok(weight) => lease.slots = HostHold::Kept { weight },
                                 Err(held) => lease.slots = HostHold::Own(held),
                             }
-                            true
+                            Some(marker)
                         }
-                        None => false,
+                        None => None,
                     },
                 };
-                if held {
+                if let Some(marker) = marker {
                     // Under its own host slot: the slots' share, as greengate gives.
                     lease.env = self.environment(ask.weight, ask.env, Placement::UnderHostSlot);
-                    lease
-                        .env
-                        .insert(HOST_SLOT_ENV.to_string(), HELD_MARKER.to_string());
+                    lease.env.insert(HOST_SLOT_ENV.to_string(), marker);
                 }
             }
             // The window between the grant and the use: space may have gone
