@@ -86,8 +86,22 @@ id.
 |---|---|---|
 | research | afk | a relais `inspect` run or an Explore agent; several may run at once |
 | prototype | hitl | a cheap artifact to react to: a mockup, a stub, a rough take |
-| grilling | hitl | AskUserQuestion, two to four options, recommendation first; the person answers, never you |
+| grilling | hitl | AskUserQuestion, two to four options, recommendation first; the person answers, never you. Worked in rounds (below) |
 | task | afk or hitl | a relais run, or an exact checklist for the person; it only unblocks a decision |
+
+**Grilling rounds.** A grilling ticket is a design tree, not one question.
+Its frontier is every open question whose prerequisites are settled: the
+questions that can be asked now without guessing at answers not yet heard.
+Ask the whole frontier in one round, numbered, each with its recommended
+option first and worded so that "yes" accepts it (AskUserQuestion takes four
+per call; a larger round takes several calls, sent together). Then recompute
+the frontier from the answers and ask the next round. A question that depends
+on one still open in this round waits for a later round. Facts come from an
+agent, never from the person: a question a filesystem or tool check settles
+is sent to an Explore agent, and the rest of the frontier is asked while it
+runs. The grilling is done when the frontier is empty; its Resolution names
+each branch and its answer. Do not act on the decisions until the person has
+confirmed the shared understanding.
 
 A ticket resolves a decision, not a deliverable. The build happens
 afterwards, as ordinary plans. When the answer is a lasting decision for
