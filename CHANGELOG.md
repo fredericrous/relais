@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.96.1
+
 A relais command waiting for a host slot now belongs to the Claude session
 that dispatched its run, not to the run, so that session can move it ahead
 with `greengate slot promote <id> --reason …` (greengate 5.2.0 or later), and
@@ -19,6 +21,12 @@ no host-slot row carries the run id any more, and relais's own
 `events.jsonl` still ties each wait to its run. A run started outside a
 Claude session keeps the run id and cannot be moved. (amont
 host-slot-admission t24)
+
+The programme skill's grilling tickets are worked in rounds: the open
+frontier is asked together, each question with its recommended option
+first, and facts come from an agent rather than from the person. A session
+that reads the skill after the plugin is reinstalled follows this; nothing
+in the binary changes.
 
 ## v0.96.0
 
