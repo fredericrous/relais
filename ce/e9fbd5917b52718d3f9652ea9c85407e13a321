@@ -1,0 +1,19 @@
+greengate-provenance-v1
+commit cee9fbd5917b52718d3f9652ea9c85407e13a321
+tree e7be6c7b77be9013e591bdaef44075eec860c878
+canon e8550a85e139f866d559b2afba8dd5cb6bd3361a
+patch 68ec64dd2debab42e9bbc2b7e34e312b9d76efc1
+plan docs/plans/2026-11-28-relais-jobs-belong-to-session.md 088dd58c7c44b11cee823d2abfe530881ada7e3b9222f1dbce8a300e8a64f74d
+review reviewed 6ea881b14e614a657d601f06e5540753def0557872d84e1e6692df08ed1cbb79
+code-review backend reviewed 6ea881b14e614a657d601f06e5540753def0557872d84e1e6692df08ed1cbb79
+code-review lang:rust reviewed 6ea881b14e614a657d601f06e5540753def0557872d84e1e6692df08ed1cbb79
+code-review tui reviewed 6ea881b14e614a657d601f06e5540753def0557872d84e1e6692df08ed1cbb79
+preview not-required
+producer greenbelay 6.18.3
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABAm5z9KEc5UqdST7y8XlQk1CAm/TZIADyeuuFk45BWAH
+0AWPuCMwD+G3ppMgK4iZ5tDWWAjw0qZHrw6q6SOzn4BQ==
+-----END SSH SIGNATURE-----
