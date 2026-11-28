@@ -84,9 +84,11 @@ pub enum GapCause {
     /// The full text of a code rule is not in memory, so it cannot be carried;
     /// this is missing text, never a timeout.
     TextUnavailable,
-    /// A cause this relais does not know, read from a manifest written by
-    /// another version, such as the old program's name for `GreentopoTooOld`
-    /// before the rename. Never written: it only keeps such a manifest readable.
+    /// A bare-string cause this relais does not know, read from a manifest
+    /// written by another version, such as the old program's name for
+    /// `GreentopoTooOld` before the rename (a cause that carries data still
+    /// fails to parse). Nothing here builds it: it only keeps such a manifest
+    /// readable.
     #[serde(other)]
     Unknown,
 }

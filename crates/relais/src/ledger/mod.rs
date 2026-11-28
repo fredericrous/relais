@@ -1359,6 +1359,6 @@ mod tests {
             serde_json::to_string(&new).expect("serializes"),
             "\"greentopo_tool_failure\""
         );
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort cleanup of the test's temp dir
     }
 }

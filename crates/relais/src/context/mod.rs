@@ -2099,16 +2099,23 @@ mod tests {
             causes,
             [guidance::GapCause::Unknown, guidance::GapCause::Unknown]
         );
+        // The catch-all covers a bare-string cause only: an unknown cause
+        // that carries data still fails, and the variant writes `unknown`.
+        assert!(serde_json::from_str::<guidance::GapCause>(r#"{"new_cause": 5}"#).is_err());
+        assert_eq!(
+            serde_json::to_string(&guidance::GapCause::Unknown).expect("json"),
+            "\"unknown\""
+        );
     }
 
     /// A new manifest writes only the new names, and the causes that carry
     /// data keep their shape beside the catch-all.
     #[test]
     fn a_new_manifest_writes_the_greentopo_names() {
-        let mut m = manifest();
-        m.tool_versions.greentopo = Some("3.0.0".into());
-        m.guidance.greentopo_version = Some("3.0.0".into());
-        m.guidance.gaps = vec![
+        let mut written = manifest();
+        written.tool_versions.greentopo = Some("3.0.0".into());
+        written.guidance.greentopo_version = Some("3.0.0".into());
+        written.guidance.gaps = vec![
             guidance::GuidanceGap::new(
                 guidance::GuidanceSource::CodeRules,
                 guidance::GapCause::GreentopoTooOld,
@@ -2128,7 +2135,7 @@ mod tests {
                 "big",
             ),
         ];
-        let json = serde_json::to_value(&m).expect("json");
+        let json = serde_json::to_value(&written).expect("json");
         assert_eq!(json["tool_versions"]["greentopo"], "3.0.0");
         assert_eq!(json["guidance"]["greentopo_version"], "3.0.0");
         let gaps = &json["guidance"]["gaps"];
@@ -2140,7 +2147,7 @@ mod tests {
         );
         assert!(!json.to_string().contains("aval"), "{json}");
         let back: ContextManifest = serde_json::from_value(json).expect("round trip");
-        assert_eq!(back.guidance.gaps, m.guidance.gaps);
+        assert_eq!(back.guidance.gaps, written.guidance.gaps);
     }
 
     /// V15: a read hint that resolves to nothing used to contribute no

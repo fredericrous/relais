@@ -1713,14 +1713,25 @@ timeout_seconds = 30
         )
         .expect("task");
         let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+        let stdout = text(&run.stdout);
         let stderr = text(&run.stderr);
         assert_eq!(run.status.code(), Some(3), "{bin}: {stderr}");
-        assert!(stderr.contains("greentopo_tool_failure"), "{bin}: {stderr}");
-        assert!(!stderr.contains("aval"), "{bin}: {stderr}");
-        assert_eq!(
-            stderr.contains(bin) && stderr.contains("relais.toml"),
-            names_bin,
+        assert!(
+            stderr.contains("blocked: greentopo_tool_failure"),
             "{bin}: {stderr}"
+        );
+        assert!(!stderr.contains("aval"), "{bin}: {stderr}");
+        assert!(!stdout.contains("aval"), "{bin}: {stdout}");
+        if names_bin {
+            assert!(
+                stderr.contains(bin) && stderr.contains("relais.toml"),
+                "{bin}: {stderr}"
+            );
+        }
+        // The fake worker logs every launch beside itself: none happened.
+        assert!(
+            !world.root.join("invocations.log").exists(),
+            "{bin}: a worker was launched"
         );
     }
 }
