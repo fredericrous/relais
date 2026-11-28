@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: prog/relais-modularise/t05-wait-loop-cancel-seam
 repos: [relais, amont]
 adrs: [ADR-0022, ADR-0015]
@@ -144,13 +144,13 @@ relais's `greenharness-slots` requirement rises to the released minor
 
 ## Phases
 
-- [ ] Phase 1 — amont: `wait_in_line_paced`, `Pause`, `Ended`, the wrapper,
+- [x] Phase 1 — amont: `wait_in_line_paced`, `Pause`, `Ended`, the wrapper,
   tests, docs: `crates/greenharness-slots/src/lib.rs`,
   `crates/greenharness-slots/README.md`, `docs/host-slots.md`,
   `CHANGELOG.md`; PR on `feat/slots-paced-wait`, merged, then released as the
   next minor after 5.4.0 (in flight in another session) with the
   `tag-release` skill; the crates.io job's conclusion read.
-- [ ] Phase 2 — relais: switch `slot::take`, remove `load_average`, raise the
+- [x] Phase 2 — relais: switch `slot::take`, remove `load_average`, raise the
   requirement: `crates/relais/src/verify/heavy.rs`, `crates/relais/src/procs.rs`,
   `crates/relais/src/verify/mod.rs`, `crates/relais/src/cli/replay.rs`,
   `crates/relais/Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`; the ticket closed
@@ -165,45 +165,87 @@ relais's `greenharness-slots` requirement rises to the released minor
   answer on `&Queue` alone would break its "unusable before joining" fallback.
 - 2026-11-27 — additive (`Ended<B>` wraps `LineEnd`), because `LineEnd` is
   matched exhaustively by greengate-runtime and relais pins `"5"`.
+- 2026-11-27 — `Pause` and `Ended` are exhaustive, not `#[non_exhaustive]` as
+  the panel had it: the decided rule `types.exhaustive-matching` wins (amont
+  code review, lang:rust and architect), so relais writes no wildcard arm and
+  a new variant is a major change. Carried findings 1 and 4 fall away with it.
+- 2026-11-27 — the crate README is left as it is: 8 lines, no API list;
+  `docs/host-slots.md` and the rustdoc name `wait_in_line_paced`.
+- 2026-11-27 — `Line(Ceiling)` maps to a new `SlotLineEnd::Ceiling` (relais
+  code review, architect and backend), not to `Stalled`: its event and its
+  journal row both say "ceiling".
+- 2026-11-27 — the 360 s live pilot is not run. On a host at load ~19 to 494
+  with 4 GB free, a real `relais run` behind a 6-minute holder costs a model
+  dispatch and a slot for little more than the cancel test now asserts (one
+  heartbeat per pause, against the recording gate); the lease-expiry path is
+  the coordinator's, which t05 does not touch.
+- 2026-11-27 — CI pins greentopo 2.0.0 while this Mac runs 3.0.0; the pack
+  refresh's `HEADS.md` is regenerated with 2.0.0 in both repositories
+  (greenharness/greengate#538 failed heads-fresh first). Follow-up f36.
+- 2026-11-27 — kept as today, out of t05's scope (relais code review,
+  backend): the heartbeat's result is still discarded (`let _ =`), and a lock
+  that fails before joining still writes no journal row; `origin/main` does
+  both the same.
 
 ## Verification
 
 - Phase 1: `cargo test -p greenharness-slots` → the existing `wait_in_line_with`
-  tests pass unedited, the new Break/Retrying/order tests pass →
+  tests pass unedited, the new Break/Retrying/order tests pass → 106 passed
+  (only `run_line`'s closures changed).
 - Phase 1: `cargo +1.74.0 check -p greenharness-slots` (or CI's `msrv` job) →
-  builds →
+  builds → OK locally (with greengate-runtime, no lockfile); CI `msrv` green.
 - Phase 1: `greengate slot run -- sleep 1` with a held slot, the built binary →
-  waits and runs as before (the wrapper path) →
+  waits and runs as before (the wrapper path) → queued ~3 s behind a `sleep 4`
+  holder, then ran, rc 0.
 - Phase 1: `greengate slot run -- sh -c 'exit 7'; echo $?` with a held slot →
-  prints 7 (the wrapper keeps the child's exit status) →
+  prints 7 (the wrapper keeps the child's exit status) → 7, after a 5.2 s queue.
 - Phase 2: `cargo test -p relais --lib verify::heavy` → the slot-wait tests
   (`a_stalled_line_ends_the_wait_and_the_row_says_so`,
   `an_unreadable_line_after_joining_ends_the_wait_with_its_own_cause`,
   `a_moving_line_outlives_the_admission_budget_and_the_grant_is_not_blocked`,
   `queued_time_is_charged_…`, `a_queued_command_says_it_is_waiting_…`) pass
-  without an assertion edit →
+  without an assertion edit → 59 passed against crates.io 5.5.0, no existing
+  assertion edited; one earlier run hit the known load-dependent
+  `setup_keeps_one_slot` flake (in the relais inbox twice already), which
+  passed on reruns and on `origin/main`'s code.
 - Phase 2: a new test sets the cancel flag during a queued host-slot wait →
   `LeaseStop` Cancelled, one `deferred` row with no `end`, and the waiter's
-  slot file gone from `dir` (the `Caller(Break)` path leaves the queue) →
+  slot file gone from `dir` (the `Caller(Break)` path leaves the queue) → passes;
+  also asserts one heartbeat per pause (3).
 - Phase 2: a `verify::heavy` test (else reliance on the crate's Retrying-Break
   test, stated) for a poll error before joining → `host_slots_off` once,
-  `Ok(None)` →
+  `Ok(None)` → a `verify::heavy` test (an `admission` directory fails the lock
+  after the ticket is made) passes: `host_slots_off` once, with "a host slot
+  could not be locked".
 - Phase 2: `cargo check -p relais --target x86_64-pc-windows-msvc` (when the
-  target is installed) → builds without `procs::load_average` →
+  target is installed) → builds without `procs::load_average` → not run: the
+  check stops in `libsqlite3-sys`'s C build script (no cross C compiler here);
+  no `load_average` reference is left under any `cfg`.
 - Phase 2: a piloted relais run whose verification command queues behind a
   `greengate slot run -- sleep 360` holder, the run started with `GREENHARNESS_SLOT_STALL_S=600` (the verification lease is admitted `Unbound`, which goes stale at the 300 s `LEASE_GRACE`, not the 120 s `DEFAULT_AGENT_LEASE_TTL` that covers hook-`Leased` agents only; the default 300 s stall would end the wait first) → waits, the queued dispatch's heartbeat age in coordinator status stays under 60 s throughout (beats every 30 s), no `stale`/`unbindable` report names it, then runs;
   the journal row reads `admitted`, and the `waiting_for_slot` events and
-  any `admission_queue_*` reason read as on `origin/main` →
+  any `admission_queue_*` reason read as on `origin/main` → not run (Decision
+  log); the heartbeat-per-pause assertion stands in.
 - Phase 2: `git diff --numstat origin/main -- crates/relais/src/verify/heavy.rs
   crates/relais/src/procs.rs` → the net lines removed per file, expected
   about 40 in `heavy.rs` and 25 in `procs.rs`; under 20 net is recorded as
-  "one loop, little code saved" and the ticket still closes →
+  "one loop, little code saved" and the ticket still closes → `procs.rs` −20,
+  `heavy.rs` +108/−100 before the ceiling variant: about −12 production lines
+  net, plus 89 lines of new tests. One loop, little code saved.
 
 ## After release
 
-- 7 days after the relais release, count the relais rows in `waits.jsonl`
-  against the 7 days before: the share ending `stalled` or `io_error`, and
-  the number of "slots unusable" notes. Either more than doubling is a
-  revert of the Phase 2 commit (filed as a due follow-up ticket at close).
+- Filed as [t07](../programmes/relais-modularise/t07-slot-wait-week-count.md),
+  due 2026-12-08, with the corrected counts: the `host_slots_off` "could not
+  be locked" events come from the run events, not `waits.jsonl`, with a floor
+  of 3 rows before a doubling counts.
+
+## Outcome
+
+Shipped: greengate 5.5.0 (`wait_in_line_paced`, #538, #540) and relais waiting
+through it. Not shipped: the live pilot and the Windows cross-check (above).
+Surprise: the copy was mostly end mapping, not loop, so the line saving is
+small; and a fleet-pack refresh made with the Mac's greentopo fails CI's
+pinned one.
 
 <!-- panel: repos=relais,amont adds=contract reviewers=backend,lang:rust,architect,po,tui,unix body-sha=965738b77130 -->
